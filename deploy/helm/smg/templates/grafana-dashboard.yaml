@@ -596,13 +596,15 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum(max by (worker) (smg_worker_health{namespace=~\"$namespace\", job=~\"$job\"}))",
+              "expr": "sum(max by (worker) (smg_worker_health{namespace=~\"$namespace\", job=~\"$job\"})) or vector(0)",
               "legendFormat": "healthy"
             }
           ],
+          "description": "Registered workers whose health probes pass. A worker's series leaves the scrape with its registration, so a gateway with no worker at all has no series: shown as 0, the state the SmgNoHealthyWorker alert fires on.",
           "fieldConfig": {
             "defaults": {
               "unit": "short",
+              "noValue": "0",
               "thresholds": {
                 "mode": "absolute",
                 "steps": [

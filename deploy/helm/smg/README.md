@@ -288,7 +288,7 @@ shutdowns and local Ctrl+C exits. A value of 0 skips the propagation wait
 | Alert | Severity | Fires when |
 |---|---|---|
 | `SmgGatewayDown` | critical | the router's scrape target is down, or no target matches the selector, for `scrapeMissingFor` |
-| `SmgNoHealthyWorker` | critical | no registered worker is healthy for `noHealthyWorkerFor` |
+| `SmgNoHealthyWorker` | critical | no registered worker is healthy, or no worker is registered at all while the gateway's scrape is up, for `noHealthyWorkerFor` |
 | `SmgHighErrorRatio` | critical | the 5xx share of responses, the probe routes (`/health`, `/readiness`, `/liveness`) excluded, exceeds `errorRatio` for `errorRatioFor` |
 | `SmgHighRouterErrorRatio` | critical | the router's server-side failed share of its requests (upstream failures and streams that failed after their first token, which the edge counts as 200s; the client's own refusals are not counted) exceeds `errorRatio` for `errorRatioFor` |
 | `SmgTtftP99High` | critical | p99 time to first token exceeds `ttftP99Seconds` for `ttftP99For` |
