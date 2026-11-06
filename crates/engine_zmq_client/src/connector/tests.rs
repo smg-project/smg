@@ -3677,3 +3677,197 @@ async fn kv_transfer_samples_fold_for_a_taker_until_taken() {
     assert_eq!(stats.samples("transfer_duration"), Some(&[0.1, 0.3][..]));
     assert!(client.take_kv_transfer().is_empty(), "taken once");
 }
+
+/// Reservation is atomic at the boundary, and overflow cannot wrap usage.
+#[test]
+fn retained_input_rejects_exhaustion_and_overflow() {
+    let total = Arc::new(AtomicUsize::new(0));
+    let first = RetainedInput::reserve(&total, 7, 10).unwrap();
+    assert!(matches!(
+        RetainedInput::reserve(&total, 4, 10),
+        Err(Error::EngineInputBytesFull {
+            retained_bytes: 7,
+            request_bytes: 4,
+            limit_bytes: 10
+        })
+    ));
+    let control = RetainedInput::reserve(&total, 4, usize::MAX).unwrap();
+    assert_eq!(total.load(Ordering::Relaxed), 11);
+    drop((first, control));
+    let full = RetainedInput::reserve(&total, usize::MAX, usize::MAX).unwrap();
+    assert!(RetainedInput::reserve(&total, 1, usize::MAX).is_err());
+    assert_eq!(total.load(Ordering::Relaxed), usize::MAX);
+    drop(full);
+    assert_eq!(total.load(Ordering::Relaxed), 0);
+}
+
+/// Concurrent producers must not overshoot the limit before the writer runs.
+#[test]
+fn retained_input_concurrent_reservations_are_bounded() {
+    let total = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(std::sync::Barrier::new(16));
+    std::thread::scope(|scope| {
+        for _ in 0..16 {
+            let total = total.clone();
+            let barrier = barrier.clone();
+            scope.spawn(move || {
+                let reservation = RetainedInput::reserve(&total, 1, 4);
+                barrier.wait();
+                assert_eq!(total.load(Ordering::Relaxed), 4);
+                barrier.wait();
+                drop(reservation);
+            });
+        }
+    });
+    assert_eq!(total.load(Ordering::Relaxed), 0);
+}
+
+/// Active writes and queued aux frames retain credit even after callers cancel;
+/// control messages still enqueue, and closing the client releases all of them.
+#[tokio::test]
+async fn retained_input_covers_active_queued_cancelled_and_closed_frames() {
+    let (client, _engine, _ns) = connect().await;
+    client.set_input_queue_limit(1, 1);
+    client.set_input_byte_limit(10);
+    let transport_credit = client.inner.reserve_input(1).await;
+    let id = EngineId::from_engine_index(0);
+    let first = client
+        .inner
+        .queue_write(
+            &id,
+            Bytes::from_static(b"x"),
+            vec![0; 3],
+            vec![Bytes::from_static(b"aux")],
+            Some(6),
+        )
+        .unwrap();
+    tokio::time::timeout(TIMEOUT, async {
+        while client.inner.writing_since.lock().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(client.inner.waiting_adds.load(Ordering::Relaxed), 0);
+    assert_eq!(client.inner.retained_input_bytes.load(Ordering::Relaxed), 6);
+    let second = client
+        .inner
+        .queue_write(&id, Bytes::from_static(b"x"), vec![0; 4], vec![], Some(4))
+        .unwrap();
+    drop((first, second));
+    assert!(matches!(
+        client
+            .send_typed(&id, Bytes::from_static(b"x"), vec![0], vec![])
+            .await,
+        Err(Error::EngineInputBytesFull {
+            retained_bytes: 10,
+            ..
+        })
+    ));
+    client
+        .inner
+        .queue_frame(&id, Bytes::from_static(b"x"), vec![0], vec![], None, None)
+        .unwrap();
+    let total = client.inner.retained_input_bytes.clone();
+    assert_eq!(total.load(Ordering::Relaxed), 11);
+    drop(client);
+    tokio::time::timeout(TIMEOUT, async {
+        while total.load(Ordering::Relaxed) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(transport_credit);
+}
+
+/// A failed socket send and enqueueing to a closed writer both return credit.
+#[tokio::test]
+async fn retained_input_releases_on_send_and_enqueue_failure() {
+    let (client, _engine, _ns) = connect().await;
+    let missing = EngineId::from_engine_index(99);
+    assert!(client
+        .send_typed(&missing, Bytes::from_static(b"x"), vec![0; 4], vec![])
+        .await
+        .is_err());
+    assert_eq!(client.inner.retained_input_bytes.load(Ordering::Relaxed), 0);
+    let inner = client.inner.clone();
+    drop(client);
+    tokio::time::timeout(TIMEOUT, async {
+        while !inner.input_tx.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        inner.queue_frame(
+            &missing,
+            Bytes::from_static(b"x"),
+            vec![0; 4],
+            vec![],
+            None,
+            Some(4)
+        ),
+        Err(Error::ClientClosed { .. })
+    ));
+    assert_eq!(inner.retained_input_bytes.load(Ordering::Relaxed), 0);
+}
+
+/// Successful local admission releases the writer allowance independently of
+/// any references still held by the transport.
+#[tokio::test]
+async fn retained_input_releases_after_successful_send() {
+    let (client, mut engine, _ns) = connect().await;
+    let stream = client
+        .submit(request_for("retained-success", 0))
+        .await
+        .unwrap();
+    assert_eq!(client.inner.retained_input_bytes.load(Ordering::Relaxed), 0);
+    let _ = tokio::time::timeout(TIMEOUT, engine.recv()).await.unwrap();
+    drop(stream);
+}
+
+/// Both the input-death timeout and a peer disconnect destroy active and
+/// queued frames without requiring the caller to drop the client.
+#[tokio::test]
+async fn retained_input_releases_on_timeout_and_peer_disconnect() {
+    for disconnect in [false, true] {
+        let (client, engine, _ns) = connect().await;
+        client.set_input_queue_limit(1, 1);
+        if !disconnect {
+            client.set_input_death_timeout(Duration::from_millis(20));
+        }
+        let credit = client.inner.reserve_input(1).await;
+        let id = EngineId::from_engine_index(0);
+        for _ in 0..2 {
+            client
+                .inner
+                .queue_frame(
+                    &id,
+                    Bytes::from_static(b"x"),
+                    vec![0; 4],
+                    vec![],
+                    None,
+                    Some(4),
+                )
+                .unwrap();
+        }
+        assert_eq!(client.inner.retained_input_bytes.load(Ordering::Relaxed), 8);
+        let engine = if disconnect {
+            drop(engine);
+            None
+        } else {
+            Some(engine)
+        };
+        tokio::time::timeout(TIMEOUT, async {
+            while client.inner.retained_input_bytes.load(Ordering::Relaxed) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!client.is_alive());
+        drop((credit, engine));
+    }
+}
