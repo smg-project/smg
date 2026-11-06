@@ -169,7 +169,9 @@ fn completion_choice(
 
 /// The chunk's logprobs when the request asked for them: its positions in
 /// the legacy shape, their offsets continuing `text_offset`, the choice's
-/// count of characters so far.
+/// count of characters so far; `None` for a chunk whose message scored no
+/// position (a wire may send the message empty), so a chunk without text
+/// goes out only with a position to carry.
 fn chunk_logprobs(
     spec: &CompletionResponseSpec,
     tokenizer: &Arc<dyn Tokenizer>,
@@ -184,6 +186,7 @@ fn chunk_logprobs(
         top_logprobs,
         text_offset,
     ))
+    .filter(|logprobs| !logprobs.tokens.is_empty())
 }
 
 impl<'a> CompletionStream<'a> {

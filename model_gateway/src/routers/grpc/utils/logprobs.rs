@@ -135,8 +135,10 @@ pub(crate) fn convert_generate_input_logprobs(
 ///
 /// `top_logprobs` is the request's `logprobs`: the public API returns that
 /// many most likely tokens and always the sampled token's logprob, up to
-/// `logprobs + 1` entries per position, so the engine's candidates are kept
-/// in its order up to that many, one per token id, keyed by their text as the
+/// `logprobs + 1` entries per position. So a position's map holds the
+/// sampled token's entry first (whether or not the engine ranked it: a wire
+/// sends no row for `logprobs: 0`), then the engine's candidates in its
+/// order up to that many, one per token id, keyed by their text as the
 /// engine's own server keys them (a later candidate of the same text takes
 /// the entry).
 pub(crate) fn convert_proto_to_completion_logprobs(
@@ -169,10 +171,13 @@ pub(crate) fn completion_logprobs(
     let entries = top_logprobs as usize + 1;
     for position in proto_logprobs.positions() {
         let token = decode_token(position.token_id);
-        // The candidates by text; a repeated id (a wire that leads its row
-        // with the sampled token and ranks it too) takes no second entry.
-        let mut candidates = HashMap::with_capacity(entries.min(position.top_logprobs.len()));
+        // The sampled token's entry, then the candidates, by text; a repeated
+        // id (a wire that leads its row with the sampled token and ranks it
+        // too) takes no second entry.
+        let mut candidates = HashMap::with_capacity(entries.min(position.top_logprobs.len() + 1));
         let mut kept: Vec<u32> = Vec::with_capacity(entries);
+        kept.push(position.token_id);
+        candidates.insert(token.clone(), position.logprob);
         for (token_id, logprob) in position.top_logprobs.iter() {
             if kept.len() >= entries {
                 break;
@@ -181,12 +186,7 @@ pub(crate) fn completion_logprobs(
                 continue;
             }
             kept.push(token_id);
-            let text = if token_id == position.token_id {
-                token.clone()
-            } else {
-                decode_token(token_id)
-            };
-            candidates.insert(text, logprob);
+            candidates.insert(decode_token(token_id), logprob);
         }
         logprobs.text_offset.push(*text_offset);
         *text_offset =
@@ -488,6 +488,44 @@ mod tests {
         assert_eq!(
             logprobs.top_logprobs,
             vec![Some(pairs(&[("t1", -0.1), ("t3", -2.5)]))]
+        );
+    }
+
+    /// The sampled token's entry is always there, as the public API returns
+    /// it: a row that does not rank it, or no row at all (`logprobs: 0` on a
+    /// wire that sends none), still yields it, and it counts toward the cap.
+    #[test]
+    fn completion_candidates_always_hold_the_sampled_token() {
+        let proto = vllm::OutputLogProbs {
+            token_logprobs: vec![-0.1, -0.2],
+            token_ids: vec![1, 2],
+            top_logprobs: vec![
+                vllm::TopLogProbs {
+                    values: vec![-1.5, -2.5],
+                    token_ids: vec![3, 4],
+                },
+                vllm::TopLogProbs {
+                    values: vec![],
+                    token_ids: vec![],
+                },
+            ],
+        };
+        let one = completion_logprobs(ProtoOutputLogProbs::Vllm(&proto), 1, &mut 0, |id| {
+            format!("t{id}")
+        });
+        assert_eq!(
+            one.top_logprobs,
+            vec![
+                Some(pairs(&[("t1", -0.1), ("t3", -1.5)])),
+                Some(pairs(&[("t2", -0.2)]))
+            ]
+        );
+        let none = completion_logprobs(ProtoOutputLogProbs::Vllm(&proto), 0, &mut 0, |id| {
+            format!("t{id}")
+        });
+        assert_eq!(
+            none.top_logprobs,
+            vec![Some(pairs(&[("t1", -0.1)])), Some(pairs(&[("t2", -0.2)]))]
         );
     }
 }
