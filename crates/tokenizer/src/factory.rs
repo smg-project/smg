@@ -6,6 +6,7 @@ use tracing::debug;
 use crate::{
     hub::download_tokenizer_from_hf,
     huggingface::HuggingFaceTokenizer,
+    tekken,
     tiktoken::{has_tiktoken_file, is_tiktoken_file, TiktokenTokenizer},
     traits,
 };
@@ -23,6 +24,7 @@ pub enum TokenizerType {
 /// The file extension is used to determine the tokenizer type.
 /// Supported file types are:
 /// - json: HuggingFace tokenizer
+/// - tekken.json: a tekken vocabulary, through the tiktoken backend
 /// - For testing: can return mock tokenizer
 pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
     create_tokenizer_with_chat_template(file_path, None)
@@ -47,6 +49,20 @@ pub fn create_tokenizer_with_chat_template(
 
     // If path is a directory, search for tokenizer files
     if path.is_dir() {
+        // A tekken.json vocabulary outranks the tokenizer.json a checkpoint
+        // may ship beside it: the file is what the family's reference reads
+        // (BOS on request, every special id by its spelling), and the
+        // conversion carries no frame. The loader reads tokenizer_config.json
+        // and the chat template beside the file itself.
+        if tekken::has_tekken_file(path) {
+            return Ok(Arc::new(
+                TiktokenTokenizer::from_tekken_file_with_chat_template(
+                    &path.join(tekken::FILE_NAME),
+                    chat_template_path,
+                )?,
+            ));
+        }
+
         let tokenizer_json = path.join("tokenizer.json");
         if tokenizer_json.exists() {
             // Resolve chat template: provided path takes precedence over auto-discovery
@@ -104,7 +120,7 @@ pub fn create_tokenizer_with_chat_template(
         }
 
         return Err(Error::msg(format!(
-            "Directory '{file_path}' does not contain a valid tokenizer file (tokenizer.json, tiktoken.model, *.tiktoken, or vocab.json)"
+            "Directory '{file_path}' does not contain a valid tokenizer file (tekken.json, tokenizer.json, tiktoken.model, *.tiktoken, or vocab.json)"
         )));
     }
 
@@ -115,6 +131,9 @@ pub fn create_tokenizer_with_chat_template(
         .map(|s| s.to_lowercase());
 
     let result = match extension.as_deref() {
+        Some("json") if tekken::is_tekken_file(path) => Ok(Arc::new(
+            TiktokenTokenizer::from_tekken_file_with_chat_template(path, chat_template_path)?,
+        ) as Arc<dyn traits::Tokenizer>),
         Some("json") => {
             let tokenizer =
                 HuggingFaceTokenizer::from_file_with_chat_template(file_path, chat_template_path)?;
@@ -436,13 +455,22 @@ pub async fn create_tokenizer_async_with_chat_template(
 }
 
 /// The tokenizer of a checkpoint downloaded from the Hub, from the files in
-/// its cache directory: `tokenizer.json`, else a tiktoken vocabulary, else the
-/// layouts the directory loader knows (`vocab.json` + `merges.txt`).
+/// its cache directory: `tekken.json`, else `tokenizer.json`, else a tiktoken
+/// vocabulary, else the layouts the directory loader knows (`vocab.json` +
+/// `merges.txt`).
 fn create_tokenizer_from_downloaded_dir(
     cache_dir: &Path,
     model_name_or_path: &str,
     chat_template_path: Option<&str>,
 ) -> Result<Arc<dyn traits::Tokenizer>> {
+    if tekken::has_tekken_file(cache_dir) {
+        return Ok(Arc::new(
+            TiktokenTokenizer::from_tekken_file_with_chat_template(
+                &cache_dir.join(tekken::FILE_NAME),
+                chat_template_path,
+            )?,
+        ));
+    }
     // Look for tokenizer.json in the cache directory
     let tokenizer_path = cache_dir.join("tokenizer.json");
     if tokenizer_path.exists() {
@@ -537,6 +565,9 @@ pub fn get_tokenizer_info(file_path: &str) -> Result<TokenizerType> {
         .map(|s| s.to_lowercase());
 
     match extension.as_deref() {
+        Some("json") if tekken::is_tekken_file(path) => {
+            Ok(TokenizerType::Tiktoken(file_path.to_string()))
+        }
         Some("json") => Ok(TokenizerType::HuggingFace(file_path.to_string())),
         _ => {
             // Try auto-detection
@@ -566,8 +597,54 @@ mod tests {
 
     use super::{
         create_tokenizer, create_tokenizer_async, create_tokenizer_from_downloaded_dir,
-        create_tokenizer_from_file, is_likely_json, is_likely_openai_model,
+        create_tokenizer_from_file, get_tokenizer_info, is_likely_json, is_likely_openai_model,
+        TokenizerType,
     };
+
+    /// A checkpoint that ships `tekken.json` loads it ahead of the
+    /// `tokenizer.json` conversion beside it, from a directory, from a Hub
+    /// download and as the file itself; the file alone loads too.
+    #[test]
+    fn a_checkpoint_that_ships_tekken_json_loads_it_ahead_of_tokenizer_json() {
+        use crate::{tekken::testing, tiktoken::TiktokenTokenizer};
+        let dir = testing::dir_with(&testing::minimal());
+        let path = dir.path();
+        let alone = create_tokenizer(path.to_str().unwrap())
+            .unwrap_or_else(|e| panic!("tekken.json alone does not load: {e:#}"));
+        assert_eq!(alone.encode("hello", true).unwrap().token_ids(), [1, 262]);
+
+        // The conversion beside it: a word-level file whose `hello` is id 0.
+        std::fs::write(
+            path.join("tokenizer.json"),
+            r#"{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+                "normalizer": null, "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null,
+                "decoder": null, "model": {"type": "WordLevel", "vocab": {"hello": 0, "<unk>": 1},
+                "unk_token": "<unk>"}}"#,
+        )
+        .unwrap();
+        let conversion = create_tokenizer(path.join("tokenizer.json").to_str().unwrap()).unwrap();
+        assert_eq!(conversion.encode("hello", false).unwrap().token_ids(), [0]);
+        for loaded in [
+            create_tokenizer(path.to_str().unwrap()).unwrap(),
+            create_tokenizer_from_downloaded_dir(path, "org/model", None).unwrap(),
+            create_tokenizer_from_file(path.join("tekken.json").to_str().unwrap()).unwrap(),
+        ] {
+            assert!(loaded
+                .as_any()
+                .downcast_ref::<TiktokenTokenizer>()
+                .is_some());
+            assert_eq!(loaded.encode("hello", false).unwrap().token_ids(), [262]);
+            assert_eq!(loaded.encode("hello", true).unwrap().token_ids(), [1, 262]);
+        }
+        assert!(matches!(
+            get_tokenizer_info(path.join("tekken.json").to_str().unwrap()).unwrap(),
+            TokenizerType::Tiktoken(_)
+        ));
+        assert!(matches!(
+            get_tokenizer_info(path.join("tokenizer.json").to_str().unwrap()).unwrap(),
+            TokenizerType::HuggingFace(_)
+        ));
+    }
 
     /// A downloaded checkpoint that ships `vocab.json` + `merges.txt` and no
     /// `tokenizer.json` (Qwen3-Omni) loads from its cache directory, and gives

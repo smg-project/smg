@@ -116,6 +116,7 @@ TRACK_INTERVAL_SECS = 2.0  # how often the supervisor's poll refreshes the engin
 # What makes a directory a tokenizer directory to the Rust tokenizer loader.
 TOKENIZER_FILE_GLOBS = (
     "tokenizer.json",
+    "tekken.json",
     "tokenizer.model",
     "tiktoken.model",
     "*.tiktoken",
