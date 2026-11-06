@@ -3,9 +3,16 @@
 //! This module provides Rust types for the Anthropic Messages API.
 //! See: <https://docs.anthropic.com/en/api/messages>
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    marker::PhantomData,
+};
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, value::SeqAccessDeserializer, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 use serde_json::{Map, Value};
 use validator::Validate;
 
@@ -379,11 +386,68 @@ pub enum ServiceTier {
 }
 
 /// System content can be a string or an array of text blocks
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum SystemContent {
     String(String),
     Blocks(Vec<SystemContentBlock>),
+}
+
+impl<'de> Deserialize<'de> for SystemContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(
+            match string_or_blocks(deserializer, "a string or an array of text blocks")? {
+                StringOrBlocks::String(text) => Self::String(text),
+                StringOrBlocks::Blocks(blocks) => Self::Blocks(blocks),
+            },
+        )
+    }
+}
+
+/// A content field as the public API shapes it: a string, or an array of
+/// blocks of one kind. Read by hand instead of as an untagged enum, so that
+/// a block that cannot be read is refused with the block's own error (its
+/// position in the array, the unknown `type` and the accepted ones, the
+/// missing field), where an untagged enum reports "data did not match any
+/// variant" and names nothing.
+enum StringOrBlocks<B> {
+    String(String),
+    Blocks(Vec<B>),
+}
+
+/// Reads [`StringOrBlocks`]; `expecting` names the shape in a refusal of
+/// any other JSON type.
+fn string_or_blocks<'de, D, B>(
+    deserializer: D,
+    expecting: &'static str,
+) -> Result<StringOrBlocks<B>, D::Error>
+where
+    D: Deserializer<'de>,
+    B: Deserialize<'de>,
+{
+    struct StringOrBlocksVisitor<B>(&'static str, PhantomData<B>);
+
+    impl<'de, B: Deserialize<'de>> Visitor<'de> for StringOrBlocksVisitor<B> {
+        type Value = StringOrBlocks<B>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+
+        fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
+            Ok(StringOrBlocks::String(text.to_owned()))
+        }
+
+        fn visit_string<E: de::Error>(self, text: String) -> Result<Self::Value, E> {
+            Ok(StringOrBlocks::String(text))
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+            Vec::<B>::deserialize(SeqAccessDeserializer::new(seq)).map(StringOrBlocks::Blocks)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrBlocksVisitor(expecting, PhantomData))
 }
 
 /// System content block — wraps TextBlock with the required `type` discriminator
@@ -431,11 +495,22 @@ pub enum Role {
 }
 
 /// Input content can be a string or an array of content blocks
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum InputContent {
     String(String),
     Blocks(Vec<InputContentBlock>),
+}
+
+impl<'de> Deserialize<'de> for InputContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(
+            match string_or_blocks(deserializer, "a string or an array of content blocks")? {
+                StringOrBlocks::String(text) => Self::String(text),
+                StringOrBlocks::Blocks(blocks) => Self::Blocks(blocks),
+            },
+        )
+    }
 }
 
 // ============================================================================
@@ -591,11 +666,25 @@ pub struct ToolResultBlock {
 }
 
 /// Tool result content (string or blocks)
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum ToolResultContent {
     String(String),
     Blocks(Vec<ToolResultContentBlock>),
+}
+
+impl<'de> Deserialize<'de> for ToolResultContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(
+            match string_or_blocks(
+                deserializer,
+                "a string or an array of tool result content blocks",
+            )? {
+                StringOrBlocks::String(text) => Self::String(text),
+                StringOrBlocks::Blocks(blocks) => Self::Blocks(blocks),
+            },
+        )
+    }
 }
 
 /// Content blocks allowed in tool results
@@ -630,7 +719,7 @@ pub struct ThinkingBlock {
     pub signature: String,
 }
 
-fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+fn null_as_empty<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
@@ -1164,17 +1253,17 @@ impl ThinkingDisplay {
 /// refusal still opens with serde's words, so the public `code` follows
 /// them (`invalid_value`, `invalid_type`).
 impl<'de> Deserialize<'de> for ThinkingDisplay {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct DisplayVisitor;
 
-        impl serde::de::Visitor<'_> for DisplayVisitor {
+        impl Visitor<'_> for DisplayVisitor {
             type Value = ThinkingDisplay;
 
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(ThinkingDisplay::EXPECTED)
             }
 
-            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
                 ThinkingDisplay::VALUES
                     .iter()
                     .find(|(name, _)| *name == value)
@@ -2540,6 +2629,103 @@ mod tests {
             miss["cache_read_input_tokens"], 0,
             "a miss is an integer zero, never null"
         );
+    }
+
+    /// A content field that is neither a string nor an array of blocks, or
+    /// holds a block that cannot be read, is refused with the block's own
+    /// reason: the unknown `type` with the accepted ones, the missing field,
+    /// the wrong JSON type; never "data did not match any variant".
+    #[test]
+    fn an_unreadable_content_block_is_refused_by_its_own_reason() {
+        let refusal = |message: Value| {
+            serde_json::from_value::<InputMessage>(message)
+                .expect_err("refused")
+                .to_string()
+        };
+        let unknown_block = refusal(json!({
+            "role": "assistant",
+            "content": [{"type": "mcp_tool_use", "id": "m1", "name": "echo", "server_name": "s", "input": {}}]
+        }));
+        assert!(
+            unknown_block.starts_with(
+                "unknown variant `mcp_tool_use`, expected one of `text`, `image`, `document`, `tool_use`, `tool_result`, `thinking`"
+            ),
+            "{unknown_block}"
+        );
+        assert!(
+            unknown_block.contains("`tool_reference`"),
+            "{unknown_block}"
+        );
+        let unknown_source = refusal(json!({
+            "role": "user",
+            "content": [{"type": "image", "source": {"type": "file", "file_id": "file_1"}}]
+        }));
+        assert!(
+            unknown_source.starts_with("unknown variant `file`, expected `base64` or `url`"),
+            "{unknown_source}"
+        );
+        let missing_field = refusal(json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "content": "ok"}]
+        }));
+        assert!(
+            missing_field.starts_with("missing field `tool_use_id`"),
+            "{missing_field}"
+        );
+        let untyped = refusal(json!({"role": "user", "content": [{"text": "hi"}]}));
+        assert!(untyped.starts_with("missing field `type`"), "{untyped}");
+        let null = refusal(json!({"role": "user", "content": null}));
+        assert!(
+            null.starts_with("invalid type: null, expected a string or an array of content blocks"),
+            "{null}"
+        );
+        let number = refusal(json!({"role": "user", "content": 5}));
+        assert!(
+            number.starts_with(
+                "invalid type: integer `5`, expected a string or an array of content blocks"
+            ),
+            "{number}"
+        );
+
+        // The same for the system prompt and a tool result's content.
+        let system = serde_json::from_value::<SystemContent>(json!([{"type": "image"}]))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            system.starts_with("unknown variant `image`, expected `text`"),
+            "{system}"
+        );
+        let system = serde_json::from_value::<SystemContent>(json!({}))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            system.starts_with("invalid type: map, expected a string or an array of text blocks"),
+            "{system}"
+        );
+        let result = serde_json::from_value::<ToolResultContent>(
+            json!([{"type": "thinking", "thinking": "x"}]),
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(
+            result.starts_with(
+                "unknown variant `thinking`, expected one of `text`, `image`, `document`, `search_result`, `tool_reference`"
+            ),
+            "{result}"
+        );
+
+        // Both shapes still read, and round-trip as they are written.
+        for content in [json!("hi"), json!([{"type": "text", "text": "hi"}])] {
+            let message: InputMessage =
+                serde_json::from_value(json!({"role": "user", "content": content}))
+                    .expect("accepted");
+            assert_eq!(serde_json::to_value(&message.content).unwrap(), content);
+        }
+        let system: SystemContent = serde_json::from_value(json!("be brief")).expect("accepted");
+        assert!(matches!(system, SystemContent::String(ref s) if s == "be brief"));
+        let result: ToolResultContent =
+            serde_json::from_value(json!([{"type": "text", "text": "ok"}])).expect("accepted");
+        assert!(matches!(result, ToolResultContent::Blocks(ref b) if b.len() == 1));
     }
 
     /// History echoed by Claude Code (a ToolSearch result) and by the Anthropic
