@@ -26,6 +26,21 @@ const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
 /// The most frames the family's own video loader hands its processor.
 const LOADER_MAX_FRAMES: usize = 768;
 
+/// The frames the Qwen2-VL line's own video loader hands its processor
+/// ([`FrameSampling::SteppedGroups`]): `total / fps x 2` frames clamped to
+/// [4, 768] in whole temporal groups, at a constant step from the first
+/// frame; the group is the processor config's `temporal_patch_size` where
+/// the checkpoint states one. Qwen3-Omni (`super::qwen3_omni`) is served
+/// by the same loader and answers the same rule.
+pub(super) fn loader_frame_sampling(config: Option<&PreProcessorConfig>) -> FrameSampling {
+    FrameSampling::SteppedGroups {
+        temporal_patch_size: config
+            .and_then(|config| config.temporal_patch_size)
+            .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
+        max_frames: LOADER_MAX_FRAMES,
+    }
+}
+
 pub(super) struct QwenVLVisionSpec;
 
 impl QwenVLVisionSpec {
@@ -203,25 +218,15 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
     }
 
     /// The family's own video loader samples a clip before its processor sees
-    /// it: `total / fps x 2` frames clamped to [4, 768] in whole temporal
-    /// groups, at a constant step from the first frame
-    /// ([`FrameSampling::SteppedGroups`]).
+    /// it ([`loader_frame_sampling`]).
     fn video_frame_sampling(&self) -> FrameSampling {
-        FrameSampling::SteppedGroups {
-            temporal_patch_size: DEFAULT_TEMPORAL_PATCH_SIZE,
-            max_frames: LOADER_MAX_FRAMES,
-        }
+        loader_frame_sampling(None)
     }
 
     /// The temporal group is the processor config's `temporal_patch_size`
     /// where the checkpoint states one.
     fn video_frame_sampling_with(&self, config: Option<&PreProcessorConfig>) -> FrameSampling {
-        FrameSampling::SteppedGroups {
-            temporal_patch_size: config
-                .and_then(|config| config.temporal_patch_size)
-                .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
-            max_frames: LOADER_MAX_FRAMES,
-        }
+        loader_frame_sampling(config)
     }
 
     /// One layout per modality for the gateway's assembly: a video batch

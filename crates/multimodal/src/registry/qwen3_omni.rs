@@ -5,9 +5,10 @@ use serde_json::Value;
 use crate::{
     audio::{AudioPreProcessor, Qwen3AudioProcessor},
     encoder_inputs::PreprocessedEncoderInputs,
+    media::FrameSampling,
     registry::{
-        qwen_vl::IMAGE_PAD_TOKEN, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
-        RegistryResult,
+        qwen_vl::{loader_frame_sampling, IMAGE_PAD_TOKEN},
+        ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
     types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
     vision::{PreProcessorConfig, Qwen3OmniVisionProcessor, VisionPreProcessor},
@@ -161,6 +162,20 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
             model_config,
             preprocessor_config,
         ))))
+    }
+
+    /// The family's video loader is the Qwen2-VL line's: a clip is sampled
+    /// before its processor sees it, `total / fps x 2` frames in whole
+    /// temporal groups, at most 768 ([`FrameSampling::SteppedGroups`]), so a
+    /// 5-frame clip at 1 fps is four frames, two temporal groups.
+    fn video_frame_sampling(&self) -> FrameSampling {
+        loader_frame_sampling(None)
+    }
+
+    /// The temporal group is the processor config's `temporal_patch_size`
+    /// where the checkpoint states one.
+    fn video_frame_sampling_with(&self, config: Option<&PreProcessorConfig>) -> FrameSampling {
+        loader_frame_sampling(config)
     }
 
     fn prompt_replacements(
@@ -329,6 +344,46 @@ mod tests {
             assert!(Qwen3OmniSpec.worker_expandable(modality), "{modality}");
         }
         assert!(!Qwen3OmniSpec.worker_expandable(Modality::ImageEmbeds));
+    }
+
+    /// A clip is sampled the way the family's own video loader samples it:
+    /// a 5-frame clip at 1 fps is its first four frames (two temporal groups),
+    /// not ten frames at the nominal 2 fps with every frame doubled; the
+    /// temporal group follows the processor config; a one-frame clip, shorter
+    /// than one temporal group, gets no frame, as on the engine's own server.
+    #[test]
+    fn omni_video_frames_follow_the_qwen2_vl_loader_rule() {
+        use crate::media::{sampled_frame_indices, VideoFetchConfig};
+
+        let spec = Qwen3OmniSpec;
+        assert_eq!(
+            spec.video_frame_sampling(),
+            FrameSampling::SteppedGroups {
+                temporal_patch_size: 2,
+                max_frames: 768,
+            }
+        );
+        let config = PreProcessorConfig {
+            temporal_patch_size: Some(4),
+            ..PreProcessorConfig::default()
+        };
+        assert_eq!(
+            spec.video_frame_sampling_with(Some(&config)),
+            FrameSampling::SteppedGroups {
+                temporal_patch_size: 4,
+                max_frames: 768,
+            }
+        );
+        let fetch = VideoFetchConfig {
+            sampling: spec.video_frame_sampling(),
+            ..VideoFetchConfig::default()
+        };
+        assert_eq!(sampled_frame_indices(5, 1.0, fetch), vec![0, 1, 2, 3]);
+        assert_eq!(
+            sampled_frame_indices(150, 30.0, fetch),
+            (0..10).map(|group| group * 15).collect::<Vec<_>>()
+        );
+        assert!(sampled_frame_indices(1, 30.0, fetch).is_empty());
     }
 
     #[test]
