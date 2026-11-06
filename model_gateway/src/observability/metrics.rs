@@ -260,6 +260,12 @@ mod handles {
         pub(super) static WORKER_SELECTIONS: RefCell<ByLabels<SelectionLabels, Counter>> = RefCell::new(HashMap::new());
         /// `smg_cache_aware_policy_branch_total` by branch.
         pub(super) static CACHE_AWARE_BRANCHES: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        /// `smg_manual_policy_branch_total` by branch.
+        pub(super) static MANUAL_BRANCHES: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        /// `smg_consistent_hashing_policy_branch_total` by branch.
+        pub(super) static CONSISTENT_HASHING_BRANCHES: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        /// `smg_prefix_hash_policy_branch_total` by branch.
+        pub(super) static PREFIX_HASH_BRANCHES: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
         /// `smg_cache_aware_match_ratio`: one series.
         pub(super) static CACHE_AWARE_MATCH_RATIO: RefCell<Option<Histogram>> = const { RefCell::new(None) };
         /// `smg_routing_key_source_total` by source.
@@ -290,6 +296,9 @@ mod handles {
         WORKER_CB_OUTCOMES.with_borrow_mut(|kept| *kept = WorkerOutcomes::default());
         WORKER_SELECTIONS.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_BRANCHES.with_borrow_mut(HashMap::clear);
+        MANUAL_BRANCHES.with_borrow_mut(HashMap::clear);
+        CONSISTENT_HASHING_BRANCHES.with_borrow_mut(HashMap::clear);
+        PREFIX_HASH_BRANCHES.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_MATCH_RATIO.set(None);
         ROUTING_KEY_SOURCES.with_borrow_mut(HashMap::clear);
         ADMISSION_QUEUE_DEPTH.set(None);
@@ -2660,11 +2669,12 @@ impl Metrics {
 
     /// Record manual policy execution branch for routing decisions
     pub fn record_worker_manual_policy_branch(branch: &'static str) {
-        counter!(
-            "smg_manual_policy_branch_total",
-            "branch" => branch
-        )
-        .increment(1);
+        handles::with_static(
+            &handles::MANUAL_BRANCHES,
+            branch,
+            || counter!("smg_manual_policy_branch_total", "branch" => branch),
+            |count| count.increment(1),
+        );
     }
 
     /// Set manual policy cache entries count
@@ -2746,20 +2756,22 @@ impl Metrics {
 
     /// Record consistent hashing policy execution branch for routing decisions
     pub fn record_worker_consistent_hashing_policy_branch(branch: &'static str) {
-        counter!(
-            "smg_consistent_hashing_policy_branch_total",
-            "branch" => branch
-        )
-        .increment(1);
+        handles::with_static(
+            &handles::CONSISTENT_HASHING_BRANCHES,
+            branch,
+            || counter!("smg_consistent_hashing_policy_branch_total", "branch" => branch),
+            |count| count.increment(1),
+        );
     }
 
     /// Record prefix hash policy execution branch for routing decisions
     pub fn record_worker_prefix_hash_policy_branch(branch: &'static str) {
-        counter!(
-            "smg_prefix_hash_policy_branch_total",
-            "branch" => branch
-        )
-        .increment(1);
+        handles::with_static(
+            &handles::PREFIX_HASH_BRANCHES,
+            branch,
+            || counter!("smg_prefix_hash_policy_branch_total", "branch" => branch),
+            |count| count.increment(1),
+        );
     }
 
     /// A request dispatched to a worker (each attempt, each PD side), counted
