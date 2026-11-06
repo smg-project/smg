@@ -571,6 +571,23 @@ pub(crate) enum ExecutionPlanKind {
 }
 
 impl ExecutionPlan {
+    /// Encoding rewrites a clone with replica-bound EC handles; the retained
+    /// pre-encode plan cannot replay those handles after any attempt failure.
+    pub(crate) fn has_replica_bound_ec_handoff(&self) -> bool {
+        let carries_media = |request: &ProtoGenerateRequest| {
+            request.is_vllm() && (request.has_mm_inputs() || request.has_vllm_media_refs())
+        };
+        match self {
+            Self::EncodePrefillDecode { request } => carries_media(request),
+            Self::Batch {
+                kind: ExecutionPlanKind::EncodePrefillDecode,
+                requests,
+                ..
+            } => requests.iter().any(carries_media),
+            _ => false,
+        }
+    }
+
     pub(crate) fn generate(kind: ExecutionPlanKind, request: ProtoGenerateRequest) -> Self {
         match kind {
             ExecutionPlanKind::Single => Self::Single(ProtoRequest::Generate(request)),
@@ -1730,6 +1747,35 @@ mod tests {
 
     use super::*;
     use crate::routers::grpc::{client::GrpcClient, test_engine::mock_engine};
+
+    /// Only multimodal vLLM EPD owns EC state absent from its retained plan.
+    #[test]
+    fn replica_bound_ec_policy_preserves_other_retry_shapes() {
+        use smg_grpc_client::{tokenspeed_proto, vllm_proto};
+        let media = ProtoGenerateRequest::Vllm(Box::new(vllm_proto::GenerateRequest {
+            media_refs: Some(vllm_proto::MediaRefs::default()),
+            ..Default::default()
+        }));
+        for kind in [
+            ExecutionPlanKind::Single,
+            ExecutionPlanKind::PrefillDecode,
+            ExecutionPlanKind::EncodePrefillDecode,
+        ] {
+            assert_eq!(
+                ExecutionPlan::generate(kind, media.clone()).has_replica_bound_ec_handoff(),
+                kind == ExecutionPlanKind::EncodePrefillDecode
+            );
+        }
+        for request in [
+            ProtoGenerateRequest::Vllm(Box::default()),
+            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
+                mm_inputs: Some(tokenspeed_proto::MultimodalInputs::default()),
+                ..Default::default()
+            })),
+        ] {
+            assert!(!ExecutionPlan::EncodePrefillDecode { request }.has_replica_bound_ec_handoff());
+        }
+    }
 
     /// The status of a failure a stage reports and the code of its JSON
     /// error object.

@@ -789,7 +789,7 @@ fn an_owner_back_from_a_crash_tombstones_the_keys_of_its_earlier_life_so_its_pee
         let _serial = serial();
         MockHttpWorker::start()
     };
-    let (a, b) = spawn_pair(&certs, &probe, Mesh::Plain, &[&engine.url]);
+    let (a, b) = spawn_pair(&certs, &probe, Mesh::Plain, &[], &[&engine.url]);
 
     let mut first_id = None;
     assert!(
@@ -823,7 +823,7 @@ fn an_owner_back_from_a_crash_tombstones_the_keys_of_its_earlier_life_so_its_pee
     let a = {
         let _serial = serial();
         drop(a);
-        let mut a = spawn_gateway("nodea", &certs, ports, None, Mesh::Plain, &[&engine.url]);
+        let mut a = spawn_gateway("nodea", &certs, ports, &[], Mesh::Plain, &[&engine.url]);
         let failure = a.start_up(&certs, &probe, Mesh::Plain);
         assert!(
             failure.is_none() && !a.lost_a_port(),

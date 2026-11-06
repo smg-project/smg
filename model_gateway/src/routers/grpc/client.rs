@@ -1157,6 +1157,20 @@ mod tests {
 
     use super::{trtllm_status_healthy, ModelInfo, ServerInfo, SUPPORTS_VISION_LABEL};
 
+    /// EC compatibility fields survive discovery as routing labels.
+    #[test]
+    fn vllm_ec_capabilities_flatten_into_labels() {
+        let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
+            supports_ec_transfer: true,
+            ec_connector: "ECCPUConnector".into(),
+            ec_role: "ec_producer".into(),
+            ..Default::default()
+        }));
+        let labels = info.to_labels();
+        assert_eq!(labels["ec_connector"], "ECCPUConnector");
+        assert_eq!(labels["ec_role"], "ec_producer");
+    }
+
     /// A vLLM worker's `GetServerInfo` fields flatten into labels as they
     /// are: the engine's per-prompt media limits arrive as `mm_item_limits`
     /// and its encoder budget as `mm_encoder_budget`, and an engine without

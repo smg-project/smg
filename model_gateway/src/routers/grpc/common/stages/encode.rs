@@ -61,6 +61,7 @@ impl EncodeStage {
 
 #[async_trait]
 impl PipelineStage for EncodeStage {
+    /// Plan TokenSpeed rendezvous; vLLM encodes its assembled prompt at dispatch.
     async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         if ctx
             .state
@@ -69,6 +70,18 @@ impl PipelineStage for EncodeStage {
             .and_then(WorkerSelection::encode_assignments)
             .is_none_or(|assignments| assignments.is_empty())
         {
+            return Ok(());
+        }
+
+        // vLLM sends the assembled prompt to E during request execution; it
+        // does not use TokenSpeed's per-item bootstrap rendezvous.
+        if matches!(
+            ctx.state.workers.as_ref(),
+            Some(WorkerSelection::Disaggregated {
+                runtime_type: RuntimeType::Vllm,
+                ..
+            })
+        ) {
             return Ok(());
         }
 

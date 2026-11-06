@@ -529,6 +529,9 @@ message GetServerInfoResponse {
   bool supports_ec_transfer = 27;
   // Mooncake consumer entry point for each DP rank; each entry discovers its TP shards.
   repeated string ec_zmq_addrs = 28;
+  // E/P must agree on the connector and advertise complementary roles.
+  string ec_connector = 29;
+  string ec_role = 30;
 }
 
 // =====================

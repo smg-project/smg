@@ -102,6 +102,17 @@ except Exception:  # pragma: no cover - version lookup is best-effort
     VLLM_VERSION = ""
 
 
+def _valid_cpu_ec_handle(handle) -> bool:
+    """ECCPU needs an address for every encoding it will fetch remotely."""
+    return (
+        isinstance(handle, dict)
+        and isinstance(handle.get("peer_host"), str)
+        and bool(handle["peer_host"])
+        and type(handle.get("peer_port")) is int
+        and 0 < handle["peer_port"] <= 65535
+    )
+
+
 def _prompt_length(prompt) -> int:
     """The token count of an engine prompt (0 when it is text the engine tokenizes)."""
     if isinstance(prompt, dict):
@@ -389,6 +400,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 getattr(self.engine, "vllm_config", None), "ec_transfer_config", None
             )
             is_ec_consumer = ec_config is not None and ec_config.is_ec_consumer
+            is_ec_producer = ec_config is not None and ec_config.is_ec_producer
 
             if request.HasField("media_refs"):
                 # Media references from the router: the worker fetches and runs
@@ -446,19 +458,57 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 # Every batch needs its own, not just one of them: a batch left
                 # out contributes no encoder tensor, and the engine would run
                 # that modality's encoder with nothing to encode.
-                if (
-                    batches_missing_pixels(preprocessed_batches)
-                    and kv_transfer_params is None
-                    and not is_ec_consumer
+                missing_pixels = batches_missing_pixels(preprocessed_batches)
+                ec_handoff = bool(is_ec_consumer and ec_transfer_params)
+                if ec_handoff and ec_config.ec_connector in (
+                    "ECCPUConnector",
+                    "ECMooncakeConnector",
                 ):
+                    ec_handoff = all(batch.mm_hashes for batch in missing_pixels)
+                if ec_handoff and ec_config.ec_connector == "ECMooncakeConnector":
+                    # Mooncake consumes per-occurrence transfer IDs; a nonempty
+                    # dict alone does not prevent a pixel-less encoder schedule.
+                    items = ec_transfer_params.get("ec_items", [])
+                    hashes = (
+                        [
+                            item.get("mm_hash")
+                            for item in items
+                            if isinstance(item, dict) and item.get("transfer_id")
+                        ]
+                        if isinstance(items, list)
+                        else []
+                    )
+                    for batch in preprocessed_batches:
+                        if batches_missing_pixels([batch]):
+                            for mm_hash in batch.mm_hashes:
+                                if mm_hash not in hashes:
+                                    ec_handoff = False
+                                    break
+                                hashes.remove(mm_hash)
+                if ec_handoff and ec_config.ec_connector == "ECCPUConnector":
+                    ec_handoff = all(
+                        _valid_cpu_ec_handle(ec_transfer_params.get(mm_hash))
+                        for batch in missing_pixels
+                        for mm_hash in batch.mm_hashes
+                    )
+                # P may send KV remotely, but it still needs every incoming EC
+                # handle. Only a leg without EC parameters may rely on KV alone.
+                if (
+                    missing_pixels
+                    and (ec_transfer_params is not None or kv_transfer_params is None)
+                    and not ec_handoff
+                ):
+                    reason = (
+                        "ec_transfer_params_json is not usable for every pixel-less media item"
+                        if ec_transfer_params is not None
+                        else "no kv_transfer_params or ec_transfer_params"
+                    )
                     logger.warning(
-                        "Request %s: pixel-less multimodal payload with no kv_transfer_params; "
-                        "rejecting (prefill worker did not hand off KV?)",
-                        request_id,
+                        "Request %s: pixel-less multimodal payload rejected: %s", request_id, reason
                     )
                     raise ValueError(
                         "multimodal payload carries grid tensors but no pixel_values and "
-                        "no kv_transfer_params; a pixel-less leg requires remote KV"
+                        f"{reason}; a pixel-less leg requires a handoff"
                     )
                 # Preprocessed multimodal from Rust router.
                 # Token IDs already have expanded placeholders; tensors are
@@ -470,6 +520,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     self._build_preprocessed_mm_inputs, request.tokenized, preprocessed_batches
                 )
                 prompt["arrival_time"] = arrival_time
+                if ec_transfer_params is not None and is_ec_producer and not missing_pixels:
+                    media_identity = build_media_identity(prompt)
             elif input_type == "tokenized":
                 prompt: TokensPrompt = {"prompt_token_ids": list(request.tokenized.input_ids)}
                 if request.tokenized.original_text:
@@ -554,6 +606,25 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 trace_headers=trace_headers(context.invocation_metadata()),
                 data_parallel_rank=pinned_rank,
             ):
+                # ECCPU may evict an encoding before completion and return
+                # metadata without a fetch address. P has no pixels to
+                # recompute it after EPD, so refuse before returning a handoff.
+                if (
+                    output.finished
+                    and ec_transfer_params is not None
+                    and ec_config is not None
+                    and is_ec_producer
+                    and ec_config.ec_connector == "ECCPUConnector"
+                    and media_identity is not None
+                ):
+                    handles = getattr(output, "ec_transfer_params", None) or {}
+                    for batch in mm_batches(media_identity):
+                        for mm_hash in batch.mm_hashes:
+                            handle = handles.get(mm_hash, {})
+                            if not _valid_cpu_ec_handle(handle):
+                                raise RuntimeError(
+                                    "Encoder returned an incomplete ECCPU transfer handle"
+                                )
                 if not engine_started:
                     # The engine holds the request from its first output on
                     # (a refusal below never gets here). The prompt's cached
@@ -956,6 +1027,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         ec_config = getattr(self.engine.vllm_config, "ec_transfer_config", None)
         if "supports_ec_transfer" in info.DESCRIPTOR.fields_by_name:
             info.supports_ec_transfer = ec_config is not None
+        if ec_config is not None and "ec_connector" in info.DESCRIPTOR.fields_by_name:
+            info.ec_connector = ec_config.ec_connector or ""
+            info.ec_role = ec_config.ec_role or ""
         if (
             "ec_zmq_addrs" in info.DESCRIPTOR.fields_by_name
             and ec_config is not None
@@ -965,12 +1039,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             from vllm.utils.network_utils import make_zmq_path
 
             parallel = self.engine.vllm_config.parallel_config
+            ranks = managed_ranks(self.engine)
             info.ec_zmq_addrs.extend(
                 make_zmq_path(
                     "tcp",
                     ec_config.ec_ip,
                     ec_config.ec_port + rank * parallel.tensor_parallel_size,
                 )
+                if rank in ranks
+                else ""
                 for rank in range(parallel.data_parallel_size)
             )
         return info

@@ -725,6 +725,9 @@ impl RequestPipeline {
             };
             Metrics::record_request_buffers_released_early(plan.wire_len());
 
+            // Keep the original failure and metrics, without sleeping for a
+            // retry that cannot safely replay an encoder's replica-bound handoff.
+            let retry_config = retry_config.filter(|_| !plan.has_replica_bound_ec_handoff());
             let max_attempts = retry_config.map_or(1, |config| config.max_retries.max(1));
             let mut plan = Some(plan);
             let mut spec = Some(spec);

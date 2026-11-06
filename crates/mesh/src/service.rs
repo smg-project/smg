@@ -1072,7 +1072,7 @@ mod tests {
         let (listener_b, bind_b) = bind_node().await;
         let (proxy_b, accepted) = counting_proxy(bind_b).await;
         let (server_b, handler_b) =
-            MeshServerBuilder::new("B".to_string(), bind_b, proxy_b, None).build();
+            MeshServerBuilder::new("B".to_string(), bind_b, proxy_b, Vec::new()).build();
         #[expect(
             clippy::disallowed_methods,
             reason = "test node runs in the background for the duration of the assertion"
@@ -1083,7 +1083,7 @@ mod tests {
             }
         });
         let (listener_a, addr_a) = bind_node().await;
-        let handler_a = mesh_run!("A", listener_a, addr_a, Some(proxy_b));
+        let handler_a = mesh_run!("A", listener_a, addr_a, vec![proxy_b]);
 
         wait_for(
             || handler_a.state.read().len() == 2 && handler_b.state.read().len() == 2,
