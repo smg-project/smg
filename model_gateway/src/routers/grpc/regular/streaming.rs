@@ -2689,7 +2689,7 @@ impl StreamingProcessor {
 /// token or changing the shared Chat response type. A populated usage field
 /// is serialized only by `chunk`, so there is never a duplicate JSON key.
 #[derive(Serialize)]
-struct ChatChunkWithUsage<'a> {
+pub(crate) struct ChatChunkWithUsage<'a> {
     #[serde(flatten)]
     chunk: &'a ChatCompletionStreamResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2697,7 +2697,7 @@ struct ChatChunkWithUsage<'a> {
 }
 
 impl<'a> ChatChunkWithUsage<'a> {
-    fn new(chunk: &'a ChatCompletionStreamResponse, emit_usage_null: bool) -> Self {
+    pub(crate) fn new(chunk: &'a ChatCompletionStreamResponse, emit_usage_null: bool) -> Self {
         Self {
             chunk,
             usage: (emit_usage_null && chunk.usage.is_none()).then_some(()),
@@ -2809,7 +2809,10 @@ struct ChatStream<'a> {
     first_token_time: Option<Instant>,
 
     /// DeepSeek always reports aggregate usage on the final finish chunk;
-    /// `include_usage` controls null placeholders on earlier chunks only.
+    /// the public dialect ends the stream with a usage-only chunk when
+    /// `include_usage` asks for one. Under `include_usage` every chunk that
+    /// carries no usage writes the `usage: null` placeholder, as the public
+    /// API does (`emit_usage_null`).
     deepseek_usage: bool,
     include_usage: bool,
     emit_usage_null: bool,
@@ -2896,7 +2899,7 @@ impl<'a> ChatStream<'a> {
             .stream_options
             .as_ref()
             .is_some_and(|opts| opts.include_usage.unwrap_or(false));
-        let emit_usage_null = deepseek_usage && include_usage;
+        let emit_usage_null = include_usage;
         let mut continuous_usage = spec
             .stream_options
             .as_ref()
