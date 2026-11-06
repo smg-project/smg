@@ -110,15 +110,13 @@ pub(super) struct CompletionStream<'a> {
     /// the read flushes before every poll, so the first token waits for
     /// nothing ([`StreamingProcessor::next_packed`]).
     first_token_out: bool,
-    /// Whether some unit's first-token frame has been the body's first frame,
-    /// shared by the units of one batched request (`None`: this unit is the
-    /// body's only one). The first unit to flush its first token claims the
-    /// body's first frame and its hand-off yields once, the body's own yield
-    /// after its first frame making the two; a later unit's first-token
-    /// frame is not the body's first, so its hand-off yields twice (as the
-    /// Messages stream's), or the frame would reach the connection behind
-    /// the burst read after it.
-    first_frame: Option<&'a AtomicBool>,
+    /// The body's first frame as this unit sees it ([`BodysFirstFrame`]): a
+    /// first-token frame that claimed it has its hand-off yield once, the
+    /// body's own yield after its first frame making the two; any later
+    /// first-token frame is not the body's first, so its hand-off yields
+    /// twice (as the Messages stream's), or the frame would reach the
+    /// connection behind the burst read after it.
+    first_frame: BodysFirstFrame<'a>,
 
     /// The per-choice state, one entry per choice the request expects
     /// (`spec.choices_per_prompt`), at the engine's index.
@@ -266,7 +264,10 @@ impl<'a> CompletionStream<'a> {
                 })
                 .collect(),
             first_token_out: false,
-            first_frame,
+            first_frame: BodysFirstFrame {
+                shared: first_frame,
+                frame_out: false,
+            },
             engine_outlived: false,
             tail_tokens: 0,
             frame,
@@ -291,18 +292,13 @@ impl<'a> CompletionStream<'a> {
         grpc_stream: &mut ProtoStream,
     ) -> Result<(), utils::StreamFailure> {
         loop {
-            // This poll hands the first token's frame off (the flush before the
-            // poll, the first token seen, the frame written) exactly when the
-            // read has not flushed it yet: the claim of the body's first frame
-            // is made then, once per unit. A claim with nothing behind it:
-            // relaxed is enough.
-            let hands_off_first_token = !self.first_token_out
-                && self.first_token_time.is_some()
-                && !self.sse_buffer.is_empty();
-            let first_frame_is_first_token = !hands_off_first_token
-                || self
-                    .first_frame
-                    .is_none_or(|first_frame| !first_frame.swap(true, Ordering::Relaxed));
+            // Until the first token's frame is out, the packed read flushes
+            // the buffer before the poll; that flush, when it is this unit's
+            // first frame, decides whether the frame is the body's first (a
+            // finish with no token ahead of it claims as much as a first
+            // token's frame); the hand-off yields once only for a first-token
+            // frame that is the body's first.
+            let first_frame_is_first_token = self.frame_leaves();
             let next = StreamingProcessor::next_packed(
                 grpc_stream,
                 self.tx,
@@ -323,7 +319,9 @@ impl<'a> CompletionStream<'a> {
             let gen_response = match response {
                 Ok(response) => response,
                 Err(e) => {
-                    // What was produced before the failure still goes out.
+                    // What was produced before the failure still goes out (a
+                    // first frame of any kind claims the body's first frame).
+                    self.frame_leaves();
                     StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
                     return Err(utils::StreamFailure::upstream(
                         e,
@@ -341,6 +339,7 @@ impl<'a> CompletionStream<'a> {
                 // What was produced ahead of the failure (the chunks written
                 // since the last flush) still goes out, as it does ahead of
                 // an upstream failure; the failure's event follows it.
+                self.frame_leaves();
                 StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
                 return Err(failure);
             }
@@ -352,8 +351,18 @@ impl<'a> CompletionStream<'a> {
                 break;
             }
         }
+        self.frame_leaves();
         StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
         Ok(())
+    }
+
+    /// A flush of the buffer is due (the packed read's before a poll, a
+    /// failure's, the read's end, the finish of the open choices): whether the
+    /// frame about to leave is the body's first ([`BodysFirstFrame::leaves`]);
+    /// false when nothing is in the buffer (no frame leaves) and after this
+    /// unit's first frame.
+    fn frame_leaves(&mut self) -> bool {
+        !self.first_token_out && !self.sse_buffer.is_empty() && self.first_frame.leaves()
     }
 
     /// An engine chunk: the choice's tokens through its stop decoder (made on
@@ -422,6 +431,12 @@ impl<'a> CompletionStream<'a> {
                 },
             )
             .await?;
+            after_write(
+                &self.sse_buffer,
+                &mut self.first_frame,
+                self.first_token_time,
+                &mut self.first_token_out,
+            );
         }
 
         if stopped {
@@ -450,6 +465,12 @@ impl<'a> CompletionStream<'a> {
                     &completion_choice(index, sfx.to_string(), None),
                 )
                 .await?;
+                after_write(
+                    &self.sse_buffer,
+                    &mut self.first_frame,
+                    self.first_token_time,
+                    &mut self.first_token_out,
+                );
             }
 
             StreamingProcessor::write_completion_chunk(
@@ -459,6 +480,12 @@ impl<'a> CompletionStream<'a> {
                 &completion_choice(index, String::new(), Some("stop".to_string())),
             )
             .await?;
+            after_write(
+                &self.sse_buffer,
+                &mut self.first_frame,
+                self.first_token_time,
+                &mut self.first_token_out,
+            );
         }
         Ok(())
     }
@@ -504,6 +531,12 @@ impl<'a> CompletionStream<'a> {
                 &completion_choice(index, self.prompt_text.to_string(), None),
             )
             .await?;
+            after_write(
+                &self.sse_buffer,
+                &mut self.first_frame,
+                self.first_token_time,
+                &mut self.first_token_out,
+            );
             choice.started = true;
         }
 
@@ -524,6 +557,12 @@ impl<'a> CompletionStream<'a> {
                         &completion_choice(index, text, None),
                     )
                     .await?;
+                    after_write(
+                        &self.sse_buffer,
+                        &mut self.first_frame,
+                        self.first_token_time,
+                        &mut self.first_token_out,
+                    );
                 }
             }
         }
@@ -536,6 +575,12 @@ impl<'a> CompletionStream<'a> {
                 &completion_choice(index, sfx.to_string(), None),
             )
             .await?;
+            after_write(
+                &self.sse_buffer,
+                &mut self.first_frame,
+                self.first_token_time,
+                &mut self.first_token_out,
+            );
         }
 
         let finish_reason =
@@ -548,6 +593,12 @@ impl<'a> CompletionStream<'a> {
             &completion_choice(index, String::new(), Some(finish_reason)),
         )
         .await?;
+        after_write(
+            &self.sse_buffer,
+            &mut self.first_frame,
+            self.first_token_time,
+            &mut self.first_token_out,
+        );
         Ok(())
     }
 
@@ -569,6 +620,7 @@ impl<'a> CompletionStream<'a> {
             let tail = match decoder.finish() {
                 Ok(tail) => tail,
                 Err(failure) => {
+                    self.frame_leaves();
                     StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
                     return Err(failure.to_string().into());
                 }
@@ -595,9 +647,16 @@ impl<'a> CompletionStream<'a> {
                 &completion_choice(index, text, stopped.then(|| "stop".to_string())),
             )
             .await?;
+            after_write(
+                &self.sse_buffer,
+                &mut self.first_frame,
+                self.first_token_time,
+                &mut self.first_token_out,
+            );
         }
         // The finish of the open choices is written after the read's end
         // flush: it leaves as its own frame.
+        self.frame_leaves();
         StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
         Ok(())
     }
@@ -665,5 +724,53 @@ impl<'a> CompletionStream<'a> {
             first_token_time: self.first_token_time,
             saw_complete,
         }
+    }
+}
+
+/// The body's first frame, as the units of one request see it: the first
+/// unit to send a frame of any kind (a first token's, a finish with no token
+/// ahead of it, the chunk writer's own send of a full buffer) claims it.
+struct BodysFirstFrame<'a> {
+    /// The flag shared by the units of one batched request (`None`: this
+    /// unit is the body's only one).
+    shared: Option<&'a AtomicBool>,
+    /// Whether a frame of this unit has left.
+    frame_out: bool,
+}
+
+impl BodysFirstFrame<'_> {
+    /// A frame of this unit leaves, or has just left: the first call claims
+    /// the body's first frame and answers whether this unit's frame is it;
+    /// every later call answers false. A claim with nothing behind it:
+    /// relaxed is enough.
+    fn leaves(&mut self) -> bool {
+        if self.frame_out {
+            return false;
+        }
+        self.frame_out = true;
+        self.shared
+            .is_none_or(|shared| !shared.swap(true, Ordering::Relaxed))
+    }
+}
+
+/// After a chunk write ([`StreamingProcessor::write_completion_chunk`]): a
+/// buffer left empty means the writer sent the full buffer itself (a first
+/// chunk past the flush size, the echo of a long prompt in front of the
+/// first token), so a frame of the unit is gone: it claims the body's first
+/// frame if it was the unit's first, and, the first token being among it,
+/// the first-token frame is out and the hand-off is not paid on a later
+/// frame.
+fn after_write(
+    buffer: &BytesMut,
+    first_frame: &mut BodysFirstFrame<'_>,
+    first_token_time: Option<Instant>,
+    first_token_out: &mut bool,
+) {
+    if !buffer.is_empty() {
+        return;
+    }
+    first_frame.leaves();
+    if first_token_time.is_some() {
+        *first_token_out = true;
     }
 }
