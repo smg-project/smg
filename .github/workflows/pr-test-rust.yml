@@ -2636,6 +2636,7 @@ jobs:
       connection_mode: ""
       servicer_impl: ""
       parser: "legacy"
+      sampling_profile: "original1"
       min_selected: 202
       servicer_unit_tests: true
       setup_agentic_deps: false
