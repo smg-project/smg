@@ -167,15 +167,22 @@ impl LocalRateLimitBackend {
     /// bucket and none can take it before it is gone. A reserve that comes
     /// after finds the slot vacant and starts a fresh bucket.
     fn sweep_idle_buckets(&self, idle_ttl: Duration) -> usize {
+        let candidates = self.idle_bucket_candidates(idle_ttl);
+        self.evict_idle_candidates(&candidates, idle_ttl)
+    }
+
+    fn idle_bucket_candidates(&self, idle_ttl: Duration) -> Vec<ScopeKey> {
         let now = Instant::now();
-        let candidates: Vec<ScopeKey> = self
-            .buckets
+        self.buckets
             .iter()
             .filter(|entry| {
                 Arc::strong_count(entry.value()) == 1 && entry.value().idle_at(now) >= idle_ttl
             })
             .map(|entry| entry.key().clone())
-            .collect();
+            .collect()
+    }
+
+    fn evict_idle_candidates(&self, candidates: &[ScopeKey], idle_ttl: Duration) -> usize {
         candidates
             .iter()
             .filter(|key| {
@@ -779,6 +786,115 @@ mod tests {
             rounds.load(Ordering::Relaxed) >= ROUNDS,
             "the reserve threads and the sweep did not get through {ROUNDS} rounds in 10 s"
         );
+    }
+
+    /// Force a reserve after the sweep collects an idle candidate, before
+    /// its final Arc-count recheck. Held reservations must keep that bucket
+    /// served; after all closes the next sweep must evict it.
+    #[test]
+    fn a_reserve_between_sweep_passes_never_debits_a_removed_bucket() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Barrier,
+        };
+
+        use futures::FutureExt;
+
+        const TENANT: &str = "ip:203.0.113.7";
+        const ROUNDS: usize = 128;
+        // Refills a one-token draw in nanoseconds, so the bucket is full,
+        // and sweepable, almost whenever no reserve holds it.
+        let backend = LocalRateLimitBackend::new(policy_set(u32::MAX, u32::MAX));
+        let key = ScopeKey::TenantGlobal(TenantKey::new(TENANT));
+        let phases = Barrier::new(4);
+        let bad_reserves = AtomicUsize::new(0);
+        let bad_candidates = AtomicUsize::new(0);
+        let wrong_bucket = AtomicUsize::new(0);
+        let bad_sweeps = AtomicUsize::new(0);
+        let seed = || {
+            drop(backend.bucket_for(
+                key.clone(),
+                ScopeLimits {
+                    tokens_per_minute: u32::MAX,
+                    requests_per_minute: u32::MAX,
+                },
+            ));
+        };
+        seed();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..ROUNDS {
+                    // Pause the actual two-pass sweep after its count-of-one
+                    // observation, then let all three reserves clone that Arc.
+                    let candidates = backend.idle_bucket_candidates(Duration::ZERO);
+                    if candidates.as_slice() != std::slice::from_ref(&key) {
+                        bad_candidates.fetch_add(1, Ordering::Relaxed);
+                    }
+                    phases.wait(); // first pass finished; let reserves run
+                    phases.wait(); // all reservations now hold their bucket
+                    if backend.evict_idle_candidates(&candidates, Duration::ZERO) != 0 {
+                        bad_sweeps.fetch_add(1, Ordering::Relaxed);
+                    }
+                    phases.wait(); // re-check finished; let readers check identity
+                    phases.wait(); // all identity checks finished; let reserves close
+                    phases.wait(); // all reservation-held Arcs have been dropped
+                    if backend.sweep_idle_buckets(Duration::ZERO) != 1 {
+                        bad_sweeps.fetch_add(1, Ordering::Relaxed);
+                    }
+                    seed();
+                    phases.wait(); // prepare the next race before releasing readers
+                }
+            });
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    for _ in 0..ROUNDS {
+                        phases.wait();
+                        let req = request(TENANT, 1);
+                        let charge_id = req.request_charge_id;
+                        // reserve/close never await, so one poll finishes them.
+                        if backend.reserve(req).now_or_never() != Some(ReserveOutcome::Admitted) {
+                            bad_reserves.fetch_add(1, Ordering::Relaxed);
+                        }
+                        phases.wait();
+                        phases.wait();
+                        {
+                            let matches =
+                                match (backend.active.get(&charge_id), backend.buckets.get(&key)) {
+                                    (Some(held), Some(served)) => {
+                                        Arc::ptr_eq(&held.buckets[0], served.value())
+                                    }
+                                    _ => false,
+                                };
+                            if !matches {
+                                wrong_bucket.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        phases.wait();
+                        if backend
+                            .close_reserved_only(charge_id)
+                            .now_or_never()
+                            .is_none()
+                        {
+                            bad_reserves.fetch_add(1, Ordering::Relaxed);
+                        }
+                        phases.wait();
+                        phases.wait();
+                    }
+                });
+            }
+        });
+
+        // Assert after joining, so an invariant failure cannot strand another
+        // participant at a barrier. Each round checks both held and idle states.
+        assert_eq!(bad_reserves.load(Ordering::Relaxed), 0);
+        assert_eq!(bad_candidates.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            wrong_bucket.load(Ordering::Relaxed),
+            0,
+            "an admitted reservation holds a bucket the map no longer serves"
+        );
+        assert_eq!(bad_sweeps.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
