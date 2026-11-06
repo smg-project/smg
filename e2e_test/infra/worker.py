@@ -1302,6 +1302,7 @@ def validate_startup_profile_worker(
     tp: int | None = None,
     extra_engine_args: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
+    wait_ready: bool = True,
     **_kwargs,
 ) -> None:
     """Validate the opt-in profile before start_workers prepares any worker."""
@@ -1382,8 +1383,23 @@ def validate_startup_profile_worker(
             "--config",
         ) or option.startswith(("-tp", "-dp")):
             raise ValueError(f"{profile} forbids appended TP/DP/model override arguments")
-    if extra_env and any(
-        key.startswith("E2E_") or key == "SMG_VLLM_SERVICER_WARMUP" for key in extra_env
+    # Only the unchanged full-warmup case's exact vLLM call shape may override
+    # the job's fast level. Its existing watch owns its independent time bounds.
+    original1_full_warmup = (
+        profile == "original1-vllm-chat-legacy"
+        and model_id == "meta-llama/Llama-3.2-1B-Instruct"
+        and mode == ConnectionMode.GRPC
+        and wait_ready is False
+        and extra_engine_args == []
+        and extra_env == {"SMG_VLLM_SERVICER_WARMUP": "full"}
+        and _kwargs.get("kv_backend") is None
+    )
+    if (
+        extra_env
+        and any(
+            key.startswith("E2E_") or key == "SMG_VLLM_SERVICER_WARMUP" for key in extra_env
+        )
+        and not original1_full_warmup
     ):
         raise ValueError(f"{profile} forbids a worker environment override of its lane/warm-up")
 
@@ -1438,6 +1454,7 @@ def start_workers(
         tp=tp,
         extra_engine_args=extra_engine_args,
         extra_env=extra_env,
+        wait_ready=wait_ready,
         kv_backend=kv_backend,
     )
     # The lane's GPU slice: every worker shifts by E2E_GPU_OFFSET.
