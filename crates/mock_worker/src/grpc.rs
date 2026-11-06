@@ -680,8 +680,6 @@ impl MockScheduler {
         Ok(Box::pin(in_flight.until_done(stream::iter(items))))
     }
 
-    /// Every wire's `HealthCheck` answer: healthy unless the admin API set
-    /// the worker not serving, with the message each proto carries.
     /// The admin fan-out's flush: every rank's cache cleared at once, whatever
     /// is in flight (the request's wait for an idle scheduler is not
     /// simulated), answered with success; a canned worker has no cache and
@@ -719,6 +717,8 @@ impl MockScheduler {
         profile_response(self.ops.stop_profile())
     }
 
+    /// Every wire's `HealthCheck` answer: healthy unless the admin API set
+    /// the worker not serving, with the message each proto carries.
     pub(crate) fn health(&self) -> (bool, &'static str) {
         let serving = self.overrides.serving();
         (serving, if serving { "ok" } else { "not serving" })

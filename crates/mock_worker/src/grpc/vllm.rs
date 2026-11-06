@@ -664,6 +664,57 @@ mod tests {
         assert!(info.mm_device_do_normalize);
     }
 
+    /// The admin fan-out's three RPCs on this wire call the core's answers:
+    /// the flush succeeds, a profiling run starts and stops with one trace
+    /// file in the requested directory, and a second stop is refused.
+    #[tokio::test]
+    async fn the_admin_fan_out_rpcs_answer_on_this_wire() {
+        let (service, _stop) = MockScheduler::for_tests(Config::default(), 65_208);
+        let flushed = VllmEngine::flush_cache(
+            &service,
+            Request::new(common::FlushCacheRequest { timeout_s: 0.0 }),
+        )
+        .await
+        .expect("flush")
+        .into_inner();
+        assert!(flushed.success, "{}", flushed.message);
+        assert!(
+            flushed.message.ends_with("cache cleared on 0 engine(s)"),
+            "{}",
+            flushed.message
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let traces = dir.path().join("traces");
+        let started = VllmEngine::start_profile(
+            &service,
+            Request::new(common::StartProfileRequest {
+                output_dir: Some(traces.display().to_string()),
+                num_steps: Some(2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("start")
+        .into_inner();
+        assert!(started.success, "{}", started.message);
+        let stopped =
+            VllmEngine::stop_profile(&service, Request::new(common::StopProfileRequest {}))
+                .await
+                .expect("stop")
+                .into_inner();
+        assert!(stopped.success, "{}", stopped.message);
+        let files = std::fs::read_dir(&traces)
+            .expect("the output directory")
+            .count();
+        assert_eq!(files, 1, "{}", stopped.message);
+        let again = VllmEngine::stop_profile(&service, Request::new(common::StopProfileRequest {}))
+            .await
+            .expect("stop")
+            .into_inner();
+        assert!(!again.success, "a stop with no run in progress is refused");
+    }
+
     /// The served worker answers this wire's health check and names its
     /// service on the standard health service; the other wires' checks are
     /// unimplemented there, which is how the gateway tells the runtime.
