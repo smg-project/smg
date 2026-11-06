@@ -23,9 +23,13 @@
 //!   worker answers to that prompt; `GET` reads the queue length and the hit
 //!   and miss counts, `DELETE` drops the queue ([`crate::script`]); a name no
 //!   worker of the process has is a 404, as on the fault routes.
+//! - `GET /admin/zmq/{worker}`: a ZMQ rank's `batch_messages` (the output
+//!   messages that carried request outputs) and `outputs` (the outputs in
+//!   them) since it connected: cumulative, a reset does not clear them; a
+//!   rank name, not `all`.
 //!
 //! Worker names are `grpc:<port>` / `http:<port>` / `zmq:<index>`; `all`
-//! addresses every worker.
+//! addresses every worker on the routes that take it.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -86,6 +90,7 @@ fn router(state: Arc<AdminState>) -> Router {
         // labels. For beds that change an engine's reported settings between
         // two health transitions.
         .route("/admin/serving/{port}", get(serving_get).post(serving_set))
+        .route("/admin/zmq/{worker}", get(zmq_rank))
         .route("/admin/info/{port}", get(info_get).post(info_patch))
         .with_state(state)
 }
@@ -403,6 +408,25 @@ fn injected_failures() -> Value {
         })
         .collect();
     Value::Object(workers)
+}
+
+/// What a ZMQ rank has pushed since it connected: the messages that carried
+/// request outputs and the outputs in them, cumulative (a reset does not
+/// clear them), so a test tells an engine's step of many outputs from one
+/// message per token.
+async fn zmq_rank(Path(worker): Path<String>) -> Response {
+    match crate::zmq::rank_output_counts(&worker) {
+        Some(counts) => {
+            let (batch_messages, outputs) = counts.read();
+            Json(json!({
+                "worker": worker,
+                "batch_messages": batch_messages,
+                "outputs": outputs,
+            }))
+            .into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "unknown ZMQ rank").into_response(),
+    }
 }
 
 async fn cache(Path(worker): Path<String>) -> Response {
