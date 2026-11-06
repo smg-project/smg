@@ -686,6 +686,8 @@ class GrpcRequestManager:
                     self.last_receive_tstamp = real_time()
                     if getattr(recv_obj, "rid", None):
                         await self._handle_health_check_output(recv_obj)
+                elif isinstance(recv_obj, AbortReq):
+                    await self._handle_abort_req(recv_obj)
                 elif not self._dispatch_communicator_output(recv_obj):
                     logger.warning(f"Unknown type on tokenizer socket: {type(recv_obj)}")
             except zmq.error.Again:

@@ -18,6 +18,11 @@ class HealthCheckOutput:
     rid: str | None = None
 
 
+@dataclass
+class AbortReq:
+    rid: str
+
+
 def _tokenizer_loop():
     tree = ast.parse(_REQUEST_MANAGER.read_text())
     method = next(
@@ -26,6 +31,7 @@ def _tokenizer_loop():
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_tokenizer_loop"
     )
     namespace = {
+        "AbortReq": AbortReq,
         "HealthCheckOutput": HealthCheckOutput,
         "get_exception_traceback": lambda: "",
         "logger": logging.getLogger(__name__),
@@ -72,4 +78,25 @@ def test_tokenizer_health_signal_refreshes_liveness_without_spurious_request(rid
         manager._handle_health_check_output.assert_awaited_once_with(health_output)
     else:
         manager._handle_health_check_output.assert_not_awaited()
+    manager._dispatch_communicator_output.assert_not_called()
+
+
+def test_tokenizer_abort_req_is_dispatched_to_the_request_manager():
+    loop, _ = _tokenizer_loop()
+    abort_req = AbortReq(rid="r-abort")
+
+    async def receive():
+        manager.gracefully_exit = True
+        return abort_req
+
+    manager = SimpleNamespace(
+        gracefully_exit=False,
+        recv_from_tokenizer=SimpleNamespace(recv_pyobj=receive),
+        _dispatch_communicator_output=Mock(return_value=False),
+        _handle_abort_req=AsyncMock(),
+    )
+
+    asyncio.run(loop(manager))
+
+    manager._handle_abort_req.assert_awaited_once_with(abort_req)
     manager._dispatch_communicator_output.assert_not_called()
