@@ -49,8 +49,8 @@ use super::{
     service::{
         broadcast_node_states,
         gossip::{
-            gossip_client::GossipClient, gossip_message, NodeState, NodeStatus, Ping, PingReq,
-            StateSync, StreamMessage,
+            gossip_client::GossipClient, gossip_message, NodeState, NodeStatus, NodeUpdate, Ping,
+            PingReq, StateSync, StreamMessage,
         },
         ClusterState,
     },
@@ -362,6 +362,93 @@ impl GossipController {
         }
     }
 
+    /// A peer's answer to a probe, direct or relayed, written into the
+    /// table: an `Alive` or `Leaving` status and the address it advertises
+    /// go in and the entry comes back; any other status is left to the
+    /// verdict path and `None` comes back.
+    pub(crate) fn record_in_table(
+        state: &ClusterState,
+        node_update: &NodeUpdate,
+    ) -> Option<NodeState> {
+        if node_update.status != NodeStatus::Alive as i32
+            && node_update.status != NodeStatus::Leaving as i32
+        {
+            return None;
+        }
+        let mut s = state.write();
+        let entry = s
+            .entry(node_update.name.clone())
+            .and_modify(|e| {
+                e.status = node_update.status;
+                e.address.clone_from(&node_update.address);
+            })
+            .or_insert_with(|| NodeState {
+                name: node_update.name.clone(),
+                address: node_update.address.clone(),
+                status: node_update.status,
+                version: 1,
+                metadata: HashMap::new(),
+            });
+        Some(entry.clone())
+    }
+
+    /// The answer a relay brought back: recorded (`true`) when it is the
+    /// probed peer's own, refused (`false`) when it is not. A relay answers
+    /// for the node it reached, so an answer named for another member (a
+    /// stale address another node holds now) must not mark the peer
+    /// reachable or move its entry; the join peer's placeholder is the one
+    /// name the answer may supply. The peer's own answer goes into the table
+    /// as a direct answer's does, so a member held `Suspected` after an
+    /// earlier break is `Alive` again on the first relay that reaches it, as
+    /// long as it still holds itself `Alive` (a verdict that reached it
+    /// through a peer is what it answers with). No sync stream is started
+    /// here: the direct probe has just failed on this node's link to the
+    /// peer, and the stream would dial that same link.
+    pub(crate) fn record_relayed_answer(
+        state: &ClusterState,
+        peer_name: &str,
+        relay_address: &str,
+        node_update: &NodeUpdate,
+    ) -> bool {
+        if !is_join_peer(peer_name) && node_update.name != peer_name {
+            log::warn!(
+                "The relay through {} answered for {}, not {}: a stale address, next relay",
+                relay_address,
+                node_update.name,
+                peer_name
+            );
+            return false;
+        }
+        log::info!("Received NodeUpdate through the relay: {:?}", node_update);
+        Self::record_in_table(state, node_update);
+        true
+    }
+
+    /// Record a peer's answer to a direct probe: its status and address
+    /// (`record_in_table`), and for an `Alive` member the sync stream,
+    /// started at the freshest address over the link that has just answered.
+    async fn record_answer(&self, node_update: NodeUpdate) {
+        log::info!("Received NodeUpdate from peer: {:?}", node_update);
+        let Some(updated_peer) = Self::record_in_table(&self.state, &node_update) else {
+            return;
+        };
+
+        // If node is Alive, establish sync_stream connection with freshest address.
+        if node_update.status == NodeStatus::Alive as i32 {
+            if let Err(e) = self
+                .start_sync_stream_connection(updated_peer.clone())
+                .await
+            {
+                log::warn!(
+                    "Failed to start sync_stream to {}: {}",
+                    updated_peer.name,
+                    e
+                );
+                // Connection failure doesn't affect ping flow, will retry in next cycle
+            }
+        }
+    }
+
     async fn connect_to_peer(&self, peer: NodeState) -> Result<()> {
         log::info!("Connecting to peer {} at {}", peer.name, peer.address);
 
@@ -383,46 +470,7 @@ impl GossipController {
             )
             .await
         {
-            Ok(node_update) => {
-                log::info!("Received NodeUpdate from peer: {:?}", node_update);
-                // Update state for Alive or Leaving status
-                if node_update.status == NodeStatus::Alive as i32
-                    || node_update.status == NodeStatus::Leaving as i32
-                {
-                    let updated_peer = {
-                        let mut s = read_state.write();
-                        let entry = s
-                            .entry(node_update.name.clone())
-                            .and_modify(|e| {
-                                e.status = node_update.status;
-                                e.address.clone_from(&node_update.address);
-                            })
-                            .or_insert_with(|| NodeState {
-                                name: node_update.name.clone(),
-                                address: node_update.address.clone(),
-                                status: node_update.status,
-                                version: 1,
-                                metadata: HashMap::new(),
-                            });
-                        entry.clone()
-                    }; // Lock is released here
-
-                    // If node is Alive, establish sync_stream connection with freshest address.
-                    if node_update.status == NodeStatus::Alive as i32 {
-                        if let Err(e) = self
-                            .start_sync_stream_connection(updated_peer.clone())
-                            .await
-                        {
-                            log::warn!(
-                                "Failed to start sync_stream to {}: {}",
-                                updated_peer.name,
-                                e
-                            );
-                            // Connection failure doesn't affect ping flow, will retry in next cycle
-                        }
-                    }
-                }
-            }
+            Ok(node_update) => self.record_answer(node_update).await,
             Err(e) => {
                 log::info!("Failed to connect to peer: {}, now try ping-req", e);
                 let mut map = read_state.read().clone();
@@ -439,7 +487,7 @@ impl GossipController {
                         node.address,
                         peer_addr
                     );
-                    if self
+                    let relayed = self
                         .dialer
                         .ping(
                             node,
@@ -447,9 +495,16 @@ impl GossipController {
                                 node: Some(peer.clone()),
                             })),
                         )
-                        .await
-                        .is_ok()
-                    {
+                        .await;
+                    if let Ok(node_update) = relayed {
+                        if !Self::record_relayed_answer(
+                            &self.state,
+                            &peer_name,
+                            &node.address,
+                            &node_update,
+                        ) {
+                            continue;
+                        }
                         reachable = true;
                         break;
                     }
