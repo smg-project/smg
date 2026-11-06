@@ -1010,10 +1010,11 @@ def test_original1_caller_keeps_original_cohort_caps_and_optin_gate():
     job = yaml.safe_load(workflow.read_text())["jobs"]["e2e-1gpu-chat-legacy-vllm-amd"]
     inputs = job["with"]
     assert (inputs["startup_profile"], inputs["sampling_profile"], inputs["parser"]) == (
-        "original1-vllm-chat-legacy", "original1", "legacy"
+        "original1-vllm-chat-legacy",
+        "original1",
+        "legacy",
     )
     assert (inputs["timeout"], inputs["test_timeout"], inputs["min_selected"]) == (32, 24, 202)
     assert (inputs["test_dirs"], inputs["test_filter"]) == ("e2e_test/chat_completions", "")
     assert "vars.SMG_RUN_AMD_VLLM_CHAT_LEGACY == 'true'" in job["if"]
     assert "vars.SMG_RUN_AMD_ON_PRS == 'true'" in job["if"]
-
