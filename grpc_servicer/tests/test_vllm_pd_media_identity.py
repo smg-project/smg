@@ -341,6 +341,7 @@ async def test_cpu_consumer_rejects_missing_or_invalid_hash_handles(monkeypatch,
     assert [r async for r in servicer.Generate(request, context)] == []
     context.abort.assert_awaited_once()
     assert context.abort.call_args.args[0] is grpc.StatusCode.INVALID_ARGUMENT
+    assert "ec_transfer_params_json is not usable" in context.abort.call_args.args[1]
     assert seen == []
 
 

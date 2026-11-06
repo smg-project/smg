@@ -498,14 +498,17 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     and (ec_transfer_params is not None or kv_transfer_params is None)
                     and not ec_handoff
                 ):
+                    reason = (
+                        "ec_transfer_params_json is not usable for every pixel-less media item"
+                        if ec_transfer_params is not None
+                        else "no kv_transfer_params or ec_transfer_params"
+                    )
                     logger.warning(
-                        "Request %s: pixel-less multimodal payload with no EC or KV handoff; "
-                        "rejecting (prefill worker did not hand off KV?)",
-                        request_id,
+                        "Request %s: pixel-less multimodal payload rejected: %s", request_id, reason
                     )
                     raise ValueError(
                         "multimodal payload carries grid tensors but no pixel_values and "
-                        "no kv_transfer_params or ec_transfer_params; a pixel-less leg requires a handoff"
+                        f"{reason}; a pixel-less leg requires a handoff"
                     )
                 # Preprocessed multimodal from Rust router.
                 # Token IDs already have expanded placeholders; tensors are
