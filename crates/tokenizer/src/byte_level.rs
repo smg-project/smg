@@ -249,10 +249,28 @@ impl ByteLevelTable {
                 }
             }
         }
-        match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+        text_of(bytes).0
+    }
+
+    /// [`Self::decode`] for a vocabulary that does not drop unknown ids:
+    /// `None` at the first id without an entry, before anything is rendered,
+    /// so the caller decodes the whole sequence its own way (the tiktoken
+    /// backend's crate decode, with its unknown-id error and its lossy
+    /// fallback); otherwise the same bytes, concatenated and converted once,
+    /// with whether the conversion was lossy, for the caller's log.
+    pub(crate) fn decode_known(
+        &self,
+        ids: &[TokenIdType],
+        skip_special_tokens: bool,
+    ) -> Option<(String, bool)> {
+        let mut bytes = Vec::with_capacity(ids.len().saturating_mul(4));
+        for &id in ids {
+            let (token_bytes, special) = self.token_bytes(id)?;
+            if !skip_special_tokens || !special {
+                bytes.extend_from_slice(token_bytes);
+            }
         }
+        Some(text_of(bytes))
     }
 
     /// Where `id` lives: its kind and its span in the store the kind names;
@@ -297,6 +315,16 @@ impl ByteLevelTable {
             Piece::Bytes(&self.bytes[span])
         };
         Some((piece, kind.special()))
+    }
+}
+
+/// The text of concatenated token bytes: one UTF-8 conversion, lossy only
+/// when the sequence is not valid UTF-8 (a character cut by the sequence's
+/// end, or bytes that never formed one); the flag says it was lossy.
+fn text_of(bytes: Vec<u8>) -> (String, bool) {
+    match String::from_utf8(bytes) {
+        Ok(text) => (text, false),
+        Err(error) => (String::from_utf8_lossy(error.as_bytes()).into_owned(), true),
     }
 }
 

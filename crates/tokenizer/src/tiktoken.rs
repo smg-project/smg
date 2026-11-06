@@ -963,7 +963,27 @@ impl TiktokenTokenizer {
 }
 
 impl Decoder for TiktokenTokenizer {
+    /// A vocabulary with the per-id table decodes through it, as its streams
+    /// do: every id's bytes concatenated, specials dropped by the table's
+    /// per-id marks when asked, one UTF-8 conversion, in place of the crate's
+    /// lookup per id; bytes that are not UTF-8 render lossily and are logged
+    /// as the crate path logs its fallback. An id the table lacks, or a
+    /// vocabulary too sparse for one, takes the crate's decode below, with
+    /// its unknown-id error and its lossy fallback.
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
+        if let Some((text, lossy)) = self
+            .byte_level
+            .as_ref()
+            .and_then(|table| table.decode_known(token_ids, skip_special_tokens))
+        {
+            if lossy {
+                tracing::warn!(
+                    token_count = token_ids.len(),
+                    "tiktoken decode failed; returning lossy UTF-8 fallback"
+                );
+            }
+            return Ok(text);
+        }
         let token_ids = self.kept_ids(token_ids, skip_special_tokens);
         match self.tokenizer.decode(&token_ids) {
             Ok(text) => Ok(text),
@@ -2565,6 +2585,62 @@ mod tests {
         assert!(
             ids.contains(&100257),
             "Special token <|endoftext|> should be recognized as single token, got: {ids:?}"
+        );
+    }
+
+    /// The whole-sequence decode runs through the per-id table the streams
+    /// read and renders what the crate's decode renders: the same bytes,
+    /// specials included, the skip flag read from the table's per-id marks.
+    #[test]
+    fn decode_through_the_table_renders_what_the_crate_decode_renders() {
+        let tokenizer = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).unwrap();
+        assert!(
+            tokenizer.byte_level.is_some(),
+            "the builtin vocabulary has a table"
+        );
+        let ids = tokenizer
+            .encode(
+                "hello<|endoftext|>w\u{f6}rld \u{4f60}\u{597d} \u{1f642} <|endoftext|>",
+                false,
+            )
+            .unwrap();
+        let ids = ids.token_ids().to_vec();
+        assert!(ids.contains(&100257));
+        assert_eq!(
+            tokenizer.decode(&ids, false).unwrap(),
+            tokenizer.tokenizer.decode(&ids).unwrap()
+        );
+        let kept: Vec<TokenIdType> = ids.iter().copied().filter(|id| *id != 100257).collect();
+        assert_eq!(
+            tokenizer.decode(&ids, true).unwrap(),
+            tokenizer.tokenizer.decode(&kept).unwrap()
+        );
+    }
+
+    /// Bytes that are not UTF-8 render lossily on the table path, as the
+    /// crate path's fallback rendered them; an id the table lacks sends the
+    /// sequence to the crate path, whose unknown-id error stays.
+    #[test]
+    fn decode_through_the_table_keeps_the_lossy_text_and_the_unknown_id_error() {
+        // `a`, `b`, and the lone lead byte 0xC3 of a two-byte character.
+        let dir = write_tiktoken_dir("YQ== 0\nYg== 1\nww== 2\n", "{}", None);
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        assert!(tokenizer.byte_level.is_some());
+        let (text, warnings) = warnings_during(|| tokenizer.decode(&[0, 2, 1], false));
+        assert_eq!(text.unwrap(), "a\u{FFFD}b");
+        assert_eq!(
+            warnings, 1,
+            "the lossy conversion is logged once, as the crate path logs it"
+        );
+        let (text, warnings) = warnings_during(|| tokenizer.decode(&[0, 1], false));
+        assert_eq!(text.unwrap(), "ab");
+        assert_eq!(warnings, 0);
+        assert_eq!(tokenizer.decode(&[2], true).unwrap(), "\u{FFFD}");
+        let err = tokenizer.decode(&[0, 2, 1, 9], false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("tiktoken decode failed for unknown token id"),
+            "unexpected error: {err}"
         );
     }
 }
