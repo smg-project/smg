@@ -381,7 +381,7 @@ fn validate_output_format(req: &CreateMessageRequest) -> Result<(), ValidationEr
                 .as_ref()
                 .and_then(|config| config.format.as_ref()),
         ),
-        ("output_format", req.output_format.as_ref()),
+        ("output_format", req.output_format.as_deref()),
     ];
     for (field, format) in under {
         if format.is_some_and(|format| !format.schema().is_object()) {

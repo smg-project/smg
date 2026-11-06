@@ -92,13 +92,16 @@ pub struct CreateMessageRequest {
     pub rid: Option<String>,
 
     /// The effort the response renders with, the format its text must fit,
-    /// and the config's other keys.
-    pub output_config: Option<OutputConfig>,
+    /// and the config's other keys. Boxed, as is `output_format`: few
+    /// requests send either, and the request every call carries (the
+    /// gateway shares it behind an `Arc`) pays a pointer for each instead of
+    /// the config's and the format's own room.
+    pub output_config: Option<Box<OutputConfig>>,
 
     /// The format the answer's text must fit, under the field's earlier
     /// top-level name; `output_config.format` is the current one and wins
     /// when both are sent ([`Self::output_schema`]).
-    pub output_format: Option<OutputFormat>,
+    pub output_format: Option<Box<OutputFormat>>,
 
     /// Additional fields not explicitly defined above (e.g. beta features like
     /// context_management). Captured and forwarded to backends.
@@ -223,7 +226,7 @@ impl CreateMessageRequest {
         self.output_config
             .as_ref()
             .and_then(|config| config.format.as_ref())
-            .or(self.output_format.as_ref())
+            .or(self.output_format.as_deref())
             .map(OutputFormat::schema)
     }
 
@@ -1753,8 +1756,9 @@ pub struct CountMessageTokensRequest {
     /// Tool definitions
     pub tools: Option<Vec<Tool>>,
 
-    /// The effort the prompt is rendered with, and the config's other keys.
-    pub output_config: Option<OutputConfig>,
+    /// The effort the prompt is rendered with, and the config's other keys
+    /// (boxed as [`CreateMessageRequest::output_config`] is).
+    pub output_config: Option<Box<OutputConfig>>,
 
     /// Additional backend-specific token counting options.
     #[serde(flatten)]
@@ -2890,6 +2894,24 @@ mod tests {
         );
         let back = serde_json::to_value(&request).expect("serializes");
         assert_eq!(back["output_config"], with_format["output_config"]);
+    }
+
+    /// The output config and the format under its earlier name ride behind
+    /// a pointer each: the request every Messages call carries is 464 bytes
+    /// on 64-bit targets (688 with the two inline, 544 before they were
+    /// typed), and with the `Arc` header the gateway adds it fits the
+    /// allocator's 512-byte class (it had moved up to the 768 one). A field
+    /// that grows it past the class needs its own read of the Messages route.
+    #[test]
+    fn the_output_config_and_the_output_format_ride_behind_a_pointer_each() {
+        assert_eq!(size_of::<Option<Box<OutputConfig>>>(), size_of::<usize>());
+        assert_eq!(size_of::<Option<Box<OutputFormat>>>(), size_of::<usize>());
+        let arc_header = 2 * size_of::<usize>();
+        assert!(
+            size_of::<CreateMessageRequest>() + arc_header <= 512,
+            "the request is {} bytes",
+            size_of::<CreateMessageRequest>()
+        );
     }
 
     /// The answer's schema comes from `output_config.format`, else from the
