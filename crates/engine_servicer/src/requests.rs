@@ -98,12 +98,17 @@ pub(crate) struct Registration {
     registry: Arc<RequestRegistry>,
     request_id: String,
     generation: u64,
+    /// Whether this lifetime is in the active count (a client's request is,
+    /// the servicer's own health probe is not).
+    counted: bool,
 }
 
 impl Drop for Registration {
     /// Release this lifetime independently of the cancellation-map entry.
     fn drop(&mut self) {
-        self.registry.active.fetch_sub(1, Ordering::AcqRel);
+        if self.counted {
+            self.registry.active.fetch_sub(1, Ordering::AcqRel);
+        }
         if let Ok(mut entries) = self.registry.entries.lock() {
             if entries
                 .get(&self.request_id)
@@ -132,6 +137,25 @@ impl RequestRegistry {
         self: &Arc<Self>,
         request_id: &str,
     ) -> Result<(Registration, oneshot::Receiver<CancelReason>), Status> {
+        self.register_as(request_id, true)
+    }
+
+    /// [`register`](Self::register) for the servicer's own health probe: the
+    /// entry is cancelled and settled like any request's, and the lifetime
+    /// is outside the active count ([`active`](Self::active)), so a scrape
+    /// during the probe's few milliseconds reads no request of a client's.
+    pub(crate) fn register_uncounted(
+        self: &Arc<Self>,
+        request_id: &str,
+    ) -> Result<(Registration, oneshot::Receiver<CancelReason>), Status> {
+        self.register_as(request_id, false)
+    }
+
+    fn register_as(
+        self: &Arc<Self>,
+        request_id: &str,
+        counted: bool,
+    ) -> Result<(Registration, oneshot::Receiver<CancelReason>), Status> {
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let generation = self.generation.fetch_add(1, Ordering::Relaxed);
         let mut entries = self
@@ -152,13 +176,16 @@ impl RequestRegistry {
             return Err(Status::unavailable("servicer is warming up"));
         }
         entries.insert(request_id.to_string(), (generation, cancel_tx));
-        self.active.fetch_add(1, Ordering::AcqRel);
+        if counted {
+            self.active.fetch_add(1, Ordering::AcqRel);
+        }
         drop(entries);
         Ok((
             Registration {
                 registry: Arc::clone(self),
                 request_id: request_id.to_string(),
                 generation,
+                counted,
             },
             cancel_rx,
         ))
@@ -188,6 +215,7 @@ impl RequestRegistry {
 
     /// Count request lifetimes, including aborted streams still unwinding.
     /// The cancellation map alone loses those entries before their cleanup.
+    /// The servicer's own health probe is registered outside this count.
     pub(crate) fn active(&self) -> usize {
         self.active.load(Ordering::Acquire)
     }

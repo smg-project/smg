@@ -52,7 +52,12 @@ pub(super) async fn generate(
     let request_id: Arc<str> = Arc::from(req.request_id.as_str());
     // Register before the submit: an `Abort` landing in the gap must find the
     // entry, and a duplicate id is refused up front.
-    let (registration, mut cancel) = state.shared.registry.register(&request_id)?;
+    // The servicer's own probe is registered for cancellation and settling
+    // like a client's request, outside the active count the scrape reports.
+    let (registration, mut cancel) = match origin {
+        RequestOrigin::Client => state.shared.registry.register(&request_id)?,
+        RequestOrigin::HealthProbe => state.shared.registry.register_uncounted(&request_id)?,
+    };
     let original = req.return_media_identity.then(|| req.clone());
     let reused = super::media_identity::apply(state, &mut req);
     // Hash fields are only accepted on an internally validated pixel-less hint

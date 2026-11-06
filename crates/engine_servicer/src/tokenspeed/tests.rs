@@ -640,6 +640,11 @@ async fn a_health_probe_is_counted_neither_as_a_request_nor_as_load() {
         info::health_check_with(state, Duration::from_secs(5)),
         async {
             let probe = recv_add(engine_in).await;
+            assert_eq!(
+                state.shared.registry.active(),
+                0,
+                "a probe in flight is not an active request"
+            );
             // Answered after more than the tracker's millisecond of
             // validity: a counted probe would leave a prefill sample.
             tokio::time::sleep(Duration::from_millis(5)).await;
