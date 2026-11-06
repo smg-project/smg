@@ -1689,7 +1689,7 @@ impl NativeEncoder {
             }
             return fallback.map_or(Ok(()), Err);
         }
-        // A1: one walk per unit. A single-stage encoder consumes its stage's
+        // One walk per unit. A single-stage encoder consumes its stage's
         // matches here and probes each piece in place (no recursive walk, no
         // closure call per piece); the chain hands its pieces to the same
         // probe through its static callback; any other shape walks.
@@ -1743,7 +1743,7 @@ impl NativeEncoder {
 
     /// Applies the stages from `depth` on to `text`, calling `f` with each
     /// final piece. `f` is taken by static dispatch so that the per-piece
-    /// work compiles into the walk (A4 of the loop design seat).
+    /// work compiles into the walk.
     fn pieces<F: FnMut(&str)>(&self, depth: usize, text: &str, f: &mut F) {
         if text.is_empty() {
             return;
@@ -1792,7 +1792,7 @@ impl NativeEncoder {
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         // The hot path of a warm encode, and nothing else in this function:
-        // the key of a short piece and the packed table's probe (A4).
+        // the key of a short piece and the packed table's probe.
         let key = ShortPieceKey::of(piece.as_bytes());
         if let Some(key) = key {
             if let Some(packed) = &cache.packed {
