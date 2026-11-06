@@ -702,7 +702,7 @@ def test_model_info_advertises_the_engines_item_limits():
             get_limit_per_prompt=lambda modality: {"image": 8, "video": 2, "audio": 1}[modality],
         ),
     )
-    assert rust.model_info_from_config(config)["mm_item_limits"] == "image=8,video=2"
+    assert rust.model_info_from_config(config)["mm_item_limits"] == "audio=1,image=8,video=2"
 
 
 def test_model_info_advertises_the_engines_encoder_budget():

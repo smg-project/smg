@@ -1360,7 +1360,7 @@ impl Format {
 
     /// Find a parser-only boundary row unless the request preserves reasoning markers.
     pub(crate) fn leading_next(&self, from: usize, on: usize) -> Option<usize> {
-        if self.shown(on) {
+        if self.leading_transitions.is_empty() || self.shown(on) {
             return None;
         }
         self.leading_transitions
