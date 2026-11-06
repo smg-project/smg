@@ -2004,7 +2004,7 @@ mod tests {
     /// a request stored are gone once the engines have run the reset pass.
     #[tokio::test]
     async fn a_flush_clears_every_rank_s_cache_on_a_realistic_worker() {
-        let (service, _stop) = scheduler_with_ranks(2, 65_103);
+        let (service, _stop) = scheduler_with_ranks(2, 65_108);
         for (id, rank) in [("flush-r0", 0), ("flush-r1", 1)] {
             // A prompt of four blocks: a shorter one stores nothing to clear.
             let mut request = generate_request(id, Some(rank), 2);
