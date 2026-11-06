@@ -166,9 +166,13 @@ async def test_ec_consumer_accepts_metadata_without_a_kv_handoff(monkeypatch):
     servicer = _servicer(monkeypatch, processor)
     prefill = await _complete(servicer, _request(refs=True, kv=True))
     processor.calls.clear()
-    servicer.engine.vllm_config.ec_transfer_config = SimpleNamespace(is_ec_consumer=True)
+    servicer.engine.vllm_config.ec_transfer_config = SimpleNamespace(
+        is_ec_consumer=True, is_ec_producer=False, ec_connector="ECMooncakeConnector"
+    )
     request = _request(identity=prefill.media_identity)
-    request.ec_transfer_params_json = json.dumps({"ec_items": [{"mm_hash": "h1"}]})
+    request.ec_transfer_params_json = json.dumps(
+        {"ec_items": [{"mm_hash": "h1", "transfer_id": "transfer-1"}]}
+    )
     generate = servicer.engine.generate
 
     async def capture(**kwargs):
@@ -237,14 +241,18 @@ async def test_an_identity_that_cannot_be_built_does_not_fail_the_request(monkey
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ec", [None, "{}", "{", "[]", "null"])
+@pytest.mark.parametrize(
+    "ec", [None, "{}", '{"ec_items":[]}', '{"ec_items":[{"mm_hash":"h1"}]}', "{", "[]", "null"]
+)
 async def test_ec_consumer_rejects_metadata_without_a_usable_handoff(monkeypatch, ec):
     """The real handler refuses malformed/missing EC params before engine submission."""
     import grpc
 
     servicer = _servicer(monkeypatch, _Processor())
     prefill = await _complete(servicer, _request(refs=True, kv=True))
-    servicer.engine.vllm_config.ec_transfer_config = SimpleNamespace(is_ec_consumer=True)
+    servicer.engine.vllm_config.ec_transfer_config = SimpleNamespace(
+        is_ec_consumer=True, is_ec_producer=False, ec_connector="ECMooncakeConnector"
+    )
     request = _request(identity=prefill.media_identity)
     if ec is not None:
         request.ec_transfer_params_json = ec
@@ -272,7 +280,7 @@ async def test_router_processed_encoder_returns_a_pixel_less_identity(monkeypatc
     request.ec_transfer_params_json = "{}"
     handles = {"h1": {"peer_host": "encoder", "peer_port": 9000, "size_bytes": 128}}
     servicer.engine.vllm_config.ec_transfer_config = SimpleNamespace(
-        is_ec_consumer=False, ec_connector="ECCPUConnector"
+        is_ec_consumer=False, is_ec_producer=True, ec_connector="ECCPUConnector"
     )
 
     async def generate(**kwargs):

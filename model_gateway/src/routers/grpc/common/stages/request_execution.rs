@@ -708,16 +708,18 @@ async fn execute_epd_dispatch(
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
-    if proto_request.is_vllm() && workers.encode_assignments().is_some() {
-        super::vllm_encode::encode(&mut proto_request, workers).await?;
-    }
+    let mut cleanup = if proto_request.is_vllm() && workers.encode_assignments().is_some() {
+        Some(super::vllm_encode::encode(&mut proto_request, workers).await?)
+    } else {
+        None
+    };
     if let Some(encode_dispatch) = encode_dispatch {
         spawn_encode_dispatch(encode_dispatch);
     }
     if !proto_request.is_vllm() {
         proto_request.clear_mm_pixel_values();
     }
-    execute_pd_dispatch(
+    let result = execute_pd_dispatch(
         proto_request,
         clients,
         workers,
@@ -725,7 +727,13 @@ async fn execute_epd_dispatch(
         prefill_guard,
         ledger,
     )
-    .await
+    .await;
+    if result.is_ok() {
+        if let Some(cleanup) = cleanup.as_mut() {
+            cleanup.disarm();
+        }
+    }
+    result
 }
 
 #[expect(

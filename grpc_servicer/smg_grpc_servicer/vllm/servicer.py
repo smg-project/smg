@@ -389,6 +389,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 getattr(self.engine, "vllm_config", None), "ec_transfer_config", None
             )
             is_ec_consumer = ec_config is not None and ec_config.is_ec_consumer
+            is_ec_producer = ec_config is not None and ec_config.is_ec_producer
 
             if request.HasField("media_refs"):
                 # Media references from the router: the worker fetches and runs
@@ -446,10 +447,31 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 # Every batch needs its own, not just one of them: a batch left
                 # out contributes no encoder tensor, and the engine would run
                 # that modality's encoder with nothing to encode.
+                ec_handoff = bool(is_ec_consumer and ec_transfer_params)
+                if ec_handoff and ec_config.ec_connector == "ECMooncakeConnector":
+                    # Mooncake consumes per-occurrence transfer IDs; a nonempty
+                    # dict alone does not prevent a pixel-less encoder schedule.
+                    items = ec_transfer_params.get("ec_items", [])
+                    hashes = (
+                        [
+                            item.get("mm_hash")
+                            for item in items
+                            if isinstance(item, dict) and item.get("transfer_id")
+                        ]
+                        if isinstance(items, list)
+                        else []
+                    )
+                    for batch in preprocessed_batches:
+                        if batches_missing_pixels([batch]):
+                            for mm_hash in batch.mm_hashes:
+                                if mm_hash not in hashes:
+                                    ec_handoff = False
+                                    break
+                                hashes.remove(mm_hash)
                 if (
                     batches_missing_pixels(preprocessed_batches)
                     and kv_transfer_params is None
-                    and not (is_ec_consumer and ec_transfer_params)
+                    and not ec_handoff
                 ):
                     logger.warning(
                         "Request %s: pixel-less multimodal payload with no EC or KV handoff; "
@@ -470,7 +492,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     self._build_preprocessed_mm_inputs, request.tokenized, preprocessed_batches
                 )
                 prompt["arrival_time"] = arrival_time
-                if ec_transfer_params is not None and not is_ec_consumer:
+                if ec_transfer_params is not None and is_ec_producer:
                     media_identity = build_media_identity(prompt)
             elif input_type == "tokenized":
                 prompt: TokensPrompt = {"prompt_token_ids": list(request.tokenized.input_ids)}
@@ -562,7 +584,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 if (
                     output.finished
                     and ec_config is not None
-                    and not is_ec_consumer
+                    and is_ec_producer
                     and ec_config.ec_connector == "ECCPUConnector"
                     and media_identity is not None
                 ):
@@ -976,6 +998,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         ec_config = getattr(self.engine.vllm_config, "ec_transfer_config", None)
         if "supports_ec_transfer" in info.DESCRIPTOR.fields_by_name:
             info.supports_ec_transfer = ec_config is not None
+        if ec_config is not None and "ec_connector" in info.DESCRIPTOR.fields_by_name:
+            info.ec_connector = ec_config.ec_connector or ""
+            info.ec_role = ec_config.ec_role or ""
         if (
             "ec_zmq_addrs" in info.DESCRIPTOR.fields_by_name
             and ec_config is not None

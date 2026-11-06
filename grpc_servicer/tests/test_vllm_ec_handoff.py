@@ -67,7 +67,20 @@ def _generate(**overrides):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("consumer", [False, True])
-@pytest.mark.parametrize("ec", [None, "{}", '{"ec_items":[{"mm_hash":"h"}]}', "{", "[]", "null"])
+@pytest.mark.parametrize(
+    "ec",
+    [
+        None,
+        "{}",
+        '{"ec_items":[]}',
+        '{"ec_items":[{"mm_hash":"h"}]}',
+        '{"ec_items":[{"mm_hash":"h","transfer_id":"t"}]}',
+        '{"ec_items":[{"mm_hash":"other","transfer_id":"t"}]}',
+        "{",
+        "[]",
+        "null",
+    ],
+)
 @pytest.mark.parametrize("kv", [False, True])
 async def test_grid_only_requires_a_handoff(consumer, ec, kv):
     """Reject incomplete EC inputs before processing tensors or submitting engine work."""
@@ -99,7 +112,9 @@ async def test_grid_only_requires_a_handoff(consumer, ec, kv):
             generate=generate,
             vllm_config=SimpleNamespace(
                 ec_transfer_config=SimpleNamespace(
-                    is_ec_consumer=consumer, ec_connector="ECMooncakeConnector"
+                    is_ec_consumer=consumer,
+                    is_ec_producer=not consumer,
+                    ec_connector="ECMooncakeConnector",
                 )
             ),
         ),
@@ -113,8 +128,10 @@ async def test_grid_only_requires_a_handoff(consumer, ec, kv):
         _notify_kv_transfer_rejected=AsyncMock(),
     )
     context = SimpleNamespace(abort=abort, invocation_metadata=lambda: ())
-    valid_json = ec in (None, "{}", '{"ec_items":[{"mm_hash":"h"}]}')
-    allowed = valid_json and (kv or (consumer and ec not in (None, "{}")))
+    valid_json = ec not in ("{", "[]", "null")
+    allowed = valid_json and (
+        kv or (consumer and ec == '{"ec_items":[{"mm_hash":"h","transfer_id":"t"}]}')
+    )
     if allowed:
         assert [reply async for reply in _generate()(servicer, request, context)] == []
         assert len(seen) == 1
@@ -130,9 +147,19 @@ async def test_grid_only_requires_a_handoff(consumer, ec, kv):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("consumer", [False, True])
 @pytest.mark.parametrize("connector", ["ECCPUConnector", "ECExampleConnector"])
-@pytest.mark.parametrize("handle", [{}, {"metadata": {}}, {"peer_host": "e", "peer_port": 9000}])
-async def test_encoder_only_validates_connector_specific_handles(connector, handle):
+@pytest.mark.parametrize(
+    "handle",
+    [
+        {},
+        {"metadata": {}},
+        {"peer_host": "e"},
+        {"peer_host": "e", "peer_port": 0},
+        {"peer_host": "e", "peer_port": 9000},
+    ],
+)
+async def test_encoder_only_validates_connector_specific_handles(consumer, connector, handle):
     """CPU cache misses fail before metadata escapes; other connector handles stay opaque."""
     identity = pb.MediaIdentity(
         prompt_token_ids=[1, 2], mm_inputs=pb.MultimodalInputs(mm_hashes=["h"])
@@ -160,7 +187,9 @@ async def test_encoder_only_validates_connector_specific_handles(connector, hand
         engine=SimpleNamespace(
             generate=generate,
             vllm_config=SimpleNamespace(
-                ec_transfer_config=SimpleNamespace(is_ec_consumer=False, ec_connector=connector)
+                ec_transfer_config=SimpleNamespace(
+                    is_ec_consumer=consumer, is_ec_producer=True, ec_connector=connector
+                )
             ),
         ),
         _build_preprocessed_mm_inputs=lambda *args: {"prompt_token_ids": [1, 2]},
@@ -177,7 +206,7 @@ async def test_encoder_only_validates_connector_specific_handles(connector, hand
     method = _generate(
         build_media_identity=lambda prompt: identity, _request_rank=lambda *args, **kwargs: 0
     )
-    if connector == "ECCPUConnector" and not handle.get("peer_host"):
+    if connector == "ECCPUConnector" and not (handle.get("peer_host") and handle.get("peer_port")):
         with pytest.raises(_Aborted) as exc:
             _ = [reply async for reply in method(servicer, request, context)]
         assert exc.value.args[0] is grpc.StatusCode.INTERNAL

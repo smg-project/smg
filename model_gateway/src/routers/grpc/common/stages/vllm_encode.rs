@@ -19,7 +19,7 @@ use crate::routers::{
 pub(super) async fn encode(
     request: &mut ProtoGenerateRequest,
     workers: &WorkerSelection,
-) -> Result<(), Response> {
+) -> Result<PushCleanup, Response> {
     if request.sampling_n() != 1 {
         return Err(error::bad_request(
             "ec_multiple_samples",
@@ -96,7 +96,7 @@ pub(super) async fn encode(
             .collect();
     }
     encoder.ec_transfer_params_json = Some(params.to_string());
-    let mut cleanup = PushCleanup::new(&params);
+    let cleanup = PushCleanup::new(&params);
     let backend = assignment
         .worker
         .get_backend_client()
@@ -125,10 +125,17 @@ pub(super) async fn encode(
         if complete.finish_reason == "error" {
             return Err(error::bad_gateway("ec_encode_failed", "Encoder failed"));
         }
-        apply_completion(request, complete, &mut params)?;
-        cleanup.0 = None;
+        let connector = assignment
+            .worker
+            .metadata()
+            .spec
+            .labels
+            .get("ec_connector")
+            .map(String::as_str)
+            .unwrap_or("");
+        apply_completion(request, complete, &mut params, connector)?;
         stream.mark_completed();
-        return Ok(());
+        return Ok(cleanup);
     }
     Err(error::bad_gateway(
         "ec_encode_incomplete",
@@ -154,6 +161,7 @@ fn apply_completion(
     request: &mut ProtoGenerateRequest,
     complete: vllm::GenerateComplete,
     params: &mut serde_json::Value,
+    connector: &str,
 ) -> Result<(), Response> {
     let identity = complete.media_identity.ok_or_else(|| {
         error::bad_gateway("ec_metadata_missing", "Encoder returned no media identity")
@@ -171,6 +179,31 @@ fn apply_completion(
             "ec_handles_invalid",
             "Expected an EC handle object",
         ));
+    }
+    for hash in identity
+        .mm_inputs
+        .iter()
+        .chain(&identity.extra_mm_inputs)
+        .flat_map(|mm| &mm.mm_hashes)
+    {
+        let handle = handles.get(hash).filter(|handle| {
+            handle.is_object() && handle.as_object().is_some_and(|h| !h.is_empty())
+        });
+        let valid = handle.is_some_and(|handle| {
+            connector != "ECCPUConnector"
+                || (handle["peer_host"]
+                    .as_str()
+                    .is_some_and(|host| !host.is_empty())
+                    && handle["peer_port"]
+                        .as_u64()
+                        .is_some_and(|port| (1..=65535).contains(&port)))
+        });
+        if !valid {
+            return Err(error::bad_gateway(
+                "ec_handles_invalid",
+                format!("Missing or invalid EC handle for {hash}"),
+            ));
+        }
     }
     if let Some(items) = params
         .get_mut("ec_items")
@@ -214,9 +247,14 @@ fn apply_completion(
 }
 
 /// Own unconsumed PUSH ids until a validated handoff can reach prefill.
-struct PushCleanup(Option<(String, Vec<String>)>);
+pub(super) struct PushCleanup(Option<(String, Vec<String>)>);
 
 impl PushCleanup {
+    /// Prefill accepted the handoff; its engine now owns the reservations.
+    pub(super) fn disarm(&mut self) {
+        self.0 = None;
+    }
+
     /// PULL has no destination reservation to release.
     fn new(params: &serde_json::Value) -> Self {
         Self(params["consumer_zmq"].as_str().map(|addr| {
@@ -256,7 +294,7 @@ impl Drop for PushCleanup {
 
 /// Use Mooncake's cancellation protocol without abandoning an active remote write.
 async fn release_push(addr: &str, ids: &[String]) -> anyhow::Result<()> {
-    let peers = control_request(addr, json!({"op": "peers"})).await?;
+    let peers = control_request(addr, json!({"op": "peers"}), &mut None).await?;
     let ports = peers["ports"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("Invalid EC peers"))?;
@@ -264,20 +302,37 @@ async fn release_push(addr: &str, ids: &[String]) -> anyhow::Result<()> {
     let (host, _) = addr
         .rsplit_once(':')
         .ok_or_else(|| anyhow::anyhow!("Invalid EC address"))?;
-    for port in ports {
-        let port = port
-            .as_u64()
-            .filter(|port| (1..=65535).contains(port))
-            .ok_or_else(|| anyhow::anyhow!("Invalid EC peer port"))?;
+    // Independent shards progress even when one is unreachable. Each shard
+    // reuses its REQ connection, replacing it after a failed exchange.
+    let failures = futures::future::join_all(ports.iter().map(|port| async move {
+        let Some(port) = port.as_u64().filter(|port| (1..=65535).contains(port)) else {
+            return vec![format!("Invalid EC peer port: {port}")];
+        };
         let shard = format!("{host}:{port}");
+        let mut socket = None;
+        let mut failures = Vec::new();
         for id in ids {
-            control_request(
-                &shard,
-                json!({"op": "cancel", "transfer_id": id, "reservation_id": ""}),
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                control_request(
+                    &shard,
+                    json!({"op": "cancel", "transfer_id": id, "reservation_id": ""}),
+                    &mut socket,
+                ),
             )
-            .await?;
+            .await;
+            if !matches!(result, Ok(Ok(_))) {
+                failures.push(format!("{shard}/{id}: {result:?}"));
+                socket = None;
+            }
         }
-    }
+        failures
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    anyhow::ensure!(failures.is_empty(), "EC cleanup failed: {failures:?}");
     Ok(())
 }
 
@@ -285,10 +340,17 @@ async fn release_push(addr: &str, ids: &[String]) -> anyhow::Result<()> {
 async fn control_request(
     addr: &str,
     payload: serde_json::Value,
+    connection: &mut Option<zeromq::ReqSocket>,
 ) -> anyhow::Result<serde_json::Value> {
     use zeromq::{Socket, SocketRecv, SocketSend};
-    let mut socket = zeromq::ReqSocket::new();
-    socket.connect(addr).await?;
+    if connection.is_none() {
+        let mut socket = zeromq::ReqSocket::new();
+        socket.connect(addr).await?;
+        *connection = Some(socket);
+    }
+    let socket = connection
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("EC connection missing"))?;
     socket.send(payload.to_string().into()).await?;
     let reply = socket.recv().await?;
     let reply: serde_json::Value = serde_json::from_slice(
@@ -360,14 +422,34 @@ mod tests {
     /// Malformed PULL handles must not strip the original media.
     #[test]
     fn pull_handles_are_validated_before_rewriting() {
-        for handles in ["[]", "bad"] {
+        for handles in [
+            "[]",
+            "bad",
+            "{}",
+            r#"{"other":{"peer_host":"e","peer_port":1}}"#,
+            r#"{"h":{}}"#,
+            r#"{"h":{"peer_host":"e"}}"#,
+            r#"{"h":{"peer_host":"e","peer_port":0}}"#,
+        ] {
             let mut request = request();
-            assert!(apply_completion(&mut request, completion(handles), &mut json!({})).is_err());
+            assert!(apply_completion(
+                &mut request,
+                completion(handles),
+                &mut json!({}),
+                "ECCPUConnector"
+            )
+            .is_err());
             assert!(request.has_vllm_media_refs());
         }
         let mut request = request();
         let handles = r#"{"h":{"peer_host":"host","peer_port":9000,"size_bytes":128}}"#;
-        apply_completion(&mut request, completion(handles), &mut json!({})).unwrap();
+        apply_completion(
+            &mut request,
+            completion(handles),
+            &mut json!({}),
+            "ECCPUConnector",
+        )
+        .unwrap();
         assert!(!request.has_vllm_media_refs());
         let ProtoGenerateRequest::Vllm(request) = request else {
             panic!("expected a vLLM request")
@@ -384,15 +466,21 @@ mod tests {
     fn push_preserves_duplicate_ids_and_rejects_bad_metadata() {
         let mut params = json!({"consumer_zmq":"tcp://p:9000", "ec_items":[{"transfer_id":"one"},{"transfer_id":"two"}]});
         let mut request = request();
-        let mut bad = completion("{}");
+        let mut bad = completion(r#"{"h":{"transfer_id":"two"}}"#);
         bad.media_identity
             .as_mut()
             .unwrap()
             .prompt_token_ids
             .clear();
-        assert!(apply_completion(&mut request, bad, &mut params).is_err());
+        assert!(apply_completion(&mut request, bad, &mut params, "ECMooncakeConnector").is_err());
         assert!(request.has_vllm_media_refs());
-        apply_completion(&mut request, completion("{}"), &mut params).unwrap();
+        apply_completion(
+            &mut request,
+            completion(r#"{"h":{"transfer_id":"two"}}"#),
+            &mut params,
+            "ECMooncakeConnector",
+        )
+        .unwrap();
         let ProtoGenerateRequest::Vllm(request) = request else {
             panic!("expected a vLLM request")
         };
@@ -408,53 +496,55 @@ mod tests {
     #[tokio::test]
     async fn dropped_push_releases_every_shard() {
         use zeromq::{Socket, SocketRecv, SocketSend};
-        let mut first = zeromq::RepSocket::new();
-        let addr = first.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
-        let mut second = zeromq::RepSocket::new();
-        let other = second.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
-        let ports: Vec<u16> = [&addr, &other]
-            .iter()
-            .map(|a| a.rsplit_once(':').unwrap().1.parse().unwrap())
-            .collect();
-        let serve = async {
-            let message = first.recv().await.unwrap();
-            let message: serde_json::Value =
-                serde_json::from_slice(message.get(0).unwrap()).unwrap();
-            assert_eq!(message["op"], "peers");
-            first
-                .send(
-                    json!({"ok":true,"result":{"ports":ports}})
-                        .to_string()
-                        .into(),
-                )
-                .await
-                .unwrap();
-            for socket in [&mut first, &mut second] {
-                for id in ["one", "two"] {
-                    let message = socket.recv().await.unwrap();
-                    let message: serde_json::Value =
-                        serde_json::from_slice(message.get(0).unwrap()).unwrap();
-                    assert_eq!(
-                        message,
-                        json!({"op":"cancel","transfer_id":id,"reservation_id":""})
-                    );
-                    socket
+        for reject_first in [false, true] {
+            let mut first = zeromq::RepSocket::new();
+            let addr = first.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
+            let mut second = zeromq::RepSocket::new();
+            let other = second.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
+            let ports: Vec<u16> = [&addr, &other]
+                .iter()
+                .map(|a| a.rsplit_once(':').unwrap().1.parse().unwrap())
+                .collect();
+            let serve = async {
+                let message = first.recv().await.unwrap();
+                let message: serde_json::Value =
+                    serde_json::from_slice(message.get(0).unwrap()).unwrap();
+                assert_eq!(message["op"], "peers");
+                first
+                    .send(
+                        json!({"ok":true,"result":{"ports":ports}})
+                            .to_string()
+                            .into(),
+                    )
+                    .await
+                    .unwrap();
+                for (shard, socket) in [&mut first, &mut second].into_iter().enumerate() {
+                    for id in ["one", "two"] {
+                        let message = socket.recv().await.unwrap();
+                        let message: serde_json::Value =
+                            serde_json::from_slice(message.get(0).unwrap()).unwrap();
+                        assert_eq!(
+                            message,
+                            json!({"op":"cancel","transfer_id":id,"reservation_id":""})
+                        );
+                        socket
                         .send(
-                            json!({"ok":true,"result":{"cancelled":true}})
+                            json!({"ok": !(reject_first && shard == 0 && id == "one"),"result":{"cancelled":true}})
                                 .to_string()
                                 .into(),
                         )
                         .await
                         .unwrap();
+                    }
                 }
-            }
-        };
-        let cleanup = PushCleanup::new(
-            &json!({"consumer_zmq":addr,"ec_items":[{"transfer_id":"one"},{"transfer_id":"two"}]}),
-        );
-        drop(cleanup);
-        tokio::time::timeout(std::time::Duration::from_secs(5), serve)
-            .await
-            .unwrap();
+            };
+            let cleanup = PushCleanup::new(
+                &json!({"consumer_zmq":addr,"ec_items":[{"transfer_id":"one"},{"transfer_id":"two"}]}),
+            );
+            drop(cleanup);
+            tokio::time::timeout(std::time::Duration::from_secs(5), serve)
+                .await
+                .unwrap();
+        }
     }
 }

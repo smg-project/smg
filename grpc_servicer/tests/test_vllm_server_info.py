@@ -181,7 +181,11 @@ def test_ec_addresses_preserve_managed_global_rank_slots(monkeypatch, ranks):
         model_config=SimpleNamespace(dtype="torch.float16", is_multimodal_model=False),
         parallel_config=SimpleNamespace(data_parallel_size=2, tensor_parallel_size=4),
         ec_transfer_config=SimpleNamespace(
-            is_ec_consumer=True, ec_connector="ECMooncakeConnector", ec_ip="127.0.0.1", ec_port=9000
+            is_ec_consumer=True,
+            ec_connector="ECMooncakeConnector",
+            ec_role="ec_consumer",
+            ec_ip="127.0.0.1",
+            ec_port=9000,
         ),
     )
     servicer = SimpleNamespace(
@@ -194,6 +198,8 @@ def test_ec_addresses_preserve_managed_global_rank_slots(monkeypatch, ranks):
     info = asyncio.run(
         _server_info_method(vllm_engine_pb2.GetServerInfoResponse)(servicer, None, None)
     )
+    assert info.ec_connector == "ECMooncakeConnector"
+    assert info.ec_role == "ec_consumer"
     assert list(info.ec_zmq_addrs) == [
         f"tcp://127.0.0.1:{9000 + rank * 4}" if rank in ranks else "" for rank in range(2)
     ]

@@ -60,16 +60,15 @@ const ACCEPTS_MEDIA_REFS: CandidateFilter<'static> = &accepts_media_refs;
 /// Why an EPD selection produced nothing: a full Prefill pool, unsupported
 /// media references, or a failure judged per role afterwards by
 /// [`WorkerSelectionStage::selection_failure`].
-#[derive(Clone, Copy)]
 enum EpdSelectionFailure {
     Unavailable,
-    PrefillAtCapacity,
+    Placement(Box<PairFailure>),
     EncodeNotSupported,
 }
 
 impl PrefillCandidateError for EpdSelectionFailure {
     fn is_at_capacity(&self) -> bool {
-        matches!(self, Self::PrefillAtCapacity)
+        matches!(self, Self::Placement(failure) if failure.is_at_capacity())
     }
 }
 
@@ -359,7 +358,12 @@ impl<'a> SelectionInputs<'a> {
         };
         let demand = PairDemands::new(
             stage.prefill_side_needs_vision(needs_vision),
-            stage.decode_side_needs_vision(&input.request_type, intermediate, media_refs),
+            stage.decode_side_needs_vision(
+                &input.request_type,
+                intermediate,
+                media_refs
+                    && (needs_vision || stage.mode != WorkerSelectionMode::EncodePrefillDecode),
+            ),
         )
         .with_media_refs(media_refs, media_refs_pipeline)
         .with_context(context_requirements);
@@ -643,7 +647,10 @@ impl WorkerSelectionStage {
                             placement,
                             sticky_key,
                             &encode_item_hashes,
-                            inputs.media_refs,
+                            EpdDemands {
+                                encode: media,
+                                decode_vision: inputs.demand.decode,
+                            },
                         ),
                     )
                     .await?;
@@ -778,7 +785,9 @@ impl WorkerSelectionStage {
                         media,
                         PairDemands::new(
                             self.prefill_side_needs_vision(ctx.routing.needs_vision),
-                            ctx.routing.decode_needs_vision,
+                            ctx.routing.decode_needs_vision
+                                && (self.mode != WorkerSelectionMode::EncodePrefillDecode
+                                    || ctx.wire.runtime == RuntimeType::Vllm),
                         )
                         .with_media_refs(media_refs, ctx.wire.pipeline)
                         .with_context(context_requirements),
@@ -793,21 +802,24 @@ impl WorkerSelectionStage {
         Ok(())
     }
 
-    /// Whether this stage's decode side needs a vision encoder for the
-    /// request ([`decode_needs_vision`]), recorded in the routing snapshot
-    /// and paired under: in prefill/decode mode only. In
-    /// encode/prefill/decode mode the encode workers take the pixels and the
-    /// decode side is dispatched without them, so it never needs the encoder
-    /// and a retry must not be held to a worker with one; regular mode has
-    /// no decode side.
+    /// Keep grid-bearing decode identities on vision-capable workers. EPD
+    /// references are still unresolved here, so image/video references need
+    /// that capability too; a known hash-only identity does not.
     fn decode_side_needs_vision(
         &self,
         request: &RequestType,
         intermediate: Option<&multimodal::MultimodalIntermediate>,
         media_refs: bool,
     ) -> bool {
-        self.mode == WorkerSelectionMode::PrefillDecode
-            && decode_needs_vision(request, intermediate, media_refs)
+        match self.mode {
+            WorkerSelectionMode::PrefillDecode => {
+                decode_needs_vision(request, intermediate, media_refs)
+            }
+            WorkerSelectionMode::EncodePrefillDecode => {
+                media_refs || intermediate.is_some_and(|mm| mm.has_mrope_grids())
+            }
+            WorkerSelectionMode::Regular => false,
+        }
     }
 
     /// Whether this stage's prefill side needs a vision encoder for a request
@@ -853,7 +865,7 @@ impl WorkerSelectionStage {
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
         encode_item_hashes: &[Vec<u8>],
-        media_refs: bool,
+        demand: EpdDemands,
     ) -> Result<(EncodePrefillDecodeWorkerSelection, PrefillLoadGuard), Response> {
         acquire_prefill(
             self.prefill_admission.as_deref(),
@@ -864,7 +876,7 @@ impl WorkerSelectionStage {
                     model_id,
                     inputs,
                     encode_item_hashes,
-                    media_refs,
+                    demand,
                     capacity,
                 )
             },
@@ -872,8 +884,14 @@ impl WorkerSelectionStage {
         .await
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |failure| {
-                if matches!(failure, EpdSelectionFailure::EncodeNotSupported) {
-                    return multimodal::MmRefsError::EncodeNotSupported.into_response();
+                match failure {
+                    EpdSelectionFailure::EncodeNotSupported => {
+                        return multimodal::MmRefsError::EncodeNotSupported.into_response()
+                    }
+                    EpdSelectionFailure::Placement(failure) => {
+                        return self.pair_failure(model_id, *failure)
+                    }
+                    EpdSelectionFailure::Unavailable => {}
                 }
                 // Encode is a demanded role only when the request carries
                 // encode items; an idle-but-vetoed encode pool must not shed
@@ -1917,43 +1935,51 @@ impl WorkerSelectionStage {
         model_id: &str,
         inputs: PlacementInputs<'_>,
         encode_item_hashes: &[Vec<u8>],
-        media_refs: bool,
+        demand: EpdDemands,
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     ) -> Result<EncodePrefillDecodeWorkerSelection, EpdSelectionFailure> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let needs_encode = !encode_item_hashes.is_empty();
         let mut available_encode =
             epd_role_candidates(&snapshot, WorkerType::Encode, needs_encode)?;
-        available_encode.retain(|worker| match worker.metadata().spec.runtime_type {
-            RuntimeType::Vllm => {
-                multimodal::worker_supports_ec_transfer(worker.as_ref())
-                    && (!media_refs
-                        || inputs
-                            .candidate_filter
-                            .is_none_or(|accepts| accepts(worker.as_ref())))
-            }
-            RuntimeType::TokenSpeed => !media_refs,
-            _ => false,
-        });
+        let capable = |worker: &Arc<dyn Worker>| {
+            demand.encode.accepts(worker.as_ref())
+                && match worker.metadata().spec.runtime_type {
+                    RuntimeType::Vllm => ec_role(worker.as_ref(), "ec_producer"),
+                    RuntimeType::TokenSpeed => !demand.encode.media_refs,
+                    _ => false,
+                }
+        };
+        available_encode.retain(capable);
         if needs_encode && available_encode.is_empty() {
-            return Err(if media_refs {
-                EpdSelectionFailure::EncodeNotSupported
-            } else {
-                EpdSelectionFailure::Unavailable
-            });
+            // Capability is a membership fact; an eligible encoder that is
+            // temporarily unhealthy must retain the retryable 503 verdict.
+            return Err(
+                if demand.encode.media_refs
+                    && !snapshot.pool(RoutingPool::GrpcEncode).iter().any(capable)
+                {
+                    EpdSelectionFailure::EncodeNotSupported
+                } else {
+                    EpdSelectionFailure::Unavailable
+                },
+            );
         }
         // References go to E only. P consumes EC metadata and D consumes KV;
         // neither needs a media processor. Use the same membership snapshot's
         // compatibility index so the selected P/D connectors can rendezvous.
         let eligible = |worker: &dyn Worker| {
             let runtime = worker.metadata().spec.runtime_type;
-            !needs_encode
-                || (available_encode
-                    .iter()
-                    .any(|e| e.metadata().spec.runtime_type == runtime)
-                    && (runtime != RuntimeType::Vllm
-                        || worker.worker_type() != &WorkerType::Prefill
-                        || multimodal::worker_supports_ec_transfer(worker)))
+            (runtime != RuntimeType::Vllm
+                || !demand.decode_vision
+                || worker.worker_type() != &WorkerType::Decode
+                || vision_capable(worker))
+                && (!needs_encode
+                    || available_encode.iter().any(|encoder| {
+                        encoder.metadata().spec.runtime_type == runtime
+                            && (runtime != RuntimeType::Vllm
+                                || worker.worker_type() != &WorkerType::Prefill
+                                || ec_pair(encoder.as_ref(), worker))
+                    }))
         };
         let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
         let pair = placement::select_pair(
@@ -1969,14 +1995,12 @@ impl WorkerSelectionStage {
                 ..inputs
             },
         )
-        .map_err(|failure| {
-            if failure.is_at_capacity() {
-                EpdSelectionFailure::PrefillAtCapacity
-            } else {
-                EpdSelectionFailure::Unavailable
-            }
-        })?;
-        available_encode.retain(|worker| worker.metadata().spec.runtime_type == pair.runtime);
+        .map_err(EpdSelectionFailure::Placement)?;
+        available_encode.retain(|worker| {
+            worker.metadata().spec.runtime_type == pair.runtime
+                && (pair.runtime != RuntimeType::Vllm
+                    || ec_pair(worker.as_ref(), pair.prefill.as_ref()))
+        });
         // vLLM encodes the whole prompt on one worker; TokenSpeed routes items.
         let prompt_hash;
         let hashes = if pair.runtime == RuntimeType::Vllm && needs_encode {
@@ -2000,6 +2024,33 @@ impl WorkerSelectionStage {
         .ok_or(EpdSelectionFailure::Unavailable)?;
         Ok((assignments, pair.prefill, pair.decode, pair.runtime))
     }
+}
+
+/// E consumes the media; D may still need grids for positional embeddings.
+#[derive(Clone, Copy)]
+struct EpdDemands {
+    encode: MediaDemands,
+    decode_vision: bool,
+}
+
+/// A configured connector must explicitly support the selected E/P role.
+fn ec_role(worker: &dyn Worker, role: &str) -> bool {
+    let labels = &worker.metadata().spec.labels;
+    multimodal::worker_supports_ec_transfer(worker)
+        && labels
+            .get("ec_role")
+            .is_some_and(|value| value == role || value == "ec_both")
+        && labels
+            .get("ec_connector")
+            .is_some_and(|value| !value.is_empty())
+}
+
+/// EC producers and consumers must speak the same transfer protocol.
+fn ec_pair(encoder: &dyn Worker, prefill: &dyn Worker) -> bool {
+    ec_role(encoder, "ec_producer")
+        && ec_role(prefill, "ec_consumer")
+        && encoder.metadata().spec.labels.get("ec_connector")
+            == prefill.metadata().spec.labels.get("ec_connector")
 }
 
 /// A role's available candidates from the EPD membership snapshot. A demanded
@@ -3797,6 +3848,15 @@ mod tests {
                     .connection_mode(ConnectionMode::Grpc)
                     .health_config(no_health_check())
                     .label("supports_ec_transfer", ec.to_string())
+                    .label("ec_connector", if ec { "ECCPUConnector" } else { "" })
+                    .label(
+                        "ec_role",
+                        if role == WorkerType::Encode {
+                            "ec_producer"
+                        } else {
+                            "ec_consumer"
+                        },
+                    )
                     .label("kv_connector", connector)
                     .label(
                         "mm_processor",
@@ -3825,7 +3885,14 @@ mod tests {
                             ..Default::default()
                         },
                         &[vec![1], vec![2]],
-                        media_refs,
+                        EpdDemands {
+                            encode: MediaDemands {
+                                media_refs,
+                                vision: true,
+                                pipeline: PipelinePin::Any,
+                            },
+                            decode_vision: true,
+                        },
                         None,
                     )
                     .unwrap_or_else(|_| panic!("eligible EPD set must be selected"));
@@ -3833,6 +3900,228 @@ mod tests {
                 assert_eq!(encoders.len(), 1);
                 assert_eq!(prefill.url(), "grpc://127.0.0.1:8805");
                 assert_eq!(decode.url(), "grpc://127.0.0.1:8807");
+            }
+            let encoder = stage
+                .worker_registry
+                .get_by_url("grpc://127.0.0.1:8803")
+                .unwrap();
+            encoder.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+            let pick = || {
+                stage.select_encode_prefill_decode_workers(
+                    model,
+                    PlacementInputs {
+                        candidate_filter: Some(ACCEPTS_MEDIA_REFS),
+                        ..Default::default()
+                    },
+                    &[vec![1]],
+                    EpdDemands {
+                        encode: MediaDemands {
+                            media_refs,
+                            vision: true,
+                            pipeline: PipelinePin::Any,
+                        },
+                        decode_vision: true,
+                    },
+                    None,
+                )
+            };
+            assert!(matches!(pick(), Err(EpdSelectionFailure::Unavailable)));
+            encoder.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            // Remove every compatible pair, including incapable/other-runtime
+            // pairs, so the compatibility verdict must survive admission.
+            for port in [8800, 8801, 8802, 8804, 8807] {
+                stage
+                    .worker_registry
+                    .remove_by_url(&format!("grpc://127.0.0.1:{port}"));
+            }
+            let failure = pick().err().expect("the remaining P/D cannot pair");
+            let EpdSelectionFailure::Placement(failure) = failure else {
+                panic!("pair verdict must be preserved")
+            };
+            let response = stage.pair_failure(model, *failure);
+            assert_eq!(
+                error::extract_error_code_from_response(&response),
+                "no_compatible_pd_pair"
+            );
+        }
+    }
+
+    /// EC roles/connectors and E/D vision demands are independent constraints.
+    #[test]
+    fn epd_enforces_ec_roles_connectors_and_media_demands() {
+        for runtime in [RuntimeType::Vllm, RuntimeType::TokenSpeed] {
+            for (
+                e_connector,
+                p_connector,
+                e_role,
+                p_role,
+                e_vision,
+                d_vision,
+                needs_vision,
+                grids,
+                allowed,
+            ) in [
+                (
+                    "ECCPUConnector",
+                    "ECCPUConnector",
+                    "ec_producer",
+                    "ec_consumer",
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                ),
+                (
+                    "ECCPUConnector",
+                    "ECMooncakeConnector",
+                    "ec_producer",
+                    "ec_consumer",
+                    true,
+                    true,
+                    true,
+                    true,
+                    false,
+                ),
+                (
+                    "ECCPUConnector",
+                    "ECCPUConnector",
+                    "ec_consumer",
+                    "ec_consumer",
+                    true,
+                    true,
+                    true,
+                    true,
+                    false,
+                ),
+                (
+                    "ECCPUConnector",
+                    "ECCPUConnector",
+                    "ec_producer",
+                    "ec_producer",
+                    true,
+                    true,
+                    true,
+                    true,
+                    false,
+                ),
+                (
+                    "ECCPUConnector",
+                    "ECCPUConnector",
+                    "ec_both",
+                    "ec_both",
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                ),
+                (
+                    "",
+                    "",
+                    "ec_producer",
+                    "ec_consumer",
+                    true,
+                    true,
+                    true,
+                    true,
+                    false,
+                ),
+                (
+                    "ECCPUConnector",
+                    "ECCPUConnector",
+                    "ec_producer",
+                    "ec_consumer",
+                    false,
+                    true,
+                    true,
+                    false,
+                    false,
+                ),
+                (
+                    "ECCPUConnector",
+                    "ECCPUConnector",
+                    "ec_producer",
+                    "ec_consumer",
+                    false,
+                    false,
+                    false,
+                    false,
+                    true,
+                ),
+                (
+                    "ECCPUConnector",
+                    "ECCPUConnector",
+                    "ec_producer",
+                    "ec_consumer",
+                    true,
+                    false,
+                    true,
+                    true,
+                    false,
+                ),
+                (
+                    "ECCPUConnector",
+                    "ECCPUConnector",
+                    "ec_producer",
+                    "ec_consumer",
+                    true,
+                    false,
+                    true,
+                    false,
+                    true,
+                ),
+            ] {
+                let registry = Arc::new(WorkerRegistry::new());
+                let model = "epd-capabilities";
+                for (port, role, connector, ec_role, vision) in [
+                    (8810, WorkerType::Encode, e_connector, e_role, e_vision),
+                    (8811, WorkerType::Prefill, p_connector, p_role, true),
+                    (8812, WorkerType::Decode, "", "", d_vision),
+                ] {
+                    registry
+                        .register(Arc::new(
+                            BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                                .model(ModelCard::new(model))
+                                .worker_type(role)
+                                .runtime_type(runtime)
+                                .connection_mode(ConnectionMode::Grpc)
+                                .health_config(no_health_check())
+                                .label("supports_ec_transfer", "true")
+                                .label("ec_connector", connector)
+                                .label("ec_role", ec_role)
+                                .label("supports_vision", vision.to_string())
+                                .label("kv_connector", "NixlConnector")
+                                .build(),
+                        ))
+                        .unwrap();
+                }
+                let stage = WorkerSelectionStage::new(
+                    registry,
+                    Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                    WorkerSelectionMode::EncodePrefillDecode,
+                    None,
+                );
+                let result = stage.select_encode_prefill_decode_workers(
+                    model,
+                    PlacementInputs::default(),
+                    &[vec![1]],
+                    EpdDemands {
+                        encode: MediaDemands {
+                            media_refs: false,
+                            vision: needs_vision,
+                            pipeline: PipelinePin::Any,
+                        },
+                        decode_vision: grids,
+                    },
+                    None,
+                );
+                let allowed = if runtime == RuntimeType::Vllm {
+                    allowed
+                } else {
+                    !needs_vision || e_vision
+                };
+                assert_eq!(result.is_ok(), allowed, "{e_connector}/{p_connector} {e_role}/{p_role} E vision={e_vision} D vision={d_vision} demand={needs_vision}/{grids}");
             }
         }
     }
@@ -5744,13 +6033,10 @@ mod tests {
         );
     }
 
-    /// The demand is recorded in prefill/decode mode only: the decode side of
-    /// encode/prefill/decode mode is dispatched without the pixels (its
-    /// encode workers take them), so neither its first selection nor a retry
-    /// is held to a decode worker with the encoder; regular mode has no
-    /// decode side.
+    /// Both disaggregated modes retain grid-dependent decode requirements;
+    /// regular mode has no decode side.
     #[test]
-    fn the_decode_side_demand_is_recorded_in_prefill_decode_mode_only() {
+    fn disaggregated_modes_retain_decode_grid_demands() {
         use openai_protocol::chat::ChatCompletionRequest;
 
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
@@ -5776,10 +6062,11 @@ mod tests {
 
         let epd = stage(WorkerSelectionMode::EncodePrefillDecode);
         assert!(
-            !epd.decode_side_needs_vision(&request, Some(&gridded), false),
-            "the encode/prefill/decode decode side takes no pixels"
+            epd.decode_side_needs_vision(&request, Some(&gridded), false),
+            "grid metadata still needs the vision model on decode"
         );
-        assert!(!epd.decode_side_needs_vision(&request, None, true));
+        assert!(epd.decode_side_needs_vision(&request, None, true));
+        assert!(!epd.decode_side_needs_vision(&request, None, false));
 
         let regular = stage(WorkerSelectionMode::Regular);
         assert!(!regular.decode_side_needs_vision(&request, Some(&gridded), false));
