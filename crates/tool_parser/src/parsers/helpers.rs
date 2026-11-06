@@ -9,6 +9,43 @@ use crate::{
     types::{StreamingParseResult, ToolCallItem},
 };
 
+/// Declared types for XML arguments, including unlisted parameter names.
+pub(crate) struct ParamTypes<'a> {
+    schema: Option<&'a Value>,
+}
+
+impl<'a> ParamTypes<'a> {
+    pub(crate) fn for_function(tools: &'a [Tool], func_name: &str) -> Self {
+        Self {
+            schema: tools
+                .iter()
+                .find(|tool| tool.function.name == func_name)
+                .map(|tool| &tool.function.parameters),
+        }
+    }
+
+    /// Read a single declared type without changing union or unknown-type inference.
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
+        let root = self.schema?;
+        let schema = if let Some(property) = root.get("properties").and_then(|p| p.get(name)) {
+            property
+        } else {
+            // additionalProperties excludes keys matched by patternProperties.
+            // Patterns are not evaluated here; any nonempty patternProperties
+            // keeps unlisted keys on the existing inference path.
+            if root
+                .get("patternProperties")
+                .and_then(Value::as_object)
+                .is_some_and(|patterns| !patterns.is_empty())
+            {
+                return None;
+            }
+            root.get("additionalProperties")?
+        };
+        schema.get("type").and_then(Value::as_str)
+    }
+}
+
 /// `param_name -> declared JSON-schema type` for the named function (empty if the
 /// function or its `properties` are absent). Lets XML-style parsers coerce by the
 /// declared type instead of guessing from text (e.g. keep a numeric-looking
@@ -509,6 +546,49 @@ pub(crate) fn handle_json_tool_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_additional_parameter_types_preserve_explicit_properties() {
+        let schema = serde_json::json!({
+            "properties": {"count": {"type": "integer"}, "untyped": {}},
+            "additionalProperties": {"type": "string"}
+        });
+        let types = ParamTypes {
+            schema: Some(&schema),
+        };
+        assert_eq!(types.get("code"), Some("string"));
+        assert_eq!(types.get("count"), Some("integer"));
+        assert_eq!(types.get("untyped"), None);
+    }
+
+    #[test]
+    fn test_additional_parameter_types_keep_unknown_type_fallback() {
+        for additional in [
+            Value::Bool(true),
+            Value::Bool(false),
+            serde_json::json!({}),
+            serde_json::json!({"type": ["string", "null"]}),
+        ] {
+            let schema = serde_json::json!({"additionalProperties": additional});
+            assert_eq!(
+                ParamTypes {
+                    schema: Some(&schema)
+                }
+                .get("code"),
+                None
+            );
+        }
+        let schema = serde_json::json!({
+            "properties": {"count": {"type": "integer"}},
+            "patternProperties": {"^code": {"type": "number"}},
+            "additionalProperties": {"type": "string"}
+        });
+        let types = ParamTypes {
+            schema: Some(&schema),
+        };
+        assert_eq!(types.get("code"), None);
+        assert_eq!(types.get("count"), Some("integer"));
+    }
 
     #[test]
     fn test_ends_with_partial_token() {
