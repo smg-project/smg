@@ -88,10 +88,11 @@ async fn a_chat_request_s_logit_bias_reaches_the_engine_from_the_harmony_pipelin
     }
 }
 
-/// With no tokenizer registered for the model the Harmony pipeline cannot
-/// judge the keys and refuses a request that carries a bias, saying so.
+/// While the served model's tokenizer is still loading the Harmony pipeline
+/// cannot judge the keys: a request that carries a bias gets the regular
+/// pipeline's not-ready answer (503, retry shortly), not a 400 about its keys.
 #[tokio::test]
-async fn a_harmony_chat_request_s_logit_bias_is_refused_when_the_model_has_no_tokenizer() {
+async fn a_harmony_chat_request_s_logit_bias_waits_for_the_model_s_tokenizer() {
     let (pipeline, components, scheduler) =
         pipeline_over(Endpoint::Harmony, Arc::new(TokenizerRegistry::new())).await;
     let (status, body) = chat_error_body(
@@ -100,10 +101,10 @@ async fn a_harmony_chat_request_s_logit_bias_is_refused_when_the_model_has_no_to
         chat_with_bias(serde_json::json!({"1": -100})),
     )
     .await;
-    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"]["code"], "logit_bias_invalid_key", "{body}");
+    assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["code"], "tokenizer_not_ready", "{body}");
     let message = body["error"]["message"].as_str().expect("message");
-    assert!(message.contains("no tokenizer is registered"), "{message}");
+    assert!(message.contains("is not registered yet"), "{message}");
     assert!(
         bias_seen(&scheduler).is_empty(),
         "the engine saw no request"
