@@ -62,8 +62,8 @@ use crate::{
             },
             context,
             proto_wrapper::{
-                ProtoGenerateComplete, ProtoGenerateStreamChunk, ProtoInputLogProbs,
-                ProtoResponseVariant, ProtoStream,
+                ProtoGenerateComplete, ProtoGenerateResponse, ProtoGenerateStreamChunk,
+                ProtoInputLogProbs, ProtoResponseVariant, ProtoStream,
             },
             spec::{
                 ChatResponseSpec, CompletionResponseSpec, GenerateResponseSpec,
@@ -1572,6 +1572,56 @@ impl StreamingProcessor {
             .map_err(|_| "Failed to send chunks".to_string())
     }
 
+    /// The engine's next message as the packed loops read it (the chat and
+    /// Messages streams). The engine is polled once in place before the
+    /// events written into `buffer` leave: a message it has ready joins the
+    /// frame being written, so the messages ready at one poll leave as one
+    /// frame; when it has none ready, the frame leaves before the reader
+    /// parks, so no text waits for the engine. The frame carrying the first
+    /// token leaves before the engine is polled again, whatever is ready
+    /// behind it: the client's first token waits for nothing. The one poll
+    /// registers the reader's wake where the message will come from; `next`
+    /// resumes it after the flush. `first_token_out` turns true once that
+    /// frame has left (`first_token_seen`: the stream has produced its first
+    /// token); the two yields there hand the frame to the connection through
+    /// the body driving this reading (see `DrivenBody`): the first lets the
+    /// body hand the frame out, the second lets the body answer the
+    /// connection's next pull with pending, so the connection writes the
+    /// frame before the reading runs on. With one yield the connection pulls
+    /// the reading's next frame first, and under a burst of engine messages
+    /// that frame comes only when the burst has been read: the first token
+    /// would reach the client behind the burst, as it did on the Messages
+    /// stream (whose first frame, `message_start`, is not the first token's;
+    /// the chat stream's first frame is, and the body yields after the first
+    /// frame on its own). A failed flush is the channel's end.
+    async fn next_packed(
+        grpc_stream: &mut ProtoStream,
+        tx: &SseSender,
+        buffer: &mut BytesMut,
+        first_token_out: &mut bool,
+        first_token_seen: bool,
+    ) -> Result<Option<Result<ProtoGenerateResponse, tonic::Status>>, String> {
+        let mut next = std::pin::pin!(grpc_stream.next());
+        let ready = if *first_token_out {
+            std::future::poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await
+        } else {
+            Poll::Pending
+        };
+        match ready {
+            Poll::Ready(item) => Ok(item),
+            Poll::Pending => {
+                let frame_out = !buffer.is_empty();
+                Self::flush_chunks(tx, buffer).await?;
+                if frame_out && !*first_token_out && first_token_seen {
+                    *first_token_out = true;
+                    tokio::task::yield_now().await;
+                    tokio::task::yield_now().await;
+                }
+                Ok(next.await)
+            }
+        }
+    }
+
     /// The chunk that opens a choice: the assistant role with the public
     /// API's first delta ([`opening_choice`]).
     async fn send_role_chunk(
@@ -1607,11 +1657,12 @@ impl StreamingProcessor {
         }
     }
 
-    /// Format a `MessageStreamEvent` as Anthropic SSE into `buffer`.
+    /// Format a `MessageStreamEvent` as Anthropic SSE onto the end of `buffer`.
     ///
-    /// Writes `event: {type}\ndata: {json}\n\n` into `buffer`, which the
-    /// sender splits off to the channel without a copy
-    /// ([`Self::send_messages_event`]); the buffer keeps its room.
+    /// Appends `event: {type}\ndata: {json}\n\n` to `buffer`, which a sender
+    /// splits off to the channel without a copy, alone
+    /// ([`Self::send_messages_event`]) or with the events written before it
+    /// ([`Self::write_messages_event`]); the buffer keeps its room.
     ///
     /// The `content_block_delta` frames of the four string deltas, the frames a
     /// stream sends per token, are written in one pass by
@@ -1627,7 +1678,6 @@ impl StreamingProcessor {
         buffer: &mut BytesMut,
         event: &MessageStreamEvent,
     ) -> Result<(), String> {
-        buffer.clear();
         let string_delta: Option<(&u32, &'static [u8], &str)> = match event {
             MessageStreamEvent::ContentBlockDelta { index, delta } => match delta {
                 ContentBlockDelta::TextDelta { text } => {
@@ -1674,7 +1724,7 @@ impl StreamingProcessor {
         format!("Failed to serialize messages event: {e}")
     }
 
-    /// The `content_block_delta` frame of one string delta, written in one pass into the cleared
+    /// The `content_block_delta` frame of one string delta, written in one pass onto the end of
     /// `buffer`: the constant text as literals (`delta_head` is the delta's type and key, the
     /// `text_delta` one [`Self::TEXT_DELTA_HEAD`]) and serde for the index and the text, so the
     /// frame costs the escape of its text. The bytes are those of the serialized event, which
@@ -1687,7 +1737,6 @@ impl StreamingProcessor {
         delta_head: &'static [u8],
         text: &str,
     ) -> Result<(), String> {
-        buffer.clear();
         // One reserve per frame, ahead of its writes: the constant text and the
         // delta's string (an escape grows the frame in place, as before).
         buffer.reserve(MESSAGES_DELTA_ROOM + text.len());
@@ -1741,13 +1790,13 @@ impl StreamingProcessor {
         stop
     }
 
-    /// Feeds Symphony's `events` to the content-block `machine` and sends the stream events it
+    /// Feeds Symphony's `events` to the content-block `machine` and writes the stream events it
     /// gives, in order, the `thinking_delta`s only when `thinking_text` (a `thinking.display` of
     /// `omitted` keeps the thinking block, its start and its stop, and no text); the stop reason
     /// when a `Finish` was among the events. The machine writes into the stream's `blocks`
     /// buffer, emptied here before the step: one buffer serves every step, as `buffer` does.
     /// A step that is one text delta into the open text block, the steady state of a streamed
-    /// answer, goes straight from the borrowed text to the frame ([`Self::send_text_delta`])
+    /// answer, goes straight from the borrowed text into the buffer ([`Self::write_text_delta`])
     /// when the machine says it would send exactly that
     /// ([`adapt::messages::Stream::direct_text_index`]): no owned event and no `String` per delta.
     async fn send_symphony_blocks(
@@ -1759,7 +1808,7 @@ impl StreamingProcessor {
     ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
         if let [Event::Content(text)] = events {
             if let Some(index) = machine.direct_text_index(&text.text) {
-                Self::send_text_delta(tx, buffer, index, &text.text).await?;
+                Self::write_text_delta(tx, buffer, index, &text.text).await?;
                 return Ok(None);
             }
         }
@@ -1779,39 +1828,75 @@ impl StreamingProcessor {
             if thinking_delta && !thinking_text {
                 continue;
             }
-            Self::send_messages_event(tx, buffer, block).await?;
+            Self::write_messages_event(tx, buffer, block).await?;
         }
         Ok(stop)
     }
 
     /// Write a `MessageStreamEvent` into `buffer` and hand it to the SSE
-    /// channel as one frame: the written bytes are split off, no copy, and
-    /// the buffer keeps its room for the next event (the chat stream's
-    /// `push_chunk` does the same).
+    /// channel as one frame at once: the written bytes are split off, no
+    /// copy, and the buffer keeps its room for the next event. The send-now
+    /// primitive of the error paths; the stream loops write through
+    /// [`Self::write_messages_event`] and flush, as the chat stream's
+    /// `push_chunk` buffers.
     async fn send_messages_event(
         tx: &SseSender,
         buffer: &mut BytesMut,
         event: &MessageStreamEvent,
     ) -> Result<(), String> {
-        Self::format_messages_sse_into(buffer, event)?;
+        let start = buffer.len();
+        if let Err(error) = Self::format_messages_sse_into(buffer, event) {
+            buffer.truncate(start);
+            return Err(error);
+        }
         tx.send(Ok(buffer.split().freeze()))
             .await
             .map_err(|_| "Client disconnected".to_string())
     }
 
-    /// Write the `text_delta` frame of `text` into the open block `index` and hand it to the SSE
-    /// channel as one frame, from the borrowed text: the common delta of a Symphony Messages
-    /// stream ([`Self::send_symphony_blocks`]), the same bytes as the event's frame.
-    async fn send_text_delta(
+    /// Write one Messages event into `buffer`. The buffer goes to the channel
+    /// as one frame, without a copy, by [`Self::flush_chunks`] once the
+    /// engine has nothing more ready (the Messages loop's `read_engine`: the
+    /// events ready at one poll share a frame, after the first token's), at
+    /// the stream's end, or here once it holds [`CHUNK_FLUSH_BYTES`].
+    async fn write_messages_event(
+        tx: &SseSender,
+        buffer: &mut BytesMut,
+        event: &MessageStreamEvent,
+    ) -> Result<(), String> {
+        let start = buffer.len();
+        if let Err(error) = Self::format_messages_sse_into(buffer, event) {
+            // A frame whose serialization failed is not left half-written: the
+            // buffer goes back to the event's start, so the events ahead of it
+            // still leave whole with the next frame.
+            buffer.truncate(start);
+            return Err(error);
+        }
+        Self::flush_when_full(tx, buffer)
+            .await
+            .map_err(|()| "Client disconnected".to_string())
+    }
+
+    /// Write the `text_delta` event of `text` for the open block `index` into
+    /// `buffer`, from the borrowed text: the common delta of a Symphony Messages
+    /// stream ([`Self::send_symphony_blocks`]), the same bytes as the event's
+    /// frame; it leaves as [`Self::write_messages_event`]'s writes do.
+    async fn write_text_delta(
         tx: &SseSender,
         buffer: &mut BytesMut,
         index: u32,
         text: &str,
     ) -> Result<(), String> {
-        Self::format_string_delta_frame_into(buffer, index, Self::TEXT_DELTA_HEAD, text)?;
-        tx.send(Ok(buffer.split().freeze()))
+        let start = buffer.len();
+        if let Err(error) =
+            Self::format_string_delta_frame_into(buffer, index, Self::TEXT_DELTA_HEAD, text)
+        {
+            buffer.truncate(start);
+            return Err(error);
+        }
+        Self::flush_when_full(tx, buffer)
             .await
-            .map_err(|_| "Client disconnected".to_string())
+            .map_err(|()| "Client disconnected".to_string())
     }
 
     /// Stop the open content block, if any, so the next block gets the next
@@ -1827,7 +1912,7 @@ impl StreamingProcessor {
             .fold(false, |any, open| std::mem::take(open) | any)
         {
             let stop = MessageStreamEvent::ContentBlockStop { index: *index };
-            Self::send_messages_event(tx, buffer, &stop).await?;
+            Self::write_messages_event(tx, buffer, &stop).await?;
             *index += 1;
         }
         Ok(())
@@ -1854,7 +1939,7 @@ impl StreamingProcessor {
             index,
             delta: ContentBlockDelta::InputJsonDelta { partial_json },
         };
-        Self::send_messages_event(tx, buffer, &delta).await
+        Self::write_messages_event(tx, buffer, &delta).await
     }
 
     /// Process reasoning content in Messages streaming mode (n=1 only).
@@ -2130,13 +2215,19 @@ impl StreamingProcessor {
         let terminal = if client_left {
             Ok(())
         } else {
-            async {
+            // The tail's events leave whole, ahead of a tail failure's event
+            // as ahead of the stop: the flush runs either way.
+            let tail = async {
                 stream.flush_parsers().await?;
                 stream.close_open_blocks().await?;
                 stream.send_message_delta().await?;
                 stream.send_message_stop().await
             }
-            .await
+            .await;
+            let flushed = StreamingProcessor::flush_chunks(stream.tx, &mut stream.sse_buffer)
+                .await
+                .map_err(utils::StreamFailure::from);
+            tail.and(flushed)
         };
 
         stream
@@ -3129,6 +3220,13 @@ impl<'a> ChatStream<'a> {
                 self.engine_outlived = true;
             }
             let response = if self.final_indices.is_none() && !self.engine_outlived {
+                // The packed read, kept inline here: the Messages and
+                // completion loops read through
+                // `StreamingProcessor::next_packed`, the same block as a
+                // shared future, which on this stream cost about 85
+                // instructions per delta (+1.1 percent of a 128-delta
+                // request on the pair of record); this loop is the
+                // most-travelled one, so its twin stays by measurement.
                 // The engine is polled once in place before the chunks
                 // written so far leave: a message it has ready joins the
                 // frame being written, so the messages ready at one poll
@@ -4224,7 +4322,7 @@ impl ContentBlocks {
         content_block: ContentBlock,
     ) -> Result<(), String> {
         self.stop_open(tx, buffer).await?;
-        StreamingProcessor::send_messages_event(
+        StreamingProcessor::write_messages_event(
             tx,
             buffer,
             &MessageStreamEvent::ContentBlockStart {
@@ -4293,7 +4391,7 @@ impl ContentBlocks {
             .await?;
             self.text_open = true;
         }
-        StreamingProcessor::send_messages_event(
+        StreamingProcessor::write_messages_event(
             tx,
             buffer,
             &MessageStreamEvent::ContentBlockDelta {
@@ -4346,9 +4444,13 @@ struct MessagesStream<'a> {
     // Metrics timing
     start_time: Instant,
     first_token_time: Option<Instant>,
+    /// Whether the frame carrying the first token has left: until it has,
+    /// the engine is not polled before a flush, so that frame leaves alone.
+    first_token_out: bool,
 
     /// The buffer every event is written into and split off from without a
-    /// copy, as the chat stream's (`StreamingProcessor::send_messages_event`).
+    /// copy, as the chat stream's (`StreamingProcessor::write_messages_event`):
+    /// the events ready at one poll leave as one frame.
     sse_buffer: BytesMut,
 
     blocks: ContentBlocks,
@@ -4556,6 +4658,7 @@ impl<'a> MessagesStream<'a> {
             pd_timing,
             start_time,
             first_token_time: None,
+            first_token_out: false,
             sse_buffer: BytesMut::with_capacity(MESSAGES_FIRST_BLOCK),
             blocks: ContentBlocks::default(),
             has_tool_calls: false,
@@ -4652,7 +4755,7 @@ impl<'a> MessagesStream<'a> {
             usage: StreamingProcessor::initial_messages_usage(self.spec.prompt_tokens),
             container: None,
         };
-        StreamingProcessor::send_messages_event(
+        StreamingProcessor::write_messages_event(
             self.tx,
             &mut self.sse_buffer,
             &MessageStreamEvent::MessageStart {
@@ -4684,35 +4787,76 @@ impl<'a> MessagesStream<'a> {
             let response = if self.decoder_finished_at_eof || self.engine_outlived {
                 None
             } else {
-                let next = grpc_stream.next().await;
+                // The packed read, as the chat loop's
+                // (`StreamingProcessor::next_packed`): the events ready at one
+                // poll share a frame; the first token's frame leaves alone,
+                // before the engine is polled again.
+                let next = StreamingProcessor::next_packed(
+                    grpc_stream,
+                    self.tx,
+                    &mut self.sse_buffer,
+                    &mut self.first_token_out,
+                    self.first_token_time.is_some(),
+                )
+                .await?;
                 if next.is_none() && grpc_stream.client_left() {
                     // As on the chat path: the departure ends the read before
                     // held-back text is flushed to the closed sender.
                     return Ok(());
                 }
-                next.transpose().map_err(|e| {
-                    utils::StreamFailure::upstream(e, self.completion_tokens.delivered())
-                })?
+                match next.transpose() {
+                    Ok(response) => response,
+                    Err(e) => {
+                        // What was produced before the failure still goes out.
+                        StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
+                        return Err(utils::StreamFailure::upstream(
+                            e,
+                            self.completion_tokens.delivered(),
+                        ));
+                    }
+                }
             };
             final_chunk = response.is_none() && self.decoder_finished_at_eof;
 
             let pending = match response.map(|response| response.into_response()) {
-                Some(ProtoResponseVariant::Chunk(chunk)) => self.read_chunk(chunk).await?,
+                Some(ProtoResponseVariant::Chunk(chunk)) => self.read_chunk(chunk).await,
                 Some(ProtoResponseVariant::Complete(complete)) => {
-                    self.read_complete(complete).await?
+                    self.read_complete(complete).await
                 }
                 Some(ProtoResponseVariant::None) => continue,
-                None if !self.decoder_finished_at_eof => self.read_end().await?,
-                None if self.reasoning_parser.is_some() => Some((String::new(), 0)),
+                None if !self.decoder_finished_at_eof => self.read_end().await,
+                None if self.reasoning_parser.is_some() => Ok(Some((String::new(), 0))),
                 None => break,
+            };
+            let pending = match pending {
+                Ok(pending) => pending,
+                Err(failure) => return self.fail_after_flush(failure).await,
             };
 
             let Some((chunk_text, chunk_tokens)) = pending else {
                 continue;
             };
-            self.emit(chunk_text, chunk_tokens, final_chunk).await?;
+            if let Err(failure) = self.emit(chunk_text, chunk_tokens, final_chunk).await {
+                return self.fail_after_flush(failure).await;
+            }
         }
+        StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
         Ok(())
+    }
+
+    /// A failure inside the processing of a message returns after the
+    /// events written since the last frame have left, as an upstream
+    /// failure does: the failure's event follows every event the stream
+    /// produced. The processing failure is the stream's failure, as the
+    /// tail's is over its flush's: a flush that fails here is the client
+    /// gone, and the failure's event would reach nobody, so its result
+    /// does not replace what is reported.
+    async fn fail_after_flush(
+        &mut self,
+        failure: utils::StreamFailure,
+    ) -> Result<(), utils::StreamFailure> {
+        let _ = StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await;
+        Err(failure)
     }
 
     /// An engine chunk: its tokens through the stop decoder (or Symphony's
@@ -4958,7 +5102,7 @@ impl<'a> MessagesStream<'a> {
                     .await?;
             }
             if self.spec.thinking_text_returned {
-                StreamingProcessor::send_messages_event(
+                StreamingProcessor::write_messages_event(
                     self.tx,
                     &mut self.sse_buffer,
                     &MessageStreamEvent::ContentBlockDelta {
@@ -4978,7 +5122,7 @@ impl<'a> MessagesStream<'a> {
 
         // Transition: reasoning ended, close thinking block
         if self.blocks.thinking_open && !in_reasoning && !normal_text.is_empty() {
-            StreamingProcessor::send_messages_event(
+            StreamingProcessor::write_messages_event(
                 self.tx,
                 &mut self.sse_buffer,
                 &MessageStreamEvent::ContentBlockStop {
@@ -5154,7 +5298,7 @@ impl<'a> MessagesStream<'a> {
     /// Phase 3.5: close any open content blocks.
     async fn close_open_blocks(&mut self) -> Result<(), utils::StreamFailure> {
         if self.blocks.thinking_open {
-            StreamingProcessor::send_messages_event(
+            StreamingProcessor::write_messages_event(
                 self.tx,
                 &mut self.sse_buffer,
                 &MessageStreamEvent::ContentBlockStop {
@@ -5166,7 +5310,7 @@ impl<'a> MessagesStream<'a> {
         }
 
         if self.blocks.text_open {
-            StreamingProcessor::send_messages_event(
+            StreamingProcessor::write_messages_event(
                 self.tx,
                 &mut self.sse_buffer,
                 &MessageStreamEvent::ContentBlockStop {
@@ -5178,7 +5322,7 @@ impl<'a> MessagesStream<'a> {
         }
 
         if self.blocks.tool_open {
-            StreamingProcessor::send_messages_event(
+            StreamingProcessor::write_messages_event(
                 self.tx,
                 &mut self.sse_buffer,
                 &MessageStreamEvent::ContentBlockStop {
@@ -5226,7 +5370,7 @@ impl<'a> MessagesStream<'a> {
             None
         };
 
-        StreamingProcessor::send_messages_event(
+        StreamingProcessor::write_messages_event(
             self.tx,
             &mut self.sse_buffer,
             &MessageStreamEvent::MessageDelta {
@@ -5255,7 +5399,7 @@ impl<'a> MessagesStream<'a> {
 
     /// Phase 5: the `message_stop`.
     async fn send_message_stop(&mut self) -> Result<(), utils::StreamFailure> {
-        StreamingProcessor::send_messages_event(
+        StreamingProcessor::write_messages_event(
             self.tx,
             &mut self.sse_buffer,
             &MessageStreamEvent::MessageStop,
