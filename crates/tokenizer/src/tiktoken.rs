@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
@@ -14,7 +15,9 @@ use tiktoken_rs::{
 };
 
 use crate::{
-    byte_level::{ByteLevelIncremental, ByteLevelTable, ByteLevelTableBuilder, UnknownId},
+    byte_level::{
+        cut_start, ByteLevelIncremental, ByteLevelTable, ByteLevelTableBuilder, UnknownId,
+    },
     chat_template::{
         load_chat_template_from_file, python_isspace, ChatTemplateContentFormat,
         ChatTemplateParams, ChatTemplateState, ConfigChatTemplates, PreparedTools, ThinkingKeyName,
@@ -34,8 +37,8 @@ use crate::{
     kimi_k2_tokenizer,
     native::NativeEncoder,
     traits::{
-        ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, IncrementalDecoder,
-        PromptEncoding, RendererCapabilities, SpecialTokens, TokenIdType,
+        past_emitted, ChatTemplateOutput, DecodeStep, Decoder, EncodeJob, Encoder, Encoding,
+        IncrementalDecoder, PromptEncoding, RendererCapabilities, SpecialTokens, TokenIdType,
         Tokenizer as TokenizerTrait,
     },
 };
@@ -927,31 +930,48 @@ impl Encoder for TiktokenTokenizer {
     }
 }
 
+impl TiktokenTokenizer {
+    /// `token_ids` without the special tokens a skip leaves out: the ids
+    /// `decode` renders.
+    fn kept_ids<'a>(
+        &self,
+        token_ids: &'a [TokenIdType],
+        skip_special_tokens: bool,
+    ) -> Cow<'a, [TokenIdType]> {
+        if skip_special_tokens && !self.skip_token_ids.is_empty() {
+            Cow::Owned(
+                token_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !self.skip_token_ids.contains(id))
+                    .collect(),
+            )
+        } else {
+            Cow::Borrowed(token_ids)
+        }
+    }
+
+    /// The bytes known ids stand for, in order: what `decode` renders before
+    /// the UTF-8 validation.
+    fn bytes_of(&self, token_ids: &[TokenIdType]) -> Vec<u8> {
+        self.tokenizer
+            ._decode_native_and_split(token_ids.to_vec())
+            .flatten()
+            .collect()
+    }
+}
+
 impl Decoder for TiktokenTokenizer {
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
-        let kept: Vec<TokenIdType>;
-        let token_ids: &[TokenIdType] = if skip_special_tokens && !self.skip_token_ids.is_empty() {
-            kept = token_ids
-                .iter()
-                .copied()
-                .filter(|id| !self.skip_token_ids.contains(id))
-                .collect();
-            &kept
-        } else {
-            token_ids
-        };
-        match self.tokenizer.decode(token_ids) {
+        let token_ids = self.kept_ids(token_ids, skip_special_tokens);
+        match self.tokenizer.decode(&token_ids) {
             Ok(text) => Ok(text),
             Err(err) if is_unknown_tiktoken_decode_error(&err) => Err(Error::msg(format!(
                 "tiktoken decode failed for unknown token id: {err}"
             ))),
             Err(err) => {
                 // Fallback to lossy decoding for incomplete UTF-8 sequences
-                let bytes: Vec<u8> = self
-                    .tokenizer
-                    ._decode_native_and_split(token_ids.to_vec())
-                    .flatten()
-                    .collect();
+                let bytes = self.bytes_of(&token_ids);
                 tracing::warn!(
                     error = %err,
                     token_count = token_ids.len(),
@@ -960,6 +980,37 @@ impl Decoder for TiktokenTokenizer {
                 Ok(String::from_utf8_lossy(&bytes).into_owned())
             }
         }
+    }
+
+    /// The end of a stream on the generic window (a vocabulary without the
+    /// per-id table): the held bytes as `decode` renders them, except a
+    /// character the end cut short, for which nothing is released (see
+    /// `byte_level::cut_start`); a window of ranks ends inside a character as
+    /// easily as the per-stream decoder's buffer does.
+    fn finish_decode(
+        &self,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<DecodeStep> {
+        let step = if ids.len() <= *prefix_index {
+            DecodeStep::default()
+        } else {
+            let mut decoded = self.decode(ids, skip_special_tokens)?;
+            if decoded.ends_with(char::REPLACEMENT_CHARACTER) {
+                // The window may end inside a character: render its bytes
+                // (every id known, the decode above read them) without the
+                // sequence the end cut.
+                let bytes = self.bytes_of(&self.kept_ids(ids, skip_special_tokens));
+                decoded = String::from_utf8_lossy(&bytes[..cut_start(&bytes)]).into_owned();
+            }
+            past_emitted(&decoded, prefix)
+        };
+        ids.clear();
+        prefix.clear();
+        *prefix_index = 0;
+        Ok(step)
     }
 
     /// Every id stands for fixed bytes, so one stream needs only a
@@ -1283,9 +1334,40 @@ mod tests {
         (pieces, sequence.finish().unwrap())
     }
 
-    /// Ranks `a`, `b`, the lead byte C3, the continuation byte A9 and the three
-    /// bytes of a literal U+FFFD: a character can end a stream unfinished.
-    const PARTIAL_BYTE_TIKTOKEN_MODEL: &str = "YQ== 0\nYg== 1\nww== 2\nqQ== 3\n77+9 4\n";
+    /// Ranks `a`, `b`, the lead byte C3, the continuation byte A9, the three
+    /// bytes of a literal U+FFFD and a space with the lead byte C3 after it:
+    /// a character can end a stream unfinished, alone or behind text.
+    const PARTIAL_BYTE_TIKTOKEN_MODEL: &str = "YQ== 0\nYg== 1\nww== 2\nqQ== 3\n77+9 4\nIMM= 5\n";
+
+    /// The stop decoder's reading of `ids`: as a stream (the deltas joined,
+    /// the finish last) and as one buffer (every token, then the finish,
+    /// appended into it: the non-streaming path).
+    fn stop_decoded(
+        tokenizer: &Arc<dyn Tokenizer>,
+        ids: &[TokenIdType],
+        skip: bool,
+    ) -> (String, String) {
+        use crate::stop::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
+        let mut decoder =
+            StopSequenceDecoder::new(Arc::clone(tokenizer), StopSequenceConfig::default(), skip);
+        let mut streamed = String::new();
+        for &id in ids {
+            if let SequenceDecoderOutput::Text(text) = decoder.process_token(id).unwrap() {
+                streamed.push_str(&text);
+            }
+        }
+        if let SequenceDecoderOutput::Text(text) = decoder.finish().unwrap() {
+            streamed.push_str(&text);
+        }
+        let mut decoder =
+            StopSequenceDecoder::new(Arc::clone(tokenizer), StopSequenceConfig::default(), skip);
+        let mut whole = String::new();
+        for &id in ids {
+            decoder.process_token_into(id, &mut whole).unwrap();
+        }
+        decoder.finish_into(&mut whole).unwrap();
+        (streamed, whole)
+    }
 
     fn write_minimal_tiktoken_dir(
         tokenizer_config: &str,
@@ -1768,83 +1850,93 @@ mod tests {
         assert!(err.to_string().contains("unknown token id"), "{err}");
     }
 
-    /// A stream that ends while the per-stream decoder holds bytes (a lead byte,
-    /// a lone continuation byte, a literal replacement character, a byte before
-    /// a skipped special token): its finish releases what the full decode
-    /// renders for them, and the pieces before it hold as they did.
+    /// The streams of `PARTIAL_BYTE_TIKTOKEN_MODEL` (with `[EOS]` as id 6) that
+    /// end while the decoder holds bytes: (ids, skip special tokens, the full
+    /// decode, what the stream reads). A lone continuation byte, a literal
+    /// replacement character and a byte before a skipped special token are
+    /// released as the full decode renders them; a lead byte the end cut (C3
+    /// alone, after `a`, before a skipped special token, or behind the space
+    /// of its own rank, which is released) is released as nothing.
+    const STREAM_END_CASES: [(&[TokenIdType], bool, &str, &str); 9] = [
+        (&[2], false, "\u{FFFD}", ""),
+        (&[0, 2], false, "a\u{FFFD}", "a"),
+        (&[2, 6], true, "\u{FFFD}", ""),
+        (&[5], false, " \u{FFFD}", " "),
+        (&[0, 1, 3], false, "ab\u{FFFD}", "ab\u{FFFD}"),
+        (&[4], false, "\u{FFFD}", "\u{FFFD}"),
+        (&[2, 3], false, "é", "é"),
+        (&[3, 6], true, "\u{FFFD}", "\u{FFFD}"),
+        (&[3, 6], false, "\u{FFFD}[EOS]", "\u{FFFD}[EOS]"),
+    ];
+
+    /// `STREAM_END_CASES` on `tokenizer`, through `Sequence`, through the
+    /// stop decoder as a stream and as one buffer (the non-streaming path).
+    fn assert_stream_end_cases(tokenizer: &Arc<dyn Tokenizer>) {
+        for (ids, skip, full, streamed) in STREAM_END_CASES {
+            assert_eq!(tokenizer.decode(ids, skip).unwrap(), full, "ids={ids:?}");
+            let (pieces, finish) = stream_then_finish(tokenizer, ids, skip);
+            assert_eq!(
+                pieces.concat() + &finish,
+                streamed,
+                "ids={ids:?} skip={skip}: pieces {pieces:?}, finish {finish:?}"
+            );
+            let (stop_streamed, whole) = stop_decoded(tokenizer, ids, skip);
+            assert_eq!(
+                stop_streamed, streamed,
+                "stop decoder: ids={ids:?} skip={skip}"
+            );
+            assert_eq!(whole, streamed, "whole: ids={ids:?} skip={skip}");
+        }
+    }
+
+    /// A stream that ends while the per-stream decoder holds bytes: its finish
+    /// releases what is text and nothing for a character the end cut, and the
+    /// pieces before it hold as they did.
     #[test]
-    fn stream_end_releases_the_bytes_it_holds() {
+    fn stream_end_releases_held_text_but_not_a_cut_character() {
         let dir = write_tiktoken_dir(
             PARTIAL_BYTE_TIKTOKEN_MODEL,
-            r#"{"added_tokens_decoder": {"5": {"content": "[EOS]", "special": true}}}"#,
+            r#"{"added_tokens_decoder": {"6": {"content": "[EOS]", "special": true}}}"#,
             None,
         );
         let tokenizer: Arc<dyn Tokenizer> =
             Arc::new(TiktokenTokenizer::from_dir(dir.path()).unwrap());
         assert!(tokenizer.incremental_decoder(false).is_some());
-        let cases: [(&[TokenIdType], bool, &str); 6] = [
-            (&[2], false, "\u{FFFD}"),
-            (&[0, 1, 3], false, "ab\u{FFFD}"),
-            (&[4], false, "\u{FFFD}"),
-            (&[2, 3], false, "é"),
-            (&[3, 5], true, "\u{FFFD}"),
-            (&[3, 5], false, "\u{FFFD}[EOS]"),
-        ];
-        for (ids, skip, expected) in cases {
-            assert_eq!(
-                tokenizer.decode(ids, skip).unwrap(),
-                expected,
-                "ids={ids:?}"
-            );
-            let (pieces, finish) = stream_then_finish(&tokenizer, ids, skip);
-            assert_eq!(
-                pieces.concat() + &finish,
-                expected,
-                "ids={ids:?} skip={skip}: pieces {pieces:?}, finish {finish:?}"
-            );
-        }
+        assert_stream_end_cases(&tokenizer);
         let (pieces, finish) = stream_then_finish(&tokenizer, &[0, 1, 3], false);
         assert_eq!(pieces, ["a", "b", ""]);
         assert_eq!(finish, "\u{FFFD}");
-        let (pieces, finish) = stream_then_finish(&tokenizer, &[3, 5], true);
+        let (pieces, finish) = stream_then_finish(&tokenizer, &[3, 6], true);
         assert_eq!(pieces, ["", ""]);
         assert_eq!(finish, "\u{FFFD}");
+        let (pieces, finish) = stream_then_finish(&tokenizer, &[0, 2], false);
+        assert_eq!(pieces, ["a", ""]);
+        assert_eq!(finish, "");
+        let (pieces, finish) = stream_then_finish(&tokenizer, &[5], false);
+        assert_eq!(pieces, [""]);
+        assert_eq!(finish, " ");
     }
 
     /// The same end through the generic decoder (no per-id table because an
     /// added token sits far beyond the ranks): the window's held bytes are
-    /// released as the full decode renders them.
+    /// released as the full decode renders them, minus a cut character.
     #[test]
-    fn stream_end_releases_the_bytes_it_holds_on_the_generic_path() {
+    fn stream_end_releases_held_text_but_not_a_cut_character_on_the_generic_path() {
         let dir = write_tiktoken_dir(
             PARTIAL_BYTE_TIKTOKEN_MODEL,
-            r#"{"added_tokens_decoder": {"100000000": {"content": "[FAR]", "special": true}}}"#,
+            r#"{"added_tokens_decoder": {"6": {"content": "[EOS]", "special": true}, "100000000": {"content": "[FAR]", "special": true}}}"#,
             None,
         );
         let tokenizer: Arc<dyn Tokenizer> =
             Arc::new(TiktokenTokenizer::from_dir(dir.path()).unwrap());
         assert!(tokenizer.incremental_decoder(false).is_none());
-        let cases: [(&[TokenIdType], &str); 3] = [
-            (&[2], "\u{FFFD}"),
-            (&[0, 1, 3], "ab\u{FFFD}"),
-            (&[2, 3], "é"),
-        ];
-        for (ids, expected) in cases {
-            assert_eq!(
-                tokenizer.decode(ids, false).unwrap(),
-                expected,
-                "ids={ids:?}"
-            );
-            let (pieces, finish) = stream_then_finish(&tokenizer, ids, false);
-            assert_eq!(
-                pieces.concat() + &finish,
-                expected,
-                "ids={ids:?}: pieces {pieces:?}, finish {finish:?}"
-            );
-        }
+        assert_stream_end_cases(&tokenizer);
         let (pieces, finish) = stream_then_finish(&tokenizer, &[0, 1, 3], false);
         assert_eq!(pieces, ["a", "b", ""]);
         assert_eq!(finish, "\u{FFFD}");
+        let (pieces, finish) = stream_then_finish(&tokenizer, &[0, 2], false);
+        assert_eq!(pieces, ["a", ""]);
+        assert_eq!(finish, "");
     }
 
     #[test]
