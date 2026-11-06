@@ -1380,7 +1380,7 @@ fn prefill_request() -> ChatCompletionRequest {
     .unwrap()
 }
 
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
+fn block_on<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
