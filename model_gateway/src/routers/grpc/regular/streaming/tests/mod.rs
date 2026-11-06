@@ -8,6 +8,7 @@ mod generate_tokens;
 mod isolation;
 mod local_stop;
 mod messages_bytes;
+mod messages_failure;
 mod pd_anchor;
 mod pd_usage;
 mod sse_bytes;

@@ -1844,7 +1844,11 @@ impl StreamingProcessor {
         buffer: &mut BytesMut,
         event: &MessageStreamEvent,
     ) -> Result<(), String> {
-        Self::format_messages_sse_into(buffer, event)?;
+        let start = buffer.len();
+        if let Err(error) = Self::format_messages_sse_into(buffer, event) {
+            buffer.truncate(start);
+            return Err(error);
+        }
         tx.send(Ok(buffer.split().freeze()))
             .await
             .map_err(|_| "Client disconnected".to_string())
@@ -1860,7 +1864,14 @@ impl StreamingProcessor {
         buffer: &mut BytesMut,
         event: &MessageStreamEvent,
     ) -> Result<(), String> {
-        Self::format_messages_sse_into(buffer, event)?;
+        let start = buffer.len();
+        if let Err(error) = Self::format_messages_sse_into(buffer, event) {
+            // A frame whose serialization failed is not left half-written: the
+            // buffer goes back to the event's start, so the events ahead of it
+            // still leave whole with the next frame.
+            buffer.truncate(start);
+            return Err(error);
+        }
         Self::flush_when_full(tx, buffer)
             .await
             .map_err(|()| "Client disconnected".to_string())
@@ -1876,7 +1887,13 @@ impl StreamingProcessor {
         index: u32,
         text: &str,
     ) -> Result<(), String> {
-        Self::format_string_delta_frame_into(buffer, index, Self::TEXT_DELTA_HEAD, text)?;
+        let start = buffer.len();
+        if let Err(error) =
+            Self::format_string_delta_frame_into(buffer, index, Self::TEXT_DELTA_HEAD, text)
+        {
+            buffer.truncate(start);
+            return Err(error);
+        }
         Self::flush_when_full(tx, buffer)
             .await
             .map_err(|()| "Client disconnected".to_string())
@@ -2198,16 +2215,19 @@ impl StreamingProcessor {
         let terminal = if client_left {
             Ok(())
         } else {
-            async {
+            // The tail's events leave whole, ahead of a tail failure's event
+            // as ahead of the stop: the flush runs either way.
+            let tail = async {
                 stream.flush_parsers().await?;
                 stream.close_open_blocks().await?;
                 stream.send_message_delta().await?;
-                stream.send_message_stop().await?;
-                StreamingProcessor::flush_chunks(stream.tx, &mut stream.sse_buffer)
-                    .await
-                    .map_err(utils::StreamFailure::from)
+                stream.send_message_stop().await
             }
-            .await
+            .await;
+            let flushed = StreamingProcessor::flush_chunks(stream.tx, &mut stream.sse_buffer)
+                .await
+                .map_err(utils::StreamFailure::from);
+            tail.and(flushed)
         };
 
         stream
@@ -4792,23 +4812,44 @@ impl<'a> MessagesStream<'a> {
             final_chunk = response.is_none() && self.decoder_finished_at_eof;
 
             let pending = match response.map(|response| response.into_response()) {
-                Some(ProtoResponseVariant::Chunk(chunk)) => self.read_chunk(chunk).await?,
+                Some(ProtoResponseVariant::Chunk(chunk)) => self.read_chunk(chunk).await,
                 Some(ProtoResponseVariant::Complete(complete)) => {
-                    self.read_complete(complete).await?
+                    self.read_complete(complete).await
                 }
                 Some(ProtoResponseVariant::None) => continue,
-                None if !self.decoder_finished_at_eof => self.read_end().await?,
-                None if self.reasoning_parser.is_some() => Some((String::new(), 0)),
+                None if !self.decoder_finished_at_eof => self.read_end().await,
+                None if self.reasoning_parser.is_some() => Ok(Some((String::new(), 0))),
                 None => break,
+            };
+            let pending = match pending {
+                Ok(pending) => pending,
+                Err(failure) => return self.fail_after_flush(failure).await,
             };
 
             let Some((chunk_text, chunk_tokens)) = pending else {
                 continue;
             };
-            self.emit(chunk_text, chunk_tokens, final_chunk).await?;
+            if let Err(failure) = self.emit(chunk_text, chunk_tokens, final_chunk).await {
+                return self.fail_after_flush(failure).await;
+            }
         }
         StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
         Ok(())
+    }
+
+    /// A failure inside the processing of a message returns after the
+    /// events written since the last frame have left, as an upstream
+    /// failure does: the failure's event follows every event the stream
+    /// produced. The processing failure is the stream's failure, as the
+    /// tail's is over its flush's: a flush that fails here is the client
+    /// gone, and the failure's event would reach nobody, so its result
+    /// does not replace what is reported.
+    async fn fail_after_flush(
+        &mut self,
+        failure: utils::StreamFailure,
+    ) -> Result<(), utils::StreamFailure> {
+        let _ = StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await;
+        Err(failure)
     }
 
     /// An engine chunk: its tokens through the stop decoder (or Symphony's
