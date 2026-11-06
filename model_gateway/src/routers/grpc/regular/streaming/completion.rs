@@ -109,10 +109,6 @@ pub(super) struct CompletionStream<'a> {
     /// Tokens the engine streamed for choices after their local stop, read
     /// before the abort: the tail generated for nobody.
     tail_tokens: u64,
-    /// Per expected choice, at the engine's index: the characters of the
-    /// choice's tokens so far, where its next chunk's logprobs offsets start
-    /// (the echoed prompt's first).
-    logprob_offsets: Vec<u32>,
 
     /// The per-chunk SSE frames: the bytes around a chunk's choice are the
     /// same for every chunk of this stream and are serialized once; per
@@ -135,6 +131,10 @@ struct ChoiceState {
     stop_decoder: Option<StopSequenceDecoder>,
     /// The choice's first output went out (the echo goes in front of it).
     started: bool,
+    /// The characters of the choice's tokens so far, where its next chunk's
+    /// logprobs offsets start (the echoed prompt's first); read only when
+    /// the request asked for logprobs.
+    text_offset: u32,
     /// The local stop decoder fired: "stop" is emitted even if the backend's
     /// eventual Complete carries "length" (the local stop sequence fired
     /// first), and later engine output for the choice is ignored.
@@ -212,17 +212,10 @@ impl<'a> CompletionStream<'a> {
             dispatch.weight_version.as_deref(),
         );
         // Where every choice's logprobs offsets start: after the echoed
-        // prompt. A request that asked for no logprobs keeps no offsets (an
-        // empty vector allocates nothing).
-        let logprob_offsets = if spec.logprobs.is_some() {
-            let echoed = if spec.echo {
-                u32::try_from(prompt_text.chars().count()).unwrap_or(u32::MAX)
-            } else {
-                0
-            };
-            vec![echoed; spec.choices_per_prompt as usize]
-        } else {
-            Vec::new()
+        // prompt, counted only for a request that asked for logprobs.
+        let text_offset = match spec.logprobs {
+            Some(_) if spec.echo => u32::try_from(prompt_text.chars().count()).unwrap_or(u32::MAX),
+            _ => 0,
         };
         Self {
             dispatch,
@@ -236,11 +229,13 @@ impl<'a> CompletionStream<'a> {
             backend_type,
             first_token_time: None,
             choices: (0..spec.choices_per_prompt)
-                .map(|_| ChoiceState::default())
+                .map(|_| ChoiceState {
+                    text_offset,
+                    ..Default::default()
+                })
                 .collect(),
             engine_outlived: false,
             tail_tokens: 0,
-            logprob_offsets,
             frame,
             sse_buffer: BytesMut::with_capacity(4096),
             total_prompt: 0,
@@ -333,12 +328,7 @@ impl<'a> CompletionStream<'a> {
 
         // The chunk's logprobs when the request asked for them: a chunk
         // whose tokens made no text yet carries them all the same.
-        let logprobs = self
-            .logprob_offsets
-            .get_mut(chunk.index() as usize)
-            .and_then(|text_offset| {
-                chunk_logprobs(self.spec, &self.tokenizer, text_offset, &chunk)
-            });
+        let logprobs = chunk_logprobs(self.spec, &self.tokenizer, &mut choice.text_offset, &chunk);
         if !text.is_empty() || logprobs.is_some() {
             StreamingProcessor::send_completion_chunk(
                 self.tx,
