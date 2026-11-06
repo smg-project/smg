@@ -1,17 +1,21 @@
 use rustc_hash::FxHashMap;
 use tiktoken_rs::CoreBPE;
 use tokenizers::{
-    decoders::byte_level::ByteLevel as ByteLevelDecoder,
+    decoders::{
+        byte_fallback::ByteFallback, byte_level::ByteLevel as ByteLevelDecoder, fuse::Fuse,
+        sequence::Sequence as DecoderSequence, strip::Strip,
+    },
     models::{
         bpe::{Merges, Vocab, BPE},
         wordlevel::WordLevel,
     },
     normalizers::{
         unicode::{NFC, NFKC},
-        NormalizerWrapper,
+        NormalizerWrapper, Replace,
     },
     pre_tokenizers::{
         byte_level::ByteLevel as ByteLevelPreTokenizer,
+        metaspace::{Metaspace, PrependScheme},
         sequence::Sequence,
         split::{Split, SplitPattern},
         PreTokenizerWrapper,
@@ -23,11 +27,12 @@ use tokenizers::{
         template::{SpecialToken, TemplateProcessing},
         PostProcessorWrapper,
     },
-    AddedToken, SplitDelimiterBehavior, Tokenizer as HfTokenizer,
+    AddedToken, AddedVocabulary, DecoderWrapper, SplitDelimiterBehavior, Tokenizer as HfTokenizer,
 };
 use unicode_normalization_alignments::{is_nfc_quick, IsNormalized};
 
 use super::{
+    sentencepiece::{MERGE_SCRATCH_SYMBOLS, WORD_MARKER},
     short_pieces::{ShortPieceKey, ShortPieceTable, MIN_SLOTS},
     *,
 };
@@ -2105,7 +2110,9 @@ fn a_template_post_processor_frames_the_ids_on_request() {
         );
         // The plain encode of a segment never frames.
         assert_eq!(
-            native.encode_plain(Some(model), "hello").expect("plain"),
+            native
+                .encode_plain(Some(model), "hello", true)
+                .expect("plain"),
             native.encode(Some(model), "hello", false).expect("ids"),
             "{name}"
         );
@@ -2486,7 +2493,7 @@ fn a_tiktoken_vocabulary_encodes_on_the_direct_path_as_its_own_encoder_does() {
                 "bytes last {bytes_last}: {text:?}"
             );
             assert_eq!(
-                native.encode_plain(None, &text),
+                native.encode_plain(None, &text, true),
                 Ok(own.encode_ordinary(&text)),
                 "bytes last {bytes_last}, plain: {text:?}"
             );
@@ -2497,9 +2504,420 @@ fn a_tiktoken_vocabulary_encodes_on_the_direct_path_as_its_own_encoder_does() {
             Ok(own.encode_with_special_tokens(&long))
         );
         assert_eq!(
-            native.encode_plain(None, &long),
+            native.encode_plain(None, &long, true),
             Ok(own.encode_ordinary(&long))
         );
+    }
+}
+
+/// Characters of the pool the sentencepiece vocabulary below has no token
+/// for: they fall to their bytes' tokens.
+const BYTE_FALLBACK_CHARS: &[char] = &['😀', '👍', '\u{1F3FD}', 'Ω', 'ǅ', '\u{0}', '\u{7F}'];
+
+/// Added tokens of the sentencepiece shapes: one matched on the raw text,
+/// one after normalization.
+const SENTENCEPIECE_ADDED: &[(&str, bool)] = &[("<think>", false), ("[note]", true)];
+
+/// A sentencepiece-style BPE with byte fallback: `<unk>`, the sentinels,
+/// the 256 byte tokens, the word marker, one token per other character of
+/// the pool but [`BYTE_FALLBACK_CHARS`], and merges for the pairs of a
+/// corpus of pool text with its spaces as markers (as a trainer leaves
+/// them), so pieces merge and the marker merges with the words it starts;
+/// one merge joins a word to the marker after it, so a token spans a word
+/// boundary.
+fn sentencepiece_model(state: &mut u64) -> BPE {
+    let mut vocab = Vocab::default();
+    let add = |vocab: &mut Vocab, token: String| {
+        if !vocab.contains_key(&token) {
+            let id = vocab.len() as u32;
+            vocab.insert(token, id);
+        }
+    };
+    for token in ["<unk>", "<s>", "</s>"] {
+        add(&mut vocab, token.to_owned());
+    }
+    for byte in 0..=255u8 {
+        add(&mut vocab, format!("<0x{byte:02X}>"));
+    }
+    add(&mut vocab, WORD_MARKER.to_string());
+    for &c in POOL {
+        if c != ' ' && !BYTE_FALLBACK_CHARS.contains(&c) {
+            add(&mut vocab, c.to_string());
+        }
+    }
+    let corpus = random_text(state, 4000, &[]).replace(' ', "\u{2581}");
+    let chars: Vec<char> = corpus.chars().collect();
+    let mut merges = Merges::new();
+    let mut seen = std::collections::HashSet::new();
+    for pair in chars.windows(2) {
+        let (a, b) = (pair[0].to_string(), pair[1].to_string());
+        if !vocab.contains_key(&a)
+            || !vocab.contains_key(&b)
+            || !seen.insert((a.clone(), b.clone()))
+        {
+            continue;
+        }
+        let merged = format!("{a}{b}");
+        if vocab.contains_key(&merged) {
+            continue;
+        }
+        add(&mut vocab, merged);
+        merges.push((a, b));
+        if merges.len() >= 600 {
+            break;
+        }
+    }
+    for (a, b) in [
+        ("\u{2581}t", "h"),
+        ("\u{2581}th", "e"),
+        ("t", "he"),
+        ("\u{2581}", "the"),
+        ("\u{2581}the", "\u{2581}"),
+        ("e", "d"),
+    ] {
+        if vocab.contains_key(a) && vocab.contains_key(b) {
+            let merged = format!("{a}{b}");
+            if !vocab.contains_key(&merged) {
+                add(&mut vocab, merged);
+                merges.push((a.to_owned(), b.to_owned()));
+            }
+        }
+    }
+    BPE::builder()
+        .vocab_and_merges(vocab, merges)
+        .byte_fallback(true)
+        .unk_token("<unk>".to_owned())
+        .fuse_unk(true)
+        .build()
+        .expect("a byte-fallback BPE")
+}
+
+/// The pipelines of the byte-fallback families: the marker by a `Replace`
+/// normalizer with the no-op `Split` behind it (the Gemma class) or alone,
+/// or by the Llama class's `Metaspace` under each prepend scheme.
+struct SentencepieceShape {
+    name: &'static str,
+    replace: bool,
+    split: bool,
+    metaspace: Option<PrependScheme>,
+    /// The post-processor frames the ids with `<s>`.
+    bos: bool,
+}
+
+fn sentencepiece_shapes() -> Vec<SentencepieceShape> {
+    vec![
+        SentencepieceShape {
+            name: "replace-split",
+            replace: true,
+            split: true,
+            metaspace: None,
+            bos: true,
+        },
+        SentencepieceShape {
+            name: "replace",
+            replace: true,
+            split: false,
+            metaspace: None,
+            bos: false,
+        },
+        SentencepieceShape {
+            name: "metaspace-first",
+            replace: false,
+            split: false,
+            metaspace: Some(PrependScheme::First),
+            bos: true,
+        },
+        SentencepieceShape {
+            name: "metaspace-always",
+            replace: false,
+            split: false,
+            metaspace: Some(PrependScheme::Always),
+            bos: false,
+        },
+        SentencepieceShape {
+            name: "metaspace-never",
+            replace: false,
+            split: false,
+            metaspace: Some(PrependScheme::Never),
+            bos: false,
+        },
+    ]
+}
+
+fn sentencepiece_tokenizer(shape: &SentencepieceShape, state: &mut u64) -> HfTokenizer {
+    let mut tokenizer = HfTokenizer::new(sentencepiece_model(state));
+    if shape.replace {
+        tokenizer
+            .with_normalizer(Some(
+                Replace::new(" ", "\u{2581}").expect("a Replace normalizer"),
+            ))
+            .expect("normalizer");
+    }
+    if shape.split {
+        tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Split(
+            Split::new(
+                SplitPattern::String(" ".to_owned()),
+                SplitDelimiterBehavior::MergedWithPrevious,
+                false,
+            )
+            .expect("split"),
+        )));
+    }
+    if let Some(scheme) = shape.metaspace {
+        tokenizer.with_pre_tokenizer(Some(Metaspace::new('\u{2581}', scheme, false)));
+    }
+    let mut decoder: Vec<DecoderWrapper> = vec![
+        Replace::new("\u{2581}", " ")
+            .expect("a Replace decoder")
+            .into(),
+        ByteFallback::new().into(),
+        Fuse::new().into(),
+    ];
+    if shape
+        .metaspace
+        .is_some_and(|scheme| scheme != PrependScheme::Never)
+    {
+        decoder.push(Strip::new(' ', 1, 0).into());
+    }
+    tokenizer.with_decoder(Some(DecoderSequence::new(decoder)));
+    if shape.bos {
+        let bos = tokenizer.get_model().token_to_id("<s>").expect("<s>");
+        tokenizer.with_post_processor(Some(template("<s> $A", vec![("<s>", bos).into()])));
+    }
+    tokenizer
+        .add_special_tokens([
+            AddedToken::from("<s>", true),
+            AddedToken::from("</s>", true),
+        ])
+        .expect("special tokens");
+    tokenizer
+        .add_tokens(
+            SENTENCEPIECE_ADDED
+                .iter()
+                .map(|(s, normalized)| AddedToken::from(*s, false).normalized(*normalized)),
+        )
+        .expect("added tokens");
+    tokenizer
+}
+
+/// The spellings [`random_text`] drops into a text of a sentencepiece shape.
+fn sentencepiece_added() -> Vec<&'static str> {
+    ["<s>", "</s>"]
+        .into_iter()
+        .chain(SENTENCEPIECE_ADDED.iter().map(|(s, _)| *s))
+        .collect()
+}
+
+/// The plain tokenizer the segment encode falls back to: the pipeline
+/// without its added vocabulary, and after a control under `Metaspace`
+/// `First` the scheme `Never` (as `huggingface` builds it).
+fn plain_tokenizer(tokenizer: &HfTokenizer, at_start: bool) -> HfTokenizer {
+    let mut plain = tokenizer.clone();
+    plain.with_added_vocabulary(AddedVocabulary::new());
+    if let Some(PreTokenizerWrapper::Metaspace(metaspace)) = tokenizer.get_pre_tokenizer() {
+        if !at_start && metaspace.get_prepend_scheme() == PrependScheme::First {
+            plain.with_pre_tokenizer(Some(Metaspace::new(
+                metaspace.get_replacement(),
+                PrependScheme::Never,
+                metaspace.get_split(),
+            )));
+        }
+    }
+    plain
+}
+
+#[test]
+fn every_sentencepiece_shape_gets_a_native_path() {
+    let mut state = 0x5EED_5EED_5EED_5EEDu64;
+    for shape in sentencepiece_shapes() {
+        let tokenizer = sentencepiece_tokenizer(&shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer);
+        assert!(
+            native.is_ok(),
+            "{}: {:?}",
+            shape.name,
+            native.as_ref().err()
+        );
+        let native = native.expect("native");
+        assert!(native.chars.is_some(), "{}", shape.name);
+        assert!(
+            native.stages.is_empty() && native.merges.is_none(),
+            "{}",
+            shape.name
+        );
+    }
+}
+
+/// A byte-level vocabulary whose file sets `byte_fallback` keeps the
+/// byte-level path: the shape decides, not the flag.
+#[test]
+fn a_byte_level_vocabulary_with_the_byte_fallback_flag_keeps_its_path() {
+    let mut state = 0xB17E_1E7E_1F1A_6000u64;
+    let shape = &shapes()[0];
+    let mut tokenizer = tokenizer_of(shape, &mut state);
+    let mut model = model(&mut state, shape.ignore_merges);
+    model.byte_fallback = true;
+    tokenizer.with_model(model);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("the byte-level path");
+    assert!(native.chars.is_none() && !native.stages.is_empty());
+}
+
+#[test]
+fn ids_match_tokenizers_on_random_text_for_every_sentencepiece_shape() {
+    let mut state = 0x0DD5_EED1_2345_6789u64;
+    let added = sentencepiece_added();
+    for shape in sentencepiece_shapes() {
+        let tokenizer = sentencepiece_tokenizer(&shape, &mut state);
+        let native = seeded(&tokenizer);
+        let model = tokenizer.get_model();
+        for round in 0..300 {
+            let mut text = random_text(&mut state, 1 + round % 90, &added);
+            // Texts that start with a space, a marker or an added token read
+            // the prepend rule.
+            match round % 5 {
+                1 => text.insert(0, ' '),
+                2 => text.insert(0, '\u{2581}'),
+                3 => text.insert_str(0, "<s>"),
+                _ => {}
+            }
+            for special in [false, true] {
+                let expected = tokenizer
+                    .encode(text.as_str(), special)
+                    .expect("tokenizers encodes")
+                    .get_ids()
+                    .to_vec();
+                assert_eq!(
+                    native.encode(Some(model), &text, special),
+                    Ok(expected.clone()),
+                    "{}: {text:?} (special {special})",
+                    shape.name
+                );
+                // Again, from the thread's piece cache.
+                assert_eq!(
+                    native.encode(Some(model), &text, special),
+                    Ok(expected),
+                    "{}: {text:?} again",
+                    shape.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fixed_texts_match_tokenizers_for_every_sentencepiece_shape() {
+    let mut state = 0xF1DE_D5EE_D000_0001u64;
+    for shape in sentencepiece_shapes() {
+        let tokenizer = sentencepiece_tokenizer(&shape, &mut state);
+        let native = seeded(&tokenizer);
+        let model = tokenizer.get_model();
+        for text in [
+            "",
+            " ",
+            "  ",
+            "\u{2581}",
+            "the",
+            " the",
+            "the the  the",
+            "<s>the</s> the<think> the [note]the",
+            "the\u{2581}the",
+            "ed\n\nthe\tthe\r\n",
+            "中文 字 😀 the Ω",
+            "e\u{301}d \u{E31}\u{E48}",
+            "123 ٣ ² the",
+            "a\u{0}b\u{7F}c",
+            "the\u{2581}",
+            "\u{2581}\u{2581}the",
+        ] {
+            for special in [false, true] {
+                let expected = tokenizer
+                    .encode(text, special)
+                    .expect("tokenizers encodes")
+                    .get_ids()
+                    .to_vec();
+                assert_eq!(
+                    native.encode(Some(model), text, special),
+                    Ok(expected),
+                    "{}: {text:?} (special {special})",
+                    shape.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn plain_segments_match_tokenizers_without_its_added_vocabulary_for_every_sentencepiece_shape() {
+    let mut state = 0x7A1E_5EED_0000_0001u64;
+    let added = sentencepiece_added();
+    for shape in sentencepiece_shapes() {
+        let tokenizer = sentencepiece_tokenizer(&shape, &mut state);
+        let native = seeded(&tokenizer);
+        let model = tokenizer.get_model();
+        for at_start in [true, false] {
+            let plain = plain_tokenizer(&tokenizer, at_start);
+            // An empty segment: no marker, as `tokenizers` drops the empty
+            // split before its pre-tokenizer.
+            assert_eq!(
+                native.encode_plain(Some(model), "", at_start),
+                Ok(Vec::new()),
+                "{}: empty (at_start {at_start})",
+                shape.name
+            );
+            for round in 0..120 {
+                let mut text = random_text(&mut state, 1 + round % 60, &added);
+                if round % 3 == 1 {
+                    text.insert(0, ' ');
+                }
+                let expected = plain
+                    .encode(text.as_str(), false)
+                    .expect("tokenizers encodes")
+                    .get_ids()
+                    .to_vec();
+                assert_eq!(
+                    native.encode_plain(Some(model), &text, at_start),
+                    Ok(expected),
+                    "{}: {text:?} (at_start {at_start})",
+                    shape.name
+                );
+            }
+        }
+    }
+}
+
+/// A long text of a sentencepiece shape encodes the same on the pool as in
+/// one piece: the chunks after the first get no word marker under any
+/// scheme, and the cuts between them cross no merge.
+#[test]
+fn a_long_sentencepiece_text_encodes_the_same_on_the_pool_as_in_one_piece() {
+    let mut state = 0x1017_5EED_C0FF_EE00u64;
+    let added = sentencepiece_added();
+    for shape in sentencepiece_shapes() {
+        let tokenizer = sentencepiece_tokenizer(&shape, &mut state);
+        let native = seeded(&tokenizer);
+        let model = tokenizer.get_model();
+        for special in [false, true] {
+            let text = long_text(&mut state, &added, 3 * PARALLEL_MIN_BYTES);
+            let units = native.units(&text, true, true).as_slice().len();
+            assert!(units >= 4, "{}: {units} units", shape.name);
+            let reference = tokenizer
+                .encode(text.as_str(), special)
+                .expect("tokenizers encodes")
+                .get_ids()
+                .to_vec();
+            assert_eq!(
+                native.encode_with(Some(model), &text, false, special),
+                Ok(reference.clone()),
+                "{}: in one piece",
+                shape.name
+            );
+            assert_eq!(
+                native.encode_with(Some(model), &text, true, special),
+                Ok(reference),
+                "{}: on the pool",
+                shape.name
+            );
+        }
     }
 }
 
@@ -2747,4 +3165,193 @@ fn the_chain_scanner_cuts_the_fixture_and_fuzz_texts_as_its_stage_programs_do() 
     for _ in 0..rounds {
         check(&fuzz_text(&mut state, &fixtures));
     }
+}
+
+#[test]
+fn sentencepiece_shapes_outside_the_path_are_declined() {
+    let mut state = 0xDEC1_1DED_5EED_0001u64;
+    let shapes = sentencepiece_shapes();
+    let declined = |tokenizer: &HfTokenizer| {
+        NativeEncoder::from_tokenizer(tokenizer)
+            .expect_err("declined")
+            .to_string()
+    };
+    // A normalizer other than the Replace.
+    let mut tokenizer = sentencepiece_tokenizer(&shapes[0], &mut state);
+    tokenizer
+        .with_normalizer(Some(NormalizerWrapper::NFC(NFC)))
+        .expect("normalizer");
+    assert_eq!(
+        declined(&tokenizer),
+        "a byte-fallback vocabulary with a normalizer other than Replace(space, marker) or none"
+    );
+    // Neither the Replace nor a Metaspace.
+    let mut tokenizer = sentencepiece_tokenizer(&shapes[1], &mut state);
+    tokenizer
+        .with_normalizer(None::<NormalizerWrapper>)
+        .expect("normalizer");
+    assert_eq!(
+        declined(&tokenizer),
+        "a byte-fallback vocabulary with neither a Replace normalizer nor a Metaspace \
+         pre-tokenizer"
+    );
+    // A Metaspace that splits, and one under the Replace.
+    let mut tokenizer = sentencepiece_tokenizer(&shapes[2], &mut state);
+    tokenizer.with_pre_tokenizer(Some(Metaspace::new('\u{2581}', PrependScheme::First, true)));
+    assert_eq!(
+        declined(&tokenizer),
+        "a byte-fallback vocabulary with the pre-tokenizer Metaspace (only none or a Split on \
+         the space after the Replace normalizer, or Metaspace without split)"
+    );
+    let mut tokenizer = sentencepiece_tokenizer(&shapes[1], &mut state);
+    tokenizer.with_pre_tokenizer(Some(Metaspace::new(
+        '\u{2581}',
+        PrependScheme::Never,
+        false,
+    )));
+    assert!(declined(&tokenizer)
+        .starts_with("a byte-fallback vocabulary with the pre-tokenizer Metaspace"));
+    // A Split on something else behind the Replace.
+    let mut tokenizer = sentencepiece_tokenizer(&shapes[0], &mut state);
+    tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Split(
+        Split::new(
+            SplitPattern::String("\n".to_owned()),
+            SplitDelimiterBehavior::MergedWithPrevious,
+            false,
+        )
+        .expect("split"),
+    )));
+    assert!(
+        declined(&tokenizer).starts_with("a byte-fallback vocabulary with the pre-tokenizer Split")
+    );
+    // An added token with a space, matched after the Replace.
+    let mut tokenizer = sentencepiece_tokenizer(&shapes[0], &mut state);
+    tokenizer
+        .add_tokens([AddedToken::from("end of text", false).normalized(true)])
+        .expect("added token");
+    assert_eq!(
+        declined(&tokenizer),
+        "a byte-fallback vocabulary with an added token matched after the Replace normalizer \
+         that holds a space or the word marker"
+    );
+    // The same token under Metaspace is matched on the same text either way.
+    let mut tokenizer = sentencepiece_tokenizer(&shapes[2], &mut state);
+    tokenizer
+        .add_tokens([AddedToken::from("end of text", false).normalized(true)])
+        .expect("added token");
+    assert!(NativeEncoder::from_tokenizer(&tokenizer).is_ok());
+    // ignore_merges.
+    let mut tokenizer = sentencepiece_tokenizer(&shapes[0], &mut state);
+    let mut model = sentencepiece_model(&mut state);
+    model.ignore_merges = true;
+    tokenizer.with_model(model);
+    assert_eq!(
+        declined(&tokenizer),
+        "a byte-fallback vocabulary with ignore_merges (the whole text is looked up)"
+    );
+    // A byte token missing, and a token that spells one inside it.
+    let small = |extra: &[&str], drop: &str| {
+        let mut vocab = Vocab::default();
+        for token in ["<unk>", "a", "b", "\u{2581}"]
+            .into_iter()
+            .chain(
+                (0..=255u8)
+                    .map(|byte| format!("<0x{byte:02X}>"))
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .map(String::as_str),
+            )
+            .chain(extra.iter().copied())
+        {
+            if token != drop {
+                let id = vocab.len() as u32;
+                vocab.insert(token.to_owned(), id);
+            }
+        }
+        let model = BPE::builder()
+            .vocab_and_merges(vocab, Merges::new())
+            .byte_fallback(true)
+            .unk_token("<unk>".to_owned())
+            .build()
+            .expect("a small byte-fallback BPE");
+        let mut tokenizer = HfTokenizer::new(model);
+        tokenizer
+            .with_normalizer(Some(
+                Replace::new(" ", "\u{2581}").expect("a Replace normalizer"),
+            ))
+            .expect("normalizer");
+        tokenizer
+    };
+    assert_eq!(declined(&small(&[], "<0x7F>")), "byte 0x7f has no token");
+    assert_eq!(
+        declined(&small(&["a<0x41>"], "")),
+        "the token \"a<0x41>\" spells a byte token inside it"
+    );
+    assert!(NativeEncoder::from_tokenizer(&small(&["ab"], "")).is_ok());
+}
+
+/// A piece no vocabulary token cuts can be the whole text: the thread's
+/// scratch list of initial symbols grows to it for the merge and is handed
+/// back afterwards, so a thread keeps `MERGE_SCRATCH_SYMBOLS` of scratch,
+/// not the longest piece it ever met.
+#[test]
+fn a_long_uncut_piece_leaves_the_thread_a_bounded_scratch() {
+    let mut vocab = Vocab::default();
+    let add = |vocab: &mut Vocab, token: String| {
+        if !vocab.contains_key(&token) {
+            let id = vocab.len() as u32;
+            vocab.insert(token, id);
+        }
+    };
+    add(&mut vocab, "<unk>".to_owned());
+    for byte in 0..=255u8 {
+        add(&mut vocab, format!("<0x{byte:02X}>"));
+    }
+    for token in [
+        "\u{4e2d}",
+        "\u{6587}",
+        "\u{4e2d}\u{6587}",
+        "\u{6587}\u{4e2d}",
+    ] {
+        add(&mut vocab, token.to_owned());
+    }
+    let merges: Merges = vec![
+        ("\u{4e2d}".to_owned(), "\u{6587}".to_owned()),
+        ("\u{6587}".to_owned(), "\u{4e2d}".to_owned()),
+    ];
+    let model = BPE::builder()
+        .vocab_and_merges(vocab, merges)
+        .byte_fallback(true)
+        .unk_token("<unk>".to_owned())
+        .build()
+        .expect("a byte-fallback BPE");
+    let mut tokenizer = HfTokenizer::new(model);
+    tokenizer
+        .with_normalizer(Some(
+            Replace::new(" ", "\u{2581}").expect("a Replace normalizer"),
+        ))
+        .expect("normalizer");
+    let native = seeded(&tokenizer);
+    // Every adjacent pair of bytes of the text is in a vocabulary token, so
+    // the text is one piece, merged on this thread.
+    let text = "\u{4e2d}\u{6587}".repeat(4 * MERGE_SCRATCH_SYMBOLS);
+    assert_eq!(
+        native.units(&text, true, true).as_slice().len(),
+        1,
+        "nothing cuts the text"
+    );
+    let expected = tokenizer
+        .encode(text.as_str(), false)
+        .expect("tokenizers encodes")
+        .get_ids()
+        .to_vec();
+    assert_eq!(
+        native.encode(Some(tokenizer.get_model()), &text, false),
+        Ok(expected)
+    );
+    let scratch = native.thread_piece_cache().borrow().symbols.capacity();
+    assert!(
+        scratch <= MERGE_SCRATCH_SYMBOLS,
+        "the thread kept a scratch of {scratch} symbols"
+    );
 }
