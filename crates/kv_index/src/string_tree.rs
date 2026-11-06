@@ -582,7 +582,7 @@ impl Tree {
     /// compare-exchange the node's hash from 0, and take the entry back only
     /// when the exchange lost to a different hash. A request that named the
     /// node with this same hash in between wrote this same entry (the request
-    /// path and a repair page hash a node's page-aligned path alike), so the
+    /// path and a repair page hash a node's whole text alike), so the
     /// entry is the request's as much as the repair's and stays; removing it
     /// would leave a named node that no lookup reaches until its eviction.
     fn claim_unless_named(&self, node: &NodeRef, path_hash: u64) {
