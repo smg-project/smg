@@ -84,6 +84,9 @@ ENV_TRTLLM_SERVICER_IMPL = "E2E_TRTLLM_SERVICER_IMPL"
 ENV_MM_PROCESSING = (
     "E2E_MM_PROCESSING"  # Per-lane multimodal processing location — see get_mm_processing
 )
+ENV_MOCK_WIRE = (
+    "E2E_MOCK_WIRE"  # The scheduler wire the mock's gRPC workers speak — see get_mock_wire
+)
 ENV_VLLM_MM_PROCESSOR = "E2E_VLLM_MM_PROCESSOR"  # Worker-lane processor — see get_vllm_mm_processor
 ENV_PARSER = "E2E_PARSER"  # The gateway's --parser for a lane — see get_parser
 ENV_STARTUP_TIMEOUT = (
@@ -207,6 +210,33 @@ def get_mm_processing() -> str | None:
         raise ValueError(
             f"{ENV_MM_PROCESSING}={value!r} is not a valid processing location; "
             f"use {MM_PROCESSING_WORKER!r} or leave it unset"
+        )
+    return value
+
+
+# The scheduler protos the mock's gRPC workers can serve (`--grpc-wire`), the
+# mock's own default first.
+MOCK_WIRES = ("tokenspeed", "vllm", "sglang")
+
+
+def get_mock_wire() -> str | None:
+    """The scheduler wire a lane's mock gRPC workers speak (``E2E_MOCK_WIRE``).
+
+    The scripted mock worker serves one of the gateway's three scheduler protos
+    per process (``mock-worker --grpc-wire tokenspeed|vllm|sglang``), the same
+    answers behind each; the gateway detects the runtime from it. Set the
+    variable to run the mock suite over another proto's client arm. Unset or
+    blank leaves the mock on its default (no flag on the command line); a
+    set-but-unrecognized value is a misconfiguration and raises. A class that
+    names a wire of its own passes ``--grpc-wire`` in its ``extra_engine_args``,
+    which the command takes after the lane's flag, so the class's wins.
+    """
+    value = os.environ.get(ENV_MOCK_WIRE, "").strip().lower()
+    if not value:
+        return None
+    if value not in MOCK_WIRES:
+        raise ValueError(
+            f"{ENV_MOCK_WIRE}={value!r} is not a scheduler wire; use one of {MOCK_WIRES}"
         )
     return value
 

@@ -208,10 +208,6 @@ jobs:
           retention-days: 1
           if-no-files-found: ignore
 
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
-
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
@@ -381,10 +377,6 @@ jobs:
           source "$HOME/.cargo/env"
           bash scripts/ci_rust_tests.sh check
 
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
-
   # One job per shard of scripts/ci_rust_tests.sh that a pull request can
   # affect: detect-changes maps its rust-* path filters to the shard table and
   # emits the matrix (every shard on a push to main or a dispatch). The build
@@ -484,10 +476,6 @@ jobs:
       - name: Cleanup Postgres test database
         if: always() && contains(matrix.needs, 'postgres')
         run: bash scripts/ci_agentic_svc_deps.sh cleanup-postgres-db postgres-db
-
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
 
   # --- Dependency audit ---
 
@@ -2301,7 +2289,7 @@ jobs:
         env:
           SHOW_WORKER_LOGS: "0"
           E2E_LOG_DIR: e2e-logs
-          # floor ≈ 95% of the 471 cases the mock marker selects: the chat
+          # floor ≈ 95% of the 487 cases the mock marker selects: the chat
           # completion, request-id, concurrency, reasoning-content, EOS
           # stripping, function-calling, tool-choice (three models),
           # multi-turn and sampling-defaults classes, the constraint-failure
@@ -2314,8 +2302,10 @@ jobs:
           # parameters, item references, the object shape), and the gpt-oss
           # classes of chat and Responses on the Harmony token stream (the
           # mock's tokenizer turns a scripted answer's channel markers into
-          # the special tokens)
-          E2E_MIN_SELECTED: "447"
+          # the special tokens), and the scheduler-wire classes (a chat, a
+          # streamed and a tool-call turn through the gateway on each of the
+          # three gRPC protos the mock serves)
+          E2E_MIN_SELECTED: "462"
           MOCK_WORKER_BIN: ${{ github.workspace }}/target/debug/mock-worker
           ROUTER_LOCAL_MODEL_PATH: ${{ runner.temp }}/models
           TIKTOKEN_ENCODINGS_BASE: ${{ runner.temp }}/models/tiktoken
@@ -2336,10 +2326,6 @@ jobs:
           path: e2e-logs/
           retention-days: 7
           if-no-files-found: ignore
-
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
 
   # --- Vendor E2E: CPU-only cloud backend tests ---
 
