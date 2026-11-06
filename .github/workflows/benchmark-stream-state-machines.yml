@@ -84,7 +84,8 @@ jobs:
 
       # A base without the bench source (the first pull request that adds it, a
       # release branch it was not backported to) has nothing to gate against:
-      # the base build and the gate are skipped and the step says so.
+      # the base build and the gate are skipped, the step says so, and the pull
+      # request's binary runs once on its own as a smoke run of the five rows.
       - name: Build the base branch's benchmark
         id: base
         if: github.event_name == 'pull_request'
@@ -111,6 +112,14 @@ jobs:
           python3 scripts/bench_gate.py run --gates .github/bench-gates/stream-state-machines.toml \
             --base "$RUNNER_TEMP/bench-gate/base" --pr "$RUNNER_TEMP/bench-gate/pr" \
             --cwd model_gateway --out bench-gate 2>&1 | tee benchmark_output.txt
+
+      - name: Run the pull request's benchmark (no base to gate against)
+        if: github.event_name == 'pull_request' && steps.base.outputs.present != 'true'
+        timeout-minutes: 40
+        working-directory: model_gateway
+        run: |
+          set -o pipefail
+          CRITERION_HOME="$GITHUB_WORKSPACE/target/criterion" "$RUNNER_TEMP/bench-gate/pr" --bench --noplot 2>&1 | tee ../benchmark_output.txt
 
       - name: Run benchmark
         if: github.event_name != 'pull_request'
