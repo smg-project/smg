@@ -23,7 +23,10 @@ use smg_grpc_client::{sglang_proto as sglang, vllm_proto as vllm, WorkerMediaFau
 use tracing::{info, warn};
 
 use super::{
-    assemble::{assemble_sglang_batches, assemble_vllm_batches_with, VllmAssembly},
+    assemble::{
+        assemble_sglang_batches, assemble_vllm_batches_with, FloatsForDeviceNormalization,
+        VllmAssembly,
+    },
     capability::runtime_reads_format,
     config::{MultimodalComponents, MultimodalConfigRegistry, MultimodalModelConfig},
     encoder_budget::ItemOverEncoderBudget,
@@ -711,7 +714,7 @@ impl WorkerMediaPipeline {
             .process_inputs(prompt_token_ids, items, RuntimeType::Vllm)
             .await?;
         let data = assemble_vllm_batches_with(output.intermediate, &self.assembly)
-            .map_err(|error| WorkerMediaError::Internal(format!("{error:#}")))?;
+            .map_err(classify_assembly)?;
         let (first, extras) = data.into_protos();
         let identity = want_identity.then(|| vllm::MediaIdentity {
             prompt_token_ids: output.expanded_token_ids.clone(),
@@ -947,6 +950,22 @@ fn classify(error: anyhow::Error) -> WorkerMediaError {
     }
 }
 
+/// Whose fault an assembly error is: the typed refusal of normalized floats
+/// by a worker that normalizes on device is the request's (the client can
+/// send images the processor gives as bytes), as the router-side pipeline
+/// answers it; anything else in assembly is ours.
+fn classify_assembly(error: anyhow::Error) -> WorkerMediaError {
+    let message = format!("{error:#}");
+    if error
+        .chain()
+        .any(|cause| cause.is::<FloatsForDeviceNormalization>())
+    {
+        WorkerMediaError::Invalid(message)
+    } else {
+        WorkerMediaError::Internal(message)
+    }
+}
+
 fn classify_fetch(error: &MediaConnectorError, message: String) -> WorkerMediaError {
     let fault = match error.fault() {
         MediaFault::Client => WorkerMediaFault::Client,
@@ -1038,6 +1057,25 @@ mod tests {
         let effective = effective_item_limits(&spec, &HashMap::new(), None, |_| None);
         assert_eq!(effective[&Modality::Image], at(128, Spec));
         assert_eq!(effective[&Modality::Video], at(8, Spec));
+    }
+
+    /// The assembly's refusal of normalized floats by a worker that
+    /// normalizes on device is the request's error (a 400 through the
+    /// servicer), as on the router-side pipeline; any other assembly error
+    /// stays this worker's own.
+    #[test]
+    fn the_float_refusal_is_the_requests_error_and_other_assembly_errors_ours() {
+        let refusal = anyhow::Error::new(FloatsForDeviceNormalization).context("assembly");
+        let error = classify_assembly(refusal);
+        assert!(matches!(error, WorkerMediaError::Invalid(_)), "{error}");
+        assert!(
+            error.to_string().contains("mm_device_do_normalize"),
+            "{error}"
+        );
+        let other = classify_assembly(anyhow::anyhow!(
+            "multimodal intermediate is missing its first batch"
+        ));
+        assert!(matches!(other, WorkerMediaError::Internal(_)), "{other}");
     }
 
     #[test]
