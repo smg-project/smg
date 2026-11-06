@@ -1572,34 +1572,38 @@ impl StreamingProcessor {
             .map_err(|_| "Failed to send chunks".to_string())
     }
 
-    /// The engine's next message as the packed loops read it (the chat,
-    /// completion and Messages streams). The engine is polled once in place before the
-    /// events written into `buffer` leave: a message it has ready joins the
-    /// frame being written, so the messages ready at one poll leave as one
-    /// frame; when it has none ready, the frame leaves before the reader
+    /// The engine's next message as the packed loops read it (the
+    /// completion and Messages streams; the chat loop keeps its own copy of
+    /// the block, by measurement). The engine is polled once in place before
+    /// the events written into `buffer` leave: a message it has ready joins
+    /// the frame being written, so the messages ready at one poll leave as
+    /// one frame; when it has none ready, the frame leaves before the reader
     /// parks, so no text waits for the engine. The frame carrying the first
     /// token leaves before the engine is polled again, whatever is ready
     /// behind it: the client's first token waits for nothing. The one poll
     /// registers the reader's wake where the message will come from; `next`
     /// resumes it after the flush. `first_token_out` turns true once that
     /// frame has left (`first_token_seen`: the stream has produced its first
-    /// token); the two yields there hand the frame to the connection through
-    /// the body driving this reading (see `DrivenBody`): the first lets the
-    /// body hand the frame out, the second lets the body answer the
-    /// connection's next pull with pending, so the connection writes the
-    /// frame before the reading runs on. With one yield the connection pulls
-    /// the reading's next frame first, and under a burst of engine messages
-    /// that frame comes only when the burst has been read: the first token
-    /// would reach the client behind the burst, as it did on the Messages
-    /// stream (whose first frame, `message_start`, is not the first token's;
-    /// the chat stream's first frame is, and the body yields after the first
-    /// frame on its own). A failed flush is the channel's end.
+    /// token); the yields there hand the frame to the connection through the
+    /// body driving this reading (see `DrivenBody`): one lets the body hand
+    /// the frame out, a second lets the body answer the connection's next
+    /// pull with pending, so the connection writes the frame before the
+    /// reading runs on. The body yields once after its own first frame:
+    /// where the first token's frame is that frame
+    /// (`first_frame_is_first_token`: the completion stream, as the chat
+    /// stream) one yield here makes the two; where it is not (the Messages
+    /// stream, whose first frame is `message_start`) this read yields
+    /// twice. One yield short, the connection pulls the reading's next
+    /// frame first, and under a burst of engine messages that frame comes
+    /// only when the burst has been read: the first token would reach the
+    /// client behind the burst. A failed flush is the channel's end.
     async fn next_packed(
         grpc_stream: &mut ProtoStream,
         tx: &SseSender,
         buffer: &mut BytesMut,
         first_token_out: &mut bool,
         first_token_seen: bool,
+        first_frame_is_first_token: bool,
     ) -> Result<Option<Result<ProtoGenerateResponse, tonic::Status>>, String> {
         let mut next = std::pin::pin!(grpc_stream.next());
         let ready = if *first_token_out {
@@ -1615,7 +1619,9 @@ impl StreamingProcessor {
                 if frame_out && !*first_token_out && first_token_seen {
                     *first_token_out = true;
                     tokio::task::yield_now().await;
-                    tokio::task::yield_now().await;
+                    if !first_frame_is_first_token {
+                        tokio::task::yield_now().await;
+                    }
                 }
                 Ok(next.await)
             }
@@ -3226,11 +3232,16 @@ impl<'a> ChatStream<'a> {
             let response = if self.final_indices.is_none() && !self.engine_outlived {
                 // The packed read, kept inline here: the Messages and
                 // completion loops read through
-                // `StreamingProcessor::next_packed`, the same block as a
+                // `StreamingProcessor::next_packed`, the same read as a
                 // shared future, which on this stream cost about 85
                 // instructions per delta (+1.1 percent of a 128-delta
                 // request on the pair of record); this loop is the
-                // most-travelled one, so its twin stays by measurement.
+                // most-travelled one, so its twin stays by measurement. It
+                // yields once at the first token, as `next_packed` does for
+                // the completion stream: this stream's first frame carries
+                // the first token, and `DrivenBody` yields after its first
+                // frame on its own (`next_packed` yields twice for the
+                // Messages stream, whose first frame is `message_start`).
                 // The engine is polled once in place before the chunks
                 // written so far leave: a message it has ready joins the
                 // frame being written, so the messages ready at one poll
@@ -4794,13 +4805,17 @@ impl<'a> MessagesStream<'a> {
                 // The packed read, as the chat loop's
                 // (`StreamingProcessor::next_packed`): the events ready at one
                 // poll share a frame; the first token's frame leaves alone,
-                // before the engine is polled again.
+                // before the engine is polled again, with two yields at its
+                // hand-off: this stream's first frame is `message_start`,
+                // not the first token's, so the body's own yield is spent
+                // before it.
                 let next = StreamingProcessor::next_packed(
                     grpc_stream,
                     self.tx,
                     &mut self.sse_buffer,
                     &mut self.first_token_out,
                     self.first_token_time.is_some(),
+                    false,
                 )
                 .await?;
                 if next.is_none() && grpc_stream.client_left() {

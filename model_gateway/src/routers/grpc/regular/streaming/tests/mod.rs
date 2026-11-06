@@ -1,3 +1,4 @@
+mod completion_failure;
 mod delta_slicing;
 pub(crate) mod eof;
 mod failure;

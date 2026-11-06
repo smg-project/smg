@@ -263,7 +263,10 @@ impl<'a> CompletionStream<'a> {
     /// The loop over the engine's messages: each is processed as soon as it
     /// arrives and its chunks are written into the unit's buffer; the chunks
     /// of the messages ready at one poll leave as one frame, the first
-    /// token's alone (the packed read, as the chat loop's).
+    /// token's alone (the packed read, as the chat loop's: the first token's
+    /// frame is this stream's first frame, so its hand-off yields once). A
+    /// failure inside the processing of a message returns after the chunks
+    /// written ahead of it have left, as an upstream failure does.
     pub(super) async fn read_engine(
         &mut self,
         grpc_stream: &mut ProtoStream,
@@ -275,6 +278,7 @@ impl<'a> CompletionStream<'a> {
                 &mut self.sse_buffer,
                 &mut self.first_token_out,
                 self.first_token_time.is_some(),
+                true,
             )
             .await?;
             let Some(response) = next else {

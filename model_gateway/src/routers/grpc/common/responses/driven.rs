@@ -134,8 +134,9 @@ impl Stream for DrivenBody {
                 // the body's first frame (`yield_once`): after any later
                 // frame the connection pulls again at once and the reading
                 // runs on; a reading that needs such a frame written first
-                // yields twice itself (the packed engine read's first token,
-                // `StreamingProcessor::next_packed`).
+                // yields twice itself (the Messages stream's first token in
+                // `StreamingProcessor::next_packed`: its first frame is not
+                // the body's).
                 Poll::Pending => {
                     this.reading = Some(reading);
                     return match this.rx.try_recv() {
