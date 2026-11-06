@@ -3,8 +3,10 @@
 use std::{
     collections::HashMap,
     fmt,
-    future::Future,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+    },
     time::Duration,
 };
 
@@ -31,7 +33,7 @@ use openai_protocol::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::sync::Semaphore;
+use tokio::{sync::Semaphore, task::yield_now};
 use tool_parser::types::ToolCallItem;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -300,7 +302,9 @@ pub(crate) fn missing_tokenizer_response(
 /// own size, a batch (a completion with several prompts, as text or as ids, a
 /// tokenize call, a Decisions request's prompts and label probes) by what the
 /// call has already encoded or decoded in place, through [`InPlaceBudget`]. A
-/// prompt of ids counts its ids' bytes, four each.
+/// prompt of ids counts its ids' bytes, four each. An input under the
+/// break-even size ([`OFFLOAD_BREAK_EVEN_BYTES`]) never takes the pool: once
+/// the call's share is spent it yields the worker instead.
 ///
 /// The bound is where the encode outweighs its offload. An offloaded encode
 /// costs the request a round trip through the pool: the pool thread's wake,
@@ -319,6 +323,13 @@ pub(crate) fn missing_tokenizer_response(
 /// earlier bound of 512 bytes charged the round trip to every ordinary
 /// conversation: a system prompt and a few turns render to 1-10 KiB.
 const ENCODE_OFFLOAD_MIN_BYTES: usize = 16 * 1024;
+
+/// Below this input size the pool's round trip costs more than the work it
+/// would move (the measurement above: a trip is about 55 k instructions, an
+/// encode about 70 k per kilobyte), so such an input never takes the pool:
+/// when the call's in-place share is spent it yields the worker once instead
+/// and starts the next share.
+const OFFLOAD_BREAK_EVEN_BYTES: usize = 1024;
 
 /// Bounds how many CPU-bound encodes run concurrently on the blocking pool.
 /// tokio's blocking pool is otherwise unbounded (grows to 512 threads), so under
@@ -356,6 +367,15 @@ where
     if !offloads(len) {
         return work();
     }
+    pool(work).await
+}
+
+/// Run `work` on the blocking pool behind the [`encode_permits`].
+async fn pool<T, F>(work: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
     let _permit = encode_permits()
         .acquire()
         .await
@@ -374,78 +394,129 @@ pub(crate) async fn encode_blocking(
     text: &str,
     add_special_tokens: bool,
 ) -> anyhow::Result<Encoding> {
-    encode_sized(tokenizer, text, add_special_tokens, text.len()).await
-}
-
-/// Tokenize `text` as `len` bytes of work: in place, from the caller's own
-/// text, when [`offloads`] says no; otherwise copied once, for the blocking
-/// task, which outlives the borrow. [`encode_blocking`] passes the text's own
-/// length, [`encode_blocking_in_batch`] what its call has charged.
-async fn encode_sized(
-    tokenizer: Arc<dyn Tokenizer>,
-    text: &str,
-    add_special_tokens: bool,
-    len: usize,
-) -> anyhow::Result<Encoding> {
-    if !offloads(len) {
+    if !offloads(text.len()) {
         return tokenizer.encode(text, add_special_tokens);
     }
     let text = text.to_string();
-    offload(len, move || tokenizer.encode(&text, add_special_tokens)).await
+    pool(move || tokenizer.encode(&text, add_special_tokens)).await
 }
 
-/// What one call has encoded or decoded on the runtime thread so far. A batch
-/// charges each of its inputs against the bound together with the bytes the
-/// call already ran in place, so the call as a whole holds a worker for no
-/// longer than one input at the bound would; an input that would take the
-/// call over the bound goes to the pool, beside the others there, as every
-/// input at or above the bound does.
+/// What one call has encoded or decoded on the runtime thread since it last
+/// yielded it: the call's share. A call's inputs charge it as each first runs
+/// (a join polls its futures one by one), so the call holds a worker for about
+/// one input at the bound before it lets go. An input that would take the
+/// share over the bound goes to the pool if it is worth the trip
+/// ([`OFFLOAD_BREAK_EVEN_BYTES`]), beside the others there; a smaller one
+/// yields the worker once and starts the next share, in a sequential loop as
+/// in a join, where the inputs behind it yield to the join's next pass.
 #[derive(Default)]
 pub(crate) struct InPlaceBudget {
-    in_place: usize,
+    /// The bytes run in place in the current share.
+    in_place: AtomicUsize,
+    /// The share's number: of the inputs that yielded on finding a share
+    /// spent, the first one back starts the next.
+    share: AtomicUsize,
+}
+
+/// Where an input of a call runs, by [`InPlaceBudget::place`].
+enum Placement {
+    /// On the calling thread, within the share.
+    InPlace,
+    /// On the blocking pool.
+    Pool,
+    /// On the calling thread, after one yield of it; the share it found spent.
+    AfterYield(usize),
 }
 
 impl InPlaceBudget {
-    /// The bytes `len` brings the call to, charged only while that stays
-    /// under the bound ([`offloads`]).
-    fn charge(&mut self, len: usize) -> usize {
-        let total = self.in_place + len;
-        if !offloads(total) {
-            self.in_place = total;
+    /// Where an input of `len` bytes runs now.
+    fn place(&self, len: usize) -> Placement {
+        if offloads(len) {
+            return Placement::Pool;
         }
-        total
+        let mut seen = self.in_place.load(Ordering::Relaxed);
+        loop {
+            let total = seen + len;
+            if offloads(total) {
+                return if len >= OFFLOAD_BREAK_EVEN_BYTES {
+                    Placement::Pool
+                } else {
+                    Placement::AfterYield(self.share.load(Ordering::Relaxed))
+                };
+            }
+            match self.in_place.compare_exchange_weak(
+                seen,
+                total,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Placement::InPlace,
+                Err(now) => seen = now,
+            }
+        }
+    }
+
+    /// Back from the yield an input took on finding `share` spent: the first
+    /// one back starts the next share, the others place themselves in it.
+    fn resumed(&self, share: usize) {
+        if self
+            .share
+            .compare_exchange(share, share + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.in_place.store(0, Ordering::Relaxed);
+        }
     }
 }
 
-/// Tokenize one `text` of a batch through the offload policy of [`offload`],
-/// the call's [`InPlaceBudget`] deciding where. The decision is taken when the
-/// future is made, so a batch may make all of its futures and join them at
-/// once; the future borrows the text as [`encode_blocking`] does, in place
-/// from the caller's own text, on the pool from one copy.
-pub(crate) fn encode_blocking_in_batch<'a>(
+/// Tokenize one `text` of a call through the offload policy, the call's
+/// [`InPlaceBudget`] placing it when it first runs: in place from the caller's
+/// own text, as [`encode_blocking`] does below the bound; on the pool from one
+/// copy; or in place after one yield of the worker.
+pub(crate) async fn encode_blocking_in_batch(
     tokenizer: Arc<dyn Tokenizer>,
-    text: &'a str,
+    text: &str,
     add_special_tokens: bool,
-    budget: &mut InPlaceBudget,
-) -> impl Future<Output = anyhow::Result<Encoding>> + 'a {
-    let charged = budget.charge(text.len());
-    encode_sized(tokenizer, text, add_special_tokens, charged)
+    budget: &InPlaceBudget,
+) -> anyhow::Result<Encoding> {
+    loop {
+        match budget.place(text.len()) {
+            Placement::InPlace => return tokenizer.encode(text, add_special_tokens),
+            Placement::Pool => {
+                let text = text.to_string();
+                return pool(move || tokenizer.encode(&text, add_special_tokens)).await;
+            }
+            Placement::AfterYield(share) => {
+                yield_now().await;
+                budget.resumed(share);
+            }
+        }
+    }
 }
 
-/// Decode one prompt of `ids` of a call through the offload policy of
-/// [`offload`], the call's [`InPlaceBudget`] deciding where, as
+/// Decode one prompt of `ids` of a call through the offload policy, the
+/// call's [`InPlaceBudget`] placing it when it first runs, as
 /// [`encode_blocking_in_batch`] does for a text: a prompt given as ids leaves
 /// the worker thread at the same size a text prompt does, four bytes an id.
-/// The decision is taken when the future is made; a call of one prompt
-/// charges a budget of its own.
-pub(crate) fn decode_blocking_in_batch(
+/// A call of one prompt charges a budget of its own.
+pub(crate) async fn decode_blocking_in_batch(
     tokenizer: Arc<dyn Tokenizer>,
     ids: Vec<u32>,
     skip_special_tokens: bool,
-    budget: &mut InPlaceBudget,
-) -> impl Future<Output = anyhow::Result<String>> {
-    let charged = budget.charge(ids.len() * size_of::<u32>());
-    offload(charged, move || tokenizer.decode(&ids, skip_special_tokens))
+    budget: &InPlaceBudget,
+) -> anyhow::Result<String> {
+    loop {
+        match budget.place(ids.len() * size_of::<u32>()) {
+            Placement::InPlace => return tokenizer.decode(&ids, skip_special_tokens),
+            Placement::Pool => {
+                return pool(move || tokenizer.decode(&ids, skip_special_tokens)).await
+            }
+            Placement::AfterYield(share) => {
+                yield_now().await;
+                budget.resumed(share);
+            }
+        }
+    }
 }
 
 /// Tokenize a rendered chat prompt the way its renderer said to: a deferred

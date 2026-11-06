@@ -5,7 +5,7 @@
 //! `CompletionRequest` native in the request context instead of laundering it
 //! through `GenerateRequest`.
 
-use std::{future::Future, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
@@ -111,19 +111,20 @@ async fn encode_prompts(
     tokenizer: &Arc<dyn Tokenizer>,
     prompts: &[String],
 ) -> Result<Vec<CompletionItem>, Response> {
-    let mut budget = utils::InPlaceBudget::default();
-    let encodings = try_join_all(prompts.iter().map(|prompt| {
-        utils::encode_blocking_in_batch(tokenizer.clone(), prompt, false, &mut budget)
-    }))
-    .await
-    .map_err(|e| {
-        error!(
-            function = "CompletionPreparationStage::execute",
-            error = %e,
-            "Tokenization failed"
-        );
-        error::bad_request("tokenization_failed", format!("Tokenization failed: {e}"))
-    })?;
+    let budget = utils::InPlaceBudget::default();
+    let encodings =
+        try_join_all(prompts.iter().map(|prompt| {
+            utils::encode_blocking_in_batch(tokenizer.clone(), prompt, false, &budget)
+        }))
+        .await
+        .map_err(|e| {
+            error!(
+                function = "CompletionPreparationStage::execute",
+                error = %e,
+                "Tokenization failed"
+            );
+            error::bad_request("tokenization_failed", format!("Tokenization failed: {e}"))
+        })?;
 
     Ok(prompts
         .iter()
@@ -148,32 +149,28 @@ async fn encode_prompts(
 /// tokenizer's range that its encoding never assigned (a hole of a tiktoken
 /// id space) is the decode's to find, and is refused as the client's error. A
 /// long prompt decodes off the worker thread, as a long text encodes, and a
-/// call's lists charge one in-place `budget` as a call's texts do: the list
-/// is charged when the future is made, so the lists decode in place up to the
-/// bound and on the pool past it. `field` names the prompt in a refusal:
-/// `prompt`, or `prompt[b]` for one list of a batch.
-fn token_prompt<'a>(
+/// call's lists charge one in-place `budget` as a call's texts do, so they
+/// decode in place up to the bound and on the pool past it. `field` names the
+/// prompt in a refusal: `prompt`, or `prompt[b]` for one list of a batch.
+async fn token_prompt(
     tokenizer: &Arc<dyn Tokenizer>,
-    ids: &'a [u32],
+    ids: &[u32],
     field: &str,
     embedding_rows: impl FnOnce() -> Option<usize>,
-    budget: &mut utils::InPlaceBudget,
-) -> impl Future<Output = Result<CompletionItem, Response>> + 'a {
-    let known = reject_unknown_token_id(tokenizer.as_ref(), ids, field, embedding_rows).map_err(
-        |message| {
-            warn!(
-                function = "CompletionPreparationStage::execute",
-                error = %message,
-                "Prompt token id outside the model's vocabulary"
-            );
-            error::bad_request("invalid_prompt_token", message)
-        },
-    );
+    budget: &utils::InPlaceBudget,
+) -> Result<CompletionItem, Response> {
+    reject_unknown_token_id(tokenizer.as_ref(), ids, field, embedding_rows).map_err(|message| {
+        warn!(
+            function = "CompletionPreparationStage::execute",
+            error = %message,
+            "Prompt token id outside the model's vocabulary"
+        );
+        error::bad_request("invalid_prompt_token", message)
+    })?;
     let decodable = decodable_ids(tokenizer.as_ref(), ids);
-    let decode = utils::decode_blocking_in_batch(tokenizer.clone(), decodable, false, budget);
-    async move {
-        known?;
-        let text = decode.await.map_err(|e| {
+    let text = utils::decode_blocking_in_batch(tokenizer.clone(), decodable, false, budget)
+        .await
+        .map_err(|e| {
             // The range check behind `decodable_ids` is a fast path, not a guarantee: a
             // tiktoken encoding leaves holes below its reported size (ids with neither a
             // rank nor a special token), which only the decode finds. Such an id is the
@@ -188,11 +185,10 @@ fn token_prompt<'a>(
                 format!("prompt token ids cannot be decoded: {e}"),
             )
         })?;
-        Ok(CompletionItem {
-            text,
-            token_ids: ids.to_vec(),
-        })
-    }
+    Ok(CompletionItem {
+        text,
+        token_ids: ids.to_vec(),
+    })
 }
 
 /// The token prompts of a call, one item per list, charged to one in-place
@@ -204,12 +200,12 @@ async fn token_prompts(
     fields: &[String],
     embedding_rows: impl FnOnce() -> Option<usize> + Copy,
 ) -> Result<Vec<CompletionItem>, Response> {
-    let mut budget = utils::InPlaceBudget::default();
+    let budget = utils::InPlaceBudget::default();
     try_join_all(
         batches
             .iter()
             .zip(fields)
-            .map(|(ids, field)| token_prompt(tokenizer, ids, field, embedding_rows, &mut budget)),
+            .map(|(ids, field)| token_prompt(tokenizer, ids, field, embedding_rows, &budget)),
     )
     .await
 }
@@ -233,7 +229,7 @@ mod tests {
             ids,
             field,
             || None,
-            &mut utils::InPlaceBudget::default(),
+            &utils::InPlaceBudget::default(),
         )
         .await
         {
@@ -264,7 +260,7 @@ mod tests {
             &ids,
             "prompt",
             || None,
-            &mut utils::InPlaceBudget::default(),
+            &utils::InPlaceBudget::default(),
         )
         .await
         .expect("known ids");
@@ -315,7 +311,7 @@ mod tests {
             &ids,
             "prompt",
             || None,
-            &mut utils::InPlaceBudget::default(),
+            &utils::InPlaceBudget::default(),
         )
         .await
         .expect("known ids");
@@ -337,7 +333,7 @@ mod tests {
             &ids,
             "prompt",
             || None,
-            &mut utils::InPlaceBudget::default(),
+            &utils::InPlaceBudget::default(),
         )
         .await
         .expect("an added token is a token");
@@ -382,7 +378,7 @@ mod tests {
             &[hello, 1_500],
             "prompt",
             || Some(2_000),
-            &mut utils::InPlaceBudget::default(),
+            &utils::InPlaceBudget::default(),
         )
         .await
         .expect("an id below the table is one the model can emit");
@@ -409,7 +405,7 @@ mod tests {
             &ids,
             "prompt",
             || Some(vocab + 1_000),
-            &mut utils::InPlaceBudget::default(),
+            &utils::InPlaceBudget::default(),
         )
         .await
         .expect("an id inside the reported table is one the model can emit");

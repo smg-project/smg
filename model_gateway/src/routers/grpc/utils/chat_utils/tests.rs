@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use llm_tokenizer::{chat_template::ChatTemplateContentFormat, traits::RendererCapabilities};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
@@ -1996,7 +1998,7 @@ fn a_long_decode_takes_the_offload_path_and_a_short_one_runs_inline() {
             tokenizer.clone(),
             ids,
             false,
-            &mut InPlaceBudget::default(),
+            &InPlaceBudget::default(),
         ))
         .unwrap()
     };
@@ -2145,10 +2147,10 @@ fn a_batch_encodes_in_place_up_to_the_bound_and_the_rest_on_the_pool() {
     let (tokenizer, ran_on) = thread_recording_tokenizer();
     let here = thread::current().id();
     let batch = |texts: Vec<String>| {
-        let mut budget = InPlaceBudget::default();
+        let budget = InPlaceBudget::default();
         let futures: Vec<_> = texts
             .iter()
-            .map(|text| encode_blocking_in_batch(tokenizer.clone(), text, false, &mut budget))
+            .map(|text| encode_blocking_in_batch(tokenizer.clone(), text, false, &budget))
             .collect();
         block_on(try_join_all(futures)).unwrap();
         std::mem::take(&mut *ran_on.lock().unwrap())
@@ -2172,6 +2174,81 @@ fn a_batch_encodes_in_place_up_to_the_bound_and_the_rest_on_the_pool() {
     assert!(
         threads.iter().all(|t| *t == here),
         "a batch under the bound in total is encoded on the thread that holds the request"
+    );
+}
+
+/// An input under the break-even size never takes the pool: once a call's
+/// share is spent it yields the worker and starts the next share, whether the
+/// call awaits its inputs one by one (a tokenize call of many short texts)
+/// or joins them, where the join runs about one share per poll pass.
+#[test]
+fn short_inputs_after_a_spent_share_stay_in_place_and_yield_instead() {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+        thread,
+    };
+
+    use futures::future::try_join_all;
+
+    use crate::routers::grpc::testing::thread_recording_tokenizer;
+
+    /// The polls a future took to complete: one per pass of a join.
+    struct Polls<F>(Pin<Box<F>>, usize);
+    impl<F: Future> Future for Polls<F> {
+        type Output = (F::Output, usize);
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.1 += 1;
+            match self.0.as_mut().poll(cx) {
+                Poll::Ready(output) => Poll::Ready((output, self.1)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    let (tokenizer, ran_on) = thread_recording_tokenizer();
+    let here = thread::current().id();
+    let spends_the_share = "word ".repeat((ENCODE_OFFLOAD_MIN_BYTES - 512) / 5);
+    let short = "word ".repeat(20); // 100 bytes, under the break-even size
+    let texts = vec![short; 2_000]; // 200 KB in all: twelve shares and a bit
+
+    // One by one, as the tokenize loop awaits them.
+    let budget = InPlaceBudget::default();
+    block_on(async {
+        encode_blocking_in_batch(tokenizer.clone(), &spends_the_share, false, &budget)
+            .await
+            .unwrap();
+        for text in &texts {
+            encode_blocking_in_batch(tokenizer.clone(), text, false, &budget)
+                .await
+                .unwrap();
+        }
+    });
+    let threads = std::mem::take(&mut *ran_on.lock().unwrap());
+    assert_eq!(threads.len(), 2_001);
+    assert!(
+        threads.iter().all(|t| *t == here),
+        "a short input is never sent to the pool, spent share or not"
+    );
+
+    // Joined, as a completion batch is.
+    let budget = InPlaceBudget::default();
+    let ((), polls) = block_on(Polls(
+        Box::pin(async {
+            let futures: Vec<_> = texts
+                .iter()
+                .map(|text| encode_blocking_in_batch(tokenizer.clone(), text, false, &budget))
+                .collect();
+            try_join_all(futures).await.unwrap();
+        }),
+        0,
+    ));
+    let threads = std::mem::take(&mut *ran_on.lock().unwrap());
+    assert_eq!(threads.len(), 2_000);
+    assert!(threads.iter().all(|t| *t == here));
+    assert!(
+        (12..=16).contains(&polls),
+        "the join runs about one share of short inputs per pass and yields between passes: {polls} passes"
     );
 }
 
