@@ -1887,10 +1887,16 @@ impl NativeEncoder {
 
     /// The calling thread's piece cache for this encoder, made at the
     /// thread's first encode with it (from then on the thread counts toward
-    /// every thread's share, see [`Self::piece_cache_share`]).
+    /// every thread's share, see [`Self::piece_cache_share`]); that first
+    /// encode also reads the merge table through once
+    /// (`MergeTable::read_through`), so the thread's first-sight pieces find
+    /// its lines in the caches.
     fn thread_piece_cache(&self) -> &RefCell<PieceCache> {
         self.piece_cache.get_or(|| {
             self.threads.fetch_add(1, Ordering::Relaxed);
+            if let Some(merges) = &self.merges {
+                merges.read_through();
+            }
             RefCell::default()
         })
     }
