@@ -414,11 +414,6 @@ impl QwenVLProcessorBase {
         self.transforms.do_resize
     }
 
-    /// The resize filter the preprocessor config selected.
-    pub(super) fn filter(&self) -> FilterType {
-        self.transforms.filter
-    }
-
     /// Preserve an already aligned native-loader video grid and its pixel bytes.
     /// Only the caller's clone is changed; ordinary Qwen/vLLM planning is unchanged.
     pub(super) fn with_aligned_video_frames(mut self, pixels: usize) -> Self {
