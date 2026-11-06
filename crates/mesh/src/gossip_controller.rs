@@ -41,13 +41,11 @@ use anyhow::Result;
 use parking_lot::RwLock;
 use rand::seq::{IndexedRandom, SliceRandom};
 use tokio::sync::{mpsc, watch, Mutex};
-use tonic::transport::Endpoint;
 use tracing as log;
 use tracing::{instrument, Instrument};
 
 use super::{
     dialer::Dialer,
-    mtls::tls_server_name,
     service::{
         broadcast_node_states,
         gossip::{
@@ -696,33 +694,14 @@ impl GossipController {
             peer_addr
         );
 
-        // Connect to peer's gRPC service via Endpoint so TLS can be configured.
-        // The stream keeps a connection of its own (see `dialer`).
-        let connect_url = if self.dialer.mtls_manager().is_some() {
-            format!("https://{peer_addr}")
-        } else {
-            format!("http://{peer_addr}")
-        };
-        log::info!("Connecting to URL: {}", connect_url);
-
-        let mut endpoint = Endpoint::from_shared(connect_url.clone())
-            .map_err(|e| anyhow::anyhow!("Invalid peer endpoint {connect_url}: {e}"))?;
-
-        if let Some(mtls_manager) = self.dialer.mtls_manager() {
-            let tls_domain = endpoint.uri().host().map_or_else(
-                || peer_name.clone(),
-                |host| tls_server_name(host).to_owned(),
-            );
-            let tls = mtls_manager
-                .client_tls_config(&tls_domain)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to load the mTLS identity: {e}"))?;
-            endpoint = endpoint
-                .tls_config(tls)
-                .map_err(|e| anyhow::anyhow!("Failed to configure TLS endpoint: {e}"))?;
-        }
-
-        let channel = endpoint.connect().await.map_err(|e| {
+        // The stream runs on the channel the probes keep for the peer's
+        // address, with the node's TLS identity when the mesh has one: one
+        // connection per direction of a pair, reconnected by the channel
+        // itself after a loss (see `dialer`).
+        let addr = peer_addr.parse::<SocketAddr>().map_err(|e| {
+            anyhow::anyhow!("Invalid peer address {peer_addr} for the sync stream: {e}")
+        })?;
+        let channel = self.dialer.channel(&peer_name, addr).await.map_err(|e| {
             log::warn!(
                 "Failed to connect to peer {} for sync_stream: {}",
                 peer_name,
