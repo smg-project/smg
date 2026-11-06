@@ -281,10 +281,14 @@ impl<'a> CompletionStream<'a> {
     /// The loop over the engine's messages: each is processed as soon as it
     /// arrives and its chunks are written into the unit's buffer; the chunks
     /// of the messages ready at one poll leave as one frame, the first
-    /// token's alone (the packed read, as the chat loop's: the first token's
-    /// frame is this stream's first frame, so its hand-off yields once; in a
-    /// batched request only the first unit's is, and the later units' hand-offs
-    /// yield twice, see [`Self::first_frame`]). A failure inside the
+    /// token's alone (the packed read, as the chat loop's). The first token's
+    /// frame has its hand-off yield once when it is the body's first frame
+    /// (this stream's, as the chat stream's) and twice when it is not: in a
+    /// batched request the body's first frame may be an earlier unit's, its
+    /// first token's, its finish with no token ahead of it, or the chunk
+    /// writer's own send of a first chunk past the flush size (see
+    /// [`Self::first_frame`]); a first-token frame the writer sent itself
+    /// pays its hand-off there ([`after_write`]). A failure inside the
     /// processing of a message returns after the chunks written ahead of it
     /// have left, as an upstream failure does.
     pub(super) async fn read_engine(
@@ -436,7 +440,8 @@ impl<'a> CompletionStream<'a> {
                 &mut self.first_frame,
                 self.first_token_time,
                 &mut self.first_token_out,
-            );
+            )
+            .await;
         }
 
         if stopped {
@@ -470,7 +475,8 @@ impl<'a> CompletionStream<'a> {
                     &mut self.first_frame,
                     self.first_token_time,
                     &mut self.first_token_out,
-                );
+                )
+                .await;
             }
 
             StreamingProcessor::write_completion_chunk(
@@ -485,7 +491,8 @@ impl<'a> CompletionStream<'a> {
                 &mut self.first_frame,
                 self.first_token_time,
                 &mut self.first_token_out,
-            );
+            )
+            .await;
         }
         Ok(())
     }
@@ -536,7 +543,8 @@ impl<'a> CompletionStream<'a> {
                 &mut self.first_frame,
                 self.first_token_time,
                 &mut self.first_token_out,
-            );
+            )
+            .await;
             choice.started = true;
         }
 
@@ -562,7 +570,8 @@ impl<'a> CompletionStream<'a> {
                         &mut self.first_frame,
                         self.first_token_time,
                         &mut self.first_token_out,
-                    );
+                    )
+                    .await;
                 }
             }
         }
@@ -580,7 +589,8 @@ impl<'a> CompletionStream<'a> {
                 &mut self.first_frame,
                 self.first_token_time,
                 &mut self.first_token_out,
-            );
+            )
+            .await;
         }
 
         let finish_reason =
@@ -598,7 +608,8 @@ impl<'a> CompletionStream<'a> {
             &mut self.first_frame,
             self.first_token_time,
             &mut self.first_token_out,
-        );
+        )
+        .await;
         Ok(())
     }
 
@@ -652,7 +663,8 @@ impl<'a> CompletionStream<'a> {
                 &mut self.first_frame,
                 self.first_token_time,
                 &mut self.first_token_out,
-            );
+            )
+            .await;
         }
         // The finish of the open choices is written after the read's end
         // flush: it leaves as its own frame.
@@ -758,9 +770,12 @@ impl BodysFirstFrame<'_> {
 /// chunk past the flush size, the echo of a long prompt in front of the
 /// first token), so a frame of the unit is gone: it claims the body's first
 /// frame if it was the unit's first, and, the first token being among it,
-/// the first-token frame is out and the hand-off is not paid on a later
-/// frame.
-fn after_write(
+/// it is the first-token frame, whose hand-off the packed read's flush will
+/// not pay (the buffer is empty at the next poll): it is paid here, before
+/// the reading runs on into whatever the engine has ready behind the chunk,
+/// the one yield when the frame is the body's first and the two when it is
+/// not, as the read's flush pays it ([`StreamingProcessor::next_packed`]).
+async fn after_write(
     buffer: &BytesMut,
     first_frame: &mut BodysFirstFrame<'_>,
     first_token_time: Option<Instant>,
@@ -769,8 +784,13 @@ fn after_write(
     if !buffer.is_empty() {
         return;
     }
-    first_frame.leaves();
-    if first_token_time.is_some() {
-        *first_token_out = true;
+    let bodys_first = first_frame.leaves();
+    if first_token_time.is_none() || *first_token_out {
+        return;
+    }
+    *first_token_out = true;
+    tokio::task::yield_now().await;
+    if !bodys_first {
+        tokio::task::yield_now().await;
     }
 }

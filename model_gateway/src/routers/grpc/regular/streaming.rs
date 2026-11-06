@@ -2358,8 +2358,8 @@ impl StreamingProcessor {
             // Fail-fast: the first stream error cancels the remaining units
             // (their streams abort on drop) and fails the whole request.
             let completion_request = &completion_request;
-            // The body's first frame, claimed by the first unit to flush its
-            // first token (see `CompletionStream::first_frame`).
+            // The body's first frame, claimed by the first unit to send a
+            // frame of any kind (see `BodysFirstFrame`).
             let body_first_frame = AtomicBool::new(false);
             // The units' reading, isolated: a panic in it ends this response
             // with an error event and `[DONE]`, not the task polling the

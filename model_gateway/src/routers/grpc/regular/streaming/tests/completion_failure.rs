@@ -11,9 +11,14 @@
 //! its hand-off, so that frame too reaches the connection before the burst
 //! behind it is read, whether the body's first frame was an earlier prompt's
 //! first token, its finish with no token ahead of it, or the chunk writer's
-//! own send of its first chunk past the flush size.
+//! own send of its first chunk past the flush size, whose hand-off the
+//! writer's path pays itself: the burst behind that chunk is decoded only
+//! once the connection holds the frame.
 
-use std::{pin::Pin, sync::atomic::AtomicBool};
+use std::{
+    pin::Pin,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use futures::{future::try_join_all, Stream, StreamExt as _};
 use llm_tokenizer::{
@@ -634,23 +639,101 @@ async fn an_earlier_prompts_token_less_finish_is_the_bodys_first_frame_and_a_lat
     later_server.abort();
 }
 
+/// The character tokenizer, counting the tokens it decoded (`decoded`): a
+/// test reads how far the reading got when the body handed a frame out.
+#[derive(Default)]
+struct CountsDecodedTokens {
+    inner: CharacterTokenizer,
+    decoded: AtomicUsize,
+}
+
+impl Encoder for CountsDecodedTokens {
+    fn encode(&self, text: &str, add_special_tokens: bool) -> anyhow::Result<Encoding> {
+        self.inner.encode(text, add_special_tokens)
+    }
+
+    fn encode_batch(
+        &self,
+        texts: &[&str],
+        add_special_tokens: bool,
+    ) -> anyhow::Result<Vec<Encoding>> {
+        self.inner.encode_batch(texts, add_special_tokens)
+    }
+}
+
+impl Decoder for CountsDecodedTokens {
+    fn decode(&self, ids: &[TokenIdType], skip_special_tokens: bool) -> anyhow::Result<String> {
+        self.inner.decode(ids, skip_special_tokens)
+    }
+
+    fn decode_step(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> anyhow::Result<Option<String>> {
+        self.decoded.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+
+    fn decode_step_eager(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> anyhow::Result<Option<String>> {
+        self.decoded.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .decode_step_eager(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+}
+
+impl Tokenizer for CountsDecodedTokens {
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    fn get_special_tokens(&self) -> &SpecialTokens {
+        self.inner.get_special_tokens()
+    }
+
+    fn token_to_id(&self, token: &str) -> Option<TokenIdType> {
+        self.inner.token_to_id(token)
+    }
+
+    fn id_to_token(&self, id: TokenIdType) -> Option<String> {
+        self.inner.id_to_token(id)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// An earlier prompt whose first chunk is past the flush size (the echo of a
 /// long prompt in front of its first token) leaves through the chunk writer's
 /// own send, with no flush of the read's: that frame is the body's first all
 /// the same, so a later prompt's first-token frame is not and its hand-off
 /// yields twice, the pull after it pending and the pull after that its burst;
 /// the earlier prompt's own first token went with its first frame, so no
-/// hand-off is paid on its second.
+/// hand-off is paid on its second. The writer's send pays that frame's
+/// hand-off itself: the burst ready behind the first chunk is decoded only
+/// once the connection holds the frame, and leaves as the frame after it.
 #[tokio::test]
 async fn an_earlier_prompts_echo_past_the_flush_size_is_the_bodys_first_frame_and_a_later_prompts_first_token_yields_twice(
 ) {
     // The first prompt: a long prompt echoed in front of its first token, so
     // the first chunk's text alone fills the writer's buffer past its flush
-    // size; its end held back.
+    // size, with a burst ready behind that chunk; its end held back.
     let prompt_text = "p".repeat(CHUNK_FLUSH_BYTES + 1);
     let (first_end_tx, first_end) = oneshot::channel();
     let (first_stream, first_server) = gated_stream(
-        vec![chunk(0, "a")],
+        vec![chunk(0, "a"), chunk(0, "b"), chunk(0, "c"), chunk(0, "d")],
         first_end,
         vec![complete(0, "stop")],
         "0",
@@ -674,8 +757,12 @@ async fn an_earlier_prompts_echo_past_the_flush_size_is_the_bodys_first_frame_an
     let processor = processor(false);
     let spec_with_echo = completion_spec_with_echo();
     let spec = completion_spec();
+    // The tokenizer counts the tokens decoded: how far the reading got when
+    // the body handed a frame out.
+    let tokenizer = Arc::new(CountsDecodedTokens::default());
+    let decoding = Arc::clone(&tokenizer);
     let reading = async move {
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+        let tokenizer: Arc<dyn Tokenizer> = decoding;
         let body_first_frame = AtomicBool::new(false);
         let outcomes = try_join_all([
             processor.process_completion_streaming_chunks(
@@ -716,14 +803,34 @@ async fn an_earlier_prompts_echo_past_the_flush_size_is_the_bodys_first_frame_an
         first_len > CHUNK_FLUSH_BYTES
             && first.contains(r#""text":"ppp"#)
             && first.contains(r#"pa""#)
-            && !first.contains(r#""text":"x""#),
-        "the body's first frame is the first prompt's echo and first token, past the flush size: {first_len} bytes"
+            && !first.contains(r#""text":"b""#),
+        "the body's first frame is the first prompt's echo and first token, past the flush size, alone: {first_len} bytes"
+    );
+    // The writer's send of that frame paid its hand-off: the burst behind the
+    // first chunk is not decoded until the connection holds the frame.
+    assert_eq!(
+        tokenizer.decoded.load(Ordering::Relaxed),
+        1,
+        "only the first chunk's token is decoded when the body hands the first frame out"
     );
     // The pull after the body's first frame: pending, the body's own yield.
     let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
     assert!(
         pull.is_pending(),
         "the pull after the body's first frame must be pending: {pull:?}"
+    );
+    // The pull after that: the burst behind the first chunk, as one frame
+    // (one yield at the writer's hand-off, the body's own made the second).
+    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
+    let Poll::Ready(Some(Ok(burst))) = pull else {
+        panic!("the pull after the pending one is the first prompt's burst: {pull:?}");
+    };
+    let burst = String::from_utf8(burst.to_vec()).expect("text");
+    assert!(
+        burst.contains(r#""text":"b""#)
+            && burst.contains(r#""text":"d""#)
+            && !burst.contains(r#""text":"x""#),
+        "the chunks ready behind the first prompt's first chunk share a frame: {burst}"
     );
     later_tx.send(()).expect("the later prompt's gate");
     let later_first = body
