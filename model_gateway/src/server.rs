@@ -2498,12 +2498,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         shutdown_signal().await;
         // The mesh hears of the stop first: `Leaving` goes to the live
         // members during the settle window (the broadcast is bounded by 3 s,
-        // then a second for propagation, then the gossip loop stops), so
-        // they know as soon as this member stops serving, instead of finding
-        // out from failed probes once it is gone. The leave gets the window
-        // and no more (with no window, what the grace allows); cut short, its
-        // broadcast tasks run on and the gossip loop is stopped by
-        // `stop_mesh`.
+        // then a second for propagation, then a second broadcast bounded by
+        // half a second for a peer a late probe turned back to Alive, 4.5 s
+        // at the worst, then the gossip loop stops), so they know as soon as
+        // this member stops serving,
+        // instead of finding out from failed probes once it is gone. The
+        // leave gets the window and no more (with no window, what the grace
+        // allows); cut short, its broadcast tasks run on and the gossip loop
+        // is stopped by `stop_mesh`.
         let leave_mesh = async {
             if let Some(mesh) = &mesh_handler {
                 if let Err(e) = mesh.graceful_shutdown().await {

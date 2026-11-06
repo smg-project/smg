@@ -26,7 +26,18 @@ RPCs of the `Gossip` service in `proto/gossip.proto`:
   membership table; the answer is merged into the local table. A member
   that answers neither a direct probe nor an indirect one (a `PingReq`
   relayed through up to three other live members) is marked `Suspected`, on
-  the next failure `Down`, and the new status is broadcast.
+  the next failure `Down`, and the new status is broadcast. A verdict is the
+  peers' word; the member's own word wins over it: a member that reads a
+  verdict on itself in a probe's table refutes it (`Alive`, one version
+  above), and a member's own entry in a probe or a broadcast it sends (both
+  name their sender) wins on the receiver whatever version it held, `Alive`
+  again after a verdict or `Leaving` when it stops, so a late answer, a pause
+  or a restart under the same name heal within a probe round and a clean stop
+  is not undone by a verdict. A stopping member broadcasts `Leaving` twice,
+  once at the stop and once after its propagation wait: a probe that was in
+  flight when the stop began carries its table from before it, and a peer
+  that reads that `Alive` after the first broadcast holds the member alive
+  again until the second one.
 - **State** (`SyncStream`, bidirectional streaming): one long-lived stream per
   pair of members. Every second each end sends the round's new entries of the
   stream namespaces and the CRDT operations the peer has not acknowledged
@@ -203,7 +214,9 @@ StatefulSet and passes the Pod's name, which survives restarts, as
 `--mesh-server-name`. Once a key's owner has been `Down` or `Leaving` for
 20 s (`DEAD_OWNER_GRACE` in `adapters/worker_sync.rs`), the other members
 ignore the key and remove the worker they had imported from it. A member that
-should reclaim its keys when it returns needs a stable `--mesh-server-name`.
+should reclaim its keys when it returns needs a stable `--mesh-server-name`:
+back under that name, it is alive again on a peer at its first probe of it,
+and its keys import again.
 
 ## See Also
 

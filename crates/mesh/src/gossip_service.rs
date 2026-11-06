@@ -250,22 +250,64 @@ impl GossipService {
         })
     }
 
-    fn merge_state(&self, incoming_nodes: Vec<NodeState>) -> bool {
+    /// Merge a peer's table into this node's: an entry wins by the higher
+    /// version, with two exceptions, both a member's own word about itself.
+    /// This node's own entry is never replaced by a peer's copy of it: a
+    /// verdict on this node other than `Alive` is refuted (`refute_or_adopt`),
+    /// and the probe's answer and the tables of the next probes carry the
+    /// refutation. The entry of `sender`, the member whose probe or broadcast
+    /// this table came with, is that member's own word about itself and wins
+    /// whatever version this node holds it at: `Alive` from a member this
+    /// node holds `Suspected`, `Down` or `Leaving` (a probe it answered late,
+    /// a crash or a clean stop before this life of it) makes it alive again,
+    /// and `Leaving` from a member this node holds above its own version (it
+    /// was alive again here after a verdict, and had not read that version
+    /// back) makes it leaving; both written above the held version so the
+    /// stale entry loses to it everywhere, as the member itself refutes a
+    /// verdict. Without this, a verdict outlived the member's return (`Down`
+    /// and `Leaving` members are never probed, and a member back under its
+    /// name starts counting at version 1), and a re-admitted member's clean
+    /// stop was learned through failed probes alone.
+    fn merge_state(&self, incoming_nodes: Vec<NodeState>, sender: &str) -> bool {
         let mut state = self.state.write();
         let mut updated = false;
         for node in incoming_nodes {
-            state
-                .entry(node.name.clone())
-                .and_modify(|entry| {
-                    if node.version > entry.version {
-                        *entry = node.clone();
-                        updated = true;
-                    }
-                })
-                .or_insert_with(|| {
+            if node.name == self.self_name {
+                if let Some(own) = state.get_mut(&node.name) {
+                    updated |= refute_or_adopt(own, &node);
+                }
+                continue;
+            }
+            match state.get_mut(&node.name) {
+                None => {
+                    state.insert(node.name.clone(), node);
                     updated = true;
-                    node
-                });
+                }
+                Some(entry) if node.version > entry.version => {
+                    *entry = node;
+                    updated = true;
+                }
+                Some(entry)
+                    if node.name == sender
+                        && node.status != entry.status
+                        && (node.status == NodeStatus::Alive as i32
+                            || node.status == NodeStatus::Leaving as i32) =>
+                {
+                    log::info!(
+                        "Member {} speaks: {:?} at version {} by its own word (held {:?} at version {})",
+                        node.name,
+                        NodeStatus::try_from(node.status).unwrap_or(NodeStatus::Init),
+                        entry.version + 1,
+                        NodeStatus::try_from(entry.status).unwrap_or(NodeStatus::Init),
+                        entry.version
+                    );
+                    entry.status = node.status;
+                    entry.version += 1;
+                    entry.address = node.address;
+                    updated = true;
+                }
+                Some(_) => {}
+            }
         }
         if updated {
             log::info!("Cluster state updated. Current nodes: {}", state.len());
@@ -290,7 +332,7 @@ impl Gossip for GossipService {
                 log::info!("Received {:?}", ping);
                 if let Some(stat_sync) = ping.state_sync {
                     log::info!("Merging state from Ping: {} nodes", stat_sync.nodes.len());
-                    self.merge_state(stat_sync.nodes);
+                    self.merge_state(stat_sync.nodes, &ping.sender);
                 }
                 // Return current status of self node (could be Alive or Leaving)
                 let current_status = {
@@ -476,6 +518,39 @@ impl Gossip for GossipService {
             Box::pin(output_stream) as Self::SyncStreamStream
         ))
     }
+}
+
+/// A peer's entry for this node merged into this node's own, `own`: a
+/// verdict other than `Alive` at or above the own version is refuted, the
+/// own entry set `Alive` one above the verdict's version (a late answer to a
+/// probe, a crash or a clean stop the peers saw before this life); an `Alive`
+/// entry above the own version lends its version (a life that began again at
+/// 1 counts on from where the peers hold it), and an older verdict changes
+/// nothing (the refutation already stands above it). A node that is leaving
+/// keeps saying so. True when `own` changed.
+fn refute_or_adopt(own: &mut NodeState, incoming: &NodeState) -> bool {
+    if own.status == NodeStatus::Leaving as i32 {
+        return false;
+    }
+    if incoming.status == NodeStatus::Alive as i32 {
+        if incoming.version > own.version {
+            own.version = incoming.version;
+            return true;
+        }
+        return false;
+    }
+    if incoming.version < own.version {
+        return false;
+    }
+    log::info!(
+        "Refuting {:?} at version {} on this node: alive at version {}",
+        NodeStatus::try_from(incoming.status).unwrap_or(NodeStatus::Init),
+        incoming.version,
+        incoming.version + 1
+    );
+    own.status = NodeStatus::Alive as i32;
+    own.version = incoming.version + 1;
+    true
 }
 
 #[cfg(test)]
@@ -747,5 +822,76 @@ mod tests {
             Some("router_mesh_peer_connections{peer=\"probe\"} 2"),
             "two streams were open:\n{while_both_open}"
         );
+    }
+}
+
+#[cfg(test)]
+mod refutation_tests {
+    use std::collections::HashMap;
+
+    use super::{refute_or_adopt, NodeState, NodeStatus};
+
+    fn entry(status: NodeStatus, version: u64) -> NodeState {
+        NodeState {
+            name: "self".to_string(),
+            address: "127.0.0.1:1".to_string(),
+            status: status as i32,
+            version,
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// A verdict at or above the own version is refuted one above it; the
+    /// own address stays.
+    #[test]
+    fn a_verdict_on_this_node_is_refuted_one_version_above_it() {
+        for status in [NodeStatus::Suspected, NodeStatus::Down, NodeStatus::Leaving] {
+            let mut own = entry(NodeStatus::Alive, 1);
+            let mut verdict = entry(status, 5);
+            verdict.address = "10.0.0.9:9".to_string();
+            assert!(refute_or_adopt(&mut own, &verdict), "{status:?}");
+            assert_eq!(
+                (own.status, own.version, own.address.as_str()),
+                (NodeStatus::Alive as i32, 6, "127.0.0.1:1"),
+                "{status:?}"
+            );
+        }
+        let mut own = entry(NodeStatus::Alive, 4);
+        assert!(refute_or_adopt(&mut own, &entry(NodeStatus::Down, 4)));
+        assert_eq!(
+            own.version, 5,
+            "a verdict at the own version is refuted too"
+        );
+    }
+
+    /// An older verdict changes nothing: the refutation already stands above
+    /// it.
+    #[test]
+    fn an_older_verdict_changes_nothing() {
+        let mut own = entry(NodeStatus::Alive, 6);
+        assert!(!refute_or_adopt(&mut own, &entry(NodeStatus::Suspected, 5)));
+        assert_eq!((own.status, own.version), (NodeStatus::Alive as i32, 6));
+    }
+
+    /// A peer that holds this node Alive at a higher version (a life that
+    /// began again at 1) lends its version; a lower or equal one changes
+    /// nothing.
+    #[test]
+    fn an_alive_entry_above_the_own_version_lends_its_version() {
+        let mut own = entry(NodeStatus::Alive, 1);
+        assert!(refute_or_adopt(&mut own, &entry(NodeStatus::Alive, 7)));
+        assert_eq!((own.status, own.version), (NodeStatus::Alive as i32, 7));
+        assert!(!refute_or_adopt(&mut own, &entry(NodeStatus::Alive, 7)));
+        assert!(!refute_or_adopt(&mut own, &entry(NodeStatus::Alive, 3)));
+        assert_eq!(own.version, 7);
+    }
+
+    /// A node that is leaving keeps saying so, whatever a peer holds.
+    #[test]
+    fn a_leaving_node_keeps_saying_so() {
+        let mut own = entry(NodeStatus::Leaving, 3);
+        assert!(!refute_or_adopt(&mut own, &entry(NodeStatus::Down, 9)));
+        assert!(!refute_or_adopt(&mut own, &entry(NodeStatus::Alive, 9)));
+        assert_eq!((own.status, own.version), (NodeStatus::Leaving as i32, 3));
     }
 }
