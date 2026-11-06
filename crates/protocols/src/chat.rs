@@ -307,8 +307,8 @@ pub struct ChatCompletionRequest {
     /// Whether to return audio output.
     pub return_audio: Option<bool>,
 
-    /// How many chat completion choices to generate for each input message
-    #[validate(range(min = 1, max = 10))]
+    /// How many chat completion choices to generate for each input message (1 to 128)
+    #[validate(range(min = 1, max = 128))]
     pub n: Option<u32>,
 
     /// Whether to enable parallel function calling during tool use
@@ -2041,6 +2041,23 @@ mod request_contract_tests {
             serde_json::to_value(&with_text).expect("json"),
             json!({"role": "function", "name": "f", "content": "result"})
         );
+    }
+
+    /// `n` takes the public API's 1 to 128; 0 and 129 cross the bound and
+    /// the refusal names the field.
+    #[test]
+    fn n_takes_the_public_apis_bound() {
+        for n in [1, 10, 11, 128] {
+            assert_eq!(rejection(&request(json!({"n": n}))), None, "n {n}");
+        }
+        for (n, bound) in [(0, "min"), (129, "max")] {
+            let errors = request(json!({"n": n}))
+                .validate()
+                .expect_err(&format!("n {n}"));
+            let error = &errors.field_errors()["n"][0];
+            assert_eq!(error.code, "range", "n {n}");
+            assert_eq!(error.params[bound], if n == 0 { 1 } else { 128 }, "n {n}");
+        }
     }
 
     #[test]
