@@ -113,8 +113,8 @@ mod tests {
         input::{EngineFinish, Input},
         parser::Parser,
         testing::{
-            self, bytes, content, drive_to, malformed, reasoning, the_same_at_every_cut,
-            weather_tools,
+            self, an_invoke_outside_a_block_reads_as_the_engines_do, bytes, content, drive_to,
+            malformed, reasoning, the_same_at_every_cut, weather_tools,
         },
         Declared,
     };
@@ -616,94 +616,24 @@ mod tests {
         assert!(deepseek_v3_2().terminal_texts().any(|text| text == spelled));
     }
 
-    /// The six shapes of a call written without its block, whole, one character at a time and
-    /// at every two-way cut, read as the serving engines' own parsers read them (the V4 table's
-    /// notes say why): the bare invoke alone is the call; bare and then again inside a block, two
-    /// calls and the model's text; prose after a bare call is text between calls, shown to a chat
-    /// client as content; an invoke inside the thought stays there; after a preamble the blank
-    /// line before a bare invoke is the text's; two bare invokes are two calls.
+    /// Every shape of an invoke written outside a block (the shared
+    /// [`testing::an_invoke_outside_a_block_reads_as_the_engines_do`] lists them) reads as the
+    /// serving engines' own parsers read it; the V4 table's notes say why.
     #[test]
     fn every_shape_of_an_invoke_written_outside_a_block_reads_as_the_engines_own_parsers_read_it() {
-        use crate::adapt;
-        const BARE_INVOKE: &str = concat!(
-            "<｜DSML｜invoke name=\"add_integers\">\n",
-            "<｜DSML｜parameter name=\"a\" string=\"false\">6</｜DSML｜parameter>\n",
-            "<｜DSML｜parameter name=\"b\" string=\"false\">8</｜DSML｜parameter>\n",
-            "</｜DSML｜invoke>"
-        );
-        let call = || {
-            (
-                "add_integers".to_string(),
-                r#"{"a": 6, "b": 8}"#.to_string(),
-            )
-        };
-        let chat = CHAT;
-        let thinking = THINKING;
-        let shapes: Vec<(&str, String, &str, usize, &str)> = vec![
-            ("the bare invoke alone", BARE_INVOKE.to_string(), chat, 1, ""),
-            (
-                "bare, then the block",
-                format!(
-                    "\n\n:tool\n{BARE_INVOKE}\n\n<｜DSML｜function_calls>\n{BARE_INVOKE}\n</｜DSML｜function_calls>"
-                ),
-                chat,
-                2,
-                "\n\n:tool\n",
+        an_invoke_outside_a_block_reads_as_the_engines_do(
+            run,
+            concat!(
+                "<｜DSML｜invoke name=\"add_integers\">\n",
+                "<｜DSML｜parameter name=\"a\" string=\"false\">6</｜DSML｜parameter>\n",
+                "<｜DSML｜parameter name=\"b\" string=\"false\">8</｜DSML｜parameter>\n",
+                "</｜DSML｜invoke>"
             ),
-            ("bare, then prose", format!("{BARE_INVOKE}\nThe sum is 14."), chat, 1, ""),
-            (
-                "inside the thought",
-                format!("Let me add.{BARE_INVOKE}</think>Done."),
-                thinking,
-                0,
-                "Done.",
-            ),
-            ("after a preamble", format!("Let me check.\n\n{BARE_INVOKE}"), chat, 1, "Let me check.\n\n"),
-            ("two bare invokes", format!("{BARE_INVOKE}\n{BARE_INVOKE}"), chat, 2, ""),
-        ];
-        for (name, output, prompt, count, content) in shapes {
-            assert_eq!(bytes(&run(prompt, &[&output])), output, "{name}");
-            let said = the_same_at_every_cut(|pieces| run(prompt, pieces), &output);
-            assert_eq!(said.content, content, "{name}");
-            assert_eq!(said.calls.len(), count, "{name}: {:?}", said.calls);
-            assert!(
-                said.calls.iter().all(|c| *c == call()),
-                "{name}: {:?}",
-                said.calls
-            );
-            assert_eq!(
-                said.finish.map(|(_, calls)| calls),
-                Some(count as u32),
-                "{name}"
-            );
-        }
-        // The bare invoke alone: nothing malformed, and a chat client reads the call alone.
-        let events = run(chat, &[BARE_INVOKE]);
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, Event::Malformed { .. })),
-            "{events:?}"
+            "<｜DSML｜function_calls>",
+            "</｜DSML｜function_calls>",
+            CHAT,
+            THINKING,
         );
-        let choice = adapt::chat::message(0, &events);
-        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
-        assert_eq!(choice.message.content, None);
-        // Prose after a bare call is text between calls, shown to a chat client as content.
-        let events = run(chat, &[&format!("{BARE_INVOKE}\nThe sum is 14.")]);
-        let between: String = malformed(&events)
-            .into_iter()
-            .filter(|(_, why)| *why == MalformedReason::TextBetweenCalls)
-            .map(|(text, _)| text)
-            .collect();
-        assert_eq!(between, "The sum is 14.");
-        assert_eq!(
-            adapt::chat::message(0, &events).message.content.as_deref(),
-            Some("The sum is 14.")
-        );
-        // Inside the thought, the invoke's bytes are the thought's.
-        let output = format!("Let me add.{BARE_INVOKE}</think>Done.");
-        let said = the_same_at_every_cut(|pieces| run(thinking, pieces), &output);
-        assert_eq!(said.reasoning, format!("Let me add.{BARE_INVOKE}"));
     }
 
     /// The rows from the content into an invoke change no forced-call tag: the grammar takes the
