@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     fmt,
+    future::Future,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -295,8 +296,10 @@ pub(crate) fn missing_tokenizer_response(
 /// Below this input size (in bytes) a prompt is tokenized on the runtime
 /// thread that holds the request; from this size up the encode runs on the
 /// blocking pool, bounded by [`encode_permits`], so no worker is held for
-/// longer than about one request's own share of work. A prompt of ids counts
-/// its ids' bytes, four each.
+/// longer than about one request's own share of work: a single prompt by its
+/// own size, a batch (a completion with several prompts, a tokenize call) by
+/// what the call has already encoded in place, through [`InPlaceBudget`]. A
+/// prompt of ids counts its ids' bytes, four each.
 ///
 /// The bound is where the encode outweighs its offload. An offloaded encode
 /// costs the request a round trip through the pool: the pool thread's wake,
@@ -370,14 +373,62 @@ pub(crate) async fn encode_blocking(
     text: &str,
     add_special_tokens: bool,
 ) -> anyhow::Result<Encoding> {
-    if !offloads(text.len()) {
+    encode_sized(tokenizer, text, add_special_tokens, text.len()).await
+}
+
+/// Tokenize `text` as `len` bytes of work: in place, from the caller's own
+/// text, when [`offloads`] says no; otherwise copied once, for the blocking
+/// task, which outlives the borrow. [`encode_blocking`] passes the text's own
+/// length, [`encode_blocking_in_batch`] what its call has charged.
+async fn encode_sized(
+    tokenizer: Arc<dyn Tokenizer>,
+    text: &str,
+    add_special_tokens: bool,
+    len: usize,
+) -> anyhow::Result<Encoding> {
+    if !offloads(len) {
         return tokenizer.encode(text, add_special_tokens);
     }
     let text = text.to_string();
-    offload(text.len(), move || {
-        tokenizer.encode(&text, add_special_tokens)
-    })
-    .await
+    offload(len, move || tokenizer.encode(&text, add_special_tokens)).await
+}
+
+/// What one call has encoded on the runtime thread so far. A batch charges
+/// each of its texts against the bound together with the bytes the call
+/// already encoded in place, so the call as a whole holds a worker for no
+/// longer than one text at the bound would; a text that would take the call
+/// over the bound goes to the pool, beside the others there, as every text at
+/// or above the bound does.
+#[derive(Default)]
+pub(crate) struct InPlaceBudget {
+    in_place: usize,
+}
+
+impl InPlaceBudget {
+    /// The bytes `len` brings the call to, charged only while that stays
+    /// under the bound ([`offloads`]).
+    fn charge(&mut self, len: usize) -> usize {
+        let total = self.in_place + len;
+        if !offloads(total) {
+            self.in_place = total;
+        }
+        total
+    }
+}
+
+/// Tokenize one `text` of a batch through the offload policy of [`offload`],
+/// the call's [`InPlaceBudget`] deciding where. The decision is taken when the
+/// future is made, so a batch may make all of its futures and join them at
+/// once; the future borrows the text as [`encode_blocking`] does, in place
+/// from the caller's own text, on the pool from one copy.
+pub(crate) fn encode_blocking_in_batch<'a>(
+    tokenizer: Arc<dyn Tokenizer>,
+    text: &'a str,
+    add_special_tokens: bool,
+    budget: &mut InPlaceBudget,
+) -> impl Future<Output = anyhow::Result<Encoding>> + 'a {
+    let charged = budget.charge(text.len());
+    encode_sized(tokenizer, text, add_special_tokens, charged)
 }
 
 /// Decode `ids` through the offload policy of [`offload`]: a prompt given as

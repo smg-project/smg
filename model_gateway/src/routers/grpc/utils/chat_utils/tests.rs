@@ -2182,6 +2182,104 @@ fn a_conversation_of_a_few_kilobytes_is_encoded_on_the_request_thread() {
 }
 
 #[test]
+fn a_batch_encodes_in_place_up_to_the_bound_and_the_rest_on_the_pool() {
+    use std::{
+        sync::Mutex,
+        thread::{self, ThreadId},
+    };
+
+    use futures::future::try_join_all;
+    use llm_tokenizer::traits::{Decoder, Encoder, Encoding, SpecialTokens};
+
+    /// The mock behind a record of the thread each encode ran on.
+    struct ThreadRecordingTokenizer {
+        inner: llm_tokenizer::MockTokenizer,
+        ran_on: Arc<Mutex<Vec<ThreadId>>>,
+    }
+
+    impl Encoder for ThreadRecordingTokenizer {
+        fn encode(&self, input: &str, add_special_tokens: bool) -> anyhow::Result<Encoding> {
+            self.ran_on.lock().unwrap().push(thread::current().id());
+            self.inner.encode(input, add_special_tokens)
+        }
+
+        fn encode_batch(
+            &self,
+            inputs: &[&str],
+            add_special_tokens: bool,
+        ) -> anyhow::Result<Vec<Encoding>> {
+            self.inner.encode_batch(inputs, add_special_tokens)
+        }
+    }
+
+    impl Decoder for ThreadRecordingTokenizer {
+        fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+            self.inner.decode(token_ids, skip_special_tokens)
+        }
+    }
+
+    impl Tokenizer for ThreadRecordingTokenizer {
+        fn vocab_size(&self) -> usize {
+            self.inner.vocab_size()
+        }
+
+        fn get_special_tokens(&self) -> &SpecialTokens {
+            self.inner.get_special_tokens()
+        }
+
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            self.inner.token_to_id(token)
+        }
+
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            self.inner.id_to_token(id)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    // `block_on` polls on this thread, so an encode in place runs here and an
+    // offloaded one somewhere else.
+    let ran_on: Arc<Mutex<Vec<ThreadId>>> = Arc::new(Mutex::new(Vec::new()));
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(ThreadRecordingTokenizer {
+        inner: llm_tokenizer::MockTokenizer::new(),
+        ran_on: ran_on.clone(),
+    });
+    let here = thread::current().id();
+    let batch = |texts: Vec<String>| {
+        let mut budget = InPlaceBudget::default();
+        let futures: Vec<_> = texts
+            .iter()
+            .map(|text| encode_blocking_in_batch(tokenizer.clone(), text, false, &mut budget))
+            .collect();
+        block_on(try_join_all(futures)).unwrap();
+        std::mem::take(&mut *ran_on.lock().unwrap())
+    };
+
+    // Sixty-four prompts of twelve kibibytes, the shape of a completion batch:
+    // each alone is under the bound, the batch is forty times over it.
+    let long = "word ".repeat(12 * 1024 / 5);
+    assert!(long.len() < ENCODE_OFFLOAD_MIN_BYTES && 2 * long.len() > ENCODE_OFFLOAD_MIN_BYTES);
+    let threads = batch(vec![long; 64]);
+    assert_eq!(threads.len(), 64, "every prompt of the batch is encoded");
+    assert_eq!(
+        threads.iter().filter(|t| **t == here).count(),
+        1,
+        "one prompt of the batch fits the bound in place; the other sixty-three go to the pool"
+    );
+
+    // Sixty-four short prompts, under the bound in total, all stay in place.
+    let threads = batch(vec!["hello there".to_string(); 64]);
+    assert_eq!(threads.len(), 64);
+    assert!(
+        threads.iter().all(|t| *t == here),
+        "a batch under the bound in total is encoded on the thread that holds the request"
+    );
+}
+
+#[test]
 fn public_entry_point_keeps_the_flat_text_for_a_deferred_renderer() {
     let tokenizer = llm_tokenizer::MockTokenizer::new().with_deferred_chat_ids(vec![7]);
     let processed = process_chat_messages(&prefill_request(), &tokenizer, None).unwrap();

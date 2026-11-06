@@ -110,11 +110,10 @@ async fn encode_prompts(
     tokenizer: &Arc<dyn Tokenizer>,
     prompts: &[String],
 ) -> Result<Vec<CompletionItem>, Response> {
-    let encodings = try_join_all(
-        prompts
-            .iter()
-            .map(|prompt| utils::encode_blocking(tokenizer.clone(), prompt, false)),
-    )
+    let mut budget = utils::InPlaceBudget::default();
+    let encodings = try_join_all(prompts.iter().map(|prompt| {
+        utils::encode_blocking_in_batch(tokenizer.clone(), prompt, false, &mut budget)
+    }))
     .await
     .map_err(|e| {
         error!(
