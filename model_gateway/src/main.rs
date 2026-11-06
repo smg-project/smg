@@ -1787,9 +1787,16 @@ struct IntegrationArgs {
     secret_sources: SecretSources,
 
     // ==================== Mesh Server ====================
+    /// Start the mesh: several gateways find each other, keep one membership
+    /// table and replicate the workers each of them registered locally.
     #[arg(long, default_value_t = false)]
     enable_mesh: bool,
 
+    /// This node's name in the mesh: the owner stamped on the worker keys it
+    /// publishes, the `peer` of its metrics and log lines. Give it a name
+    /// that survives restarts (the chart passes the pod's); the default,
+    /// `Mesh_` and four random characters, does not, and the old name stays
+    /// in the members' tables.
     #[arg(long)]
     mesh_server_name: Option<String>,
 
@@ -1803,10 +1810,17 @@ struct IntegrationArgs {
     #[arg(long)]
     mesh_advertise_host: Option<String>,
 
+    /// The mesh listener's port, advertised with `--mesh-advertise-host`;
+    /// must differ from the other listeners' ports and cannot be 0.
     #[arg(long, default_value_t = 39527)]
     mesh_port: u16,
 
-    #[arg(long, num_args = 0..)]
+    /// Where to join, as `ip:port` of other members' mesh listeners,
+    /// space- or comma-separated: while the membership table holds nobody
+    /// else, the entries are dialed in turn under the retry backoff until
+    /// one answers, and the rest of the mesh is learned from that member. On
+    /// Kubernetes `--router-selector` finds the members instead.
+    #[arg(long, num_args = 0.., value_delimiter = ',')]
     mesh_peer_urls: Vec<String>,
 
     /// The CA certificate (PEM) the mesh peers' certificates chain to. With
@@ -2483,6 +2497,80 @@ mod tests {
                 other => panic!("expected {value} refused by name, got {other:?}"),
             }
         }
+    }
+
+    /// Every `--mesh-peer-urls` entry is a join peer, in the order given; an
+    /// entry that is no socket address is refused by name, whatever its
+    /// position.
+    #[test]
+    fn every_mesh_peer_url_is_a_join_peer_and_a_bad_one_is_refused_by_name() {
+        let mesh = cli_args_from(&[
+            "--enable-mesh",
+            "--mesh-host",
+            "127.0.0.1",
+            "--mesh-peer-urls",
+            "10.0.0.2:39527",
+            "10.0.0.3:39527",
+        ])
+        .build_mesh_server_config()
+        .expect("a valid mesh configuration")
+        .expect("the mesh is on");
+        let expected: Vec<std::net::SocketAddr> = vec![
+            "10.0.0.2:39527".parse().unwrap(),
+            "10.0.0.3:39527".parse().unwrap(),
+        ];
+        assert_eq!(mesh.init_peers, expected, "every entry, in order");
+
+        let err = cli_args_from(&[
+            "--enable-mesh",
+            "--mesh-host",
+            "127.0.0.1",
+            "--mesh-peer-urls",
+            "10.0.0.2:39527",
+            "not-an-address",
+        ])
+        .build_mesh_server_config()
+        .err()
+        .expect("a second entry that is no socket address must be refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("mesh_peer_urls") && text.contains("not-an-address"),
+            "the refusal names the field and the value: {text}"
+        );
+    }
+
+    /// The peer URLs may stand as separate values or as one comma-separated
+    /// list; both read as the same join peers, in the order given.
+    #[test]
+    fn mesh_peer_urls_parse_the_same_comma_separated_and_as_separate_values() {
+        let init_peers = |peer_args: &[&str]| {
+            let mut args = vec![
+                "--enable-mesh",
+                "--mesh-host",
+                "127.0.0.1",
+                "--mesh-peer-urls",
+            ];
+            args.extend_from_slice(peer_args);
+            cli_args_from(&args)
+                .build_mesh_server_config()
+                .expect("a valid mesh configuration")
+                .expect("the mesh is on")
+                .init_peers
+        };
+        let expected: Vec<std::net::SocketAddr> = vec![
+            "10.0.0.2:39527".parse().unwrap(),
+            "10.0.0.3:39527".parse().unwrap(),
+        ];
+        assert_eq!(
+            init_peers(&["10.0.0.2:39527", "10.0.0.3:39527"]),
+            expected,
+            "separate values, in order"
+        );
+        assert_eq!(
+            init_peers(&["10.0.0.2:39527,10.0.0.3:39527"]),
+            expected,
+            "one comma-separated list reads as the same join peers"
+        );
     }
 
     /// Mesh bind and advertise hosts go through the shared bind-host rule, so

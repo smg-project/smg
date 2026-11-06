@@ -3070,7 +3070,10 @@ class RouterArgs:
             nargs="*",
             action="extend",
             default=[],
-            help="Peer mesh server addresses to join (format: host:port)",
+            help=(
+                "Mesh listeners of other members to join, as ip:port (a hostname is"
+                " refused), separate values or one comma-separated list"
+            ),
         )
         mesh_group.add_argument(
             f"--{prefix}mesh-tls-ca-cert",

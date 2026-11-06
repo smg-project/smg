@@ -86,7 +86,7 @@ The gateway configures the mesh from its flags (`model_gateway/src/main.rs`,
 | `--mesh-host <ip>` | Bind address of the mesh listener; an IP literal, IPv6 with or without brackets. Default `0.0.0.0`. |
 | `--mesh-port <port>` | The listener's port, default `39527`; must differ from `--port`, `--prometheus-port`, `--health-check-port` and `--admin-port`, and cannot be `0`. |
 | `--mesh-advertise-host <ip>` | The address peers dial for this node; required when `--mesh-host` is unspecified (`0.0.0.0`, `::`). Advertised with `--mesh-port`. |
-| `--mesh-peer-urls <ip:port> ...` | Where to join: the first entry is dialed once, in the node's first round, when its membership table holds nobody else; the rest of the mesh is learned from that peer. If that one dial fails (the peer is not up yet) it is not retried and the node stays alone, so start the peer first. Further entries are accepted and not used. |
+| `--mesh-peer-urls <ip:port> ...` | Where to join, as separate values or one comma-separated list: while the node's membership table holds nobody else, the entries are dialed in turn, one per round, each under the retry backoff (1 s doubling to 60 s), until one answers; the rest of the mesh is learned from that member. A peer that is not up yet is dialed again, so the members may start in any order. |
 | `--mesh-tls-ca-cert`, `--mesh-tls-cert`, `--mesh-tls-key` | Mutual TLS between members: all three or none. The listener then serves TLS with the node certificate and requires a peer certificate from the CA; every dial presents this node's certificate. The node certificate carries the node's IP as a SAN. |
 
 A member whose mesh port is held by another process, or whose TLS material
@@ -135,7 +135,7 @@ With `--log-level info` the mesh reports (source file in parentheses):
 | Level | Line | Meaning |
 |---|---|---|
 | info | `Round <n> Status:{...}` | Once a second, the whole membership table as this node sees it: every member's name, address, status and version (`gossip_controller.rs`, the event loop). |
-| info | `Connecting to peer <name> at <addr>` / `Successfully connected to peer <name>` | A probe and its success. The configured join peer is called `init_peer` until its name is learned from its answer. |
+| info | `Connecting to peer <name> at <addr>` / `Successfully connected to peer <name>` | A probe and its success. The configured join peers are called `init_peer`, `init_peer_1`, `init_peer_2` (their position in `--mesh-peer-urls`) until their names are learned from their answers. |
 | warn | `Error connecting to peer <name> (attempt <n>): <error>. Next retry in <delay>` | A failed probe and the backoff. |
 | info | `Cluster state updated. Current nodes: <n>` | A received probe changed the membership table (`gossip_service.rs`). |
 | info | `Starting sync_stream connection to peer <name> at address <addr>` / `Sync stream connection to <name> established` | This node dialed a sync stream. |
@@ -168,11 +168,11 @@ smg --host 127.0.0.1 --port 29744 --prometheus-host 127.0.0.1 --prometheus-port 
     --mesh-peer-urls 127.0.0.1:29742
 ```
 
-A goes first: B dials it once, in B's first round. Within a few rounds B's
-log shows `Successfully connected to peer init_peer` and A's `Cluster state
-updated. Current nodes: 2`; each `Round <n> Status` line then lists both
-members with `status: Alive`. `A` sorts before `B`, so A dials the sync
-stream and B accepts it:
+Start them in either order: B dials A under its backoff until A answers.
+Within a few rounds B's log shows `Successfully connected to peer init_peer`
+and A's `Cluster state updated. Current nodes: 2`; each `Round <n> Status`
+line then lists both members with `status: Alive`. `A` sorts before `B`, so
+A dials the sync stream and B accepts it:
 
 ```bash
 curl -s http://127.0.0.1:29745/metrics | grep '^router_mesh_peer_connections'
@@ -188,12 +188,11 @@ the listener.
 A gateway told to stop (SIGTERM) leaves the mesh first: during its settle
 window it broadcasts `Leaving` to the live members
 (`MeshServerHandler::graceful_shutdown` in `service.rs`, bounded by the
-window), so they see the member leave within seconds. A member that dies
-without that is noticed through the probes, `Suspected` after the first
-failed probe round and `Down` after the next. Under mesh mTLS the broadcast
-reaches the members only once the status broadcasts dial with the node's TLS
-identity (a change of the mesh crate of its own); until then they find out
-through the probes as well.
+window), so they see the member leave within seconds; the broadcast dials
+the members with the node's TLS identity when the mesh has one, so it
+reaches them under mTLS too. A member that dies without that is noticed
+through the probes, `Suspected` after the first failed probe round and
+`Down` after the next.
 
 Only the owner of a `worker:` key tombstones it. Without `--mesh-server-name`
 a restarted gateway comes back under a fresh random name, so the old name

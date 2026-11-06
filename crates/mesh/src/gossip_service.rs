@@ -540,12 +540,11 @@ mod tests {
             .collect()
     }
 
-    /// A mesh node on an ephemeral loopback port, joining `init_peer` when
-    /// given.
-    async fn node(name: &str, init_peer: Option<SocketAddr>) -> (SocketAddr, MeshServerHandler) {
+    /// A mesh node on an ephemeral loopback port, joining `init_peers`.
+    async fn node(name: &str, init_peers: Vec<SocketAddr>) -> (SocketAddr, MeshServerHandler) {
         let (listener, addr) = bind_node().await;
         let (server, handler) =
-            MeshServerBuilder::new(name.to_string(), addr, addr, init_peer).build();
+            MeshServerBuilder::new(name.to_string(), addr, addr, init_peers).build();
         #[expect(
             clippy::disallowed_methods,
             reason = "test node runs in the background for the duration of the assertion"
@@ -565,8 +564,8 @@ mod tests {
     #[test]
     fn the_peer_gauge_carries_the_dialers_name_and_no_empty_label() {
         let rendered = metrics_of(|metrics| async move {
-            let (addr_a, handler_a) = node("A", None).await;
-            let (_addr_b, handler_b) = node("B", Some(addr_a)).await;
+            let (addr_a, handler_a) = node("A", Vec::new()).await;
+            let (_addr_b, handler_b) = node("B", vec![addr_a]).await;
             wait_for(
                 || {
                     peer_gauge_lines(&metrics.render())
@@ -594,7 +593,7 @@ mod tests {
     #[test]
     fn a_stream_closed_before_naming_its_peer_leaves_no_series() {
         let rendered = metrics_of(|_| async move {
-            let (addr, handler) = node("A", None).await;
+            let (addr, handler) = node("A", Vec::new()).await;
             wait_for(
                 || std::net::TcpStream::connect(addr).is_ok(),
                 Duration::from_secs(5),
@@ -633,7 +632,7 @@ mod tests {
     #[test]
     fn a_named_stream_that_closed_reads_zero_under_its_name() {
         let rendered = metrics_of(|_| async move {
-            let (addr, handler) = node("A", None).await;
+            let (addr, handler) = node("A", Vec::new()).await;
             wait_for(
                 || std::net::TcpStream::connect(addr).is_ok(),
                 Duration::from_secs(5),
@@ -689,7 +688,7 @@ mod tests {
     fn overlapping_streams_of_one_dialer_add_up() {
         let (_, (while_both_open, after_first_closed)) =
             metrics_and_result_of(|metrics| async move {
-                let (addr, handler) = node("A", None).await;
+                let (addr, handler) = node("A", Vec::new()).await;
                 wait_for(
                     || std::net::TcpStream::connect(addr).is_ok(),
                     Duration::from_secs(5),
