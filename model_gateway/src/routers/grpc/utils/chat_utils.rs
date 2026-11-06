@@ -468,11 +468,11 @@ pub(crate) async fn encode_blocking_in_batch(
 }
 
 /// Tokenize a call's `texts` as one pass over them: each is placed once by
-/// the call's [`InPlaceBudget`] and encoded there and then when in place, the
-/// call yielding the worker once per spent share; the texts worth the trip go
-/// to the pool together, joined at the end, so they run in parallel and start
-/// late by at most one share of in-place work. The encodings in the texts'
-/// order.
+/// the call's [`InPlaceBudget`]; the texts in place are encoded one after
+/// another on the calling thread, the call yielding the worker once per spent
+/// share, and the texts worth the trip run on the pool beside them, started
+/// with the pass's first poll and joined at its end. The encodings in the
+/// texts' order.
 pub(crate) async fn encode_texts_blocking(
     tokenizer: Arc<dyn Tokenizer>,
     texts: &[String],
@@ -516,8 +516,12 @@ type PoolJob<T> = Box<dyn FnOnce() -> anyhow::Result<T> + Send + 'static>;
 
 /// One pass of a call over its `inputs` through the offload policy: `len` is
 /// an input's bytes for the budget, `in_place` runs one on the calling
-/// thread, `job` makes the pool's job of one. The outputs in the inputs'
-/// order; the first error ends the pass, the pool's jobs not yet started.
+/// thread, `job` makes the pool's job of one. The pass is planned first, every
+/// input placed and the pool's jobs made; then the pool's join and the
+/// in-place pass run together, the join polled first, so the pool's jobs
+/// start on the pass's first poll and the in-place inputs run one after
+/// another, the call yielding the worker once per spent share. The outputs in
+/// the inputs' order; the first error ends the pass.
 async fn place_all<I, T>(
     inputs: impl IntoIterator<Item = I>,
     len: impl Fn(&I) -> usize,
@@ -529,24 +533,37 @@ where
 {
     let mut budget = InPlaceBudget::default();
     let mut outputs: Vec<Option<T>> = Vec::new();
+    // The in-place inputs in order, each with whether the call yields before it.
+    let mut placed = Vec::new();
     let mut pooled = Vec::new();
     for (index, input) in inputs.into_iter().enumerate() {
         let len = len(&input);
         match budget.place(len) {
-            Placement::InPlace => outputs.push(Some(in_place(&input)?)),
+            Placement::InPlace => placed.push((index, input, false)),
             Placement::AfterYield => {
-                yield_now().await;
                 budget.next_share(len);
-                outputs.push(Some(in_place(&input)?));
+                placed.push((index, input, true));
             }
             Placement::Pool => {
                 let job = job(input);
                 pooled.push(async move { pool(job).await.map(|output| (index, output)) });
-                outputs.push(None);
             }
         }
+        outputs.push(None);
     }
-    for (index, output) in futures::future::try_join_all(pooled).await? {
+    let in_place_pass = async {
+        let mut done = Vec::with_capacity(placed.len());
+        for (index, input, yields_first) in placed {
+            if yields_first {
+                yield_now().await;
+            }
+            done.push((index, in_place(&input)?));
+        }
+        anyhow::Ok(done)
+    };
+    let (from_pool, from_here) =
+        futures::future::try_join(futures::future::try_join_all(pooled), in_place_pass).await?;
+    for (index, output) in from_pool.into_iter().chain(from_here) {
         outputs[index] = Some(output);
     }
     outputs
