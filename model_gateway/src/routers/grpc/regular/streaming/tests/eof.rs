@@ -423,6 +423,124 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
     }
 }
 
+/// The SSE events of a streamed completion of `request` over `frames`, read
+/// to the end of the body.
+async fn completion_events(
+    frames: Vec<proto::GenerateResponse>,
+    request: Value,
+) -> (String, Vec<Value>) {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let request: openai_protocol::completion::CompletionRequest =
+        serde_json::from_value(request).unwrap();
+    let response = Arc::new(processor(false))
+        .process_completion_streaming_response(
+            context::ExecutionResult::Single { stream },
+            CompletionResponseSpec::new(&request, Vec::new()),
+            dispatch(),
+            tokenizer,
+            None,
+            None,
+            utils::StreamSource::new(None, &dispatch(), metrics_labels::ENDPOINT_COMPLETIONS),
+        )
+        .await;
+    let body = timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 65536),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
+    let wire = String::from_utf8(body.to_vec()).unwrap();
+    let events = wire
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("data: ")
+                .filter(|json| *json != "[DONE]")
+                .map(|json| serde_json::from_str(json).unwrap())
+        })
+        .collect();
+    (wire, events)
+}
+
+/// Eight choices whose chunks come in the order 7, 2, 5, 0, 3, 6, 1, 4, each
+/// holding a character the stop `zz` may begin, and an engine that ends
+/// without a Complete: the held text goes out at the end in choice order, not
+/// in the order the chunks came in. Eight choices, so that a map's iteration
+/// order matches the choice order by chance in one run of forty thousand,
+/// not one in six.
+#[tokio::test]
+async fn completion_open_choices_finish_in_choice_order_at_eof() {
+    let (wire, events) = completion_events(
+        vec![
+            chunk(7, "hz"),
+            chunk(2, "cz"),
+            chunk(5, "fz"),
+            chunk(0, "az"),
+            chunk(3, "dz"),
+            chunk(6, "gz"),
+            chunk(1, "bz"),
+            chunk(4, "ez"),
+        ],
+        serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true, "n":8,
+            "max_tokens":4, "stop":"zz"}),
+    )
+    .await;
+    assert!(
+        !events.iter().any(|event| event.get("error").is_some()),
+        "{wire}"
+    );
+    let texts: Vec<(u64, &str)> = events
+        .iter()
+        .filter_map(|event| {
+            let choice = &event["choices"][0];
+            Some((choice["index"].as_u64()?, choice["text"].as_str()?))
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            (7, "h"),
+            (2, "c"),
+            (5, "f"),
+            (0, "a"),
+            (3, "d"),
+            (6, "g"),
+            (1, "b"),
+            (4, "e"),
+            (0, "z"),
+            (1, "z"),
+            (2, "z"),
+            (3, "z"),
+            (4, "z"),
+            (5, "z"),
+            (6, "z"),
+            (7, "z"),
+        ],
+        "the streamed characters as they came, then the held ones in choice order: {wire}"
+    );
+}
+
+/// A chunk for a choice index at or past the request's `n` is a decoding
+/// failure, as it is on the chat stream, not a choice the stream grows.
+#[tokio::test]
+async fn completion_chunk_for_a_choice_past_n_is_a_decoding_failure() {
+    let (wire, events) = completion_events(
+        vec![chunk(0, "a"), chunk(1, "b"), complete(0, "length")],
+        serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true, "max_tokens":4}),
+    )
+    .await;
+    assert!(
+        events.iter().any(|event| event.get("error").is_some()),
+        "{wire}"
+    );
+    assert!(
+        wire.contains("engine sent choice index 1; the request expects 1 choice(s)"),
+        "{wire}"
+    );
+}
+
 #[tokio::test]
 async fn byte_fallback_generate_mid_run_stop_reports_gateway_stop() {
     // `t` `t` then <0xF2>: the string stop `tt` closes at the second token,

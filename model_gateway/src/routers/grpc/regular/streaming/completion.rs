@@ -4,11 +4,7 @@
 //! record. Moved out of `streaming.rs` as is; the processor's completion
 //! entry points stay there and drive it.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Instant,
-};
+use std::{sync::Arc, time::Instant};
 
 use bytes::BytesMut;
 use llm_tokenizer::{
@@ -100,25 +96,9 @@ pub(super) struct CompletionStream<'a> {
 
     first_token_time: Option<Instant>,
 
-    // Per-choice state (per index, for n>1 support)
-    stop_decoders: HashMap<u32, StopSequenceDecoder>,
-    is_firsts: HashMap<u32, bool>,
-    /// Indices whose local stop decoder fired: "stop" is emitted even if the
-    /// backend's eventual Complete carries "length" (the local stop sequence
-    /// fired first), and later engine output for the index is ignored.
-    stopped_indices: HashSet<u32>,
-    /// Indices that received a `Complete` message -- tracked separately
-    /// from `reasoning_tokens` (which exists for a different purpose and
-    /// only incidentally gets exactly one insert per completed index
-    /// today) so the completeness gate doesn't silently break if that
-    /// insert behavior ever changes. A choice is closed by its Complete or
-    /// by its local stop (whose usage is as settled, see `read_chunk`).
-    completed_indices: HashSet<u32>,
-    /// Stopped indices the engine streamed a chunk for after their stop: it
-    /// is generating past the stop, which only a stop it cannot see does (an
-    /// engine that saw the stop ends the choice on that step and sends its
-    /// Complete next).
-    tailed_indices: HashSet<u32>,
+    /// The per-choice state, one entry per choice the request expects
+    /// (`spec.choices_per_prompt`), at the engine's index.
+    choices: Vec<ChoiceState>,
     /// The engine was streaming past a stop when every choice had closed:
     /// the loop stopped polling it, and the driver aborts it instead of
     /// marking it completed (see [`Self::release_engine`]).
@@ -138,10 +118,32 @@ pub(super) struct CompletionStream<'a> {
     /// messages rather than the sum (same prompt tokenized once, not per-choice).
     total_prompt: u32,
     total_cached: u32,
-    reasoning_tokens: HashMap<u32, u32>,
-    spec_accepted: HashMap<u32, u32>,
-    spec_drafted: HashMap<u32, u32>,
     total_completion: CompletionTokenTracker,
+}
+
+/// One choice of the unit: its decoder, made on its first chunk, and the
+/// flags and counts the loop keeps for it.
+#[derive(Default)]
+struct ChoiceState {
+    stop_decoder: Option<StopSequenceDecoder>,
+    /// The choice's first output went out (the echo goes in front of it).
+    started: bool,
+    /// The local stop decoder fired: "stop" is emitted even if the backend's
+    /// eventual Complete carries "length" (the local stop sequence fired
+    /// first), and later engine output for the choice is ignored.
+    stopped: bool,
+    /// The engine's `Complete` came. A choice is closed by its Complete or
+    /// by its local stop (whose usage is as settled, see `read_chunk`); the
+    /// completeness gate counts the closed choices.
+    completed: bool,
+    /// The engine streamed a chunk for the choice after its stop: it is
+    /// generating past the stop, which only a stop it cannot see does (an
+    /// engine that saw the stop ends the choice on that step and sends its
+    /// Complete next).
+    tailed: bool,
+    reasoning_tokens: u32,
+    spec_accepted: u32,
+    spec_drafted: u32,
 }
 
 /// A completion chunk's choice: `text` at `index`, with its finish reason.
@@ -191,20 +193,15 @@ impl<'a> CompletionStream<'a> {
             pd_timing,
             backend_type,
             first_token_time: None,
-            stop_decoders: HashMap::new(),
-            is_firsts: HashMap::new(),
-            stopped_indices: HashSet::new(),
-            completed_indices: HashSet::new(),
-            tailed_indices: HashSet::new(),
+            choices: (0..spec.choices_per_prompt)
+                .map(|_| ChoiceState::default())
+                .collect(),
             engine_outlived: false,
             tail_tokens: 0,
             frame,
             sse_buffer: BytesMut::with_capacity(4096),
             total_prompt: 0,
             total_cached: 0,
-            reasoning_tokens: HashMap::new(),
-            spec_accepted: HashMap::new(),
-            spec_drafted: HashMap::new(),
             total_completion: CompletionTokenTracker::new(),
         }
     }
@@ -238,7 +235,9 @@ impl<'a> CompletionStream<'a> {
 
     /// An engine chunk: the choice's tokens through its stop decoder (made on
     /// its first chunk), the prompt echoed in front of the first text, the
-    /// text out, and on a local stop the suffix and the "stop" finish.
+    /// text out, and on a local stop the suffix and the "stop" finish. A
+    /// chunk for a choice past the ones the request expects is a decoding
+    /// failure.
     async fn read_chunk(
         &mut self,
         chunk: ProtoGenerateStreamChunk,
@@ -251,22 +250,22 @@ impl<'a> CompletionStream<'a> {
         }
 
         let index = self.index_offset + chunk.index();
+        let choice = utils::choice_mut(&mut self.choices, chunk.index())?;
 
         // A choice's engine chunk after its local stop is the tail the
         // engine generated for nobody (an engine that saw the stop sends
         // its Complete instead): counted, not read; the unit is aborted
         // once every choice has closed, until then another choice may
         // still be streaming.
-        if self.stopped_indices.contains(&index) {
+        if choice.stopped {
             self.tail_tokens += chunk.token_ids().len() as u64;
-            self.tailed_indices.insert(index);
+            choice.tailed = true;
             return Ok(());
         }
 
-        let is_first = self.is_firsts.entry(index).or_insert(true);
         self.total_completion.record_chunk(&chunk);
 
-        let stop_decoder = self.stop_decoders.entry(index).or_insert_with(|| {
+        let stop_decoder = choice.stop_decoder.get_or_insert_with(|| {
             let (ref stop, ref stop_token_ids, skip_special_tokens, no_stop_trim, ignore_eos) =
                 self.stop_params;
             utils::create_stop_decoder(
@@ -282,11 +281,11 @@ impl<'a> CompletionStream<'a> {
         let (mut text, stopped) =
             StreamingProcessor::process_chunk_tokens(stop_decoder, chunk.token_ids())?;
 
-        if *is_first {
+        if !choice.started {
             if self.spec.echo {
                 text.insert_str(0, self.prompt_text);
             }
-            *is_first = false;
+            choice.started = true;
         }
 
         if !text.is_empty() {
@@ -303,7 +302,7 @@ impl<'a> CompletionStream<'a> {
             // Stop-decoder match takes precedence: emit "stop" even if
             // the backend's eventual Complete carries "length". This is
             // intentional — the local stop sequence fired first.
-            self.stopped_indices.insert(index);
+            choice.stopped = true;
             // The choice closes here, as its Complete would close it: the
             // counts of the chunk the stop matched in are its counts (the
             // engine's own server counts a stopped request through that
@@ -312,8 +311,7 @@ impl<'a> CompletionStream<'a> {
             // the abort cuts, never the client's usage.
             self.total_prompt = self.total_prompt.max(chunk.prompt_tokens());
             self.total_cached = self.total_cached.max(chunk.cached_tokens());
-            self.reasoning_tokens
-                .insert(index, chunk.reasoning_tokens());
+            choice.reasoning_tokens = chunk.reasoning_tokens();
             // The tracker keys by the engine's own choice index, as its
             // chunks and Completes do; `index` is the client's.
             self.total_completion.record_local_stop(chunk.index());
@@ -349,33 +347,30 @@ impl<'a> CompletionStream<'a> {
         complete: ProtoGenerateComplete,
     ) -> Result<(), utils::StreamFailure> {
         let index = self.index_offset + complete.index();
-        self.completed_indices.insert(index);
-        self.spec_accepted
-            .insert(index, complete.spec_accepted_tokens());
-        self.spec_drafted
-            .insert(index, complete.spec_draft_tokens());
+        let choice = utils::choice_mut(&mut self.choices, complete.index())?;
+        choice.completed = true;
+        choice.spec_accepted = complete.spec_accepted_tokens();
+        choice.spec_drafted = complete.spec_draft_tokens();
         // The Complete of a choice the engine generated past its local stop
         // (another choice of the unit kept the stream open) is the tail's
         // end: the choice closed at its stop with that step's counts, and
         // only the counts the stop could not know are taken from it.
-        if self.tailed_indices.contains(&index) {
+        if choice.tailed {
             return Ok(());
         }
         self.total_prompt = self.total_prompt.max(complete.prompt_tokens());
         self.total_cached = self.total_cached.max(complete.cached_tokens());
-        self.reasoning_tokens
-            .insert(index, complete.reasoning_tokens());
+        choice.reasoning_tokens = complete.reasoning_tokens();
         self.total_completion.record_complete(&complete);
 
-        if self.stopped_indices.contains(&index) {
+        if choice.stopped {
             return Ok(());
         }
 
         // Handle echo when Complete arrives without any preceding Chunks
         // (e.g., max_tokens=0). The Chunk arm normally prepends prompt_text
         // on the first event, but if no Chunks arrive we must emit it here.
-        let is_first = self.is_firsts.entry(index).or_insert(true);
-        if *is_first && self.spec.echo && !self.prompt_text.is_empty() {
+        if !choice.started && self.spec.echo && !self.prompt_text.is_empty() {
             StreamingProcessor::send_completion_chunk(
                 self.tx,
                 &mut self.sse_buffer,
@@ -383,14 +378,14 @@ impl<'a> CompletionStream<'a> {
                 &completion_choice(index, self.prompt_text.to_string(), None),
             )
             .await?;
-            *is_first = false;
+            choice.started = true;
         }
 
-        if let Some(decoder) = self.stop_decoders.get_mut(&index) {
+        if let Some(decoder) = choice.stop_decoder.as_mut() {
             let tail = decoder.finish().map_err(|e| e.to_string())?;
             utils::warn_detokenize_recoveries(&self.dispatch.request_id, index, decoder);
             if decoder.is_stopped() {
-                self.stopped_indices.insert(index);
+                choice.stopped = true;
             }
             if let SequenceDecoderOutput::Text(text)
             | SequenceDecoderOutput::StoppedWithText(text) = tail
@@ -417,11 +412,8 @@ impl<'a> CompletionStream<'a> {
             .await?;
         }
 
-        let finish_reason = utils::completion_finish_reason(
-            self.stopped_indices.contains(&index),
-            complete.finish_reason(),
-        )
-        .to_string();
+        let finish_reason =
+            utils::completion_finish_reason(choice.stopped, complete.finish_reason()).to_string();
 
         StreamingProcessor::send_completion_chunk(
             self.tx,
@@ -434,15 +426,19 @@ impl<'a> CompletionStream<'a> {
     }
 
     /// After the engine's end: pending text and locally matched stops of
-    /// the choices no `Complete` closed go out, without inventing engine
-    /// usage. A local stop still honors the requested suffix.
+    /// the choices no `Complete` closed go out, in choice order, without
+    /// inventing engine usage. A local stop still honors the requested suffix.
     pub(super) async fn finish_open_choices(&mut self) -> Result<(), utils::StreamFailure> {
-        for (index, decoder) in &mut self.stop_decoders {
-            if self.completed_indices.contains(index) || self.stopped_indices.contains(index) {
+        for (at, choice) in self.choices.iter_mut().enumerate() {
+            if choice.completed || choice.stopped {
                 continue;
             }
+            let Some(decoder) = choice.stop_decoder.as_mut() else {
+                continue;
+            };
+            let index = self.index_offset + at as u32;
             let tail = decoder.finish().map_err(|e| e.to_string())?;
-            utils::warn_detokenize_recoveries(&self.dispatch.request_id, *index, decoder);
+            utils::warn_detokenize_recoveries(&self.dispatch.request_id, index, decoder);
             let stopped = decoder.is_stopped();
             let mut text = match tail {
                 SequenceDecoderOutput::Text(text)
@@ -461,7 +457,7 @@ impl<'a> CompletionStream<'a> {
                 self.tx,
                 &mut self.sse_buffer,
                 &self.frame,
-                &completion_choice(*index, text, stopped.then(|| "stop".to_string())),
+                &completion_choice(index, text, stopped.then(|| "stop".to_string())),
             )
             .await?;
         }
@@ -470,11 +466,10 @@ impl<'a> CompletionStream<'a> {
 
     /// Choices closed by their Complete or by their local stop.
     fn closed_choices(&self) -> u32 {
-        (self.completed_indices.len()
-            + self
-                .stopped_indices
-                .difference(&self.completed_indices)
-                .count()) as u32
+        self.choices
+            .iter()
+            .filter(|choice| choice.completed || choice.stopped)
+            .count() as u32
     }
 
     /// Whether the engine has outlived the unit: every expected choice is
@@ -485,16 +480,13 @@ impl<'a> CompletionStream<'a> {
     /// Complete is the next message, so nothing is aborted; a chunk instead
     /// is the tail. Nothing to look at while no stop has fired.
     fn engine_outlived_now(&self) -> bool {
-        if self.stopped_indices.is_empty() {
-            return false;
-        }
-        let mut open_stops = 0u32;
         let mut tailed = false;
-        for index in self.stopped_indices.difference(&self.completed_indices) {
-            open_stops += 1;
-            tailed |= self.tailed_indices.contains(index);
+        for choice in &self.choices {
+            if choice.stopped && !choice.completed {
+                tailed |= choice.tailed;
+            }
         }
-        tailed && self.completed_indices.len() as u32 + open_stops >= self.spec.choices_per_prompt
+        tailed && self.closed_choices() >= self.spec.choices_per_prompt
     }
 
     /// The engine stream, released before the unit's open choices are
@@ -518,19 +510,19 @@ impl<'a> CompletionStream<'a> {
         drop(grpc_stream);
     }
 
-    /// The unit's totals for the coordinator. `completed_indices` counts
-    /// distinct indices that finished cleanly via a `Complete` message. A
-    /// clean EOF partway through this unit's `n>1` choices (some completed,
-    /// others didn't) must not be treated as full usage.
+    /// The unit's totals for the coordinator. The closed choices are the
+    /// ones that finished cleanly via a `Complete` message or at their local
+    /// stop. A clean EOF partway through this unit's `n>1` choices (some
+    /// completed, others didn't) must not be treated as full usage.
     pub(super) fn outcome(self) -> CompletionStreamOutcome {
         let expected_choices = self.spec.choices_per_prompt;
         let saw_complete = self.closed_choices() >= expected_choices;
         CompletionStreamOutcome {
             prompt_tokens: self.total_prompt,
             cached_tokens: self.total_cached,
-            reasoning_tokens: self.reasoning_tokens.values().sum(),
-            spec_accepted_tokens: self.spec_accepted.values().sum(),
-            spec_draft_tokens: self.spec_drafted.values().sum(),
+            reasoning_tokens: self.choices.iter().map(|c| c.reasoning_tokens).sum(),
+            spec_accepted_tokens: self.choices.iter().map(|c| c.spec_accepted).sum(),
+            spec_draft_tokens: self.choices.iter().map(|c| c.spec_drafted).sum(),
             completion_tokens: self.total_completion.total(),
             first_token_time: self.first_token_time,
             saw_complete,

@@ -49,7 +49,7 @@ pub(crate) use parsers::{
     ParserResolver, TagVocabulary, WorkerDecoding,
 };
 pub(crate) use pd_bootstrap::{account_pd_side_failure, dead_rendezvous_of, DeadRendezvous};
-pub(crate) use stream_failure::{send_stream_failure, StreamFailure, StreamSource};
+pub(crate) use stream_failure::{choice_mut, send_stream_failure, StreamFailure, StreamSource};
 
 /// One WARN per choice whose stream recovered from a rewritten decode prefix
 /// (see `smg_detokenize_prefix_mismatch_total`): the client got the text as
