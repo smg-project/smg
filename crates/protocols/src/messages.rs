@@ -2904,8 +2904,11 @@ mod tests {
     /// that grows it past the class needs its own read of the Messages route.
     #[test]
     fn the_output_config_and_the_output_format_ride_behind_a_pointer_each() {
-        assert_eq!(size_of::<Option<Box<OutputConfig>>>(), size_of::<usize>());
-        assert_eq!(size_of::<Option<Box<OutputFormat>>>(), size_of::<usize>());
+        let request: CreateMessageRequest =
+            serde_json::from_value(json!({"model": "m", "max_tokens": 8, "messages": []}))
+                .expect("the smallest valid request");
+        assert_eq!(size_of_val(&request.output_config), size_of::<usize>());
+        assert_eq!(size_of_val(&request.output_format), size_of::<usize>());
         let arc_header = 2 * size_of::<usize>();
         assert!(
             size_of::<CreateMessageRequest>() + arc_header <= 512,
