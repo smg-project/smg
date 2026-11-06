@@ -18,9 +18,9 @@
 //!
 //! `MM_PINS_RECORD=1 cargo test -p llm-multimodal --test alloc_pins -- --nocapture`
 //! prints the table instead of asserting, for re-pinning after a change that moves a
-//! count on purpose. The preprocess calls are pinned per resize row path (scalar, NEON):
-//! a re-pin records each count on its own architecture, and a failing run prints its
-//! table with the failure.
+//! count on purpose. The preprocess calls are pinned per resize row path (scalar, or the
+//! vector rows of NEON and AVX2): a re-pin records each count on its own path, and a
+//! failing run prints its table with the failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
 mod common;
@@ -267,23 +267,39 @@ impl Frames {
     }
 }
 
-/// A call count per resize row path. The resize's rows run through NEON on aarch64
-/// (`vision/torch_resample.rs`): its width pass collects wide taps and a scratch row of
-/// its own, and its height pass skips the scalar path's sums buffer, so a class counts
-/// one or two calls more or fewer than on the scalar path. Both counts are recorded on
-/// their own architecture; CI runs this test on each.
+/// A call count per resize row path. The resize's rows run through NEON on aarch64 and
+/// AVX2 on x86-64 (`vision/torch_resample.rs`): the vector width pass collects wide taps
+/// and a scratch row of its own, and its height pass skips the scalar path's sums buffer,
+/// so a class counts one or two calls more or fewer than on the scalar path. Both counts
+/// are recorded on their own path; CI runs this test on each architecture.
 struct Calls {
     scalar: usize,
-    neon: usize,
+    vector: usize,
 }
 
 impl Calls {
     fn here(&self) -> usize {
-        if cfg!(target_arch = "aarch64") {
-            self.neon
+        if vector_rows() {
+            self.vector
         } else {
             self.scalar
         }
+    }
+}
+
+/// Whether this host resizes through the vector rows, the way the crate decides it.
+fn vector_rows() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("neon")
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        false
     }
 }
 
@@ -297,7 +313,7 @@ const PINS: &[Pin] = &[
         copy: (1, 1),
         preprocess_calls: Calls {
             scalar: 6038,
-            neon: 6037,
+            vector: 6037,
         },
         preprocess_large: 2,
         serialize_calls: 0,
@@ -311,7 +327,7 @@ const PINS: &[Pin] = &[
         copy: (1, 0),
         preprocess_calls: Calls {
             scalar: 1051,
-            neon: 1052,
+            vector: 1052,
         },
         preprocess_large: 1,
         serialize_calls: 0,
@@ -325,7 +341,7 @@ const PINS: &[Pin] = &[
         copy: (1, 1),
         preprocess_calls: Calls {
             scalar: 1370,
-            neon: 1371,
+            vector: 1371,
         },
         preprocess_large: 2,
         serialize_calls: 0,
@@ -339,7 +355,7 @@ const PINS: &[Pin] = &[
         copy: (1, 0),
         preprocess_calls: Calls {
             scalar: 1051,
-            neon: 1052,
+            vector: 1052,
         },
         preprocess_large: 1,
         serialize_calls: 0,
@@ -353,7 +369,7 @@ const PINS: &[Pin] = &[
         copy: (1, 1),
         preprocess_calls: Calls {
             scalar: 1429,
-            neon: 1428,
+            vector: 1428,
         },
         preprocess_large: 1,
         serialize_calls: 0,
@@ -367,7 +383,7 @@ const PINS: &[Pin] = &[
         copy: (1, 1),
         preprocess_calls: Calls {
             scalar: 15,
-            neon: 15,
+            vector: 15,
         },
         preprocess_large: 0,
         serialize_calls: 0,
