@@ -245,8 +245,11 @@ fn unreported_entry(state: &State, dp_rank: i32, capacity: &Capacity) -> vllm::S
 
 /// `GetLoads`: the per-rank load piggybacked on engine output, in the gRPC
 /// response shape, with the handshake's capacity figures and this servicer's
-/// own figures per rank ([`reported_entry`], [`unreported_entry`]).
-pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
+/// own figures per rank ([`reported_entry`], [`unreported_entry`]). The rank
+/// the request names (`dp_rank`) is answered alone, every rank without one,
+/// as the other wires answer it; a rank this servicer does not serve answers
+/// no entry.
+pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<vllm::GetLoadsResponse, Status> {
     let client = state.shared.engine()?;
     let ready = client.ready_response();
     let capacity = Capacity::of(state);
@@ -255,7 +258,7 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
         client.get_loads().loads,
         capacity.max_total_num_tokens,
         ranks,
-        None,
+        dp_rank,
         |load, figures| reported_entry(state, load, figures, &capacity),
         |dp_rank| unreported_entry(state, dp_rank, &capacity),
     );
