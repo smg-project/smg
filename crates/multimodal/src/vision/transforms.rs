@@ -1848,7 +1848,88 @@ pub fn center_crop(image: &DynamicImage, crop_w: u32, crop_h: u32) -> DynamicIma
     let top = (h.saturating_sub(crop_h)) / 2;
     let actual_w = crop_w.min(w);
     let actual_h = crop_h.min(h);
-    image.crop_imm(left, top, actual_w, actual_h)
+    match image {
+        DynamicImage::ImageRgb8(rgb) => {
+            DynamicImage::ImageRgb8(crop_rgb(rgb, left, top, actual_w, actual_h))
+        }
+        other => other.crop_imm(left, top, actual_w, actual_h),
+    }
+}
+
+/// The `width` x `height` crop of `image` at (`x`, `y`), clipped to the
+/// image as the generic crop clips it, as row copies out of the image's own
+/// bytes. The generic crop builds a zeroed image and copies pixel by pixel;
+/// the zero fill cost the allocator's page faults on a crop of the image's
+/// own scale, and the per-pixel copy its bounds checks.
+pub(crate) fn crop_rgb(image: &RgbImage, x: u32, y: u32, width: u32, height: u32) -> RgbImage {
+    let (image_w, image_h) = image.dimensions();
+    let (x, y) = (x.min(image_w), y.min(image_h));
+    let (width, height) = (width.min(image_w - x), height.min(image_h - y));
+    // A zero-width image has no rows; a chunk size of 0 would panic.
+    let stride = (image_w as usize * 3).max(1);
+    let (start, len) = (x as usize * 3, width as usize * 3);
+    let mut data = Vec::with_capacity(len * height as usize);
+    for row in image
+        .as_raw()
+        .chunks_exact(stride)
+        .skip(y as usize)
+        .take(height as usize)
+    {
+        data.extend_from_slice(&row[start..start + len]);
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "data holds exactly width * height * 3 bytes by construction"
+    )]
+    RgbImage::from_raw(width, height, data).expect("crop buffer size")
+}
+
+/// `image` pasted at (`x`, `y`) on a `width` x `height` canvas of
+/// `background`, built row by row: background rows above and below the
+/// paste, and every pasted row the left margin, the image's row and the
+/// right margin. The part of the image past the canvas's edges is left out,
+/// as the generic paste leaves it out; the paste of an opaque image is a
+/// copy. The canvas is written exactly once; a canvas filled first and then
+/// painted pixel by pixel paid the fill (and, for a zeroed canvas, the
+/// allocator's page faults) and the paste's bounds checks per pixel.
+pub(crate) fn paste_rgb(
+    image: &RgbImage,
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    background: [u8; 3],
+) -> RgbImage {
+    let (visible_w, visible_h) = (
+        image.width().min(width.saturating_sub(x)) as usize,
+        image.height().min(height.saturating_sub(y)) as usize,
+    );
+    let row = width as usize * 3;
+    let left = x.min(width) as usize * 3;
+    let right = row - left - visible_w * 3;
+    let background_row: Vec<u8> = background.repeat(width as usize);
+    let mut canvas = Vec::with_capacity(row * height as usize);
+    for _ in 0..y.min(height) {
+        canvas.extend_from_slice(&background_row);
+    }
+    // A zero-width image has no rows to paste; a chunk size of 0 would panic.
+    for source_row in image
+        .as_raw()
+        .chunks_exact((image.width() as usize * 3).max(1))
+        .take(visible_h)
+    {
+        canvas.extend_from_slice(&background_row[..left]);
+        canvas.extend_from_slice(&source_row[..visible_w * 3]);
+        canvas.extend_from_slice(&background_row[..right]);
+    }
+    while canvas.len() < row * height as usize {
+        canvas.extend_from_slice(&background_row);
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "the canvas holds exactly width * height * 3 bytes by construction"
+    )]
+    RgbImage::from_raw(width, height, canvas).expect("canvas buffer size")
 }
 
 /// Expand image to square by padding with background color.
@@ -1999,12 +2080,21 @@ pub fn stack_batch(tensors: &[Array3<f32>]) -> Result<Array4<f32>> {
         }
     }
 
-    let mut batch = Array4::<f32>::zeros((tensors.len(), c, h, w));
-    for (i, tensor) in tensors.iter().enumerate() {
-        batch.slice_mut(s![i, .., .., ..]).assign(tensor);
+    // The batch assembled from the tensors by copy, every element written
+    // once; a zeroed batch assigned tensor by tensor paid the allocator's page
+    // faults for a zero fill the copies then overwrote.
+    let mut data = Vec::with_capacity(tensors.len() * c * h * w);
+    for tensor in tensors {
+        match tensor.as_slice() {
+            Some(values) => data.extend_from_slice(values),
+            None => data.extend(tensor.iter()),
+        }
     }
-
-    Ok(batch)
+    #[expect(
+        clippy::expect_used,
+        reason = "data holds tensors.len() * c * h * w elements by construction"
+    )]
+    Ok(Array4::from_shape_vec((tensors.len(), c, h, w), data).expect("batch matches its shape"))
 }
 
 /// Convert PIL/HuggingFace resampling enum to image crate filter.
@@ -2730,6 +2820,86 @@ mod tests {
     }
 
     #[test]
+    fn center_crop_is_the_generic_crop() {
+        let (w, h) = (97u32, 61u32);
+        let image = DynamicImage::ImageRgb8(
+            RgbImage::from_raw(w, h, gradient_rgb(w as usize, h as usize, 13))
+                .expect("gradient size"),
+        );
+        // A crop inside the image, one flush with an edge, one wider than the
+        // image on one axis (clipped there, centred on the other).
+        for (crop_w, crop_h) in [(50, 50), (97, 20), (20, 61), (200, 10)] {
+            let expected = image.crop_imm(
+                w.saturating_sub(crop_w) / 2,
+                h.saturating_sub(crop_h) / 2,
+                crop_w.min(w),
+                crop_h.min(h),
+            );
+            let cropped = center_crop(&image, crop_w, crop_h);
+            assert_eq!(
+                cropped.dimensions(),
+                expected.dimensions(),
+                "{crop_w}x{crop_h}"
+            );
+            assert_eq!(cropped.as_bytes(), expected.as_bytes(), "{crop_w}x{crop_h}");
+        }
+    }
+
+    #[test]
+    fn paste_rgb_is_the_generic_paste() {
+        // A paste offset on either axis, a flush paste, an image the canvas
+        // clips, and one placed past the canvas; on black and on a colour.
+        for (image_w, image_h, canvas_w, canvas_h, x, y) in [
+            (20u32, 10u32, 24u32, 24u32, 2u32, 7u32),
+            (10, 20, 24, 24, 7, 2),
+            (24, 7, 24, 24, 0, 8),
+            (24, 24, 24, 24, 0, 0),
+            (30, 10, 24, 24, 3, 20),
+            (5, 5, 24, 24, 30, 1),
+        ] {
+            for background in [[0, 0, 0], [127, 10, 250]] {
+                let image = RgbImage::from_raw(
+                    image_w,
+                    image_h,
+                    gradient_rgb(image_w as usize, image_h as usize, 3),
+                )
+                .expect("gradient size");
+                let mut expected = RgbImage::from_pixel(canvas_w, canvas_h, Rgb(background));
+                image::imageops::overlay(&mut expected, &image, i64::from(x), i64::from(y));
+                let pasted = paste_rgb(&image, canvas_w, canvas_h, x, y, background);
+                assert_eq!(
+                    pasted.as_raw(),
+                    expected.as_raw(),
+                    "{image_w}x{image_h} at ({x}, {y}) on {canvas_w}x{canvas_h} {background:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn center_crop_and_paste_rgb_stay_total_on_a_zero_width_image() {
+        // The generic crop and paste give an empty crop and an untouched
+        // canvas for a zero-width image; the row copies do the same.
+        let empty = RgbImage::new(0, 61);
+        let image = DynamicImage::ImageRgb8(empty.clone());
+        for (crop_w, crop_h) in [(50, 20), (0, 61), (200, 10)] {
+            let expected = image.crop_imm(0, 61u32.saturating_sub(crop_h) / 2, 0, crop_h.min(61));
+            let cropped = center_crop(&image, crop_w, crop_h);
+            assert_eq!(
+                cropped.dimensions(),
+                expected.dimensions(),
+                "{crop_w}x{crop_h}"
+            );
+            assert!(cropped.as_bytes().is_empty(), "{crop_w}x{crop_h}");
+        }
+        let expected = RgbImage::from_pixel(24, 24, Rgb([127, 10, 250]));
+        assert_eq!(
+            paste_rgb(&empty, 24, 24, 3, 2, [127, 10, 250]).as_raw(),
+            expected.as_raw()
+        );
+    }
+
+    #[test]
     fn test_expand_to_square_horizontal() {
         let img = create_test_image(100, 50, Rgb([255, 0, 0]));
         let background = Rgb([0, 0, 0]);
@@ -2767,6 +2937,29 @@ mod tests {
         let batch = stack_batch(&[t1, t2]).unwrap();
 
         assert_eq!(batch.shape(), &[2, 3, 10, 10]);
+    }
+
+    #[test]
+    fn stack_batch_holds_the_tensors_in_order() {
+        let first =
+            Array3::<f32>::from_shape_fn((3, 4, 5), |(c, y, x)| (c * 100 + y * 10 + x) as f32);
+        let second = first.mapv(|v| -v - 1.0);
+        // A tensor that is not in standard layout (its axes reversed) reads
+        // element by element.
+        let third =
+            Array3::<f32>::from_shape_fn((5, 4, 3), |(x, y, c)| (c * 1000 + y * 10 + x) as f32)
+                .reversed_axes();
+        assert!(third.as_slice().is_none());
+        let tensors = [first, second, third];
+
+        let batch = stack_batch(&tensors).unwrap();
+
+        // The zeroed form: a zero batch with every tensor assigned.
+        let mut expected = Array4::<f32>::zeros((3, 3, 4, 5));
+        for (i, tensor) in tensors.iter().enumerate() {
+            expected.slice_mut(s![i, .., .., ..]).assign(tensor);
+        }
+        assert_eq!(batch, expected);
     }
 
     #[test]
