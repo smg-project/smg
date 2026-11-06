@@ -46,10 +46,8 @@ pixel-less preprocessed inputs without a remote KV handoff.
 Select the Python implementation with `--servicer-impl python` (or
 `SMG_VLLM_SERVICER_IMPL=python`); the Rust implementation does not yet carry
 this EC contract. Use a matching `smg-grpc-proto` build. Workers advertise
-`supports_ec_transfer` through GetServerInfo. For worker-side media refs,
-use `--mm-processor inprocess`; optional per-media UUIDs are preserved through
-processing so E and P agree on encoder-cache identity. Other media processor
-backends currently reject explicit UUIDs.
+`supports_ec_transfer` through GetServerInfo. Use `--mm-processor inprocess`
+on E; its returned media identity preserves the encoder-cache hashes for P/D.
 
 SMG can route these workers directly with `--epd-disaggregation --mm-processing
 worker --backend vllm --encode grpc://E:50051 --prefill grpc://P:50052 --decode

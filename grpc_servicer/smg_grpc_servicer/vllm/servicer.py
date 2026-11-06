@@ -405,11 +405,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                         "mm_processor label"
                     )
                 items = parse_media_refs(request.media_refs)
-                if (
-                    any(item.uuid is not None for item in items)
-                    and self._mm_processor.name != "inprocess"
-                ):
-                    raise ValueError("Media UUIDs require --mm-processor=inprocess")
                 validate_schemes(items, self._mm_processor.accepted_schemes)
                 await self._acquire_mm_slot()
                 try:
@@ -498,9 +493,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 prompt = request.text
 
             # Build sampling params with detokenize=False
-            cache_salt = getattr(request, "cache_salt", "")
-            if cache_salt and isinstance(prompt, dict):
-                prompt["cache_salt"] = cache_salt
             sampling_params = self._sampling_params_from_proto(
                 request.sampling_params,
                 stream=request.stream,
@@ -511,8 +503,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     **(sampling_params.extra_args or {}),
                     "ec_transfer_params": ec_transfer_params,
                 }
-            if getattr(request, "skip_reading_prefix_cache", False):
-                sampling_params.skip_reading_prefix_cache = True
             tokenization_kwargs = self._tokenization_kwargs_from_proto(request.sampling_params)
 
             # Extract logprobs configuration
@@ -963,15 +953,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if "constrained_decoding_start" in info.DESCRIPTOR.fields_by_name:
             info.engine_reasoning_parser = engine_reasoning_parser(self.engine.vllm_config)
             info.constrained_decoding_start = constrained_decoding_start(self.engine.vllm_config)
-        if "supports_ec_transfer" in info.DESCRIPTOR.fields_by_name:
-            info.supports_ec_transfer = (
-                "ec_transfer_params_json"
-                in vllm_engine_pb2.GenerateRequest.DESCRIPTOR.fields_by_name
-                and "ec_transfer_params_json"
-                in vllm_engine_pb2.GenerateComplete.DESCRIPTOR.fields_by_name
-                and getattr(self.engine.vllm_config, "ec_transfer_config", None) is not None
-            )
         ec_config = getattr(self.engine.vllm_config, "ec_transfer_config", None)
+        if "supports_ec_transfer" in info.DESCRIPTOR.fields_by_name:
+            info.supports_ec_transfer = ec_config is not None
         if (
             "ec_zmq_addrs" in info.DESCRIPTOR.fields_by_name
             and ec_config is not None
@@ -1458,14 +1442,16 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             completion = output.outputs[0] if output.outputs else None
 
         ec_params = getattr(output, "ec_transfer_params", None)
-        ec_fields = {}
+        stop_kwargs = {}
         if ec_params is not None:
             if (
                 "ec_transfer_params_json"
                 not in vllm_engine_pb2.GenerateComplete.DESCRIPTOR.fields_by_name
             ):
                 raise ValueError("Encoder completion requires an EC-capable smg-grpc-proto")
-            ec_fields["ec_transfer_params_json"] = json.dumps(ec_params)
+            stop_kwargs["ec_transfer_params_json"] = json.dumps(ec_params)
+        if media_identity is not None and media_identity_supported():
+            stop_kwargs["media_identity"] = media_identity
 
         if completion is None:
             # Empty completion
@@ -1479,8 +1465,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     completion_tokens=0,
                     cached_tokens=0,
                     index=0,
-                    **({"media_identity": media_identity} if media_identity is not None else {}),
-                    **ec_fields,
+                    **stop_kwargs,
                 ),
             )
 
@@ -1504,13 +1489,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         )
 
         # Build matched_stop kwargs from stop_reason (int token ID or str stop sequence)
-        stop_kwargs = ec_fields
-        # A proto package predating the field cannot carry the identity.
-        if (
-            media_identity is not None
-            and "media_identity" in vllm_engine_pb2.GenerateComplete.DESCRIPTOR.fields_by_name
-        ):
-            stop_kwargs["media_identity"] = media_identity
         if completion.stop_reason is not None:
             if isinstance(completion.stop_reason, int):
                 stop_kwargs["matched_token_id"] = completion.stop_reason

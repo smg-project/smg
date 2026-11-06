@@ -29,11 +29,6 @@ def _refs(*pairs):
 
 
 class TestParseMediaRefs:
-    def test_preserves_explicit_uuid(self):
-        refs = _refs((common_pb2.IMAGE, "https://a/1.png"))
-        refs.items[0].uuid = "shared-encoder-hash"
-        assert media_refs.parse_media_refs(refs)[0].uuid == "shared-encoder-hash"
-
     def test_preserves_prompt_order_and_maps_modalities(self):
         items = media_refs.parse_media_refs(
             _refs(

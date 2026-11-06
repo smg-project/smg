@@ -9,6 +9,7 @@ use crate::routers::{
     error,
     grpc::{
         context::WorkerSelection,
+        multimodal::worker_supports_ec_transfer,
         proto_wrapper::{ProtoGenerateRequest, ProtoGenerateResponse},
         utils::tonic_ext::TonicStatusExt,
     },
@@ -41,13 +42,7 @@ pub(super) async fn encode(
             "vLLM requires one encoder per prompt",
         ));
     };
-    if !prefill
-        .metadata()
-        .spec
-        .labels
-        .get("supports_ec_transfer")
-        .is_some_and(|value| value == "true")
-    {
+    if !worker_supports_ec_transfer(prefill.as_ref()) {
         return Err(error::service_unavailable(
             "ec_consumer_unsupported",
             "Prefill worker does not support EC transfer",

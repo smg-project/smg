@@ -221,6 +221,15 @@ pub(crate) fn worker_accepts_media_refs(worker: &dyn Worker) -> bool {
             })
 }
 
+pub(crate) fn worker_supports_ec_transfer(worker: &dyn Worker) -> bool {
+    worker
+        .metadata()
+        .spec
+        .labels
+        .get("supports_ec_transfer")
+        .is_some_and(|value| value == "true")
+}
+
 /// Whether `worker` processes media references with the gateway's own
 /// pipeline ([`GATEWAY_PIPELINE_PROCESSOR`]) rather than the engine's.
 pub(crate) fn worker_runs_gateway_pipeline(worker: &dyn Worker) -> bool {
@@ -506,12 +515,7 @@ pub(crate) fn resolve_mm_processing(
                         .filter(|worker| *worker.worker_type() == WorkerType::Encode)
                         .all(|worker| {
                             worker.metadata().spec.runtime_type == RuntimeType::Vllm
-                                && worker
-                                    .metadata()
-                                    .spec
-                                    .labels
-                                    .get("supports_ec_transfer")
-                                    .is_some_and(|value| value == "true")
+                                && worker_supports_ec_transfer(worker.as_ref())
                                 && worker_accepts_media_refs(worker.as_ref())
                         });
                 let uniform = vllm_encode
@@ -735,12 +739,6 @@ pub(crate) fn assemble_media_refs(plan: MediaPlan) -> Result<vllm::MediaRefs, Mm
         items.push(vllm::MediaRef {
             modality: modality as i32,
             url: url.to_string(),
-            uuid: match part {
-                MediaContentPart::ImageUrl { uuid, .. }
-                | MediaContentPart::AudioUrl { uuid, .. }
-                | MediaContentPart::VideoUrl { uuid, .. } => uuid.clone(),
-                _ => None,
-            },
         });
     }
     Ok(vllm::MediaRefs { items })

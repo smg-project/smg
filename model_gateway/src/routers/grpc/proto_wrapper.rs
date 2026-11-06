@@ -2562,7 +2562,6 @@ mod tests {
             items: vec![vllm::MediaRef {
                 modality: common::Modality::Video as i32,
                 url: "data:video/mp4;base64,AA==".into(),
-                ..Default::default()
             }],
         };
         request.set_media_refs(refs.clone()).unwrap();
@@ -2586,7 +2585,6 @@ mod tests {
         mixed.items.push(vllm::MediaRef {
             modality: common::Modality::Image as i32,
             url: "https://example.test/image.png".into(),
-            ..Default::default()
         });
         request.set_media_refs(mixed).unwrap();
         let mm = request.as_sglang().mm_inputs.as_ref().unwrap();

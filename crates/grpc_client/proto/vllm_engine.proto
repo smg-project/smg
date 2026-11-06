@@ -189,7 +189,6 @@ message MultimodalInputs {
 message MediaRef {
   smg.grpc.common.Modality modality = 1;  // IMAGE | VIDEO
   string url = 2;
-  optional string uuid = 3;
 }
 
 // Media references in prompt (media-part) order. `tokenized.input_ids` carries
@@ -233,8 +232,6 @@ message GenerateRequest {
 
   // Opaque EC connector request parameters for encoder disaggregation.
   optional string ec_transfer_params_json = 12;
-  optional string cache_salt = 13;
-  bool skip_reading_prefix_cache = 14;
 
   // Connector KV-transfer params as a JSON object, passed verbatim to the
   // engine (e.g. NIXL's do_remote_prefill/remote_block_ids/remote_host/...).

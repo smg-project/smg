@@ -378,6 +378,7 @@ pub(crate) async fn execute_plan(
                 execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger).await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
+                let vllm_encode = request.has_vllm_media_refs();
                 // Bootstrap info was injected into the prefill request during
                 // request building; dispatch the encode jobs with the
                 // prefill+decode side.
@@ -392,6 +393,13 @@ pub(crate) async fn execute_plan(
                     ledger,
                 )
                 .await
+                .map_err(|mut response| {
+                    // A PUSH may already have reserved buffers on this P replica.
+                    if vllm_encode {
+                        mark_non_retryable(&mut response);
+                    }
+                    response
+                })
             }
             ExecutionPlan::Batch { kind, requests, .. } => {
                 execute_batch_dispatch(
@@ -699,15 +707,8 @@ async fn execute_epd_dispatch(
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
-    let vllm_encode = proto_request.has_vllm_media_refs();
-    if vllm_encode {
-        super::vllm_encode::encode(&mut proto_request, workers)
-            .await
-            .map_err(|mut response| {
-                // A PUSH may already have reserved buffers on this prefill replica.
-                mark_non_retryable(&mut response);
-                response
-            })?;
+    if proto_request.has_vllm_media_refs() {
+        super::vllm_encode::encode(&mut proto_request, workers).await?;
     }
     if let Some(encode_dispatch) = encode_dispatch {
         spawn_encode_dispatch(encode_dispatch);
@@ -724,12 +725,6 @@ async fn execute_epd_dispatch(
         ledger,
     )
     .await
-    .map_err(|mut response| {
-        if vllm_encode {
-            mark_non_retryable(&mut response);
-        }
-        response
-    })
 }
 
 #[expect(
@@ -4627,7 +4622,6 @@ mod tests {
             items: vec![vllm::MediaRef {
                 modality: smg_grpc_client::common_proto::Modality::Image as i32,
                 url: "https://a/1.png".to_string(),
-                ..Default::default()
             }],
         };
         let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
@@ -4667,7 +4661,6 @@ mod tests {
                 items: vec![vllm::MediaRef {
                     modality: smg_grpc_client::common_proto::Modality::Image as i32,
                     url: "https://a/1.png".to_string(),
-                    ..Default::default()
                 }],
             })
             .expect("vLLM request accepts media refs");
@@ -4991,7 +4984,6 @@ mod tests {
                 items: vec![vllm::MediaRef {
                     modality: smg_grpc_client::common_proto::Modality::Image as i32,
                     url: "https://a/1.png".to_string(),
-                    ..Default::default()
                 }],
             })
             .expect("vLLM request accepts media refs");

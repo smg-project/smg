@@ -610,10 +610,9 @@ impl WorkerSelectionStage {
                         .map_err(multimodal::MmRefsError::into_response)?;
                     let mut hash = blake3::Hasher::new();
                     for item in &refs.items {
-                        let key = item.uuid.as_deref().unwrap_or(&item.url);
                         hash.update(&item.modality.to_le_bytes());
-                        hash.update(&(key.len() as u64).to_le_bytes());
-                        hash.update(key.as_bytes());
+                        hash.update(&(item.url.len() as u64).to_le_bytes());
+                        hash.update(item.url.as_bytes());
                     }
                     Ok(vec![hash.finalize().as_bytes().to_vec()])
                 } else {
@@ -1957,12 +1956,7 @@ impl WorkerSelectionStage {
         if target_runtime == RuntimeType::Vllm && needs_encode {
             available_encode.retain(|worker| {
                 accepts_media_refs(worker.as_ref())
-                    && worker
-                        .metadata()
-                        .spec
-                        .labels
-                        .get("supports_ec_transfer")
-                        .is_some_and(|value| value == "true")
+                    && multimodal::worker_supports_ec_transfer(worker.as_ref())
             });
         }
         let mut available_prefill = on_runtime(all_prefill, target_runtime);
@@ -2101,12 +2095,7 @@ fn shared_epd_runtime(
                     && all_encode.iter().any(|worker| {
                         worker.metadata().spec.runtime_type == *runtime
                             && accepts_media_refs(worker.as_ref())
-                            && worker
-                                .metadata()
-                                .spec
-                                .labels
-                                .get("supports_ec_transfer")
-                                .is_some_and(|value| value == "true")
+                            && multimodal::worker_supports_ec_transfer(worker.as_ref())
                     })))
                 && all_decode
                     .iter()

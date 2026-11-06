@@ -271,12 +271,10 @@ fn the_request_line_spells_the_python_servicers_words() {
             vllm::MediaRef {
                 modality: common::Modality::Image as i32,
                 url: "https://example.test/a.jpg".to_string(),
-                ..Default::default()
             },
             vllm::MediaRef {
                 modality: common::Modality::Video as i32,
                 url: "https://example.test/b.mp4".to_string(),
-                ..Default::default()
             },
         ],
     });
@@ -3028,7 +3026,6 @@ fn media_refs(urls: &[&str]) -> vllm::MediaRefs {
             .map(|url| vllm::MediaRef {
                 modality: common::Modality::Image as i32,
                 url: url.to_string(),
-                ..Default::default()
             })
             .collect(),
     }
@@ -3291,7 +3288,6 @@ async fn audio_refs_reach_a_processor_that_takes_them() {
         items: vec![vllm::MediaRef {
             modality: common::Modality::Audio as i32,
             url: "https://example.com/x.wav".to_string(),
-            ..Default::default()
         }],
     });
     let _stream = h
@@ -3340,7 +3336,6 @@ async fn malformed_media_refs_are_refused_before_processing() {
         items: vec![vllm::MediaRef {
             modality: common::Modality::Audio as i32,
             url: "https://example.com/x.wav".to_string(),
-            ..Default::default()
         }],
     });
     let mut empty = generate_request("mr5", false, Vec::new());
@@ -4598,7 +4593,6 @@ async fn media_processing_records_its_families() {
         items: vec![vllm::MediaRef {
             modality: common::Modality::Audio as i32,
             url: "https://example.com/x.wav".to_string(),
-            ..Default::default()
         }],
     });
     let status = h.client.generate(audio).await.expect_err("refused");
