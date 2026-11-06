@@ -42,7 +42,7 @@ from infra import (
     get_runtime,
     launch_cloud_gateway,
 )
-from infra.constants import vllm_kv_backend
+from infra.constants import vllm_kv_backend, zmq_backend
 from infra.model_specs import get_model_spec
 from infra.worker import stop_workers
 from infra.worker_pool import get_pool
@@ -86,11 +86,13 @@ _WORKER_DEFAULTS = {
 _worker_start_failures: dict[str, int] = {}  # engine -> count
 _MAX_WORKER_START_FAILURES = 3  # fail fast after this many failures (matches --reruns 2)
 
-# Engines that speak the direct-ZMQ backend wire in e2e. Pairing ZMQ with any
-# other engine can't work, so we reject it up front instead of timing out on a
-# worker that never becomes ready.
+# Engines that speak the direct-ZMQ backend wire in e2e: the three engines and
+# the mock worker, whose ZMQ ranks speak the vLLM wire (the gateway is pinned
+# to it, ``zmq_backend``). Pairing ZMQ with any other engine can't work, so we
+# reject it up front instead of timing out on a worker that never becomes
+# ready.
 ZMQ_CAPABLE_ENGINES = frozenset(
-    {Runtime.VLLM.value, Runtime.TOKENSPEED.value, Runtime.SGLANG.value}
+    {Runtime.VLLM.value, Runtime.TOKENSPEED.value, Runtime.SGLANG.value, Runtime.MOCK.value}
 )
 
 
@@ -515,7 +517,7 @@ def _setup_local(
             worker_urls=[w.base_url for w in workers],
             workers=workers,
             model_path=model_path,
-            backend=engine if is_zmq else None,
+            backend=zmq_backend(engine) if is_zmq else None,
         )
         logger.info("%s backend ready at %s", backend_name, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
@@ -940,7 +942,7 @@ def backend_router(request: pytest.FixtureRequest):
             worker_urls=[w.base_url for w in workers],
             workers=workers,
             model_path=model_path,
-            backend=engine if is_zmq else None,
+            backend=zmq_backend(engine) if is_zmq else None,
             # ZMQ loads the model inside the gateway's readiness gate; cover it.
             timeout=_gateway_readiness_timeout(connection_mode, model_id, DEFAULT_ROUTER_TIMEOUT),
         )
