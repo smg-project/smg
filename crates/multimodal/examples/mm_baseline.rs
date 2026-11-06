@@ -20,8 +20,19 @@
 //! frame (`ImageFrame::decode_all`), the per-frame clone the gateway makes before the
 //! processor, the processor's one-pass write in the destination's dtype (bf16 unless
 //! `--wire` says otherwise; the two-pass path where a processor has no one-pass write),
-//! and the move of the wire bytes (`into_bytes_as`). Video decodes through the media
-//! connector under the family's own sampling rule; audio through the in-process decoder.
+//! and the move of the wire bytes (`into_bytes_as`); the wire then returns to the buffer
+//! pool as a sent payload returns it (`recycled_bytes`), so a run measures the pool's
+//! steady state rather than a fresh zeroed buffer per iteration. The pool is
+//! process-wide and bounded, so per-class numbers are read one class per process
+//! (`--only`, or a one-class manifest): in a multi-class run a later class inherits
+//! the pool the classes before it filled, and its row depends on their order. The
+//! pool keeps at most its bound of buffers, so at a thread count whose wires exceed
+//! it some iterations take a fresh buffer, as the gateway's requests do under the
+//! same concurrency: the row reports that steady state, and at a low `--repeats`
+//! its averaged columns and its p90 carry each thread's first cold take (the median
+//! only at `--repeats 1`).
+//! Video decodes through the media connector under the family's own sampling rule;
+//! audio through the in-process decoder.
 //!
 //! The output is JSON Lines. The first line, `{"kind":"meta",...}`, names the
 //! architecture, the core count, the decoders found at runtime (TurboJPEG, libwebp),
@@ -47,7 +58,6 @@ use std::{
     env,
     error::Error,
     fs,
-    hint::black_box,
     io::{BufWriter, Cursor, Write},
     mem::size_of,
     num::NonZeroUsize,
@@ -62,6 +72,7 @@ use bytes::Bytes;
 use image::{DynamicImage, ImageReader};
 use llm_multimodal::{
     audio::{decode_audio_mono_f32, Qwen3AudioProcessor},
+    buffer_pool::{recycle, recycled_bytes},
     encoder_inputs::{EncoderDtype, EncoderInput, ModelSpecificValue, PreprocessedEncoderInputs},
     jpeg_turbo, parallelism,
     registry::{ModelMetadata, ModelRegistry, Tokenizer},
@@ -485,7 +496,9 @@ fn facts(
     };
     let (_, one_pass) = iterate(work, wire, transparency, runtime)?;
     let wire_sha256 = sha256(&one_pass);
-    match work {
+    // The warm-up's pooled buffers return to the pool as the timed loop's wire does,
+    // so the pool is warm before the timed loop starts.
+    let facts = match work {
         Work::Images { processor, files } => {
             let (images, _, _) = decode_images(files, transparency)?;
             let rgb = images.first().map(|image| sha256(image.to_rgb8().as_raw()));
@@ -502,21 +515,23 @@ fn facts(
                 _ => None,
             };
             let two_pass_wire = two_pass.encoder_input.write_as(wire);
-            Ok(Facts {
+            let f32_bytes = two_pass.encoder_input.write_as(EncoderDtype::Float32);
+            let facts = Facts {
                 shape: two_pass.encoder_input.shape().to_vec(),
                 grid: grid_of(&two_pass),
                 items: files.len(),
                 encoded_bytes,
                 rgb_sha256: rgb,
-                f32_sha256: Some(sha256(
-                    &two_pass.encoder_input.write_as(EncoderDtype::Float32),
-                )),
+                f32_sha256: Some(sha256(&f32_bytes)),
                 u8_sha256,
                 wire_sha256,
                 one_pass_equals_two_pass: Some(two_pass_wire == one_pass),
                 video_frames: None,
                 video_second_per_grid: None,
-            })
+            };
+            recycle(two_pass_wire);
+            recycle(f32_bytes);
+            facts
         }
         Work::Video {
             processor,
@@ -528,21 +543,22 @@ fn facts(
                 .block_on(connector.fetch_video(MediaSource::InlineBytes(bytes.clone()), *config))
                 .map_err(|e| e.to_string())?;
             let inputs = preprocess_clip(processor.as_ref(), &clip)?;
-            Ok(Facts {
+            let f32_bytes = inputs.encoder_input.write_as(EncoderDtype::Float32);
+            let facts = Facts {
                 shape: inputs.encoder_input.shape().to_vec(),
                 grid: grid_of(&inputs),
                 items: 1,
                 encoded_bytes,
                 rgb_sha256: None,
-                f32_sha256: Some(sha256(
-                    &inputs.encoder_input.write_as(EncoderDtype::Float32),
-                )),
+                f32_sha256: Some(sha256(&f32_bytes)),
                 u8_sha256: None,
                 wire_sha256,
                 one_pass_equals_two_pass: None,
                 video_frames: Some(clip_frame_count(&clip)),
                 video_second_per_grid: second_per_grid_of(&inputs),
-            })
+            };
+            recycle(f32_bytes);
+            facts
         }
         Work::Audio { processor, bytes } => {
             let decoded = runtime
@@ -551,23 +567,26 @@ fn facts(
             let inputs = processor
                 .preprocess_decoded_clips(&[&decoded])
                 .map_err(|e| e.to_string())?;
-            Ok(Facts {
+            let f32_bytes = inputs.encoder_input.write_as(EncoderDtype::Float32);
+            let facts = Facts {
                 shape: inputs.encoder_input.shape().to_vec(),
                 grid: Vec::new(),
                 items: 1,
                 encoded_bytes,
                 rgb_sha256: None,
-                f32_sha256: Some(sha256(
-                    &inputs.encoder_input.write_as(EncoderDtype::Float32),
-                )),
+                f32_sha256: Some(sha256(&f32_bytes)),
                 u8_sha256: None,
                 wire_sha256,
                 one_pass_equals_two_pass: None,
                 video_frames: None,
                 video_second_per_grid: None,
-            })
+            };
+            recycle(f32_bytes);
+            facts
         }
-    }
+    };
+    recycle(one_pass);
+    Ok(facts)
 }
 
 /// Build the class's processor through the registry, as the gateway does, and read its
@@ -693,7 +712,8 @@ fn run_class(
                 barrier.wait();
                 for _ in 0..repeats {
                     let (sample, bytes) = iterate(&work, wire, transparency, &runtime)?;
-                    black_box(bytes);
+                    // The wire back to the pool, as a sent payload returns it.
+                    drop(recycled_bytes(bytes));
                     samples.push(sample);
                 }
                 Ok(samples)
