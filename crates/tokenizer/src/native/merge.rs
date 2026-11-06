@@ -80,9 +80,12 @@ const NO_KEY: u32 = u32::MAX;
 const MAX_RANKS: usize = 1 << (u32::BITS - SHORT_KEY_BITS);
 /// The rank of a pair that is no merge.
 const NO_RANK: u32 = u32::MAX;
-/// Filter bits per merge of the pair table (see `MergeTable::pair_filter`):
-/// two set per pair, so a pair that is no merge passes the filter one time
-/// in twenty at most, in 128-256 KiB for a vocabulary's merges.
+/// Filter bits per merge of the pair table (see `MergeTable::pair_filter`),
+/// at least: two set per pair in one word, so at eight bits per merge about
+/// one pair in twenty that is no merge passes the filter (5.3 % measured on
+/// random pairs; the rounding of the word count up to a power of two gives
+/// up to sixteen bits per merge and a rate down to 2 %), in 64-512 KiB for
+/// the vocabularies in use (50k to 280k merges).
 const PAIR_FILTER_BITS_PER_MERGE: usize = 8;
 /// The least words of the pair filter: 8 KiB for a small vocabulary.
 const PAIR_FILTER_MIN_WORDS: usize = 1024;
@@ -196,16 +199,17 @@ pub(super) struct MergeTable {
     shift: u32,
     /// The pairs' filter: one 64-bit word per pair key and two bits of it,
     /// set by [`Self::insert`], [`PAIR_FILTER_BITS_PER_MERGE`] bits per
-    /// merge (128-256 KiB for a vocabulary's merges, a table the
+    /// merge at least (64-512 KiB for the vocabularies in use, a table the
     /// second-level cache keeps). A pair with either bit clear was never
     /// inserted, and [`Self::merge_of`] answers it from that one line; a
     /// pair with both set goes on to its bucket, which answers as before, so
-    /// a false positive costs what every lookup cost. Measured on first-sight
-    /// text: half of a merge's pair lookups are pairs that are no merge, and
-    /// each read a bucket line of a 4-8 MiB table from the last-level cache
-    /// or memory; with the filter the cold cells of the encode bar read up to
-    /// 14 % faster across the families and classes, the warm cells unchanged
-    /// (a warm text merges nothing).
+    /// a false positive (about one pair in twenty at the tightest rounding)
+    /// costs what every lookup cost. Measured on first-sight text: half of a
+    /// merge's pair lookups are pairs that are no merge, and each read a
+    /// bucket line of a 4-16 MiB table from the last-level cache or memory;
+    /// with the filter the cold cells of the encode bar read 3 to 18 %
+    /// faster from 2 KB texts on (1 to 10 % by class median) and the warm
+    /// cells unchanged (a warm text merges nothing).
     pair_filter: Box<[u64]>,
     /// Bits a key's filter hash is shifted right by to give its filter word;
     /// the filter holds `1 << (64 - pair_filter_shift)` words.
@@ -372,7 +376,8 @@ impl MergeTable {
         } else {
             Box::default()
         };
-        let filter_words = (merges * PAIR_FILTER_BITS_PER_MERGE / u64::BITS as usize)
+        let filter_words = (merges * PAIR_FILTER_BITS_PER_MERGE)
+            .div_ceil(u64::BITS as usize)
             .next_power_of_two()
             .max(PAIR_FILTER_MIN_WORDS);
         Self {
