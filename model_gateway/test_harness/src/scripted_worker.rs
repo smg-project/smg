@@ -71,13 +71,30 @@ impl TokenSpeedScheduler for ScriptedWorker {
             ));
         }
         let (request_id, return_logprob) = (request.request_id, request.return_logprob);
+        let top_logprobs = usize::try_from(request.top_logprobs_num).unwrap_or(0);
         let ids: Vec<u32> = (0..self.output_tokens).map(|i| 100 + i).collect();
-        // When asked, token `100 + i` reports logprob `-(i + 1)`.
+        let count = ids.len();
+        // When asked, token `100 + i` reports logprob `-(i + 1)`; with
+        // `top_logprobs_num` candidates asked for, a row per token leads with
+        // the token itself, then the generated tokens after it in turn, each
+        // half a nat below the one before.
         let logprobs = |ids: &[u32]| {
             return_logprob.then(|| ts::OutputLogProbs {
                 token_logprobs: ids.iter().map(|id| 99.0 - *id as f32).collect(),
                 token_ids: ids.to_vec(),
-                top_logprobs: Vec::new(),
+                top_logprobs: ids
+                    .iter()
+                    .filter(|_| top_logprobs > 0)
+                    .map(|id| {
+                        let (token_ids, values) = (0..top_logprobs.min(count))
+                            .map(|rank| {
+                                let candidate = 100 + (id - 100 + rank as u32) % count as u32;
+                                (candidate, 99.0 - *id as f32 - 0.5 * rank as f32)
+                            })
+                            .unzip();
+                        ts::TopLogProbs { values, token_ids }
+                    })
+                    .collect(),
             })
         };
 

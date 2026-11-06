@@ -257,7 +257,9 @@ pub(crate) struct CompletionResponseSpec {
     pub choices_per_prompt: u32,
     pub echo: bool,
     pub suffix: Option<String>,
-    pub logprobs: bool,
+    /// `logprobs`: how many alternatives per generated token the request
+    /// asked for; `None` when it asked for no logprobs.
+    pub logprobs: Option<u32>,
     pub include_usage: bool,
     /// Populated only when `echo` (choices prepend their prompt text).
     pub prompt_texts: Vec<String>,
@@ -277,7 +279,7 @@ impl CompletionResponseSpec {
             choices_per_prompt: request.choices(),
             echo: request.echo,
             suffix: request.suffix.clone(),
-            logprobs: request.logprobs.is_some(),
+            logprobs: request.logprobs,
             include_usage: request
                 .stream_options
                 .as_ref()

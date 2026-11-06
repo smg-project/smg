@@ -146,6 +146,7 @@ impl ProcessStage for CompletionResponseProcessingStage {
                 execution_result,
                 completion_request,
                 dispatch,
+                &tokenizer,
                 stop_decoder,
             )
             .await?;
