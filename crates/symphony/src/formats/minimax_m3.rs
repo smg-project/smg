@@ -13,7 +13,9 @@ use crate::{
 /// The separator token the template writes before every tag, dropped wherever it stands.
 pub const SEPARATOR: &str = "]<]minimax[>[";
 
-/// The MiniMax M3 table.
+/// The MiniMax M3 table. With reasoning separation, closers before substantive content are
+/// ignored. Under the default content policy, surrounding whitespace belongs to the answer
+/// when text follows, and to the template otherwise. Closers after text or calls stay literal.
 pub fn minimax_m3() -> Format {
     Format::new("minimax_m3")
         .terminal("think_open", "<mm:think>")
@@ -26,19 +28,24 @@ pub fn minimax_m3() -> Format {
         .state("start", Emits::Content)
         .state("reasoning", Emits::Reasoning)
         .state("content", Emits::Content)
+        // A completed call must not reopen the boundary-closer tolerance.
+        .state("after_calls", Emits::Content)
         .state("calls", Emits::Wrapper)
         .state("invoke", Emits::Arguments)
         .transition("start", "think_open", "reasoning")
         .transition("start", "think_close", "content")
         .transition("reasoning", "think_close", "content")
+        .leading_transition("start", "think_close", "content")
+        .leading_transition("content", "think_close", "content")
         .transition("start", "calls_open", "calls")
         .transition("reasoning", "calls_open", "calls")
         .transition("content", "calls_open", "calls")
+        .transition("after_calls", "calls_open", "calls")
         .transition("calls", "invoke_open", "invoke")
         .transition("invoke", "invoke_close", "calls")
         .transition("invoke", "invoke_open", "invoke")
-        .transition("invoke", "calls_close", "content")
-        .transition("calls", "calls_close", "content")
+        .transition("invoke", "calls_close", "after_calls")
+        .transition("calls", "calls_close", "after_calls")
         .calls(CallSyntax::Xml)
         .opens_turn("]~b]ai\n")
 }
@@ -451,6 +458,134 @@ mod tests {
         // No marker at all: content.
         let events = run("", &["Hello."]);
         assert_eq!(content(&events), "Hello.");
+    }
+
+    /// The legacy parser removes only boundary closers, preserving whitespace and literal
+    /// markers after content begins. Whole responses and every streaming cut must agree.
+    #[test]
+    fn repeated_boundary_closers_preserve_content_at_every_chunk_boundary() {
+        for (prompt, output, thought, answer) in [
+            ("", "</mm:think></mm:think>答案", "", "答案"),
+            ("", " \n</mm:think>\t</mm:think> 答案", "", " \n\t 答案"),
+            (
+                "",
+                "<mm:think>思考</mm:think> </mm:think>\n答案",
+                "思考",
+                " \n答案",
+            ),
+            ("", "正文</mm:think>后续", "", "正文</mm:think>后续"),
+            ("", "</mm:think></mm:thi", "", "</mm:thi"),
+            (
+                "",
+                "<mm:think>思考</mm:think>正文</mm:think>后续",
+                "思考",
+                "正文</mm:think>后续",
+            ),
+            (
+                "",
+                "</mm:think>Say <mm:think>x</mm:think>",
+                "",
+                "Say <mm:think>x</mm:think>",
+            ),
+            (
+                "]~b]ai\n<mm:think>",
+                "思考</mm:think></mm:think>答案",
+                "思考",
+                "答案",
+            ),
+            ("]~b]ai\n</mm:think>", "</mm:think>答案", "", "答案"),
+            (
+                "]~b]ai\n</mm:think>正文",
+                "</mm:think>后续",
+                "",
+                "</mm:think>后续",
+            ),
+            // A whitespace-only stay retains the existing empty-content convention.
+            ("", "</mm:think> \n</mm:think>\t", "", ""),
+        ] {
+            let check = |pieces: &[&str]| {
+                let events = run(prompt, pieces);
+                assert_eq!(bytes(&events), output);
+                assert_eq!(reasoning(&events), thought, "{prompt:?}: {pieces:?}");
+                assert_eq!(content(&events), answer, "{prompt:?}: {pieces:?}");
+                let message = chat::message(0, &events);
+                assert_eq!(
+                    message.message.content.as_deref(),
+                    (!answer.trim().is_empty()).then_some(answer)
+                );
+                let streamed: String = chat::deltas(0, &events)
+                    .into_iter()
+                    .filter_map(|choice| choice.delta.content)
+                    .collect();
+                assert_eq!(streamed, answer);
+            };
+            check(&[output]);
+            for (cut, _) in output.char_indices().skip(1) {
+                check(&[&output[..cut], &output[cut..]]);
+            }
+            let chars: Vec<_> = output
+                .char_indices()
+                .map(|(at, ch)| &output[at..at + ch.len_utf8()])
+                .collect();
+            check(&chars);
+        }
+    }
+
+    /// Tool-call tails and requests without reasoning separation preserve literal closers.
+    #[test]
+    fn boundary_closers_do_not_strip_markers_after_calls_or_without_reasoning() {
+        let output = concat!(
+            "</mm:think></mm:think><tool_call><invoke name=\"f\"></invoke></tool_call>",
+            "</mm:think>正文"
+        );
+        let events = run("", &[output]);
+        assert_eq!(names(&events), ["f"]);
+        assert_eq!(content(&events), "</mm:think>正文");
+        assert_eq!(bytes(&events), output);
+
+        let output = "</mm:think> <mm:think>思考</mm:think></mm:think>答案";
+        let events = drive(
+            &mut Engine::new(minimax_m3().without_reasoning(), Declared::default()),
+            "",
+            &[output],
+        );
+        assert_eq!(content(&events), output);
+        assert_eq!(reasoning(&events), "");
+    }
+
+    /// Parser-only rows preserve byte order and literal tails under format policies.
+    #[test]
+    fn boundary_closers_respect_content_policies_and_structural_tails() {
+        for (format, output, answer) in [
+            (minimax_m3().framing("content"), " </mm:think> hello", ""),
+            (
+                minimax_m3().keeps("content"),
+                " </mm:think>hello</mm:think>",
+                " hello</mm:think>",
+            ),
+            (minimax_m3().trims("content"), " </mm:think> hello", "hello"),
+            (
+                minimax_m3().structural_token("</mm:th"),
+                "answer</mm:th",
+                "answer</mm:th",
+            ),
+            (minimax_m3().structural_token("</mm:th"), "</mm:th", ""),
+            (
+                minimax_m3().structural_token("</mm:th"),
+                "</mm:think></mm:th",
+                "",
+            ),
+        ] {
+            for cut in 0..=output.len() {
+                let events = drive(
+                    &mut Engine::new(format.clone(), Declared::default()),
+                    "",
+                    &[&output[..cut], &output[cut..]],
+                );
+                assert_eq!(bytes(&events), output, "{output:?}: {cut}");
+                assert_eq!(content(&events), answer, "{output:?}: {cut}");
+            }
+        }
     }
 
     #[test]
