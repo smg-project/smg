@@ -199,8 +199,8 @@ pub struct CacheAwarePolicy {
     /// keeping selection and credit atomic under concurrent arrivals.
     load_scorer: LeastLoadPolicy,
     /// Selection policy run over the per-worker inputs gathered for each
-    /// request (`cost` module); the default reproduces the affinity-group
-    /// decision exactly and the ports of published cost functions replace it.
+    /// request (`cost` module); the default, the one the catalog holds,
+    /// reproduces the affinity-group decision exactly.
     selection: WorkerSelectionPolicy,
     /// Optimistic self-accounting of dispatches the engines have not yet
     /// reported; `None` unless `selection_accounting_ttl_ms > 0`.
@@ -2429,10 +2429,9 @@ impl CacheAwarePolicy {
     ///   gate, then expected wait, which credits the result).
     /// - `Pick::None`: the miss path (expected wait over the eligible workers
     ///   under the count-pressure gate).
-    /// - `Pick::Final`: that worker, credited through the expected-wait
-    ///   selector; the policy owns the load trade-off, so the count-pressure
-    ///   gate does not apply. If the waiting-queue veto drops it, the fleet
-    ///   fallback runs.
+    /// - `Pick::Final`: that worker, credited the whole prompt through the
+    ///   expected-wait selector; the policy owns the load trade-off, so the
+    ///   count-pressure gate does not apply.
     ///
     /// `unit` is what the request's lengths count (tokens, or the string
     /// tree's characters); the gate prices each holder's prefix in tokens.
