@@ -123,15 +123,27 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
     /// refused as unsupported) without a bound of the spec's, so the effective
     /// limit is the engine's advertised one, else the deployment's
     /// `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`. A checkpoint
-    /// whose config names a video token serves video too, one clip per
-    /// request as the spec's declared default.
+    /// whose config names a video token serves video too, likewise without a
+    /// count of the spec's (the same processing info declares `video: None`),
+    /// so `SMG_VIDEO_MAX_COUNT` or the engine's advertised limit bounds it.
+    ///
+    /// What still bounds such a request, and where it lives. Before any
+    /// fetch: the per-request limit the model's workers advertise for their
+    /// engine, which caps the router's own limit in the gateway's limit
+    /// resolution, and the deployment's `SMG_IMAGE_MAX_COUNT` /
+    /// `SMG_VIDEO_MAX_COUNT` / `SMG_AUDIO_MAX_COUNT` (and
+    /// `--mm-per-request-image-limit` for images), read in the same
+    /// resolution. At or after the fetch: the gateway's cap on media bytes
+    /// in flight (`multimodal_max_inflight_bytes`), the engine's advertised
+    /// encoder budget and the context length. A number of the spec's own
+    /// would be a declared default again, not a bound of the family's.
     fn modality_limits(
         &self,
         metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
         let mut limits = HashMap::from([(Modality::Image, usize::MAX)]);
         if Self::names_a_video_token(metadata.config) {
-            limits.insert(Modality::Video, 1);
+            limits.insert(Modality::Video, usize::MAX);
         }
         Ok(limits)
     }
@@ -374,10 +386,11 @@ mod tests {
         ));
     }
 
-    /// A checkpoint whose config names a video token serves video: one clip
-    /// per request, the clip's `<|video_pad|>` expanded to the processor's
-    /// token count, the family's own loader rule for the frames, and the
-    /// video tensors declared beside the image ones.
+    /// A checkpoint whose config names a video token serves video: clips
+    /// without a count of the spec's own (a deployment cap still binds), each
+    /// clip's `<|video_pad|>` expanded to the processor's token count, the
+    /// family's own loader rule for the frames, and the video tensors
+    /// declared beside the image ones.
     #[test]
     fn qwen_vl_serves_video_when_the_config_names_a_video_token() {
         use std::collections::HashMap;
@@ -406,12 +419,17 @@ mod tests {
 
         assert_eq!(
             spec.modality_limits(&metadata).unwrap(),
-            HashMap::from([(Modality::Image, usize::MAX), (Modality::Video, 1)])
+            HashMap::from([(Modality::Image, usize::MAX), (Modality::Video, usize::MAX)])
         );
-        spec.validate_media_request(&metadata, &[(Modality::Video, 1)])
-            .expect("one clip per request");
+        for count in [1, 2, 100] {
+            spec.validate_media_request(&metadata, &[(Modality::Video, count)])
+                .unwrap_or_else(|error| panic!("{count} clips: {error}"));
+        }
+        // A deployment's own cap (the environment override, or the engine's
+        // advertised limit the gateway passes in) still binds.
+        let capped = HashMap::from([(Modality::Video, 1)]);
         assert_eq!(
-            spec.validate_media_request(&metadata, &[(Modality::Video, 2)]),
+            spec.validate_media_request_with_limits(&metadata, &[(Modality::Video, 2)], &capped),
             Err(ModelRegistryError::ModalityLimitExceeded {
                 spec: "qwen_vl",
                 modality: Modality::Video,

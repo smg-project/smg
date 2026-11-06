@@ -90,17 +90,28 @@ impl ModelProcessorSpec for InklingSpec {
         }
     }
 
-    /// The family sets no per-request image count of its own: its serving
-    /// engines read the image count as unlimited (the family's processing
-    /// info declares `image: None` for a checkpoint with a vision tower), the
-    /// checkpoint's processor config and card bound an image's dimensions,
-    /// not the number of images, and the context length is the practical
-    /// bound. Images stay declared (an undeclared modality is refused as
+    /// The family sets no per-request image or audio count of its own: its
+    /// serving engines read both counts as unlimited (the family's processing
+    /// info declares `image: None` for a checkpoint with a vision tower and
+    /// `audio: None` for one with an audio tower), the checkpoint's processor
+    /// config and card bound an image's dimensions and a clip's duration, not
+    /// how many of either, and the context length is the practical bound.
+    /// Both modalities stay declared (an undeclared modality is refused as
     /// unsupported) without a bound of the spec's, so the effective limit is
     /// the engine's advertised one, else the deployment's
-    /// `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`. The audio
-    /// count keeps the spec's declared default (`SMG_AUDIO_MAX_COUNT` moves
-    /// it).
+    /// `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT` for images and
+    /// `SMG_AUDIO_MAX_COUNT` for audio.
+    ///
+    /// What still bounds such a request, and where it lives. Before any
+    /// fetch: the per-request limit the model's workers advertise for their
+    /// engine, which caps the router's own limit in the gateway's limit
+    /// resolution, and the deployment's `SMG_IMAGE_MAX_COUNT` /
+    /// `SMG_VIDEO_MAX_COUNT` / `SMG_AUDIO_MAX_COUNT` (and
+    /// `--mm-per-request-image-limit` for images), read in the same
+    /// resolution. At or after the fetch: the gateway's cap on media bytes
+    /// in flight (`multimodal_max_inflight_bytes`), the engine's advertised
+    /// encoder budget and the context length. A number of the spec's own
+    /// would be a declared default again, not a bound of the family's.
     fn modality_limits(
         &self,
         metadata: &ModelMetadata,
@@ -110,7 +121,7 @@ impl ModelProcessorSpec for InklingSpec {
             limits.insert(Modality::Image, usize::MAX);
         }
         if Self::tower_enabled(metadata, "audio_config") {
-            limits.insert(Modality::Audio, 10);
+            limits.insert(Modality::Audio, usize::MAX);
         }
         Ok(limits)
     }
@@ -364,6 +375,46 @@ mod tests {
         ));
     }
 
+    /// The family bounds its audio by context and clip length, not by count:
+    /// the spec declares the modality without a limit of its own (the ten it
+    /// carried was a declared default of the same kind as the image ten,
+    /// never a count of the family's), so a deployment's `SMG_AUDIO_MAX_COUNT`
+    /// or the engine's advertised limit is the only router-side bound.
+    #[test]
+    fn inkling_declares_audio_without_a_count_of_its_own() {
+        use crate::{registry::ModelRegistryError, types::Modality};
+
+        let tokenizer = tokenizer();
+        let config = config();
+        let metadata = ModelMetadata {
+            model_id: "local-checkpoint",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let spec = InklingSpec;
+
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap()[&Modality::Audio],
+            usize::MAX
+        );
+        for count in [11, 1_000] {
+            spec.validate_media_request(&metadata, &[(Modality::Audio, count)])
+                .unwrap_or_else(|error| panic!("{count} clips: {error}"));
+        }
+        // A deployment's own cap (the environment override, or the engine's
+        // advertised limit the gateway passes in) still binds.
+        let capped = HashMap::from([(Modality::Audio, 10)]);
+        assert_eq!(
+            spec.validate_media_request_with_limits(&metadata, &[(Modality::Audio, 11)], &capped),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "inkling",
+                modality: Modality::Audio,
+                limit: 10,
+                requested: 11,
+            })
+        );
+    }
+
     #[test]
     fn modality_limits_follow_configured_towers() {
         let tokenizer = tokenizer();
@@ -375,7 +426,7 @@ mod tests {
                 }),
                 HashMap::from([
                     (crate::types::Modality::Image, usize::MAX),
-                    (crate::types::Modality::Audio, 10),
+                    (crate::types::Modality::Audio, usize::MAX),
                 ]),
             ),
             (
@@ -383,7 +434,7 @@ mod tests {
                     "vision_config": {"decoder_dmodel": null},
                     "audio_config": {"decoder_dmodel": 6144}
                 }),
-                HashMap::from([(crate::types::Modality::Audio, 10)]),
+                HashMap::from([(crate::types::Modality::Audio, usize::MAX)]),
             ),
             (
                 json!({

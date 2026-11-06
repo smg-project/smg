@@ -124,14 +124,36 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
         }
     }
 
+    /// The family sets no per-request media count of its own for any of its
+    /// three modalities: its serving engines read all three as unlimited (the
+    /// family's processing info declares `audio: None`, `image: None`,
+    /// `video: None`), the checkpoint's processor config bounds an image's
+    /// pixels, a clip's frames and a recording's length, not how many of
+    /// each, and the context length is the practical bound. The three stay
+    /// declared (an undeclared modality is refused as unsupported) without a
+    /// bound of the spec's, so the effective limit per modality is the
+    /// engine's advertised one, else the deployment's
+    /// `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`,
+    /// `SMG_VIDEO_MAX_COUNT` or `SMG_AUDIO_MAX_COUNT`.
+    ///
+    /// What still bounds such a request, and where it lives. Before any
+    /// fetch: the per-request limit the model's workers advertise for their
+    /// engine, which caps the router's own limit in the gateway's limit
+    /// resolution, and the deployment's `SMG_IMAGE_MAX_COUNT` /
+    /// `SMG_VIDEO_MAX_COUNT` / `SMG_AUDIO_MAX_COUNT` (and
+    /// `--mm-per-request-image-limit` for images), read in the same
+    /// resolution. At or after the fetch: the gateway's cap on media bytes
+    /// in flight (`multimodal_max_inflight_bytes`), the engine's advertised
+    /// encoder budget and the context length. A number of the spec's own
+    /// would be a declared default again, not a bound of the family's.
     fn modality_limits(
         &self,
         _metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
         Ok(HashMap::from([
-            (Modality::Image, 10),
-            (Modality::Video, 1),
-            (Modality::Audio, 10),
+            (Modality::Image, usize::MAX),
+            (Modality::Video, usize::MAX),
+            (Modality::Audio, usize::MAX),
         ]))
     }
 
@@ -317,6 +339,63 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(replacements[0].tokens, vec![expected; 3]);
+        }
+    }
+
+    /// The family bounds its media by context, not by count: the spec
+    /// declares its three modalities without a limit of its own (the ten, one
+    /// and ten it carried were declared defaults, never counts of the
+    /// family's), so a deployment knob or the engine's advertised limit is the
+    /// only router-side bound for each.
+    #[test]
+    fn omni_declares_its_media_without_a_count_of_its_own() {
+        let tokenizer = omni_tokenizer();
+        let config = json!({
+            "model_type": "qwen3_omni_moe",
+            "thinker_config": {
+                "audio_token_id": 151675,
+                "image_token_id": 151655,
+                "video_token_id": 151656
+            }
+        });
+        let metadata = ModelMetadata {
+            model_id: "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let spec = Qwen3OmniSpec;
+
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap(),
+            HashMap::from([
+                (Modality::Image, usize::MAX),
+                (Modality::Video, usize::MAX),
+                (Modality::Audio, usize::MAX),
+            ])
+        );
+        // Above the old declared defaults each modality passes the spec's
+        // own validation; a deployment's cap (the flag or the environment
+        // override, or the engine's advertised limit the gateway passes in)
+        // still binds.
+        for (modality, cap) in [
+            (Modality::Image, 10),
+            (Modality::Video, 1),
+            (Modality::Audio, 10),
+        ] {
+            for count in [cap + 1, 1_000] {
+                spec.validate_media_request(&metadata, &[(modality, count)])
+                    .unwrap_or_else(|error| panic!("{count} {modality} items: {error}"));
+            }
+            let capped = HashMap::from([(modality, cap)]);
+            assert_eq!(
+                spec.validate_media_request_with_limits(&metadata, &[(modality, cap + 1)], &capped),
+                Err(ModelRegistryError::ModalityLimitExceeded {
+                    spec: "qwen3_omni",
+                    modality,
+                    limit: cap,
+                    requested: cap + 1,
+                })
+            );
         }
     }
 
