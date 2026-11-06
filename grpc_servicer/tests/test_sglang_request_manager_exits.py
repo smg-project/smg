@@ -120,6 +120,7 @@ def manager(monkeypatch):
     sent: list = []
     rm = module.GrpcRequestManager.__new__(module.GrpcRequestManager)
     rm.rid_to_state = {}
+    rm.metrics_collector = None  # added field from PR; test fixture only
     rm.disaggregation_mode = "null"
     rm.crash_dump_request_list = []
     rm.enable_trace = False  # the stand-in stats start the trace themselves
