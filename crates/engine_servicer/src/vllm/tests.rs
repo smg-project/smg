@@ -5388,3 +5388,58 @@ async fn server_info_and_the_zero_filled_loads_count_the_connected_ranks() {
         vec![0, 1]
     );
 }
+
+/// 256 engine-timed prefills that share one scheduled-to-first-output
+/// interval read the capacity of the whole batch: 256 x 2 computed tokens
+/// over the half second they share, counted once (the reference for the
+/// wires that measure on the servicer's clock; a ring of per-request
+/// samples read the newest 64 of them over the same half second).
+#[tokio::test]
+async fn a_burst_of_overlapping_prefills_reads_the_capacity_of_the_whole_batch() {
+    use engine_zmq_client::protocol::vllm::output::{EngineCoreEvent, EngineCoreEventType};
+    let mut h = harness(model_info(), None).await;
+    for index in 0..256 {
+        let id = format!("b{index}");
+        let mut stream = h
+            .client
+            .generate(generate_request(&id, true, vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(recv_add(&mut h.engine_in).await.request_id, id);
+        h.engine_out
+            .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+                engine_index: 0,
+                timestamp: 10.5,
+                outputs: vec![EngineCoreOutput {
+                    request_id: id.clone(),
+                    new_token_ids: vec![10],
+                    finish_reason: Some(EngineCoreFinishReason::Length),
+                    events: Some(vec![EngineCoreEvent {
+                        r#type: EngineCoreEventType::Scheduled,
+                        timestamp: 10.0,
+                    }]),
+                    prefill_stats: Some(PrefillStats {
+                        num_prompt_tokens: 3,
+                        num_cached_tokens: 1,
+                        num_computed_tokens: 2,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                scheduler_stats: Some(SchedulerStats::default()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.loads[0].prefill_throughput, Some(1_024.0));
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}

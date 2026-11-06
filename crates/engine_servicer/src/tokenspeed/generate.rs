@@ -21,7 +21,7 @@ use tonic::Status;
 
 use super::State;
 use crate::{
-    load_tracker::{rank_of, ChoiceLoad, PendingGuard, PrefillProbe, Submission},
+    load_tracker::{rank_of, ChoiceLoad, PendingGuard, Submission},
     metrics::{complete_finish_reason, ChoiceMetrics},
     requests::HeldTerminal,
     stop_match::{stop_decoder, StopMatcher},
@@ -71,9 +71,9 @@ pub(super) async fn generate(
         .await?;
     // The load tracker's view of the request: in flight on the rank its
     // first choice went to (the choice that reports the prompt) from here
-    // until the engine's first output (or the stream's end), with a
-    // servicer-clock prefill sample when it met no queue there (this wire
-    // carries no engine timing).
+    // until the engine's first output (or the stream's end), each choice's
+    // prefill sampled on the servicer's clock from here to its first output
+    // (this wire carries no engine timing).
     let at = Instant::now();
     let rank = rank_of(
         subs.iter()
@@ -81,17 +81,10 @@ pub(super) async fn generate(
             .or_else(|| subs.first())
             .and_then(TokenSpeedGenerateStream::engine_index),
     );
-    let mut probe = state.shared.loads.submit(Submission {
+    let probe = state.shared.loads.submit(Submission {
         request_id: &request_id,
         rank,
         prompt_tokens,
-        choices: n,
-        tail: u32::try_from(rank)
-            .ok()
-            .and_then(|rank| client.engine_load(rank)),
-        window: state
-            .shared
-            .running_window(state.model.max_running_requests),
         at,
     });
     let loads = PendingGuard::new(Arc::clone(state), &request_id);
@@ -112,15 +105,7 @@ pub(super) async fn generate(
         };
         // Each choice's engine request went to its own rank (an unpinned
         // fan-out is placed per choice): its tokens are credited there.
-        let load = ChoiceLoad::new(
-            rank_of(sub.engine_index()),
-            sub.index(),
-            if sub.index() == 0 {
-                std::mem::take(&mut probe)
-            } else {
-                PrefillProbe::default()
-            },
-        );
+        let load = ChoiceLoad::new(rank_of(sub.engine_index()), sub.index(), probe);
         choices.push(ChoiceStream::new(
             Arc::clone(&request_id),
             Arc::clone(state),
