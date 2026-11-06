@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     collections::HashMap,
     ops::Range,
     path::Path,
@@ -1404,58 +1403,15 @@ impl HuggingFaceTokenizer {
         // tokens between marks, the special tokens it reads included, and
         // reads every request string (messages, tools, documents, template
         // kwargs) with its marks removed, so no request can forge one.
-        let marked = self.chat_template.marked();
-        let stripped_messages;
-        let messages: &[serde_json::Value] = if marked {
-            stripped_messages = marks::without_marks(messages);
-            &stripped_messages
-        } else {
-            messages
-        };
-        let stripped_tools;
-        let mut tools = params.tools;
-        let mut prepared_tools = params.prepared_tools;
-        let stripped_documents;
-        let mut documents = params.documents;
-        let stripped_kwargs;
-        let mut template_kwargs = params.template_kwargs;
-        if marked {
-            if let Some(Cow::Owned(stripped)) = params.tools.map(marks::without_marks) {
-                stripped_tools = stripped;
-                tools = Some(stripped_tools.as_slice());
-                prepared_tools = None;
-            }
-            if let Some(Cow::Owned(stripped)) = params.documents.map(marks::without_marks) {
-                stripped_documents = stripped;
-                documents = Some(stripped_documents.as_slice());
-            }
-            if let Some(Cow::Owned(stripped)) =
-                params.template_kwargs.map(marks::kwargs_without_marks)
-            {
-                stripped_kwargs = stripped;
-                template_kwargs = Some(&stripped_kwargs);
-            }
-        }
-        let marked_tokens;
-        let special_tokens = match (
-            self.special_tokens_marked.as_ref().filter(|_| marked),
-            params.special_tokens,
-        ) {
-            (Some(ours), None) => Some(ours),
-            (Some(_), Some(given)) => {
-                marked_tokens = marks::marked_special_tokens(given);
-                Some(&marked_tokens)
-            }
-            (None, given) => given.or(Some(&self.special_tokens)),
-        };
-        let params = ChatTemplateParams {
-            tools,
-            documents,
-            template_kwargs,
-            special_tokens,
-            prepared_tools,
-            ..params
-        };
+        let inputs = marks::TemplateInputs::new(
+            messages,
+            &params,
+            self.special_tokens_marked
+                .as_ref()
+                .filter(|_| self.chat_template.marked()),
+            &self.special_tokens,
+        );
+        let (messages, params) = inputs.split(params);
         // A template that writes nothing for the request's tools gets them
         // as a system message block (the V3.1 template, see `deepseek_v31`).
         let with_block = self

@@ -19,7 +19,7 @@ use anyhow::{bail, Result};
 use serde_json::Value;
 
 use super::PromptSegment;
-use crate::{native::AddedTokens, traits::SpecialTokens};
+use crate::{chat_template::ChatTemplateParams, native::AddedTokens, traits::SpecialTokens};
 
 /// The mark before a control token the renderer wrote.
 pub(crate) const START: char = '\u{FDD0}';
@@ -233,6 +233,80 @@ pub(crate) fn marked_special_tokens(tokens: &SpecialTokens) -> SpecialTokens {
             .iter()
             .map(|token| mark(token))
             .collect(),
+    }
+}
+
+/// The messages and parameters a template renders. For a marked template
+/// (see `ChatTemplateState::mark_controls`), every request string (the
+/// messages, the tools, the documents, the template keyword arguments) with
+/// the marks removed, so no request can forge a control token, and the
+/// special tokens the template reads between the marks; for any other
+/// template, the request as given, the tokenizer's special tokens standing
+/// in when the caller passed none. Owns the copies it had to make, borrows
+/// the rest.
+pub(crate) struct TemplateInputs<'a> {
+    messages: Cow<'a, [Value]>,
+    tools: Option<Cow<'a, [Value]>>,
+    documents: Option<Cow<'a, [Value]>>,
+    template_kwargs: Option<Cow<'a, HashMap<String, Value>>>,
+    special_tokens: Cow<'a, SpecialTokens>,
+}
+
+impl<'a> TemplateInputs<'a> {
+    /// The inputs of `messages` under `params`: unmarked when `marked_tokens`
+    /// is given (the tokenizer's special tokens between the marks, read when
+    /// the caller passed none; the caller's own are marked here), else as
+    /// given, with `special_tokens` standing in for the caller's.
+    pub(crate) fn new(
+        messages: &'a [Value],
+        params: &ChatTemplateParams<'a>,
+        marked_tokens: Option<&'a SpecialTokens>,
+        special_tokens: &'a SpecialTokens,
+    ) -> Self {
+        match marked_tokens {
+            Some(marked_tokens) => Self {
+                messages: without_marks(messages),
+                tools: params.tools.map(without_marks),
+                documents: params.documents.map(without_marks),
+                template_kwargs: params.template_kwargs.map(kwargs_without_marks),
+                special_tokens: match params.special_tokens {
+                    Some(given) => Cow::Owned(marked_special_tokens(given)),
+                    None => Cow::Borrowed(marked_tokens),
+                },
+            },
+            None => Self {
+                messages: Cow::Borrowed(messages),
+                tools: params.tools.map(Cow::Borrowed),
+                documents: params.documents.map(Cow::Borrowed),
+                template_kwargs: params.template_kwargs.map(Cow::Borrowed),
+                special_tokens: Cow::Borrowed(params.special_tokens.unwrap_or(special_tokens)),
+            },
+        }
+    }
+
+    /// The messages, and `params` with its strings replaced by these (a
+    /// prepared form of the tools is of the tools as given, so a copy of
+    /// them drops it).
+    pub(crate) fn split<'b>(
+        &'b self,
+        params: ChatTemplateParams<'b>,
+    ) -> (&'b [Value], ChatTemplateParams<'b>) {
+        let tools_copied = matches!(self.tools, Some(Cow::Owned(_)));
+        (
+            &self.messages,
+            ChatTemplateParams {
+                tools: self.tools.as_deref(),
+                documents: self.documents.as_deref(),
+                template_kwargs: self.template_kwargs.as_deref(),
+                special_tokens: Some(&self.special_tokens),
+                prepared_tools: if tools_copied {
+                    None
+                } else {
+                    params.prepared_tools
+                },
+                ..params
+            },
+        )
     }
 }
 
