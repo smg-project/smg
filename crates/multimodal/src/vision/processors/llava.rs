@@ -46,7 +46,7 @@ use crate::vision::{
     processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
     transforms::{
         center_crop, expand_to_square, mean_to_rgb, pil_to_filter, resize, resize_bicubic_torch_aa,
-        stack_batch, to_tensor_by_table, TransformError,
+        resize_bicubic_torch_aa_cropped, stack_batch, to_tensor_by_table, TransformError,
     },
 };
 
@@ -285,6 +285,20 @@ impl LlavaProcessor {
                 // 2. Center crop to crop_size x crop_size
                 let resized = if transforms.do_resize {
                     let (new_w, new_h) = shortest_edge_size(image.dimensions(), target_size);
+                    if transforms.do_center_crop
+                        && filter == FilterType::CatmullRom
+                        && (new_w > crop_size || new_h > crop_size)
+                    {
+                        // The crop's pixels alone: the columns a center crop
+                        // discards are never resampled, and of the rows only
+                        // the ones its height taps read are. The same bytes as
+                        // the resize followed by `center_crop`.
+                        let crop = (crop_size.min(new_w), crop_size.min(new_h));
+                        let origin = ((new_w - crop.0) / 2, (new_h - crop.1) / 2);
+                        let cropped =
+                            resize_bicubic_torch_aa_cropped(image, new_w, new_h, origin, crop);
+                        return to_tensor_by_table(&cropped, &transforms.table);
+                    }
                     resize_as_reference(image, new_w, new_h, filter)
                 } else {
                     Cow::Borrowed(image)

@@ -1607,6 +1607,43 @@ pub fn resize_bicubic_torch_aa(image: &DynamicImage, out_w: u32, out_h: u32) -> 
     )
 }
 
+/// [`resize_bicubic_torch_aa`] to `out_w` x `out_h` followed by the crop of
+/// `crop` (width, height) at `origin` (left, top), computed for the crop's
+/// pixels alone: the width pass runs on the crop's columns only (a center
+/// crop after a shortest-edge resize discards 25 to 44 % of them) and over
+/// the source rows the crop's height taps read. The same bytes as the resize
+/// and the crop.
+pub(crate) fn resize_bicubic_torch_aa_cropped(
+    image: &DynamicImage,
+    out_w: u32,
+    out_h: u32,
+    origin: (u32, u32),
+    crop: (u32, u32),
+) -> DynamicImage {
+    let (in_w, in_h, data) = rgb_bytes(image);
+    let output = super::torch_resample::resize_rgb_window(
+        &data,
+        in_w,
+        in_h,
+        out_w as usize,
+        out_h as usize,
+        (
+            origin.0 as usize,
+            origin.1 as usize,
+            crop.0 as usize,
+            crop.1 as usize,
+        ),
+        PilResizeFilter::Bicubic,
+    );
+    #[expect(
+        clippy::expect_used,
+        reason = "output is exactly crop.0*crop.1*3 bytes by construction"
+    )]
+    DynamicImage::ImageRgb8(
+        RgbImage::from_raw(crop.0, crop.1, output).expect("torch resize window buffer size"),
+    )
+}
+
 /// Keys' cubic (`a = -0.5`) as torch's compiled CPU kernel evaluates it in
 /// `f32`: `((a + 2) x - (a + 3)) x x + 1` below one and
 /// `((a x - 5a) x + 8a) x - 4a` below two, with the fused multiply-adds its
