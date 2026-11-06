@@ -2078,14 +2078,16 @@ mod request_contract_tests {
         assert_eq!(rejection(&empty), None);
     }
 
-    /// `logit_bias` is keyed by token ids and its biases stay within the
-    /// public API's -100..=100; a refusal names the field.
+    /// `logit_bias` is keyed by token ids, no two of them spelling one id,
+    /// and its biases stay within the public API's -100..=100; a refusal
+    /// names the field. A single key with a leading zero names its id.
     #[test]
     fn logit_bias_is_keyed_by_token_ids_and_bounded() {
         for (bias, code) in [
             (json!({"not-a-token": 1}), "logit_bias_invalid_key"),
             (json!({"-5": 1}), "logit_bias_invalid_key"),
             (json!({"99999999999": 1}), "logit_bias_invalid_key"),
+            (json!({"5": 1, "05": 2}), "logit_bias_duplicate_key"),
             (json!({"1": 1000}), "integer_above_max_value"),
             (json!({"1": 100.5}), "integer_above_max_value"),
             (json!({"1": -101}), "integer_below_min_value"),
@@ -2095,7 +2097,17 @@ mod request_contract_tests {
             let error = &errors.field_errors()["logit_bias"][0];
             assert_eq!(error.code, code, "{bias}");
         }
-        let good = request(json!({"logit_bias": {"50256": -100, "0": 1.5, "7": 100}}));
+        let colliding = request(json!({"logit_bias": {"5": 1, "05": 2}}));
+        let errors = colliding.validate().expect_err("colliding keys");
+        let message = errors.field_errors()["logit_bias"][0]
+            .message
+            .as_deref()
+            .unwrap_or_default();
+        assert!(
+            message.contains("'05' and '5' both name token 5"),
+            "{message}"
+        );
+        let good = request(json!({"logit_bias": {"50256": -100, "0": 1.5, "7": 100, "08": 0}}));
         assert_eq!(rejection(&good), None);
     }
 

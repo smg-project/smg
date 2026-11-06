@@ -308,18 +308,35 @@ pub(crate) fn on_field(
 }
 
 /// Validates `logit_bias` as the public API bounds it: every key a
-/// non-negative integer token id, every bias within -100..=100 (a bias of
-/// -100 bans the token, 100 forces it). Used by the chat and the completion
-/// request; the serving path bounds the ids by the model's vocabulary before
-/// the map reaches an engine.
+/// non-negative integer token id, no two keys spelling one id (`"5"` and
+/// `"05"` would reach an engine as one entry with either bias), every bias
+/// within -100..=100 (a bias of -100 bans the token, 100 forces it). Used by
+/// the chat and the completion request; the serving path bounds the ids by
+/// the model's vocabulary before the map reaches an engine.
 pub fn validate_logit_bias(bias: &HashMap<String, f32>) -> Result<(), validator::ValidationError> {
+    // The key first seen for each token id.
+    let mut keys_by_id = HashMap::with_capacity(bias.len());
     for (key, bias) in bias {
-        if !key.parse::<i32>().is_ok_and(|id| id >= 0) {
+        let Some(id) = key.parse::<i32>().ok().filter(|id| *id >= 0) else {
             return Err(invalid(
                 "logit_bias_invalid_key",
                 format!(
                     "Invalid key in 'logit_bias': '{key}'; keys must be non-negative integer token \
                      ids"
+                ),
+            ));
+        };
+        if let Some(other) = keys_by_id.insert(id, key.as_str()) {
+            let (first, second) = if other < key.as_str() {
+                (other, key.as_str())
+            } else {
+                (key.as_str(), other)
+            };
+            return Err(invalid(
+                "logit_bias_duplicate_key",
+                format!(
+                    "Invalid key in 'logit_bias': '{first}' and '{second}' both name token {id}; \
+                     each token takes one bias"
                 ),
             ));
         }

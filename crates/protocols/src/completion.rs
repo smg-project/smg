@@ -498,6 +498,10 @@ mod tests {
                 serde_json::json!({"not-a-token": 1}),
                 "logit_bias_invalid_key",
             ),
+            (
+                serde_json::json!({"5": 1, "05": 2}),
+                "logit_bias_duplicate_key",
+            ),
             (serde_json::json!({"1": 101}), "integer_above_max_value"),
             (serde_json::json!({"1": -101}), "integer_below_min_value"),
         ] {
