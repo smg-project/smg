@@ -324,6 +324,28 @@ mod tests {
         assert!(registry.register("resumed").is_ok());
     }
 
+    /// The servicer's own probe is abortable like any request and touches
+    /// the active count neither on registration nor on release: its drop
+    /// leaves a client's lifetime counted, and the client's drop empties the
+    /// count.
+    #[test]
+    fn an_uncounted_registration_is_abortable_and_outside_the_active_count() {
+        let registry = Arc::new(RequestRegistry::default());
+        let (client, _cancel) = registry.register("client").unwrap();
+        let (probe, mut cancel) = registry.register_uncounted("HEALTH_CHECK_1").unwrap();
+        assert_eq!((registry.active(), registry.len()), (1, 2));
+        assert_eq!(registry.abort(&["HEALTH_CHECK_1".to_string()]).unwrap(), 1);
+        assert!(matches!(cancel.try_recv(), Ok(CancelReason::Abort)));
+        drop(probe);
+        assert_eq!(
+            (registry.active(), registry.len()),
+            (1, 1),
+            "the probe's release leaves the client's lifetime"
+        );
+        drop(client);
+        assert_eq!(registry.active(), 0);
+    }
+
     /// While readiness is held for the planned warm-up, the warm-up's own
     /// requests are admitted and every other id is refused as not serving;
     /// the drain refuses the warm-up's own as well; the release admits all.
