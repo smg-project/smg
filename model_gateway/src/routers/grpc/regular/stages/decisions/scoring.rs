@@ -10,7 +10,10 @@ use llm_tokenizer::{
 use openai_protocol::decisions::{DecisionResponse, DecisionsRequest};
 use serde_json::{json, Map, Value};
 
-use crate::routers::{common::decisions::SglangDecisionAdapter, grpc::utils::encode_blocking};
+use crate::routers::{
+    common::decisions::SglangDecisionAdapter,
+    grpc::utils::{encode_blocking_in_batch, InPlaceBudget},
+};
 
 pub(crate) struct DecisionPrompt {
     pub text: String,
@@ -56,6 +59,9 @@ pub(crate) async fn prepare_decisions(
     let mut prompts = Vec::with_capacity(questions.len());
     let mut kinds = Vec::with_capacity(questions.len());
     let mut pair_labels = None;
+    // The request's encodes are one call's: they run in place up to the bound
+    // and on the pool past it, so no worker holds the request for longer.
+    let mut budget = InPlaceBudget::default();
     for (name, question) in questions {
         let kind = match question["type"].as_str() {
             Some("noul") => QuestionKind::Predicate,
@@ -96,8 +102,8 @@ pub(crate) async fn prepare_decisions(
         let content = render_question(&state, question, kind, &labels)?;
         let text = render_prompt(&tokenizer, &content)?;
         reject_reasoning(&tokenizer, &content, &text, answers_open_reasoning)?;
-        let token_ids = encode_ids(&tokenizer, &text).await?;
-        let label_context = label_suffix(&tokenizer, &text, &token_ids).await?;
+        let token_ids = encode_ids(&tokenizer, &text, &mut budget).await?;
+        let label_context = label_suffix(&tokenizer, &text, &token_ids, &mut budget).await?;
         let (label_text, label_prefix) = label_context
             .as_ref()
             .map_or((text.as_str(), token_ids.as_slice()), |(text, ids)| {
@@ -108,7 +114,8 @@ pub(crate) async fn prepare_decisions(
         // A verified added-token boundary permits the same bounded suffix
         // check as native SGLang, avoiding repeated encoding of the evidence.
         for label in labels {
-            let Some(id) = label_token_id(&tokenizer, label_text, label_prefix, &label).await?
+            let Some(id) =
+                label_token_id(&tokenizer, label_text, label_prefix, &label, &mut budget).await?
             else {
                 return Err(format!("question {name}: answer label {label:?} is not one distinct token after the chat prompt"));
             };
@@ -301,8 +308,15 @@ fn suffixed_reasoning_markers(text: &str) -> impl Iterator<Item = (String, Strin
     })
 }
 
-async fn encode_ids(tokenizer: &Arc<dyn Tokenizer>, text: &str) -> Result<Vec<u32>, String> {
-    encode_blocking(tokenizer.clone(), text, false)
+/// The ids of `text`, charged to the call's `budget`: a request's prompts,
+/// answer boundaries and label probes encode in place up to the bound and on
+/// the pool past it.
+async fn encode_ids(
+    tokenizer: &Arc<dyn Tokenizer>,
+    text: &str,
+    budget: &mut InPlaceBudget,
+) -> Result<Vec<u32>, String> {
+    encode_blocking_in_batch(tokenizer.clone(), text, false, budget)
         .await
         .map(Encoding::into_token_ids)
         .map_err(|error| format!("Decisions tokenization failed: {error}"))
@@ -313,8 +327,9 @@ async fn label_token_id(
     text: &str,
     ids: &[u32],
     label: &str,
+    budget: &mut InPlaceBudget,
 ) -> Result<Option<u32>, String> {
-    let extended = encode_ids(tokenizer, &format!("{text}{label}")).await?;
+    let extended = encode_ids(tokenizer, &format!("{text}{label}"), budget).await?;
     Ok((extended.len() == ids.len() + 1 && extended.starts_with(ids)).then(|| extended[ids.len()]))
 }
 
@@ -324,6 +339,7 @@ async fn label_suffix(
     tokenizer: &Arc<dyn Tokenizer>,
     prompt: &str,
     ids: &[u32],
+    budget: &mut InPlaceBudget,
 ) -> Result<Option<(String, Vec<u32>)>, String> {
     let added = &tokenizer.get_special_tokens().additional_special_tokens;
     for (index, id) in ids.iter().enumerate().rev() {
@@ -337,7 +353,7 @@ async fn label_suffix(
             continue;
         };
         let suffix = &prompt[at + token.len()..];
-        let suffix_ids = encode_ids(tokenizer, suffix).await?;
+        let suffix_ids = encode_ids(tokenizer, suffix, budget).await?;
         if suffix_ids == ids[index + 1..] {
             return Ok(Some((suffix.to_owned(), suffix_ids)));
         }
@@ -345,13 +361,18 @@ async fn label_suffix(
     Ok(None)
 }
 
+/// The two-letter labels the tokenizer keeps as one token behind the answer
+/// boundary. Each probe is one encode of a constant-size suffix, placed by
+/// its own size (a fresh [`InPlaceBudget`]): the probes are independent of
+/// user input and a few bytes each, so none would pay its offload.
 async fn encode_pair_labels(tokenizer: &Arc<dyn Tokenizer>) -> Result<Vec<String>, String> {
+    let own = InPlaceBudget::default;
     let first_prompt = render_prompt(tokenizer, "x")?;
-    let first_ids = encode_ids(tokenizer, &first_prompt).await?;
-    let first = label_suffix(tokenizer, &first_prompt, &first_ids).await?;
+    let first_ids = encode_ids(tokenizer, &first_prompt, &mut own()).await?;
+    let first = label_suffix(tokenizer, &first_prompt, &first_ids, &mut own()).await?;
     let second_prompt = render_prompt(tokenizer, "y")?;
-    let second_ids = encode_ids(tokenizer, &second_prompt).await?;
-    let second = label_suffix(tokenizer, &second_prompt, &second_ids).await?;
+    let second_ids = encode_ids(tokenizer, &second_prompt, &mut own()).await?;
+    let second = label_suffix(tokenizer, &second_prompt, &second_ids, &mut own()).await?;
     let Some((suffix, ids)) = first.filter(|first| second.as_ref() == Some(first)) else {
         return Err(
             "More than 26 Decisions choices requires a stable added-token answer boundary".into(),
@@ -362,7 +383,7 @@ async fn encode_pair_labels(tokenizer: &Arc<dyn Tokenizer>) -> Result<Vec<String
     for a in b'A'..=b'Z' {
         for b in b'A'..=b'Z' {
             let label = format!("{}{}", char::from(a), char::from(b));
-            if let Some(id) = label_token_id(tokenizer, &suffix, &ids, &label).await? {
+            if let Some(id) = label_token_id(tokenizer, &suffix, &ids, &label, &mut own()).await? {
                 if seen.insert(id) {
                     labels.push(label);
                 }
@@ -572,6 +593,36 @@ mod tests {
             let result = prepare_decisions(&request(), tokenizer(template), false).await;
             assert!(result.err().unwrap().contains("reasoning"));
         }
+    }
+
+    /// The label probes of one call charge one in-place budget: over a prompt
+    /// of a few kibibytes they encode on the calling thread up to the bound
+    /// and on the pool past it, as every one of them did below the earlier
+    /// bound.
+    #[tokio::test]
+    async fn label_probes_encode_in_place_up_to_the_bound_and_the_rest_on_the_pool() {
+        use crate::routers::grpc::testing::thread_recording_tokenizer;
+
+        let (tokenizer, ran_on) = thread_recording_tokenizer();
+        let text = "word ".repeat(1024);
+        let ids = tokenizer.encode(&text, false).unwrap().into_token_ids();
+        ran_on.lock().unwrap().clear();
+        let here = std::thread::current().id();
+
+        let mut budget = InPlaceBudget::default();
+        for label in ["A", "B", "C", "D", "E", "F"] {
+            label_token_id(&tokenizer, &text, &ids, label, &mut budget)
+                .await
+                .unwrap();
+        }
+
+        let threads = std::mem::take(&mut *ran_on.lock().unwrap());
+        assert_eq!(threads.len(), 6, "every probe is encoded");
+        assert_eq!(
+            threads.iter().filter(|t| **t == here).count(),
+            3,
+            "three probes of five kibibytes fit the bound in place; the rest go to the pool"
+        );
     }
 
     #[tokio::test]

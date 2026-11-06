@@ -297,8 +297,9 @@ pub(crate) fn missing_tokenizer_response(
 /// thread that holds the request; from this size up the encode runs on the
 /// blocking pool, bounded by [`encode_permits`], so no worker is held for
 /// longer than about one request's own share of work: a single prompt by its
-/// own size, a batch (a completion with several prompts, a tokenize call) by
-/// what the call has already encoded in place, through [`InPlaceBudget`]. A
+/// own size, a batch (a completion with several prompts, as text or as ids, a
+/// tokenize call, a Decisions request's prompts and label probes) by what the
+/// call has already encoded or decoded in place, through [`InPlaceBudget`]. A
 /// prompt of ids counts its ids' bytes, four each.
 ///
 /// The bound is where the encode outweighs its offload. An offloaded encode
@@ -393,12 +394,12 @@ async fn encode_sized(
     offload(len, move || tokenizer.encode(&text, add_special_tokens)).await
 }
 
-/// What one call has encoded on the runtime thread so far. A batch charges
-/// each of its texts against the bound together with the bytes the call
-/// already encoded in place, so the call as a whole holds a worker for no
-/// longer than one text at the bound would; a text that would take the call
-/// over the bound goes to the pool, beside the others there, as every text at
-/// or above the bound does.
+/// What one call has encoded or decoded on the runtime thread so far. A batch
+/// charges each of its inputs against the bound together with the bytes the
+/// call already ran in place, so the call as a whole holds a worker for no
+/// longer than one input at the bound would; an input that would take the
+/// call over the bound goes to the pool, beside the others there, as every
+/// input at or above the bound does.
 #[derive(Default)]
 pub(crate) struct InPlaceBudget {
     in_place: usize,
@@ -431,17 +432,20 @@ pub(crate) fn encode_blocking_in_batch<'a>(
     encode_sized(tokenizer, text, add_special_tokens, charged)
 }
 
-/// Decode `ids` through the offload policy of [`offload`]: a prompt given as
-/// ids leaves the worker thread at the same size a text prompt does.
-pub(crate) async fn decode_blocking(
+/// Decode one prompt of `ids` of a call through the offload policy of
+/// [`offload`], the call's [`InPlaceBudget`] deciding where, as
+/// [`encode_blocking_in_batch`] does for a text: a prompt given as ids leaves
+/// the worker thread at the same size a text prompt does, four bytes an id.
+/// The decision is taken when the future is made; a call of one prompt
+/// charges a budget of its own.
+pub(crate) fn decode_blocking_in_batch(
     tokenizer: Arc<dyn Tokenizer>,
     ids: Vec<u32>,
     skip_special_tokens: bool,
-) -> anyhow::Result<String> {
-    offload(ids.len() * size_of::<u32>(), move || {
-        tokenizer.decode(&ids, skip_special_tokens)
-    })
-    .await
+    budget: &mut InPlaceBudget,
+) -> impl Future<Output = anyhow::Result<String>> {
+    let charged = budget.charge(ids.len() * size_of::<u32>());
+    offload(charged, move || tokenizer.decode(&ids, skip_special_tokens))
 }
 
 /// Tokenize a rendered chat prompt the way its renderer said to: a deferred
