@@ -28,6 +28,18 @@ REGRESSIONS = (
         "e2e_test/benchmarks/nightly_summarize.py",
         "scripts/tests/test_nightly_summary_errors.py",
     ),
+    (
+        ".github/workflows/e2e-gpu-job.yml",
+        "scripts/tests/test_ci_final_environment_scope.py",
+    ),
+    (
+        ".github/workflows/e2e-gpu-job.yml",
+        "scripts/tests/test_ci_e2e_log_pump_lifetime.py",
+    ),
+    (
+        "scripts/ci_verify_sglang_rocm_cohort.py",
+        "scripts/tests/test_ci_engine_http_dependencies.py",
+    ),
 )
 
 

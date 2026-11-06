@@ -139,11 +139,23 @@ on:
         required: false
         type: string
         default: ""
+      final_environment_check:
+        description: "Opt in to fixed-image AMD SGLang setup, live JUnit/log capture and prepared/final pip/cohort verification"
+        required: false
+        type: boolean
+        default: false
       enabled:
         description: "Whether this row runs: false skips the job before it takes a runner (a caller's matrix row the changed paths do not reach)"
         required: false
         type: boolean
         default: true
+    outputs:
+      complete_evidence_artifact:
+        description: "Successful per-invocation complete upload; matrix calls return one nonempty leg, not all rows"
+        value: ${{ jobs.run.outputs.complete_evidence_artifact }}
+      worker_log_artifact:
+        description: "Successful per-invocation worker-log upload; matrix calls do not aggregate rows"
+        value: ${{ jobs.run.outputs.worker_log_artifact }}
 
 jobs:
   run:
@@ -151,6 +163,9 @@ jobs:
     runs-on: ${{ inputs.runner }}
     container: ${{ inputs.container_image != '' && fromJSON(format('{{"image":{0},"options":{1}}}', toJSON(inputs.container_image), toJSON(inputs.container_options))) || vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: ${{ inputs.timeout }}
+    outputs:
+      complete_evidence_artifact: ${{ steps.upload-complete-evidence.outputs.artifact-id != '' && steps.evidence-identity.outputs.complete_artifact || '' }}
+      worker_log_artifact: ${{ steps.upload-worker-logs.outputs.artifact-id != '' && steps.evidence-identity.outputs.worker_artifact || '' }}
     permissions:
       contents: read
     env:
@@ -199,10 +214,32 @@ jobs:
             url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf \
             "https://github.com/"
 
+      - name: Check final-environment verification scope
+        if: inputs.final_environment_check
+        env:
+          CHECK_ENGINE: ${{ inputs.engine }}
+          CHECK_VENDOR: ${{ inputs.gpu_vendor }}
+          CHECK_IMAGE: ${{ inputs.container_image }}
+        shell: bash
+        run: |
+          test "$CHECK_ENGINE" = sglang
+          test "$CHECK_VENDOR" = amd
+          [[ "$CHECK_IMAGE" =~ ^[[:alnum:]][[:alnum:]_.:/-]*:[[:alnum:]_.-]+@sha256:[a-f0-9]{64}$ ]]
+          test "$(grep -Ec '^[[:space:]]*IMAGE([[:space:]:=]|$)' scripts/ci_verify_sglang_rocm_cohort.py)" = 1
+          grep -Fqx "IMAGE = \"$CHECK_IMAGE\"" scripts/ci_verify_sglang_rocm_cohort.py
+          test -s scripts/ci_setup_sglang_rocm_image.sh
+          test -s scripts/ci_verify_sglang_rocm_cohort.py
+
       # Engine-specific setup
       - name: Setup SGLang backend
-        if: inputs.engine == 'sglang'
+        if: inputs.engine == 'sglang' && !inputs.final_environment_check
         uses: ./.github/actions/setup-sglang
+
+      - name: Setup AMD SGLang in its fixed ROCm image
+        if: inputs.final_environment_check
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+        run: bash scripts/ci_setup_sglang_rocm_image.sh
 
       - name: Setup vLLM backend
         if: inputs.engine == 'vllm' && inputs.gpu_vendor != 'amd'
@@ -238,6 +275,23 @@ jobs:
           pip install wheel/*.whl
           bash scripts/ci_install_e2e_deps.sh ${{ inputs.extra_deps }}
 
+      - name: Check prepared AMD SGLang environment
+        if: inputs.final_environment_check
+        timeout-minutes: 2
+        shell: bash
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+        run: |
+          mkdir -p e2e-logs
+          pip_status=0
+          python3 -m pip check >e2e-logs/prepared-pip.stdout 2>e2e-logs/prepared-pip.stderr || pip_status=$?
+          cohort_status=0
+          bash scripts/ci_setup_sglang_rocm_image.sh --verify-only e2e-logs/sglang-native-environment-prepared.json \
+            >e2e-logs/prepared-cohort.stdout 2>e2e-logs/prepared-cohort.stderr || cohort_status=$?
+          printf '{"pip_returncode":%s,"cohort_returncode":%s}\n' "$pip_status" "$cohort_status" >e2e-logs/prepared-environment-status.json
+          test "$pip_status" -eq 0
+          test "$cohort_status" -eq 0
+
       # The servicer's engine-gated unit tests (importorskip("vllm"),
       # importorskip("sglang") for the SGLang ZMQ wire pins) only meet a real
       # engine here; the CPU unit-test job skips them. One lane per engine opts in.
@@ -271,6 +325,7 @@ jobs:
       # Run tests
       - name: Run E2E tests
         timeout-minutes: ${{ inputs.test_timeout }}
+        shell: bash
         env:
           SMG_PROVIDER_OPENAI_API_KEY: ${{ inputs.provider_api_keys && secrets.OPENAI_API_KEY || '' }}
           SMG_PROVIDER_XAI_API_KEY: ${{ inputs.provider_api_keys && secrets.XAI_API_KEY || '' }}
@@ -280,6 +335,7 @@ jobs:
           E2E_MIN_SELECTED: ${{ inputs.min_selected }}
           E2E_AMD_REQUIRE_PASSING_CALL: ${{ inputs.gpu_vendor == 'amd' && '1' || '' }}
           E2E_GPU_VENDOR: ${{ inputs.gpu_vendor }}
+          FINAL_ENVIRONMENT_CHECK: ${{ inputs.final_environment_check && '1' || '0' }}
           E2E_WORKER_RUST_LOG: ${{ inputs.worker_log_filter }}
           BRAVE_MCP_HOST: ${{ inputs.setup_agentic_deps && 'brave-search-mcp' || '' }}
           # Every gRPC servicer runs a planned warm-up before it reports
@@ -313,64 +369,140 @@ jobs:
           else
             bash scripts/ci_killall_sglang.sh "nuke_gpus"
           fi
-          pytest ${{ inputs.test_dirs }} \
-            --ignore=e2e_test/benchmarks \
-            --ignore=e2e_test/bindings_go \
-            ${{ inputs.test_filter }} \
-            --reruns 2 --reruns-delay 5 \
+          pytest_args=(
+            ${{ inputs.test_dirs }}
+            --ignore=e2e_test/benchmarks
+            --ignore=e2e_test/bindings_go
+            ${{ inputs.test_filter }}
+            --reruns 2 --reruns-delay 5
             -s -vv
+          )
+          if [ "$FINAL_ENVIRONMENT_CHECK" = 1 ]; then
+            mkdir -p e2e-logs
+            # Descendants may keep writing after pytest exits. They inherit
+            # regular spool files, never the live pumps' pipes.
+            : >e2e-logs/pytest.stdout.source
+            : >e2e-logs/pytest.stderr.source
+            set +e
+            pytest "${pytest_args[@]}" --junitxml=e2e-logs/sglang-results.xml \
+              >e2e-logs/pytest.stdout.source 2>e2e-logs/pytest.stderr.source &
+            pytest_pid=$!
+            (
+              set -o pipefail
+              tail -n +1 --pid="$pytest_pid" --sleep-interval=0.1 -f e2e-logs/pytest.stdout.source \
+                | tee e2e-logs/pytest.stdout
+            ) &
+            stdout_pump_pid=$!
+            (
+              set -o pipefail
+              tail -n +1 --pid="$pytest_pid" --sleep-interval=0.1 -f e2e-logs/pytest.stderr.source \
+                | tee e2e-logs/pytest.stderr >&2
+            ) &
+            stderr_pump_pid=$!
+            wait "$pytest_pid"
+            pytest_status=$?
+            wait "$stdout_pump_pid"
+            stdout_status=$?
+            wait "$stderr_pump_pid"
+            stderr_status=$?
+            set -e
+            # Preserve pytest's failure; either live-copy failure also rejects green.
+            if [ "$pytest_status" -ne 0 ]; then
+              exit "$pytest_status"
+            fi
+            if [ "$stdout_status" -ne 0 ]; then
+              exit "$stdout_status"
+            fi
+            exit "$stderr_status"
+          fi
+          pytest "${pytest_args[@]}"
+
+      - name: Identify row evidence
+        id: evidence-identity
+        if: always() && ((inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd') || failure() || cancelled())
+        env:
+          EVIDENCE_INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib
+          import json
+          import os
+          import re
+          import uuid
+
+          inputs = json.loads(os.environ["EVIDENCE_INPUTS"])
+          canonical = json.dumps(inputs, sort_keys=True, separators=(",", ":"))
+          digest = hashlib.sha256(canonical.encode()).hexdigest()[:12]
+          engine = inputs.get("engine", "")
+          backend = inputs.get("kv_backend") or (
+              inputs.get("vllm_kv_backend", "") if engine == "vllm" else ""
+          )
+          mode = (
+              (inputs.get("vllm_moriio_mode", "").strip().lower() or "read")
+              if engine == "vllm" and backend == "moriio"
+              else ""
+          )
+          vendor = inputs.get("gpu_vendor") or "unknown"
+          dp = str(inputs.get("zmq_engine_count") or "").strip()
+          fields = [engine, inputs.get("test_dirs", ""), backend or "auto", mode,
+                    vendor, inputs.get("connection_mode", ""),
+                    f"dp{dp}" if dp not in ("", "1") else "",
+                    inputs.get("servicer_impl", ""), inputs.get("mm_processing", "")]
+          label = re.sub(r"[^A-Za-z0-9_.-]+", "-", "-".join(fields)).strip("-.")[:96]
+          tier = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(inputs.get("gpu_tier", "")))
+          contract = f"{label}-gpu{tier}-{digest}"
+          # Keep the existing per-invocation UUID safety for identical parallel rows.
+          attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
+          invocation = f"{attempt}-{uuid.uuid4().hex}"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"complete_artifact=sglang-complete-results-{contract}-{invocation}", file=output)
+              print(f"worker_artifact=e2e-worker-logs-{contract}-{invocation}", file=output)
+          PYTHON
+
+      # This is deliberately after pytest and before marker-based process cleanup.
+      # Keep both return codes and streams even when pytest or either check fails.
+      - name: Check final AMD SGLang environment
+        id: final-environment
+        if: always() && inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
+        timeout-minutes: 2
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+        run: |
+          mkdir -p e2e-logs
+          pip_status=0
+          python3 -m pip check >e2e-logs/final-pip.stdout 2>e2e-logs/final-pip.stderr || pip_status=$?
+          cohort_status=0
+          bash scripts/ci_setup_sglang_rocm_image.sh --verify-only e2e-logs/sglang-native-environment-final.json \
+            >e2e-logs/final-cohort.stdout 2>e2e-logs/final-cohort.stderr || cohort_status=$?
+          printf '{"pip_returncode":%s,"cohort_returncode":%s}\n' "$pip_status" "$cohort_status" >e2e-logs/final-environment-status.json
+          test "$pip_status" -eq 0
+          test "$cohort_status" -eq 0
+
+      - name: Upload AMD SGLang complete test and final-environment evidence
+        id: upload-complete-evidence
+        if: always() && inputs.final_environment_check && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.evidence-identity.outputs.complete_artifact }}
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Worker failure diagnostics
         if: failure() || cancelled()
+        env:
+          WORKER_LOG_ARTIFACT: ${{ steps.evidence-identity.outputs.worker_artifact }}
         run: |
-          LABEL=$(echo '${{ inputs.test_dirs }}' | tr '/' '-')
-          # vLLM legs can differ only by KV backend; disambiguate the artifact
-          SUFFIX=""
-          if [ -n "${{ inputs.kv_backend }}" ]; then
-            SUFFIX="-${{ inputs.kv_backend }}"
-          elif [ "${{ inputs.engine }}" = "vllm" ]; then
-            SUFFIX="-${{ inputs.vllm_kv_backend }}"
-          fi
-          # MoRI-IO lanes differ by transfer mode, and AMD lanes by vendor.
-          if [ -n "${{ inputs.vllm_moriio_mode }}" ]; then
-            SUFFIX="${SUFFIX}-${{ inputs.vllm_moriio_mode }}"
-          fi
-          if [ "${{ inputs.gpu_vendor }}" = amd ]; then
-            SUFFIX="${SUFFIX}-amd"
-          fi
-          # gRPC and ZMQ chat legs share engine/GPU/test-dir and differ only by
-          # wire mode; fold it in so their log artifacts don't collide.
-          MODE="${{ inputs.connection_mode }}"
-          if [ -n "$MODE" ]; then
-            SUFFIX="${SUFFIX}-${MODE}"
-          fi
-          # A grouped ZMQ lane runs the same suite over the same wire with
-          # several engines per worker; its logs are its own.
-          DP="${{ inputs.zmq_engine_count }}"
-          if [ -n "$DP" ] && [ "$DP" -gt 1 ]; then
-            SUFFIX="${SUFFIX}-dp${DP}"
-          fi
-          # The worker-side media lane reuses the multimodal test files.
-          MM="${{ inputs.mm_processing }}"
-          if [ -n "$MM" ]; then
-            SUFFIX="${SUFFIX}-mm-${MM}"
-          fi
-          # A leg that names its servicer runs the same suite as the engine's
-          # default leg; keep their log artifacts apart.
-          IMPL="${{ inputs.servicer_impl }}"
-          if [ -n "$IMPL" ]; then
-            SUFFIX="${SUFFIX}-${IMPL}-servicer"
-          fi
-          ARTIFACT="e2e-worker-logs-${{ inputs.engine }}-gpu${{ inputs.gpu_tier }}-${LABEL}${SUFFIX}"
-          bash scripts/ci_dump_worker_logs.sh e2e-logs "$ARTIFACT"
-          echo "artifact=${ARTIFACT}" >> "$GITHUB_OUTPUT"
+          bash scripts/ci_dump_worker_logs.sh e2e-logs "$WORKER_LOG_ARTIFACT"
+          echo "artifact=${WORKER_LOG_ARTIFACT}" >> "$GITHUB_OUTPUT"
         id: log-snapshot
 
       - name: Upload worker logs
+        id: upload-worker-logs
         if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.log-snapshot.outputs.artifact }}
+          name: ${{ steps.evidence-identity.outputs.worker_artifact }}
           path: e2e-logs/
           retention-days: 7
           if-no-files-found: ignore
