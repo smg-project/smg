@@ -344,7 +344,9 @@ pub struct Tree {
     /// The node each hashed insert ended at, by path hash, so a path named
     /// by its hash alone (a mesh delta) resolves to its node without a
     /// second copy of the text; an entry leaves with its node, under the
-    /// same eviction (see [`Tree::detach_if_empty`]).
+    /// same eviction (see [`Tree::detach_if_empty`]). The root is never
+    /// named: the empty text ends there, every tenant holds it, and a
+    /// repair page carries it as its first entry.
     hashed: DashMap<u64, Weak<Node>, FxBuildHasher>,
 }
 
@@ -586,6 +588,9 @@ impl Tree {
     /// entry is the request's as much as the repair's and stays; removing it
     /// would leave a named node that no lookup reaches until its eviction.
     fn claim_unless_named(&self, node: &NodeRef, path_hash: u64) {
+        if Arc::ptr_eq(node, &self.root) {
+            return;
+        }
         self.hashed.insert(path_hash, Arc::downgrade(node));
         if let Err(current) =
             node.path_hash
@@ -611,7 +616,7 @@ impl Tree {
         let Some(path_hash) = path_hash else {
             return;
         };
-        if node.path_hash.load(Ordering::Relaxed) == path_hash {
+        if Arc::ptr_eq(node, &self.root) || node.path_hash.load(Ordering::Relaxed) == path_hash {
             return;
         }
         self.hashed.insert(path_hash, Arc::downgrade(node));

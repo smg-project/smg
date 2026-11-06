@@ -2346,7 +2346,12 @@ fn peers_resolve_every_tail_of_a_shared_prefix() {
         next_cursor: None,
         is_last: true,
     };
-    assert_eq!(b.apply_repair_page(&page), 1);
+    // The page carries two entries: the root's tenants (a tenant that
+    // inserted anything exists at the root) and the shared node. The root
+    // entry inserts and names nothing; the node's entry finds the node
+    // named by the request already.
+    assert_eq!(page.entries.len(), 2);
+    assert_eq!(b.apply_repair_page(&page), 2);
     let resolved_after = prompts
         .iter()
         .filter(|prompt| {

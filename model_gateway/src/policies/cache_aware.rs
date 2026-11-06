@@ -905,7 +905,8 @@ impl CacheAwarePolicy {
                 .map(|entry| entry.value().clone());
 
             if let Some(tree) = tree {
-                if self.mesh_attached() {
+                // The empty text ends at the root, which no hash names.
+                if self.mesh_attached() && !text.is_empty() {
                     tree.insert_text_with_hash(text, worker_url, kv_index::hash_node_path(text));
                 } else {
                     tree.insert_text(text, worker_url);
@@ -3314,10 +3315,10 @@ impl CacheAwarePolicy {
         let keyed: &str = &keyed;
 
         // The hash rides on the insert and the delta while the mesh is
-        // attached (see `select_worker_with_tokens`).
-        let path_hash = self
-            .mesh_attached()
-            .then(|| kv_index::hash_node_path(keyed));
+        // attached (see `select_worker_with_tokens`); the empty text ends at
+        // the root, which no hash names.
+        let path_hash =
+            (self.mesh_attached() && !keyed.is_empty()).then(|| kv_index::hash_node_path(keyed));
 
         let mut selected_idx: Option<usize> = None;
         let result = tree.match_and_insert_with_hash(keyed, path_hash, |result| {

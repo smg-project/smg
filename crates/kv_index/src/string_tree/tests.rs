@@ -2418,3 +2418,24 @@ fn hashes_name_live_nodes_through_random_inserts_and_evictions() {
     assert_eq!(tree.hashed_paths(), 0);
     assert_hashes_name_live_nodes(&tree);
 }
+
+#[test]
+fn the_empty_text_names_nothing() {
+    // The empty text ends at the root, which every tenant holds: a request
+    // that hashes it and a repair page's root entry record nothing, and the
+    // hash resolves to no node. The token tree's rule for a sequence under
+    // one page, kept in the twin.
+    let tree = Tree::new();
+    let empty = crate::hash_node_path("");
+    tree.insert_text_with_hash("", "t1", empty);
+    tree.insert_text_with_hash_unless_named("", "t1", empty);
+    tree.match_and_insert_with_hash("", Some(empty), |_| Some("t1"));
+    assert_eq!(tree.hashed_paths(), 0);
+    assert!(!tree.insert_tenant_by_hash(empty, "t2"));
+
+    let named = crate::hash_node_path("hello world");
+    tree.insert_text_with_hash("hello world", "t1", named);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(tree.insert_tenant_by_hash(named, "t2"));
+    assert_hashes_name_live_nodes(&tree);
+}
