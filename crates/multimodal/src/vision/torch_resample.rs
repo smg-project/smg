@@ -24,6 +24,8 @@
     allow(unsafe_code)
 )]
 
+use std::ops::Range;
+
 use super::{
     execution,
     transforms::{FixedKernel, KernelQuantization, PilResizeFilter},
@@ -67,17 +69,30 @@ enum Rows {
 
 impl Axis {
     fn new(in_size: usize, out_size: usize, filter: PilResizeFilter, pass: Pass) -> Self {
+        Self::window(in_size, out_size, filter, pass, 0..out_size)
+    }
+
+    /// The axis for the outputs `window` of an `out_size`-wide resample
+    /// alone: those outputs keep the taps and the source ranges they have in
+    /// the whole, so their pixels come out the same.
+    fn window(
+        in_size: usize,
+        out_size: usize,
+        filter: PilResizeFilter,
+        pass: Pass,
+        window: Range<usize>,
+    ) -> Self {
         let kernel = FixedKernel::new(in_size, out_size, filter, KernelQuantization::TorchUint8);
-        let stride = kernel
-            .taps
+        let window_taps = &kernel.taps[window.clone()];
+        let stride = window_taps
             .iter()
             .map(Vec::len)
             .max()
             .unwrap_or(0)
             .div_ceil(4)
             * 4;
-        let mut taps = vec![0i16; out_size * stride];
-        for (index, output_taps) in kernel.taps.iter().enumerate() {
+        let mut taps = vec![0i16; window_taps.len() * stride];
+        for (index, output_taps) in window_taps.iter().enumerate() {
             for (k, &tap) in output_taps.iter().enumerate() {
                 // Below 2^15 in magnitude by the quantization's rule (the
                 // finest scale that keeps the largest tap under it); a tap
@@ -104,7 +119,13 @@ impl Axis {
         #[cfg(not(target_arch = "aarch64"))]
         let _ = pass;
         Self {
-            bounds: kernel.bounds,
+            bounds: {
+                // The window's entries, in place.
+                let mut bounds = kernel.bounds;
+                bounds.truncate(window.end);
+                bounds.drain(..window.start);
+                bounds
+            },
             stride,
             taps,
             #[cfg(target_arch = "aarch64")]
@@ -157,6 +178,102 @@ fn resize_rgb_scalar(
     filter: PilResizeFilter,
 ) -> Vec<u8> {
     resize_rgb_with(data, in_w, in_h, out_w, out_h, filter, Rows::Scalar)
+}
+
+/// `data` resampled as [`resize_rgb`] would, but only the `window`
+/// (`x, y, width, height` of the output) computed and returned: the width
+/// pass runs on the window's columns over the source rows the window's height
+/// taps read, the height pass on the window's rows of that narrower
+/// intermediate, so the bytes are the whole's bytes there and what a crop
+/// discards costs nothing.
+pub(super) fn resize_rgb_window(
+    data: &[u8],
+    in_w: usize,
+    in_h: usize,
+    out_w: usize,
+    out_h: usize,
+    window: (usize, usize, usize, usize),
+    filter: PilResizeFilter,
+) -> Vec<u8> {
+    resize_rgb_window_with(
+        data,
+        (in_w, in_h),
+        (out_w, out_h),
+        window,
+        filter,
+        Rows::Detected,
+    )
+}
+
+/// [`resize_rgb_window`] on the given rows.
+fn resize_rgb_window_with(
+    data: &[u8],
+    (in_w, in_h): (usize, usize),
+    (out_w, out_h): (usize, usize),
+    window: (usize, usize, usize, usize),
+    filter: PilResizeFilter,
+    path: Rows,
+) -> Vec<u8> {
+    let (x, y, w, h) = window;
+    debug_assert_eq!(data.len(), in_w * in_h * 3);
+    debug_assert!(x + w <= out_w && y + h <= out_h);
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let row = in_w * 3;
+    let width_axis = || Axis::window(in_w, out_w, filter, Pass::Width, x..x + w);
+    let height_axis = || Axis::window(in_h, out_h, filter, Pass::Height, y..y + h);
+    match (in_w != out_w, in_h != out_h) {
+        (false, false) => crop_rows(data, in_w, window),
+        // The window's rows are the source's: their columns alone.
+        (true, false) => horizontal_pass(
+            &data[y * row..(y + h) * row],
+            in_w,
+            h,
+            w,
+            &width_axis(),
+            path,
+        ),
+        (false, true) => {
+            let columns = crop_rows(data, in_w, (x, 0, w, in_h));
+            vertical_pass(&columns, w, h, &height_axis(), path)
+        }
+        (true, true) => {
+            // The source rows the window's height taps read, and no other,
+            // through the width pass; the height axis counts from the first.
+            let mut height = height_axis();
+            let first = height.bounds.first().map_or(0, |&(start, _)| start);
+            let last = height
+                .bounds
+                .iter()
+                .map(|&(start, n)| start + n)
+                .max()
+                .unwrap_or(first);
+            for (start, _) in &mut height.bounds {
+                *start -= first;
+            }
+            let mid = horizontal_pass(
+                &data[first * row..last * row],
+                in_w,
+                last - first,
+                w,
+                &width_axis(),
+                path,
+            );
+            vertical_pass(&mid, w, h, &height, path)
+        }
+    }
+}
+
+/// The `(x, y, width, height)` window of a `row_w`-wide RGB buffer, copied
+/// out.
+fn crop_rows(data: &[u8], row_w: usize, window: (usize, usize, usize, usize)) -> Vec<u8> {
+    let (x, y, w, h) = window;
+    let mut out = Vec::with_capacity(w * h * 3);
+    for row in y..y + h {
+        out.extend_from_slice(&data[(row * row_w + x) * 3..(row * row_w + x + w) * 3]);
+    }
+    out
 }
 
 /// [`resize_rgb`] on the given rows.
@@ -861,6 +978,44 @@ mod tests {
                 &expected,
                 &format!("{in_w}x{in_h} -> {out_w}x{out_h}, the scalar rows"),
             );
+        }
+    }
+
+    /// A window of the output computed alone equals the crop of the whole,
+    /// on the detected rows and on the scalar loops: the LLaVA 1.5 shapes (a
+    /// 16:9 and a 9:16 source to a 336 short side, the center crop's window),
+    /// small windows at the edges, an axis kept, both axes kept.
+    #[test]
+    fn a_window_of_the_resample_equals_the_crop_of_the_whole() {
+        let cases = [
+            (1920, 1080, 597, 336, (130, 0, 336, 336)),
+            (1080, 1920, 336, 597, (0, 130, 336, 336)),
+            (33, 17, 7, 5, (0, 0, 3, 2)),
+            (33, 17, 7, 5, (4, 3, 3, 2)),
+            (7, 5, 33, 17, (30, 15, 3, 2)),
+            (31, 23, 31, 17, (5, 4, 20, 9)),
+            (31, 23, 19, 23, (2, 20, 10, 3)),
+            (31, 23, 31, 23, (3, 2, 10, 5)),
+        ];
+        for (seed, &(in_w, in_h, out_w, out_h, window)) in cases.iter().enumerate() {
+            let data = gradient_rgb(in_w, in_h, seed * 7 + 3);
+            let whole = resize_rgb(&data, in_w, in_h, out_w, out_h, PilResizeFilter::Bicubic);
+            let expected = crop_rows(&whole, out_w, window);
+            for (path, rows) in [(Rows::Detected, "detected"), (Rows::Scalar, "scalar")] {
+                let actual = resize_rgb_window_with(
+                    &data,
+                    (in_w, in_h),
+                    (out_w, out_h),
+                    window,
+                    PilResizeFilter::Bicubic,
+                    path,
+                );
+                assert_same_bytes(
+                    &actual,
+                    &expected,
+                    &format!("{in_w}x{in_h} -> {out_w}x{out_h} window {window:?}, {rows} rows"),
+                );
+            }
         }
     }
 
