@@ -622,7 +622,10 @@ struct ClientInner<P: EngineProtocol> {
     /// written) and their payload bytes, for the bound.
     waiting_adds: AtomicUsize,
     waiting_add_bytes: AtomicUsize,
+    /// Logical payload bytes held by queued frames and the active write.
     retained_input_bytes: Arc<AtomicUsize>,
+    /// Data allowance: [`ENGINE_INPUT_RETAINED_BYTES`] unless
+    /// [`Client::set_input_byte_limit`] changed it. Controls bypass this limit.
     input_byte_limit: AtomicUsize,
     /// When the input writer began the write it is in, if any: a write
     /// pending for a whole send window is the sign of a blocked input.
@@ -866,7 +869,9 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// a whole window sooner than one that waits; the error names the
     /// request's size. The check is not synchronized with the
     /// queue, so a burst can overshoot the bound by a few frames; a burst to
-    /// an engine that reads is never refused, whatever its size.
+    /// an engine that reads is never refused by this check. Independently,
+    /// enqueueing enforces [`Client::set_input_byte_limit`] even on healthy
+    /// engines and can return [`Error::EngineInputBytesFull`].
     fn admit_add(&self, bytes: usize) -> Result<()> {
         let send_timeout = *self.send_timeout.lock();
         let blocked = self
@@ -970,7 +975,9 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// Queue a frame for the input writer, behind every frame queued before
     /// it; `done`, if any, receives the result of the write, and `counted`
     /// bytes are held against the queue bound until the writer takes the
-    /// frame.
+    /// frame. Independently reserves payload bytes through the active write
+    /// against [`Client::set_input_byte_limit`]; `counted: None` controls bypass
+    /// that limit but still contribute to the retained total.
     fn queue_frame(
         &self,
         engine_id: &EngineId,
@@ -982,7 +989,7 @@ impl<P: EngineProtocol> ClientInner<P> {
     ) -> Result<()> {
         let bytes = aux_frames.iter().try_fold(payload.len(), |used, frame| {
             used.checked_add(frame.len())
-                .ok_or(Error::EngineInputBytesFull {
+                .ok_or_else(|| Error::EngineInputBytesFull {
                     retained_bytes: self.retained_input_bytes.load(Ordering::Relaxed),
                     request_bytes: usize::MAX,
                     limit_bytes: self.input_byte_limit.load(Ordering::Relaxed),
@@ -1281,7 +1288,7 @@ impl<P: EngineProtocol> Client<P> {
             waiting_adds: AtomicUsize::new(0),
             waiting_add_bytes: AtomicUsize::new(0),
             retained_input_bytes: Arc::new(AtomicUsize::new(0)),
-            input_byte_limit: AtomicUsize::new(8usize.saturating_mul(1024 * 1024 * 1024)),
+            input_byte_limit: AtomicUsize::new(ENGINE_INPUT_RETAINED_BYTES),
             writing_since: Mutex::new(None),
             refused: AtomicUsize::new(0),
             engines,
@@ -1723,6 +1730,8 @@ impl<P: EngineProtocol> Client<P> {
     /// `ClientInner::admit_add`): once the engine has stopped reading for
     /// a whole send window, a frame that would take the waiting payload past
     /// the bound is refused at once rather than parked and delivered later.
+    /// The unconditional [`Self::set_input_byte_limit`] also applies, returning
+    /// [`Error::EngineInputBytesFull`] even if input is not blocked.
     pub async fn send_typed(
         &self,
         engine_id: &EngineId,
@@ -1886,6 +1895,9 @@ const DRAIN_REWAKES_PER_PROMPT: u8 = 3;
 /// watchdog needs requests in flight, which the requests a blocked input
 /// failed are not.
 const ENGINE_INPUT_DEATH_TIMEOUT: Duration = ENGINE_SILENCE_DEATH_TIMEOUT;
+
+/// Default logical payload allowance for queued frames and the active writer.
+const ENGINE_INPUT_RETAINED_BYTES: usize = 8usize.saturating_mul(1 << 30);
 
 /// The bound on add-requests waiting behind a blocked input, in frames and in
 /// payload bytes: once a send window has elapsed with a frame unaccepted, a
