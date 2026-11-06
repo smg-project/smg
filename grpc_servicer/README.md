@@ -105,9 +105,10 @@ The worker then advertises `mm_processor=inprocess` and `mm_media_ref_schemes`
 through `GetServerInfo`; a router with media-reference support forwards
 `media_refs` only to workers that advertise, and a router without it ignores the
 labels and keeps sending preprocessed tensors. Whatever the processor mode, a
-multimodal engine also advertises its resolved `--limit-mm-per-prompt` as
-`mm_item_limits` (`image=8,video=2`), so a router that preprocesses media
-itself holds requests to the engine's limits, and its encoder budget as
+multimodal engine also advertises its resolved `--limit-mm-per-prompt` for
+audio, image and video as `mm_item_limits` (`audio=1,image=8,video=2`), so a
+router that preprocesses media itself holds requests to the engine's limits,
+and its encoder budget as
 `mm_encoder_budget` (the `budget of N tokens` of the engine's encoder-cache
 start-up line, derived at launch with vLLM's own helper): the most feature
 tokens one media item may carry and still be scheduled, so the router refuses
