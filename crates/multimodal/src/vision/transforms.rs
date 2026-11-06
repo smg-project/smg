@@ -970,18 +970,27 @@ fn pil_h_outputs<const C: usize>(row: &[u8], kernel: &FixedKernel, first: usize,
 }
 
 /// How [`pil_resample_horizontal`] runs its rows: the portable per-output
-/// loop, or, on an x86-64 processor that reports AVX2, the 16-bit
-/// multiply-add steps of [`avx2::h_band`] over the kernel's taps split for
-/// them.
+/// loop; on an x86-64 processor that reports AVX2, the 16-bit multiply-add
+/// steps of [`avx2::h_band`] over the kernel's taps split for them; on one
+/// that reports AVX-512 VNNI and VBMI, the byte dot products of
+/// [`avx512::h_band`] over the taps' byte chunks, for an axis whose output
+/// groups fit its gather ([`GroupTaps`]).
 enum WidthPass {
     Portable,
     #[cfg(target_arch = "x86_64")]
     Avx2(SplitTaps),
+    #[cfg(target_arch = "x86_64")]
+    Avx512(GroupTaps),
 }
 
 impl WidthPass {
     #[cfg(target_arch = "x86_64")]
-    fn new(kernel: &FixedKernel) -> Self {
+    fn new<const C: usize>(kernel: &FixedKernel) -> Self {
+        if avx512::detected() {
+            if let Some(groups) = GroupTaps::new::<C>(kernel) {
+                return Self::Avx512(groups);
+            }
+        }
         if std::arch::is_x86_feature_detected!("avx2") {
             Self::Avx2(SplitTaps::new(kernel, 0, kernel.bounds.len(), 4))
         } else {
@@ -990,18 +999,18 @@ impl WidthPass {
     }
 
     #[cfg(not(target_arch = "x86_64"))]
-    fn new(_kernel: &FixedKernel) -> Self {
+    fn new<const C: usize>(_kernel: &FixedKernel) -> Self {
         Self::Portable
     }
 
     /// Output rows `[y0, y0 + band.len() / (out_w * C))` of the width pass;
-    /// the vector arm detects its feature and calls in one place, as the
+    /// a vector arm detects its features and calls in one place, as the
     /// crate's NEON kernels and the FMA pass keep them.
     #[cfg_attr(
         target_arch = "x86_64",
         expect(
             unsafe_code,
-            reason = "the target-feature function runs only after this function detected its feature"
+            reason = "the target-feature function runs only after this function detected its features"
         )
     )]
     fn rows<const C: usize>(
@@ -1024,6 +1033,16 @@ impl WidthPass {
                 // above, the only requirement of a `target_feature(enable =
                 // "avx2")` function.
                 unsafe { avx2::h_band::<C>(src, kernel, split, in_w, out_w, y0, band) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx512(groups) => {
+                if !avx512::detected() {
+                    return pil_h_band::<C>(src, kernel, in_w, out_w, y0, band);
+                }
+                // SAFETY: `avx512::detected()` answered true just above: the
+                // processor reports every feature the `target_feature`
+                // function enables, its only requirement.
+                unsafe { avx512::h_band::<C>(src, kernel, groups, in_w, out_w, y0, band) }
             }
         }
     }
@@ -1096,8 +1115,157 @@ fn lane_pair(low: i16, high: i16) -> i32 {
     i32::from_le_bytes([a, b, c, d])
 }
 
+/// The width of a tap's byte chunks in the AVX-512 arms: a tap `t` is taken
+/// as `c2 · 2^16 + c1 · 2^8 + c0` with every chunk a signed byte
+/// ([`tap_chunks`]), the radix three signed bytes need for a 22-bit tap (a
+/// weight of one is 2^22, past what chunks of seven bits reach), so that
+/// `Σ pixel · t = ((Σ pixel · c2) << 8 + Σ pixel · c1) << 8 + Σ pixel · c0`
+/// with every partial sum and every stage of that recombination inside `i32`
+/// over the longest window of either filter
+/// (`pil_tap_chunks_fit_the_bytes_and_32_bit_sums`).
+#[cfg(any(target_arch = "x86_64", test))]
+const CHUNK_BITS: u32 = 8;
+
+/// `[c0, c1, c2]` of a tap, see [`CHUNK_BITS`]: each chunk is the low byte of
+/// what the chunks below it leave, read as signed, so a chunk is in `[-128,
+/// 127]` and the top one is below 2^7 in magnitude for a tap below 2^23
+/// ([`FixedKernel`]).
+#[cfg(any(target_arch = "x86_64", test))]
+fn tap_chunks(tap: i32) -> [i8; 3] {
+    let c0 = tap as i8;
+    let rest = (tap - i32::from(c0)) >> CHUNK_BITS;
+    let c1 = rest as i8;
+    let c2 = (rest - i32::from(c1)) >> CHUNK_BITS;
+    // Below 2^7 in magnitude by the kernel's bound; a tap outside it would be
+    // a broken invariant, not a value to clamp.
+    debug_assert!(
+        i8::try_from(c2).is_ok(),
+        "tap {tap} exceeds three byte chunks"
+    );
+    [c0, c1, c2 as i8]
+}
+
+/// The taps of one axis as the AVX-512 width pass reads them: the outputs in
+/// groups of `outputs` (five for three channels, four for four, fewer when
+/// the windows of a group would not fit one gather), the sixteen 32-bit
+/// lanes of a vector being the group's outputs' channels. Per group, 64
+/// bytes of gather indices (for every lane, the four consecutive source
+/// pixels of its channel relative to the group's first window start, taken
+/// four taps at a time from a 128-byte window that moves four pixels per
+/// step), then per step of four taps three 64-byte blocks, one per chunk
+/// level, in the lanes' layout (a lane's four bytes: its output's four
+/// taps' chunks of that level), zero where a window ends or a lane has no
+/// output.
+#[cfg(target_arch = "x86_64")]
+struct GroupTaps {
+    outputs: usize,
+    /// Bytes per group in `table`: the indices plus three blocks per step.
+    stride: usize,
+    table: Vec<u8>,
+    /// Steps of four taps per group (the group's longest window).
+    steps: Vec<usize>,
+    /// Bytes of a row's end the pass copies behind zero padding, enough for
+    /// the windows of the row's last groups: a gather of 128 bytes from the
+    /// last step's start.
+    tail: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl GroupTaps {
+    /// Bytes one gather reads from its window.
+    const WINDOW: usize = 128;
+
+    /// `None` when even pairs of outputs spread over more than one window
+    /// (a downscale by more than about thirty), the arm's limit; the axis
+    /// then takes the split-tap arm.
+    fn new<const C: usize>(kernel: &FixedKernel) -> Option<Self> {
+        let count = kernel.bounds.len();
+        let longest = kernel.taps.iter().map(Vec::len).max().unwrap_or(0).max(1);
+        let most_steps = longest.div_ceil(4);
+        let outputs = (2..=16 / C).rev().find(|&outputs| {
+            kernel.bounds.chunks(outputs).all(|group| {
+                let span = group[group.len() - 1].0 - group[0].0;
+                (span + 4) * C <= Self::WINDOW
+            })
+        })?;
+        let groups = count.div_ceil(outputs);
+        let stride = 64 * (1 + 3 * most_steps);
+        let mut table = vec![0_u8; groups * stride];
+        let mut steps = Vec::with_capacity(groups);
+        for ((g, group), block) in kernel
+            .bounds
+            .chunks(outputs)
+            .enumerate()
+            .zip(table.chunks_exact_mut(stride))
+        {
+            let first_start = group[0].0;
+            let (indices, blocks) = block.split_at_mut(64);
+            let mut group_longest = 1;
+            for (o, &(start, n)) in group.iter().enumerate() {
+                group_longest = group_longest.max(n);
+                for c in 0..C {
+                    let lane = o * C + c;
+                    for (b, index) in indices[4 * lane..4 * lane + 4].iter_mut().enumerate() {
+                        *index = ((start - first_start + b) * C + c) as u8;
+                    }
+                }
+                for (k, &tap) in kernel.taps[g * outputs + o].iter().enumerate() {
+                    for (level, chunk) in tap_chunks(tap).into_iter().enumerate() {
+                        let block = &mut blocks[64 * (3 * (k / 4) + level)..][..64];
+                        for c in 0..C {
+                            block[4 * (o * C + c) + k % 4] = chunk as u8;
+                        }
+                    }
+                }
+            }
+            steps.push(group_longest.div_ceil(4));
+        }
+        Some(Self {
+            outputs,
+            stride,
+            table,
+            steps,
+            tail: Self::WINDOW + 4 * C * most_steps,
+        })
+    }
+}
+
+/// The taps of `count` output rows from `first` of one axis as the AVX-512
+/// height pass reads them: per row and per step of four taps, three words
+/// holding the four taps' chunks of one level each, a word the pass
+/// broadcasts; zero past a window's end.
+#[cfg(target_arch = "x86_64")]
+struct ChunkTaps {
+    words: Vec<i32>,
+    /// Steps per row (the longest window of the rows).
+    steps: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl ChunkTaps {
+    fn new(kernel: &FixedKernel, first: usize, count: usize) -> Self {
+        let outputs = &kernel.taps[first..first + count];
+        let steps = outputs
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+            .max(1)
+            .div_ceil(4);
+        let mut words = vec![0_i32; count * steps * 3];
+        for (words, taps) in words.chunks_exact_mut(steps * 3).zip(outputs) {
+            for (k, &tap) in taps.iter().enumerate() {
+                for (level, chunk) in tap_chunks(tap).into_iter().enumerate() {
+                    words[(k / 4) * 3 + level] |= i32::from(chunk as u8) << (8 * (k % 4));
+                }
+            }
+        }
+        Self { words, steps }
+    }
+}
+
 /// Output rows `[y0, y0 + band.len() / row_len)` of the height pass, the
-/// portable arm of [`pil_v_rows`]: each output row sums its taps over whole
+/// portable arm of [`HeightPass`]: each output row sums its taps over whole
 /// source rows, one tap's row at a time, so the inner loop runs along the
 /// row.
 fn pil_v_band(src: &[u8], kernel: &FixedKernel, row_len: usize, y0: usize, band: &mut [u8]) {
@@ -1118,32 +1286,79 @@ fn pil_v_band(src: &[u8], kernel: &FixedKernel, row_len: usize, y0: usize, band:
     }
 }
 
-/// The height pass's rows on the AVX2 unit when the processor has one (the
-/// 16-bit row-pair steps of [`avx2::v_band`] over the band's taps split for
-/// them), the portable loop otherwise: the detection and the call sit in one
-/// function, as the crate's NEON kernels and the FMA pass keep them.
-#[cfg(target_arch = "x86_64")]
-#[expect(
-    unsafe_code,
-    reason = "the target-feature function runs only after this function detected its feature"
-)]
-fn pil_v_rows(src: &[u8], kernel: &FixedKernel, row_len: usize, y0: usize, band: &mut [u8]) {
-    if !std::arch::is_x86_feature_detected!("avx2") {
-        return pil_v_band(src, kernel, row_len, y0, band);
-    }
-    let split = SplitTaps::new(kernel, y0, band.len() / row_len, 2);
-    // SAFETY: `is_x86_feature_detected!("avx2")` answered true just above, the
-    // only requirement of a `target_feature(enable = "avx2")` function.
-    unsafe { avx2::v_band(src, kernel, &split, row_len, y0, band) }
+/// How [`pil_resample_vertical`] runs its rows: the portable row loop; on an
+/// x86-64 processor that reports AVX2, the 16-bit row-pair steps of
+/// [`avx2::v_band`] over the band's taps split for them; on one that
+/// reports AVX-512 VNNI and VBMI, the byte dot products of
+/// [`avx512::v_band`] over four source rows at a time.
+#[derive(Clone, Copy)]
+enum HeightPass {
+    Portable,
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
+    #[cfg(target_arch = "x86_64")]
+    Avx512,
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn pil_v_rows(src: &[u8], kernel: &FixedKernel, row_len: usize, y0: usize, band: &mut [u8]) {
-    pil_v_band(src, kernel, row_len, y0, band);
+impl HeightPass {
+    #[cfg(target_arch = "x86_64")]
+    fn new() -> Self {
+        if avx512::detected() {
+            Self::Avx512
+        } else if std::arch::is_x86_feature_detected!("avx2") {
+            Self::Avx2
+        } else {
+            Self::Portable
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn new() -> Self {
+        Self::Portable
+    }
+
+    /// Output rows `[y0, y0 + band.len() / row_len)` of the height pass; a
+    /// vector arm builds the band's tap layout, detects its features and
+    /// calls in one place, as the crate's NEON kernels and the FMA pass keep
+    /// them.
+    #[cfg_attr(
+        target_arch = "x86_64",
+        expect(
+            unsafe_code,
+            reason = "the target-feature function runs only after this function detected its features"
+        )
+    )]
+    fn rows(self, src: &[u8], kernel: &FixedKernel, row_len: usize, y0: usize, band: &mut [u8]) {
+        match self {
+            Self::Portable => pil_v_band(src, kernel, row_len, y0, band),
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx2 => {
+                if !std::arch::is_x86_feature_detected!("avx2") {
+                    return pil_v_band(src, kernel, row_len, y0, band);
+                }
+                let split = SplitTaps::new(kernel, y0, band.len() / row_len, 2);
+                // SAFETY: `is_x86_feature_detected!("avx2")` answered true just
+                // above, the only requirement of a `target_feature(enable =
+                // "avx2")` function.
+                unsafe { avx2::v_band(src, kernel, &split, row_len, y0, band) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx512 => {
+                if !avx512::detected() {
+                    return pil_v_band(src, kernel, row_len, y0, band);
+                }
+                let chunks = ChunkTaps::new(kernel, y0, band.len() / row_len);
+                // SAFETY: `avx512::detected()` answered true just above: the
+                // processor reports every feature the `target_feature`
+                // function enables, its only requirement.
+                unsafe { avx512::v_band(src, kernel, &chunks, row_len, y0, band) }
+            }
+        }
+    }
 }
 
 /// The Pillow-exact passes compiled for AVX2, the vector arms of
-/// [`WidthPass`] and [`pil_v_rows`]: the same integer sums as the portable
+/// [`WidthPass`] and [`HeightPass`]: the same integer sums as the portable
 /// passes, taken two taps at a time by the multiply-add of adjacent 16-bit
 /// lanes over the taps' split halves ([`SplitTaps`]) and recombined in 32
 /// bits per output. Integer sums are the same in any order, so the bytes
@@ -1462,6 +1677,377 @@ mod avx2 {
     }
 }
 
+/// The Pillow-exact passes compiled for the AVX-512 VNNI unit with VBMI, the
+/// vector arms of [`WidthPass`] and [`HeightPass`] where the processor has
+/// one: the same integer sums as the portable passes, taken four taps at a
+/// time by the byte dot product (sixteen lanes of four unsigned pixel bytes
+/// against four signed tap bytes, accumulated in 32 bits without saturation)
+/// over the taps' three byte chunks ([`tap_chunks`]), an accumulator per
+/// chunk level, recombined per output in 32 bits. Integer sums are the same
+/// in any order, so the bytes are those of the portable passes and of
+/// Pillow.
+#[cfg(target_arch = "x86_64")]
+mod avx512 {
+    #![expect(
+        unsafe_code,
+        reason = "the vector loads and stores; every pointer is bounded by an exact-size chunk of a slice or by a mask over the bytes of a slice"
+    )]
+
+    use std::arch::x86_64::{
+        __m128i, __m512i, __mmask64, _mm512_add_epi32, _mm512_dpbusd_epi32, _mm512_loadu_epi32,
+        _mm512_loadu_epi8, _mm512_mask_storeu_epi8, _mm512_maskz_loadu_epi8, _mm512_packus_epi16,
+        _mm512_packus_epi32, _mm512_permutex2var_epi8, _mm512_permutexvar_epi32, _mm512_set1_epi32,
+        _mm512_setr_epi32, _mm512_setzero_si512, _mm512_slli_epi32, _mm512_sra_epi32,
+        _mm512_storeu_epi32, _mm512_storeu_epi8, _mm512_unpackhi_epi16, _mm512_unpackhi_epi8,
+        _mm512_unpacklo_epi16, _mm512_unpacklo_epi8, _mm_cvtsi32_si128,
+    };
+
+    use super::{ChunkTaps, FixedKernel, GroupTaps, CHUNK_BITS};
+
+    /// The processor reports every feature the arms enable.
+    pub(super) fn detected() -> bool {
+        std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+            && std::arch::is_x86_feature_detected!("avx512vbmi")
+    }
+
+    /// Output rows a group iteration of the width pass carries at once: the
+    /// group's gather indices and every step's chunk lines are loaded once
+    /// for them, and their dot products are independent chains.
+    const ROWS: usize = 4;
+
+    /// Output rows `[y0, y0 + band.len() / (out_w * C))` of the width pass,
+    /// [`ROWS`] rows at a time by [`h_rows`] and the last rows one by one.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    pub(super) fn h_band<const C: usize>(
+        src: &[u8],
+        kernel: &FixedKernel,
+        groups: &GroupTaps,
+        in_w: usize,
+        out_w: usize,
+        y0: usize,
+        band: &mut [u8],
+    ) {
+        let row_in = in_w * C;
+        let row_out = out_w * C;
+        let tail_len = groups.tail.min(row_in);
+        let mut tails = vec![0_u8; ROWS * (tail_len + GroupTaps::WINDOW)];
+        // A group's sixteen lanes land whole; the last group's lanes past the
+        // row and the narrowing's last loads stay inside a row's scratch.
+        let mut sums = vec![0_i32; ROWS * (row_out.next_multiple_of(64) + 16)];
+        let mut blocks = band.chunks_exact_mut(ROWS * row_out);
+        let mut y = y0;
+        for block in blocks.by_ref() {
+            h_rows::<C, ROWS>(src, kernel, groups, row_in, y, block, &mut tails, &mut sums);
+            y += ROWS;
+        }
+        for out_row in blocks.into_remainder().chunks_exact_mut(row_out) {
+            h_rows::<C, 1>(
+                src, kernel, groups, row_in, y, out_row, &mut tails, &mut sums,
+            );
+            y += 1;
+        }
+    }
+
+    /// Output rows `[y0, y0 + R)` of the width pass into `out`, a group of
+    /// outputs per vector ([`GroupTaps`]): per step of four taps, each row's
+    /// two vectors from the group's window start are gathered by the group's
+    /// indices into every lane's four pixels and three dot products
+    /// accumulate them against the step's chunk lines; the windows of a
+    /// row's last groups read from a zero-padded copy of the row's end (one
+    /// per row in `tails`). A group's recombined and shifted sums go to the
+    /// row's scratch of 32-bit lanes in `sums`, which [`narrowed`] clamps
+    /// into the output row once the row's groups are done.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[inline]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the band's scratch buffers ride along so every block of rows reuses them"
+    )]
+    fn h_rows<const C: usize, const R: usize>(
+        src: &[u8],
+        kernel: &FixedKernel,
+        groups: &GroupTaps,
+        row_in: usize,
+        y0: usize,
+        out: &mut [u8],
+        tails: &mut [u8],
+        sums: &mut [i32],
+    ) {
+        let row_out = out.len() / R;
+        let tail_stride = tails.len() / ROWS;
+        let tail_len = tail_stride - GroupTaps::WINDOW;
+        let scratch = sums.len() / ROWS;
+        let half = _mm512_set1_epi32(kernel.half());
+        let shift = _mm_cvtsi32_si128(kernel.precision as i32);
+        let zero = _mm512_setzero_si512();
+        let mut rows: [&[u8]; R] = [&[]; R];
+        for (r, row) in rows.iter_mut().enumerate() {
+            *row = &src[(y0 + r) * row_in..(y0 + r + 1) * row_in];
+        }
+        for (tail, row) in tails.chunks_exact_mut(tail_stride).zip(&rows) {
+            tail[..tail_len].copy_from_slice(&row[row_in - tail_len..]);
+        }
+        let tails: &[u8] = tails;
+        let mut padded: [&[u8]; R] = [&[]; R];
+        for (r, padded) in padded.iter_mut().enumerate() {
+            *padded = &tails[r * tail_stride..(r + 1) * tail_stride];
+        }
+        for ((g, block), &steps) in groups
+            .table
+            .chunks_exact(groups.stride)
+            .enumerate()
+            .zip(&groups.steps)
+        {
+            let first = g * groups.outputs;
+            let begin = kernel.bounds[first].0 * C;
+            // The rows themselves while the group's last window ends inside
+            // them, else the padded copies of their ends.
+            let (sources, base) = if begin + 4 * C * (steps - 1) + GroupTaps::WINDOW <= row_in {
+                (&rows, begin)
+            } else {
+                (&padded, begin - (row_in - tail_len))
+            };
+            let (indices, blocks) = block.split_at(64);
+            let indices = load64(&indices.as_chunks::<64>().0[0]);
+            let (mut sum0, mut sum1, mut sum2) = ([half; R], [zero; R], [zero; R]);
+            for (s, levels) in blocks.as_chunks::<192>().0.iter().take(steps).enumerate() {
+                let at = base + 4 * C * s;
+                let levels = levels.as_chunks::<64>().0;
+                let (chunks0, chunks1, chunks2) =
+                    (load64(&levels[0]), load64(&levels[1]), load64(&levels[2]));
+                for (((source, sum0), sum1), sum2) in
+                    sources.iter().zip(&mut sum0).zip(&mut sum1).zip(&mut sum2)
+                {
+                    let window = source[at..at + GroupTaps::WINDOW].as_chunks::<64>().0;
+                    let pixels =
+                        _mm512_permutex2var_epi8(load64(&window[0]), indices, load64(&window[1]));
+                    *sum0 = _mm512_dpbusd_epi32(*sum0, pixels, chunks0);
+                    *sum1 = _mm512_dpbusd_epi32(*sum1, pixels, chunks1);
+                    *sum2 = _mm512_dpbusd_epi32(*sum2, pixels, chunks2);
+                }
+            }
+            let at = first * C;
+            for (r, ((&sum0, &sum1), &sum2)) in sum0.iter().zip(&sum1).zip(&sum2).enumerate() {
+                store16(
+                    &mut sums[r * scratch + at..r * scratch + at + 16]
+                        .as_chunks_mut::<16>()
+                        .0[0],
+                    recombined(sum0, sum1, sum2, shift),
+                );
+            }
+        }
+        for (sums, out_row) in sums
+            .chunks_exact(scratch)
+            .zip(out.chunks_exact_mut(row_out))
+        {
+            narrowed(sums, out_row);
+        }
+    }
+
+    /// `out`'s row of shifted sums (`sums`, at least as long rounded up to a
+    /// multiple of sixty-four) clamped to bytes, sixty-four at a time: both
+    /// packs saturate (`i32 -> u16` is the clamp below zero, `i16 -> u8` the
+    /// clamp above 255; a shifted sum is below 2^10 in magnitude) and leave
+    /// every 128-bit lane with four bytes of each of the four source
+    /// vectors, which one dword permute puts in order; the row's last
+    /// columns run under a mask.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[inline]
+    fn narrowed(sums: &[i32], out: &mut [u8]) {
+        let order = _mm512_setr_epi32(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+        for (sums, out) in sums.as_chunks::<64>().0.iter().zip(out.chunks_mut(64)) {
+            let quads = sums.as_chunks::<16>().0;
+            let bytes = _mm512_packus_epi16(
+                _mm512_packus_epi32(load16(&quads[0]), load16(&quads[1])),
+                _mm512_packus_epi32(load16(&quads[2]), load16(&quads[3])),
+            );
+            let bytes = _mm512_permutexvar_epi32(order, bytes);
+            match out.as_chunks_mut::<64>() {
+                ([full], []) => store64(full, bytes),
+                _ => store_masked(out, bytes),
+            }
+        }
+    }
+
+    /// Output rows `[y0, y0 + band.len() / row_len)` of the height pass,
+    /// sixty-four columns at a time across the taps ([`v_tile`]); the row's
+    /// last columns run under a mask.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    pub(super) fn v_band(
+        src: &[u8],
+        kernel: &FixedKernel,
+        chunks: &ChunkTaps,
+        row_len: usize,
+        y0: usize,
+        band: &mut [u8],
+    ) {
+        for (i, out_row) in band.chunks_exact_mut(row_len).enumerate() {
+            let (start, n) = kernel.bounds[y0 + i];
+            let window = (start, start + n - 1);
+            let words = &chunks.words[i * chunks.steps * 3..][..n.div_ceil(4) * 3];
+            let (full, rest) = out_row.as_chunks_mut::<64>();
+            for (x, out) in full.iter_mut().enumerate() {
+                v_tile::<false>(src, kernel, row_len, window, words, x * 64, out);
+            }
+            if !rest.is_empty() {
+                v_tile::<true>(src, kernel, row_len, window, words, full.len() * 64, rest);
+            }
+        }
+    }
+
+    /// One output row's columns `column..column + out.len()` (sixty-four, or
+    /// fewer under the mask) of the height pass, four source rows per step:
+    /// the rows' bytes interleave (bytes, then words) so that every 32-bit
+    /// lane holds one column's four pixels in row order, and the dot
+    /// products against the step's broadcast chunks accumulate, a level in
+    /// accumulators of its own; the rows past the window's last (`rows.1`)
+    /// repeat it under zero chunks.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[inline]
+    fn v_tile<const MASKED: bool>(
+        src: &[u8],
+        kernel: &FixedKernel,
+        row_len: usize,
+        rows: (usize, usize),
+        words: &[i32],
+        column: usize,
+        out: &mut [u8],
+    ) {
+        let half = _mm512_set1_epi32(kernel.half());
+        let shift = _mm_cvtsi32_si128(kernel.precision as i32);
+        let zero = _mm512_setzero_si512();
+        let (start, last) = rows;
+        let mut sums = [[half; 4], [zero; 4], [zero; 4]];
+        for (s, levels) in words.as_chunks::<3>().0.iter().enumerate() {
+            let mut rows = [zero; 4];
+            for (j, row) in rows.iter_mut().enumerate() {
+                let y = (start + 4 * s + j).min(last);
+                let bytes = &src[y * row_len + column..][..out.len()];
+                *row = if MASKED {
+                    load_masked(bytes)
+                } else {
+                    load64(&bytes.as_chunks::<64>().0[0])
+                };
+            }
+            let (ab_lo, ab_hi) = (
+                _mm512_unpacklo_epi8(rows[0], rows[1]),
+                _mm512_unpackhi_epi8(rows[0], rows[1]),
+            );
+            let (cd_lo, cd_hi) = (
+                _mm512_unpacklo_epi8(rows[2], rows[3]),
+                _mm512_unpackhi_epi8(rows[2], rows[3]),
+            );
+            // Columns 0..4, 4..8, 8..12 and 12..16 of each sixteen: the
+            // order the packs below put back.
+            let tiles = [
+                _mm512_unpacklo_epi16(ab_lo, cd_lo),
+                _mm512_unpackhi_epi16(ab_lo, cd_lo),
+                _mm512_unpacklo_epi16(ab_hi, cd_hi),
+                _mm512_unpackhi_epi16(ab_hi, cd_hi),
+            ];
+            for (sums, &word) in sums.iter_mut().zip(levels) {
+                let taps = _mm512_set1_epi32(word);
+                for (sum, &tile) in sums.iter_mut().zip(&tiles) {
+                    *sum = _mm512_dpbusd_epi32(*sum, tile, taps);
+                }
+            }
+        }
+        let [sum0, sum1, sum2] = sums;
+        let (s0, s1, s2, s3) = (
+            recombined(sum0[0], sum1[0], sum2[0], shift),
+            recombined(sum0[1], sum1[1], sum2[1], shift),
+            recombined(sum0[2], sum1[2], sum2[2], shift),
+            recombined(sum0[3], sum1[3], sum2[3], shift),
+        );
+        // Both packs saturate (the clamp); packing the four-column tiles in
+        // pairs, then the pairs, puts every 128-bit lane's sixteen columns
+        // in order.
+        let bytes = _mm512_packus_epi16(_mm512_packus_epi32(s0, s1), _mm512_packus_epi32(s2, s3));
+        if MASKED {
+            store_masked(out, bytes);
+        } else {
+            store64(&mut out.as_chunks_mut::<64>().0[0], bytes);
+        }
+    }
+
+    /// `((sum2 << 8) + sum1) << 8 + sum0`, the sums of a tap's chunks
+    /// recombined, shifted by the kernel's precision: `kernel.clip8` before
+    /// its clamp, sixteen lanes at a time.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[inline]
+    fn recombined(sum0: __m512i, sum1: __m512i, sum2: __m512i, shift: __m128i) -> __m512i {
+        let high = _mm512_add_epi32(_mm512_slli_epi32::<CHUNK_BITS>(sum2), sum1);
+        _mm512_sra_epi32(
+            _mm512_add_epi32(_mm512_slli_epi32::<CHUNK_BITS>(high), sum0),
+            shift,
+        )
+    }
+
+    /// Sixty-four bytes as one vector.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[inline]
+    fn load64(bytes: &[u8; 64]) -> __m512i {
+        // SAFETY: the array is exactly 64 bytes.
+        unsafe { _mm512_loadu_epi8(bytes.as_ptr().cast::<i8>()) }
+    }
+
+    /// Sixty-four bytes stored.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[inline]
+    fn store64(out: &mut [u8; 64], bytes: __m512i) {
+        // SAFETY: the array is exactly 64 bytes.
+        unsafe { _mm512_storeu_epi8(out.as_mut_ptr().cast::<i8>(), bytes) }
+    }
+
+    /// The bytes a mask over `len` bytes of a vector selects.
+    #[inline]
+    fn mask64(len: usize) -> __mmask64 {
+        debug_assert!(len <= 64, "{len} bytes exceed a vector");
+        if len >= 64 {
+            !0
+        } else {
+            (1_u64 << len) - 1
+        }
+    }
+
+    /// At most sixty-four bytes as one vector, zero past them.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[inline]
+    fn load_masked(bytes: &[u8]) -> __m512i {
+        // SAFETY: the mask selects exactly the slice's bytes and a masked
+        // load reads no byte outside its mask.
+        unsafe { _mm512_maskz_loadu_epi8(mask64(bytes.len()), bytes.as_ptr().cast::<i8>()) }
+    }
+
+    /// The first `out.len()` (at most sixty-four) bytes of a vector stored.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[inline]
+    fn store_masked(out: &mut [u8], bytes: __m512i) {
+        // SAFETY: the mask selects exactly the slice's bytes and a masked
+        // store writes no byte outside its mask.
+        unsafe { _mm512_mask_storeu_epi8(out.as_mut_ptr().cast::<i8>(), mask64(out.len()), bytes) }
+    }
+
+    /// Sixteen 32-bit lanes as one vector.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[inline]
+    fn load16(lanes: &[i32; 16]) -> __m512i {
+        // SAFETY: the array is exactly sixteen 32-bit lanes.
+        unsafe { _mm512_loadu_epi32(lanes.as_ptr()) }
+    }
+
+    /// Sixteen 32-bit lanes stored.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[inline]
+    fn store16(out: &mut [i32; 16], lanes: __m512i) {
+        // SAFETY: the array is exactly sixteen 32-bit lanes.
+        unsafe { _mm512_storeu_epi32(out.as_mut_ptr(), lanes) }
+    }
+}
+
 /// Every row of `src` (`rows` rows of `in_w` interleaved pixels of `C`
 /// channels) resampled along the width to `out_w` pixels; rows banded across
 /// the pool (an output row depends on its own input row alone, so the banding
@@ -1475,7 +2061,7 @@ fn pil_resample_horizontal<const C: usize>(
 ) -> Vec<u8> {
     let row_out = out_w * C;
     let mut out = vec![0_u8; rows * row_out];
-    let pass = &WidthPass::new(kernel);
+    let pass = &WidthPass::new::<C>(kernel);
     let tasks = par_threads(out.len(), rows);
     if tasks <= 1 {
         pass.rows::<C>(src, kernel, in_w, out_w, 0, &mut out);
@@ -1507,9 +2093,10 @@ fn pil_resample_vertical<const C: usize>(
 ) -> Vec<u8> {
     let row_len = width * C;
     let mut out = vec![0_u8; out_h * row_len];
+    let pass = HeightPass::new();
     let tasks = par_threads(out.len(), out_h);
     if tasks <= 1 {
-        pil_v_rows(src, kernel, row_len, 0, &mut out);
+        pass.rows(src, kernel, row_len, 0, &mut out);
         return out;
     }
     let band_rows = out_h.div_ceil(tasks);
@@ -1521,7 +2108,7 @@ fn pil_resample_vertical<const C: usize>(
             let (band, tail) = rest.split_at_mut(n * row_len);
             rest = tail;
             let start = y0;
-            scope.spawn(move |_| pil_v_rows(src, kernel, row_len, start, band));
+            scope.spawn(move |_| pass.rows(src, kernel, row_len, start, band));
             y0 += n;
         }
     });
@@ -2550,9 +3137,11 @@ mod tests {
         }
     }
 
-    /// The portable and the detected arms of the two passes write the same
-    /// bytes on every case, three and four channels (on a processor without
-    /// the vector unit both arms are the portable loop).
+    /// The portable arm and every vector arm the host can build (the
+    /// detected one, and on x86-64 each of AVX2 and AVX-512 the processor
+    /// reports) write the same bytes on every case, three and four channels
+    /// (on a processor without a vector unit every arm is the portable
+    /// loop).
     #[test]
     fn pil_pass_arms_agree() {
         fn check<const C: usize>(
@@ -2564,23 +3153,58 @@ mod tests {
             let kernel = FixedKernel::new(in_w, out_w, filter, KernelQuantization::Pillow);
             let mut portable = vec![0_u8; in_h * out_w * C];
             WidthPass::Portable.rows::<C>(data, &kernel, in_w, out_w, 0, &mut portable);
-            let mut detected = vec![0_u8; in_h * out_w * C];
-            WidthPass::new(&kernel).rows::<C>(data, &kernel, in_w, out_w, 0, &mut detected);
-            assert_same_bytes(
-                &detected,
-                &portable,
-                &format!("width pass, {C} channels, {what}"),
-            );
+            #[cfg_attr(
+                not(target_arch = "x86_64"),
+                expect(unused_mut, reason = "only the x86-64 arms are pushed")
+            )]
+            let mut arms = vec![("detected", WidthPass::new::<C>(&kernel))];
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    let split = SplitTaps::new(&kernel, 0, kernel.bounds.len(), 4);
+                    arms.push(("avx2", WidthPass::Avx2(split)));
+                }
+                if avx512::detected() {
+                    if let Some(groups) = GroupTaps::new::<C>(&kernel) {
+                        arms.push(("avx512", WidthPass::Avx512(groups)));
+                    }
+                }
+            }
+            for (name, arm) in &arms {
+                let mut detected = vec![0_u8; in_h * out_w * C];
+                arm.rows::<C>(data, &kernel, in_w, out_w, 0, &mut detected);
+                assert_same_bytes(
+                    &detected,
+                    &portable,
+                    &format!("width pass {name}, {C} channels, {what}"),
+                );
+            }
             let kernel = FixedKernel::new(in_h, out_h, filter, KernelQuantization::Pillow);
             let mut portable_rows = vec![0_u8; out_h * out_w * C];
-            pil_v_band(&portable, &kernel, out_w * C, 0, &mut portable_rows);
-            let mut detected_rows = vec![0_u8; out_h * out_w * C];
-            pil_v_rows(&portable, &kernel, out_w * C, 0, &mut detected_rows);
-            assert_same_bytes(
-                &detected_rows,
-                &portable_rows,
-                &format!("height pass, {C} channels, {what}"),
-            );
+            HeightPass::Portable.rows(&portable, &kernel, out_w * C, 0, &mut portable_rows);
+            #[cfg_attr(
+                not(target_arch = "x86_64"),
+                expect(unused_mut, reason = "only the x86-64 arms are pushed")
+            )]
+            let mut arms = vec![("detected", HeightPass::new())];
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    arms.push(("avx2", HeightPass::Avx2));
+                }
+                if avx512::detected() {
+                    arms.push(("avx512", HeightPass::Avx512));
+                }
+            }
+            for (name, arm) in &arms {
+                let mut detected_rows = vec![0_u8; out_h * out_w * C];
+                arm.rows(&portable, &kernel, out_w * C, 0, &mut detected_rows);
+                assert_same_bytes(
+                    &detected_rows,
+                    &portable_rows,
+                    &format!("height pass {name}, {C} channels, {what}"),
+                );
+            }
         }
         for (f, filter) in [PilResizeFilter::Bicubic, PilResizeFilter::Lanczos]
             .into_iter()
@@ -2675,6 +3299,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The byte chunks the AVX-512 arms rest on, checked over the same sweep
+    /// for both filters: every tap is `c2 · 2^16 + c1 · 2^8 + c0` with each
+    /// chunk a signed byte, and over any output's window every stage of the
+    /// arms' sums stays inside `i32` for every pixel assignment: each level's
+    /// own sum, the top level shifted and added to the middle one, that
+    /// shifted again, and the whole with the rounding term; a sum of `pixel ·
+    /// coefficient` over pixels in `0..=255` is largest at 255 under the
+    /// positive coefficients and smallest at 255 under the negative ones.
+    #[test]
+    fn pil_tap_chunks_fit_the_bytes_and_32_bit_sums() {
+        let sizes = [1usize, 2, 3, 5, 7, 16, 100, 1000, 4096];
+        let (max, min) = (i64::from(i32::MAX), i64::from(i32::MIN));
+        for filter in [PilResizeFilter::Bicubic, PilResizeFilter::Lanczos] {
+            for &in_size in &sizes {
+                for &out_size in &sizes {
+                    let k = FixedKernel::new(in_size, out_size, filter, KernelQuantization::Pillow);
+                    let half = 1_i64 << (k.precision - 1);
+                    for taps in &k.taps {
+                        // Per stage, the positive and the negative coefficient sums.
+                        let (mut up, mut down) = ([0_i64; 6], [0_i64; 6]);
+                        for &tap in taps {
+                            let [c0, c1, c2] = tap_chunks(tap);
+                            assert_eq!(
+                                (i32::from(c2) << 16) + (i32::from(c1) << 8) + i32::from(c0),
+                                tap,
+                                "{in_size} -> {out_size}: tap {tap} is not its chunks recombined"
+                            );
+                            let (c0, c1, c2) = (i64::from(c0), i64::from(c1), i64::from(c2));
+                            let high = (c2 << CHUNK_BITS) + c1;
+                            let stages = [c0, c1, c2, high, high << CHUNK_BITS, i64::from(tap)];
+                            for ((up, down), coefficient) in
+                                up.iter_mut().zip(&mut down).zip(stages)
+                            {
+                                *up += coefficient.max(0);
+                                *down += coefficient.min(0);
+                            }
+                        }
+                        for (stage, (&up, &down)) in up.iter().zip(&down).enumerate() {
+                            let rounding = if stage == 0 || stage == 5 { half } else { 0 };
+                            assert!(
+                                rounding + 255 * up <= max && rounding + 255 * down >= min,
+                                "{in_size} -> {out_size}: stage {stage} of the chunk sums leaves i32 (Σ {up} / {down})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The AVX-512 width arm takes an axis only while its output groups
+    /// gather their four-tap windows from one 128-byte window: five RGB
+    /// outputs per vector (four RGBA) on the usual downscales, fewer as the
+    /// scale grows, none past about thirty, where the axis keeps the
+    /// split-tap arm.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pil_group_taps_take_only_windows_that_fit_the_gather() {
+        let groups = |in_size, out_size| {
+            let kernel = FixedKernel::new(
+                in_size,
+                out_size,
+                PilResizeFilter::Bicubic,
+                KernelQuantization::Pillow,
+            );
+            (
+                GroupTaps::new::<3>(&kernel).map(|groups| groups.outputs),
+                GroupTaps::new::<4>(&kernel).map(|groups| groups.outputs),
+            )
+        };
+        assert_eq!(groups(8192, 3584), (Some(5), Some(4)), "a 2.3x downscale");
+        assert_eq!(groups(8192, 1344), (Some(5), Some(4)), "a 6.1x downscale");
+        assert_eq!(groups(1000, 100), (Some(4), Some(3)), "a 10x downscale");
+        assert_eq!(groups(64, 2000), (Some(5), Some(4)), "an upscale");
+        assert_eq!(groups(2000, 13), (None, None), "a 154x downscale");
     }
 
     /// The bytes-level pad is the paste `image::imageops::overlay` makes of
