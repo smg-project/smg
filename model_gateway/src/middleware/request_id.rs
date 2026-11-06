@@ -17,9 +17,10 @@
 //! first value.
 
 use std::{
+    future::Future,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
 };
 
 use axum::{
@@ -27,6 +28,7 @@ use axum::{
     http::{HeaderName, HeaderValue},
     response::Response,
 };
+use pin_project_lite::pin_project;
 use rand::RngExt;
 // Re-export RequestId from auth crate for backward compatibility
 pub use smg_auth::RequestId;
@@ -38,6 +40,11 @@ use super::messages_errors::wants_messages_envelope;
 const REQUEST_ID_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 /// The random characters after the prefix of a fresh id.
 const RANDOM_PART_LEN: usize = 24;
+/// The response header that echoes the id the gateway chose: parsed once,
+/// so putting it on a response copies a reference to its text, not the text.
+static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
+/// The header the Messages API's SDKs read the request id from.
+static REQUEST_ID: HeaderName = HeaderName::from_static("request-id");
 
 /// The longest inbound request id the gateway honours, in bytes. The ids
 /// proxies and clients commonly mint are 32 to 55 characters (a hex request
@@ -139,13 +146,11 @@ fn fresh_id(path: &str) -> (String, HeaderValue) {
 
 impl<S> Service<Request> for RequestIdMiddleware<S>
 where
-    S: Service<Request, Response = Response> + Send + 'static,
-    S::Future: Send + 'static,
+    S: Service<Request, Response = Response>,
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future =
-        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = RequestIdFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -198,23 +203,48 @@ where
         // for. Every other response keeps its bytes.
         let speaks_messages = wants_messages_envelope(req.headers(), req.uri().path());
 
-        // Call the inner service
-        let future = self.inner.call(req);
+        // The route's own future with the echo beside it, not a box around both.
+        RequestIdFuture {
+            inner: self.inner.call(req),
+            header_value: Some(header_value),
+            speaks_messages,
+        }
+    }
+}
 
-        Box::pin(async move {
-            let mut response = future.await?;
+pin_project! {
+    /// The request-id layer's future: the route's future, then the chosen id
+    /// echoed on the response (`header_value`, until it is on the response);
+    /// `speaks_messages` is whether the request had the Messages API's shape,
+    /// which is answered with the id as `request-id` too.
+    pub struct RequestIdFuture<F> {
+        #[pin]
+        inner: F,
+        header_value: Option<HeaderValue>,
+        speaks_messages: bool,
+    }
+}
 
-            // The id the gateway chose, echoed to the client.
-            if speaks_messages {
+impl<F, E> Future for RequestIdFuture<F>
+where
+    F: Future<Output = Result<Response, E>>,
+{
+    type Output = Result<Response, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let mut response = ready!(this.inner.poll(cx))?;
+        // The id the gateway chose, echoed to the client.
+        if let Some(value) = this.header_value.take() {
+            if *this.speaks_messages {
                 response
                     .headers_mut()
-                    .entry("request-id")
-                    .or_insert_with(|| header_value.clone());
+                    .entry(&REQUEST_ID)
+                    .or_insert_with(|| value.clone());
             }
-            response.headers_mut().insert("x-request-id", header_value);
-
-            Ok(response)
-        })
+            response.headers_mut().insert(&X_REQUEST_ID, value);
+        }
+        Poll::Ready(Ok(response))
     }
 }
 
