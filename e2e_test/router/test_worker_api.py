@@ -37,7 +37,8 @@ pytestmark = pytest.mark.skip_for_runtime("vllm", reason="vLLM does not support 
 _MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 # Nothing here reads what an engine produces: the assertions are the
 # gateway's own (the registry on /workers, the ids on /v1/models, the status
-# codes), so every class also runs on the scripted mock worker, on the CPU
+# codes), so every class but the mixed local-and-external one (it needs
+# external provider keys) also runs on the scripted mock worker, on the CPU
 # row, under the same checkpoint's tokenizer from an ungated repository.
 _MODEL_BY_ENGINE = {"mock": "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8"}
 
