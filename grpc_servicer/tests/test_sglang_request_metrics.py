@@ -32,6 +32,7 @@ def manager_mod(monkeypatch):
         "sglang.srt.observability.req_time_stats": (
             "APIServerReqTimeStats calibrate_time_diff real_time"
         ),
+        "sglang.srt.runtime_context": "get_observability",
         "sglang.srt.server_args": "PortArgs ServerArgs",
         "sglang.srt.utils": "get_or_create_event_loop kill_process_tree",
         "sglang.srt.utils.network": "get_zmq_socket",
@@ -50,6 +51,14 @@ def manager_mod(monkeypatch):
             setattr(module, attr, SimpleNamespace if attr == "AbortReq" else object)
         if "DisaggregationMode" in attrs.split():
             module.DisaggregationMode = SimpleNamespace(PREFILL="prefill")
+        if "get_observability" in attrs.split():
+            # The constructor's tracing switch (`_tracing_enabled`) reads the
+            # runtime context the entrypoint publishes before it builds the
+            # manager; built here without the entrypoint, the manager reads
+            # this stand-in, an engine started without tracing, whether or
+            # not an SGLang is installed (an installed one's unpublished
+            # context raises).
+            module.get_observability = lambda: SimpleNamespace(enable_trace=False)
         monkeypatch.setitem(sys.modules, name, module)
     path = Path(__file__).parents[1] / "smg_grpc_servicer" / "sglang" / "request_manager.py"
     spec = importlib.util.spec_from_file_location("request_metrics_under_test", path)
