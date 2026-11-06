@@ -628,8 +628,9 @@ impl PolicyRegistry {
 
     /// The policy that places requests on `worker`: the prefill, decode or
     /// encode policy by worker type, else the model's policy. Completion
-    /// reports and in-flight reconciliation both go there.
-    fn policy_for_worker(&self, worker: &dyn Worker) -> Arc<dyn LoadBalancingPolicy> {
+    /// reports and in-flight reconciliation both go there, and the worker's
+    /// stream is chosen by what it needs (see `UpdatePoliciesStep`).
+    pub(crate) fn policy_for_worker(&self, worker: &dyn Worker) -> Arc<dyn LoadBalancingPolicy> {
         match worker.worker_type() {
             WorkerType::Prefill => self.get_prefill_policy(),
             WorkerType::Decode => self.get_decode_policy(),
