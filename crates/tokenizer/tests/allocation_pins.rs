@@ -173,10 +173,11 @@ fn distinct(steps: &[usize]) -> BTreeSet<usize> {
 }
 
 /// A first sight of a piece of up to 128 bytes merges on the stack. What
-/// the encode allocates is its list of units, its ids (the list, grown once
-/// past its guess) and the thread's cache entry for a piece longer than the
-/// packed table keys (the piece and its ids, two boxes): five calls. What
-/// moves it: a merge that returns to the heap (the linked list and the
+/// the encode allocates is its ids (the list, grown once past its guess) and
+/// the thread's cache entry for a piece longer than the packed table keys
+/// (the piece and its ids, two boxes): four calls; its list of units lives
+/// inline (it was a fifth). What moves it: a list of units on the heap again,
+/// a merge that returns to the heap (the linked list and the
 /// candidate heap of the long merge were two more calls), a cache tier that
 /// copies differently. The opt-in v1 pipeline, when its feature is compiled
 /// in, takes a BPE tokenizer in front of the direct path, so this pin of the
@@ -197,9 +198,9 @@ fn a_first_sight_of_a_forty_byte_piece_merges_without_the_heap() {
     let encoding = encoding.expect("an encode");
     assert_eq!(encoding.token_ids().len(), 24, "h e llo, eight times");
     assert_eq!(
-        calls, 5,
-        "a first sight of a 40-byte piece allocated {calls} times: the units, the ids and the \
-         cache entry are five, the merge itself none"
+        calls, 4,
+        "a first sight of a 40-byte piece allocated {calls} times: the ids and the cache entry \
+         are four (the units live inline), the merge itself none"
     );
 }
 
@@ -311,13 +312,14 @@ fn forty_messages() -> Vec<serde_json::Value> {
 }
 
 /// The allocation calls of a forty-turn segmented encode today: the direct
-/// encoder's encodes make almost all of it (a unit list and an ids list per
-/// piece it is handed, where the file's own encoder made a parts list and a
-/// rank list per word it merged); the ids buffer, sized up front at one id per
-/// three bytes, makes one and its regrowths on this one-id-per-byte vocabulary
-/// (about twice the reservation) make the rest of its share; nothing is made
-/// per segment by the segmented encode itself.
-const PIN_SEGMENTED_ENCODE_CALLS: usize = 1_572;
+/// encoder's encodes make almost all of it (an ids list per piece it is
+/// handed; its list of units lives inline, and was a second list per piece
+/// before, where the file's own encoder made a parts list and a rank list per
+/// word it merged); the ids buffer, sized up front at one id per three bytes,
+/// makes one and its regrowths on this one-id-per-byte vocabulary (about twice
+/// the reservation) make the rest of its share; nothing is made per segment by
+/// the segmented encode itself.
+const PIN_SEGMENTED_ENCODE_CALLS: usize = 829;
 
 #[test]
 fn a_segmented_render_of_forty_turns_encodes_its_ids_into_one_buffer() {
@@ -350,7 +352,7 @@ fn a_segmented_render_of_forty_turns_encodes_its_ids_into_one_buffer() {
         PIN_SEGMENTED_ENCODE_CALLS,
         "encoding the segments of a forty-turn render ({} ids; about twenty segments per turn, \
          every piece of a tag's attributes one of them) allocated {calls} times: the direct \
-         encoder's encodes make almost all of it (a unit list and an ids list per piece), the \
+         encoder's encodes make almost all of it (an ids list per piece; the units live inline), the \
          ids buffer sized up front at one id per three bytes makes one and its regrowths on \
          this one-id-per-byte vocabulary the rest of its share, and nothing is made per \
          segment by the segmented encode itself; a list per segment (the checkpoint's cut of \

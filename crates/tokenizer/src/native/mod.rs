@@ -67,10 +67,12 @@ use thread_local::ThreadLocal;
 use tokenizers::{models::ModelWrapper, Model};
 use unicode_normalization_alignments::UnicodeNormalization;
 
+mod cased;
 mod chain;
 mod merge;
 mod nfc;
 mod pattern;
+mod scan;
 mod short_pieces;
 mod unicode;
 
@@ -493,9 +495,56 @@ impl AddedTokens {
     }
 }
 
+#[derive(Clone, Copy)]
 enum Segment<'t> {
     Text(&'t str),
     Added(u32),
+}
+
+/// Units an encode call keeps inline: a prompt without added tokens is one
+/// unit, a chat turn a handful; a long text cut for the thread pool, or a
+/// render with many added tokens, spills to the heap.
+const INLINE_UNITS: usize = 8;
+
+/// The units of one encode: up to [`INLINE_UNITS`] in place, the rest in a
+/// Vec made at the first spill. The short-text path makes no allocation for
+/// its units this way (measured: the units list was one of the two
+/// allocations of a 256-byte or 2 KB encode, the other the ids returned).
+struct Units<'t> {
+    inline: [Segment<'t>; INLINE_UNITS],
+    len: usize,
+    spill: Vec<Segment<'t>>,
+}
+
+impl<'t> Units<'t> {
+    fn new() -> Self {
+        Self {
+            inline: [Segment::Text(""); INLINE_UNITS],
+            len: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, unit: Segment<'t>) {
+        if !self.spill.is_empty() {
+            self.spill.push(unit);
+        } else if self.len < INLINE_UNITS {
+            self.inline[self.len] = unit;
+            self.len += 1;
+        } else {
+            self.spill.reserve(2 * INLINE_UNITS);
+            self.spill.extend_from_slice(&self.inline);
+            self.spill.push(unit);
+        }
+    }
+
+    fn as_slice(&self) -> &[Segment<'t>] {
+        if self.spill.is_empty() {
+            &self.inline[..self.len]
+        } else {
+            &self.spill
+        }
+    }
 }
 
 /// A raw added token, or a text between raw added tokens in NFC: borrowed
@@ -1168,22 +1217,34 @@ impl NativeEncoder {
             Some(gaps) => self.units_of(gaps, parallel, added),
             None => self.units(text, parallel, added),
         };
+        let units = units.as_slice();
         let (before, after): (&[u32], &[u32]) = if framed {
             (&self.frame.before, &self.frame.after)
         } else {
             (&[], &[])
         };
         if parallel && units.len() >= 2 {
-            let parts: Vec<Vec<u32>> = units
+            // One Vec per unit, reserved for its text's estimate up front
+            // (see `ids_capacity`: a denser unit grows past it by doubling)
+            // and filled in place, then joined; the pool's collection makes
+            // no list of its own (measured by the crate's encode_cost bench:
+            // a 32k-token encode made 60-125 allocations this way before,
+            // 6-49 after; what remains is per unit, the mapping buffer below
+            // growing to its first piece and the ids growing past their
+            // estimate on denser text). The join copies each id once, as it
+            // did.
+            let mut parts: Vec<Vec<u32>> = units
+                .iter()
+                .map(|unit| Vec::with_capacity(Self::ids_capacity(unit)))
+                .collect();
+            units
                 .par_iter()
-                .map(|unit| {
-                    let mut ids = Vec::new();
+                .zip(parts.par_iter_mut())
+                .try_for_each(|(unit, ids)| {
                     let mut mapped = String::new();
                     let mut cache = self.piece_cache_for_call();
-                    self.encode_unit(model, unit, &mut mapped, &mut ids, &mut cache)
-                        .map(|()| ids)
-                })
-                .collect::<Result<_, _>>()?;
+                    self.encode_unit(model, unit, &mut mapped, ids, &mut cache)
+                })?;
             let body: usize = parts.iter().map(Vec::len).sum();
             let mut ids = Vec::with_capacity(before.len() + body + after.len());
             ids.extend_from_slice(before);
@@ -1197,11 +1258,22 @@ impl NativeEncoder {
         ids.extend_from_slice(before);
         let mut mapped = String::new();
         let mut cache = self.piece_cache_for_call();
-        for unit in &units {
+        for unit in units {
             self.encode_unit(model, unit, &mut mapped, &mut ids, &mut cache)?;
         }
         ids.extend_from_slice(after);
         Ok(ids)
+    }
+
+    /// Room for the ids of one unit, from its bytes: about a token per three
+    /// bytes of prose, with a floor for a short unit; a unit of a denser
+    /// script grows its Vec past the estimate (by doubling, so a unit at one
+    /// id per byte grows twice).
+    fn ids_capacity(unit: &Segment<'_>) -> usize {
+        match unit {
+            Segment::Added(_) => 1,
+            Segment::Text(text) => text.len() / 3 + 8,
+        }
     }
 
     /// Whether `text` is in NFC by the library's tables: the quick check's
@@ -1222,8 +1294,8 @@ impl NativeEncoder {
     /// ([`Self::stable_cut`]). Both kinds of added token come out before any
     /// cut: a cut inside one would turn it into pieces. With `added` off no
     /// token is cut out: the whole text is text.
-    fn units<'t>(&self, text: &'t str, chunked: bool, added: bool) -> Vec<Segment<'t>> {
-        let mut units = Vec::new();
+    fn units<'t>(&self, text: &'t str, chunked: bool, added: bool) -> Units<'t> {
+        let mut units = Units::new();
         if !added {
             self.push_text(text, chunked, &mut units);
             return units;
@@ -1241,8 +1313,8 @@ impl NativeEncoder {
     /// [`Self::units`] over the gaps of a text that was not in NFC
     /// ([`Self::nfc_gaps`]): the raw cut is done and every text is in NFC,
     /// what remains is the cut after normalization and the chunking.
-    fn units_of<'g>(&self, gaps: &'g [Gap<'_>], chunked: bool, added: bool) -> Vec<Segment<'g>> {
-        let mut units = Vec::with_capacity(gaps.len());
+    fn units_of<'g>(&self, gaps: &'g [Gap<'_>], chunked: bool, added: bool) -> Units<'g> {
+        let mut units = Units::new();
         for gap in gaps {
             match gap {
                 Gap::Added(id) => units.push(Segment::Added(*id)),
@@ -1275,7 +1347,7 @@ impl NativeEncoder {
 
     /// Appends the units of a text between raw added tokens: the added
     /// tokens matched after normalization and the texts between them.
-    fn push_normalized<'t>(&self, text: &'t str, chunked: bool, units: &mut Vec<Segment<'t>>) {
+    fn push_normalized<'t>(&self, text: &'t str, chunked: bool, units: &mut Units<'t>) {
         match &self.normalized_added {
             Some(added) => added.split(text, |segment| match segment {
                 Segment::Added(id) => units.push(Segment::Added(id)),
@@ -1287,7 +1359,7 @@ impl NativeEncoder {
 
     /// Appends a text as one unit, or for the thread pool (`chunked`) as
     /// several, cut at stable boundaries ([`Self::stable_cut`]).
-    fn push_text<'t>(&self, text: &'t str, chunked: bool, units: &mut Vec<Segment<'t>>) {
+    fn push_text<'t>(&self, text: &'t str, chunked: bool, units: &mut Units<'t>) {
         let mut rest = text;
         while chunked && rest.len() > 2 * PARALLEL_CHUNK_BYTES {
             let Some(cut) = self.stable_cut(rest, PARALLEL_CHUNK_BYTES) else {
