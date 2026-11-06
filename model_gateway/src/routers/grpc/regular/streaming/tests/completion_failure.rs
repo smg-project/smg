@@ -4,11 +4,18 @@
 //! it makes the two); and a chunk the tokenizer cannot decode after the first
 //! frame fails the stream as the chat stream does, after the chunks written
 //! ahead of it have left: the loop flushes what it wrote since its last frame
-//! before it returns the failure.
+//! before it returns the failure; and the finish of the open choices at the
+//! engine's end, the stream's third exit, flushes the same way ahead of a
+//! later choice's failed finish.
 
 use std::pin::Pin;
 
 use futures::{Stream, StreamExt as _};
+use llm_tokenizer::{
+    traits::{Decoder, Encoder, Encoding, TokenIdType, Tokenizer},
+    SpecialTokens,
+};
+use openai_protocol::common::StringOrArray;
 use serde_json::{json, Value};
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
 use tokio::sync::oneshot;
@@ -205,5 +212,165 @@ async fn a_chunk_that_fails_to_decode_after_the_first_frame_flushes_the_chunks_w
         text_of(&frames),
         "hi there",
         "every chunk written ahead of the failure reached the client: {frames:?}"
+    );
+}
+
+/// The character tokenizer, except that it HOLDS the surrogate id at the
+/// step, plain or eager (into the decode window, no text, no error),
+/// instead of failing it:
+/// the finish then decodes the window, as the production finish does, and
+/// fails there. The one way to reach the finish's failure exit with every
+/// chunk read, since the character tokenizer fails such an id at the read.
+#[derive(Default)]
+struct HoldsAnUndecodableId {
+    inner: CharacterTokenizer,
+}
+
+impl Encoder for HoldsAnUndecodableId {
+    fn encode(&self, text: &str, add_special_tokens: bool) -> anyhow::Result<Encoding> {
+        self.inner.encode(text, add_special_tokens)
+    }
+
+    fn encode_batch(
+        &self,
+        texts: &[&str],
+        add_special_tokens: bool,
+    ) -> anyhow::Result<Vec<Encoding>> {
+        self.inner.encode_batch(texts, add_special_tokens)
+    }
+}
+
+impl Decoder for HoldsAnUndecodableId {
+    fn decode(&self, ids: &[TokenIdType], skip_special_tokens: bool) -> anyhow::Result<String> {
+        self.inner.decode(ids, skip_special_tokens)
+    }
+
+    fn decode_step(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> anyhow::Result<Option<String>> {
+        if token_id == 0xD800 {
+            ids.push(token_id);
+            return Ok(None);
+        }
+        self.inner
+            .decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+
+    fn decode_step_eager(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> anyhow::Result<Option<String>> {
+        if token_id == 0xD800 {
+            ids.push(token_id);
+            return Ok(None);
+        }
+        self.inner
+            .decode_step_eager(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+}
+
+impl Tokenizer for HoldsAnUndecodableId {
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    fn get_special_tokens(&self) -> &SpecialTokens {
+        self.inner.get_special_tokens()
+    }
+
+    fn token_to_id(&self, token: &str) -> Option<TokenIdType> {
+        self.inner.token_to_id(token)
+    }
+
+    fn id_to_token(&self, id: TokenIdType) -> Option<String> {
+        self.inner.id_to_token(id)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// The third exit: at the engine's end without a `Complete`, the open
+/// choices finish in order and their tails are written into the buffer;
+/// a later choice's failed finish returns the failure with the earlier
+/// choice's tail already written. The flush ahead of the failure sends it,
+/// as the read's two exits send theirs: two choices, choice 0's tail held by
+/// a stop-sequence prefix, choice 1 holding an id no tokenizer decodes until
+/// its finish, and the client reads choice 0's tail before the error ends
+/// the stream.
+#[tokio::test]
+async fn a_failed_finish_of_a_later_choice_flushes_the_earlier_choice_s_tail_written_ahead_of_it() {
+    let (stream, server) = staged_stream(
+        vec![(
+            None,
+            vec![
+                chunk(0, "hi"),
+                chunk(1, "yo"),
+                chunk(0, "q"),
+                chunk_of_ids(1, vec![0xD800]),
+            ],
+        )],
+        "0",
+    )
+    .await;
+    let request: openai_protocol::completion::CompletionRequest = serde_json::from_value(json!({
+        "model": "eof-test", "prompt": "test", "stream": true, "max_tokens": 16, "n": 2
+    }))
+    .expect("a two-choice completion request");
+    let spec = CompletionResponseSpec::new(&request, Vec::new());
+    let (tx, mut rx) = sse_channel();
+    let processor = processor(false);
+    let reading = async {
+        let result = processor
+            .process_completion_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(HoldsAnUndecodableId::default()),
+                (
+                    Some(StringOrArray::Array(vec!["qzz".to_string()])),
+                    None,
+                    false,
+                    false,
+                    false,
+                ),
+                &spec,
+                "",
+                0,
+                &tx,
+            )
+            .await;
+        drop(tx);
+        result
+    };
+    let reader = async {
+        let mut frames = Vec::new();
+        while let Some(frame) = rx.recv().await {
+            frames.push(frame.expect("a write"));
+        }
+        frames
+    };
+    let (result, frames) = tokio::join!(reading, reader);
+    server.abort();
+    let Err(failure) = result else {
+        panic!("choice 1's failed finish fails the stream");
+    };
+    assert!(
+        failure.to_string().contains("character"),
+        "the failure is the held id's decode at the finish: {failure}"
+    );
+    assert_eq!(
+        text_of(&frames),
+        "hiyoq",
+        "choice 0's held tail (q) reached the client ahead of choice 1's failed finish: {frames:?}"
     );
 }

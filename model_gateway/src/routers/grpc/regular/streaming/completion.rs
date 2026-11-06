@@ -532,7 +532,16 @@ impl<'a> CompletionStream<'a> {
                 continue;
             };
             let index = self.index_offset + at as u32;
-            let tail = decoder.finish().map_err(|e| e.to_string())?;
+            // The third exit agrees with the read's two: an earlier choice's
+            // tail already in the buffer reaches the client ahead of this
+            // choice's failure.
+            let tail = match decoder.finish() {
+                Ok(tail) => tail,
+                Err(failure) => {
+                    StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
+                    return Err(failure.to_string().into());
+                }
+            };
             utils::warn_detokenize_recoveries(&self.dispatch.request_id, index, decoder);
             let stopped = decoder.is_stopped();
             let mut text = match tail {
