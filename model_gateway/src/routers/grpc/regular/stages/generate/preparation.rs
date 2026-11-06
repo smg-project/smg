@@ -127,7 +127,7 @@ impl GeneratePreparationStage {
         text: &str,
     ) -> Result<(String, Vec<u32>), String> {
         // Don't add special tokens - raw text generation uses text as-is
-        let encoding = utils::encode_blocking(tokenizer.clone(), text.to_string(), false)
+        let encoding = utils::encode_blocking(tokenizer.clone(), text, false)
             .await
             .map_err(|e| format!("Tokenization failed: {e}"))?;
         Ok((text.to_string(), encoding.into_token_ids()))

@@ -302,7 +302,7 @@ fn suffixed_reasoning_markers(text: &str) -> impl Iterator<Item = (String, Strin
 }
 
 async fn encode_ids(tokenizer: &Arc<dyn Tokenizer>, text: &str) -> Result<Vec<u32>, String> {
-    encode_blocking(tokenizer.clone(), text.to_owned(), false)
+    encode_blocking(tokenizer.clone(), text, false)
         .await
         .map(Encoding::into_token_ids)
         .map_err(|error| format!("Decisions tokenization failed: {error}"))
