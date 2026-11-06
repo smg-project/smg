@@ -683,7 +683,7 @@ struct WorkerArgs {
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
     pd_disaggregation: bool,
 
-    /// Enable EPD (Encode-Prefill-Decode) disaggregated mode (gRPC + TokenSpeed only).
+    /// Enable EPD (Encode-Prefill-Decode) disaggregated mode (gRPC vLLM or TokenSpeed).
     /// Encode workers run the vision tower and ship embeddings to prefill over Mooncake;
     /// prefill/decode reuse the PD path. Encode urls are given via `--encode <url> [bootstrap_port]`.
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]

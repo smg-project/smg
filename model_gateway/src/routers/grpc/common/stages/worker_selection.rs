@@ -504,6 +504,12 @@ impl WorkerSelectionStage {
         if let Some(guard) = prefill_guard {
             ctx.state.pd_prefill_guard = Some(guard);
         }
+        if self.mode == WorkerSelectionMode::EncodePrefillDecode
+            && inputs.media_refs
+            && selection_runtime(&workers) != RuntimeType::Vllm
+        {
+            return Err(multimodal::MmRefsError::EncodeNotSupported.into_response());
+        }
 
         // Reject an unsupported (backend, modality) combination now that the
         // runtime is known, before request building assembles the payload only
@@ -599,12 +605,21 @@ impl WorkerSelectionStage {
                 Ok((disaggregated(pair), Some(guard)))
             }
             WorkerSelectionMode::EncodePrefillDecode => {
-                // Encode workers never process references: refuse strict
-                // worker mode here rather than silently bypass the encode fleet.
-                if inputs.media_refs {
-                    return Err(multimodal::MmRefsError::EncodeNotSupported.into_response());
-                }
-                let encode_item_hashes = match encode_item_hashes(inputs.intermediate) {
+                let hashes = if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
+                    // A vLLM encoder processes the whole prompt, batching its media.
+                    let refs = multimodal::assemble_media_refs(plan.clone())
+                        .map_err(multimodal::MmRefsError::into_response)?;
+                    let mut hash = blake3::Hasher::new();
+                    for item in &refs.items {
+                        hash.update(&item.modality.to_le_bytes());
+                        hash.update(&(item.url.len() as u64).to_le_bytes());
+                        hash.update(item.url.as_bytes());
+                    }
+                    Ok(vec![hash.finalize().as_bytes().to_vec()])
+                } else {
+                    encode_item_hashes(inputs.intermediate)
+                };
+                let encode_item_hashes = match hashes {
                     Ok(hashes) => hashes,
                     Err(err) => {
                         error!(
@@ -1943,7 +1958,13 @@ impl WorkerSelectionStage {
         }
 
         // Filter all three pools to the target runtime
-        let available_encode = on_runtime(all_encode, target_runtime);
+        let mut available_encode = on_runtime(all_encode, target_runtime);
+        if target_runtime == RuntimeType::Vllm && needs_encode {
+            available_encode.retain(|worker| {
+                accepts_media_refs(worker.as_ref())
+                    && multimodal::worker_supports_ec_transfer(worker.as_ref())
+            });
+        }
         let mut available_prefill = on_runtime(all_prefill, target_runtime);
         let available_decode = on_runtime(all_decode, target_runtime);
 
@@ -2072,10 +2093,16 @@ fn shared_epd_runtime(
         .iter()
         .map(|w| w.metadata().spec.runtime_type)
         .find(|runtime| {
-            // The current EPD multimodal encoder adapter is TokenSpeed-
-            // specific. Do not select a shared SGLang/vLLM runtime only to
-            // reject it later during request building.
-            (!needs_encode || *runtime == RuntimeType::TokenSpeed)
+            // vLLM needs the EC-capable Python servicer; other runtimes keep
+            // their existing encoder transport contract.
+            (!needs_encode
+                || *runtime == RuntimeType::TokenSpeed
+                || (*runtime == RuntimeType::Vllm
+                    && all_encode.iter().any(|worker| {
+                        worker.metadata().spec.runtime_type == *runtime
+                            && accepts_media_refs(worker.as_ref())
+                            && multimodal::worker_supports_ec_transfer(worker.as_ref())
+                    })))
                 && all_decode
                     .iter()
                     .any(|w| w.metadata().spec.runtime_type == *runtime)

@@ -230,6 +230,9 @@ message GenerateRequest {
   // its own modality, tensors, placeholders and hashes.
   repeated MultimodalInputs extra_mm_inputs = 11;
 
+  // Opaque EC connector request parameters for encoder disaggregation.
+  optional string ec_transfer_params_json = 12;
+
   // Connector KV-transfer params as a JSON object, passed verbatim to the
   // engine (e.g. NIXL's do_remote_prefill/remote_block_ids/remote_host/...).
   // Preferred over the legacy typed kv_transfer_params field.
@@ -340,6 +343,9 @@ message GenerateComplete {
   // pixel-less MultimodalInputs per modality (hashes, placeholders, grid
   // tensors). Absent on non-PD requests and from older servicers.
   MediaIdentity media_identity = 15;
+
+  // Encoder completion handles and placeholder metadata, including token-less E replies.
+  optional string ec_transfer_params_json = 16;
 }
 
 // What the prefill worker learned about the media it processed, in the shape
@@ -520,6 +526,9 @@ message GetServerInfoResponse {
   // language; a `token` node stays as derived, so a table that writes
   // single-token markers still meets the older compiler's refusal.
   string structural_tag_vocabulary = 26;
+  bool supports_ec_transfer = 27;
+  // Mooncake consumer entry point for each DP rank; each entry discovers its TP shards.
+  repeated string ec_zmq_addrs = 28;
 }
 
 // =====================

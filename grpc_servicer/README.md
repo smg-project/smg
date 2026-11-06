@@ -36,6 +36,28 @@ pip install smg-grpc-servicer[sglang]
 vllm serve meta-llama/Llama-2-7b-hf --grpc
 ```
 
+#### Encoder disaggregation
+
+The Python vLLM servicer accepts opaque `ec_transfer_params_json` on Generate
+and returns EC handles and placeholder metadata in the completion, including
+encoder-only requests which generate no tokens. EC consumers may receive
+pixel-less preprocessed inputs without a remote KV handoff.
+
+Select the Python implementation with `--servicer-impl python` (or
+`SMG_VLLM_SERVICER_IMPL=python`); the Rust implementation does not yet carry
+this EC contract. Use a matching `smg-grpc-proto` build. Workers advertise
+`supports_ec_transfer` through GetServerInfo. Use `--mm-processor inprocess`
+on E; its returned media identity preserves the encoder-cache hashes for P/D.
+
+SMG can route these workers directly with `--epd-disaggregation --mm-processing
+worker --backend vllm --encode grpc://E:50051 --prefill grpc://P:50052 --decode
+grpc://D:50053`. E runs `--mm-processor inprocess`; P and D can keep media
+processing off. E returns the expanded prompt and pixel-less media identity
+before P runs, and SMG relays P's KV handoff to D. Mooncake consumers advertise
+their per-DP EC endpoints through GetServerInfo; PULL EC connectors return
+their transfer handles from E instead. Multimodal EPD requests currently
+require `n=1`; failed transfers are not replayed onto another P replica.
+
 Without `--kv-events-config`, the servicer turns vLLM's ZMQ KV-event publisher
 on by itself, under either implementation, before the engine is built, at a
 port found free on the host rather than vLLM's fixed default (one per

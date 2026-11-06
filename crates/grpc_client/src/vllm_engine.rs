@@ -68,6 +68,7 @@ impl VllmEngineClient {
             mm_inputs,
             media_refs: None,
             extra_mm_inputs: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -644,6 +645,7 @@ mod tests {
             mm_inputs: None,
             media_refs: None,
             extra_mm_inputs: Vec::new(),
+            ..Default::default()
         };
 
         assert_eq!(gen_req.request_id, "test-req-123");
