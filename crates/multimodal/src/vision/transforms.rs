@@ -295,13 +295,25 @@ fn build_planar_tensor(
     scale: [f32; 3],
     bias: [f32; 3],
 ) -> Array3<f32> {
+    build_planes(w, h, |r_plane, g_plane, b_plane| {
+        deinterleave_rgb_to_planes(raw, r_plane, g_plane, b_plane, scale, bias);
+    })
+}
+
+/// A `[3, h, w]` f32 tensor over the pooled scratch, its R, G and B planes
+/// written by `fill`.
+fn build_planes(
+    w: usize,
+    h: usize,
+    fill: impl FnOnce(&mut [f32], &mut [f32], &mut [f32]),
+) -> Array3<f32> {
     let pixels = h * w;
     // Pooled: this large per-image buffer is the data plane's hottest allocation.
     let mut data = scratch::take_f32(3 * pixels);
     let (r_plane, rest) = data.split_at_mut(pixels);
     let (g_plane, b_plane) = rest.split_at_mut(pixels);
 
-    deinterleave_rgb_to_planes(raw, r_plane, g_plane, b_plane, scale, bias);
+    fill(r_plane, g_plane, b_plane);
 
     #[expect(
         clippy::expect_used,
@@ -389,6 +401,18 @@ pub fn to_tensor(image: &DynamicImage) -> Array3<f32> {
     let (w, h, raw) = rgb_bytes(image);
     let s = 1.0 / 255.0;
     build_planar_tensor(&raw, w, h, [s, s, s], [0.0, 0.0, 0.0])
+}
+
+/// [`to_tensor`] and the normalization in one pass through a per-channel
+/// table of the 256 byte levels: `output[c][i] = table[c][raw[i*3 + c]]`,
+/// for a reference whose rescale and normalize no single multiply-add
+/// reproduces in the last bit (the table of
+/// [`PixelNorm::table_f32`](crate::encoder_inputs::PixelNorm::table_f32)).
+pub fn to_tensor_by_table(image: &DynamicImage, table: &[[f32; 256]; 3]) -> Array3<f32> {
+    let (w, h, raw) = rgb_bytes(image);
+    build_planes(w, h, |r_plane, g_plane, b_plane| {
+        deinterleave_rgb_to_planes_by_table(&raw, r_plane, g_plane, b_plane, table);
+    })
 }
 
 /// Convert image to tensor [C, H, W] without normalization (keeps [0, 255]).
@@ -2052,12 +2076,13 @@ pub fn calculate_mean_color(image: &DynamicImage) -> Rgb<u8> {
     ])
 }
 
-/// Convert normalized mean values [0, 1] to RGB bytes.
+/// Convert normalized mean values [0, 1] to RGB bytes, truncated like the
+/// reference's `int(x * 255)` (the CLIP mean fills with 122, 116, 104).
 pub fn mean_to_rgb(mean: &[f64; 3]) -> Rgb<u8> {
     Rgb([
-        (mean[0] * 255.0).round() as u8,
-        (mean[1] * 255.0).round() as u8,
-        (mean[2] * 255.0).round() as u8,
+        (mean[0] * 255.0) as u8,
+        (mean[1] * 255.0) as u8,
+        (mean[2] * 255.0) as u8,
     ])
 }
 
@@ -2786,12 +2811,12 @@ mod tests {
 
     #[test]
     fn test_mean_to_rgb() {
-        let mean = [0.5, 0.25, 1.0];
-        let rgb = mean_to_rgb(&mean);
-
-        assert_eq!(rgb[0], 128);
-        assert_eq!(rgb[1], 64);
-        assert_eq!(rgb[2], 255);
+        // Truncated, as the reference's `int(x * 255)`.
+        assert_eq!(mean_to_rgb(&[0.5, 0.25, 1.0]), Rgb([127, 63, 255]));
+        assert_eq!(
+            mean_to_rgb(&[0.48145466, 0.4578275, 0.40821073]),
+            Rgb([122, 116, 104])
+        );
     }
 
     fn chessboard(square_size: u32, on_top_left: bool) -> TransparentBgConfig {
