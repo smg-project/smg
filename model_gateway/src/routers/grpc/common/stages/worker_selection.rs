@@ -32,10 +32,11 @@ use crate::{
         grpc::{
             context::{
                 stage_output, DispatchContext, EncodeWorkerAssignment, ExecutionPlan,
-                PreparationOutput, RequestContext, RequestInput, RequestType, RoutingSnapshot,
-                WireConstraint, WorkerSelection,
+                ExecutionPlanKind, PreparationOutput, RequestContext, RequestInput, RequestType,
+                RoutingSnapshot, WireConstraint, WorkerSelection,
             },
             multimodal,
+            proto_wrapper::ProtoGenerateRequest,
         },
         prefill_queue_full, prefill_queue_timeout,
     },
@@ -63,6 +64,8 @@ const ACCEPTS_MEDIA_REFS: CandidateFilter<'static> = &accepts_media_refs;
 enum EpdSelectionFailure {
     Unavailable,
     Placement(Box<PairFailure>),
+    EcIncompatible,
+    DecodeVisionUnsupported,
     EncodeNotSupported,
 }
 
@@ -358,12 +361,7 @@ impl<'a> SelectionInputs<'a> {
         };
         let demand = PairDemands::new(
             stage.prefill_side_needs_vision(needs_vision),
-            stage.decode_side_needs_vision(
-                &input.request_type,
-                intermediate,
-                media_refs
-                    && (needs_vision || stage.mode != WorkerSelectionMode::EncodePrefillDecode),
-            ),
+            stage.decode_side_needs_vision(&input.request_type, intermediate, media_refs),
         )
         .with_media_refs(media_refs, media_refs_pipeline)
         .with_context(context_requirements);
@@ -682,7 +680,9 @@ impl WorkerSelectionStage {
     /// plan's prompt ids, after the request dropped at build. Candidates are
     /// pinned to the retained plan's wire (runtime + transport): the plan
     /// cannot be rebuilt for another flavor.
-    /// EPD re-selects only the prefill/decode pair — the first dispatch
+    /// vLLM EC handoffs are replica-bound and cannot replay the retained,
+    /// pre-encode plan. Such requests terminate here instead of re-encoding.
+    /// TokenSpeed EPD re-selects only the prefill/decode pair — the first dispatch
     /// already launched the encode jobs, and the plan carries their
     /// bootstrap rooms. A disaggregated retry takes a fresh Prefill
     /// admission slot for its new prefill worker.
@@ -707,6 +707,26 @@ impl WorkerSelectionStage {
         ctx: &mut DispatchContext,
         plan: &ExecutionPlan,
     ) -> Result<(), Response> {
+        let carries_ec_media = |request: &ProtoGenerateRequest| {
+            request.is_vllm() && (request.has_mm_inputs() || request.has_vllm_media_refs())
+        };
+        let cannot_replay = match plan {
+            ExecutionPlan::EncodePrefillDecode { request } => carries_ec_media(request),
+            ExecutionPlan::Batch {
+                kind: ExecutionPlanKind::EncodePrefillDecode,
+                requests,
+                ..
+            } => requests.iter().any(carries_ec_media),
+            _ => false,
+        };
+        if cannot_replay {
+            let mut response = error::bad_gateway(
+                "ec_retry_unsupported",
+                "Cannot replay a replica-bound EC handoff from the pre-encode request",
+            );
+            mark_non_retryable(&mut response);
+            return Err(response);
+        }
         let text = ctx.routing.routing_text.as_deref();
         let tokens = Some(plan.routing_token_ids()).filter(|ids| !ids.is_empty());
         let rid_key = ctx.routing.rid_key.as_deref();
@@ -802,9 +822,9 @@ impl WorkerSelectionStage {
         Ok(())
     }
 
-    /// Keep grid-bearing decode identities on vision-capable workers. EPD
-    /// references are still unresolved here, so image/video references need
-    /// that capability too; a known hash-only identity does not.
+    /// Keep known grid-bearing decode identities on vision-capable workers.
+    /// EPD references are unresolved: prefer vision when available, but let
+    /// dispatch validate the resulting identity before using a stripped leg.
     fn decode_side_needs_vision(
         &self,
         request: &RequestType,
@@ -816,7 +836,7 @@ impl WorkerSelectionStage {
                 decode_needs_vision(request, intermediate, media_refs)
             }
             WorkerSelectionMode::EncodePrefillDecode => {
-                media_refs || intermediate.is_some_and(|mm| mm.has_mrope_grids())
+                intermediate.is_some_and(|mm| mm.has_mrope_grids())
             }
             WorkerSelectionMode::Regular => false,
         }
@@ -886,10 +906,23 @@ impl WorkerSelectionStage {
             Self::acquire_failure(model_id, error, |failure| {
                 match failure {
                     EpdSelectionFailure::EncodeNotSupported => {
-                        return multimodal::MmRefsError::EncodeNotSupported.into_response()
+                        return if demand.encode.vision {
+                            self.vision_refusal(model_id, "encode workers")
+                        } else {
+                            multimodal::MmRefsError::EncodeNotSupported.into_response()
+                        }
                     }
                     EpdSelectionFailure::Placement(failure) => {
                         return self.pair_failure(model_id, *failure)
+                    }
+                    EpdSelectionFailure::EcIncompatible => {
+                        warn!(model_id, "No compatible EC producer/consumer pair; check EC connector and role metadata");
+                        let mut response = error::service_unavailable("ec_incompatible_pair", "No compatible EC producer/consumer pair; check E/P connector and role configuration and update servicer/proto metadata");
+                        mark_non_retryable(&mut response);
+                        return response
+                    }
+                    EpdSelectionFailure::DecodeVisionUnsupported => {
+                        return self.vision_refusal(model_id, "decode workers")
                     }
                     EpdSelectionFailure::Unavailable => {}
                 }
@@ -1940,8 +1973,7 @@ impl WorkerSelectionStage {
     ) -> Result<EncodePrefillDecodeWorkerSelection, EpdSelectionFailure> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let needs_encode = !encode_item_hashes.is_empty();
-        let mut available_encode =
-            epd_role_candidates(&snapshot, WorkerType::Encode, needs_encode)?;
+        let mut available_encode = Self::available_workers(&snapshot, RoutingPool::GrpcEncode);
         let capable = |worker: &Arc<dyn Worker>| {
             demand.encode.accepts(worker.as_ref())
                 && match worker.metadata().spec.runtime_type {
@@ -1951,37 +1983,63 @@ impl WorkerSelectionStage {
                 }
         };
         available_encode.retain(capable);
+        let registered_encode = snapshot.pool(RoutingPool::GrpcEncode);
         if needs_encode && available_encode.is_empty() {
-            // Capability is a membership fact; an eligible encoder that is
-            // temporarily unhealthy must retain the retryable 503 verdict.
-            return Err(
-                if demand.encode.media_refs
-                    && !snapshot.pool(RoutingPool::GrpcEncode).iter().any(capable)
-                {
-                    EpdSelectionFailure::EncodeNotSupported
-                } else {
-                    EpdSelectionFailure::Unavailable
-                },
-            );
+            // Only membership can prove a permanent configuration gap.
+            return Err(if registered_encode.iter().any(capable) {
+                EpdSelectionFailure::Unavailable
+            } else if registered_encode.iter().any(|worker| {
+                worker.metadata().spec.runtime_type == RuntimeType::Vllm
+                    && demand.encode.accepts(worker.as_ref())
+                    && multimodal::worker_supports_ec_transfer(worker.as_ref())
+            }) {
+                EpdSelectionFailure::EcIncompatible
+            } else if !registered_encode.is_empty() && demand.encode.any() {
+                EpdSelectionFailure::EncodeNotSupported
+            } else {
+                EpdSelectionFailure::Unavailable
+            });
         }
-        // References go to E only. P consumes EC metadata and D consumes KV;
-        // neither needs a media processor. Use the same membership snapshot's
-        // compatibility index so the selected P/D connectors can rendezvous.
-        let eligible = |worker: &dyn Worker| {
+        // References go to E only; P consumes EC and D consumes KV. Diagnose
+        // permanent constraints against membership, not transient health.
+        let compatible = |encoder: &Arc<dyn Worker>, worker: &dyn Worker| {
             let runtime = worker.metadata().spec.runtime_type;
-            (runtime != RuntimeType::Vllm
-                || !demand.decode_vision
+            encoder.metadata().spec.runtime_type == runtime
+                && (runtime != RuntimeType::Vllm
+                    || worker.worker_type() != &WorkerType::Prefill
+                    || ec_pair(encoder.as_ref(), worker))
+        };
+        let registered_ec = |worker: &dyn Worker| {
+            !needs_encode
+                || registered_encode
+                    .iter()
+                    .any(|e| capable(e) && compatible(e, worker))
+        };
+        let decode_vision = |worker: &dyn Worker| {
+            worker.metadata().spec.runtime_type != RuntimeType::Vllm
                 || worker.worker_type() != &WorkerType::Decode
-                || vision_capable(worker))
-                && (!needs_encode
-                    || available_encode.iter().any(|encoder| {
-                        encoder.metadata().spec.runtime_type == runtime
-                            && (runtime != RuntimeType::Vllm
-                                || worker.worker_type() != &WorkerType::Prefill
-                                || ec_pair(encoder.as_ref(), worker))
-                    }))
+                || vision_capable(worker)
         };
         let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
+        let ec_pair_exists = pair_admitted_by(&pairs, None, &registered_ec);
+        if !ec_pair_exists && pair_admitted_by(&pairs, None, &|_| true) {
+            return Err(EpdSelectionFailure::EcIncompatible);
+        }
+        let vision_pair_exists = pair_admitted_by(&pairs, None, &|worker| {
+            registered_ec(worker) && decode_vision(worker)
+        });
+        if demand.decode_vision && ec_pair_exists && !vision_pair_exists {
+            return Err(EpdSelectionFailure::DecodeVisionUnsupported);
+        }
+        // Unknown reference identities may be grid-free. Prefer a vision D
+        // when registered, but retain the stripped-hash path otherwise; the
+        // post-encode dispatch check rejects actual grids before sending P/D.
+        let prefer_vision = demand.decode_vision
+            || (demand.encode.media_refs && demand.encode.vision && vision_pair_exists);
+        let eligible = |worker: &dyn Worker| {
+            (!prefer_vision || decode_vision(worker))
+                && (!needs_encode || available_encode.iter().any(|e| compatible(e, worker)))
+        };
         let pair = placement::select_pair(
             &self.worker_registry,
             &self.policy_registry,
@@ -2051,22 +2109,6 @@ fn ec_pair(encoder: &dyn Worker, prefill: &dyn Worker) -> bool {
         && ec_role(prefill, "ec_consumer")
         && encoder.metadata().spec.labels.get("ec_connector")
             == prefill.metadata().spec.labels.get("ec_connector")
-}
-
-/// A role's available candidates from the EPD membership snapshot. A demanded
-/// role with none fails the selection as unavailable; the encode role is
-/// demanded only when the request carries encode items.
-fn epd_role_candidates(
-    snapshot: &ModelWorkerSnapshot,
-    role: WorkerType,
-    demanded: bool,
-) -> Result<Vec<Arc<dyn Worker>>, EpdSelectionFailure> {
-    let candidates = WorkerSelectionStage::available_workers(snapshot, role_pool(role));
-    if demanded && candidates.is_empty() {
-        warn!("No available {} workers", role_name(role));
-        return Err(EpdSelectionFailure::Unavailable);
-    }
-    Ok(candidates)
 }
 
 fn encode_item_hashes(
@@ -3792,6 +3834,54 @@ mod tests {
         assert_eq!(selected(&other), "grpc://127.0.0.1:9401");
     }
 
+    /// A late stream failure cannot replay raw media after the EC handoff.
+    #[tokio::test]
+    async fn vllm_epd_retries_do_not_replay_the_pre_encode_plan() {
+        use smg_grpc_client::vllm_proto as vllm;
+        for refs in [true, false] {
+            for batch in [true, false] {
+                let stage = WorkerSelectionStage::new(
+                    Arc::new(WorkerRegistry::new()),
+                    Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                    WorkerSelectionMode::EncodePrefillDecode,
+                    None,
+                );
+                let mut ctx = dispatch_ctx(
+                    "epd-retry",
+                    WireConstraint {
+                        runtime: RuntimeType::Vllm,
+                        connection: ConnectionMode::Grpc,
+                        requires_media_refs: refs,
+                        pipeline: PipelinePin::Any,
+                    },
+                );
+                let request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+                    media_refs: refs.then(vllm::MediaRefs::default),
+                    mm_inputs: (!refs).then(|| vllm::MultimodalInputs {
+                        pixel_values: Some(vllm::TensorData::default()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }));
+                let plan = if batch {
+                    ExecutionPlan::Batch {
+                        kind: ExecutionPlanKind::EncodePrefillDecode,
+                        requests: vec![request],
+                        shared_request_id: "epd-retry".into(),
+                    }
+                } else {
+                    ExecutionPlan::EncodePrefillDecode { request }
+                };
+                let refusal = stage.reselect(&mut ctx, &plan).await.unwrap_err();
+                assert_eq!(
+                    error::extract_error_code_from_response(&refusal),
+                    "ec_retry_unsupported"
+                );
+                assert!(ctx.workers.is_none());
+            }
+        }
+    }
+
     /// EPD selects a compatible EC consumer even with mixed runtimes and connectors.
     #[test]
     fn epd_filters_capabilities_and_pairs_before_encoding() {
@@ -4088,6 +4178,8 @@ mod tests {
                                 .connection_mode(ConnectionMode::Grpc)
                                 .health_config(no_health_check())
                                 .label("supports_ec_transfer", "true")
+                                .label("mm_processor", "inprocess")
+                                .label("mm_media_ref_schemes", "http,https,data")
                                 .label("ec_connector", connector)
                                 .label("ec_role", ec_role)
                                 .label("supports_vision", vision.to_string())
@@ -4122,6 +4214,63 @@ mod tests {
                     !needs_vision || e_vision
                 };
                 assert_eq!(result.is_ok(), allowed, "{e_connector}/{p_connector} {e_role}/{p_role} E vision={e_vision} D vision={d_vision} demand={needs_vision}/{grids}");
+                if runtime == RuntimeType::Vllm && !allowed && e_vision {
+                    assert!(matches!(
+                        result,
+                        Err(EpdSelectionFailure::EcIncompatible
+                            | EpdSelectionFailure::DecodeVisionUnsupported)
+                    ));
+                }
+                if runtime == RuntimeType::Vllm && needs_vision && !e_vision {
+                    assert!(matches!(
+                        result,
+                        Err(EpdSelectionFailure::EncodeNotSupported)
+                    ));
+                    stage
+                        .worker_registry
+                        .get_by_url("grpc://127.0.0.1:8810")
+                        .unwrap()
+                        .set_status(openai_protocol::worker::WorkerStatus::NotReady);
+                    assert!(matches!(
+                        stage.select_encode_prefill_decode_workers(
+                            model,
+                            PlacementInputs::default(),
+                            &[vec![1]],
+                            EpdDemands {
+                                encode: MediaDemands {
+                                    media_refs: false,
+                                    vision: true,
+                                    pipeline: PipelinePin::Any
+                                },
+                                decode_vision: grids
+                            },
+                            None
+                        ),
+                        Err(EpdSelectionFailure::EncodeNotSupported)
+                    ));
+                }
+                if runtime == RuntimeType::Vllm && allowed && !d_vision {
+                    let refs = EpdDemands {
+                        encode: MediaDemands {
+                            media_refs: true,
+                            vision: needs_vision,
+                            pipeline: PipelinePin::Any,
+                        },
+                        decode_vision: false,
+                    };
+                    assert!(
+                        stage
+                            .select_encode_prefill_decode_workers(
+                                model,
+                                PlacementInputs::default(),
+                                &[vec![1]],
+                                refs,
+                                None
+                            )
+                            .is_ok(),
+                        "unresolved refs may use a stripped decode leg when no vision D exists"
+                    );
+                }
             }
         }
     }
@@ -6065,7 +6214,7 @@ mod tests {
             epd.decode_side_needs_vision(&request, Some(&gridded), false),
             "grid metadata still needs the vision model on decode"
         );
-        assert!(epd.decode_side_needs_vision(&request, None, true));
+        assert!(!epd.decode_side_needs_vision(&request, None, true));
         assert!(!epd.decode_side_needs_vision(&request, None, false));
 
         let regular = stage(WorkerSelectionMode::Regular);

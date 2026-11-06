@@ -23,10 +23,14 @@ class _Aborted(Exception):
 def _generate(**overrides):
     """Compile the actual handler with engine-independent dependencies."""
     path = Path(__file__).parents[1] / "smg_grpc_servicer/vllm/servicer.py"
-    cls = next(
+    module = ast.parse(path.read_text())
+    helper = next(
         n
-        for n in ast.parse(path.read_text()).body
-        if isinstance(n, ast.ClassDef) and n.name == "VllmEngineServicer"
+        for n in module.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_valid_cpu_ec_handle"
+    )
+    cls = next(
+        n for n in module.body if isinstance(n, ast.ClassDef) and n.name == "VllmEngineServicer"
     )
     method = next(
         n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "Generate"
@@ -61,7 +65,7 @@ def _generate(**overrides):
         "GracefulHTTPError": type("GracefulHTTPError", (Exception,), {}),
     }
     namespace.update(overrides)
-    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
+    exec(compile(ast.Module(body=[helper, method], type_ignores=[]), str(path), "exec"), namespace)
     return namespace["Generate"]
 
 

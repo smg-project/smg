@@ -102,6 +102,17 @@ except Exception:  # pragma: no cover - version lookup is best-effort
     VLLM_VERSION = ""
 
 
+def _valid_cpu_ec_handle(handle) -> bool:
+    """ECCPU needs an address for every encoding it will fetch remotely."""
+    return (
+        isinstance(handle, dict)
+        and isinstance(handle.get("peer_host"), str)
+        and bool(handle["peer_host"])
+        and type(handle.get("peer_port")) is int
+        and 0 < handle["peer_port"] <= 65535
+    )
+
+
 def _prompt_length(prompt) -> int:
     """The token count of an engine prompt (0 when it is text the engine tokenizes)."""
     if isinstance(prompt, dict):
@@ -468,6 +479,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                                     ec_handoff = False
                                     break
                                 hashes.remove(mm_hash)
+                if ec_handoff and ec_config.ec_connector == "ECCPUConnector":
+                    ec_handoff = all(
+                        _valid_cpu_ec_handle(ec_transfer_params.get(mm_hash))
+                        for batch in batches_missing_pixels(preprocessed_batches)
+                        for mm_hash in batch.mm_hashes
+                    )
                 if (
                     batches_missing_pixels(preprocessed_batches)
                     and kv_transfer_params is None
@@ -492,7 +509,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     self._build_preprocessed_mm_inputs, request.tokenized, preprocessed_batches
                 )
                 prompt["arrival_time"] = arrival_time
-                if ec_transfer_params is not None and is_ec_producer:
+                if (
+                    ec_transfer_params is not None
+                    and is_ec_producer
+                    and not batches_missing_pixels(preprocessed_batches)
+                ):
                     media_identity = build_media_identity(prompt)
             elif input_type == "tokenized":
                 prompt: TokensPrompt = {"prompt_token_ids": list(request.tokenized.input_ids)}
@@ -592,7 +613,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     for batch in mm_batches(media_identity):
                         for mm_hash in batch.mm_hashes:
                             handle = handles.get(mm_hash, {})
-                            if not handle.get("peer_host") or not handle.get("peer_port"):
+                            if not _valid_cpu_ec_handle(handle):
                                 raise RuntimeError(
                                     "Encoder returned an incomplete ECCPU transfer handle"
                                 )

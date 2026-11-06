@@ -5,14 +5,17 @@ use serde_json::json;
 use smg_grpc_client::vllm_proto as vllm;
 use uuid::Uuid;
 
-use crate::routers::{
-    error,
-    grpc::{
-        context::WorkerSelection,
-        multimodal::worker_supports_ec_transfer,
-        proto_wrapper::{ProtoGenerateRequest, ProtoGenerateResponse},
-        utils::tonic_ext::TonicStatusExt,
+use crate::{
+    routers::{
+        error,
+        grpc::{
+            context::WorkerSelection,
+            multimodal::worker_supports_ec_transfer,
+            proto_wrapper::{ProtoGenerateRequest, ProtoGenerateResponse},
+            utils::tonic_ext::TonicStatusExt,
+        },
     },
+    worker::Worker,
 };
 
 /// Encode one prompt, validating every handoff before removing its media.
@@ -70,15 +73,7 @@ pub(super) async fn encode(
     let mut params = json!({});
     // Mooncake PUSH needs the exact selected DP replica, not the HTTP endpoint.
     // PULL connectors leave this list empty and return their handles from E.
-    if let Some(addrs) = prefill.metadata().spec.labels.get("ec_zmq_addrs") {
-        let addrs: Vec<String> = serde_json::from_str(addrs)
-            .map_err(|e| error::internal_error("ec_consumer_address", e.to_string()))?;
-        let addr = consumer_address(&addrs, prefill.dp_rank()).ok_or_else(|| {
-            error::service_unavailable(
-                "ec_consumer_address",
-                "No EC destination for the selected DP rank",
-            )
-        })?;
+    if let Some(addr) = push_destination(prefill.as_ref())? {
         params["consumer_zmq"] = json!(addr);
         let count = encoder.media_refs.as_ref().map_or_else(
             || {
@@ -141,6 +136,34 @@ pub(super) async fn encode(
         "ec_encode_incomplete",
         "Encoder closed without a completion",
     ))
+}
+
+/// A Mooncake consumer must advertise a destination before E reserves buffers.
+fn push_destination(prefill: &dyn Worker) -> Result<Option<String>, Response> {
+    let labels = &prefill.metadata().spec.labels;
+    let required = labels
+        .get("ec_connector")
+        .is_some_and(|name| name == "ECMooncakeConnector");
+    let Some(addrs) = labels.get("ec_zmq_addrs") else {
+        return if required {
+            Err(error::service_unavailable(
+                "ec_consumer_address",
+                "Mooncake consumer has no EC destination",
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    let addrs: Vec<String> = serde_json::from_str(addrs)
+        .map_err(|e| error::internal_error("ec_consumer_address", e.to_string()))?;
+    consumer_address(&addrs, prefill.dp_rank())
+        .map(|addr| Some(addr.to_owned()))
+        .ok_or_else(|| {
+            error::service_unavailable(
+                "ec_consumer_address",
+                "No EC destination for the selected DP rank",
+            )
+        })
 }
 
 /// Resolve global rank slots, allowing an unranked worker only one destination.
@@ -417,6 +440,29 @@ mod tests {
         );
         assert_eq!(consumer_address(&addrs, Some(0)), None);
         assert_eq!(consumer_address(&["a".into(), "b".into()], None), None);
+    }
+
+    /// Missing PUSH discovery must fail before the encoder is contacted.
+    #[test]
+    fn mooncake_requires_a_destination() {
+        use crate::worker::BasicWorkerBuilder;
+        for connector in ["ECCPUConnector", "ECMooncakeConnector"] {
+            let worker = BasicWorkerBuilder::new("grpc://127.0.0.1:9000")
+                .label("ec_connector", connector)
+                .build();
+            assert_eq!(
+                push_destination(&worker).is_err(),
+                connector == "ECMooncakeConnector"
+            );
+        }
+        let worker = BasicWorkerBuilder::new("grpc://127.0.0.1:9000")
+            .label("ec_connector", "ECMooncakeConnector")
+            .label("ec_zmq_addrs", r#"["tcp://127.0.0.1:9001"]"#)
+            .build();
+        assert_eq!(
+            push_destination(&worker).unwrap().as_deref(),
+            Some("tcp://127.0.0.1:9001")
+        );
     }
 
     /// Malformed PULL handles must not strip the original media.

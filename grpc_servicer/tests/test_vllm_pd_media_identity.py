@@ -161,17 +161,22 @@ async def test_decode_side_from_identity_never_touches_the_processor(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_ec_consumer_accepts_metadata_without_a_kv_handoff(monkeypatch):
+@pytest.mark.parametrize("producer", [False, True])
+@pytest.mark.parametrize("connector", ["ECCPUConnector", "ECMooncakeConnector"])
+async def test_ec_consumer_accepts_metadata_without_a_kv_handoff(monkeypatch, producer, connector):
+    """An ec_both prefill consumes E's handles without having to publish new ones."""
     processor = _Processor()
     servicer = _servicer(monkeypatch, processor)
     prefill = await _complete(servicer, _request(refs=True, kv=True))
     processor.calls.clear()
     servicer.engine.vllm_config.ec_transfer_config = SimpleNamespace(
-        is_ec_consumer=True, is_ec_producer=False, ec_connector="ECMooncakeConnector"
+        is_ec_consumer=True, is_ec_producer=producer, ec_connector=connector
     )
     request = _request(identity=prefill.media_identity)
     request.ec_transfer_params_json = json.dumps(
         {"ec_items": [{"mm_hash": "h1", "transfer_id": "transfer-1"}]}
+        if connector == "ECMooncakeConnector"
+        else {"h1": {"peer_host": "encoder", "peer_port": 9000}}
     )
     generate = servicer.engine.generate
 
@@ -302,3 +307,34 @@ async def test_router_processed_encoder_returns_a_pixel_less_identity(monkeypatc
     assert list(complete.media_identity.mm_inputs.mm_hashes) == ["h1"]
     assert not complete.media_identity.mm_inputs.HasField("pixel_values")
     assert json.loads(complete.ec_transfer_params_json) == handles
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handles",
+    [
+        {"other": {"peer_host": "e", "peer_port": 1}},
+        {"h1": {}},
+        {"h1": {"peer_host": "e"}},
+        {"h1": {"peer_host": "e", "peer_port": 0}},
+        {"h1": {"peer_host": "e", "peer_port": "9000"}},
+    ],
+)
+async def test_cpu_consumer_rejects_missing_or_invalid_hash_handles(monkeypatch, handles):
+    """A grid-only ECCPU leg must never fall back to encoding missing pixels."""
+    import grpc
+
+    servicer = _servicer(monkeypatch, _Processor())
+    prefill = await _complete(servicer, _request(refs=True, kv=True))
+    servicer.engine.vllm_config.ec_transfer_config = SimpleNamespace(
+        is_ec_consumer=True, is_ec_producer=False, ec_connector="ECCPUConnector"
+    )
+    request = _request(identity=prefill.media_identity)
+    request.ec_transfer_params_json = json.dumps(handles)
+    seen = []
+    servicer.engine.generate = _engine(seen).generate
+    context = SimpleNamespace(abort=AsyncMock(), invocation_metadata=lambda: ())
+    assert [r async for r in servicer.Generate(request, context)] == []
+    context.abort.assert_awaited_once()
+    assert context.abort.call_args.args[0] is grpc.StatusCode.INVALID_ARGUMENT
+    assert seen == []
