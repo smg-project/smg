@@ -27,6 +27,10 @@ pub struct Config {
     /// requests of its own otherwise, and reports one `GetLoads` entry and one
     /// KV-event stream per rank. 1 (the default) is a single-rank engine.
     pub grpc_dp_size: u16,
+    /// The scheduler proto the gRPC workers serve (`--grpc-wire`). The
+    /// gateway tells a worker's runtime by the proto whose health check it
+    /// answers, so a worker serves exactly one.
+    pub grpc_wire: SchedulerWire,
     /// Frontend handshake `ipc://` address ZMQ mock engines connect to (they
     /// dial the SMG/test frontend, which binds the sockets).
     pub zmq_handshake: Option<String>,
@@ -164,6 +168,44 @@ impl std::str::FromStr for Role {
     }
 }
 
+/// The scheduler proto a gRPC worker serves (`--grpc-wire`): one of the
+/// three engine wires the gateway's gRPC client speaks. The canned and
+/// scripted answers, the realistic engine, the rank placement and the roles
+/// are the same behind each; the wire module shapes the messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SchedulerWire {
+    #[default]
+    TokenSpeed,
+    Vllm,
+    Sglang,
+}
+
+impl SchedulerWire {
+    /// The wire as the flag spells it, and as the gateway names the runtime.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TokenSpeed => "tokenspeed",
+            Self::Vllm => "vllm",
+            Self::Sglang => "sglang",
+        }
+    }
+}
+
+impl std::str::FromStr for SchedulerWire {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "tokenspeed" => Ok(Self::TokenSpeed),
+            "vllm" => Ok(Self::Vllm),
+            "sglang" => Ok(Self::Sglang),
+            other => Err(format!(
+                "--grpc-wire must be tokenspeed|vllm|sglang, got {other}"
+            )),
+        }
+    }
+}
+
 /// Timing flags collected while parsing; resolved into one [`TimingModel`]
 /// at the end so flag order does not matter.
 #[derive(Default)]
@@ -235,6 +277,7 @@ impl Default for Config {
             grpc_base_port: 0,
             grpc_count: 0,
             grpc_dp_size: 1,
+            grpc_wire: SchedulerWire::TokenSpeed,
             zmq_handshake: None,
             zmq_count: 0,
             zmq_start_index: 0,
@@ -295,6 +338,7 @@ impl Config {
                 "--grpc-base-port" => cfg.grpc_base_port = parse(value(&mut args, &flag)?, &flag)?,
                 "--grpc-count" => cfg.grpc_count = parse(value(&mut args, &flag)?, &flag)?,
                 "--grpc-dp-size" => cfg.grpc_dp_size = parse(value(&mut args, &flag)?, &flag)?,
+                "--grpc-wire" => cfg.grpc_wire = value(&mut args, &flag)?.parse()?,
                 "--zmq-handshake" => cfg.zmq_handshake = Some(value(&mut args, &flag)?),
                 "--zmq-count" => cfg.zmq_count = parse(value(&mut args, &flag)?, &flag)?,
                 "--zmq-start-index" => {
@@ -463,6 +507,13 @@ impl Config {
         if cfg.zmq_count > 0 && cfg.zmq_handshake.is_none() {
             return Err("--zmq-handshake <ipc://…> is required when --zmq-count > 0".to_string());
         }
+        if cfg.replay.capture.is_some() && cfg.grpc_wire != SchedulerWire::TokenSpeed {
+            return Err(format!(
+                "--capture records the request's fields as the tokenspeed wire names them: it \
+                 needs --grpc-wire tokenspeed, not {}",
+                cfg.grpc_wire.as_str()
+            ));
+        }
         if cfg.role.is_some() {
             if cfg.grpc_count == 0 {
                 return Err(
@@ -560,6 +611,9 @@ pub fn usage() -> String {
                                 rank, an unpinned one on the rank with the fewest of its own requests,\n\
                                 GetLoads and the KV-event stream report per rank; no\n\
                                 --kv-events-zmq-base-port publisher (it would carry rank 0 alone)\n\
+       --grpc-wire <tokenspeed|vllm|sglang>  the scheduler proto the gRPC workers serve (default\n\
+                                tokenspeed): the same answers, engine, ranks and roles behind each;\n\
+                                the gateway detects the runtime from it (--capture: tokenspeed only)\n\
        --grpc-max-message-bytes <n>  largest gRPC message a worker decodes or encodes, in bytes\n\
                                 (default none, as the engine servicers; tonic's own default is 4 MiB)\n\
        --zmq-handshake <addr>   frontend ipc:// handshake addr (required if --zmq-count > 0)\n\
@@ -705,6 +759,57 @@ mod tests {
 
     fn parse(flags: &[&str]) -> Result<Config, String> {
         Config::parse(flags.iter().map(|flag| (*flag).to_string()))
+    }
+
+    /// The gRPC workers serve the tokenspeed wire unless `--grpc-wire` names
+    /// another; a wire the gateway's client does not speak is refused, and
+    /// the last flag wins, as a class's own argument after a lane's.
+    #[test]
+    fn the_grpc_wire_defaults_to_tokenspeed_and_takes_the_three_names() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        assert_eq!(
+            parse(&grpc).expect("defaults").grpc_wire,
+            SchedulerWire::TokenSpeed
+        );
+        for (name, wire) in [
+            ("tokenspeed", SchedulerWire::TokenSpeed),
+            ("vllm", SchedulerWire::Vllm),
+            ("sglang", SchedulerWire::Sglang),
+        ] {
+            let cfg = parse(&[&grpc[..], &["--grpc-wire", name]].concat()).expect(name);
+            assert_eq!(cfg.grpc_wire, wire);
+            assert_eq!(cfg.grpc_wire.as_str(), name);
+        }
+        let last = parse(&[&grpc[..], &["--grpc-wire", "vllm", "--grpc-wire", "sglang"]].concat())
+            .expect("two flags");
+        assert_eq!(last.grpc_wire, SchedulerWire::Sglang);
+        let refused =
+            parse(&[&grpc[..], &["--grpc-wire", "trtllm"]].concat()).expect_err("an unknown wire");
+        assert!(
+            refused.contains("--grpc-wire must be tokenspeed|vllm|sglang, got trtllm"),
+            "{refused}"
+        );
+    }
+
+    /// The capture file's keys are the tokenspeed request's field names, so a
+    /// capture on another wire is refused rather than misnamed.
+    #[test]
+    fn a_capture_needs_the_tokenspeed_wire() {
+        let flags = [
+            "--grpc-base-port",
+            "19000",
+            "--grpc-count",
+            "1",
+            "--capture",
+            "/tmp/requests.jsonl",
+        ];
+        assert!(parse(&flags).is_ok(), "the default wire captures");
+        let refused = parse(&[&flags[..], &["--grpc-wire", "vllm"]].concat())
+            .expect_err("a capture on the vllm wire");
+        assert!(
+            refused.contains("--capture") && refused.contains("not vllm"),
+            "{refused}"
+        );
     }
 
     #[test]
