@@ -23,6 +23,7 @@ import os
 import time
 
 import anthropic
+import infra.constants as startup_constants
 import openai
 import pytest
 from infra import (
@@ -42,12 +43,7 @@ from infra import (
     get_runtime,
     launch_cloud_gateway,
 )
-from infra.constants import (
-    ENV_STARTUP_PROFILE,
-    get_startup_profile,
-    startup_profile_definition,
-    vllm_kv_backend,
-)
+from infra.constants import vllm_kv_backend
 from infra.model_specs import get_model_spec
 from infra.worker import stop_workers, validate_startup_profile_worker, worker_startup_timeout
 from infra.worker_pool import get_pool
@@ -55,6 +51,12 @@ from infra.worker_pool import get_pool
 from .hooks import FINALIZED_ZMQ_GATEWAY_KEY, SERVING_CLASS_FAILED_KEY
 from .markers import get_marker_kwargs, get_marker_value, model_id_for_engine, resolve_class_marker
 from .mock_answers import clear_class_workers, set_class_workers
+
+# Keep the startup-profile bindings independent of the backend import above.
+# Current main extends that import with its mock ZMQ backend mapping.
+ENV_STARTUP_PROFILE = startup_constants.ENV_STARTUP_PROFILE
+get_startup_profile = startup_constants.get_startup_profile
+startup_profile_definition = startup_constants.startup_profile_definition
 
 logger = logging.getLogger(__name__)
 

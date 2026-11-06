@@ -2594,7 +2594,7 @@ jobs:
           name: genai-bench-results-go-bindings
           path: benchmark_go_bindings/
 
-  # Frozen original38 index1 / ordinal2; private proposal, dedicated opt-in OFF.
+  # Frozen original38 index1 / ordinal2; published Source definition; dedicated opt-in OFF by default.
   e2e-1gpu-chat-legacy-vllm-amd:
     name: e2e-1gpu-chat-legacy-vllm-amd (vllm)
     needs: [build-wheel, detect-changes]
@@ -2632,7 +2632,7 @@ jobs:
       container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
     secrets: inherit
 
-  # Frozen original38 index4 / ordinal5; private proposal, dedicated opt-in OFF.
+  # Frozen original38 index4 / ordinal5; published Source definition; dedicated opt-in OFF by default.
   e2e-1gpu-chat-symphony-sglang-amd:
     name: e2e-1gpu-chat-symphony-sglang-amd (sglang)
     needs: [build-wheel, detect-changes]
@@ -2669,7 +2669,7 @@ jobs:
       final_environment_check: true
     secrets: inherit
 
-  # Frozen original38 index5 / ordinal6; private proposal, dedicated opt-in OFF.
+  # Frozen original38 index5 / ordinal6; published Source definition; dedicated opt-in OFF by default.
   e2e-1gpu-chat-symphony-vllm-amd:
     name: e2e-1gpu-chat-symphony-vllm-amd (vllm)
     needs: [build-wheel, detect-changes]

@@ -136,11 +136,13 @@ class TestOpenAIServerFunctionCalling:
     answer per choice the request samples.
 
     On a real engine the cases that leave the choice to the model
-    (``tool_choice: auto``) decode greedily (``temperature=0``): they assert
+    (``tool_choice: auto``) decode greedily by default (``temperature=0``): they assert
     the shape of the tool call the gateway reads, and a sampled answer in
     plain words would fail that by chance. The constrained cases (a
     ``required`` or a named choice) are decided by the grammar the gateway
-    installs, not by the draw.
+    installs, not by the draw. The explicit Original1 sampling profile under
+    vLLM/Legacy instead preserves the historical temperature/top_p pairs.
+    Its sampled auto answers can be plain text and fail the same shape assertions.
     """
 
     def test_function_calling_format(self, model, api_client, mock_answers):
