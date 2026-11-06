@@ -1843,6 +1843,7 @@ fn zmq_status_of(error: &engine_zmq_client::Error) -> tonic::Status {
         engine_zmq_client::Error::EngineCoreDead
         | engine_zmq_client::Error::EngineInputBlocked { .. }
         | engine_zmq_client::Error::EngineInputFull { .. }
+        | engine_zmq_client::Error::EngineInputBytesFull { .. }
         | engine_zmq_client::Error::ClientClosed { .. } => {
             tonic::Status::unavailable(error.to_string())
         }
@@ -2025,6 +2026,20 @@ mod tests {
             request_id: "req-1".to_string(),
         });
         assert_eq!(engine_failure.code(), Code::Internal, "{engine_failure:?}");
+    }
+
+    /// Byte-budget rejection remains retryable, including shared errors.
+    #[test]
+    fn retained_input_exhaustion_answers_unavailable() {
+        let status = zmq_status(engine_zmq_client::Error::Shared(Arc::new(
+            engine_zmq_client::Error::EngineInputBytesFull {
+                retained_bytes: 10,
+                request_bytes: 1,
+                limit_bytes: 10,
+            },
+        )));
+        assert_eq!(status.code(), Code::Unavailable);
+        assert!(status.message().contains("10 bytes"));
     }
 
     /// The failure the connector fans out to the requests in flight when its
