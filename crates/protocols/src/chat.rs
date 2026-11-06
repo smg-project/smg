@@ -852,7 +852,7 @@ fn validate_tool_choice(
             Err(invalid(
                 "tool_choice_invalid_mode",
                 format!(
-                    "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{mode}'."
+                    "Invalid value for 'tool_choice.allowed_tools.mode': must be 'auto' or 'required', got '{mode}'."
                 ),
             ))
         }
@@ -860,13 +860,13 @@ fn validate_tool_choice(
         ToolChoice::AllowedTools { tools, .. } => tools.iter().try_for_each(|tool_ref| match tool_ref {
             ToolReference::Function { name } if !declared(name) => Err(invalid(
                 "tool_choice_tool_not_found",
-                format!("Invalid value for 'tool_choice.tools': tool '{name}' not found in 'tools'."),
+                format!("Invalid value for 'tool_choice.allowed_tools.tools': tool '{name}' not found in 'tools'."),
             )),
             ToolReference::Function { .. } => Ok(()),
             _ => Err(invalid(
                 "tool_choice_invalid_tool_type",
                 format!(
-                    "Invalid value for 'tool_choice.tools': Chat Completion API only supports function tools, got '{}'.",
+                    "Invalid value for 'tool_choice.allowed_tools.tools': Chat Completion API only supports function tools, got '{}'.",
                     tool_ref.identifier()
                 ),
             )),
@@ -2124,6 +2124,16 @@ mod tool_choice_tests {
                 json!({"type": "allowed_tools", "mode": "auto",
                        "tools": [{"type": "function", "name": "get_weather"}]}),
                 None,
+            ),
+            (
+                json!({"type": "allowed_tools", "allowed_tools": {"mode": "required",
+                       "tools": [{"type": "function", "function": {"name": "get_weather"}}]}}),
+                None,
+            ),
+            (
+                json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto",
+                       "tools": [{"type": "function", "function": {"name": "get_time"}}]}}),
+                Some("tool_choice_tool_not_found"),
             ),
             (
                 json!({"type": "allowed_tools", "mode": "sometimes",
