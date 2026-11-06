@@ -6,11 +6,14 @@
 //! ahead of it have left: the loop flushes what it wrote since its last frame
 //! before it returns the failure; and the finish of the open choices at the
 //! engine's end, the stream's third exit, flushes the same way ahead of a
-//! later choice's failed finish.
+//! later choice's failed finish; and a batched request's later prompt, whose
+//! first-token frame is not the body's first frame, gets the two yields of
+//! its hand-off, so that frame too reaches the connection before the burst
+//! behind it is read.
 
-use std::pin::Pin;
+use std::{pin::Pin, sync::atomic::AtomicBool};
 
-use futures::{Stream, StreamExt as _};
+use futures::{future::try_join_all, Stream, StreamExt as _};
 use llm_tokenizer::{
     traits::{Decoder, Encoder, Encoding, TokenIdType, Tokenizer},
     SpecialTokens,
@@ -23,7 +26,8 @@ use tokio::sync::oneshot;
 use super::{
     super::*,
     eof::{
-        chunk, complete, dispatch, processor, scripted_stream, staged_stream, CharacterTokenizer,
+        chunk, complete, dispatch, gated_stream, processor, scripted_stream, staged_stream,
+        CharacterTokenizer,
     },
 };
 use crate::routers::common::sse::sse_channel;
@@ -102,6 +106,7 @@ async fn the_first_tokens_frame_is_pending_to_the_connection_before_the_burst_is
                 "",
                 0,
                 &tx,
+                None,
             )
             .await;
         assert!(result.is_ok(), "{:?}", result.err());
@@ -183,6 +188,7 @@ async fn a_chunk_that_fails_to_decode_after_the_first_frame_flushes_the_chunks_w
                 "",
                 0,
                 &tx,
+                None,
             )
             .await;
         drop(tx);
@@ -347,6 +353,7 @@ async fn a_failed_finish_of_a_later_choice_flushes_the_earlier_choice_s_tail_wri
                 "",
                 0,
                 &tx,
+                None,
             )
             .await;
         drop(tx);
@@ -373,4 +380,132 @@ async fn a_failed_finish_of_a_later_choice_flushes_the_earlier_choice_s_tail_wri
         "hiyoq",
         "choice 0's held tail (q) reached the client ahead of choice 1's failed finish: {frames:?}"
     );
+}
+
+/// A batched request's units share one body, whose own yield follows its
+/// first frame only: that frame is the first prompt's first token, so a later
+/// prompt's first-token frame is not the body's first and its hand-off yields
+/// twice, as the Messages stream's does: the pull after that frame is pending
+/// (the connection writes it) and the pull after that is its burst. One yield
+/// short, with every unit on the one-yield path, the reading runs on into the
+/// burst and the later prompt's first token reaches the client behind it.
+#[tokio::test]
+async fn a_later_prompts_first_token_is_pending_to_the_connection_before_its_burst_on_a_batched_completion_stream(
+) {
+    // The first prompt: its first token at once, its end held back.
+    let (first_end_tx, first_end) = oneshot::channel();
+    let (first_stream, first_server) = gated_stream(
+        vec![chunk(0, "a")],
+        first_end,
+        vec![complete(0, "stop")],
+        "0",
+    )
+    .await;
+    // The later prompt: nothing until its gate opens, then its first token
+    // with a burst ready behind it.
+    let (later_tx, later) = oneshot::channel();
+    let (later_stream, later_server) = staged_stream(
+        vec![(
+            Some(later),
+            vec![
+                chunk(0, "x"),
+                chunk(0, "y"),
+                chunk(0, "z"),
+                complete(0, "stop"),
+            ],
+        )],
+        "0",
+    )
+    .await;
+    let (tx, rx) = driven_channel();
+    let processor = processor(false);
+    let spec = completion_spec();
+    let reading = async move {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+        // The units of one request share the body's first frame, as the
+        // fan-out of a batched request gives it to them.
+        let body_first_frame = AtomicBool::new(false);
+        let outcomes = try_join_all([
+            processor.process_completion_streaming_chunks(
+                first_stream,
+                dispatch(),
+                Arc::clone(&tokenizer),
+                (None, None, false, false, false),
+                &spec,
+                "",
+                0,
+                &tx,
+                Some(&body_first_frame),
+            ),
+            processor.process_completion_streaming_chunks(
+                later_stream,
+                dispatch(),
+                Arc::clone(&tokenizer),
+                (None, None, false, false, false),
+                &spec,
+                "",
+                1,
+                &tx,
+                Some(&body_first_frame),
+            ),
+        ])
+        .await;
+        assert!(outcomes.is_ok(), "{:?}", outcomes.err());
+    };
+    let mut body = DrivenBody::new(Box::pin(reading), rx);
+    let first = body
+        .next()
+        .await
+        .expect("the body ends only after the first prompt's first token")
+        .expect("a write");
+    let first = String::from_utf8(first.to_vec()).expect("text");
+    assert!(
+        first.contains(r#""text":"a""#),
+        "the body's first frame is the first prompt's first token: {first}"
+    );
+    // The pull after the body's first frame: pending, the body's own yield.
+    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
+    assert!(
+        pull.is_pending(),
+        "the pull after the body's first frame must be pending: {pull:?}"
+    );
+    // The later prompt's messages are ready: its first token's frame leaves
+    // alone, the burst behind it unread.
+    later_tx.send(()).expect("the later prompt's gate");
+    let later_first = body
+        .next()
+        .await
+        .expect("the body ends only after the later prompt's first token")
+        .expect("a write");
+    let later_first = String::from_utf8(later_first.to_vec()).expect("text");
+    assert!(
+        later_first.contains(r#""text":"x""#) && !later_first.contains(r#""text":"y""#),
+        "the later prompt's first token leaves alone: {later_first}"
+    );
+    // The pull after it: pending, the second yield of the hand-off (the
+    // body's own yield went with its first frame), so the connection writes
+    // the frame before the reading runs on into the burst.
+    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
+    assert!(
+        pull.is_pending(),
+        "the pull after a later prompt's first-token frame must be pending, not its burst: {pull:?}"
+    );
+    // The pull after that: the burst's frame.
+    let pull = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut body).poll_next(cx))).await;
+    let Poll::Ready(Some(Ok(burst))) = pull else {
+        panic!("the pull after the pending one is the burst's frame: {pull:?}");
+    };
+    let burst = String::from_utf8(burst.to_vec()).expect("text");
+    assert!(
+        burst.contains(r#""text":"y""#) && burst.contains(r#""text":"z""#),
+        "the chunks ready behind the later prompt's first token share a frame: {burst}"
+    );
+    first_end_tx.send(()).expect("the first prompt's end");
+    let rest: Vec<_> = body.collect().await;
+    assert!(
+        rest.iter().all(Result::is_ok),
+        "the stream ends without a failed write: {rest:?}"
+    );
+    first_server.abort();
+    later_server.abort();
 }

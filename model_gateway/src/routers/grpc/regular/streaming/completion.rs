@@ -4,7 +4,13 @@
 //! record. Moved out of `streaming.rs` as is; the processor's completion
 //! entry points stay there and drive it.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use bytes::BytesMut;
 use llm_tokenizer::{
@@ -104,6 +110,15 @@ pub(super) struct CompletionStream<'a> {
     /// the read flushes before every poll, so the first token waits for
     /// nothing ([`StreamingProcessor::next_packed`]).
     first_token_out: bool,
+    /// Whether some unit's first-token frame has been the body's first frame,
+    /// shared by the units of one batched request (`None`: this unit is the
+    /// body's only one). The first unit to flush its first token claims the
+    /// body's first frame and its hand-off yields once, the body's own yield
+    /// after its first frame making the two; a later unit's first-token
+    /// frame is not the body's first, so its hand-off yields twice (as the
+    /// Messages stream's), or the frame would reach the connection behind
+    /// the burst read after it.
+    first_frame: Option<&'a AtomicBool>,
 
     /// The per-choice state, one entry per choice the request expects
     /// (`spec.choices_per_prompt`), at the engine's index.
@@ -210,6 +225,7 @@ impl<'a> CompletionStream<'a> {
         tx: &'a SseSender,
         pd_timing: Option<context::PdTiming>,
         backend_type: &'static str,
+        first_frame: Option<&'a AtomicBool>,
     ) -> Self {
         let frame = CompletionChunkFrame::new(
             &dispatch.request_id,
@@ -250,6 +266,7 @@ impl<'a> CompletionStream<'a> {
                 })
                 .collect(),
             first_token_out: false,
+            first_frame,
             engine_outlived: false,
             tail_tokens: 0,
             frame,
@@ -264,21 +281,35 @@ impl<'a> CompletionStream<'a> {
     /// arrives and its chunks are written into the unit's buffer; the chunks
     /// of the messages ready at one poll leave as one frame, the first
     /// token's alone (the packed read, as the chat loop's: the first token's
-    /// frame is this stream's first frame, so its hand-off yields once). A
-    /// failure inside the processing of a message returns after the chunks
-    /// written ahead of it have left, as an upstream failure does.
+    /// frame is this stream's first frame, so its hand-off yields once; in a
+    /// batched request only the first unit's is, and the later units' hand-offs
+    /// yield twice, see [`Self::first_frame`]). A failure inside the
+    /// processing of a message returns after the chunks written ahead of it
+    /// have left, as an upstream failure does.
     pub(super) async fn read_engine(
         &mut self,
         grpc_stream: &mut ProtoStream,
     ) -> Result<(), utils::StreamFailure> {
         loop {
+            // This poll hands the first token's frame off (the flush before the
+            // poll, the first token seen, the frame written) exactly when the
+            // read has not flushed it yet: the claim of the body's first frame
+            // is made then, once per unit. A claim with nothing behind it:
+            // relaxed is enough.
+            let hands_off_first_token = !self.first_token_out
+                && self.first_token_time.is_some()
+                && !self.sse_buffer.is_empty();
+            let first_frame_is_first_token = !hands_off_first_token
+                || self
+                    .first_frame
+                    .is_none_or(|first_frame| !first_frame.swap(true, Ordering::Relaxed));
             let next = StreamingProcessor::next_packed(
                 grpc_stream,
                 self.tx,
                 &mut self.sse_buffer,
                 &mut self.first_token_out,
                 self.first_token_time.is_some(),
-                true,
+                first_frame_is_first_token,
             )
             .await?;
             let Some(response) = next else {

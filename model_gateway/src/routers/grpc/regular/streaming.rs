@@ -5,7 +5,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    sync::Arc,
+    sync::{atomic::AtomicBool, Arc},
     task::Poll,
     time::Instant,
 };
@@ -2358,6 +2358,9 @@ impl StreamingProcessor {
             // Fail-fast: the first stream error cancels the remaining units
             // (their streams abort on drop) and fails the whole request.
             let completion_request = &completion_request;
+            // The body's first frame, claimed by the first unit to flush its
+            // first token (see `CompletionStream::first_frame`).
+            let body_first_frame = AtomicBool::new(false);
             // The units' reading, isolated: a panic in it ends this response
             // with an error event and `[DONE]`, not the task polling the
             // body (see `utils::isolation`).
@@ -2390,6 +2393,7 @@ impl StreamingProcessor {
                     let index_offset = prompt_index as u32 * choices_per_prompt;
                     let processor = &processor;
                     let tx = &tx;
+                    let body_first_frame = &body_first_frame;
                     async move {
                         match unit {
                             CompletionStreamUnit::Single(stream) => {
@@ -2403,6 +2407,7 @@ impl StreamingProcessor {
                                         prompt_text,
                                         index_offset,
                                         tx,
+                                        Some(body_first_frame),
                                     )
                                     .await
                             }
@@ -2425,6 +2430,7 @@ impl StreamingProcessor {
                                         tx,
                                         pd_timing,
                                         prefill_guards,
+                                        Some(body_first_frame),
                                     )
                                     .await
                             }
@@ -2601,6 +2607,7 @@ impl StreamingProcessor {
         prompt_text: &str,
         index_offset: u32,
         tx: &SseSender,
+        first_frame: Option<&AtomicBool>,
     ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
         self.process_completion_streaming_chunks_inner(
             grpc_stream,
@@ -2612,6 +2619,7 @@ impl StreamingProcessor {
             index_offset,
             tx,
             None,
+            first_frame,
         )
         .await
     }
@@ -2631,6 +2639,7 @@ impl StreamingProcessor {
         index_offset: u32,
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
+        first_frame: Option<&AtomicBool>,
     ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
         let mut stream = CompletionStream::open(
             &dispatch,
@@ -2642,6 +2651,7 @@ impl StreamingProcessor {
             tx,
             pd_timing,
             self.backend_type,
+            first_frame,
         );
         stream.read_engine(&mut grpc_stream).await?;
         // The stream's verdict, before the engine side is released: a client
@@ -2673,6 +2683,7 @@ impl StreamingProcessor {
         tx: &SseSender,
         pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
+        first_frame: Option<&AtomicBool>,
     ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
         // The client's prompt-side usage is the prefill side's.
         let prefill_cached_tokens =
@@ -2692,6 +2703,7 @@ impl StreamingProcessor {
                 index_offset,
                 tx,
                 Some(pd_timing),
+                first_frame,
             )
             .await;
 

@@ -286,6 +286,7 @@ async fn a_local_stop_ends_the_completion_read_and_the_engine_request() {
             "",
             0,
             &tx,
+            None,
         ),
     )
     .await
@@ -728,6 +729,7 @@ async fn a_stop_the_engine_ends_the_completion_choice_on_is_read_to_the_engines_
             "",
             0,
             &tx,
+            None,
         ),
     )
     .await

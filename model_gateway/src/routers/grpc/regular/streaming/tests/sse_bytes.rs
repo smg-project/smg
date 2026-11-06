@@ -327,6 +327,7 @@ async fn completion_stream_bytes(scenario: &CompletionScenario) -> Vec<u8> {
             scenario.prompt_text,
             0,
             &tx,
+            None,
         )
         .await;
     drop(tx);
@@ -483,6 +484,7 @@ async fn ready_engine_chunks_share_a_frame_after_the_first_token_on_the_completi
                 "",
                 0,
                 &tx,
+                None,
             )
             .await;
         drop(tx);
