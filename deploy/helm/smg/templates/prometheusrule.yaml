@@ -78,14 +78,19 @@ spec:
           annotations:
             summary: "A worker's circuit breaker is open or half-open"
             description: "The circuit breaker of worker {{ `{{ $labels.worker }}` }} of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} has been open or half-open for {{ $a.circuitBreakerOpenFor }}: the worker fails requests although it may still pass its health probes."
+        {{- /* One limiter is live at a time: the concurrency limit (smg_admission_queue_rejected_total by reason; its counter also takes the multimodal bounds and a selection timeout under either mode) or the opt-in priority scheduler (smg_scheduler_admit_total by class and outcome, the rejected_* outcomes). The union reads whichever is live; the two label sets never coincide, so `or` drops nothing. */}}
         - alert: SmgAdmissionRejections
-          expr: sum by (namespace, job) (rate(smg_admission_queue_rejected_total{ {{ $job }} }[5m])) > 0
+          expr: |
+            sum by (namespace, job) (
+              rate(smg_admission_queue_rejected_total{ {{ $job }} }[5m])
+                or rate(smg_scheduler_admit_total{ {{ $job }}, outcome=~"rejected_.*" }[5m])
+            ) > 0
           for: {{ $a.admissionRejectionsFor }}
           labels:
             severity: warning
           annotations:
             summary: "The gateway is rejecting requests at admission"
-            description: "{{ `{{ $value | humanize }}` }} requests per second have been rejected at the admission queue of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} for {{ $a.admissionRejectionsFor }}: the concurrency limit is reached."
+            description: "{{ `{{ $value | humanize }}` }} requests per second have been rejected at admission by {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} for {{ $a.admissionRejectionsFor }}: the concurrency limit, or the priority scheduler's queue bound or wait, is reached."
         - alert: SmgEventLoopStalls
           expr: sum by (namespace, job) (increase(smg_tokio_event_loop_stalls_total{ {{ $job }} }[10m])) > {{ $a.eventLoopStalls }}
           labels:

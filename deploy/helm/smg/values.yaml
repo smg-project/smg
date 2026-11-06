@@ -458,8 +458,10 @@ grafana:
 #     its timeout, so a worker that fails requests while passing its health
 #     probes cycles open -> half-open -> open; five minutes in either state
 #     is that worker, not one failed call.
-#   admissionRejectionsFor 5m: rejections at the admission queue for five
-#     minutes are sustained overload, not a burst.
+#   admissionRejectionsFor 5m: rejections at admission for five minutes are
+#     sustained overload, not a burst; the alert reads whichever limiter is
+#     live, the concurrency limit's queue or the priority scheduler's
+#     per-class queues.
 #   eventLoopStalls 5 per 10m: a stall is a wake drift over 5 ms on the
 #     runtime's canary; a handful in ten minutes is a blocked thread or CPU
 #     starvation.

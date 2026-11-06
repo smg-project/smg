@@ -392,8 +392,17 @@ data:
             {
               "expr": "sum(smg_admission_queue_depth{namespace=~\"$namespace\", job=~\"$job\"})",
               "legendFormat": "queued"
+            },
+            {
+              "expr": "sum by (class) (smg_scheduler_inflight{namespace=~\"$namespace\", job=~\"$job\"})",
+              "legendFormat": "{{ "{{" }}class{{ "}}" }} in flight (scheduler)"
+            },
+            {
+              "expr": "sum by (class) (smg_scheduler_queue_depth{namespace=~\"$namespace\", job=~\"$job\"})",
+              "legendFormat": "{{ "{{" }}class{{ "}}" }} queued (scheduler)"
             }
           ],
+          "description": "One limiter is live at a time: the concurrency limit's in-flight and queued requests, or the priority scheduler's per class.",
           "fieldConfig": {
             "defaults": {
               "unit": "short"
@@ -415,8 +424,13 @@ data:
             {
               "expr": "sum(rate(smg_admission_queue_rejected_total{namespace=~\"$namespace\", job=~\"$job\"}[5m]))",
               "legendFormat": "rejected"
+            },
+            {
+              "expr": "sum by (class, outcome) (rate(smg_scheduler_admit_total{namespace=~\"$namespace\", job=~\"$job\", outcome=~\"rejected_.*\"}[5m]))",
+              "legendFormat": "{{ "{{" }}class{{ "}}" }} {{ "{{" }}outcome{{ "}}" }}"
             }
           ],
+          "description": "Rejections by whichever limiter is live: the concurrency limit's queue, or the priority scheduler's per-class queues (rejected_queue_full, rejected_queue_timeout); the SmgAdmissionRejections alert fires on their sum.",
           "fieldConfig": {
             "defaults": {
               "unit": "reqps"
