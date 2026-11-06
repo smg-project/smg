@@ -87,26 +87,49 @@ impl PolicyRegistration {
         needs_kv_events
     }
 
-    /// Restart the stream under `worker`'s URL for `worker`. The one running
-    /// was started for another worker object at the same address (an import
-    /// this node then claimed). A stream carries its worker object into the
-    /// pushed loads, the overload verdict and the liveness it reports; the
-    /// load state drops a report whose object the registry no longer holds
-    /// (`is_current_incarnation`) while the records' receipts suppress the
-    /// poll, so the worker's load would freeze. The stop and the start pair
-    /// with the registration workflow's own admission in either order:
-    /// `on_worker_added` keeps an active stream and waits for one being
-    /// removed, so one stream, `worker`'s, remains.
-    pub async fn restart_stream(&self, worker: &Arc<dyn Worker>) {
-        let Some(monitor) = &self.kv_event_monitor else {
-            return;
-        };
-        monitor.on_worker_removed(worker.url()).await;
-        let needs_kv_events = self
-            .policy_registry
-            .policy_for_worker(worker.as_ref())
-            .needs_kv_events();
-        self.start_stream(worker, needs_kv_events).await;
+    /// Hand the stream under `from`'s address to `to`, the registry's worker
+    /// at that address now (a local claim of an import's address, or a
+    /// registration that took it after the import's tombstone), and release
+    /// `from`'s share of its model's count. The stream was started for
+    /// `from` and holds its worker object: a stream carries its object into
+    /// the pushed loads, the overload verdict and the liveness it reports,
+    /// the load state drops a report whose object the registry no longer
+    /// holds (`is_current_incarnation`) while the records' receipts suppress
+    /// the poll, so `to`'s load would freeze. The stream stops here, and is
+    /// started again for `to` when `to`'s model has a policy, under the kind
+    /// the policy that places `to` needs. When the model has none yet,
+    /// `to`'s own admission is still to come and starts the right kind: it
+    /// keeps a running stream, so one started here under a guessed kind
+    /// would stick. Either order
+    /// with the registration workflow's admission ends with one stream,
+    /// `to`'s (`on_worker_added` keeps an active stream and waits for one
+    /// being removed). The URL's dispatch tally is `to`'s now and stays; the
+    /// tree tenants `from` learned under models `to` does not serve are
+    /// purged. `from`'s count goes last, so when the two share a model the
+    /// policy still decides the kind.
+    pub async fn hand_over(&self, from: &Arc<dyn Worker>, to: &Arc<dyn Worker>) {
+        if let Some(monitor) = &self.kv_event_monitor {
+            monitor.on_worker_removed(from.url()).await;
+            if self.policy_registry.get_policy(to.model_id()).is_some() {
+                let needs_kv_events = self
+                    .policy_registry
+                    .policy_for_worker(to.as_ref())
+                    .needs_kv_events();
+                self.start_stream(to, needs_kv_events).await;
+            }
+        }
+        let kept: HashSet<String> = WorkerRegistry::worker_model_ids(to).into_iter().collect();
+        let mut removals: HashMap<String, HashSet<String>> = HashMap::new();
+        for model_id in WorkerRegistry::worker_model_ids(from) {
+            if !kept.contains(&model_id) {
+                removals
+                    .entry(model_id)
+                    .or_default()
+                    .insert(from.url().to_string());
+            }
+        }
+        self.remove_cache_state(removals).await;
+        self.policy_registry.on_worker_removed(from.model_id());
     }
 
     /// The worker's stream into the KV event monitor: its KV events into the

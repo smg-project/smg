@@ -169,29 +169,26 @@ impl Sync {
     /// local worker of a claim, or a registration that took the address
     /// after the tombstone), the registration workflow admits that worker
     /// under the same URL on its own schedule. The URL's stream was started
-    /// for the import and holds its worker object, so it is restarted for
-    /// the worker at the address (`PolicyRegistration::restart_stream`, in
-    /// either order with the workflow's admission). The dispatch tallies and
-    /// the tree tenants of the URL are the same engine's and stay. The
-    /// import's share of its model's count is released last, so the model's
-    /// policy still decides the restarted stream's kind. A release keyed by
-    /// the URL, run after the workflow's admission, would stop that worker's
-    /// stream for good. A free address takes the full release.
+    /// for the import and holds its worker object, so it is handed to the
+    /// worker at the address (`PolicyRegistration::hand_over`: started again
+    /// for it under its model's policy, or left to its admission when the
+    /// model has no policy yet; the tenants the import learned under models
+    /// that worker does not serve purged; the URL's dispatch tally kept; the
+    /// import's share of its model's count released last). A release keyed
+    /// by the URL, run after the workflow's admission, would stop that
+    /// worker's stream for good. A free address takes the full release.
     async fn release_or_hand_over(&mut self, worker_id: &WorkerId) {
         let Some(worker) = self.tracked.remove(worker_id) else {
             return;
         };
         match self.registry.get_by_url(worker.url()) {
             Some(holder) if !Arc::ptr_eq(&holder, &worker) => {
-                self.registration.restart_stream(&holder).await;
-                self.registration
-                    .policy_registry
-                    .on_worker_removed(worker.model_id());
+                self.registration.hand_over(&worker, &holder).await;
                 debug!(
                     worker_id = %worker_id.as_str(),
                     url = worker.redacted_url(),
                     model = worker.model_id(),
-                    "Mesh import's address held by another worker; the URL's stream restarted for it, the import's share of the model's count released"
+                    "Mesh import's address held by another worker; the URL's stream handed to it, the import's share of the model's count released"
                 );
             }
             _ => {
@@ -250,8 +247,10 @@ mod tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        policies::PolicyRegistry,
-        worker::{test_support::no_health_check, BasicWorkerBuilder, KvEventMonitor},
+        policies::{CacheAwarePolicy, PolicyRegistry},
+        worker::{
+            test_support::no_health_check, BasicWorkerBuilder, KvEventMonitor, WorkerMonitor,
+        },
     };
 
     fn registration(
@@ -723,5 +722,134 @@ mod tests {
             held - 1,
             "the restarted stream's task held the local worker's object"
         );
+    }
+
+    /// A cache-aware policy, a KV event monitor and a worker monitor that
+    /// wants every worker's loads: a gRPC worker whose model has no
+    /// cache-aware policy streams its load records.
+    fn streaming_registration_with_loads(
+        worker_registry: &Arc<WorkerRegistry>,
+    ) -> (PolicyRegistration, Arc<PolicyRegistry>, Arc<KvEventMonitor>) {
+        let (registration, policies, monitor) = streaming_registration(worker_registry);
+        let loads = Arc::new(WorkerMonitor::new(
+            Arc::clone(worker_registry),
+            Arc::clone(&policies),
+            5,
+            false,
+            false,
+        ));
+        (
+            PolicyRegistration {
+                worker_monitor: Some(loads),
+                ..registration
+            },
+            policies,
+            monitor,
+        )
+    }
+
+    /// The tenants of `model_id`'s string tree in its cache-aware policy.
+    fn tenants(policies: &PolicyRegistry, model_id: &str) -> Vec<String> {
+        policies
+            .get_policy(model_id)
+            .and_then(|policy| {
+                policy
+                    .as_any()
+                    .downcast_ref::<CacheAwarePolicy>()
+                    .map(|cache_aware| cache_aware.string_tree_tenants(model_id))
+            })
+            .unwrap_or_default()
+    }
+
+    /// The worker at the import's address serves another model and is not
+    /// admitted yet when this task sees the import's `Removed`: its model
+    /// has no policy, so the kind of its stream is its admission's to
+    /// decide. A stream started here under a guessed kind would stick (the
+    /// monitor keeps an active stream): the registry's default is
+    /// cache-aware, the admission's label names round-robin, and a KV-event
+    /// stream started early would leave an index nothing reads.
+    #[tokio::test]
+    async fn a_hand_over_to_another_models_worker_leaves_the_stream_kind_to_its_admission() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let (registration, policies, monitor) = streaming_registration_with_loads(&registry);
+        let mut sync = sync_by_hand(&registry, &registration);
+        let mut events = registry.subscribe_events();
+
+        registry.on_remote_worker_state(&grpc_remote_state("peer-w1", "grpc://127.0.0.1:1", "m1"));
+        handle_queued(&mut sync, &mut events).await;
+        let id = registry.get_id_by_url("grpc://127.0.0.1:1").unwrap();
+        assert!(monitor.get_indexer("m1").is_some());
+
+        assert!(registry.remove_remote(&id).is_some());
+        let local = grpc_local_worker("grpc://127.0.0.1:1", "m2");
+        registry
+            .register(Arc::clone(&local))
+            .expect("the tombstone freed the address");
+        handle_queued(&mut sync, &mut events).await;
+        assert_eq!(
+            count(&policies, "m1"),
+            None,
+            "the import's share was its model's last"
+        );
+        assert!(sync.tracked.is_empty());
+
+        // The workflow's admission comes after, under a policy whose kind
+        // differs from the default's: a load-record stream (it holds the
+        // worker until the monitor removes it), no index.
+        registration.admit(&local, Some("round_robin")).await;
+        assert_eq!(count(&policies, "m2"), Some(1));
+        assert!(policies
+            .get_policy("m2")
+            .is_some_and(|policy| policy.name() == "round_robin"));
+        assert!(
+            monitor.get_indexer("m2").is_none(),
+            "the admission's round-robin policy streams load records; a start at the hand-over under the default's kind would have left an index"
+        );
+        let held = Arc::strong_count(&local);
+        monitor.on_worker_removed("grpc://127.0.0.1:1").await;
+        assert_eq!(
+            Arc::strong_count(&local),
+            held - 1,
+            "the admission started the local worker's load-record stream"
+        );
+    }
+
+    /// The import learned tree tenants under its model; the worker at its
+    /// address now serves another model. The hand-over purges the URL's
+    /// tenants under the models that worker does not serve, so the index of
+    /// the import's model does not route to an address that left it.
+    #[tokio::test]
+    async fn a_hand_over_purges_the_imports_tenants_under_models_the_holder_does_not_serve() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let (registration, policies, _monitor) = streaming_registration(&registry);
+        let mut sync = sync_by_hand(&registry, &registration);
+        let mut events = registry.subscribe_events();
+
+        // Two imports of the model keep its policy alive across the hand-over.
+        registry.on_remote_worker_state(&grpc_remote_state("peer-w1", "grpc://127.0.0.1:1", "m1"));
+        registry.on_remote_worker_state(&grpc_remote_state("peer-w2", "grpc://127.0.0.1:2", "m1"));
+        handle_queued(&mut sync, &mut events).await;
+        let id = registry.get_id_by_url("grpc://127.0.0.1:1").unwrap();
+        assert!(
+            tenants(&policies, "m1").contains(&"grpc://127.0.0.1:1".to_string()),
+            "the import is a tenant of its model's tree"
+        );
+
+        assert!(registry.remove_remote(&id).is_some());
+        let local = grpc_local_worker("grpc://127.0.0.1:1", "m2");
+        registry
+            .register(Arc::clone(&local))
+            .expect("the tombstone freed the address");
+        registration.admit(&local, None).await;
+        handle_queued(&mut sync, &mut events).await;
+
+        assert_eq!(count(&policies, "m1"), Some(1));
+        let left = tenants(&policies, "m1");
+        assert!(
+            !left.contains(&"grpc://127.0.0.1:1".to_string()),
+            "the URL left the import's model: {left:?}"
+        );
+        assert!(left.contains(&"grpc://127.0.0.1:2".to_string()));
+        assert_eq!(sync.tracked.len(), 1, "the other import stays tracked");
     }
 }
