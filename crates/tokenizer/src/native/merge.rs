@@ -207,7 +207,7 @@ pub(super) struct MergeTable {
     /// a false positive (about one pair in twenty at the tightest rounding)
     /// costs what every lookup cost. Measured on first-sight text: half of a
     /// merge's pair lookups are pairs that are no merge, and each read a
-    /// bucket line of a 4-16 MiB table from the last-level cache or memory;
+    /// bucket line of a 2-16 MiB table from the last-level cache or memory;
     /// with the filter the cold cells of the encode bar read 3 to 18 %
     /// faster from 2 KB texts on (1 to 10 % by class median) and the warm
     /// cells unchanged (a warm text merges nothing).
