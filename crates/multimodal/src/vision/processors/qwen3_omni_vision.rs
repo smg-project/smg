@@ -123,10 +123,13 @@ impl Qwen3OmniVisionProcessor {
         if modality == Modality::Video && !config.is_image_only_processor_type() {
             Self::from_video_preprocessor_config(config)
         } else {
-            // Qwen3-Omni's shared preprocessor_config.json carries image
-            // limits. The HF processor supplies separate video defaults at
-            // call time, so those image limits must not become a per-frame
-            // video budget here.
+            // The checkpoint's one preprocessor_config.json carries the image
+            // bounds. The family's composite processor hands its video
+            // processor a size of its own at call time, the module's video
+            // defaults (128 and 768 merged patches of 32 x 32 pixels per
+            // frame), over whatever that processor read from the file, so
+            // the file's image bounds must not become the per-frame video
+            // budget here.
             Self::from_preprocessor_config(config)
         }
     }
@@ -242,6 +245,11 @@ mod tests {
         );
     }
 
+    /// The checkpoint ships one `preprocessor_config.json` for its image and
+    /// its video processor, but the family's composite processor passes its
+    /// own video size at call time, so a clip keeps the per-frame video
+    /// defaults and never takes the file's image bounds: a 720p frame is
+    /// sized to 1152x640 (36 x 20 patches), not kept at 1280x720.
     #[test]
     fn shared_image_config_keeps_omni_video_defaults() {
         let config = PreProcessorConfig::from_json(
