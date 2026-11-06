@@ -13,12 +13,11 @@
 //! releases it, and `Replaced` tells an owner's in-place rebuild (still an
 //! import: released as the old worker, admitted as the new one) from a local
 //! claim of its address (the worker is local now and the registration
-//! workflow admits it under the same URL: the URL's stream is restarted for
-//! the local worker, the import's share of its model's count is released,
-//! the dispatch tallies and the tree tenants of the URL stay). A removal
-//! whose address another worker took by the time this task sees it, a
-//! registration after the tombstone, is released the way a claim is. A
-//! lagged channel resyncs the set it tracks against the registry.
+//! workflow admits it under the same URL; the import's stream and its share
+//! of the model's count are handed to it, `PolicyRegistration::hand_over`).
+//! A removal whose address another worker took by the time this task sees
+//! it, a registration after the tombstone, is released the way a claim is.
+//! A lagged channel resyncs the set it tracks against the registry.
 
 use std::{collections::HashMap, sync::Arc};
 
