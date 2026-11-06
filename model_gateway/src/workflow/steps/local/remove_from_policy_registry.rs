@@ -21,8 +21,8 @@ static CACHE_REMOVAL_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_CA
 
 /// Step to remove workers from the policy registry.
 ///
-/// Removes each worker from cache-aware policies and notifies
-/// the policy registry of worker removal.
+/// Removes each worker from cache-aware policies and drops the policy of a
+/// model that no worker of this node serves any more.
 pub struct RemoveFromPolicyRegistryStep;
 
 impl RemoveFromPolicyRegistryStep {
@@ -97,10 +97,16 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
         }
         Self::remove_cache_state(Arc::clone(&app_context.policy_registry), cache_removals).await;
 
-        for worker in workers_to_remove {
-            app_context
-                .policy_registry
-                .on_worker_removed(worker.model_id());
+        // The workers have left the worker registry: a model none of this
+        // node's workers serves any more loses its policy. Asked of the
+        // registry rather than counted, so a worker added again on a
+        // replacement or an update, or a mesh import removed here, cannot
+        // keep a policy alive or end it early.
+        let models: HashSet<&str> = workers_to_remove.iter().map(|w| w.model_id()).collect();
+        for model_id in models {
+            if !app_context.worker_registry.serves_model_locally(model_id) {
+                app_context.policy_registry.on_model_unserved(model_id);
+            }
         }
 
         debug!(

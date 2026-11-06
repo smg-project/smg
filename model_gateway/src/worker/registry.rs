@@ -469,6 +469,16 @@ impl WorkerRegistry {
         self.worker_origins.get(worker_id).map(|entry| *entry)
     }
 
+    /// Whether a worker this node owns serves `model_id` (a canonical model
+    /// or an alias). Mesh imports do not count: a model's policy is built
+    /// from a local registration's labels and lives as long as one does.
+    pub fn serves_model_locally(&self, model_id: &str) -> bool {
+        self.get_by_model(model_id).iter().any(|worker| {
+            self.get_id_by_url(worker.url())
+                .is_some_and(|id| self.origin_of(&id) == Some(WorkerOrigin::Local))
+        })
+    }
+
     /// Subscribe to the `WorkerEvent` broadcast stream.
     ///
     /// Returns a `broadcast::Receiver` that observes every future mutation
