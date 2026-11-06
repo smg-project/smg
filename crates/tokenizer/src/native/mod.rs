@@ -1668,44 +1668,83 @@ impl NativeEncoder {
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         let mut fallback = None;
-        let mut tokenize = |segment: &str, ids: &mut Vec<u32>| {
-            let mut per_piece = |piece: &str| {
-                if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
-                    fallback = Some(declined);
-                }
-            };
-            if let Some(chars) = &self.chars {
-                // An empty text gets no marker: `tokenizers` drops an empty
-                // split before the pre-tokenizer runs.
-                if !segment.is_empty() {
-                    chars.pieces(&CharSymbols::marked(segment, marker), &mut per_piece);
-                }
-                return;
+        let text = match *unit {
+            Segment::Added(id) => {
+                ids.push(id);
+                return Ok(());
             }
-            match &self.chain {
-                // The chain's pieces come back through the stage walk's leaf,
-                // so that `per_piece` is called from one place only and the
-                // work it carries is compiled into the walk, as it is without
-                // a chain (a second caller left it out of line: measured).
-                Some(chain) => {
-                    let leaf = self.stages.len();
-                    chain.pieces(segment, &mut |piece| {
-                        self.pieces(leaf, piece, &mut per_piece);
-                    });
-                }
-                None => self.pieces(0, segment, &mut per_piece),
-            }
+            Segment::Text(text) => text,
         };
-        match *unit {
-            Segment::Added(id) => ids.push(id),
-            Segment::Text(text) => tokenize(text, ids),
+        if let Some(chars) = &self.chars {
+            // The sentencepiece path cuts the text itself and hands each piece
+            // to the same probe as the shapes below. An empty text gets no
+            // marker: `tokenizers` drops an empty split before the
+            // pre-tokenizer runs.
+            if !text.is_empty() {
+                chars.pieces(&CharSymbols::marked(text, marker), &mut |piece: &str| {
+                    if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
+                        fallback = Some(declined);
+                    }
+                });
+            }
+            return fallback.map_or(Ok(()), Err);
+        }
+        // One walk per unit. A single-stage encoder consumes its stage's
+        // matches here and probes each piece in place (no recursive walk, no
+        // closure call per piece); the chain hands its pieces to the same
+        // probe through its static callback; any other shape walks.
+        match (&self.chain, self.stages.as_slice()) {
+            (Some(chain), _) => {
+                chain.pieces(text, &mut |piece: &str| {
+                    if piece.is_empty() {
+                        return;
+                    }
+                    if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
+                        fallback = Some(declined);
+                    }
+                });
+            }
+            (None, [stage]) => {
+                let mut cursor = 0;
+                for (start, end) in stage.pattern.find_iter(text) {
+                    if stage.keep_gaps && cursor < start {
+                        if let Err(declined) =
+                            self.tokenize_piece(model, &text[cursor..start], mapped, ids, cache)
+                        {
+                            fallback = Some(declined);
+                        }
+                    }
+                    if let Err(declined) =
+                        self.tokenize_piece(model, &text[start..end], mapped, ids, cache)
+                    {
+                        fallback = Some(declined);
+                    }
+                    cursor = end;
+                }
+                if stage.keep_gaps && cursor < text.len() {
+                    if let Err(declined) =
+                        self.tokenize_piece(model, &text[cursor..], mapped, ids, cache)
+                    {
+                        fallback = Some(declined);
+                    }
+                }
+            }
+            (None, _) => {
+                let mut per_piece = |piece: &str| {
+                    if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
+                        fallback = Some(declined);
+                    }
+                };
+                self.pieces(0, text, &mut per_piece);
+            }
         }
         fallback.map_or(Ok(()), Err)
     }
 
     /// Applies the stages from `depth` on to `text`, calling `f` with each
-    /// final piece.
-    fn pieces(&self, depth: usize, text: &str, f: &mut dyn FnMut(&str)) {
+    /// final piece. `f` is taken by static dispatch so that the per-piece
+    /// work compiles into the walk.
+    fn pieces<F: FnMut(&str)>(&self, depth: usize, text: &str, f: &mut F) {
         if text.is_empty() {
             return;
         }
@@ -1743,6 +1782,7 @@ impl NativeEncoder {
     /// the encode once rather than here once per piece (measured: 4 % of the
     /// instructions per token of a warm encode on a 151k byte-level
     /// vocabulary).
+    #[inline(always)]
     fn tokenize_piece(
         &self,
         model: Option<&ModelWrapper>,
@@ -1751,16 +1791,34 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
-        let bytes = piece.as_bytes();
-        let key = ShortPieceKey::of(bytes);
-        let cacheable = bytes.len() <= LONG_PIECE_MAX_BYTES;
+        // The hot path of a warm encode, and nothing else in this function:
+        // the key of a short piece and the packed table's probe.
+        let key = ShortPieceKey::of(piece.as_bytes());
         if let Some(key) = key {
             if let Some(packed) = &cache.packed {
                 if packed.ids_into(key, ids) {
                     return Ok(());
                 }
             }
-        } else if cacheable {
+        }
+        self.tokenize_piece_slow(model, piece, key, mapped, ids, cache)
+    }
+
+    /// The rest of [`Self::tokenize_piece`], out of line: the longer pieces'
+    /// cache, the seed, the merge or the model, and the cache insert.
+    #[inline(never)]
+    fn tokenize_piece_slow(
+        &self,
+        model: Option<&ModelWrapper>,
+        piece: &str,
+        key: Option<ShortPieceKey>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let bytes = piece.as_bytes();
+        let cacheable = bytes.len() <= LONG_PIECE_MAX_BYTES;
+        if key.is_none() && cacheable {
             if let Some(found) = cache.get(bytes) {
                 ids.extend_from_slice(found);
                 return Ok(());
