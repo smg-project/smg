@@ -61,7 +61,17 @@ running request (a request that produced faster than the period waits its
 turn, one output per step), instead of one message per token;
 `GET /admin/zmq/zmq:<index>` reads what the rank pushed since it connected,
 the messages that carried request outputs and the outputs in them
-(cumulative; a reset does not clear them).
+(cumulative; a reset does not clear them). A rank waits for the frontend to
+bind its handshake endpoint in three rounds of 30 s, each round it misses
+logged (a gateway binds the handshake of a worker it was started with at that
+worker's first health probe, up to one check interval after its own start),
+then gives up.
+
+A worker that stops on its own (a port already in use, a rank whose frontend
+never bound) is logged and the others keep serving; when the last one stops
+the process exits with status 1, so a launcher sees a fleet that serves
+nothing as the failed start it is instead of waiting on it. The admin API is
+not a worker: it neither counts nor keeps the process up alone.
 
 ## Run (canned)
 
