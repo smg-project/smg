@@ -4,6 +4,12 @@
 //! into a [`StorageHook`] implementation, allowing WASM guests to intercept
 //! storage operations with custom before/after logic.
 
+use std::{
+    sync::mpsc::{self, RecvTimeoutError},
+    thread,
+    time::Duration,
+};
+
 use async_trait::async_trait;
 use serde_json::Value;
 use smg_data_connector::{
@@ -22,6 +28,14 @@ use crate::storage_spec::{
     },
     StorageHook as StorageHookBindings,
 };
+
+/// How often the hook's engine epoch advances: the unit a call's execution
+/// budget is counted in.
+const EPOCH_INTERVAL_MS: u64 = 100;
+
+/// Execution budget of one `before()`/`after()` call, counted from the moment
+/// its store is created, so instantiation is included.
+const CALL_BUDGET_MS: u64 = 5_000;
 
 /// WASI state for storage hook WASM execution.
 struct StorageHookWasiState {
@@ -46,10 +60,17 @@ type StoreLimits = wasmtime::StoreLimits;
 /// Compiles the WASM component once at construction. Each `before()`/`after()`
 /// call instantiates the component in a fresh store, calls the export, and
 /// converts the result back to Rust types.
+///
+/// Every call has the same execution budget of `CALL_BUDGET_MS` (5 s, to
+/// within one epoch tick), measured from its own start: neither a slow call nor
+/// the number of calls in flight shortens it. A call still running when its
+/// budget is spent traps with an interrupt and fails with
+/// [`HookError::Internal`].
 pub struct WasmStorageHook {
     engine: Engine,
     component: Component,
     linker: Linker<StorageHookWasiState>,
+    _epoch_ticker: EpochTicker,
 }
 
 impl WasmStorageHook {
@@ -57,6 +78,10 @@ impl WasmStorageHook {
     ///
     /// The bytes must be a valid WASM component (not a core module).
     /// Use `wasm-tools component new` to wrap a core module if needed.
+    ///
+    /// Also starts the thread that advances the engine's epoch every
+    /// `EPOCH_INTERVAL_MS` for as long as the hook lives; dropping the hook
+    /// stops it.
     pub fn new(wasm_bytes: &[u8]) -> Result<Self, String> {
         let mut config = Config::new();
         config.wasm_component_model(true);
@@ -70,14 +95,19 @@ impl WasmStorageHook {
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
             .map_err(|e| format!("WASI linker setup failed: {e}"))?;
 
+        let epoch_ticker = EpochTicker::start(engine.clone())
+            .map_err(|e| format!("epoch ticker spawn failed: {e}"))?;
+
         Ok(Self {
             engine,
             component,
             linker,
+            _epoch_ticker: epoch_ticker,
         })
     }
 
-    /// Create a fresh WASM store with default WASI context and memory limits.
+    /// Create a fresh WASM store with default WASI context, memory limits and
+    /// the execution budget of one call.
     fn new_store(&self) -> Store<StorageHookWasiState> {
         let mut builder = WasiCtx::builder();
         let limits = StoreLimitsBuilder::new()
@@ -94,8 +124,61 @@ impl WasmStorageHook {
             },
         );
         store.limiter(|state| &mut state.limits);
-        store.set_epoch_deadline(1);
+        store.set_epoch_deadline(deadline_ticks(CALL_BUDGET_MS, EPOCH_INTERVAL_MS));
         store
+    }
+}
+
+/// The epoch deadline, in ticks of `interval_ms`, that gives a store
+/// `budget_ms` of execution time.
+///
+/// A deadline counts from the engine's epoch at the moment it is set, and all
+/// the hook's stores share that epoch; counting the whole budget in ticks of a
+/// steady clock is what keeps each call's budget its own. Never less than one
+/// tick: a deadline of zero has already passed.
+fn deadline_ticks(budget_ms: u64, interval_ms: u64) -> u64 {
+    (budget_ms / interval_ms).max(1)
+}
+
+/// Advances an engine's epoch every `EPOCH_INTERVAL_MS` until dropped.
+///
+/// A plain thread rather than a task: hook calls run guest code on the
+/// caller's async workers, and a guest that never yields holds its worker
+/// until the interrupt fires, so the clock behind that interrupt must not
+/// need a worker itself.
+struct EpochTicker {
+    stop: mpsc::Sender<()>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn start(engine: Engine) -> std::io::Result<Self> {
+        let (stop, stopped) = mpsc::channel();
+        let interval = Duration::from_millis(EPOCH_INTERVAL_MS);
+        let thread = thread::Builder::new()
+            .name("smg-hook-epoch".to_string())
+            .spawn(move || {
+                // Times out once per interval; anything else is the stop.
+                while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(interval) {
+                    engine.increment_epoch();
+                }
+            })?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        // The thread only ever waits in `recv_timeout`, which returns as soon
+        // as the stop arrives, so the join is immediate and no tick lands
+        // after the hook is gone.
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -170,6 +253,7 @@ impl StorageHook for WasmStorageHook {
         context: Option<&RequestContext>,
         payload: &Value,
     ) -> Result<BeforeHookResult, HookError> {
+        // The store's epoch deadline is this call's execution budget.
         let mut store = self.new_store();
 
         let bindings =
@@ -181,28 +265,11 @@ impl StorageHook for WasmStorageHook {
         let wit_ctx = to_wit_context(context);
         let payload_str = payload.to_string();
 
-        // Spawn epoch ticker to enforce a 5-second execution budget.
-        // The task is aborted immediately after the WASM call completes,
-        // so it is safe for the gateway to shut down without waiting for it.
-        let epoch_engine = self.engine.clone();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "epoch ticker is aborted after WASM call"
-        )]
-        let ticker = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            epoch_engine.increment_epoch();
-        });
-
         let result = bindings
             .smg_storage_storage_hook_before()
             .call_before(&mut store, wit_op, &wit_ctx, &payload_str)
-            .await;
-
-        ticker.abort();
-
-        let result =
-            result.map_err(|e| HookError::Internal(format!("WASM before() call failed: {e}")))?;
+            .await
+            .map_err(|e| HookError::Internal(format!("WASM before() call failed: {e}")))?;
 
         match result {
             WitBeforeResult::DoContinue(extra_cols) => Ok(BeforeHookResult::Continue(
@@ -220,6 +287,7 @@ impl StorageHook for WasmStorageHook {
         result: &Value,
         extra: &ExtraColumns,
     ) -> Result<ExtraColumns, HookError> {
+        // The store's epoch deadline is this call's execution budget.
         let mut store = self.new_store();
 
         let bindings =
@@ -233,19 +301,6 @@ impl StorageHook for WasmStorageHook {
         let result_str = result.to_string();
         let wit_extra = to_wit_extra_columns(extra);
 
-        // Spawn epoch ticker to enforce a 5-second execution budget.
-        // The task is aborted immediately after the WASM call completes,
-        // so it is safe for the gateway to shut down without waiting for it.
-        let epoch_engine = self.engine.clone();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "epoch ticker is aborted after WASM call"
-        )]
-        let ticker = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            epoch_engine.increment_epoch();
-        });
-
         let updated = bindings
             .smg_storage_storage_hook_after()
             .call_after(
@@ -256,12 +311,8 @@ impl StorageHook for WasmStorageHook {
                 &result_str,
                 &wit_extra,
             )
-            .await;
-
-        ticker.abort();
-
-        let updated =
-            updated.map_err(|e| HookError::Internal(format!("WASM after() call failed: {e}")))?;
+            .await
+            .map_err(|e| HookError::Internal(format!("WASM after() call failed: {e}")))?;
 
         Ok(from_wit_extra_columns(updated))
     }
@@ -269,9 +320,115 @@ impl StorageHook for WasmStorageHook {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        time::{Duration, Instant},
+    };
+
+    use wasmtime::{Instance, Module, Trap, TypedFunc};
 
     use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// The hook compiles any component; the epoch tests drive its engine and
+    /// stores directly.
+    const EMPTY_COMPONENT: &[u8] = b"(component)";
+
+    /// A core module whose `spin` export loops `n` times. Every iteration
+    /// checks the epoch, so a call traps once its store's deadline has passed.
+    const SPIN_WAT: &str = r#"
+        (module
+            (func (export "spin") (param $n i32)
+                (loop $again
+                    (br_if $again
+                        (local.tee $n (i32.sub (local.get $n) (i32.const 1)))))))
+    "#;
+
+    fn spinner<T: 'static>(
+        store: &mut Store<T>,
+        module: &Module,
+    ) -> wasmtime::Result<TypedFunc<i32, ()>> {
+        Instance::new(&mut *store, module, &[])?.get_typed_func(&mut *store, "spin")
+    }
+
+    #[test]
+    fn deadline_ticks_counts_the_budget_in_whole_ticks() {
+        assert_eq!(deadline_ticks(CALL_BUDGET_MS, EPOCH_INTERVAL_MS), 50);
+        assert_eq!(deadline_ticks(5_099, 100), 50);
+        // A budget shorter than a tick still gets one tick.
+        assert_eq!(deadline_ticks(50, 100), 1);
+    }
+
+    /// Every store of the hook counts its deadline on the one epoch of the
+    /// hook's engine, so ticks are shared: a tick that lands right after a
+    /// call's store is created must not use up that call's budget.
+    #[test]
+    fn a_store_keeps_its_budget_when_the_epoch_ticks() -> TestResult {
+        let hook = WasmStorageHook::new(EMPTY_COMPONENT)?;
+        let module = Module::new(&hook.engine, SPIN_WAT)?;
+
+        let mut store = hook.new_store();
+        hook.engine.increment_epoch();
+        let outcome = spinner(&mut store, &module)?.call(&mut store, 1_000);
+        assert!(outcome.is_ok(), "one tick ended the call: {outcome:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_runs_out_once_its_budget_has_ticked_by() -> TestResult {
+        let hook = WasmStorageHook::new(EMPTY_COMPONENT)?;
+        let module = Module::new(&hook.engine, SPIN_WAT)?;
+
+        let mut store = hook.new_store();
+        for _ in 0..deadline_ticks(CALL_BUDGET_MS, EPOCH_INTERVAL_MS) {
+            hook.engine.increment_epoch();
+        }
+        let trap = spinner(&mut store, &module)?
+            .call(&mut store, 1_000)
+            .expect_err("a call past its budget must be interrupted");
+        assert_eq!(trap.downcast_ref::<Trap>(), Some(&Trap::Interrupt));
+        Ok(())
+    }
+
+    #[test]
+    fn the_hook_ticks_its_engine_until_it_is_dropped() -> TestResult {
+        let hook = WasmStorageHook::new(EMPTY_COMPONENT)?;
+        let engine = hook.engine.clone();
+        let module = Module::new(&engine, SPIN_WAT)?;
+
+        // While the hook lives, its engine's epoch advances with no call
+        // driving it: a store one tick from its deadline runs out.
+        let mut store = Store::new(&engine, ());
+        store.set_epoch_deadline(1);
+        let spin = spinner(&mut store, &module)?;
+        let started = Instant::now();
+        let trap = loop {
+            match spin.call(&mut store, 1_000) {
+                Err(trap) => break trap,
+                Ok(()) => {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(5),
+                        "the hook's engine did not tick within 5 s"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        assert_eq!(trap.downcast_ref::<Trap>(), Some(&Trap::Interrupt));
+
+        // Once the hook is dropped, the epoch stands still.
+        drop(hook);
+        let mut store = Store::new(&engine, ());
+        store.set_epoch_deadline(1);
+        thread::sleep(Duration::from_millis(500));
+        let outcome = spinner(&mut store, &module)?.call(&mut store, 1_000);
+        assert!(
+            outcome.is_ok(),
+            "the epoch ticked after the drop: {outcome:?}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn operation_conversion_round_trips() {
