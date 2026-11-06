@@ -484,6 +484,38 @@ fn to_fir_algorithm(filter: FilterType) -> ResizeAlg {
     }
 }
 
+/// A buffer of `len` bytes for a kernel that writes every one of them: a plain
+/// allocation filled in place, never a zeroed allocation. The allocators
+/// serve a large zeroed block by handing its pages back to the kernel and
+/// taking them again page fault by page fault (jemalloc zeroes a recycled
+/// block that way; glibc's zeroed allocation of a fresh heap top relies on
+/// fresh pages), which costs more than the kernel's own pass on a buffer of
+/// the image's scale; a plain allocation reuses the pages the allocator kept.
+#[expect(
+    clippy::slow_vector_initialization,
+    reason = "the zero-filled `vec!` is the calloc this helper exists to avoid; see its doc comment"
+)]
+fn plain_buffer(len: usize) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(len);
+    buffer.resize(len, 0);
+    buffer
+}
+
+/// [`plain_buffer`] for a kernel that writes `f32` values.
+fn plain_f32(len: usize) -> Vec<f32> {
+    let mut buffer = Vec::with_capacity(len);
+    buffer.resize(len, 0.0);
+    buffer
+}
+
+/// The resizer's destination image over a [`plain_buffer`] rather than the
+/// zeroed one its own constructor allocates; the resizer writes every pixel.
+fn fir_destination(width: u32, height: u32, pixel_type: PixelType) -> FirImage<'static> {
+    let len = width as usize * height as usize * pixel_type.size();
+    FirImage::from_vec_u8(width, height, plain_buffer(len), pixel_type)
+        .unwrap_or_else(|_| FirImage::new(width, height, pixel_type))
+}
+
 thread_local! {
     static RESIZER: RefCell<Resizer> = RefCell::new(Resizer::new());
 }
@@ -504,7 +536,7 @@ pub fn resize(image: &DynamicImage, width: u32, height: u32, filter: FilterType)
         Some(pt) => pt,
         None => return image.resize_exact(width, height, filter),
     };
-    let mut dst = FirImage::new(width, height, pixel_type);
+    let mut dst = fir_destination(width, height, pixel_type);
     let options = ResizeOptions::new().resize_alg(to_fir_algorithm(filter));
     let ok = RESIZER.with(|r| r.borrow_mut().resize(image, &mut dst, &options).is_ok());
     if !ok {
@@ -557,7 +589,11 @@ pub(crate) fn resize_catmull_rom_rgb(src: &RgbImage, width: u32, height: u32) ->
     let ys = catmull_rom_weights(src.height(), height);
     let src_stride = src.width() as usize * 3;
     let dst_stride = width as usize * 3;
-    let mut dst = RgbImage::new(width, height);
+    let Some(mut dst) =
+        RgbImage::from_raw(width, height, plain_buffer(dst_stride * height as usize))
+    else {
+        return image::imageops::resize(src, width, height, FilterType::CatmullRom);
+    };
     if dst.set_color_space(src.color_space()).is_err() {
         return image::imageops::resize(src, width, height, FilterType::CatmullRom);
     }
@@ -598,7 +634,7 @@ pub fn resize_rgb_bytes(
 ) -> Result<RgbImage> {
     let src = FirImageRef::new(width, height, data, PixelType::U8x3)
         .map_err(|e| TransformError::ShapeError(format!("invalid RGB source image: {e}")))?;
-    let mut dst = FirImage::new(target_width, target_height, PixelType::U8x3);
+    let mut dst = fir_destination(target_width, target_height, PixelType::U8x3);
     let options = ResizeOptions::new().resize_alg(to_fir_algorithm(filter));
     RESIZER
         .with(|r| r.borrow_mut().resize(&src, &mut dst, &options))
@@ -2060,7 +2096,7 @@ fn pil_resample_horizontal<const C: usize>(
     kernel: &FixedKernel,
 ) -> Vec<u8> {
     let row_out = out_w * C;
-    let mut out = vec![0_u8; rows * row_out];
+    let mut out = plain_buffer(rows * row_out);
     let pass = &WidthPass::new::<C>(kernel);
     let tasks = par_threads(out.len(), rows);
     if tasks <= 1 {
@@ -2092,7 +2128,7 @@ fn pil_resample_vertical<const C: usize>(
     kernel: &FixedKernel,
 ) -> Vec<u8> {
     let row_len = width * C;
-    let mut out = vec![0_u8; out_h * row_len];
+    let mut out = plain_buffer(out_h * row_len);
     let pass = HeightPass::new();
     let tasks = par_threads(out.len(), out_h);
     if tasks <= 1 {
@@ -2492,7 +2528,7 @@ fn torch_aa_passes(data: &[u8], in_w: usize, x: &TorchAaAxis<'_>, y: &TorchAaAxi
     let (out_w, out_h) = (x.bounds.len(), y.bounds.len());
     let in_h = data.len() / (in_w * 3);
 
-    let mut rows = vec![0.0_f32; in_h * out_w * 3];
+    let mut rows = plain_f32(in_h * out_w * 3);
     for (src, dst) in data
         .chunks_exact(in_w * 3)
         .zip(rows.chunks_exact_mut(out_w * 3))
@@ -2522,7 +2558,7 @@ fn torch_aa_passes(data: &[u8], in_w: usize, x: &TorchAaAxis<'_>, y: &TorchAaAxi
         }
     }
 
-    let mut out = vec![0.0_f32; out_h * out_w * 3];
+    let mut out = plain_f32(out_h * out_w * 3);
     let row = out_w * 3;
     for (dst, (&(start, count), weights)) in out
         .chunks_exact_mut(row)
@@ -2707,18 +2743,22 @@ pub(crate) fn paste_rgb(
 /// centered and padded with the mean color on the shorter dimension.
 pub fn expand_to_square(image: &DynamicImage, background: Rgb<u8>) -> DynamicImage {
     let (w, h) = image.dimensions();
-    match w.cmp(&h) {
-        std::cmp::Ordering::Equal => image.clone(),
-        std::cmp::Ordering::Less => {
-            // Height > Width: pad horizontally
-            let mut new_image = DynamicImage::from(RgbImage::from_pixel(h, h, background));
-            image::imageops::overlay(&mut new_image, image, ((h - w) / 2) as i64, 0);
-            new_image
+    if w == h {
+        return image.clone();
+    }
+    // The image centred on the shorter axis of a square of the longer side.
+    let side = w.max(h);
+    let (x, y) = ((side - w) / 2, (side - h) / 2);
+    match image {
+        // An opaque image's paste is a copy: the square is built from rows.
+        DynamicImage::ImageRgb8(rgb) => {
+            DynamicImage::ImageRgb8(paste_rgb(rgb, side, side, x, y, background.0))
         }
-        std::cmp::Ordering::Greater => {
-            // Width > Height: pad vertically
-            let mut new_image = DynamicImage::from(RgbImage::from_pixel(w, w, background));
-            image::imageops::overlay(&mut new_image, image, 0, ((w - h) / 2) as i64);
+        // Any other layout is pasted pixel by pixel, as the generic paste
+        // blends it (an alpha channel over the background).
+        other => {
+            let mut new_image = DynamicImage::from(RgbImage::from_pixel(side, side, background));
+            image::imageops::overlay(&mut new_image, other, i64::from(x), i64::from(y));
             new_image
         }
     }
@@ -2800,32 +2840,28 @@ pub fn pad_to_size_pil_rgb(
         PilResizeFilter::Bicubic,
         KernelQuantization::Pillow,
     );
-    let canvas = if target_w == out_w && target_h == out_h {
-        resized
+    let resized = RgbImage::from_raw(target_w, target_h, resized).ok_or_else(|| {
+        TransformError::ShapeError(format!(
+            "failed to build the resized {target_w}x{target_h} image"
+        ))
+    })?;
+    if target_w == out_w && target_h == out_h {
+        return Ok(resized);
+    }
+    // The paste at round((size - resized) * 0.5) along the padded axis, on a
+    // canvas of `color`, built from rows.
+    let (x, y) = if target_w == out_w {
+        (
+            0,
+            (f64::from(out_h - target_h) * 0.5).round_ties_even() as u32,
+        )
     } else {
-        let (canvas_w, canvas_h) = (out_w as usize, out_h as usize);
-        let (resized_w, resized_h) = (target_w as usize, target_h as usize);
-        let mut canvas = vec![0_u8; canvas_w * canvas_h * 3];
-        for pixel in canvas.as_chunks_mut::<3>().0.iter_mut() {
-            *pixel = color.0;
-        }
-        if resized_w == canvas_w {
-            let y = (f64::from(out_h - target_h) * 0.5).round_ties_even() as usize;
-            canvas[y * canvas_w * 3..(y + resized_h) * canvas_w * 3].copy_from_slice(&resized);
-        } else {
-            let x = (f64::from(out_w - target_w) * 0.5).round_ties_even() as usize;
-            for (row, resized_row) in canvas
-                .chunks_exact_mut(canvas_w * 3)
-                .zip(resized.chunks_exact(resized_w * 3))
-            {
-                row[x * 3..(x + resized_w) * 3].copy_from_slice(resized_row);
-            }
-        }
-        canvas
+        (
+            (f64::from(out_w - target_w) * 0.5).round_ties_even() as u32,
+            0,
+        )
     };
-    RgbImage::from_raw(out_w, out_h, canvas).ok_or_else(|| {
-        TransformError::ShapeError(format!("failed to build the padded {out_w}x{out_h} image"))
-    })
+    Ok(paste_rgb(&resized, out_w, out_h, x, y, color.0))
 }
 
 /// Stack multiple [C, H, W] tensors into [B, C, H, W].
@@ -3866,6 +3902,30 @@ mod tests {
 
         assert_eq!(squared.width(), 100);
         assert_eq!(squared.height(), 100);
+    }
+
+    #[test]
+    fn expand_to_square_is_the_generic_paste() {
+        // A wide image (padded above and below), a tall one (padded on the
+        // sides), and odd sizes whose padding does not split evenly.
+        for (w, h) in [(100u32, 50u32), (50, 100), (31, 17), (17, 31)] {
+            let image = DynamicImage::ImageRgb8(
+                RgbImage::from_raw(w, h, gradient_rgb(w as usize, h as usize, 9))
+                    .expect("gradient size"),
+            );
+            let background = Rgb([200, 30, 90]);
+            let side = w.max(h);
+            let mut expected = DynamicImage::from(RgbImage::from_pixel(side, side, background));
+            image::imageops::overlay(
+                &mut expected,
+                &image,
+                i64::from((side - w) / 2),
+                i64::from((side - h) / 2),
+            );
+            let squared = expand_to_square(&image, background);
+            assert_eq!(squared.dimensions(), (side, side), "{w}x{h}");
+            assert_eq!(squared.as_bytes(), expected.as_bytes(), "{w}x{h}");
+        }
     }
 
     #[test]
