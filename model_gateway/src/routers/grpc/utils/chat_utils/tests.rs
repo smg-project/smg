@@ -1994,13 +1994,9 @@ fn a_long_decode_takes_the_offload_path_and_a_short_one_runs_inline() {
     let (tokenizer, ran_on) = thread_recording_tokenizer();
     let hello = tokenizer.token_to_id("Hello").expect("mock vocab");
     let decode = |ids: Vec<u32>| {
-        block_on(decode_blocking_in_batch(
-            tokenizer.clone(),
-            ids,
-            false,
-            &InPlaceBudget::default(),
-        ))
-        .unwrap()
+        block_on(decode_ids_blocking(tokenizer.clone(), vec![ids], false))
+            .unwrap()
+            .remove(0)
     };
 
     let long = vec![hello; ENCODE_OFFLOAD_MIN_BYTES / size_of::<u32>()];
@@ -2138,8 +2134,6 @@ fn a_conversation_of_a_few_kilobytes_is_encoded_on_the_request_thread() {
 fn a_batch_encodes_in_place_up_to_the_bound_and_the_rest_on_the_pool() {
     use std::thread;
 
-    use futures::future::try_join_all;
-
     use crate::routers::grpc::testing::thread_recording_tokenizer;
 
     // `block_on` polls on this thread, so an encode in place runs here and an
@@ -2147,12 +2141,7 @@ fn a_batch_encodes_in_place_up_to_the_bound_and_the_rest_on_the_pool() {
     let (tokenizer, ran_on) = thread_recording_tokenizer();
     let here = thread::current().id();
     let batch = |texts: Vec<String>| {
-        let budget = InPlaceBudget::default();
-        let futures: Vec<_> = texts
-            .iter()
-            .map(|text| encode_blocking_in_batch(tokenizer.clone(), text, false, &budget))
-            .collect();
-        block_on(try_join_all(futures)).unwrap();
+        block_on(encode_texts_blocking(tokenizer.clone(), &texts, false)).unwrap();
         std::mem::take(&mut *ran_on.lock().unwrap())
     };
 
@@ -2189,11 +2178,9 @@ fn short_inputs_after_a_spent_share_stay_in_place_and_yield_instead() {
         thread,
     };
 
-    use futures::future::try_join_all;
-
     use crate::routers::grpc::testing::thread_recording_tokenizer;
 
-    /// The polls a future took to complete: one per pass of a join.
+    /// The polls a future took to complete: one per yield of the call.
     struct Polls<F>(Pin<Box<F>>, usize);
     impl<F: Future> Future for Polls<F> {
         type Output = (F::Output, usize);
@@ -2213,13 +2200,13 @@ fn short_inputs_after_a_spent_share_stay_in_place_and_yield_instead() {
     let texts = vec![short; 2_000]; // 200 KB in all: twelve shares and a bit
 
     // One by one, as the tokenize loop awaits them.
-    let budget = InPlaceBudget::default();
+    let mut budget = InPlaceBudget::default();
     block_on(async {
-        encode_blocking_in_batch(tokenizer.clone(), &spends_the_share, false, &budget)
+        encode_blocking_in_batch(tokenizer.clone(), &spends_the_share, false, &mut budget)
             .await
             .unwrap();
         for text in &texts {
-            encode_blocking_in_batch(tokenizer.clone(), text, false, &budget)
+            encode_blocking_in_batch(tokenizer.clone(), text, false, &mut budget)
                 .await
                 .unwrap();
         }
@@ -2231,24 +2218,25 @@ fn short_inputs_after_a_spent_share_stay_in_place_and_yield_instead() {
         "a short input is never sent to the pool, spent share or not"
     );
 
-    // Joined, as a completion batch is.
-    let budget = InPlaceBudget::default();
+    // As one call's batch, placed in one pass.
     let ((), polls) = block_on(Polls(
         Box::pin(async {
-            let futures: Vec<_> = texts
-                .iter()
-                .map(|text| encode_blocking_in_batch(tokenizer.clone(), text, false, &budget))
-                .collect();
-            try_join_all(futures).await.unwrap();
+            encode_texts_blocking(tokenizer.clone(), &texts, false)
+                .await
+                .unwrap();
         }),
         0,
     ));
     let threads = std::mem::take(&mut *ran_on.lock().unwrap());
-    assert_eq!(threads.len(), 2_000);
+    assert_eq!(
+        threads.len(),
+        2_000,
+        "each input of the batch is encoded exactly once"
+    );
     assert!(threads.iter().all(|t| *t == here));
     assert!(
         (12..=16).contains(&polls),
-        "the join runs about one share of short inputs per pass and yields between passes: {polls} passes"
+        "the batch runs about one share of short inputs per pass and yields between passes: {polls} passes"
     );
 }
 

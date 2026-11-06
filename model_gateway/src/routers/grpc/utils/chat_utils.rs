@@ -3,10 +3,7 @@
 use std::{
     collections::HashMap,
     fmt,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, OnceLock,
-    },
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -402,20 +399,14 @@ pub(crate) async fn encode_blocking(
 }
 
 /// What one call has encoded or decoded on the runtime thread since it last
-/// yielded it: the call's share. A call's inputs charge it as each first runs
-/// (a join polls its futures one by one), so the call holds a worker for about
-/// one input at the bound before it lets go. An input that would take the
-/// share over the bound goes to the pool if it is worth the trip
-/// ([`OFFLOAD_BREAK_EVEN_BYTES`]), beside the others there; a smaller one
-/// yields the worker once and starts the next share, in a sequential loop as
-/// in a join, where the inputs behind it yield to the join's next pass.
+/// yielded it: the call's share. A call places its inputs one after another
+/// against it, so it holds a worker for about one input at the bound before
+/// it lets go: an input that would take the share over the bound goes to the
+/// pool if it is worth the trip ([`OFFLOAD_BREAK_EVEN_BYTES`]), and a smaller
+/// one has the call yield the worker once and start the next share.
 #[derive(Default)]
 pub(crate) struct InPlaceBudget {
-    /// The bytes run in place in the current share.
-    in_place: AtomicUsize,
-    /// The share's number: of the inputs that yielded on finding a share
-    /// spent, the first one back starts the next.
-    share: AtomicUsize,
+    in_place: usize,
 }
 
 /// Where an input of a call runs, by [`InPlaceBudget::place`].
@@ -424,99 +415,144 @@ enum Placement {
     InPlace,
     /// On the blocking pool.
     Pool,
-    /// On the calling thread, after one yield of it; the share it found spent.
-    AfterYield(usize),
+    /// On the calling thread, once the call has yielded it: the share is spent.
+    AfterYield,
 }
 
 impl InPlaceBudget {
-    /// Where an input of `len` bytes runs now.
-    fn place(&self, len: usize) -> Placement {
+    /// Where an input of `len` bytes runs, the share charged when in place.
+    fn place(&mut self, len: usize) -> Placement {
         if offloads(len) {
             return Placement::Pool;
         }
-        let mut seen = self.in_place.load(Ordering::Relaxed);
-        loop {
-            let total = seen + len;
-            if offloads(total) {
-                return if len >= OFFLOAD_BREAK_EVEN_BYTES {
-                    Placement::Pool
-                } else {
-                    Placement::AfterYield(self.share.load(Ordering::Relaxed))
-                };
-            }
-            match self.in_place.compare_exchange_weak(
-                seen,
-                total,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Placement::InPlace,
-                Err(now) => seen = now,
-            }
+        let total = self.in_place + len;
+        if !offloads(total) {
+            self.in_place = total;
+            Placement::InPlace
+        } else if len >= OFFLOAD_BREAK_EVEN_BYTES {
+            Placement::Pool
+        } else {
+            Placement::AfterYield
         }
     }
 
-    /// Back from the yield an input took on finding `share` spent: the first
-    /// one back starts the next share, the others place themselves in it.
-    fn resumed(&self, share: usize) {
-        if self
-            .share
-            .compare_exchange(share, share + 1, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            self.in_place.store(0, Ordering::Relaxed);
-        }
+    /// The next share, opened by an input of `len` bytes after the yield.
+    fn next_share(&mut self, len: usize) {
+        self.in_place = len;
     }
 }
 
-/// Tokenize one `text` of a call through the offload policy, the call's
-/// [`InPlaceBudget`] placing it when it first runs: in place from the caller's
-/// own text, as [`encode_blocking`] does below the bound; on the pool from one
-/// copy; or in place after one yield of the worker.
+/// Tokenize one `text` of a call's sequence through the offload policy, the
+/// call's [`InPlaceBudget`] placing it: in place from the caller's own text,
+/// as [`encode_blocking`] does below the bound; on the pool from one copy; or
+/// in place once the call has yielded the worker. A call that holds several
+/// inputs at once places them in one pass with [`encode_texts_blocking`].
 pub(crate) async fn encode_blocking_in_batch(
     tokenizer: Arc<dyn Tokenizer>,
     text: &str,
     add_special_tokens: bool,
-    budget: &InPlaceBudget,
+    budget: &mut InPlaceBudget,
 ) -> anyhow::Result<Encoding> {
-    loop {
-        match budget.place(text.len()) {
-            Placement::InPlace => return tokenizer.encode(text, add_special_tokens),
-            Placement::Pool => {
-                let text = text.to_string();
-                return pool(move || tokenizer.encode(&text, add_special_tokens)).await;
-            }
-            Placement::AfterYield(share) => {
-                yield_now().await;
-                budget.resumed(share);
-            }
+    match budget.place(text.len()) {
+        Placement::InPlace => tokenizer.encode(text, add_special_tokens),
+        Placement::AfterYield => {
+            yield_now().await;
+            budget.next_share(text.len());
+            tokenizer.encode(text, add_special_tokens)
+        }
+        Placement::Pool => {
+            let text = text.to_string();
+            pool(move || tokenizer.encode(&text, add_special_tokens)).await
         }
     }
 }
 
-/// Decode one prompt of `ids` of a call through the offload policy, the
-/// call's [`InPlaceBudget`] placing it when it first runs, as
-/// [`encode_blocking_in_batch`] does for a text: a prompt given as ids leaves
-/// the worker thread at the same size a text prompt does, four bytes an id.
-/// A call of one prompt charges a budget of its own.
-pub(crate) async fn decode_blocking_in_batch(
+/// Tokenize a call's `texts` as one pass over them: each is placed once by
+/// the call's [`InPlaceBudget`] and encoded there and then when in place, the
+/// call yielding the worker once per spent share; the texts worth the trip go
+/// to the pool together, joined at the end, so they run in parallel and start
+/// late by at most one share of in-place work. The encodings in the texts'
+/// order.
+pub(crate) async fn encode_texts_blocking(
     tokenizer: Arc<dyn Tokenizer>,
-    ids: Vec<u32>,
+    texts: &[String],
+    add_special_tokens: bool,
+) -> anyhow::Result<Vec<Encoding>> {
+    place_all(
+        texts.iter(),
+        |text| text.len(),
+        |text| tokenizer.encode(text.as_str(), add_special_tokens),
+        |text| {
+            let (tokenizer, text) = (tokenizer.clone(), text.to_string());
+            Box::new(move || tokenizer.encode(&text, add_special_tokens))
+        },
+    )
+    .await
+}
+
+/// Decode a call's prompts given as ids, `lists`, as one pass over them, as
+/// [`encode_texts_blocking`] does for texts: a prompt of ids leaves the worker
+/// thread at the same size a text prompt does, four bytes an id. The texts in
+/// the lists' order.
+pub(crate) async fn decode_ids_blocking(
+    tokenizer: Arc<dyn Tokenizer>,
+    lists: Vec<Vec<u32>>,
     skip_special_tokens: bool,
-    budget: &InPlaceBudget,
-) -> anyhow::Result<String> {
-    loop {
-        match budget.place(ids.len() * size_of::<u32>()) {
-            Placement::InPlace => return tokenizer.decode(&ids, skip_special_tokens),
-            Placement::Pool => {
-                return pool(move || tokenizer.decode(&ids, skip_special_tokens)).await
-            }
-            Placement::AfterYield(share) => {
+) -> anyhow::Result<Vec<String>> {
+    place_all(
+        lists,
+        |ids| ids.len() * size_of::<u32>(),
+        |ids| tokenizer.decode(ids, skip_special_tokens),
+        |ids| {
+            let tokenizer = tokenizer.clone();
+            Box::new(move || tokenizer.decode(&ids, skip_special_tokens))
+        },
+    )
+    .await
+}
+
+/// The pool's job for an input a call does not run in place.
+type PoolJob<T> = Box<dyn FnOnce() -> anyhow::Result<T> + Send + 'static>;
+
+/// One pass of a call over its `inputs` through the offload policy: `len` is
+/// an input's bytes for the budget, `in_place` runs one on the calling
+/// thread, `job` makes the pool's job of one. The outputs in the inputs'
+/// order; the first error ends the pass, the pool's jobs not yet started.
+async fn place_all<I, T>(
+    inputs: impl IntoIterator<Item = I>,
+    len: impl Fn(&I) -> usize,
+    in_place: impl Fn(&I) -> anyhow::Result<T>,
+    job: impl Fn(I) -> PoolJob<T>,
+) -> anyhow::Result<Vec<T>>
+where
+    T: Send + 'static,
+{
+    let mut budget = InPlaceBudget::default();
+    let mut outputs: Vec<Option<T>> = Vec::new();
+    let mut pooled = Vec::new();
+    for (index, input) in inputs.into_iter().enumerate() {
+        let len = len(&input);
+        match budget.place(len) {
+            Placement::InPlace => outputs.push(Some(in_place(&input)?)),
+            Placement::AfterYield => {
                 yield_now().await;
-                budget.resumed(share);
+                budget.next_share(len);
+                outputs.push(Some(in_place(&input)?));
+            }
+            Placement::Pool => {
+                let job = job(input);
+                pooled.push(async move { pool(job).await.map(|output| (index, output)) });
+                outputs.push(None);
             }
         }
     }
+    for (index, output) in futures::future::try_join_all(pooled).await? {
+        outputs[index] = Some(output);
+    }
+    outputs
+        .into_iter()
+        .map(|output| output.ok_or_else(|| anyhow!("an input of the pass was left unplaced")))
+        .collect()
 }
 
 /// Tokenize a rendered chat prompt the way its renderer said to: a deferred

@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
-use futures::future::try_join_all;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::completion::CompletionPrompt;
 use tracing::{error, warn};
@@ -111,11 +110,7 @@ async fn encode_prompts(
     tokenizer: &Arc<dyn Tokenizer>,
     prompts: &[String],
 ) -> Result<Vec<CompletionItem>, Response> {
-    let budget = utils::InPlaceBudget::default();
-    let encodings =
-        try_join_all(prompts.iter().map(|prompt| {
-            utils::encode_blocking_in_batch(tokenizer.clone(), prompt, false, &budget)
-        }))
+    let encodings = utils::encode_texts_blocking(tokenizer.clone(), prompts, false)
         .await
         .map_err(|e| {
             error!(
@@ -136,39 +131,44 @@ async fn encode_prompts(
         .collect())
 }
 
-/// A prompt given as token ids goes to the engine as given, with no encode,
-/// once every id is bound to a row of the model's embedding table
-/// ([`reject_unknown_token_id`], the rule `/generate` applies to `input_ids`:
-/// on the headless lanes an id past the table is an out-of-range index on
-/// the engine, not a refused request). Its text, for `echo` and for the
-/// policies that route on text, is the decode of the ids the tokenizer knows
-/// ([`decodable_ids`]) with special tokens kept, as the engines' own servers
-/// echo a token prompt: an id known only to the engine's table rides the wire
-/// and leaves no text, on every decoder (the byte-level and HF decoders would
-/// drop it, the tiktoken decoder would refuse it). An id inside the
-/// tokenizer's range that its encoding never assigned (a hole of a tiktoken
-/// id space) is the decode's to find, and is refused as the client's error. A
-/// long prompt decodes off the worker thread, as a long text encodes, and a
-/// call's lists charge one in-place `budget` as a call's texts do, so they
-/// decode in place up to the bound and on the pool past it. `field` names the
-/// prompt in a refusal: `prompt`, or `prompt[b]` for one list of a batch.
-async fn token_prompt(
+/// The token prompts of a call, one item per list. A prompt given as token
+/// ids goes to the engine as given, with no encode, once every id is bound to
+/// a row of the model's embedding table ([`reject_unknown_token_id`], the rule
+/// `/generate` applies to `input_ids`: on the headless lanes an id past the
+/// table is an out-of-range index on the engine, not a refused request). Its
+/// text, for `echo` and for the policies that route on text, is the decode of
+/// the ids the tokenizer knows ([`decodable_ids`]) with special tokens kept,
+/// as the engines' own servers echo a token prompt: an id known only to the
+/// engine's table rides the wire and leaves no text, on every decoder (the
+/// byte-level and HF decoders would drop it, the tiktoken decoder would
+/// refuse it). An id inside the tokenizer's range that its encoding never
+/// assigned (a hole of a tiktoken id space) is the decode's to find, and is
+/// refused as the client's error. The lists are checked first, the first
+/// refusal ending the call, then decoded as one pass of the call
+/// ([`utils::decode_ids_blocking`]): in place up to the bound, on the pool
+/// past it, as a call's texts are ([`encode_prompts`]). `fields` names each
+/// list in a refusal: `prompt`, or `prompt[b]` for one list of a batch.
+async fn token_prompts(
     tokenizer: &Arc<dyn Tokenizer>,
-    ids: &[u32],
-    field: &str,
-    embedding_rows: impl FnOnce() -> Option<usize>,
-    budget: &utils::InPlaceBudget,
-) -> Result<CompletionItem, Response> {
-    reject_unknown_token_id(tokenizer.as_ref(), ids, field, embedding_rows).map_err(|message| {
-        warn!(
-            function = "CompletionPreparationStage::execute",
-            error = %message,
-            "Prompt token id outside the model's vocabulary"
-        );
-        error::bad_request("invalid_prompt_token", message)
-    })?;
-    let decodable = decodable_ids(tokenizer.as_ref(), ids);
-    let text = utils::decode_blocking_in_batch(tokenizer.clone(), decodable, false, budget)
+    batches: &[Vec<u32>],
+    fields: &[String],
+    embedding_rows: impl FnOnce() -> Option<usize> + Copy,
+) -> Result<Vec<CompletionItem>, Response> {
+    let mut decodable = Vec::with_capacity(batches.len());
+    for (ids, field) in batches.iter().zip(fields) {
+        reject_unknown_token_id(tokenizer.as_ref(), ids, field, embedding_rows).map_err(
+            |message| {
+                warn!(
+                    function = "CompletionPreparationStage::execute",
+                    error = %message,
+                    "Prompt token id outside the model's vocabulary"
+                );
+                error::bad_request("invalid_prompt_token", message)
+            },
+        )?;
+        decodable.push(decodable_ids(tokenizer.as_ref(), ids));
+    }
+    let texts = utils::decode_ids_blocking(tokenizer.clone(), decodable, false)
         .await
         .map_err(|e| {
             // The range check behind `decodable_ids` is a fast path, not a guarantee: a
@@ -185,29 +185,14 @@ async fn token_prompt(
                 format!("prompt token ids cannot be decoded: {e}"),
             )
         })?;
-    Ok(CompletionItem {
-        text,
-        token_ids: ids.to_vec(),
-    })
-}
-
-/// The token prompts of a call, one item per list, charged to one in-place
-/// budget as a text batch is ([`encode_prompts`]); `fields` names each list
-/// in a refusal.
-async fn token_prompts(
-    tokenizer: &Arc<dyn Tokenizer>,
-    batches: &[Vec<u32>],
-    fields: &[String],
-    embedding_rows: impl FnOnce() -> Option<usize> + Copy,
-) -> Result<Vec<CompletionItem>, Response> {
-    let budget = utils::InPlaceBudget::default();
-    try_join_all(
-        batches
-            .iter()
-            .zip(fields)
-            .map(|(ids, field)| token_prompt(tokenizer, ids, field, embedding_rows, &budget)),
-    )
-    .await
+    Ok(batches
+        .iter()
+        .zip(texts)
+        .map(|(ids, text)| CompletionItem {
+            text,
+            token_ids: ids.to_vec(),
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -222,17 +207,22 @@ mod tests {
         Arc::new(MockTokenizer::new().with_tokens(&[("<|added|>", 50_000)]))
     }
 
+    /// One token prompt, `field` naming it, through the stage's batch form.
+    async fn token_prompt(
+        tokenizer: &Arc<dyn Tokenizer>,
+        ids: &[u32],
+        field: &str,
+        embedding_rows: impl FnOnce() -> Option<usize> + Copy,
+    ) -> Result<CompletionItem, Response> {
+        let (lists, fields) = ([ids.to_vec()], [field.to_string()]);
+        token_prompts(tokenizer, &lists, &fields, embedding_rows)
+            .await
+            .map(|mut items| items.remove(0))
+    }
+
     /// The refusal of `ids` under `field`: a 400 of this route's code, its body returned.
     async fn refusal(tokenizer: &Arc<dyn Tokenizer>, ids: &[u32], field: &str) -> String {
-        let response = match token_prompt(
-            tokenizer,
-            ids,
-            field,
-            || None,
-            &utils::InPlaceBudget::default(),
-        )
-        .await
-        {
+        let response = match token_prompt(tokenizer, ids, field, || None).await {
             Ok(_) => panic!("{ids:?} is refused"),
             Err(response) => response,
         };
@@ -255,15 +245,9 @@ mod tests {
             .map(|token| tokenizer.token_to_id(token).expect("mock vocab"))
             .collect();
 
-        let item = token_prompt(
-            &tokenizer,
-            &ids,
-            "prompt",
-            || None,
-            &utils::InPlaceBudget::default(),
-        )
-        .await
-        .expect("known ids");
+        let item = token_prompt(&tokenizer, &ids, "prompt", || None)
+            .await
+            .expect("known ids");
 
         assert_eq!(item.token_ids, ids);
         assert_eq!(item.text, "Hello world");
@@ -306,15 +290,9 @@ mod tests {
         let hello = tokenizer.token_to_id("Hello").expect("mock vocab");
         let ids = vec![hello; 1024];
 
-        let item = token_prompt(
-            &tokenizer,
-            &ids,
-            "prompt",
-            || None,
-            &utils::InPlaceBudget::default(),
-        )
-        .await
-        .expect("known ids");
+        let item = token_prompt(&tokenizer, &ids, "prompt", || None)
+            .await
+            .expect("known ids");
 
         assert_eq!(item.token_ids, ids);
         assert_eq!(item.text, tokenizer.decode(&ids, false).expect("decode"));
@@ -328,15 +306,9 @@ mod tests {
         let hello = tokenizer.token_to_id("Hello").expect("mock vocab");
         let ids = vec![hello, 50_000];
 
-        let item = token_prompt(
-            &tokenizer,
-            &ids,
-            "prompt",
-            || None,
-            &utils::InPlaceBudget::default(),
-        )
-        .await
-        .expect("an added token is a token");
+        let item = token_prompt(&tokenizer, &ids, "prompt", || None)
+            .await
+            .expect("an added token is a token");
 
         assert_eq!(item.token_ids, ids);
         assert_eq!(item.text, tokenizer.decode(&ids, false).expect("decode"));
@@ -373,15 +345,9 @@ mod tests {
         let tokenizer = mock();
         let hello = tokenizer.token_to_id("Hello").expect("mock vocab");
 
-        let item = token_prompt(
-            &tokenizer,
-            &[hello, 1_500],
-            "prompt",
-            || Some(2_000),
-            &utils::InPlaceBudget::default(),
-        )
-        .await
-        .expect("an id below the table is one the model can emit");
+        let item = token_prompt(&tokenizer, &[hello, 1_500], "prompt", || Some(2_000))
+            .await
+            .expect("an id below the table is one the model can emit");
 
         assert_eq!(item.token_ids, vec![hello, 1_500], "the ids ride as given");
         assert_eq!(item.text, "Hello", "the id without a token leaves no text");
@@ -400,15 +366,9 @@ mod tests {
             .into_token_ids();
         ids.push(vocab as u32 + 500);
 
-        let item = token_prompt(
-            &tokenizer,
-            &ids,
-            "prompt",
-            || Some(vocab + 1_000),
-            &utils::InPlaceBudget::default(),
-        )
-        .await
-        .expect("an id inside the reported table is one the model can emit");
+        let item = token_prompt(&tokenizer, &ids, "prompt", || Some(vocab + 1_000))
+            .await
+            .expect("an id inside the reported table is one the model can emit");
 
         assert_eq!(item.token_ids, ids, "the ids ride as given");
         assert_eq!(item.text, "Hello world", "the gap id leaves no text");

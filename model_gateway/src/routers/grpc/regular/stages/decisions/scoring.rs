@@ -62,7 +62,7 @@ pub(crate) async fn prepare_decisions(
     // The request's encodes are one call's: they run in place up to the bound
     // and on the pool past it (a probe of a few bytes yields the worker
     // instead), so no worker holds the request for longer.
-    let budget = InPlaceBudget::default();
+    let mut budget = InPlaceBudget::default();
     for (name, question) in questions {
         let kind = match question["type"].as_str() {
             Some("noul") => QuestionKind::Predicate,
@@ -89,7 +89,7 @@ pub(crate) async fn prepare_decisions(
                 .collect(),
             QuestionKind::Choice(count) => {
                 if pair_labels.is_none() {
-                    pair_labels = Some(encode_pair_labels(&tokenizer, &budget).await?);
+                    pair_labels = Some(encode_pair_labels(&tokenizer, &mut budget).await?);
                 }
                 let available = pair_labels
                     .as_ref()
@@ -103,8 +103,8 @@ pub(crate) async fn prepare_decisions(
         let content = render_question(&state, question, kind, &labels)?;
         let text = render_prompt(&tokenizer, &content)?;
         reject_reasoning(&tokenizer, &content, &text, answers_open_reasoning)?;
-        let token_ids = encode_ids(&tokenizer, &text, &budget).await?;
-        let label_context = label_suffix(&tokenizer, &text, &token_ids, &budget).await?;
+        let token_ids = encode_ids(&tokenizer, &text, &mut budget).await?;
+        let label_context = label_suffix(&tokenizer, &text, &token_ids, &mut budget).await?;
         let (label_text, label_prefix) = label_context
             .as_ref()
             .map_or((text.as_str(), token_ids.as_slice()), |(text, ids)| {
@@ -116,7 +116,7 @@ pub(crate) async fn prepare_decisions(
         // check as native SGLang, avoiding repeated encoding of the evidence.
         for label in labels {
             let Some(id) =
-                label_token_id(&tokenizer, label_text, label_prefix, &label, &budget).await?
+                label_token_id(&tokenizer, label_text, label_prefix, &label, &mut budget).await?
             else {
                 return Err(format!("question {name}: answer label {label:?} is not one distinct token after the chat prompt"));
             };
@@ -315,7 +315,7 @@ fn suffixed_reasoning_markers(text: &str) -> impl Iterator<Item = (String, Strin
 async fn encode_ids(
     tokenizer: &Arc<dyn Tokenizer>,
     text: &str,
-    budget: &InPlaceBudget,
+    budget: &mut InPlaceBudget,
 ) -> Result<Vec<u32>, String> {
     encode_blocking_in_batch(tokenizer.clone(), text, false, budget)
         .await
@@ -328,7 +328,7 @@ async fn label_token_id(
     text: &str,
     ids: &[u32],
     label: &str,
-    budget: &InPlaceBudget,
+    budget: &mut InPlaceBudget,
 ) -> Result<Option<u32>, String> {
     let extended = encode_ids(tokenizer, &format!("{text}{label}"), budget).await?;
     Ok((extended.len() == ids.len() + 1 && extended.starts_with(ids)).then(|| extended[ids.len()]))
@@ -340,7 +340,7 @@ async fn label_suffix(
     tokenizer: &Arc<dyn Tokenizer>,
     prompt: &str,
     ids: &[u32],
-    budget: &InPlaceBudget,
+    budget: &mut InPlaceBudget,
 ) -> Result<Option<(String, Vec<u32>)>, String> {
     let added = &tokenizer.get_special_tokens().additional_special_tokens;
     for (index, id) in ids.iter().enumerate().rev() {
@@ -367,7 +367,7 @@ async fn label_suffix(
 /// the request.
 async fn encode_pair_labels(
     tokenizer: &Arc<dyn Tokenizer>,
-    budget: &InPlaceBudget,
+    budget: &mut InPlaceBudget,
 ) -> Result<Vec<String>, String> {
     let first_prompt = render_prompt(tokenizer, "x")?;
     let first_ids = encode_ids(tokenizer, &first_prompt, budget).await?;
@@ -611,9 +611,9 @@ mod tests {
         ran_on.lock().unwrap().clear();
         let here = std::thread::current().id();
 
-        let budget = InPlaceBudget::default();
+        let mut budget = InPlaceBudget::default();
         for label in ["A", "B", "C", "D", "E", "F"] {
-            label_token_id(&tokenizer, &text, &ids, label, &budget)
+            label_token_id(&tokenizer, &text, &ids, label, &mut budget)
                 .await
                 .unwrap();
         }
@@ -634,9 +634,9 @@ mod tests {
         use crate::routers::grpc::testing::thread_recording_tokenizer;
 
         let (tokenizer, ran_on) = thread_recording_tokenizer();
-        let budget = InPlaceBudget::default();
+        let mut budget = InPlaceBudget::default();
         let prompt = "word ".repeat(3 * 1024); // 15 KiB: the share all but spent
-        encode_ids(&tokenizer, &prompt, &budget).await.unwrap();
+        encode_ids(&tokenizer, &prompt, &mut budget).await.unwrap();
         let suffix = "assistant\n";
         let suffix_ids = tokenizer.encode(suffix, false).unwrap().into_token_ids();
         ran_on.lock().unwrap().clear();
@@ -644,7 +644,7 @@ mod tests {
 
         for probe in 0..2_000 {
             let label = format!("{probe}");
-            label_token_id(&tokenizer, suffix, &suffix_ids, &label, &budget)
+            label_token_id(&tokenizer, suffix, &suffix_ids, &label, &mut budget)
                 .await
                 .unwrap();
         }
