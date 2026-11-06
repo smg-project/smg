@@ -12,7 +12,7 @@ use tokenizers::{
 };
 
 use super::{
-    super::bytes_char, ByteTokens, MergeTable, SHORT_PIECE_SMALL, SHORT_PIECE_SYMBOLS,
+    super::bytes_char, ByteTokens, Merge, MergeTable, SHORT_PIECE_SMALL, SHORT_PIECE_SYMBOLS,
     SHORT_PIECE_TINY,
 };
 
@@ -858,14 +858,19 @@ fn two_byte_characters_on_one_id_merge_as_the_model_does() {
 
 /// The table is the byte-pair grid (256 x 256 words) and its entries: a
 /// power of two of buckets, one cache line of four sixteen-byte entries
-/// each, at a load of one half or less.
+/// each, at a load of one half or less, and the pair filter.
 #[test]
-fn the_tables_bytes_are_the_grid_and_its_buckets_at_half_load_or_less() {
+fn the_tables_bytes_are_the_grid_the_filter_and_its_buckets_at_half_load_or_less() {
     let bpe = model_with(&merges(), false);
     let table = table_of(&bpe);
     let merges = merges().len();
     let grid = 256 * 256 * size_of::<u64>();
-    let entries = (table.bytes() - size_of::<MergeTable>() - grid) / 16;
+    let filter = table.pair_filter_bytes();
+    assert!(
+        filter * 8 >= 8 * merges && filter.is_power_of_two(),
+        "{filter} filter bytes for {merges} merges"
+    );
+    let entries = (table.bytes() - size_of::<MergeTable>() - grid - filter) / 16;
     assert!(entries.is_power_of_two(), "{entries} entries");
     assert!(
         entries >= 2 * merges,
@@ -874,5 +879,42 @@ fn the_tables_bytes_are_the_grid_and_its_buckets_at_half_load_or_less() {
     assert!(
         entries < 4 * merges + 8,
         "{entries} entries for {merges} merges"
+    );
+}
+
+/// Every merge of the model passes the pair filter (a false negative would
+/// lose a merge), and pairs that are no merge mostly do not (a filter that
+/// admitted them all would save no bucket line).
+#[test]
+fn every_merge_passes_the_pair_filter_and_a_pair_that_is_none_mostly_does_not() {
+    let bpe = model_with(&merges(), false);
+    let table = table_of(&bpe);
+    let id = |token: &str| bpe.token_to_id(token).expect("a token of the model");
+    for (a, b) in merges() {
+        assert!(
+            table.pair_filter_admits(id(a), id(b)),
+            "the merge ({a}, {b}) fails the filter"
+        );
+    }
+    let ids = bpe.get_vocab_size() as u64;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let (mut none, mut admitted) = (0, 0);
+    while none < 20_000 {
+        let (a, b) = ((next() % ids) as u32, (next() % ids) as u32);
+        if table.merge_of(a, b) != Merge::NONE {
+            continue;
+        }
+        none += 1;
+        admitted += usize::from(table.pair_filter_admits(a, b));
+    }
+    assert!(
+        admitted * 20 < none,
+        "{admitted} of {none} pairs that are no merge pass the filter"
     );
 }
