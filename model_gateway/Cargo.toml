@@ -291,6 +291,11 @@ name = "sse_rechunk"
 harness = false
 path = "benches/sse_rechunk.rs"
 
+[[bench]]
+name = "stream_state_machines"
+harness = false
+path = "benches/stream_state_machines.rs"
+
 [lints]
 workspace = true
 
