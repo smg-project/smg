@@ -437,13 +437,13 @@ impl PolicyRegistry {
             result
         };
 
-        let healthy = get_healthy_worker_indices(workers, info);
-        if healthy.is_empty() {
-            return finish(None, ExecutionBranch::NoHealthyWorkers);
-        }
         let delegate = sticky.assignment_mode() == ManualAssignmentMode::Delegate;
 
-        let pin = sticky.peek_pin(workers, key, &healthy);
+        // A hit reads the pin's candidates alone; the eligible list is built
+        // only where a worker has to be chosen from it.
+        let pin = sticky.peek_pin(workers, key, |idx| {
+            info.admits(workers[idx].routing_state())
+        });
         if let PinState::Pinned(idx) = pin {
             if !over_cap(idx) {
                 return finish(Some(idx), ExecutionBranch::OccupiedHit);
@@ -458,12 +458,23 @@ impl PolicyRegistry {
                     None => return finish(None, ExecutionBranch::CapRespill),
                 }
             } else {
+                // The pin was admitted by a live read above; the pool can lose
+                // every eligible worker before this second read.
+                let healthy = get_healthy_worker_indices(workers, info);
+                if healthy.is_empty() {
+                    return finish(None, ExecutionBranch::NoHealthyWorkers);
+                }
                 sticky.assign_index(workers, &healthy)
             };
             if new_idx != idx && !over_cap(new_idx) {
                 sticky.pin_front(key, workers[new_idx].url());
             }
             return finish(Some(new_idx), ExecutionBranch::CapRespill);
+        }
+
+        let healthy = get_healthy_worker_indices(workers, info);
+        if healthy.is_empty() {
+            return finish(None, ExecutionBranch::NoHealthyWorkers);
         }
 
         if delegate {
@@ -2808,5 +2819,50 @@ mod tests {
                 "size {size}"
             );
         }
+    }
+
+    /// The keyed decisions of a replay under the delegating override: eight
+    /// regular workers behind a round-robin registry, sixteen session keys
+    /// picked over three rounds, two workers vetoed for the second round and
+    /// back for the third (a pin whose worker is vetoed respills and
+    /// follows the respill). The sequence was recorded from the override
+    /// that built its eligible list before reading the pin and copied the
+    /// key per lookup; the override that reads the pin borrowed and lists
+    /// only to assign must pick the same.
+    #[test]
+    fn the_replayed_keyed_requests_pick_the_recorded_sequence() {
+        const RECORDED: [usize; 48] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 1, 3, 4, 3, 6, 7, 0, 1, 4, 3, 4,
+            6, 6, 7, 0, 1, 1, 3, 4, 3, 6, 7, 0, 1, 4, 3, 4, 6, 6, 7,
+        ];
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| worker(&format!("http://w{i}"), WorkerType::Regular))
+            .collect();
+        let keys: Vec<String> = (0..16).map(|i| format!("conv{i}_t{}", i % 3)).collect();
+        let mut picks = Vec::with_capacity(RECORDED.len());
+        for round in 0..3 {
+            for vetoed in [2, 5] {
+                workers[vetoed].set_overloaded(round == 1);
+            }
+            for key in &keys {
+                let info = SelectWorkerInfo {
+                    rid_key: Some(key),
+                    ..Default::default()
+                };
+                picks.push(
+                    reg.select_worker(&policy, &workers, &info)
+                        .expect("six workers stay eligible"),
+                );
+            }
+        }
+        assert_eq!(
+            picks, RECORDED,
+            "the replay picked {picks:?}; the recorded sequence is the decision"
+        );
     }
 }

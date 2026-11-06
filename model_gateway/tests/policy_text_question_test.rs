@@ -4,10 +4,12 @@
 //! allocates its eligible list and nothing else once it has dispatched to a
 //! worker; a request placed by a ring policy, which pays the ring's own
 //! lookup and the record of its branch metric and nothing besides (prefix
-//! hash also its eligible list and its boundary list); and a power-of-two,
+//! hash also its eligible list and its boundary list); a power-of-two,
 //! random or passthrough pick, which allocates nothing at all over a pool the
-//! draw covers. A separate executable, so it can declare the counting
-//! allocator the pins need.
+//! draw covers; and a keyed hit on a sticky pin, which pays its namespaced key
+//! under the routing-key override and its eligible list in the manual policy,
+//! with the records of their metrics, and nothing besides. A separate
+//! executable, so it can declare the counting allocator the pins need.
 
 #![expect(unsafe_code, reason = "a global allocator that counts allocations")]
 
@@ -21,11 +23,11 @@ use std::{
 use http::HeaderMap;
 use openai_protocol::worker::HealthCheckConfig;
 use smg::{
-    config::types::{PolicyConfig, RoutingKeyOverrideConfig},
+    config::types::{ManualAssignmentMode, PolicyConfig, RoutingKeyOverrideConfig},
     policies::{
-        ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, PassthroughPolicy,
-        PolicyRegistry, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy,
-        SelectWorkerInfo,
+        ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, ManualPolicy,
+        PassthroughPolicy, PolicyRegistry, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy,
+        RandomPolicy, SelectWorkerInfo,
     },
     worker::{
         load_state::{one_rank_load, TestFeed},
@@ -337,5 +339,85 @@ fn a_power_of_two_random_or_passthrough_pick_allocates_nothing() {
     assert!(
         over_budget.is_empty(),
         "picks allocated {over_budget:?}; nothing is the budget"
+    );
+}
+
+/// What a keyed hit still pays once its key is read borrowed and the
+/// eligible list is built only to assign, per hit: under the routing-key
+/// override the namespaced key it formats (model, role and key in one
+/// string, the map's key) and the records of its metrics (blocks in the
+/// metrics layer, outside this path); in the manual policy its eligible list
+/// (a filter collected without a size hint: four indices, then eight) and
+/// the record of its branch metric. Recorded on the unchanged code as the
+/// hit's count less the key copy and the list, then held after the change.
+const OVERRIDE_HIT_BUDGET: usize = 5;
+
+const MANUAL_HIT_BUDGET: usize = 3;
+
+/// Eight ready regular workers (no health checker behind them) and sixteen
+/// conversations pinned once. A keyed hit under the routing-key override
+/// (delegating its assignments to a round-robin registry) pays its budget
+/// and nothing besides: the pin is read through the borrowed key, and no
+/// eligible list is built for a hit. A keyed hit in the manual policy pays
+/// its budget and nothing besides: its key is read borrowed too.
+#[test]
+fn a_keyed_hit_pays_its_key_under_the_override_and_its_eligible_list_in_manual() {
+    let workers: Vec<Arc<dyn Worker>> = (0..8)
+        .map(|i| {
+            Arc::new(
+                BasicWorkerBuilder::new(format!("http://worker-{i}:8000"))
+                    .worker_type(WorkerType::Regular)
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            ) as Arc<dyn Worker>
+        })
+        .collect();
+    let model_id = workers[0].model_id().to_string();
+    let registry = PolicyRegistry::with_override(
+        PolicyConfig::RoundRobin,
+        RoutingKeyOverrideConfig {
+            enabled: true,
+            assignment_mode: ManualAssignmentMode::Delegate,
+            ..Default::default()
+        },
+    );
+    let policy = registry.get_default_policy();
+    let manual = ManualPolicy::new();
+    let keys: Vec<String> = (0..16).map(|i| format!("conversation-{i:04}")).collect();
+    let infos: Vec<SelectWorkerInfo> = keys
+        .iter()
+        .map(|key| SelectWorkerInfo {
+            rid_key: Some(key),
+            ..Default::default()
+        })
+        .collect();
+    for info in &infos {
+        assert!(registry
+            .select_worker_for_model(&policy, &model_id, &workers, info)
+            .is_some());
+        assert!(manual.select_worker(&workers, info).is_some());
+    }
+
+    let hits = 1_000;
+    let mut override_allocations = 0;
+    let mut manual_allocations = 0;
+    for hit in 0..hits {
+        let info = &infos[hit % infos.len()];
+        override_allocations += allocations_during(|| {
+            black_box(registry.select_worker_for_model(&policy, &model_id, &workers, info));
+        });
+        manual_allocations += allocations_during(|| {
+            black_box(manual.select_worker(&workers, info));
+        });
+    }
+    assert!(
+        override_allocations == OVERRIDE_HIT_BUDGET * hits
+            && manual_allocations == MANUAL_HIT_BUDGET * hits,
+        "keyed hits allocated {override_allocations} times under the override and \
+         {manual_allocations} times in the manual policy over {hits} hits; the budgets are \
+         {OVERRIDE_HIT_BUDGET} and {MANUAL_HIT_BUDGET} per hit"
     );
 }
