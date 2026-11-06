@@ -14,6 +14,7 @@ use std::sync::Arc;
 use axum::response::Response;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{common::Tool, profile::ProviderProfile};
+use tool_parser::ToolConstraint;
 use tracing::error;
 
 use crate::{
@@ -35,7 +36,8 @@ use crate::{
 pub(crate) struct Prepared {
     /// The constraint for what the request asks, before its worker is known:
     /// the table's tag for a forced call, else the older registry's; a JSON
-    /// answer's tag as it derives for a worker's start; or why the table
+    /// answer's tag as it derives for a worker's start, or its schema itself
+    /// where no table reads a Messages request's answer; or why the table
     /// cannot constrain the request. Request building decides on the selected
     /// worker (`regular::symphony::worker_constraint`).
     pub constraint: PreparedConstraint,
@@ -163,6 +165,19 @@ pub(crate) fn prepare(
             Ok(symphony::Prepared::from(constraint))
         }
         (prepared, _) => prepared,
+    };
+    // Where nothing above constrains the answer, a Messages request's answer
+    // schema is the engine's own JSON-schema constraint, as a chat request's
+    // `response_format` is through its request builder; a table that reads
+    // the response gave the schema its tag above (`Prepared::Answer`), and a
+    // request whose choice forces a call takes none (the turn has no text
+    // answer to format, whether or not the call has a constraint).
+    let constraint = match constraint {
+        Ok(symphony::Prepared::None) => Ok(symphony::Prepared::from(
+            asks.untabled_answer_schema(tools)
+                .map(|schema| ToolConstraint::JsonSchema(schema.to_string())),
+        )),
+        prepared => prepared,
     };
     let json_schema = matches!(
         &constraint,
@@ -355,7 +370,10 @@ pub(crate) fn decide(
     if decided.by_policy {
         ctx.state.constraint_decided_on = Some(decoding);
     }
-    let tool_constraints = decided.constraint.map(|constraint| constraint.to_tuple());
+    // The table's constraint, as Symphony's assignment reads it below: a
+    // `json_schema` pair there is the older path's forced call, which the
+    // legacy parsers read.
+    let tabled = decided.constraint.map(|constraint| constraint.to_tuple());
     let provider = ctx
         .state
         .provider
@@ -370,16 +388,22 @@ pub(crate) fn decide(
         None => symphony::reading(parser, &names, model, &ctx.components.templates)
             .map_err(|why| error::bad_request("invalid_parser_configuration", why))?,
     };
-    let assignment = symphony::assign_for(
-        read,
-        asks,
-        tool_constraints.as_ref(),
-        processed_text,
-        provider,
-    );
+    let assignment = symphony::assign_for(read, asks, tabled.as_ref(), processed_text, provider);
     ctx.state.parser = Some(match assignment {
         Some(_) => ParserChoice::Symphony,
         None => ParserChoice::Legacy,
+    });
+    // A Messages answer the table gave this worker no tag for (a registry
+    // table leaves the schema alone to the engine, as it does for a chat
+    // `response_format`, whose request builder then carries the schema) is
+    // the request's own schema, the engine's JSON-schema constraint, on the
+    // pair the engine receives alone: the assignment above read the table's,
+    // so Symphony still reads the response, and the tag stays on the attempt
+    // stamp, from which a retry's worker derives its own
+    // (`helpers::ToolConstraintStamp::capture_table`).
+    let tool_constraints = tabled.or_else(|| {
+        asks.untabled_answer_schema(declared)
+            .map(|schema| ToolConstraint::JsonSchema(schema.to_string()).to_tuple())
     });
     Ok(Decided {
         table_tag: decided.table_tag,
@@ -396,7 +420,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::routers::grpc::regular::stages::testing::components;
+    use crate::routers::grpc::{regular::stages::testing::components, utils::message_utils};
 
     /// A model the registry has a table for, named by no label or flag.
     const MODEL: &str = "Qwen/Qwen3-8B";
@@ -430,6 +454,140 @@ mod tests {
                 .map(|assignment| (assignment.format.name().to_string(), assignment.prompt)),
             constraint: decided.tool_constraints,
         }
+    }
+
+    /// A Messages request's answer schema reaches the engine where the table gives the worker no
+    /// tag for it: a registry table leaves the schema alone to the engine, as it does for a chat
+    /// `response_format` (whose request builder carries the schema), so the decision hands the
+    /// engine the request's own JSON-schema constraint, and the table's tag stays for the stamp;
+    /// Symphony's assignment read the table's constraint, not the schema (a `json_schema` pair
+    /// there is the older path's forced call), so the table still reads the response.
+    #[test]
+    fn a_messages_answer_schema_the_table_leaves_alone_is_the_engines_constraint() {
+        let schema = json!({
+            "type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]
+        });
+        let request: Arc<CreateMessageRequest> = Arc::new(
+            serde_json::from_value(json!({
+                "model": MODEL, "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}],
+                "output_config": {"format": {"type": "json_schema", "schema": schema}},
+            }))
+            .expect("a Messages request"),
+        );
+        let mut ctx =
+            RequestContext::for_messages(Arc::clone(&request), None, MODEL.into(), components());
+        ctx.state.parser = Some(ParserChoice::Symphony);
+        let asks = Asks::Messages {
+            request: &request,
+            continues: false,
+        };
+        let names = ctx.components.parser_resolver.names_for(None, MODEL);
+        let read = symphony::reading(
+            ParserChoice::Symphony,
+            &names,
+            MODEL,
+            &ctx.components.templates,
+        )
+        .expect("a table reads the model");
+        let prepared = symphony::constraint_for(
+            &read,
+            asks,
+            &[],
+            true,
+            false,
+            symphony::grammar_start_of(&[]),
+            symphony::vocabulary_of(&[]),
+        );
+        assert!(
+            matches!(prepared, Ok(symphony::Prepared::Answer(_))),
+            "{prepared:?}"
+        );
+        let decided = decide(&mut ctx, asks, &[], PROMPT, prepared, |_| {
+            panic!("the policy is requested: no auto tag")
+        })
+        .map_err(|response| response.status())
+        .expect("nothing refused");
+        assert_eq!(
+            decided.tool_constraints,
+            Some(("json_schema".to_string(), schema.to_string()))
+        );
+        assert!(decided.table_tag.is_some() && !decided.whole_turn);
+        assert!(
+            decided.assignment.is_some(),
+            "the table reads the response, not the legacy parsers"
+        );
+        assert!(matches!(ctx.state.parser, Some(ParserChoice::Symphony)));
+    }
+
+    /// The decision follows preparation on whether the choice forces a call, over different tool
+    /// lists: preparation reads the tools the template renders, narrowed by `tool_choice`
+    /// (`message_utils::template_tools`), the decision the request's declared chat tools. A choice
+    /// naming a tool of another kind (a server tool, which the custom tools never hold) narrows
+    /// preparation's list to nothing and names no declared chat tool at the decision, so both
+    /// leave the answer formatted and the engine gets the schema.
+    #[test]
+    fn a_choice_naming_a_tool_the_model_never_sees_leaves_the_answer_formatted_at_the_decision() {
+        let schema = json!({
+            "type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]
+        });
+        let request: Arc<CreateMessageRequest> = Arc::new(
+            serde_json::from_value(json!({
+                "model": MODEL, "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}],
+                "tools": [
+                    {"name": "lookup", "input_schema": {"type": "object", "properties": {}}},
+                    {"type": "web_search_20250305", "name": "web_search"}
+                ],
+                "tool_choice": {"type": "tool", "name": "web_search"},
+                "output_config": {"format": {"type": "json_schema", "schema": schema}},
+            }))
+            .expect("a Messages request"),
+        );
+        let declared = request.chat_tools();
+        let narrowed = message_utils::template_tools(&declared, request.tool_choice.as_ref());
+        assert_eq!(
+            (declared.len(), narrowed.len()),
+            (1, 0),
+            "the custom tool alone is declared, and the choice narrows it away"
+        );
+        let mut ctx =
+            RequestContext::for_messages(Arc::clone(&request), None, MODEL.into(), components());
+        ctx.state.parser = Some(ParserChoice::Symphony);
+        let asks = Asks::Messages {
+            request: &request,
+            continues: false,
+        };
+        let names = ctx.components.parser_resolver.names_for(None, MODEL);
+        let read = symphony::reading(
+            ParserChoice::Symphony,
+            &names,
+            MODEL,
+            &ctx.components.templates,
+        )
+        .expect("a table reads the model");
+        let prepared = symphony::constraint_for(
+            &read,
+            asks,
+            &narrowed,
+            true,
+            false,
+            symphony::grammar_start_of(&[]),
+            symphony::vocabulary_of(&[]),
+        );
+        assert!(
+            matches!(prepared, Ok(symphony::Prepared::Answer(_))),
+            "{prepared:?}"
+        );
+        let decided = decide(&mut ctx, asks, &declared, PROMPT, prepared, |_| {
+            panic!("the policy is requested: no auto tag")
+        })
+        .map_err(|response| response.status())
+        .expect("nothing refused");
+        assert_eq!(
+            decided.tool_constraints,
+            Some(("json_schema".to_string(), schema.to_string())),
+            "the decision names no forced call over the declared tools either"
+        );
+        assert!(decided.assignment.is_some());
     }
 
     /// Request building's reasoning decision reads the replay preparation kept where a table reads

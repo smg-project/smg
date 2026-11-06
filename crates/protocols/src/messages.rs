@@ -91,8 +91,14 @@ pub struct CreateMessageRequest {
     /// Request ID forwarded to the backend for log correlation (an engine extension)
     pub rid: Option<String>,
 
-    /// The effort the response renders with, and the config's other keys.
+    /// The effort the response renders with, the format its text must fit,
+    /// and the config's other keys.
     pub output_config: Option<OutputConfig>,
+
+    /// The format the answer's text must fit, under the field's earlier
+    /// top-level name; `output_config.format` is the current one and wins
+    /// when both are sent ([`Self::output_schema`]).
+    pub output_format: Option<OutputFormat>,
 
     /// Additional fields not explicitly defined above (e.g. beta features like
     /// context_management). Captured and forwarded to backends.
@@ -105,15 +111,40 @@ impl Normalizable for CreateMessageRequest {
 }
 
 /// `output_config`: `effort` is read as a Chat `reasoning_effort` is (a
-/// string, or a number as its text; another type is refused); the other
-/// keys (a `format`, beta fields) ride through.
+/// string, or a number as its text; another type is refused); `format` is
+/// the JSON schema the answer's text must fit; the other keys (beta fields)
+/// ride through.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OutputConfig {
     #[serde(default, deserialize_with = "deserialize_reasoning_effort")]
     pub effort: Option<String>,
+    pub format: Option<OutputFormat>,
     #[serde(flatten)]
     pub other: Map<String, Value>,
+}
+
+/// The format a Messages answer's text must fit: a JSON schema, the one
+/// `type` the public API names (`output_config.format`). Another `type` is
+/// refused as an unknown variant; that the schema is an object is checked
+/// with the request's other rules (the crate's `messages_validation`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OutputFormat {
+    /// `{"type": "json_schema", "schema": {...}}`.
+    JsonSchema {
+        /// The JSON schema of the format.
+        schema: Value,
+    },
+}
+
+impl OutputFormat {
+    /// The JSON schema the format names.
+    pub fn schema(&self) -> &Value {
+        match self {
+            Self::JsonSchema { schema } => schema,
+        }
+    }
 }
 
 /// The thinking preference a prompt is rendered with: the `thinking` block,
@@ -185,21 +216,15 @@ impl CreateMessageRequest {
         template_thinking_for(provider, self.thinking_toggle(), self.reasoning_effort())
     }
 
-    /// The field the request asks for a structured output format with,
-    /// `output_format` or `output_config.format`, if any; `null` asks for none.
-    pub fn output_format_field(&self) -> Option<&'static str> {
-        let set = |value: Option<&Value>| value.is_some_and(|value| !value.is_null());
-        if set(self.other.get("output_format")) {
-            Some("output_format")
-        } else if set(self
-            .output_config
+    /// The JSON schema the answer's text must fit: `output_config.format`'s,
+    /// else the one under the field's earlier top-level name, `output_format`;
+    /// none when neither is sent (or either is `null`).
+    pub fn output_schema(&self) -> Option<&Value> {
+        self.output_config
             .as_ref()
-            .and_then(|config| config.other.get("format")))
-        {
-            Some("output_config.format")
-        } else {
-            None
-        }
+            .and_then(|config| config.format.as_ref())
+            .or(self.output_format.as_ref())
+            .map(OutputFormat::schema)
     }
 
     /// Whether the request's `tool_choice` turns parallel tool use off.
@@ -2848,40 +2873,59 @@ mod tests {
                 .is_err()
         );
 
-        let with_format = body(json!({"effort": "low", "format": {"type": "json_schema"}}));
+        let with_format = body(json!({
+            "effort": "low", "format": {"type": "json_schema", "schema": {"type": "object"}},
+            "beta_key": true
+        }));
         let request: CreateMessageRequest =
             serde_json::from_value(with_format.clone()).expect("a Messages request");
         assert_eq!(
             request
                 .output_config
                 .as_ref()
-                .and_then(|config| config.other.get("format")),
-            Some(&json!({"type": "json_schema"}))
+                .and_then(|config| config.format.as_ref()),
+            Some(&OutputFormat::JsonSchema {
+                schema: json!({"type": "object"})
+            })
         );
         let back = serde_json::to_value(&request).expect("serializes");
         assert_eq!(back["output_config"], with_format["output_config"]);
     }
 
-    /// A structured output format is asked for under `output_format` or
-    /// `output_config.format`; `null` under either, an `output_config`
-    /// without `format`, and no field at all ask for none.
+    /// The answer's schema comes from `output_config.format`, else from the
+    /// field's earlier top-level name, `output_format`; `null` under either,
+    /// an `output_config` without `format`, and no field at all name none.
+    /// The format's one `type` is `json_schema`, with its `schema`.
     #[test]
-    fn a_request_names_the_field_its_output_format_comes_under() {
-        let request = |extra: Value| -> CreateMessageRequest {
+    fn the_output_schema_comes_from_output_config_format_else_output_format() {
+        let request = |extra: Value| -> Result<CreateMessageRequest, serde_json::Error> {
             let mut body = json!({"model": "m", "max_tokens": 8, "messages": []});
             body.as_object_mut()
                 .expect("an object")
                 .extend(extra.as_object().expect("an object").clone());
-            serde_json::from_value(body).expect("a Messages request")
+            serde_json::from_value(body)
         };
-        let format = json!({"type": "json_schema", "schema": {"type": "object"}});
+        let schema = json!({"type": "object", "properties": {"a": {"type": "string"}}});
+        let format = json!({"type": "json_schema", "schema": schema});
+        let other = json!({"type": "json_schema", "schema": {"type": "object"}});
         assert_eq!(
-            request(json!({"output_format": format})).output_format_field(),
-            Some("output_format")
+            request(json!({"output_config": {"format": format}}))
+                .expect("parses")
+                .output_schema(),
+            Some(&schema)
         );
         assert_eq!(
-            request(json!({"output_config": {"format": format}})).output_format_field(),
-            Some("output_config.format")
+            request(json!({"output_format": format}))
+                .expect("parses")
+                .output_schema(),
+            Some(&schema)
+        );
+        assert_eq!(
+            request(json!({"output_config": {"format": format}, "output_format": other}))
+                .expect("parses")
+                .output_schema(),
+            Some(&schema),
+            "the current field wins"
         );
         for extra in [
             json!({}),
@@ -2890,10 +2934,23 @@ mod tests {
             json!({"output_config": {"effort": "high"}}),
         ] {
             assert_eq!(
-                request(extra.clone()).output_format_field(),
+                request(extra.clone()).expect("parses").output_schema(),
                 None,
                 "{extra}"
             );
+        }
+        for (extra, refused_for) in [
+            (
+                json!({"output_config": {"format": {"type": "xml", "schema": {}}}}),
+                "unknown variant `xml`",
+            ),
+            (
+                json!({"output_format": {"type": "json_schema"}}),
+                "missing field `schema`",
+            ),
+        ] {
+            let error = request(extra.clone()).expect_err("refused").to_string();
+            assert!(error.contains(refused_for), "{extra}: {error}");
         }
     }
 
@@ -3029,6 +3086,7 @@ mod tests {
     fn base_request() -> CreateMessageRequest {
         CreateMessageRequest {
             output_config: None,
+            output_format: None,
             model: "claude-test".to_string(),
             messages: vec![InputMessage {
                 role: Role::User,
