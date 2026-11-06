@@ -737,6 +737,13 @@ fn a_byte_fallback_vocabulary_merges_its_symbols_as_the_model_does() {
     let table = MergeTable::from_model(&ModelWrapper::BPE(bpe.clone()), ByteTokens::Hex)
         .expect("the table loads with hex byte tokens");
     assert_eq!(table.merges(), merges.len());
+    // No merge of such a table starts from bytes: the byte-pair grid is not
+    // built (512 KiB per loaded vocabulary otherwise).
+    assert!(
+        table.byte_grid.is_empty(),
+        "a table built for character symbols carries no byte grid"
+    );
+    assert!(table.bytes() < 256 * 256 * size_of::<u64>());
     // The symbols of a word as `merge_word` makes them: a character's token,
     // else its bytes' tokens.
     let symbols = |word: &str| -> Vec<u32> {

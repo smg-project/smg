@@ -156,7 +156,8 @@ pub(super) enum ByteTokens {
     /// GPT-2's alphabet: a character per byte.
     Alphabet,
     /// Sentencepiece's `<0xHH>` tokens (a piece of such a vocabulary starts
-    /// from character symbols instead, see [`MergeTable::merge_symbols`]).
+    /// from character symbols instead, see [`MergeTable::merge_symbols`];
+    /// the table carries no byte-pair grid).
     Hex,
 }
 
@@ -167,10 +168,14 @@ pub(super) struct MergeTable {
     /// `byte_grid[a * 256 + b]`: the merge of the pair of the byte tokens of
     /// bytes `a` and `b`, by the bytes rather than the ids (the byte tokens
     /// sit at any ids: the first 256, or 3 to 258, or 1000 to 1255 in the
-    /// vocabularies in use). The first round of every merge is byte pairs
-    /// alone, read here without a hash from 512 KiB that stays in the
-    /// second-level cache; the same pairs are in the bucket table too, which
-    /// the later rounds read for every pair.
+    /// vocabularies in use). The first round of a byte piece's merge
+    /// ([`Self::merge`]) is byte pairs alone, read here without a hash from
+    /// 512 KiB that stays in the second-level cache; the same pairs are in
+    /// the bucket table too, which the later rounds read for every pair.
+    /// Empty for a table whose pieces start from character symbols
+    /// ([`ByteTokens::Hex`]): their first round reads the bucket table
+    /// ([`Self::merge_symbols`]), and the grid's 512 KiB and 65,536 lookups
+    /// per loaded vocabulary stay unspent.
     byte_grid: Box<[Merge]>,
     /// The pairs, open-addressed by bucket with linear probing over whole
     /// buckets: a pair's key hashes to a bucket of [`BUCKET`] entries, and a
@@ -233,7 +238,11 @@ impl MergeTable {
                 "more merges than a short merge's keys carry",
             ));
         }
-        let mut table = Self::with_capacity(merges.len(), bpe.ignore_merges);
+        let mut table = Self::with_capacity(
+            merges.len(),
+            bpe.ignore_merges,
+            tokens == ByteTokens::Alphabet,
+        );
         table.byte_ids = byte_ids;
         let mut token = String::new();
         for (rank, (left, right)) in merges.iter().enumerate() {
@@ -303,7 +312,7 @@ impl MergeTable {
                 )));
             }
         }
-        let mut table = Self::with_capacity(splits.len(), false);
+        let mut table = Self::with_capacity(splits.len(), false, true);
         table.byte_ids = byte_ids;
         for &(left, right, rank) in &splits {
             table.insert(left, right, Merge::new(rank, rank));
@@ -325,16 +334,22 @@ impl MergeTable {
         Ok(table)
     }
 
-    /// An empty table sized for `merges` pairs.
-    fn with_capacity(merges: usize, ignore_merges: bool) -> Self {
+    /// An empty table sized for `merges` pairs, with the byte-pair grid when
+    /// `byte_grid` (a table whose merges start from bytes).
+    fn with_capacity(merges: usize, ignore_merges: bool, byte_grid: bool) -> Self {
         // Buckets for a load of one half at most, two at least: a probe
         // always meets an empty entry, and the shift that picks a bucket
         // from a key's high bits stays below the key's width.
         let buckets = merges.div_ceil(BUCKET / 2).next_power_of_two().max(2);
         let shift = u64::BITS - buckets.trailing_zeros();
+        let byte_grid = if byte_grid {
+            vec![Merge::NONE; 256 * 256].into_boxed_slice()
+        } else {
+            Box::default()
+        };
         Self {
             byte_ids: [0; 256],
-            byte_grid: vec![Merge::NONE; 256 * 256].into_boxed_slice(),
+            byte_grid,
             buckets: vec![Bucket::EMPTY; buckets].into_boxed_slice(),
             shift,
             merges,
@@ -364,8 +379,12 @@ impl MergeTable {
     /// one lookup per pair of bytes: the grid then answers as the table does
     /// for any vocabulary, one whose byte tokens share an id included (a map
     /// from id back to byte filled one of the two bytes' rows), and a pair
-    /// recorded twice keeps the later merge in one place.
+    /// recorded twice keeps the later merge in one place. Nothing to fill for
+    /// a table without the grid.
     fn fill_byte_grid(&mut self) {
+        if self.byte_grid.is_empty() {
+            return;
+        }
         for a in 0..256 {
             for b in 0..256 {
                 self.byte_grid[a * 256 + b] = self.merge_of(self.byte_ids[a], self.byte_ids[b]);
@@ -444,6 +463,10 @@ impl MergeTable {
     /// call, a hit pays nothing for the merge and a miss pays the call.
     #[inline(never)]
     pub(super) fn merge(&self, piece: &[u8], ids: &mut Vec<u32>) {
+        debug_assert!(
+            !self.byte_grid.is_empty(),
+            "a byte-level merge on a table built for character symbols"
+        );
         if piece.is_empty() {
             return;
         }
