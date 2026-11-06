@@ -699,10 +699,22 @@ async fn execute_epd_dispatch(
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
+    let vllm_encode = proto_request.has_vllm_media_refs();
+    if vllm_encode {
+        super::vllm_encode::encode(&mut proto_request, workers)
+            .await
+            .map_err(|mut response| {
+                // A PUSH may already have reserved buffers on this prefill replica.
+                mark_non_retryable(&mut response);
+                response
+            })?;
+    }
     if let Some(encode_dispatch) = encode_dispatch {
         spawn_encode_dispatch(encode_dispatch);
     }
-    proto_request.clear_mm_pixel_values();
+    if !proto_request.is_vllm() {
+        proto_request.clear_mm_pixel_values();
+    }
     execute_pd_dispatch(
         proto_request,
         clients,
@@ -712,6 +724,12 @@ async fn execute_epd_dispatch(
         ledger,
     )
     .await
+    .map_err(|mut response| {
+        if vllm_encode {
+            mark_non_retryable(&mut response);
+        }
+        response
+    })
 }
 
 #[expect(
@@ -2519,11 +2537,14 @@ impl SequentialPlan {
         // must run the vision encoder, so that side keeps the full multimodal
         // payload (SHM-backed tensors cannot serve both sides and fail loudly
         // on the decode read).
-        let decode_request = match self.decode_form {
+        let mut decode_request = match self.decode_form {
             SequentialPdDecodeForm::Full => proto_request.clone(),
             SequentialPdDecodeForm::TextPlusHashes => proto_request.clone_without_mm(),
             SequentialPdDecodeForm::IdentityOnly => proto_request.clone_without_mm_pixels(),
         };
+        if let ProtoGenerateRequest::Vllm(request) = &mut decode_request {
+            request.ec_transfer_params_json = None;
+        }
         // Sanitize prefill sampling (max_tokens=1, n=1), stream=false.
         let mut prefill_request = proto_request;
         prefill_request.sanitize_sampling_for_prefill(1);
@@ -4606,6 +4627,7 @@ mod tests {
             items: vec![vllm::MediaRef {
                 modality: smg_grpc_client::common_proto::Modality::Image as i32,
                 url: "https://a/1.png".to_string(),
+                ..Default::default()
             }],
         };
         let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
@@ -4645,6 +4667,7 @@ mod tests {
                 items: vec![vllm::MediaRef {
                     modality: smg_grpc_client::common_proto::Modality::Image as i32,
                     url: "https://a/1.png".to_string(),
+                    ..Default::default()
                 }],
             })
             .expect("vLLM request accepts media refs");
@@ -4968,6 +4991,7 @@ mod tests {
                 items: vec![vllm::MediaRef {
                     modality: smg_grpc_client::common_proto::Modality::Image as i32,
                     url: "https://a/1.png".to_string(),
+                    ..Default::default()
                 }],
             })
             .expect("vLLM request accepts media refs");

@@ -24,6 +24,7 @@ BASE_SCHEMES = ("http", "https", "data")
 class MediaRefItem:
     modality: str
     url: str
+    uuid: str | None = None
 
 
 def parse_media_refs(refs) -> list[MediaRefItem]:
@@ -36,7 +37,9 @@ def parse_media_refs(refs) -> list[MediaRefItem]:
             raise ValueError(f"media_refs[{index}]: unsupported modality {name}")
         if not ref.url:
             raise ValueError(f"media_refs[{index}]: empty url")
-        items.append(MediaRefItem(modality=modality, url=ref.url))
+        items.append(
+            MediaRefItem(modality=modality, url=ref.url, uuid=getattr(ref, "uuid", "") or None)
+        )
     if not items:
         raise ValueError("media_refs is set but carries no items")
     return items

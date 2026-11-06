@@ -28,7 +28,11 @@ def _server_info_method(response_type):
     for arg in method.args.args:
         arg.annotation = None
     namespace = {
-        "vllm_engine_pb2": SimpleNamespace(GetServerInfoResponse=response_type),
+        "vllm_engine_pb2": SimpleNamespace(
+            GetServerInfoResponse=response_type,
+            GenerateRequest=vllm_engine_pb2.GenerateRequest,
+            GenerateComplete=vllm_engine_pb2.GenerateComplete,
+        ),
         "server_facts": model_info.server_facts,
         "mm_device_do_normalize": model_info.mm_device_do_normalize,
         "mm_item_limits": model_info.mm_item_limits,

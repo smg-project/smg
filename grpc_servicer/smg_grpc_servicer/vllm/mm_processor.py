@@ -372,6 +372,11 @@ class InProcessMediaProcessor:
             "prompt_token_ids": prompt_token_ids,
             "multi_modal_data": multi_modal_data,
         }
+        if any(getattr(item, "uuid", None) is not None for item in items):
+            uuids: dict[str, list[str | None]] = {}
+            for item in items:
+                uuids.setdefault(item.modality, []).append(getattr(item, "uuid", None))
+            prompt["multi_modal_uuids"] = uuids
         if prompt_text:
             prompt["prompt"] = prompt_text
         # skip_mm_cache routes through the renderer's read-only processor cache,

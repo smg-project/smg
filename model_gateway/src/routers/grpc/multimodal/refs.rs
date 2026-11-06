@@ -497,16 +497,29 @@ pub(crate) fn resolve_mm_processing(
                 // Every registered worker, healthy or not: a health flap must
                 // not flip a model between modes request to request.
                 let workers = registry.get_by_model(model_id);
-                // On an encode-prefill-decode pool references never travel
-                // (`pool_has_encode_worker`), whatever its workers advertise:
-                // the router processes the media itself rather than resolve
-                // to a mode selection would refuse.
+                // vLLM EC encoders process references themselves; their P/D
+                // workers consume metadata and need no media processor.
                 let epd = pool_has_encode_worker(workers.iter());
-                let uniform = !workers.is_empty()
-                    && !epd
+                let vllm_encode = epd
                     && workers
                         .iter()
-                        .all(|worker| worker_accepts_media_refs(worker.as_ref()));
+                        .filter(|worker| *worker.worker_type() == WorkerType::Encode)
+                        .all(|worker| {
+                            worker.metadata().spec.runtime_type == RuntimeType::Vllm
+                                && worker
+                                    .metadata()
+                                    .spec
+                                    .labels
+                                    .get("supports_ec_transfer")
+                                    .is_some_and(|value| value == "true")
+                                && worker_accepts_media_refs(worker.as_ref())
+                        });
+                let uniform = vllm_encode
+                    || (!workers.is_empty()
+                        && !epd
+                        && workers
+                            .iter()
+                            .all(|worker| worker_accepts_media_refs(worker.as_ref())));
                 // The gateway's own pipeline on every worker expands any
                 // spec's anchor; a fleet mixing it with the engine's
                 // processors keeps the spec's opt-in.
@@ -570,6 +583,13 @@ pub(crate) fn ensure_selection_supports_media_refs(
     let needs_pipeline = pin == PipelinePin::Only;
     let workers: Vec<&dyn Worker> = match workers {
         WorkerSelection::Single { worker } => vec![worker.as_ref()],
+        WorkerSelection::Disaggregated {
+            encode_assignments: Some(assignments),
+            ..
+        } if !assignments.is_empty() => assignments
+            .iter()
+            .map(|assignment| assignment.worker.as_ref())
+            .collect(),
         WorkerSelection::Disaggregated {
             prefill, decode, ..
         } => vec![prefill.as_ref(), decode.as_ref()],
@@ -715,6 +735,12 @@ pub(crate) fn assemble_media_refs(plan: MediaPlan) -> Result<vllm::MediaRefs, Mm
         items.push(vllm::MediaRef {
             modality: modality as i32,
             url: url.to_string(),
+            uuid: match part {
+                MediaContentPart::ImageUrl { uuid, .. }
+                | MediaContentPart::AudioUrl { uuid, .. }
+                | MediaContentPart::VideoUrl { uuid, .. } => uuid.clone(),
+                _ => None,
+            },
         });
     }
     Ok(vllm::MediaRefs { items })

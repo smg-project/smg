@@ -161,6 +161,58 @@ async def test_decode_side_from_identity_never_touches_the_processor(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_ec_consumer_accepts_metadata_without_a_kv_handoff(monkeypatch):
+    processor = _Processor()
+    servicer = _servicer(monkeypatch, processor)
+    prefill = await _complete(servicer, _request(refs=True, kv=True))
+    processor.calls.clear()
+    servicer.engine.vllm_config.ec_transfer_config = SimpleNamespace(is_ec_consumer=True)
+    request = _request(identity=prefill.media_identity)
+    request.ec_transfer_params_json = json.dumps({"ec_items": [{"mm_hash": "h1"}]})
+    generate = servicer.engine.generate
+
+    async def capture(**kwargs):
+        assert kwargs["sampling_params"].extra_args["ec_transfer_params"] == json.loads(
+            request.ec_transfer_params_json
+        )
+        async for output in generate(**kwargs):
+            yield output
+
+    servicer.engine.generate = capture
+    complete = await _complete(servicer, request)
+    assert list(complete.output_ids) == [42]
+    assert processor.calls == []
+
+
+@pytest.mark.asyncio
+async def test_encoder_only_returns_handles_without_output_tokens(monkeypatch):
+    servicer = _servicer(monkeypatch, _Processor())
+    handles = {"h1": {"metadata": {"image_grid_thw": [1, 4, 6]}, "transfer_id": "t1"}}
+
+    async def generate(**kwargs):
+        yield RequestOutput(
+            request_id=kwargs["request_id"],
+            prompt=None,
+            prompt_token_ids=[7, 100, 100, 100, 9],
+            prompt_logprobs=None,
+            outputs=[],
+            finished=True,
+            ec_transfer_params=handles,
+        )
+
+    servicer.engine.generate = generate
+    request = _request(refs=True)
+    request.ec_transfer_params_json = "{}"
+    complete = await _complete(servicer, request)
+    assert complete.finish_reason == "stop"
+    assert not complete.output_ids
+    assert complete.prompt_tokens == 5
+    assert json.loads(complete.ec_transfer_params_json) == handles
+    assert list(complete.media_identity.prompt_token_ids) == [7, 100, 100, 100, 9]
+    assert list(complete.media_identity.mm_inputs.mm_hashes) == ["h1"]
+
+
+@pytest.mark.asyncio
 async def test_an_identity_that_cannot_be_built_does_not_fail_the_request(monkeypatch, caplog):
     # The identity is an optimisation with a fallback (decode reprocesses the
     # media), so a shape it did not anticipate must not turn a served request

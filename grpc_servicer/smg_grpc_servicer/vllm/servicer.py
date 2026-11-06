@@ -7,6 +7,7 @@ Implements the VllmEngine gRPC service on top of vLLM's EngineClient.
 
 import asyncio
 import itertools
+import json
 import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
@@ -380,6 +381,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         try:
             arrival_time = time.time()
             kv_transfer_params = params_from_request(request)
+            ec_json = getattr(request, "ec_transfer_params_json", "")
+            ec_transfer_params = json.loads(ec_json) if ec_json else None
+            if ec_json and not isinstance(ec_transfer_params, dict):
+                raise ValueError("ec_transfer_params_json must contain a JSON object")
+            ec_config = getattr(
+                getattr(self.engine, "vllm_config", None), "ec_transfer_config", None
+            )
+            is_ec_consumer = ec_config is not None and ec_config.is_ec_consumer
 
             if request.HasField("media_refs"):
                 # Media references from the router: the worker fetches and runs
@@ -396,6 +405,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                         "mm_processor label"
                     )
                 items = parse_media_refs(request.media_refs)
+                if (
+                    any(item.uuid is not None for item in items)
+                    and self._mm_processor.name != "inprocess"
+                ):
+                    raise ValueError("Media UUIDs require --mm-processor=inprocess")
                 validate_schemes(items, self._mm_processor.accepted_schemes)
                 await self._acquire_mm_slot()
                 try:
@@ -412,7 +426,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 # served without pixels or references. The identity is an
                 # optimisation with a fallback (decode reprocesses), so a
                 # shape it cannot read must not fail a served request.
-                if kv_transfer_params is not None:
+                if kv_transfer_params is not None or ec_transfer_params is not None:
                     if media_identity_supported():
                         try:
                             media_identity = build_media_identity(prompt)
@@ -437,7 +451,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 # Every batch needs its own, not just one of them: a batch left
                 # out contributes no encoder tensor, and the engine would run
                 # that modality's encoder with nothing to encode.
-                if batches_missing_pixels(preprocessed_batches) and kv_transfer_params is None:
+                if (
+                    batches_missing_pixels(preprocessed_batches)
+                    and kv_transfer_params is None
+                    and not is_ec_consumer
+                ):
                     logger.warning(
                         "Request %s: pixel-less multimodal payload with no kv_transfer_params; "
                         "rejecting (prefill worker did not hand off KV?)",
@@ -480,11 +498,21 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 prompt = request.text
 
             # Build sampling params with detokenize=False
+            cache_salt = getattr(request, "cache_salt", "")
+            if cache_salt and isinstance(prompt, dict):
+                prompt["cache_salt"] = cache_salt
             sampling_params = self._sampling_params_from_proto(
                 request.sampling_params,
                 stream=request.stream,
                 kv_transfer_params=kv_transfer_params,
             )
+            if ec_transfer_params is not None:
+                sampling_params.extra_args = {
+                    **(sampling_params.extra_args or {}),
+                    "ec_transfer_params": ec_transfer_params,
+                }
+            if getattr(request, "skip_reading_prefix_cache", False):
+                sampling_params.skip_reading_prefix_cache = True
             tokenization_kwargs = self._tokenization_kwargs_from_proto(request.sampling_params)
 
             # Extract logprobs configuration
@@ -550,6 +578,13 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     )
                 for completion in output.outputs:
                     self._loads.generated(len(completion.token_ids), rank=rank_of(completion.index))
+                if (
+                    output.finished
+                    and not output.outputs
+                    and getattr(output, "ec_transfer_params", None) is not None
+                ):
+                    yield self._complete_response(output, media_identity=media_identity)
+                    continue
                 # For streaming, send chunks for EACH completion output (n outputs)
                 if request.stream:
                     for completion in output.outputs:
@@ -928,6 +963,32 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if "constrained_decoding_start" in info.DESCRIPTOR.fields_by_name:
             info.engine_reasoning_parser = engine_reasoning_parser(self.engine.vllm_config)
             info.constrained_decoding_start = constrained_decoding_start(self.engine.vllm_config)
+        if "supports_ec_transfer" in info.DESCRIPTOR.fields_by_name:
+            info.supports_ec_transfer = (
+                "ec_transfer_params_json"
+                in vllm_engine_pb2.GenerateRequest.DESCRIPTOR.fields_by_name
+                and "ec_transfer_params_json"
+                in vllm_engine_pb2.GenerateComplete.DESCRIPTOR.fields_by_name
+                and getattr(self.engine.vllm_config, "ec_transfer_config", None) is not None
+            )
+        ec_config = getattr(self.engine.vllm_config, "ec_transfer_config", None)
+        if (
+            "ec_zmq_addrs" in info.DESCRIPTOR.fields_by_name
+            and ec_config is not None
+            and ec_config.is_ec_consumer
+            and ec_config.ec_connector == "ECMooncakeConnector"
+        ):
+            from vllm.utils.network_utils import make_zmq_path
+
+            parallel = self.engine.vllm_config.parallel_config
+            info.ec_zmq_addrs.extend(
+                make_zmq_path(
+                    "tcp",
+                    ec_config.ec_ip,
+                    ec_config.ec_port + rank * parallel.tensor_parallel_size,
+                )
+                for rank in range(parallel.data_parallel_size)
+            )
         return info
 
     async def GetLoads(
@@ -1396,16 +1457,30 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if completion is None:
             completion = output.outputs[0] if output.outputs else None
 
+        ec_params = getattr(output, "ec_transfer_params", None)
+        ec_fields = {}
+        if ec_params is not None:
+            if (
+                "ec_transfer_params_json"
+                not in vllm_engine_pb2.GenerateComplete.DESCRIPTOR.fields_by_name
+            ):
+                raise ValueError("Encoder completion requires an EC-capable smg-grpc-proto")
+            ec_fields["ec_transfer_params_json"] = json.dumps(ec_params)
+
         if completion is None:
             # Empty completion
             return vllm_engine_pb2.GenerateResponse(
                 complete=vllm_engine_pb2.GenerateComplete(
                     output_ids=[],
-                    finish_reason="error",
-                    prompt_tokens=0,
+                    finish_reason="stop" if ec_params is not None else "error",
+                    prompt_tokens=len(output.prompt_token_ids or ())
+                    if ec_params is not None
+                    else 0,
                     completion_tokens=0,
                     cached_tokens=0,
                     index=0,
+                    **({"media_identity": media_identity} if media_identity is not None else {}),
+                    **ec_fields,
                 ),
             )
 
@@ -1429,7 +1504,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         )
 
         # Build matched_stop kwargs from stop_reason (int token ID or str stop sequence)
-        stop_kwargs = {}
+        stop_kwargs = ec_fields
         # A proto package predating the field cannot carry the identity.
         if (
             media_identity is not None
