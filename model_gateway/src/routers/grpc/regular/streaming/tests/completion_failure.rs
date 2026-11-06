@@ -1,17 +1,25 @@
 //! The completion stream's first token reaches the connection before the
 //! reading runs on into a burst, with the one yield of its hand-off (the
 //! stream's first frame is the first token's, so the body's own yield after
-//! it makes the two).
+//! it makes the two); and a chunk the tokenizer cannot decode after the first
+//! frame fails the stream as the chat stream does, after the chunks written
+//! ahead of it have left: the loop flushes what it wrote since its last frame
+//! before it returns the failure.
 
 use std::pin::Pin;
 
 use futures::{Stream, StreamExt as _};
-use serde_json::json;
+use serde_json::{json, Value};
+use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
+use tokio::sync::oneshot;
 
 use super::{
     super::*,
-    eof::{chunk, complete, dispatch, processor, scripted_stream, CharacterTokenizer},
+    eof::{
+        chunk, complete, dispatch, processor, scripted_stream, staged_stream, CharacterTokenizer,
+    },
 };
+use crate::routers::common::sse::sse_channel;
 
 /// A one-choice streamed completion of up to 16 tokens, no stop.
 fn completion_spec() -> CompletionResponseSpec {
@@ -20,6 +28,35 @@ fn completion_spec() -> CompletionResponseSpec {
     }))
     .expect("a completion request");
     CompletionResponseSpec::new(&request, Vec::new())
+}
+
+/// A chunk of raw token ids: an id that is no character (a surrogate) is one
+/// the character tokenizer cannot decode.
+fn chunk_of_ids(index: u32, token_ids: Vec<u32>) -> proto::GenerateResponse {
+    proto::GenerateResponse {
+        response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
+            index,
+            completion_tokens: token_ids.len() as u32,
+            token_ids,
+            ..Default::default()
+        })),
+    }
+}
+
+/// The text of the completion events in the SSE frames, in order.
+fn text_of(frames: &[Bytes]) -> String {
+    frames
+        .iter()
+        .flat_map(|frame| {
+            std::str::from_utf8(frame)
+                .expect("UTF-8 SSE")
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|data| serde_json::from_str::<Value>(data).expect("SSE JSON"))
+                .collect::<Vec<Value>>()
+        })
+        .filter_map(|event| event["choices"][0]["text"].as_str().map(str::to_owned))
+        .collect()
 }
 
 /// The first token's frame reaches the connection before the reading runs on
@@ -98,4 +135,75 @@ async fn the_first_tokens_frame_is_pending_to_the_connection_before_the_burst_is
         "the stream ends without a failed write: {rest:?}"
     );
     server.abort();
+}
+
+/// A chunk the tokenizer cannot decode after the first frame fails the
+/// stream, and every chunk written ahead of it reaches the client first: the
+/// second chunk, buffered behind the first token's frame because the failing
+/// chunk was ready in the same poll, is flushed before the loop returns.
+#[tokio::test]
+async fn a_chunk_that_fails_to_decode_after_the_first_frame_flushes_the_chunks_written_ahead_of_it()
+{
+    // The first token on its own; then, once its frame left, a second chunk
+    // and a chunk no tokenizer decodes, ready together.
+    let (gate, gated) = oneshot::channel();
+    let (stream, server) = staged_stream(
+        vec![
+            (None, vec![chunk(0, "hi")]),
+            (
+                Some(gated),
+                vec![
+                    chunk(0, " there"),
+                    chunk_of_ids(0, vec![0xD800]),
+                    complete(0, "stop"),
+                ],
+            ),
+        ],
+        "0",
+    )
+    .await;
+    let spec = completion_spec();
+    let (tx, mut rx) = sse_channel();
+    let processor = processor(false);
+    let reading = async {
+        let result = processor
+            .process_completion_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                &spec,
+                "",
+                0,
+                &tx,
+            )
+            .await;
+        drop(tx);
+        result
+    };
+    let reader = async {
+        let mut frames = Vec::new();
+        // The first token's frame: the reader opens the gate only after it
+        // left.
+        frames.push(rx.recv().await.expect("a frame").expect("a write"));
+        gate.send(()).expect("the reader waits at the gate");
+        while let Some(frame) = rx.recv().await {
+            frames.push(frame.expect("a write"));
+        }
+        frames
+    };
+    let (result, frames) = tokio::join!(reading, reader);
+    server.abort();
+    let Err(failure) = result else {
+        panic!("the chunk the tokenizer cannot decode fails the stream");
+    };
+    assert!(
+        format!("{failure:?}").contains("decode"),
+        "the failure names the decode: {failure:?}"
+    );
+    assert_eq!(
+        text_of(&frames),
+        "hi there",
+        "every chunk written ahead of the failure reached the client: {frames:?}"
+    );
 }

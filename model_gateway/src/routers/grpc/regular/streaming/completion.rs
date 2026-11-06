@@ -301,10 +301,17 @@ impl<'a> CompletionStream<'a> {
                 }
             };
 
-            match gen_response.into_response() {
-                ProtoResponseVariant::Chunk(chunk) => self.read_chunk(chunk).await?,
-                ProtoResponseVariant::Complete(complete) => self.read_complete(complete).await?,
+            let read = match gen_response.into_response() {
+                ProtoResponseVariant::Chunk(chunk) => self.read_chunk(chunk).await,
+                ProtoResponseVariant::Complete(complete) => self.read_complete(complete).await,
                 ProtoResponseVariant::None => continue,
+            };
+            if let Err(failure) = read {
+                // What was produced ahead of the failure (the chunks written
+                // since the last flush) still goes out, as it does ahead of
+                // an upstream failure; the failure's event follows it.
+                StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
+                return Err(failure);
             }
             // An engine that outlived the unit (every choice closed, a
             // locally stopped one streaming on past its stop) is not polled
