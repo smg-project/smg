@@ -241,7 +241,7 @@ fn continuous_chat_usage_accumulates_delta_ids_without_double_counting_complete(
 /// in both the message_start skeleton and the final message_delta usage.
 #[test]
 fn messages_usage_cache_counters_serialize_as_integer_zeros() {
-    let start = serde_json::to_value(StreamingProcessor::initial_messages_usage()).unwrap();
+    let start = serde_json::to_value(StreamingProcessor::initial_messages_usage(0)).unwrap();
     assert_eq!(start["input_tokens"], 0);
     assert_eq!(start["output_tokens"], 0);
     assert_eq!(start["cache_creation_input_tokens"], 0);
@@ -283,7 +283,11 @@ fn message_delta_cache_read_input_tokens_is_the_engines_hit() {
 /// turn that ran with thinking and no such key otherwise.
 #[test]
 fn messages_usage_always_present_keys_and_thinking_tokens() {
-    let start = serde_json::to_value(StreamingProcessor::initial_messages_usage()).unwrap();
+    let start = serde_json::to_value(StreamingProcessor::initial_messages_usage(25)).unwrap();
+    // The skeleton reports the prompt's count, as the public API's reference
+    // stream does, and no output yet.
+    assert_eq!(start["input_tokens"], 25);
+    assert_eq!(start["output_tokens"], 0);
     assert_eq!(
         start["cache_creation"],
         serde_json::json!({"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0})

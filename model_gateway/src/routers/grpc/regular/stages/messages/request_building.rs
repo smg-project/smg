@@ -189,6 +189,7 @@ impl BuildStage for MessageRequestBuildingStage {
             },
         )?;
 
+        let prompt_tokens = u32::try_from(token_ids.len()).unwrap_or(u32::MAX);
         let (plan, stamp) = build_messages_backed_plan(
             ctx,
             &messages_request,
@@ -203,6 +204,7 @@ impl BuildStage for MessageRequestBuildingStage {
             self.plan_kind,
         )?;
         spec.reasoning_in_prefill = require_reasoning;
+        spec.prompt_tokens = prompt_tokens;
         spec.symphony = assignment;
         spec.parser_names.clone_from(&ctx.state.parser_names);
         Ok(BuildOutput {

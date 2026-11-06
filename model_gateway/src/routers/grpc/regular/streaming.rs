@@ -2645,15 +2645,22 @@ impl StreamingProcessor {
     }
 
     /// Skeleton usage for the `message_start` event, written before the
-    /// engine's first frame: every count zero. Cache counters are integer
-    /// zeros, never null: the Anthropic wire contract has always-present
-    /// cache counters and clients do arithmetic on them; the cache-creation
-    /// breakdown, service tier and inference geography are written on the
-    /// skeleton too, as the public API writes them. The measured prompt and
-    /// cache-read counts come with the final `message_delta`
+    /// engine's first frame: the rendered prompt's whole token count as
+    /// `input_tokens`, where the public API writes the prompt's count, and
+    /// no output yet. The gateway cannot know the engine's prefix-cache hit
+    /// before that frame, so on a hit the final `message_delta` reports the
+    /// prompt outside the cache as `input_tokens` and the hit as
+    /// `cache_read_input_tokens` (their sum this count), where the public
+    /// API's skeleton already excludes the hit. Cache counters are integer
+    /// zeros, never null: the
+    /// Anthropic wire contract has always-present cache counters and clients
+    /// do arithmetic on them; the cache-creation breakdown, service tier and
+    /// inference geography are written on the skeleton too, as the public
+    /// API writes them. The engine's measured prompt and cache-read counts
+    /// come with the final `message_delta`
     /// ([`Self::final_messages_delta_usage`]).
-    fn initial_messages_usage() -> messages::Usage {
-        messages::Usage::from_counts(0, 0)
+    fn initial_messages_usage(prompt_tokens: u32) -> messages::Usage {
+        messages::Usage::from_counts(prompt_tokens, 0)
     }
 
     /// Usage for the final `message_delta` event. `authoritative_prompt` is
@@ -4635,7 +4642,7 @@ impl<'a> MessagesStream<'a> {
             stop_reason: None,
             stop_sequence: None,
             stop_details: None,
-            usage: StreamingProcessor::initial_messages_usage(),
+            usage: StreamingProcessor::initial_messages_usage(self.spec.prompt_tokens),
             container: None,
         };
         StreamingProcessor::send_messages_event(

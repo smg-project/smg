@@ -951,6 +951,7 @@ pub(crate) fn response_processor() -> ResponseProcessor {
 /// tools, no stops. The streaming tests that want nothing else build theirs here.
 pub(crate) fn messages_spec(thinking: bool) -> MessagesResponseSpec {
     MessagesResponseSpec {
+        prompt_tokens: 0,
         thinking_requested: thinking,
         thinking_text_returned: true,
         reasoning_in_prefill: false,
@@ -2330,6 +2331,7 @@ async fn messages_stream_stop_reason_follows_what_the_engine_matched() {
         let (stream, server) = scripted_stream(vec![chunk(0, "Hi."), done], "0").await;
         let (tx, rx) = sse_channel();
         let spec = MessagesResponseSpec {
+            prompt_tokens: 0,
             thinking_requested: false,
             thinking_text_returned: true,
             reasoning_in_prefill: false,
@@ -2697,6 +2699,7 @@ async fn messages_blocks_and_inputs(
     texts: &[&str],
 ) -> (Vec<String>, Vec<Value>) {
     let spec = MessagesResponseSpec {
+        prompt_tokens: 0,
         thinking_requested: true,
         thinking_text_returned: true,
         reasoning_in_prefill: false,
