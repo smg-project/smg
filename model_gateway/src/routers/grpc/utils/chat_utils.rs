@@ -576,12 +576,16 @@ fn process_content_format_with_order(
 
             if let Some(obj) = message_json.as_object_mut() {
                 // skip_serializing_none omits content when None (a tool-call-only
-                // assistant turn, the OpenAI shape). The engine's chat utils hand
-                // such a turn to the template as empty content in the template's
-                // own format, never as none, which a template that tests, splits
-                // or concatenates every assistant message's content cannot take.
-                if obj.get("role").and_then(|v| v.as_str()) == Some("assistant")
-                    && !obj.contains_key("content")
+                // assistant turn, the OpenAI shape), and a function result with
+                // `content: null` keeps its null on the wire. The engine's chat
+                // utils hand such a turn to the template as empty content in the
+                // template's own format, never as none, which a template that
+                // tests, splits or concatenates every message's content cannot
+                // take.
+                if matches!(
+                    obj.get("role").and_then(|v| v.as_str()),
+                    Some("assistant" | "function")
+                ) && obj.get("content").is_none_or(Value::is_null)
                 {
                     obj.insert("content".to_string(), empty_content(content_format));
                 }

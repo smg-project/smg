@@ -83,10 +83,32 @@ fn known_chat_content_parts_are_accepted() {
             {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
         ]},
         {"role": "assistant", "content": null},
-        {"role": "function", "name": "lookup", "content": "result"}
+        {"role": "function", "name": "lookup", "content": "result"},
+        {"role": "function", "name": "lookup", "content": null}
     ]))
     .unwrap();
     assert!(validate_chat_content_parts(&messages).is_ok());
+}
+
+/// A function result with `content: null` (the deprecated role's shape for a
+/// call that returned nothing) reaches the template as empty content in the
+/// template's own format, as a tool-call-only assistant turn does.
+#[test]
+fn a_function_result_without_content_reaches_the_template_as_empty_content() {
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "hi"},
+        {"role": "function", "name": "lookup", "content": null},
+        {"role": "function", "name": "lookup", "content": "found"}
+    ]))
+    .unwrap();
+    let as_string =
+        process_content_format(&messages, ChatTemplateContentFormat::String, None).unwrap();
+    assert_eq!(as_string[1]["content"], json!(""));
+    assert_eq!(as_string[2]["content"], json!("found"));
+    let as_parts =
+        process_content_format(&messages, ChatTemplateContentFormat::OpenAI, None).unwrap();
+    assert_eq!(as_parts[1]["content"], json!([]));
+    assert_eq!(as_parts[2]["content"], json!("found"));
 }
 
 #[test]
