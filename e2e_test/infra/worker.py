@@ -1396,9 +1396,7 @@ def validate_startup_profile_worker(
     )
     if (
         extra_env
-        and any(
-            key.startswith("E2E_") or key == "SMG_VLLM_SERVICER_WARMUP" for key in extra_env
-        )
+        and any(key.startswith("E2E_") or key == "SMG_VLLM_SERVICER_WARMUP" for key in extra_env)
         and not original1_full_warmup
     ):
         raise ValueError(f"{profile} forbids a worker environment override of its lane/warm-up")
