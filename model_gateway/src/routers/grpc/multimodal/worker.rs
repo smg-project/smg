@@ -161,23 +161,25 @@ fn default_loader_reads(entry: &str) -> bool {
 /// samplers that never followed the loader keep their rule, so the engine
 /// starts as before. Which rules reach a spec depends on whose loader it
 /// follows: the engine's default loader, which samples up to a frame budget
-/// ([`FrameSampling::UpTo`]), reads the environment variable and the kwargs
-/// [`default_loader_reads`] names; a loader the engine registers for a
+/// ([`FrameSampling::UpTo`]; [`FrameSampling::UpToThenRate`] takes that
+/// loader's frames and resamples them), reads the environment variable and the
+/// kwargs [`default_loader_reads`] names; a loader the engine registers for a
 /// processor class (the stepped groups of the Qwen2-VL line and of Qwen3-Omni,
-/// [`FrameSampling::SteppedGroups`]) reads every flag kwarg the launcher
-/// reports and never the environment variable, which names the default loader
-/// alone, so a fleet-wide environment setting must not keep such a family from
-/// starting; an explicit `video.video_backend=opencv` swaps that loader for
-/// the default one and is refused there, while a family on the default loader
-/// keeps it. Three more families follow a loader and keep starting as before
-/// until their own per-family reads and tests land in a change of their own:
-/// [`FrameSampling::EvenRounded`] (the Qwen3-VL family, whose engine loader
-/// is registered for its processor class as well and reads `fps`,
-/// `min_frames` and `max_frames` from the media kwargs, while the spec takes
-/// its rate from the preprocessor config), [`FrameSampling::RateWalk`] (whose
-/// engine loader reads `fps` from the media kwargs as well) and
-/// [`FrameSampling::UpToThenRate`] (the default loader's frames, then the
-/// processor's own resample).
+/// [`FrameSampling::SteppedGroups`]; the rate walk of the GLM-5 family,
+/// [`FrameSampling::RateWalk`], whose loader reads `fps`, `max_frames` and
+/// `temporal_patch_size` from the media kwargs and ignores `min_frames`, which
+/// is refused with them rather than telling the per-class loaders apart by
+/// key) reads every flag kwarg the launcher reports and never the environment
+/// variable, which names the default loader alone, so a fleet-wide environment
+/// setting must not keep such a family from starting; an explicit
+/// `video.video_backend=opencv` swaps that loader for the default one and is
+/// refused there, while a family on the default loader keeps it. One more
+/// family follows a loader and keeps starting as before until its own
+/// per-family read and tests land in a change of their own:
+/// [`FrameSampling::EvenRounded`] (the Qwen3-VL family, whose engine loader is
+/// registered for its processor class as well and reads `fps`, `min_frames`
+/// and `max_frames` from the media kwargs, while the spec takes its rate from
+/// the preprocessor config).
 fn loader_rule_conflict(
     rule: Option<&str>,
     spec_name: &str,
@@ -185,9 +187,16 @@ fn loader_rule_conflict(
 ) -> Option<String> {
     let rule = rule?;
     let reaches_the_spec = |entry: &&str| match sampling {
-        FrameSampling::UpTo { .. } => default_loader_reads(entry),
-        FrameSampling::SteppedGroups { .. } => entry.trim().starts_with(LOADER_FLAG_RULE),
-        _ => false,
+        FrameSampling::UpTo { .. } | FrameSampling::UpToThenRate { .. } => {
+            default_loader_reads(entry)
+        }
+        FrameSampling::RateWalk { .. } | FrameSampling::SteppedGroups { .. } => {
+            entry.trim().starts_with(LOADER_FLAG_RULE)
+        }
+        FrameSampling::Even
+        | FrameSampling::Interval
+        | FrameSampling::EvenRounded
+        | FrameSampling::TemporalGroups { .. } => false,
     };
     let conflicting: Vec<&str> = rule.split("; ").filter(reaches_the_spec).collect();
     if conflicting.is_empty() {
@@ -2270,6 +2279,94 @@ mod unsupported_model_tests {
             .expect("the default-loader family is refused for both");
         assert!(message.starts_with(&format!("{both} changes")), "{message}");
         assert_eq!(loader_rule_conflict(None, "qwen_vl", stepped), None);
+    }
+
+    /// The GLM-5 family samples by the rate walk of its own loader, which the
+    /// engine registers for the family's video processor class: a launch-flag
+    /// rule reaches that loader (`video.fps` moves the walk's rate,
+    /// `max_frames` and `temporal_patch_size` its bounds, an explicit
+    /// `video.video_backend` replaces the loader, the default one included;
+    /// `min_frames`, which that loader ignores, is refused with them rather
+    /// than told apart by key) and the environment variable never does, so the
+    /// family is refused for the flag rules alone, like the stepped-groups
+    /// families.
+    #[test]
+    fn the_rate_walk_family_is_refused_for_the_flag_rules_alone() {
+        let walk = FrameSampling::RateWalk {
+            max_frames: 2048,
+            temporal_patch_size: 2,
+        };
+        let environment = "VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic";
+        for flag in [
+            "--media-io-kwargs video.fps=1",
+            "--media-io-kwargs video.video_backend=x",
+            "--media-io-kwargs video.video_backend=opencv",
+            "--media-io-kwargs video.max_frames=64",
+            "--media-io-kwargs video.temporal_patch_size=4",
+            "--media-io-kwargs video.min_frames=4",
+        ] {
+            let message = loader_rule_conflict(Some(flag), "glm53_flash", walk)
+                .expect("the flag rule is refused");
+            assert!(message.starts_with(&format!("{flag} changes")), "{message}");
+            assert!(
+                message.contains("glm53_flash pipeline samples the way the loader does"),
+                "{message}"
+            );
+        }
+        assert_eq!(
+            loader_rule_conflict(Some(environment), "glm53_flash", walk),
+            None,
+            "the environment variable never reaches the family's own loader"
+        );
+        let both = format!("{environment}; --media-io-kwargs video.fps=2");
+        let message = loader_rule_conflict(Some(&both), "glm53_flash", walk)
+            .expect("the flag rule is refused");
+        assert!(
+            message.starts_with("--media-io-kwargs video.fps=2 changes"),
+            "{message}"
+        );
+        assert!(!message.contains(environment), "{message}");
+        assert_eq!(loader_rule_conflict(None, "glm53_flash", walk), None);
+    }
+
+    /// A rule that resamples the engine's default loader's frames at a rate
+    /// takes those frames as that loader picked them, so the rules the default
+    /// loader reads reach it and the keys that loader never reads pass, as for
+    /// the default loader itself. No family on the registry samples this way
+    /// today (the GLM-5 family moved to its own loader's walk); the variant
+    /// keeps its place in the classification.
+    #[test]
+    fn a_loader_then_rate_rule_is_refused_like_the_default_loader() {
+        let loader_then_rate = FrameSampling::UpToThenRate {
+            max_frames: 32,
+            rate_max_frames: 2048,
+        };
+        let both = "VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic; --media-io-kwargs video.fps=2";
+        for read in [
+            "--media-io-kwargs video.fps=1",
+            "--media-io-kwargs video.video_backend=x",
+            "VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic",
+            both,
+        ] {
+            let message = loader_rule_conflict(Some(read), "glm53_flash", loader_then_rate)
+                .expect("a rule the default loader reads is refused");
+            assert!(message.starts_with(&format!("{read} changes")), "{message}");
+        }
+        for unread in [
+            "--media-io-kwargs video.video_backend=opencv",
+            "--media-io-kwargs video.fps=0",
+            "--media-io-kwargs video.max_frames=64",
+        ] {
+            assert_eq!(
+                loader_rule_conflict(Some(unread), "glm53_flash", loader_then_rate),
+                None,
+                "{unread} is no change for the default loader's frames"
+            );
+        }
+        assert_eq!(
+            loader_rule_conflict(None, "glm53_flash", loader_then_rate),
+            None
+        );
     }
 
     /// The loader rule matters only to a pipeline that can be handed a video:
