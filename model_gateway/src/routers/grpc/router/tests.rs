@@ -21,7 +21,7 @@ use super::*;
 use crate::{
     config::{
         test_support::{epd_routing_mode, pd_routing_mode, regular_routing_mode},
-        ParserChoice, RoutingMode,
+        GroupedDpSticky, ParserChoice, RoutingMode,
     },
     rate_limit::{
         RateLimitBackend, ReserveOutcome, ReserveRequest, SharedReservationHandle, UsageSettlement,
@@ -126,6 +126,29 @@ async fn the_attempt_deadline_is_armed_only_by_grpc_request_timeout_secs() {
     let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
     for pipeline in pipelines_of(&router) {
         assert_eq!(pipeline.request_timeout(), Some(Duration::from_secs(30)));
+    }
+}
+
+/// `--grouped-dp-sticky` reaches every pipeline a router builds, so a sticky
+/// request is pinned alike on every endpoint: off by default, and the
+/// configured placement when the configuration names one.
+#[tokio::test]
+async fn the_grouped_dp_pinning_reaches_every_pipeline() {
+    let mcp_orchestrator = mcp_orchestrator().await;
+    let config = grpc_config(regular_routing_mode()).build_unchecked();
+    let ctx = grpc_ctx_from(&config, Arc::clone(&mcp_orchestrator));
+    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+    for pipeline in pipelines_of(&router) {
+        assert_eq!(pipeline.grouped_dp_sticky(), GroupedDpSticky::Off);
+    }
+
+    let config = grpc_config(regular_routing_mode())
+        .grouped_dp_sticky(GroupedDpSticky::Hash)
+        .build_unchecked();
+    let ctx = grpc_ctx_from(&config, mcp_orchestrator);
+    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+    for pipeline in pipelines_of(&router) {
+        assert_eq!(pipeline.grouped_dp_sticky(), GroupedDpSticky::Hash);
     }
 }
 

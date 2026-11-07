@@ -1312,6 +1312,7 @@ impl CliArgs {
                 PdPairingMode::parse(&self.routing.pd_pairing_mode).unwrap_or_default(),
             )
             .policy_engine(PolicyEngineMode::parse(&self.routing.policy_engine).unwrap_or_default())
+            .grouped_dp_sticky(self.routing.grouped_dp_sticky)
             .routing_key_override(RoutingKeyOverrideConfig {
                 enabled: self.routing.routing_key_override,
                 eviction_interval_secs: self.routing.eviction_interval,
