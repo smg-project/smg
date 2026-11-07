@@ -1701,10 +1701,11 @@ impl NativeEncoder {
         // ASCII unit skip the pre-formed path and its per-piece test (see
         // `tokenize_piece_slow`).
         cache.unit_ascii = text.is_ascii();
-        // One walk per unit. A single-stage encoder consumes its stage's
-        // matches here and probes each piece in place (no recursive walk, no
-        // closure call per piece); the chain hands its pieces to the same
-        // probe through its static callback; any other shape walks.
+        // One walk per unit. A single-stage encoder hands the unit to
+        // `encode_single_stage`, out of line, where the scanner's own loop
+        // probes each piece in place (no recursive walk); the chain hands its
+        // pieces to the same probe through its static callback; any other
+        // shape walks.
         match (&self.chain, self.stages.as_slice()) {
             (Some(chain), _) => {
                 chain.pieces(text, &mut |piece: &str| {
