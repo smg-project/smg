@@ -926,6 +926,32 @@ fn stepped_group_clips_report_the_loaders_sampled_rate() {
     assert_eq!(super::clip_sample_fps(Some(&short), Some(5.0), even), 2.0);
 }
 
+/// The interval walk's clips report the rate of its picks the same way: a 1 s
+/// clip at 30 fps gives `[0, 29]`, 2 fps (1 s a group of two), where the
+/// target-rate estimate under the connector's bounds says 4 fps; an 800 s clip
+/// at 1 fps gives 800 picks, 1 fps, where the estimate says 0.96. Without a
+/// selection the estimate stands.
+#[test]
+fn interval_clips_report_the_loaders_sampled_rate() {
+    let interval = VideoFetchConfig {
+        sampling: FrameSampling::Interval,
+        ..VideoFetchConfig::default()
+    };
+    let one_second = super::FrameSelection::new(30.0, 30, vec![0, 29]);
+    assert_eq!(
+        super::clip_sample_fps(Some(&one_second), Some(1.0), interval),
+        2.0
+    );
+    assert_eq!(effective_sample_fps(Some(1.0), interval), 4.0);
+    let long = super::FrameSelection::new(1.0, 800, (0..800).collect());
+    assert_eq!(
+        super::clip_sample_fps(Some(&long), Some(800.0), interval),
+        1.0
+    );
+    assert_eq!(effective_sample_fps(Some(800.0), interval), 0.96);
+    assert_eq!(super::clip_sample_fps(None, Some(1.0), interval), 4.0);
+}
+
 #[test]
 fn ffmpeg_decodes_carry_the_thread_budget_ahead_of_the_input() {
     let args = |autorotate: bool| {

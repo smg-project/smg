@@ -161,7 +161,8 @@ pub enum FrameSampling {
     Even,
     /// One frame per sampling interval from the start, plus the last frame:
     /// the walk of the family's own video loader, which has no frame floor
-    /// or cap, so `min_frames` and `max_frames` do not apply.
+    /// or cap, so `min_frames` and `max_frames` do not apply (a clip whose
+    /// rate is unknown falls back to `Even`, which keeps them).
     Interval,
     /// `trunc(duration x rate)` frames, at least `min_frames`, at most
     /// `max_frames` and never more than the clip has, each the nearest frame
@@ -1603,7 +1604,7 @@ where
         .into_bytes();
     let source_fps = (fps.is_finite() && fps > 0.0).then_some(fps);
     let sample_fps = match (cfg.sampling, source_fps) {
-        (FrameSampling::SteppedGroups { .. }, Some(source_fps)) => {
+        (FrameSampling::SteppedGroups { .. } | FrameSampling::Interval, Some(source_fps)) => {
             loader_sampled_fps(frame_indices.len(), total_frames, source_fps)
         }
         _ => effective_sample_fps(source_fps.map(|fps| total_frames as f64 / fps), cfg),
@@ -2240,7 +2241,8 @@ fn spread_evenly_rounded(total_frames: usize, count: usize) -> Vec<usize> {
 /// loader's whatever their number: a short clip gives one or two frames and
 /// a long one every interval of its length, with no floor at `min_frames`
 /// and no thinning at `max_frames` (both are the generic connector's
-/// bounds, which the loader does not have).
+/// bounds, which the loader does not have). A clip whose rate is unknown
+/// takes the `Even` rule, bounds included.
 fn interval_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
     if !(fps.is_finite() && fps > 0.0) || cfg.sample_fps <= 0.0 {
         return even_frame_indices(total_frames, fps, cfg);
@@ -3686,22 +3688,25 @@ fn effective_sample_fps(duration_seconds: Option<f64>, cfg: VideoFetchConfig) ->
 }
 
 /// The rate the decoded frames stand for, which the processor turns into the
-/// seconds per temporal group: under the stepped groups the rate the engine's
-/// loader reports for its picks ([`loader_sampled_fps`]; the clamps and the
-/// group alignment move it off the target rate on short and long clips),
-/// under every other rule the target rate bounded by the clip
-/// ([`effective_sample_fps`]).
+/// seconds per temporal group: under the stepped groups and the interval walk
+/// the rate the engine's loader reports for its picks ([`loader_sampled_fps`];
+/// the clamps and the group alignment move the one, the kept last frame the
+/// other, off the target rate on short and long clips), under every other
+/// rule, and under those two without a selection, the target rate bounded by
+/// the clip ([`effective_sample_fps`]).
 fn clip_sample_fps(
     selection: Option<&FrameSelection>,
     duration_seconds: Option<f64>,
     cfg: VideoFetchConfig,
 ) -> f64 {
     match (cfg.sampling, selection) {
-        (FrameSampling::SteppedGroups { .. }, Some(selection)) => loader_sampled_fps(
-            selection.frame_indices.len(),
-            selection.total_frames,
-            selection.source_fps,
-        ),
+        (FrameSampling::SteppedGroups { .. } | FrameSampling::Interval, Some(selection)) => {
+            loader_sampled_fps(
+                selection.frame_indices.len(),
+                selection.total_frames,
+                selection.source_fps,
+            )
+        }
         _ => effective_sample_fps(duration_seconds, cfg),
     }
 }
