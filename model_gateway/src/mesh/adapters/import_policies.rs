@@ -11,7 +11,8 @@
 //! registry's events the way the worker manager does and runs the two steps
 //! for every worker of origin `Mesh`: `Registered` admits it, `Removed`
 //! releases it, and `Replaced` tells an owner's in-place rebuild (still an
-//! import: released as the old worker, admitted as the new one) from a local
+//! import: the new worker admitted, the old one's stream and count share
+//! handed to it, so a same-model rebuild keeps the policy) from a local
 //! claim of its address (the worker is local now and the registration
 //! workflow admits it under the same URL; the import's stream and its share
 //! of the model's count are handed to it, `PolicyRegistration::hand_over`).
@@ -105,10 +106,10 @@ impl Sync {
 
     /// One registry event. A `Replaced` of a tracked import is read by what
     /// the registry holds under the id now: still an import, an owner's
-    /// in-place rebuild; a local worker, a claim of the import's address;
-    /// nothing, an import gone before this task saw its rebuild. A claim and
-    /// a removal release what the registry's worker at the address, if any,
-    /// does not take over (`Self::release_or_hand_over`).
+    /// in-place rebuild (`Self::rebuild`); a local worker, a claim of the
+    /// import's address; nothing, an import gone before this task saw its
+    /// rebuild. A claim and a removal release what the registry's worker at
+    /// the address, if any, does not take over (`Self::release_or_hand_over`).
     async fn handle(&mut self, event: WorkerEvent) {
         match event {
             WorkerEvent::Registered { worker_id, worker } => {
@@ -121,10 +122,7 @@ impl Sync {
                     return;
                 }
                 match self.registry.origin_of(&worker_id) {
-                    Some(WorkerOrigin::Mesh) => {
-                        self.release(&worker_id).await;
-                        self.admit(worker_id, new).await;
-                    }
+                    Some(WorkerOrigin::Mesh) => self.rebuild(&worker_id, new).await,
                     Some(WorkerOrigin::Local) | None => {
                         self.release_or_hand_over(&worker_id).await;
                     }
@@ -163,18 +161,25 @@ impl Sync {
         self.tracked.insert(worker_id, worker);
     }
 
-    /// Release the worker admitted under `worker_id`: what was admitted is
-    /// what a release undoes, whatever the registry holds now.
-    async fn release(&mut self, worker_id: &WorkerId) {
-        let Some(worker) = self.tracked.remove(worker_id) else {
+    /// An owner's in-place rebuild of the import under `worker_id` (a
+    /// metadata update): the replacement is admitted first, then the URL's
+    /// stream and the old object's share of its model's count are handed to
+    /// it (`PolicyRegistration::hand_over`). A rebuild under the same model
+    /// so keeps the model's policy and the tenants the import learned; one
+    /// under another model purges the old model's tenants, as a hand-over
+    /// does. A release followed by an admission would drop both for a
+    /// moment, and the policy with the last worker.
+    async fn rebuild(&mut self, worker_id: &WorkerId, new: Arc<dyn Worker>) {
+        let Some(old) = self.tracked.remove(worker_id) else {
             return;
         };
-        self.registration.release(&worker).await;
+        self.admit(worker_id.clone(), Arc::clone(&new)).await;
+        self.registration.hand_over(&old, &new).await;
         debug!(
             worker_id = %worker_id.as_str(),
-            url = worker.redacted_url(),
-            model = worker.model_id(),
-            "Mesh import released from the policies"
+            url = new.redacted_url(),
+            model = new.model_id(),
+            "Mesh import rebuilt in place; the URL's stream and the count share handed to the new worker"
         );
     }
 
@@ -222,8 +227,9 @@ impl Sync {
     /// registry no longer holds as an import is released, or hands its
     /// stream to the worker now at its address (a claim, or a registration
     /// after the tombstone); one it holds as an import under another worker
-    /// object was rebuilt (released as the old worker, admitted as the new);
-    /// an import this task has not seen is admitted.
+    /// object was rebuilt (the new worker admitted, the old one's stream and
+    /// count share handed to it); an import this task has not seen is
+    /// admitted.
     async fn resync(&mut self) {
         let imports: HashMap<WorkerId, Arc<dyn Worker>> = self
             .registry
@@ -239,7 +245,7 @@ impl Sync {
         for (worker_id, worker) in tracked {
             match imports.get(&worker_id) {
                 Some(current) if Arc::ptr_eq(current, &worker) => {}
-                Some(_) => self.release(&worker_id).await,
+                Some(current) => self.rebuild(&worker_id, Arc::clone(current)).await,
                 None => self.release_or_hand_over(&worker_id).await,
             }
         }
@@ -329,6 +335,25 @@ mod tests {
         spec.models = WorkerModels::Single(Box::new(ModelCard::new(model_id)));
         spec.connection_mode = ConnectionMode::Grpc;
         spec.worker_type = WorkerType::Prefill;
+        WorkerState {
+            spec: serde_json::to_vec(&spec).expect("a worker spec serializes"),
+            ..remote_state(worker_id, url, model_id)
+        }
+    }
+
+    /// A peer's worker whose spec names a policy: admitted under a hint
+    /// other than the operator's default, its model gets a policy object
+    /// of its own, not the registry's shared default, so a drop and a
+    /// re-creation of the model's policy shows as a different object.
+    fn labelled_remote_state(
+        worker_id: &str,
+        url: &str,
+        model_id: &str,
+        policy: &str,
+    ) -> WorkerState {
+        let mut spec = WorkerSpec::new(url);
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new(model_id)));
+        spec.labels.insert("policy".into(), policy.into());
         WorkerState {
             spec: serde_json::to_vec(&spec).expect("a worker spec serializes"),
             ..remote_state(worker_id, url, model_id)
@@ -644,6 +669,100 @@ mod tests {
 
         assert_eq!(count(&policies, "m1"), None);
         assert_eq!(count(&policies, "m2"), Some(1));
+        assert!(
+            sync.tracked
+                .get(&id)
+                .is_some_and(|tracked| Arc::ptr_eq(tracked, &rebuilt)),
+            "the new worker is the one tracked"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_place_rebuild_under_the_same_model_keeps_its_policy() {
+        // A metadata update on the owner rebuilds the import under the same
+        // model. The model's policy object and its count survive the
+        // rebuild: the replacement is admitted before the old worker's
+        // share is released, so a sole worker's policy is never dropped
+        // and re-created.
+        let registry = Arc::new(WorkerRegistry::new());
+        let policies = Arc::new(PolicyRegistry::new(PolicyConfig::Random));
+        let registration = registration(&registry, &policies);
+        let mut sync = sync_by_hand(&registry, &registration);
+        let mut events = registry.subscribe_events();
+
+        registry.on_remote_worker_state(&labelled_remote_state(
+            "peer-w1",
+            "http://remote:8080",
+            "m1",
+            "round_robin",
+        ));
+        handle_queued(&mut sync, &mut events).await;
+        let policy = policies
+            .get_policy("m1")
+            .expect("the import's model has a policy");
+        assert_eq!(
+            policy.name(),
+            "round_robin",
+            "the model's own policy object"
+        );
+        assert_eq!(count(&policies, "m1"), Some(1));
+
+        let id = registry.get_id_by_url("http://remote:8080").unwrap();
+        let rebuilt = local_worker("http://remote:8080", "m1");
+        assert!(registry.replace(&id, Arc::clone(&rebuilt)));
+        assert_eq!(registry.origin_of(&id), Some(WorkerOrigin::Mesh));
+        handle_queued(&mut sync, &mut events).await;
+
+        assert!(
+            policies
+                .get_policy("m1")
+                .is_some_and(|after| Arc::ptr_eq(&after, &policy)),
+            "the model keeps its policy object across the rebuild"
+        );
+        assert_eq!(count(&policies, "m1"), Some(1));
+        assert!(
+            sync.tracked
+                .get(&id)
+                .is_some_and(|tracked| Arc::ptr_eq(tracked, &rebuilt)),
+            "the new worker is the one tracked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resync_after_a_missed_same_model_rebuild_keeps_its_policy() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let policies = Arc::new(PolicyRegistry::new(PolicyConfig::Random));
+        let registration = registration(&registry, &policies);
+        let mut sync = sync_by_hand(&registry, &registration);
+
+        registry.on_remote_worker_state(&labelled_remote_state(
+            "peer-w1",
+            "http://remote:8080",
+            "m1",
+            "round_robin",
+        ));
+        sync.resync().await;
+        let policy = policies
+            .get_policy("m1")
+            .expect("the import's model has a policy");
+        assert_eq!(
+            policy.name(),
+            "round_robin",
+            "the model's own policy object"
+        );
+
+        let id = registry.get_id_by_url("http://remote:8080").unwrap();
+        let rebuilt = local_worker("http://remote:8080", "m1");
+        assert!(registry.replace(&id, Arc::clone(&rebuilt)));
+        sync.resync().await;
+
+        assert!(
+            policies
+                .get_policy("m1")
+                .is_some_and(|after| Arc::ptr_eq(&after, &policy)),
+            "the model keeps its policy object across the missed rebuild"
+        );
+        assert_eq!(count(&policies, "m1"), Some(1));
         assert!(
             sync.tracked
                 .get(&id)
