@@ -500,9 +500,10 @@ impl MergeTable {
     /// at load and the rest of the load pushed it out; measured on the
     /// encode bar, the probes of a 256-byte cold text were 1.5 fills from
     /// memory per token against 0.16 from the last-level cache, and this read
-    /// takes 11-28 % off those cells and 3-9 % off the 2 KB ones (with the
-    /// pair filter, 7-29 % off every cold cell), for 0.43-0.46 ms once per
-    /// thread per encoder on a 128-151k-merge table.
+    /// takes 10-20 % off those cells (16 % by median) and 8 % by median off
+    /// the 2 KB ones, nothing measurable from 32 KB up, against a parent that
+    /// has the pair filter, for 0.3-0.5 ms once per thread per encoder on a
+    /// 128-151k-merge table.
     #[inline(never)]
     pub(super) fn read_through(&self) {
         const GRID_STEP: usize = 64 / size_of::<Merge>();
