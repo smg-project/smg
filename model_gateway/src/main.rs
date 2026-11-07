@@ -1320,7 +1320,8 @@ struct ServingArgs {
     tenant_rate_limit_config: Option<String>,
 
     // ==================== Retry Configuration ====================
-    /// Maximum number of retry attempts
+    /// Default attempts per request in all, the first one included (1 disables retries).
+    /// A worker's per-model retry override takes precedence.
     #[arg(long, default_value_t = 5, help_heading = "Retry Configuration")]
     retry_max_retries: u32,
 
