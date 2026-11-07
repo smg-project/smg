@@ -39,9 +39,10 @@ def _content_text(content: Any) -> str:
 
 def is_no_results_answer(error: Any) -> bool:
     """Whether an ``mcp_call`` error is the backend's no-results answer and nothing else."""
+    error_type = error.get("type") if isinstance(error, dict) else getattr(error, "type", None)
+    content = error.get("content") if isinstance(error, dict) else getattr(error, "content", None)
     return (
-        getattr(error, "type", None) == TOOL_EXECUTION_ERROR
-        and _content_text(getattr(error, "content", None)).strip() == NO_RESULTS_ANSWER
+        error_type == TOOL_EXECUTION_ERROR and _content_text(content).strip() == NO_RESULTS_ANSWER
     )
 
 
