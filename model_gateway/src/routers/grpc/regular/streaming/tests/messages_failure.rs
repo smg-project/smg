@@ -4,27 +4,16 @@
 //! failure, as it does ahead of an upstream failure.
 
 use serde_json::Value;
-use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
 use tokio::sync::oneshot;
 
 use super::{
     super::*,
-    eof::{chunk, complete, dispatch, messages_spec, processor, staged_stream, CharacterTokenizer},
+    eof::{
+        chunk, chunk_of_ids, complete, dispatch, messages_spec, processor, staged_stream,
+        CharacterTokenizer,
+    },
 };
 use crate::routers::common::sse::sse_channel;
-
-/// A chunk of raw token ids: an id that is no character (a surrogate) is one
-/// the character tokenizer cannot decode.
-fn chunk_of_ids(index: u32, token_ids: Vec<u32>) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
-            index,
-            completion_tokens: token_ids.len() as u32,
-            token_ids,
-            ..Default::default()
-        })),
-    }
-}
 
 /// The events of the SSE frames, in order.
 fn events_of(frames: &[Bytes]) -> Vec<Value> {
