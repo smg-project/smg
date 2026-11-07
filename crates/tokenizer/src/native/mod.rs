@@ -106,10 +106,14 @@ const BYTE_LEVEL_PATTERN: &str =
 /// `LONG_PIECE_MAX_BYTES`, by the bytes they take (see
 /// `LONG_PIECE_BYTES_CAPACITY`).
 const CACHED_PIECE_MAX_BYTES: usize = 64;
-/// Longest piece cached at all (a clause of some 80 characters in a script
-/// without word spaces, 256 of ASCII): a longer piece is rare and tokenized
-/// every time.
-const LONG_PIECE_MAX_BYTES: usize = 256;
+/// Longest piece cached at all, 16 KiB. The byte-pair cut leaves long pieces
+/// in a script without word spaces (a clause of some 85 such characters is
+/// 256 bytes, a paragraph a few KiB) and in code or prose whose word markers the
+/// vocabulary bridges; a fifth of such a text can sit in pieces past 256
+/// bytes, and with the cap there every encode of it merged them again. The
+/// tier is bounded by bytes, so an entry costs what it takes; a longer piece
+/// is tokenized every time.
+const LONG_PIECE_MAX_BYTES: usize = 16 << 10;
 /// Entries a thread's piece cache holds for one encoder before it is cleared,
 /// at most; see `PIECE_CACHE_TOTAL_CAPACITY`. This is also the cliff of a
 /// repeated document: one with fewer distinct pieces is encoded again at the
@@ -243,6 +247,10 @@ struct PieceCache {
     /// The initial symbols of a piece being merged on the sentencepiece
     /// path: a scratch list of the thread.
     symbols: Vec<u32>,
+    /// Whether the unit being encoded is ASCII throughout, read once per
+    /// unit (see `Native::encode_unit`): the cold pieces of such a unit take
+    /// the byte merge without a test of their own.
+    unit_ascii: bool,
 }
 
 impl PieceCache {
@@ -701,6 +709,7 @@ impl NativeEncoder {
                 tracing::debug!(
                     merges = table.merges(),
                     bytes = table.bytes(),
+                    preformed_characters = table.preformed_characters(),
                     "the native encode path merges its piece-cache misses itself"
                 );
                 Some(table)
@@ -1689,6 +1698,11 @@ impl NativeEncoder {
             }
             return fallback.map_or(Ok(()), Err);
         }
+        // One pass over the unit (word at a time in the standard library) on
+        // the byte-level path, the one that reads it: the cold pieces of an
+        // ASCII unit skip the pre-formed path and its per-piece test (see
+        // `tokenize_piece_slow`).
+        cache.unit_ascii = text.is_ascii();
         // One walk per unit. A single-stage encoder consumes its stage's
         // matches here and probes each piece in place (no recursive walk, no
         // closure call per piece); the chain hands its pieces to the same
@@ -1846,7 +1860,15 @@ impl NativeEncoder {
                     };
                 match whole {
                     Some(id) => ids.push(id),
-                    None => table.merge(bytes, ids),
+                    // A cold piece of a unit with a non-ASCII byte merges
+                    // from its pre-formed characters when it has them (the
+                    // pre-formed path reads the piece's bytes itself); a
+                    // piece of an ASCII unit never reads that analysis.
+                    None => {
+                        if cache.unit_ascii || !table.merge_preformed(bytes, ids) {
+                            table.merge(bytes, ids);
+                        }
+                    }
                 }
             } else {
                 match model.map(|model| model.tokenize(self.mapped(bytes, mapped))) {

@@ -30,7 +30,7 @@ use openai_protocol::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::sync::Semaphore;
+use tokio::{sync::Semaphore, task::yield_now};
 use tool_parser::types::ToolCallItem;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -292,11 +292,41 @@ pub(crate) fn missing_tokenizer_response(
     )
 }
 
-/// Below this input size (in bytes) the `spawn_blocking` + permit round-trip
-/// costs more than the encode itself, so we tokenize inline. Larger prompts —
-/// the ones that actually pin a worker thread — are offloaded. A prompt of
-/// ids counts its ids' bytes, four each.
-const ENCODE_OFFLOAD_MIN_BYTES: usize = 512;
+/// Below this input size (in bytes) a prompt is tokenized on the runtime
+/// thread that holds the request; from this size up the encode runs on the
+/// blocking pool, bounded by [`encode_permits`], so no worker is held for
+/// longer than about one request's own share of work: a single prompt by its
+/// own size, a batch (a completion with several prompts, as text or as ids, a
+/// tokenize call, a Decisions request's prompts and label probes) by what the
+/// call has already encoded or decoded in place, through [`InPlaceBudget`]. A
+/// prompt of ids counts its ids' bytes, four each. An input under the
+/// break-even size ([`OFFLOAD_BREAK_EVEN_BYTES`]) never takes the pool: once
+/// the call's share is spent it yields the worker instead.
+///
+/// The bound is where the encode outweighs its offload. An offloaded encode
+/// costs the request a round trip through the pool: the pool thread's wake,
+/// the request task re-scheduled through the inject queue when the encode
+/// ends, and the parked worker those wakes notify. On the gateway's CPU bed
+/// (the repository's `gateway-perf` cells: eight runtime threads, 500 chat
+/// requests per second against scripted engines) the round trip costs the
+/// same whatever the prompt's length: about 55 k instructions, 3.7 context
+/// switches and, on a virtual machine, 0.25 ms of CPU time per request more
+/// than the same encode in place, and the first token leaves 0.2 ms later.
+/// The encode itself costs about 70 k instructions and 10-20 us per
+/// kilobyte of prompt with a byte-level BPE tokenizer: from one kilobyte up
+/// the work outweighs the trip in instructions, and at 16 KiB (about 3,000
+/// tokens, 0.2-0.3 ms) it still holds a worker for no longer than one short
+/// request's own CPU time (0.3 ms). Above that the pool takes it. The
+/// earlier bound of 512 bytes charged the round trip to every ordinary
+/// conversation: a system prompt and a few turns render to 1-10 KiB.
+const ENCODE_OFFLOAD_MIN_BYTES: usize = 16 * 1024;
+
+/// Below this input size the pool's round trip costs more than the work it
+/// would move (the measurement above: a trip is about 55 k instructions, an
+/// encode about 70 k per kilobyte), so such an input never takes the pool:
+/// when the call's in-place share is spent it yields the worker once instead
+/// and starts the next share.
+const OFFLOAD_BREAK_EVEN_BYTES: usize = 1024;
 
 /// Bounds how many CPU-bound encodes run concurrently on the blocking pool.
 /// tokio's blocking pool is otherwise unbounded (grows to 512 threads), so under
@@ -334,13 +364,37 @@ where
     if !offloads(len) {
         return work();
     }
-    let _permit = encode_permits()
+    pool(work).await
+}
+
+/// Run `work` on the blocking pool behind the [`encode_permits`].
+async fn pool<T, F>(work: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    pool_on(encode_permits(), work).await
+}
+
+/// Run `work` on the blocking pool behind one of `permits`. The permit rides
+/// in the blocking closure, held until the work ends whatever happens to this
+/// future: a pass ended by another input's error, or dropped by a client
+/// gone, still counts its running jobs against the bound.
+async fn pool_on<T, F>(permits: &'static Semaphore, work: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    let permit = permits
         .acquire()
         .await
         .map_err(|e| anyhow!("encode semaphore closed: {e}"))?;
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|e| anyhow!("tokenizer task failed: {e}"))?
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|e| anyhow!("tokenizer task failed: {e}"))?
 }
 
 /// Tokenize `text` through the offload policy of [`offload`]: a prompt below
@@ -356,23 +410,182 @@ pub(crate) async fn encode_blocking(
         return tokenizer.encode(text, add_special_tokens);
     }
     let text = text.to_string();
-    offload(text.len(), move || {
-        tokenizer.encode(&text, add_special_tokens)
-    })
+    pool(move || tokenizer.encode(&text, add_special_tokens)).await
+}
+
+/// What one call has encoded or decoded on the runtime thread since it last
+/// yielded it: the call's share. A call places its inputs one after another
+/// against it, so it holds a worker for about one input at the bound before
+/// it lets go: an input that would take the share over the bound goes to the
+/// pool if it is worth the trip ([`OFFLOAD_BREAK_EVEN_BYTES`]), and a smaller
+/// one has the call yield the worker once and start the next share.
+#[derive(Default)]
+pub(crate) struct InPlaceBudget {
+    in_place: usize,
+}
+
+/// Where an input of a call runs, by [`InPlaceBudget::place`].
+enum Placement {
+    /// On the calling thread, within the share.
+    InPlace,
+    /// On the blocking pool.
+    Pool,
+    /// On the calling thread, once the call has yielded it: the share is spent.
+    AfterYield,
+}
+
+impl InPlaceBudget {
+    /// Where an input of `len` bytes runs, the share charged when in place.
+    fn place(&mut self, len: usize) -> Placement {
+        if offloads(len) {
+            return Placement::Pool;
+        }
+        let total = self.in_place + len;
+        if !offloads(total) {
+            self.in_place = total;
+            Placement::InPlace
+        } else if len >= OFFLOAD_BREAK_EVEN_BYTES {
+            Placement::Pool
+        } else {
+            Placement::AfterYield
+        }
+    }
+
+    /// The next share, opened by an input of `len` bytes after the yield.
+    fn next_share(&mut self, len: usize) {
+        self.in_place = len;
+    }
+}
+
+/// Tokenize one `text` of a call's sequence through the offload policy, the
+/// call's [`InPlaceBudget`] placing it: in place from the caller's own text,
+/// as [`encode_blocking`] does below the bound; on the pool from one copy; or
+/// in place once the call has yielded the worker. A call that holds several
+/// inputs at once places them in one pass with [`encode_texts_blocking`].
+pub(crate) async fn encode_blocking_in_batch(
+    tokenizer: Arc<dyn Tokenizer>,
+    text: &str,
+    add_special_tokens: bool,
+    budget: &mut InPlaceBudget,
+) -> anyhow::Result<Encoding> {
+    match budget.place(text.len()) {
+        Placement::InPlace => tokenizer.encode(text, add_special_tokens),
+        Placement::AfterYield => {
+            yield_now().await;
+            budget.next_share(text.len());
+            tokenizer.encode(text, add_special_tokens)
+        }
+        Placement::Pool => {
+            let text = text.to_string();
+            pool(move || tokenizer.encode(&text, add_special_tokens)).await
+        }
+    }
+}
+
+/// Tokenize a call's `texts` as one pass over them: each is placed once by
+/// the call's [`InPlaceBudget`]; the texts in place are encoded one after
+/// another on the calling thread, the call yielding the worker once per spent
+/// share, and the texts worth the trip run on the pool beside them, started
+/// with the pass's first poll and joined at its end. The encodings in the
+/// texts' order.
+pub(crate) async fn encode_texts_blocking(
+    tokenizer: Arc<dyn Tokenizer>,
+    texts: &[String],
+    add_special_tokens: bool,
+) -> anyhow::Result<Vec<Encoding>> {
+    place_all(
+        texts.iter(),
+        |text| text.len(),
+        |text| tokenizer.encode(text.as_str(), add_special_tokens),
+        |text| {
+            let (tokenizer, text) = (tokenizer.clone(), text.to_string());
+            Box::new(move || tokenizer.encode(&text, add_special_tokens))
+        },
+    )
     .await
 }
 
-/// Decode `ids` through the offload policy of [`offload`]: a prompt given as
-/// ids leaves the worker thread at the same size a text prompt does.
-pub(crate) async fn decode_blocking(
+/// Decode a call's prompts given as ids, `lists`, as one pass over them, as
+/// [`encode_texts_blocking`] does for texts: a prompt of ids leaves the worker
+/// thread at the same size a text prompt does, four bytes an id. The texts in
+/// the lists' order.
+pub(crate) async fn decode_ids_blocking(
     tokenizer: Arc<dyn Tokenizer>,
-    ids: Vec<u32>,
+    lists: Vec<Vec<u32>>,
     skip_special_tokens: bool,
-) -> anyhow::Result<String> {
-    offload(ids.len() * size_of::<u32>(), move || {
-        tokenizer.decode(&ids, skip_special_tokens)
-    })
+) -> anyhow::Result<Vec<String>> {
+    place_all(
+        lists,
+        |ids| ids.len() * size_of::<u32>(),
+        |ids| tokenizer.decode(ids, skip_special_tokens),
+        |ids| {
+            let tokenizer = tokenizer.clone();
+            Box::new(move || tokenizer.decode(&ids, skip_special_tokens))
+        },
+    )
     .await
+}
+
+/// The pool's job for an input a call does not run in place.
+type PoolJob<T> = Box<dyn FnOnce() -> anyhow::Result<T> + Send + 'static>;
+
+/// One pass of a call over its `inputs` through the offload policy: `len` is
+/// an input's bytes for the budget, `in_place` runs one on the calling
+/// thread, `job` makes the pool's job of one. The pass is planned first, every
+/// input placed and the pool's jobs made; then the pool's join and the
+/// in-place pass run together, the join polled first, so the pool's jobs
+/// start on the pass's first poll and the in-place inputs run one after
+/// another, the call yielding the worker once per spent share. The outputs in
+/// the inputs' order; the first error ends the pass, and a pool job already
+/// running finishes on its thread, its permit held until then ([`pool_on`]).
+async fn place_all<I, T>(
+    inputs: impl IntoIterator<Item = I>,
+    len: impl Fn(&I) -> usize,
+    in_place: impl Fn(&I) -> anyhow::Result<T>,
+    job: impl Fn(I) -> PoolJob<T>,
+) -> anyhow::Result<Vec<T>>
+where
+    T: Send + 'static,
+{
+    let mut budget = InPlaceBudget::default();
+    let mut outputs: Vec<Option<T>> = Vec::new();
+    // The in-place inputs in order, each with whether the call yields before it.
+    let mut placed = Vec::new();
+    let mut pooled = Vec::new();
+    for (index, input) in inputs.into_iter().enumerate() {
+        let len = len(&input);
+        match budget.place(len) {
+            Placement::InPlace => placed.push((index, input, false)),
+            Placement::AfterYield => {
+                budget.next_share(len);
+                placed.push((index, input, true));
+            }
+            Placement::Pool => {
+                let job = job(input);
+                pooled.push(async move { pool(job).await.map(|output| (index, output)) });
+            }
+        }
+        outputs.push(None);
+    }
+    let in_place_pass = async {
+        let mut done = Vec::with_capacity(placed.len());
+        for (index, input, yields_first) in placed {
+            if yields_first {
+                yield_now().await;
+            }
+            done.push((index, in_place(&input)?));
+        }
+        anyhow::Ok(done)
+    };
+    let (from_pool, from_here) =
+        futures::future::try_join(futures::future::try_join_all(pooled), in_place_pass).await?;
+    for (index, output) in from_pool.into_iter().chain(from_here) {
+        outputs[index] = Some(output);
+    }
+    outputs
+        .into_iter()
+        .map(|output| output.ok_or_else(|| anyhow!("an input of the pass was left unplaced")))
+        .collect()
 }
 
 /// Tokenize a rendered chat prompt the way its renderer said to: a deferred

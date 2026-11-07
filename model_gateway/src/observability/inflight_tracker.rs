@@ -11,7 +11,10 @@ use serde::Serialize;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-use super::gauge_histogram::{BucketBounds, GaugeHistogramHandle, GaugeHistogramVec};
+use super::{
+    gauge_histogram::{BucketBounds, GaugeHistogramHandle, GaugeHistogramVec},
+    metrics::Metrics,
+};
 use crate::policies::utils::PeriodicTask;
 
 static INFLIGHT_AGE_BOUNDS: BucketBounds<11> =
@@ -147,9 +150,18 @@ impl InFlightRequestTracker {
             .collect()
     }
 
+    /// The sampler's tick: the in-flight age histogram from the tracked
+    /// requests, and `smg_http_connections_active` from the count. The
+    /// gauge's per-event sets (the arrival, the three releases) each load
+    /// the count and set the gauge as two steps, so two releases that
+    /// interleave as load, load, set, set leave the gauge one above the
+    /// count until the next event, and a server that goes idle right then
+    /// has no next event; the tick sets the gauge from the count, so a stale
+    /// reading lasts one sample interval at most.
     fn sample_and_record(&self) {
         let counts = self.compute_bucket_counts();
         INFLIGHT_AGE_HANDLE.set_counts(&counts);
+        Metrics::set_http_connections_active(self.len());
     }
 }
 
@@ -185,6 +197,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::observability::metrics::test_support::render_with_recorder;
 
     impl InFlightRequestTracker {
         fn insert_with_time(&self, request_id: u64, start_time: Instant) {
@@ -286,6 +299,27 @@ mod tests {
         assert_ne!(
             tracker.snapshot().instance_id,
             InFlightRequestTracker::new().snapshot().instance_id
+        );
+    }
+
+    /// What two releases that interleave their loads and sets leave behind:
+    /// the gauge above the count, set through the recorder as the edge sets
+    /// it. One tick of the sampler reads the count and sets the gauge from
+    /// it.
+    #[test]
+    fn a_sampler_tick_sets_the_active_gauge_from_the_count_after_a_stale_set() {
+        let tracker = InFlightRequestTracker::new();
+        let _guards = [tracker.track(), tracker.track()];
+        assert_eq!(tracker.len(), 2);
+        let rendered = render_with_recorder(|| {
+            Metrics::set_http_connections_active(3);
+            tracker.sample_and_record();
+        });
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line == "smg_http_connections_active 2"),
+            "{rendered}"
         );
     }
 

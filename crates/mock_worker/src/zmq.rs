@@ -18,7 +18,10 @@ use std::{
 
 use engine_zmq_client::{
     codec::OpaqueValue,
-    mock_engine::{connect_to_frontend, default_ready_response, EngineInbound, MockEngineOutput},
+    mock_engine::{
+        connect_to_frontend, default_ready_response, wait_for_endpoint, EngineInbound,
+        MockEngineOutput,
+    },
     protocol::vllm::{
         logprobs::{Logprobs, PositionLogprobs, TokenLogprob},
         output::{
@@ -27,7 +30,7 @@ use engine_zmq_client::{
         },
         stats::{PrefillStats, SchedulerStats},
     },
-    EngineId,
+    EngineId, Error,
 };
 use tokio::{
     sync::mpsc,
@@ -48,6 +51,16 @@ use crate::{
 // This is best-effort transport linger, not a delivery acknowledgement; the
 // process-wide drain deadline still bounds shutdown if the frontend is stuck.
 const OUTPUT_LINGER: Duration = Duration::from_secs(1);
+
+/// How many waits for the frontend's handshake endpoint (one mock deadline,
+/// 30 s, each) a rank makes before it gives up. An engine's handshake socket
+/// dials until the frontend binds, however late; a gateway binds the
+/// handshake of a worker it was started with at that worker's first health
+/// probe, which can come one check interval (60 s by default) after the
+/// gateway's start. Three rounds outlive that. A rank still without an
+/// endpoint after them ends, and the process with it when it was the last
+/// worker, so a launcher reads the failure instead of waiting on it.
+const DIAL_ROUNDS: u32 = 3;
 
 /// What a rank has pushed on its output socket: the messages that carried
 /// request outputs and the outputs in them (a utility reply is neither). The
@@ -129,18 +142,55 @@ pub async fn serve_until(
     ready.data_parallel_rank = engine_index;
     ready.instance_id = format!("mock-zmq-{engine_index}");
 
-    let mock = match connect_to_frontend(
-        &handshake_address,
-        EngineId::from_engine_index(engine_index),
-        ready,
-    )
-    .await
-    {
-        Ok(mock) => mock,
-        Err(error) => {
-            tracing::error!("zmq engine {engine_index} handshake failed: {error}");
+    // The frontend's handshake endpoint, waited for in rounds: a round that
+    // ends without it is logged, the last one ends the rank; a stop during
+    // the wait ends it at once, as a signal ends an engine still dialing.
+    let mut shutdown = pin!(shutdown);
+    for round in 1..=DIAL_ROUNDS {
+        let waited = tokio::select! {
+            waited = wait_for_endpoint(&handshake_address) => waited,
+            () = &mut shutdown => {
+                tracing::info!(
+                    "zmq engine {engine_index}: stopping before the frontend bound {handshake_address}"
+                );
+                return;
+            }
+        };
+        match waited {
+            Ok(()) => break,
+            Err(error) if round < DIAL_ROUNDS => tracing::warn!(
+                "zmq engine {engine_index}: {error}; dialing {handshake_address} again (round {} of {DIAL_ROUNDS})",
+                round + 1
+            ),
+            Err(error) => {
+                tracing::error!("zmq engine {engine_index} handshake failed: {error}");
+                return;
+            }
+        }
+    }
+
+    // The handshake is raced against the stop as well, the stop first: a stop
+    // that lands together with the endpoint ends the rank here, not after a
+    // handshake that would run on into the drain.
+    let mock = tokio::select! {
+        biased;
+        () = &mut shutdown => {
+            tracing::info!(
+                "zmq engine {engine_index}: stopping during the handshake with {handshake_address}"
+            );
             return;
         }
+        connected = connect_to_frontend(
+            &handshake_address,
+            EngineId::from_engine_index(engine_index),
+            ready,
+        ) => match connected {
+            Ok(mock) => mock,
+            Err(error) => {
+                tracing::error!("zmq engine {engine_index} handshake failed: {error}");
+                return;
+            }
+        },
     };
     tracing::info!("zmq mock engine {engine_index} connected to {handshake_address}");
 
@@ -254,7 +304,6 @@ pub async fn serve_until(
         drop(output);
     });
 
-    let mut shutdown = pin!(shutdown);
     let mut stopped = false;
     // The forwarders of the admitted requests, and their abort handles by
     // request id. A stop admits nothing more and keeps reading the input
@@ -426,6 +475,11 @@ pub async fn serve_until(
                     output: UtilityOutput::from_outcome(call.call_id, outcome),
                 }));
             }
+            // The mock module's read bound, not a disconnect: a rank that
+            // heard nothing for that long waits on for the next request or a
+            // stop, as an engine does. (The process ends when its last rank
+            // does, so an idle rank must not count as a stopped one.)
+            Err(Error::HandshakeTimeout { .. }) => {}
             Err(error) => {
                 tracing::info!("zmq engine {engine_index} input closed: {error}");
                 break false;

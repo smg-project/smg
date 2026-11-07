@@ -29,12 +29,6 @@ pub const DEEPSEEK_V41_IMAGE_PLACEHOLDER: &str = "<｜deepseek_image｜>";
 pub(super) struct DeepseekV41VisionSpec;
 
 impl DeepseekV41VisionSpec {
-    /// vLLM leaves the image count unlimited for this model
-    /// (`get_supported_mm_limits` returns `{"image": None}`); keep a generous
-    /// cap until the gateway can express "unlimited". Deployments raise or
-    /// lower it with `SMG_IMAGE_MAX_COUNT`.
-    const MAX_IMAGES_PER_PROMPT: usize = 128;
-
     fn image_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
         metadata
             .config_u32(&["image_token_id"])
@@ -89,14 +83,30 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
         Self::image_token_id(metadata)
     }
 
+    /// The family sets no per-request image count of its own: its serving
+    /// engines read the count as unlimited (the family's processing info
+    /// declares `image: None`), the checkpoint's config bounds an image's
+    /// tokens and pixels, not the number of images, and the context length
+    /// is the practical bound. Images stay declared (an undeclared modality
+    /// is refused as unsupported) without a bound of the spec's, so the
+    /// effective limit is the engine's advertised one, else the deployment's
+    /// `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`.
+    ///
+    /// What still bounds such a request, and where it lives. Before any
+    /// fetch: the per-request limit the model's workers advertise for their
+    /// engine, which caps the router's own limit in the gateway's limit
+    /// resolution, and the deployment's `SMG_IMAGE_MAX_COUNT` /
+    /// `SMG_VIDEO_MAX_COUNT` / `SMG_AUDIO_MAX_COUNT` (and
+    /// `--mm-per-request-image-limit` for images), read in the same
+    /// resolution. At or after the fetch: the gateway's cap on media bytes
+    /// in flight (`multimodal_max_inflight_bytes`), the engine's advertised
+    /// encoder budget and the context length. A number of the spec's own
+    /// would be a declared default again, not a bound of the family's.
     fn modality_limits(
         &self,
         _metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
-        Ok(HashMap::from([(
-            Modality::Image,
-            Self::MAX_IMAGES_PER_PROMPT,
-        )]))
+        Ok(HashMap::from([(Modality::Image, usize::MAX)]))
     }
 
     fn vision_processor(
@@ -260,6 +270,40 @@ mod tests {
         }
     }
 
+    /// The family bounds its images by context, not by count: the spec
+    /// declares the modality without a limit of its own (the 128 it carried
+    /// was a declared default, never a count of the family's), so a
+    /// deployment knob or the engine's advertised limit is the only
+    /// router-side bound.
+    #[test]
+    fn deepseek_v41_declares_images_without_a_count_of_its_own() {
+        let tokenizer = TestTokenizer::new(&[]);
+        let config = json!({"model_type": "deepseek_v41", "image_token_id": IMAGE_TOKEN_ID});
+        let metadata = metadata(&tokenizer, &config);
+        let spec = DeepseekV41VisionSpec;
+
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap(),
+            HashMap::from([(Modality::Image, usize::MAX)])
+        );
+        for count in [129, 1_000] {
+            spec.validate_media_request(&metadata, &[(Modality::Image, count)])
+                .unwrap_or_else(|error| panic!("{count} images: {error}"));
+        }
+        // A deployment's own cap (the flag or the environment override, or
+        // the engine's advertised limit the gateway passes in) still binds.
+        let capped = HashMap::from([(Modality::Image, 128)]);
+        assert_eq!(
+            spec.validate_media_request_with_limits(&metadata, &[(Modality::Image, 129)], &capped),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "deepseek_v41",
+                modality: Modality::Image,
+                limit: 128,
+                requested: 129,
+            })
+        );
+    }
+
     #[test]
     fn placeholder_and_contract_hooks() {
         let tokenizer = TestTokenizer::new(&[]);
@@ -286,7 +330,7 @@ mod tests {
         );
         assert_eq!(
             spec.modality_limits(&metadata).unwrap(),
-            HashMap::from([(Modality::Image, 128)])
+            HashMap::from([(Modality::Image, usize::MAX)])
         );
         let layouts = spec.field_layouts();
         assert_eq!(

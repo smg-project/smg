@@ -1375,3 +1375,98 @@ async fn the_zmq_sglang_arm_assembles_the_grpc_paths_payload_and_the_wire_carrie
         grid.data.as_slice()
     );
 }
+
+/// A batch of images of different sizes through the Pixtral processor is
+/// floats (the reference pads it after normalizing, with a value no byte
+/// maps to), which a worker that normalizes pixels on device cannot take:
+/// the request is refused with the typed error instead of written as floats
+/// the device would normalize again. A same-size batch reaches that worker
+/// as bytes, and the mixed-size batch reaches a worker that normalizes on
+/// host as floats.
+#[test]
+fn a_mixed_size_batch_is_refused_by_a_worker_that_normalizes_on_device() {
+    use llm_multimodal::{vision::PixtralProcessor, ImageSource, VisionPreProcessor};
+
+    let frame_of = |width: u32, height: u32, hash: String| {
+        let image =
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(width, height, |x, y| {
+                image::Rgb([x as u8 * 5, y as u8 * 5, 7])
+            }));
+        let frame = Arc::new(ImageFrame::new(
+            image.clone(),
+            bytes::Bytes::from_static(b"bytes"),
+            ImageDetail::Auto,
+            ImageSource::InlineBytes,
+            hash,
+        ));
+        (image, frame)
+    };
+    let processor = PixtralProcessor::new();
+    let intermediate = |sizes: [(u32, u32); 2]| {
+        let (images, frames): (Vec<_>, Vec<_>) = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, &(width, height))| frame_of(width, height, format!("hash-{index}")))
+            .unzip();
+        let preprocessed = processor
+            .preprocess(&images.iter().collect::<Vec<_>>())
+            .expect("Pixtral preprocess");
+        let bindings = preprocessed
+            .feature_token_counts
+            .iter()
+            .enumerate()
+            .map(|(item_index, &length)| PromptBinding {
+                item_index,
+                prompt_ordinal: item_index,
+                structural: PlaceholderRange {
+                    offset: 10 + 1000 * item_index,
+                    length,
+                },
+                patches: vec![],
+            })
+            .collect();
+        PrecomputedMultimodalIntermediate {
+            preprocessed,
+            media: MediaBatch::Images(frames),
+            bindings,
+            placeholder_token_id: Some(10),
+            field_layouts: EncoderFieldLayouts::new(
+                FieldLayout::Batched,
+                HashMap::from([("image_sizes".to_string(), FieldLayout::Batched)]),
+            ),
+            keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
+        }
+    };
+    let normalizes_on_device = VllmAssembly {
+        encoder_dtype: "bfloat16".to_string(),
+        device_normalizes: true,
+        shm_enabled: false,
+        shm_min_bytes: 0,
+    };
+    let normalizes_on_host = VllmAssembly {
+        device_normalizes: false,
+        ..normalizes_on_device.clone()
+    };
+
+    let error = assemble_vllm(intermediate([(32, 32), (48, 32)]), &normalizes_on_device)
+        .expect_err("a batch the processor pads after normalizing has no bytes for the worker");
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.is::<FloatsForDeviceNormalization>()),
+        "{error:#}"
+    );
+    assert!(
+        error.to_string().contains("mm_device_do_normalize"),
+        "{error:#}"
+    );
+
+    let bytes = assemble_vllm(intermediate([(32, 32), (32, 32)]), &normalizes_on_device)
+        .expect("a same-size batch is the pixels' own bytes");
+    assert_eq!(bytes.pixel_values_dtype, "uint8");
+
+    let floats = assemble_vllm(intermediate([(32, 32), (48, 32)]), &normalizes_on_host)
+        .expect("a worker that normalizes on host takes the floats");
+    assert_eq!(floats.pixel_values_dtype, "bfloat16");
+}

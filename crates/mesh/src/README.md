@@ -130,12 +130,13 @@ log and the `router_mesh_*` series on the metrics listener
 
 ### Log lines
 
-With `--log-level info` the mesh reports (source file in parentheses):
+The mesh reports, by level (source file in parentheses):
 
 | Level | Line | Meaning |
 |---|---|---|
-| info | `Round <n> Status:{...}` | Once a second, the whole membership table as this node sees it: every member's name, address, status and version (`gossip_controller.rs`, the event loop). |
-| info | `Connecting to peer <name> at <addr>` / `Successfully connected to peer <name>` | A probe and its success. The configured join peers are called `init_peer`, `init_peer_1`, `init_peer_2` (their position in `--mesh-peer-urls`) until their names are learned from their answers. |
+| info | `Member <name> is <Status> at version <n> (<how>)` | A member's status changed in this node's table, and `<how>` says what changed it: it joined the table; `a peer's table` (the table a probe carried) held a higher version; or `its own word`, the member's answer to this node's probe, differed from what was held (`gossip_service.rs`, `gossip_controller.rs`). Nothing is written while nothing changes. |
+| warn | `Failed to connect to peer <name> at <addr>: <error>, now try ping-req` | A direct probe failed; up to three live members are asked to probe the peer in turn (`gossip_controller.rs`). A pair that cannot talk while a third member reaches both shows up here and nowhere else. |
+| info | `Broadcasting node status to <n> alive nodes, new_state: ...` | This node's verdict on a member that answered neither a probe nor a relayed one (`gossip_controller.rs`). |
 | warn | `Error connecting to peer <name> (attempt <n>): <error>. Next retry in <delay>` | A failed probe and the backoff. |
 | info | `Cluster state updated. Current nodes: <n>` | A received probe changed the membership table (`gossip_service.rs`). |
 | info | `Starting sync_stream connection to peer <name> at address <addr>` / `Sync stream connection to <name> established` | This node dialed a sync stream. |
@@ -144,6 +145,13 @@ With `--log-level info` the mesh reports (source file in parentheses):
 | info | `Mesh listener <addr> is prepared to serve TLS with the node certificate` | At start, with the TLS flags. |
 | error | `Mesh server failed: <error>` | The mesh server's task ended while the gateway runs (`model_gateway/src/server.rs`). |
 | info | `Mesh router discovery started` | Kubernetes discovery of the members is running. |
+
+At `--log-level debug` and `trace` the mesh adds, among the per-round lines:
+
+| Level | Line | Meaning |
+|---|---|---|
+| debug | `Connecting to peer <name> at <addr>` / `Successfully connected to peer <name>` | A probe and its success, once a round. The configured join peers are called `init_peer`, `init_peer_1`, `init_peer_2` (their position in `--mesh-peer-urls`) until their names are learned from their answers. |
+| trace | `Round <n> Status:{...}` | Once a second, the whole membership table as this node sees it: every member's name, address, status and version (`gossip_controller.rs`, the event loop). |
 
 ### Metrics
 
@@ -169,10 +177,12 @@ smg --host 127.0.0.1 --port 29744 --prometheus-host 127.0.0.1 --prometheus-port 
 ```
 
 Start them in either order: B dials A under its backoff until A answers.
-Within a few rounds B's log shows `Successfully connected to peer init_peer`
-and A's `Cluster state updated. Current nodes: 2`; each `Round <n> Status`
-line then lists both members with `status: Alive`. `A` sorts before `B`, so
-A dials the sync stream and B accepts it:
+Within a few rounds B's log shows `Member A is Alive at version 1 (its own
+word; was not in the table)` and A's `Member B is Alive at version 1 (joined
+this node's table)` with `Cluster state updated. Current nodes: 2`; at
+`--log-level trace` each `Round <n> Status` line lists both members with
+`status: Alive`. `A` sorts before `B`, so A dials the sync stream and B
+accepts it:
 
 ```bash
 curl -s http://127.0.0.1:29745/metrics | grep '^router_mesh_peer_connections'

@@ -285,6 +285,82 @@ fn record_engine_load_sets_pd_gauges_when_disagg_present() {
     );
 }
 
+/// The `smg_engine_*` set recorded through kept handles renders exactly as
+/// it does with a key built per record: the same series with the same
+/// values, a capacity or PD series only where a load carried the figure,
+/// and a rank's own record (the pushed shape) moving that rank's values
+/// alone.
+#[test]
+fn the_engine_load_set_renders_the_same_through_kept_handles() {
+    let report = |running: i32, hit_rate: f64| WorkerLoadResponse {
+        timestamp: "t".to_string(),
+        dp_rank_count: 2,
+        loads: vec![
+            SchedulerLoadSnapshot {
+                dp_rank: 0,
+                num_running_reqs: running,
+                num_waiting_reqs: 1,
+                token_usage: 0.5,
+                gen_throughput: 42.0,
+                cache_hit_rate: hit_rate,
+                max_total_num_tokens: 262_144,
+                disagg_mode: Some("prefill".to_string()),
+                kv_transfer_latency_ms: Some(3.5),
+                prefill_queue_reqs: Some(9),
+                ..Default::default()
+            },
+            SchedulerLoadSnapshot {
+                dp_rank: 1,
+                num_running_reqs: running + 1,
+                cache_hit_rate: hit_rate,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let records = || {
+        Metrics::record_engine_load("http://w:1", "m", &report(7, 0.25));
+        Metrics::record_engine_rank_load("http://w:1", "m", &report(8, 0.75).loads[0]);
+        Metrics::record_engine_load("http://w:2", "m2", &report(1, 0.5));
+    };
+    let built = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(false));
+        records();
+        handles::reset();
+    });
+    let kept = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(true));
+        records();
+        handles::reset();
+    });
+    assert_eq!(sorted_series(&kept), sorted_series(&built));
+    for expected in [
+        "smg_engine_running_requests{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\"} 8",
+        "smg_engine_running_requests{worker=\"http://w:1\",model=\"m\",dp_rank=\"1\"} 8",
+        "smg_engine_cache_hit_rate{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\"} 0.75",
+        "smg_engine_cache_hit_rate{worker=\"http://w:1\",model=\"m\",dp_rank=\"1\"} 0.25",
+        "smg_engine_kv_capacity_tokens{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\"} 262144",
+        "smg_engine_pd_kv_transfer_latency_ms{worker=\"http://w:1\",role=\"prefill\",dp_rank=\"0\"} 3.5",
+        "smg_engine_pd_prefill_queue_reqs{worker=\"http://w:1\",role=\"prefill\",dp_rank=\"0\"} 9",
+        "smg_engine_running_requests{worker=\"http://w:2\",model=\"m2\",dp_rank=\"1\"} 2",
+    ] {
+        assert!(
+            kept.lines().any(|line| line == expected),
+            "missing {expected} in:\n{kept}"
+        );
+    }
+    assert!(
+        !kept.contains(
+            "smg_engine_kv_capacity_tokens{worker=\"http://w:1\",model=\"m\",dp_rank=\"1\""
+        ),
+        "a rank whose loads carry no capacity has no capacity series:\n{kept}"
+    );
+    assert!(
+        !kept.contains("smg_engine_pd_kv_transfer_speed_gb_s"),
+        "a figure no load carried has no series:\n{kept}"
+    );
+}
+
 #[test]
 fn cache_tree_setters_emit_per_model_gauges() {
     let rendered = render_with_recorder(|| {

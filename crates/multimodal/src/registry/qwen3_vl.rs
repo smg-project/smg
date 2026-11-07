@@ -296,23 +296,34 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         }
     }
 
-    /// The family sets no per-request image count of its own: its serving
-    /// engines read the image count as unlimited (the processing info of the
-    /// Qwen2-VL line, which the Qwen3-VL and Qwen3.5 infos inherit, declares
-    /// `image: None`), the checkpoints' processor configs bound an image's
-    /// pixels, not the number of images, and the context length is the
-    /// practical bound. Images stay declared (an undeclared modality is
-    /// refused as unsupported) without a bound of the spec's, so the
-    /// effective limit is the engine's advertised one, else the deployment's
-    /// `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`. One video per
-    /// request stays the spec's declared default.
+    /// The family sets no per-request image or video count of its own: its
+    /// serving engines read both counts as unlimited (the processing info of
+    /// the Qwen2-VL line, which the Qwen3-VL and Qwen3.5 infos inherit,
+    /// declares `image: None, video: None`), the checkpoints' processor
+    /// configs bound an image's pixels and a clip's frames, not how many of
+    /// either, and the context length is the practical bound. Both stay
+    /// declared (an undeclared modality is refused as unsupported) without a
+    /// bound of the spec's, so the effective limit is the engine's advertised
+    /// one, else the deployment's `--mm-per-request-image-limit` /
+    /// `SMG_IMAGE_MAX_COUNT` for images and `SMG_VIDEO_MAX_COUNT` for video.
+    ///
+    /// What still bounds such a request, and where it lives. Before any
+    /// fetch: the per-request limit the model's workers advertise for their
+    /// engine, which caps the router's own limit in the gateway's limit
+    /// resolution, and the deployment's `SMG_IMAGE_MAX_COUNT` /
+    /// `SMG_VIDEO_MAX_COUNT` / `SMG_AUDIO_MAX_COUNT` (and
+    /// `--mm-per-request-image-limit` for images), read in the same
+    /// resolution. At or after the fetch: the gateway's cap on media bytes
+    /// in flight (`multimodal_max_inflight_bytes`), the engine's advertised
+    /// encoder budget and the context length. A number of the spec's own
+    /// would be a declared default again, not a bound of the family's.
     fn modality_limits(
         &self,
         metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
         let mut limits = HashMap::from([(Modality::Image, usize::MAX)]);
         if metadata.config_u32(&["video_token_id"]).is_some() {
-            limits.insert(Modality::Video, 1);
+            limits.insert(Modality::Video, usize::MAX);
         }
         Ok(limits)
     }
@@ -713,8 +724,8 @@ mod tests {
     /// The family bounds its images by context, not by count: the spec
     /// declares the modality without a limit of its own (the ten it carried
     /// was the first registry's default, never a count of the family's), so
-    /// a deployment knob is the only router-side bound; the single video
-    /// stays declared and audio stays unsupported.
+    /// a deployment knob is the only router-side bound; video stays declared
+    /// (without a count either) and audio stays unsupported.
     #[test]
     fn qwen3_vl_declares_images_without_a_count_of_its_own() {
         use std::collections::HashMap;
@@ -732,7 +743,7 @@ mod tests {
 
         assert_eq!(
             spec.modality_limits(&metadata).unwrap(),
-            HashMap::from([(Modality::Image, usize::MAX), (Modality::Video, 1)])
+            HashMap::from([(Modality::Image, usize::MAX), (Modality::Video, usize::MAX)])
         );
         for count in [11, 1_000] {
             spec.validate_media_request(&metadata, &[(Modality::Image, count)])
@@ -757,6 +768,48 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// The family bounds its video by context, not by count: the spec
+    /// declares the modality without a limit of its own (the one clip it
+    /// carried was a declared default, never a count of the family's), so a
+    /// deployment's `SMG_VIDEO_MAX_COUNT` or the engine's advertised limit is
+    /// the only router-side bound.
+    #[test]
+    fn qwen3_vl_declares_video_without_a_count_of_its_own() {
+        use std::collections::HashMap;
+
+        use crate::registry::{ModelProcessorSpec, ModelRegistryError};
+
+        let tokenizer = TestTokenizer::new(&[("<|video_pad|>", 151656)]);
+        let config = video_config("qwen3_vl");
+        let metadata = ModelMetadata {
+            model_id: "Qwen3-VL-8B-Instruct",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let spec = super::Qwen3VLVisionSpec;
+
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap()[&Modality::Video],
+            usize::MAX
+        );
+        for count in [2, 100] {
+            spec.validate_media_request(&metadata, &[(Modality::Video, count)])
+                .unwrap_or_else(|error| panic!("{count} clips: {error}"));
+        }
+        // A deployment's own cap (the environment override, or the engine's
+        // advertised limit the gateway passes in) still binds.
+        let capped = HashMap::from([(Modality::Video, 1)]);
+        assert_eq!(
+            spec.validate_media_request_with_limits(&metadata, &[(Modality::Video, 2)], &capped),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "qwen3_vl",
+                modality: Modality::Video,
+                limit: 1,
+                requested: 2,
+            })
+        );
     }
 
     #[test]

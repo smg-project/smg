@@ -653,12 +653,16 @@ struct ClientInner<P: EngineProtocol> {
     /// only: vLLM reserves negative ids for notices it sends unprompted.
     next_call_id: AtomicI64,
     /// The engine's last output of any kind (a token, a completion, a
-    /// stats-only step), in milliseconds on `output_clock`; reset at the
-    /// first submission the engine reports every step after a spell without
-    /// one, so the silence such a request sees counts from its own dispatch.
-    /// Read by [`Client::output_silence`].
+    /// stats-only step), in milliseconds on `output_clock`; 0 before the
+    /// first. Read by [`Client::last_output_at`] and, beside
+    /// `step_reports_since_ms`, by [`Client::output_silence`].
     output_clock: Instant,
     last_output_ms: AtomicU64,
+    /// When the first request the engine reports every step was dispatched
+    /// after a spell without one, in milliseconds on `output_clock`: the
+    /// silence such a request sees counts from its own dispatch, not from an
+    /// output the engine gave before it had anything to say.
+    step_reports_since_ms: AtomicU64,
     /// The engine has sent a scheduler step without any token (a stats-only
     /// step report): its silence is then the scheduler's own, not a prefill
     /// in progress. Read by [`Client::reports_steps`].
@@ -756,10 +760,17 @@ impl<P: EngineProtocol> ClientInner<P> {
         }
     }
 
-    /// Stamp an output from the engine (or a dispatch onto an idle one) now.
+    /// Milliseconds on `output_clock` now.
+    fn clock_ms(&self) -> u64 {
+        u64::try_from(self.output_clock.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Stamp an output from the engine now: never 0, which
+    /// [`Client::last_output_at`] reads as no output yet, so a batch within
+    /// the clock's first millisecond reads as its first.
     fn note_output(&self) {
-        let millis = u64::try_from(self.output_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.last_output_ms.store(millis, Ordering::Relaxed);
+        self.last_output_ms
+            .store(self.clock_ms().max(1), Ordering::Relaxed);
     }
 
     /// Retire in-flight request ids from a rank. Idempotent: an id already
@@ -1301,6 +1312,7 @@ impl<P: EngineProtocol> Client<P> {
             next_call_id: AtomicI64::new(1),
             output_clock: Instant::now(),
             last_output_ms: AtomicU64::new(0),
+            step_reports_since_ms: AtomicU64::new(0),
             steps_reported: AtomicBool::new(false),
             kv_transfer_wanted: AtomicBool::new(false),
         });
@@ -1547,8 +1559,24 @@ impl<P: EngineProtocol> Client<P> {
         if self.inner.registry.lock().reported_every_step() == 0 {
             return None;
         }
-        let since = Duration::from_millis(self.inner.last_output_ms.load(Ordering::Relaxed));
+        let since = Duration::from_millis(
+            self.inner
+                .last_output_ms
+                .load(Ordering::Relaxed)
+                .max(self.inner.step_reports_since_ms.load(Ordering::Relaxed)),
+        );
         Some(self.inner.output_clock.elapsed().saturating_sub(since))
+    }
+
+    /// When the engine last sent an output batch of any kind (a token, a
+    /// completion, a stats-only step), to the millisecond; `None` before
+    /// the first. Read whether or not anything is in flight, and never moved
+    /// by a dispatch: a caller that submitted a request of its own at some
+    /// instant reads a later one here as the engine having spoken since,
+    /// whichever request it spoke for (the servicers' deep health probe).
+    pub fn last_output_at(&self) -> Option<Instant> {
+        let millis = self.inner.last_output_ms.load(Ordering::Relaxed);
+        (millis > 0).then(|| self.inner.output_clock + Duration::from_millis(millis))
     }
 
     /// Whether the engine's wire reports every scheduler step: it has shown
@@ -1625,7 +1653,9 @@ impl<P: EngineProtocol> Client<P> {
             // with nothing it reports every step had nothing to say until
             // now.
             if quiet && every_step {
-                self.inner.note_output();
+                self.inner
+                    .step_reports_since_ms
+                    .store(self.inner.clock_ms(), Ordering::Relaxed);
             }
             receiver
         };
@@ -1968,6 +1998,11 @@ impl<P: EngineProtocol> Dispatcher<P> {
         self.consecutive_decode_errors = 0;
         let inner = &self.inner;
         inner.note_output();
+        // A batch with neither outputs nor finished requests is a stats-only
+        // step report when it carries a load tail (the engine's wire reports
+        // every step); without one it is the engine's bare liveness signal
+        // (a scheduler answering a health probe it could not queue): an
+        // output like any other, and no step report.
         if batch.outputs.is_empty() && batch.finished_request_ids.is_empty() && batch.load.is_some()
         {
             inner.steps_reported.store(true, Ordering::Relaxed);

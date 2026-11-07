@@ -1,11 +1,20 @@
 //! Test support of the gRPC router: the `AppContext` a test constructs its
 //! router over, with the components `GrpcRouter::new` needs (the parser
 //! factories always; an initialized MCP orchestrator, which the Responses
-//! contexts of the regular and the disaggregated modes read).
+//! contexts of the regular and the disaggregated modes read), and the
+//! labelled worker selection the stages' tests read a decode worker's
+//! labels from.
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    sync::{Arc, Mutex, OnceLock},
+    thread::{self, ThreadId},
+};
 
-use llm_tokenizer::registry::TokenizerRegistry;
+use llm_tokenizer::{
+    registry::TokenizerRegistry,
+    traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer},
+    MockTokenizer,
+};
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
@@ -17,7 +26,8 @@ use crate::{
     app_context::AppContext,
     config::{ParserChoice, PolicyConfig, RouterConfig, RouterConfigBuilder, RoutingMode},
     policies::PolicyRegistry,
-    worker::WorkerRegistry,
+    routers::grpc::context::WorkerSelection,
+    worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType},
 };
 
 /// Minimal `AppContext` for constructing a gRPC router in `mode`. Regular and
@@ -98,4 +108,91 @@ pub(crate) fn grpc_ctx_from(
             .build()
             .expect("app context"),
     )
+}
+
+/// One regular gRPC worker carrying `labels`, as the selection a stage or a
+/// parser utility reads the decode worker's labels from.
+pub(crate) fn worker(labels: &[(&str, &str)]) -> WorkerSelection {
+    let mut builder =
+        BasicWorkerBuilder::new("grpc://engine:50051").worker_type(WorkerType::Regular);
+    for (key, value) in labels {
+        builder = builder.label(*key, *value);
+    }
+    WorkerSelection::Single {
+        worker: Arc::new(builder.build()),
+    }
+}
+
+/// The threads a [`ThreadRecordingTokenizer`]'s encodes and decodes ran on,
+/// in order.
+pub(crate) type ThreadRecord = Arc<Mutex<Vec<ThreadId>>>;
+
+/// The mock tokenizer behind a record of the thread each of its encodes and
+/// decodes ran on: the probe of the offload policy, under which an input
+/// below the bound runs on the calling thread and one at or above it on the
+/// blocking pool.
+pub(crate) struct ThreadRecordingTokenizer {
+    inner: MockTokenizer,
+    ran_on: ThreadRecord,
+}
+
+/// A [`ThreadRecordingTokenizer`] over the plain mock, with its record.
+pub(crate) fn thread_recording_tokenizer() -> (Arc<dyn Tokenizer>, ThreadRecord) {
+    let ran_on: ThreadRecord = Arc::new(Mutex::new(Vec::new()));
+    let tokenizer = Arc::new(ThreadRecordingTokenizer {
+        inner: MockTokenizer::new(),
+        ran_on: ran_on.clone(),
+    });
+    (tokenizer, ran_on)
+}
+
+impl ThreadRecordingTokenizer {
+    fn record(&self) {
+        self.ran_on.lock().unwrap().push(thread::current().id());
+    }
+}
+
+impl Encoder for ThreadRecordingTokenizer {
+    fn encode(&self, input: &str, add_special_tokens: bool) -> anyhow::Result<Encoding> {
+        self.record();
+        self.inner.encode(input, add_special_tokens)
+    }
+
+    fn encode_batch(
+        &self,
+        inputs: &[&str],
+        add_special_tokens: bool,
+    ) -> anyhow::Result<Vec<Encoding>> {
+        self.record();
+        self.inner.encode_batch(inputs, add_special_tokens)
+    }
+}
+
+impl Decoder for ThreadRecordingTokenizer {
+    fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+        self.record();
+        self.inner.decode(token_ids, skip_special_tokens)
+    }
+}
+
+impl Tokenizer for ThreadRecordingTokenizer {
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    fn get_special_tokens(&self) -> &SpecialTokens {
+        self.inner.get_special_tokens()
+    }
+
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }

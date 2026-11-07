@@ -7,38 +7,7 @@ use std::{
     process::Command,
 };
 
-/// Set to a non-empty value where the video tools must be installed (CI sets
-/// it on the shard that installs ffmpeg): the container agreement tests then
-/// fail, instead of skipping, when ffmpeg, ffprobe or an encoder they use is
-/// missing.
-const REQUIRE_VIDEO_TOOLS: &str = "SMG_REQUIRE_VIDEO_TOOLS";
-
-/// Reports that `missing` keeps a test or a case from running: a failure
-/// where [`REQUIRE_VIDEO_TOOLS`] is set, a skip said on stderr elsewhere.
-#[expect(
-    clippy::print_stderr,
-    reason = "a skip says so; the harness shows it under --nocapture"
-)]
-fn skip_for(missing: &str) {
-    let required = std::env::var_os(REQUIRE_VIDEO_TOOLS).is_some_and(|value| !value.is_empty());
-    assert!(!required, "{missing}, and {REQUIRE_VIDEO_TOOLS} is set");
-    eprintln!("{missing}: skipping; the synthetic container tests still run");
-}
-
-/// Whether ffmpeg and ffprobe run on this host.
-fn video_tools_available() -> bool {
-    let runs = |tool: &str| {
-        Command::new(tool)
-            .arg("-version")
-            .output()
-            .is_ok_and(|out| out.status.success())
-    };
-    let available = runs("ffmpeg") && runs("ffprobe");
-    if !available {
-        skip_for("ffmpeg or ffprobe is not installed");
-    }
-    available
-}
+use crate::test_support::{skip_for, video_tools_available};
 
 /// Whether this ffmpeg build carries `encoder`. `ffmpeg -h encoder=<name>`
 /// exits 0 for a name it does not know as well, so the answer is what it

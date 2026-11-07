@@ -62,6 +62,18 @@ pub(crate) trait WireState: Send + Sync + 'static {
     fn shared(&self) -> &Shared;
 }
 
+/// Whose request a wire's generate path serves, which decides what is
+/// counted: a client's goes into the request metrics and the load tracker;
+/// the servicer's own health probe of the scheduler goes into neither, so a
+/// one-token probe on an idle rank every probe interval never reads as a
+/// client's request in the counters and latencies, nor as a sample of the
+/// rank's prefill capacity, hit rate or generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestOrigin {
+    Client,
+    HealthProbe,
+}
+
 /// The half of a servicer's state every wire shares.
 pub(crate) struct Shared {
     /// The KV-event relay for the engine's ZMQ publisher; `None` when events

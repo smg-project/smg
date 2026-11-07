@@ -1324,6 +1324,8 @@ const KIMI_K3_OUTPUTS: &[&str] = &[
      <|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>",
     "<|open|>think<|sep|>Janet sells 9 eggs.\nShe makes $18.<|close|>think<|sep|>\
      <|open|>response<|sep|>18<|close|>response<|sep|><|close|>message<|sep|>",
+    // The reply written straight into the prefilled thought and closed by the answer's closer.
+    "<|open|>think<|sep|>The answer is 42.<|close|>response<|sep|><|close|>message<|sep|>",
     "<|open|>think<|sep|><|close|>think<|sep|>\
      <|open|>response<|sep|><|close|>response<|sep|>\
      <|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>\

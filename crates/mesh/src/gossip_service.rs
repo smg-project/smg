@@ -54,9 +54,9 @@ use super::{
         gossip::{
             self,
             gossip_server::{Gossip, GossipServer},
-            GossipMessage, NodeState, NodeStatus, NodeUpdate, PingReq, StreamMessage,
+            GossipMessage, NodeState, NodeStatus, NodeUpdate, Ping, PingReq, StreamMessage,
         },
-        ClusterState,
+        status_of, ClusterState,
     },
     transport::{
         limits::MAX_MESSAGE_SIZE,
@@ -254,18 +254,32 @@ impl GossipService {
         let mut state = self.state.write();
         let mut updated = false;
         for node in incoming_nodes {
-            state
-                .entry(node.name.clone())
-                .and_modify(|entry| {
-                    if node.version > entry.version {
-                        *entry = node.clone();
-                        updated = true;
-                    }
-                })
-                .or_insert_with(|| {
+            match state.get_mut(&node.name) {
+                None => {
+                    log::info!(
+                        "Member {} is {:?} at version {} (joined this node's table)",
+                        node.name,
+                        status_of(&node),
+                        node.version
+                    );
+                    state.insert(node.name.clone(), node);
                     updated = true;
-                    node
-                });
+                }
+                Some(entry) if node.version > entry.version => {
+                    if node.status != entry.status {
+                        log::info!(
+                            "Member {} is {:?} at version {} (a peer's table; was {:?})",
+                            node.name,
+                            status_of(&node),
+                            node.version,
+                            status_of(entry)
+                        );
+                    }
+                    *entry = node;
+                    updated = true;
+                }
+                Some(_) => {}
+            }
         }
         if updated {
             log::info!("Cluster state updated. Current nodes: {}", state.len());
@@ -287,9 +301,9 @@ impl Gossip for GossipService {
         let message = request.into_inner();
         match message.payload {
             Some(gossip::gossip_message::Payload::Ping(ping)) => {
-                log::info!("Received {:?}", ping);
+                log::trace!("Received {:?}", ping);
                 if let Some(stat_sync) = ping.state_sync {
-                    log::info!("Merging state from Ping: {} nodes", stat_sync.nodes.len());
+                    log::debug!("Merging state from Ping: {} nodes", stat_sync.nodes.len());
                     self.merge_state(stat_sync.nodes);
                 }
                 // Return current status of self node (could be Alive or Leaving)
@@ -307,8 +321,12 @@ impl Gossip for GossipService {
                 }))
             }
             Some(gossip::gossip_message::Payload::PingReq(PingReq { node: Some(node) })) => {
-                log::info!("PingReq to node {} addr:{}", node.name, node.address);
-                let res = self.dialer.ping(&node, None).await?;
+                log::debug!("PingReq to node {} addr:{}", node.name, node.address);
+                // The probe sent on the asker's behalf carries no table: the
+                // asker's is not this node's to send, and the target's own
+                // answer is what the asker is waiting for.
+                let probe = gossip::gossip_message::Payload::Ping(Ping { state_sync: None });
+                let res = self.dialer.ping(&node, Some(probe)).await?;
                 Ok(Response::new(res))
             }
             _ => Err(Status::invalid_argument("Invalid message payload")),

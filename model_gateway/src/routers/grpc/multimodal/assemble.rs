@@ -353,35 +353,56 @@ pub(super) fn assemble_sglang_with_dtype(
 }
 
 /// The dtype the primary tensor is written in: the engine's own float dtype,
-/// or the pixels' own bytes for an engine that normalizes on device. A
-/// preprocessor that produces normalized floats has no bytes to give such an
-/// engine, which is a deployment mismatch, said once.
+/// or the pixels' own bytes for an engine that normalizes on device.
+/// Normalized floats have no bytes to give such an engine, which would
+/// normalize them again: the request is refused
+/// ([`FloatsForDeviceNormalization`]) rather than answered wrong.
 fn vllm_pixel_dtype<'a>(
     preprocessed: &PreprocessedEncoderInputs,
     assembly: &'a VllmAssembly,
-) -> &'a str {
+) -> Result<&'a str> {
     if !assembly.device_normalizes {
-        return &assembly.encoder_dtype;
+        return Ok(&assembly.encoder_dtype);
     }
     if preprocessed.encoder_input.pixel_norm().is_some() {
-        return "uint8";
+        return Ok("uint8");
     }
-    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    WARNED.get_or_init(|| {
-        warn!(
-            "the engine normalizes pixels on device but this model's preprocessor produces \
-             normalized floats, which the engine will normalize again; start the engine with \
-             --mm-device-do-normalize=false"
-        );
-    });
-    &assembly.encoder_dtype
+    Err(anyhow::Error::new(FloatsForDeviceNormalization))
 }
+
+/// Normalized floats met a worker that normalizes pixels on device
+/// (`mm_device_do_normalize`): it takes the pixels' own bytes and would
+/// normalize these a second time, so the request is refused instead of
+/// answered wrong. A processor that produces floats meets it on every
+/// request to such a worker (a pairing the in-process pipeline refuses at
+/// startup); a processor that produces bytes meets it on the one batch it
+/// can only pad after normalizing (a Pixtral-tower batch of images of
+/// different sizes), which both pipelines answer as the request's own error
+/// (`assembly_error_response` on the router side, `WorkerMediaError::Invalid`
+/// on the worker side). The remedy is in the message: a worker that does not
+/// normalize on device, or images the processor gives as bytes.
+#[derive(Debug)]
+pub(crate) struct FloatsForDeviceNormalization;
+
+impl std::fmt::Display for FloatsForDeviceNormalization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the selected worker normalizes pixels on device (mm_device_do_normalize) and takes \
+             raw pixel bytes, but these images were prepared as normalized floats, which it \
+             would normalize again; serve the model on a worker that does not normalize on \
+             device (--mm-device-do-normalize=false), or send images the processor gives as \
+             bytes (one image, or images of one size, per request)",
+        )
+    }
+}
+
+impl std::error::Error for FloatsForDeviceNormalization {}
 
 fn assemble_vllm(
     intermediate: PrecomputedMultimodalIntermediate,
     assembly: &VllmAssembly,
 ) -> Result<VllmMultimodalData> {
-    let dtype = vllm_pixel_dtype(&intermediate.preprocessed, assembly);
+    let dtype = vllm_pixel_dtype(&intermediate.preprocessed, assembly)?;
     let (pixel_values, pixel_values_shape, pixel_values_dtype) =
         serialize_encoder_input_owned(intermediate.preprocessed.encoder_input, dtype)?;
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);

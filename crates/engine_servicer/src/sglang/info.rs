@@ -1,24 +1,128 @@
-//! Read-only RPCs: `HealthCheck`, `GetModelInfo`, `GetServerInfo`, `GetLoads`.
+//! The informational RPCs: `HealthCheck` (the Python servicer's one-token
+//! probe of the scheduler), `GetModelInfo`, `GetServerInfo`, `GetLoads`.
 //! Metadata comes from the launcher's config (what the Python servicer reads
 //! off SGLang's `ModelConfig` and `ServerArgs`) and from the handshake.
 
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use futures::StreamExt;
 use prost_types::Timestamp;
 use smg_grpc_client::sglang_proto as sg;
 use tonic::Status;
 
-use super::{State, HEALTHY};
+use super::{embed, generate, State};
 use crate::{
+    health_probe::{self, Verdict},
     load_report::{mean, rank_entries},
     proto_json::{insert_capacity, struct_from_json},
-    servicer::proto_token_ids,
+    servicer::{proto_token_ids, RequestOrigin},
 };
 
-/// `HealthCheck`: SERVING only with the engine link up and no drain announced.
-pub(super) fn health_check(state: &State) -> sg::HealthCheckResponse {
-    sg::HealthCheckResponse {
-        healthy: state.shared.is_serving(),
-        message: state.shared.health_message(HEALTHY).to_string(),
+/// What `HealthCheck` says of a scheduler that answered the probe, or
+/// pushed anything while it was out (the Python servicer's words).
+const PASSED: &str = "Health check passed";
+
+/// `HealthCheck`: unhealthy with the engine link down or the drain
+/// announced, as every wire; else the Python servicer's deep probe, a
+/// one-token request through [`generate::generate`] (an embedding request
+/// on a model without generation), healthy once the scheduler pushed
+/// anything since the probe started or answered it, unhealthy the moment the
+/// probe fails, unhealthy at the servicer's bound with neither
+/// ([`health_probe::run`]). A disaggregated role answers shallow: its
+/// requests pair with a peer, so a lone probe would not reach the scheduler.
+pub(super) async fn health_check(state: &Arc<State>) -> sg::HealthCheckResponse {
+    health_check_with(state, state.health_probe_timeout).await
+}
+
+/// [`health_check`] with the probe's bound given.
+pub(super) async fn health_check_with(
+    state: &Arc<State>,
+    timeout: Duration,
+) -> sg::HealthCheckResponse {
+    if !state.shared.is_serving() {
+        return sg::HealthCheckResponse {
+            healthy: false,
+            message: state.shared.health_message(PASSED).to_string(),
+        };
     }
+    if health_probe::disaggregated_role(&state.model.server_args_json) {
+        return sg::HealthCheckResponse {
+            healthy: true,
+            message: health_probe::SHALLOW_MESSAGE.to_string(),
+        };
+    }
+    let client = match state.shared.engine() {
+        Ok(client) => client,
+        Err(status) => {
+            return sg::HealthCheckResponse {
+                healthy: false,
+                message: status.message().to_string(),
+            }
+        }
+    };
+    let verdict = health_probe::run(timeout, || client.last_output_at(), probe(state)).await;
+    sg::HealthCheckResponse {
+        healthy: verdict.healthy(),
+        message: match verdict {
+            Verdict::Passed => PASSED.to_string(),
+            Verdict::Failed => "Health check probe failed".to_string(),
+            Verdict::TimedOut => format!("Health check timeout after {}s", timeout.as_secs()),
+        },
+    }
+}
+
+/// The probe, as the Python servicer sends it: one token from the prompt
+/// `[0]` at temperature zero under a `HEALTH_CHECK_` id, resolved at its
+/// first output; on a model without generation, the same prompt as an
+/// embedding request. It is the servicer's own, counted neither as a
+/// client's request nor as load ([`RequestOrigin::HealthProbe`]). Dropping
+/// it before the output aborts the request on the scheduler, as a client's
+/// stream does.
+async fn probe(state: &Arc<State>) -> Result<(), Status> {
+    let request_id = format!("HEALTH_CHECK_{}", probe_nanos());
+    let tokenized = Some(sg::TokenizedInput {
+        input_ids: vec![0],
+        original_text: String::new(),
+    });
+    if !state.model.is_generation {
+        let request = sg::EmbedRequest {
+            request_id,
+            tokenized,
+            ..Default::default()
+        };
+        return embed::embed(state, request).await.map(|_| ());
+    }
+    let request = sg::GenerateRequest {
+        request_id,
+        tokenized,
+        sampling_params: Some(sg::SamplingParams {
+            max_new_tokens: Some(1),
+            temperature: 0.0,
+            ..Default::default()
+        }),
+        logprob_start_len: -1,
+        stream: false,
+        ..Default::default()
+    };
+    let mut stream = generate::generate(state, request, None, RequestOrigin::HealthProbe).await?;
+    match stream.next().await {
+        Some(Ok(_)) => Ok(()),
+        Some(Err(status)) => Err(status),
+        None => Err(Status::internal(
+            "the probe's stream ended without an output",
+        )),
+    }
+}
+
+/// The probe id's suffix: nanoseconds since the epoch (the Python servicer
+/// stamps its clock the same way).
+fn probe_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos())
 }
 
 /// `GetModelInfo`: the launcher's config, with the handshake's context length

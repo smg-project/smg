@@ -7,10 +7,11 @@ use validator::Validate;
 use super::{
     common::{
         default_true, deserialize_null_as_empty_vec, deserialize_null_as_false,
-        deserialize_null_as_true, invalid, is_false, is_true, validate_json_schema_shape,
-        validate_stop, CachePartition, ChatLogProbs, ContentPart, Function, FunctionCall,
-        FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool,
-        ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
+        deserialize_null_as_true, invalid, invalid_at, is_false, is_true, on_field,
+        validate_json_schema_shape, validate_logit_bias, validate_stop, CachePartition,
+        ChatLogProbs, ContentPart, Function, FunctionCall, FunctionChoice, GenerationRequest,
+        ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice,
+        ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -282,7 +283,9 @@ pub struct ChatCompletionRequest {
     #[deprecated(note = "Use tools instead")]
     pub functions: Option<Vec<Function>>,
 
-    /// Modify the likelihood of specified tokens appearing in the completion
+    /// Modify the likelihood of specified tokens appearing in the completion:
+    /// token id to a bias in -100..=100, applied by the engine's sampler
+    #[validate(custom(function = "validate_logit_bias"))]
     pub logit_bias: Option<HashMap<String, f32>>,
 
     /// Whether to return log probabilities of the output tokens
@@ -684,13 +687,16 @@ fn validate_verbosity(verbosity: &str) -> Result<(), validator::ValidationError>
     }
 }
 
-/// Schema-level validation for cross-field dependencies
+/// Schema-level validation for cross-field dependencies. Each rule names the
+/// field it is about (`invalid_at`), which the error envelope reports as
+/// `param`; the provider profiles' rules keep their own form.
 fn validate_chat_cross_parameters(
     req: &ChatCompletionRequest,
 ) -> Result<(), validator::ValidationError> {
     // 1. Validate logprobs dependency
     if req.top_logprobs.is_some() && !req.logprobs {
-        return Err(invalid(
+        return Err(invalid_at(
+            "top_logprobs",
             "top_logprobs_requires_logprobs",
             "top_logprobs is only allowed when logprobs is enabled",
         ));
@@ -698,7 +704,8 @@ fn validate_chat_cross_parameters(
 
     // 2. Validate stream_options dependency
     if req.stream_options.is_some() && !req.stream {
-        return Err(invalid(
+        return Err(invalid_at(
+            "stream_options",
             "stream_options_requires_stream",
             "The 'stream_options' parameter is only allowed when 'stream' is enabled",
         ));
@@ -707,7 +714,8 @@ fn validate_chat_cross_parameters(
     // 3. Validate token limits - min <= max
     if let (Some(min), Some(max)) = (req.min_tokens, req.output_token_cap()) {
         if min > max {
-            return Err(invalid(
+            return Err(invalid_at(
+                "min_tokens",
                 "min_tokens_exceeds_max",
                 "min_tokens cannot exceed max_tokens/max_completion_tokens",
             ));
@@ -721,14 +729,16 @@ fn validate_chat_cross_parameters(
     );
 
     if has_json_format && req.regex.is_some() {
-        return Err(invalid(
+        return Err(invalid_at(
+            "regex",
             "regex_conflicts_with_json",
             "cannot use regex constraint with JSON response format",
         ));
     }
 
     if has_json_format && req.ebnf.is_some() {
-        return Err(invalid(
+        return Err(invalid_at(
+            "ebnf",
             "ebnf_conflicts_with_json",
             "cannot use EBNF constraint with JSON response format",
         ));
@@ -744,8 +754,11 @@ fn validate_chat_cross_parameters(
     .filter(|&&x| x)
     .count();
 
+    // Only `regex` beside `ebnf` reaches this rule (a JSON format beside
+    // either was refused above); the second constraint is the one named.
     if constraint_count > 1 {
-        return Err(invalid(
+        return Err(invalid_at(
+            "ebnf",
             "multiple_constraints",
             "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
         ));
@@ -753,7 +766,8 @@ fn validate_chat_cross_parameters(
 
     // 6. Validate response format JSON schema name and shape
     if let Some(ResponseFormat::JsonSchema { json_schema }) = &req.response_format {
-        validate_json_schema_shape(&json_schema.name, &json_schema.schema)?;
+        validate_json_schema_shape(&json_schema.name, &json_schema.schema)
+            .map_err(|error| on_field(error, "response_format"))?;
     }
 
     // 7. A tool_choice against the tools the model will see
@@ -768,7 +782,8 @@ fn validate_chat_cross_parameters(
             continue;
         };
         if !schema.is_object() {
-            return Err(invalid(
+            return Err(invalid_at(
+                format!("tools[{index}].function.parameters"),
                 "invalid_type",
                 format!(
                     "Invalid 'tools[{index}].function.parameters': expected an object, but got {} \
@@ -779,34 +794,18 @@ fn validate_chat_cross_parameters(
         }
     }
 
-    // 9. `logit_bias` is keyed by token ids
-    if let Some(key) = req
-        .logit_bias
-        .iter()
-        .flatten()
-        .map(|(key, _)| key)
-        .find(|key| key.parse::<u64>().is_err())
-    {
-        return Err(invalid(
-            "logit_bias_invalid_key",
-            format!(
-                "Invalid key in 'logit_bias': '{key}'; keys must be non-negative integer token \
-                 ids"
-            ),
-        ));
-    }
-
-    // 10. A continued final message and the generation header exclude each
+    // 9. A continued final message and the generation header exclude each
     //     other: the pair set together is refused, as the engine that has
     //     the field refuses it; `continue_final_message` alone continues.
     if req.continue_final_message && req.add_generation_prompt == Some(true) {
-        return Err(invalid(
+        return Err(invalid_at(
+            "add_generation_prompt",
             "add_generation_prompt_conflicts_with_continue_final_message",
             "Cannot set both `continue_final_message` and `add_generation_prompt` to True.",
         ));
     }
 
-    // 11. Provider-profile contract rules, selected from the model id. Both
+    // 10. Provider-profile contract rules, selected from the model id. Both
     //     token limits at once are judged there: the request keeps whichever
     //     the client wrote and `output_token_cap` reads `max_completion_tokens`
     //     first, the precedence the serving engines apply themselves; only
@@ -833,7 +832,8 @@ fn validate_tool_choice(
         ToolChoice::Value(ToolChoiceValue::None | ToolChoiceValue::Auto)
     );
     if requires_tools && !has_tools {
-        return Err(invalid(
+        return Err(invalid_at(
+            "tool_choice",
             "tool_choice_requires_tools",
             "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
         ));
@@ -845,7 +845,8 @@ fn validate_tool_choice(
         effective_tools().any(|tool| tool.tool_type == "function" && tool.function.name == name)
     };
     match tool_choice {
-        ToolChoice::Function { function, .. } if !declared(&function.name) => Err(invalid(
+        ToolChoice::Function { function, .. } if !declared(&function.name) => Err(invalid_at(
+            "tool_choice",
             "tool_choice_function_not_found",
             format!(
                 "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
@@ -853,7 +854,8 @@ fn validate_tool_choice(
             ),
         )),
         ToolChoice::AllowedTools { mode, .. } if mode != "auto" && mode != "required" => {
-            Err(invalid(
+            Err(invalid_at(
+                "tool_choice.mode",
                 "tool_choice_invalid_mode",
                 format!(
                     "Invalid value for 'tool_choice.allowed_tools.mode': must be 'auto' or 'required', got '{mode}'."
@@ -862,12 +864,14 @@ fn validate_tool_choice(
         }
         // The Chat Completions API takes function tools only in an allowed-tools choice.
         ToolChoice::AllowedTools { tools, .. } => tools.iter().try_for_each(|tool_ref| match tool_ref {
-            ToolReference::Function { name } if !declared(name) => Err(invalid(
+            ToolReference::Function { name } if !declared(name) => Err(invalid_at(
+                "tool_choice.tools",
                 "tool_choice_tool_not_found",
                 format!("Invalid value for 'tool_choice.allowed_tools.tools': tool '{name}' not found in 'tools'."),
             )),
             ToolReference::Function { .. } => Ok(()),
-            _ => Err(invalid(
+            _ => Err(invalid_at(
+                "tool_choice.tools",
                 "tool_choice_invalid_tool_type",
                 format!(
                     "Invalid value for 'tool_choice.allowed_tools.tools': Chat Completion API only supports function tools, got '{}'.",
@@ -2074,11 +2078,36 @@ mod request_contract_tests {
         assert_eq!(rejection(&empty), None);
     }
 
+    /// `logit_bias` is keyed by token ids, no two of them spelling one id,
+    /// and its biases stay within the public API's -100..=100; a refusal
+    /// names the field. A single key with a leading zero names its id.
     #[test]
-    fn logit_bias_is_keyed_by_token_ids() {
-        let bad = request(json!({"logit_bias": {"not-a-token": 1}}));
-        assert!(rejection(&bad).is_some_and(|e| e.contains("logit_bias_invalid_key")));
-        let good = request(json!({"logit_bias": {"50256": -100, "0": 1.5}}));
+    fn logit_bias_is_keyed_by_token_ids_and_bounded() {
+        for (bias, code) in [
+            (json!({"not-a-token": 1}), "logit_bias_invalid_key"),
+            (json!({"-5": 1}), "logit_bias_invalid_key"),
+            (json!({"99999999999": 1}), "logit_bias_invalid_key"),
+            (json!({"5": 1, "05": 2}), "logit_bias_duplicate_key"),
+            (json!({"1": 1000}), "integer_above_max_value"),
+            (json!({"1": 100.5}), "integer_above_max_value"),
+            (json!({"1": -101}), "integer_below_min_value"),
+        ] {
+            let bad = request(json!({"logit_bias": bias}));
+            let errors = bad.validate().expect_err(&bias.to_string());
+            let error = &errors.field_errors()["logit_bias"][0];
+            assert_eq!(error.code, code, "{bias}");
+        }
+        let colliding = request(json!({"logit_bias": {"5": 1, "05": 2}}));
+        let errors = colliding.validate().expect_err("colliding keys");
+        let message = errors.field_errors()["logit_bias"][0]
+            .message
+            .as_deref()
+            .unwrap_or_default();
+        assert!(
+            message.contains("'05' and '5' both name token 5"),
+            "{message}"
+        );
+        let good = request(json!({"logit_bias": {"50256": -100, "0": 1.5, "7": 100, "08": 0}}));
         assert_eq!(rejection(&good), None);
     }
 

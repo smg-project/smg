@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
-use futures::future::try_join_all;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::completion::CompletionPrompt;
 use tracing::{error, warn};
@@ -21,6 +20,7 @@ use crate::routers::{
         context::{CompletionItem, PreparationOutput, RequestContext},
         regular::stages::token_ids::{
             decodable_ids, reject_unknown_token_id, reported_embedding_rows,
+            validate_logit_bias_token_ids,
         },
         utils,
     },
@@ -37,10 +37,17 @@ impl PipelineStage for CompletionPreparationStage {
             utils::resolve_tokenizer(ctx, "CompletionPreparationStage::execute").map_err(|e| *e)?;
 
         // The embedding table the model's workers report, read only after an id the
-        // tokenizer does not know (the bound of `token_prompt`).
+        // tokenizer does not know (the bound of the `logit_bias` keys and of `token_prompt`).
         let worker_registry = &ctx.components.worker_registry;
         let model_id = ctx.input.model_id.as_str();
         let embedding_rows = || reported_embedding_rows(worker_registry, model_id);
+
+        validate_logit_bias_token_ids(
+            request.logit_bias.as_ref(),
+            tokenizer.as_ref(),
+            embedding_rows,
+        )
+        .map_err(|e| error::bad_request("logit_bias_invalid_key", e))?;
 
         // Empty arrays are rejected at the boundary (`validate_completion_prompt`).
         let items = match &request.prompt {
@@ -49,18 +56,19 @@ impl PipelineStage for CompletionPreparationStage {
             }
             CompletionPrompt::Texts(texts) => encode_prompts(&tokenizer, texts).await?,
             CompletionPrompt::TokenIds(ids) => {
-                vec![token_prompt(&tokenizer, ids, "prompt", embedding_rows).await?]
+                let fields = ["prompt".to_string()];
+                token_prompts(
+                    &tokenizer,
+                    std::slice::from_ref(ids),
+                    &fields,
+                    embedding_rows,
+                )
+                .await?
             }
             CompletionPrompt::TokenIdBatches(batches) => {
                 let fields: Vec<String> =
                     (0..batches.len()).map(|b| format!("prompt[{b}]")).collect();
-                try_join_all(
-                    batches
-                        .iter()
-                        .zip(&fields)
-                        .map(|(ids, field)| token_prompt(&tokenizer, ids, field, embedding_rows)),
-                )
-                .await?
+                token_prompts(&tokenizer, batches, &fields, embedding_rows).await?
             }
         };
 
@@ -102,20 +110,16 @@ async fn encode_prompts(
     tokenizer: &Arc<dyn Tokenizer>,
     prompts: &[String],
 ) -> Result<Vec<CompletionItem>, Response> {
-    let encodings = try_join_all(
-        prompts
-            .iter()
-            .map(|prompt| utils::encode_blocking(tokenizer.clone(), prompt, false)),
-    )
-    .await
-    .map_err(|e| {
-        error!(
-            function = "CompletionPreparationStage::execute",
-            error = %e,
-            "Tokenization failed"
-        );
-        error::bad_request("tokenization_failed", format!("Tokenization failed: {e}"))
-    })?;
+    let encodings = utils::encode_texts_blocking(tokenizer.clone(), prompts, false)
+        .await
+        .map_err(|e| {
+            error!(
+                function = "CompletionPreparationStage::execute",
+                error = %e,
+                "Tokenization failed"
+            );
+            error::bad_request("tokenization_failed", format!("Tokenization failed: {e}"))
+        })?;
 
     Ok(prompts
         .iter()
@@ -127,37 +131,44 @@ async fn encode_prompts(
         .collect())
 }
 
-/// A prompt given as token ids goes to the engine as given, with no encode,
-/// once every id is bound to a row of the model's embedding table
-/// ([`reject_unknown_token_id`], the rule `/generate` applies to `input_ids`:
-/// on the headless lanes an id past the table is an out-of-range index on
-/// the engine, not a refused request). Its text, for `echo` and for the
-/// policies that route on text, is the decode of the ids the tokenizer knows
-/// ([`decodable_ids`]) with special tokens kept, as the engines' own servers
-/// echo a token prompt: an id known only to the engine's table rides the wire
-/// and leaves no text, on every decoder (the byte-level and HF decoders would
-/// drop it, the tiktoken decoder would refuse it). An id inside the
-/// tokenizer's range that its encoding never assigned (a hole of a tiktoken
-/// id space) is the decode's to find, and is refused as the client's error. A
-/// long prompt decodes off the worker thread, as a long text encodes. `field`
-/// names the prompt in a refusal: `prompt`, or `prompt[b]` for one list of a
-/// batch.
-async fn token_prompt(
+/// The token prompts of a call, one item per list. A prompt given as token
+/// ids goes to the engine as given, with no encode, once every id is bound to
+/// a row of the model's embedding table ([`reject_unknown_token_id`], the rule
+/// `/generate` applies to `input_ids`: on the headless lanes an id past the
+/// table is an out-of-range index on the engine, not a refused request). Its
+/// text, for `echo` and for the policies that route on text, is the decode of
+/// the ids the tokenizer knows ([`decodable_ids`]) with special tokens kept,
+/// as the engines' own servers echo a token prompt: an id known only to the
+/// engine's table rides the wire and leaves no text, on every decoder (the
+/// byte-level and HF decoders would drop it, the tiktoken decoder would
+/// refuse it). An id inside the tokenizer's range that its encoding never
+/// assigned (a hole of a tiktoken id space) is the decode's to find, and is
+/// refused as the client's error. The lists are checked first, the first
+/// refusal ending the call, then decoded as one pass of the call
+/// ([`utils::decode_ids_blocking`]): in place up to the bound, on the pool
+/// past it, as a call's texts are ([`encode_prompts`]). `fields` names each
+/// list in a refusal: `prompt`, or `prompt[b]` for one list of a batch.
+async fn token_prompts(
     tokenizer: &Arc<dyn Tokenizer>,
-    ids: &[u32],
-    field: &str,
-    embedding_rows: impl FnOnce() -> Option<usize>,
-) -> Result<CompletionItem, Response> {
-    reject_unknown_token_id(tokenizer.as_ref(), ids, field, embedding_rows).map_err(|message| {
-        warn!(
-            function = "CompletionPreparationStage::execute",
-            error = %message,
-            "Prompt token id outside the model's vocabulary"
-        );
-        error::bad_request("invalid_prompt_token", message)
-    })?;
-    let decodable = decodable_ids(tokenizer.as_ref(), ids);
-    let text = utils::decode_blocking(tokenizer.clone(), decodable, false)
+    batches: &[Vec<u32>],
+    fields: &[String],
+    embedding_rows: impl FnOnce() -> Option<usize> + Copy,
+) -> Result<Vec<CompletionItem>, Response> {
+    let mut decodable = Vec::with_capacity(batches.len());
+    for (ids, field) in batches.iter().zip(fields) {
+        reject_unknown_token_id(tokenizer.as_ref(), ids, field, embedding_rows).map_err(
+            |message| {
+                warn!(
+                    function = "CompletionPreparationStage::execute",
+                    error = %message,
+                    "Prompt token id outside the model's vocabulary"
+                );
+                error::bad_request("invalid_prompt_token", message)
+            },
+        )?;
+        decodable.push(decodable_ids(tokenizer.as_ref(), ids));
+    }
+    let texts = utils::decode_ids_blocking(tokenizer.clone(), decodable, false)
         .await
         .map_err(|e| {
             // The range check behind `decodable_ids` is a fast path, not a guarantee: a
@@ -174,10 +185,14 @@ async fn token_prompt(
                 format!("prompt token ids cannot be decoded: {e}"),
             )
         })?;
-    Ok(CompletionItem {
-        text,
-        token_ids: ids.to_vec(),
-    })
+    Ok(batches
+        .iter()
+        .zip(texts)
+        .map(|(ids, text)| CompletionItem {
+            text,
+            token_ids: ids.to_vec(),
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -190,6 +205,19 @@ mod tests {
     /// The mock's base vocabulary is its token count; an added token sits far above it.
     fn mock() -> Arc<dyn Tokenizer> {
         Arc::new(MockTokenizer::new().with_tokens(&[("<|added|>", 50_000)]))
+    }
+
+    /// One token prompt, `field` naming it, through the stage's batch form.
+    async fn token_prompt(
+        tokenizer: &Arc<dyn Tokenizer>,
+        ids: &[u32],
+        field: &str,
+        embedding_rows: impl FnOnce() -> Option<usize> + Copy,
+    ) -> Result<CompletionItem, Response> {
+        let (lists, fields) = ([ids.to_vec()], [field.to_string()]);
+        token_prompts(tokenizer, &lists, &fields, embedding_rows)
+            .await
+            .map(|mut items| items.remove(0))
     }
 
     /// The refusal of `ids` under `field`: a 400 of this route's code, its body returned.
@@ -223,6 +251,35 @@ mod tests {
 
         assert_eq!(item.token_ids, ids);
         assert_eq!(item.text, "Hello world");
+    }
+
+    /// A batch of token prompts charges one in-place budget, as a batch of
+    /// texts does: its lists decode on the calling thread up to the bound and
+    /// on the pool past it.
+    #[tokio::test]
+    async fn a_token_prompt_batch_decodes_in_place_up_to_the_bound_and_the_rest_on_the_pool() {
+        use crate::routers::grpc::testing::thread_recording_tokenizer;
+
+        let (tokenizer, ran_on) = thread_recording_tokenizer();
+        let hello = tokenizer.token_to_id("Hello").expect("mock vocab");
+        // Sixty-four lists of four thousand ids: each under the bound alone (16,000
+        // bytes), the batch forty times over it.
+        let lists = vec![vec![hello; 4_000]; 64];
+        let fields: Vec<String> = (0..lists.len()).map(|b| format!("prompt[{b}]")).collect();
+        let here = std::thread::current().id();
+
+        let items = token_prompts(&tokenizer, &lists, &fields, || None)
+            .await
+            .expect("known ids");
+
+        assert_eq!(items.len(), 64);
+        let threads = std::mem::take(&mut *ran_on.lock().unwrap());
+        assert_eq!(threads.len(), 64, "every list of the batch is decoded");
+        assert_eq!(
+            threads.iter().filter(|t| **t == here).count(),
+            1,
+            "one list of the batch fits the bound in place; the other sixty-three go to the pool"
+        );
     }
 
     /// A prompt long enough to decode off the worker thread reads the same

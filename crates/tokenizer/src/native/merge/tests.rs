@@ -12,8 +12,8 @@ use tokenizers::{
 };
 
 use super::{
-    super::bytes_char, ByteTokens, MergeTable, SHORT_PIECE_SMALL, SHORT_PIECE_SYMBOLS,
-    SHORT_PIECE_TINY,
+    super::bytes_char, ByteTokens, Merge, MergeTable, PAIR_FILTER_BITS_PER_MERGE,
+    SHORT_PIECE_SMALL, SHORT_PIECE_SYMBOLS, SHORT_PIECE_TINY,
 };
 
 /// The byte-level alphabet as the first 256 entries of a vocabulary.
@@ -54,6 +54,31 @@ fn model_with(merges: &[(&str, &str)], ignore_merges: bool) -> BPE {
         .expect("a byte-level BPE")
 }
 
+/// [`model_with`] whose vocabulary also holds `tokens` that no merge
+/// produces (an entry no merge sequence reaches, as some vocabularies have).
+fn model_with_tokens(merges: &[(&str, &str)], tokens: &[&str]) -> BPE {
+    let (mut vocab, _) = alphabet_vocab();
+    for token in tokens {
+        if !vocab.contains_key(*token) {
+            let id = vocab.len() as u32;
+            vocab.insert((*token).to_owned(), id);
+        }
+    }
+    let mut list = Merges::new();
+    for (a, b) in merges {
+        let merged = format!("{a}{b}");
+        if !vocab.contains_key(&merged) {
+            let id = vocab.len() as u32;
+            vocab.insert(merged, id);
+        }
+        list.push(((*a).to_owned(), (*b).to_owned()));
+    }
+    BPE::builder()
+        .vocab_and_merges(vocab, list)
+        .build()
+        .expect("a byte-level BPE")
+}
+
 /// The ids the model's own merge gives a piece.
 fn model_ids(bpe: &BPE, table: &[char; 256], piece: &[u8]) -> Vec<u32> {
     bpe.tokenize(&mapped(table, piece))
@@ -72,6 +97,19 @@ fn table_ids(table: &MergeTable, piece: &[u8]) -> Vec<u32> {
     let mut ids = Vec::new();
     table.merge(piece, &mut ids);
     ids
+}
+
+/// The ids the table gives a piece the way the encoder asks for them: a
+/// piece with a non-ASCII byte from its pre-formed characters first
+/// (`MergeTable::merge_preformed`), from its bytes when that declines; and
+/// whether the pre-formed path answered.
+fn table_ids_preformed(table: &MergeTable, piece: &[u8]) -> (Vec<u32>, bool) {
+    let mut ids = Vec::new();
+    let answered = !piece.is_ascii() && table.merge_preformed(piece, &mut ids);
+    if !answered {
+        table.merge(piece, &mut ids);
+    }
+    (ids, answered)
 }
 
 /// The raw bytes an alphabet string stands for.
@@ -858,14 +896,21 @@ fn two_byte_characters_on_one_id_merge_as_the_model_does() {
 
 /// The table is the byte-pair grid (256 x 256 words) and its entries: a
 /// power of two of buckets, one cache line of four sixteen-byte entries
-/// each, at a load of one half or less.
+/// each, at a load of one half or less, the pair filter, and the pre-formed
+/// character analysis counted apart.
 #[test]
-fn the_tables_bytes_are_the_grid_and_its_buckets_at_half_load_or_less() {
+fn the_tables_bytes_are_the_grid_the_filter_and_its_buckets_at_half_load_or_less() {
     let bpe = model_with(&merges(), false);
     let table = table_of(&bpe);
     let merges = merges().len();
     let grid = 256 * 256 * size_of::<u64>();
-    let entries = (table.bytes() - size_of::<MergeTable>() - grid) / 16;
+    let filter = table.pair_filter_bytes();
+    assert!(
+        filter * 8 >= PAIR_FILTER_BITS_PER_MERGE * merges && filter.is_power_of_two(),
+        "{filter} filter bytes for {merges} merges"
+    );
+    let analysis = table.preformed.bytes();
+    let entries = (table.bytes() - size_of::<MergeTable>() - grid - filter - analysis) / 16;
     assert!(entries.is_power_of_two(), "{entries} entries");
     assert!(
         entries >= 2 * merges,
@@ -875,4 +920,362 @@ fn the_tables_bytes_are_the_grid_and_its_buckets_at_half_load_or_less() {
         entries < 4 * merges + 8,
         "{entries} entries for {merges} merges"
     );
+}
+
+/// Every merge of the model passes the pair filter (a false negative would
+/// lose a merge), and pairs that are no merge mostly do not (a filter that
+/// admitted them all would save no bucket line).
+#[test]
+fn every_merge_passes_the_pair_filter_and_a_pair_that_is_none_mostly_does_not() {
+    let bpe = model_with(&merges(), false);
+    let table = table_of(&bpe);
+    let id = |token: &str| bpe.token_to_id(token).expect("a token of the model");
+    for (a, b) in merges() {
+        assert!(
+            table.pair_filter_admits(id(a), id(b)),
+            "the merge ({a}, {b}) fails the filter"
+        );
+    }
+    let ids = bpe.get_vocab_size() as u64;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let (mut none, mut admitted) = (0, 0);
+    while none < 20_000 {
+        let (a, b) = ((next() % ids) as u32, (next() % ids) as u32);
+        if table.merge_of(a, b) != Merge::NONE {
+            continue;
+        }
+        none += 1;
+        admitted += usize::from(table.pair_filter_admits(a, b));
+    }
+    assert!(
+        admitted * 20 < none,
+        "{admitted} of {none} pairs that are no merge pass the filter"
+    );
+}
+
+/// At a vocabulary's size and the tightest rounding of the filter (131,072
+/// merges: exactly eight bits per merge), every inserted pair passes and
+/// about one pair in twenty that is no merge does: a filter whose density
+/// or hash degraded (bits per merge down, bit positions collapsed) would
+/// admit far more.
+#[test]
+fn the_pair_filter_admits_about_one_absent_pair_in_twenty_at_a_vocabularys_size() {
+    const MERGES: usize = 131_072;
+    const IDS: u64 = 160_000;
+    let mut state = 0x6A09_E667_F3BC_C909u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut table = MergeTable::with_capacity(MERGES, false, false);
+    let mut pairs = HashSet::new();
+    while pairs.len() < MERGES {
+        let (a, b) = ((next() % IDS) as u32, (next() % IDS) as u32);
+        if pairs.insert((a, b)) {
+            let rank = pairs.len() as u32 - 1;
+            table.insert(a, b, Merge::new(rank, IDS as u32 + rank));
+        }
+    }
+    assert!(
+        table.pair_filter_bytes() * 8 == PAIR_FILTER_BITS_PER_MERGE * MERGES,
+        "{} filter bytes for {MERGES} merges",
+        table.pair_filter_bytes()
+    );
+    for &(a, b) in &pairs {
+        assert!(
+            table.pair_filter_admits(a, b),
+            "the merge ({a}, {b}) fails the filter"
+        );
+    }
+    let (mut none, mut admitted) = (0usize, 0usize);
+    while none < 200_000 {
+        let (a, b) = ((next() % IDS) as u32, (next() % IDS) as u32);
+        if pairs.contains(&(a, b)) {
+            continue;
+        }
+        none += 1;
+        admitted += usize::from(table.pair_filter_admits(a, b));
+    }
+    let rate = admitted as f64 / none as f64;
+    assert!(
+        (0.03..0.07).contains(&rate),
+        "{admitted} of {none} absent pairs pass the filter ({:.2} %)",
+        100.0 * rate
+    );
+}
+/// A vocabulary of random merges over a corpus of whole characters of
+/// several multi-byte scripts and ASCII, so that character tokens, tokens of
+/// several characters and fragment tokens (a token ending inside a character,
+/// one starting with continuation bytes) all arise; `seed` varies the draw.
+fn random_character_model(seed: u64, merges: usize) -> (BPE, [char; 256], Vec<u8>) {
+    let mut state = seed;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let (mut vocab, alphabet) = alphabet_vocab();
+    // Ideographs, kana, Hangul, Cyrillic, Greek, a two-byte Latin letter,
+    // an emoji, ASCII letters and a space: whole characters, so that the
+    // vocabulary grows tokens of them and of their parts.
+    let pool: &[&str] = &[
+        "中", "文", "日", "本", "語", "の", "한", "국", "п", "р", "и", "в", "ε", "é", "😀", "a",
+        "b", " ",
+    ];
+    let corpus: Vec<u8> = (0..4000)
+        .flat_map(|_| pool[next() as usize % pool.len()].as_bytes().to_vec())
+        .collect();
+    let mut list = Merges::new();
+    let mut seen = HashSet::new();
+    let mapped_corpus = mapped(&alphabet, &corpus);
+    let mut tokens: Vec<String> = mapped_corpus.chars().map(|c| c.to_string()).collect();
+    // About three of four multi-byte characters of the pool are whole tokens
+    // before the random merges (their byte merges rank first), the rest stay
+    // loose bytes: the random merges then join anything adjacent, so whole
+    // characters pre-form, multi-character tokens arise, and fragment
+    // tokens arise around the loose bytes and decline their characters.
+    let mut whole: Vec<String> = Vec::new();
+    for entry in pool {
+        let m = mapped(&alphabet, entry.as_bytes());
+        if m.chars().count() > 1 && next() % 4 != 0 {
+            whole.push(m);
+        }
+    }
+    for m in &whole {
+        let parts: Vec<String> = m.chars().map(|c| c.to_string()).collect();
+        let mut acc = parts[0].clone();
+        for part in &parts[1..] {
+            let merged = format!("{acc}{part}");
+            if seen.insert((acc.clone(), part.clone())) {
+                if !vocab.contains_key(&merged) {
+                    let id = vocab.len() as u32;
+                    vocab.insert(merged.clone(), id);
+                }
+                list.push((acc.clone(), part.clone()));
+            }
+            acc = merged;
+        }
+    }
+    let mut rebuilt: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let run = whole.iter().find(|m| {
+            let n = m.chars().count();
+            i + n <= tokens.len() && tokens[i..i + n].concat() == **m
+        });
+        match run {
+            Some(m) => {
+                i += m.chars().count();
+                rebuilt.push(m.clone());
+            }
+            None => {
+                rebuilt.push(tokens[i].clone());
+                i += 1;
+            }
+        }
+    }
+    tokens = rebuilt;
+    while list.len() < merges {
+        let i = next() as usize % (tokens.len() - 1);
+        let (a, b) = (tokens[i].clone(), tokens[i + 1].clone());
+        if !seen.insert((a.clone(), b.clone())) {
+            continue;
+        }
+        let merged = format!("{a}{b}");
+        if vocab.contains_key(&merged) {
+            continue;
+        }
+        let id = vocab.len() as u32;
+        vocab.insert(merged.clone(), id);
+        list.push((a, b));
+        tokens[i] = merged;
+        tokens.remove(i + 1);
+    }
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, list)
+        .build()
+        .expect("a random BPE");
+    (bpe, alphabet, corpus)
+}
+
+#[test]
+fn pieces_of_multi_byte_scripts_merge_to_the_models_ids_from_pre_formed_characters() {
+    // Several draws: in each, some characters pre-form and some are declined
+    // (a merge taking the character ranks early, or a fragment token covers
+    // part of it next to the bytes the corpus puts beside it), and pieces cut
+    // at any byte, inside characters too, must merge to the model's ids.
+    let mut pre_formed_somewhere = 0;
+    let mut answered_somewhere = 0;
+    for seed in [
+        0x2545_F491_4F6C_DD1Du64,
+        0x9E37_79B9_7F4A_7C15,
+        0xD6E8_FEB8_6659_FD93,
+    ] {
+        let (bpe, alphabet, corpus) = random_character_model(seed, 900);
+        let table = table_of(&bpe);
+        pre_formed_somewhere += table.preformed_characters();
+        let mut state = seed ^ 0xA5A5;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..3000 {
+            let len = 1 + round % 300;
+            let start = next() as usize % (corpus.len() - len);
+            let piece = &corpus[start..start + len];
+            let (ids, answered) = table_ids_preformed(&table, piece);
+            assert_eq!(
+                ids,
+                model_ids(&bpe, &alphabet, piece),
+                "seed {seed:#x} piece {:?}",
+                String::from_utf8_lossy(piece)
+            );
+            answered_somewhere += usize::from(answered);
+        }
+        assert!(
+            answered_somewhere > 0,
+            "seed {seed:#x}: the pre-formed path answered no piece"
+        );
+        answered_somewhere = 0;
+    }
+    assert!(pre_formed_somewhere > 0, "no draw pre-formed a character");
+}
+
+#[test]
+fn a_character_pre_forms_only_under_the_three_conditions() {
+    // "中" is E4 B8 AD; its alphabet form is "ä¸Ń". (E4, B8) then (E4B8, AD)
+    // form it: a pre-formable character when nothing else touches its bytes.
+    let (_, alphabet) = alphabet_vocab();
+    let zhong = mapped(&alphabet, "中".as_bytes());
+    let (e4, b8, ad) = (
+        zhong.chars().next().expect("E4").to_string(),
+        zhong.chars().nth(1).expect("B8").to_string(),
+        zhong.chars().nth(2).expect("AD").to_string(),
+    );
+    let e4b8 = format!("{e4}{b8}");
+    // (1) and (2) hold, no fragment: pre-formed.
+    let bpe = model_with(
+        &[(&e4, &b8), (&e4b8, &ad), (&zhong, &zhong)].map(|(a, b)| (a.as_str(), b.as_str())),
+        false,
+    );
+    let table = table_of(&bpe);
+    assert_eq!(table.preformed_characters(), 1);
+    let (ids, answered) = table_ids_preformed(&table, "中中".as_bytes());
+    assert!(
+        answered,
+        "the pre-formed path answers a piece of pre-formed characters"
+    );
+    assert_eq!(ids, model_ids(&bpe, &alphabet, "中中".as_bytes()));
+    // (2) fails: a merge taking the character ranks before the merge that
+    // completes it ((中, 中) at rank 1, (E4B8, AD) at rank 2).
+    let bpe = model_with(
+        &[(&e4, &b8), (&zhong, &zhong), (&e4b8, &ad)].map(|(a, b)| (a.as_str(), b.as_str())),
+        false,
+    );
+    // A merge that takes the character as an operand ranks before the merge
+    // that completes it: the character is not pre-formed (the bytes merge
+    // as the model's do) and the ids agree.
+    let table = table_of(&bpe);
+    assert_eq!(table.preformed_characters(), 0);
+    assert!(!table_ids_preformed(&table, "中中".as_bytes()).1);
+    assert_eq!(
+        table_ids_preformed(&table, "中中".as_bytes()).0,
+        model_ids(&bpe, &alphabet, "中中".as_bytes())
+    );
+    // (1) fails: the token exists but the bytes alone do not reach it (no
+    // (E4B8, AD) merge).
+    let bpe = model_with_tokens(
+        &[(&e4, &b8), (&zhong, &zhong)].map(|(a, b)| (a.as_str(), b.as_str())),
+        &[zhong.as_str()],
+    );
+    assert_eq!(table_of(&bpe).preformed_characters(), 0);
+    // (3): a fragment token "a" + E4 B8 (a token ending inside the character)
+    // declines the occurrence after an "a" but not elsewhere; the ids agree
+    // either way.
+    let bpe = model_with(
+        &[
+            (e4.as_str(), b8.as_str()),
+            ("a", e4b8.as_str()),
+            (e4b8.as_str(), ad.as_str()),
+            (zhong.as_str(), zhong.as_str()),
+        ],
+        false,
+    );
+    let table = table_of(&bpe);
+    assert_eq!(table.preformed_characters(), 1);
+    // The one character after an "a" is declined and the piece merges from
+    // its bytes; a run that starts with the character is answered.
+    assert!(!table_ids_preformed(&table, "a中".as_bytes()).1);
+    assert!(table_ids_preformed(&table, "中中a".as_bytes()).1);
+    for text in ["a中中", "b中中", "中中a", "a中", "中a中"] {
+        assert_eq!(
+            table_ids_preformed(&table, text.as_bytes()).0,
+            model_ids(&bpe, &alphabet, text.as_bytes()),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn a_run_of_one_character_overflows_the_stack_arrays_and_a_pair_no_token_holds_is_cut() {
+    // 中 pre-forms and (中, 中) merges: a run of n 中 is one segment of n
+    // symbols, merged on the stack arrays up to SHORT_PIECE_SYMBOLS and from
+    // its bytes beyond, to the model's ids either way.
+    let (_, alphabet) = alphabet_vocab();
+    let zhong = mapped(&alphabet, "中".as_bytes());
+    let wen = mapped(&alphabet, "文".as_bytes());
+    let [e4, b8, ad] = [0, 1, 2].map(|i| zhong.chars().nth(i).expect("a byte").to_string());
+    let [e6, x96, x87] = [0, 1, 2].map(|i| wen.chars().nth(i).expect("a byte").to_string());
+    let e4b8 = format!("{e4}{b8}");
+    let e696 = format!("{e6}{x96}");
+    let bpe = model_with(
+        &[(&e4, &b8), (&e4b8, &ad), (&zhong, &zhong)].map(|(a, b)| (a.as_str(), b.as_str())),
+        false,
+    );
+    let table = table_of(&bpe);
+    assert_eq!(table.preformed_characters(), 1);
+    for n in [
+        1,
+        2,
+        3,
+        SHORT_PIECE_SYMBOLS - 1,
+        SHORT_PIECE_SYMBOLS,
+        SHORT_PIECE_SYMBOLS + 1,
+        200,
+        300,
+    ] {
+        let piece = "中".repeat(n);
+        let (ids, answered) = table_ids_preformed(&table, piece.as_bytes());
+        assert!(answered, "{n} characters");
+        assert_eq!(
+            ids,
+            model_ids(&bpe, &alphabet, piece.as_bytes()),
+            "{n} characters"
+        );
+    }
+    // 中 and 文 pre-form and no token holds them adjacent: the walk cuts
+    // between them and each segment merges alone, to the model's ids.
+    let bpe = model_with(
+        &[(&e4, &b8), (&e4b8, &ad), (&e6, &x96), (&e696, &x87)]
+            .map(|(a, b)| (a.as_str(), b.as_str())),
+        false,
+    );
+    let table = table_of(&bpe);
+    assert_eq!(table.preformed_characters(), 2);
+    for text in ["中文", "中文中文", "文中", "a中文b"] {
+        let (ids, answered) = table_ids_preformed(&table, text.as_bytes());
+        assert!(answered, "{text}");
+        assert_eq!(ids, model_ids(&bpe, &alphabet, text.as_bytes()), "{text}");
+    }
 }

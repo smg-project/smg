@@ -19,7 +19,9 @@ use crate::routers::{
             ExecutionPlanKind, PreparationOutput, RequestContext, RequestType,
         },
         proto_wrapper::ProtoGenerateRequest,
+        regular::stages::token_ids,
         spec::{HarmonyResponseSpec, ResponseSpec},
+        utils::missing_tokenizer_response,
         zmq_client::ZmqDialect,
     },
 };
@@ -145,6 +147,38 @@ impl BuildStage for HarmonyRequestBuildingStage {
                 ));
             }
         };
+
+        // The engine builders lay a chat request's `logit_bias` on the wire,
+        // past the engine front ends that bound its ids, so the ids are judged
+        // here first, as a pretokenized prompt's are. This pipeline encodes
+        // with its own Harmony encoding and resolves no tokenizer for the
+        // request, so the model's is looked up here, for a request with a
+        // bias only.
+        if let HarmonyBody::Chat(request) = &body {
+            if let Some(bias) = request.logit_bias.as_ref().filter(|bias| !bias.is_empty()) {
+                let model_id = ctx.input.model_id.as_str();
+                // A model without a registered tokenizer is answered as the
+                // regular pipeline answers it (not found; not ready, with a
+                // retry hint, while the gateway loads it; a gateway fault
+                // without autoload), not as a fault of the keys.
+                let Some(tokenizer) = ctx.components.tokenizer_registry.get(model_id) else {
+                    return Err(missing_tokenizer_response(
+                        "HarmonyRequestBuildingStage::build",
+                        model_id,
+                        ctx.components.worker_registry.contains_model(model_id),
+                        ctx.components.tokenizer_autoload,
+                        ctx.components
+                            .tokenizer_load_failures
+                            .get(model_id)
+                            .as_ref(),
+                    ));
+                };
+                token_ids::validate_logit_bias_token_ids(Some(bias), tokenizer.as_ref(), || {
+                    token_ids::reported_embedding_rows(&ctx.components.worker_registry, model_id)
+                })
+                .map_err(|e| error::bad_request("logit_bias_invalid_key", e))?;
+            }
+        }
 
         let mut proto_request = build_harmony_proto(
             builder_client,

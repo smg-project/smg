@@ -20,9 +20,10 @@ use tonic::Status;
 
 use super::{hidden_states_cap, HiddenStatesCap, SglangModelInfo, State};
 use crate::{
-    load_tracker::{rank_of, ChoiceLoad, PendingGuard, Submission},
+    load_tracker::{rank_of, ChoiceLoad, PendingGuard, PrefillProbe, Submission},
     metrics::{complete_finish_reason, ChoiceMetrics},
     requests::HeldTerminal,
+    servicer::RequestOrigin,
     stream::{poll_engine_item, Choice, Choices, RequestStream},
     BoxStream,
 };
@@ -30,11 +31,14 @@ use crate::{
 /// Handle one `Generate` request against the connected scheduler.
 /// `trace_headers` is the caller's W3C trace context (see
 /// [`crate::trace_context::trace_headers`]), carried to the scheduler beside
-/// each choice's request so the engine's spans join the Router's trace.
+/// each choice's request so the engine's spans join the Router's trace;
+/// `origin` says whose request it is, which decides what is counted
+/// ([`RequestOrigin`]).
 pub(super) async fn generate(
     state: &Arc<State>,
     mut req: sg::GenerateRequest,
     trace_headers: Option<BTreeMap<String, String>>,
+    origin: RequestOrigin,
 ) -> Result<BoxStream<sg::GenerateResponse>, Status> {
     // The request's arrival, the instant its latencies are measured from.
     let arrival = Instant::now();
@@ -48,7 +52,12 @@ pub(super) async fn generate(
     let request_id: Arc<str> = Arc::from(req.request_id.as_str());
     // Register before the submit: an `Abort` landing in the gap must find the
     // entry, and a duplicate id is refused up front.
-    let (registration, mut cancel) = state.shared.registry.register(&request_id)?;
+    // The servicer's own probe is registered for cancellation and settling
+    // like a client's request, outside the active count the scrape reports.
+    let (registration, mut cancel) = match origin {
+        RequestOrigin::Client => state.shared.registry.register(&request_id)?,
+        RequestOrigin::HealthProbe => state.shared.registry.register_uncounted(&request_id)?,
+    };
     let original = req.return_media_identity.then(|| req.clone());
     let reused = super::media_identity::apply(state, &mut req);
     // Hash fields are only accepted on an internally validated pixel-less hint
@@ -133,37 +142,54 @@ pub(super) async fn generate(
             state.mm_hasher.as_ref(),
         )
         .await?;
-    // The load tracker's view of the request: in flight on the rank its
-    // first choice went to (the choice that reports the prompt) from here
-    // until the engine's first output (or the stream's end), each choice's
-    // prefill sampled on the servicer's clock from here to its first output
-    // (this wire carries no engine timing).
-    let at = Instant::now();
-    let rank = rank_of(
-        subs.iter()
-            .find(|sub| sub.index() == 0)
-            .or_else(|| subs.first())
-            .and_then(SglangGenerateStream::engine_index),
-    );
-    let probe = state.shared.loads.submit(Submission {
-        request_id: &request_id,
-        rank,
-        prompt_tokens,
-        at,
-    });
-    let loads = PendingGuard::new(Arc::clone(state), &request_id);
-    let metrics = state.shared.metrics.request(
-        arrival,
-        subs.first().and_then(SglangGenerateStream::engine_index),
-        prompt_tokens,
-        max_tokens,
-        n,
-    );
+    // A client's request is in the load tracker's view (in flight on the
+    // rank its first choice went to, the choice that reports the prompt,
+    // from here until the engine's first output or the stream's end, each
+    // choice's prefill sampled on the servicer's clock from here to its
+    // first output: this wire carries no engine timing) and in the request
+    // metrics; the servicer's own health probe is in neither.
+    let (probe, loads, metrics) = match origin {
+        RequestOrigin::Client => {
+            let at = Instant::now();
+            let rank = rank_of(
+                subs.iter()
+                    .find(|sub| sub.index() == 0)
+                    .or_else(|| subs.first())
+                    .and_then(SglangGenerateStream::engine_index),
+            );
+            (
+                state.shared.loads.submit(Submission {
+                    request_id: &request_id,
+                    rank,
+                    prompt_tokens,
+                    at,
+                }),
+                Some(PendingGuard::new(Arc::clone(state), &request_id)),
+                state.shared.metrics.request(
+                    arrival,
+                    subs.first().and_then(SglangGenerateStream::engine_index),
+                    prompt_tokens,
+                    max_tokens,
+                    n,
+                ),
+            )
+        }
+        RequestOrigin::HealthProbe => (
+            PrefillProbe::default(),
+            None,
+            state.shared.metrics.uncounted(),
+        ),
+    };
     let mut choices = Choices::new();
     for sub in subs {
         // Each choice's engine request went to its own rank (an unpinned
         // fan-out is placed per choice): its tokens are credited there.
-        let load = ChoiceLoad::new(rank_of(sub.engine_index()), sub.index(), probe);
+        let load = match origin {
+            RequestOrigin::Client => {
+                ChoiceLoad::new(rank_of(sub.engine_index()), sub.index(), probe)
+            }
+            RequestOrigin::HealthProbe => ChoiceLoad::uncounted(),
+        };
         choices.push(ChoiceStream {
             request_id: Arc::clone(&request_id),
             state: Arc::clone(state),

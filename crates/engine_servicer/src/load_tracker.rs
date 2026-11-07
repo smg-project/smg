@@ -517,6 +517,9 @@ pub(crate) struct ChoiceLoad {
     first: bool,
     probe: PrefillProbe,
     prompt_counted: bool,
+    /// Whether the choice is a client's, counted; the servicer's own health
+    /// probe is not ([`Self::uncounted`]).
+    counted: bool,
 }
 
 impl ChoiceLoad {
@@ -526,6 +529,21 @@ impl ChoiceLoad {
             first: index == 0,
             probe,
             prompt_counted: false,
+            counted: true,
+        }
+    }
+
+    /// The share of a request the tracker never sees: the servicer's own
+    /// health probe of the scheduler, whose one token on an idle rank is no
+    /// measure of the rank's prefill capacity, its prompt no hit-rate sample
+    /// and its token no generation of the rank's.
+    pub(crate) fn uncounted() -> Self {
+        Self {
+            rank: 0,
+            first: false,
+            probe: PrefillProbe::default(),
+            prompt_counted: true,
+            counted: false,
         }
     }
 
@@ -546,7 +564,7 @@ impl ChoiceLoad {
         cached_tokens: u32,
         now: Instant,
     ) {
-        if self.prompt_counted || prompt_tokens == 0 {
+        if !self.counted || self.prompt_counted || prompt_tokens == 0 {
             return;
         }
         if self.first {
@@ -559,7 +577,9 @@ impl ChoiceLoad {
 
     /// The choice streamed `tokens` to the client at `at`.
     pub(crate) fn generated(&self, loads: &LoadTracker, tokens: u32, at: Instant) {
-        loads.generated_at(self.rank, tokens, at);
+        if self.counted {
+            loads.generated_at(self.rank, tokens, at);
+        }
     }
 }
 
@@ -1094,6 +1114,34 @@ mod tests {
         let mut only = ChoiceLoad::new(1, 0, armed);
         only.count_prompt(&loads, "s", 100, 0, later + Duration::from_millis(10));
         assert_eq!((loads.pending(), loads.prefill_samples(1)), (0, 2));
+    }
+
+    /// The uncounted share (the servicer's own health probe) records
+    /// nothing: no prompt, no prefill sample, no generation; the rank it
+    /// met reads idle after it, as before.
+    #[test]
+    fn an_uncounted_choice_records_nothing() {
+        let loads = LoadTracker::default();
+        let now = Instant::now();
+        let mut probe = ChoiceLoad::uncounted();
+        probe.count_prompt(
+            &loads,
+            "HEALTH_CHECK_1",
+            1,
+            0,
+            now + Duration::from_millis(10),
+        );
+        probe.generated(&loads, 1, now + Duration::from_millis(10));
+        assert_eq!((loads.pending(), loads.prefill_samples(0)), (0, 0));
+        let rank = loads.estimate_at(0, 0, now + Duration::from_millis(10));
+        assert_eq!(
+            (
+                rank.cache_hit_rate,
+                rank.gen_throughput,
+                rank.prefill_throughput
+            ),
+            (0.0, 0.0, None)
+        );
     }
 
     /// Two ranks serve: each rank's hit rate, throughput and queued work are

@@ -726,7 +726,10 @@ impl WorkerRegistry {
     }
 
     /// Return the immutable global membership snapshot used by routing paths
-    /// whose model/provider filters are evaluated dynamically.
+    /// whose model/provider filters are evaluated dynamically, and by the
+    /// periodic readers that visit every worker (the liveness sweep, the
+    /// readiness recompute): one pointer load while the fleet is stable,
+    /// where an iteration of the worker map locks every shard.
     pub(crate) fn get_routing_workers(&self) -> Arc<[Arc<dyn Worker>]> {
         Arc::clone(&self.current_global_routing_snapshot().all)
     }
