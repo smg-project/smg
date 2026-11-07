@@ -162,6 +162,7 @@ mod tests {
             affected_models: std::collections::HashSet::new(),
             app_context: Some(app_context),
             actual_workers_to_remove: Some(workers),
+            removed_workers: Vec::new(),
         };
         WorkflowContext::new(WorkflowInstanceId::new(), data)
     }
