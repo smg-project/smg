@@ -142,9 +142,11 @@ struct RequestCount {
     started: AtomicU64,
     upgraded: AtomicBool,
     /// The connection task's waker, registered while the bounds are
-    /// suspended and woken when the last request in flight ends: the server
-    /// polls the read side of an idle connection again only when bytes
-    /// arrive, so without this wake the idle bound would never be armed.
+    /// suspended and woken when the last request in flight ends somewhere
+    /// the connection is not polled afterwards (see [`InFlightGuard::end`]):
+    /// the server polls the read side of an idle connection again only when
+    /// bytes arrive, so without that wake the idle bound would never be
+    /// armed.
     idle_waker: AtomicWaker,
 }
 
@@ -158,26 +160,48 @@ impl RequestCount {
 
 /// Holds one in-flight request on its connection's count.
 #[derive(Debug)]
-struct InFlightGuard(Arc<RequestCount>);
+struct InFlightGuard {
+    count: Arc<RequestCount>,
+    /// Whether the release wakes the connection task; [`Self::end`] clears
+    /// it.
+    wake: bool,
+}
 
 impl InFlightGuard {
     fn start(count: Arc<RequestCount>) -> Self {
         count.in_flight.fetch_add(1, Ordering::AcqRel);
         count.started.fetch_add(1, Ordering::AcqRel);
-        Self(count)
+        Self { count, wake: true }
     }
 
     /// The response switched protocols: the connection is a stream from now
     /// on, outside both bounds for the rest of its life.
     fn mark_upgraded(&self) {
-        self.0.upgraded.store(true, Ordering::Release);
+        self.count.upgraded.store(true, Ordering::Release);
+    }
+
+    /// The request ended under a poll of its response (its body's last frame,
+    /// or a response whose body was complete on arrival): the release does
+    /// not wake the connection task, because the connection flushes that
+    /// response afterwards and arms the idle bound there, with the task's
+    /// own waker ([`TimedConnection::poll_flush`]). On HTTP/1 the response is
+    /// polled by the connection task itself, and a task woken while it is
+    /// being polled is run again as a yield: queued behind everything else
+    /// and a parked worker notified to come and steal it, a futex wake and a
+    /// context switch per request for a poll that finds nothing to do.
+    fn end(mut self) {
+        self.wake = false;
     }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        if self.0.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.0.idle_waker.wake();
+        if self.count.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 && self.wake {
+            // The request ended somewhere no flush of the connection follows
+            // (its response future or body dropped, on HTTP/2 from the
+            // stream's own task): wake the connection task so its read side
+            // arms the idle bound.
+            self.count.idle_waker.wake();
         }
     }
 }
@@ -394,6 +418,15 @@ impl<I> TimedConnection<I> {
             self.armed = None;
             return Poll::Pending;
         }
+        match self.poll_bound(cx) {
+            Poll::Ready(timeout) => self.expire(timeout, Instant::now()),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// No request in flight: arm the bound that applies to the current wait
+    /// and poll it, with this task's waker; `Ready` once it has expired.
+    fn poll_bound(&mut self, cx: &mut Context<'_>) -> Poll<Timeout> {
         // The clock is read when a wait begins (once per idle period, not
         // once per poll of the read side): the deadline follows from the wait
         // alone, and a poll while it is armed asks the sleep.
@@ -416,10 +449,7 @@ impl<I> TimedConnection<I> {
             }
         }
         match self.sleep.as_mut() {
-            Some(sleep) => match sleep.as_mut().poll(cx) {
-                Poll::Ready(()) => self.expire(timeout, Instant::now()),
-                Poll::Pending => Poll::Pending,
-            },
+            Some(sleep) => sleep.as_mut().poll(cx).map(|()| timeout),
             None => Poll::Pending,
         }
     }
@@ -487,7 +517,17 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for TimedConnection<I> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let flushed = Pin::new(&mut self.inner).poll_flush(cx);
+        // The response that ended the last request is out: the idle bound is
+        // armed here, with this task's waker, so that the request's end did
+        // not need to wake the task ([`InFlightGuard::end`]); the server
+        // polls the read side of an idle HTTP/1 connection again only when
+        // bytes arrive. An expiry is reported by the read side, when the
+        // sleep wakes the task.
+        if flushed.is_ready() && !self.count.exempt() {
+            let _ = self.as_mut().get_mut().poll_bound(cx);
+        }
+        flushed
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -574,9 +614,16 @@ impl<B: Body> TrackedBody<B> {
         let mut body = Self { inner, guard };
         // An already-complete body (an empty response) may never be polled.
         if body.inner.is_end_stream() {
-            body.guard = None;
+            body.end();
         }
         body
+    }
+
+    /// The end of the body is known: the request ends without a wake.
+    fn end(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            guard.end();
+        }
     }
 }
 
@@ -593,8 +640,8 @@ impl<B: Body + Unpin> Body for TrackedBody<B> {
         // Release as soon as the end of the stream is knowable; the drop
         // covers a client that went away.
         match &poll {
-            Poll::Ready(None) | Poll::Ready(Some(Err(_))) => this.guard = None,
-            Poll::Ready(Some(Ok(_))) if this.inner.is_end_stream() => this.guard = None,
+            Poll::Ready(None) | Poll::Ready(Some(Err(_))) => this.end(),
+            Poll::Ready(Some(Ok(_))) if this.inner.is_end_stream() => this.end(),
             _ => {}
         }
         poll
@@ -672,13 +719,15 @@ mod tests {
     }
 
     /// Serves the test app through the production acceptor on a loopback
-    /// port, runs `check` against it and returns the acceptor's counters.
+    /// port, runs `check` against it (with the acceptor's counters, for a
+    /// check that watches a close it cannot see from its end) and returns
+    /// the counters.
     async fn with_server<F, Fut>(
         timeouts: ConnectionTimeouts,
         check: F,
     ) -> Arc<ConnectionTimeoutStats>
     where
-        F: FnOnce(SocketAddr, Handle<SocketAddr>) -> Fut,
+        F: FnOnce(SocketAddr, Handle<SocketAddr>, Arc<ConnectionTimeoutStats>) -> Fut,
         Fut: Future<Output = ()>,
     {
         let handle = Handle::new();
@@ -691,7 +740,7 @@ mod tests {
                 .listening()
                 .await
                 .expect("the test server did not bind");
-            check(addr, handle.clone()).await;
+            check(addr, handle.clone(), Arc::clone(&stats)).await;
             handle.shutdown();
         };
         let (served, ()) = tokio::join!(serving, checking);
@@ -793,7 +842,7 @@ mod tests {
     async fn a_connection_that_sends_nothing_is_closed_at_the_header_read_timeout() {
         let stats = with_server(
             ConnectionTimeouts::from_secs(SHORT, LONG),
-            |addr, _| async move {
+            |addr, _, _| async move {
                 let mut silent = connect(addr).await;
                 closed(closed_within(&mut silent, WINDOW).await);
             },
@@ -807,7 +856,7 @@ mod tests {
     {
         let stats = with_server(
             ConnectionTimeouts::from_secs(SHORT, LONG),
-            |addr, _| async move {
+            |addr, _, _| async move {
                 let mut partial = connect(addr).await;
                 partial
                     .write_all(b"GET /ok HTTP/1.1\r\nHost: test\r\nX-Half: a")
@@ -820,14 +869,95 @@ mod tests {
         assert_eq!(counts(&stats), (1, 0));
     }
 
+    /// The request ends under the connection task's own poll (HTTP/1 polls
+    /// the response there) and its end wakes nobody: the bound is armed by
+    /// the read hyper makes once the response is flushed, and this fails if
+    /// that read stops coming.
     #[tokio::test]
     async fn an_idle_keep_alive_connection_is_closed_at_the_idle_timeout() {
         let stats = with_server(
             ConnectionTimeouts::from_secs(LONG, SHORT),
-            |addr, _| async move {
+            |addr, _, _| async move {
                 let mut keep_alive = connect(addr).await;
                 get_ok(&mut keep_alive).await;
                 closed(closed_within(&mut keep_alive, WINDOW).await);
+            },
+        )
+        .await;
+        assert_eq!(counts(&stats), (0, 1));
+    }
+
+    /// An HTTP/2 client over the plain port, with prior knowledge; one
+    /// connection, kept alive between requests.
+    fn http2_client() -> reqwest::Client {
+        crate::clients::http_client_builder()
+            .http2_prior_knowledge()
+            .build()
+            .expect("the HTTP/2 client")
+    }
+
+    /// Waits up to `within` for the acceptor's idle counter to reach `n`:
+    /// the time it took, or `None` while it has not at the end of the
+    /// window.
+    async fn idle_closes_within(
+        stats: &ConnectionTimeoutStats,
+        n: u64,
+        within: Duration,
+    ) -> Option<Duration> {
+        let started = Instant::now();
+        while stats.closed_by_idle_timeout() < n {
+            if started.elapsed() >= within {
+                return None;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        Some(started.elapsed())
+    }
+
+    /// On HTTP/2 the request ends on its stream's task, which hands the
+    /// stream's last frame to the connection after that; the connection's
+    /// read after writing it arms the bound, with no wake.
+    #[tokio::test]
+    async fn an_idle_keep_alive_http2_connection_is_closed_at_the_idle_timeout() {
+        let stats = with_server(
+            ConnectionTimeouts::from_secs(LONG, SHORT),
+            |addr, _, stats| async move {
+                let client = http2_client();
+                let response = client
+                    .get(format!("http://{addr}/ok"))
+                    .send()
+                    .await
+                    .expect("the request");
+                assert_eq!(response.version(), http::Version::HTTP_2);
+                assert_eq!(response.text().await.expect("the body"), "ok");
+                closed(idle_closes_within(&stats, 1, WINDOW).await);
+            },
+        )
+        .await;
+        assert_eq!(counts(&stats), (0, 1));
+    }
+
+    /// A response body dropped before its end (the client reset the stream)
+    /// ends the request where no read of the connection follows: that end
+    /// wakes the connection task, which arms the bound.
+    #[tokio::test]
+    async fn a_stream_reset_by_the_client_still_leaves_the_http2_connection_to_the_idle_timeout() {
+        let stats = with_server(
+            ConnectionTimeouts::from_secs(LONG, SHORT),
+            |addr, _, stats| async move {
+                let client = http2_client();
+                let mut response = client
+                    .get(format!("http://{addr}/stream"))
+                    .send()
+                    .await
+                    .expect("the request");
+                assert_eq!(response.version(), http::Version::HTTP_2);
+                let first = response.chunk().await.expect("the first event");
+                assert!(first.is_some(), "the stream ended before its first event");
+                // The producer is silent for longer than the bound from here;
+                // dropping the response resets the stream.
+                drop(response);
+                closed(idle_closes_within(&stats, 1, WINDOW).await);
             },
         )
         .await;
@@ -839,7 +969,7 @@ mod tests {
     ) {
         let stats = with_server(
             ConnectionTimeouts::from_secs(SHORT, LONG),
-            |addr, _| async move {
+            |addr, _, _| async move {
                 let mut keep_alive = connect(addr).await;
                 get_ok(&mut keep_alive).await;
                 // The idle bound is out of reach; the partial head arms the
@@ -859,7 +989,7 @@ mod tests {
     async fn a_streaming_response_with_a_silent_producer_outlives_both_timeouts() {
         let stats = with_server(
             ConnectionTimeouts::from_secs(SHORT, SHORT),
-            |addr, _| async move {
+            |addr, _, _| async move {
                 let mut streaming = connect(addr).await;
                 streaming
                     .write_all(b"GET /stream HTTP/1.1\r\nHost: test\r\n\r\n")
@@ -883,7 +1013,7 @@ mod tests {
     async fn an_upgraded_connection_is_exempt_from_both_timeouts() {
         let stats = with_server(
             ConnectionTimeouts::from_secs(SHORT, SHORT),
-            |addr, _| async move {
+            |addr, _, _| async move {
                 let mut websocket = connect(addr).await;
                 websocket
                     .write_all(
@@ -916,18 +1046,21 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_timeouts_leave_connections_open() {
-        let stats = with_server(ConnectionTimeouts::from_secs(0, 0), |addr, _| async move {
-            let mut silent = connect(addr).await;
-            let mut keep_alive = connect(addr).await;
-            get_ok(&mut keep_alive).await;
-            let window = Duration::from_secs(2);
-            let (silent_closed, idle_closed) = tokio::join!(
-                closed_within(&mut silent, window),
-                closed_within(&mut keep_alive, window)
-            );
-            assert_eq!((silent_closed, idle_closed), (None, None));
-            get_ok(&mut keep_alive).await;
-        })
+        let stats = with_server(
+            ConnectionTimeouts::from_secs(0, 0),
+            |addr, _, _| async move {
+                let mut silent = connect(addr).await;
+                let mut keep_alive = connect(addr).await;
+                get_ok(&mut keep_alive).await;
+                let window = Duration::from_secs(2);
+                let (silent_closed, idle_closed) = tokio::join!(
+                    closed_within(&mut silent, window),
+                    closed_within(&mut keep_alive, window)
+                );
+                assert_eq!((silent_closed, idle_closed), (None, None));
+                get_ok(&mut keep_alive).await;
+            },
+        )
         .await;
         assert_eq!(counts(&stats), (0, 0));
     }
@@ -936,7 +1069,7 @@ mod tests {
     async fn the_drain_still_closes_idle_connections_and_lets_streams_finish() {
         let stats = with_server(
             ConnectionTimeouts::from_secs(LONG, LONG),
-            |addr, handle| async move {
+            |addr, handle, _| async move {
                 let mut keep_alive = connect(addr).await;
                 get_ok(&mut keep_alive).await;
                 let mut streaming = connect(addr).await;
@@ -961,6 +1094,62 @@ mod tests {
         )
         .await;
         assert_eq!(counts(&stats), (0, 0));
+    }
+
+    /// A waker that counts its wakes.
+    struct CountingWaker(AtomicUsize);
+
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn counting_waker() -> (Arc<CountingWaker>, std::task::Waker) {
+        let wakes = Arc::new(CountingWaker(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(Arc::clone(&wakes));
+        (wakes, waker)
+    }
+
+    #[test]
+    fn a_request_that_ends_under_a_poll_does_not_wake_the_connection_a_dropped_one_does() {
+        let count = Arc::new(RequestCount::default());
+        let (wakes, waker) = counting_waker();
+
+        count.idle_waker.register(&waker);
+        InFlightGuard::start(Arc::clone(&count)).end();
+        assert!(!count.exempt());
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+
+        count.idle_waker.register(&waker);
+        drop(InFlightGuard::start(Arc::clone(&count)));
+        assert!(!count.exempt());
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_response_body_polled_to_its_end_releases_the_request_without_a_wake() {
+        let count = Arc::new(RequestCount::default());
+        let (wakes, waker) = counting_waker();
+        count.idle_waker.register(&waker);
+
+        let guard = InFlightGuard::start(Arc::clone(&count));
+        let mut body = TrackedBody::new(axum::body::Body::from("ok"), Some(guard));
+        assert!(count.exempt());
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        while let Poll::Ready(Some(frame)) = Pin::new(&mut body).poll_frame(&mut cx) {
+            frame.expect("the body failed");
+        }
+        assert!(!count.exempt());
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+
+        count.idle_waker.register(&waker);
+        let guard = InFlightGuard::start(Arc::clone(&count));
+        let empty = TrackedBody::new(axum::body::Body::empty(), Some(guard));
+        assert!(!count.exempt());
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+        drop(empty);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
     }
 
     fn idle_connection(timeouts: ConnectionTimeouts) -> TimedConnection<tokio::io::Empty> {
