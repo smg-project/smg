@@ -15,6 +15,7 @@ from typing import IO, TYPE_CHECKING, Any
 import httpx
 
 from .constants import (
+    CLOUD_REQUEST_TIMEOUT_SECS,
     DEFAULT_HOST,
     DEFAULT_ROUTER_TIMEOUT,
     ENV_SHOW_ROUTER_LOGS,
@@ -569,6 +570,8 @@ class Gateway:
             "--history-backend",
             actual_history_backend,
             "--disable-health-check",
+            "--request-timeout-secs",
+            str(CLOUD_REQUEST_TIMEOUT_SECS),
         ]
 
         if history_backend == "oracle-custom":
