@@ -1717,34 +1717,10 @@ impl NativeEncoder {
                 });
             }
             (None, [stage]) => {
-                // The stage's matches through the scanner's own loop, the
-                // probe compiled into it; a gap between matches is a piece
-                // of its own through the same probe (a shape that splits on
-                // the space makes every word one, so the gap is the hot
-                // path there, not a cold one).
-                let keep_gaps = stage.keep_gaps;
-                let mut cursor = 0;
-                stage.pattern.for_each_match(text, |start, end| {
-                    if keep_gaps && cursor < start {
-                        if let Err(declined) =
-                            self.tokenize_piece_at(model, text, cursor..start, mapped, ids, cache)
-                        {
-                            fallback = Some(declined);
-                        }
-                    }
-                    if let Err(declined) =
-                        self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
-                    {
-                        fallback = Some(declined);
-                    }
-                    cursor = end;
-                });
-                if keep_gaps && cursor < text.len() {
-                    if let Err(declined) =
-                        self.tokenize_piece_at(model, text, cursor..text.len(), mapped, ids, cache)
-                    {
-                        fallback = Some(declined);
-                    }
+                if let Err(declined) =
+                    self.encode_single_stage(model, stage, text, mapped, ids, cache)
+                {
+                    fallback = Some(declined);
                 }
             }
             (None, _) => {
@@ -1820,6 +1796,52 @@ impl NativeEncoder {
             }
         }
         self.tokenize_piece_slow(model, piece, key, mapped, ids, cache)
+    }
+
+    /// A unit of a single-stage encoder: the stage's matches through the
+    /// scanner's own loop with the probe compiled into it; a gap between
+    /// matches is a piece of its own through the same probe. Out of line
+    /// so that [`Self::encode_unit`] keeps the frame the other shapes pay
+    /// per unit: the sentencepiece path calls it once per word, and the
+    /// loop inlined there cost that path 3 % of its instructions per token
+    /// (measured); one call per unit here is nothing against a unit's
+    /// pieces.
+    #[inline(never)]
+    fn encode_single_stage(
+        &self,
+        model: Option<&ModelWrapper>,
+        stage: &Stage,
+        text: &str,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let keep_gaps = stage.keep_gaps;
+        let mut cursor = 0;
+        let mut fallback = None;
+        stage.pattern.for_each_match(text, |start, end| {
+            if keep_gaps && cursor < start {
+                if let Err(declined) =
+                    self.tokenize_piece_at(model, text, cursor..start, mapped, ids, cache)
+                {
+                    fallback = Some(declined);
+                }
+            }
+            if let Err(declined) =
+                self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
+            {
+                fallback = Some(declined);
+            }
+            cursor = end;
+        });
+        if keep_gaps && cursor < text.len() {
+            if let Err(declined) =
+                self.tokenize_piece_at(model, text, cursor..text.len(), mapped, ids, cache)
+            {
+                fallback = Some(declined);
+            }
+        }
+        fallback.map_or(Ok(()), Err)
     }
 
     /// [`Self::tokenize_piece`] for the piece `text[piece]` of a unit: the
