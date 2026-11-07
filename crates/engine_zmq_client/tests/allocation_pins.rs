@@ -67,10 +67,12 @@ fn one_token_five_candidates() -> Vec<Bytes> {
 }
 
 /// Decoding one output whose logprobs ride inline: the outputs vector, the
-/// request id, the token ids, the three arrays' dtype strings, shape vectors
-/// and raw views, the three decoded columns, the positions and the entries.
-/// The three field names a failed decode would name are formatted on the
-/// error path alone.
+/// request id, the token ids, the boxed logprobs payload, the three arrays'
+/// shape vectors, the three decoded columns, the positions and the entries.
+/// The arrays' dtypes are borrowed spellings and their raw views slices of
+/// the frame, so neither allocates (the frame's shared header is made by the
+/// first decode of a frame, here the warm one). The three field names a
+/// failed decode would name are formatted on the error path alone.
 #[test]
 fn decoding_one_output_with_inline_logprobs_allocates_this_much() {
     let frames = one_token_five_candidates();
@@ -81,7 +83,7 @@ fn decoding_one_output_with_inline_logprobs_allocates_this_much() {
     let outputs = &decoded.as_request_batch().expect("a batch").outputs;
     assert_eq!(outputs[0].new_logprobs.as_ref().map(Logprobs::len), Some(1));
     eprintln!("allocation calls per decode: {allocations}");
-    assert_eq!(allocations, 25, "allocation calls per decode");
+    assert_eq!(allocations, 13, "allocation calls per decode");
 }
 
 /// `ZMQ_DECODE_COUNTED=<n>`: the decode `n` times, for a counter-based

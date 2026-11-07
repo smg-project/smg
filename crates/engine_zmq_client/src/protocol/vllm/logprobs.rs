@@ -5,6 +5,8 @@
 //! Log probabilities on the engine's wire: the per-token and per-position records a request's
 //! output carries, decoded from the engine's packed arrays.
 
+use std::borrow::Cow;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
@@ -172,17 +174,17 @@ impl WireLogprobs {
 
         Ok(Self {
             logprob_token_ids: WireNdArray {
-                dtype: "<i8".to_string(),
+                dtype: Cow::Borrowed("<i8"),
                 shape: vec![rows, cols],
                 data: WireArrayData::RawView(token_ids.into()),
             },
             logprobs: WireNdArray {
-                dtype: "<f4".to_string(),
+                dtype: Cow::Borrowed("<f4"),
                 shape: vec![rows, cols],
                 data: WireArrayData::RawView(logprobs.into()),
             },
             token_ranks: WireNdArray {
-                dtype: "<i8".to_string(),
+                dtype: Cow::Borrowed("<i8"),
                 shape: vec![rows],
                 data: WireArrayData::RawView(token_ranks.into()),
             },
