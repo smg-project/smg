@@ -1,3 +1,13 @@
+mod decode_limit;
+mod exif_orientation;
+mod hop_budget;
+mod ico_png_entry;
+mod max_long_side_pixel;
+mod seek_decode;
+mod sixteen_bit_colour;
+mod sixteen_bit_grey;
+mod transparency;
+mod video_frame_cap;
 mod video_sampling;
 
 use std::{
