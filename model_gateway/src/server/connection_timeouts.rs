@@ -942,7 +942,8 @@ mod tests {
     /// wakes the connection task, which arms the bound, so the close comes
     /// at the bound and not at the stream's own end. The test pins that
     /// outcome (h2 wakes the task for the reset as well); the guard's own
-    /// wake on a drop is pinned on its waker by the unit test above.
+    /// wake on a drop is pinned on its waker by
+    /// `a_request_that_ends_under_a_poll_does_not_wake_the_connection_a_dropped_one_does`.
     #[tokio::test]
     async fn a_stream_reset_by_the_client_still_leaves_the_http2_connection_to_the_idle_timeout() {
         let stats = with_server(
