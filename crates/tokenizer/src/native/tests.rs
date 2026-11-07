@@ -3106,10 +3106,17 @@ fn scanner_differential(patterns: &[&str]) {
         assert!(parsed.has_scanner(), "{pattern}");
         let program = parsed.program_only();
         let check = |text: &str| {
+            let expected = program.find_iter(text).collect::<Vec<_>>();
             assert_eq!(
                 parsed.find_iter(text).collect::<Vec<_>>(),
-                program.find_iter(text).collect::<Vec<_>>(),
+                expected,
                 "pattern {pattern:?} text {text:?}"
+            );
+            let mut each = Vec::new();
+            parsed.for_each_match(text, |start, end| each.push((start, end)));
+            assert_eq!(
+                each, expected,
+                "for_each_match: pattern {pattern:?} text {text:?}"
             );
         };
         for text in &fixtures {

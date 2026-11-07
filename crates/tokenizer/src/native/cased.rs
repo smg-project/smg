@@ -46,7 +46,7 @@
 
 use super::{
     pattern::{
-        clitic_match, concat, next_char, plain_class, previous_boundary, repeat, Class, Node,
+        clitic_match, concat, each_match, plain_class, previous_boundary, repeat, Class, Node,
     },
     scan::{Bits, Roles},
 };
@@ -474,20 +474,6 @@ impl Scanner {
         text: &str,
         f: &mut F,
     ) {
-        let mut pos = 0;
-        while pos < text.len() {
-            match self.match_at(classes, text, pos) {
-                Some(end) if end > pos => {
-                    f(pos, end);
-                    pos = end;
-                }
-                _ => {
-                    let Some((_, len)) = next_char(text, pos) else {
-                        return;
-                    };
-                    pos += len;
-                }
-            }
-        }
+        each_match(text, |pos| self.match_at(classes, text, pos), f);
     }
 }

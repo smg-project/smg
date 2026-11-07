@@ -929,21 +929,7 @@ impl Scanner {
     /// is passed over by one character, as the iterator does.
     #[inline(always)]
     fn for_each_match<F: FnMut(usize, usize)>(&self, classes: &[Class], text: &str, f: &mut F) {
-        let mut pos = 0;
-        while pos < text.len() {
-            match self.match_at(classes, text, pos) {
-                Some(end) if end > pos => {
-                    f(pos, end);
-                    pos = end;
-                }
-                _ => {
-                    let Some((_, len)) = next_char(text, pos) else {
-                        return;
-                    };
-                    pos += len;
-                }
-            }
-        }
+        each_match(text, |pos| self.match_at(classes, text, pos), f);
     }
 }
 
@@ -1217,6 +1203,34 @@ fn first_sets(node: &mut Node, classes: &[Class]) -> First {
             nullable: true,
             ..First::default()
         },
+    }
+}
+
+/// Calls `f` with each match of `text` in order, each continuing after the
+/// last, `match_at(pos)` giving the end of the match that starts at `pos`:
+/// a position no alternative matches at is passed over by one character,
+/// as [`Matches::next`] does. The one loop behind the scanners'
+/// `for_each_match`, compiled into each with its own `match_at`.
+#[inline(always)]
+pub(super) fn each_match<M, F>(text: &str, mut match_at: M, f: &mut F)
+where
+    M: FnMut(usize) -> Option<usize>,
+    F: FnMut(usize, usize),
+{
+    let mut pos = 0;
+    while pos < text.len() {
+        match match_at(pos) {
+            Some(end) if end > pos => {
+                f(pos, end);
+                pos = end;
+            }
+            _ => {
+                let Some((_, len)) = next_char(text, pos) else {
+                    return;
+                };
+                pos += len;
+            }
+        }
     }
 }
 
