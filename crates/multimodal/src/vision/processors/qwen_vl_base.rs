@@ -89,6 +89,19 @@ pub enum QwenVideoResizeMode {
     PerFrame,
 }
 
+/// What a clip's `video_second_per_grid`, the time one temporal patch spans
+/// in the position ids, divides the temporal patch size by.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QwenVideoTiming {
+    /// The rate the clip was sampled at, which the Qwen2-VL line's
+    /// processors read from the video metadata.
+    SampledRate,
+    /// A rate the processor fixes on its own, whatever the clip was sampled
+    /// at: the Qwen3-Omni processor divides by its `fps` argument, 1.0
+    /// unless a caller passes one.
+    FixedRate(f64),
+}
+
 #[derive(Clone)]
 struct VideoFrameRgb<'a> {
     width: usize,
@@ -345,6 +358,7 @@ pub struct QwenVLProcessorBase {
     config: QwenVLConfig,
     allow_video_dimensions_below_factor: bool,
     raise_rounded_sides_to_factor: bool,
+    video_timing: QwenVideoTiming,
     transforms: QwenTransforms,
 }
 
@@ -393,6 +407,7 @@ impl QwenVLProcessorBase {
             config,
             allow_video_dimensions_below_factor: false,
             raise_rounded_sides_to_factor: false,
+            video_timing: QwenVideoTiming::SampledRate,
         }
     }
 
@@ -485,6 +500,13 @@ impl QwenVLProcessorBase {
         self.config.temporal_patch_size
     }
 
+    /// Divide a clip's temporal patch size by `timing`'s rate for its
+    /// `video_second_per_grid`, rather than by the rate it was sampled at.
+    pub fn with_video_timing(mut self, timing: QwenVideoTiming) -> Self {
+        self.video_timing = timing;
+        self
+    }
+
     fn plan_video(
         &self,
         frame_count: usize,
@@ -513,11 +535,21 @@ impl QwenVLProcessorBase {
                 "Qwen video patch buffer size overflow: patches={num_patches}, features={patch_features}"
             ))
         })?;
-        // The rate the clip was sampled at sets the time each temporal patch spans.
+        // The rate the clip was sampled at sets the time each temporal patch
+        // spans, unless the processor fixes a rate of its own.
         let sample_fps = clip.sample_fps;
         if !sample_fps.is_finite() || sample_fps <= 0.0 {
             return Err(TransformError::ShapeError(format!(
                 "Qwen video fps must be finite and positive, got {sample_fps}"
+            )));
+        }
+        let timing_rate = match self.video_timing {
+            QwenVideoTiming::SampledRate => sample_fps,
+            QwenVideoTiming::FixedRate(rate) => rate,
+        };
+        if !timing_rate.is_finite() || timing_rate <= 0.0 {
+            return Err(TransformError::ShapeError(format!(
+                "Qwen video timing rate must be finite and positive, got {timing_rate}"
             )));
         }
 
@@ -532,7 +564,7 @@ impl QwenVLProcessorBase {
             num_patches,
             output_values,
             tokens: self.calculate_tokens_from_grid(grid_t, grid_h, grid_w),
-            second_per_grid: (temporal_patch_size as f64 / sample_fps) as f32,
+            second_per_grid: (temporal_patch_size as f64 / timing_rate) as f32,
             filter: self.transforms.filter,
             do_resize: self.transforms.do_resize,
             norm: self.transforms.norm,
@@ -2520,6 +2552,25 @@ mod tests {
         let processor = QwenVLProcessorBase::new(create_test_config());
         let tokens = processor.calculate_tokens_from_grid(1, 32, 32);
         assert_eq!(tokens, (32 * 32) / 4);
+    }
+
+    /// A processor that fixes its own timing rate is refused one that cannot
+    /// divide the temporal patch size, as a clip sampled at such a rate is:
+    /// the guard covers the rate the plan divides by, whichever it is.
+    #[test]
+    fn fixed_timing_rate_must_be_finite_and_positive() {
+        let frames = vec![create_pattern_frame(3), create_pattern_frame(101)];
+        for rate in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let processor = QwenVLProcessorBase::new(create_video_test_config())
+                .with_video_timing(QwenVideoTiming::FixedRate(rate));
+            match processor.preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0)) {
+                Err(TransformError::ShapeError(message)) => {
+                    assert!(message.contains("timing rate"), "rate {rate}: {message}");
+                }
+                Err(other) => panic!("rate {rate}: {other}"),
+                Ok(_) => panic!("rate {rate} was accepted"),
+            }
+        }
     }
 
     #[test]

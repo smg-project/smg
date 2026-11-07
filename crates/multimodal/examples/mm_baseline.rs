@@ -265,6 +265,8 @@ struct Facts {
     wire_sha256: String,
     one_pass_equals_two_pass: Option<bool>,
     video_frames: Option<usize>,
+    /// A clip's `video_second_per_grid`, the time one temporal patch spans as the processor reports it.
+    video_second_per_grid: Option<f32>,
 }
 
 #[expect(
@@ -393,6 +395,14 @@ fn grid_of(inputs: &PreprocessedEncoderInputs) -> Vec<i64> {
         .unwrap_or_default()
 }
 
+/// The time one temporal patch of a clip spans, as the processor reports it.
+fn second_per_grid_of(inputs: &PreprocessedEncoderInputs) -> Option<f32> {
+    match inputs.model_specific.get("video_second_per_grid") {
+        Some(ModelSpecificValue::Tensor { data, .. }) => data.first().copied(),
+        _ => None,
+    }
+}
+
 /// One timed iteration of a class: the stage times and the wire bytes.
 fn iterate(
     work: &Work,
@@ -505,6 +515,7 @@ fn facts(
                 wire_sha256,
                 one_pass_equals_two_pass: Some(two_pass_wire == one_pass),
                 video_frames: None,
+                video_second_per_grid: None,
             })
         }
         Work::Video {
@@ -530,6 +541,7 @@ fn facts(
                 wire_sha256,
                 one_pass_equals_two_pass: None,
                 video_frames: Some(clip_frame_count(&clip)),
+                video_second_per_grid: second_per_grid_of(&inputs),
             })
         }
         Work::Audio { processor, bytes } => {
@@ -552,6 +564,7 @@ fn facts(
                 wire_sha256,
                 one_pass_equals_two_pass: None,
                 video_frames: None,
+                video_second_per_grid: None,
             })
         }
     }
@@ -729,6 +742,7 @@ fn run_class(
         "shape": facts.shape,
         "grid": facts.grid,
         "video_frames": facts.video_frames,
+        "video_second_per_grid": facts.video_second_per_grid,
         "digests": {
             "rgb_sha256": facts.rgb_sha256,
             "f32_sha256": facts.f32_sha256,
