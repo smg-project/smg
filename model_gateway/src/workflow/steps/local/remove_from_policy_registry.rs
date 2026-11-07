@@ -86,8 +86,14 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
                 .remove_worker_from_policies(worker.url());
         }
 
+        // The removed workers' URLs leave their models' trees too: a same-URL
+        // replacement during the drain is the one removed, and its models
+        // can differ from the found worker's.
         let mut cache_removals: HashMap<String, HashSet<String>> = HashMap::new();
-        for worker in workers_to_remove {
+        for worker in workers_to_remove
+            .iter()
+            .chain(&context.data.removed_workers)
+        {
             for model_id in WorkerRegistry::worker_model_ids(worker) {
                 cache_removals
                     .entry(model_id)

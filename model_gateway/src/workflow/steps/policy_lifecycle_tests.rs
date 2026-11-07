@@ -17,6 +17,7 @@ use super::{
 use crate::{
     app_context::{testing::app_context_for_tests, AppContext},
     config::RouterConfig,
+    policies::CacheAwarePolicy,
     worker::{BasicWorkerBuilder, ModelCard, Worker, WorkerRegistry},
     workflow::data::WorkerRegistrationMode,
 };
@@ -249,6 +250,38 @@ async fn a_removal_takes_the_policy_of_the_worker_a_replacement_put_in_its_place
         .get_by_url("http://w1:8000")
         .is_none());
     assert_eq!(policy_of(&app_context, "qwen"), None);
+}
+
+#[tokio::test]
+async fn a_removal_purges_the_cache_tenant_of_the_worker_a_replacement_put_in_its_place() {
+    // As above, with qwen's policy kept by qwen's other worker: the URL the
+    // registry step removed leaves qwen's tree, not only llama's.
+    let app_context = app_context();
+    let llama = worker("http://w1:8000", "llama");
+    register(&app_context, Arc::clone(&llama), "random").await;
+    register(
+        &app_context,
+        worker("http://w2:8000", "qwen"),
+        "cache_aware",
+    )
+    .await;
+    register(
+        &app_context,
+        worker("http://w1:8000", "qwen"),
+        "cache_aware",
+    )
+    .await;
+    let policy = app_context.policy_registry.get_policy("qwen").unwrap();
+    let tree = policy
+        .as_any()
+        .downcast_ref::<CacheAwarePolicy>()
+        .and_then(|policy| policy.string_tree("qwen"))
+        .expect("qwen's cache-aware tree");
+    tree.insert_text("a prompt the replacement served", "http://w1:8000");
+
+    remove(&app_context, llama).await;
+    assert_eq!(policy_of(&app_context, "qwen"), Some("cache_aware"));
+    assert!(!tree.get_tenant_char_count().contains_key("http://w1:8000"));
 }
 
 #[tokio::test]
