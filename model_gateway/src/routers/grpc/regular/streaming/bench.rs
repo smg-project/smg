@@ -268,6 +268,7 @@ impl StreamBench {
                     COMPLETION_PROMPT,
                     0,
                     &tx,
+                    None,
                 )
                 .await;
             drop(tx);

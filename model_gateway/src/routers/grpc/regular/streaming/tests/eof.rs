@@ -1099,6 +1099,7 @@ async fn byte_fallback_completion_transport_eof_preserves_text_without_complete(
                 "",
                 0,
                 &tx,
+                None,
             )
             .await
             .unwrap();
@@ -1151,6 +1152,7 @@ async fn byte_fallback_completion_transport_eof_reports_local_stop_without_compl
                     "",
                     0,
                     &tx,
+                    None,
                 )
                 .await;
             drop(tx);

@@ -1365,6 +1365,7 @@ async fn a_watched_completion_stream_whose_client_leaves_with_held_text_ends_at_
         "p",
         0,
         &tx,
+        None,
     );
     let client = async {
         let mut text = String::new();
