@@ -11,8 +11,9 @@
 //! registry's events the way the worker manager does and runs the two steps
 //! for every worker of origin `Mesh`: `Registered` admits it, `Removed`
 //! releases it, and `Replaced` tells an owner's in-place rebuild (still an
-//! import: the new worker admitted, the old one's stream and count share
-//! handed to it, so a same-model rebuild keeps the policy) from a local
+//! import: under the same role the new worker is admitted and the old one's
+//! stream and count share handed to it, so a same-model rebuild keeps the
+//! policy; under another role the old one is released first) from a local
 //! claim of its address (the worker is local now and the registration
 //! workflow admits it under the same URL; the import's stream and its share
 //! of the model's count are handed to it, `PolicyRegistration::hand_over`).
@@ -162,17 +163,34 @@ impl Sync {
     }
 
     /// An owner's in-place rebuild of the import under `worker_id` (a
-    /// metadata update): the replacement is admitted first, then the URL's
-    /// stream and the old object's share of its model's count are handed to
-    /// it (`PolicyRegistration::hand_over`). A rebuild under the same model
-    /// so keeps the model's policy and the tenants the import learned; one
-    /// under another model purges the old model's tenants, as a hand-over
-    /// does. A release followed by an admission would drop both for a
-    /// moment, and the policy with the last worker.
+    /// metadata update). Under the same role the replacement is admitted
+    /// first, then the URL's stream and the old object's share of its
+    /// model's count are handed to it (`PolicyRegistration::hand_over`). A
+    /// rebuild under the same model so keeps the model's policy and the
+    /// tenants the import learned; one under another model purges the old
+    /// model's tenants, as a hand-over does. A release followed by an
+    /// admission would drop both for a moment, and the policy with the
+    /// last worker. A rebuild under another role (a prefill import now a
+    /// decode worker) is that release then admission: the hand-over keeps
+    /// every state at the URL under a model the new worker serves, so the
+    /// old role's policy would keep the address in its worker set and its
+    /// tree. The release is keyed by the URL and runs before the
+    /// admission, when only the old object's state is at the address.
     async fn rebuild(&mut self, worker_id: &WorkerId, new: Arc<dyn Worker>) {
         let Some(old) = self.tracked.remove(worker_id) else {
             return;
         };
+        if old.worker_type() != new.worker_type() {
+            self.registration.release(&old).await;
+            self.admit(worker_id.clone(), Arc::clone(&new)).await;
+            debug!(
+                worker_id = %worker_id.as_str(),
+                url = new.redacted_url(),
+                model = new.model_id(),
+                "Mesh import rebuilt in place under another role; the old worker released, the new one admitted"
+            );
+            return;
+        }
         self.admit(worker_id.clone(), Arc::clone(&new)).await;
         self.registration.hand_over(&old, &new).await;
         debug!(
@@ -227,8 +245,9 @@ impl Sync {
     /// registry no longer holds as an import is released, or hands its
     /// stream to the worker now at its address (a claim, or a registration
     /// after the tombstone); one it holds as an import under another worker
-    /// object was rebuilt (the new worker admitted, the old one's stream and
-    /// count share handed to it); an import this task has not seen is
+    /// object was rebuilt (under the same role the new worker is admitted and
+    /// the old one's stream and count share handed to it, under another role
+    /// the old one is released first); an import this task has not seen is
     /// admitted.
     async fn resync(&mut self) {
         let imports: HashMap<WorkerId, Arc<dyn Worker>> = self
@@ -268,7 +287,7 @@ mod tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        policies::{BucketPolicy, CacheAwarePolicy, PolicyRegistry},
+        policies::{BucketPolicy, CacheAwareConfig, CacheAwarePolicy, PolicyRegistry},
         worker::{
             test_support::no_health_check, BasicWorkerBuilder, KvEventMonitor, WorkerMonitor,
         },
@@ -375,6 +394,19 @@ mod tests {
         Arc::new(
             BasicWorkerBuilder::new(url)
                 .model(ModelCard::new(model_id))
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    /// A decode worker over gRPC at `url`: the role an owner's rebuild can
+    /// give an import that was a prefill worker.
+    fn grpc_decode_worker(url: &str, model_id: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(model_id))
+                .worker_type(WorkerType::Decode)
                 .connection_mode(ConnectionMode::Grpc)
                 .health_config(no_health_check())
                 .build(),
@@ -907,6 +939,16 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// The tenants of the prefill policy's tree under `model_id`.
+    fn prefill_tenants(policies: &PolicyRegistry, model_id: &str) -> Vec<String> {
+        policies
+            .get_prefill_policy()
+            .as_any()
+            .downcast_ref::<CacheAwarePolicy>()
+            .map(|cache_aware| cache_aware.string_tree_tenants(model_id))
+            .unwrap_or_default()
+    }
+
     /// The worker at the import's address serves another model and is not
     /// admitted yet when this task sees the import's `Removed`: its model
     /// has no policy, so the kind of its stream is its admission's to
@@ -957,6 +999,99 @@ mod tests {
             Arc::strong_count(&local),
             held - 1,
             "the admission started the local worker's load-record stream"
+        );
+    }
+
+    /// A same-model rebuild of a streaming import: the admission of the
+    /// replacement finds the old object's stream active and keeps it, so
+    /// the hand-over's stop and restart is what moves the URL's stream to
+    /// the new object, and the old object is released by its stream's end.
+    #[tokio::test]
+    async fn an_in_place_rebuild_restarts_the_urls_stream_for_the_new_worker() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let (registration, policies, monitor) = streaming_registration(&registry);
+        let mut sync = sync_by_hand(&registry, &registration);
+        let mut events = registry.subscribe_events();
+
+        registry.on_remote_worker_state(&grpc_remote_state("peer-w1", "grpc://127.0.0.1:1", "m1"));
+        handle_queued(&mut sync, &mut events).await;
+        let id = registry.get_id_by_url("grpc://127.0.0.1:1").unwrap();
+        let import = Arc::downgrade(&registry.get(&id).unwrap());
+
+        let rebuilt = grpc_local_worker("grpc://127.0.0.1:1", "m1");
+        assert!(registry.replace(&id, Arc::clone(&rebuilt)));
+        handle_queued(&mut sync, &mut events).await;
+
+        until(
+            "the import's worker object is released by its stream",
+            || import.upgrade().is_none(),
+        )
+        .await;
+        assert_eq!(count(&policies, "m1"), Some(1));
+        assert!(
+            monitor.get_indexer("m1").is_some(),
+            "the restarted stream feeds the model's index"
+        );
+        assert!(
+            sync.tracked
+                .get(&id)
+                .is_some_and(|tracked| Arc::ptr_eq(tracked, &rebuilt)),
+            "the new worker is the one tracked"
+        );
+        // The restarted stream's task holds the new worker's object: ending
+        // the stream releases exactly that hold.
+        let held = Arc::strong_count(&rebuilt);
+        monitor.on_worker_removed("grpc://127.0.0.1:1").await;
+        assert_eq!(
+            Arc::strong_count(&rebuilt),
+            held - 1,
+            "the restarted stream's task held the new worker's object"
+        );
+    }
+
+    /// A prefill import rebuilt as a decode worker under the same model:
+    /// the old role's policy state at the address goes. A hand-over keeps
+    /// every state under a model the new worker serves, so the prefill
+    /// tree would keep the address as a tenant, and its best prefix match
+    /// could name a worker that no longer prefills.
+    #[tokio::test]
+    async fn a_rebuild_under_another_role_purges_the_old_roles_tenants() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let (registration, policies, _monitor) = streaming_registration(&registry);
+        policies.set_prefill_policy(Arc::new(CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        })));
+        let mut sync = sync_by_hand(&registry, &registration);
+        let mut events = registry.subscribe_events();
+
+        registry.on_remote_worker_state(&prefill_remote_state(
+            "peer-p1",
+            "grpc://127.0.0.1:1",
+            "m1",
+        ));
+        handle_queued(&mut sync, &mut events).await;
+        assert!(
+            prefill_tenants(&policies, "m1").contains(&"grpc://127.0.0.1:1".to_string()),
+            "the prefill import is a tenant of the prefill tree"
+        );
+
+        let id = registry.get_id_by_url("grpc://127.0.0.1:1").unwrap();
+        let rebuilt = grpc_decode_worker("grpc://127.0.0.1:1", "m1");
+        assert!(registry.replace(&id, Arc::clone(&rebuilt)));
+        handle_queued(&mut sync, &mut events).await;
+
+        let left = prefill_tenants(&policies, "m1");
+        assert!(
+            !left.contains(&"grpc://127.0.0.1:1".to_string()),
+            "the address left the prefill tree with its role: {left:?}"
+        );
+        assert_eq!(count(&policies, "m1"), Some(1));
+        assert!(
+            sync.tracked
+                .get(&id)
+                .is_some_and(|tracked| Arc::ptr_eq(tracked, &rebuilt)),
+            "the new worker is the one tracked"
         );
     }
 
