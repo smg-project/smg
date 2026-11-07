@@ -470,7 +470,7 @@ impl MuseSparkVisionProcessor {
         let mut original = (0u32, 0u32);
         let mut rows_per_group = 0;
         let mut out: Vec<u8> = Vec::new();
-        let mut group: Vec<Vec<u8>> = Vec::with_capacity(temporal);
+        let mut group: Vec<std::borrow::Cow<'a, [u8]>> = Vec::with_capacity(temporal);
         let mut written = 0;
         for (index, (width, height, data)) in frames.enumerate() {
             let plan = match plan {
@@ -488,10 +488,10 @@ impl MuseSparkVisionProcessor {
                 return Err(TransformError::InconsistentShapes);
             }
             let frame = resized_frame(data, width, height, plan, do_resize)?;
-            group.push(frame.data.into_owned());
+            group.push(frame.data);
             let last_of_group = group.len() == temporal || index + 1 == count;
             if last_of_group {
-                let refs: Vec<&[u8]> = group.iter().map(Vec::as_slice).collect();
+                let refs: Vec<&[u8]> = group.iter().map(|data| data.as_ref()).collect();
                 let slice =
                     &mut out[written * rows_per_group * features..][..rows_per_group * features];
                 patchify_group(&refs, plan, settings, slice);

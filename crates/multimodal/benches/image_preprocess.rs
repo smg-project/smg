@@ -14,7 +14,7 @@ use bytes::Bytes;
 use criterion::{
     criterion_group, criterion_main,
     measurement::{Measurement, ValueFormatter},
-    BenchmarkGroup, BenchmarkId, Criterion, Throughput,
+    BenchmarkGroup, BenchmarkId, Criterion, SamplingMode, Throughput,
 };
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage, RgbImage};
 use llm_multimodal::{
@@ -28,7 +28,7 @@ use llm_multimodal::{
             DeepseekV41Processor, KimiK3Processor, Llama4VisionProcessor, Qwen2VLProcessor,
             Qwen3VLProcessor,
         },
-        transforms, VisionPreProcessor,
+        transforms, VideoClipOptions, VisionPreProcessor,
     },
     Modality,
 };
@@ -129,6 +129,36 @@ fn bench_qwen3_vl(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("single", label), &images, |b, imgs| {
             b.iter(|| returned(processor.preprocess(imgs).unwrap()));
         });
+    }
+    group.finish();
+}
+
+/// A clip's frames through the video path at three frame sizes off the family's
+/// 32-pixel grid, so that every frame is resized to it (a frame already on the
+/// grid is patchified from its borrowed bytes and never reaches the resize),
+/// the frames patchified two by two into one pooled buffer. The throughput is
+/// per frame, in the process's CPU time.
+fn bench_qwen3_vl_video(c: &mut Criterion<CpuTime>) {
+    const FRAMES: usize = 8;
+    let config = PreProcessorConfig::from_json(
+        r#"{"do_resize": true, "size": {"shortest_edge": 3136, "longest_edge": 12845056}, "temporal_patch_size": 2}"#,
+    )
+    .unwrap();
+    let processor = Qwen3VLProcessor::from_config_for(&config, Modality::Video);
+    let clip = VideoClipOptions::sampled_at(2.0);
+
+    let mut group = c.benchmark_group("qwen3_vl_video");
+    group.sampling_mode(SamplingMode::Flat);
+    group.throughput(Throughput::Elements(FRAMES as u64));
+    for &(w, h) in &[(650, 490), (1000, 750), (1920, 1080)] {
+        let frames: Vec<DynamicImage> = (0..FRAMES).map(|_| make_test_image(w, h)).collect();
+        group.bench_with_input(
+            BenchmarkId::new("frame", format!("{w}x{h}")),
+            &frames,
+            |b, frames| {
+                b.iter(|| returned(processor.preprocess_video(frames, &clip).unwrap()));
+            },
+        );
     }
     group.finish();
 }
@@ -319,7 +349,7 @@ criterion_group!(
 criterion_group!(
     name = wire_benches;
     config = Criterion::default().with_measurement(CpuTime);
-    targets = bench_wire_write, bench_deepseek_v41, bench_decode_preprocess
+    targets = bench_wire_write, bench_deepseek_v41, bench_decode_preprocess, bench_qwen3_vl_video
 );
 criterion_main!(benches, wire_benches);
 
