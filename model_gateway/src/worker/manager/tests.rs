@@ -1636,6 +1636,91 @@ fn test_reconcile_from_registry_captures_pending_and_ready_workers() {
     );
 }
 
+/// The bootstrap schedules a worker without a verdict as a registration
+/// would: due now, not an interval out. A worker that carries a verdict
+/// keeps its interval.
+#[test]
+fn the_bootstrap_schedules_a_pending_worker_now_and_a_ready_one_an_interval_out() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let pending_worker = make_worker("http://pending:1", 2, 3);
+    assert_eq!(pending_worker.status(), WorkerStatus::Pending);
+    let pending_id = registry.register(pending_worker).unwrap();
+    let ready_worker = make_worker("http://ready:1", 2, 3);
+    ready_worker.set_status(WorkerStatus::Ready);
+    let ready_id = registry.register(ready_worker).unwrap();
+
+    let before = tokio::time::Instant::now();
+    let mut next_check = HashMap::new();
+    reconcile_from_registry(&registry, &mut next_check, &test_config());
+    let after = tokio::time::Instant::now();
+
+    assert!(
+        next_check[&pending_id] <= after,
+        "a worker without a verdict is due the moment the loop starts, not an interval later"
+    );
+    assert!(
+        next_check[&ready_id] >= before + Duration::from_secs(1),
+        "a worker that carries a verdict keeps its interval"
+    );
+}
+
+/// Through the running loop: a worker registered before the manager started
+/// (a start-up worker whose registration won the race with the manager's
+/// start) is probed on the loop's first tick, as one registered under the
+/// running loop is. With an hour between probes, the only probe this test
+/// can see is that first one.
+#[tokio::test]
+async fn a_worker_registered_before_the_manager_starts_is_probed_at_once_not_an_interval_later() {
+    let serving = Arc::new(AtomicBool::new(true));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let url = start_health_stub(serving, hits.clone()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = probed_worker(&url, ConnectionMode::Http);
+    assert_eq!(worker.status(), WorkerStatus::Pending);
+    registry.register(worker.clone()).unwrap();
+
+    let started = tokio::time::Instant::now();
+    let mut manager = manager_over(&registry);
+    wait_until(
+        started + Duration::from_secs(5),
+        "a worker already in the registry at the manager's start was not probed at once: its \
+         first read waits a whole interval",
+        || hits.load(Ordering::SeqCst) > 0,
+    )
+    .await;
+    wait_until(
+        started + Duration::from_secs(5),
+        "the first read's pass did not promote the worker",
+        || worker.status() == WorkerStatus::Ready,
+    )
+    .await;
+
+    manager.shutdown().await;
+}
+
+/// A worker the bootstrap finds with a verdict is not read at the start: its
+/// interval stands; only the workers without one are brought forward.
+#[tokio::test]
+async fn a_ready_worker_registered_before_the_manager_starts_keeps_its_interval() {
+    let serving = Arc::new(AtomicBool::new(true));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let url = start_health_stub(serving, hits.clone()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = probed_worker(&url, ConnectionMode::Http);
+    worker.set_status(WorkerStatus::Ready);
+    registry.register(worker).unwrap();
+
+    let mut manager = manager_over(&registry);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a worker that carries a verdict is read an interval after the start, not at once"
+    );
+
+    manager.shutdown().await;
+}
+
 #[tokio::test]
 async fn test_worker_manager_start_is_deterministic_with_preexisting_workers() {
     // End-to-end contract for fix #2: a worker that exists in the
