@@ -28,7 +28,7 @@ use smg_grpc_client::{
 use tracing::error;
 use uuid::Uuid;
 
-use super::{helpers::bootstrap_rendezvous, PipelineStage};
+use super::{helpers::bootstrap_rendezvous, pd_protocol::EncodeHandoff, PipelineStage};
 use crate::{
     routers::grpc::{
         backend_client::BackendClient,
@@ -61,7 +61,8 @@ impl EncodeStage {
 
 #[async_trait]
 impl PipelineStage for EncodeStage {
-    /// Plan TokenSpeed rendezvous; vLLM encodes its assembled prompt at dispatch.
+    /// Plan the rendezvous rooms; a push handoff encodes the built prompt at
+    /// dispatch and plans nothing here.
     async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         if ctx
             .state
@@ -73,15 +74,15 @@ impl PipelineStage for EncodeStage {
             return Ok(());
         }
 
-        // vLLM sends the assembled prompt to E during request execution; it
-        // does not use TokenSpeed's per-item bootstrap rendezvous.
-        if matches!(
-            ctx.state.workers.as_ref(),
-            Some(WorkerSelection::Disaggregated {
-                runtime_type: RuntimeType::Vllm,
-                ..
-            })
-        ) {
+        // Under a push handoff the encoder takes the built prompt during
+        // request execution; there is no per-item bootstrap rendezvous.
+        if ctx
+            .state
+            .workers
+            .as_ref()
+            .and_then(WorkerSelection::encode_handoff)
+            == Some(EncodeHandoff::Push)
+        {
             return Ok(());
         }
 
