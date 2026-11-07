@@ -31,6 +31,7 @@ use futures::StreamExt;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerType};
 use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto as vllm};
+use tokio::time::Instant;
 
 #[cfg(unix)]
 use crate::sockets::unlink_stale_socket;
@@ -1575,6 +1576,18 @@ impl ZmqEngineClient {
             ZmqBackend::TokenSpeed(client) => client.output_silence(),
             ZmqBackend::Sglang(client) => client.output_silence(),
             ZmqBackend::Trtllm(client) => client.output_silence(),
+        }
+    }
+
+    /// When the engine last sent an output batch of any kind, `None` before
+    /// the first (the ZMQ client's `last_output_at`): read whether or not
+    /// anything is in flight, and never moved by a dispatch.
+    pub fn last_output_at(&self) -> Option<Instant> {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.last_output_at(),
+            ZmqBackend::TokenSpeed(client) => client.last_output_at(),
+            ZmqBackend::Sglang(client) => client.last_output_at(),
+            ZmqBackend::Trtllm(client) => client.last_output_at(),
         }
     }
 

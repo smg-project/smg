@@ -527,9 +527,10 @@ def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
     config.model_config.multimodal_config.media_io_kwargs = {}
     assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 8
     # A loader of its own (video_backend in the kwargs or the environment) or a
-    # frame rate above zero, which thins by duration: rules the pipeline cannot
-    # follow go along by name, and the pipeline refuses them only for a family
-    # that samples the way the loader does. The budget rides along regardless.
+    # sampling key an engine loader reads (fps, max_frames, min_frames,
+    # temporal_patch_size), whatever its value: rules the pipeline cannot
+    # follow go along by name, and the pipeline refuses them per family. The
+    # budget rides along regardless.
 
     def rule():
         return rust.smg_media_options(config, settings, str(tmp_path))["video_loader_rule"]
@@ -538,22 +539,36 @@ def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
     assert rule() == "--media-io-kwargs video.video_backend=x"
     assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 8
     config.model_config.multimodal_config.media_io_kwargs = {"video": {"video_backend": "opencv"}}
-    assert rule() is None, "the default loader by name is no rule"
+    assert rule() == "--media-io-kwargs video.video_backend=opencv", (
+        "an explicit kwarg is reported whatever its value: it swaps a per-class loader"
+    )
     config.model_config.multimodal_config.media_io_kwargs = {"video": {"fps": 1}}
     assert rule() == "--media-io-kwargs video.fps=1"
-    for no_cap in (-1, 0, "0"):
-        config.model_config.multimodal_config.media_io_kwargs = {"video": {"fps": no_cap}}
-        assert rule() is None, f"fps={no_cap!r} thins nothing"
+    # A non-positive rate goes along as well: the default loader reads it as no
+    # rate, the per-class loaders clamp every clip to min_frames; which it is
+    # the pipeline tells per family.
+    for rate in (-1, 0, "0"):
+        config.model_config.multimodal_config.media_io_kwargs = {"video": {"fps": rate}}
+        assert rule() == f"--media-io-kwargs video.fps={rate}"
+    # The keys the per-class loaders read go along as given, in the launcher's
+    # key order; num_frames is the frame budget, not a rule.
+    config.model_config.multimodal_config.media_io_kwargs = {
+        "video": {"temporal_patch_size": 4, "num_frames": 16, "max_frames": 64, "min_frames": 8}
+    }
+    assert rule() == (
+        "--media-io-kwargs video.max_frames=64; --media-io-kwargs video.min_frames=8; "
+        "--media-io-kwargs video.temporal_patch_size=4"
+    )
     config.model_config.multimodal_config.media_io_kwargs = {}
     monkeypatch.setenv("VLLM_VIDEO_LOADER_BACKEND", "opencv_dynamic")
     assert rule() == "VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic"
     config.model_config.multimodal_config.media_io_kwargs = {"video": {"fps": 2}}
     assert rule() == "VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic; --media-io-kwargs video.fps=2"
     # vLLM takes the kwarg over the environment: a kwarg naming opencv silences
-    # a fleet-wide VLLM_VIDEO_LOADER_BACKEND, and a foreign kwarg is the rule
-    # whatever the environment says.
+    # a fleet-wide VLLM_VIDEO_LOADER_BACKEND (the kwarg itself is the one rule),
+    # and a foreign kwarg is the rule whatever the environment says.
     config.model_config.multimodal_config.media_io_kwargs = {"video": {"video_backend": "opencv"}}
-    assert rule() is None
+    assert rule() == "--media-io-kwargs video.video_backend=opencv"
     monkeypatch.setenv("VLLM_VIDEO_LOADER_BACKEND", "opencv")
     config.model_config.multimodal_config.media_io_kwargs = {"video": {"video_backend": "x"}}
     assert rule() == "--media-io-kwargs video.video_backend=x"
@@ -702,7 +717,7 @@ def test_model_info_advertises_the_engines_item_limits():
             get_limit_per_prompt=lambda modality: {"image": 8, "video": 2, "audio": 1}[modality],
         ),
     )
-    assert rust.model_info_from_config(config)["mm_item_limits"] == "image=8,video=2"
+    assert rust.model_info_from_config(config)["mm_item_limits"] == "audio=1,image=8,video=2"
 
 
 def test_model_info_advertises_the_engines_encoder_budget():

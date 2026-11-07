@@ -105,9 +105,10 @@ The worker then advertises `mm_processor=inprocess` and `mm_media_ref_schemes`
 through `GetServerInfo`; a router with media-reference support forwards
 `media_refs` only to workers that advertise, and a router without it ignores the
 labels and keeps sending preprocessed tensors. Whatever the processor mode, a
-multimodal engine also advertises its resolved `--limit-mm-per-prompt` as
-`mm_item_limits` (`image=8,video=2`), so a router that preprocesses media
-itself holds requests to the engine's limits, and its encoder budget as
+multimodal engine also advertises its resolved `--limit-mm-per-prompt` for
+audio, image and video as `mm_item_limits` (`audio=1,image=8,video=2`), so a
+router that preprocesses media itself holds requests to the engine's limits,
+and its encoder budget as
 `mm_encoder_budget` (the `budget of N tokens` of the engine's encoder-cache
 start-up line, derived at launch with vLLM's own helper): the most feature
 tokens one media item may carry and still be scheduled, so the router refuses
@@ -642,12 +643,21 @@ Worker-side media processing uses the same `--mm-processor` /
   cap the in-process and Redis processors apply, so an unbounded count stays
   bounded in `smg` mode too (a cap below the engine's count then samples fewer
   frames than the engine's own server would, as intended), and a loader rule
-  the pipeline cannot follow (`video_backend` in the engine's media kwargs,
-  else `VLLM_VIDEO_LOADER_BACKEND`, other than `opencv`, or a `video.fps` above
-  zero, which thins frames by duration) is refused at launch for a family that
-  samples the way the loader does (Gemma 4) and serves video at all; the
-  families with a rate-based sampler of their own never followed the loader and
-  start as before. An engine that normalizes pixels on
+  the pipeline cannot follow (an explicit `video_backend` in the engine's media
+  kwargs, else a `VLLM_VIDEO_LOADER_BACKEND` other than `opencv`, and every
+  sampling key of the video kwargs that an engine loader reads: `fps`,
+  `max_frames`, `min_frames`, `temporal_patch_size`) is refused at launch, per
+  family, for a worker that serves video at all: for a family that samples the
+  way the engine's default loader does (Gemma 4), the rules that loader reads
+  (a kwarg naming `opencv` is that loader, a non-positive `fps` is no rate to
+  it, and it never reads the three keys of the per-class loaders, so those
+  pass); for a family whose loader the engine registers for its processor
+  class (the Qwen2-VL line and Qwen3-Omni: `VLLM_VIDEO_LOADER_BACKEND` never
+  reaches that loader, while an explicit kwarg, `opencv` included, swaps it),
+  the `--media-io-kwargs` rules alone; and none yet for the other families,
+  which start as before: those with a sampler of their own, which never
+  followed the loader, and those whose per-class-loader read is still pending
+  (Qwen3-VL, the GLM line). An engine that normalizes pixels on
   device
   (vLLM's `mm_device_do_normalize`, on by default for the Qwen-VL family)
   takes raw `uint8` pixels, and the pipeline writes those for it; a model

@@ -234,7 +234,9 @@ impl WorkerManager {
         // because it happened synchronously on this thread, or (b) arrives
         // as a Registered event in the broadcast buffer and is idempotently
         // applied by the event loop. The "a or b" dichotomy is what makes
-        // startup deterministic regardless of task scheduling.
+        // startup deterministic regardless of task scheduling, and both
+        // paths read a worker without a verdict at once: the bootstrap
+        // below schedules a Pending worker as the event does.
         let events_rx = registry.subscribe_events();
 
         // Run the bootstrap reconcile synchronously on the caller's thread
@@ -389,9 +391,10 @@ impl ProbeSlot {
 }
 
 /// Writes `worker_id`'s slot. A probed worker is due at once (`immediate`: a
-/// registration or replacement is probed without waiting an interval, and so
-/// is a demoted worker a contact brings forward) or after its interval; any
-/// other slot leaves the schedule. (A demoted worker's passing probe short of
+/// registration or replacement is probed without waiting an interval, so is
+/// a demoted worker a contact brings forward, and so is a worker the
+/// bootstrap finds without a verdict) or after its interval; any other slot
+/// leaves the schedule. (A demoted worker's passing probe short of
 /// its success threshold brings the next read to a probe timeout away, or
 /// leaves an earlier deadline standing; that write is the health loop's own.)
 fn schedule_at(
@@ -639,7 +642,17 @@ fn apply_registry_event(
 }
 
 /// Side-effect-free startup reconcile: rebuild the schedule from the
-/// current registry snapshot without publishing new events or removals.
+/// current registry snapshot without publishing new events or removals. A
+/// worker the snapshot holds still Pending has no verdict yet, so it is due
+/// at once, as its registration under a running loop would have made it
+/// (`apply_registry_event`): a start-up worker whose registration landed
+/// before the loop subscribed is read when the loop starts, not one interval
+/// later. For a ZMQ worker that first read starts the connect driver that
+/// binds the handshake the engine dials. A worker that carries a verdict
+/// keeps its interval. The lag-recovery rebuild (`apply_registry_event` on
+/// `RecvError::Lagged`) shares this seed: a worker still Pending after a lag
+/// is read at once too, one read toward its pending cap, as the `Registered`
+/// events the lag lost would have been.
 fn reconcile_from_registry(
     registry: &Arc<WorkerRegistry>,
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
@@ -654,7 +667,8 @@ fn reconcile_from_registry(
             config,
             should_remove_failed(registry, &descriptor.worker_id, config.remove_unhealthy),
         );
-        schedule_at(next_check, descriptor.worker_id, slot, now, false);
+        let immediate = descriptor.status == WorkerStatus::Pending;
+        schedule_at(next_check, descriptor.worker_id, slot, now, immediate);
     }
 }
 

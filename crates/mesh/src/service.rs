@@ -401,6 +401,12 @@ impl PreparedMeshServer {
     }
 }
 
+/// The status a table entry carries, for the log lines (an unknown value
+/// reads as `Init`).
+pub(crate) fn status_of(entry: &NodeState) -> NodeStatus {
+    NodeStatus::try_from(entry.status).unwrap_or(NodeStatus::Init)
+}
+
 /// Broadcast node state updates to target nodes, each dialed through
 /// `dialer` (the channel the probes keep to it, with the node's TLS identity
 /// when the mesh has one).
@@ -537,7 +543,7 @@ mod tests {
     };
 
     use super::{
-        gossip::{gossip_client, gossip_server::GossipServer, GossipMessage, NodeUpdate},
+        gossip::{gossip_client, gossip_server::GossipServer, GossipMessage, NodeUpdate, PingReq},
         *,
     };
     use crate::{
@@ -844,10 +850,21 @@ mod tests {
         init_peers: Vec<SocketAddr>,
         certs: &MtlsTestCerts,
     ) -> (SocketAddr, MeshServerHandler) {
+        mtls_node_with(name, ip, init_peers, mtls_config(certs)).await
+    }
+
+    /// A mesh node with mTLS on under `config`, bound to an ephemeral port
+    /// of `ip`, joining `init_peers`.
+    async fn mtls_node_with(
+        name: &str,
+        ip: IpAddr,
+        init_peers: Vec<SocketAddr>,
+        config: MTLSConfig,
+    ) -> (SocketAddr, MeshServerHandler) {
         let listener = TcpListener::bind((ip, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (server, handler) = MeshServerBuilder::new(name.to_string(), addr, addr, init_peers)
-            .with_mtls(mtls_config(certs))
+            .with_mtls(config)
             .build();
         let name = name.to_string();
         #[expect(
@@ -1144,6 +1161,244 @@ mod tests {
             }
         });
         (addr, accepted)
+    }
+
+    /// The member asked to probe a peer on another member's behalf sends
+    /// the peer a probe without a table and hands back the peer's own
+    /// answer: C answers B's relayed probe with its name, address and
+    /// status, and nothing joins C's table from it. (The relay used to send
+    /// a message without a payload, which the peer refused as invalid, so
+    /// no relayed probe ever reached its target.)
+    #[tokio::test]
+    async fn a_relayed_probe_reaches_its_target_and_brings_back_its_answer() {
+        init();
+        let (addr_b, handler_b) = plain_node("B").await;
+        let (addr_c, handler_c) = plain_node("C").await;
+
+        let answer = Dialer::new(None)
+            .ping(
+                &node_state("B", addr_b),
+                Some(gossip_message::Payload::PingReq(PingReq {
+                    node: Some(node_state("C", addr_c)),
+                })),
+            )
+            .await
+            .expect("the relayed probe is answered");
+
+        assert_eq!(
+            (answer.name, answer.address, answer.status),
+            (
+                "C".to_string(),
+                addr_c.to_string(),
+                NodeStatus::Alive as i32
+            ),
+            "B handed back something other than C's own answer"
+        );
+        assert_eq!(
+            handler_c.state.read().keys().cloned().collect::<Vec<_>>(),
+            vec!["C".to_string()],
+            "a relayed probe without a table changed C's table"
+        );
+        handler_b.shutdown();
+        handler_c.shutdown();
+    }
+
+    /// A relay answers for the node it reached. A table holds C at an
+    /// address X answers at now: B's relayed probe to that address brings
+    /// back X's answer, which is not C's. It is refused, C's entry stays as
+    /// held and nothing of X enters the table; C's own answer through B is
+    /// recorded and C is `Alive` again.
+    #[tokio::test]
+    async fn a_relayed_answer_from_a_stale_address_is_not_the_peers() {
+        init();
+        let (addr_b, handler_b) = plain_node("B").await;
+        let (addr_c, handler_c) = plain_node("C").await;
+        let (addr_x, handler_x) = plain_node("X").await;
+        let stale = NodeState {
+            status: NodeStatus::Suspected as i32,
+            version: 3,
+            ..node_state("C", addr_x)
+        };
+        let table: ClusterState = Arc::new(RwLock::new(BTreeMap::from([(
+            "C".to_string(),
+            stale.clone(),
+        )])));
+        let dialer = Dialer::new(None);
+
+        let answer = dialer
+            .ping(
+                &node_state("B", addr_b),
+                Some(gossip_message::Payload::PingReq(PingReq {
+                    node: Some(stale),
+                })),
+            )
+            .await
+            .expect("B relayed the probe to the stale address");
+        assert_eq!(
+            answer.name, "X",
+            "the node at the stale address answers as itself"
+        );
+        assert!(
+            !GossipController::record_relayed_answer(&table, "C", &addr_b.to_string(), &answer),
+            "X's answer was taken as C's"
+        );
+        {
+            let table = table.read();
+            let c = table.get("C").expect("the table still holds C");
+            assert_eq!(
+                (c.status, c.address.clone(), c.version),
+                (NodeStatus::Suspected as i32, addr_x.to_string(), 3),
+                "C's entry moved on X's answer"
+            );
+            assert!(!table.contains_key("X"), "X's answer entered the table");
+        }
+
+        let answer = dialer
+            .ping(
+                &node_state("B", addr_b),
+                Some(gossip_message::Payload::PingReq(PingReq {
+                    node: Some(node_state("C", addr_c)),
+                })),
+            )
+            .await
+            .expect("B relayed the probe to C");
+        assert!(
+            GossipController::record_relayed_answer(&table, "C", &addr_b.to_string(), &answer),
+            "C's own answer was refused"
+        );
+        assert_eq!(
+            table.read().get("C").map(|c| c.status),
+            Some(NodeStatus::Alive as i32),
+            "C is not Alive after its own answer through B"
+        );
+        handler_b.shutdown();
+        handler_c.shutdown();
+        handler_x.shutdown();
+    }
+
+    /// Two members that cannot reach each other stay `Alive` on each other
+    /// through the member that reaches both. A's certificate comes from a
+    /// CA that B trusts and C does not, and C's from the CA A and B trust:
+    /// A's and C's dials to each other fail at the handshake, every dial to
+    /// or from B passes, so each failed direct probe between A and C is
+    /// relayed through B, and for fifteen seconds neither marks the other
+    /// `Suspected`.
+    #[tokio::test]
+    async fn two_members_that_cannot_reach_each_other_stay_alive_through_the_one_that_reaches_both()
+    {
+        init();
+        install_crypto_provider();
+        let certs = MtlsTestCerts::generate();
+        let other_ca = MtlsTestCerts::generate();
+        // A trust file with both CAs: its holder accepts either certificate
+        // from a client and from a server.
+        let both = certs.ca_cert_path.with_file_name("ca-both.pem");
+        std::fs::write(
+            &both,
+            [
+                std::fs::read(&certs.ca_cert_path).unwrap(),
+                std::fs::read(&other_ca.ca_cert_path).unwrap(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let trusting_both = |member: &MtlsTestCerts| MTLSConfig {
+            ca_cert_path: both.clone(),
+            server_cert_path: member.node_cert_path.clone(),
+            server_key_path: member.node_key_path.clone(),
+            require_client_cert: true,
+        };
+        let ip: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let (addr_a, handler_a) =
+            mtls_node_with("A", ip, Vec::new(), trusting_both(&other_ca)).await;
+        let (addr_b, handler_b) =
+            mtls_node_with("B", ip, vec![addr_a], trusting_both(&certs)).await;
+        let (addr_c, handler_c) = mtls_node_with("C", ip, vec![addr_b], mtls_config(&certs)).await;
+
+        // The bed: A and C refuse each other, B reaches both.
+        let a_to_c = handler_a
+            .dialer
+            .ping(&node_state("C", addr_c), Some(probe()))
+            .await;
+        assert!(a_to_c.is_err(), "A reached C directly: {a_to_c:?}");
+        let c_to_a = handler_c
+            .dialer
+            .ping(&node_state("A", addr_a), Some(probe()))
+            .await;
+        assert!(c_to_a.is_err(), "C reached A directly: {c_to_a:?}");
+        for (name, addr) in [("A", addr_a), ("C", addr_c)] {
+            let from_b = handler_b
+                .dialer
+                .ping(&node_state(name, addr), Some(probe()))
+                .await;
+            assert!(from_b.is_ok(), "B did not reach {name}: {from_b:?}");
+        }
+
+        wait_for(
+            || {
+                [&handler_a, &handler_b, &handler_c]
+                    .iter()
+                    .all(|handler| handler.state.read().len() == 3)
+            },
+            Duration::from_secs(20),
+            "the three members know each other",
+        )
+        .await;
+
+        let status_on = |holder: &MeshServerHandler, name: &str| {
+            holder.state.read().get(name).map(|node| node.status)
+        };
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(15) {
+            for (holder, label, name) in [(&handler_a, "A", "C"), (&handler_c, "C", "A")] {
+                let status = status_on(holder, name);
+                assert_eq!(
+                    status,
+                    Some(NodeStatus::Alive as i32),
+                    "{label} holds {name} at status {status:?} after {:?} although B reaches {name}",
+                    started.elapsed()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // A verdict from an earlier break: C's own answer, brought back by
+        // the relay through B, recorded as the loop records it over a
+        // `Suspected` entry for C one above what A holds, and A holds C
+        // `Alive` again. The relay is asked here and its answer recorded by
+        // hand, not waited for on the loop: the loop could carry the verdict
+        // to C through B first, and C would answer with it (the standoff the
+        // refutation addresses).
+        let answer = handler_a
+            .dialer
+            .ping(
+                &node_state("B", addr_b),
+                Some(gossip_message::Payload::PingReq(PingReq {
+                    node: Some(node_state("C", addr_c)),
+                })),
+            )
+            .await
+            .expect("B relayed the probe to C");
+        assert_eq!(
+            (answer.name.as_str(), answer.status),
+            ("C", NodeStatus::Alive as i32),
+            "C's own answer through B"
+        );
+        {
+            let mut table = handler_a.state.write();
+            let entry = table.get_mut("C").expect("A holds C");
+            entry.status = NodeStatus::Suspected as i32;
+            entry.version += 1;
+        }
+        GossipController::record_in_table(&handler_a.state, &answer);
+        assert_eq!(
+            status_on(&handler_a, "C"),
+            Some(NodeStatus::Alive as i32),
+            "A holds C Alive again once the relay's answer is recorded"
+        );
+        handler_a.shutdown();
+        handler_b.shutdown();
+        handler_c.shutdown();
     }
 
     /// A plain mesh node on an ephemeral loopback port, listening.

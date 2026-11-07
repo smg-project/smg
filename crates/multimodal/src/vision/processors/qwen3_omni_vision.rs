@@ -4,11 +4,14 @@
 //! `QwenVLProcessorBase`, but cannot use `Qwen3VLProcessor` directly. Omni
 //! applies video pixel limits per frame rather than across the sampled clip,
 //! gives its video preprocessor config precedence for video-specific limits,
-//! and emits timing metadata required by mixed-modality M-RoPE.
+//! and emits the timing metadata mixed-modality M-RoPE needs at the rate its
+//! processor fixes rather than the clip's sampled rate.
 
 use image::DynamicImage;
 
-use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
+use super::qwen_vl_base::{
+    QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode, QwenVideoTiming,
+};
 use crate::{
     encoder_inputs::EncoderDtype,
     types::{Modality, RgbFrameRef},
@@ -28,6 +31,13 @@ pub const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 32 * 32;
 pub const DEFAULT_PATCH_SIZE: usize = 16;
 pub const DEFAULT_MERGE_SIZE: usize = 2;
 pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
+
+/// The `fps` argument of the checkpoint's processor. It computes a clip's
+/// `video_second_per_grid`, the time one temporal patch spans in the
+/// position ids, as the temporal patch size over this argument, which
+/// defaults to 1.0 and which the serving path leaves at its default: two
+/// seconds a temporal patch, whatever rate the clip was sampled at.
+const PROCESSOR_FPS_ARGUMENT: f64 = 1.0;
 
 #[derive(Debug, Clone)]
 pub struct Qwen3OmniVisionProcessor {
@@ -75,7 +85,8 @@ impl Qwen3OmniVisionProcessor {
                 mean: QWEN3_OMNI_MEAN,
                 std: QWEN3_OMNI_STD,
                 model_name: "qwen3-omni",
-            }),
+            })
+            .with_video_timing(QwenVideoTiming::FixedRate(PROCESSOR_FPS_ARGUMENT)),
         }
     }
 
@@ -280,8 +291,14 @@ mod tests {
             .all(|value| (*value + 1.0).abs() < 1e-6));
     }
 
+    /// The checkpoint's processor computes `video_second_per_grid` as the
+    /// temporal patch size over its own `fps` argument, 1.0 unless a caller
+    /// passes one, and the serving path passes none: a two-frame temporal
+    /// patch spans two seconds whatever rate the clip was sampled at, where
+    /// the Qwen2-VL line's processors report the sampled rate's share (0.5
+    /// at 4 frames a second).
     #[test]
-    fn sampled_video_fps_controls_mrope_grid_timing() {
+    fn video_second_per_grid_is_the_processors_constant() {
         let config = PreProcessorConfig::from_json(
             r#"{"size":{"shortest_edge":1024,"longest_edge":65536}}"#,
         )
@@ -290,15 +307,20 @@ mod tests {
             DynamicImage::ImageRgb8(RgbImage::new(32, 32)),
             DynamicImage::ImageRgb8(RgbImage::new(32, 32)),
         ];
+        let processor = Qwen3OmniVisionProcessor::from_config_for(&config, Modality::Video);
 
-        let output = Qwen3OmniVisionProcessor::from_config_for(&config, Modality::Video)
-            .preprocess_video(&frames, &VideoClipOptions::sampled_at(4.0))
-            .unwrap();
-
-        assert!(matches!(
-            output.model_specific.get("video_second_per_grid"),
-            Some(ModelSpecificValue::Tensor { data, shape })
-                if data == &vec![0.5] && shape == &vec![1]
-        ));
+        for sampled_fps in [0.8, 2.0, 4.0] {
+            let output = processor
+                .preprocess_video(&frames, &VideoClipOptions::sampled_at(sampled_fps))
+                .unwrap();
+            assert!(
+                matches!(
+                    output.model_specific.get("video_second_per_grid"),
+                    Some(ModelSpecificValue::Tensor { data, shape })
+                        if data == &vec![2.0] && shape == &vec![1]
+                ),
+                "sampled at {sampled_fps}"
+            );
+        }
     }
 }

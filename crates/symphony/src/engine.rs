@@ -726,7 +726,9 @@ impl Engine {
                 self.lead(text, out);
             }
             Emits::Content | Emits::Reasoning => {
-                self.stay.begun |= !text.chars().all(is_strip_space);
+                if !self.stay.begun {
+                    self.stay.begun = !text.chars().all(is_strip_space);
+                }
                 self.release_stay(out);
                 self.show(text, out);
             }
@@ -842,6 +844,9 @@ impl Engine {
     /// The run the stay held is the state's text: the whitespace is shown, and an ignored
     /// terminal among it is dropped in its place.
     fn release_stay(&mut self, out: &mut Events) {
+        if self.stay.held.is_empty() {
+            return;
+        }
         for held in std::mem::take(&mut self.stay.held) {
             match held {
                 Held::Space(space) => self.show(Cow::Owned(space), out),

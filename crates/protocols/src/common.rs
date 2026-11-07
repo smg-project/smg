@@ -281,6 +281,81 @@ pub(crate) fn invalid(
     e
 }
 
+/// The parameter under which a validation error of a rule checked across
+/// fields names the field the refusal is about: the error envelope's
+/// `param`. The validator crate files such a rule's error under the whole
+/// request (`__all__`), a key that names no field.
+pub(crate) const FIELD_PARAM: &str = "field";
+
+/// [`invalid`] for a rule checked across fields, naming the field the
+/// refusal is about (the envelope's `param`); the message names it too, in
+/// the public API's words.
+pub(crate) fn invalid_at(
+    field: impl Into<String>,
+    code: &'static str,
+    message: impl Into<Cow<'static, str>>,
+) -> validator::ValidationError {
+    on_field(invalid(code, message), field)
+}
+
+/// `error`, naming `field` as the field it is about (see [`invalid_at`]).
+pub(crate) fn on_field(
+    mut error: validator::ValidationError,
+    field: impl Into<String>,
+) -> validator::ValidationError {
+    error.add_param(Cow::Borrowed(FIELD_PARAM), &field.into());
+    error
+}
+
+/// Validates `logit_bias` as the public API bounds it: every key a
+/// non-negative integer token id, no two keys spelling one id (`"5"` and
+/// `"05"` would reach an engine as one entry with either bias), every bias
+/// within -100..=100 (a bias of -100 bans the token, 100 forces it). Used by
+/// the chat and the completion request; the serving path bounds the ids by
+/// the model's vocabulary before the map reaches an engine.
+pub fn validate_logit_bias(bias: &HashMap<String, f32>) -> Result<(), validator::ValidationError> {
+    // The key first seen for each token id.
+    let mut keys_by_id = HashMap::with_capacity(bias.len());
+    for (key, bias) in bias {
+        let Some(id) = key.parse::<i32>().ok().filter(|id| *id >= 0) else {
+            return Err(invalid(
+                "logit_bias_invalid_key",
+                format!(
+                    "Invalid key in 'logit_bias': '{key}'; keys must be non-negative integer token \
+                     ids"
+                ),
+            ));
+        };
+        if let Some(other) = keys_by_id.insert(id, key.as_str()) {
+            let (first, second) = if other < key.as_str() {
+                (other, key.as_str())
+            } else {
+                (key.as_str(), other)
+            };
+            return Err(invalid(
+                "logit_bias_duplicate_key",
+                format!(
+                    "Invalid key in 'logit_bias': '{first}' and '{second}' both name token {id}; \
+                     each token takes one bias"
+                ),
+            ));
+        }
+        let code = match *bias {
+            b if b > 100.0 => "integer_above_max_value",
+            b if b < -100.0 => "integer_below_min_value",
+            _ => continue,
+        };
+        return Err(invalid(
+            code,
+            format!(
+                "Invalid value for 'logit_bias': token '{key}' has bias {bias}; each bias must be \
+                 between -100 and 100."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Validates stop sequences (max 4, non-empty strings)
 /// Used by both ChatCompletionRequest and ResponsesRequest
 pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationError> {

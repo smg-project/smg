@@ -157,7 +157,7 @@ async fn test_openai_router_models() {
         .body(Body::empty())
         .unwrap();
 
-    let response = list_models(&ctx, req.headers(), "req_test".to_string()).await;
+    let response = list_models(&ctx, req.headers(), None, "req_test".to_string()).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let (_, body) = response.into_parts();
@@ -973,7 +973,7 @@ async fn test_openai_router_models_from_registry() {
         .body(Body::empty())
         .unwrap();
 
-    let response = list_models(&ctx, req.headers(), "req_test".to_string()).await;
+    let response = list_models(&ctx, req.headers(), None, "req_test".to_string()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let (_, body) = response.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();

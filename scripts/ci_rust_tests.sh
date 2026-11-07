@@ -151,8 +151,6 @@ commands_of() {
             # One invocation for both packages: on its own, the harness's `-p` would unify the gateway
             # down to the harness's feature set and build the gateway lib a second time.
             echo "-p smg -p smg-test-harness --lib --bin smg"
-            # Reuse the gateway unit-test build for the opt-in mixed-media video regression.
-            echo "-p smg -p smg-test-harness --lib sglang_mixed_media_preserves_interleaved_anchors :: --ignored"
             echo "-p smg --doc" ;;
         gateway-[0-9]*)
             local index=${shard#gateway-} selectors

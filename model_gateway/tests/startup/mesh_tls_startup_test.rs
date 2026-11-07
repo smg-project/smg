@@ -417,16 +417,16 @@ fn nameless_peer_series(gateway: &Gateway) -> Option<Vec<String>> {
     )
 }
 
-/// `member`'s status in `gateway`'s latest view of the membership (its last
-/// `Round <n> Status` log line), such as `Alive` or `Leaving`; `None` while
-/// no round line names the member.
+/// `member`'s status in `gateway`'s view of the membership, read from the
+/// last transition line that names it (`Member <name> is <Status> at version
+/// <n> (...)`, written whenever the member's status changes in this node's
+/// table), such as `Alive` or `Leaving`; `None` while no line names the
+/// member.
 fn status_on(gateway: &Gateway, member: &str) -> Option<String> {
     let log = gateway.log();
-    let round = log.lines().rev().find(|line| {
-        line.contains("Status:{") && line.contains(&format!("\"{member}\": NodeState"))
-    })?;
-    let entry = &round[round.find(&format!("\"{member}\": NodeState"))?..];
-    let status = &entry[entry.find("status: ")? + "status: ".len()..];
+    let prefix = format!("Member {member} is ");
+    let line = log.lines().rev().find(|line| line.contains(&prefix))?;
+    let status = &line[line.find(&prefix)? + prefix.len()..];
     Some(
         status
             .chars()

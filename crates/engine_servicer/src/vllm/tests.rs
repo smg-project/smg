@@ -1696,6 +1696,55 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// `GetLoads` with a rank named answers that rank's entry alone, as the
+/// other three wires and the Python servicer answer it; without one, every
+/// rank's; a rank this servicer does not serve answers no entry (the shape
+/// of the three filtering wires).
+#[tokio::test]
+async fn get_loads_answers_the_named_rank_alone() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let (mut h, _rank1_in, _rank1_out) = two_rank_harness(model).await;
+    let ranks_of = |response: &vllm::GetLoadsResponse| {
+        response
+            .loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>()
+    };
+    let every = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((every.dp_rank_count, ranks_of(&every)), (2, vec![0, 1]));
+    let one = h
+        .client
+        .get_loads(vllm::GetLoadsRequest {
+            dp_rank: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((one.dp_rank_count, ranks_of(&one)), (1, vec![1]), "{one:?}");
+    let unserved = h
+        .client
+        .get_loads(vllm::GetLoadsRequest {
+            dp_rank: Some(7),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (unserved.dp_rank_count, ranks_of(&unserved)),
+        (0, Vec::new()),
+        "{unserved:?}"
+    );
+}
+
 /// Two ranks behind one servicer: the request the second rank serves is
 /// credited to that rank's hit rate and throughput, on the poll and on the
 /// pushed record, and the first rank reads idle rather than carrying the

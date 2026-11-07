@@ -50,6 +50,7 @@ use tonic::service::Routes;
 
 use crate::{
     engine_link::EngineLink,
+    health_probe,
     kv_events::KvEventRelay,
     metrics::{Identity, ServicerMetrics},
     proto_json,
@@ -61,8 +62,9 @@ use crate::{
 pub const SERVICE_NAME: &str = "sglang.grpc.scheduler.SglangScheduler";
 /// The `wire` label of this servicer's metrics.
 const WIRE: &str = "sglang";
-/// What `HealthCheck`'s message says of a serving engine on this wire.
-const HEALTHY: &str = "healthy";
+/// The knob the Python servicer reads its health probe's bound from, in
+/// seconds; this servicer reads the same one.
+const HEALTH_CHECK_TIMEOUT_ENV: &str = "SGLANG_HEALTH_CHECK_TIMEOUT";
 
 /// What `GetModelInfo` and `GetServerInfo` report: the facts the Python
 /// servicer reads off SGLang's `ModelConfig` and `ServerArgs`, which the
@@ -314,6 +316,9 @@ pub(super) struct State {
     /// Resolved once at startup; missing or malformed roles cannot enable reuse.
     pub(super) media_disaggregation_mode: Option<String>,
     pub(super) mm_hasher: Option<engine_zmq_adapter::SglangCpuMmHasher>,
+    /// How long `HealthCheck`'s probe waits for the scheduler
+    /// ([`HEALTH_CHECK_TIMEOUT_ENV`]).
+    pub(super) health_probe_timeout: Duration,
 }
 
 impl WireState for State {
@@ -420,6 +425,7 @@ impl SglangServicerServer {
             media: config.media_processor,
             mm_hasher,
             media_identity_enabled,
+            health_probe_timeout: health_probe::timeout_from_env(HEALTH_CHECK_TIMEOUT_ENV),
         });
         let routes = Routes::new(
             SglangSchedulerServer::new(service::SglangService {

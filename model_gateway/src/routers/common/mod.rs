@@ -28,6 +28,8 @@
 //!   HTTP and gRPC families used to each carry a copy of
 //! - [`worker_selection`] — per-request worker-selection helpers used
 //!   by every routing path (regular, PD, fallback, external provider)
+//! - `test_support` (test builds only) — the fast retry policy the HTTP
+//!   and gRPC routers' tests retry under
 //! - `attempt_ledger` — one request's bookkeeping across its retry
 //!   attempts: the circuit breaker charged once per request per worker,
 //!   and a worker's definitive answer never replayed on it
@@ -125,6 +127,25 @@ pub(crate) fn attach_sized_body(
         )))
     } else {
         builder.body(body)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! What the HTTP and gRPC routers' tests share.
+
+    use crate::config::types::RetryConfig;
+
+    /// `max_retries` attempts with one to two milliseconds between them and
+    /// no jitter: a retrying test's whole schedule fits in its own bound.
+    pub(crate) fn fast_retry_config(max_retries: u32) -> RetryConfig {
+        RetryConfig {
+            max_retries,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 2,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        }
     }
 }
 

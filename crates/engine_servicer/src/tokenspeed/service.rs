@@ -17,7 +17,7 @@ use smg_grpc_client::{
 use tonic::{Request, Response, Status};
 
 use super::{generate, info, State};
-use crate::{kv_events, rpc, BoxStream};
+use crate::{kv_events, rpc, servicer::RequestOrigin, BoxStream};
 
 #[derive(Clone)]
 pub(super) struct TokenSpeedService {
@@ -56,7 +56,8 @@ impl TokenSpeedScheduler for TokenSpeedService {
                 "Generate is unavailable on TokenSpeed encode workers",
             ));
         }
-        let stream = generate::generate(&self.state, request.into_inner()).await;
+        let stream =
+            generate::generate(&self.state, request.into_inner(), RequestOrigin::Client).await;
         rpc::generated(&self.state, stream)
     }
 
@@ -64,7 +65,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         _request: Request<ts::HealthCheckRequest>,
     ) -> Result<Response<ts::HealthCheckResponse>, Status> {
-        Ok(Response::new(info::health_check(&self.state)))
+        Ok(Response::new(info::health_check(&self.state).await))
     }
 
     async fn abort(

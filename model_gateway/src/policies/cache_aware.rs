@@ -1627,6 +1627,12 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         true
     }
 
+    /// The event-driven path reads the model's KV-event index; without it
+    /// the selection falls back to the approximate token tree.
+    fn needs_kv_events(&self) -> bool {
+        true
+    }
+
     fn remove_worker(&self, url: &str) {
         // The CacheAware-specific removal path already prunes trees and hash
         // placements before the registry invokes this generic load-aware

@@ -335,6 +335,9 @@ pub struct Format {
     transitions: Vec<Transition>,
     /// Parser-only boundary tolerance; grammars retain the canonical transitions.
     leading_transitions: Vec<Transition>,
+    /// Parser-only recovery rows, followed after text as well, for a terminal the model writes
+    /// where the canonical rows have none; grammars retain the canonical transitions.
+    recovery_transitions: Vec<Transition>,
     calls: Option<CallSyntax>,
     /// Where a call's id comes from.
     call_id: CallId,
@@ -453,6 +456,7 @@ impl Format {
             states: Vec::new(),
             transitions: Vec::new(),
             leading_transitions: Vec::new(),
+            recovery_transitions: Vec::new(),
             calls: None,
             call_id: CallId::Minted,
             turn_opener: None,
@@ -547,6 +551,14 @@ impl Format {
             on: self.terminal_named(on),
             to: self.state_named(to),
         };
+        assert!(
+            !self
+                .recovery_transitions
+                .iter()
+                .any(|row| row.from == transition.from && row.on == transition.on),
+            "{}: a recovery row already reads {on} in {from}",
+            self.name
+        );
         self.transitions.push(transition);
         self
     }
@@ -562,6 +574,31 @@ impl Format {
         assert_eq!(self.emits(row.from), Emits::Content);
         assert_eq!(self.emits(row.to), Emits::Content);
         self.leading_transitions.push(row);
+        self
+    }
+
+    /// `from + on = to` for the parser alone: a terminal the model writes where the canonical
+    /// rows have none, read as the row says, after text as well (Kimi K3's answer closer inside
+    /// its thought). A grammar derived from the table keeps the canonical rows, so it never asks
+    /// the model for the shape.
+    pub(crate) fn recovery_transition(mut self, from: &str, on: &str, to: &str) -> Self {
+        let row = Transition {
+            from: self.state_named(from),
+            on: self.terminal_named(on),
+            to: self.state_named(to),
+        };
+        assert!(
+            self.next(row.from, row.on).is_none(),
+            "{}: a canonical row already reads {on} in {from}",
+            self.name
+        );
+        assert!(
+            self.emits(row.from) != Emits::Arguments && self.emits(row.to) != Emits::Arguments,
+            "{}: a recovery row may not touch an arguments state ({from} + {on} = {to}); the \
+             engine reads a call's rows from the canonical table alone",
+            self.name
+        );
+        self.recovery_transitions.push(row);
         self
     }
 
@@ -1355,12 +1392,23 @@ impl Format {
         if let Some(to) = self.leading_next(from, on) {
             return (!begun).then_some(to);
         }
-        self.next(from, on)
+        self.next(from, on).or_else(|| self.recovery_next(from, on))
+    }
+
+    /// A parser-only recovery row, unless the request shows the marker as text.
+    pub(crate) fn recovery_next(&self, from: usize, on: usize) -> Option<usize> {
+        if self.recovery_transitions.is_empty() || self.shown(on) {
+            return None;
+        }
+        self.recovery_transitions
+            .iter()
+            .find(|row| row.from == from && row.on == on)
+            .map(|row| row.to)
     }
 
     /// Find a parser-only boundary row unless the request preserves reasoning markers.
     pub(crate) fn leading_next(&self, from: usize, on: usize) -> Option<usize> {
-        if self.shown(on) {
+        if self.leading_transitions.is_empty() || self.shown(on) {
             return None;
         }
         self.leading_transitions

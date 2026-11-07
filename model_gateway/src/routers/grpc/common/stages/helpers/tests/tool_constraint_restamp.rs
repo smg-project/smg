@@ -9,9 +9,8 @@ use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto};
 use tool_parser::ToolConstraint;
 
 use super::*;
-use crate::{
-    routers::grpc::{context::ExecutionPlanKind, proto_wrapper::ProtoRequest},
-    worker::{BasicWorkerBuilder, WorkerType},
+use crate::routers::grpc::{
+    context::ExecutionPlanKind, proto_wrapper::ProtoRequest, testing::worker,
 };
 
 /// A parser that registers a reasoning prefix, so a forced call on a
@@ -20,17 +19,6 @@ const PARSER: &str = "glm47_moe";
 const BARE_CALLS: &str = "the bare calls (grammar after the reasoning)";
 const THOUGHT_THEN_CALLS: &str = "the thought block then the calls (grammar from the first token)";
 const PREFIX_THEN_CALLS: &str = "the free-text prefix then the calls (either engine)";
-
-fn worker(labels: &[(&str, &str)]) -> WorkerSelection {
-    let mut builder =
-        BasicWorkerBuilder::new("grpc://engine:50051").worker_type(WorkerType::Regular);
-    for (key, value) in labels {
-        builder = builder.label(*key, *value);
-    }
-    WorkerSelection::Single {
-        worker: Arc::new(builder.build()),
-    }
-}
 
 fn forced_call_on_a_thinking_prompt(factory: &ToolParserFactory) -> (String, String) {
     let tools: Vec<Tool> = serde_json::from_value(serde_json::json!([{
