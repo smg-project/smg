@@ -77,22 +77,35 @@ fn endpoints() -> Vec<Endpoint> {
     ]
 }
 
-/// The arrivals split at the engine's first token: the first frame that is
-/// not a keep-alive and arrived once the engine's silence was over (the
-/// early events of a stream come well before, the tokens only after).
-fn split_at_first_token<'a>(
+/// The arrivals split at the engine's first frame: the first frame after the
+/// first keep-alive that is not a keep-alive. A stream's early events come
+/// with the response headers, before any keep-alive is due; the engine's
+/// frames come after its silence, once keep-alive frames went out. The split
+/// reads the frame order and not the arrival clock: that clock starts at the
+/// response headers, while the engine's silence started at the request it
+/// was sent before them, so on a loaded host the engine's frames land a few
+/// milliseconds before the silence's length on the arrival clock.
+fn split_at_first_engine_frame<'a>(
     arrivals: &'a [Arrival],
     keep_alive: &str,
-    silence: Duration,
 ) -> (&'a [Arrival], &'a [Arrival]) {
-    let first = arrivals
+    let first_keep_alive = arrivals
         .iter()
-        .position(|arrival| arrival.at >= silence && arrival.text() != keep_alive);
+        .position(|arrival| arrival.text() == keep_alive);
     assert!(
-        first.is_some(),
-        "no frame after the {silence:?} silence: {arrivals:#?}"
+        first_keep_alive.is_some(),
+        "no keep-alive before the engine's first frame: {arrivals:#?}"
     );
-    arrivals.split_at(first.unwrap_or(arrivals.len()))
+    let searched_from = first_keep_alive.unwrap_or(arrivals.len());
+    let first_frame = arrivals[searched_from..]
+        .iter()
+        .position(|arrival| arrival.text() != keep_alive)
+        .map(|offset| searched_from + offset);
+    assert!(
+        first_frame.is_some(),
+        "no frame of the engine's after the keep-alive frames: {arrivals:#?}"
+    );
+    arrivals.split_at(first_frame.unwrap_or(arrivals.len()))
 }
 
 fn keep_alives<'a>(arrivals: &'a [Arrival], keep_alive: &str) -> Vec<&'a Arrival> {
@@ -108,7 +121,7 @@ async fn every_streaming_endpoint_carries_a_keep_alive_through_the_engine_s_sile
     for endpoint in endpoints() {
         let (arrivals, eof) =
             stream_to_end(&app, endpoint.path, endpoint.body.clone(), BUDGET).await;
-        let (silence, flowing) = split_at_first_token(&arrivals, endpoint.keep_alive, SILENCE);
+        let (silence, flowing) = split_at_first_engine_frame(&arrivals, endpoint.keep_alive);
         let during = keep_alives(silence, endpoint.keep_alive);
         assert!(
             (2..=4).contains(&during.len()),
@@ -157,10 +170,17 @@ async fn an_interval_of_zero_sends_nothing_through_the_silence() {
     let endpoints = endpoints();
     let chat = &endpoints[0];
     let arrivals = stream(&app, chat.path, chat.body.clone(), BUDGET).await;
-    let (silence, _) = split_at_first_token(&arrivals, chat.keep_alive, SILENCE);
     assert!(
-        silence.is_empty(),
-        "nothing before the first token with the keep-alive off: {arrivals:#?}"
+        keep_alives(&arrivals, chat.keep_alive).is_empty(),
+        "a keep-alive with the interval at zero: {arrivals:#?}"
+    );
+    // The engine's frames are the first on the stream, after a silence in
+    // which a 1 s interval would have sent three keep-alive frames.
+    assert!(
+        arrivals
+            .first()
+            .is_some_and(|arrival| arrival.at >= Duration::from_secs(1)),
+        "nothing before the engine's first frame with the keep-alive off: {arrivals:#?}"
     );
     server.abort();
 }
