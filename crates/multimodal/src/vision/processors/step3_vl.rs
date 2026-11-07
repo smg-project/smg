@@ -1,0 +1,720 @@
+//! The Step3-VL image processor: a global view and sliding-window crops.
+//!
+//! The reference is the serving engine's own processor module for the
+//! family. The checkpoints ship no `preprocessor_config.json`; the engine
+//! builds the processor from its constants and reads one switch from the
+//! model config, `vision_config.enable_patch`. Per image:
+//!
+//! 1. an image under 32 px on its short side with an aspect ratio past 4 is
+//!    pasted at the top-left of a black square of its long side;
+//! 2. a long side over 3024 px is scaled down to 3024 (both sides truncated to
+//!    whole pixels) with Pillow's BILINEAR resize; the result is the global
+//!    view's source;
+//! 3. the crop window: a long side under 728 px takes crops of the short side
+//!    when the aspect ratio is over 1.5 and none otherwise; from 728 px the
+//!    window is 504, or the short side when that is under 504 and the aspect
+//!    ratio over 4;
+//! 4. with a window, each side at least one window long is rounded to a
+//!    multiple of the window (up when the fraction is over 0.2), the view is
+//!    resized to that size (Pillow BILINEAR) and cut into windows row by row,
+//!    the last window of a side pulled back to its edge; a side shorter than
+//!    the window keeps its length and the window reads black past it;
+//! 5. the global view and every crop go through torchvision's `ToTensor` and
+//!    `Normalize` (CLIP's mean and std) and its antialiased BILINEAR tensor
+//!    resize to 728 x 728 and 504 x 504 (a tensor already that size passes
+//!    through).
+//!
+//! The output carries the global views as the encoder input
+//! `[N, 3, 728, 728]`, the crops as `patch_pixel_values` `[P, 3, 504, 504]`
+//! (flat, split per image by `num_patches`), `num_patches` `[N]`, and
+//! `patch_newline_mask` `[P]`, one per crop, set after every crop row but the
+//! last. The token count per image is `crops * (81 + 2) + 169 + 2 +
+//! newlines`: the crops each between a start and an end token, a newline
+//! token after every row but the last, then the view between its own start
+//! and end tokens.
+
+use std::{borrow::Cow, collections::HashMap};
+
+use image::{DynamicImage, RgbImage};
+use ndarray::Array4;
+use serde_json::Value;
+
+use super::llava::{CLIP_MEAN, CLIP_STD};
+use crate::vision::{
+    processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
+    scratch,
+    transforms::{self, TransformError},
+};
+
+/// The global view's side after the tensor resize.
+pub const IMAGE_SIZE: u32 = 728;
+/// A crop's side after the tensor resize.
+pub const PATCH_SIZE: u32 = 504;
+/// The longest side a decoded image is scaled down to before anything else.
+const MAX_IMAGE_SIZE: u32 = 3024;
+/// The feature tokens of the global view.
+pub const IMAGE_FEATURE_TOKENS: usize = 169;
+/// The feature tokens of one crop.
+pub const PATCH_FEATURE_TOKENS: usize = 81;
+
+/// The crops, flat across the batch: `[P, 3, 504, 504]`.
+pub const PATCH_PIXEL_VALUES: &str = "patch_pixel_values";
+/// The crop count per image: `[N]`.
+pub const NUM_PATCHES: &str = "num_patches";
+/// One flag per crop, set after every crop row but the last: `[P]`.
+pub const PATCH_NEWLINE_MASK: &str = "patch_newline_mask";
+
+/// The crop window of one image and the grid it cuts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CropGrid {
+    /// The window's side in the source the crops are cut from.
+    pub window: u32,
+    /// The size the view is resized to before the cut; a side under the
+    /// window keeps the view's length.
+    pub source: (u32, u32),
+    /// Windows along the width.
+    pub columns: usize,
+    /// Windows along the height.
+    pub rows: usize,
+}
+
+/// What the family's rule makes of one decoded size, before any pixel moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CropPlan {
+    /// The side of the black square the image is pasted onto when its short
+    /// side is under 32 px and its aspect ratio past 4; `None` otherwise.
+    pub square: Option<u32>,
+    /// The global view's source size: the (padded) image under the 3024 px
+    /// cap, as `(width, height)`.
+    pub view: (u32, u32),
+    /// The crops' window and grid; `None` when the image takes no crops.
+    pub crops: Option<CropGrid>,
+}
+
+impl CropPlan {
+    /// The crops of the image.
+    pub fn num_patches(&self) -> usize {
+        self.crops.map_or(0, |grid| grid.columns * grid.rows)
+    }
+
+    /// The newline tokens between the crop rows.
+    pub fn num_newlines(&self) -> usize {
+        self.crops.map_or(0, |grid| grid.rows - 1)
+    }
+
+    /// The tokens one image expands to: every crop between its start and end
+    /// tokens, a newline after every row but the last, the view between its
+    /// own start and end tokens.
+    pub fn num_tokens(&self) -> usize {
+        self.num_patches() * (PATCH_FEATURE_TOKENS + 2)
+            + IMAGE_FEATURE_TOKENS
+            + 2
+            + self.num_newlines()
+    }
+}
+
+/// The square pad: the side of the square an image under 32 px on its short
+/// side with an aspect ratio past 4 is pasted onto, `None` for any other.
+fn square_side(width: u32, height: u32) -> Option<u32> {
+    let ratio = f64::from(width) / f64::from(height);
+    (width.min(height) < 32 && (ratio > 4.0 || ratio < 0.25)).then(|| width.max(height))
+}
+
+/// The size under the 3024 px cap: both sides scaled by the cap over the long
+/// side and truncated, as the reference's `int()` truncates them.
+fn capped_size(width: u32, height: u32) -> (u32, u32) {
+    let long = width.max(height);
+    if long <= MAX_IMAGE_SIZE {
+        return (width, height);
+    }
+    let scale = f64::from(MAX_IMAGE_SIZE) / f64::from(long);
+    (
+        (f64::from(width) * scale) as u32,
+        (f64::from(height) * scale) as u32,
+    )
+}
+
+/// The crop window of a view, `0` for none.
+fn window_size(long: u32, short: u32) -> u32 {
+    let ratio = f64::from(long) / f64::from(short);
+    if long < IMAGE_SIZE {
+        if ratio > 1.5 {
+            short
+        } else {
+            0
+        }
+    } else if ratio > 4.0 {
+        short.min(PATCH_SIZE)
+    } else {
+        PATCH_SIZE
+    }
+}
+
+/// One side of the size the view is cut at: a whole number of windows, rounded
+/// up when the fraction is over 0.2; a side under the window keeps its length.
+fn crop_axis(length: u32, window: u32) -> u32 {
+    let ratio = f64::from(length) / f64::from(window);
+    if ratio < 1.0 {
+        return length;
+    }
+    let whole = length / window;
+    let fraction = ratio - f64::from(whole);
+    window * if fraction > 0.2 { whole + 1 } else { whole }
+}
+
+/// The window starts along one side: one per window length, the last pulled
+/// back so that it ends at the edge; a side under the window has one window
+/// at 0.
+fn window_starts(length: u32, window: u32) -> Vec<u32> {
+    let count = if length <= window {
+        1
+    } else {
+        (f64::from(length - window) / f64::from(window) + 1.0).ceil() as u32
+    };
+    let mut starts: Vec<u32> = (0..count).map(|i| window * i).collect();
+    if let Some(last) = starts.last_mut() {
+        if count > 1 && *last + window > length {
+            *last = length - window;
+        }
+    }
+    starts
+}
+
+/// The tensors of one image: the view's planes, every crop's planes back to
+/// back, and the newline flag of every crop.
+struct ImageTensors {
+    view: Vec<f32>,
+    crops: Vec<f32>,
+    newlines: Vec<i64>,
+    plan: CropPlan,
+}
+
+/// The Step3-VL image processor.
+#[derive(Debug, Clone)]
+pub struct Step3VLProcessor {
+    /// Whether the image takes crops beside its global view
+    /// (`vision_config.enable_patch`, true when the config says nothing).
+    enable_patch: bool,
+    /// Every byte through `ToTensor` then `Normalize` with CLIP's mean and std,
+    /// per channel.
+    table: [[f32; 256]; 3],
+}
+
+impl Default for Step3VLProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Step3VLProcessor {
+    /// The processor as the reference builds it from its constants, crops on.
+    pub fn new() -> Self {
+        Self::with_crops(true)
+    }
+
+    /// The processor with crops on or off.
+    pub fn with_crops(enable_patch: bool) -> Self {
+        Self {
+            enable_patch,
+            table: transforms::to_tensor_then_normalize_table(&CLIP_MEAN, &CLIP_STD),
+        }
+    }
+
+    /// The processor as the reference builds it for a checkpoint: its
+    /// constants, and `vision_config.enable_patch` from the model config
+    /// (crops on when the config says nothing). The family ships no
+    /// preprocessor config, and the reference reads none.
+    pub fn from_model_config(config: &Value) -> Self {
+        let enable_patch = config
+            .get("vision_config")
+            .and_then(|vision| vision.get("enable_patch"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        Self::with_crops(enable_patch)
+    }
+
+    /// Whether images take crops beside their global view.
+    pub fn crops_enabled(&self) -> bool {
+        self.enable_patch
+    }
+
+    /// The plan of a `width` x `height` image: the pad, the view and the crop
+    /// grid the reference's rule derives from the size alone.
+    pub fn plan(&self, width: u32, height: u32) -> CropPlan {
+        let square = square_side(width, height);
+        let (padded_w, padded_h) = square.map_or((width, height), |side| (side, side));
+        let view = capped_size(padded_w, padded_h);
+        let (long, short) = (view.0.max(view.1), view.0.min(view.1));
+        let window = if self.enable_patch {
+            window_size(long, short)
+        } else {
+            0
+        };
+        let crops = (window > 0).then(|| {
+            let source = (crop_axis(view.0, window), crop_axis(view.1, window));
+            CropGrid {
+                window,
+                source,
+                columns: window_starts(source.0, window).len(),
+                rows: window_starts(source.1, window).len(),
+            }
+        });
+        CropPlan {
+            square,
+            view,
+            crops,
+        }
+    }
+
+    /// `rgb` through the table and torchvision's antialiased BILINEAR resize
+    /// to `side` x `side`, as planes `[3, side, side]`; an image already that
+    /// size goes through the table alone, as the reference's resize returns
+    /// such a tensor unchanged.
+    fn normalized_square(&self, rgb: &RgbImage, side: u32) -> Result<Vec<f32>, TransformError> {
+        let (width, height) = rgb.dimensions();
+        let pixels = side as usize * side as usize;
+        let mut planes = scratch::take_f32_cap(3 * pixels);
+        if (width, height) == (side, side) {
+            let (pixels, _) = rgb.as_raw().as_chunks::<3>();
+            for (channel, table) in self.table.iter().enumerate() {
+                planes.extend(
+                    pixels
+                        .iter()
+                        .map(|pixel| table[usize::from(pixel[channel])]),
+                );
+            }
+        } else {
+            let resized = transforms::resize_bilinear_torch_aa_normalized(
+                rgb.as_raw(),
+                width,
+                height,
+                side,
+                side,
+                &self.table,
+            )?;
+            let (pixels, _) = resized.as_chunks::<3>();
+            for channel in 0..3 {
+                planes.extend(pixels.iter().map(|pixel| pixel[channel]));
+            }
+        }
+        Ok(planes)
+    }
+
+    /// One image through the reference's steps.
+    fn process(&self, image: &DynamicImage) -> Result<ImageTensors, TransformError> {
+        let (width, height) = (image.width(), image.height());
+        if width == 0 || height == 0 {
+            return Err(TransformError::ShapeError(format!(
+                "a {width}x{height} image has no view to resize"
+            )));
+        }
+        let plan = self.plan(width, height);
+        let source: Cow<'_, RgbImage> = match image {
+            DynamicImage::ImageRgb8(rgb) => Cow::Borrowed(rgb),
+            other => Cow::Owned(other.to_rgb8()),
+        };
+        let black = [0_u8; 3];
+        let padded = match plan.square {
+            Some(side) => Cow::Owned(transforms::paste_rgb(&source, side, side, 0, 0, black)),
+            None => source,
+        };
+        let view = if padded.dimensions() == plan.view {
+            padded
+        } else {
+            Cow::Owned(transforms::resize_bilinear_pil_rgb(
+                padded.as_raw(),
+                padded.width(),
+                padded.height(),
+                plan.view.0,
+                plan.view.1,
+            )?)
+        };
+        let view_planes = self.normalized_square(&view, IMAGE_SIZE)?;
+
+        let mut crops = Vec::new();
+        let mut newlines = Vec::new();
+        if let Some(grid) = plan.crops {
+            let cut = if view.dimensions() == grid.source {
+                Cow::Borrowed(view.as_ref())
+            } else {
+                Cow::Owned(transforms::resize_bilinear_pil_rgb(
+                    view.as_raw(),
+                    view.width(),
+                    view.height(),
+                    grid.source.0,
+                    grid.source.1,
+                )?)
+            };
+            let columns = window_starts(grid.source.0, grid.window);
+            let rows = window_starts(grid.source.1, grid.window);
+            let crop_len = 3 * PATCH_SIZE as usize * PATCH_SIZE as usize;
+            crops.reserve_exact(columns.len() * rows.len() * crop_len);
+            for (row, &y) in rows.iter().enumerate() {
+                for (column, &x) in columns.iter().enumerate() {
+                    let crop = transforms::crop_rgb(&cut, x, y, grid.window, grid.window);
+                    // A window past the edge of a side shorter than it reads
+                    // black there, as the reference's crop does.
+                    let crop = if crop.dimensions() == (grid.window, grid.window) {
+                        crop
+                    } else {
+                        transforms::paste_rgb(&crop, grid.window, grid.window, 0, 0, black)
+                    };
+                    let planes = self.normalized_square(&crop, PATCH_SIZE)?;
+                    crops.extend_from_slice(&planes);
+                    scratch::give_f32(planes);
+                    newlines.push(i64::from(
+                        column + 1 == columns.len() && row + 1 < rows.len(),
+                    ));
+                }
+            }
+        }
+        Ok(ImageTensors {
+            view: view_planes,
+            crops,
+            newlines,
+            plan,
+        })
+    }
+}
+
+impl VisionPreProcessor for Step3VLProcessor {
+    /// Each image's pad, resizes, crops and normalization read that image
+    /// alone, and the batch's tensors are the images' back to back.
+    fn supports_per_image_preprocessing(&self) -> bool {
+        true
+    }
+
+    fn default_mean(&self) -> [f64; 3] {
+        CLIP_MEAN
+    }
+
+    fn default_std(&self) -> [f64; 3] {
+        CLIP_STD
+    }
+
+    fn preprocess(
+        &self,
+        images: &[&DynamicImage],
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        if images.is_empty() {
+            return Err(TransformError::EmptyBatch);
+        }
+        let side = IMAGE_SIZE as usize;
+        let view_len = 3 * side * side;
+        let mut views: Vec<Vec<f32>> = Vec::with_capacity(images.len());
+        let mut crops = Vec::new();
+        let mut newlines = Vec::new();
+        let mut counts = Vec::with_capacity(images.len());
+        let mut tokens = Vec::with_capacity(images.len());
+        let mut sizes = Vec::with_capacity(images.len());
+        for image in images {
+            let tensors = self.process(image)?;
+            views.push(tensors.view);
+            crops.extend_from_slice(&tensors.crops);
+            newlines.extend_from_slice(&tensors.newlines);
+            counts.push(tensors.plan.num_patches() as i64);
+            tokens.push(tensors.plan.num_tokens());
+            sizes.push((image.width(), image.height()));
+        }
+        // One image's planes are the batch; several are copied back to back.
+        let data = if views.len() == 1 {
+            views.swap_remove(0)
+        } else {
+            let mut data = Vec::with_capacity(views.len() * view_len);
+            for view in views {
+                data.extend_from_slice(&view);
+                scratch::give_f32(view);
+            }
+            data
+        };
+        let encoder_input = Array4::from_shape_vec((images.len(), 3, side, side), data)
+            .map_err(|error| TransformError::ShapeError(error.to_string()))?;
+        let total_crops = newlines.len();
+        let patch = PATCH_SIZE as usize;
+        let model_specific = HashMap::from([
+            (
+                PATCH_PIXEL_VALUES.to_string(),
+                ModelSpecificValue::Tensor {
+                    data: crops,
+                    shape: vec![total_crops, 3, patch, patch],
+                },
+            ),
+            (
+                NUM_PATCHES.to_string(),
+                ModelSpecificValue::IntTensor {
+                    data: counts,
+                    shape: vec![images.len()],
+                },
+            ),
+            (
+                PATCH_NEWLINE_MASK.to_string(),
+                ModelSpecificValue::IntTensor {
+                    data: newlines,
+                    shape: vec![total_crops],
+                },
+            ),
+        ]);
+        Ok(PreprocessedEncoderInputs {
+            encoder_input: encoder_input.into(),
+            feature_token_counts: tokens,
+            item_sizes: sizes,
+            model_specific,
+        })
+    }
+
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
+        if width == 0 || height == 0 {
+            return Err(TransformError::ShapeError(format!(
+                "a {width}x{height} image has no view to resize"
+            )));
+        }
+        Ok(self.plan(width, height).num_tokens())
+    }
+
+    fn model_name(&self) -> &'static str {
+        "step3_vl"
+    }
+
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
+        Some((IMAGE_SIZE, IMAGE_SIZE))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use image::{Rgb, RgbImage};
+    use serde_json::json;
+
+    use super::*;
+
+    fn plan(width: u32, height: u32) -> CropPlan {
+        Step3VLProcessor::new().plan(width, height)
+    }
+
+    /// The reference's crop counts, newline counts and token counts over the
+    /// sizes that exercise every branch of its rule: no crops under a 728 px
+    /// long side at a gentle aspect ratio, crops of the short side past 1.5,
+    /// the 504 window from 728 px, the short-side window past an aspect ratio
+    /// of 4, the square pad under 32 px, and the 3024 px cap.
+    #[test]
+    fn the_plan_counts_the_references_crops_newlines_and_tokens() {
+        for (width, height, crops, newlines, tokens) in [
+            (1, 1, 0, 0, 171),
+            (7, 5, 0, 0, 171),
+            (64, 48, 0, 0, 171),
+            (640, 480, 0, 0, 171),
+            (727, 500, 0, 0, 171),
+            (728, 728, 4, 1, 504),
+            (1024, 768, 4, 1, 504),
+            (1920, 1080, 8, 1, 836),
+            (600, 300, 2, 0, 337),
+            (1000, 300, 2, 0, 337),
+            (2000, 40, 50, 0, 4321),
+            (40, 2000, 50, 49, 4370),
+            (4000, 15, 36, 5, 3164),
+            (10000, 10, 36, 5, 3164),
+            (3, 900, 4, 1, 504),
+            (4096, 2304, 24, 3, 2166),
+            (3840, 2160, 24, 3, 2166),
+            (8192, 8192, 36, 5, 3164),
+        ] {
+            let plan = plan(width, height);
+            assert_eq!(plan.num_patches(), crops, "{width}x{height} crops");
+            assert_eq!(plan.num_newlines(), newlines, "{width}x{height} newlines");
+            assert_eq!(plan.num_tokens(), tokens, "{width}x{height} tokens");
+            assert_eq!(
+                Step3VLProcessor::new()
+                    .calculate_num_tokens(width, height)
+                    .unwrap(),
+                tokens
+            );
+        }
+    }
+
+    /// The sizes behind the counts: the square pad and the cap of a 4000x15
+    /// strip (a 3024 square cut in 6 x 6), the second resize of a 1920x1080
+    /// frame to 2016x1008, a 1000x300 image whose 300 px side stays under the
+    /// window, and a 2000x40 strip cut in 40 px windows.
+    #[test]
+    fn the_plan_derives_the_references_sizes() {
+        assert_eq!(
+            plan(4000, 15),
+            CropPlan {
+                square: Some(4000),
+                view: (3024, 3024),
+                crops: Some(CropGrid {
+                    window: 504,
+                    source: (3024, 3024),
+                    columns: 6,
+                    rows: 6,
+                }),
+            }
+        );
+        assert_eq!(
+            plan(1920, 1080),
+            CropPlan {
+                square: None,
+                view: (1920, 1080),
+                crops: Some(CropGrid {
+                    window: 504,
+                    source: (2016, 1008),
+                    columns: 4,
+                    rows: 2,
+                }),
+            }
+        );
+        assert_eq!(
+            plan(1000, 300),
+            CropPlan {
+                square: None,
+                view: (1000, 300),
+                crops: Some(CropGrid {
+                    window: 504,
+                    source: (1008, 300),
+                    columns: 2,
+                    rows: 1,
+                }),
+            }
+        );
+        assert_eq!(
+            plan(2000, 40),
+            CropPlan {
+                square: None,
+                view: (2000, 40),
+                crops: Some(CropGrid {
+                    window: 40,
+                    source: (2000, 40),
+                    columns: 50,
+                    rows: 1,
+                }),
+            }
+        );
+        assert_eq!(
+            plan(8192, 8192),
+            CropPlan {
+                square: None,
+                view: (3024, 3024),
+                crops: Some(CropGrid {
+                    window: 504,
+                    source: (3024, 3024),
+                    columns: 6,
+                    rows: 6,
+                }),
+            }
+        );
+        assert_eq!(plan(640, 480).crops, None);
+    }
+
+    /// The window starts of a side: one per window with the last pulled back
+    /// to the edge, and one window at 0 for a side under the window.
+    #[test]
+    fn window_starts_follow_the_references_sliding_window() {
+        assert_eq!(window_starts(1008, 504), vec![0, 504]);
+        assert_eq!(window_starts(1000, 504), vec![0, 496]);
+        assert_eq!(window_starts(300, 504), vec![0]);
+        assert_eq!(window_starts(504, 504), vec![0]);
+        assert_eq!(window_starts(2000, 40).len(), 50);
+    }
+
+    /// A model config switches the crops off; the view stays.
+    #[test]
+    fn the_model_config_switches_the_crops_off() {
+        let processor =
+            Step3VLProcessor::from_model_config(&json!({"vision_config": {"enable_patch": false}}));
+        assert!(!processor.crops_enabled());
+        let plan = processor.plan(1920, 1080);
+        assert_eq!(plan.crops, None);
+        assert_eq!(plan.num_tokens(), 171);
+        assert!(Step3VLProcessor::from_model_config(&json!({"vision_config": {}})).crops_enabled());
+    }
+
+    /// The tensors of a 1000x300 image: one view, two crops of which the
+    /// second's right part and both crops' lower parts read the black past the
+    /// image (the normalized zero byte), one newline flag of zero.
+    #[test]
+    fn a_short_side_under_the_window_reads_black_past_the_image() {
+        let processor = Step3VLProcessor::new();
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(1000, 300, Rgb([200, 100, 50])));
+        let out = processor.preprocess(&[&image]).unwrap();
+        assert_eq!(out.encoder_input.shape(), &[1, 3, 728, 728]);
+        assert_eq!(out.feature_token_counts, vec![337]);
+        assert_eq!(out.item_sizes, vec![(1000, 300)]);
+        let Some(ModelSpecificValue::Tensor { data, shape }) =
+            out.model_specific.get(PATCH_PIXEL_VALUES)
+        else {
+            panic!("the crops tensor");
+        };
+        assert_eq!(shape, &[2, 3, 504, 504]);
+        let black = processor.table[0][0];
+        let crop_len = 3 * 504 * 504;
+        // The first crop's red plane: the image's colour in its upper 300
+        // rows, black below.
+        let first = &data[..crop_len];
+        assert_eq!(first[0], processor.table[0][200]);
+        assert_eq!(first[299 * 504], processor.table[0][200]);
+        assert_eq!(first[300 * 504], black);
+        assert_eq!(first[503 * 504 + 503], black);
+        assert!(matches!(
+            out.model_specific.get(NUM_PATCHES),
+            Some(ModelSpecificValue::IntTensor { data, shape }) if data == &[2] && shape == &[1]
+        ));
+        assert!(matches!(
+            out.model_specific.get(PATCH_NEWLINE_MASK),
+            Some(ModelSpecificValue::IntTensor { data, shape }) if data == &[0, 0] && shape == &[2]
+        ));
+    }
+
+    /// Two images of a batch stack their views and lay their crops back to
+    /// back, with the per-image counts and the newline flags in crop order.
+    #[test]
+    fn a_batch_lays_the_views_and_crops_back_to_back() {
+        let processor = Step3VLProcessor::new();
+        let small = DynamicImage::ImageRgb8(RgbImage::from_pixel(64, 48, Rgb([10, 20, 30])));
+        let frame = DynamicImage::ImageRgb8(RgbImage::from_pixel(1920, 1080, Rgb([40, 50, 60])));
+        let out = processor.preprocess(&[&small, &frame]).unwrap();
+        assert_eq!(out.encoder_input.shape(), &[2, 3, 728, 728]);
+        assert_eq!(out.feature_token_counts, vec![171, 836]);
+        assert!(matches!(
+            out.model_specific.get(NUM_PATCHES),
+            Some(ModelSpecificValue::IntTensor { data, .. }) if data == &[0, 8]
+        ));
+        assert!(matches!(
+            out.model_specific.get(PATCH_NEWLINE_MASK),
+            Some(ModelSpecificValue::IntTensor { data, .. }) if data == &[0, 0, 0, 1, 0, 0, 0, 0]
+        ));
+        assert!(matches!(
+            out.model_specific.get(PATCH_PIXEL_VALUES),
+            Some(ModelSpecificValue::Tensor { shape, .. }) if shape == &[8, 3, 504, 504]
+        ));
+        let single = processor.preprocess(&[&frame]).unwrap();
+        let both = out.encoder_input.flat_f32();
+        assert_eq!(&both[3 * 728 * 728..], &single.encoder_input.flat_f32()[..]);
+    }
+
+    /// An image with no crops still carries the crops tensor, empty, as the
+    /// reference emits it, so the engine takes the pixel path.
+    #[test]
+    fn an_image_without_crops_carries_an_empty_crops_tensor() {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(640, 480, Rgb([1, 2, 3])));
+        let out = Step3VLProcessor::new().preprocess(&[&image]).unwrap();
+        assert!(matches!(
+            out.model_specific.get(PATCH_PIXEL_VALUES),
+            Some(ModelSpecificValue::Tensor { data, shape }) if data.is_empty() && shape == &[0, 3, 504, 504]
+        ));
+        assert!(matches!(
+            out.model_specific.get(PATCH_NEWLINE_MASK),
+            Some(ModelSpecificValue::IntTensor { data, shape }) if data.is_empty() && shape == &[0]
+        ));
+    }
+
+    /// An empty batch and a zero-sized image are refused.
+    #[test]
+    fn an_empty_batch_and_a_zero_sized_image_are_refused() {
+        let processor = Step3VLProcessor::new();
+        assert!(matches!(
+            processor.preprocess(&[]),
+            Err(TransformError::EmptyBatch)
+        ));
+        assert!(processor.calculate_num_tokens(0, 10).is_err());
+    }
+}

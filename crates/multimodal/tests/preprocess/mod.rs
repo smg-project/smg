@@ -18,6 +18,7 @@ mod qwen_pixel_norm_golden;
 mod qwen_preprocess_golden;
 mod qwen_smart_resize_golden;
 mod resize_fingerprint;
+mod step3_vl_preprocess_golden;
 mod vision_golden_tests;
 mod wire_parity;
 

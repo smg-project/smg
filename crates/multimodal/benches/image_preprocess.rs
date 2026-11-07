@@ -26,7 +26,7 @@ use llm_multimodal::{
         preprocessor_config::PreProcessorConfig,
         processors::{
             DeepseekV41Processor, KimiK3Processor, Llama4VisionProcessor, Qwen2VLProcessor,
-            Qwen3VLProcessor,
+            Qwen3VLProcessor, Step3VLProcessor,
         },
         transforms, VideoClipOptions, VisionPreProcessor,
     },
@@ -349,7 +349,7 @@ criterion_group!(
 criterion_group!(
     name = wire_benches;
     config = Criterion::default().with_measurement(CpuTime);
-    targets = bench_wire_write, bench_deepseek_v41, bench_decode_preprocess, bench_qwen3_vl_video
+    targets = bench_wire_write, bench_deepseek_v41, bench_step3_vl, bench_decode_preprocess, bench_qwen3_vl_video
 );
 criterion_main!(benches, wire_benches);
 
@@ -648,6 +648,44 @@ fn bench_deepseek_v41(c: &mut Criterion<CpuTime>) {
                     "{class}-{w}x{h}-to-{}x{}",
                     plan.best_width, plan.best_height
                 ),
+            ),
+            &images,
+            |b, imgs| b.iter(|| returned(processor.preprocess(imgs).unwrap())),
+        );
+    }
+    group.finish();
+}
+
+// ── Step3-VL: one image per size class ───────────────────────────
+
+/// The per-image cost of the global-view-and-crops processor (the Pillow
+/// resizes, the crops, the normalized antialiased resize of the view to 728
+/// and of every crop to 504) on one image of each size class, in CPU time:
+/// the crop count grows with the size, from none on a small diagram to
+/// thirty on a capped 4k-side scan.
+fn bench_step3_vl(c: &mut Criterion<CpuTime>) {
+    let processor = Step3VLProcessor::new();
+    let classes: &[(&str, u32, u32)] = &[
+        ("small", 300, 232),
+        ("medium", 640, 480),
+        ("large", 1024, 768),
+        ("document", 1240, 1754),
+        ("scan", 2048, 1536),
+        ("huge", 4096, 3072),
+    ];
+    let mut group = c.benchmark_group("step3_vl");
+    group
+        .sample_size(20)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(2));
+    for &(class, w, h) in classes {
+        let plan = processor.plan(w, h);
+        let image = make_test_image(w, h);
+        let images = [&image];
+        group.bench_with_input(
+            BenchmarkId::new(
+                "single",
+                format!("{class}-{w}x{h}-crops{}", plan.num_patches()),
             ),
             &images,
             |b, imgs| b.iter(|| returned(processor.preprocess(imgs).unwrap())),
