@@ -200,9 +200,10 @@ A group is **ready** when its table is on main, bellwether's `main` holds the gr
 benchmark-scale set (the count in **bellwether set**), and a run of the fixture test
 (`tests/bellwether_parse_fixtures.rs`) on main's code has replayed every case of that set at every
 chunking with no difference. That run is local, and the pull request that marked the group ready
-records it: SMG's CI runs the fixture test on every change to the crate against the bellwether
-commit pinned in `.github/versions/bellwether.ref`, which holds the hand-written sets only, so CI
-guards a ready group's set once the pin moves to a commit that holds it. **Replaying the set**
+records it: SMG's CI runs the fixture test on every change to the crate against the tree its
+fixture job unpacks from the bellwether commit pinned in `.github/versions/bellwether.ref` (every
+hand-written set, and one compressed set in 3,500 of bellwether's), every case of it, so CI guards
+a ready group's benchmark-scale set when that sample holds it. **Replaying the set**
 means the table is on main and bellwether's `main` holds the set, and that run has not finished.
 A group bellwether recorded under another checkpoint's slug, because that checkpoint shares its
 tokenizer, template and generation config (the group's manifest names it), replays that recording
