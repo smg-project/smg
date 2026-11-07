@@ -1718,14 +1718,16 @@ impl NativeEncoder {
             }
             (None, [stage]) => {
                 // The stage's matches through the scanner's own loop, the
-                // probe compiled into it; a gap between matches (none with
-                // the template shapes) is a piece of its own, out of line.
+                // probe compiled into it; a gap between matches is a piece
+                // of its own through the same probe (a shape that splits on
+                // the space makes every word one, so the gap is the hot
+                // path there, not a cold one).
                 let keep_gaps = stage.keep_gaps;
                 let mut cursor = 0;
                 stage.pattern.for_each_match(text, |start, end| {
                     if keep_gaps && cursor < start {
                         if let Err(declined) =
-                            self.tokenize_gap(model, text, cursor..start, mapped, ids, cache)
+                            self.tokenize_piece_at(model, text, cursor..start, mapped, ids, cache)
                         {
                             fallback = Some(declined);
                         }
@@ -1739,7 +1741,7 @@ impl NativeEncoder {
                 });
                 if keep_gaps && cursor < text.len() {
                     if let Err(declined) =
-                        self.tokenize_gap(model, text, cursor..text.len(), mapped, ids, cache)
+                        self.tokenize_piece_at(model, text, cursor..text.len(), mapped, ids, cache)
                     {
                         fallback = Some(declined);
                     }
@@ -1842,22 +1844,6 @@ impl NativeEncoder {
             }
         }
         self.tokenize_piece_slow(model, &text[piece], key, mapped, ids, cache)
-    }
-
-    /// A gap of a stage that keeps its gaps, `text[gap]`, as a piece; out of
-    /// line, since the template shapes leave none.
-    #[cold]
-    #[inline(never)]
-    fn tokenize_gap(
-        &self,
-        model: Option<&ModelWrapper>,
-        text: &str,
-        gap: Range<usize>,
-        mapped: &mut String,
-        ids: &mut Vec<u32>,
-        cache: &mut PieceCache,
-    ) -> Result<(), Fallback> {
-        self.tokenize_piece_at(model, text, gap, mapped, ids, cache)
     }
 
     /// The rest of [`Self::tokenize_piece`], out of line: the longer pieces'
