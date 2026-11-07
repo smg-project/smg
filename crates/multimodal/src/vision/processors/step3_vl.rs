@@ -180,15 +180,6 @@ fn window_starts(length: u32, window: u32) -> Vec<u32> {
     starts
 }
 
-/// The tensors of one image: the view's planes, every crop's planes back to
-/// back, and the newline flag of every crop.
-struct ImageTensors {
-    view: Vec<f32>,
-    crops: Vec<f32>,
-    newlines: Vec<i64>,
-    plan: CropPlan,
-}
-
 /// The Step3-VL image processor.
 #[derive(Debug, Clone)]
 pub struct Step3VLProcessor {
@@ -267,13 +258,16 @@ impl Step3VLProcessor {
     }
 
     /// `rgb` through the table and torchvision's antialiased BILINEAR resize
-    /// to `side` x `side`, as planes `[3, side, side]`; an image already that
-    /// size goes through the table alone, as the reference's resize returns
-    /// such a tensor unchanged.
-    fn normalized_square(&self, rgb: &RgbImage, side: u32) -> Result<Vec<f32>, TransformError> {
+    /// to `side` x `side`, appended to `planes` as `[3, side, side]`; an image
+    /// already that size goes through the table alone, as the reference's
+    /// resize returns such a tensor unchanged.
+    fn normalized_square(
+        &self,
+        rgb: &RgbImage,
+        side: u32,
+        planes: &mut Vec<f32>,
+    ) -> Result<(), TransformError> {
         let (width, height) = rgb.dimensions();
-        let pixels = side as usize * side as usize;
-        let mut planes = scratch::take_f32_cap(3 * pixels);
         if (width, height) == (side, side) {
             let (pixels, _) = rgb.as_raw().as_chunks::<3>();
             for (channel, table) in self.table.iter().enumerate() {
@@ -297,11 +291,18 @@ impl Step3VLProcessor {
                 planes.extend(pixels.iter().map(|pixel| pixel[channel]));
             }
         }
-        Ok(planes)
+        Ok(())
     }
 
-    /// One image through the reference's steps.
-    fn process(&self, image: &DynamicImage) -> Result<ImageTensors, TransformError> {
+    /// One image through the reference's steps: its view's planes and its
+    /// plan come back, its crops' planes and newline flags are appended to
+    /// the batch's `crops` and `newlines`.
+    fn process(
+        &self,
+        image: &DynamicImage,
+        crops: &mut Vec<f32>,
+        newlines: &mut Vec<i64>,
+    ) -> Result<(Vec<f32>, CropPlan), TransformError> {
         let (width, height) = (image.width(), image.height());
         if width == 0 || height == 0 {
             return Err(TransformError::ShapeError(format!(
@@ -329,10 +330,10 @@ impl Step3VLProcessor {
                 plan.view.1,
             )?)
         };
-        let view_planes = self.normalized_square(&view, IMAGE_SIZE)?;
+        let side = IMAGE_SIZE as usize;
+        let mut view_planes = scratch::take_f32_cap(3 * side * side);
+        self.normalized_square(&view, IMAGE_SIZE, &mut view_planes)?;
 
-        let mut crops = Vec::new();
-        let mut newlines = Vec::new();
         if let Some(grid) = plan.crops {
             let cut = if view.dimensions() == grid.source {
                 Cow::Borrowed(view.as_ref())
@@ -347,8 +348,6 @@ impl Step3VLProcessor {
             };
             let columns = window_starts(grid.source.0, grid.window);
             let rows = window_starts(grid.source.1, grid.window);
-            let crop_len = 3 * PATCH_SIZE as usize * PATCH_SIZE as usize;
-            crops.reserve_exact(columns.len() * rows.len() * crop_len);
             for (row, &y) in rows.iter().enumerate() {
                 for (column, &x) in columns.iter().enumerate() {
                     let crop = transforms::crop_rgb(&cut, x, y, grid.window, grid.window);
@@ -359,21 +358,14 @@ impl Step3VLProcessor {
                     } else {
                         transforms::paste_rgb(&crop, grid.window, grid.window, 0, 0, black)
                     };
-                    let planes = self.normalized_square(&crop, PATCH_SIZE)?;
-                    crops.extend_from_slice(&planes);
-                    scratch::give_f32(planes);
+                    self.normalized_square(&crop, PATCH_SIZE, crops)?;
                     newlines.push(i64::from(
                         column + 1 == columns.len() && row + 1 < rows.len(),
                     ));
                 }
             }
         }
-        Ok(ImageTensors {
-            view: view_planes,
-            crops,
-            newlines,
-            plan,
-        })
+        Ok((view_planes, plan))
     }
 }
 
@@ -401,19 +393,28 @@ impl VisionPreProcessor for Step3VLProcessor {
         }
         let side = IMAGE_SIZE as usize;
         let view_len = 3 * side * side;
+        let patch = PATCH_SIZE as usize;
+        // The batch's crops buffer is sized from the plans before any pixel
+        // moves, so every crop's planes are written into it once.
+        let total_crops: usize = images
+            .iter()
+            .map(|image| self.plan(image.width(), image.height()).num_patches())
+            .sum();
+        let mut crops = if total_crops == 0 {
+            Vec::new()
+        } else {
+            scratch::take_f32_cap(total_crops * 3 * patch * patch)
+        };
+        let mut newlines = Vec::with_capacity(total_crops);
         let mut views: Vec<Vec<f32>> = Vec::with_capacity(images.len());
-        let mut crops = Vec::new();
-        let mut newlines = Vec::new();
         let mut counts = Vec::with_capacity(images.len());
         let mut tokens = Vec::with_capacity(images.len());
         let mut sizes = Vec::with_capacity(images.len());
         for image in images {
-            let tensors = self.process(image)?;
-            views.push(tensors.view);
-            crops.extend_from_slice(&tensors.crops);
-            newlines.extend_from_slice(&tensors.newlines);
-            counts.push(tensors.plan.num_patches() as i64);
-            tokens.push(tensors.plan.num_tokens());
+            let (view, plan) = self.process(image, &mut crops, &mut newlines)?;
+            views.push(view);
+            counts.push(plan.num_patches() as i64);
+            tokens.push(plan.num_tokens());
             sizes.push((image.width(), image.height()));
         }
         // One image's planes are the batch; several are copied back to back.
@@ -429,8 +430,6 @@ impl VisionPreProcessor for Step3VLProcessor {
         };
         let encoder_input = Array4::from_shape_vec((images.len(), 3, side, side), data)
             .map_err(|error| TransformError::ShapeError(error.to_string()))?;
-        let total_crops = newlines.len();
-        let patch = PATCH_SIZE as usize;
         let model_specific = HashMap::from([
             (
                 PATCH_PIXEL_VALUES.to_string(),
