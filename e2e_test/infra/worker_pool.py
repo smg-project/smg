@@ -34,7 +34,7 @@ import threading
 from .constants import DEFAULT_STARTUP_TIMEOUT, ConnectionMode, WorkerType, zmq_backend
 from .gateway import Gateway
 from .process_utils import wait_for_workers_ready
-from .worker import Worker, start_workers, stop_workers
+from .worker import Worker, start_workers, stop_workers, validate_encode_worker_pair
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +104,8 @@ class WorkerPool:
         with self._lock:
             if self._closed:
                 raise RuntimeError("WorkerPool has been closed")
+
+            validate_encode_worker_pair(engine, mode, worker_type)
 
             # Non-REGULAR workers (PD prefill/decode) aren't cached, but we
             # still have to release any cached regular worker first — it
