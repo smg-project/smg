@@ -31,10 +31,13 @@ const PATCH_START: &str = "<patch_start>";
 const PATCH_END: &str = "<patch_end>";
 /// The token after every crop row but the last.
 const PATCH_NEWLINE: &str = "<patch_newline>";
-/// Images per request. The serving engine advertises no count for the
-/// family; eight (the count of the other global-view-and-tiles family) bounds
-/// a request's crops tensor at eight images of the per-image limit, and a
-/// deployment's own image limit may lower it.
+/// Images per request by default. The serving engine advertises no count
+/// for the family; eight (the count of the other global-view-and-tiles
+/// family) bounds a request's crops tensor at eight images of the per-image
+/// limit. A deployment's `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`
+/// replaces this number outright (the operator's call: 32 images are up to
+/// 3.4 GiB of float32 crops), and the engine's advertised limit caps the
+/// result.
 const MAX_IMAGES_PER_REQUEST: usize = 8;
 
 /// The Step3-VL image spec (`model_type` `step3_vl`, and `step5_vl`, which
@@ -168,9 +171,9 @@ impl ModelProcessorSpec for Step3VLVisionSpec {
         Self::image_token_id(metadata)
     }
 
-    /// Images per request: [`MAX_IMAGES_PER_REQUEST`]; the engine's
-    /// advertised limit or the deployment's `--mm-per-request-image-limit` /
-    /// `SMG_IMAGE_MAX_COUNT` may lower it.
+    /// Images per request: [`MAX_IMAGES_PER_REQUEST`] by default; the
+    /// deployment's `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`
+    /// replaces it, and the engine's advertised limit caps the result.
     fn modality_limits(
         &self,
         _metadata: &ModelMetadata,

@@ -24,16 +24,24 @@
 //!    resize to 728 x 728 and 504 x 504 (a tensor already that size passes
 //!    through).
 //!
-//! The rule bounds nothing but the long side: the serving engine declares
-//! the most features one image can have as those of a 3024 x 3024 image (the
-//! size it names as the one with the most features and sizes its encoder
-//! cache for), 36 crops and 3164 feature tokens, while a thin image whose
-//! short side falls under the pad threshold only after the cap takes a window
-//! as small as that side, with the crop count growing as the long side over
-//! it (a 96768 x 32 image would take 3024 one-pixel windows, 8.6 GiB of
-//! float32). A plan past the engine's count, like a side that caps to zero,
-//! is refused before any pixel moves, naming the size, the crops and the
-//! limit; inside the count every image is the engine's bit for bit.
+//! The rule bounds nothing but the long side. The serving engine publishes
+//! 3164 feature tokens as its per-image maximum for the family (the count of
+//! a 3024 x 3024 image, the size it names as the one with the most features:
+//! 36 crops, five newlines, the view) and admits a larger item only under
+//! its batched-token budget, a deployment flag (2048, 8192 or 16384 by the
+//! engine's memory size at the pin). A thin image (an aspect ratio past 4
+//! with a short side of 32 px or more, one under 32 px after the cap
+//! included) takes a window as small as its short side, with the crop count
+//! growing as the long side over it: a 2000 x 40 image plans 50 crops and
+//! 4321 tokens, a 96768 x 32 image 3024 one-pixel windows and 8.6 GiB of
+//! float32. A plan past the published maximum, like a side that caps to
+//! zero, is refused before any pixel moves, with the size, the crops, the
+//! count and the limit named: strips thinner than about 1:36 that an engine
+//! with a larger budget would serve are refused here, and on an engine at the
+//! 2048 default the same strips never schedule (a stall the gateway cannot
+//! see), so the bound is the gateway's own admission line, like the
+//! per-request image count; inside it every image is the engine's bit for
+//! bit.
 //!
 //! The output carries the global views as the encoder input
 //! `[N, 3, 728, 728]`, the crops as `patch_pixel_values` `[P, 3, 504, 504]`
@@ -67,7 +75,7 @@ const MAX_IMAGE_SIZE: u32 = 3024;
 pub const IMAGE_FEATURE_TOKENS: usize = 169;
 /// The feature tokens of one crop.
 pub const PATCH_FEATURE_TOKENS: usize = 81;
-/// The most feature tokens the serving engine declares for one image: the
+/// The per-image maximum the serving engine publishes for the family: the
 /// count of a 3024 x 3024 image (36 crops, five newlines, the view). A plan
 /// past it is refused; see the module doc.
 pub const MAX_IMAGE_TOKENS: usize = 3164;
@@ -275,7 +283,8 @@ impl Step3VLProcessor {
     /// The plan the processor carries out for a `width` x `height` image: a
     /// zero side (decoded, or after the cap) and a plan past
     /// [`MAX_IMAGE_TOKENS`] are refused here, before any pixel moves, so the
-    /// token count and the preprocessing agree on every image.
+    /// token count and the preprocessing agree on every image (the gateway's
+    /// own admission line; see the module doc).
     fn checked_plan(&self, width: u32, height: u32) -> Result<CropPlan, TransformError> {
         if width == 0 || height == 0 {
             return Err(TransformError::ShapeError(format!(
@@ -292,7 +301,7 @@ impl Step3VLProcessor {
         let tokens = plan.num_tokens();
         if tokens > MAX_IMAGE_TOKENS {
             return Err(TransformError::ShapeError(format!(
-                "a {width}x{height} image plans {} crops and {tokens} feature tokens, above the {MAX_IMAGE_TOKENS} the serving engine declares for one image (a {MAX_IMAGE_SIZE}x{MAX_IMAGE_SIZE} image's)",
+                "a {width}x{height} image plans {} crops and {tokens} feature tokens, above the {MAX_IMAGE_TOKENS} the serving engine publishes as its per-image maximum (a {MAX_IMAGE_SIZE}x{MAX_IMAGE_SIZE} image's; a larger item is admitted only under its batched-token budget, a deployment setting)",
                 plan.num_patches()
             )));
         }
@@ -529,9 +538,6 @@ mod tests {
     /// of 4, the square pad under 32 px, and the 3024 px cap.
     #[test]
     fn the_plan_counts_the_references_crops_newlines_and_tokens() {
-        // The rule's arithmetic on the engine's own numbers; two of the sizes
-        // (2000x40, 40x2000) plan past the bound and are refused by the
-        // checked entry points, which the bound's own test covers.
         for (width, height, crops, newlines, tokens) in [
             (1, 1, 0, 0, 171),
             (7, 5, 0, 0, 171),
@@ -556,10 +562,12 @@ mod tests {
             assert_eq!(plan.num_patches(), crops, "{width}x{height} crops");
             assert_eq!(plan.num_newlines(), newlines, "{width}x{height} newlines");
             assert_eq!(plan.num_tokens(), tokens, "{width}x{height} tokens");
-            assert_eq!(
-                Step3VLProcessor::new().plan(width, height).num_tokens(),
-                tokens
-            );
+            // The public entry point agrees with the plan inside the bound and
+            // refuses past it (2000x40 and 40x2000 here).
+            match Step3VLProcessor::new().calculate_num_tokens(width, height) {
+                Ok(counted) => assert_eq!(counted, tokens, "{width}x{height} counted"),
+                Err(_) => assert!(tokens > MAX_IMAGE_TOKENS, "{width}x{height} refused"),
+            }
         }
     }
 
