@@ -968,8 +968,10 @@ fn an_interval_claim_past_the_decoded_bytes_budget_is_refused_before_its_picks()
         ..VideoFetchConfig::default()
     };
     let full_hd = 1920 * 1080 * 3;
+    let budget = super::video_max_decoded_bytes();
     for (total_frames, fps) in [(1usize << 31, 30.0), (1_000, 1.0)] {
-        let refused = super::ensure_interval_picks_fit(total_frames, fps, full_hd, interval);
+        let refused =
+            super::ensure_interval_picks_fit(total_frames, fps, full_hd, interval, budget);
         assert!(
             matches!(
                 refused,
@@ -985,17 +987,29 @@ fn an_interval_claim_past_the_decoded_bytes_budget_is_refused_before_its_picks()
     // The smallest frames and an unsized probe are bounded through the picks'
     // records alone: the claim is refused, a clip within the budget passes.
     for frame_size in [3, 0] {
-        let refused = super::ensure_interval_picks_fit(1 << 31, 30.0, frame_size, interval);
+        let refused = super::ensure_interval_picks_fit(1 << 31, 30.0, frame_size, interval, budget);
         assert!(
             matches!(refused, Err(MediaConnectorError::DecodedTooLarge { .. })),
             "frame size {frame_size}: {refused:?}"
         );
-        assert!(super::ensure_interval_picks_fit(1_000, 1.0, frame_size, interval).is_ok());
+        assert!(super::ensure_interval_picks_fit(1_000, 1.0, frame_size, interval, budget).is_ok());
     }
-    assert!(super::ensure_interval_picks_fit(150, 30.0, full_hd, interval).is_ok());
+    assert!(super::ensure_interval_picks_fit(150, 30.0, full_hd, interval, budget).is_ok());
     let even = VideoFetchConfig::default();
-    assert!(super::ensure_interval_picks_fit(1 << 31, 30.0, full_hd, even).is_ok());
-    assert!(super::ensure_interval_picks_fit(1 << 31, f64::NAN, full_hd, interval).is_ok());
+    assert!(super::ensure_interval_picks_fit(1 << 31, 30.0, full_hd, even, budget).is_ok());
+    assert!(super::ensure_interval_picks_fit(1 << 31, f64::NAN, full_hd, interval, budget).is_ok());
+    // The boundary, pinned with a small budget and no allocation: at 1 fps
+    // every frame is a pick, so the count is the frame count; the records
+    // alone price an unsized pick at 128 bytes, a one-pixel pick at 131.
+    let small = 1usize << 20;
+    for (frame_size, fits, refused) in [(0, 8_192, 8_193), (3, 8_004, 8_005)] {
+        assert!(super::ensure_interval_picks_fit(fits, 1.0, frame_size, interval, small).is_ok());
+        let error = super::ensure_interval_picks_fit(refused, 1.0, frame_size, interval, small);
+        assert!(
+            matches!(error, Err(MediaConnectorError::DecodedTooLarge { limit, .. }) if limit == small),
+            "frame size {frame_size}: {error:?}"
+        );
+    }
 }
 
 #[test]

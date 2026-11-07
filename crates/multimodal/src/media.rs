@@ -1485,7 +1485,13 @@ where
     } else {
         0
     };
-    ensure_interval_picks_fit(total_frames, fps, frame_size, cfg)?;
+    ensure_interval_picks_fit(
+        total_frames,
+        fps,
+        frame_size,
+        cfg,
+        video_max_decoded_bytes(),
+    )?;
     let frame_indices = sampled_frame_indices(total_frames, fps, cfg);
     if frame_indices.is_empty() {
         return Err(MediaConnectorError::VideoDecode(
@@ -2306,19 +2312,19 @@ fn interval_walk(total_frames: usize, fps: f64, rate: f64) -> impl Iterator<Item
     })
 }
 
-/// What a pick costs in memory besides its frame: its index, its entry in
-/// the unique list, its copy in the sampling info and at most one seek
-/// segment's timestamp.
-const PICK_RECORD_BYTES: usize =
-    2 * size_of::<usize>() + size_of::<(usize, usize)>() + size_of::<f64>();
+/// What a pick costs in memory besides its frame, at the peak of the ffmpeg
+/// path and with headroom: its index, its entry in the unique list, its copy
+/// in the sampling info, its term in an explicit select filter, a seek
+/// segment's timestamp and the decoded frame's record.
+const PICK_RECORD_BYTES: usize = 128;
 
 /// Refuses, with the decoded-bytes budget's own error, a clip whose interval
-/// picks cannot fit the budget, before any vector is sized by the container's
-/// frame claim: the walk is counted, not collected, and the count stops at
-/// the first pick past the budget, so a claim of any size costs the budget's
-/// picks in iterations and no memory. A pick costs its frame at source
-/// resolution and its records ([`PICK_RECORD_BYTES`]), so the bound is the
-/// later byte check's with the records added, and it holds for an unsized
+/// picks cannot fit `limit` (the budget), before any vector is sized by the
+/// container's frame claim: the walk is counted, not collected, and the count
+/// stops at the first pick past the budget, so a claim of any size costs the
+/// budget's picks in iterations and no memory. A pick costs its frame at
+/// source resolution and its records ([`PICK_RECORD_BYTES`]), so the bound is
+/// the later byte check's with the records added, and it holds for an unsized
 /// probe (`frame_size` 0) and for the smallest frames through the records
 /// alone. The other rules are bounded by their frame caps, and a clip whose
 /// rate is unknown takes the bounded `Even` rule.
@@ -2327,6 +2333,7 @@ fn ensure_interval_picks_fit(
     fps: f64,
     frame_size: usize,
     cfg: VideoFetchConfig,
+    limit: usize,
 ) -> Result<(), MediaConnectorError> {
     if !matches!(cfg.sampling, FrameSampling::Interval)
         || !(fps.is_finite() && fps > 0.0)
@@ -2335,13 +2342,14 @@ fn ensure_interval_picks_fit(
         return Ok(());
     }
     let pick_bytes = frame_size.saturating_add(PICK_RECORD_BYTES);
-    let budget_picks = video_max_decoded_bytes() / pick_bytes;
+    let budget_picks = limit / pick_bytes;
     if interval_walk(total_frames, fps, cfg.sample_fps)
         .nth(budget_picks)
         .is_some()
     {
-        return ensure_decoded_byte_limit(
+        return ensure_decoded_bytes_within(
             budget_picks.saturating_add(1).saturating_mul(pick_bytes),
+            limit,
         );
     }
     Ok(())
@@ -2362,7 +2370,13 @@ fn ensure_probed_interval_picks_fit(
     } else {
         rawvideo_frame_size(probed.width, probed.height)?
     };
-    ensure_interval_picks_fit(total_frames, fps, frame_size, cfg)
+    ensure_interval_picks_fit(
+        total_frames,
+        fps,
+        frame_size,
+        cfg,
+        video_max_decoded_bytes(),
+    )
 }
 
 /// Distinct indices in order, each with its repeat count.
@@ -2465,9 +2479,12 @@ async fn decode_video_with_ffmpeg(
     if let Some(reason) = metadata.and_then(|probed| refused_by_the_familys_rule(probed, cfg)) {
         return Err(MediaConnectorError::VideoDecode(reason));
     }
-    if let Some(probed) = metadata {
-        ensure_probed_interval_picks_fit(probed, cfg)?;
-    }
+    let metadata = match metadata {
+        Some(probed) => {
+            Some(interval_picks_fit_on_the_decoders_size(probed, cfg, input_path).await?)
+        }
+        None => None,
+    };
     let Some((mut probed, selection)) = metadata.and_then(|probed| {
         FrameSelection::from_metadata(probed, cfg).map(|selection| (probed, selection))
     }) else {
@@ -2942,20 +2959,18 @@ fn ensure_decode_work_limit(
     )))
 }
 
-/// The work cap judged on `metadata`'s size ([`ensure_decode_work_limit`])
-/// and, where that size is the container's and the cap refuses, judged again
-/// on the probe's size, the decoder's, read once for it: a sample entry that
-/// overstates the stream's size does not refuse a decode the budget fits. A
-/// probe that cannot run, or states no size, leaves the container's refusal
-/// standing (the `0x0` clip keeps its own route, and its cap counts no
-/// pixels). Returns the metadata the decode goes on with.
-async fn decode_work_limit_on_the_decoders_size(
-    frames: usize,
-    selection: &FrameSelection,
+/// `judge` on `metadata`'s size and, where that size is the container's and
+/// the judgment refuses, again on the probe's size, the decoder's, read once
+/// for it: a sample entry that overstates the stream's size does not refuse
+/// a decode the budget fits. A probe that cannot run, or states no size,
+/// leaves the container's refusal standing (the `0x0` clip keeps its own
+/// route). Returns the metadata the decode goes on with.
+async fn judged_on_the_decoders_size(
     metadata: VideoMetadata,
     input_path: &Path,
+    judge: impl Fn(VideoMetadata) -> Result<(), MediaConnectorError>,
 ) -> Result<VideoMetadata, MediaConnectorError> {
-    let refusal = match ensure_decode_work_limit(frames, selection, metadata) {
+    let refusal = match judge(metadata) {
         Ok(()) => return Ok(metadata),
         Err(refusal) if metadata.from_container => refusal,
         Err(refusal) => return Err(refusal),
@@ -2965,19 +2980,49 @@ async fn decode_work_limit_on_the_decoders_size(
         .and_then(|info| video_metadata_from(info, false))
     {
         Ok(probed) if !probed.is_unsized() => {
-            ensure_decode_work_limit(frames, selection, probed)?;
+            judge(probed)?;
             Ok(probed)
         }
         probed => {
             if let Err(error) = probed {
                 info!(
                     error = %error,
-                    "video probe after a work-cap refusal on the container's size failed; the container's size stands"
+                    "video probe after a refusal on the container's size failed; the container's size stands"
                 );
             }
             Err(refusal)
         }
     }
+}
+
+/// The work cap ([`ensure_decode_work_limit`]) judged on `metadata`'s size
+/// and, where that is the container's, on the decoder's
+/// ([`judged_on_the_decoders_size`]); its cap counts no pixels for a `0x0`
+/// clip.
+async fn decode_work_limit_on_the_decoders_size(
+    frames: usize,
+    selection: &FrameSelection,
+    metadata: VideoMetadata,
+    input_path: &Path,
+) -> Result<VideoMetadata, MediaConnectorError> {
+    judged_on_the_decoders_size(metadata, input_path, |metadata| {
+        ensure_decode_work_limit(frames, selection, metadata)
+    })
+    .await
+}
+
+/// The interval picks' budget ([`ensure_probed_interval_picks_fit`]) judged on
+/// the probe's size and, where that is the container's, on the decoder's
+/// ([`judged_on_the_decoders_size`]).
+async fn interval_picks_fit_on_the_decoders_size(
+    probed: VideoMetadata,
+    cfg: VideoFetchConfig,
+    input_path: &Path,
+) -> Result<VideoMetadata, MediaConnectorError> {
+    judged_on_the_decoders_size(probed, input_path, |probed| {
+        ensure_probed_interval_picks_fit(probed, cfg)
+    })
+    .await
 }
 
 /// The error of a decode that ran past the process budget, in the clip's
@@ -2999,7 +3044,11 @@ fn decode_budget_exceeded(
 }
 
 fn ensure_decoded_byte_limit(bytes: usize) -> Result<(), MediaConnectorError> {
-    let limit = video_max_decoded_bytes();
+    ensure_decoded_bytes_within(bytes, video_max_decoded_bytes())
+}
+
+/// [`ensure_decoded_byte_limit`] against a given `limit`.
+fn ensure_decoded_bytes_within(bytes: usize, limit: usize) -> Result<(), MediaConnectorError> {
     if bytes > limit {
         return Err(MediaConnectorError::DecodedTooLarge {
             media: "video RGB",
