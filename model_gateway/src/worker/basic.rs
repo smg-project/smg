@@ -179,6 +179,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         0
     }
 
+    /// Raise the revision to at least `floor`, for a worker that keeps one
+    /// (nothing happens for a worker whose revision is always `0`): the
+    /// registry raises a claimed mesh import's revision past the version
+    /// its peers hold for the key, so the claim's publication outranks it.
+    fn raise_revision_to(&self, _floor: u64) {}
+
     /// Epochs reported during metadata discovery, invalidated after a health
     /// failure. These are observations, not proof against an undetected restart.
     fn cache_trace_epochs(&self) -> Vec<String> {
@@ -1490,6 +1496,10 @@ impl Worker for BasicWorker {
 
     fn revision(&self) -> u64 {
         self.runtime.load().revision()
+    }
+
+    fn raise_revision_to(&self, floor: u64) {
+        self.runtime.load().raise_revision_to(floor);
     }
 
     fn cache_trace_epochs(&self) -> Vec<String> {

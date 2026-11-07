@@ -1581,8 +1581,22 @@ impl WorkerRegistry {
         if let Some(origin) = promote_origin {
             self.worker_origins.insert(worker_id.clone(), origin);
             // A claimed import is this node's worker from here on; the
-            // publication it was built from no longer matters.
-            self.import_records.remove(worker_id);
+            // publication it was built from no longer matters, except for
+            // its version. The claim publishes the key at the shared
+            // runtime's revision, which restarts at zero with the process
+            // (a node back under its name claims its earlier life's key at
+            // revision 1, whatever that life reached), and a peer follows a
+            // publication only above the version it recorded for the
+            // import. The revision is raised past the record's version
+            // before the `Replaced` event, so the claim outranks every
+            // version this node saw for the key: the record's version is
+            // the latest it imported. A later publication of the earlier
+            // life that a peer saw first reaches this node after the claim
+            // and is answered by the worker-sync adapter, which raises the
+            // revision past it and publishes the worker again.
+            if let Some((_, record)) = self.import_records.remove(worker_id) {
+                new_worker.raise_revision_to(record.version + 1);
+            }
         }
         if let Some(record) = import {
             // The rebuild says what the import is built from now. A claim or
@@ -2878,7 +2892,7 @@ impl WorkerRegistry {
 
     /// Under the worker's lock: whether a mesh import is rebuilt to the
     /// publication `record` is for. It is not when the worker was claimed
-    /// (no longer an import), when it has no record (removed and imported
+    /// (no longer an import) or removed, when it has no record (removed and imported
     /// again since the check outside the lock: the new import's record
     /// follows its registration), when a publication at or past that
     /// version rebuilt it first, or when the publication carries no spec this node
@@ -2889,12 +2903,25 @@ impl WorkerRegistry {
     /// does not read them again every interval). A minimal import is
     /// rebuilt: nothing is lost, and the owner's new model is gained.
     fn import_rebuild_wanted(&self, worker_id: &WorkerId, record: ImportRecord) -> bool {
-        if self.origin_of(worker_id) != Some(WorkerOrigin::Mesh) {
-            tracing::warn!(
-                worker_id = %worker_id.as_str(),
-                "Aborting the rebuild of a mesh-synced worker: it was claimed before the lock was acquired"
-            );
-            return false;
+        match self.origin_of(worker_id) {
+            Some(WorkerOrigin::Mesh) => {}
+            Some(WorkerOrigin::Local) => {
+                tracing::warn!(
+                    worker_id = %worker_id.as_str(),
+                    "Aborting the rebuild of a mesh-synced worker: it was claimed before the lock was acquired"
+                );
+                return false;
+            }
+            // Removed under this lock since the check outside it: the
+            // ordinary removal race, and the replacement would find no
+            // worker anyway.
+            None => {
+                tracing::debug!(
+                    worker_id = %worker_id.as_str(),
+                    "Skipping the rebuild of a mesh-synced worker: it was removed before the lock was acquired"
+                );
+                return false;
+            }
         }
         let Some(built_from) = self
             .import_records
