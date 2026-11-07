@@ -831,6 +831,37 @@ fn a_long_selection_is_described_rather_than_listed() {
     }
 }
 
+/// A long interval selection is described, not listed, whatever the source
+/// rate: its picks are a fixed stride from the first frame plus the clip's
+/// last frame, so the filter is the spread of its own frames plus one
+/// trailing term, a string of constant size (what [`PICK_RECORD_BYTES`]
+/// counts on, since the listed form would grow with the picks).
+#[test]
+fn a_long_interval_selection_is_described_in_constant_size_at_every_rate() {
+    let interval = VideoFetchConfig {
+        sampling: FrameSampling::Interval,
+        sample_fps: 1.0,
+        ..cfg()
+    };
+    for fps in [30.0, 29.97, 25.0, 24.0, 23.976, 60.0, 15.0] {
+        let selection =
+            FrameSelection::from_metadata(metadata(Some(fps), Some(1_080_000)), interval)
+                .expect("frame rate and count are known");
+        assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS, "{fps}");
+        let filter = selection.select_filter();
+        assert!(
+            filter.starts_with("select='eq(n\\,floor("),
+            "{fps}: described, not listed: {filter}"
+        );
+        assert!(
+            filter.matches('+').count() <= FFMPEG_SPREAD_EXTRA_TERMS && filter.len() < 256,
+            "{fps}: {} explicit terms, {} bytes: {filter}",
+            filter.matches('+').count(),
+            filter.len()
+        );
+    }
+}
+
 /// The selection run through ffmpeg itself, where it is installed: a
 /// synthetic clip longer than the list cutoff, the filter as the crate
 /// builds it in both of its shapes (the described spread and the explicit

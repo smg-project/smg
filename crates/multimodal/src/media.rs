@@ -2313,9 +2313,15 @@ fn interval_walk(total_frames: usize, fps: f64, rate: f64) -> impl Iterator<Item
 }
 
 /// What a pick costs in memory besides its frame, at the peak of the ffmpeg
-/// path and with headroom: its index, its entry in the unique list, its copy
-/// in the sampling info, its term in an explicit select filter, a seek
-/// segment's timestamp and the decoded frame's record.
+/// path and with headroom. Live across the decode: its index (8 bytes), its
+/// entry in the unique list (16), its copy in the sampling info (8), the
+/// decoded frame's record (24) and at most one seek segment (8): 64. While
+/// the select filter is built: the distinct-index list and the spread's
+/// described list (8 each): 80 at the peak. A long interval selection is
+/// described in constant size, never listed (its picks are a fixed stride
+/// plus the last frame, which [`FrameSelection::spread_select_filter`]
+/// reproduces), and a listed one has at most [`FFMPEG_MAX_SELECT_TERMS`]
+/// terms, so the filter's text does not grow with the picks.
 const PICK_RECORD_BYTES: usize = 128;
 
 /// Refuses, with the decoded-bytes budget's own error, a clip whose interval
