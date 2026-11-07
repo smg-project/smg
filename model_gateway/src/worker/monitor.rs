@@ -565,10 +565,11 @@ impl WorkerMonitor {
     /// the servicer's `GetLoads` figures for `dp_rank`, received at
     /// `received_at`): the same input as a poll of that worker. It replaces
     /// the rank's entry in the worker's report in place, goes to the overload
-    /// verdict, the wedged rule and the `smg_engine_*` gauges at once, which
-    /// read the report where it is, and into the shared snapshot, which
-    /// routing reads, in the next coalesced publish, which copies the report
-    /// once per window: a record allocates no report, key or timestamp of
+    /// verdict and the wedged rule at once, which read the report where it
+    /// is, to its own rank's `smg_engine_*` gauges, set through the handles
+    /// kept for that rank, and into the shared snapshot, which routing
+    /// reads, in the next coalesced publish, which copies the report once
+    /// per window: a record allocates no report, key, label or timestamp of
     /// its own. The report's `sampled_at` is the receipt less the record's
     /// age and the one-way margin, what a policy releases its dispatch credit
     /// against. Negative ranks and records for another virtual worker's rank
@@ -619,19 +620,21 @@ impl WorkerMonitor {
         // kept from the last record that carried it.
         let mut fresh = SchedulerLoadSnapshot::from(record);
         fresh.dp_rank = dp_rank;
-        match report
+        let at = match report
             .loads
             .binary_search_by_key(&dp_rank, |load| load.dp_rank)
         {
             Ok(at) => {
                 let previous = std::mem::replace(&mut report.loads[at], fresh);
                 keep_telemetry(&mut report.loads[at], previous, record);
+                at
             }
             Err(at) => {
                 report.loads.insert(at, fresh);
                 report.dp_rank_count = i32::try_from(report.loads.len()).unwrap_or(i32::MAX);
+                at
             }
-        }
+        };
         report.sampled_at = Some(sampled_at);
         // What a poll does with a fresh report, read off the worker's own.
         self.apply_overload_verdict(worker, Some(&*report), "pushed record");
@@ -644,7 +647,9 @@ impl WorkerMonitor {
             record.engine_reports_steps.unwrap_or(false),
             record.prefill_pending_tokens.map(u64::from),
         );
-        Metrics::record_engine_load(url, worker.model_id(), report);
+        // The record feeds its own rank's `smg_engine_*` series through the
+        // handles kept for it; a poll's report feeds every rank's.
+        Metrics::record_engine_rank_load(url, worker.model_id(), &report.loads[at]);
         // The DP-rank token cache takes a report with absolute token counts,
         // as it takes a poll; a core-only record leaves its last-known-good
         // entry alone.

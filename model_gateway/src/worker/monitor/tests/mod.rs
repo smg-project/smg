@@ -789,8 +789,10 @@ async fn a_quiet_ranks_figures_follow_the_poll_rather_than_its_last_pushed_recor
         polled_at + Duration::from_millis(1),
     );
     monitor.apply_polled_load(url, &poll(0.91), polled_at);
-    // The next heartbeat names rank 0 only: the report it publishes and
-    // the gauges carry rank 1 at the poll's figure, rank 0 at its own.
+    // The next heartbeat names rank 0 only: the report it publishes carries
+    // rank 1 at the poll's figure and rank 0 at its own, and the record sets
+    // its own rank's gauges alone (rank 1's took the poll's figure from the
+    // poll itself, as every polled rank's do).
     let rendered = render_with_recorder(|| {
         monitor.apply_pushed_load(
             &worker,
@@ -804,16 +806,22 @@ async fn a_quiet_ranks_figures_follow_the_poll_rather_than_its_last_pushed_recor
     let report = snapshot.get(url).expect("published");
     assert_eq!(report.version, "pushed");
     assert_eq!(ranks_of(report), vec![(0, 5, 0.5), (1, 8, 0.91)]);
-    let rank1_hit_rate = rendered
-        .lines()
-        .find(|l| {
-            l.starts_with("smg_engine_cache_hit_rate{")
-                && l.contains("worker=\"grpc://w1:9000\"")
-                && l.contains("dp_rank=\"1\"")
-        })
-        .map(|l| l.rsplit(' ').next().unwrap_or("").to_string())
-        .unwrap_or_else(|| panic!("rank 1's hit rate gauge missing:\n{rendered}"));
-    assert_eq!(rank1_hit_rate, "0.91");
+    let hit_rate_of = |rank: &str| {
+        rendered
+            .lines()
+            .find(|l| {
+                l.starts_with("smg_engine_cache_hit_rate{")
+                    && l.contains("worker=\"grpc://w1:9000\"")
+                    && l.contains(&format!("dp_rank=\"{rank}\""))
+            })
+            .map(|l| l.rsplit(' ').next().unwrap_or("").to_string())
+    };
+    assert_eq!(hit_rate_of("0").as_deref(), Some("0.5"), "{rendered}");
+    assert_eq!(
+        hit_rate_of("1"),
+        None,
+        "a record touches no other rank's series:\n{rendered}"
+    );
 
     // The receipts are the stream's: rank 1 is still quiet, the worker
     // stays polled, and each poll's figure replaces the last. A rank

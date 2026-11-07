@@ -89,8 +89,10 @@ mod handles {
     #[cfg(test)]
     pub(super) use smg_external_router::metrics::handles::force_on_this_thread;
     pub(super) use smg_external_router::metrics::handles::{
-        keep_handles, nested, recorder_installed, with_handle, with_model_handle, ByLabels,
+        keep_handles, kept, nested, recorder_installed, with_handle, with_model_handle, ByLabels,
     };
+
+    use super::{intern_model_label, intern_string};
 
     /// Handles by the matched path (the only label a request computes).
     pub(super) type ByPath<H> = HashMap<String, H>;
@@ -136,6 +138,167 @@ mod handles {
         pub(super) output_tokens: OnceCell<Counter>,
         /// `smg_router_tokens_total{token_type="cached"}`.
         pub(super) cached_tokens: OnceCell<Counter>,
+    }
+
+    /// The `smg_engine_*` handles of one rank of a worker under one model
+    /// label, each built the first time a load has a figure for it, so the
+    /// series that exist are exactly the ones recorded to: the core gauges
+    /// with the rank's first load, the capacity gauge with the first that
+    /// carries the capacity, the PD gauges under the role the engine reports
+    /// with the first that carries a `disagg` section.
+    #[derive(Default)]
+    pub(super) struct EngineRankHandles {
+        pub(super) core: Option<EngineCoreHandles>,
+        /// `smg_engine_kv_capacity_tokens`.
+        pub(super) kv_capacity: Option<Gauge>,
+        /// The PD gauges, under the role label the engine last reported.
+        pd: Option<EnginePdHandles>,
+    }
+
+    /// The labels of one rank's core series, interned once per record that
+    /// builds a handle (a rank's first sight, or every record while handles
+    /// are not kept) and shared by the handles it builds; a record on the
+    /// kept path interns nothing.
+    pub(super) struct EngineLabels {
+        worker: Arc<str>,
+        model: Arc<str>,
+        dp_rank: Arc<str>,
+    }
+
+    impl EngineLabels {
+        fn new(worker_url: &str, model_id: &str, dp_rank: i32) -> Self {
+            Self {
+                worker: intern_string(worker_url),
+                model: intern_model_label(model_id),
+                dp_rank: intern_string(&dp_rank.to_string()),
+            }
+        }
+    }
+
+    /// The labels in `slot`, built on the first call of a record.
+    pub(super) fn engine_labels<'l>(
+        slot: &'l mut Option<EngineLabels>,
+        worker_url: &str,
+        model_id: &str,
+        dp_rank: i32,
+    ) -> &'l EngineLabels {
+        slot.get_or_insert_with(|| EngineLabels::new(worker_url, model_id, dp_rank))
+    }
+
+    /// The gauges every load sets for its rank.
+    pub(super) struct EngineCoreHandles {
+        /// `smg_engine_running_requests`.
+        pub(super) running: Gauge,
+        /// `smg_engine_waiting_requests`.
+        pub(super) waiting: Gauge,
+        /// `smg_engine_token_usage`.
+        pub(super) token_usage: Gauge,
+        /// `smg_engine_gen_throughput`.
+        pub(super) gen_throughput: Gauge,
+        /// `smg_engine_cache_hit_rate`.
+        pub(super) cache_hit_rate: Gauge,
+    }
+
+    /// The gauges of a rank's `disagg` section under one role label, each
+    /// built when a load first carries its figure.
+    pub(super) struct EnginePdHandles {
+        /// The role label the engine reported, interned once per role.
+        pub(super) role: Arc<str>,
+        /// `smg_engine_pd_kv_transfer_latency_ms`.
+        pub(super) kv_transfer_latency: Option<Gauge>,
+        /// `smg_engine_pd_kv_transfer_speed_gb_s`.
+        pub(super) kv_transfer_speed: Option<Gauge>,
+        /// `smg_engine_pd_prefill_queue_reqs`.
+        pub(super) prefill_queue: Option<Gauge>,
+        /// `smg_engine_pd_decode_queue_reqs`.
+        pub(super) decode_queue: Option<Gauge>,
+    }
+
+    impl EngineRankHandles {
+        /// The PD handles under `role`: the kept set while the engine keeps
+        /// reporting that role, a fresh set when it reports another (the
+        /// old role's series stay as they were, as they always have).
+        pub(super) fn pd(&mut self, role: &str) -> &mut EnginePdHandles {
+            let kept = self
+                .pd
+                .get_or_insert_with(|| EnginePdHandles::new(intern_string(role)));
+            if kept.role.as_ref() != role {
+                *kept = EnginePdHandles::new(intern_string(role));
+            }
+            kept
+        }
+    }
+
+    impl EngineCoreHandles {
+        /// The five core series of the rank `labels` name.
+        pub(super) fn new(labels: &EngineLabels) -> Self {
+            Self {
+                running: engine_gauge("smg_engine_running_requests", labels),
+                waiting: engine_gauge("smg_engine_waiting_requests", labels),
+                token_usage: engine_gauge("smg_engine_token_usage", labels),
+                gen_throughput: engine_gauge("smg_engine_gen_throughput", labels),
+                cache_hit_rate: engine_gauge("smg_engine_cache_hit_rate", labels),
+            }
+        }
+    }
+
+    impl EnginePdHandles {
+        fn new(role: Arc<str>) -> Self {
+            Self {
+                role,
+                kv_transfer_latency: None,
+                kv_transfer_speed: None,
+                prefill_queue: None,
+                decode_queue: None,
+            }
+        }
+    }
+
+    /// The series `name` of the rank `labels` name, by the key the
+    /// engine-load record has always built: the series is the same one
+    /// whether it is reached through a kept handle or a key built per call,
+    /// and the scrape reads the same.
+    pub(super) fn engine_gauge(name: &'static str, labels: &EngineLabels) -> Gauge {
+        metrics::gauge!(
+            name,
+            "worker" => Arc::clone(&labels.worker),
+            "model" => Arc::clone(&labels.model),
+            "dp_rank" => Arc::clone(&labels.dp_rank),
+        )
+    }
+
+    /// A PD series: labelled by the role the engine reported, not the model.
+    pub(super) fn engine_pd_gauge(
+        name: &'static str,
+        labels: &EngineLabels,
+        role: &Arc<str>,
+    ) -> Gauge {
+        metrics::gauge!(
+            name,
+            "worker" => Arc::clone(&labels.worker),
+            "role" => Arc::clone(role),
+            "dp_rank" => Arc::clone(&labels.dp_rank),
+        )
+    }
+
+    /// The kept handles of rank `dp_rank` under `model_id`'s label for one
+    /// worker, created on first sight: the model map's key is the interner's
+    /// own allocation, as the request counters' is, and a label the interner
+    /// refused (its sentinel) keeps nothing (`None`).
+    pub(super) fn engine_rank<'m>(
+        by_model: &'m mut HashMap<Arc<str>, HashMap<i32, EngineRankHandles>>,
+        model_id: &str,
+        dp_rank: i32,
+    ) -> Option<&'m mut EngineRankHandles> {
+        if !by_model.contains_key(model_id) {
+            let label = intern_model_label(model_id);
+            if !kept(by_model.len(), &label) {
+                return None;
+            }
+            by_model.insert(label, HashMap::new());
+        }
+        let ranks = by_model.get_mut(model_id)?;
+        Some(ranks.entry(dp_rank).or_default())
     }
 
     /// Every registration or removal of a worker moves this on, and a
@@ -201,6 +364,10 @@ mod handles {
     /// handle, not through a key built and looked up per call.
     pub(super) type WorkerGauges = ByWorker<Gauge>;
 
+    /// The `smg_engine_*` set: by worker URL, then the model label as the
+    /// interner gave it, then the DP rank.
+    pub(super) type EngineLoads = ByWorker<HashMap<Arc<str>, HashMap<i32, EngineRankHandles>>>;
+
     /// Uses the one handle of a series with no dynamic label: this thread's
     /// kept handle, built on first use, or a key built per call when handles
     /// are not kept.
@@ -256,6 +423,8 @@ mod handles {
         pub(super) static WORKER_CB_SUCCESSES: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
         /// `smg_worker_cb_outcomes_total`.
         pub(super) static WORKER_CB_OUTCOMES: RefCell<WorkerOutcomes> = RefCell::new(WorkerOutcomes::default());
+        /// The `smg_engine_*` set.
+        pub(super) static ENGINE_LOADS: RefCell<EngineLoads> = RefCell::new(EngineLoads::default());
         /// `smg_worker_selection_total` by its static labels, then the model.
         pub(super) static WORKER_SELECTIONS: RefCell<ByLabels<SelectionLabels, Counter>> = RefCell::new(HashMap::new());
         /// `smg_cache_aware_policy_branch_total` by branch.
@@ -294,6 +463,7 @@ mod handles {
         WORKER_CB_FAILURES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
         WORKER_CB_SUCCESSES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
         WORKER_CB_OUTCOMES.with_borrow_mut(|kept| *kept = WorkerOutcomes::default());
+        ENGINE_LOADS.with_borrow_mut(|kept| *kept = EngineLoads::default());
         WORKER_SELECTIONS.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_BRANCHES.with_borrow_mut(HashMap::clear);
         MANUAL_BRANCHES.with_borrow_mut(HashMap::clear);
@@ -323,6 +493,17 @@ mod handles {
             assert_eq!(counters.len(), 1);
             worker_set_changed();
             assert!(kept.for_worker("http://w1").is_empty());
+        }
+
+        #[test]
+        fn engine_rank_handles_are_made_once_per_model_and_rank() {
+            let mut by_model = HashMap::new();
+            for (model, rank) in [("m", 0), ("m", 1), ("m", 0), ("m2", 0), ("m", 1)] {
+                assert!(engine_rank(&mut by_model, model, rank).is_some());
+            }
+            assert_eq!(by_model.len(), 2, "one map per model label");
+            assert_eq!(by_model.get("m").map(HashMap::len), Some(2));
+            assert_eq!(by_model.get("m2").map(HashMap::len), Some(1));
         }
     }
 }
@@ -3366,7 +3547,9 @@ impl Metrics {
     // Layer 3: Engine load re-export
     // ========================================================================
 
-    /// Re-export a worker's `GetLoads` snapshot as `smg_engine_*` gauges.
+    /// Re-export a worker's `GetLoads` snapshot as `smg_engine_*` gauges:
+    /// every rank the report carries, as a poll's does. A pushed record
+    /// names one rank and goes through [`Self::record_engine_rank_load`].
     ///
     /// Core gauges are per DP rank (`dp_rank` bounded by dp_size). PD gauges
     /// are emitted only for ranks that carry a `disagg` section, labeled by the
@@ -3376,102 +3559,129 @@ impl Metrics {
         model_id: &str,
         response: &openai_protocol::worker::WorkerLoadResponse,
     ) {
-        let worker = intern_string(worker_url);
-        let model = intern_model_label(model_id);
-
         for load in &response.loads {
-            let dp_rank = intern_string(&load.dp_rank.to_string());
+            Self::record_engine_rank_load(worker_url, model_id, load);
+        }
+    }
 
-            gauge!(
-                "smg_engine_running_requests",
-                "worker" => Arc::clone(&worker),
-                "model" => Arc::clone(&model),
-                "dp_rank" => Arc::clone(&dp_rank),
-            )
-            .set(load.num_running_reqs as f64);
-            gauge!(
-                "smg_engine_waiting_requests",
-                "worker" => Arc::clone(&worker),
-                "model" => Arc::clone(&model),
-                "dp_rank" => Arc::clone(&dp_rank),
-            )
-            .set(load.num_waiting_reqs as f64);
-            gauge!(
-                "smg_engine_token_usage",
-                "worker" => Arc::clone(&worker),
-                "model" => Arc::clone(&model),
-                "dp_rank" => Arc::clone(&dp_rank),
-            )
-            .set(load.token_usage);
-            gauge!(
-                "smg_engine_gen_throughput",
-                "worker" => Arc::clone(&worker),
-                "model" => Arc::clone(&model),
-                "dp_rank" => Arc::clone(&dp_rank),
-            )
-            .set(load.gen_throughput);
-            gauge!(
-                "smg_engine_cache_hit_rate",
-                "worker" => Arc::clone(&worker),
-                "model" => Arc::clone(&model),
-                "dp_rank" => Arc::clone(&dp_rank),
-            )
-            .set(load.cache_hit_rate);
-            // The capacity behind the usage ratio, when the engine reports
-            // it (a snapshot read off an HTTP metrics page carries the
-            // ratio alone and leaves it 0).
-            if load.max_total_num_tokens > 0 {
-                gauge!(
-                    "smg_engine_kv_capacity_tokens",
-                    "worker" => Arc::clone(&worker),
-                    "model" => Arc::clone(&model),
-                    "dp_rank" => Arc::clone(&dp_rank),
-                )
+    /// Re-export one rank's figures as its `smg_engine_*` gauges: through
+    /// this thread's kept handles for the worker, model and rank (built on
+    /// the rank's first sight, dropped when the worker set changes), or
+    /// through keys built per call when handles are not kept. A record
+    /// pushed at the engine's batch rate is then a few atomic stores, with
+    /// nothing built or allocated, and touches no other rank's series.
+    pub fn record_engine_rank_load(
+        worker_url: &str,
+        model_id: &str,
+        load: &openai_protocol::worker::SchedulerLoadSnapshot,
+    ) {
+        if handles::keep_handles() {
+            let recorded = handles::ENGINE_LOADS.with_borrow_mut(|kept| {
+                handles::engine_rank(kept.for_worker(worker_url), model_id, load.dp_rank)
+                    .map(|rank| Self::set_engine_rank_gauges(rank, worker_url, model_id, load))
+                    .is_some()
+            });
+            if recorded {
+                return;
+            }
+        }
+        // Nothing kept (no recorder installed yet, or a model label the
+        // interner refused): the keys are built for this call alone.
+        Self::set_engine_rank_gauges(
+            &mut handles::EngineRankHandles::default(),
+            worker_url,
+            model_id,
+            load,
+        );
+    }
+
+    /// Set a rank's gauges through `rank`'s handles, each built the first
+    /// time the rank has a figure for its series; the labels are interned
+    /// once per record that builds a handle and not at all otherwise.
+    fn set_engine_rank_gauges(
+        rank: &mut handles::EngineRankHandles,
+        worker_url: &str,
+        model_id: &str,
+        load: &openai_protocol::worker::SchedulerLoadSnapshot,
+    ) {
+        let dp_rank = load.dp_rank;
+        let mut labels = None;
+        let core = rank.core.get_or_insert_with(|| {
+            handles::EngineCoreHandles::new(handles::engine_labels(
+                &mut labels,
+                worker_url,
+                model_id,
+                dp_rank,
+            ))
+        });
+        core.running.set(load.num_running_reqs as f64);
+        core.waiting.set(load.num_waiting_reqs as f64);
+        core.token_usage.set(load.token_usage);
+        core.gen_throughput.set(load.gen_throughput);
+        core.cache_hit_rate.set(load.cache_hit_rate);
+        // The capacity behind the usage ratio, when the engine reports
+        // it (a snapshot read off an HTTP metrics page carries the
+        // ratio alone and leaves it 0).
+        if load.max_total_num_tokens > 0 {
+            rank.kv_capacity
+                .get_or_insert_with(|| {
+                    handles::engine_gauge(
+                        "smg_engine_kv_capacity_tokens",
+                        handles::engine_labels(&mut labels, worker_url, model_id, dp_rank),
+                    )
+                })
                 .set(f64::from(load.max_total_num_tokens));
-            }
+        }
 
-            // PD gauges only when the engine reported a disagg section. Labeled
-            // by dp_rank too, so DP ranks sharing a role don't overwrite.
-            let Some(role) = load.disagg_mode.as_deref() else {
-                continue;
-            };
-            let role = intern_string(role);
-            if let Some(latency) = load.kv_transfer_latency_ms {
-                gauge!(
-                    "smg_engine_pd_kv_transfer_latency_ms",
-                    "worker" => Arc::clone(&worker),
-                    "role" => Arc::clone(&role),
-                    "dp_rank" => Arc::clone(&dp_rank),
-                )
+        // PD gauges only when the engine reported a disagg section. Labeled
+        // by dp_rank too, so DP ranks sharing a role don't overwrite.
+        let Some(role) = load.disagg_mode.as_deref() else {
+            return;
+        };
+        let pd = rank.pd(role);
+        if let Some(latency) = load.kv_transfer_latency_ms {
+            pd.kv_transfer_latency
+                .get_or_insert_with(|| {
+                    handles::engine_pd_gauge(
+                        "smg_engine_pd_kv_transfer_latency_ms",
+                        handles::engine_labels(&mut labels, worker_url, model_id, dp_rank),
+                        &pd.role,
+                    )
+                })
                 .set(latency);
-            }
-            if let Some(speed) = load.kv_transfer_speed_gb_s {
-                gauge!(
-                    "smg_engine_pd_kv_transfer_speed_gb_s",
-                    "worker" => Arc::clone(&worker),
-                    "role" => Arc::clone(&role),
-                    "dp_rank" => Arc::clone(&dp_rank),
-                )
+        }
+        if let Some(speed) = load.kv_transfer_speed_gb_s {
+            pd.kv_transfer_speed
+                .get_or_insert_with(|| {
+                    handles::engine_pd_gauge(
+                        "smg_engine_pd_kv_transfer_speed_gb_s",
+                        handles::engine_labels(&mut labels, worker_url, model_id, dp_rank),
+                        &pd.role,
+                    )
+                })
                 .set(speed);
-            }
-            if let Some(reqs) = load.prefill_queue_reqs {
-                gauge!(
-                    "smg_engine_pd_prefill_queue_reqs",
-                    "worker" => Arc::clone(&worker),
-                    "role" => Arc::clone(&role),
-                    "dp_rank" => Arc::clone(&dp_rank),
-                )
+        }
+        if let Some(reqs) = load.prefill_queue_reqs {
+            pd.prefill_queue
+                .get_or_insert_with(|| {
+                    handles::engine_pd_gauge(
+                        "smg_engine_pd_prefill_queue_reqs",
+                        handles::engine_labels(&mut labels, worker_url, model_id, dp_rank),
+                        &pd.role,
+                    )
+                })
                 .set(reqs as f64);
-            }
-            if let Some(reqs) = load.decode_queue_reqs {
-                gauge!(
-                    "smg_engine_pd_decode_queue_reqs",
-                    "worker" => Arc::clone(&worker),
-                    "role" => role,
-                    "dp_rank" => dp_rank,
-                )
+        }
+        if let Some(reqs) = load.decode_queue_reqs {
+            pd.decode_queue
+                .get_or_insert_with(|| {
+                    handles::engine_pd_gauge(
+                        "smg_engine_pd_decode_queue_reqs",
+                        handles::engine_labels(&mut labels, worker_url, model_id, dp_rank),
+                        &pd.role,
+                    )
+                })
                 .set(reqs as f64);
-            }
         }
     }
 
