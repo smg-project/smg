@@ -956,9 +956,11 @@ fn interval_clips_report_the_loaders_sampled_rate() {
 /// picks at source resolution cannot fit the decoded-bytes budget is refused
 /// with that budget's own error before any pick is held, and the count stops
 /// at the budget, so the claim's size is no cost: two billion frames at 30
-/// fps in full HD are refused after the budget's 172 picks. A clip within the
-/// budget, the other rules (bounded by their caps), an unsized probe and an
-/// unknown rate (the bounded `Even` fallback) pass.
+/// fps in full HD are refused after the budget's 172 picks, and the same
+/// claim in one-pixel frames or from an unsized probe after the picks the
+/// budget holds in records alone. A clip within the budget, the other rules
+/// (bounded by their caps) and an unknown rate (the bounded `Even` fallback)
+/// pass.
 #[test]
 fn an_interval_claim_past_the_decoded_bytes_budget_is_refused_before_its_picks() {
     let interval = VideoFetchConfig {
@@ -980,10 +982,19 @@ fn an_interval_claim_past_the_decoded_bytes_budget_is_refused_before_its_picks()
             "{total_frames} frames at {fps} fps: {refused:?}"
         );
     }
+    // The smallest frames and an unsized probe are bounded through the picks'
+    // records alone: the claim is refused, a clip within the budget passes.
+    for frame_size in [3, 0] {
+        let refused = super::ensure_interval_picks_fit(1 << 31, 30.0, frame_size, interval);
+        assert!(
+            matches!(refused, Err(MediaConnectorError::DecodedTooLarge { .. })),
+            "frame size {frame_size}: {refused:?}"
+        );
+        assert!(super::ensure_interval_picks_fit(1_000, 1.0, frame_size, interval).is_ok());
+    }
     assert!(super::ensure_interval_picks_fit(150, 30.0, full_hd, interval).is_ok());
     let even = VideoFetchConfig::default();
     assert!(super::ensure_interval_picks_fit(1 << 31, 30.0, full_hd, even).is_ok());
-    assert!(super::ensure_interval_picks_fit(1 << 31, 30.0, 0, interval).is_ok());
     assert!(super::ensure_interval_picks_fit(1 << 31, f64::NAN, full_hd, interval).is_ok());
 }
 

@@ -2306,15 +2306,22 @@ fn interval_walk(total_frames: usize, fps: f64, rate: f64) -> impl Iterator<Item
     })
 }
 
+/// What a pick costs in memory besides its frame: its index, its entry in
+/// the unique list, its copy in the sampling info and at most one seek
+/// segment's timestamp.
+const PICK_RECORD_BYTES: usize =
+    2 * size_of::<usize>() + size_of::<(usize, usize)>() + size_of::<f64>();
+
 /// Refuses, with the decoded-bytes budget's own error, a clip whose interval
-/// picks at source resolution cannot fit the budget, before any vector is
-/// sized by the container's frame claim: the walk is counted, not collected,
-/// and the count stops at the first pick past the budget, so a claim of any
-/// size costs the budget's frames in iterations and no memory. The other
-/// rules are bounded by their frame caps, a clip whose rate is unknown takes
-/// the bounded `Even` rule, and a `frame_size` of 0 (an unsized probe) counts
-/// no bytes, as the work cap counts no pixels for it, and leaves the clip to
-/// the decoders' own checks.
+/// picks cannot fit the budget, before any vector is sized by the container's
+/// frame claim: the walk is counted, not collected, and the count stops at
+/// the first pick past the budget, so a claim of any size costs the budget's
+/// picks in iterations and no memory. A pick costs its frame at source
+/// resolution and its records ([`PICK_RECORD_BYTES`]), so the bound is the
+/// later byte check's with the records added, and it holds for an unsized
+/// probe (`frame_size` 0) and for the smallest frames through the records
+/// alone. The other rules are bounded by their frame caps, and a clip whose
+/// rate is unknown takes the bounded `Even` rule.
 fn ensure_interval_picks_fit(
     total_frames: usize,
     fps: f64,
@@ -2322,26 +2329,27 @@ fn ensure_interval_picks_fit(
     cfg: VideoFetchConfig,
 ) -> Result<(), MediaConnectorError> {
     if !matches!(cfg.sampling, FrameSampling::Interval)
-        || frame_size == 0
         || !(fps.is_finite() && fps > 0.0)
         || cfg.sample_fps <= 0.0
     {
         return Ok(());
     }
-    let budget_frames = video_max_decoded_bytes() / frame_size;
+    let pick_bytes = frame_size.saturating_add(PICK_RECORD_BYTES);
+    let budget_picks = video_max_decoded_bytes() / pick_bytes;
     if interval_walk(total_frames, fps, cfg.sample_fps)
-        .nth(budget_frames)
+        .nth(budget_picks)
         .is_some()
     {
         return ensure_decoded_byte_limit(
-            budget_frames.saturating_add(1).saturating_mul(frame_size),
+            budget_picks.saturating_add(1).saturating_mul(pick_bytes),
         );
     }
     Ok(())
 }
 
 /// [`ensure_interval_picks_fit`] on a probe, over the frames and rate its
-/// selection would be built from; a probe without them builds no selection.
+/// selection would be built from (a probe without them builds no selection);
+/// an unsized probe counts its picks' records alone.
 fn ensure_probed_interval_picks_fit(
     probed: VideoMetadata,
     cfg: VideoFetchConfig,
