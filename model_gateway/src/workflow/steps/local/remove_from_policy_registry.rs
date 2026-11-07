@@ -104,8 +104,12 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
         // keep a policy alive or end it early. Every model a worker served
         // is asked after, not its primary alone: a worker listing several
         // models can be the last to serve one whose own workers left first.
+        // The workers the registry step removed count as well as the ones
+        // found, since a same-URL replacement during the drain is the one
+        // removed.
         let models: HashSet<String> = workers_to_remove
             .iter()
+            .chain(&context.data.removed_workers)
             .flat_map(WorkerRegistry::policy_model_ids)
             .collect();
         for model_id in &models {

@@ -234,6 +234,24 @@ async fn a_replacement_that_lists_a_model_fewer_takes_its_policy() {
 }
 
 #[tokio::test]
+async fn a_removal_takes_the_policy_of_the_worker_a_replacement_put_in_its_place() {
+    // The removal found llama's worker, then a registration replaced it at
+    // its URL during the drain: the registry step removes the replacement,
+    // and qwen's policy goes with qwen's last worker.
+    let app_context = app_context();
+    let llama = worker("http://w1:8000", "llama");
+    register(&app_context, Arc::clone(&llama), "cache_aware").await;
+    register(&app_context, worker("http://w1:8000", "qwen"), "random").await;
+
+    remove(&app_context, llama).await;
+    assert!(app_context
+        .worker_registry
+        .get_by_url("http://w1:8000")
+        .is_none());
+    assert_eq!(policy_of(&app_context, "qwen"), None);
+}
+
+#[tokio::test]
 async fn a_mesh_import_removed_here_leaves_the_local_workers_policy() {
     // The import never added to the model's workers here, so its removal
     // must not end a policy a local worker still routes by.
