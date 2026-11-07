@@ -469,10 +469,10 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
     selection_temperature: f32,
 
-    /// Worker selection policy for cache_aware, run over the per-worker
-    /// inputs the router gathers (prefix overlap, in-flight requests,
-    /// backend load reports); cache-aware-default, the affinity-group
-    /// decision, is the one policy
+    /// Worker selection policy for cache_aware, run over each worker's
+    /// prefix overlap and decayed affinity score and the fleet's mean
+    /// in-flight count; cache-aware-default, the affinity-group decision,
+    /// is the one policy
     #[arg(
         long,
         default_value = "cache-aware-default",
