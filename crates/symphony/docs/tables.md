@@ -398,6 +398,15 @@ What this table says beyond the DeepSeek one:
   (`reasoning + response_open = content`, `reasoning + tools_open = tools`) and for a tools
   block opened inside the answer (`content + tools_open = tools`): the region ended, however
   the model left it, since the tags are tokens the model cannot write as text.
+- **The answer's closer ends a thought too.** On about 1 % of very long turns the model writes
+  its reply straight into the prefilled thought and closes it with `<|close|>response<|sep|>`,
+  never with the thought's closer or the answer's opener (`reasoning + response_close =
+  message`, a row for the parser alone: the grammars derived from the table keep the
+  thought's own close): the closer ends the thought as the end-of-turn tag would and is
+  dropped as wrapping, so no marker reaches the client. The reply stays the thought's text, streamed and
+  whole alike, since every byte is classified once, where it arrives; the engine's own parser
+  reads the whole output as the answer and, streaming, sends the reply a second time as the
+  answer after the thought. Before the row the closer was the thought's text.
 - **The prompt opens the thought.** The template ends the generation prompt with
   `<|open|>message role="assistant"<|sep|><|open|>think<|sep|>`, so an empty thought writes
   `<|close|>think<|sep|>` at once, and the engine's prompt replay puts the output inside the
