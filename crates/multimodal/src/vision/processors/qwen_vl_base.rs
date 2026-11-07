@@ -344,8 +344,10 @@ fn resize_dynamic_frame_to_raw(
     } else {
         resize(frame, target_width, target_height, filter)
     };
-    let (width, height, data) = rgb_bytes(&resized);
-    (width, height, data.into_owned())
+    let (width, height) = (resized.width() as usize, resized.height() as usize);
+    // Both resizers hand the frame back as RGB8, whose buffer moves out; a resize
+    // that kept another layout (a source with alpha) converts once.
+    (width, height, resized.into_rgb8().into_raw())
 }
 
 /// Generic Qwen VL image processor.
