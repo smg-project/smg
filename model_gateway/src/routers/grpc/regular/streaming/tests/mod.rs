@@ -70,6 +70,7 @@ fn chunk_frames_write_the_bytes_of_the_whole_structs() {
                 object: "chat.completion.chunk".to_string(),
                 created: 1_700_000_000,
                 model: "model-x".to_string(),
+                service_tier: openai_protocol::chat::DEFAULT_SERVICE_TIER.to_string(),
                 system_fingerprint: fingerprint.map(str::to_string),
                 choices: vec![choice.clone()],
                 usage: usage.clone(),
