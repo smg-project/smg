@@ -2328,7 +2328,11 @@ class RouterArgs:
             f"--{prefix}retry-max-retries",
             type=int,
             default=RouterArgs.retry_max_retries,
-            help="Maximum number of retry attempts for failed requests",
+            help=(
+                "Default attempts per request in all, the first one "
+                "included (1 disables retries). A worker's per-model "
+                "retry override takes precedence."
+            ),
         )
         retry_group.add_argument(
             f"--{prefix}retry-initial-backoff-ms",
