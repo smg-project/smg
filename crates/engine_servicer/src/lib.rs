@@ -31,6 +31,7 @@ pub mod engine_hash;
 mod engine_link;
 mod error;
 mod health;
+mod health_probe;
 pub mod kv_events;
 pub mod kv_history;
 pub mod kv_state;

@@ -30,6 +30,7 @@ use tonic::service::Routes;
 
 use crate::{
     engine_link::{EngineLink, TokenizerSlot},
+    health_probe,
     kv_events::KvEventRelay,
     metrics::{Identity, ServicerMetrics},
     servicer::{self, Shared, WireState},
@@ -43,8 +44,9 @@ pub const SERVICE_NAME: &str = "tokenspeed.grpc.scheduler.TokenSpeedScheduler";
 pub const ENCODER_SERVICE_NAME: &str = "tokenspeed.grpc.encoder.TokenSpeedEncoder";
 /// The `wire` label of this servicer's metrics.
 const WIRE: &str = "tokenspeed";
-/// What `HealthCheck`'s message says of a serving engine on this wire.
-const HEALTHY: &str = "healthy";
+/// The knob the Python servicer reads its health probe's bound from, in
+/// seconds; this servicer reads the same one.
+const HEALTH_CHECK_TIMEOUT_ENV: &str = "TOKENSPEED_HEALTH_CHECK_TIMEOUT";
 
 /// What `GetModelInfo` and `GetServerInfo` report: the facts the Python
 /// servicer reads off TokenSpeed's `ModelConfig` and `ServerArgs`, which the
@@ -318,6 +320,9 @@ pub(super) struct State {
     /// `Generate` refused, and the engine's handshake must list the encode
     /// request.
     pub(super) encode_role: Option<EncodeRendezvous>,
+    /// How long `HealthCheck`'s probe waits for the scheduler
+    /// ([`HEALTH_CHECK_TIMEOUT_ENV`]).
+    pub(super) health_probe_timeout: Duration,
 }
 
 impl WireState for State {
@@ -396,6 +401,7 @@ impl TokenSpeedServicerServer {
             ),
             tokenizer: TokenizerSlot::new(),
             encode_role,
+            health_probe_timeout: health_probe::timeout_from_env(HEALTH_CHECK_TIMEOUT_ENV),
         });
         if let Some(tokenizer) = tokenizer {
             let _ = state.tokenizer.set(Some(tokenizer));

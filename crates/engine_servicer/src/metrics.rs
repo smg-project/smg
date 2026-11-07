@@ -597,10 +597,30 @@ impl ServicerMetrics {
             }
             handles.request_params_n.record(n.max(1));
         }
+        self.observation(slot, arrival, prompt_tokens, true)
+    }
+
+    /// A request of the servicer's own (its health probe of the scheduler):
+    /// an observation that records nothing, so the probe's one token every
+    /// probe interval never reads as a client's request in the counters, the
+    /// token totals or the latencies. The stream and its choices record into
+    /// it as into any.
+    pub(crate) fn uncounted(self: &Arc<Self>) -> Arc<RequestMetrics> {
+        self.observation(self.slot(None), Instant::now(), 0, false)
+    }
+
+    fn observation(
+        self: &Arc<Self>,
+        slot: usize,
+        arrival: Instant,
+        prompt_tokens: u32,
+        counted: bool,
+    ) -> Arc<RequestMetrics> {
         Arc::new(RequestMetrics {
             metrics: Arc::clone(self),
             slot,
             arrival,
+            counted,
             first_output: OnceLock::new(),
             last_output_ns: AtomicU64::new(0),
             prompt_counted: AtomicBool::new(false),
@@ -1017,6 +1037,9 @@ pub(crate) struct RequestMetrics {
     metrics: Arc<ServicerMetrics>,
     slot: usize,
     arrival: Instant,
+    /// Whether the request is a client's, recorded as one; the servicer's
+    /// own health probe is not ([`ServicerMetrics::uncounted`]).
+    counted: bool,
     first_output: OnceLock<Instant>,
     /// Nanoseconds from arrival to the last output chunk; 0 before any.
     last_output_ns: AtomicU64,
@@ -1049,6 +1072,9 @@ impl RequestMetrics {
 
     /// The stream ended with a gRPC status.
     pub(crate) fn failed(&self, code: Code) {
+        if !self.counted {
+            return;
+        }
         if !self.errored.swap(true, Ordering::Relaxed) {
             if let Some(recorded) = &self.metrics.recorded {
                 recorded.error(code).increment(1);
@@ -1064,6 +1090,9 @@ impl RequestMetrics {
     /// stats line reads them); `now` is the instant a listener read, and the
     /// first one is the request's first output.
     fn output(&self, now: Option<Instant>, prompt_tokens: u32, cached_tokens: u32) {
+        if !self.counted {
+            return;
+        }
         if prompt_tokens > 0 && !self.prompt_counted.swap(true, Ordering::Relaxed) {
             let totals = self.metrics.rank_totals(self.slot);
             totals
@@ -1108,8 +1137,12 @@ impl RequestMetrics {
 }
 
 impl Drop for RequestMetrics {
-    /// The stream and every choice are gone: the request's end.
+    /// The stream and every choice are gone: the request's end (of a
+    /// client's request; the servicer's own probe is none of the counters').
     fn drop(&mut self) {
+        if !self.counted {
+            return;
+        }
         let Some(handles) = self.metrics.rank_handles(self.slot) else {
             return;
         };
@@ -1149,13 +1182,17 @@ pub(crate) struct ChoiceMetrics {
 impl ChoiceMetrics {
     /// An output chunk of `tokens` new tokens reached the servicer, with
     /// the engine's prompt figures on it. Returns the instant it read, for
-    /// a caller that needs one too; `None` without a listener (nothing read).
+    /// a caller that needs one too; `None` without a listener (nothing read)
+    /// and for an uncounted request (nothing recorded).
     pub(crate) fn chunk(
         &mut self,
         tokens: u32,
         prompt_tokens: u32,
         cached_tokens: u32,
     ) -> Option<Instant> {
+        if !self.request.counted {
+            return None;
+        }
         let metrics = &self.request.metrics;
         if tokens > 0 {
             metrics
@@ -1199,6 +1236,9 @@ impl ChoiceMetrics {
 
     /// This servicer ended the choice on a stop string it matched.
     pub(crate) fn string_stop(&mut self) {
+        if !self.request.counted {
+            return;
+        }
         self.request
             .metrics
             .rank_totals(self.request.slot)
@@ -1357,6 +1397,62 @@ mod tests {
         );
         assert_eq!(one_two_five_buckets(0), [1.0]);
         assert_eq!(one_two_five_buckets(4096).len(), 11);
+    }
+
+    /// The servicer's own probe is none of the counters': its observation
+    /// records nothing, from the chunk to the drop, beside a client's that
+    /// does.
+    #[test]
+    fn an_uncounted_observation_records_nothing() {
+        let metrics = ServicerMetrics::new(&identity(1), true).unwrap();
+        let probe = metrics.uncounted();
+        let mut choice = probe.choice();
+        assert_eq!(
+            choice.chunk(1, 3, 0),
+            None,
+            "nothing read, nothing recorded"
+        );
+        choice.complete("length", 3, 0);
+        choice.string_stop();
+        probe.failed(Code::Internal);
+        drop(choice);
+        drop(probe);
+        assert_eq!(
+            (
+                metrics.prompt_tokens_total(),
+                metrics.generation_tokens_total()
+            ),
+            (0, 0)
+        );
+        let body = metrics.render(snapshot());
+        for reason in ["length", "stop", "error", "abort"] {
+            assert_eq!(
+                sample(
+                    &body,
+                    names::REQUESTS_TOTAL,
+                    &format!("finish_reason=\"{reason}\"")
+                ),
+                Some(0.0),
+                "{reason}"
+            );
+        }
+        assert_eq!(
+            sample(&body, names::REQUEST_ERRORS_TOTAL, "code=\"internal\""),
+            None,
+            "the error counter was never touched"
+        );
+        let request = metrics.request(Instant::now(), Some(0), 3, Some(8), 1);
+        let mut choice = request.choice();
+        assert!(choice.chunk(1, 3, 0).is_some(), "a client's is read");
+        drop(choice);
+        drop(request);
+        assert_eq!(
+            (
+                metrics.prompt_tokens_total(),
+                metrics.generation_tokens_total()
+            ),
+            (3, 1)
+        );
     }
 
     #[test]

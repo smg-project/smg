@@ -389,7 +389,9 @@ fn starts_at_boot(value: Option<&str>) -> bool {
     !value.is_some_and(|value| value.trim().eq_ignore_ascii_case("lazy"))
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
+/// `name` from the environment as a count, `default` when unset, empty or
+/// not a number (said once in the log).
+pub(crate) fn env_usize(name: &str, default: usize) -> usize {
     match std::env::var(name) {
         Ok(value) if !value.trim().is_empty() => match value.trim().parse::<usize>() {
             Ok(parsed) => parsed,
