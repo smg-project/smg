@@ -310,6 +310,28 @@ fn build_planar_tensor(
     Array3::from_shape_vec((3, h, w), data).expect("shape matches pre-allocated buffer")
 }
 
+/// [`build_planar_tensor`] through a per-channel table:
+/// `output[c][i] = table[c][raw[i*3 + c]]`.
+fn build_planar_tensor_by_table(
+    raw: &[u8],
+    w: usize,
+    h: usize,
+    table: &[[f32; 256]; 3],
+) -> Array3<f32> {
+    let pixels = h * w;
+    let mut data = scratch::take_f32(3 * pixels);
+    let (r_plane, rest) = data.split_at_mut(pixels);
+    let (g_plane, b_plane) = rest.split_at_mut(pixels);
+
+    deinterleave_rgb_to_planes_by_table(raw, r_plane, g_plane, b_plane, table);
+
+    #[expect(
+        clippy::expect_used,
+        reason = "data has exactly 3*h*w elements by construction"
+    )]
+    Array3::from_shape_vec((3, h, w), data).expect("shape matches pre-allocated buffer")
+}
+
 /// Paint an `image_w` x `image_h` image, given as interleaved RGB bytes, onto
 /// the top-left of a `canvas_w` x `canvas_h` planar canvas: `planes` holds the
 /// R, G and B planes back to back (`3 * canvas_w * canvas_h` elements), every
@@ -445,6 +467,25 @@ pub fn to_tensor_and_normalize(
     let scale: [f32; 3] = std::array::from_fn(|c| 1.0 / (255.0 * std[c] as f32));
     let bias: [f32; 3] = std::array::from_fn(|c| -(mean[c] as f32) / (std[c] as f32));
     build_planar_tensor(&raw, w, h, scale, bias)
+}
+
+/// Convert image to tensor and normalize in the steps of torchvision's
+/// `Compose([ToTensor(), Normalize(mean, std)])`: the byte divided by 255,
+/// the mean subtracted, the std divided, each rounded to `f32`. The fused
+/// [`to_tensor_and_normalize`] differs from these three roundings in the
+/// last bit on about half of the byte values; a reference that composes the
+/// two transforms takes this one.
+pub fn to_tensor_then_normalize(
+    image: &DynamicImage,
+    mean: &[f64; 3],
+    std: &[f64; 3],
+) -> Array3<f32> {
+    let (w, h, raw) = rgb_bytes(image);
+    let table: [[f32; 256]; 3] = std::array::from_fn(|c| {
+        let (mean, std) = (mean[c] as f32, std[c] as f32);
+        std::array::from_fn(|byte| (byte as f32 / 255.0 - mean) / std)
+    });
+    build_planar_tensor_by_table(&raw, w, h, &table)
 }
 
 /// Rescale tensor by a constant factor.
@@ -652,11 +693,15 @@ fn fir_image_to_dynamic(
 const PIL_PRECISION_BITS: u32 = 32 - 8 - 2;
 const PIL_BICUBIC_SUPPORT: f64 = 2.0;
 const PIL_LANCZOS_SUPPORT: f64 = 3.0;
+const PIL_BILINEAR_SUPPORT: f64 = 1.0;
 
 #[derive(Clone, Copy)]
 pub(super) enum PilResizeFilter {
     Bicubic,
     Lanczos,
+    /// Pillow's BILINEAR: the triangle filter, support 1, widened by the
+    /// downscale factor like the others.
+    Bilinear,
 }
 
 impl PilResizeFilter {
@@ -664,6 +709,7 @@ impl PilResizeFilter {
         match self {
             Self::Bicubic => PIL_BICUBIC_SUPPORT,
             Self::Lanczos => PIL_LANCZOS_SUPPORT,
+            Self::Bilinear => PIL_BILINEAR_SUPPORT,
         }
     }
 
@@ -671,6 +717,7 @@ impl PilResizeFilter {
         match self {
             Self::Bicubic => pil_cubic(x),
             Self::Lanczos => pil_lanczos(x),
+            Self::Bilinear => pil_bilinear(x),
         }
     }
 }
@@ -704,6 +751,17 @@ fn pil_lanczos(x: f64) -> f64 {
     let x = x.abs();
     if x < PIL_LANCZOS_SUPPORT {
         pil_sinc(x) * pil_sinc(x / PIL_LANCZOS_SUPPORT)
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn pil_bilinear(x: f64) -> f64 {
+    // Pillow's `bilinear_filter`: the triangle.
+    let x = x.abs();
+    if x < PIL_BILINEAR_SUPPORT {
+        1.0 - x
     } else {
         0.0
     }
@@ -2202,6 +2260,33 @@ pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> Dynam
     )
 }
 
+/// Pillow-exact BILINEAR resize (RGB8), matching
+/// `PIL.Image.resize(.., BILINEAR)`: the triangle filter widened by the
+/// downscale factor, Pillow's 22-bit taps and its two passes. This is what
+/// torchvision's `resize` computes on a PIL image at its default
+/// interpolation, and so what an image processor that resizes the decoded
+/// image before converting it to a tensor runs.
+pub fn resize_bilinear_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
+    let rgb = image.to_rgb8();
+    let (in_w, in_h) = rgb.dimensions();
+    let output = resize_pil_bytes::<3>(
+        rgb.as_raw(),
+        in_w,
+        in_h,
+        out_w,
+        out_h,
+        PilResizeFilter::Bilinear,
+        KernelQuantization::Pillow,
+    );
+    #[expect(
+        clippy::expect_used,
+        reason = "output is exactly out_w*out_h*3 bytes by construction"
+    )]
+    DynamicImage::ImageRgb8(
+        RgbImage::from_raw(out_w, out_h, output).expect("pil resize buffer size"),
+    )
+}
+
 /// `data` (`in_w` x `in_h` interleaved pixels of `C` channels) resampled to
 /// `out_w` x `out_h` with `filter`'s kernel in `quantization`: the width pass
 /// first, then the height pass, each skipped on an axis that keeps its size
@@ -3021,13 +3106,468 @@ pub fn bicubic_resize(tensor: &Array3<f32>, target_h: usize, target_w: usize) ->
     result
 }
 
+// ---------------------------------------------------------------------------
+// torch's bicubic interpolation of a float tensor without antialiasing.
+
+/// The four cubic convolution coefficients torch's `upsample_bicubic2d`
+/// computes for the fraction `t` (`a = -0.75`, the OpenCV constant; the
+/// antialiased kernel uses `-0.5`), in `f32` as its compiled kernel
+/// evaluates the two polynomials: `((a + 2) x - (a + 3)) x x + 1` in plain
+/// operations, `((a x - 5a) x + 8a) x - 4a` with its first two steps fused
+/// multiply-adds and its last one plain. Read off the kernel's coefficients
+/// at ratios whose fractions are not dyadic: every other mix of fused and
+/// plain steps moves some coefficient by one ULP (the antialiased kernel
+/// fuses every step, [`torch_aa_cubic_f32`]).
+#[inline]
+fn torch_cubic_coefficients(t: f32) -> [f32; 4] {
+    const A: f32 = -0.75;
+    let near = |x: f32| ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0;
+    let far = |x: f32| A.mul_add(x, -(5.0 * A)).mul_add(x, 8.0 * A) * x - 4.0 * A;
+    [far(t + 1.0), near(t), near(1.0 - t), far(2.0 - t)]
+}
+
+/// One axis of [`resize_bicubic_torch_f32`]: per output index the four
+/// clamped source indices and their coefficients, as torch's
+/// `compute_indices_weights` lays them out: the source position
+/// `scale * (i + 0.5) - 0.5` with `scale = in / out` in `f32` and the
+/// product and difference rounded once (the kernel's fused multiply-add;
+/// two roundings move the position by one ULP at some indices of a
+/// non-dyadic ratio), its floor (capped at the last index) and the
+/// fraction above it.
+fn torch_cubic_axis(in_size: usize, out_size: usize) -> Vec<([usize; 4], [f32; 4])> {
+    let scale = in_size as f32 / out_size as f32;
+    let last = in_size as i64 - 1;
+    (0..out_size)
+        .map(|i| {
+            let position = scale.mul_add(i as f32 + 0.5, -0.5);
+            let index = (position.floor() as i64).min(last);
+            let fraction = (position - index as f32).clamp(0.0, 1.0);
+            let taps = std::array::from_fn(|j| (index - 1 + j as i64).clamp(0, last) as usize);
+            (taps, torch_cubic_coefficients(fraction))
+        })
+        .collect()
+}
+
+/// Four taps summed as torch's compiled kernel sums them: the second tap's
+/// rounded product first, then the first, third and fourth taps as fused
+/// multiply-adds (read off the kernel's output on impulse and random inputs;
+/// every other order differs in the last bit on some inputs).
+#[inline(always)]
+fn torch_cubic_dot(taps: [f32; 4], weights: [f32; 4]) -> f32 {
+    let sum = taps[1] * weights[1];
+    let sum = taps[0].mul_add(weights[0], sum);
+    let sum = taps[2].mul_add(weights[2], sum);
+    taps[3].mul_add(weights[3], sum)
+}
+
+/// The output of [`resize_bicubic_torch_f32`] for every channel: the width
+/// dot of each of the four source rows, then the height dot of the four
+/// results, the kernel's own nesting. Inlined into its callers so that the
+/// fused multiply-adds compile to the caller's instruction set.
+#[inline(always)]
+fn torch_cubic_passes(
+    tensor: &Array3<f32>,
+    x_axis: &[([usize; 4], [f32; 4])],
+    y_axis: &[([usize; 4], [f32; 4])],
+) -> Array3<f32> {
+    let channels = tensor.shape()[0];
+    let (out_h, out_w) = (y_axis.len(), x_axis.len());
+    let mut out = scratch::take_f32(channels * out_h * out_w);
+    for (channel, plane) in out.chunks_exact_mut(out_h * out_w).enumerate() {
+        let source = tensor.index_axis(ndarray::Axis(0), channel);
+        for ((rows, row_weights), out_row) in y_axis.iter().zip(plane.chunks_exact_mut(out_w)) {
+            for ((columns, column_weights), value) in x_axis.iter().zip(out_row.iter_mut()) {
+                let along_rows =
+                    rows.map(|y| torch_cubic_dot(columns.map(|x| source[[y, x]]), *column_weights));
+                *value = torch_cubic_dot(along_rows, *row_weights);
+            }
+        }
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "out has exactly channels*out_h*out_w elements by construction"
+    )]
+    Array3::from_shape_vec((channels, out_h, out_w), out).expect("shape matches the buffer")
+}
+
+/// [`torch_cubic_passes`] compiled for the fused multiply-add instruction:
+/// at the baseline x86-64 target the fused taps call the C library's
+/// software `fmaf`, the same bits several times slower.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma")]
+fn torch_cubic_passes_fma(
+    tensor: &Array3<f32>,
+    x_axis: &[([usize; 4], [f32; 4])],
+    y_axis: &[([usize; 4], [f32; 4])],
+) -> Array3<f32> {
+    torch_cubic_passes(tensor, x_axis, y_axis)
+}
+
+/// `torch.nn.functional.interpolate(mode="bicubic", align_corners=False)` on
+/// a float `[C, H, W]` tensor without antialiasing, bit for bit: the cubic
+/// convolution with `a = -0.75` on four taps per axis, the taps clamped at
+/// the edges, torch's `f32` positions and coefficients and its compiled
+/// kernel's order of roundings (`torch_cubic_dot`); verified against the
+/// kernel on whole outputs at the integer scales of the tiling processors
+/// and at ratios whose fractions are not dyadic (the pinned 5:3, 13:7,
+/// 448:336 and 640:336 among them). The Keys kernel of
+/// [`bicubic_resize`] (`a = -0.5`, a single summation) differs from it by
+/// up to a fifth of the normalized scale on a 2x downscale.
+pub fn resize_bicubic_torch_f32(tensor: &Array3<f32>, out_h: usize, out_w: usize) -> Array3<f32> {
+    let (h, w) = (tensor.shape()[1], tensor.shape()[2]);
+    if out_h == 0 || out_w == 0 || h == 0 || w == 0 {
+        return Array3::zeros((tensor.shape()[0], out_h, out_w));
+    }
+    let x_axis = torch_cubic_axis(w, out_w);
+    let y_axis = torch_cubic_axis(h, out_h);
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("fma") {
+        #[expect(
+            unsafe_code,
+            reason = "the target-feature function runs only after this function detected its feature"
+        )]
+        // SAFETY: `is_x86_feature_detected!("fma")` answered true just above,
+        // the only requirement of a `target_feature(enable = "fma")` function.
+        return unsafe { torch_cubic_passes_fma(tensor, &x_axis, &y_axis) };
+    }
+    torch_cubic_passes(tensor, &x_axis, &y_axis)
+}
+
 #[cfg(test)]
 mod tests {
 
     use image::Rgba;
 
     use super::*;
-    use crate::test_support::{assert_same_bytes, create_test_image, gradient_rgb};
+    use crate::test_support::{
+        assert_same_bytes, create_test_image, gradient_rgb, lcg_bytes, lcg_rgb_image,
+    };
+
+    /// Pillow's BILINEAR output on three images of generator bytes (12x5 to
+    /// 5x3: a downscale on both axes; 9x4 to 4x4: the width pass alone; 6x7
+    /// to 9x10: an upscale), byte for byte: `PIL.Image.resize(size, BILINEAR)`
+    /// of Pillow 12.3 on the same bytes.
+    #[test]
+    fn resize_bilinear_pil_matches_pillow() {
+        let expected: [&[u8]; 3] = [
+            &[
+                147, 178, 85, 89, 108, 108, 140, 116, 110, 145, 127, 168, 73, 90, 118, 112, 156,
+                106, 99, 155, 110, 146, 108, 147, 152, 124, 154, 152, 109, 72, 119, 186, 168, 126,
+                176, 137, 184, 120, 135, 191, 113, 112, 138, 60, 92,
+            ],
+            &[
+                114, 97, 140, 83, 45, 52, 145, 77, 149, 139, 153, 123, 193, 105, 130, 159, 194,
+                120, 108, 90, 131, 87, 141, 209, 120, 203, 71, 60, 160, 173, 92, 161, 173, 53, 151,
+                97, 210, 101, 115, 145, 128, 80, 177, 214, 88, 152, 210, 91,
+            ],
+            &[
+                18, 29, 102, 102, 124, 91, 170, 199, 68, 113, 118, 24, 87, 160, 42, 63, 185, 100,
+                13, 43, 219, 128, 108, 131, 254, 209, 13, 67, 71, 135, 133, 128, 115, 190, 183, 95,
+                153, 167, 98, 118, 144, 102, 99, 115, 120, 125, 83, 181, 175, 126, 140, 219, 177,
+                82, 101, 97, 165, 156, 123, 152, 199, 157, 144, 155, 189, 163, 117, 126, 139, 113,
+                62, 117, 203, 97, 149, 189, 139, 150, 152, 172, 141, 85, 76, 174, 147, 97, 201,
+                180, 121, 216, 69, 140, 175, 45, 115, 103, 72, 77, 62, 165, 45, 147, 118, 135, 157,
+                47, 234, 147, 118, 30, 221, 119, 72, 199, 123, 122, 172, 140, 163, 153, 99, 121,
+                153, 61, 59, 145, 84, 21, 98, 77, 119, 90, 63, 225, 95, 146, 50, 199, 103, 94, 180,
+                80, 147, 162, 165, 190, 169, 131, 134, 187, 75, 69, 175, 71, 74, 64, 82, 140, 81,
+                94, 203, 126, 168, 133, 111, 104, 157, 148, 58, 187, 191, 131, 214, 215, 128, 153,
+                191, 110, 104, 140, 124, 188, 59, 127, 194, 134, 128, 178, 229, 194, 160, 83, 134,
+                136, 149, 78, 133, 195, 90, 219, 116, 93, 148, 98, 98, 69, 115, 119, 125, 181, 134,
+                176, 156, 143, 212, 114, 121, 165, 80, 135, 146, 126, 140, 130, 152, 109, 145, 70,
+                107, 141, 78, 110, 126, 129, 98, 100, 214, 141, 136, 154, 186, 178, 73, 21, 158,
+                88, 122, 166, 99, 208, 149, 99, 151, 53, 57, 141, 134, 96, 131, 211, 156, 74, 97,
+                200, 147, 96, 142, 233, 122, 73,
+            ],
+        ];
+        let sizes = [(12, 5, 5, 3, 11), (9, 4, 4, 4, 12), (6, 7, 9, 10, 13)];
+        for ((w, h, out_w, out_h, seed), expected) in sizes.into_iter().zip(expected) {
+            let out = resize_bilinear_pil(&lcg_rgb_image(w, h, seed), out_w, out_h);
+            assert_same_bytes(
+                out.as_rgb8().unwrap().as_raw(),
+                expected,
+                &format!("{w}x{h} -> {out_w}x{out_h}"),
+            );
+        }
+    }
+
+    /// Every byte through `to_tensor_then_normalize` is the value of
+    /// torchvision's `ToTensor` then `Normalize` (the three roundings), the
+    /// bits of six bytes per channel pinned from torchvision; the fused form
+    /// differs from it on some bytes.
+    #[test]
+    fn to_tensor_then_normalize_takes_torchvisions_roundings() {
+        let mean = [0.48145466, 0.4578275, 0.40821073];
+        let std = [0.26862954, 0.26130258, 0.27577711];
+        let bytes: Vec<u8> = (0..=255u8).flat_map(|byte| [byte; 3]).collect();
+        let image = DynamicImage::ImageRgb8(RgbImage::from_raw(16, 16, bytes).unwrap());
+        let stepwise = to_tensor_then_normalize(&image, &mean, &std);
+        let fused = to_tensor_and_normalize(&image, &mean, &std);
+        let pinned: [(usize, [u32; 3]); 6] = [
+            (0, [0xbfe5_68dc, 0xbfe0_44b8, 0xbfbd_77d8]),
+            (1, [0xbfe3_8a7f, 0xbfde_58f1, 0xbfbb_a5e1]),
+            (127, [0x3d7c_e092, 0x3e1d_9531, 0x3ea6_c5e6]),
+            (128, [0x3d9c_5620, 0x3e2c_f36b, 0x3eae_0dc4]),
+            (254, [0x3ff5_36e5, 0x4003_d502, 0x4008_6d66]),
+            (255, [0x3ff7_1541, 0x4004_cae5, 0x4009_5660]),
+        ];
+        let mut fused_differs = 0;
+        for channel in 0..3 {
+            let (mean, std) = (mean[channel] as f32, std[channel] as f32);
+            for byte in 0..256usize {
+                let value = stepwise[[channel, byte / 16, byte % 16]];
+                let expected = (byte as f32 / 255.0 - mean) / std;
+                assert_eq!(
+                    value.to_bits(),
+                    expected.to_bits(),
+                    "channel {channel} byte {byte}"
+                );
+                fused_differs += usize::from(fused[[channel, byte / 16, byte % 16]] != value);
+            }
+            for (byte, bits) in pinned {
+                assert_eq!(
+                    stepwise[[channel, byte / 16, byte % 16]].to_bits(),
+                    bits[channel],
+                    "channel {channel} byte {byte}"
+                );
+            }
+        }
+        assert!(fused_differs > 0);
+    }
+
+    /// torch's non-antialiased bicubic on four generator inputs (values
+    /// `byte / 64 - 2`), bit for bit: integer scales (2 and 2; 3 and 1; 4 and
+    /// 2) and a fractional one (1.5), the outputs of
+    /// `torch.nn.functional.interpolate(mode="bicubic")` of torch 2.13 on the
+    /// same values; and a constant input returns its value.
+    #[test]
+    fn resize_bicubic_torch_f32_matches_torch() {
+        let cases: [(usize, usize, u32, [u32; 16]); 4] = [
+            (
+                8,
+                8,
+                1,
+                [
+                    0x3f2f_0300,
+                    0x3f32_9000,
+                    0xbed9_d600,
+                    0x3fd1_8400,
+                    0xbf0e_8700,
+                    0xbe10_9800,
+                    0x3df8_e800,
+                    0xbfd1_0000,
+                    0xbda5_3000,
+                    0xbf9e_2a00,
+                    0x3e37_4800,
+                    0x3ed8_f000,
+                    0xbeb4_2c00,
+                    0x3f45_5a00,
+                    0x3f30_7c00,
+                    0xbf94_1800,
+                ],
+            ),
+            (
+                12,
+                4,
+                2,
+                [
+                    0xbfbe_0000,
+                    0x3fda_0000,
+                    0x3fb2_0000,
+                    0x3ea8_0000,
+                    0xbfca_0000,
+                    0x3e98_0000,
+                    0x3f7c_0000,
+                    0xbff4_0000,
+                    0x3f40_0000,
+                    0x3ef8_0000,
+                    0x3de0_0000,
+                    0x3f4c_0000,
+                    0xbfaa_0000,
+                    0x3f80_0000,
+                    0x3e40_0000,
+                    0x3f64_0000,
+                ],
+            ),
+            (
+                16,
+                8,
+                3,
+                [
+                    0x3f11_5e00,
+                    0x3ead_a800,
+                    0x3e90_8c00,
+                    0x3e0a_e400,
+                    0xbf80_c600,
+                    0xbf3b_6300,
+                    0x3f2e_4400,
+                    0x3ef5_fe00,
+                    0xbf9d_2180,
+                    0xbec5_0600,
+                    0xbf07_ba00,
+                    0xbf0f_8c00,
+                    0xbde1_f800,
+                    0xbe65_7800,
+                    0x3ea5_8000,
+                    0xbe0b_b000,
+                ],
+            ),
+            (
+                6,
+                6,
+                4,
+                [
+                    0xbf87_5316,
+                    0x3f90_0138,
+                    0xbf36_b784,
+                    0xbe4a_5da0,
+                    0x3ccb_5e00,
+                    0xbf6f_bc5c,
+                    0x3f86_a3d4,
+                    0x3ebc_7cf8,
+                    0xbd94_1360,
+                    0xbfc7_2008,
+                    0x3f95_db42,
+                    0xbf19_857c,
+                    0x3f96_e3d4,
+                    0x3f21_5c64,
+                    0x3faa_ebaa,
+                    0xbc98_9e00,
+                ],
+            ),
+        ];
+        for (w, h, seed, expected) in cases {
+            let values: Vec<f32> = lcg_bytes(w * h, seed)
+                .into_iter()
+                .map(|byte| f32::from(byte) / 64.0 - 2.0)
+                .collect();
+            let tensor = Array3::from_shape_vec((1, h, w), values).unwrap();
+            let out = resize_bicubic_torch_f32(&tensor, 4, 4);
+            assert_eq!(out.shape(), &[1, 4, 4]);
+            let bits: Vec<u32> = out.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(bits, expected, "{w}x{h} seed {seed}");
+        }
+        let constant = Array3::from_elem((3, 8, 8), f32::from_bits(0xbfe5_68dc));
+        assert!(resize_bicubic_torch_f32(&constant, 4, 4)
+            .iter()
+            .all(|value| value.to_bits() == 0xbfe5_68dc));
+    }
+
+    /// torch's non-antialiased bicubic at ratios whose fractions are not
+    /// dyadic, where the kernel's fused multiply-adds (the source position,
+    /// the far polynomial's first two steps) and its plain operations (the
+    /// near polynomial, the far polynomial's last step) each move a
+    /// coefficient by one ULP when swapped: the outputs of torch 2.13 on the
+    /// generator inputs, the small ones in full and the large ones as the
+    /// SHA-256 of their `f32` bits.
+    #[test]
+    fn resize_bicubic_torch_f32_matches_torch_at_non_dyadic_ratios() {
+        use sha2::{Digest, Sha256};
+        let tensor = |w: usize, h: usize, seed: u32| {
+            let values: Vec<f32> = lcg_bytes(w * h, seed)
+                .into_iter()
+                .map(|byte| f32::from(byte) / 64.0 - 2.0)
+                .collect();
+            Array3::from_shape_vec((1, h, w), values).unwrap()
+        };
+        // (w, h, out_w, out_h, seed)
+        let pinned = [
+            (5, 5, 3, 3, 5),
+            (10, 10, 3, 3, 14),
+            (3, 5, 5, 3, 11),
+            (7, 3, 3, 5, 9),
+        ];
+        let expected: [&[u32]; 4] = [
+            &[
+                0x3ea6_a17f,
+                0xbe89_ecfc,
+                0x3eb8_5391,
+                0xbf69_ed02,
+                0x3ffa_0000,
+                0x3eca_f65c,
+                0xbf35_d142,
+                0x3fc5_4bd5,
+                0xbe4b_6f7a,
+            ],
+            &[
+                0xbee9_f3d0,
+                0x3e05_b6d3,
+                0xbfa5_e18c,
+                0xbe09_2a82,
+                0x3f3f_2900,
+                0x3edf_651e,
+                0x3fad_6848,
+                0xbfa1_263f,
+                0xbfc6_29ee,
+            ],
+            &[
+                0x3dfd_c848,
+                0x3f1b_a965,
+                0x3f86_25ee,
+                0x3eec_bde2,
+                0xbde0_3cd8,
+                0x3ffd_8d52,
+                0x3fc3_72a8,
+                0x3f18_0000,
+                0xbf58_7ef9,
+                0xbfe9_1270,
+                0xbfb2_3815,
+                0xbfe9_0b84,
+                0xbfe2_097b,
+                0x3ee5_6773,
+                0x400f_8c08,
+            ],
+            &[
+                0x3f81_8494,
+                0x3f09_0e56,
+                0x3fbe_2b7b,
+                0x3e56_75f9,
+                0x3e14_fe04,
+                0x3ee2_b421,
+                0xbf43_ed0f,
+                0xbd40_0000,
+                0xbf0f_a128,
+                0xbf3b_81dc,
+                0x3f85_893a,
+                0x3ef9_193c,
+                0xbefe_a62b,
+                0x3ffc_a7f2,
+                0x3fc7_240d,
+            ],
+        ];
+        for ((w, h, out_w, out_h, seed), expected) in pinned.into_iter().zip(expected) {
+            let out = resize_bicubic_torch_f32(&tensor(w, h, seed), out_h, out_w);
+            let bits: Vec<u32> = out.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(bits, expected, "{w}x{h} -> {out_w}x{out_h} seed {seed}");
+        }
+        let digested = [
+            (13, 13, 7, 7, 6),
+            (9, 7, 7, 5, 10),
+            (4, 4, 7, 7, 12),
+            (448, 448, 336, 336, 8),
+            (640, 640, 336, 336, 7),
+            (1008, 1008, 336, 336, 13),
+        ];
+        let digests = [
+            "36a2bd819c84946a5b479acba6af42ad0387c20a817599ae25c1588a6e7e18dd",
+            "fef907498d1618ff67edfbaad3eb6838de577fab47f31e20940a901ac30a6cf5",
+            "a1d36322c57c03b75c5089da73755c6ba237811cf6392ee9fbc5498bffff1f3c",
+            "8a3eba7b7189cadb42453f76787cd7f77c9b310a4313239f78c3896dd54baf19",
+            "7eafa75bda050c73f8cd85ef6cfb1e2eceef901b94b98de065ff5cace220e2c8",
+            "a18747fb9c63193e811aa291531f8b9a408d3f461cc8bd72e73c9849b8f8a04c",
+        ];
+        for ((w, h, out_w, out_h, seed), digest) in digested.into_iter().zip(digests) {
+            let out = resize_bicubic_torch_f32(&tensor(w, h, seed), out_h, out_w);
+            let bytes: Vec<u8> = out
+                .iter()
+                .flat_map(|value| value.to_bits().to_le_bytes())
+                .collect();
+            let actual = Sha256::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(actual, digest, "{w}x{h} -> {out_w}x{out_h} seed {seed}");
+        }
+    }
 
     #[test]
     fn catmull_rom_rgb_matches_image_resize() {
@@ -3213,9 +3753,13 @@ mod tests {
             );
             assert_same_bytes(&actual, &expected, &format!("{C} channels, {what}"));
         }
-        for (f, filter) in [PilResizeFilter::Bicubic, PilResizeFilter::Lanczos]
-            .into_iter()
-            .enumerate()
+        for (f, filter) in [
+            PilResizeFilter::Bicubic,
+            PilResizeFilter::Lanczos,
+            PilResizeFilter::Bilinear,
+        ]
+        .into_iter()
+        .enumerate()
         {
             for (seed, &case) in PIL_PASS_CASES.iter().enumerate() {
                 let (in_w, in_h, out_w, out_h) = case;
@@ -3296,9 +3840,13 @@ mod tests {
                 );
             }
         }
-        for (f, filter) in [PilResizeFilter::Bicubic, PilResizeFilter::Lanczos]
-            .into_iter()
-            .enumerate()
+        for (f, filter) in [
+            PilResizeFilter::Bicubic,
+            PilResizeFilter::Lanczos,
+            PilResizeFilter::Bilinear,
+        ]
+        .into_iter()
+        .enumerate()
         {
             for (seed, &case) in PIL_PASS_CASES.iter().enumerate() {
                 let (in_w, in_h, out_w, out_h) = case;

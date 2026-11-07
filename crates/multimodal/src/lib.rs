@@ -118,6 +118,26 @@ pub(crate) mod test_support {
         DynamicImage::from(RgbImage::from_pixel(width, height, color))
     }
 
+    /// `len` bytes from a linear congruential generator seeded with `seed`
+    /// (`state * 1103515245 + 12345`, masked to 31 bits, byte = bits 16..24):
+    /// the pixels the kernel tests feed the reference libraries to pin their
+    /// outputs, reproducible in any language.
+    pub(crate) fn lcg_bytes(len: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
+                ((state >> 16) & 0xff) as u8
+            })
+            .collect()
+    }
+
+    /// A `width` by `height` RGB image of [`lcg_bytes`], interleaved.
+    pub(crate) fn lcg_rgb_image(width: u32, height: u32, seed: u32) -> DynamicImage {
+        let bytes = lcg_bytes((width * height * 3) as usize, seed);
+        DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, bytes).expect("image size"))
+    }
+
     /// `w` by `h` RGB bytes that vary with the position and `seed`: the
     /// resamplers' parity inputs.
     pub(crate) fn gradient_rgb(w: usize, h: usize, seed: usize) -> Vec<u8> {
