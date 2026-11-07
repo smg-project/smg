@@ -52,7 +52,10 @@ use tokenizers::{models::ModelWrapper, Model};
 
 use crate::{encode_path::Declined, tiktoken::MAX_BYTE_LEVEL_TABLE_IDS};
 
+mod preformed;
 mod serialized;
+
+use preformed::{char_len, code_point, is_continuation, Preformed, NO_CHAR};
 
 /// Entries of one bucket of the pair table: sixteen bytes each, so a bucket
 /// is one 64-byte cache line, read whole.
@@ -217,6 +220,12 @@ pub(super) struct MergeTable {
     pair_filter_shift: u32,
     /// Merges the table holds.
     merges: usize,
+    /// The characters of a multi-byte script a piece may start from as one
+    /// symbol each instead of from their bytes, with the cuts between them
+    /// (see `preformed`); empty for a table whose vocabulary proves none.
+    /// Behind a `Box`: the table's own struct keeps the layout of its hot
+    /// fields (the byte ids, the grid, the buckets, the filter).
+    preformed: Box<Preformed>,
     /// The model's `ignore_merges`: a piece that is a token is that token,
     /// looked up before any merge (by the caller, in the model's vocabulary).
     pub(super) ignore_merges: bool,
@@ -275,6 +284,7 @@ impl MergeTable {
         );
         table.byte_ids = byte_ids;
         let mut token = String::new();
+        let mut pairs = Vec::with_capacity(merges.len());
         for (rank, (left, right)) in merges.iter().enumerate() {
             let rank = u32::try_from(rank)
                 .ok()
@@ -293,8 +303,30 @@ impl MergeTable {
                 )));
             };
             table.insert(a, b, Merge::new(rank, new_id));
+            pairs.push((rank, a, b));
         }
         table.fill_byte_grid();
+        if tokens == ByteTokens::Alphabet {
+            // The least rank of a merge that takes each id as an operand.
+            let ids_end = pairs
+                .iter()
+                .map(|&(_, a, b)| a.max(b) as usize + 1)
+                .max()
+                .unwrap_or(0);
+            let mut min_operand = vec![NO_RANK; ids_end];
+            for &(rank, a, b) in &pairs {
+                min_operand[a as usize] = min_operand[a as usize].min(rank);
+                min_operand[b as usize] = min_operand[b as usize].min(rank);
+            }
+            // The byte each alphabet character stands for, by character.
+            let alphabet = super::bytes_char();
+            let mut byte_of =
+                vec![None; alphabet.iter().map(|&c| c as usize).max().unwrap_or(0) + 1];
+            for (byte, &c) in alphabet.iter().enumerate() {
+                byte_of[c as usize] = Some(byte as u8);
+            }
+            table.preformed = Box::new(Preformed::analyse(&table, bpe, &byte_of, &min_operand));
+        }
         Ok(table)
     }
 
@@ -389,6 +421,7 @@ impl MergeTable {
             pair_filter: vec![0; filter_words].into_boxed_slice(),
             pair_filter_shift: u64::BITS - filter_words.trailing_zeros(),
             merges,
+            preformed: Box::new(Preformed::empty()),
             ignore_merges,
         }
     }
@@ -399,6 +432,12 @@ impl MergeTable {
             + size_of_val(&*self.byte_grid)
             + size_of_val(&*self.buckets)
             + self.pair_filter_bytes()
+            + self.preformed.bytes()
+    }
+
+    /// Characters of the vocabulary a piece may start from as one symbol.
+    pub(super) fn preformed_characters(&self) -> usize {
+        self.preformed.characters()
     }
 
     /// Bytes of the pair filter.
@@ -539,10 +578,128 @@ impl MergeTable {
         if piece.is_empty() {
             return;
         }
+        self.merge_bytes(piece, ids);
+    }
+
+    /// The merge of a piece from its bytes' tokens: on stack arrays up to
+    /// [`SHORT_PIECE_SYMBOLS`], on the heap beyond.
+    #[inline(always)]
+    fn merge_bytes(&self, piece: &[u8], ids: &mut Vec<u32>) {
         if piece.len() <= SHORT_PIECE_SYMBOLS {
             self.merge_short(piece, ids);
         } else {
             self.merge_long(piece, ids);
+        }
+    }
+
+    /// The merge of a piece from its characters (see `preformed`): a symbol
+    /// per character that pre-forms and a byte's token for every other
+    /// byte, cut into segments between two pre-formed characters no token
+    /// holds adjacent, each segment merged on its own (a segment with more
+    /// symbols than the stack arrays hold merges from its bytes: it merges
+    /// the same on its own as inside the piece). `false`, and nothing
+    /// appended, when no character of the piece pre-forms, when the piece
+    /// does not pay off (its first multi-byte character's block holds too
+    /// few pre-formable characters for the piece's length) or when nothing
+    /// pre-forms under the vocabulary: the caller merges from the bytes
+    /// then. The caller sends a cold piece of a unit that holds a non-ASCII
+    /// byte here first (a piece of an ASCII unit never comes); an ASCII
+    /// piece of a mixed unit leaves at the pays-off test.
+    #[inline(never)]
+    pub(super) fn merge_preformed(&self, piece: &[u8], ids: &mut Vec<u32>) -> bool {
+        let pre = &self.preformed;
+        if pre.is_empty() || !pre.pays_off(piece) {
+            return false;
+        }
+        let mut segment = [0u32; SHORT_PIECE_SYMBOLS];
+        let mut n = 0usize;
+        let mut overflow = false;
+        let mut start = 0usize;
+        let mut prev = NO_CHAR;
+        let mut any = false;
+        let mut i = 0usize;
+        while i < piece.len() {
+            let lead = piece[i];
+            let len = char_len(lead);
+            let whole = lead < 0x80
+                || (len > 1
+                    && i + len <= piece.len()
+                    && piece[i + 1..i + len].iter().all(|&b| is_continuation(b)));
+            if !whole {
+                // A byte that starts no character of the text (the piece is
+                // text, so none is met; a bare byte string merges as bytes).
+                push_symbol(
+                    &mut segment,
+                    &mut n,
+                    &mut overflow,
+                    self.byte_ids[usize::from(lead)],
+                );
+                prev = NO_CHAR;
+                i += 1;
+                continue;
+            }
+            if lead < 0x80 {
+                push_symbol(
+                    &mut segment,
+                    &mut n,
+                    &mut overflow,
+                    self.byte_ids[usize::from(lead)],
+                );
+                prev = NO_CHAR;
+                i += 1;
+                continue;
+            }
+            let cp = code_point(&piece[i..], len);
+            match pre.token_at(piece, i, len, cp) {
+                Some(id) => {
+                    if prev != NO_CHAR && !pre.joinable(prev, cp) {
+                        self.merge_segment(&segment, n, overflow, &piece[start..i], ids);
+                        n = 0;
+                        overflow = false;
+                        start = i;
+                    }
+                    push_symbol(&mut segment, &mut n, &mut overflow, id);
+                    any = true;
+                    prev = cp;
+                }
+                None => {
+                    for &byte in &piece[i..i + len] {
+                        push_symbol(
+                            &mut segment,
+                            &mut n,
+                            &mut overflow,
+                            self.byte_ids[usize::from(byte)],
+                        );
+                    }
+                    prev = NO_CHAR;
+                }
+            }
+            i += len;
+        }
+        if !any {
+            return false;
+        }
+        self.merge_segment(&segment, n, overflow, &piece[start..], ids);
+        true
+    }
+
+    /// One segment of [`Self::merge_preformed`]: its `n` symbols, or its
+    /// `bytes` when it outgrew the arrays.
+    #[inline(always)]
+    fn merge_segment(
+        &self,
+        segment: &[u32; SHORT_PIECE_SYMBOLS],
+        n: usize,
+        overflow: bool,
+        bytes: &[u8],
+        ids: &mut Vec<u32>,
+    ) {
+        if overflow {
+            self.merge_bytes(bytes, ids);
+        } else if n == 1 {
+            ids.push(segment[0]);
+        } else if n > 1 {
+            self.merge_symbols(&segment[..n], ids);
         }
     }
 
@@ -681,6 +838,23 @@ impl MergeTable {
                 .map(|symbol| symbol.id)
                 .filter(|&id| id != NONE),
         );
+    }
+}
+
+/// Appends `symbol` to a segment of [`MergeTable::merge_preformed`], or
+/// marks the segment as outgrown.
+#[inline(always)]
+fn push_symbol(
+    segment: &mut [u32; SHORT_PIECE_SYMBOLS],
+    n: &mut usize,
+    overflow: &mut bool,
+    symbol: u32,
+) {
+    if *n < SHORT_PIECE_SYMBOLS {
+        segment[*n] = symbol;
+        *n += 1;
+    } else {
+        *overflow = true;
     }
 }
 
