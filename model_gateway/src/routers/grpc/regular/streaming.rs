@@ -286,6 +286,16 @@ struct GenerateLogprobs<'a> {
     output_token_logprobs: Option<&'a [Vec<Option<f64>>]>,
 }
 
+/// The room of a generate stream's frame buffer: two frames. Every generate
+/// event carries the text so far, so the frames of a long answer reach
+/// [`CHUNK_FLUSH_BYTES`] back to back; with this room the frame being written
+/// fills the half behind the frame in flight, and at the next bound the
+/// buffer's `reserve` takes the whole allocation back once the connection has
+/// dropped the sent frame (`BytesMut` reclaims a buffer no other handle
+/// shares): a frame costs a short copy to the front, and an allocation of its
+/// own only while the frame before it is still in flight.
+const GENERATE_FRAME_ROOM: usize = 2 * CHUNK_FLUSH_BYTES;
+
 /// Shared streaming processor for both single and prefill/decode dispatch modes
 #[derive(Clone)]
 pub(crate) struct StreamingProcessor {
@@ -771,11 +781,10 @@ impl StreamingProcessor {
         // Track state per index for n>1 case
         let mut choices: HashMap<u32, GenerateChoice> = HashMap::new();
         let mut usage = GenerateStreamUsage::default();
-        // Reusable SSE encoder shared across every chunk emitted for this stream.
-        let mut sse_encoder = SseEncoder::new();
         // The frame being written: the events ready at one poll share it
-        // (the packed read, as the chat, completion and Messages loops).
-        let mut sse_buffer = BytesMut::new();
+        // (the packed read, as the chat, completion and Messages loops), with
+        // the room of `GENERATE_FRAME_ROOM`.
+        let mut sse_buffer = BytesMut::with_capacity(GENERATE_FRAME_ROOM);
         let mut first_token_out = false;
 
         loop {
@@ -855,10 +864,7 @@ impl StreamingProcessor {
                             index,
                         };
 
-                        let sse_data = sse_encoder
-                            .encode_data(&chunk_response)
-                            .map_err(|e| format!("Failed to serialize generate chunk: {e}"))?;
-                        sse_buffer.extend_from_slice(&sse_data);
+                        Self::write_generate_event(&mut sse_buffer, &chunk_response, "chunk")?;
                         Self::flush_when_full(tx, &mut sse_buffer)
                             .await
                             .map_err(|()| "Failed to send chunk".to_string())?;
@@ -896,10 +902,7 @@ impl StreamingProcessor {
                             index,
                         };
 
-                        let sse_data = sse_encoder
-                            .encode_data(&finish_response)
-                            .map_err(|e| format!("Failed to serialize generate finish: {e}"))?;
-                        sse_buffer.extend_from_slice(&sse_data);
+                        Self::write_generate_event(&mut sse_buffer, &finish_response, "finish")?;
                         Self::flush_when_full(tx, &mut sse_buffer)
                             .await
                             .map_err(|()| "Failed to send finish chunk".to_string())?;
@@ -1022,11 +1025,10 @@ impl StreamingProcessor {
         let mut accumulated_output_logprobs: HashMap<u32, Option<Vec<Vec<Option<f64>>>>> =
             HashMap::new();
         let mut usage = GenerateStreamUsage::default();
-        // Reusable SSE encoder shared across every chunk emitted for this stream.
-        let mut sse_encoder = SseEncoder::new();
         // The frame being written: the events ready at one poll share it
-        // (the packed read, as the chat, completion and Messages loops).
-        let mut sse_buffer = BytesMut::new();
+        // (the packed read, as the chat, completion and Messages loops), with
+        // the room of `GENERATE_FRAME_ROOM`.
+        let mut sse_buffer = BytesMut::with_capacity(GENERATE_FRAME_ROOM);
         let mut first_token_out = false;
 
         loop {
@@ -1132,10 +1134,7 @@ impl StreamingProcessor {
                             index,
                         };
 
-                        let sse_data = sse_encoder
-                            .encode_data(&chunk_response)
-                            .map_err(|e| format!("Failed to serialize generate chunk: {e}"))?;
-                        sse_buffer.extend_from_slice(&sse_data);
+                        Self::write_generate_event(&mut sse_buffer, &chunk_response, "chunk")?;
                         Self::flush_when_full(tx, &mut sse_buffer)
                             .await
                             .map_err(|()| "Failed to send chunk".to_string())?;
@@ -1182,10 +1181,7 @@ impl StreamingProcessor {
                             index,
                         };
 
-                        let sse_data = sse_encoder
-                            .encode_data(&finish_response)
-                            .map_err(|e| format!("Failed to serialize generate finish: {e}"))?;
-                        sse_buffer.extend_from_slice(&sse_data);
+                        Self::write_generate_event(&mut sse_buffer, &finish_response, "finish")?;
                         Self::flush_when_full(tx, &mut sse_buffer)
                             .await
                             .map_err(|()| "Failed to send finish chunk".to_string())?;
@@ -1586,6 +1582,29 @@ impl StreamingProcessor {
         if buffer.len() >= CHUNK_FLUSH_BYTES {
             tx.send(Ok(buffer.split().freeze())).await.map_err(|_| ())?;
         }
+        Ok(())
+    }
+
+    /// Write one generate event (`what`: its chunk or its finish) into
+    /// `buffer` as its `data:` frame, straight into the frame being written:
+    /// the bytes the shared SSE encoder makes, without the event-sized copy
+    /// it hands back (the event is the text so far). A failed serialization
+    /// leaves the buffer at the event's start, so the events ahead of it still
+    /// leave whole. The frame leaves by [`Self::flush_when_full`] once it
+    /// holds [`CHUNK_FLUSH_BYTES`], or by [`Self::flush_chunks`] at the read's
+    /// end.
+    fn write_generate_event(
+        buffer: &mut BytesMut,
+        event: &GenerateEvent<'_>,
+        what: &str,
+    ) -> Result<(), String> {
+        let start = buffer.len();
+        buffer.extend_from_slice(b"data: ");
+        if let Err(error) = serde_json::to_writer(FrameSink(buffer), event) {
+            buffer.truncate(start);
+            return Err(format!("Failed to serialize generate {what}: {error}"));
+        }
+        buffer.extend_from_slice(b"\n\n");
         Ok(())
     }
 
