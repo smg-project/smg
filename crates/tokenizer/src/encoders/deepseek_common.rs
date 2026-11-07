@@ -1,8 +1,10 @@
 //! What the DeepSeek renderers (V3.2, V4, V4.1) share, implemented and
-//! tested once: the JSON spelling and the OpenAI-shape readers every one of
-//! them uses, the message read (`Turn`), the last-user index predicates, the
-//! quick-instruction task tokens, the tools-and-response-format section of a
-//! system or developer turn, and the V4 family's message preprocessing
+//! tested once: the error type (`DsEncodingError`), the JSON spelling and
+//! the OpenAI-shape readers every one of them uses, the message read
+//! (`Turn`) with the two refusals every dialect spells the same way, the
+//! last-user index predicates, the quick-instruction task tokens, the
+//! tools-and-response-format section of a system or developer turn, and the
+//! V4 family's message preprocessing
 //! (tool-message merging, tool-result sorting, drop-thinking, DSML argument
 //! rendering, the tools template), which V4 and V4.1 run with their own DSML
 //! tag strings (V4 bare `invoke`/`parameter`; V4.1 ` invoke`/` parameter`
@@ -110,16 +112,15 @@ pub(super) struct DsmlTags {
     pub parameter: &'static str,
 }
 
-/// Errors raised when a message list is malformed.
+/// Errors raised when a message list is malformed: one type for the three
+/// renderers, each of which re-exports it under its own path as the error
+/// of its `encode_messages`. The first three variants are the refusals
+/// every dialect's reference raises with the same sentence; the rest are
+/// one dialect's own, grouped by dialect.
 ///
-/// Shared by the V4-family renderers (V4, V4.1). V3.2 keeps its own
-/// independent error type, since its message-shape invariants differ enough
-/// that the variant sets aren't the same.
-///
-/// `pub`, not `pub(super)`: this is already part of `deepseek_v4`'s public
-/// API (returned from `encode_messages`), re-exported unchanged from there.
-/// `deepseek_common` itself stays a private module, so this is only ever
-/// reachable through that re-export, never directly.
+/// `pub`, not `pub(super)`: `deepseek_common` itself stays a private module,
+/// so this is only ever reachable through the renderers' re-exports, never
+/// directly.
 #[derive(Debug, Error)]
 pub enum DsEncodingError {
     #[error("Index {index} out of range for messages list of length {len}")]
@@ -128,6 +129,16 @@ pub enum DsEncodingError {
     InvalidMessage { role: String, msg: String },
     #[error("Unknown role: {0}")]
     UnknownRole(String),
+    // --- V3.2 only -----------------------------------------------------
+    #[error("Invalid messages at {index}: {context}")]
+    InvalidToolMessages { index: usize, context: String },
+    #[error("No tool calls but found tool output")]
+    NoToolCalls,
+    #[error("thinking mode: invalid message without reasoning_content/tool_calls after last user message: {0}")]
+    MissingReasoningOrToolCalls(String),
+    #[error("Failed to parse tool-call arguments as JSON: {0}")]
+    InvalidToolArgumentsJson(#[source] serde_json::Error),
+    // --- V4 and V4.1 ---------------------------------------------------
     #[error("DeepSeek V4 merges tool messages into user; preprocess via merge_tool_messages first (got tool message at index {0})")]
     UnmergedToolRole(usize),
     #[error(
@@ -502,9 +513,14 @@ pub(super) struct Turn<'m> {
 }
 
 impl<'m> Turn<'m> {
-    /// The message `msg` at `index` of its conversation (the renderer refuses
-    /// an index past the end in its own error type).
-    pub(super) fn read(index: usize, msg: &'m Value) -> Self {
+    /// The message at `index` of its conversation, refused past the end.
+    pub(super) fn read(index: usize, messages: &'m [Value]) -> Result<Self, DsEncodingError> {
+        let Some(msg) = messages.get(index) else {
+            return Err(DsEncodingError::IndexOutOfRange {
+                index,
+                len: messages.len(),
+            });
+        };
         let tools = msg
             .get("tools")
             .and_then(|v| v.as_array())
@@ -515,7 +531,7 @@ impl<'m> Turn<'m> {
             .and_then(|v| v.as_array())
             .map(|tool_calls| tool_calls_from_openai_format(tool_calls))
             .filter(|tool_calls| !tool_calls.is_empty());
-        Self {
+        Ok(Self {
             index,
             msg,
             role: text(msg, "role"),
@@ -524,7 +540,18 @@ impl<'m> Turn<'m> {
             response_format: msg.get("response_format").filter(|v| truthy(v)),
             tool_calls,
             reasoning_content: text(msg, "reasoning_content"),
+        })
+    }
+
+    /// The content of a developer turn, which every dialect refuses empty.
+    pub(super) fn developer_content(&self) -> Result<&'m str, DsEncodingError> {
+        if self.content.is_empty() {
+            return Err(DsEncodingError::InvalidMessage {
+                role: self.role.to_string(),
+                msg: self.msg.to_string(),
+            });
         }
+        Ok(self.content)
     }
 
     /// `wo_eos`: the message ends without the EOS token (read on demand by
@@ -861,13 +888,104 @@ mod tests {
         ] {
             assert!(!truthy(&falsy), "{falsy}");
             let msg = json!({ "role": "system", "content": "x", "response_format": falsy });
-            assert!(Turn::read(0, &msg).response_format.is_none(), "{msg}");
+            let turn = Turn::read(0, std::slice::from_ref(&msg)).unwrap();
+            assert!(turn.response_format.is_none(), "{msg}");
         }
         let schema = json!({ "type": "json_object" });
         let msg = json!({ "role": "system", "content": "x", "response_format": schema });
-        assert_eq!(Turn::read(0, &msg).response_format, Some(&schema));
+        let turn = Turn::read(0, std::slice::from_ref(&msg)).unwrap();
+        assert_eq!(turn.response_format, Some(&schema));
         let bare = json!({ "role": "system", "content": "x" });
-        assert!(Turn::read(0, &bare).response_format.is_none());
+        let turn = Turn::read(0, std::slice::from_ref(&bare)).unwrap();
+        assert!(turn.response_format.is_none());
+    }
+
+    /// The two refusals the read spells for every dialect: an index past the
+    /// end and a developer turn without content, in the family's sentences.
+    #[test]
+    fn the_read_refuses_an_index_past_the_end_and_an_empty_developer_turn() {
+        let messages = [json!({ "role": "developer", "content": "" })];
+        assert!(matches!(
+            Turn::read(1, &messages),
+            Err(DsEncodingError::IndexOutOfRange { index: 1, len: 1 })
+        ));
+        let turn = Turn::read(0, &messages).unwrap();
+        let err = turn.developer_content().unwrap_err();
+        assert!(
+            matches!(err, DsEncodingError::InvalidMessage { ref role, .. } if role == "developer"),
+            "{err}"
+        );
+        let spoken = [json!({ "role": "developer", "content": "Be brief." })];
+        let turn = Turn::read(0, &spoken).unwrap();
+        assert_eq!(turn.developer_content().unwrap(), "Be brief.");
+    }
+
+    /// The refusal sentences are the gateway's error bodies (its tokenizer
+    /// wrapper reports a renderer's error through `Display`), so each stays as
+    /// the renderers' references spell it.
+    #[test]
+    fn every_refusal_keeps_its_sentence() {
+        let parse_error = serde_json::from_str::<Value>("{not json").unwrap_err();
+        let parse_sentence = format!("Failed to parse tool-call arguments as JSON: {parse_error}");
+        let sentences = [
+            (
+                DsEncodingError::IndexOutOfRange { index: 3, len: 2 },
+                "Index 3 out of range for messages list of length 2".to_string(),
+            ),
+            (
+                DsEncodingError::InvalidMessage {
+                    role: "developer".to_string(),
+                    msg: "{}".to_string(),
+                },
+                "Invalid message for role `developer`: {}".to_string(),
+            ),
+            (
+                DsEncodingError::UnknownRole("narrator".to_string()),
+                "Unknown role: narrator".to_string(),
+            ),
+            (
+                DsEncodingError::InvalidToolMessages {
+                    index: 1,
+                    context: "{}".to_string(),
+                },
+                "Invalid messages at 1: {}".to_string(),
+            ),
+            (
+                DsEncodingError::NoToolCalls,
+                "No tool calls but found tool output".to_string(),
+            ),
+            (
+                DsEncodingError::MissingReasoningOrToolCalls("{}".to_string()),
+                "thinking mode: invalid message without reasoning_content/tool_calls after last user message: {}".to_string(),
+            ),
+            (
+                DsEncodingError::InvalidToolArgumentsJson(parse_error),
+                parse_sentence,
+            ),
+            (
+                DsEncodingError::UnmergedToolRole(4),
+                "DeepSeek V4 merges tool messages into user; preprocess via merge_tool_messages first (got tool message at index 4)".to_string(),
+            ),
+            (
+                DsEncodingError::InvalidTask("bogus".to_string()),
+                "Invalid task `bogus`. Valid tasks are: action, query, authority, domain, title, read_url".to_string(),
+            ),
+            (
+                DsEncodingError::PlaceholderInText,
+                "Message text contains the image special token `<｜deepseek_image｜>`; images must be sent as image content parts".to_string(),
+            ),
+            (
+                DsEncodingError::InvalidReasoningEffort("huge".to_string()),
+                "Invalid reasoning effort `huge`: expected an integer within [1, 100] or one of low, medium, high, xhigh, max".to_string(),
+            ),
+            (
+                DsEncodingError::UnsupportedContentPart("input_audio".to_string()),
+                "Unsupported content part type `input_audio`: only text and image parts are supported".to_string(),
+            ),
+        ];
+        for (error, sentence) in sentences {
+            assert_eq!(error.to_string(), sentence);
+        }
     }
 
     /// V4's reference rebuilds every user message from its content; V4.1's
