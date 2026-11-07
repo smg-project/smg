@@ -42,6 +42,18 @@ const EMPTY_TAG: u8 = 0;
 /// slots.
 const LOW_SALT: u64 = 0x2545_F491_4F6C_DD1D;
 const HIGH_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
+/// `KEEP_LOW[n]` keeps the low `n` bytes of a sixteen-byte word: the mask
+/// of a piece of `n` bytes read as one word of the text around it (see
+/// [`ShortPieceKey::at`]).
+const KEEP_LOW: [u128; 16] = {
+    let mut masks = [0u128; 16];
+    let mut n = 1;
+    while n < 16 {
+        masks[n] = (1u128 << (8 * n)) - 1;
+        n += 1;
+    }
+    masks
+};
 
 /// A piece of 1..=15 bytes as one integer: the bytes little-endian in the
 /// low 120 bits, the length above them, so two keys are equal exactly when
@@ -78,6 +90,31 @@ impl ShortPieceKey {
                 .fold(0u128, |bytes, (i, &b)| bytes | (u128::from(b) << (8 * i)))
         };
         Some(Self(bytes | ((len as u128) << LENGTH_SHIFT)))
+    }
+
+    /// The key of the piece `text[start..end]`, `None` as for [`Self::of`].
+    /// When sixteen bytes of the text remain past `start`, the piece is read
+    /// as one sixteen-byte word masked to its length: the length picks a
+    /// mask from a table instead of taking a branch and a shift, so the read
+    /// costs the same for every length (the length of the next piece is the
+    /// one thing the branch predictor cannot learn from the text; measured
+    /// on the warm long classes). Near the end of the text the piece is read
+    /// on its own.
+    #[inline(always)]
+    pub(super) fn at(text: &[u8], start: usize, end: usize) -> Option<Self> {
+        let len = end.checked_sub(start)?;
+        if len == 0 || len > SHORT_PIECE_MAX_BYTES {
+            return None;
+        }
+        match text.get(start..).and_then(|rest| rest.first_chunk::<16>()) {
+            Some(window) => {
+                let word = u128::from_le_bytes(*window);
+                Some(Self(
+                    (word & KEEP_LOW[len]) | ((len as u128) << LENGTH_SHIFT),
+                ))
+            }
+            None => Self::of(text.get(start..end)?),
+        }
     }
 
     /// The length of the piece the key stands for.
@@ -342,6 +379,27 @@ mod tests {
             let expected = u128::from_le_bytes(copied) | ((len as u128) << LENGTH_SHIFT);
             assert_eq!(key(last).0, expected, "{len} from the end");
         }
+    }
+
+    /// The key read from the text around a piece equals the key of the
+    /// piece on its own, for every length at every distance from the
+    /// text's end, and is `None` exactly where that is.
+    #[test]
+    fn a_key_read_from_the_text_equals_the_pieces_own_key() {
+        let text: Vec<u8> = (0..40u8)
+            .map(|b| b.wrapping_mul(37).wrapping_add(11))
+            .collect();
+        for start in 0..=text.len() {
+            for len in 0..=17 {
+                let end = (start + len).min(text.len());
+                assert_eq!(
+                    ShortPieceKey::at(&text, start, end),
+                    ShortPieceKey::of(&text[start..end]),
+                    "{start}+{len}"
+                );
+            }
+        }
+        assert_eq!(ShortPieceKey::at(&text, 5, 4), None);
     }
 
     #[test]
