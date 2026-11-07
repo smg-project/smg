@@ -373,12 +373,12 @@ def video_loader_rule(model_config, environ: Mapping[str, str] | None = None) ->
     kwarg naming ``opencv`` is its own loader, a non-positive ``fps`` is no
     rate to it, and it never reads the three keys of the per-class loaders, so
     those pass); for a family whose loader the engine registers for its
-    processor class (the Qwen2-VL line and Qwen3-Omni: the environment
-    variable never reaches that loader, an explicit ``opencv`` swaps it), the
-    flag rules alone; and none yet for the other families, which start as
-    before, so a fleet-wide loader setting does not block them: those with a
-    sampler of their own, which never followed the loader, and those whose
-    per-class-loader read is still pending (Qwen3-VL, the GLM line)."""
+    processor class (the Qwen2-VL line, Qwen3-Omni and the GLM-5 family: the
+    environment variable never reaches that loader, an explicit ``opencv``
+    swaps it), the flag rules alone; and none yet for the other families,
+    which start as before, so a fleet-wide loader setting does not block them:
+    those with a sampler of their own, which never followed the loader, and
+    the one whose per-class-loader read is still pending (Qwen3-VL)."""
     source = os.environ if environ is None else environ
     mm_config = multimodal_config(model_config)
     kwargs = getattr(mm_config, "media_io_kwargs", None) or {}

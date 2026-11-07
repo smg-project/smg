@@ -652,12 +652,13 @@ Worker-side media processing uses the same `--mm-processor` /
   (a kwarg naming `opencv` is that loader, a non-positive `fps` is no rate to
   it, and it never reads the three keys of the per-class loaders, so those
   pass); for a family whose loader the engine registers for its processor
-  class (the Qwen2-VL line and Qwen3-Omni: `VLLM_VIDEO_LOADER_BACKEND` never
-  reaches that loader, while an explicit kwarg, `opencv` included, swaps it),
-  the `--media-io-kwargs` rules alone; and none yet for the other families,
-  which start as before: those with a sampler of their own, which never
-  followed the loader, and those whose per-class-loader read is still pending
-  (Qwen3-VL, the GLM line). An engine that normalizes pixels on
+  class (the Qwen2-VL line, Qwen3-Omni and the GLM-5 family:
+  `VLLM_VIDEO_LOADER_BACKEND` never reaches that loader, while an explicit
+  kwarg, `opencv` included, swaps it), the `--media-io-kwargs` rules alone; and
+  none yet for the other families, which start as before: those with a sampler
+  of their own, which never followed the loader, and the one whose
+  per-class-loader read is still pending (Qwen3-VL). An engine that normalizes
+  pixels on
   device
   (vLLM's `mm_device_do_normalize`, on by default for the Qwen-VL family)
   takes raw `uint8` pixels, and the pipeline writes those for it; a model
