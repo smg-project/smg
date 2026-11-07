@@ -1092,9 +1092,30 @@ mod tests {
         assert_eq!(label(&labels, "version"), Some("mock"));
     }
 
+    /// A server-info label each proto's engine reports when its server info
+    /// is served, so a read without one shows the gap. The vLLM mock sends
+    /// an empty KV connector, which the flattening drops, so the connector
+    /// is patched in first; the SGLang mock sends its version.
+    fn with_server_label(
+        engine: &mock_worker::overrides::WorkerOverrides,
+        runtime: &str,
+    ) -> &'static str {
+        if runtime == "vllm" {
+            let mut patch = serde_json::Map::new();
+            patch.insert(
+                "kv_connector".to_string(),
+                serde_json::Value::String("MooncakeConnector".to_string()),
+            );
+            engine.patch_info(&patch);
+            "kv_connector"
+        } else {
+            "version"
+        }
+    }
+
     /// An engine without a server info (an `Unimplemented` answer) keeps its
-    /// model labels on a plain read and on a strict one: the call is a gap,
-    /// not a failure, on both protos.
+    /// model labels on a plain read and on a strict one, and has no server
+    /// label: the call is a gap, not a failure, on both protos.
     #[tokio::test]
     async fn an_engine_without_server_info_keeps_its_model_labels_on_a_plain_and_a_strict_read() {
         use mock_worker::{config::SchedulerWire, overrides::InfoAnswer};
@@ -1102,11 +1123,12 @@ mod tests {
         use crate::workflow::steps::util::mock_grpc_engine_on;
 
         let mut engines = Vec::new();
-        for (wire, runtime, server_label) in [
-            (SchedulerWire::Vllm, "vllm", "kv_connector"),
-            (SchedulerWire::Sglang, "sglang", "version"),
+        for (wire, runtime) in [
+            (SchedulerWire::Vllm, "vllm"),
+            (SchedulerWire::Sglang, "sglang"),
         ] {
             let (url, engine) = mock_grpc_engine_on(wire).await;
+            let server_label = with_server_label(&engine, runtime);
             engine.set_server_info(InfoAnswer::Unimplemented);
             engines.push((url, runtime, server_label));
         }
@@ -1129,8 +1151,9 @@ mod tests {
         }
     }
 
-    /// A server info that fails leaves a gap on a plain read and fails a
-    /// strict read, named, on both protos.
+    /// A server info that fails leaves a gap on a plain read (the model
+    /// labels, no server label) and fails a strict read, named, on both
+    /// protos.
     #[tokio::test]
     async fn a_failing_server_info_leaves_a_gap_for_registration_and_fails_a_strict_read_by_name() {
         use mock_worker::{config::SchedulerWire, overrides::InfoAnswer};
@@ -1143,14 +1166,16 @@ mod tests {
             (SchedulerWire::Sglang, "sglang"),
         ] {
             let (url, engine) = mock_grpc_engine_on(wire).await;
+            let server_label = with_server_label(&engine, runtime);
             engine.set_server_info(InfoAnswer::Failing);
-            engines.push((url, runtime));
+            engines.push((url, runtime, server_label));
         }
-        for (url, runtime) in &engines {
+        for (url, runtime, server_label) in &engines {
             let (labels, _) = fetch_grpc_metadata(url, runtime, false)
                 .await
                 .unwrap_or_else(|error| panic!("{runtime}: {error}"));
             assert_eq!(label(&labels, "model_path"), Some(MOCK_MODEL), "{runtime}");
+            assert_eq!(label(&labels, server_label), None, "{runtime}: {labels:?}");
 
             let error = fetch_grpc_metadata(url, runtime, true)
                 .await

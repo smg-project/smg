@@ -1,11 +1,13 @@
 //! Runtime overrides for what a gRPC worker reports about itself, keyed by
-//! its port and set through the admin API (`/admin/serving/{port}`,
-//! `/admin/info/{port}`): whether it answers its health check as serving,
-//! and the info it reports (`server_args` entries the gateway flattens into
-//! worker labels, and the model's `supports_vision`), and whether its model
-//! and server info RPCs answer, refuse as not implemented or fail. A bed
-//! uses them to change an engine's reported settings between two health
-//! transitions, as a restarted or late-loading engine does.
+//! its port: whether it answers its health check as serving and the info it
+//! reports (`server_args` entries the gateway flattens into worker labels,
+//! and the model's `supports_vision`), set through the admin API
+//! (`/admin/serving/{port}`, `/admin/info/{port}`); and whether its model
+//! and server info RPCs answer, refuse as not implemented or fail, set in
+//! process only (no admin route reaches `set_model_info` and
+//! `set_server_info`). A bed uses the admin routes to change an engine's
+//! reported settings between two health transitions, as a restarted or
+//! late-loading engine does.
 
 use std::{
     collections::BTreeMap,
