@@ -56,7 +56,7 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
     (
         "dots3-note-prev",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
     (
         "ernie-4.5-21b-a3b-thinking",
@@ -68,7 +68,11 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
     ("glm-4.7-flash", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     ("glm-5.3-flash", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     ("granite-4.1-3b", Hf(EncodePath::Native), Hf(EncodePath::V1)),
-    ("hermes-4-14b", Hf(EncodePath::Native), Hf(EncodePath::V1)),
+    (
+        "hermes-4-14b",
+        Hf(EncodePath::Native),
+        Hf(EncodePath::Native),
+    ),
     (
         "hunyuan-a13b-instruct",
         Hf(EncodePath::Native),
@@ -117,15 +121,19 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
         Hf(EncodePath::Tokenizers),
         Hf(EncodePath::V1),
     ),
-    ("mimo-v2.5", Hf(EncodePath::Native), Hf(EncodePath::V1)),
+    ("mimo-v2.5", Hf(EncodePath::Native), Hf(EncodePath::Native)),
     (
         "minicpm5-2b",
         Hf(EncodePath::Native),
         Hf(EncodePath::Native),
     ),
-    ("minimax-m2", Hf(EncodePath::Native), Hf(EncodePath::V1)),
-    ("minimax-m2.7", Hf(EncodePath::Native), Hf(EncodePath::V1)),
-    ("minimax-m3", Hf(EncodePath::Native), Hf(EncodePath::V1)),
+    ("minimax-m2", Hf(EncodePath::Native), Hf(EncodePath::Native)),
+    (
+        "minimax-m2.7",
+        Hf(EncodePath::Native),
+        Hf(EncodePath::Native),
+    ),
+    ("minimax-m3", Hf(EncodePath::Native), Hf(EncodePath::Native)),
     (
         "mistral-7b-instruct-v0.3",
         Hf(EncodePath::Native),
@@ -170,69 +178,73 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
     (
         "qwen2.5-7b-instruct-1m",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
     (
         "qwen2.5-omni-7b",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
     (
         "qwen2.5-vl-32b-instruct",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
     (
         "qwen2.5-vl-7b-instruct",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
-    ("qwen3-30b-a3b", Hf(EncodePath::Native), Hf(EncodePath::V1)),
+    (
+        "qwen3-30b-a3b",
+        Hf(EncodePath::Native),
+        Hf(EncodePath::Native),
+    ),
     (
         "qwen3-30b-a3b-instruct-2507",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
     (
         "qwen3-30b-a3b-thinking-2507",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
     (
         "qwen3-4b-instruct-2507",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
     (
         "qwen3-4b-saferl",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
     (
         "qwen3-4b-thinking-2507",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
-    ("qwen3-8b", Hf(EncodePath::Native), Hf(EncodePath::V1)),
+    ("qwen3-8b", Hf(EncodePath::Native), Hf(EncodePath::Native)),
     (
         "qwen3-coder-30b-a3b-instruct",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
     (
         "qwen3-coder-next",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
     (
         "qwen3-next-80b-a3b-instruct",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
     (
         "qwen3-next-80b-a3b-thinking",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
     (
         "qwen3-omni-30b-a3b-instruct",
@@ -247,22 +259,22 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
     (
         "qwen3-vl-235b-a22b-thinking",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
     (
         "qwen3-vl-30b-a3b-instruct",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
     (
         "qwen3-vl-8b-instruct",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
     (
         "qwen3-vl-8b-thinking",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
     (
         "qwen3.5-27b",
@@ -304,9 +316,9 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
     (
         "qwen3guard-gen-0.6b",
         Hf(EncodePath::Native),
-        Hf(EncodePath::V1),
+        Hf(EncodePath::Native),
     ),
-    ("qwq-32b", Hf(EncodePath::Native), Hf(EncodePath::V1)),
+    ("qwq-32b", Hf(EncodePath::Native), Hf(EncodePath::Native)),
     (
         "seed-oss-36b-instruct",
         Hf(EncodePath::Native),
@@ -324,7 +336,11 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
         Hf(EncodePath::Tokenizers),
         Hf(EncodePath::Tokenizers),
     ),
-    ("webworld-32b", Hf(EncodePath::Native), Hf(EncodePath::V1)),
+    (
+        "webworld-32b",
+        Hf(EncodePath::Native),
+        Hf(EncodePath::Native),
+    ),
 ];
 
 #[test]

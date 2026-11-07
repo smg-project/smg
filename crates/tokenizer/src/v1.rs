@@ -1,10 +1,23 @@
 //! Optional v1 encode acceleration. Keep model loading/configuration, decoding
 //! and streaming in the existing wrapper so there is one source of semantics.
+//!
+//! The pipeline normalizes with the tables of `unicode-normalization` (Unicode
+//! 17.0); `tokenizers` 0.23, the reference, and the direct byte-level path
+//! with it, normalize with those of `unicode-normalization-alignments`
+//! (Unicode 9.0). A mark or a composition added in between composes under
+//! the one and not the other, so a tokenizer whose normalizer reads those
+//! tables (one of the four normalization forms, alone or as a step of a
+//! sequence; a `Bert` normalizer whose accent strip decomposes the text)
+//! declines here ([`reads_normalization_tables`]) and takes the next path,
+//! which reads the reference's ids.
 
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 use serde_json::Value;
-use tokenizers::{models::ModelWrapper, pre_tokenizers::PreTokenizerWrapper, Model};
+use tokenizers::{
+    models::ModelWrapper, normalizers::NormalizerWrapper, pre_tokenizers::PreTokenizerWrapper,
+    Model,
+};
 use tokenizers_v1::{
     models::bpe::PipelineBPE,
     pipeline::{
@@ -34,6 +47,24 @@ fn has_metaspace(pre: Option<&PreTokenizerWrapper>) -> bool {
             .as_ref()
             .iter()
             .any(|step| matches!(step, PreTokenizerWrapper::Metaspace(_))),
+        _ => false,
+    }
+}
+
+/// Whether `normalizer`, alone or as a step of a sequence, normalizes by the
+/// Unicode normalization tables: one of the four normalization forms, or a
+/// `Bert` normalizer whose accent strip decomposes the text first. The
+/// pipeline's tables are newer than the reference's (see the module doc).
+pub(crate) fn reads_normalization_tables(normalizer: &NormalizerWrapper) -> bool {
+    match normalizer {
+        NormalizerWrapper::NFC(_)
+        | NormalizerWrapper::NFD(_)
+        | NormalizerWrapper::NFKC(_)
+        | NormalizerWrapper::NFKD(_) => true,
+        NormalizerWrapper::BertNormalizer(bert) => bert.strip_accents.unwrap_or(bert.lowercase),
+        NormalizerWrapper::Sequence(sequence) => {
+            sequence.as_ref().iter().any(reads_normalization_tables)
+        }
         _ => false,
     }
 }
@@ -231,6 +262,16 @@ impl V1Encoder {
         }
         if tokenizer.get_truncation().is_some() {
             return Err(Declined::from("truncation is configured"));
+        }
+        if tokenizer
+            .get_normalizer()
+            .is_some_and(reads_normalization_tables)
+        {
+            return Err(Declined::from(
+                "the normalizer reads the Unicode normalization tables, and the pipeline's are \
+                 newer than the ones the reference normalizes with (a mark or a composition added \
+                 since Unicode 9.0 would compose, and read as other ids)",
+            ));
         }
         let cut_raw = added_tokens_cut_raw(tokenizer)?;
         // Serialize AFTER config.json/tokenizer_config.json overrides, including
