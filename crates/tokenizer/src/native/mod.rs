@@ -243,6 +243,10 @@ struct PieceCache {
     /// The initial symbols of a piece being merged on the sentencepiece
     /// path: a scratch list of the thread.
     symbols: Vec<u32>,
+    /// Whether the unit being encoded is ASCII throughout, read once per
+    /// unit (see `Native::encode_unit`): the cold pieces of such a unit take
+    /// the byte merge without a test of their own.
+    unit_ascii: bool,
 }
 
 impl PieceCache {
@@ -701,6 +705,7 @@ impl NativeEncoder {
                 tracing::debug!(
                     merges = table.merges(),
                     bytes = table.bytes(),
+                    preformed_characters = table.preformed_characters(),
                     "the native encode path merges its piece-cache misses itself"
                 );
                 Some(table)
@@ -1689,6 +1694,11 @@ impl NativeEncoder {
             }
             return fallback.map_or(Ok(()), Err);
         }
+        // One pass over the unit (word at a time in the standard library) on
+        // the byte-level path, the one that reads it: the cold pieces of an
+        // ASCII unit skip the pre-formed path and its per-piece test (see
+        // `tokenize_piece_slow`).
+        cache.unit_ascii = text.is_ascii();
         // One walk per unit. A single-stage encoder consumes its stage's
         // matches here and probes each piece in place (no recursive walk, no
         // closure call per piece); the chain hands its pieces to the same
@@ -1846,7 +1856,15 @@ impl NativeEncoder {
                     };
                 match whole {
                     Some(id) => ids.push(id),
-                    None => table.merge(bytes, ids),
+                    // A cold piece of a unit with a non-ASCII byte merges
+                    // from its pre-formed characters when it has them (the
+                    // pre-formed path reads the piece's bytes itself); a
+                    // piece of an ASCII unit never reads that analysis.
+                    None => {
+                        if cache.unit_ascii || !table.merge_preformed(bytes, ids) {
+                            table.merge(bytes, ids);
+                        }
+                    }
                 }
             } else {
                 match model.map(|model| model.tokenize(self.mapped(bytes, mapped))) {
