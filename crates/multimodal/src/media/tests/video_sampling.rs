@@ -334,7 +334,11 @@ fn rate_walk_picks_what_the_familys_loader_picks() {
     assert_eq!(walk.with_frame_budget(Some(16)), walk);
     assert_eq!(walk.with_frame_budget(Some(0)), walk);
     assert!(walk.follows_the_loader());
-    assert!(!FrameSampling::EvenRounded.follows_the_loader());
+    // The rounded even spread is a loader's rule as well: its engine loader
+    // picks over the container's claim like the walk's.
+    assert!(FrameSampling::EvenRounded.follows_the_loader());
+    assert!(!FrameSampling::Even.follows_the_loader());
+    assert!(!FrameSampling::Interval.follows_the_loader());
 }
 
 /// Under the stepped-groups rule a container that states a rate but no
@@ -728,6 +732,47 @@ fn up_to_selection_follows_the_container_claim_and_the_stream_length() {
     let even = FrameSelection::from_metadata(metadata(Some(30.0), Some(60)), self::cfg())
         .expect("frame rate and count");
     assert_eq!(even.sized_to_visible(40, self::cfg()), Resized::Unchanged);
+    // The rounded even spread follows its loader like the budgeted rules: the
+    // container's claim cut to the stream where that runs two or more frames
+    // shorter, a claim one frame too long kept with the pick past the end
+    // left out, and a decode that shows the stream shorter resized the
+    // loader's way.
+    let rounded = VideoFetchConfig {
+        sampling: FrameSampling::EvenRounded,
+        ..VideoFetchConfig::default()
+    };
+    let selection = FrameSelection::from_metadata(
+        VideoMetadata {
+            total_frames: Some(60),
+            container_frames: Some(77),
+            ..metadata(Some(30.0), None)
+        },
+        rounded,
+    )
+    .expect("frame rate and counts");
+    assert_eq!(selection.total_frames, 60);
+    assert_eq!(selection.frame_indices, vec![0, 20, 39, 59]);
+    let selection = FrameSelection::from_metadata(
+        VideoMetadata {
+            total_frames: Some(60),
+            container_frames: Some(61),
+            ..metadata(Some(30.0), None)
+        },
+        rounded,
+    )
+    .expect("frame rate and counts");
+    assert_eq!(selection.total_frames, 61);
+    assert_eq!(selection.frame_indices, vec![0, 20, 40]);
+    let claimed = FrameSelection::from_metadata(metadata(Some(30.0), Some(58)), rounded)
+        .expect("frame rate and count");
+    assert_eq!(claimed.frame_indices, vec![0, 19, 38, 57]);
+    let Resized::Selection(resized) = claimed.sized_to_visible(40, rounded) else {
+        panic!("shorter than claimed: a selection over the visible frames");
+    };
+    assert_eq!(resized.total_frames, 40);
+    assert_eq!(resized.frame_indices, vec![0, 13, 26, 39]);
+    assert_eq!(claimed.sized_to_visible(58, rounded), Resized::Unchanged);
+    assert_eq!(claimed.sized_to_visible(0, rounded), Resized::Unchanged);
 }
 
 #[test]
@@ -1229,6 +1274,70 @@ fn the_described_selection_covers_the_same_frames() {
             );
         }
     }
+    // The same shapes under the rounded spread with the container claiming
+    // one frame past the stream: the pick at the claimed end is dropped, and
+    // the expression (the spread of one step more, bounded below that frame,
+    // plus its explicit terms) selects exactly the remaining picks.
+    for (fps, total, max_frames) in cases {
+        let claimed = total + 1;
+        let selection = FrameSelection::from_metadata(
+            VideoMetadata {
+                total_frames: Some(total),
+                container_frames: Some(claimed),
+                ..metadata(Some(fps), None)
+            },
+            VideoFetchConfig {
+                max_frames,
+                sampling: FrameSampling::EvenRounded,
+                ..cfg()
+            },
+        )
+        .expect("frame rate and counts are known");
+        let last = claimed - 1;
+        assert_eq!(selection.total_frames, claimed);
+        assert!(selection
+            .frame_indices
+            .last()
+            .is_some_and(|end| *end < last));
+        let filter = selection
+            .spread_select_filter()
+            .unwrap_or_else(|| panic!("cut: total={total} max_frames={max_frames}: not described"));
+        assert!(
+            filter.contains(&format!("*lt(n\\,{last})")),
+            "cut: total={total} max_frames={max_frames}: {filter}"
+        );
+        // The planned spread had one pick more than the selection keeps.
+        let denom = selection.frame_indices.len();
+        let frame_at = |step: f64| (step * (last as f64 / denom as f64)).round_ties_even() as usize;
+        let mut described: Vec<usize> = (0..last)
+            .filter(|index| {
+                let step = ((index * denom) as f64 / last as f64).round();
+                frame_at(step) == *index
+            })
+            .collect();
+        described.extend(explicit_terms(&filter));
+        described.sort_unstable();
+        described.dedup();
+        let listed: Vec<usize> = selection
+            .unique_frames
+            .iter()
+            .map(|(index, _)| *index)
+            .collect();
+        assert_eq!(
+            described, listed,
+            "cut: total={total} max_frames={max_frames}"
+        );
+    }
+}
+
+/// The frames a described filter lists explicitly beside its spread, the
+/// `+eq(n\,N)` terms.
+fn explicit_terms(filter: &str) -> Vec<usize> {
+    filter
+        .split("+eq(n\\,")
+        .skip(1)
+        .filter_map(|rest| rest.split(')').next()?.parse().ok())
+        .collect()
 }
 
 #[test]
@@ -1284,6 +1393,36 @@ fn every_nearest_frame_spread_over_the_term_limit_is_described() {
         }
     }
     assert!(checked > 8_000, "{checked} selections checked");
+    // The same lengths with the container claiming one frame past the
+    // stream: the loader's read drops the pick at the claimed end, and the
+    // selection is still described (the spread of one step more, bounded
+    // below that frame) rather than listed.
+    let mut checked_cut = 0usize;
+    for (fps, stride) in [(24usize, 1usize), (25, 13), (30, 13), (60, 13)] {
+        for total in (51 * fps..=400 * fps).step_by(stride) {
+            let selection = FrameSelection::from_metadata(
+                VideoMetadata {
+                    total_frames: Some(total),
+                    container_frames: Some(total + 1),
+                    ..metadata(Some(fps as f64), None)
+                },
+                rounded,
+            )
+            .expect("frame rate and counts are known");
+            if selection.unique_count() <= FFMPEG_MAX_SELECT_TERMS {
+                continue;
+            }
+            checked_cut += 1;
+            assert_eq!(selection.total_frames, total + 1);
+            assert!(
+                selection.spread_select_filter().is_some(),
+                "{fps} fps, {total} of {} frames ({} picks): listed, not described",
+                total + 1,
+                selection.unique_count()
+            );
+        }
+    }
+    assert!(checked_cut > 8_000, "{checked_cut} cut selections checked");
 }
 
 /// A selection with no even spread in it (gaps alternating 4 and 2) keeps

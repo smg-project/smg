@@ -164,8 +164,12 @@ pub enum FrameSampling {
     /// `trunc(duration x rate)` frames, at least `min_frames`, at most
     /// `max_frames` and never more than the clip has, each the nearest frame
     /// of `linspace(0, n - 1, count)` (ties to even, as numpy rounds): the
-    /// rule of the Qwen3-VL family's reference video processor, whose prompt
-    /// stamps every temporal group with the times of the frames it picked.
+    /// rule of the Qwen3-VL family's reference video processor, ported by the
+    /// loader its serving engine registers for that processor, which samples
+    /// a clip before the processor sees it over the length the container
+    /// claims (cut to the stream's own where that runs shorter) and drops a
+    /// pick past the stream's end; the prompt stamps every temporal group
+    /// with the times of the frames it picked.
     EvenRounded,
     /// Every frame of a clip with at most `max_frames`; a longer clip gives
     /// `max_frames` spread evenly from the first frame to the last
@@ -261,7 +265,9 @@ impl FrameSampling {
 
     /// Whether the rule samples the way the engine's loader does, over the
     /// length the container claims (cut to the stream's own where that runs
-    /// shorter) rather than over the decoded frame count.
+    /// shorter) rather than over the decoded frame count: the rules of the
+    /// loaders that read the container themselves, the rounded even spread
+    /// included, whose loader picks over the same claim as the others.
     pub(crate) fn follows_the_loader(self) -> bool {
         matches!(
             self,
@@ -269,6 +275,7 @@ impl FrameSampling {
                 | Self::UpToThenRate { .. }
                 | Self::RateWalk { .. }
                 | Self::SteppedGroups { .. }
+                | Self::EvenRounded
         )
     }
 }
@@ -1995,10 +2002,14 @@ fn loader_frames(
                 cfg,
             )
         }
-        FrameSampling::Even
-        | FrameSampling::EvenRounded
-        | FrameSampling::Interval
-        | FrameSampling::TemporalGroups { .. } => sampled_frame_indices(total_frames, fps, cfg),
+        FrameSampling::EvenRounded => read_before_the_end(
+            sampled_frame_indices(total_frames, fps, cfg),
+            claimed,
+            visible,
+        ),
+        FrameSampling::Even | FrameSampling::Interval | FrameSampling::TemporalGroups { .. } => {
+            sampled_frame_indices(total_frames, fps, cfg)
+        }
     };
     (total_frames, picks)
 }
@@ -3918,31 +3929,51 @@ impl FrameSelection {
     /// for some steps, and ffmpeg evaluates in the same doubles.
     fn spread_select_filter(&self) -> Option<String> {
         let unique: Vec<usize> = self.unique_frames.iter().map(|(index, _)| *index).collect();
-        // The picker's own spread (its steps over the whole stream), exact or
-        // with a few explicit frames beyond it.
         let last = self.total_frames.checked_sub(1).filter(|last| *last > 0)?;
-        let denom = self
+        let steps = self
             .frame_indices
             .len()
             .checked_sub(1)
-            .filter(|denom| *denom > 0)?;
-        let floored = |step: f64| (step * last as f64 / denom as f64).floor() as usize;
-        let stride = last as f64 / denom as f64;
-        let nearest_to_even = |step: f64| (step * stride).round_ties_even() as usize;
-        let floored_expr = format!("eq(n\\,floor(round(n*{denom}/{last})*{last}/{denom}))");
-        let x = format!("round(n*{denom}/{last})*({last}/{denom})");
-        let nearest_expr = format!(
-            "eq(n\\,floor({x})+gt({x}-floor({x})\\,0.5)+eq({x}-floor({x})\\,0.5)*mod(floor({x})\\,2))"
-        );
-        let floored_extra = spread_misses(&unique, last, denom, floored);
-        let nearest_extra = spread_misses(&unique, last, denom, nearest_to_even);
-        let described = match (floored_extra, nearest_extra) {
-            (Some(extra), _) if extra.is_empty() => Some((floored_expr, extra)),
-            (_, Some(extra)) if extra.is_empty() => Some((nearest_expr, extra)),
-            (Some(extra), _) => Some((floored_expr, extra)),
-            (_, Some(extra)) => Some((nearest_expr, extra)),
-            (None, None) => None,
+            .filter(|steps| *steps > 0)?;
+        // The spread of `denom` steps over the stream, as the floored and the
+        // nearest-frame formula, matched against `selected`: exact, or with a
+        // few explicit frames beyond it; `bound` closes the expression.
+        let spread = |denom: usize, selected: &[usize], bound: &str| {
+            let floored = |step: f64| (step * last as f64 / denom as f64).floor() as usize;
+            let stride = last as f64 / denom as f64;
+            let nearest_to_even = |step: f64| (step * stride).round_ties_even() as usize;
+            let floored_expr =
+                format!("eq(n\\,floor(round(n*{denom}/{last})*{last}/{denom})){bound}");
+            let x = format!("round(n*{denom}/{last})*({last}/{denom})");
+            let nearest_expr = format!(
+                "eq(n\\,floor({x})+gt({x}-floor({x})\\,0.5)+eq({x}-floor({x})\\,0.5)*mod(floor({x})\\,2)){bound}"
+            );
+            let floored_extra = spread_misses(selected, last, denom, floored);
+            let nearest_extra = spread_misses(selected, last, denom, nearest_to_even);
+            match (floored_extra, nearest_extra) {
+                (Some(extra), _) if extra.is_empty() => Some((floored_expr, extra)),
+                (_, Some(extra)) if extra.is_empty() => Some((nearest_expr, extra)),
+                (Some(extra), _) => Some((floored_expr, extra)),
+                (_, Some(extra)) => Some((nearest_expr, extra)),
+                (None, None) => None,
+            }
         };
+        // The picker's own spread (its steps over the whole stream).
+        let described = spread(steps, &unique, "");
+        // Else the picker's spread with its last step dropped: a loader's read
+        // never reaches the frame at the stream's claimed end
+        // ([`read_before_the_end`]), so the selection is the spread of one
+        // step more, bounded below that frame, which the expression then
+        // never selects whether or not the stream holds it.
+        let described = described.or_else(|| {
+            if unique.last() == Some(&last) {
+                return None;
+            }
+            let planned: Vec<usize> = unique.iter().copied().chain([last]).collect();
+            let (expr, mut extra) = spread(steps + 1, &planned, &format!("*lt(n\\,{last})"))?;
+            extra.retain(|index| *index != last);
+            Some((expr, extra))
+        });
         // Else a selection that is an even spread of its own distinct frames
         // plus a few trailing frames: a rate-based selection ends on the
         // clip's last frame, one stride short of its spread. The spread is
