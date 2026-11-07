@@ -1064,12 +1064,7 @@ mod tests {
         use crate::workflow::steps::util::mock_grpc_engine_on;
 
         let (vllm, engine) = mock_grpc_engine_on(SchedulerWire::Vllm).await;
-        let mut patch = serde_json::Map::new();
-        patch.insert(
-            "kv_connector".to_string(),
-            serde_json::Value::String("MooncakeConnector".to_string()),
-        );
-        engine.patch_info(&patch);
+        let server_label = with_server_label(&engine, "vllm");
         let (labels, runtime) = fetch_grpc_metadata(&vllm, "vllm", true)
             .await
             .expect("the vLLM read");
@@ -1078,9 +1073,10 @@ mod tests {
         assert_eq!(label(&labels, "tokenizer_path"), Some(MOCK_MODEL));
         assert_eq!(label(&labels, "served_model_name"), Some(MOCK_MODEL));
         assert_eq!(label(&labels, "max_context_length"), Some(MOCK_CONTEXT));
-        assert_eq!(label(&labels, "kv_connector"), Some("MooncakeConnector"));
+        assert_eq!(label(&labels, server_label), Some("MooncakeConnector"));
 
-        let (sglang, _) = mock_grpc_engine_on(SchedulerWire::Sglang).await;
+        let (sglang, engine) = mock_grpc_engine_on(SchedulerWire::Sglang).await;
+        let server_label = with_server_label(&engine, "sglang");
         let (labels, runtime) = fetch_grpc_metadata(&sglang, "sglang", true)
             .await
             .expect("the SGLang read");
@@ -1089,13 +1085,15 @@ mod tests {
         assert_eq!(label(&labels, "tokenizer_path"), Some(MOCK_MODEL));
         assert_eq!(label(&labels, "served_model_name"), Some(MOCK_MODEL));
         assert_eq!(label(&labels, "max_context_length"), Some(MOCK_CONTEXT));
-        assert_eq!(label(&labels, "version"), Some("mock"));
+        assert_eq!(label(&labels, server_label), Some("mock"));
     }
 
     /// A server-info label each proto's engine reports when its server info
     /// is served, so a read without one shows the gap. The vLLM mock sends
     /// an empty KV connector, which the flattening drops, so the connector
-    /// is patched in first; the SGLang mock sends its version.
+    /// is patched in first; the SGLang mock sends its version. The served
+    /// read's test takes its label here too, so the gap proofs' label is
+    /// one a served read is shown to carry.
     fn with_server_label(
         engine: &mock_worker::overrides::WorkerOverrides,
         runtime: &str,
