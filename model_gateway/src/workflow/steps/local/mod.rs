@@ -243,6 +243,7 @@ pub fn create_worker_removal_workflow_data(
         affected_models: std::collections::HashSet::new(),
         app_context: Some(app_context),
         actual_workers_to_remove: None,
+        removed_workers: Vec::new(),
     }
 }
 

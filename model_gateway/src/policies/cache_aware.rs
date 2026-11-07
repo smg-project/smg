@@ -1010,6 +1010,14 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// `model_id`'s string tree, for tests that seed and read its tenants.
+    #[cfg(test)]
+    pub(crate) fn string_tree(&self, model_id: &str) -> Option<Arc<Tree>> {
+        self.string_trees
+            .get(normalize_model_key(model_id))
+            .map(|tree| Arc::clone(tree.value()))
+    }
+
     /// Remove several workers from one model. Tree cleanup remains precise per
     /// tenant, while hash-placement state is scanned only once for the batch.
     pub(crate) fn remove_workers_from_model(&self, model_id: &str, worker_urls: &HashSet<String>) {

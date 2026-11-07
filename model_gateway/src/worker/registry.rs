@@ -469,6 +469,16 @@ impl WorkerRegistry {
         self.worker_origins.get(worker_id).map(|entry| *entry)
     }
 
+    /// Whether a worker this node owns serves `model_id` (a canonical model
+    /// or an alias). Mesh imports do not count: a model's policy is built
+    /// from a local registration's labels and lives as long as one does.
+    pub fn serves_model_locally(&self, model_id: &str) -> bool {
+        self.get_by_model(model_id).iter().any(|worker| {
+            self.get_id_by_url(worker.url())
+                .is_some_and(|id| self.origin_of(&id) == Some(WorkerOrigin::Local))
+        })
+    }
+
     /// Subscribe to the `WorkerEvent` broadcast stream.
     ///
     /// Returns a `broadcast::Receiver` that observes every future mutation
@@ -1976,6 +1986,23 @@ impl WorkerRegistry {
             model_ids.push(worker.model_id().to_string());
         }
 
+        model_ids
+    }
+
+    /// The models whose policy `worker` keeps: every model it serves
+    /// ([`Self::worker_model_ids`]), and its primary model, which names the
+    /// policy its registration built, should a refreshed model list leave
+    /// it out. A model's policy goes once no worker of this node serves it
+    /// (see [`Self::serves_model_locally`]), so a workflow that takes
+    /// `worker` away asks after each of them.
+    pub fn policy_model_ids(worker: &Arc<dyn Worker>) -> Vec<String> {
+        let mut model_ids = Self::worker_model_ids(worker);
+        if !model_ids
+            .iter()
+            .any(|model_id| model_id == worker.model_id())
+        {
+            model_ids.push(worker.model_id().to_string());
+        }
         model_ids
     }
 
