@@ -631,7 +631,6 @@ impl VisionPreProcessor for LlavaNextProcessor {
 
         // Build 5D encoder_input [num_images, max_patches, C, H, W] matching the
         // HF LlavaNextImageProcessor output the engine expects with Batched layout.
-        let max_patches = patches_per_image.iter().map(|p| p.len()).max().unwrap_or(0);
         let (c, h, w) = if let Some(first) = patches_per_image.iter().find_map(|p| p.first()) {
             let s = first.shape();
             (s[0], s[1], s[2])
@@ -640,34 +639,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
         };
 
         let num_images = images.len();
-        // The tensor assembled from the patches by copy, an image with fewer
-        // patches than the widest padded with zero patches; every element is
-        // written once. A zeroed tensor assigned patch by patch paid the
-        // allocator's page faults for a zero fill the copies then overwrote.
-        let patch_len = c * h * w;
-        let mut data = Vec::with_capacity(num_images * max_patches * patch_len);
-        for patches in &patches_per_image {
-            for patch in patches {
-                if patch.shape() != [c, h, w] {
-                    return Err(TransformError::InvalidShape {
-                        expected: format!("[{c}, {h}, {w}]"),
-                        actual: patch.shape().to_vec(),
-                    });
-                }
-                match patch.as_slice() {
-                    Some(values) => data.extend_from_slice(values),
-                    None => data.extend(patch.iter()),
-                }
-            }
-            data.resize(data.len() + (max_patches - patches.len()) * patch_len, 0.0);
-        }
-        #[expect(
-            clippy::expect_used,
-            reason = "data holds num_images * max_patches * c * h * w elements by construction"
-        )]
-        let encoder_input =
-            ndarray::Array5::from_shape_vec((num_images, max_patches, c, h, w), data)
-                .expect("patch tensor matches its shape");
+        let encoder_input = stack_patches(&patches_per_image, (c, h, w))?;
 
         // Build model-specific image_sizes tensor as [num_images, 2] in (height, width) order
         // to match the HF LlavaNextImageProcessor output format the engine expects.
@@ -889,6 +861,44 @@ fn divide_to_samples(image: &DynamicImage, crop_size: (u32, u32)) -> Vec<Dynamic
         }
     }
     samples
+}
+
+/// The batch tensor `[num_images, max_patches, c, h, w]`, `max_patches` the
+/// widest image's patch count: every image's patches in order, then zero
+/// patches up to that width, every element written once (a zeroed tensor
+/// assigned patch by patch paid the allocator's page faults for a zero fill
+/// the copies then overwrote). A patch of another shape is refused rather
+/// than broadcast into its slot.
+fn stack_patches(
+    patches_per_image: &[Vec<Array3<f32>>],
+    (c, h, w): (usize, usize, usize),
+) -> Result<ndarray::Array5<f32>, TransformError> {
+    let num_images = patches_per_image.len();
+    let max_patches = patches_per_image.iter().map(Vec::len).max().unwrap_or(0);
+    let patch_len = c * h * w;
+    let mut data = Vec::with_capacity(num_images * max_patches * patch_len);
+    for patches in patches_per_image {
+        for patch in patches {
+            if patch.shape() != [c, h, w] {
+                return Err(TransformError::InvalidShape {
+                    expected: format!("[{c}, {h}, {w}]"),
+                    actual: patch.shape().to_vec(),
+                });
+            }
+            match patch.as_slice() {
+                Some(values) => data.extend_from_slice(values),
+                None => data.extend(patch.iter()),
+            }
+        }
+        data.resize(data.len() + (max_patches - patches.len()) * patch_len, 0.0);
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "data holds num_images * max_patches * c * h * w elements by construction"
+    )]
+    let tensor = ndarray::Array5::from_shape_vec((num_images, max_patches, c, h, w), data)
+        .expect("patch tensor matches its shape");
+    Ok(tensor)
 }
 
 #[cfg(test)]
@@ -1127,6 +1137,17 @@ mod tests {
                 assert_eq!(sample.as_bytes(), expected.as_bytes(), "{width}x{height}");
             }
         }
+    }
+
+    #[test]
+    fn a_patch_of_another_shape_is_refused_not_broadcast() {
+        // A degenerate `[3, 336, 1]` patch: a zeroed tensor's assign would
+        // have broadcast it across its slot; the copy refuses it.
+        let patches = vec![vec![Array3::<f32>::zeros((3, 336, 1))]];
+        assert!(matches!(
+            stack_patches(&patches, (3, 336, 336)),
+            Err(TransformError::InvalidShape { .. })
+        ));
     }
 
     #[test]
