@@ -61,6 +61,7 @@
 use std::{
     borrow::Cow,
     cell::{RefCell, RefMut},
+    ops::Range,
     sync::atomic::{AtomicUsize, Ordering},
     time::Instant,
 };
@@ -489,10 +490,7 @@ impl AddedTokens {
     }
 
     /// The byte ranges of the added tokens in `text`, in order.
-    pub(crate) fn ranges<'a>(
-        &'a self,
-        text: &'a str,
-    ) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
+    pub(crate) fn ranges<'a>(&'a self, text: &'a str) -> impl Iterator<Item = Range<usize>> + 'a {
         self.automaton
             .find_iter(text)
             .map(|found| found.start()..found.end())
@@ -1719,25 +1717,29 @@ impl NativeEncoder {
                 });
             }
             (None, [stage]) => {
+                // The stage's matches through the scanner's own loop, the
+                // probe compiled into it; a gap between matches (none with
+                // the template shapes) is a piece of its own, out of line.
+                let keep_gaps = stage.keep_gaps;
                 let mut cursor = 0;
-                for (start, end) in stage.pattern.find_iter(text) {
-                    if stage.keep_gaps && cursor < start {
+                stage.pattern.for_each_match(text, |start, end| {
+                    if keep_gaps && cursor < start {
                         if let Err(declined) =
-                            self.tokenize_piece(model, &text[cursor..start], mapped, ids, cache)
+                            self.tokenize_gap(model, text, cursor..start, mapped, ids, cache)
                         {
                             fallback = Some(declined);
                         }
                     }
                     if let Err(declined) =
-                        self.tokenize_piece(model, &text[start..end], mapped, ids, cache)
+                        self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
                     {
                         fallback = Some(declined);
                     }
                     cursor = end;
-                }
-                if stage.keep_gaps && cursor < text.len() {
+                });
+                if keep_gaps && cursor < text.len() {
                     if let Err(declined) =
-                        self.tokenize_piece(model, &text[cursor..], mapped, ids, cache)
+                        self.tokenize_gap(model, text, cursor..text.len(), mapped, ids, cache)
                     {
                         fallback = Some(declined);
                     }
@@ -1816,6 +1818,46 @@ impl NativeEncoder {
             }
         }
         self.tokenize_piece_slow(model, piece, key, mapped, ids, cache)
+    }
+
+    /// [`Self::tokenize_piece`] for the piece `text[piece]` of a unit: the
+    /// key is read from the text around the piece (`ShortPieceKey::at`), and
+    /// the piece is cut out of the text only off the hot path.
+    #[inline(always)]
+    fn tokenize_piece_at(
+        &self,
+        model: Option<&ModelWrapper>,
+        text: &str,
+        piece: Range<usize>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let key = ShortPieceKey::at(text.as_bytes(), piece.start, piece.end);
+        if let Some(key) = key {
+            if let Some(packed) = &cache.packed {
+                if packed.ids_into(key, ids) {
+                    return Ok(());
+                }
+            }
+        }
+        self.tokenize_piece_slow(model, &text[piece], key, mapped, ids, cache)
+    }
+
+    /// A gap of a stage that keeps its gaps, `text[gap]`, as a piece; out of
+    /// line, since the template shapes leave none.
+    #[cold]
+    #[inline(never)]
+    fn tokenize_gap(
+        &self,
+        model: Option<&ModelWrapper>,
+        text: &str,
+        gap: Range<usize>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        self.tokenize_piece_at(model, text, gap, mapped, ids, cache)
     }
 
     /// The rest of [`Self::tokenize_piece`], out of line: the longer pieces'
