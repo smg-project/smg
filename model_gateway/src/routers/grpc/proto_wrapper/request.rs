@@ -956,6 +956,33 @@ impl ProtoGenerateRequest {
             }
         }
     }
+
+    /// Move the PD KV bootstrap room into the residue class of `rank` modulo
+    /// `ranks`, its other bits kept as minted: a TokenSpeed prefill of
+    /// `ranks` engines runs a disaggregated request on the rank its room's
+    /// residue names, and its decode side reads the KV from there. The room
+    /// stays in `[0, i64::MAX)`. False, and nothing changed, for a request
+    /// without a room (not TokenSpeed, or not disaggregated) or a rank
+    /// outside `0..ranks`.
+    pub fn set_kv_bootstrap_room_residue(&mut self, rank: usize, ranks: usize) -> bool {
+        let Self::TokenSpeed(req) = self else {
+            return false;
+        };
+        let Some(info) = req.kv_bootstrap_info.as_mut() else {
+            return false;
+        };
+        let (Ok(rank), Ok(ranks)) = (i64::try_from(rank), i64::try_from(ranks)) else {
+            return false;
+        };
+        if rank >= ranks || ranks == i64::MAX {
+            return false;
+        }
+        // Below `i64::MAX - ranks`, so adding back up to `ranks - 1` cannot
+        // overflow.
+        let base = info.bootstrap_room.rem_euclid(i64::MAX - ranks);
+        info.bootstrap_room = base - base % ranks + rank;
+        true
+    }
 }
 
 #[cfg(test)]
