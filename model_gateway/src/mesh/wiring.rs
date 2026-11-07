@@ -19,12 +19,9 @@ use super::adapters::{
         PeerList, RepairEntry, TreeRepairPage, TreeSyncAdapter, REPAIR_PAGE_PREFIX,
         REPAIR_REQUEST_PREFIX, TENANT_DELTA_PREFIX,
     },
-    RateLimitSyncAdapter, WorkerSyncAdapter,
+    ImportPolicySync, RateLimitSyncAdapter, WorkerSyncAdapter,
 };
-use crate::{
-    policies::{CacheAwarePolicy, PolicyRegistry, TreeHandle, TreeKind},
-    worker::WorkerRegistry,
-};
+use crate::policies::{CacheAwarePolicy, PolicyRegistration, PolicyRegistry, TreeHandle, TreeKind};
 
 /// Buffer budget for the broadcast tenant-delta namespace (`td:`). Undersized
 /// buffers FIFO-evict pending deltas before drain — the receiver then repairs
@@ -51,6 +48,7 @@ pub struct MeshAdapters {
     worker: Arc<WorkerSyncAdapter>,
     rate_limit: Arc<RateLimitSyncAdapter>,
     tree: Arc<TreeSyncAdapter>,
+    import_policies: ImportPolicySync,
 }
 
 impl MeshAdapters {
@@ -80,10 +78,14 @@ impl MeshAdapters {
     pub fn start(
         mesh_kv: &MeshKV,
         node_name: String,
-        worker_registry: Arc<WorkerRegistry>,
         cluster_state: ClusterState,
-        policy_registry: Arc<PolicyRegistry>,
+        registration: PolicyRegistration,
     ) -> Arc<Self> {
+        let worker_registry = Arc::clone(&registration.worker_registry);
+        let policy_registry = Arc::clone(&registration.policy_registry);
+        // Subscribed to the registry's events before the worker adapter can
+        // import anything: every import is admitted to the policies.
+        let import_policies = ImportPolicySync::start(registration);
         let worker_ns = mesh_kv.configure_crdt_prefix("worker:", MergeStrategy::LastWriterWins);
         let rl_ns = mesh_kv.configure_crdt_prefix("rl:", MergeStrategy::EpochMaxWins);
         let td_ns = mesh_kv.configure_stream_prefix(
@@ -137,7 +139,13 @@ impl MeshAdapters {
             worker,
             rate_limit,
             tree,
+            import_policies,
         })
+    }
+
+    /// The task that admits mesh imports to the policies and releases them.
+    pub fn import_policies(&self) -> &ImportPolicySync {
+        &self.import_policies
     }
 
     /// Worker sync adapter.
@@ -308,8 +316,22 @@ mod tests {
     use crate::{
         config::types::PolicyConfig,
         policies::SelectWorkerInfo,
-        worker::{test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerType},
+        worker::{
+            test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType,
+        },
     };
+
+    fn registration(
+        worker_registry: Arc<WorkerRegistry>,
+        policy_registry: Arc<PolicyRegistry>,
+    ) -> PolicyRegistration {
+        PolicyRegistration {
+            policy_registry,
+            worker_registry,
+            kv_event_monitor: None,
+            worker_monitor: None,
+        }
+    }
 
     fn empty_cluster_state() -> ClusterState {
         Arc::new(RwLock::new(BTreeMap::new()))
@@ -319,10 +341,53 @@ mod tests {
         MeshAdapters::start(
             mesh,
             "node-a".into(),
-            Arc::new(WorkerRegistry::new()),
             empty_cluster_state(),
-            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            registration(
+                Arc::new(WorkerRegistry::new()),
+                Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            ),
         )
+    }
+
+    /// The adapters start the import policy sync before the worker adapter
+    /// can import: a peer's worker written into the registry reaches the
+    /// policy registry. Before this change the import reached the registry
+    /// alone, and its model had neither a policy nor a worker count.
+    #[tokio::test]
+    async fn an_import_through_the_adapters_gets_its_models_policy() {
+        let mesh = MeshKV::new("node-a".into());
+        let registry = Arc::new(WorkerRegistry::new());
+        let policies = Arc::new(PolicyRegistry::new(PolicyConfig::Random));
+        let _adapters = MeshAdapters::start(
+            &mesh,
+            "node-a".into(),
+            empty_cluster_state(),
+            registration(registry.clone(), policies.clone()),
+        );
+        registry.on_remote_worker_state(&WorkerState {
+            worker_id: "peer-w1".into(),
+            model_id: "m1".into(),
+            url: "http://remote:8080".into(),
+            health: true,
+            load: 0.0,
+            version: 1,
+            spec: vec![],
+            owner: "peer".into(),
+        });
+        let mut admitted = false;
+        for _ in 0..200 {
+            sleep(Duration::from_millis(5)).await;
+            if policies.get_worker_counts().get("m1") == Some(&1)
+                && policies.get_policy("m1").is_some()
+            {
+                admitted = true;
+                break;
+            }
+        }
+        assert!(
+            admitted,
+            "the import's model has a policy and a worker count on this node"
+        );
     }
 
     #[tokio::test]
@@ -332,9 +397,11 @@ mod tests {
         let adapters = MeshAdapters::start(
             &mesh,
             "node-a".into(),
-            registry.clone(),
             empty_cluster_state(),
-            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            registration(
+                registry.clone(),
+                Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            ),
         );
 
         // A put through the adapter echoes back through the namespace
@@ -381,9 +448,8 @@ mod tests {
         let _adapters = MeshAdapters::start(
             &mesh,
             "node-a".into(),
-            Arc::new(WorkerRegistry::new()),
             empty_cluster_state(),
-            policy_registry.clone(),
+            registration(Arc::new(WorkerRegistry::new()), policy_registry.clone()),
         );
 
         // A fresh model → policy created on demand should inherit the
@@ -452,9 +518,11 @@ mod tests {
         let _ = MeshAdapters::start(
             &mesh,
             "node:a".into(),
-            Arc::new(WorkerRegistry::new()),
             empty_cluster_state(),
-            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            registration(
+                Arc::new(WorkerRegistry::new()),
+                Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            ),
         );
     }
 
@@ -484,9 +552,8 @@ mod tests {
         let _adapters = MeshAdapters::start(
             &mesh,
             "node-a".into(),
-            Arc::new(WorkerRegistry::new()),
             empty_cluster_state(),
-            policy_registry.clone(),
+            registration(Arc::new(WorkerRegistry::new()), policy_registry.clone()),
         );
 
         assert!(
@@ -505,9 +572,8 @@ mod tests {
         let _adapters = MeshAdapters::start(
             &mesh,
             "node-a".into(),
-            Arc::new(WorkerRegistry::new()),
             empty_cluster_state(),
-            policy_registry.clone(),
+            registration(Arc::new(WorkerRegistry::new()), policy_registry.clone()),
         );
         let policy = policy_registry.get_policy_or_default("llama-3");
         let cache_aware = policy
@@ -537,9 +603,8 @@ mod tests {
         let adapters = MeshAdapters::start(
             &mesh,
             "node-a".into(),
-            Arc::new(WorkerRegistry::new()),
             empty_cluster_state(),
-            policy_registry.clone(),
+            registration(Arc::new(WorkerRegistry::new()), policy_registry.clone()),
         );
 
         // Workers with no model_id → select_worker derives

@@ -9,7 +9,8 @@ use wfaas::{
 };
 
 use crate::{
-    worker::{ConnectionMode, SubscriptionKind, Worker},
+    policies::PolicyRegistration,
+    worker::{ConnectionMode, Worker},
     workflow::data::WorkerRegistrationData,
 };
 
@@ -130,59 +131,14 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
         // Track unique model IDs we've updated policies for
         let mut updated_models = Vec::new();
 
+        let registration = PolicyRegistration::of(&app_context);
         for worker in workers {
             let model_id = worker.model_id().to_string();
+            let needs_kv_events = registration.admit(worker, policy_hint).await;
 
-            // Notify policy registry
-            app_context
-                .policy_registry
-                .on_worker_added(&model_id, policy_hint);
-            // Policies learn of the request's end through the worker's load
-            // guard; the registry routes it to the policy that placed it.
-            worker.set_completion_sink(Some(app_context.policy_registry.completion_sink()));
-
-            // Initialize cache-aware policy if configured
+            // Check for configuration conflicts between prefill and decode workers
             let all_workers = app_context.worker_registry.get_by_model(&model_id);
-
-            // Check for configuration conflicts between prefill and decode
             Self::check_worker_conflicts(&model_id, &all_workers);
-            let cache_aware = app_context
-                .policy_registry
-                .get_policy(&model_id)
-                .is_some_and(|policy| policy.name() == "cache_aware");
-            if cache_aware {
-                app_context
-                    .policy_registry
-                    .init_cache_aware_policy(&model_id, &all_workers);
-            }
-
-            // The worker's stream follows the policy that places it, the
-            // role's policy for a prefill, decode or encode worker rather than
-            // the model's: its KV events into the model's index under a policy
-            // that reads the index, its load records alone otherwise, when
-            // the worker monitor wants loads at all (always by default; see
-            // `WorkerMonitor::loads_wanted`). Only gRPC workers stream.
-            let needs_kv_events = app_context
-                .policy_registry
-                .policy_for_worker(worker.as_ref())
-                .needs_kv_events();
-            if *worker.connection_mode() == ConnectionMode::Grpc {
-                if let Some(ref monitor) = app_context.kv_event_monitor {
-                    let kind = if needs_kv_events {
-                        Some(SubscriptionKind::Events)
-                    } else {
-                        app_context
-                            .worker_monitor
-                            .as_ref()
-                            .is_some_and(|loads| loads.loads_wanted(std::slice::from_ref(worker)))
-                            .then_some(SubscriptionKind::Loads)
-                    };
-                    if let Some(kind) = kind {
-                        monitor.on_worker_added(worker, kind).await;
-                    }
-                }
-            }
-
             Self::warn_on_cache_aware_without_kv_events(&model_id, worker, needs_kv_events);
 
             if !updated_models.contains(&model_id) {
@@ -190,20 +146,8 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
             }
         }
 
-        // Initialize PD policies for prefill/decode workers (local workers only)
-        let prefill_workers = app_context.worker_registry.get_prefill_workers();
-        let decode_workers = app_context.worker_registry.get_decode_workers();
-        app_context
-            .policy_registry
-            .init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
-        if !prefill_workers.is_empty() {
-            let policy = app_context.policy_registry.get_prefill_policy();
-            if policy.name() == "bucket" {
-                app_context
-                    .policy_registry
-                    .init_pd_bucket_policies(&prefill_workers);
-            }
-        }
+        // The PD policies read their prefill and decode worker sets again.
+        registration.init_pd_policies();
 
         debug!(
             "Updated policies for {} workers across {} models",

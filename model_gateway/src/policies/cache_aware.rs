@@ -1010,6 +1010,15 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// The tenants of `model_id`'s string tree, by URL (tests).
+    #[cfg(test)]
+    pub(crate) fn string_tree_tenants(&self, model_id: &str) -> Vec<String> {
+        self.string_trees
+            .get(normalize_model_key(model_id))
+            .map(|tree| tree.get_tenant_char_count().into_keys().collect())
+            .unwrap_or_default()
+    }
+
     /// Remove several workers from one model. Tree cleanup remains precise per
     /// tenant, while hash-placement state is scanned only once for the batch.
     pub(crate) fn remove_workers_from_model(&self, model_id: &str, worker_urls: &HashSet<String>) {

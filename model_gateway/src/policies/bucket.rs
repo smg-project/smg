@@ -91,6 +91,13 @@ impl BucketPolicy {
             bucket_guard.init_prefill_worker_urls(worker_urls);
         }
     }
+
+    /// Whether `model_id` has a bucket, so its prefill workers are placed by
+    /// the size partition rather than the fallback. Test reader.
+    #[cfg(test)]
+    pub(crate) fn has_bucket(&self, model_id: &str) -> bool {
+        self.buckets.contains_key(normalize_model_key(model_id))
+    }
 }
 
 impl LoadBalancingPolicy for BucketPolicy {
