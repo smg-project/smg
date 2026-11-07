@@ -939,7 +939,10 @@ mod tests {
 
     /// A response body dropped before its end (the client reset the stream)
     /// ends the request where no read of the connection follows: that end
-    /// wakes the connection task, which arms the bound.
+    /// wakes the connection task, which arms the bound, so the close comes
+    /// at the bound and not at the stream's own end. The test pins that
+    /// outcome (h2 wakes the task for the reset as well); the guard's own
+    /// wake on a drop is pinned on its waker by the unit test above.
     #[tokio::test]
     async fn a_stream_reset_by_the_client_still_leaves_the_http2_connection_to_the_idle_timeout() {
         let stats = with_server(
@@ -957,7 +960,11 @@ mod tests {
                 // The producer is silent for longer than the bound from here;
                 // dropping the response resets the stream.
                 drop(response);
-                closed(idle_closes_within(&stats, 1, WINDOW).await);
+                let at = closed(idle_closes_within(&stats, 1, WINDOW).await);
+                assert!(
+                    at < PRODUCER_SILENCE,
+                    "the close waited for the stream's own end, not the reset: {at:?}"
+                );
             },
         )
         .await;
