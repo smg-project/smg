@@ -242,12 +242,12 @@ def smg_media_options(
     of the engine's loader go along by name (``video_loader_rule``, which
     says which rule reaches which family), and the pipeline refuses the
     entries that reach the family (every rule the default loader reads for a
-    family on that loader, the flag rules for the stepped-groups families,
-    none yet for the families whose per-family read is pending) and passes
-    the rest. The engine's encoder budget goes along as well (``encoder_budget``
-    when the caller derived it, else derived here): the pipeline refuses an
-    item above it before the engine, which would admit the item and never
-    schedule it.
+    family on that loader, the flag rules for a family whose loader the engine
+    registers for its processor class, none for a sampler that never followed
+    a loader) and passes the rest. The engine's encoder budget goes along as
+    well (``encoder_budget`` when the caller derived it, else derived here):
+    the pipeline refuses an item above it before the engine, which would admit
+    the item and never schedule it.
     """
     from smg_grpc_servicer.vllm.mm_processor import SOURCE_DEFAULT as MEDIA_SOURCE_DEFAULT
 
@@ -373,12 +373,11 @@ def video_loader_rule(model_config, environ: Mapping[str, str] | None = None) ->
     kwarg naming ``opencv`` is its own loader, a non-positive ``fps`` is no
     rate to it, and it never reads the three keys of the per-class loaders, so
     those pass); for a family whose loader the engine registers for its
-    processor class (the Qwen2-VL line, Qwen3-Omni and the GLM-5 family: the
-    environment variable never reaches that loader, an explicit ``opencv``
-    swaps it), the flag rules alone; and none yet for the other families,
-    which start as before, so a fleet-wide loader setting does not block them:
-    those with a sampler of their own, which never followed the loader, and
-    the one whose per-class-loader read is still pending (Qwen3-VL)."""
+    processor class (the Qwen2-VL line, Qwen3-Omni, the GLM-5 family and the
+    Qwen3-VL family: the environment variable never reaches that loader, an
+    explicit ``opencv`` swaps it), the flag rules alone; and none for the
+    families with a sampler of their own, which never followed the loader and
+    start as before, so a fleet-wide loader setting does not block them."""
     source = os.environ if environ is None else environ
     mm_config = multimodal_config(model_config)
     kwargs = getattr(mm_config, "media_io_kwargs", None) or {}
