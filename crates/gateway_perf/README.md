@@ -68,7 +68,7 @@ admin queue) and served by the wire with no engine time: the numbers are the gat
 | `json` | chat with `response_format: json_schema` | a JSON object | 500/s |
 | `messages` | `POST /v1/messages`, `max_tokens` 8 | 8 tokens | 500/s |
 
-Five streamed shapes are opt-in (name them in `PERF_PATHS`; their rates keep the frames
+Six streamed shapes are opt-in (name them in `PERF_PATHS`; their rates keep the frames
 per second near the `stream` path's, except where said):
 
 | path | request | answer | rate |
@@ -77,7 +77,12 @@ per second near the `stream` path's, except where said):
 | `generate_stream` | `POST /generate`, `stream: true`, `max_new_tokens` 300 | 300 tokens, one per frame, the whole text so far in every frame, `length` | 100/s |
 | `completion_stream` | `POST /v1/completions`, `stream: true`, `max_tokens` 300 | 300 tokens, one `text` delta per frame, `length` | 100/s |
 | `generate_stream_long` | the same, `max_new_tokens` 2000 | 2,000 tokens, one per frame | 16/s |
+| `generate_stream_spaced` | the same, `max_new_tokens` 300, the engine pausing 20 ms between frames | 300 tokens, one per frame 20 ms apart, the whole text so far in every frame | 100/s |
 | `stream_logprobs` | the `stream` request with `logprobs: true, top_logprobs: 5` | 128 tokens, one per frame, the sampled logprob and 5 candidates each, `length` | 100/s |
+
+The spaced generate path reads the stream loops as a decoding engine drives them, one frame at a
+time (about 600 streams open at once at its rate), where the other streamed paths hand a whole
+answer over at once, an engine's burst.
 
 The logprobs path's rate is the gateway's load, not a frame-rate match: a logprobs answer costs
 the gateway about 3.5 times the instructions and 13 times the allocation calls of the plain
