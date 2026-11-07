@@ -564,9 +564,11 @@ mod tests {
             assert_eq!(plan.num_tokens(), tokens, "{width}x{height} tokens");
             // The public entry point agrees with the plan inside the bound and
             // refuses past it (2000x40 and 40x2000 here).
-            match Step3VLProcessor::new().calculate_num_tokens(width, height) {
-                Ok(counted) => assert_eq!(counted, tokens, "{width}x{height} counted"),
-                Err(_) => assert!(tokens > MAX_IMAGE_TOKENS, "{width}x{height} refused"),
+            let counted = Step3VLProcessor::new().calculate_num_tokens(width, height);
+            if tokens > MAX_IMAGE_TOKENS {
+                assert!(counted.is_err(), "{width}x{height} refused");
+            } else {
+                assert_eq!(counted.unwrap(), tokens, "{width}x{height} counted");
             }
         }
     }
