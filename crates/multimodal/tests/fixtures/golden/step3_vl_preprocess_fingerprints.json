@@ -269,25 +269,11 @@
       "width": 1000
     },
     {
-      "fnv1a_bf16": "8b365fcd3f2aafc0",
-      "fnv1a_f32": "2a131caec4783406",
-      "height": 40,
-      "name": "synthetic_2000x40",
+      "fnv1a_bf16": "5168e2e29bf1a6ca",
+      "fnv1a_f32": "8390c7ce99ef169a",
+      "height": 84,
+      "name": "row-of-36-windows-3024x84",
       "newline_mask": [
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
         0,
         0,
         0,
@@ -325,12 +311,12 @@
         0,
         0
       ],
-      "num_patches": 50,
-      "num_tokens": 4321,
-      "patches_fnv1a_bf16": "3b58563013bdcdf5",
-      "patches_fnv1a_f32": "07a43d27066cc7ed",
+      "num_patches": 36,
+      "num_tokens": 3159,
+      "patches_fnv1a_bf16": "d18cdc42f9d3297e",
+      "patches_fnv1a_f32": "33e262fc67dbcbf8",
       "patches_shape": [
-        50,
+        36,
         3,
         504,
         504
@@ -344,7 +330,7 @@
       "source": {
         "seed": 29
       },
-      "width": 2000
+      "width": 3024
     },
     {
       "fnv1a_bf16": "1f1e39a58c3c6982",

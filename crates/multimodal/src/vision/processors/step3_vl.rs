@@ -24,6 +24,17 @@
 //!    resize to 728 x 728 and 504 x 504 (a tensor already that size passes
 //!    through).
 //!
+//! The rule bounds nothing but the long side: the serving engine declares
+//! the most features one image can have as those of a 3024 x 3024 image (the
+//! size it names as the one with the most features and sizes its encoder
+//! cache for), 36 crops and 3164 feature tokens, while a thin image whose
+//! short side falls under the pad threshold only after the cap takes a window
+//! as small as that side, with the crop count growing as the long side over
+//! it (a 96768 x 32 image would take 3024 one-pixel windows, 8.6 GiB of
+//! float32). A plan past the engine's count, like a side that caps to zero,
+//! is refused before any pixel moves, naming the size, the crops and the
+//! limit; inside the count every image is the engine's bit for bit.
+//!
 //! The output carries the global views as the encoder input
 //! `[N, 3, 728, 728]`, the crops as `patch_pixel_values` `[P, 3, 504, 504]`
 //! (flat, split per image by `num_patches`), `num_patches` `[N]`, and
@@ -56,6 +67,10 @@ const MAX_IMAGE_SIZE: u32 = 3024;
 pub const IMAGE_FEATURE_TOKENS: usize = 169;
 /// The feature tokens of one crop.
 pub const PATCH_FEATURE_TOKENS: usize = 81;
+/// The most feature tokens the serving engine declares for one image: the
+/// count of a 3024 x 3024 image (36 crops, five newlines, the view). A plan
+/// past it is refused; see the module doc.
+pub const MAX_IMAGE_TOKENS: usize = 3164;
 
 /// The crops, flat across the batch: `[P, 3, 504, 504]`.
 pub const PATCH_PIXEL_VALUES: &str = "patch_pixel_values";
@@ -257,6 +272,33 @@ impl Step3VLProcessor {
         }
     }
 
+    /// The plan the processor carries out for a `width` x `height` image: a
+    /// zero side (decoded, or after the cap) and a plan past
+    /// [`MAX_IMAGE_TOKENS`] are refused here, before any pixel moves, so the
+    /// token count and the preprocessing agree on every image.
+    fn checked_plan(&self, width: u32, height: u32) -> Result<CropPlan, TransformError> {
+        if width == 0 || height == 0 {
+            return Err(TransformError::ShapeError(format!(
+                "a {width}x{height} image has no view to resize"
+            )));
+        }
+        let plan = self.plan(width, height);
+        if plan.view.0 == 0 || plan.view.1 == 0 {
+            return Err(TransformError::ShapeError(format!(
+                "a {width}x{height} image is {}x{} under the {MAX_IMAGE_SIZE} px cap: no side to resize",
+                plan.view.0, plan.view.1
+            )));
+        }
+        let tokens = plan.num_tokens();
+        if tokens > MAX_IMAGE_TOKENS {
+            return Err(TransformError::ShapeError(format!(
+                "a {width}x{height} image plans {} crops and {tokens} feature tokens, above the {MAX_IMAGE_TOKENS} the serving engine declares for one image (a {MAX_IMAGE_SIZE}x{MAX_IMAGE_SIZE} image's)",
+                plan.num_patches()
+            )));
+        }
+        Ok(plan)
+    }
+
     /// `rgb` through the table and torchvision's antialiased BILINEAR resize
     /// to `side` x `side`, appended to `planes` as `[3, side, side]`; an image
     /// already that size goes through the table alone, as the reference's
@@ -294,22 +336,16 @@ impl Step3VLProcessor {
         Ok(())
     }
 
-    /// One image through the reference's steps: its view's planes and its
-    /// plan come back, its crops' planes and newline flags are appended to
-    /// the batch's `crops` and `newlines`.
+    /// One image through the reference's steps under its checked `plan`: its
+    /// view's planes come back, its crops' planes and newline flags are
+    /// appended to the batch's `crops` and `newlines`.
     fn process(
         &self,
         image: &DynamicImage,
+        plan: CropPlan,
         crops: &mut Vec<f32>,
         newlines: &mut Vec<i64>,
-    ) -> Result<(Vec<f32>, CropPlan), TransformError> {
-        let (width, height) = (image.width(), image.height());
-        if width == 0 || height == 0 {
-            return Err(TransformError::ShapeError(format!(
-                "a {width}x{height} image has no view to resize"
-            )));
-        }
-        let plan = self.plan(width, height);
+    ) -> Result<Vec<f32>, TransformError> {
         let source: Cow<'_, RgbImage> = match image {
             DynamicImage::ImageRgb8(rgb) => Cow::Borrowed(rgb),
             other => Cow::Owned(other.to_rgb8()),
@@ -365,7 +401,7 @@ impl Step3VLProcessor {
                 }
             }
         }
-        Ok((view_planes, plan))
+        Ok(view_planes)
     }
 }
 
@@ -394,12 +430,14 @@ impl VisionPreProcessor for Step3VLProcessor {
         let side = IMAGE_SIZE as usize;
         let view_len = 3 * side * side;
         let patch = PATCH_SIZE as usize;
-        // The batch's crops buffer is sized from the plans before any pixel
-        // moves, so every crop's planes are written into it once.
-        let total_crops: usize = images
+        // Every plan is checked, and the batch's crops buffer sized from
+        // them, before any pixel moves: a refused image costs nothing, and
+        // every crop's planes are written into the buffer once.
+        let plans = images
             .iter()
-            .map(|image| self.plan(image.width(), image.height()).num_patches())
-            .sum();
+            .map(|image| self.checked_plan(image.width(), image.height()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let total_crops: usize = plans.iter().map(CropPlan::num_patches).sum();
         let mut crops = if total_crops == 0 {
             Vec::new()
         } else {
@@ -410,9 +448,8 @@ impl VisionPreProcessor for Step3VLProcessor {
         let mut counts = Vec::with_capacity(images.len());
         let mut tokens = Vec::with_capacity(images.len());
         let mut sizes = Vec::with_capacity(images.len());
-        for image in images {
-            let (view, plan) = self.process(image, &mut crops, &mut newlines)?;
-            views.push(view);
+        for (image, plan) in images.iter().zip(&plans) {
+            views.push(self.process(image, *plan, &mut crops, &mut newlines)?);
             counts.push(plan.num_patches() as i64);
             tokens.push(plan.num_tokens());
             sizes.push((image.width(), image.height()));
@@ -462,12 +499,7 @@ impl VisionPreProcessor for Step3VLProcessor {
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
-        if width == 0 || height == 0 {
-            return Err(TransformError::ShapeError(format!(
-                "a {width}x{height} image has no view to resize"
-            )));
-        }
-        Ok(self.plan(width, height).num_tokens())
+        Ok(self.checked_plan(width, height)?.num_tokens())
     }
 
     fn model_name(&self) -> &'static str {
@@ -497,6 +529,9 @@ mod tests {
     /// of 4, the square pad under 32 px, and the 3024 px cap.
     #[test]
     fn the_plan_counts_the_references_crops_newlines_and_tokens() {
+        // The rule's arithmetic on the engine's own numbers; two of the sizes
+        // (2000x40, 40x2000) plan past the bound and are refused by the
+        // checked entry points, which the bound's own test covers.
         for (width, height, crops, newlines, tokens) in [
             (1, 1, 0, 0, 171),
             (7, 5, 0, 0, 171),
@@ -522,9 +557,7 @@ mod tests {
             assert_eq!(plan.num_newlines(), newlines, "{width}x{height} newlines");
             assert_eq!(plan.num_tokens(), tokens, "{width}x{height} tokens");
             assert_eq!(
-                Step3VLProcessor::new()
-                    .calculate_num_tokens(width, height)
-                    .unwrap(),
+                Step3VLProcessor::new().plan(width, height).num_tokens(),
                 tokens
             );
         }
@@ -715,5 +748,50 @@ mod tests {
             Err(TransformError::EmptyBatch)
         ));
         assert!(processor.calculate_num_tokens(0, 10).is_err());
+    }
+
+    #[test]
+    fn a_plan_past_the_engines_declared_image_is_refused_before_any_pixel_moves() {
+        let processor = Step3VLProcessor::new();
+        // The engine's own count: a 3024 x 3024 image, 36 crops, five newlines.
+        assert_eq!(processor.plan(3024, 3024).num_tokens(), MAX_IMAGE_TOKENS);
+        assert_eq!(
+            processor.calculate_num_tokens(3024, 3024).unwrap(),
+            MAX_IMAGE_TOKENS
+        );
+        // One row of 36 windows of 84 px: just under the count, the engine's own plan.
+        assert_eq!(
+            processor.calculate_num_tokens(3024, 84).unwrap(),
+            36 * (PATCH_FEATURE_TOKENS + 2) + IMAGE_FEATURE_TOKENS + 2
+        );
+        // 6048 x 64: the short side passes the pad, the cap halves it to 32, 95 windows.
+        let error = processor
+            .calculate_num_tokens(6048, 64)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("6048x64")
+                && error.contains("95 crops")
+                && error.contains("8056 feature tokens")
+                && error.contains("3164"),
+            "{error}"
+        );
+        // The edge: 96768 x 32 caps to 3024 x 1, 3024 windows of one pixel.
+        let error = processor
+            .calculate_num_tokens(96768, 32)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("3024 crops"), "{error}");
+        // A side that caps to zero has nothing to resize.
+        let error = processor
+            .calculate_num_tokens(100_000, 32)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("3024x0"), "{error}");
+        // The preprocessing refuses the same images, before any tensor is built.
+        let thin = DynamicImage::new_rgb8(6048, 64);
+        assert!(processor.preprocess(&[&thin]).is_err());
+        let edge = DynamicImage::new_rgb8(96_768, 32);
+        assert!(processor.preprocess(&[&edge]).is_err());
     }
 }

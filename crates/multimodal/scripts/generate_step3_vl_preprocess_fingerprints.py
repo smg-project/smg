@@ -63,7 +63,7 @@ SYNTHETIC_CASES = [
     ("synthetic_1920x1080", 1920, 1080, 17),
     ("synthetic_600x300", 600, 300, 19),
     ("synthetic_1000x300", 1000, 300, 23),
-    ("synthetic_2000x40", 2000, 40, 29),
+    ("row-of-36-windows-3024x84", 3024, 84, 29),
     ("synthetic_40x700", 40, 700, 31),
     ("synthetic_4000x15", 4000, 15, 37),
     ("synthetic_3x900", 3, 900, 41),
@@ -112,8 +112,12 @@ def load_reference(tree: Path):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--engine-tree", required=True, type=Path, help="a checkout of the engine's source tree")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--engine-tree", required=True, type=Path, help="a checkout of the engine's source tree"
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     args = parser.parse_args()
 
@@ -144,7 +148,10 @@ def main() -> int:
             "patches_fnv1a_bf16": fnv1a_bf16(patches),
         }
         cases.append(case)
-        print(f"{name}: crops {num_patches}, tokens {case['num_tokens']}, {case['fnv1a_f32']}", file=sys.stderr)
+        print(
+            f"{name}: crops {num_patches}, tokens {case['num_tokens']}, {case['fnv1a_f32']}",
+            file=sys.stderr,
+        )
 
     document = {
         "reference": REFERENCE,

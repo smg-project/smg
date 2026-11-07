@@ -31,6 +31,11 @@ const PATCH_START: &str = "<patch_start>";
 const PATCH_END: &str = "<patch_end>";
 /// The token after every crop row but the last.
 const PATCH_NEWLINE: &str = "<patch_newline>";
+/// Images per request. The serving engine advertises no count for the
+/// family; eight (the count of the other global-view-and-tiles family) bounds
+/// a request's crops tensor at eight images of the per-image limit, and a
+/// deployment's own image limit may lower it.
+const MAX_IMAGES_PER_REQUEST: usize = 8;
 
 /// The Step3-VL image spec (`model_type` `step3_vl`, and `step5_vl`, which
 /// the serving engine runs through the same processor and layout).
@@ -163,15 +168,14 @@ impl ModelProcessorSpec for Step3VLVisionSpec {
         Self::image_token_id(metadata)
     }
 
-    /// The family bounds no per-request image count of its own (its serving
-    /// engine advertises none), so images stay declared without a bound of
-    /// the spec's: the engine's advertised limit, else the deployment's
-    /// `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`, is the limit.
+    /// Images per request: [`MAX_IMAGES_PER_REQUEST`]; the engine's
+    /// advertised limit or the deployment's `--mm-per-request-image-limit` /
+    /// `SMG_IMAGE_MAX_COUNT` may lower it.
     fn modality_limits(
         &self,
         _metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
-        Ok(HashMap::from([(Modality::Image, usize::MAX)]))
+        Ok(HashMap::from([(Modality::Image, MAX_IMAGES_PER_REQUEST)]))
     }
 
     /// The processor reads the model config's `vision_config.enable_patch`
@@ -448,7 +452,7 @@ mod tests {
         );
         assert_eq!(
             spec.modality_limits(&metadata).unwrap(),
-            HashMap::from([(Modality::Image, usize::MAX)])
+            HashMap::from([(Modality::Image, MAX_IMAGES_PER_REQUEST)])
         );
         assert!(matches!(
             spec.vision_processor(&config, &PreProcessorConfig::default(), Modality::Video),
