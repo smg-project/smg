@@ -18,9 +18,9 @@
 //!
 //! `MM_PINS_RECORD=1 cargo test -p llm-multimodal --test alloc_pins -- --nocapture`
 //! prints the table instead of asserting, for re-pinning after a change that moves a
-//! count on purpose. The preprocess calls are pinned per resize row path (scalar, or the
-//! vector rows of NEON and AVX2): a re-pin records each count on its own path, and a
-//! failing run prints its table with the failure.
+//! count on purpose. The preprocess calls are pinned per resize row path (scalar, NEON,
+//! AVX2): a re-pin records each count on its own path, and a failing run prints its table
+//! with the failure.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
 mod common;
@@ -268,40 +268,35 @@ impl Frames {
     }
 }
 
-/// A call count per resize row path. The resize's rows run through NEON on aarch64 and
-/// AVX2 on x86-64 (`vision/torch_resample.rs`): the vector width pass collects wide taps
-/// and a scratch row of its own, and its height pass skips the scalar path's sums buffer,
-/// so a class counts one or two calls more or fewer than on the scalar path. Both counts
-/// are recorded on their own path; CI runs this test on each architecture.
+/// A call count per resize row path (`vision/torch_resample.rs`). The NEON width pass
+/// collects wide taps and a scratch row of its own and its height pass skips the scalar
+/// path's sums buffer, so a class counts one or two calls more or fewer than on the scalar
+/// path; the AVX2 passes read the rows and the taps in place and allocate nothing of their
+/// own. Each count is recorded on its own path; CI runs this test on each architecture.
 struct Calls {
     scalar: usize,
-    vector: usize,
+    neon: usize,
+    avx2: usize,
 }
 
 impl Calls {
     fn here(&self) -> usize {
-        if vector_rows() {
-            self.vector
-        } else {
-            self.scalar
-        }
+        [self.scalar, self.neon, self.avx2][row_path()]
     }
 }
 
-/// Whether this host resizes through the vector rows, the way the crate decides it.
-fn vector_rows() -> bool {
+/// The resize row path this host runs, the way the crate decides it, as the
+/// index into a pin's (scalar, NEON, AVX2) counts.
+fn row_path() -> usize {
     #[cfg(target_arch = "aarch64")]
-    {
-        std::arch::is_aarch64_feature_detected!("neon")
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        return 1;
     }
     #[cfg(target_arch = "x86_64")]
-    {
-        std::arch::is_x86_feature_detected!("avx2")
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return 2;
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        false
-    }
+    0
 }
 
 const PINS: &[Pin] = &[
@@ -314,7 +309,8 @@ const PINS: &[Pin] = &[
         copy: (1, 1),
         preprocess_calls: Calls {
             scalar: 6038,
-            vector: 6037,
+            neon: 6037,
+            avx2: 6037,
         },
         preprocess_large: 2,
         serialize_calls: 0,
@@ -328,7 +324,8 @@ const PINS: &[Pin] = &[
         copy: (1, 0),
         preprocess_calls: Calls {
             scalar: 1051,
-            vector: 1052,
+            neon: 1052,
+            avx2: 1050,
         },
         preprocess_large: 1,
         serialize_calls: 0,
@@ -342,7 +339,8 @@ const PINS: &[Pin] = &[
         copy: (1, 1),
         preprocess_calls: Calls {
             scalar: 1370,
-            vector: 1371,
+            neon: 1371,
+            avx2: 1369,
         },
         preprocess_large: 2,
         serialize_calls: 0,
@@ -356,7 +354,8 @@ const PINS: &[Pin] = &[
         copy: (1, 0),
         preprocess_calls: Calls {
             scalar: 1051,
-            vector: 1052,
+            neon: 1052,
+            avx2: 1050,
         },
         preprocess_large: 1,
         serialize_calls: 0,
@@ -370,7 +369,8 @@ const PINS: &[Pin] = &[
         copy: (1, 1),
         preprocess_calls: Calls {
             scalar: 1429,
-            vector: 1428,
+            neon: 1428,
+            avx2: 1428,
         },
         preprocess_large: 1,
         serialize_calls: 0,
@@ -384,7 +384,8 @@ const PINS: &[Pin] = &[
         copy: (1, 1),
         preprocess_calls: Calls {
             scalar: 15,
-            vector: 15,
+            neon: 15,
+            avx2: 15,
         },
         preprocess_large: 0,
         serialize_calls: 0,

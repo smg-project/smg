@@ -16,7 +16,9 @@
 //! The AArch64 and x86-64 paths are the module's only uses of `core::arch`
 //! vector loads and stores, hence the local override of the workspace-wide
 //! `unsafe_code = "deny"`; every pointer they form is bounded by an exact-size
-//! chunk of a slice or by a scratch row padded for the widest read.
+//! chunk of a slice, by a scratch row padded for the widest read or, in the
+//! x86-64 width pass, by its guards on the pixel index against the one length
+//! of the four rows it asserts on entry.
 #![cfg_attr(
     any(target_arch = "aarch64", target_arch = "x86_64"),
     allow(unsafe_code)
@@ -29,23 +31,23 @@ use super::{
 
 /// One resample axis in the layout the passes read: per output index the
 /// source start and tap count, the taps as `i16` at a fixed stride (a
-/// multiple of four, zero-padded), on a vector architecture the same taps in
-/// the layout its width pass reads ([`wide_taps`]), and the shift that undoes
-/// their scale.
+/// multiple of four, zero-padded), on AArch64 the same taps in the layout the
+/// NEON width pass reads ([`wide_taps`]), and the shift that undoes their
+/// scale.
 struct Axis {
     bounds: Vec<(usize, usize)>,
     stride: usize,
     taps: Vec<i16>,
-    /// The taps of the width axis in the vector width pass's layout (sixteen
+    /// The taps of the width axis in the NEON width pass's layout (sixteen
     /// lanes per group of four taps), read by that pass only; empty for the
     /// height axis.
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     taps_wide: Vec<i16>,
     precision: u32,
 }
 
-/// Which pass an [`Axis`] serves: the width pass reads the taps four-wide on
-/// the vector unit, the height pass does not.
+/// Which pass an [`Axis`] serves: the NEON width pass reads the taps
+/// four-wide, the height pass does not.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pass {
     Width,
@@ -88,7 +90,7 @@ impl Axis {
                 taps[index * stride + k] = tap as i16;
             }
         }
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
         let taps_wide = match pass {
             Pass::Width => taps
                 .as_chunks::<4>()
@@ -99,13 +101,13 @@ impl Axis {
                 .collect(),
             Pass::Height => Vec::new(),
         };
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        #[cfg(not(target_arch = "aarch64"))]
         let _ = pass;
         Self {
             bounds: kernel.bounds,
             stride,
             taps,
-            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+            #[cfg(target_arch = "aarch64")]
             taps_wide,
             precision: kernel.precision,
         }
@@ -127,14 +129,6 @@ impl Axis {
 #[cfg(target_arch = "aarch64")]
 fn wide_taps(group: [i16; 4]) -> [i16; 16] {
     std::array::from_fn(|lane| group[lane / 4])
-}
-
-/// Four taps of the width axis as the AVX2 width pass reads them: the pair
-/// `(t0, t1)` four times, then `(t2, t3)` four times, so that one multiply-add
-/// of adjacent 16-bit lanes sums two source pixels of one channel.
-#[cfg(target_arch = "x86_64")]
-fn wide_taps(group: [i16; 4]) -> [i16; 16] {
-    std::array::from_fn(|lane| group[(lane / 8) * 2 + lane % 2])
 }
 
 /// `data` (`in_w` x `in_h` interleaved RGB) resampled to `out_w` x `out_h`
@@ -193,6 +187,22 @@ fn resize_rgb_with(
     }
 }
 
+/// A pass's output buffer: a plain allocation filled in place, never a zeroed
+/// one. Every byte is written by the pass, and an allocator serves a large
+/// zeroed block by returning its pages to the kernel and taking them back page
+/// fault by page fault (jemalloc zeroes a recycled block that way; glibc's
+/// zeroed allocation of a fresh heap top relies on fresh pages): on a
+/// multi-megabyte intermediate those faults cost a quarter of the pass.
+#[expect(
+    clippy::slow_vector_initialization,
+    reason = "the zeroed form the lint prefers re-faults every page of the buffer on every image under the production allocator"
+)]
+fn plain_buffer(len: usize) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(len);
+    buffer.resize(len, 0);
+    buffer
+}
+
 /// Every input row resampled along its width; rows banded across the pool
 /// (each output row depends on its input row alone, so the banding changes
 /// nothing).
@@ -205,7 +215,7 @@ fn horizontal_pass(
     path: Rows,
 ) -> Vec<u8> {
     let row_out = out_w * 3;
-    let mut out = vec![0u8; rows * row_out];
+    let mut out = plain_buffer(rows * row_out);
     let tasks = execution::task_count(out.len(), rows, 32);
     if tasks <= 1 {
         horizontal_rows(src, in_w, out_w, axis, 0, &mut out, path);
@@ -242,13 +252,25 @@ fn horizontal_rows(
     let _ = path;
     #[cfg(target_arch = "x86_64")]
     if path == Rows::Detected && std::arch::is_x86_feature_detected!("avx2") {
-        // Scratch for the input row as four bytes per pixel, padded by the
-        // widest read of a tap group (three pixels past the row's end).
-        let mut rgbx = vec![0u8; (in_w + 4) * 4];
-        for (i, out_row) in band.chunks_exact_mut(out_w * 3).enumerate() {
-            let row = &src[(y0 + i) * row_in..(y0 + i + 1) * row_in];
+        // Four output rows per step; a last group short of four rows reads
+        // the band's last row in the missing places and writes nothing there,
+        // and an empty band has no last row to read.
+        let row_out = out_w * 3;
+        let Some(last) = (y0 + band.len() / row_out).checked_sub(1) else {
+            return;
+        };
+        for (group, chunk) in band.chunks_mut(row_out * 4).enumerate() {
+            let row = |i: usize| {
+                let y = (y0 + group * 4 + i).min(last);
+                &src[y * row_in..(y + 1) * row_in]
+            };
+            let (o0, rest) = chunk.split_at_mut(row_out.min(chunk.len()));
+            let (o1, rest) = rest.split_at_mut(row_out.min(rest.len()));
+            let (o2, o3) = rest.split_at_mut(row_out.min(rest.len()));
             // SAFETY: AVX2 was detected above.
-            unsafe { avx2::horizontal_row(row, &mut rgbx, axis, out_row) };
+            unsafe {
+                avx2::horizontal_rows4([row(0), row(1), row(2), row(3)], axis, [o0, o1, o2, o3]);
+            }
         }
         return;
     }
@@ -296,7 +318,7 @@ fn horizontal_row_scalar(row: &[u8], axis: &Axis, out_row: &mut [u8]) {
 /// Every output row resampled along the height; rows banded across the pool.
 fn vertical_pass(src: &[u8], width: usize, out_h: usize, axis: &Axis, path: Rows) -> Vec<u8> {
     let row_len = width * 3;
-    let mut out = vec![0u8; out_h * row_len];
+    let mut out = plain_buffer(out_h * row_len);
     let tasks = execution::task_count(out.len(), out_h, 32);
     if tasks <= 1 {
         vertical_rows(src, row_len, axis, 0, &mut out, path);
@@ -506,170 +528,270 @@ mod neon {
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
     use core::arch::x86_64::{
-        __m128i, __m256i, _mm256_add_epi32, _mm256_broadcastsi128_si256, _mm256_castsi256_si128,
-        _mm256_cvtepu8_epi16, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
-        _mm256_max_epi32, _mm256_min_epi32, _mm256_packus_epi16, _mm256_packus_epi32,
-        _mm256_permute4x64_epi64, _mm256_set1_epi32, _mm256_setr_epi16, _mm256_setr_epi8,
+        __m128i, __m256i, _mm256_add_epi32, _mm256_castsi128_si256, _mm256_castsi256_si128,
+        _mm256_extracti128_si256, _mm256_inserti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
+        _mm256_packs_epi32, _mm256_packus_epi16, _mm256_set1_epi32, _mm256_setr_epi8,
         _mm256_setzero_si256, _mm256_shuffle_epi8, _mm256_sra_epi32, _mm256_storeu_si256,
-        _mm256_unpackhi_epi32, _mm256_unpacklo_epi32, _mm_add_epi32, _mm_cvtsi128_si32,
-        _mm_cvtsi32_si128, _mm_loadu_si128, _mm_max_epi32, _mm_min_epi32, _mm_packus_epi16,
-        _mm_packus_epi32, _mm_set1_epi32, _mm_setr_epi8, _mm_setzero_si128, _mm_shuffle_epi8,
-        _mm_sra_epi32, _mm_storeu_si128,
+        _mm256_unpackhi_epi8, _mm256_unpacklo_epi8, _mm_cvtsi128_si32, _mm_cvtsi32_si128,
+        _mm_loadl_epi64, _mm_loadu_si128,
     };
 
     use super::Axis;
 
-    /// One row of the width pass: the row is spread to four bytes per pixel
-    /// in `rgbx` (zero padded), then every output pixel sums its taps four
-    /// source pixels at a time: the pixels' bytes interleaved in pairs
-    /// (`r0 r1 g0 g1 b0 b1 x0 x1 | r2 r3 ...`), so that the multiply-add of
-    /// adjacent 16-bit lanes sums two pixels of one channel, the taps in the
-    /// same pairs ([`super::wide_taps`]).
-    #[target_feature(enable = "avx2")]
-    pub(super) fn horizontal_row(row: &[u8], rgbx: &mut [u8], axis: &Axis, out_row: &mut [u8]) {
-        let pixels = row.len() / 3;
-        debug_assert!(rgbx.len() >= (pixels + 4) * 4);
-        // Four pixels (12 bytes) spread to 16 per step; the step reads 16
-        // bytes, so every group whose read ends inside the row is done here
-        // (`12 * groups + 4 <= row.len()`) and the last pixels one by one.
-        let spread = _mm_setr_epi8(0, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1);
-        let groups = row.len().saturating_sub(4) / 12;
-        for group in 0..groups {
-            // SAFETY: `group * 12 + 16 <= 12 * groups + 4 <= row.len()` by the
-            // count above, and `16 * groups <= 4 * pixels - 5 < rgbx.len()`
-            // (`rgbx` holds `4 * pixels + 16` bytes).
-            unsafe {
-                let bytes = _mm_loadu_si128(row.as_ptr().add(group * 12).cast::<__m128i>());
-                _mm_storeu_si128(
-                    rgbx.as_mut_ptr().add(group * 16).cast::<__m128i>(),
-                    _mm_shuffle_epi8(bytes, spread),
-                );
-            }
-        }
-        for (pixel, wide) in row[groups * 12..]
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .zip(rgbx[groups * 16..].as_chunks_mut::<4>().0.iter_mut())
-        {
-            wide[..3].copy_from_slice(pixel);
-            wide[3] = 0;
-        }
-        // Pixels 0 and 1 of a 16-byte group as pairs in the low lane, pixels
-        // 2 and 3 in the high lane; `-1` zero-fills the high byte of a lane.
-        let pairs = _mm256_setr_epi8(
-            0, -1, 4, -1, 1, -1, 5, -1, 2, -1, 6, -1, 3, -1, 7, -1, 8, -1, 12, -1, 9, -1, 13, -1,
-            10, -1, 14, -1, 11, -1, 15, -1,
-        );
-        let out_w = out_row.len() / 3;
-        let half = _mm_set1_epi32(axis.half());
-        let shift = _mm_cvtsi32_si128(axis.precision as i32);
-        let zero = _mm_setzero_si128();
-        let top = _mm_set1_epi32(255);
-        for index in 0..out_w {
-            let (x0, n) = axis.bounds[index];
-            let groups = n.div_ceil(4);
-            let taps =
-                &axis.taps_wide[index * axis.stride * 4..(index * axis.stride + groups * 4) * 4];
-            let source = &rgbx[x0 * 4..(x0 + groups * 4) * 4];
-            let mut sums = _mm256_setzero_si256();
-            for (pixels, taps) in source
-                .as_chunks::<16>()
-                .0
-                .iter()
-                .zip(taps.as_chunks::<16>().0)
-            {
-                // SAFETY: `pixels` is 16 bytes (four pixels), `taps` 16
-                // `i16`s (two pairs of taps, each four times).
-                let (pixels, taps) = unsafe {
-                    (
-                        _mm_loadu_si128(pixels.as_ptr().cast::<__m128i>()),
-                        _mm256_loadu_si256(taps.as_ptr().cast::<__m256i>()),
-                    )
-                };
-                let pixels = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(pixels), pairs);
-                sums = _mm256_add_epi32(sums, _mm256_madd_epi16(pixels, taps));
-            }
-            // The two lanes hold pixels (0, 1) and (2, 3) of every group.
-            let sum = _mm_add_epi32(
-                _mm_add_epi32(
-                    _mm256_castsi256_si128(sums),
-                    _mm256_extracti128_si256::<1>(sums),
-                ),
-                half,
-            );
-            let clipped = _mm_min_epi32(_mm_max_epi32(_mm_sra_epi32(sum, shift), zero), top);
-            let bytes = _mm_packus_epi16(_mm_packus_epi32(clipped, clipped), zero);
-            // The pixel's three bytes and the padding lane's zero as a word,
-            // written through the slice: a 3-byte stride is 4-byte aligned
-            // for one pixel in four only, so no typed `u32` store.
-            let word = _mm_cvtsi128_si32(bytes).to_ne_bytes();
-            if index + 1 < out_w {
-                // The fourth byte is the next pixel's first, written again by
-                // the next iteration.
-                out_row[index * 3..index * 3 + 4].copy_from_slice(&word);
-            } else {
-                out_row[index * 3..index * 3 + 3].copy_from_slice(&word[..3]);
-            }
-        }
+    /// The pair `(t0, t1)` as the 32-bit lane `_mm256_madd_epi16` multiplies
+    /// against a `(p0, p1)` pair of 16-bit lanes: the first tap in the low
+    /// half.
+    #[inline]
+    fn tap_pair(t0: i16, t1: i16) -> i32 {
+        (i32::from(t0) & 0xffff) | (i32::from(t1) << 16)
     }
 
-    /// `sums >> precision` clamped to a byte, for eight sums.
+    /// Sixteen bytes of two rows from pixel `x`, one row per 128-bit lane.
+    ///
+    /// # Safety
+    ///
+    /// `x + 6 <= pixels per row`, so the sixteen bytes lie in both rows.
     #[inline]
     #[target_feature(enable = "avx2")]
-    fn clip8x8(sums: __m256i, shift: __m128i, zero: __m256i, top: __m256i) -> __m256i {
-        _mm256_min_epi32(_mm256_max_epi32(_mm256_sra_epi32(sums, shift), zero), top)
+    unsafe fn two_rows_16(a: &[u8], b: &[u8], x: usize) -> __m256i {
+        _mm256_inserti128_si256::<1>(
+            _mm256_castsi128_si256(_mm_loadu_si128(a.as_ptr().add(x * 3).cast::<__m128i>())),
+            _mm_loadu_si128(b.as_ptr().add(x * 3).cast::<__m128i>()),
+        )
     }
 
-    /// One row of the height pass: thirty-two output bytes at a time across
-    /// the taps. Each source row's bytes widen to sixteen 16-bit lanes per
-    /// half, and two multiply-adds against `(tap, 0)` and `(0, tap)` pairs
-    /// give the even and the odd bytes' products in 32 bits; the row's last
-    /// bytes in scalar.
+    /// Eight bytes of two rows from pixel `x`, one row per 128-bit lane.
+    ///
+    /// # Safety
+    ///
+    /// `x + 3 <= pixels per row`, so the eight bytes lie in both rows.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn two_rows_8(a: &[u8], b: &[u8], x: usize) -> __m256i {
+        _mm256_inserti128_si256::<1>(
+            _mm256_castsi128_si256(_mm_loadl_epi64(a.as_ptr().add(x * 3).cast::<__m128i>())),
+            _mm_loadl_epi64(b.as_ptr().add(x * 3).cast::<__m128i>()),
+        )
+    }
+
+    /// Pixel `x` of two rows as the first three bytes of each lane (the rest
+    /// zero, so the pair shuffle yields `(value, 0)` pairs for a single tap):
+    /// three bytes read one by one, so a row's last pixel is safe.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn two_rows_1(a: &[u8], b: &[u8], x: usize) -> __m256i {
+        let word = |row: &[u8]| i32::from_le_bytes([row[x * 3], row[x * 3 + 1], row[x * 3 + 2], 0]);
+        _mm256_inserti128_si256::<1>(
+            _mm256_castsi128_si256(_mm_cvtsi32_si128(word(a))),
+            _mm_cvtsi32_si128(word(b)),
+        )
+    }
+
+    /// Four output rows of the width pass per step (an empty output row is
+    /// skipped; its source row is a stand-in): every output pixel sums its
+    /// taps two source pixels at a time, the pixels' bytes shuffled straight
+    /// from the row into `(p0, p1)` pairs of 16-bit lanes per channel, so
+    /// that one multiply-add of adjacent lanes adds two pixels of one channel
+    /// for two rows (one row per 128-bit lane); the four rows share every tap
+    /// pair.
+    #[target_feature(enable = "avx2")]
+    pub(super) fn horizontal_rows4(rows: [&[u8]; 4], axis: &Axis, out: [&mut [u8]; 4]) {
+        // The guards on `x` below bound every unchecked load by this length.
+        assert!(rows.iter().all(|row| row.len() == rows[0].len()));
+        let in_w = rows[0].len() / 3;
+        let out_w = axis.bounds.len();
+        // Pixels 0 and 1 of a load as channel pairs (R: bytes 0 and 3, G: 1
+        // and 4, B: 2 and 5), the fourth lane zero; the same in both halves.
+        let pair01 = _mm256_setr_epi8(
+            0, -1, 3, -1, 1, -1, 4, -1, 2, -1, 5, -1, -1, -1, -1, -1, 0, -1, 3, -1, 1, -1, 4, -1,
+            2, -1, 5, -1, -1, -1, -1, -1,
+        );
+        // Pixels 2 and 3 (bytes 6 to 11).
+        let pair23 = _mm256_setr_epi8(
+            6, -1, 9, -1, 7, -1, 10, -1, 8, -1, 11, -1, -1, -1, -1, -1, 6, -1, 9, -1, 7, -1, 10,
+            -1, 8, -1, 11, -1, -1, -1, -1, -1,
+        );
+        let half = _mm256_set1_epi32(axis.half());
+        let shift = _mm_cvtsi32_si128(axis.precision as i32);
+        let zero = _mm256_setzero_si256();
+        let [r0, r1, r2, r3] = rows;
+        let [o0, o1, o2, o3] = out;
+        for index in 0..out_w {
+            let (x0, n) = axis.bounds[index];
+            let taps = &axis.taps[index * axis.stride..index * axis.stride + n];
+            let (mut sum01, mut sum23) = (half, half);
+            let (mut k, mut x) = (0, x0);
+            // Four taps per step while sixteen bytes (pixels `x` to `x + 5`)
+            // stay in the row.
+            while k + 4 <= n && x + 6 <= in_w {
+                let t01 = _mm256_set1_epi32(tap_pair(taps[k], taps[k + 1]));
+                let t23 = _mm256_set1_epi32(tap_pair(taps[k + 2], taps[k + 3]));
+                // SAFETY: `x + 6 <= in_w`.
+                let (a, b) = unsafe { (two_rows_16(r0, r1, x), two_rows_16(r2, r3, x)) };
+                sum01 = _mm256_add_epi32(
+                    sum01,
+                    _mm256_madd_epi16(_mm256_shuffle_epi8(a, pair01), t01),
+                );
+                sum01 = _mm256_add_epi32(
+                    sum01,
+                    _mm256_madd_epi16(_mm256_shuffle_epi8(a, pair23), t23),
+                );
+                sum23 = _mm256_add_epi32(
+                    sum23,
+                    _mm256_madd_epi16(_mm256_shuffle_epi8(b, pair01), t01),
+                );
+                sum23 = _mm256_add_epi32(
+                    sum23,
+                    _mm256_madd_epi16(_mm256_shuffle_epi8(b, pair23), t23),
+                );
+                k += 4;
+                x += 4;
+            }
+            // Two taps per step while eight bytes (pixels `x` to `x + 2`)
+            // stay in the row; a last odd tap takes the same step with a zero
+            // second tap.
+            while k < n && x + 3 <= in_w {
+                let next = if k + 1 < n { taps[k + 1] } else { 0 };
+                let t01 = _mm256_set1_epi32(tap_pair(taps[k], next));
+                // SAFETY: `x + 3 <= in_w`.
+                let (a, b) = unsafe { (two_rows_8(r0, r1, x), two_rows_8(r2, r3, x)) };
+                sum01 = _mm256_add_epi32(
+                    sum01,
+                    _mm256_madd_epi16(_mm256_shuffle_epi8(a, pair01), t01),
+                );
+                sum23 = _mm256_add_epi32(
+                    sum23,
+                    _mm256_madd_epi16(_mm256_shuffle_epi8(b, pair01), t01),
+                );
+                k += 2;
+                x += 2;
+            }
+            // The row's last pixels, where an eight-byte read would pass its
+            // end, one tap at a time.
+            while k < n {
+                let t = _mm256_set1_epi32(i32::from(taps[k]));
+                let (a, b) = (two_rows_1(r0, r1, x), two_rows_1(r2, r3, x));
+                sum01 =
+                    _mm256_add_epi32(sum01, _mm256_madd_epi16(_mm256_shuffle_epi8(a, pair01), t));
+                sum23 =
+                    _mm256_add_epi32(sum23, _mm256_madd_epi16(_mm256_shuffle_epi8(b, pair01), t));
+                k += 1;
+                x += 1;
+            }
+            // `>> precision`, then the saturating packs clamp to a byte: a
+            // row's R, G, B and a zero as the first four bytes of its lane.
+            let bytes01 = _mm256_packus_epi16(
+                _mm256_packs_epi32(_mm256_sra_epi32(sum01, shift), zero),
+                zero,
+            );
+            let bytes23 = _mm256_packus_epi16(
+                _mm256_packs_epi32(_mm256_sra_epi32(sum23, shift), zero),
+                zero,
+            );
+            let words = [
+                _mm_cvtsi128_si32(_mm256_castsi256_si128(bytes01)),
+                _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(bytes01)),
+                _mm_cvtsi128_si32(_mm256_castsi256_si128(bytes23)),
+                _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(bytes23)),
+            ];
+            for (out_row, word) in [&mut *o0, &mut *o1, &mut *o2, &mut *o3]
+                .into_iter()
+                .zip(words)
+            {
+                if !out_row.is_empty() {
+                    store_pixel(out_row, index, out_w, word.to_ne_bytes());
+                }
+            }
+        }
+    }
+
+    /// The pixel's three bytes and the padding zero as one word: a four-byte
+    /// write whose fourth byte the next pixel overwrites, three bytes for
+    /// the last pixel (a 3-byte stride is 4-byte aligned for one pixel in
+    /// four only, so no typed `u32` store).
+    #[inline]
+    fn store_pixel(out_row: &mut [u8], index: usize, out_w: usize, word: [u8; 4]) {
+        if index + 1 < out_w {
+            out_row[index * 3..index * 3 + 4].copy_from_slice(&word);
+        } else {
+            out_row[index * 3..index * 3 + 3].copy_from_slice(&word[..3]);
+        }
+    }
+
+    /// Two source rows' thirty-two bytes into the four accumulators of a
+    /// height-pass step: the rows' bytes interleaved into `(a, b)` pairs of
+    /// 16-bit lanes, so that one multiply-add against the `(ta, tb)` pair
+    /// adds two taps.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn two_taps(sums: &mut [__m256i; 4], a: __m256i, b: __m256i, taps: __m256i) {
+        let zero = _mm256_setzero_si256();
+        let lo = _mm256_unpacklo_epi8(a, b);
+        let hi = _mm256_unpackhi_epi8(a, b);
+        sums[0] = _mm256_add_epi32(
+            sums[0],
+            _mm256_madd_epi16(_mm256_unpacklo_epi8(lo, zero), taps),
+        );
+        sums[1] = _mm256_add_epi32(
+            sums[1],
+            _mm256_madd_epi16(_mm256_unpackhi_epi8(lo, zero), taps),
+        );
+        sums[2] = _mm256_add_epi32(
+            sums[2],
+            _mm256_madd_epi16(_mm256_unpacklo_epi8(hi, zero), taps),
+        );
+        sums[3] = _mm256_add_epi32(
+            sums[3],
+            _mm256_madd_epi16(_mm256_unpackhi_epi8(hi, zero), taps),
+        );
+    }
+
+    /// One row of the height pass: thirty-two output bytes per step, two
+    /// source rows per multiply-add (a last odd row against a zero row); the
+    /// saturating packs return the bytes in order. The row's last bytes in
+    /// scalar.
     #[target_feature(enable = "avx2")]
     pub(super) fn vertical_row(rows: &[u8], taps: &[i16], axis: &Axis, out_row: &mut [u8]) {
         let row_len = out_row.len();
         let half = _mm256_set1_epi32(axis.half());
         let shift = _mm_cvtsi32_si128(axis.precision as i32);
         let zero = _mm256_setzero_si256();
-        let top = _mm256_set1_epi32(255);
         let (chunks, rest) = out_row.as_chunks_mut::<32>();
-        for (x, out) in chunks.iter_mut().enumerate() {
-            // Even and odd bytes of the first and of the second sixteen.
-            let (mut e0, mut o0, mut e1, mut o1) = (half, half, half, half);
-            for (k, &tap) in taps.iter().enumerate() {
-                let even = _mm256_setr_epi16(
-                    tap, 0, tap, 0, tap, 0, tap, 0, tap, 0, tap, 0, tap, 0, tap, 0,
-                );
-                let odd = _mm256_setr_epi16(
-                    0, tap, 0, tap, 0, tap, 0, tap, 0, tap, 0, tap, 0, tap, 0, tap,
-                );
-                let offset = k * row_len + x * 32;
+        for (step, out) in chunks.iter_mut().enumerate() {
+            let offset = step * 32;
+            let mut sums = [half; 4];
+            let (pairs, odd) = taps.as_chunks::<2>();
+            for (k, pair) in pairs.iter().enumerate() {
+                let pair = _mm256_set1_epi32(tap_pair(pair[0], pair[1]));
                 // SAFETY: `rows` holds `taps.len()` rows of `row_len` bytes
-                // and `offset + 32 <= (k + 1) * row_len`.
-                let pixels =
-                    unsafe { _mm256_loadu_si256(rows.as_ptr().add(offset).cast::<__m256i>()) };
-                let low = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(pixels));
-                let high = _mm256_cvtepu8_epi16(_mm256_extracti128_si256::<1>(pixels));
-                e0 = _mm256_add_epi32(e0, _mm256_madd_epi16(low, even));
-                o0 = _mm256_add_epi32(o0, _mm256_madd_epi16(low, odd));
-                e1 = _mm256_add_epi32(e1, _mm256_madd_epi16(high, even));
-                o1 = _mm256_add_epi32(o1, _mm256_madd_epi16(high, odd));
+                // and `offset + 32 <= row_len`.
+                let (a, b) = unsafe {
+                    (
+                        _mm256_loadu_si256(
+                            rows.as_ptr()
+                                .add(2 * k * row_len + offset)
+                                .cast::<__m256i>(),
+                        ),
+                        _mm256_loadu_si256(
+                            rows.as_ptr()
+                                .add((2 * k + 1) * row_len + offset)
+                                .cast::<__m256i>(),
+                        ),
+                    )
+                };
+                two_taps(&mut sums, a, b, pair);
             }
-            let (e0, o0, e1, o1) = (
-                clip8x8(e0, shift, zero, top),
-                clip8x8(o0, shift, zero, top),
-                clip8x8(e1, shift, zero, top),
-                clip8x8(o1, shift, zero, top),
-            );
-            // Interleave the even and the odd bytes back into order within
-            // each lane, then put the four eight-byte quarters in order.
-            let first =
-                _mm256_packus_epi32(_mm256_unpacklo_epi32(e0, o0), _mm256_unpackhi_epi32(e0, o0));
-            let second =
-                _mm256_packus_epi32(_mm256_unpacklo_epi32(e1, o1), _mm256_unpackhi_epi32(e1, o1));
-            let bytes =
-                _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packus_epi16(first, second));
+            if let Some(&tap) = odd.first() {
+                let tap = _mm256_set1_epi32(i32::from(tap));
+                let k = pairs.len() * 2;
+                // SAFETY: as above.
+                let a = unsafe {
+                    _mm256_loadu_si256(rows.as_ptr().add(k * row_len + offset).cast::<__m256i>())
+                };
+                two_taps(&mut sums, a, zero, tap);
+            }
+            let [s0, s1, s2, s3] = sums.map(|sum| _mm256_sra_epi32(sum, shift));
+            let bytes = _mm256_packus_epi16(_mm256_packs_epi32(s0, s1), _mm256_packs_epi32(s2, s3));
             // SAFETY: `out` is exactly 32 bytes.
             unsafe { _mm256_storeu_si256(out.as_mut_ptr().cast::<__m256i>(), bytes) };
         }
@@ -750,6 +872,18 @@ mod tests {
         assert!(resize_rgb(&data, 9, 4, 0, 4, PilResizeFilter::Bicubic).is_empty());
         assert!(resize_rgb(&data, 9, 4, 9, 0, PilResizeFilter::Bicubic).is_empty());
         assert!(resize_rgb(&data, 9, 4, 0, 0, PilResizeFilter::Bicubic).is_empty());
+    }
+
+    /// A source without rows resizes to zeros on both arms (the width pass
+    /// has no band to fill; the height pass sums no taps).
+    #[test]
+    fn a_source_without_rows_resizes_to_zeros() {
+        let out = resize_rgb(&[], 5, 0, 3, 2, PilResizeFilter::Bicubic);
+        assert_eq!(out, vec![0u8; 3 * 2 * 3]);
+        assert_eq!(
+            resize_rgb_scalar(&[], 5, 0, 3, 2, PilResizeFilter::Bicubic),
+            out
+        );
     }
 
     /// The identity (no change on either axis) is a plain copy.
