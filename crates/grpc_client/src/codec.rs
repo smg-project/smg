@@ -5,9 +5,10 @@
 //! tonic's prost encoder writes a message into a growing `BytesMut`, so a
 //! multi-megabyte pixel tensor is copied again at every doubling of the
 //! buffer, into fresh pages each time. Here a request that carries multimodal
-//! inputs has the buffer reserved to its encoded length before the write, so
-//! the payload is written once into one allocation. A request that carries a
-//! prompt and no multimodal inputs is written without the reservation: the
+//! inputs or media references has the buffer reserved to its encoded length
+//! before the write, so the payload is written once into one allocation. A
+//! request that carries a prompt and neither is written without the
+//! reservation: the
 //! length walk it would take costs about nine instructions per prompt id,
 //! more than the doublings it spares (a copy at a fraction of an instruction
 //! per byte, and none at all under tonic's eager buffer). Every other message
@@ -92,17 +93,20 @@ impl<T: Message + 'static> Encoder for SizedProstEncoder<T> {
 
 /// Whether the encode buffer is reserved to `item`'s length before the
 /// write. A request that carries a prompt reserves only when it also carries
-/// multimodal inputs, the shape whose inline tensors the reservation is for;
-/// every other message reserves as before. The encoder is instantiated per
-/// message type, so each type check here folds at compile time and a text
-/// request pays one field read.
+/// multimodal inputs or media references (a media reference may be a data URL
+/// of many megabytes), the shapes whose inline payloads the reservation is
+/// for; every other message reserves as before. The encoder is instantiated
+/// per message type, so each type check here folds at compile time and a
+/// text request pays one field read.
 fn reserves_for<T: 'static>(item: &T) -> bool {
     let item: &dyn Any = item;
     if let Some(request) = item.downcast_ref::<tokenspeed_proto::GenerateRequest>() {
         return request.mm_inputs.is_some();
     }
     if let Some(request) = item.downcast_ref::<vllm_proto::GenerateRequest>() {
-        return request.mm_inputs.is_some() || !request.extra_mm_inputs.is_empty();
+        return request.mm_inputs.is_some()
+            || !request.extra_mm_inputs.is_empty()
+            || request.media_refs.is_some();
     }
     if let Some(request) = item.downcast_ref::<sglang_proto::GenerateRequest>() {
         return request.mm_inputs.is_some() || !request.extra_mm_inputs.is_empty();
@@ -262,8 +266,8 @@ mod tests {
     }
 
     /// The reservation follows the message's shape: a request that carries a
-    /// prompt reserves only when it also carries multimodal inputs; every
-    /// other message reserves.
+    /// prompt reserves only when it also carries multimodal inputs or media
+    /// references; every other message reserves.
     #[test]
     fn the_reservation_follows_the_message_shape() {
         assert!(!reserves_for(&tokenspeed_proto::GenerateRequest::default()));
@@ -285,6 +289,15 @@ mod tests {
         }));
         assert!(reserves_for(&vllm_proto::GenerateRequest {
             extra_mm_inputs: vec![vllm_multimodal(8)],
+            ..Default::default()
+        }));
+        assert!(reserves_for(&vllm_proto::GenerateRequest {
+            media_refs: Some(vllm_proto::MediaRefs {
+                items: vec![vllm_proto::MediaRef {
+                    modality: crate::common_proto::Modality::Image as i32,
+                    url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+                }],
+            }),
             ..Default::default()
         }));
         assert!(reserves_for(&sglang_proto::GenerateRequest {
