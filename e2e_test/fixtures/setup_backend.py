@@ -44,6 +44,7 @@ from infra import (
 )
 from infra.constants import vllm_kv_backend, zmq_backend
 from infra.model_specs import get_model_spec
+from infra.process_utils import ProcessExitedError
 from infra.worker import stop_workers
 from infra.worker_pool import get_pool
 
@@ -511,14 +512,27 @@ def _setup_local(
     # the mock engine.
     set_class_workers(workers)
     try:
-        _start_gateway(
-            gateway,
-            gateway_config,
-            worker_urls=[w.base_url for w in workers],
-            workers=workers,
-            model_path=model_path,
-            backend=zmq_backend(engine) if is_zmq else None,
-        )
+        try:
+            _start_gateway(
+                gateway,
+                gateway_config,
+                worker_urls=[w.base_url for w in workers],
+                workers=workers,
+                model_path=model_path,
+                backend=zmq_backend(engine) if is_zmq else None,
+            )
+        except ProcessExitedError:
+            raise
+        except (TimeoutError, RuntimeError):
+            # A ZMQ engine's start-up wait is this gate (its spawn returned
+            # at once), so an engine that died in it, or that it waited out,
+            # failed to start. Counted as the pool counts a worker that fails
+            # its own gate, a death or the bound alike: the session stops
+            # after _MAX_WORKER_START_FAILURES such failures instead of
+            # running every later class of the engine into the same one.
+            if is_zmq:
+                _worker_start_failures[engine] = _worker_start_failures.get(engine, 0) + 1
+            raise
         logger.info("%s backend ready at %s", backend_name, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     finally:
