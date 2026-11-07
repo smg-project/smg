@@ -1,11 +1,11 @@
 use super::{arena::*, slab::*, *};
 use crate::reference::{request_prefix_hashes, ReferenceIndexer};
 
-fn content(stream: u64, position: usize) -> ContentHash {
+pub(crate) fn content(stream: u64, position: usize) -> ContentHash {
     crate::compute_content_hash(&[stream as u32, (stream >> 32) as u32, position as u32])
 }
 
-fn blocks_of(contents: &[ContentHash]) -> Vec<StoredBlock> {
+pub(crate) fn blocks_of(contents: &[ContentHash]) -> Vec<StoredBlock> {
     contents
         .iter()
         .zip(request_prefix_hashes(contents))
