@@ -2273,6 +2273,69 @@ pub fn resize_bicubic_pil_rgb(
     })
 }
 
+/// Pillow's `Image.resize(.., BICUBIC)` of an `RGBA` image: the colours are
+/// premultiplied by their alpha (Pillow's `RGBa` mode, its `MULDIV255` per
+/// byte), the four channels go through the same 22-bit kernel as RGB, and the
+/// colours are divided back (`255 * v / a`, truncated and clamped; an alpha of
+/// 0 or 255 leaves them as they are). An image that keeps its size is copied,
+/// as Pillow copies it before any conversion.
+pub(crate) fn resize_bicubic_pil_rgba(
+    image: &DynamicImage,
+    out_w: u32,
+    out_h: u32,
+) -> image::RgbaImage {
+    let owned;
+    let rgba = match image {
+        DynamicImage::ImageRgba8(rgba) => rgba,
+        _ => {
+            owned = image.to_rgba8();
+            &owned
+        }
+    };
+    let (in_w, in_h) = rgba.dimensions();
+    if (in_w, in_h) == (out_w, out_h) {
+        return rgba.clone();
+    }
+    let mut premultiplied = Vec::with_capacity(rgba.as_raw().len());
+    for &[r, g, b, a] in rgba.as_raw().as_chunks::<4>().0 {
+        premultiplied.extend_from_slice(&[
+            mul_div_255(r, a),
+            mul_div_255(g, a),
+            mul_div_255(b, a),
+            a,
+        ]);
+    }
+    let mut output = resize_pil_bytes::<4>(
+        &premultiplied,
+        in_w,
+        in_h,
+        out_w,
+        out_h,
+        PilResizeFilter::Bicubic,
+        KernelQuantization::Pillow,
+    );
+    for pixel in output.as_chunks_mut::<4>().0 {
+        let alpha = u32::from(pixel[3]);
+        if alpha != 0 && alpha != 255 {
+            for value in &mut pixel[..3] {
+                *value = (255 * u32::from(*value) / alpha).min(255) as u8;
+            }
+        }
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "output is exactly out_w*out_h*4 bytes by construction"
+    )]
+    image::RgbaImage::from_raw(out_w, out_h, output).expect("pil rgba resize buffer size")
+}
+
+/// Pillow's `MULDIV255`: `value * alpha / 255` rounded to the nearest byte.
+#[inline]
+fn mul_div_255(value: u8, alpha: u8) -> u8 {
+    let product = u32::from(value) * u32::from(alpha) + 128;
+    (((product >> 8) + product) >> 8) as u8
+}
+
 /// Pillow-exact LANCZOS resize (RGB8), matching
 /// `PIL.Image.resize(.., LANCZOS)`.
 pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
@@ -4880,5 +4943,117 @@ mod tests {
                 );
             }
         }
+    }
+    /// `RGBA` bytes from a 32-bit linear congruential generator (the top byte
+    /// of the state per byte), a third of the pixels fully transparent, a
+    /// third opaque, the rest at the generator's alpha.
+    fn generated_rgba(width: u32, height: u32, seed: u32) -> image::RgbaImage {
+        let mut state = seed;
+        let mut bytes: Vec<u8> = (0..width * height * 4)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        for (index, pixel) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            match index % 3 {
+                0 => pixel[3] = 0,
+                1 => pixel[3] = 255,
+                _ => {}
+            }
+        }
+        image::RgbaImage::from_raw(width, height, bytes).unwrap()
+    }
+
+    /// Pillow 12.3.0's `Image.resize(BICUBIC)` of two generated `RGBA` images,
+    /// a downscale and an upscale: the SHA-256 of the output bytes, with the
+    /// first eight bytes in the clear. Resampling the four channels without
+    /// the premultiplication differs on 72 of the 96 and on 208 of the 288
+    /// bytes.
+    #[test]
+    fn resize_bicubic_pil_rgba_carries_pillows_bytes() {
+        use sha2::{Digest, Sha256};
+
+        for (width, height, out_w, out_h, seed, digest, first_eight) in [
+            (
+                11,
+                7,
+                6,
+                4,
+                3,
+                "1c242764fe95e780c2d12292983746425d9ca5c0d6470d688034ed0f0cee921d",
+                [136, 153, 112, 118, 23, 188, 106, 153],
+            ),
+            (
+                5,
+                3,
+                9,
+                8,
+                5,
+                "8d440c419d8017bee119cb4eda912e9b5cbded0311a8783746e9b072780dc7d7",
+                [0, 0, 0, 0, 176, 88, 119, 75],
+            ),
+        ] {
+            let image = DynamicImage::ImageRgba8(generated_rgba(width, height, seed));
+            let out = resize_bicubic_pil_rgba(&image, out_w, out_h);
+            assert_eq!(
+                out.as_raw()[..8],
+                first_eight,
+                "{width}x{height} -> {out_w}x{out_h}: the first eight bytes"
+            );
+            let hex: String = Sha256::digest(out.as_raw())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(
+                hex, digest,
+                "{width}x{height} -> {out_w}x{out_h}: the digest"
+            );
+        }
+    }
+
+    /// An opaque `RGBA` image resizes to the RGB kernel's bytes with its alpha
+    /// kept at 255, and an image that keeps its size comes back as it is: no
+    /// premultiplication round trip, which a half-transparent pixel would not
+    /// survive.
+    #[test]
+    fn resize_bicubic_pil_rgba_agrees_with_the_rgb_kernel_when_opaque_and_copies_an_unchanged_size()
+    {
+        let (width, height) = (9, 6);
+        let mut opaque = generated_rgba(width, height, 17);
+        for pixel in opaque.pixels_mut() {
+            pixel[3] = 255;
+        }
+        let rgb: Vec<u8> = opaque
+            .as_raw()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b, _]| [r, g, b])
+            .collect();
+        let expected = resize_bicubic_pil_rgb(&rgb, width, height, 5, 4).unwrap();
+        let out = resize_bicubic_pil_rgba(&DynamicImage::ImageRgba8(opaque), 5, 4);
+        for (got, want) in out
+            .as_raw()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(expected.as_raw().as_chunks::<3>().0)
+        {
+            assert_eq!(got[..3], want[..], "the colour bytes of an opaque pixel");
+            assert_eq!(got[3], 255, "the alpha of an opaque pixel");
+        }
+
+        let translucent = generated_rgba(width, height, 23);
+        let same = resize_bicubic_pil_rgba(
+            &DynamicImage::ImageRgba8(translucent.clone()),
+            width,
+            height,
+        );
+        assert_eq!(
+            same.as_raw(),
+            translucent.as_raw(),
+            "an unchanged size is a copy of the input"
+        );
     }
 }
