@@ -101,9 +101,14 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
         // node's workers serves any more loses its policy. Asked of the
         // registry rather than counted, so a worker added again on a
         // replacement or an update, or a mesh import removed here, cannot
-        // keep a policy alive or end it early.
-        let models: HashSet<&str> = workers_to_remove.iter().map(|w| w.model_id()).collect();
-        for model_id in models {
+        // keep a policy alive or end it early. Every model a worker served
+        // is asked after, not its primary alone: a worker listing several
+        // models can be the last to serve one whose own workers left first.
+        let models: HashSet<String> = workers_to_remove
+            .iter()
+            .flat_map(WorkerRegistry::policy_model_ids)
+            .collect();
+        for model_id in &models {
             if !app_context.worker_registry.serves_model_locally(model_id) {
                 app_context.policy_registry.on_model_unserved(model_id);
             }

@@ -39,6 +39,15 @@ fn worker(url: &str, model: &str) -> Arc<dyn Worker> {
     )
 }
 
+/// A worker serving several models, as an external endpoint's worker lists
+/// every model its provider serves; the first is its primary model.
+fn endpoint(url: &str, models: &[&str]) -> Arc<dyn Worker> {
+    let cards: Vec<ModelCard> = models.iter().map(|model| ModelCard::new(*model)).collect();
+    Arc::new(BasicWorkerBuilder::new(url).models(cards).build())
+}
+
+/// The model's own policy entry, `None` once it is dropped: routing would
+/// fall back to the default policy, this does not.
 fn policy_of(app_context: &AppContext, model: &str) -> Option<&'static str> {
     app_context
         .policy_registry
@@ -180,6 +189,46 @@ async fn a_replacement_on_another_model_takes_the_old_models_policy() {
     )
     .await;
 
+    assert_eq!(policy_of(&app_context, "llama"), None);
+    assert_eq!(policy_of(&app_context, "qwen"), Some("random"));
+}
+
+#[tokio::test]
+async fn the_policy_leaves_with_a_last_worker_that_serves_the_model_among_others() {
+    let app_context = app_context();
+    let llama = worker("http://w1:8000", "llama");
+    register(&app_context, Arc::clone(&llama), "cache_aware").await;
+    // Its registration builds qwen's policy; it serves llama besides.
+    let both = endpoint("http://w2:8000", &["qwen", "llama"]);
+    register(&app_context, Arc::clone(&both), "random").await;
+
+    remove(&app_context, llama).await;
+    assert_eq!(policy_of(&app_context, "llama"), Some("cache_aware"));
+    remove(&app_context, both).await;
+    assert_eq!(policy_of(&app_context, "llama"), None);
+}
+
+#[tokio::test]
+async fn a_replacement_that_lists_a_model_fewer_takes_its_policy() {
+    let app_context = app_context();
+    let llama = worker("http://w1:8000", "llama");
+    register(&app_context, Arc::clone(&llama), "cache_aware").await;
+    register(
+        &app_context,
+        endpoint("http://w2:8000", &["qwen", "llama"]),
+        "random",
+    )
+    .await;
+    remove(&app_context, llama).await;
+
+    // The endpoint registered again, its provider serving qwen alone: no
+    // worker of this node serves llama any more.
+    register(
+        &app_context,
+        endpoint("http://w2:8000", &["qwen"]),
+        "random",
+    )
+    .await;
     assert_eq!(policy_of(&app_context, "llama"), None);
     assert_eq!(policy_of(&app_context, "qwen"), Some("random"));
 }

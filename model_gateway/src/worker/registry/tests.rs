@@ -401,6 +401,29 @@ fn a_model_is_served_locally_only_by_a_worker_this_node_owns() {
     assert!(!registry.serves_model_locally("llama-3"));
 }
 
+#[test]
+fn a_worker_keeps_the_policy_of_every_model_it_serves_and_of_its_primary_model() {
+    let endpoint: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![ModelCard::new("qwen"), ModelCard::new("llama")])
+            .build(),
+    );
+    assert_eq!(
+        WorkerRegistry::policy_model_ids(&endpoint),
+        ["qwen", "llama"]
+    );
+
+    // A worker registered before its models were known names its policy by
+    // its primary model, which the models it discovers later leave out.
+    let lazy: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://lazy:8080").build());
+    let primary = lazy.model_id().to_string();
+    lazy.set_models(vec![ModelCard::new("qwen")]);
+    assert_eq!(
+        WorkerRegistry::policy_model_ids(&lazy),
+        vec!["qwen".to_string(), primary]
+    );
+}
+
 /// The record a rebuild from a decoded spec is for.
 fn record(version: u64) -> ImportRecord {
     ImportRecord {

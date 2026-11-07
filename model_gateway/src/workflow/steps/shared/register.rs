@@ -119,15 +119,15 @@ fn pool_groups_touched(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -
     groups
 }
 
-/// The models a registration of `workers` moves workers off: the model of
-/// each worker it replaces at the same URL with a worker of another model.
-fn models_left(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -> Vec<String> {
+/// The models a registration of `workers` may move workers off: every model
+/// each worker it replaces at the same URL served. Whether a worker of this
+/// node, the replacement included, still serves each one is asked once the
+/// registration is written.
+fn models_left(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -> HashSet<String> {
     workers
         .iter()
-        .filter_map(|worker| {
-            let replaced = registry.get_by_url(worker.url())?;
-            (replaced.model_id() != worker.model_id()).then(|| replaced.model_id().to_string())
-        })
+        .filter_map(|worker| registry.get_by_url(worker.url()))
+        .flat_map(|replaced| WorkerRegistry::policy_model_ids(&replaced))
         .collect()
 }
 
@@ -222,9 +222,9 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         // `(worker_type, connection_mode, model_id)` the registration touched.
         refresh_worker_pool_sizes(&app_context.worker_registry, &touched_groups);
 
-        // A replacement that moved a worker to another model takes the old
-        // model's policy with it when no worker of this node serves that
-        // model any more, as the worker's removal would.
+        // A replacement that moved a worker to another model, or that lists
+        // a model fewer, takes the policy of each model no worker of this
+        // node serves any more, as the worker's removal would.
         for model_id in &left_models {
             if !app_context.worker_registry.serves_model_locally(model_id) {
                 app_context.policy_registry.on_model_unserved(model_id);

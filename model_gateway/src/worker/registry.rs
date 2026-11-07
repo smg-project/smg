@@ -2007,6 +2007,23 @@ impl WorkerRegistry {
         model_ids
     }
 
+    /// The models whose policy `worker` keeps: every model it serves
+    /// ([`Self::worker_model_ids`]), and its primary model, which names the
+    /// policy its registration built, should a refreshed model list leave
+    /// it out. A model's policy goes once no worker of this node serves it
+    /// (see [`Self::serves_model_locally`]), so a workflow that takes
+    /// `worker` away asks after each of them.
+    pub fn policy_model_ids(worker: &Arc<dyn Worker>) -> Vec<String> {
+        let mut model_ids = Self::worker_model_ids(worker);
+        if !model_ids
+            .iter()
+            .any(|model_id| model_id == worker.model_id())
+        {
+            model_ids.push(worker.model_id().to_string());
+        }
+        model_ids
+    }
+
     fn sampling_defaults_label(worker: &Arc<dyn Worker>) -> Option<&str> {
         worker
             .metadata()
