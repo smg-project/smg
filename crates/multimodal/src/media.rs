@@ -2348,14 +2348,16 @@ fn opencv_decode_error(err: opencv::Error) -> MediaConnectorError {
 /// frame of a clip shorter than one sampling interval, `1 / rate` s (nor of
 /// a container claiming no frames at a low rate), the stepped groups pick
 /// none of a clip shorter than one temporal group and none of a clip whose
-/// rate the probe did not state, and the engine's own loader hands its
-/// processor no frame of such a clip either, so the generic resampler must
-/// not stand in for the family's rule. `None` under any other rule, when the
-/// probe stated no rate for the rate walk, and whenever the rule picks a
-/// frame.
+/// rate the probe did not state, the rounded even spread picks none of a
+/// container claiming no frames (its loader, holding a count of zero, reads
+/// nothing rather than the stream's own count), and the engine's own loader
+/// hands its processor no frame of such a clip either, so the generic
+/// resampler must not stand in for the family's rule. `None` under any other
+/// rule, when the probe stated no rate for the rate walk or the spread, and
+/// whenever the rule picks a frame.
 fn refused_by_the_familys_rule(metadata: VideoMetadata, cfg: VideoFetchConfig) -> Option<String> {
     let needs_a_rate = match cfg.sampling {
-        FrameSampling::RateWalk { .. } => false,
+        FrameSampling::RateWalk { .. } | FrameSampling::EvenRounded => false,
         FrameSampling::SteppedGroups { .. } => true,
         _ => return None,
     };
@@ -2373,23 +2375,29 @@ fn refused_by_the_familys_rule(metadata: VideoMetadata, cfg: VideoFetchConfig) -
 /// The refusal's text: the clip, and the length the rule needs (`1 / rate` s
 /// at the rule's rate, or one temporal group), so the client can see how
 /// long a clip has to be; a container that states no frame count under the
-/// stepped-groups rule is told to state it, since no length would do.
+/// stepped-groups rule or the rounded even spread is told to state it, since
+/// no length would do.
 fn the_familys_rule_picks_nothing(
     total_frames: usize,
     source_fps: f64,
     cfg: VideoFetchConfig,
 ) -> String {
+    if total_frames == 0
+        && matches!(
+            cfg.sampling,
+            FrameSampling::SteppedGroups { .. } | FrameSampling::EvenRounded
+        )
+    {
+        return format!(
+            "the model's video sampling needs the clip's frame count, which the container \
+             does not state ({source_fps} fps)"
+        );
+    }
     if let FrameSampling::SteppedGroups {
         temporal_patch_size,
         ..
     } = cfg.sampling
     {
-        if total_frames == 0 {
-            return format!(
-                "the model's video sampling needs the clip's frame count, which the container \
-                 does not state ({source_fps} fps)"
-            );
-        }
         return format!(
             "the model's video sampling picks no frame of a clip of {total_frames} frames at \
              {source_fps} fps: shorter than one temporal group of {temporal_patch_size} frames"

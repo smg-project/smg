@@ -381,6 +381,53 @@ fn a_rate_without_a_frame_count_names_the_missing_count() {
     );
 }
 
+/// Under the rounded even spread a container that states a rate and a
+/// stream count but no claim its loader would read (a format duration under
+/// one frame) is refused before any decode, as the engine's loader, holding
+/// a count of zero, hands its processor no frame rather than the stream's
+/// count; the default loader's rule reads its first frame alone there, a
+/// claimed clip passes, and the processor-side spread is never refused.
+#[test]
+fn a_container_claiming_no_frames_is_refused_under_the_rounded_spread_as_its_loader_reads_nothing()
+{
+    let probed = |claim| VideoMetadata {
+        width: 64,
+        height: 48,
+        duration_seconds: Some(3.0),
+        source_fps: Some(30.0),
+        total_frames: Some(90),
+        container_frames: claim,
+        from_container: false,
+    };
+    let rounded = VideoFetchConfig {
+        sampling: FrameSampling::EvenRounded,
+        ..VideoFetchConfig::default()
+    };
+    for claim in [None, Some(0)] {
+        assert_eq!(
+            refused_by_the_familys_rule(probed(claim), rounded).as_deref(),
+            Some(
+                "the model's video sampling needs the clip's frame count, which the container \
+                 does not state (30 fps)"
+            ),
+            "{claim:?}"
+        );
+        assert_eq!(FrameSelection::from_metadata(probed(claim), rounded), None);
+        let first = FrameSelection::from_metadata(probed(claim), up_to_cfg(32))
+            .expect("the generic loader reads the first frame of such a container");
+        assert_eq!(first.frame_indices, vec![0]);
+        assert_eq!(
+            refused_by_the_familys_rule(probed(claim), up_to_cfg(32)),
+            None
+        );
+        assert_eq!(
+            refused_by_the_familys_rule(probed(claim), VideoFetchConfig::default()),
+            None
+        );
+    }
+    assert_eq!(refused_by_the_familys_rule(probed(Some(90)), rounded), None);
+}
+
 /// A clip the family's rule picks nothing of is refused before any
 /// decode, with the clip's numbers in the reason; a clip it samples, a
 /// clip whose rate the probe did not state, and any other rule pass.
