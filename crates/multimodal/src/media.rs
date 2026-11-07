@@ -159,7 +159,9 @@ pub enum FrameSampling {
     /// Spread evenly from the first frame to the last.
     #[default]
     Even,
-    /// One frame per sampling interval from the start, plus the last frame.
+    /// One frame per sampling interval from the start, plus the last frame:
+    /// the walk of the family's own video loader, which has no frame floor
+    /// or cap, so `min_frames` and `max_frames` do not apply.
     Interval,
     /// `trunc(duration x rate)` frames, at least `min_frames`, at most
     /// `max_frames` and never more than the clip has, each the nearest frame
@@ -1762,8 +1764,9 @@ fn adaptive_decoder_threads(available_cpus: usize, active_decodes: usize) -> i32
 }
 
 /// Source index per output frame of a clip of `total_frames` at `fps` under
-/// `cfg`, in order, duplicates kept; the `Even` and `Interval` rules repeat
-/// frames up to `min_frames` on short clips.
+/// `cfg`, in order, duplicates kept; the `Even` rule repeats frames up to
+/// `min_frames` on short clips, the `Interval` walk takes what its loader
+/// takes.
 pub fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
     match cfg.sampling {
         FrameSampling::UpTo { max_frames } => up_to_frame_indices(total_frames, max_frames),
@@ -2255,7 +2258,14 @@ fn spread_evenly_rounded(total_frames: usize, count: usize) -> Vec<usize> {
 }
 
 /// One frame per sampling interval from the start, the last frame always
-/// included, thinned evenly when over `max_frames`.
+/// included: the walk of the family's own video loader, which takes the
+/// first frame, then the first frame at or past each next instant
+/// `1 / rate` seconds on (an epsilon early, as the loader counts), and the
+/// clip's last frame when it lies past the last pick. The picks are the
+/// loader's whatever their number: a short clip gives one or two frames and
+/// a long one every interval of its length, with no floor at `min_frames`
+/// and no thinning at `max_frames` (both are the generic connector's
+/// bounds, which the loader does not have).
 fn interval_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
     if !(fps.is_finite() && fps > 0.0) || cfg.sample_fps <= 0.0 {
         return even_frame_indices(total_frames, fps, cfg);
@@ -2292,23 +2302,6 @@ fn interval_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) 
     }
     if indices.is_empty() {
         indices.push(0);
-    }
-
-    if cfg.max_frames > 0 && indices.len() > cfg.max_frames {
-        let last = indices[indices.len() - 1];
-        indices = if cfg.max_frames == 1 {
-            vec![last]
-        } else {
-            let step = indices.len() as f64 / (cfg.max_frames - 1) as f64;
-            let mut thinned: Vec<usize> = (0..cfg.max_frames - 1)
-                .map(|i| indices[(i as f64 * step) as usize])
-                .collect();
-            thinned.push(last);
-            thinned
-        };
-    }
-    if indices.len() < cfg.min_frames {
-        return spread_evenly(total_frames, cfg.min_frames);
     }
     indices
 }

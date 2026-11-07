@@ -10,37 +10,81 @@ fn cfg() -> VideoFetchConfig {
     }
 }
 
-fn interval_cfg(sample_fps: f64, max_frames: usize) -> VideoFetchConfig {
+/// The interval walk under the connector's default bounds (`min_frames` 4,
+/// `max_frames` 768), as a request reaches it.
+fn interval_cfg(sample_fps: f64) -> VideoFetchConfig {
     VideoFetchConfig {
-        min_frames: 1,
-        max_frames,
         sample_fps,
-        max_long_side_pixel: None,
         sampling: FrameSampling::Interval,
+        ..VideoFetchConfig::default()
     }
 }
 
 #[test]
 fn interval_sampling_takes_one_frame_per_interval_and_keeps_the_last() {
     assert_eq!(
-        sampled_frame_indices(360, 30.0, interval_cfg(1.0, 768)),
+        sampled_frame_indices(360, 30.0, interval_cfg(1.0)),
         vec![0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 359]
     );
     assert_eq!(
-        sampled_frame_indices(60, 30.0, interval_cfg(1.0, 768)),
+        sampled_frame_indices(60, 30.0, interval_cfg(1.0)),
         vec![0, 30, 59]
     );
     assert_eq!(
-        sampled_frame_indices(100, 25.0, interval_cfg(0.5, 768)),
+        sampled_frame_indices(100, 25.0, interval_cfg(0.5)),
         vec![0, 50, 99]
     );
     assert_eq!(
-        sampled_frame_indices(300, 29.97, interval_cfg(2.0, 768)),
+        sampled_frame_indices(300, 29.97, interval_cfg(2.0)),
         vec![
             0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180, 195, 210, 225, 240, 255, 270,
             285, 299
         ]
     );
+}
+
+/// The walk's picks are its loader's whatever their number: a clip shorter
+/// than four intervals gives the frames the loader takes (no four-frame
+/// floor), a clip of more than 768 intervals every one of them (no thinning).
+/// The picks are the family's video loader's own on these clips.
+#[test]
+fn interval_sampling_takes_the_loaders_count_below_the_floor_and_above_the_cap() {
+    // Half a second, one second and two seconds at 30 fps: the first frame,
+    // then the last.
+    assert_eq!(
+        sampled_frame_indices(15, 30.0, interval_cfg(1.0)),
+        vec![0, 14]
+    );
+    assert_eq!(
+        sampled_frame_indices(30, 30.0, interval_cfg(1.0)),
+        vec![0, 29]
+    );
+    assert_eq!(
+        sampled_frame_indices(60, 30.0, interval_cfg(1.0)),
+        vec![0, 30, 59]
+    );
+    // Three seconds at 24 fps and five seconds at the NTSC rate.
+    assert_eq!(
+        sampled_frame_indices(72, 24.0, interval_cfg(1.0)),
+        vec![0, 24, 48, 71]
+    );
+    assert_eq!(
+        sampled_frame_indices(150, 29.97, interval_cfg(1.0)),
+        vec![0, 30, 60, 90, 120, 149]
+    );
+    // A single frame, and a clip of two frames at 1 fps.
+    assert_eq!(sampled_frame_indices(1, 30.0, interval_cfg(1.0)), vec![0]);
+    assert_eq!(sampled_frame_indices(2, 1.0, interval_cfg(1.0)), vec![0, 1]);
+    // A clip of 800 seconds at 1 fps: every frame is a pick, past the 768 bound.
+    let long = sampled_frame_indices(800, 1.0, interval_cfg(1.0));
+    assert_eq!(long.len(), 800);
+    assert_eq!(&long[..4], &[0, 1, 2, 3]);
+    assert_eq!(&long[796..], &[796, 797, 798, 799]);
+    // Twenty minutes at 30 fps: 1200 intervals and the last frame.
+    let twenty_minutes = sampled_frame_indices(36_000, 30.0, interval_cfg(1.0));
+    assert_eq!(twenty_minutes.len(), 1201);
+    assert_eq!(&twenty_minutes[..3], &[0, 30, 60]);
+    assert_eq!(&twenty_minutes[1198..], &[35_940, 35_970, 35_999]);
 }
 
 fn up_to_then_rate_cfg(sample_fps: f64) -> VideoFetchConfig {
@@ -489,20 +533,26 @@ fn the_loader_sizes_a_clip_by_what_it_can_see() {
     assert_eq!(loader_frame_indices(60, 0, 32), Vec::<usize>::new());
 }
 
+/// The connector's bounds, however tight or wide, leave the walk's picks
+/// alone: a budget of 10 frames does not thin a 100 s clip, the 768 default
+/// does not thin a 30 minute one, and the four-frame minimum does not pad a
+/// two-frame clip; an empty clip has no picks.
 #[test]
-fn interval_sampling_thins_to_the_frame_budget_and_fills_to_the_minimum() {
-    assert_eq!(
-        sampled_frame_indices(3000, 30.0, interval_cfg(1.0, 10)),
-        vec![0, 330, 660, 990, 1320, 1680, 2010, 2340, 2670, 2999]
-    );
-    let long = sampled_frame_indices(54_000, 30.0, interval_cfg(1.0, 768));
-    assert_eq!(long.len(), 768);
+fn interval_sampling_ignores_the_frame_budget_and_the_minimum() {
+    let tight = VideoFetchConfig {
+        min_frames: 4,
+        max_frames: 10,
+        ..interval_cfg(1.0)
+    };
+    let hundred_seconds = sampled_frame_indices(3000, 30.0, tight);
+    assert_eq!(hundred_seconds.len(), 101);
+    assert_eq!(&hundred_seconds[..3], &[0, 30, 60]);
+    assert_eq!(&hundred_seconds[99..], &[2970, 2999]);
+    let long = sampled_frame_indices(54_000, 30.0, interval_cfg(1.0));
+    assert_eq!(long.len(), 1801);
     assert_eq!(long.last(), Some(&53_999));
-
-    let mut short = interval_cfg(1.0, 768);
-    short.min_frames = 4;
-    assert_eq!(sampled_frame_indices(2, 30.0, short), vec![0, 0, 0, 1]);
-    assert_eq!(sampled_frame_indices(0, 30.0, short), Vec::<usize>::new());
+    assert_eq!(sampled_frame_indices(2, 30.0, tight), vec![0, 1]);
+    assert_eq!(sampled_frame_indices(0, 30.0, tight), Vec::<usize>::new());
 }
 
 fn metadata(source_fps: Option<f64>, total_frames: Option<usize>) -> VideoMetadata {
@@ -889,7 +939,7 @@ async fn the_selection_picks_the_same_frames_through_ffmpeg() {
         ("loader spread", up_to_cfg(300), 0),
         (
             "rate spread ending on the last frame",
-            interval_cfg(15.0, 768),
+            interval_cfg(15.0),
             1,
         ),
         (
