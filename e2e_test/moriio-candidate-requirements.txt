@@ -1,0 +1,12 @@
+# CPU/test-process dependencies for the opt-in MoRI candidate case only.
+# Install into a private venv; never activate it for the base engine workers.
+# torch/vllm/MoRI come from the already validated engine environment.
+pytest
+pyyaml
+httpx
+requests
+openai
+numpy
+jinja2
+tqdm
+pandas

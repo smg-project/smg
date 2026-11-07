@@ -109,7 +109,15 @@ class Gateway:
         host: str = DEFAULT_HOST,
         port: int | None = None,
         prometheus_port: int | None = None,
+        launch_command: list[str] | None = None,
     ):
+        if launch_command is not None and (
+            not isinstance(launch_command, list)
+            or not launch_command
+            or any(not isinstance(arg, str) or not arg for arg in launch_command)
+        ):
+            raise ValueError("launch_command must be a nonempty argv list")
+        self.launch_command = list(launch_command) if launch_command is not None else None
         self.host = host
         self._port_auto_allocated = port is None
         self._prometheus_port_auto_allocated = prometheus_port is None
@@ -503,10 +511,8 @@ class Gateway:
 
     def _build_base_cmd(self) -> list[str]:
         """Build the base command for launching the router."""
-        cmd = [
-            "python3",
-            "-m",
-            "smg.launch_router",
+        cmd = list(self.launch_command or ["python3", "-m", "smg.launch_router"])
+        cmd += [
             "--host",
             self.host,
             "--port",
