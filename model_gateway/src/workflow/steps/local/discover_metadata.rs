@@ -839,16 +839,6 @@ mod tests {
         assert_eq!(both.get("tp_size").map(String::as_str), Some("8"));
     }
 
-    #[expect(clippy::print_stderr)]
-    fn dump_labels(title: &str, labels: &HashMap<String, String>) {
-        eprintln!("\n=== {title} ({} labels) ===", labels.len());
-        let mut keys: Vec<_> = labels.keys().collect();
-        keys.sort();
-        for key in keys {
-            eprintln!("  {key}: {}", labels[key]);
-        }
-    }
-
     fn label<'a>(labels: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
         labels.get(key).map(String::as_str)
     }
@@ -1058,24 +1048,448 @@ mod tests {
         assert!(error.starts_with("server_info: "), "{error}");
     }
 
-    #[tokio::test]
-    #[ignore = "needs a live engine on a local port; run with --ignored"]
-    async fn test_sglang_grpc_metadata() {
-        let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:30001", "sglang", false)
-            .await
-            .expect("grpc metadata");
-        dump_labels("SGLang gRPC", &labels);
-        assert!(labels.contains_key("model_path"));
+    /// In-process schedulers of the vLLM and SGLang protos for the gRPC
+    /// metadata read: a fixed model info, a server info that is served, not
+    /// implemented or failing, and every other RPC answered `Unimplemented`,
+    /// since the read calls nothing else.
+    mod grpc_fakes {
+        use std::pin::Pin;
+
+        use smg_grpc_client::{
+            common_proto,
+            sglang_proto::{
+                self,
+                sglang_scheduler_server::{SglangScheduler, SglangSchedulerServer},
+            },
+            vllm_proto::{
+                self,
+                vllm_engine_server::{VllmEngine, VllmEngineServer},
+            },
+        };
+        use tokio::net::TcpListener;
+        use tonic::{
+            codegen::tokio_stream::Stream,
+            transport::{server::TcpIncoming, Server},
+            Request, Response, Status,
+        };
+
+        pub(super) const MODEL: &str = "org/model-g";
+        pub(super) const TOKENIZER: &str = "org/model-g-tokenizer";
+        pub(super) const SERVED: &str = "served-g";
+        pub(super) const CONTEXT: &str = "4096";
+        pub(super) const SGLANG_VERSION: &str = "0.5.9";
+        pub(super) const KV_CONNECTOR: &str = "MooncakeConnector";
+
+        /// What `get_server_info` answers.
+        #[derive(Clone, Copy)]
+        pub(super) enum ServerInfo {
+            Served,
+            Unimplemented,
+            Failing,
+        }
+
+        type Streaming<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+
+        fn no_such_rpc<T>(rpc: &str) -> Result<Response<T>, Status> {
+            Err(Status::unimplemented(format!(
+                "the fake engine has no {rpc}"
+            )))
+        }
+
+        struct FakeVllm(ServerInfo);
+
+        #[tonic::async_trait]
+        impl VllmEngine for FakeVllm {
+            type GenerateStream = Streaming<vllm_proto::GenerateResponse>;
+            type GetTokenizerStream = Streaming<common_proto::GetTokenizerChunk>;
+            type SubscribeKvEventsStream = Streaming<common_proto::KvEventBatch>;
+
+            async fn get_model_info(
+                &self,
+                _: Request<vllm_proto::GetModelInfoRequest>,
+            ) -> Result<Response<vllm_proto::GetModelInfoResponse>, Status> {
+                Ok(Response::new(vllm_proto::GetModelInfoResponse {
+                    model_path: MODEL.to_string(),
+                    tokenizer_path: TOKENIZER.to_string(),
+                    served_model_name: SERVED.to_string(),
+                    max_context_length: 4096,
+                    ..Default::default()
+                }))
+            }
+
+            async fn get_server_info(
+                &self,
+                _: Request<vllm_proto::GetServerInfoRequest>,
+            ) -> Result<Response<vllm_proto::GetServerInfoResponse>, Status> {
+                match self.0 {
+                    ServerInfo::Served => Ok(Response::new(vllm_proto::GetServerInfoResponse {
+                        kv_connector: KV_CONNECTOR.to_string(),
+                        ..Default::default()
+                    })),
+                    ServerInfo::Unimplemented => no_such_rpc("server info"),
+                    ServerInfo::Failing => Err(Status::internal("the server info is down")),
+                }
+            }
+
+            async fn generate(
+                &self,
+                _: Request<vllm_proto::GenerateRequest>,
+            ) -> Result<Response<Self::GenerateStream>, Status> {
+                no_such_rpc("generate")
+            }
+
+            async fn embed(
+                &self,
+                _: Request<vllm_proto::EmbedRequest>,
+            ) -> Result<Response<vllm_proto::EmbedResponse>, Status> {
+                no_such_rpc("embed")
+            }
+
+            async fn health_check(
+                &self,
+                _: Request<vllm_proto::HealthCheckRequest>,
+            ) -> Result<Response<vllm_proto::HealthCheckResponse>, Status> {
+                no_such_rpc("health check")
+            }
+
+            async fn flush_cache(
+                &self,
+                _: Request<common_proto::FlushCacheRequest>,
+            ) -> Result<Response<common_proto::FlushCacheResponse>, Status> {
+                no_such_rpc("flush")
+            }
+
+            async fn start_profile(
+                &self,
+                _: Request<common_proto::StartProfileRequest>,
+            ) -> Result<Response<common_proto::ProfileResponse>, Status> {
+                no_such_rpc("profile")
+            }
+
+            async fn stop_profile(
+                &self,
+                _: Request<common_proto::StopProfileRequest>,
+            ) -> Result<Response<common_proto::ProfileResponse>, Status> {
+                no_such_rpc("profile")
+            }
+
+            async fn abort(
+                &self,
+                _: Request<vllm_proto::AbortRequest>,
+            ) -> Result<Response<vllm_proto::AbortResponse>, Status> {
+                no_such_rpc("abort")
+            }
+
+            async fn get_loads(
+                &self,
+                _: Request<vllm_proto::GetLoadsRequest>,
+            ) -> Result<Response<vllm_proto::GetLoadsResponse>, Status> {
+                no_such_rpc("loads")
+            }
+
+            async fn get_tokenizer(
+                &self,
+                _: Request<common_proto::GetTokenizerRequest>,
+            ) -> Result<Response<Self::GetTokenizerStream>, Status> {
+                no_such_rpc("tokenizer")
+            }
+
+            async fn subscribe_kv_events(
+                &self,
+                _: Request<common_proto::SubscribeKvEventsRequest>,
+            ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
+                no_such_rpc("KV events")
+            }
+        }
+
+        struct FakeSglang(ServerInfo);
+
+        #[tonic::async_trait]
+        impl SglangScheduler for FakeSglang {
+            type GenerateStream = Streaming<sglang_proto::GenerateResponse>;
+            type GetTokenizerStream = Streaming<common_proto::GetTokenizerChunk>;
+            type SubscribeKvEventsStream = Streaming<common_proto::KvEventBatch>;
+
+            async fn get_model_info(
+                &self,
+                _: Request<sglang_proto::GetModelInfoRequest>,
+            ) -> Result<Response<sglang_proto::GetModelInfoResponse>, Status> {
+                Ok(Response::new(sglang_proto::GetModelInfoResponse {
+                    model_path: MODEL.to_string(),
+                    tokenizer_path: TOKENIZER.to_string(),
+                    served_model_name: SERVED.to_string(),
+                    max_context_length: 4096,
+                    ..Default::default()
+                }))
+            }
+
+            async fn get_server_info(
+                &self,
+                _: Request<sglang_proto::GetServerInfoRequest>,
+            ) -> Result<Response<sglang_proto::GetServerInfoResponse>, Status> {
+                match self.0 {
+                    ServerInfo::Served => Ok(Response::new(sglang_proto::GetServerInfoResponse {
+                        sglang_version: SGLANG_VERSION.to_string(),
+                        ..Default::default()
+                    })),
+                    ServerInfo::Unimplemented => no_such_rpc("server info"),
+                    ServerInfo::Failing => Err(Status::internal("the server info is down")),
+                }
+            }
+
+            async fn generate(
+                &self,
+                _: Request<sglang_proto::GenerateRequest>,
+            ) -> Result<Response<Self::GenerateStream>, Status> {
+                no_such_rpc("generate")
+            }
+
+            async fn embed(
+                &self,
+                _: Request<sglang_proto::EmbedRequest>,
+            ) -> Result<Response<sglang_proto::EmbedResponse>, Status> {
+                no_such_rpc("embed")
+            }
+
+            async fn health_check(
+                &self,
+                _: Request<sglang_proto::HealthCheckRequest>,
+            ) -> Result<Response<sglang_proto::HealthCheckResponse>, Status> {
+                no_such_rpc("health check")
+            }
+
+            async fn abort(
+                &self,
+                _: Request<sglang_proto::AbortRequest>,
+            ) -> Result<Response<sglang_proto::AbortResponse>, Status> {
+                no_such_rpc("abort")
+            }
+
+            async fn get_loads(
+                &self,
+                _: Request<sglang_proto::GetLoadsRequest>,
+            ) -> Result<Response<sglang_proto::GetLoadsResponse>, Status> {
+                no_such_rpc("loads")
+            }
+
+            async fn flush_cache(
+                &self,
+                _: Request<common_proto::FlushCacheRequest>,
+            ) -> Result<Response<common_proto::FlushCacheResponse>, Status> {
+                no_such_rpc("flush")
+            }
+
+            async fn start_profile(
+                &self,
+                _: Request<common_proto::StartProfileRequest>,
+            ) -> Result<Response<common_proto::ProfileResponse>, Status> {
+                no_such_rpc("profile")
+            }
+
+            async fn stop_profile(
+                &self,
+                _: Request<common_proto::StopProfileRequest>,
+            ) -> Result<Response<common_proto::ProfileResponse>, Status> {
+                no_such_rpc("profile")
+            }
+
+            async fn get_tokenizer(
+                &self,
+                _: Request<common_proto::GetTokenizerRequest>,
+            ) -> Result<Response<Self::GetTokenizerStream>, Status> {
+                no_such_rpc("tokenizer")
+            }
+
+            async fn subscribe_kv_events(
+                &self,
+                _: Request<common_proto::SubscribeKvEventsRequest>,
+            ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
+                no_such_rpc("KV events")
+            }
+
+            async fn load_lo_ra_adapter(
+                &self,
+                _: Request<sglang_proto::LoadLoRaAdapterRequest>,
+            ) -> Result<Response<sglang_proto::LoadLoRaAdapterResponse>, Status> {
+                no_such_rpc("LoRA loading")
+            }
+
+            async fn unload_lo_ra_adapter(
+                &self,
+                _: Request<sglang_proto::UnloadLoRaAdapterRequest>,
+            ) -> Result<Response<sglang_proto::UnloadLoRaAdapterResponse>, Status> {
+                no_such_rpc("LoRA unloading")
+            }
+
+            async fn list_loaded_lo_ra_adapters(
+                &self,
+                _: Request<sglang_proto::ListLoadedLoRaAdaptersRequest>,
+            ) -> Result<Response<sglang_proto::ListLoadedLoRaAdaptersResponse>, Status>
+            {
+                no_such_rpc("LoRA listing")
+            }
+        }
+
+        /// A loopback listener on a port of the system's choice, and the URL
+        /// the gateway dials it by.
+        async fn listener() -> (TcpListener, String) {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a loopback listener");
+            let addr = listener.local_addr().expect("the listener's address");
+            (listener, format!("grpc://{addr}"))
+        }
+
+        /// A vLLM-proto engine served for as long as the test's runtime runs.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test fixture: the fake engine lives for the test's runtime"
+        )]
+        pub(super) async fn vllm(answer: ServerInfo) -> String {
+            let (listener, url) = listener().await;
+            tokio::spawn(async move {
+                Server::builder()
+                    .add_service(VllmEngineServer::new(FakeVllm(answer)))
+                    .serve_with_incoming(TcpIncoming::from(listener))
+                    .await
+                    .expect("the fake vLLM engine serves");
+            });
+            url
+        }
+
+        /// An SGLang-proto engine served for as long as the test's runtime runs.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test fixture: the fake engine lives for the test's runtime"
+        )]
+        pub(super) async fn sglang(answer: ServerInfo) -> String {
+            let (listener, url) = listener().await;
+            tokio::spawn(async move {
+                Server::builder()
+                    .add_service(SglangSchedulerServer::new(FakeSglang(answer)))
+                    .serve_with_incoming(TcpIncoming::from(listener))
+                    .await
+                    .expect("the fake SGLang engine serves");
+            });
+            url
+        }
     }
 
+    /// The gRPC read of each proto: the model info's fields become labels,
+    /// the server info adds its own (a vLLM engine's KV connector, an SGLang
+    /// engine's version), and the runtime read is the one asked for.
     #[tokio::test]
-    #[ignore = "needs a live engine on a local port; run with --ignored"]
-    async fn test_vllm_grpc_metadata() {
-        let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:20001", "vllm", false)
+    async fn the_grpc_read_takes_the_model_info_and_the_server_info_of_each_proto() {
+        use grpc_fakes::{
+            ServerInfo, CONTEXT, KV_CONNECTOR, MODEL, SERVED, SGLANG_VERSION, TOKENIZER,
+        };
+
+        let vllm = grpc_fakes::vllm(ServerInfo::Served).await;
+        let (labels, runtime) = fetch_grpc_metadata(&vllm, "vllm", true)
             .await
-            .expect("grpc metadata");
-        dump_labels("vLLM gRPC", &labels);
-        assert!(!labels.is_empty());
+            .expect("the vLLM read");
+        assert_eq!(runtime, "vllm");
+        assert_eq!(label(&labels, "model_path"), Some(MODEL));
+        assert_eq!(label(&labels, "tokenizer_path"), Some(TOKENIZER));
+        assert_eq!(label(&labels, "served_model_name"), Some(SERVED));
+        assert_eq!(label(&labels, "max_context_length"), Some(CONTEXT));
+        assert_eq!(label(&labels, "kv_connector"), Some(KV_CONNECTOR));
+
+        let sglang = grpc_fakes::sglang(ServerInfo::Served).await;
+        let (labels, runtime) = fetch_grpc_metadata(&sglang, "sglang", true)
+            .await
+            .expect("the SGLang read");
+        assert_eq!(runtime, "sglang");
+        assert_eq!(label(&labels, "model_path"), Some(MODEL));
+        assert_eq!(label(&labels, "tokenizer_path"), Some(TOKENIZER));
+        assert_eq!(label(&labels, "served_model_name"), Some(SERVED));
+        assert_eq!(label(&labels, "max_context_length"), Some(CONTEXT));
+        assert_eq!(label(&labels, "version"), Some(SGLANG_VERSION));
+    }
+
+    /// An engine without a server info (an `Unimplemented` answer) keeps its
+    /// model labels on a plain read and on a strict one: the call is a gap,
+    /// not a failure, on both protos.
+    #[tokio::test]
+    async fn an_engine_without_server_info_keeps_its_model_labels_on_a_plain_and_a_strict_read() {
+        use grpc_fakes::{ServerInfo, MODEL};
+
+        let engines = [
+            (
+                grpc_fakes::vllm(ServerInfo::Unimplemented).await,
+                "vllm",
+                "kv_connector",
+            ),
+            (
+                grpc_fakes::sglang(ServerInfo::Unimplemented).await,
+                "sglang",
+                "version",
+            ),
+        ];
+        for (url, runtime, server_label) in &engines {
+            for strict in [false, true] {
+                let (labels, _) = fetch_grpc_metadata(url, runtime, strict)
+                    .await
+                    .unwrap_or_else(|error| panic!("{runtime} strict={strict}: {error}"));
+                assert_eq!(
+                    label(&labels, "model_path"),
+                    Some(MODEL),
+                    "{runtime} strict={strict}"
+                );
+                assert_eq!(
+                    label(&labels, server_label),
+                    None,
+                    "{runtime} strict={strict}: {labels:?}"
+                );
+            }
+        }
+    }
+
+    /// A server info that fails leaves a gap on a plain read and fails a
+    /// strict read, named, on both protos.
+    #[tokio::test]
+    async fn a_failing_server_info_leaves_a_gap_for_registration_and_fails_a_strict_read_by_name() {
+        use grpc_fakes::{ServerInfo, MODEL};
+
+        let engines = [
+            (grpc_fakes::vllm(ServerInfo::Failing).await, "vllm"),
+            (grpc_fakes::sglang(ServerInfo::Failing).await, "sglang"),
+        ];
+        for (url, runtime) in &engines {
+            let (labels, _) = fetch_grpc_metadata(url, runtime, false)
+                .await
+                .unwrap_or_else(|error| panic!("{runtime}: {error}"));
+            assert_eq!(label(&labels, "model_path"), Some(MODEL), "{runtime}");
+
+            let error = fetch_grpc_metadata(url, runtime, true)
+                .await
+                .expect_err("a strict read fails on a failing server info");
+            assert!(
+                error.starts_with("Failed to fetch gRPC server info: "),
+                "{runtime}: {error}"
+            );
+        }
+    }
+
+    /// An engine that refuses the connection fails the read at the dial,
+    /// named, strict or not.
+    #[tokio::test]
+    async fn an_engine_that_refuses_the_connection_fails_the_grpc_read_at_the_dial() {
+        use crate::test_support::RefusedAddress;
+
+        let refused = RefusedAddress::reserve();
+        let url = format!("grpc://{}", refused.addr());
+        for runtime in ["vllm", "sglang"] {
+            for strict in [false, true] {
+                let error = fetch_grpc_metadata(&url, runtime, strict)
+                    .await
+                    .expect_err("a read of an engine that refuses the connection");
+                assert!(
+                    error.starts_with("Failed to connect to gRPC: "),
+                    "{runtime} strict={strict}: {error}"
+                );
+            }
+        }
     }
 
     #[test]
