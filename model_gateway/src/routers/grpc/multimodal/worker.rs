@@ -97,11 +97,15 @@ pub struct WorkerMediaSettings {
     /// default; `None` when unknown. A spec that samples the way the engine's
     /// loader does takes it in place of its own constant.
     pub video_frame_budget: Option<usize>,
-    /// A sampling rule of the engine's loader that the pipeline cannot
-    /// follow, as the launcher names it (`--media-io-kwargs video.fps=2`,
-    /// `VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic`); `None` when the loader
-    /// samples as the pipeline expects. Refused at construction for a spec
-    /// that samples the way the loader does (see `loader_rule_conflict`).
+    /// The engine's loader rules as the launcher reported them
+    /// (`--media-io-kwargs video.fps=2`, `VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic`,
+    /// several joined by `; `); `None` when it reported none. Refused at
+    /// construction for the entries that reach the family as
+    /// `loader_rule_conflict` classifies them (every rule the default loader
+    /// reads for a family on that loader, the flag rules for the
+    /// stepped-groups families, none yet for the families whose per-family
+    /// read is pending): a spec that samples the way a loader does would
+    /// otherwise sample a clip differently from the engine's own server.
     pub video_loader_rule: Option<String>,
     /// The engine's encoder budget: the most feature tokens it can place for
     /// one media item (vLLM's encoder-cache budget, the "budget of N tokens"
@@ -119,25 +123,79 @@ pub struct WorkerMediaSettings {
     pub turbojpeg: Option<TurboJpegPolicy>,
 }
 
-/// Whether the engine's loader rule the launcher reported (`video.fps`, a
-/// loader other than the default) conflicts with the spec: a spec that samples
-/// the way the loader does would then sample a clip differently from the
-/// engine's own server, so it is refused with the rule named; the rate-based
-/// samplers never followed the loader and keep their rule, so the engine
-/// starts as before.
+/// The launcher spells a loader rule it was given as a flag with the flag's
+/// own name (`--media-io-kwargs video.fps=2`); the environment rule carries
+/// the variable's name instead (`VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic`).
+const LOADER_FLAG_RULE: &str = "--media-io-kwargs ";
+
+/// Whether the engine's default loader reads a reported rule: the environment
+/// variable and a kwarg naming another loader swap it; a positive `video.fps`
+/// thins its frames by duration, while a non-positive one is no rate to it
+/// (vLLM's own default is `-1`) and a rate it cannot read counts as one; the
+/// kwarg naming the default loader itself and the keys the launcher reports
+/// for the loaders the engine registers for a processor class (`max_frames`,
+/// `min_frames`, `temporal_patch_size`) it never reads, so they are no change
+/// for its families.
+fn default_loader_reads(entry: &str) -> bool {
+    let Some(kwarg) = entry.trim().strip_prefix(LOADER_FLAG_RULE) else {
+        return true;
+    };
+    match kwarg.split_once('=') {
+        Some(("video.video_backend", loader)) => !loader.trim().eq_ignore_ascii_case("opencv"),
+        Some(("video.fps", rate)) => match rate.trim().parse::<f64>() {
+            Ok(rate) => rate > 0.0,
+            Err(_) => true,
+        },
+        _ => false,
+    }
+}
+
+/// Whether the engine's loader rules the launcher reported (the sampling keys
+/// of the media kwargs an engine loader reads, a loader other than the
+/// default; several joined by `; `) conflict with the spec: a spec that
+/// samples the way the loader does would then sample a clip differently from
+/// the engine's own server, so it is refused with the rules named; the
+/// samplers that never followed the loader keep their rule, so the engine
+/// starts as before. Which rules reach a spec depends on whose loader it
+/// follows: the engine's default loader, which samples up to a frame budget
+/// ([`FrameSampling::UpTo`]), reads the environment variable and the kwargs
+/// [`default_loader_reads`] names; a loader the engine registers for a
+/// processor class (the stepped groups of the Qwen2-VL line and of Qwen3-Omni,
+/// [`FrameSampling::SteppedGroups`]) reads every flag kwarg the launcher
+/// reports and never the environment variable, which names the default loader
+/// alone, so a fleet-wide environment setting must not keep such a family from
+/// starting; an explicit `video.video_backend=opencv` swaps that loader for
+/// the default one and is refused there, while a family on the default loader
+/// keeps it. Three more families follow a loader and keep starting as before
+/// until their own per-family reads and tests land in a change of their own:
+/// [`FrameSampling::EvenRounded`] (the Qwen3-VL family, whose engine loader
+/// is registered for its processor class as well and reads `fps`,
+/// `min_frames` and `max_frames` from the media kwargs, while the spec takes
+/// its rate from the preprocessor config), [`FrameSampling::RateWalk`] (whose
+/// engine loader reads `fps` from the media kwargs as well) and
+/// [`FrameSampling::UpToThenRate`] (the default loader's frames, then the
+/// processor's own resample).
 fn loader_rule_conflict(
     rule: Option<&str>,
     spec_name: &str,
     sampling: FrameSampling,
 ) -> Option<String> {
     let rule = rule?;
-    matches!(sampling, FrameSampling::UpTo { .. }).then(|| {
-        format!(
-            "{rule} changes how the engine's loader samples a video, and the {spec_name} \
-             pipeline samples the way the loader does; drop it or use --mm-processor \
-             inprocess or redis"
-        )
-    })
+    let reaches_the_spec = |entry: &&str| match sampling {
+        FrameSampling::UpTo { .. } => default_loader_reads(entry),
+        FrameSampling::SteppedGroups { .. } => entry.trim().starts_with(LOADER_FLAG_RULE),
+        _ => false,
+    };
+    let conflicting: Vec<&str> = rule.split("; ").filter(reaches_the_spec).collect();
+    if conflicting.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} changes how the engine's loader samples a video, and the {spec_name} \
+         pipeline samples the way the loader does; drop it or use --mm-processor \
+         inprocess or redis",
+        conflicting.join("; ")
+    ))
 }
 
 /// What set a modality's effective per-request item limit.
@@ -2058,6 +2116,115 @@ mod unsupported_model_tests {
             );
         }
         assert_eq!(loader_rule_conflict(None, "gemma4", loader), None);
+    }
+
+    /// A family on the engine's default loader passes the rules that loader
+    /// never reads: the kwarg naming that loader itself, a non-positive rate
+    /// (no rate to it, as its own default is) and the keys of the loaders the
+    /// engine registers for a processor class; a rule it does read is refused
+    /// beside them, alone in the message, and a rate it cannot read counts as
+    /// one.
+    #[test]
+    fn a_default_loader_family_passes_the_keys_its_loader_never_reads() {
+        let loader = FrameSampling::UpTo { max_frames: 32 };
+        for unread in [
+            "--media-io-kwargs video.video_backend=opencv",
+            "--media-io-kwargs video.fps=0",
+            "--media-io-kwargs video.fps=-1",
+            "--media-io-kwargs video.fps=0.0",
+            "--media-io-kwargs video.max_frames=64",
+            "--media-io-kwargs video.min_frames=8",
+            "--media-io-kwargs video.temporal_patch_size=4",
+            "--media-io-kwargs video.video_backend=opencv; --media-io-kwargs video.max_frames=64",
+        ] {
+            assert_eq!(
+                loader_rule_conflict(Some(unread), "gemma4", loader),
+                None,
+                "{unread} is no change for the default loader"
+            );
+        }
+        for (rules, read) in [
+            (
+                "--media-io-kwargs video.video_backend=opencv; --media-io-kwargs video.fps=2",
+                "--media-io-kwargs video.fps=2",
+            ),
+            (
+                "--media-io-kwargs video.max_frames=64; --media-io-kwargs video.fps=2.5",
+                "--media-io-kwargs video.fps=2.5",
+            ),
+            (
+                "--media-io-kwargs video.min_frames=8; --media-io-kwargs video.video_backend=x",
+                "--media-io-kwargs video.video_backend=x",
+            ),
+            (
+                "--media-io-kwargs video.fps=0; VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic",
+                "VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic",
+            ),
+            (
+                "--media-io-kwargs video.fps=two",
+                "--media-io-kwargs video.fps=two",
+            ),
+        ] {
+            let message = loader_rule_conflict(Some(rules), "gemma4", loader)
+                .expect("the rule the default loader reads is refused");
+            assert!(message.starts_with(&format!("{read} changes")), "{message}");
+        }
+    }
+
+    /// A family whose loader the engine registers for its processor class
+    /// (the stepped groups of the Qwen2-VL line and of Qwen3-Omni) is refused
+    /// for a launch-flag rule, which reaches that loader, and not for the
+    /// environment variable, which names the engine's default loader alone;
+    /// the refusal names the flag rules only. The default-loader family keeps
+    /// refusing both.
+    #[test]
+    fn a_per_class_loader_family_is_refused_for_the_flag_rules_alone() {
+        let stepped = FrameSampling::SteppedGroups {
+            temporal_patch_size: 2,
+            max_frames: 768,
+        };
+        let environment = "VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic";
+        let both = "VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic; --media-io-kwargs video.fps=2";
+        for family in ["qwen_vl", "qwen3_omni"] {
+            // An explicit kwarg swaps the per-class loader whatever it names,
+            // the default loader included.
+            for flag in [
+                "--media-io-kwargs video.fps=1",
+                "--media-io-kwargs video.fps=0",
+                "--media-io-kwargs video.max_frames=64",
+                "--media-io-kwargs video.min_frames=8",
+                "--media-io-kwargs video.temporal_patch_size=4",
+                "--media-io-kwargs video.video_backend=x",
+                "--media-io-kwargs video.video_backend=opencv",
+            ] {
+                let message = loader_rule_conflict(Some(flag), family, stepped)
+                    .expect("the flag rule is refused");
+                assert!(message.starts_with(&format!("{flag} changes")), "{message}");
+                assert!(
+                    message.contains(&format!(
+                        "{family} pipeline samples the way the loader does"
+                    )),
+                    "{message}"
+                );
+            }
+            assert_eq!(
+                loader_rule_conflict(Some(environment), family, stepped),
+                None,
+                "the environment variable never reaches {family}'s per-class loader"
+            );
+            let message = loader_rule_conflict(Some(both), family, stepped)
+                .expect("the flag rule is refused");
+            assert!(
+                message.starts_with("--media-io-kwargs video.fps=2 changes"),
+                "{message}"
+            );
+            assert!(!message.contains(environment), "{message}");
+        }
+        let loader = FrameSampling::UpTo { max_frames: 32 };
+        let message = loader_rule_conflict(Some(both), "gemma4", loader)
+            .expect("the default-loader family is refused for both");
+        assert!(message.starts_with(&format!("{both} changes")), "{message}");
+        assert_eq!(loader_rule_conflict(None, "qwen_vl", stepped), None);
     }
 
     /// The loader rule matters only to a pipeline that can be handed a video:
