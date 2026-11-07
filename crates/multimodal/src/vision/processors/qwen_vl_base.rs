@@ -2068,7 +2068,7 @@ mod tests {
         }
     }
 
-    fn create_test_config() -> QwenVLConfig {
+    pub(super) fn create_test_config() -> QwenVLConfig {
         QwenVLConfig {
             patch_size: 14,
             merge_size: 2,
@@ -2704,7 +2704,7 @@ mod wire_tests {
     use super::*;
     use crate::{encoder_inputs::EncoderDtype, vision::processors::Qwen3VLProcessor};
 
-    fn gradient(w: u32, h: u32, seed: u32) -> DynamicImage {
+    pub(super) fn gradient(w: u32, h: u32, seed: u32) -> DynamicImage {
         DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
             image::Rgb([
                 ((seed + x * 7 + y * 3) % 256) as u8,
@@ -2784,39 +2784,11 @@ mod wire_tests {
 
 #[cfg(test)]
 mod buffer_pool_tests {
-    use image::{DynamicImage, RgbImage};
-
-    use super::*;
+    use super::{tests::create_test_config, wire_tests::gradient, *};
     use crate::{
         buffer_pool::{self, BufferPool, SENTINEL},
         encoder_inputs::EncoderDtype,
     };
-
-    fn config() -> QwenVLConfig {
-        QwenVLConfig {
-            patch_size: 14,
-            merge_size: 2,
-            min_pixels: 256 * 28 * 28,
-            max_pixels: 1280 * 28 * 28,
-            video_min_pixels: 256 * 28 * 28,
-            video_max_pixels: 1280 * 28 * 28,
-            video_resize_mode: QwenVideoResizeMode::TotalVolume,
-            temporal_patch_size: 2,
-            mean: [0.5, 0.5, 0.5],
-            std: [0.5, 0.5, 0.5],
-            model_name: "test-qwen-vl",
-        }
-    }
-
-    fn gradient(w: u32, h: u32, seed: u32) -> DynamicImage {
-        DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
-            image::Rgb([
-                ((seed + x * 7 + y * 3) % 256) as u8,
-                ((seed + x * 5 + y * 11) % 256) as u8,
-                ((seed + x + y * 2) % 256) as u8,
-            ])
-        }))
-    }
 
     /// A pooled buffer holds a previous request's bytes, so the band writers
     /// must write every byte they are given: a band primed with the sentinel
@@ -2824,7 +2796,7 @@ mod buffer_pool_tests {
     /// and on the patch-bytes path.
     #[test]
     fn the_band_writers_write_every_byte_of_their_band() {
-        let processor = QwenVLProcessorBase::new(config());
+        let processor = QwenVLProcessorBase::new(create_test_config());
         // 448x448 is the smallest size the rule accepts: no resize.
         let image = gradient(448, 448, 3);
         let batch = processor.plan_image_batch(&[&image]).expect("planned");
@@ -2866,7 +2838,7 @@ mod buffer_pool_tests {
     fn a_preprocess_reuses_the_returned_buffer_and_writes_the_same_bytes() {
         static MINE: BufferPool = BufferPool::new();
         buffer_pool::with_pool(&MINE, || {
-            let processor = QwenVLProcessorBase::new(config());
+            let processor = QwenVLProcessorBase::new(create_test_config());
             let image = gradient(448, 448, 5);
             let wire = |processor: &QwenVLProcessorBase| {
                 processor
