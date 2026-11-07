@@ -183,15 +183,17 @@ class TestImportBackendArgs:
         assert "--config" in backend_args
         assert "/path/to/config.yml" in backend_args
 
+    @patch.dict("sys.modules", {"sglang.srt.server_args": None})
     def test_sglang_import_error(self):
-        """sglang is not installed in test env, so parser.error should be called."""
+        """A missing SGLang backend reports a parser error."""
         parser = argparse.ArgumentParser()
         with pytest.raises(SystemExit) as exc_info:
             _import_backend_args("sglang", parser)
         assert exc_info.value.code == 2
 
+    @patch.dict("sys.modules", {"vllm.engine": None})
     def test_vllm_import_error(self):
-        """vllm is not installed in test env, so parser.error should be called."""
+        """A missing vLLM backend reports a parser error."""
         parser = argparse.ArgumentParser()
         with pytest.raises(SystemExit) as exc_info:
             _import_backend_args("vllm", parser)
