@@ -952,6 +952,41 @@ fn interval_clips_report_the_loaders_sampled_rate() {
     assert_eq!(super::clip_sample_fps(None, Some(1.0), interval), 4.0);
 }
 
+/// A container's frame claim sizes the interval walk's picks. A claim whose
+/// picks at source resolution cannot fit the decoded-bytes budget is refused
+/// with that budget's own error before any pick is held, and the count stops
+/// at the budget, so the claim's size is no cost: two billion frames at 30
+/// fps in full HD are refused after the budget's 172 picks. A clip within the
+/// budget, the other rules (bounded by their caps), an unsized probe and an
+/// unknown rate (the bounded `Even` fallback) pass.
+#[test]
+fn an_interval_claim_past_the_decoded_bytes_budget_is_refused_before_its_picks() {
+    let interval = VideoFetchConfig {
+        sampling: FrameSampling::Interval,
+        ..VideoFetchConfig::default()
+    };
+    let full_hd = 1920 * 1080 * 3;
+    for (total_frames, fps) in [(1usize << 31, 30.0), (1_000, 1.0)] {
+        let refused = super::ensure_interval_picks_fit(total_frames, fps, full_hd, interval);
+        assert!(
+            matches!(
+                refused,
+                Err(MediaConnectorError::DecodedTooLarge {
+                    media: "video RGB",
+                    knob: "SMG_VIDEO_MAX_DECODED_BYTES",
+                    ..
+                })
+            ),
+            "{total_frames} frames at {fps} fps: {refused:?}"
+        );
+    }
+    assert!(super::ensure_interval_picks_fit(150, 30.0, full_hd, interval).is_ok());
+    let even = VideoFetchConfig::default();
+    assert!(super::ensure_interval_picks_fit(1 << 31, 30.0, full_hd, even).is_ok());
+    assert!(super::ensure_interval_picks_fit(1 << 31, 30.0, 0, interval).is_ok());
+    assert!(super::ensure_interval_picks_fit(1 << 31, f64::NAN, full_hd, interval).is_ok());
+}
+
 #[test]
 fn ffmpeg_decodes_carry_the_thread_budget_ahead_of_the_input() {
     let args = |autorotate: bool| {

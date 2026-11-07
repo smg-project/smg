@@ -1474,6 +1474,18 @@ where
     let fps = capture
         .get(videoio::CAP_PROP_FPS)
         .map_err(opencv_decode_error)?;
+    let width = capture
+        .get(videoio::CAP_PROP_FRAME_WIDTH)
+        .map_err(opencv_decode_error)?;
+    let height = capture
+        .get(videoio::CAP_PROP_FRAME_HEIGHT)
+        .map_err(opencv_decode_error)?;
+    let frame_size = if width > 0.0 && height > 0.0 {
+        rawvideo_frame_size(width as u32, height as u32)?
+    } else {
+        0
+    };
+    ensure_interval_picks_fit(total_frames, fps, frame_size, cfg)?;
     let frame_indices = sampled_frame_indices(total_frames, fps, cfg);
     if frame_indices.is_empty() {
         return Err(MediaConnectorError::VideoDecode(
@@ -2247,40 +2259,102 @@ fn interval_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) 
     if !(fps.is_finite() && fps > 0.0) || cfg.sample_fps <= 0.0 {
         return even_frame_indices(total_frames, fps, cfg);
     }
-    const EPS: f64 = 1e-4;
-    let interval = 1.0 / cfg.sample_fps;
-    let last_index = total_frames - 1;
+    let mut indices: Vec<usize> = interval_walk(total_frames, fps, cfg.sample_fps).collect();
+    if indices.is_empty() {
+        indices.push(0);
+    }
+    indices
+}
 
-    let mut indices: Vec<usize> = Vec::new();
+/// The interval walk one pick at a time: the first frame, then the first
+/// frame at or past each next instant `1 / rate` seconds on (an epsilon
+/// early, as the loader counts), and the clip's last frame when it lies past
+/// the last pick. Lazy, so a count of the picks can stop at a bound without
+/// holding them ([`ensure_interval_picks_fit`]).
+fn interval_walk(total_frames: usize, fps: f64, rate: f64) -> impl Iterator<Item = usize> {
+    const EPS: f64 = 1e-4;
+    let interval = 1.0 / rate;
     let mut previous_seconds = f64::NEG_INFINITY;
-    loop {
-        let next = match indices.last() {
+    let mut previous: Option<usize> = None;
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let next = match previous {
             None => 0,
-            Some(&last) => {
+            Some(previous) => {
                 let target = ((previous_seconds + interval - EPS) * fps).ceil();
                 let target = if target.is_finite() && target > 0.0 {
                     target as usize
                 } else {
                     0
                 };
-                target.max(last + 1)
+                target.max(previous + 1)
             }
         };
-        if next >= total_frames {
-            break;
+        if next < total_frames {
+            previous_seconds = next as f64 / fps;
+            previous = Some(next);
+            return Some(next);
         }
-        indices.push(next);
-        previous_seconds = next as f64 / fps;
-    }
-    if indices.last().is_some_and(|&last| last != last_index)
-        && last_index as f64 / fps - previous_seconds > EPS
+        done = true;
+        let last_index = total_frames.checked_sub(1)?;
+        (previous.is_some_and(|previous| previous != last_index)
+            && last_index as f64 / fps - previous_seconds > EPS)
+            .then_some(last_index)
+    })
+}
+
+/// Refuses, with the decoded-bytes budget's own error, a clip whose interval
+/// picks at source resolution cannot fit the budget, before any vector is
+/// sized by the container's frame claim: the walk is counted, not collected,
+/// and the count stops at the first pick past the budget, so a claim of any
+/// size costs the budget's frames in iterations and no memory. The other
+/// rules are bounded by their frame caps, a clip whose rate is unknown takes
+/// the bounded `Even` rule, and a `frame_size` of 0 (an unsized probe) counts
+/// no bytes, as the work cap counts no pixels for it, and leaves the clip to
+/// the decoders' own checks.
+fn ensure_interval_picks_fit(
+    total_frames: usize,
+    fps: f64,
+    frame_size: usize,
+    cfg: VideoFetchConfig,
+) -> Result<(), MediaConnectorError> {
+    if !matches!(cfg.sampling, FrameSampling::Interval)
+        || frame_size == 0
+        || !(fps.is_finite() && fps > 0.0)
+        || cfg.sample_fps <= 0.0
     {
-        indices.push(last_index);
+        return Ok(());
     }
-    if indices.is_empty() {
-        indices.push(0);
+    let budget_frames = video_max_decoded_bytes() / frame_size;
+    if interval_walk(total_frames, fps, cfg.sample_fps)
+        .nth(budget_frames)
+        .is_some()
+    {
+        return ensure_decoded_byte_limit(
+            budget_frames.saturating_add(1).saturating_mul(frame_size),
+        );
     }
-    indices
+    Ok(())
+}
+
+/// [`ensure_interval_picks_fit`] on a probe, over the frames and rate its
+/// selection would be built from; a probe without them builds no selection.
+fn ensure_probed_interval_picks_fit(
+    probed: VideoMetadata,
+    cfg: VideoFetchConfig,
+) -> Result<(), MediaConnectorError> {
+    let (Some(total_frames), Some(fps)) = (probed.total_frames, probed.source_fps) else {
+        return Ok(());
+    };
+    let frame_size = if probed.is_unsized() {
+        0
+    } else {
+        rawvideo_frame_size(probed.width, probed.height)?
+    };
+    ensure_interval_picks_fit(total_frames, fps, frame_size, cfg)
 }
 
 /// Distinct indices in order, each with its repeat count.
@@ -2382,6 +2456,9 @@ async fn decode_video_with_ffmpeg(
     let metadata = probe_video_metadata(input_path).await.ok();
     if let Some(reason) = metadata.and_then(|probed| refused_by_the_familys_rule(probed, cfg)) {
         return Err(MediaConnectorError::VideoDecode(reason));
+    }
+    if let Some(probed) = metadata {
+        ensure_probed_interval_picks_fit(probed, cfg)?;
     }
     let Some((mut probed, selection)) = metadata.and_then(|probed| {
         FrameSelection::from_metadata(probed, cfg).map(|selection| (probed, selection))
