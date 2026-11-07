@@ -80,6 +80,19 @@ const NO_KEY: u32 = u32::MAX;
 const MAX_RANKS: usize = 1 << (u32::BITS - SHORT_KEY_BITS);
 /// The rank of a pair that is no merge.
 const NO_RANK: u32 = u32::MAX;
+/// Filter bits per merge of the pair table (see `MergeTable::pair_filter`),
+/// at least: two set per pair in one word, so at eight bits per merge about
+/// one pair in twenty that is no merge passes the filter (5.3 % measured on
+/// random pairs; the rounding of the word count up to a power of two gives
+/// up to sixteen bits per merge and a rate down to 2 %), in 64-512 KiB for
+/// the vocabularies in use (50k to 280k merges; a vocabulary built from token
+/// ranks is sized by its two-token splits and can take more).
+const PAIR_FILTER_BITS_PER_MERGE: usize = 8;
+/// The least words of the pair filter: 8 KiB for a small vocabulary.
+const PAIR_FILTER_MIN_WORDS: usize = 1024;
+/// The pair filter's hash multiplier: odd, and not the buckets' own, so that
+/// two pairs sharing a bucket do not share a filter word.
+const PAIR_FILTER_MULTIPLIER: u64 = 0xD6E8_FEB8_6659_FD93;
 /// An empty entry of the pair table; no pair of ids has this key.
 const EMPTY_KEY: u64 = u64::MAX;
 /// No neighbour, in the linked list of a long piece.
@@ -185,6 +198,23 @@ pub(super) struct MergeTable {
     /// Bits a key's hash is shifted right by to give its first bucket; the
     /// table holds `1 << (64 - shift)` buckets.
     shift: u32,
+    /// The pairs' filter: one 64-bit word per pair key and two bits of it,
+    /// set by [`Self::insert`], [`PAIR_FILTER_BITS_PER_MERGE`] bits per
+    /// merge at least (64-512 KiB for the vocabularies in use, a table the
+    /// second-level cache keeps). A pair with either bit clear was never
+    /// inserted, and [`Self::merge_of`] answers it from that one line; a
+    /// pair with both set goes on to its bucket, which answers as before, so
+    /// a false positive (about one pair in twenty at the tightest rounding)
+    /// costs what every lookup cost. Measured on first-sight text: half of a
+    /// merge's pair lookups are pairs that are no merge, and each read a
+    /// bucket line of a 2-16 MiB table from the last-level cache or memory;
+    /// with the filter the cold cells of the encode bar read 3 to 18 %
+    /// faster from 2 KB texts on (1 to 10 % by class median) and the warm
+    /// cells unchanged (a warm text merges nothing).
+    pair_filter: Box<[u64]>,
+    /// Bits a key's filter hash is shifted right by to give its filter word;
+    /// the filter holds `1 << (64 - pair_filter_shift)` words.
+    pair_filter_shift: u32,
     /// Merges the table holds.
     merges: usize,
     /// The model's `ignore_merges`: a piece that is a token is that token,
@@ -347,11 +377,17 @@ impl MergeTable {
         } else {
             Box::default()
         };
+        let filter_words = (merges * PAIR_FILTER_BITS_PER_MERGE)
+            .div_ceil(u64::BITS as usize)
+            .next_power_of_two()
+            .max(PAIR_FILTER_MIN_WORDS);
         Self {
             byte_ids: [0; 256],
             byte_grid,
             buckets: vec![Bucket::EMPTY; buckets].into_boxed_slice(),
             shift,
+            pair_filter: vec![0; filter_words].into_boxed_slice(),
+            pair_filter_shift: u64::BITS - filter_words.trailing_zeros(),
             merges,
             ignore_merges,
         }
@@ -359,7 +395,15 @@ impl MergeTable {
 
     /// Bytes the table holds, for the load log.
     pub(super) fn bytes(&self) -> usize {
-        size_of::<Self>() + size_of_val(&*self.byte_grid) + size_of_val(&*self.buckets)
+        size_of::<Self>()
+            + size_of_val(&*self.byte_grid)
+            + size_of_val(&*self.buckets)
+            + self.pair_filter_bytes()
+    }
+
+    /// Bytes of the pair filter.
+    fn pair_filter_bytes(&self) -> usize {
+        size_of_val(&*self.pair_filter)
     }
 
     /// The id of `byte`'s token.
@@ -398,6 +442,24 @@ impl MergeTable {
         (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
     }
 
+    /// The filter word of a pair key and its two bits: the hash's high bits
+    /// pick the word, its low twelve the two bit positions.
+    #[inline(always)]
+    fn pair_filter_slot(&self, key: u64) -> (usize, u64) {
+        let hash = key.wrapping_mul(PAIR_FILTER_MULTIPLIER);
+        let word = (hash >> self.pair_filter_shift) as usize;
+        let bits = 1u64 << (hash & 63) | 1u64 << (hash >> 6 & 63);
+        (word, bits)
+    }
+
+    /// Whether the pair `(a, b)` passes the filter: every inserted pair does,
+    /// a pair never inserted rarely.
+    #[cfg(test)]
+    fn pair_filter_admits(&self, a: u32, b: u32) -> bool {
+        let (word, bits) = self.pair_filter_slot(Self::pair_key(a, b));
+        self.pair_filter[word] & bits == bits
+    }
+
     /// The key of the pair `(a, b)` in the bucket table.
     #[inline(always)]
     fn pair_key(a: u32, b: u32) -> u64 {
@@ -414,6 +476,8 @@ impl MergeTable {
     /// merge, as the model's merge map does.
     fn insert(&mut self, a: u32, b: u32, merge: Merge) {
         let key = Self::pair_key(a, b);
+        let (word, bits) = self.pair_filter_slot(key);
+        self.pair_filter[word] |= bits;
         let mask = self.buckets.len() - 1;
         let mut bucket = self.first_bucket(key);
         loop {
@@ -428,11 +492,16 @@ impl MergeTable {
     }
 
     /// The merge of the pair `(a, b)`, [`Merge::NONE`] when it is none: the
-    /// bucket the key hashes to, read whole, and the buckets after it while
-    /// a bucket is full of other pairs.
+    /// pair's filter word first (a pair never inserted is answered there),
+    /// then the bucket the key hashes to, read whole, and the buckets after
+    /// it while a bucket is full of other pairs.
     #[inline]
     fn merge_of(&self, a: u32, b: u32) -> Merge {
         let key = Self::pair_key(a, b);
+        let (word, bits) = self.pair_filter_slot(key);
+        if self.pair_filter[word] & bits != bits {
+            return Merge::NONE;
+        }
         let buckets = &self.buckets;
         let mask = buckets.len() - 1;
         let mut bucket = self.first_bucket(key);

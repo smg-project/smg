@@ -12,8 +12,8 @@ use tokenizers::{
 };
 
 use super::{
-    super::bytes_char, ByteTokens, MergeTable, SHORT_PIECE_SMALL, SHORT_PIECE_SYMBOLS,
-    SHORT_PIECE_TINY,
+    super::bytes_char, ByteTokens, Merge, MergeTable, PAIR_FILTER_BITS_PER_MERGE,
+    SHORT_PIECE_SMALL, SHORT_PIECE_SYMBOLS, SHORT_PIECE_TINY,
 };
 
 /// The byte-level alphabet as the first 256 entries of a vocabulary.
@@ -858,14 +858,19 @@ fn two_byte_characters_on_one_id_merge_as_the_model_does() {
 
 /// The table is the byte-pair grid (256 x 256 words) and its entries: a
 /// power of two of buckets, one cache line of four sixteen-byte entries
-/// each, at a load of one half or less.
+/// each, at a load of one half or less, and the pair filter.
 #[test]
-fn the_tables_bytes_are_the_grid_and_its_buckets_at_half_load_or_less() {
+fn the_tables_bytes_are_the_grid_the_filter_and_its_buckets_at_half_load_or_less() {
     let bpe = model_with(&merges(), false);
     let table = table_of(&bpe);
     let merges = merges().len();
     let grid = 256 * 256 * size_of::<u64>();
-    let entries = (table.bytes() - size_of::<MergeTable>() - grid) / 16;
+    let filter = table.pair_filter_bytes();
+    assert!(
+        filter * 8 >= PAIR_FILTER_BITS_PER_MERGE * merges && filter.is_power_of_two(),
+        "{filter} filter bytes for {merges} merges"
+    );
+    let entries = (table.bytes() - size_of::<MergeTable>() - grid - filter) / 16;
     assert!(entries.is_power_of_two(), "{entries} entries");
     assert!(
         entries >= 2 * merges,
@@ -874,5 +879,95 @@ fn the_tables_bytes_are_the_grid_and_its_buckets_at_half_load_or_less() {
     assert!(
         entries < 4 * merges + 8,
         "{entries} entries for {merges} merges"
+    );
+}
+
+/// Every merge of the model passes the pair filter (a false negative would
+/// lose a merge), and pairs that are no merge mostly do not (a filter that
+/// admitted them all would save no bucket line).
+#[test]
+fn every_merge_passes_the_pair_filter_and_a_pair_that_is_none_mostly_does_not() {
+    let bpe = model_with(&merges(), false);
+    let table = table_of(&bpe);
+    let id = |token: &str| bpe.token_to_id(token).expect("a token of the model");
+    for (a, b) in merges() {
+        assert!(
+            table.pair_filter_admits(id(a), id(b)),
+            "the merge ({a}, {b}) fails the filter"
+        );
+    }
+    let ids = bpe.get_vocab_size() as u64;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let (mut none, mut admitted) = (0, 0);
+    while none < 20_000 {
+        let (a, b) = ((next() % ids) as u32, (next() % ids) as u32);
+        if table.merge_of(a, b) != Merge::NONE {
+            continue;
+        }
+        none += 1;
+        admitted += usize::from(table.pair_filter_admits(a, b));
+    }
+    assert!(
+        admitted * 20 < none,
+        "{admitted} of {none} pairs that are no merge pass the filter"
+    );
+}
+
+/// At a vocabulary's size and the tightest rounding of the filter (131,072
+/// merges: exactly eight bits per merge), every inserted pair passes and
+/// about one pair in twenty that is no merge does: a filter whose density
+/// or hash degraded (bits per merge down, bit positions collapsed) would
+/// admit far more.
+#[test]
+fn the_pair_filter_admits_about_one_absent_pair_in_twenty_at_a_vocabularys_size() {
+    const MERGES: usize = 131_072;
+    const IDS: u64 = 160_000;
+    let mut state = 0x6A09_E667_F3BC_C909u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut table = MergeTable::with_capacity(MERGES, false, false);
+    let mut pairs = HashSet::new();
+    while pairs.len() < MERGES {
+        let (a, b) = ((next() % IDS) as u32, (next() % IDS) as u32);
+        if pairs.insert((a, b)) {
+            let rank = pairs.len() as u32 - 1;
+            table.insert(a, b, Merge::new(rank, IDS as u32 + rank));
+        }
+    }
+    assert!(
+        table.pair_filter_bytes() * 8 == PAIR_FILTER_BITS_PER_MERGE * MERGES,
+        "{} filter bytes for {MERGES} merges",
+        table.pair_filter_bytes()
+    );
+    for &(a, b) in &pairs {
+        assert!(
+            table.pair_filter_admits(a, b),
+            "the merge ({a}, {b}) fails the filter"
+        );
+    }
+    let (mut none, mut admitted) = (0usize, 0usize);
+    while none < 200_000 {
+        let (a, b) = ((next() % IDS) as u32, (next() % IDS) as u32);
+        if pairs.contains(&(a, b)) {
+            continue;
+        }
+        none += 1;
+        admitted += usize::from(table.pair_filter_admits(a, b));
+    }
+    let rate = admitted as f64 / none as f64;
+    assert!(
+        (0.03..0.07).contains(&rate),
+        "{admitted} of {none} absent pairs pass the filter ({:.2} %)",
+        100.0 * rate
     );
 }
