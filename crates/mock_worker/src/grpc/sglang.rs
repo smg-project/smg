@@ -90,6 +90,7 @@ impl SglangScheduler for MockScheduler {
         &self,
         _request: Request<sg::GetModelInfoRequest>,
     ) -> Result<Response<sg::GetModelInfoResponse>, Status> {
+        self.overrides.model_info().refusal("model info")?;
         let context_length = self.cfg.context_length.min(i32::MAX as u32) as i32;
         Ok(Response::new(sg::GetModelInfoResponse {
             model_path: self.cfg.model_id.clone(),
@@ -117,6 +118,7 @@ impl SglangScheduler for MockScheduler {
         &self,
         _request: Request<sg::GetServerInfoRequest>,
     ) -> Result<Response<sg::GetServerInfoResponse>, Status> {
+        self.overrides.server_info().refusal("server info")?;
         Ok(Response::new(sg::GetServerInfoResponse {
             server_args: self.server_args(),
             scheduler_info: None,

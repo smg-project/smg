@@ -2,25 +2,61 @@
 //! its port and set through the admin API (`/admin/serving/{port}`,
 //! `/admin/info/{port}`): whether it answers its health check as serving,
 //! and the info it reports (`server_args` entries the gateway flattens into
-//! worker labels, and the model's `supports_vision`). A bed uses them to
-//! change an engine's reported settings between two health transitions, as
-//! a restarted or late-loading engine does.
+//! worker labels, and the model's `supports_vision`), and whether its model
+//! and server info RPCs answer, refuse as not implemented or fail. A bed
+//! uses them to change an engine's reported settings between two health
+//! transitions, as a restarted or late-loading engine does.
 
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock, PoisonError,
     },
 };
 
 use serde_json::Value;
 
+/// What an info RPC of the worker answers: its fields (the default), an
+/// `Unimplemented` status (an engine without the call), or a failure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InfoAnswer {
+    #[default]
+    Served,
+    Unimplemented,
+    Failing,
+}
+
+impl InfoAnswer {
+    /// The status this answer refuses `rpc` with, when it is a refusal.
+    pub fn refusal(self, rpc: &str) -> Result<(), tonic::Status> {
+        match self {
+            Self::Served => Ok(()),
+            Self::Unimplemented => Err(tonic::Status::unimplemented(format!(
+                "the mock engine has no {rpc}"
+            ))),
+            Self::Failing => Err(tonic::Status::internal(format!(
+                "the mock engine's {rpc} is down"
+            ))),
+        }
+    }
+
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::Unimplemented,
+            2 => Self::Failing,
+            _ => Self::Served,
+        }
+    }
+}
+
 /// What one worker reports, as far as the overrides reach.
 pub struct WorkerOverrides {
     serving: AtomicBool,
     info: Mutex<BTreeMap<String, Value>>,
     loads_polls: AtomicUsize,
+    model_info: AtomicU8,
+    server_info: AtomicU8,
 }
 
 impl WorkerOverrides {
@@ -41,6 +77,24 @@ impl WorkerOverrides {
 
     pub fn set_serving(&self, serving: bool) {
         self.serving.store(serving, Ordering::Relaxed);
+    }
+
+    /// What `GetModelInfo` answers (served by default).
+    pub fn model_info(&self) -> InfoAnswer {
+        InfoAnswer::from_u8(self.model_info.load(Ordering::Relaxed))
+    }
+
+    pub fn set_model_info(&self, answer: InfoAnswer) {
+        self.model_info.store(answer as u8, Ordering::Relaxed);
+    }
+
+    /// What `GetServerInfo` answers (served by default).
+    pub fn server_info(&self) -> InfoAnswer {
+        InfoAnswer::from_u8(self.server_info.load(Ordering::Relaxed))
+    }
+
+    pub fn set_server_info(&self, answer: InfoAnswer) {
+        self.server_info.store(answer as u8, Ordering::Relaxed);
     }
 
     /// Merge `patch` into the reported info; a `null` value removes the key.
@@ -85,6 +139,8 @@ pub fn for_port(port: u16) -> Arc<WorkerOverrides> {
             serving: AtomicBool::new(true),
             info: Mutex::new(BTreeMap::new()),
             loads_polls: AtomicUsize::new(0),
+            model_info: AtomicU8::new(InfoAnswer::Served as u8),
+            server_info: AtomicU8::new(InfoAnswer::Served as u8),
         })
     }))
 }

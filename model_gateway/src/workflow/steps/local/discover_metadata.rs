@@ -839,16 +839,6 @@ mod tests {
         assert_eq!(both.get("tp_size").map(String::as_str), Some("8"));
     }
 
-    #[expect(clippy::print_stderr)]
-    fn dump_labels(title: &str, labels: &HashMap<String, String>) {
-        eprintln!("\n=== {title} ({} labels) ===", labels.len());
-        let mut keys: Vec<_> = labels.keys().collect();
-        keys.sort();
-        for key in keys {
-            eprintln!("  {key}: {}", labels[key]);
-        }
-    }
-
     fn label<'a>(labels: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
         labels.get(key).map(String::as_str)
     }
@@ -1058,24 +1048,170 @@ mod tests {
         assert!(error.starts_with("server_info: "), "{error}");
     }
 
+    /// The crate's mock gRPC engine of each proto, as the probes' tests use
+    /// it: its model id names its model, tokenizer and served name.
+    const MOCK_MODEL: &str = "probe-model";
+    /// The mock engine's context length, as it reports it.
+    const MOCK_CONTEXT: &str = "32768";
+
+    /// The gRPC read of each proto: the model info's fields become labels,
+    /// the server info adds its own (a vLLM engine's KV connector, an SGLang
+    /// engine's version), and the runtime read is the one asked for.
     #[tokio::test]
-    #[ignore = "needs a live engine on a local port; run with --ignored"]
-    async fn test_sglang_grpc_metadata() {
-        let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:30001", "sglang", false)
+    async fn the_grpc_read_takes_the_model_info_and_the_server_info_of_each_proto() {
+        use mock_worker::config::SchedulerWire;
+
+        use crate::workflow::steps::util::mock_grpc_engine_on;
+
+        let (vllm, engine) = mock_grpc_engine_on(SchedulerWire::Vllm).await;
+        let mut patch = serde_json::Map::new();
+        patch.insert(
+            "kv_connector".to_string(),
+            serde_json::Value::String("MooncakeConnector".to_string()),
+        );
+        engine.patch_info(&patch);
+        let (labels, runtime) = fetch_grpc_metadata(&vllm, "vllm", true)
             .await
-            .expect("grpc metadata");
-        dump_labels("SGLang gRPC", &labels);
-        assert!(labels.contains_key("model_path"));
+            .expect("the vLLM read");
+        assert_eq!(runtime, "vllm");
+        assert_eq!(label(&labels, "model_path"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "tokenizer_path"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "served_model_name"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "max_context_length"), Some(MOCK_CONTEXT));
+        assert_eq!(label(&labels, "kv_connector"), Some("MooncakeConnector"));
+
+        let (sglang, _) = mock_grpc_engine_on(SchedulerWire::Sglang).await;
+        let (labels, runtime) = fetch_grpc_metadata(&sglang, "sglang", true)
+            .await
+            .expect("the SGLang read");
+        assert_eq!(runtime, "sglang");
+        assert_eq!(label(&labels, "model_path"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "tokenizer_path"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "served_model_name"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "max_context_length"), Some(MOCK_CONTEXT));
+        assert_eq!(label(&labels, "version"), Some("mock"));
     }
 
+    /// An engine without a server info (an `Unimplemented` answer) keeps its
+    /// model labels on a plain read and on a strict one: the call is a gap,
+    /// not a failure, on both protos.
     #[tokio::test]
-    #[ignore = "needs a live engine on a local port; run with --ignored"]
-    async fn test_vllm_grpc_metadata() {
-        let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:20001", "vllm", false)
-            .await
-            .expect("grpc metadata");
-        dump_labels("vLLM gRPC", &labels);
-        assert!(!labels.is_empty());
+    async fn an_engine_without_server_info_keeps_its_model_labels_on_a_plain_and_a_strict_read() {
+        use mock_worker::{config::SchedulerWire, overrides::InfoAnswer};
+
+        use crate::workflow::steps::util::mock_grpc_engine_on;
+
+        let mut engines = Vec::new();
+        for (wire, runtime, server_label) in [
+            (SchedulerWire::Vllm, "vllm", "kv_connector"),
+            (SchedulerWire::Sglang, "sglang", "version"),
+        ] {
+            let (url, engine) = mock_grpc_engine_on(wire).await;
+            engine.set_server_info(InfoAnswer::Unimplemented);
+            engines.push((url, runtime, server_label));
+        }
+        for (url, runtime, server_label) in &engines {
+            for strict in [false, true] {
+                let (labels, _) = fetch_grpc_metadata(url, runtime, strict)
+                    .await
+                    .unwrap_or_else(|error| panic!("{runtime} strict={strict}: {error}"));
+                assert_eq!(
+                    label(&labels, "model_path"),
+                    Some(MOCK_MODEL),
+                    "{runtime} strict={strict}"
+                );
+                assert_eq!(
+                    label(&labels, server_label),
+                    None,
+                    "{runtime} strict={strict}: {labels:?}"
+                );
+            }
+        }
+    }
+
+    /// A server info that fails leaves a gap on a plain read and fails a
+    /// strict read, named, on both protos.
+    #[tokio::test]
+    async fn a_failing_server_info_leaves_a_gap_for_registration_and_fails_a_strict_read_by_name() {
+        use mock_worker::{config::SchedulerWire, overrides::InfoAnswer};
+
+        use crate::workflow::steps::util::mock_grpc_engine_on;
+
+        let mut engines = Vec::new();
+        for (wire, runtime) in [
+            (SchedulerWire::Vllm, "vllm"),
+            (SchedulerWire::Sglang, "sglang"),
+        ] {
+            let (url, engine) = mock_grpc_engine_on(wire).await;
+            engine.set_server_info(InfoAnswer::Failing);
+            engines.push((url, runtime));
+        }
+        for (url, runtime) in &engines {
+            let (labels, _) = fetch_grpc_metadata(url, runtime, false)
+                .await
+                .unwrap_or_else(|error| panic!("{runtime}: {error}"));
+            assert_eq!(label(&labels, "model_path"), Some(MOCK_MODEL), "{runtime}");
+
+            let error = fetch_grpc_metadata(url, runtime, true)
+                .await
+                .expect_err("a strict read fails on a failing server info");
+            assert!(
+                error.starts_with("Failed to fetch gRPC server info: "),
+                "{runtime}: {error}"
+            );
+        }
+    }
+
+    /// A model info that fails fails the read, named, strict or not: the
+    /// model's fields are what registration reads, so there is no gap to
+    /// leave, on both protos.
+    #[tokio::test]
+    async fn a_failing_model_info_fails_the_grpc_read_by_name() {
+        use mock_worker::{config::SchedulerWire, overrides::InfoAnswer};
+
+        use crate::workflow::steps::util::mock_grpc_engine_on;
+
+        let mut engines = Vec::new();
+        for (wire, runtime) in [
+            (SchedulerWire::Vllm, "vllm"),
+            (SchedulerWire::Sglang, "sglang"),
+        ] {
+            let (url, engine) = mock_grpc_engine_on(wire).await;
+            engine.set_model_info(InfoAnswer::Failing);
+            engines.push((url, runtime));
+        }
+        for (url, runtime) in &engines {
+            for strict in [false, true] {
+                let error = fetch_grpc_metadata(url, runtime, strict)
+                    .await
+                    .expect_err("a read of an engine whose model info fails");
+                assert!(
+                    error.starts_with("Failed to fetch gRPC model info: "),
+                    "{runtime} strict={strict}: {error}"
+                );
+            }
+        }
+    }
+
+    /// An engine that refuses the connection fails the read at the dial,
+    /// named, strict or not.
+    #[tokio::test]
+    async fn an_engine_that_refuses_the_connection_fails_the_grpc_read_at_the_dial() {
+        use crate::test_support::RefusedAddress;
+
+        let refused = RefusedAddress::reserve();
+        let url = format!("grpc://{}", refused.addr());
+        for runtime in ["vllm", "sglang"] {
+            for strict in [false, true] {
+                let error = fetch_grpc_metadata(&url, runtime, strict)
+                    .await
+                    .expect_err("a read of an engine that refuses the connection");
+                assert!(
+                    error.starts_with("Failed to connect to gRPC: "),
+                    "{runtime} strict={strict}: {error}"
+                );
+            }
+        }
     }
 
     #[test]

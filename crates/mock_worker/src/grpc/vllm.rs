@@ -131,6 +131,7 @@ impl VllmEngine for MockScheduler {
         &self,
         _request: Request<vllm::GetModelInfoRequest>,
     ) -> Result<Response<vllm::GetModelInfoResponse>, Status> {
+        self.overrides.model_info().refusal("model info")?;
         Ok(Response::new(vllm::GetModelInfoResponse {
             model_path: self.cfg.model_id.clone(),
             is_generation: true,
@@ -156,6 +157,7 @@ impl VllmEngine for MockScheduler {
         &self,
         _request: Request<vllm::GetServerInfoRequest>,
     ) -> Result<Response<vllm::GetServerInfoResponse>, Status> {
+        self.overrides.server_info().refusal("server info")?;
         let mut info = vllm::GetServerInfoResponse {
             server_type: SERVER_TYPE.to_string(),
             data_parallel_size: i32::try_from(self.dp_size()).unwrap_or(i32::MAX),
