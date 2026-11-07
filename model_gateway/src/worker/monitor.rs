@@ -1675,6 +1675,15 @@ async fn run_event_loop(
 const LOAD_POLL_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Run [`liveness::sweep`] over every registered worker every quarter second.
+///
+/// A tick reads the registry's immutable membership snapshot: one pointer
+/// load while the fleet is stable, rebuilt once after a membership change,
+/// so a worker registered after this loop started is swept on the next
+/// tick. Walking the worker map instead took a read lock and boxed its guard
+/// for every shard of the map on every tick, whether or not the shard held a
+/// worker (the map has four shards per CPU the process sees, rounded up to a
+/// power of two: 1,024 on a 192-CPU host, 4,096 small allocations a second
+/// with the gateway idle).
 async fn liveness_sweep_loop(monitor: Weak<WorkerMonitor>) {
     let mut ticker = tokio::time::interval(liveness::SWEEP_INTERVAL);
     loop {
@@ -1682,11 +1691,8 @@ async fn liveness_sweep_loop(monitor: Weak<WorkerMonitor>) {
         let Some(monitor) = monitor.upgrade() else {
             return;
         };
-        for worker in monitor
-            .worker_registry
-            .get_workers_filtered(None, None, None, None, false)
-        {
-            liveness::sweep(&worker);
+        for worker in monitor.worker_registry.get_routing_workers().iter() {
+            liveness::sweep(worker);
         }
     }
 }

@@ -305,6 +305,13 @@ impl ProbeState {
     /// Core of [`Self::recompute`] with the tokenizer lookup and the media
     /// placement injected, so tests can exercise the gating logic without
     /// loading real tokenizers or seeding the process-wide settings.
+    ///
+    /// The workers come from the registry's immutable membership snapshot
+    /// (the one the routing paths and the liveness sweep read): one pointer
+    /// load while the fleet is stable, so the one-second checkpoint does not
+    /// walk the worker map, lock its shards and clone every worker out of it
+    /// when nothing has changed. Health and status are read live from each
+    /// worker, as before.
     fn recompute_with(
         &self,
         worker_registry: &WorkerRegistry,
@@ -312,7 +319,7 @@ impl ProbeState {
         tokenizer_registered: impl Fn(&str) -> bool,
         mm_processing: MmProcessingMode,
     ) {
-        let workers = worker_registry.get_all();
+        let workers = worker_registry.get_routing_workers();
         let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
 
         let role_snapshot = |worker_type: WorkerType, threshold: ReadinessRoleConfig| {
@@ -1762,6 +1769,38 @@ mod tests {
         assert!(
             became_ready.is_ok(),
             "maintainer did not pick up the Registered event"
+        );
+
+        handle.abort();
+    }
+
+    /// The checkpoint exists for the mutations that bypass the registry's
+    /// broadcast: a status set on the worker itself emits no event, and the
+    /// next checkpoint still re-derives readiness from the live workers.
+    #[tokio::test(start_paused = true)]
+    async fn maintainer_checkpoint_sees_a_status_set_on_the_worker_itself() {
+        let state = probe_state();
+        let registry = Arc::new(WorkerRegistry::new());
+        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+        let worker = http_worker("http://w1:8080", WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+
+        let handle = spawn_readiness_maintainer(
+            state.clone(),
+            registry.clone(),
+            tokenizer_registry.clone(),
+            regular_config(),
+        );
+        assert!(
+            state.readiness().workers_ready,
+            "the initial recompute sees the Ready worker"
+        );
+
+        worker.set_status(WorkerStatus::NotReady);
+        tokio::time::sleep(CHECKPOINT_INTERVAL + Duration::from_millis(1)).await;
+        assert!(
+            !state.readiness().workers_ready,
+            "the checkpoint re-derived readiness without a worker event"
         );
 
         handle.abort();
