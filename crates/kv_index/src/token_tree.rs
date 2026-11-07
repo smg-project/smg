@@ -83,6 +83,19 @@ fn align_to_page(len: usize, page_size: usize) -> usize {
     (len / page_size) * page_size
 }
 
+/// What a hashed insert does with its hash at the node the path ends at.
+#[derive(Clone, Copy)]
+enum Naming {
+    /// A plain insert: no hash.
+    None,
+    /// The node takes the hash and an earlier, different one leaves: a
+    /// request's insert names the newest sequence that ended at the node.
+    Newest(u64),
+    /// The node takes the hash only when it carries none: a repair page
+    /// fills what the tree has not named itself and displaces nothing.
+    UnlessNamed(u64),
+}
+
 /// Digest of the first `page_size` tokens (FxHash-style multiplication mixing).
 #[inline]
 fn page_key_of(tokens: &[TokenId], page_size: usize) -> TokenPageKey {
@@ -207,6 +220,10 @@ struct Node {
     creation_time: u64,
     /// Priority for priority-based eviction (higher = less likely to evict)
     priority: AtomicI32,
+    /// The 8-byte hash of the root-to-node token path, set when an insert
+    /// that carried one ended here (see [`TokenTree::insert_tokens_with_hash`]);
+    /// `0` when none did. A split leaves it on the node that keeps the path.
+    path_hash: AtomicU64,
 }
 
 impl Node {
@@ -221,6 +238,7 @@ impl Node {
             hit_count: AtomicU64::new(0),
             creation_time: next_timestamp(),
             priority: AtomicI32::new(0),
+            path_hash: AtomicU64::new(0),
         }
     }
 
@@ -241,6 +259,7 @@ impl Node {
             hit_count: AtomicU64::new(0),
             creation_time: 0,                   // Root is always oldest
             priority: AtomicI32::new(i32::MIN), // Root has minimum priority (matches SGLang)
+            path_hash: AtomicU64::new(0),
         }
     }
 
@@ -386,6 +405,11 @@ pub struct TokenTree {
     eviction_policy: EvictionPolicy,
     /// Page size for token grouping (should match the backend worker's page size)
     page_size: usize,
+    /// The node each hashed insert ended at, by path hash, so a path named
+    /// by its hash alone (a mesh delta) resolves to its node without a
+    /// second copy of the tokens; an entry leaves with its node, under the
+    /// same eviction (see [`TokenTree::cleanup_empty_ancestors_with_parent`]).
+    hashed: DashMap<u64, Weak<Node>, FxBuildHasher>,
 }
 
 impl std::fmt::Debug for TokenTree {
@@ -441,6 +465,7 @@ impl TokenTree {
             total_token_count: AtomicUsize::new(0),
             eviction_policy: policy,
             page_size,
+            hashed: DashMap::with_hasher(FxBuildHasher),
         }
     }
 
@@ -454,11 +479,172 @@ impl TokenTree {
         self.page_size
     }
 
+    /// The length of the page-aligned prefix of a sequence of `len` tokens:
+    /// what an insert of the sequence stores, so the path a hash of it names.
+    pub fn aligned_len(&self, len: usize) -> usize {
+        align_to_page(len, self.page_size)
+    }
+
     /// Insert a token sequence with associated tenant.
     ///
     /// **Page-aligned**: Input is aligned to PAGE_SIZE boundary.
     /// Sequences shorter than PAGE_SIZE are skipped (no cache benefit).
     pub fn insert_tokens(&self, tokens: &[TokenId], tenant: &str) {
+        self.insert_tokens_hashed(tokens, tenant, Naming::None);
+    }
+
+    /// [`Self::insert_tokens`], and the node the (page-aligned) path ends
+    /// at remembers `path_hash`: the caller's [`crate::hash_token_path`] of
+    /// the page-aligned prefix of `tokens`, the path the tree stores and the
+    /// one a peer's delta names, so that [`Self::insert_tenant_by_hash`]
+    /// finds the node later. The hash lives and dies with the node under the
+    /// tree's own eviction. A sequence under one page inserts nothing and
+    /// remembers nothing. The caller hashes, so a tree never asked by hash
+    /// never pays for one.
+    pub fn insert_tokens_with_hash(&self, tokens: &[TokenId], tenant: &str, path_hash: u64) {
+        self.insert_tokens_hashed(tokens, tenant, Naming::Newest(path_hash));
+    }
+
+    /// [`Self::insert_tokens_with_hash`] for a path a peer repaired: the node
+    /// takes `path_hash` only when it carries none, so a repair never
+    /// displaces the hash this tree recorded from its own request. The
+    /// request path and a repair page both hash a node's page-aligned path,
+    /// so the two agree whenever their callers do; the rule guards the node's
+    /// own record against any caller handing it another hash. A node the
+    /// tree never named itself answers to the repair's hash.
+    pub fn insert_tokens_with_hash_unless_named(
+        &self,
+        tokens: &[TokenId],
+        tenant: &str,
+        path_hash: u64,
+    ) {
+        self.insert_tokens_hashed(tokens, tenant, Naming::UnlessNamed(path_hash));
+    }
+
+    /// Attach `tenant` to the path an earlier hashed insert recorded under
+    /// `path_hash`, as [`Self::insert_tokens`] of those tokens would: along
+    /// the whole path. `false` when no live node carries the hash, the shape
+    /// of a path the tree evicted or never held; the caller then asks a peer
+    /// for the tokens. The path is read back from the node's parent chain,
+    /// each edge with its parent under the node's tokens guard (the pair a
+    /// split rewrites in one section), and inserted through the same descent
+    /// as any other sequence, so the attach meets every split and eviction
+    /// rule once, there.
+    pub fn insert_tenant_by_hash(&self, path_hash: u64, tenant: &str) -> bool {
+        let Some(node) = self
+            .hashed
+            .get(&path_hash)
+            .and_then(|entry| entry.value().upgrade())
+        else {
+            return false;
+        };
+        let Some(path) = self.path_of(&node) else {
+            return false;
+        };
+        self.insert_tokens_hashed(&path, tenant, Naming::Newest(path_hash));
+        true
+    }
+
+    /// How many paths a hash names (the size of the mesh lookup).
+    pub fn hashed_paths(&self) -> usize {
+        self.hashed.len()
+    }
+
+    /// The root-to-node tokens, read upward edge by edge; `None` when an
+    /// ancestor is gone, that is, the node left the tree with it.
+    fn path_of(&self, node: &NodeRef) -> Option<Vec<TokenId>> {
+        let mut edges: Vec<Vec<TokenId>> = Vec::new();
+        let mut current = Arc::clone(node);
+        while !Arc::ptr_eq(&current, &self.root) {
+            let tokens = current.tokens.read();
+            let parent = current.parent.read().upgrade()?;
+            edges.push(tokens.clone());
+            drop(tokens);
+            current = parent;
+        }
+        let mut path = Vec::with_capacity(edges.iter().map(Vec::len).sum());
+        for edge in edges.iter().rev() {
+            path.extend_from_slice(edge);
+        }
+        Some(path)
+    }
+
+    /// Apply `naming` at `node`, the end of an inserted path. The two named
+    /// arms may race on one node (a repair page streams while requests
+    /// route); their orders are chosen so that every interleaving ends with
+    /// the request's hash on the node and one entry in the map: a request
+    /// inserts its entry, swaps the node's hash and removes the earlier
+    /// entry (`record_hash`); a repair that has read the node as unnamed
+    /// claims it through [`Self::claim_unless_named`].
+    fn record(&self, node: &NodeRef, naming: Naming) {
+        match naming {
+            Naming::None => {}
+            Naming::Newest(path_hash) => self.record_hash(node, Some(path_hash)),
+            Naming::UnlessNamed(path_hash) => {
+                if node.path_hash.load(Ordering::Relaxed) == 0 {
+                    self.claim_unless_named(node, path_hash);
+                }
+            }
+        }
+    }
+
+    /// A repair's claim of a node it read as unnamed: insert the entry,
+    /// compare-exchange the node's hash from 0, and take the entry back only
+    /// when the exchange lost to a different hash. A request that named the
+    /// node with this same hash in between wrote this same entry (the request
+    /// path and a repair page hash a node's page-aligned path alike), so the
+    /// entry is the request's as much as the repair's and stays; removing it
+    /// would leave a named node that no lookup reaches until its eviction.
+    fn claim_unless_named(&self, node: &NodeRef, path_hash: u64) {
+        self.hashed.insert(path_hash, Arc::downgrade(node));
+        if let Err(current) =
+            node.path_hash
+                .compare_exchange(0, path_hash, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            if current != path_hash {
+                self.hashed.remove_if(&path_hash, |_, weak| {
+                    std::ptr::eq(weak.as_ptr(), Arc::as_ptr(node))
+                });
+            }
+        }
+    }
+
+    /// Remember `node` as the end of the path hashed `path_hash`: the node
+    /// carries the hash and the map names the node. A node that already
+    /// carries it costs one load; a hash moving to another node (its earlier
+    /// node was detached and the tokens re-inserted) replaces the entry; a
+    /// node handed a second hash (two sequences that differ only inside
+    /// their last, unaligned page end at one node) keeps the newer one and
+    /// its earlier entry leaves the map, so a node is named once and the
+    /// map holds at most one entry per hashed node.
+    fn record_hash(&self, node: &NodeRef, path_hash: Option<u64>) {
+        let Some(path_hash) = path_hash else {
+            return;
+        };
+        if node.path_hash.load(Ordering::Relaxed) == path_hash {
+            return;
+        }
+        self.hashed.insert(path_hash, Arc::downgrade(node));
+        let earlier = node.path_hash.swap(path_hash, Ordering::Relaxed);
+        if earlier != 0 && earlier != path_hash {
+            self.hashed.remove_if(&earlier, |_, weak| {
+                std::ptr::eq(weak.as_ptr(), Arc::as_ptr(node))
+            });
+        }
+    }
+
+    /// Drop the entry that names `node`, if it still does (a re-inserted
+    /// twin's entry stays), once the node has left the tree.
+    fn forget_hash(&self, node: &NodeRef) {
+        let path_hash = node.path_hash.load(Ordering::Relaxed);
+        if path_hash != 0 {
+            self.hashed.remove_if(&path_hash, |_, weak| {
+                std::ptr::eq(weak.as_ptr(), Arc::as_ptr(node))
+            });
+        }
+    }
+
+    fn insert_tokens_hashed(&self, tokens: &[TokenId], tenant: &str, naming: Naming) {
         let page_size = self.page_size;
         // Align to page boundary (truncate to nearest page)
         let aligned_len = align_to_page(tokens.len(), page_size);
@@ -484,7 +670,7 @@ impl TokenTree {
         let track_lfu = self.eviction_policy == EvictionPolicy::Lfu;
 
         // Descend from the root inserting the whole sequence.
-        let tokens_added = Self::insert_from(
+        let (tokens_added, ends_at) = Self::insert_from(
             Arc::clone(&self.root),
             tokens,
             Arc::clone(&tenant_id),
@@ -495,11 +681,15 @@ impl TokenTree {
 
         // Update tenant token count and tree-wide total
         self.add_tenant_tokens(tenant_id, tokens_added);
+        if let Some(end) = ends_at {
+            self.record(&end, naming);
+        }
     }
 
     /// Insert `remaining` for `tenant_id` starting the descent at `current`
     /// (treated as the parent of the first edge), returning the number of new
-    /// tokens to add to the tenant's count. Holds the exact node-split /
+    /// tokens to add to the tenant's count and the node the sequence ends at
+    /// (none when nothing was inserted). Holds the exact node-split /
     /// tenant-attach / counting logic of [`Self::insert_tokens`]; the caller
     /// owns root bookkeeping and folding the returned count into
     /// `tenant_token_count`.
@@ -521,13 +711,16 @@ impl TokenTree {
         ts: u64,
         track_lfu: bool,
         page_size: usize,
-    ) -> usize {
+    ) -> (usize, Option<NodeRef>) {
         let mut tokens_added = 0usize;
+        // The node the sequence ends at: the one a `Done` step names, else the
+        // last node a full match descended into.
+        let mut ends_at: Option<NodeRef> = None;
 
         // Result type to carry state out of the match block
         // This allows the entry guard to be dropped before we update current
         enum InsertStep {
-            Done(usize),
+            Done(usize, Option<NodeRef>),
             Continue {
                 next: NodeRef,
                 advance: usize,
@@ -545,8 +738,8 @@ impl TokenTree {
                     let new_node = Arc::new(Node::new(remaining.to_vec()));
                     new_node.set_parent(&current, page_key);
                     new_node.touch_tenant(&tenant_id, ts, track_lfu);
-                    entry.insert(new_node);
-                    InsertStep::Done(remaining.len())
+                    entry.insert(Arc::clone(&new_node));
+                    InsertStep::Done(remaining.len(), Some(new_node))
                 }
                 Entry::Occupied(mut entry) => {
                     let child = Arc::clone(entry.get());
@@ -565,7 +758,7 @@ impl TokenTree {
                     if common_len == 0 {
                         // No page-aligned match despite same page key (shouldn't happen)
                         drop(child_tokens);
-                        InsertStep::Done(0)
+                        InsertStep::Done(0, None)
                     } else if common_len == child_len {
                         // Full match with child - continue traversal. Count
                         // the tokens only on first attach (atomic via
@@ -599,11 +792,11 @@ impl TokenTree {
                         let newly_attached =
                             intermediate_node.touch_tenant(&tenant_id, ts, track_lfu);
 
-                        // Replace entry with intermediate node
-                        entry.insert(intermediate_node);
+                        // Replace entry with intermediate node; the input ends at it.
+                        entry.insert(Arc::clone(&intermediate_node));
 
                         let new_tokens = if newly_attached { common_len } else { 0 };
-                        InsertStep::Done(new_tokens)
+                        InsertStep::Done(new_tokens, Some(intermediate_node))
                     } else {
                         // Partial match - need to split and add new branch at page boundary
                         // Strategy: Create NEW intermediate node with common prefix,
@@ -617,14 +810,18 @@ impl TokenTree {
                             page_size,
                         );
 
-                        // Create new node for the remaining input suffix
+                        // Create new node for the remaining input suffix; the input ends at it.
                         let new_remaining = &remaining[common_len..];
+                        let mut new_branch: Option<NodeRef> = None;
                         let new_branch_tokens = if new_remaining.len() >= page_size {
                             let new_node = Arc::new(Node::new(new_remaining.to_vec()));
                             let new_page_key = page_key_of(new_remaining, page_size);
                             new_node.set_parent(&intermediate_node, new_page_key);
                             new_node.touch_tenant(&tenant_id, ts, track_lfu);
-                            intermediate_node.children.insert(new_page_key, new_node);
+                            intermediate_node
+                                .children
+                                .insert(new_page_key, Arc::clone(&new_node));
+                            new_branch = Some(new_node);
                             new_remaining.len()
                         } else {
                             0
@@ -638,14 +835,15 @@ impl TokenTree {
                         entry.insert(intermediate_node);
 
                         let common_tokens = if newly_attached { common_len } else { 0 };
-                        InsertStep::Done(new_branch_tokens + common_tokens)
+                        InsertStep::Done(new_branch_tokens + common_tokens, new_branch)
                     }
                 }
             };
 
             match step {
-                InsertStep::Done(added) => {
+                InsertStep::Done(added, end) => {
                     tokens_added += added;
+                    ends_at = end;
                     break;
                 }
                 InsertStep::Continue {
@@ -656,13 +854,17 @@ impl TokenTree {
                     tokens_added += counted;
                     remaining = &remaining[advance..];
                     current = next;
+                    if remaining.len() < page_size {
+                        // The sequence ends at the node just descended into.
+                        ends_at = Some(Arc::clone(&current));
+                    }
                 }
             }
         }
 
         // The caller folds this into `tenant_token_count` (once, after any
         // matched-prefix re-attach in match_and_insert_with).
-        tokens_added
+        (tokens_added, ends_at)
     }
 
     /// Split `child`, the edge of `current` under `page_key`, at the page-aligned
@@ -713,6 +915,7 @@ impl TokenTree {
             hit_count: AtomicU64::new(child.hit_count.load(Ordering::Relaxed)),
             creation_time: child.creation_time,
             priority: AtomicI32::new(child.priority.load(Ordering::Relaxed)),
+            path_hash: AtomicU64::new(0),
         });
 
         child.set_parent(&intermediate_node, suffix_page_key);
@@ -915,7 +1118,27 @@ impl TokenTree {
         // `select` runs exactly once; the Option carries the FnOnce through
         // the FnMut interface of the non-generic walk below.
         let mut select = Some(select);
-        self.match_and_insert_dyn(tokens, &mut |result| {
+        self.match_and_insert_dyn(tokens, None, &mut |result| {
+            select.take().and_then(|select| select(result))
+        })
+    }
+
+    /// [`Self::match_and_insert_with`], and, with `path_hash` given, the node
+    /// the inserted path ends at remembers it (see [`Self::insert_tokens_with_hash`]);
+    /// `None` is the plain fused walk, so one call site serves a caller that
+    /// hashes only while something will ask by hash.
+    #[inline]
+    pub fn match_and_insert_with_hash<'t, F>(
+        &self,
+        tokens: &[TokenId],
+        path_hash: Option<u64>,
+        select: F,
+    ) -> PrefixMatchResult
+    where
+        F: FnOnce(&PrefixMatchResult) -> Option<&'t str>,
+    {
+        let mut select = Some(select);
+        self.match_and_insert_dyn(tokens, path_hash, &mut |result| {
             select.take().and_then(|select| select(result))
         })
     }
@@ -927,6 +1150,7 @@ impl TokenTree {
     fn match_and_insert_dyn<'t>(
         &self,
         tokens: &[TokenId],
+        path_hash: Option<u64>,
         select: &mut dyn FnMut(&PrefixMatchResult) -> Option<&'t str>,
     ) -> PrefixMatchResult {
         let page_size = self.page_size;
@@ -1197,7 +1421,7 @@ impl TokenTree {
             // only the edges it newly attaches, so nothing is counted twice,
             // and it splices the suffix under live nodes, so the prompt is
             // cached. One extra descent, in the rare case.
-            tokens_added += Self::insert_from(
+            let (added, ends_at) = Self::insert_from(
                 Arc::clone(&self.root),
                 tokens,
                 Arc::clone(&tenant_id),
@@ -1205,6 +1429,10 @@ impl TokenTree {
                 track_lfu,
                 page_size,
             );
+            tokens_added += added;
+            if let Some(end) = ends_at {
+                self.record_hash(&end, path_hash);
+            }
         } else if remaining.len() >= page_size {
             // Splice only the unmatched suffix at the fall-off node
             // (`current`), reusing insert_tokens' exact descent loop. It
@@ -1218,7 +1446,7 @@ impl TokenTree {
                 Some(i) => Arc::clone(&path[i]),
                 None => Arc::clone(&self.root),
             };
-            tokens_added += Self::insert_from(
+            let (added, ends_at) = Self::insert_from(
                 fall_off,
                 remaining,
                 Arc::clone(&tenant_id),
@@ -1226,6 +1454,18 @@ impl TokenTree {
                 track_lfu,
                 page_size,
             );
+            tokens_added += added;
+            if let Some(end) = ends_at {
+                self.record_hash(&end, path_hash);
+            }
+        } else {
+            // The whole aligned sequence was matched: it ends at the deepest
+            // node of the path (the replay above attached the tenant there).
+            let end = match current {
+                Some(i) => &path[i],
+                None => &self.root,
+            };
+            self.record_hash(end, path_hash);
         }
 
         self.add_tenant_tokens(tenant_id, tokens_added);
@@ -1473,9 +1713,16 @@ impl TokenTree {
             // it, with every descendant it owns: the index silently shrinks or the
             // credit leaks. `remove_if` evaluates the predicate under the shard
             // lock, so the checks and the removal cannot be split.
-            parent.children.remove_if(&page_key, |_, child| {
-                Arc::ptr_eq(child, &current) && child.is_empty()
-            });
+            let detached = parent
+                .children
+                .remove_if(&page_key, |_, child| {
+                    Arc::ptr_eq(child, &current) && child.is_empty()
+                })
+                .is_some();
+            if detached {
+                // The node left the tree: its path hash's entry goes with it.
+                self.forget_hash(&current);
+            }
 
             if parent_leaf_info.is_none() && self.is_tenant_leaf(&parent, tenant_id) {
                 if let Some(ts) = parent.tenant_last_access_time.get(tenant_id.as_ref()) {
@@ -1535,6 +1782,7 @@ impl TokenTree {
         self.root.tenant_last_access_time.clear();
         self.tenant_token_count.clear();
         self.total_token_count.store(0, Ordering::Relaxed);
+        self.hashed.clear();
     }
 
     /// Remove a tenant from every node (including the root), detach nodes
@@ -1668,6 +1916,15 @@ impl TokenTree {
                 }
             }
         }
+
+        // The pass's own holds on the leaves and the promoted parents go
+        // first, so a node this pass detached counts as gone below.
+        drop(heap);
+        drop(leaf_data);
+        // An entry whose node left without passing `forget_hash` (a record
+        // that crossed the node's detach) leaves here, so the map never
+        // outgrows the tree's hashed nodes by more than one eviction pass.
+        self.hashed.retain(|_, node| node.strong_count() > 0);
 
         debug!(
             evicted = initial_total.saturating_sub(self.total_token_size()),
