@@ -513,7 +513,14 @@ def start_bootstrap_server(server_args: Any) -> Any | None:
         return None
     from sglang.srt.managers.disagg_service import start_disagg_service
 
+    from smg_grpc_servicer.sglang.bootstrap import wait_for_bootstrap_listener
+
     bootstrap_server = start_disagg_service()
+    wait_for_bootstrap_listener(
+        bootstrap_server,
+        server_args.host,
+        server_args.disaggregation_bootstrap_port,
+    )
     if bootstrap_server is not None:
         logger.info(
             "Bootstrap server started for disaggregation mode on %s:%s",
