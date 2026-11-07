@@ -280,9 +280,10 @@ impl DirectEncoders {
     /// Words the `tokenizers` model may cache per thread: none behind the
     /// direct encode path (`native`), whose own piece cache, owned by the
     /// encoder and freed with it, answers in front of the model for every
-    /// piece of up to 256 bytes (the short ones by count, the long ones, a
-    /// clause in a script without word spaces say, within a byte budget; a
-    /// longer piece is rare and merged on every encode), else
+    /// piece of up to 16 KiB (`LONG_PIECE_MAX_BYTES`: the short ones by
+    /// count, the long ones, a paragraph in a script without word spaces
+    /// say, within a byte budget; a longer piece is merged on every encode),
+    /// else
     /// [`HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD`]. The model's
     /// cache outlives the model: it is a thread-local the crate never
     /// clears, so every thread that encoded with a tokenizer the gateway
