@@ -1,7 +1,9 @@
 //! Test support of the gRPC router: the `AppContext` a test constructs its
 //! router over, with the components `GrpcRouter::new` needs (the parser
 //! factories always; an initialized MCP orchestrator, which the Responses
-//! contexts of the regular and the disaggregated modes read).
+//! contexts of the regular and the disaggregated modes read), and the
+//! labelled worker selection the stages' tests read a decode worker's
+//! labels from.
 
 use std::sync::{Arc, OnceLock};
 
@@ -17,7 +19,8 @@ use crate::{
     app_context::AppContext,
     config::{ParserChoice, PolicyConfig, RouterConfig, RouterConfigBuilder, RoutingMode},
     policies::PolicyRegistry,
-    worker::WorkerRegistry,
+    routers::grpc::context::WorkerSelection,
+    worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType},
 };
 
 /// Minimal `AppContext` for constructing a gRPC router in `mode`. Regular and
@@ -98,4 +101,17 @@ pub(crate) fn grpc_ctx_from(
             .build()
             .expect("app context"),
     )
+}
+
+/// One regular gRPC worker carrying `labels`, as the selection a stage or a
+/// parser utility reads the decode worker's labels from.
+pub(crate) fn worker(labels: &[(&str, &str)]) -> WorkerSelection {
+    let mut builder =
+        BasicWorkerBuilder::new("grpc://engine:50051").worker_type(WorkerType::Regular);
+    for (key, value) in labels {
+        builder = builder.label(*key, *value);
+    }
+    WorkerSelection::Single {
+        worker: Arc::new(builder.build()),
+    }
 }

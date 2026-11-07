@@ -2872,6 +2872,7 @@ mod tests {
                 REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE, REASON_WASM_REQUEST_HOOK,
             },
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
+            test_support::fast_retry_config,
         },
         service_discovery::testing::create_test_app_context,
         test_support::RefusedAddress,
@@ -3323,16 +3324,6 @@ mod tests {
         (format!("http://{addr}"), hits)
     }
 
-    fn fast_retries(max_retries: u32) -> RetryConfig {
-        RetryConfig {
-            max_retries,
-            initial_backoff_ms: 1,
-            max_backoff_ms: 2,
-            backoff_multiplier: 1.0,
-            jitter_factor: 0.0,
-        }
-    }
-
     /// A round-robin router over `worker_urls`, each worker's breaker opening
     /// at `failure_threshold` failures.
     fn breaker_router(worker_urls: &[&str], retry: RetryConfig, failure_threshold: u32) -> Router {
@@ -3398,7 +3389,7 @@ mod tests {
     #[tokio::test]
     async fn transient_upstream_failures_charge_the_breaker_once_per_request() {
         let (url, hits) = fixed_status_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
-        let router = breaker_router(&[&url], fast_retries(3), 2);
+        let router = breaker_router(&[&url], fast_retry_config(3), 2);
         let worker = router.worker_registry.get_all().remove(0);
 
         let response = generate(&router, "busy").await;
@@ -3428,7 +3419,7 @@ mod tests {
     #[tokio::test]
     async fn a_workers_own_500_is_not_replayed_on_it() {
         let (url, hits) = fixed_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
-        let router = breaker_router(&[&url], fast_retries(5), 2);
+        let router = breaker_router(&[&url], fast_retry_config(5), 2);
         let worker = router.worker_registry.get_all().remove(0);
 
         let response = generate(&router, "bad payload").await;
@@ -3454,7 +3445,7 @@ mod tests {
     async fn a_workers_own_500_moves_the_request_to_another_worker_once() {
         let (url_a, hits_a) = fixed_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
         let (url_b, hits_b) = fixed_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
-        let router = breaker_router(&[&url_a, &url_b], fast_retries(5), 5);
+        let router = breaker_router(&[&url_a, &url_b], fast_retry_config(5), 5);
 
         let response = generate(&router, "bad payload").await;
 
@@ -3471,7 +3462,7 @@ mod tests {
     #[tokio::test]
     async fn no_retry_runs_against_a_pool_of_open_breakers() {
         let (url, hits) = fixed_status_upstream(StatusCode::OK).await;
-        let router = breaker_router(&[&url], fast_retries(5), 1);
+        let router = breaker_router(&[&url], fast_retry_config(5), 1);
         let worker = router.worker_registry.get_all().remove(0);
         worker.record_outcome(500);
         assert!(!worker.is_available());
@@ -3535,7 +3526,7 @@ mod tests {
         let (slow_b, hits_b) = delayed_upstream(Duration::from_secs(10)).await;
         let router = breaker_router_with_client(
             &[&slow_a, &slow_b],
-            fast_retries(3),
+            fast_retry_config(3),
             1,
             Some(client_with_timeout(Duration::from_secs(1))),
         );

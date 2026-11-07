@@ -32,7 +32,12 @@ use crate::{
         proto_wrapper::ProtoGenerateComplete,
         regular::{
             processor::ResponseProcessor,
-            symphony::{assign, template::Templates, testing::Refusing, Asks, Assignment},
+            symphony::{
+                assign,
+                template::Templates,
+                testing::{tools, Refusing},
+                Asks, Assignment,
+            },
         },
         utils::ModelNames,
     },
@@ -666,16 +671,6 @@ async fn malformed_call_text_is_content_and_keeps_its_logprobs() {
     assert_eq!(kept_logprob_tokens(&choice), output);
 }
 
-/// The `lookup` tool the outputs call.
-fn lookup_tools() -> Vec<Tool> {
-    serde_json::from_value(json!([{
-        "type": "function", "function": {
-            "name": "lookup", "parameters": {"type": "object", "properties": {}}
-        }
-    }]))
-    .expect("tools")
-}
-
 /// A Messages spec with Symphony assigned `format`, replaying `prompt`, with the `lookup` tool.
 pub(super) fn assigned_message(
     format: Format,
@@ -691,7 +686,7 @@ pub(super) fn assigned_message(
         tool_choice: None,
         has_tools: true,
         history_tool_calls_count: 0,
-        chat_tools: lookup_tools().into(),
+        chat_tools: tools().into(),
         stop_sequences: None,
         symphony: Some(Assignment {
             format: Arc::new(format),
