@@ -773,110 +773,153 @@ impl StreamingProcessor {
         let mut usage = GenerateStreamUsage::default();
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
+        // The frame being written: the events ready at one poll share it
+        // (the packed read, as the chat, completion and Messages loops).
+        let mut sse_buffer = BytesMut::new();
+        let mut first_token_out = false;
 
-        while let Some(response) = stream.next().await {
-            let gen_response = response
-                .map_err(|e| utils::StreamFailure::upstream(e, usage.completion_total()))?;
+        loop {
+            // The packed read (`StreamingProcessor::next_packed`): the events
+            // ready at one poll share a frame; the first token's frame leaves
+            // alone, before the engine is polled again, and this stream's
+            // first frame is the first token's.
+            let next = Self::next_packed(
+                &mut stream,
+                tx,
+                &mut sse_buffer,
+                &mut first_token_out,
+                first_token_time.is_some(),
+                true,
+            )
+            .await?;
+            let Some(response) = next else {
+                break;
+            };
+            let gen_response = match response {
+                Ok(response) => response,
+                Err(e) => {
+                    // What was produced before the failure still goes out.
+                    Self::flush_chunks(tx, &mut sse_buffer).await?;
+                    return Err(utils::StreamFailure::upstream(e, usage.completion_total()));
+                }
+            };
 
-            match gen_response.into_response() {
-                ProtoResponseVariant::Chunk(chunk) => {
-                    // Track TTFT immediately on first chunk received from backend
-                    if first_token_time.is_none() {
-                        first_token_time = Some(Instant::now());
+            // The message's processing; a failure inside it returns after the
+            // chunks written ahead of it have left, as an upstream failure does.
+            let read: Result<(), String> = async {
+                match gen_response.into_response() {
+                    ProtoResponseVariant::Chunk(chunk) => {
+                        // Track TTFT immediately on first chunk received from backend
+                        if first_token_time.is_none() {
+                            first_token_time = Some(Instant::now());
+                        }
+
+                        let index = chunk.index();
+
+                        let current_completion_tokens = usage.record_chunk(&chunk);
+
+                        // Decode tokens to text (skip_special_tokens=true to handle
+                        // newlines correctly). A piece the tokenizer cannot decode
+                        // fails the stream, as it does the chat stream and the
+                        // collected generate answer: an empty piece would reach the
+                        // client as the model's own text, with nothing logged or
+                        // counted.
+                        let chunk_text = tokenizer
+                            .decode(chunk.token_ids(), true)
+                            .map_err(|e| format!("Failed to decode generate chunk: {e}"))?;
+
+                        // Accumulate text for this index
+                        let choice = choices
+                            .entry(index)
+                            .or_insert_with(|| GenerateChoice::new(&ctx.request_id, index));
+                        choice.text.push_str(&chunk_text);
+
+                        // The streaming response chunk (the engine's own format)
+                        let chunk_response = GenerateEvent {
+                            text: &choice.text,
+                            output_ids: chunk.token_ids(),
+                            meta_info: GenerateMetaInfo {
+                                id: &choice.id,
+                                finish_reason: None,
+                                prompt_tokens: chunk.prompt_tokens(),
+                                weight_version: effective_weight_version(
+                                    chunk.weight_version(),
+                                    Some(ctx.weight_version.as_str()),
+                                ),
+                                logprobs: None,
+                                completion_tokens: current_completion_tokens,
+                                cached_tokens: chunk.cached_tokens(),
+                                reasoning_tokens: chunk.reasoning_tokens(),
+                                e2e_latency: None,
+                            },
+                            index,
+                        };
+
+                        let sse_data = sse_encoder
+                            .encode_data(&chunk_response)
+                            .map_err(|e| format!("Failed to serialize generate chunk: {e}"))?;
+                        sse_buffer.extend_from_slice(&sse_data);
+                        Self::flush_when_full(tx, &mut sse_buffer)
+                            .await
+                            .map_err(|()| "Failed to send chunk".to_string())?;
                     }
+                    ProtoResponseVariant::Complete(complete) => {
+                        let index = complete.index();
+                        let completion_tokens = usage.record_complete(&complete);
+                        let choice = choices
+                            .entry(index)
+                            .or_insert_with(|| GenerateChoice::new(&ctx.request_id, index));
+                        let e2e_latency = start_time.elapsed().as_secs_f64();
 
-                    let index = chunk.index();
+                        // Send final chunk with finish_reason
+                        let output_ids = complete.output_ids();
+                        let finish_response = GenerateEvent {
+                            text: &choice.text,
+                            output_ids: &output_ids[output_ids.len().saturating_sub(1)..],
+                            meta_info: GenerateMetaInfo {
+                                id: &choice.id,
+                                finish_reason: Some(utils::parse_finish_reason(
+                                    complete.finish_reason(),
+                                    complete.completion_tokens(),
+                                )),
+                                prompt_tokens: complete.prompt_tokens(),
+                                weight_version: effective_weight_version(
+                                    complete.weight_version(),
+                                    Some(ctx.weight_version.as_str()),
+                                ),
+                                logprobs: None,
+                                completion_tokens,
+                                cached_tokens: complete.cached_tokens(),
+                                reasoning_tokens: complete.reasoning_tokens(),
+                                e2e_latency: Some(e2e_latency),
+                            },
+                            index,
+                        };
 
-                    let current_completion_tokens = usage.record_chunk(&chunk);
+                        let sse_data = sse_encoder
+                            .encode_data(&finish_response)
+                            .map_err(|e| format!("Failed to serialize generate finish: {e}"))?;
+                        sse_buffer.extend_from_slice(&sse_data);
+                        Self::flush_when_full(tx, &mut sse_buffer)
+                            .await
+                            .map_err(|()| "Failed to send finish chunk".to_string())?;
 
-                    // Decode tokens to text (skip_special_tokens=true to handle
-                    // newlines correctly). A piece the tokenizer cannot decode
-                    // fails the stream, as it does the chat stream and the
-                    // collected generate answer: an empty piece would reach the
-                    // client as the model's own text, with nothing logged or
-                    // counted.
-                    let chunk_text = tokenizer
-                        .decode(chunk.token_ids(), true)
-                        .map_err(|e| format!("Failed to decode generate chunk: {e}"))?;
-
-                    // Accumulate text for this index
-                    let choice = choices
-                        .entry(index)
-                        .or_insert_with(|| GenerateChoice::new(&ctx.request_id, index));
-                    choice.text.push_str(&chunk_text);
-
-                    // The streaming response chunk (the engine's own format)
-                    let chunk_response = GenerateEvent {
-                        text: &choice.text,
-                        output_ids: chunk.token_ids(),
-                        meta_info: GenerateMetaInfo {
-                            id: &choice.id,
-                            finish_reason: None,
-                            prompt_tokens: chunk.prompt_tokens(),
-                            weight_version: effective_weight_version(
-                                chunk.weight_version(),
-                                Some(ctx.weight_version.as_str()),
-                            ),
-                            logprobs: None,
-                            completion_tokens: current_completion_tokens,
-                            cached_tokens: chunk.cached_tokens(),
-                            reasoning_tokens: chunk.reasoning_tokens(),
-                            e2e_latency: None,
-                        },
-                        index,
-                    };
-
-                    let sse_data = sse_encoder
-                        .encode_data(&chunk_response)
-                        .map_err(|e| format!("Failed to serialize generate chunk: {e}"))?;
-                    tx.send(Ok(sse_data))
-                        .await
-                        .map_err(|_| "Failed to send chunk".to_string())?;
+                        // Continue to process all completions if n>1
+                    }
+                    ProtoResponseVariant::None => {}
                 }
-                ProtoResponseVariant::Complete(complete) => {
-                    let index = complete.index();
-                    let completion_tokens = usage.record_complete(&complete);
-                    let choice = choices
-                        .entry(index)
-                        .or_insert_with(|| GenerateChoice::new(&ctx.request_id, index));
-                    let e2e_latency = start_time.elapsed().as_secs_f64();
-
-                    // Send final chunk with finish_reason
-                    let output_ids = complete.output_ids();
-                    let finish_response = GenerateEvent {
-                        text: &choice.text,
-                        output_ids: &output_ids[output_ids.len().saturating_sub(1)..],
-                        meta_info: GenerateMetaInfo {
-                            id: &choice.id,
-                            finish_reason: Some(utils::parse_finish_reason(
-                                complete.finish_reason(),
-                                complete.completion_tokens(),
-                            )),
-                            prompt_tokens: complete.prompt_tokens(),
-                            weight_version: effective_weight_version(
-                                complete.weight_version(),
-                                Some(ctx.weight_version.as_str()),
-                            ),
-                            logprobs: None,
-                            completion_tokens,
-                            cached_tokens: complete.cached_tokens(),
-                            reasoning_tokens: complete.reasoning_tokens(),
-                            e2e_latency: Some(e2e_latency),
-                        },
-                        index,
-                    };
-
-                    let sse_data = sse_encoder
-                        .encode_data(&finish_response)
-                        .map_err(|e| format!("Failed to serialize generate finish: {e}"))?;
-                    tx.send(Ok(sse_data))
-                        .await
-                        .map_err(|_| "Failed to send finish chunk".to_string())?;
-
-                    // Continue to process all completions if n>1
-                }
-                ProtoResponseVariant::None => continue,
+                Ok(())
             }
+            .await;
+            if let Err(failure) = read {
+                Self::flush_chunks(tx, &mut sse_buffer).await?;
+                return Err(failure.into());
+            }
+        }
+        // The frame being written leaves at the read's end; a client that
+        // left gets nothing more (as on the chat path).
+        if !stream.client_left() {
+            Self::flush_chunks(tx, &mut sse_buffer).await?;
         }
 
         // Mark stream as completed successfully to prevent abort on drop
@@ -981,144 +1024,188 @@ impl StreamingProcessor {
         let mut usage = GenerateStreamUsage::default();
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
+        // The frame being written: the events ready at one poll share it
+        // (the packed read, as the chat, completion and Messages loops).
+        let mut sse_buffer = BytesMut::new();
+        let mut first_token_out = false;
 
-        while let Some(response) = stream.next().await {
-            let gen_response = response
-                .map_err(|e| utils::StreamFailure::upstream(e, usage.completion_total()))?;
+        loop {
+            // The packed read (`StreamingProcessor::next_packed`): the events
+            // ready at one poll share a frame; the first token's frame leaves
+            // alone, before the engine is polled again, and this stream's
+            // first frame is the first token's.
+            let next = Self::next_packed(
+                &mut stream,
+                tx,
+                &mut sse_buffer,
+                &mut first_token_out,
+                first_token_time.is_some(),
+                true,
+            )
+            .await?;
+            let Some(response) = next else {
+                break;
+            };
+            let gen_response = match response {
+                Ok(response) => response,
+                Err(e) => {
+                    // What was produced before the failure still goes out.
+                    Self::flush_chunks(tx, &mut sse_buffer).await?;
+                    return Err(utils::StreamFailure::upstream(e, usage.completion_total()));
+                }
+            };
 
-            match gen_response.into_response() {
-                ProtoResponseVariant::Chunk(chunk) => {
-                    // Track TTFT immediately on first chunk received from backend
-                    if first_token_time.is_none() {
-                        first_token_time = Some(Instant::now());
-                        if let Some(timing) = &pd_timing {
-                            timing.record_first_decode_token(ctx.backend_type, &ctx.model);
-                        }
-                    }
-
-                    let index = chunk.index();
-
-                    let current_completion_tokens = usage.record_chunk(&chunk);
-
-                    // Decode tokens to text; a piece the tokenizer cannot decode
-                    // fails the stream (see `process_generate_streaming`).
-                    let chunk_text = tokenizer
-                        .decode(chunk.token_ids(), true)
-                        .map_err(|e| format!("Failed to decode generate chunk: {e}"))?;
-
-                    // Accumulate text for this index
-                    let choice = choices
-                        .entry(index)
-                        .or_insert_with(|| GenerateChoice::new(&ctx.request_id, index));
-                    choice.text.push_str(&chunk_text);
-
-                    // Handle output logprobs by the stream's chunk semantics:
-                    // cumulative chunks replace, delta chunks accumulate.
-                    if let Some(output_logprobs) = chunk.output_logprobs() {
-                        let converted = utils::convert_generate_output_logprobs(output_logprobs);
-                        if chunk.chunk_semantics().is_delta() {
-                            // Delta - extend existing logprobs
-                            if let Some(v) = accumulated_output_logprobs
-                                .entry(index)
-                                .or_insert_with(|| Some(Vec::new()))
-                                .as_mut()
-                            {
-                                v.extend(converted);
+            // The message's processing; a failure inside it returns after the
+            // chunks written ahead of it have left, as an upstream failure does.
+            let read: Result<(), String> = async {
+                match gen_response.into_response() {
+                    ProtoResponseVariant::Chunk(chunk) => {
+                        // Track TTFT immediately on first chunk received from backend
+                        if first_token_time.is_none() {
+                            first_token_time = Some(Instant::now());
+                            if let Some(timing) = &pd_timing {
+                                timing.record_first_decode_token(ctx.backend_type, &ctx.model);
                             }
-                        } else {
-                            // Cumulative - replace
-                            accumulated_output_logprobs.insert(index, Some(converted));
                         }
+
+                        let index = chunk.index();
+
+                        let current_completion_tokens = usage.record_chunk(&chunk);
+
+                        // Decode tokens to text; a piece the tokenizer cannot decode
+                        // fails the stream (see `process_generate_streaming`).
+                        let chunk_text = tokenizer
+                            .decode(chunk.token_ids(), true)
+                            .map_err(|e| format!("Failed to decode generate chunk: {e}"))?;
+
+                        // Accumulate text for this index
+                        let choice = choices
+                            .entry(index)
+                            .or_insert_with(|| GenerateChoice::new(&ctx.request_id, index));
+                        choice.text.push_str(&chunk_text);
+
+                        // Handle output logprobs by the stream's chunk semantics:
+                        // cumulative chunks replace, delta chunks accumulate.
+                        if let Some(output_logprobs) = chunk.output_logprobs() {
+                            let converted =
+                                utils::convert_generate_output_logprobs(output_logprobs);
+                            if chunk.chunk_semantics().is_delta() {
+                                // Delta - extend existing logprobs
+                                if let Some(v) = accumulated_output_logprobs
+                                    .entry(index)
+                                    .or_insert_with(|| Some(Vec::new()))
+                                    .as_mut()
+                                {
+                                    v.extend(converted);
+                                }
+                            } else {
+                                // Cumulative - replace
+                                accumulated_output_logprobs.insert(index, Some(converted));
+                            }
+                        }
+
+                        // The streaming response chunk with the accumulated logprobs
+                        let current_output_logprobs = accumulated_output_logprobs
+                            .get(&index)
+                            .and_then(|o| o.as_deref());
+
+                        let chunk_response = GenerateEvent {
+                            text: &choice.text,
+                            output_ids: chunk.token_ids(),
+                            meta_info: GenerateMetaInfo {
+                                id: &choice.id,
+                                finish_reason: None,
+                                prompt_tokens: chunk.prompt_tokens(),
+                                weight_version: effective_weight_version(
+                                    chunk.weight_version(),
+                                    Some(ctx.weight_version.as_str()),
+                                ),
+                                logprobs: Some(GenerateLogprobs {
+                                    input_token_logprobs: input_token_logprobs.as_deref(),
+                                    output_token_logprobs: current_output_logprobs,
+                                }),
+                                completion_tokens: current_completion_tokens,
+                                cached_tokens: chunk.cached_tokens(),
+                                reasoning_tokens: chunk.reasoning_tokens(),
+                                e2e_latency: None,
+                            },
+                            index,
+                        };
+
+                        let sse_data = sse_encoder
+                            .encode_data(&chunk_response)
+                            .map_err(|e| format!("Failed to serialize generate chunk: {e}"))?;
+                        sse_buffer.extend_from_slice(&sse_data);
+                        Self::flush_when_full(tx, &mut sse_buffer)
+                            .await
+                            .map_err(|()| "Failed to send chunk".to_string())?;
                     }
+                    ProtoResponseVariant::Complete(complete) => {
+                        let index = complete.index();
+                        let completion_tokens = usage.record_complete(&complete);
+                        let choice = choices
+                            .entry(index)
+                            .or_insert_with(|| GenerateChoice::new(&ctx.request_id, index));
+                        let final_output_logprobs = accumulated_output_logprobs
+                            .get(&index)
+                            .and_then(|o| o.as_deref());
+                        let e2e_latency = start_time.elapsed().as_secs_f64();
 
-                    // The streaming response chunk with the accumulated logprobs
-                    let current_output_logprobs = accumulated_output_logprobs
-                        .get(&index)
-                        .and_then(|o| o.as_deref());
+                        // Parse finish_reason
+                        let finish_reason = utils::parse_finish_reason(
+                            complete.finish_reason(),
+                            complete.completion_tokens(),
+                        );
 
-                    let chunk_response = GenerateEvent {
-                        text: &choice.text,
-                        output_ids: chunk.token_ids(),
-                        meta_info: GenerateMetaInfo {
-                            id: &choice.id,
-                            finish_reason: None,
-                            prompt_tokens: chunk.prompt_tokens(),
-                            weight_version: effective_weight_version(
-                                chunk.weight_version(),
-                                Some(ctx.weight_version.as_str()),
-                            ),
-                            logprobs: Some(GenerateLogprobs {
-                                input_token_logprobs: input_token_logprobs.as_deref(),
-                                output_token_logprobs: current_output_logprobs,
-                            }),
-                            completion_tokens: current_completion_tokens,
-                            cached_tokens: chunk.cached_tokens(),
-                            reasoning_tokens: chunk.reasoning_tokens(),
-                            e2e_latency: None,
-                        },
-                        index,
-                    };
+                        // Send final chunk with finish_reason
+                        let output_ids = complete.output_ids();
+                        let finish_response = GenerateEvent {
+                            text: &choice.text,
+                            output_ids: &output_ids[output_ids.len().saturating_sub(1)..],
+                            meta_info: GenerateMetaInfo {
+                                id: &choice.id,
+                                finish_reason: Some(finish_reason),
+                                prompt_tokens: complete.prompt_tokens(),
+                                weight_version: effective_weight_version(
+                                    complete.weight_version(),
+                                    Some(ctx.weight_version.as_str()),
+                                ),
+                                logprobs: Some(GenerateLogprobs {
+                                    input_token_logprobs: input_token_logprobs.as_deref(),
+                                    output_token_logprobs: final_output_logprobs,
+                                }),
+                                completion_tokens,
+                                cached_tokens: complete.cached_tokens(),
+                                reasoning_tokens: complete.reasoning_tokens(),
+                                e2e_latency: Some(e2e_latency),
+                            },
+                            index,
+                        };
 
-                    let sse_data = sse_encoder
-                        .encode_data(&chunk_response)
-                        .map_err(|e| format!("Failed to serialize generate chunk: {e}"))?;
-                    tx.send(Ok(sse_data))
-                        .await
-                        .map_err(|_| "Failed to send chunk".to_string())?;
+                        let sse_data = sse_encoder
+                            .encode_data(&finish_response)
+                            .map_err(|e| format!("Failed to serialize generate finish: {e}"))?;
+                        sse_buffer.extend_from_slice(&sse_data);
+                        Self::flush_when_full(tx, &mut sse_buffer)
+                            .await
+                            .map_err(|()| "Failed to send finish chunk".to_string())?;
+
+                        // Continue to process all completions if n>1
+                    }
+                    ProtoResponseVariant::None => {}
                 }
-                ProtoResponseVariant::Complete(complete) => {
-                    let index = complete.index();
-                    let completion_tokens = usage.record_complete(&complete);
-                    let choice = choices
-                        .entry(index)
-                        .or_insert_with(|| GenerateChoice::new(&ctx.request_id, index));
-                    let final_output_logprobs = accumulated_output_logprobs
-                        .get(&index)
-                        .and_then(|o| o.as_deref());
-                    let e2e_latency = start_time.elapsed().as_secs_f64();
-
-                    // Parse finish_reason
-                    let finish_reason = utils::parse_finish_reason(
-                        complete.finish_reason(),
-                        complete.completion_tokens(),
-                    );
-
-                    // Send final chunk with finish_reason
-                    let output_ids = complete.output_ids();
-                    let finish_response = GenerateEvent {
-                        text: &choice.text,
-                        output_ids: &output_ids[output_ids.len().saturating_sub(1)..],
-                        meta_info: GenerateMetaInfo {
-                            id: &choice.id,
-                            finish_reason: Some(finish_reason),
-                            prompt_tokens: complete.prompt_tokens(),
-                            weight_version: effective_weight_version(
-                                complete.weight_version(),
-                                Some(ctx.weight_version.as_str()),
-                            ),
-                            logprobs: Some(GenerateLogprobs {
-                                input_token_logprobs: input_token_logprobs.as_deref(),
-                                output_token_logprobs: final_output_logprobs,
-                            }),
-                            completion_tokens,
-                            cached_tokens: complete.cached_tokens(),
-                            reasoning_tokens: complete.reasoning_tokens(),
-                            e2e_latency: Some(e2e_latency),
-                        },
-                        index,
-                    };
-
-                    let sse_data = sse_encoder
-                        .encode_data(&finish_response)
-                        .map_err(|e| format!("Failed to serialize generate finish: {e}"))?;
-                    tx.send(Ok(sse_data))
-                        .await
-                        .map_err(|_| "Failed to send finish chunk".to_string())?;
-
-                    // Continue to process all completions if n>1
-                }
-                ProtoResponseVariant::None => continue,
+                Ok(())
             }
+            .await;
+            if let Err(failure) = read {
+                Self::flush_chunks(tx, &mut sse_buffer).await?;
+                return Err(failure.into());
+            }
+        }
+        // The frame being written leaves at the read's end; a client that
+        // left gets nothing more (as on the chat path).
+        if !stream.client_left() {
+            Self::flush_chunks(tx, &mut sse_buffer).await?;
         }
 
         // Mark stream as completed successfully to prevent abort on drop
