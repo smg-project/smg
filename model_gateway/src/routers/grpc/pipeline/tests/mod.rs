@@ -47,7 +47,7 @@ use super::*;
 use crate::{
     config::types::PolicyConfig,
     routers::{
-        common::openai_bridge::FormatRegistry,
+        common::{openai_bridge::FormatRegistry, test_support::fast_retry_config},
         grpc::{
             client::ModelInfo,
             common::responses::{
@@ -993,16 +993,6 @@ fn completion_pipeline_with_policy(
         Duration::from_secs(60),
     );
     RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps).expect("completion pipeline")
-}
-
-fn fast_retry_config(max_retries: u32) -> RetryConfig {
-    RetryConfig {
-        max_retries,
-        initial_backoff_ms: 1,
-        max_backoff_ms: 2,
-        backoff_multiplier: 1.0,
-        jitter_factor: 0.0,
-    }
 }
 
 /// A request pinned by a routing key whose engine cannot start it
