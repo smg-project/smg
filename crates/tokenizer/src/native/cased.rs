@@ -45,7 +45,9 @@
 //! tests hold the scanner against.
 
 use super::{
-    pattern::{clitic_match, concat, plain_class, previous_boundary, repeat, Class, Node},
+    pattern::{
+        clitic_match, concat, each_match, plain_class, previous_boundary, repeat, Class, Node,
+    },
     scan::{Bits, Roles},
 };
 
@@ -460,5 +462,18 @@ impl Scanner {
             return Some(self.roles.run_end(text, after, Role::Space.bit()));
         }
         None
+    }
+
+    /// Calls `f` with each piece of `text` in order (see
+    /// `Pattern::for_each_match`): a position no alternative matches at is
+    /// passed over by one character, as the iterator does.
+    #[inline(always)]
+    pub(super) fn for_each_match<F: FnMut(usize, usize)>(
+        &self,
+        classes: &[Class],
+        text: &str,
+        f: &mut F,
+    ) {
+        each_match(text, |pos| self.match_at(classes, text, pos), f);
     }
 }

@@ -61,6 +61,7 @@
 use std::{
     borrow::Cow,
     cell::{RefCell, RefMut},
+    ops::Range,
     sync::atomic::{AtomicUsize, Ordering},
     time::Instant,
 };
@@ -489,10 +490,7 @@ impl AddedTokens {
     }
 
     /// The byte ranges of the added tokens in `text`, in order.
-    pub(crate) fn ranges<'a>(
-        &'a self,
-        text: &'a str,
-    ) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
+    pub(crate) fn ranges<'a>(&'a self, text: &'a str) -> impl Iterator<Item = Range<usize>> + 'a {
         self.automaton
             .find_iter(text)
             .map(|found| found.start()..found.end())
@@ -1703,10 +1701,11 @@ impl NativeEncoder {
         // ASCII unit skip the pre-formed path and its per-piece test (see
         // `tokenize_piece_slow`).
         cache.unit_ascii = text.is_ascii();
-        // One walk per unit. A single-stage encoder consumes its stage's
-        // matches here and probes each piece in place (no recursive walk, no
-        // closure call per piece); the chain hands its pieces to the same
-        // probe through its static callback; any other shape walks.
+        // One walk per unit. A single-stage encoder hands the unit to
+        // `encode_single_stage`, out of line, where the scanner's own loop
+        // probes each piece in place (no recursive walk); the chain hands its
+        // pieces to the same probe through its static callback; any other
+        // shape walks.
         match (&self.chain, self.stages.as_slice()) {
             (Some(chain), _) => {
                 chain.pieces(text, &mut |piece: &str| {
@@ -1719,28 +1718,10 @@ impl NativeEncoder {
                 });
             }
             (None, [stage]) => {
-                let mut cursor = 0;
-                for (start, end) in stage.pattern.find_iter(text) {
-                    if stage.keep_gaps && cursor < start {
-                        if let Err(declined) =
-                            self.tokenize_piece(model, &text[cursor..start], mapped, ids, cache)
-                        {
-                            fallback = Some(declined);
-                        }
-                    }
-                    if let Err(declined) =
-                        self.tokenize_piece(model, &text[start..end], mapped, ids, cache)
-                    {
-                        fallback = Some(declined);
-                    }
-                    cursor = end;
-                }
-                if stage.keep_gaps && cursor < text.len() {
-                    if let Err(declined) =
-                        self.tokenize_piece(model, &text[cursor..], mapped, ids, cache)
-                    {
-                        fallback = Some(declined);
-                    }
+                if let Err(declined) =
+                    self.encode_single_stage(model, stage, text, mapped, ids, cache)
+                {
+                    fallback = Some(declined);
                 }
             }
             (None, _) => {
@@ -1816,6 +1797,76 @@ impl NativeEncoder {
             }
         }
         self.tokenize_piece_slow(model, piece, key, mapped, ids, cache)
+    }
+
+    /// A unit of a single-stage encoder: the stage's matches through the
+    /// scanner's own loop with the probe compiled into it; a gap between
+    /// matches is a piece of its own through the same probe. Out of line
+    /// so that [`Self::encode_unit`] keeps the frame the other shapes pay
+    /// per unit: the sentencepiece path calls it once per word, and the
+    /// loop inlined there cost that path 3 % of its instructions per token
+    /// (measured); one call per unit here is nothing against a unit's
+    /// pieces.
+    #[inline(never)]
+    fn encode_single_stage(
+        &self,
+        model: Option<&ModelWrapper>,
+        stage: &Stage,
+        text: &str,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let keep_gaps = stage.keep_gaps;
+        let mut cursor = 0;
+        let mut fallback = None;
+        stage.pattern.for_each_match(text, |start, end| {
+            if keep_gaps && cursor < start {
+                if let Err(declined) =
+                    self.tokenize_piece_at(model, text, cursor..start, mapped, ids, cache)
+                {
+                    fallback = Some(declined);
+                }
+            }
+            if let Err(declined) =
+                self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
+            {
+                fallback = Some(declined);
+            }
+            cursor = end;
+        });
+        if keep_gaps && cursor < text.len() {
+            if let Err(declined) =
+                self.tokenize_piece_at(model, text, cursor..text.len(), mapped, ids, cache)
+            {
+                fallback = Some(declined);
+            }
+        }
+        fallback.map_or(Ok(()), Err)
+    }
+
+    /// [`Self::tokenize_piece`] for the piece `text[piece]` of a unit: the
+    /// key is read from the text around the piece (`ShortPieceKey::at`), and
+    /// the piece is cut out of the text only off the hot path.
+    #[inline(always)]
+    fn tokenize_piece_at(
+        &self,
+        model: Option<&ModelWrapper>,
+        text: &str,
+        piece: Range<usize>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let key = ShortPieceKey::at(text.as_bytes(), piece.start, piece.end);
+        if let Some(key) = key {
+            if let Some(packed) = &cache.packed {
+                if packed.ids_into(key, ids) {
+                    return Ok(());
+                }
+            }
+        }
+        self.tokenize_piece_slow(model, &text[piece], key, mapped, ids, cache)
     }
 
     /// The rest of [`Self::tokenize_piece`], out of line: the longer pieces'
