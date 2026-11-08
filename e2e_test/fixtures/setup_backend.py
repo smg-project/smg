@@ -380,6 +380,7 @@ def setup_backend(request: pytest.FixtureRequest):
                 engine,
                 connection_mode,
                 pool_counts,
+                workers_config,
                 gateway_config,
                 gateway,
                 log_dir,
@@ -796,6 +797,7 @@ def _setup_epd(
     engine,
     connection_mode,
     epd_counts,
+    workers_config,
     gateway_config,
     gateway,
     log_dir,
@@ -822,6 +824,9 @@ def _setup_epd(
         n_decode,
     )
 
+    # The class marker's engine flags (a scheduler wire, a context length)
+    # reach every pool, as they do for the prefill-decode pools.
+    extra_engine_args = workers_config.get("extra_engine_args")
     all_workers: list = []
     try:
         encode_workers = _start_workers_tracked(
@@ -833,6 +838,7 @@ def _setup_epd(
             log_dir=log_dir,
             gpu_offset=0,
             gpus=1,  # vision tower runs on one GPU regardless of LM tp
+            extra_engine_args=extra_engine_args,
         )
         all_workers.extend(encode_workers)
 
@@ -844,6 +850,7 @@ def _setup_epd(
             worker_type=WorkerType.PREFILL,
             log_dir=log_dir,
             gpu_offset=n_encode,
+            extra_engine_args=extra_engine_args,
         )
         all_workers.extend(prefill_workers)
 
@@ -855,9 +862,14 @@ def _setup_epd(
             worker_type=WorkerType.DECODE,
             log_dir=log_dir,
             gpu_offset=n_encode + n_prefill * tp,
+            extra_engine_args=extra_engine_args,
         )
         all_workers.extend(decode_workers)
 
+        # The class's workers, for the answers a test states on the mock
+        # engine (the fixture picks the decode side's) and for a test that
+        # reads one worker's own admin API.
+        set_class_workers(all_workers)
         _start_gateway(
             gateway,
             gateway_config,
@@ -865,9 +877,11 @@ def _setup_epd(
             prefill_workers=prefill_workers,
             decode_workers=decode_workers,
         )
+        _wait_for_serving(gateway, model_id, model_path)
         logger.info("%s EPD backend ready at %s", runtime_label, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     finally:
+        clear_class_workers()
         logger.info("Tearing down %s EPD backend", runtime_label)
         gateway.shutdown()
         stop_workers(all_workers)

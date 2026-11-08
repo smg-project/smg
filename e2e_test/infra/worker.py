@@ -719,17 +719,22 @@ class Worker:
             cmd += ["--zmq-handshake", handshake, "--zmq-count", "1"]
         else:
             cmd += ["--http-base-port", str(self.port), "--http-count", "1"]
-        # The disaggregation role, as the engines take theirs: a prefill
-        # worker also binds the bootstrap port the gateway is told of, where
-        # the probe finds it; both advertise the role in their server args.
-        if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
+        # The disaggregation role, as the engines take theirs: a prefill or
+        # an encode worker also binds the bootstrap port the gateway is told
+        # of, where the probe finds it; all advertise the role in their
+        # server args. The encode role is the vLLM wire's (the mock answers
+        # the encoder-cache handoff there), whatever the lane's wire; a
+        # class's own wire still comes after, and the mock takes the last.
+        if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE, WorkerType.ENCODE):
             if self.mode != ConnectionMode.GRPC:
-                raise ValueError("the mock engine's prefill and decode roles are gRPC workers")
+                raise ValueError(
+                    "the mock engine's prefill, decode and encode roles are gRPC workers"
+                )
             cmd += ["--worker-type", self.worker_type.value]
-            if self.worker_type == WorkerType.PREFILL and self.bootstrap_port is not None:
+            if self.worker_type == WorkerType.ENCODE:
+                cmd += ["--grpc-wire", "vllm"]
+            if self.worker_type != WorkerType.DECODE and self.bootstrap_port is not None:
                 cmd += ["--bootstrap-base-port", str(self.bootstrap_port)]
-        elif self.worker_type == WorkerType.ENCODE:
-            raise ValueError("the mock engine has no encode role")
         return cmd
 
     def _build_mlx_cmd(self, model_path: str, spec: dict) -> list[str]:
