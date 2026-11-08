@@ -76,10 +76,10 @@ fn contact_error(backend: &str, store: &str, bound: Duration, err: StoreContactE
     }
 }
 
-/// The URL with its password masked, for log and error text: the userinfo
-/// password and a `password` query pair alike (the Postgres driver reads the
-/// latter too).
-fn redacted(url: &str) -> String {
+/// The URL with its password masked, for log and error text and the
+/// gateway's configuration view: the userinfo password and a `password` query
+/// pair alike (the Postgres driver reads the latter too).
+pub fn redacted_url(url: &str) -> String {
     match Url::parse(url) {
         Ok(mut parsed) => {
             if parsed.password().is_some() {
@@ -169,7 +169,7 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
                 .validate_bounds()
                 .map_err(|e| format!("Invalid Postgres configuration: {e}"))?;
 
-            let log_db_url = redacted(&postgres_cfg.db_url);
+            let log_db_url = redacted_url(&postgres_cfg.db_url);
 
             info!(
                 "Initializing data connector: Postgres (db_url: {}, pool_max: {}, op_timeout_secs: {})",
@@ -194,7 +194,7 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
                 .validate_bounds()
                 .map_err(|e| format!("Invalid Redis configuration: {e}"))?;
 
-            let log_redis_url = redacted(&redis_cfg.url);
+            let log_redis_url = redacted_url(&redis_cfg.url);
 
             info!(
                 "Initializing data connector: Redis (url: {}, pool_max: {}, op_timeout_secs: {})",
@@ -273,10 +273,9 @@ fn create_oracle_storage(oracle_cfg: &OracleConfig) -> Result<StorageBundle, Str
 async fn create_postgres_storage(postgres_cfg: &PostgresConfig) -> Result<StorageBundle, String> {
     let store = PostgresStore::new(postgres_cfg.clone())?;
     let bound = postgres_cfg.op_timeout();
-    store
-        .contact(bound)
-        .await
-        .map_err(|err| contact_error("Postgres", &redacted(&postgres_cfg.db_url), bound, err))?;
+    store.contact(bound).await.map_err(|err| {
+        contact_error("Postgres", &redacted_url(&postgres_cfg.db_url), bound, err)
+    })?;
     // The tables, the schema version and the indexes: once per database, in
     // one transaction under the schema lock, so gateways starting together
     // take turns and a fresh database starts at the latest version.
@@ -303,7 +302,7 @@ async fn create_redis_storage(redis_cfg: &RedisConfig) -> Result<StorageBundle, 
     store
         .contact(bound)
         .await
-        .map_err(|err| contact_error("Redis", &redacted(&redis_cfg.url), bound, err))?;
+        .map_err(|err| contact_error("Redis", &redacted_url(&redis_cfg.url), bound, err))?;
     let redis_resp = RedisResponseStorage::new(store.clone());
     let redis_conv = RedisConversationStorage::new(store.clone());
     let redis_item = RedisConversationItemStorage::new(store);
@@ -353,22 +352,22 @@ mod tests {
     #[test]
     fn redacted_masks_the_password_in_the_userinfo_and_in_the_query() {
         assert_eq!(
-            redacted("postgres://u:s3cr3t@h:5432/db"),
+            redacted_url("postgres://u:s3cr3t@h:5432/db"),
             "postgres://u:****@h:5432/db"
         );
         assert_eq!(
-            redacted("postgres://u@h/db?password=s3cr3t&sslmode=require"),
+            redacted_url("postgres://u@h/db?password=s3cr3t&sslmode=require"),
             "postgres://u@h/db?password=****&sslmode=require"
         );
         assert_eq!(
-            redacted("postgres://u:s3cr3t@h/db?Password=s3cr3t"),
+            redacted_url("postgres://u:s3cr3t@h/db?Password=s3cr3t"),
             "postgres://u:****@h/db?Password=****"
         );
         assert_eq!(
-            redacted("redis://:s3cr3t@h:6379/0"),
+            redacted_url("redis://:s3cr3t@h:6379/0"),
             "redis://:****@h:6379/0"
         );
-        assert_eq!(redacted("not a url"), "<redacted>");
+        assert_eq!(redacted_url("not a url"), "<redacted>");
     }
 
     fn redis_config(port: u16) -> RedisConfig {

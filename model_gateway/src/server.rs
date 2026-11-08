@@ -65,7 +65,7 @@ pub use tls::{blocking_http_client, http_client, http_client_builder, install_cr
 
 use crate::{
     app_context::AppContext,
-    config::{ParserChoice, RouterConfig},
+    config::{redacted, ParserChoice, RouterConfig},
     endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
     mesh::{
         discovery::{start_mesh_discovery, MeshDiscoveryConfig},
@@ -117,6 +117,9 @@ pub struct AppState {
     /// probe listener. Maintained event-driven by
     /// [`crate::health::spawn_readiness_maintainer`].
     pub probe_state: Arc<crate::health::ProbeState>,
+    /// Where this start read its secrets (the command line, the environment
+    /// or a file), for the configuration view; the values are not here.
+    pub secret_sources: posture::SecretSources,
 }
 
 async fn parse_function_call(
@@ -869,6 +872,24 @@ async fn inflight_requests(State(state): State<Arc<AppState>>) -> Response {
     Json(state.context.inflight_tracker.snapshot()).into_response()
 }
 
+/// The control-plane reads the `admin` role alone may make: the gate
+/// refuses the `user` role there before any handler and writes the denial
+/// line, as for a mutation ([`smg_auth::ControlPlaneAuthState::with_admin_only_reads`]).
+pub const ADMIN_ONLY_READS: &[&str] = &["/config"];
+
+/// `GET /config`: the effective configuration with every secret
+/// redacted. The `admin` role alone reads it ([`ADMIN_ONLY_READS`]): the
+/// view names the store addresses, which the `user` role's reads do not.
+async fn admin_config(State(state): State<Arc<AppState>>) -> Response {
+    match redacted::effective(&state.context.router_config, &state.secret_sources) {
+        Ok(view) => Json(view).into_response(),
+        Err(error) => {
+            error!("the configuration view did not serialize: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 async fn list_workers_rest(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListWorkersQuery>,
@@ -1381,6 +1402,15 @@ pub fn build_apps(
                 .delete(delete_worker),
         );
 
+    // The configuration view names every worker and store address, so it
+    // exists only where control-plane authentication guards it; without
+    // that, the path is unknown and answers 404 like any other.
+    let admin_routes = if control_plane_auth_state.is_some() {
+        admin_routes.route("/config", get(admin_config))
+    } else {
+        admin_routes
+    };
+
     // Fallback (no control-plane auth) normally uses `admin_auth_config`.
     // If only tenant keys are configured (no shared `--api-key`), there's no
     // credential that should reach these routes — deny outright instead of
@@ -1390,7 +1420,7 @@ pub fn build_apps(
     let apply_control_plane_auth = |routes: Router<Arc<AppState>>| {
         if let Some(ref cp_state) = control_plane_auth_state {
             routes.route_layer(axum::middleware::from_fn_with_state(
-                cp_state.clone(),
+                cp_state.clone().with_admin_only_reads(ADMIN_ONLY_READS),
                 smg_auth::control_plane_auth_middleware,
             ))
         } else if !admin_auth_config.is_enabled() && serving_auth_config.is_enabled() {
@@ -2363,6 +2393,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         mesh_handler,
         mesh_adapters,
         probe_state,
+        secret_sources: config.secret_sources,
     });
     // For the shutdown task below: the mesh is told of the stop before the
     // listeners drain (`app_state` moves into the route groups first).

@@ -403,6 +403,7 @@ mod tests {
                 .unwrap(),
         );
         Arc::new(AppState {
+            secret_sources: Default::default(),
             router: Arc::new(Gateway::new(context.worker_registry.clone())),
             probe_state: ProbeState::new(context.inflight_tracker.clone()),
             context,
