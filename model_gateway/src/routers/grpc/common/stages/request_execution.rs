@@ -887,11 +887,12 @@ async fn execute_batch_dispatch(
 /// prefix caches. With a sticky key, pin the plan's single generate request
 /// to the key's rank instead, stable per key as dp-aware expansion pins gRPC
 /// and HTTP rank workers: under `sticky`, the key's hash rank. A batch's
-/// prompts, an embedding and a disaggregated request are left as they are.
-/// The ranks are the worker's `dp_size`, or, for a worker given no count
-/// (its engines declare the group at the handshake), the ranks its
-/// connection places a pin on, fixed for the connection's life:
-/// `pinnable_ranks` reads them, when the connection says (see
+/// prompts, an embedding and a disaggregated request (whose bootstrap room
+/// carries its prefill rank instead; see [`pin_grouped_dp_prefill_room`])
+/// are left as they are. The ranks are the worker's `dp_size`, or, for a
+/// worker given no count (its engines declare the group at the handshake),
+/// the ranks its connection places a pin on, fixed for the connection's
+/// life: `pinnable_ranks` reads them, when the connection says (see
 /// [`BackendClient::pinnable_ranks`]), and only for a request that may be
 /// pinned. A key whose rank is not below `pinnable_ranks` (on vLLM, one at
 /// or past the first index the group's engines lack) is left to the
