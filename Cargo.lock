@@ -7631,6 +7631,7 @@ dependencies = [
  "once_cell",
  "openai-harmony",
  "openai-protocol",
+ "openapi-gen",
  "openmetrics-parser",
  "openssl",
  "opentelemetry 0.32.0",

@@ -761,7 +761,8 @@ jobs:
               - 'scripts/ci_install_rust.sh'
               - 'scripts/ci_apt_mirror.sh'
             # The gateway and everything it links: every crate but the radix tree,
-            # plus the sources two gateway integration tests read from disk
+            # the OpenAPI generator (the gateway's control-plane route test reads
+            # its route list), plus the sources two gateway integration tests read from disk
             # (the metrics catalogue test walks model_gateway, crates, clients,
             # bindings and examples for recorder and family names, Rust sources
             # only; the dashboard test reads the Helm chart), which the previous
@@ -772,6 +773,7 @@ jobs:
               - 'model_gateway/**'
               - 'crates/**'
               - '!crates/radix_tree/**'
+              - 'clients/openapi-gen/**'
               - 'bindings/python/src/**/*.rs'
               - 'bindings/golang/src/**/*.rs'
               - 'clients/**/*.rs'
