@@ -554,7 +554,15 @@ async fn a_canned_encode_worker_reports_its_held_request_as_running() {
     // request in its own load report (whatever the process's other workers
     // carry), and the report reads idle again once the completion is out.
     let (complete, during) = tokio::join!(encoder_completion(&mut client, "ec-l1"), async {
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Sampled once the request is admitted, not after a fixed wait: a
+        // slow box must not let a sample read the worker before it holds it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while running_reqs(&mut poller).await == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the held request never showed in the worker's load report");
         let mut seen = Vec::new();
         for _ in 0..5 {
             seen.push(running_reqs(&mut poller).await);
