@@ -34,7 +34,9 @@ use super::{
     event::WorkerConnected,
     http_client::LazyHttpClient,
     pd_pairing::PdPairing,
-    runtime::{routing_state_series, AVAILABLE_CODE, CIRCUIT_OPEN_CODE, ROUTING_STATE_SERIES},
+    runtime::{
+        routing_state_series, AVAILABLE_CODE, CIRCUIT_OPEN_CODE, ROUTING_STATE_SERIES, STALE_BIT,
+    },
     CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult,
 };
 pub use super::{
@@ -990,7 +992,8 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// handshake driver: it holds the handshake and data-plane socket binds
     /// until it lands, so an orphaned driver would keep them for up to the
     /// connect timeout and collide with a same-URL re-registration. It also
-    /// stops writing the shared state code, which a replacement reads.
+    /// stops asserting the shared state code, which a replacement reads: a
+    /// fact the retired instance still writes marks the code stale instead.
     fn abort_background_tasks(&self) {}
     async fn grpc_health_check(&self) -> WorkerResult<bool>;
     /// Liveness check for a ZMQ worker. Unlike gRPC there is no health RPC on
@@ -1175,10 +1178,12 @@ pub struct BasicWorker {
     /// leaving them held until it times out. `None` until a driver is spawned.
     pub zmq_connect_abort: Arc<ArcSwapOption<AbortHandle>>,
     /// Set when the registry retires this instance (a removal, or a same-URL
-    /// replacement that took over the shared runtime). A retired instance no
-    /// longer writes the shared state code: the replacement's routing reads
-    /// answer from that code, and a replacement built with another breaker
-    /// config keeps a breaker of its own.
+    /// replacement that took over the shared runtime). A retired instance
+    /// asserts no shared state code: the replacement's routing reads answer
+    /// from that code, and a replacement built with another breaker config
+    /// keeps a breaker of its own. A fact the retired instance still writes
+    /// (a trip of a shared breaker behind a request in flight, a stall) marks
+    /// the code stale, and the replacement's next read publishes it again.
     pub superseded: AtomicBool,
     /// Wakes the manager the instant the ZMQ handshake completes so it can
     /// promote the worker without waiting for the next health poll. Set only
@@ -1361,13 +1366,17 @@ impl BasicWorker {
     /// moved, and the series end on the pair the facts give. The breaker is
     /// read as stored: its timeout's move belongs to the routing decision's
     /// read ([`Self::breaker_allows`]), which publishes it. An instance the
-    /// registry retired writes nothing: its replacement, which may keep a
-    /// breaker of its own, answers its routing reads from this code.
+    /// registry retired asserts no pair: its replacement may keep a breaker
+    /// of its own, or share this one, so the fact that moved is real. It
+    /// marks the code stale under the same lock, and the replacement's next
+    /// routing read publishes from the facts, after or before this whole
+    /// publish, never inside it.
     fn publish_state_under(&self, rt: &WorkerRuntime, forget_previous: bool) {
+        let _publish = rt.publish_lock();
         if self.superseded.load(Ordering::Acquire) {
+            rt.mark_published_stale();
             return;
         }
-        let _publish = rt.publish_lock();
         if forget_previous {
             rt.swap_published_state(0);
         }
@@ -1378,7 +1387,7 @@ impl BasicWorker {
             self.circuit_breaker.load().peek_state() == super::circuit_breaker::CircuitState::Open,
         );
         let code = index as u8 + 1;
-        let previous = rt.swap_published_state(code);
+        let previous = rt.swap_published_state(code) & !STALE_BIT;
         if previous == code {
             return;
         }
@@ -1887,11 +1896,17 @@ impl Worker for BasicWorker {
         // alone (see `routing_state`); any other code reads the vetoes, which
         // ride that guard, and the breaker under its own.
         let rt = self.runtime.load();
-        rt.published_state() == AVAILABLE_CODE
-            || (rt.status() == WorkerStatus::Ready
-                && !rt.is_overloaded()
-                && rt.stall_reason().is_none()
-                && self.breaker_allows(&rt))
+        let code = rt.published_state();
+        if code == AVAILABLE_CODE {
+            return true;
+        }
+        if code & STALE_BIT != 0 {
+            self.publish_state_under(&rt, false);
+        }
+        rt.status() == WorkerStatus::Ready
+            && !rt.is_overloaded()
+            && rt.stall_reason().is_none()
+            && self.breaker_allows(&rt)
     }
 
     fn is_healthy_and_eligible(&self) -> bool {
@@ -1924,8 +1939,10 @@ impl Worker for BasicWorker {
         // move to half-open is published by the read that makes it, below).
         // `available` says none holds, so the common case answers from the
         // code and never takes the breaker's guard. Any other code (a veto
-        // in force, or no publish yet) reads the facts.
-        if rt.published_state() == AVAILABLE_CODE {
+        // in force, or no publish yet) reads the facts; a code a retired
+        // instance marked stale is published again first, from these facts.
+        let code = rt.published_state();
+        if code == AVAILABLE_CODE {
             return RoutingState {
                 healthy: true,
                 can_execute: true,
@@ -1934,6 +1951,9 @@ impl Worker for BasicWorker {
                 overloaded: false,
                 stalled: false,
             };
+        }
+        if code & STALE_BIT != 0 {
+            self.publish_state_under(&rt, false);
         }
         RoutingState {
             healthy: rt.status() == WorkerStatus::Ready,

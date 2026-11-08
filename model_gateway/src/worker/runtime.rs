@@ -124,6 +124,16 @@ const _: () = assert!(matches!(
     b"available"
 ));
 
+/// The bit an instance the registry retired sets on the published code when
+/// a fact it still writes moves (a trip of the breaker it may share with its
+/// replacement, a stall or an overload on the shared runtime). It can assert
+/// no pair: the replacement may keep a breaker of its own, or share this
+/// one. A stale code answers no routing read from the fast path, and the
+/// first read by an instance the registry holds publishes again from the
+/// facts, which clears the bit.
+pub(super) const STALE_BIT: u8 = 0x80;
+const _: () = assert!(STALE_BIT as usize > ROUTING_STATE_SERIES.len());
+
 /// The index in [`ROUTING_STATE_SERIES`] of a worker with these facts: the
 /// first that excludes it, else available.
 pub(super) fn routing_state_series(
@@ -726,9 +736,16 @@ impl WorkerRuntime {
     }
 
     /// The code of the `smg_worker_state` series published last (0 when
-    /// none was).
+    /// none was), with the stale bit (`STALE_BIT`) set when a retired
+    /// instance marked it.
     pub fn published_state(&self) -> u8 {
         self.published_state.load(Ordering::Acquire)
+    }
+
+    /// Mark the published code stale (the `STALE_BIT`). Called under
+    /// [`Self::publish_lock`], so it lands before or after a whole publish.
+    pub fn mark_published_stale(&self) {
+        self.published_state.fetch_or(STALE_BIT, Ordering::AcqRel);
     }
 
     /// Remember `code` as the published `smg_worker_state` series; the code

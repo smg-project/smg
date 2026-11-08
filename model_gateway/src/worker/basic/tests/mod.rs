@@ -1966,10 +1966,11 @@ fn a_veto_the_published_code_does_not_carry_is_still_read() {
     assert!(!worker.is_available());
 }
 
-/// A retired instance no longer writes the shared state code. A same-URL
-/// replacement built with another breaker config keeps a breaker of its own;
-/// the retired instance's breaker moves must not publish over the
-/// replacement's veto, which the routing reads answer from.
+/// A retired instance asserts no shared state code. A same-URL replacement
+/// built with another breaker config keeps a breaker of its own; the retired
+/// instance's breaker moves must not publish over the replacement's veto,
+/// which the routing reads answer from. They mark the code stale, and the
+/// replacement's next read publishes its own facts.
 #[test]
 fn a_retired_worker_does_not_publish_over_its_replacement() {
     let retired = BasicWorkerBuilder::new("http://worker:8000")
@@ -2006,11 +2007,102 @@ fn a_retired_worker_does_not_publish_over_its_replacement() {
     // move that publishes `available` from an instance the registry holds.
     thread::sleep(Duration::from_millis(60));
     assert!(retired.routing_state().can_execute);
+    let published = replacement.runtime.load().published_state();
+    assert_ne!(
+        published, AVAILABLE_CODE,
+        "a retired instance does not publish"
+    );
+    assert_eq!(
+        published & !STALE_BIT,
+        CIRCUIT_OPEN_CODE,
+        "it marks the code stale"
+    );
+    assert!(!replacement.routing_state().can_execute);
     assert_eq!(
         replacement.runtime.load().published_state(),
         CIRCUIT_OPEN_CODE,
-        "a retired instance does not publish"
+        "the replacement's read published its own facts"
+    );
+    assert!(!replacement.is_available());
+}
+
+/// A same-URL replacement built with the same breaker config shares the
+/// retired instance's breaker with its runtime. A request in flight on the
+/// retired instance trips that breaker behind the replacement's back: the
+/// retired instance asserts no code, it marks the published one stale, and
+/// the replacement's next routing read publishes `circuit_open` from the
+/// facts instead of answering `available` from the code.
+#[test]
+fn a_shared_breaker_tripped_through_a_retired_worker_is_read() {
+    let config = || CircuitBreakerConfig {
+        failure_threshold: 1,
+        ..CircuitBreakerConfig::default()
+    };
+    let retired = BasicWorkerBuilder::new("http://worker:8000")
+        .health_config(no_health_check())
+        .circuit_breaker_config(config())
+        .build();
+    retired.set_status(WorkerStatus::Ready);
+    let replacement = BasicWorkerBuilder::new("http://worker:8000")
+        .health_config(no_health_check())
+        .circuit_breaker_config(config())
+        .build();
+    assert!(replacement.inherit_shared_state_from(&retired));
+    retired.abort_background_tasks();
+    assert_eq!(replacement.runtime.load().published_state(), AVAILABLE_CODE);
+
+    retired.record_circuit_breaker_outcome(false);
+    assert!(
+        !replacement.circuit_breaker_can_execute(),
+        "the breaker is shared"
+    );
+    assert_ne!(
+        replacement.runtime.load().published_state(),
+        AVAILABLE_CODE,
+        "a trip through the retired instance leaves no available code behind"
     );
     assert!(!replacement.routing_state().can_execute);
+    assert_eq!(
+        replacement.runtime.load().published_state(),
+        CIRCUIT_OPEN_CODE,
+        "the replacement's read published the facts"
+    );
     assert!(!replacement.is_available());
+}
+
+/// A stall written through the retired instance lands on the shared runtime,
+/// and the replacement's identical write is no edge to publish on: the
+/// retired instance's stale mark is what gets the stall read and published.
+#[test]
+fn a_stall_written_through_a_retired_worker_is_read() {
+    let retired = BasicWorkerBuilder::new("http://worker:8000")
+        .health_config(no_health_check())
+        .build();
+    retired.set_status(WorkerStatus::Ready);
+    let replacement = BasicWorkerBuilder::new("http://worker:8000")
+        .health_config(no_health_check())
+        .build();
+    assert!(replacement.inherit_shared_state_from(&retired));
+    retired.abort_background_tasks();
+    assert_eq!(replacement.runtime.load().published_state(), AVAILABLE_CODE);
+
+    assert!(retired.set_stall(Some(StallReason::Unreachable)));
+    assert!(
+        !replacement.set_stall(Some(StallReason::Unreachable)),
+        "the shared fact is written already: no edge"
+    );
+    assert!(!replacement.is_available());
+    let stalled = routing_state_series(
+        WorkerStatus::Ready,
+        false,
+        Some(StallReason::Unreachable),
+        false,
+    ) as u8
+        + 1;
+    assert_eq!(
+        replacement.runtime.load().published_state(),
+        stalled,
+        "the replacement's read published the stall"
+    );
+    assert!(replacement.routing_state().stalled);
 }
