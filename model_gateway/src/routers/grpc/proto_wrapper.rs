@@ -42,6 +42,8 @@ mod multimodal;
 mod request;
 mod shm;
 
+pub(crate) use smg_grpc_client::vllm_media_identity::identity as vllm_mm_identity;
+
 use self::shm::vllm_mm_hash_identity;
 pub use self::{
     embed::{ProtoEmbedComplete, ProtoEmbedRequest},
@@ -61,10 +63,7 @@ pub use self::{
 pub(crate) use self::{
     multimodal::{stage_tokenspeed_tensor_rdma, EncodeItemBootstrapInfo},
     request::VLLM_MROPE_GRID_KEYS,
-    shm::{
-        cleanup_tokenspeed_items_encoder_shm, finish_tokenspeed_request, finish_vllm_request,
-        vllm_mm_identity,
-    },
+    shm::{cleanup_tokenspeed_items_encoder_shm, finish_tokenspeed_request, finish_vllm_request},
 };
 
 /// Helper macro to convert input logprobs from proto types to unified type.

@@ -29,6 +29,7 @@ pub mod tokenspeed_encoder;
 pub mod tokenspeed_scheduler;
 pub mod trtllm_service;
 pub mod vllm_engine;
+pub mod vllm_media_identity;
 
 // Re-export clients
 use std::sync::Arc;

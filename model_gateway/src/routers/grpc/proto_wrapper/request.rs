@@ -55,17 +55,7 @@ pub enum ProtoGenerateRequest {
     TokenSpeed(Box<tokenspeed::GenerateRequest>),
 }
 
-/// Per-item grid metadata the engine reads to compute M-RoPE positions
-/// (`_get_mrope_input_positions` in vLLM); a few ints per item. The video
-/// timing has two spellings: `second_per_grid_ts` from the Qwen-VL
-/// processors, `video_second_per_grid` from the Qwen-Omni family and this
-/// gateway's own processors. The servicer's `GRID_KEYS` mirrors this list.
-pub(crate) const VLLM_MROPE_GRID_KEYS: [&str; 4] = [
-    "image_grid_thw",
-    "video_grid_thw",
-    "second_per_grid_ts",
-    "video_second_per_grid",
-];
+pub(crate) use smg_grpc_client::vllm_media_identity::MROPE_GRID_KEYS as VLLM_MROPE_GRID_KEYS;
 
 /// A JSON answer's constraint as the worker of an attempt takes it: the table's
 /// structural tag, or the request's own schema where the table gives that
