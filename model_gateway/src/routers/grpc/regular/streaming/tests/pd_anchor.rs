@@ -17,7 +17,9 @@ use tokio::task::JoinHandle;
 
 use super::{
     super::*,
-    eof::{chunk, complete, messages_spec, processor, scripted_stream, CharacterTokenizer},
+    eof::{
+        chunk, complete, messages_spec, processor, runtime, scripted_stream, CharacterTokenizer,
+    },
 };
 use crate::{
     observability::metrics::test_support::render_with_recorder,
@@ -152,10 +154,7 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Vec<JoinHandle<()>>>,
 {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a current-thread runtime");
+    let rt = runtime();
     render_with_recorder(|| {
         for server in rt.block_on(case()) {
             server.abort();

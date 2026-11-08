@@ -11,7 +11,7 @@ use tracing_test::traced_test;
 
 use super::{
     super::*,
-    eof::{chat_spec, chunk, complete, scripted_stream, CharacterTokenizer},
+    eof::{chat_spec, chunk, complete, runtime, scripted_stream, CharacterTokenizer},
 };
 use crate::{
     observability::metrics::test_support::render_with_recorder,
@@ -129,13 +129,6 @@ fn client_error_event(
     let event = serde_json::from_str(frame.trim_start_matches("data: ").trim())
         .unwrap_or_else(|e| panic!("{e}: {frame}"));
     (event, rendered)
-}
-
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a current-thread runtime")
 }
 
 /// The rendered line of `family` whose labels contain every `label`.
