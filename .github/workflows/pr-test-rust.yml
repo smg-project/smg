@@ -1877,7 +1877,10 @@ jobs:
           # smoke of SGLang over NIXL (its venv gets NIXL only on this row,
           # #2498). The peer-restart test stays out of the NIXL smoke: the
           # SGLang prefill segfaults when its decode comes back on the same
-          # address (#2503). The full sweeps run in nightly-pd.
+          # address (#2503). The smoke carries the 1p1d-http row too: the
+          # HTTP PD router is its own code path (pairing, error answers and
+          # the KV handoff on SGLang), and this is its one pull-request
+          # signal. The other HTTP rows and the full sweeps run in nightly-pd.
           - engine: vllm
             kv_backend: mooncake
             timeout: 50
@@ -1886,7 +1889,7 @@ jobs:
             kv_backend: nixl
             timeout: 60
             test_timeout: 50
-            test_filter: -k "1p1d and not http and not sole_leg_outage"
+            test_filter: -k "1p1d and not sole_leg_outage"
             min_selected: 11
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
