@@ -1,6 +1,7 @@
 // These modules are used by tests and benchmarks
 #![allow(dead_code, clippy::allow_attributes, clippy::large_futures)]
 
+pub mod decode_stream;
 pub mod engine_answers;
 pub mod grpc_harness;
 pub mod held_worker;

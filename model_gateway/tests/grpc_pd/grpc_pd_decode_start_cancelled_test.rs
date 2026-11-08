@@ -20,11 +20,11 @@ use std::{
 };
 
 use common::{
+    decode_stream::{chunk, complete, GenerateTx},
     engine_answers::{VllmAnswers, VllmGenerateStream},
     grpc_harness::{build_grpc_router, grpc_router_config, grpc_workers, serve_engine},
 };
 use metrics_exporter_prometheus::PrometheusBuilder;
-use proto::generate_response::Response as GenResp;
 use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
@@ -47,8 +47,6 @@ const OUTPUT_TOKENS: u32 = 3;
 const CASE_CAP: Duration = Duration::from_secs(30);
 /// The words tonic puts on a call whose connection closed under it.
 const CANCEL_MESSAGE: &str = "operation was canceled";
-
-type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
 
 /// What a mock engine does with a generate call.
 #[derive(Clone, Copy)]
@@ -77,31 +75,6 @@ impl Engine {
 
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
-    }
-}
-
-fn chunk(id: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Chunk(proto::GenerateStreamChunk {
-            token_ids: vec![id],
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-fn complete(finish_reason: &str, tokens: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Complete(proto::GenerateComplete {
-            output_ids: (1..=tokens).collect(),
-            finish_reason: finish_reason.to_string(),
-            prompt_tokens: 1,
-            completion_tokens: tokens,
-            index: 0,
-            ..Default::default()
-        })),
     }
 }
 
