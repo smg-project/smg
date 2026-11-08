@@ -110,8 +110,9 @@ where
 }
 
 /// The encoder's buffer: a `Vec<u8>` whose growth fails as an I/O error the
-/// encode reports, instead of aborting the process, as `rmp_serde`'s own
-/// vector writer does.
+/// encode reports instead of aborting the process. The same writer as the
+/// one `rmp_serde::to_vec_named` uses, which is private and starts from an
+/// empty vector, so a reserved buffer needs its own.
 struct FallibleBuffer(Vec<u8>);
 
 impl Write for FallibleBuffer {

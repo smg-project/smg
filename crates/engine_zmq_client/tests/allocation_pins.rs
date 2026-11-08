@@ -1,8 +1,9 @@
 //! What the decode of an output with logprobs and the encode of an
 //! add-request allocate, pinned at today's counts, so the next change that
-//! adds a copy fails a test rather than moving a bench inside its noise. A separate executable, so it can declare
-//! the counting allocator the pin needs. `ZMQ_DECODE_COUNTED=<n>` runs the
-//! decode `n` times and exits, for a counter-based reading (`perf stat`).
+//! adds a copy fails a test rather than moving a bench inside its noise. A
+//! separate executable, so it can declare the counting allocator the pin
+//! needs. `ZMQ_DECODE_COUNTED=<n>` runs the decode `n` times and exits, for a
+//! counter-based reading (`perf stat`).
 
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 #![expect(
@@ -12,10 +13,10 @@
 
 mod common;
 
-use std::{hint::black_box, sync::atomic::Ordering};
+use std::hint::black_box;
 
 use bytes::Bytes;
-use common::counting_alloc::{calls, Counting, ALLOCATED};
+use common::counting_alloc::{bytes, calls, Counting};
 use engine_zmq_client::{
     codec::encode_msgpack,
     protocol::{
@@ -135,9 +136,9 @@ fn encode_allocations<P: EngineProtocol>(
     layout: &P::Layout,
 ) -> (Vec<u8>, usize, usize) {
     P::encode_add(request, layout).expect("encode");
-    let bytes_before = ALLOCATED.load(Ordering::Relaxed);
+    let bytes_before = bytes();
     let (encoded, allocations) = allocations_during(|| P::encode_add(request, layout));
-    let bytes = ALLOCATED.load(Ordering::Relaxed) - bytes_before;
+    let bytes = bytes() - bytes_before;
     let (payload, aux_frames) = encoded.expect("encode");
     assert!(
         aux_frames.is_empty(),
