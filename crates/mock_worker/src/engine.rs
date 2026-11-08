@@ -463,7 +463,7 @@ pub struct EngineParams {
 /// prompt's aligned replay boundary (what a later request can resume from);
 /// a Mamba group keeps the one state block ending there. vLLM writes a
 /// sparse group's store with the step's whole token span and the kept hashes
-/// only; so does the mock's vLLM wire ([`Published::spans`]), while its gRPC
+/// only; so does the mock's vLLM wire (`Published::spans`), while its gRPC
 /// stream, the shape of a relay's output, carries the kept blocks with their
 /// own tokens.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1736,7 +1736,7 @@ struct Step {
     sends: Vec<(mpsc::UnboundedSender<GenEvent>, GenEvent)>,
     batch: Option<common::KvEventBatch>,
     /// The whole token span of each sparse cache-group store of `batch`, by
-    /// event index (see [`Published::spans`]).
+    /// event index (see `Published::spans`).
     spans: Vec<(usize, Vec<u32>)>,
     snapshot: LoadSnapshot,
     /// Cache deltas this pass, for the actor's mirror.
