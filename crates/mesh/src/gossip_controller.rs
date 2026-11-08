@@ -52,7 +52,7 @@ use super::{
             gossip_client::GossipClient, gossip_message, NodeState, NodeStatus, NodeUpdate, Ping,
             PingReq, StateSync, StreamMessage,
         },
-        status_of, ClusterState,
+        member_transition_line, status_of, ClusterState,
     },
 };
 use crate::{
@@ -394,13 +394,16 @@ impl GossipController {
         let entry = entry.clone();
         if held != Some(status_of(&entry)) {
             log::info!(
-                "Member {} is {:?} at version {} (its own word; was {})",
-                entry.name,
-                status_of(&entry),
-                entry.version,
-                held.map_or_else(
-                    || "not in the table".to_string(),
-                    |status| format!("{status:?}")
+                "{}",
+                member_transition_line(
+                    &entry,
+                    format_args!(
+                        "its own word; was {}",
+                        held.map_or_else(
+                            || "not in the table".to_string(),
+                            |status| format!("{status:?}")
+                        )
+                    )
                 )
             );
         }

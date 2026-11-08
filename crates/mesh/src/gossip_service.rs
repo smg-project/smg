@@ -56,7 +56,7 @@ use super::{
             gossip_server::{Gossip, GossipServer},
             GossipMessage, NodeState, NodeStatus, NodeUpdate, Ping, PingReq, StreamMessage,
         },
-        status_of, ClusterState,
+        member_transition_line, status_of, ClusterState,
     },
     transport::{
         limits::MAX_MESSAGE_SIZE,
@@ -257,10 +257,8 @@ impl GossipService {
             match state.get_mut(&node.name) {
                 None => {
                     log::info!(
-                        "Member {} is {:?} at version {} (joined this node's table)",
-                        node.name,
-                        status_of(&node),
-                        node.version
+                        "{}",
+                        member_transition_line(&node, "joined this node's table")
                     );
                     state.insert(node.name.clone(), node);
                     updated = true;
@@ -268,11 +266,11 @@ impl GossipService {
                 Some(entry) if node.version > entry.version => {
                     if node.status != entry.status {
                         log::info!(
-                            "Member {} is {:?} at version {} (a peer's table; was {:?})",
-                            node.name,
-                            status_of(&node),
-                            node.version,
-                            status_of(entry)
+                            "{}",
+                            member_transition_line(
+                                &node,
+                                format_args!("a peer's table; was {:?}", status_of(entry))
+                            )
                         );
                     }
                     *entry = node;
