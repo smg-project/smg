@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock},
+    sync::{atomic::AtomicBool, Arc, LazyLock},
 };
 
 use llm_tokenizer::stop::StopSequenceDecoder;
@@ -48,6 +48,10 @@ pub(crate) struct Assignment {
     /// response's reading runs outside the span (the response body drives it), so the span
     /// travels with the assignment rather than being looked up where the output ends.
     pub span: Span,
+    /// Set by the first reading of the request that marks the span ([`Tally::mark`],
+    /// [`telemetry::mark_failed`]): one reading stands on the span, the first that was not clean,
+    /// and a later choice's reading or a later failure of the same request leaves it.
+    pub marked: Arc<AtomicBool>,
 }
 
 impl Assignment {
@@ -74,6 +78,7 @@ pub(super) fn assignment(
         forbids_calls,
         past_the_end,
         span: Span::current(),
+        marked: Arc::default(),
     }
 }
 
@@ -347,6 +352,8 @@ pub(crate) struct Reader {
     /// The request's span ([`Assignment::span`]): an output that ends other than clean leaves its
     /// reading on it ([`Tally::mark`]).
     span: Span,
+    /// The request's mark ([`Assignment::marked`]): set by the first reading that is not clean.
+    marked: Arc<AtomicBool>,
 }
 
 impl Reader {
@@ -376,6 +383,7 @@ impl Reader {
             framing_text: String::new(),
             trap: isolation::test_trap(),
             span: assignment.span.clone(),
+            marked: Arc::clone(&assignment.marked),
         };
         // The prompt's events carry no text of the prompt (a thought it opens or closes), so they
         // move from the replay's own buffer into the caller's one by one, whatever delta that one
@@ -490,7 +498,8 @@ impl Reader {
     /// ends where the call should be; the whitespace before the first opener and after the last
     /// refused byte stays the template's, and the table's rule keeps debris out of an answer
     /// that went on past the block: a block that text or a call follows stays dropped. The
-    /// output is recorded here, under `who`: its counters, and the line when it was not clean
+    /// output is recorded here, under `who`: the request span's mark when it was not clean
+    /// ([`Tally::mark`]), then its counters and its line, written inside the span
     /// ([`Tally::report`]); an output of whitespace alone counts as `empty`, one with refused
     /// blocks as `malformed`, whether or not bytes were released, and the line says how many
     /// were.
@@ -514,8 +523,12 @@ impl Reader {
             self.tally.released(released.len());
             release_before_the_finish(released, out);
         }
-        self.tally.report(self.table, who);
-        self.tally.mark(&self.span, self.table, who.choice);
+        self.tally
+            .mark(&self.span, &self.marked, self.table, who.choice);
+        // The line is written inside the request's span, after the mark: a streamed response's
+        // reading runs outside the span, and only from within does the line carry the span's
+        // request id and the fields just marked.
+        self.span.in_scope(|| self.tally.report(self.table, who));
         Ok(())
     }
 
@@ -531,7 +544,7 @@ impl Reader {
     pub(crate) fn failed(&mut self, why: String) -> SymphonyError {
         self.ended = true;
         telemetry::record_failed(self.table);
-        telemetry::mark_failed(&self.span, self.table, self.read);
+        telemetry::mark_failed(&self.span, &self.marked, self.table, self.read);
         SymphonyError::Read(why)
     }
 
@@ -780,6 +793,7 @@ mod tests {
             forbids_calls: false,
             past_the_end: false,
             span: Span::none(),
+            marked: Arc::default(),
         };
         // A step's events borrow its delta, as a stream's do: each piece is a step of its own,
         // its events taken owned before the next.
@@ -1910,6 +1924,7 @@ mod tests {
             forbids_calls: false,
             past_the_end: false,
             span: Span::none(),
+            marked: Arc::default(),
         };
         let json = "{\"city\": \"Oslo\", \"country\": \"Norway\"}";
         let thought = "<|content_thinking|>plan<|end_message|><|message_model|><|content_text|>";
@@ -1983,6 +1998,7 @@ mod tests {
             forbids_calls: false,
             past_the_end: false,
             span: Span::none(),
+            marked: Arc::default(),
         };
         let pieces = [
             "\n<think></think>\n<tool_call>answer_string\n<arg_key>answer</arg_key>\n<arg_value>",
@@ -2041,6 +2057,7 @@ mod tests {
             forbids_calls: false,
             past_the_end: false,
             span: Span::none(),
+            marked: Arc::default(),
         };
         let mut events = Events::new();
         let mut reader = Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
@@ -2111,6 +2128,7 @@ mod tests {
             forbids_calls: false,
             past_the_end: false,
             span: Span::none(),
+            marked: Arc::default(),
         };
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(Refusing::default());
         let mut decoder = StopSequenceDecoder::new(
@@ -2237,6 +2255,7 @@ mod tests {
             forbids_calls: false,
             past_the_end: false,
             span: Span::none(),
+            marked: Arc::default(),
         };
         let calls = |first_only: bool| {
             let mut events = Events::new();
@@ -2269,6 +2288,7 @@ mod tests {
             forbids_calls: false,
             past_the_end: false,
             span: Span::none(),
+            marked: Arc::default(),
         };
         let first_run_at = |steps: &[&str]| -> (Option<usize>, usize) {
             let mut events = Events::new();
@@ -2318,6 +2338,7 @@ mod tests {
             forbids_calls: false,
             past_the_end: false,
             span: Span::none(),
+            marked: Arc::default(),
         };
         let mut events = Events::new();
         let mut reader = Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
@@ -2353,6 +2374,7 @@ mod tests {
             forbids_calls: true,
             past_the_end: false,
             span: Span::none(),
+            marked: Arc::default(),
         };
         let mut events = Vec::new();
         let scrape = rendered(|| {
@@ -2404,6 +2426,7 @@ mod tests {
             forbids_calls: false,
             past_the_end: false,
             span: Span::none(),
+            marked: Arc::default(),
             ..assignment
         };
         let mut out = Events::new();
@@ -2599,6 +2622,7 @@ mod tests {
                 forbids_calls: false,
                 past_the_end: false,
                 span: Span::none(),
+                marked: Arc::default(),
             };
             let mut replayed = Events::new();
             let mut reader =

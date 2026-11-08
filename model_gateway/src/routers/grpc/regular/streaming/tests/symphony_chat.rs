@@ -55,6 +55,7 @@ pub(super) fn assigned(
         forbids_calls: false,
         past_the_end: false,
         span: Span::none(),
+        marked: Arc::default(),
     });
     spec
 }
@@ -695,6 +696,7 @@ pub(super) fn assigned_message(
             forbids_calls: false,
             past_the_end: false,
             span: Span::none(),
+            marked: Arc::default(),
         }),
         parser_names: None,
     }

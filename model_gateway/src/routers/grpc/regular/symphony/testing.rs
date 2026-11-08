@@ -275,6 +275,7 @@ pub(super) fn read_with(format: Format) -> Vec<Event<'static>> {
         forbids_calls: false,
         past_the_end: false,
         span: tracing::Span::none(),
+        marked: Arc::default(),
     };
     let mut events = Events::new();
     let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");

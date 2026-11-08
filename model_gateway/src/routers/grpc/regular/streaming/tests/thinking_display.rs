@@ -2,6 +2,8 @@
 //! text, `summarized`, `updates` and no display return it, under the reasoning parser and under
 //! Symphony alike, in the stream and in the message; the usage is the same under every value.
 
+use std::sync::Arc;
+
 use openai_protocol::messages::CreateMessageRequest;
 use serde_json::{json, Value};
 use smg_grpc_client::vllm_engine::proto::generate_response::Response as GenerationEvent;
@@ -45,6 +47,7 @@ fn spec(display: Option<&str>, with_symphony: bool) -> MessagesResponseSpec {
             forbids_calls: false,
             past_the_end: false,
             span: Span::none(),
+            marked: Arc::default(),
         });
     }
     spec

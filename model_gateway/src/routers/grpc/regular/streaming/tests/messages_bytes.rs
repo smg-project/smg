@@ -9,7 +9,7 @@
 //! event, intended or not, fails here. Set `SMG_RECORD_SSE_FIXTURES=1` to
 //! rewrite them from the current code.
 
-use std::pin::Pin;
+use std::{pin::Pin, sync::Arc};
 
 use futures::{Stream, StreamExt as _};
 use smg_grpc_client::vllm_engine::proto;
@@ -140,6 +140,7 @@ async fn stream_bytes(scenario: &MessagesScenario) -> Vec<u8> {
             forbids_calls: false,
             past_the_end: false,
             span: Span::none(),
+            marked: Arc::default(),
         }),
         first_tool_call_only: false,
         parser_names: None,

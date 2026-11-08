@@ -182,9 +182,12 @@ finish and the calls, bounded per table and reason (a burst of twenty lines, the
 the lines refused meanwhile counted on the next one written), so a flood of one shape hides no
 other; and the same facts as fields of the request's span (`symphony.table`, `symphony.outcome`,
 `symphony.choice`, `symphony.reason`, `symphony.bytes`, `symphony.malformed_bytes`,
-`symphony.finish`), recorded when the output ends, so the request's own access-log line says how
-its output read even where the output's line was bounded away, and a trace of the request carries
-the reading as attributes. A clean output leaves one counter increment and nothing else. Nothing
+`symphony.finish`), recorded when the output ends, once per request (the first reading that was
+not clean), so a trace of the request carries the reading as attributes, the sampled line carries
+them with the request id, and a whole response's access-log line says how its output read even
+where the output's line was bounded away; a streamed response's access-log line goes out before
+the reading and carries them only where the stream's end line is written (`access_log_fields` with
+`response_bytes`). A clean output leaves one counter increment and nothing else. Nothing
 of any of this reaches the client: the response is the same bytes whatever was recorded.
 
 ## The seam with a caller
