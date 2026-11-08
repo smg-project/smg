@@ -1800,6 +1800,18 @@ struct IntegrationArgs {
     #[arg(skip)]
     secret_files: SecretFiles,
 
+    /// Watch the key files (`--api-key-file`, `--tenant-api-keys-file`,
+    /// `--control-plane-api-keys-file`) and put a changed file's keys in
+    /// force, as `POST /secrets/reload` does: a mounted secret rotated in
+    /// place takes effect without a restart. Off by default; a start with no
+    /// key file has nothing to watch and says so.
+    #[arg(
+        long,
+        default_value_t = false,
+        help_heading = "Control Plane Authentication"
+    )]
+    secrets_auto_reload: bool,
+
     // ==================== Mesh Server ====================
     /// Start the mesh: several gateways find each other, keep one membership
     /// table and replicate the workers each of them registered locally.

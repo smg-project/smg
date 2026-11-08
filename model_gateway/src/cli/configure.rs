@@ -1381,6 +1381,7 @@ impl CliArgs {
             webrtc_stun_server: self.integrations.webrtc_stun_server.clone(),
             secret_sources: self.integrations.secret_sources,
             secret_files: self.integrations.secret_files.clone(),
+            secrets_auto_reload: self.integrations.secrets_auto_reload,
         })
     }
 

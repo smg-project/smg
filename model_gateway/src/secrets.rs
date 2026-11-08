@@ -9,11 +9,13 @@
 //! as the start read it, and a reload rebuilds the serving map from that
 //! fixed part and the files'.
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
 use serde::Serialize;
 use smg_auth::ApiKeySet;
+use tokio::{sync::mpsc, task, time};
+use tracing::{error, info, warn};
 
 use crate::{
     config::{
@@ -24,9 +26,14 @@ use crate::{
         validation::ConfigValidator,
         ConfigError, TenantApiKeyEntry,
     },
+    fs_watch::{settle, DirectoryWatch},
     middleware::AuthConfig,
     server::posture::{SecretSource, SecretSources},
 };
+
+/// How often a lost watch (the key files' directory removed or moved away) is
+/// tried again.
+const REWATCH: Duration = Duration::from_secs(1);
 
 /// The files the keys were read from at start, where a file was the
 /// source: a reload's targets. `None` where the key came from the command
@@ -44,9 +51,38 @@ pub struct SecretFiles {
 impl SecretFiles {
     /// Whether any key has a file.
     pub fn any(&self) -> bool {
-        self.api_key.is_some()
-            || self.tenant_api_keys.is_some()
-            || self.control_plane_api_keys.is_some()
+        self.count() > 0
+    }
+
+    /// How many keys have a file.
+    pub fn count(&self) -> usize {
+        self.paths().count()
+    }
+
+    fn paths(&self) -> impl Iterator<Item = &PathBuf> {
+        [
+            &self.api_key,
+            &self.tenant_api_keys,
+            &self.control_plane_api_keys,
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    /// The files by directory: what the watch of `--secrets-auto-reload`
+    /// watches, and for which names.
+    fn by_directory(&self) -> BTreeMap<PathBuf, Vec<OsString>> {
+        let mut dirs: BTreeMap<PathBuf, Vec<OsString>> = BTreeMap::new();
+        for path in self.paths() {
+            let dir = match path.parent() {
+                Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+                _ => PathBuf::from("."),
+            };
+            if let Some(name) = path.file_name() {
+                dirs.entry(dir).or_default().push(name.to_os_string());
+            }
+        }
+        dirs
     }
 }
 
@@ -244,6 +280,115 @@ impl SecretReloader {
             set.replace(entries);
         }
         Ok(report)
+    }
+}
+
+/// One reload off the runtime's threads (the files are small, but a mount
+/// can stall), its outcome logged under `trigger` (`route` or `watch`): the
+/// files read and whether each set changed, or the file that stopped it with
+/// every key in force standing. `None` when the reload's task did not
+/// complete, which is logged as an error.
+pub async fn reload_logged(
+    reloader: Arc<SecretReloader>,
+    trigger: &'static str,
+) -> Option<Result<ReloadReport, BadFile>> {
+    match task::spawn_blocking(move || reloader.reload()).await {
+        Ok(Ok(report)) => {
+            info!(
+                trigger,
+                files = report.files.len(),
+                serving_changed = report.serving_changed,
+                control_plane_changed = report.control_plane_changed,
+                "the keys were reloaded from their files"
+            );
+            Some(Ok(report))
+        }
+        Ok(Err(BadFile(error))) => {
+            warn!(trigger, %error, "the keys were not reloaded; the keys in force stand");
+            Some(Err(BadFile(error)))
+        }
+        Err(error) => {
+            error!(trigger, %error, "the keys' reload did not complete");
+            None
+        }
+    }
+}
+
+/// `--secrets-auto-reload`: the directories of the key files the start read
+/// are watched (`DirectoryWatch`), and a change runs the reload the route
+/// runs, once a burst of changes has settled. A directory that cannot be
+/// watched refuses the start. A directory removed or moved away is said so
+/// once and watched again once it exists, with one reload then. The task runs
+/// for the lifetime of the server.
+pub fn start_auto_reload(reloader: Arc<SecretReloader>) -> notify::Result<task::JoinHandle<()>> {
+    let (wake, woken) = mpsc::channel(1);
+    let mut watches = Vec::new();
+    for (dir, names) in reloader.files.by_directory() {
+        let watch = DirectoryWatch::start(&dir, names.clone(), wake.clone())?;
+        watches.push(Watched {
+            dir,
+            names,
+            watch: Some(watch),
+        });
+    }
+    info!(
+        files = reloader.files.count(),
+        directories = watches.len(),
+        "watching the key files; a change reloads the keys"
+    );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the key-file watch runs for the lifetime of the server"
+    )]
+    let handle = task::spawn(watch_loop(reloader, wake, woken, watches));
+    Ok(handle)
+}
+
+/// One watched directory of key files; `watch` is `None` while the directory
+/// is gone and the watch waits to be started again.
+struct Watched {
+    dir: PathBuf,
+    names: Vec<OsString>,
+    watch: Option<DirectoryWatch>,
+}
+
+async fn watch_loop(
+    reloader: Arc<SecretReloader>,
+    wake: mpsc::Sender<()>,
+    mut woken: mpsc::Receiver<()>,
+    mut watches: Vec<Watched>,
+) {
+    let mut rewatch = time::interval(REWATCH);
+    rewatch.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            Some(()) = woken.recv() => {
+                settle(&mut woken).await;
+                for watched in &mut watches {
+                    if watched.watch.as_ref().is_some_and(DirectoryWatch::is_lost) {
+                        warn!(
+                            directory = %watched.dir.display(),
+                            "the key files' directory was removed or moved; watching it again once it exists"
+                        );
+                        watched.watch = None;
+                    }
+                }
+                let _ = reload_logged(Arc::clone(&reloader), "watch").await;
+            }
+            _ = rewatch.tick(), if watches.iter().any(|watched| watched.watch.is_none()) => {
+                for watched in &mut watches {
+                    if watched.watch.is_some() {
+                        continue;
+                    }
+                    if let Ok(watch) = DirectoryWatch::start(&watched.dir, watched.names.clone(), wake.clone()) {
+                        info!(directory = %watched.dir.display(), "watching the key files' directory again");
+                        watched.watch = Some(watch);
+                        // What changed while the directory was gone is read now.
+                        let _ = wake.try_send(());
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -503,6 +648,140 @@ mod tests {
                 "{rule}: every key stands"
             );
         }
+    }
+
+    /// The watch: a rotation as a secret manager does it, a staged file
+    /// renamed over the key file, is in force without a call.
+    #[tokio::test]
+    async fn the_watch_puts_a_rotated_file_in_force_without_a_call() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let file = write(dir.path(), "key", "k-one\n");
+        let serving = AuthConfig::new(Some("k-one".into()));
+        let reloader = Arc::new(
+            SecretReloader::new(
+                SecretFiles {
+                    api_key: Some(file.clone()),
+                    ..SecretFiles::default()
+                },
+                &sources(SecretSource::File, None),
+                Some("k-one"),
+                &[],
+                serving.clone(),
+                None,
+            )
+            .expect("a file source"),
+        );
+        let handle = start_auto_reload(Arc::clone(&reloader)).expect("the directory is watched");
+
+        let staged = write(dir.path(), "key.staged", "k-two\n");
+        std::fs::rename(&staged, &file).expect("renamed over the key file");
+        let deadline = time::Instant::now() + Duration::from_secs(10);
+        while !serving.contains_token("k-two") {
+            assert!(
+                time::Instant::now() < deadline,
+                "the rotation was not reloaded"
+            );
+            time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!serving.contains_token("k-one"), "the old key is out");
+        handle.abort();
+    }
+
+    /// The key files' directory removed and recreated with a rotated key:
+    /// every key stands while it is gone, and the rotated key is in force
+    /// within the re-watch's second without a call. The key is written in
+    /// the same instant as the directory, before the re-watch's next tick,
+    /// so the re-watch's own wake is what reads it.
+    #[tokio::test]
+    async fn a_lost_directory_is_watched_again_and_its_rotated_key_put_in_force() {
+        let root = tempfile::tempdir().expect("a directory");
+        let dir = root.path().join("keys");
+        std::fs::create_dir(&dir).expect("the key directory");
+        let file = write(&dir, "key", "k-one\n");
+        let serving = AuthConfig::new(Some("k-one".into()));
+        let reloader = Arc::new(
+            SecretReloader::new(
+                SecretFiles {
+                    api_key: Some(file),
+                    ..SecretFiles::default()
+                },
+                &sources(SecretSource::File, None),
+                Some("k-one"),
+                &[],
+                serving.clone(),
+                None,
+            )
+            .expect("a file source"),
+        );
+        let handle = start_auto_reload(Arc::clone(&reloader)).expect("the directory is watched");
+
+        std::fs::remove_dir_all(&dir).expect("the directory removed");
+        time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            serving.contains_token("k-one"),
+            "every key stands while the directory is gone"
+        );
+
+        std::fs::create_dir(&dir).expect("the directory again");
+        write(&dir, "key", "k-two\n");
+        let deadline = time::Instant::now() + Duration::from_secs(10);
+        while !serving.contains_token("k-two") {
+            assert!(
+                time::Instant::now() < deadline,
+                "the rotated key was not reloaded after the re-watch"
+            );
+            time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!serving.contains_token("k-one"), "the old key is out");
+        handle.abort();
+    }
+
+    /// A mounted secret in the kubelet's shape: the files in a timestamped
+    /// directory, `..data` pointing at it, each file a symlink through
+    /// `..data`. The kubelet rotates it by swapping the `..data` symlink,
+    /// which the watch sees through the file it reads.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mounted_secret_swap_is_seen_through_the_data_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let mount = tempfile::tempdir().expect("a directory");
+        let first = mount.path().join("..2026_11_08_v1");
+        std::fs::create_dir(&first).expect("the first version");
+        write(&first, "key", "k-one\n");
+        symlink("..2026_11_08_v1", mount.path().join("..data")).expect("..data");
+        symlink("..data/key", mount.path().join("key")).expect("the file's link");
+        let file = mount.path().join("key");
+
+        let serving = AuthConfig::new(Some("k-one".into()));
+        let reloader = Arc::new(
+            SecretReloader::new(
+                SecretFiles {
+                    api_key: Some(file),
+                    ..SecretFiles::default()
+                },
+                &sources(SecretSource::File, None),
+                Some("k-one"),
+                &[],
+                serving.clone(),
+                None,
+            )
+            .expect("a file source"),
+        );
+        let handle = start_auto_reload(Arc::clone(&reloader)).expect("the mount is watched");
+
+        let second = mount.path().join("..2026_11_08_v2");
+        std::fs::create_dir(&second).expect("the second version");
+        write(&second, "key", "k-two\n");
+        symlink("..2026_11_08_v2", mount.path().join("..data_tmp")).expect("the new link");
+        std::fs::rename(mount.path().join("..data_tmp"), mount.path().join("..data"))
+            .expect("the swap");
+        let deadline = time::Instant::now() + Duration::from_secs(10);
+        while !serving.contains_token("k-two") {
+            assert!(time::Instant::now() < deadline, "the swap was not reloaded");
+            time::sleep(Duration::from_millis(50)).await;
+        }
+        handle.abort();
     }
 
     #[test]
