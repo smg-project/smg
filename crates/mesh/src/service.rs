@@ -547,6 +547,7 @@ mod tests {
         *,
     };
     use crate::{
+        gossip_controller::ROUND_PERIOD,
         tests::{
             mtls_certs::MtlsTestCerts,
             test_utils::{bind_node, wait_for},
@@ -614,11 +615,21 @@ mod tests {
         handler.shutdown();
     }
 
+    /// Membership converges on every member: four form, a fifth joins and is
+    /// hard-stopped, one leaves gracefully, and the three left hold the leaver
+    /// `Leaving` and the stopped member not `Alive`. Every budget is twenty
+    /// rounds of the gossip tick (`ROUND_PERIOD`): a probe carries the
+    /// prober's whole table, so a join reaches every member within a few
+    /// rounds; the stopped member is known to every live member before the
+    /// stop, so each of them probes it with probability one third per round
+    /// and twenty rounds miss it with probability (2/3)^60; its closed socket
+    /// refuses the probe and the relays at once, and the verdict is
+    /// broadcast in the same round.
     #[tokio::test]
-    #[ignore = "SWIM failure detection for hard-shutdown nodes needs many gossip rounds; flaky under parallel CI load"]
     async fn test_state_synchronization() {
         init();
         log::info!("Starting test_state_synchronization");
+        let budget = ROUND_PERIOD * 20;
 
         // 1. Setup A-B cluster
         let (listener_a, addr_a) = bind_node().await;
@@ -628,7 +639,7 @@ mod tests {
 
         wait_for(
             || handler_a.state.read().len() == 2,
-            Duration::from_secs(15),
+            budget,
             "A-B cluster formed",
         )
         .await;
@@ -641,46 +652,58 @@ mod tests {
 
         wait_for(
             || handler_a.state.read().len() == 4,
-            Duration::from_secs(30),
+            budget,
             "4-node cluster formed",
         )
         .await;
 
-        // 3. Add E, let it join, then kill it
-        {
+        // 3. Add E on a runtime of its own, let every member learn of it, then
+        //    drop that runtime: a hard stop closes E's listener and streams at
+        //    once, as a process exit does. (The handler's `shutdown` ends the
+        //    gossip loop and leaves the listener draining the open streams; a
+        //    probe meets that as a wedge, accepted and never answered, and
+        //    finds it through the dialer's timeouts instead.)
+        let member_e = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        member_e.spawn(async move {
             let (listener_e, addr_e) = bind_node().await;
-            let handler_e = mesh_run!("E", listener_e, addr_e, vec![addr_d]);
-
+            let (server, _handler_e) =
+                MeshServerBuilder::new("E".to_string(), addr_e, addr_e, vec![addr_d]).build();
+            if let Err(e) = server.start_with_listener(listener_e).await {
+                tracing::error!("Mesh server failed: {}", e);
+            }
+        });
+        for (handler, name) in [(&handler_a, "A"), (&handler_b, "B"), (&handler_c, "C")] {
             wait_for(
-                || handler_a.state.read().len() == 5,
-                Duration::from_secs(30),
-                "E joined cluster",
+                || handler.state.read().len() == 5,
+                budget,
+                &format!("E joined the cluster on node {name}"),
             )
             .await;
-
-            handler_e.shutdown();
         }
+        member_e.shutdown_background();
 
         // 4. Gracefully shutdown D
         handler_d.graceful_shutdown().await.unwrap();
 
-        // 5. Wait for D=Leaving and E=Down (not Alive) on all remaining nodes
-        let check_statuses = |handler: &MeshServerHandler| {
-            let state = handler.state.read();
-            let d_leaving = state
-                .get("D")
-                .is_some_and(|n| n.status == NodeStatus::Leaving as i32);
-            let e_not_alive = state
-                .get("E")
-                .is_some_and(|n| n.status != NodeStatus::Alive as i32);
-            d_leaving && e_not_alive
+        // 5. D=Leaving and E not Alive on every remaining node
+        let status_on = |handler: &MeshServerHandler, member: &str| {
+            handler.state.read().get(member).map(|n| n.status)
         };
-
         for (handler, name) in [(&handler_a, "A"), (&handler_b, "B"), (&handler_c, "C")] {
             wait_for(
-                || check_statuses(handler),
-                Duration::from_secs(60),
-                &format!("D=Leaving, E not Alive on node {name}"),
+                || status_on(handler, "D") == Some(NodeStatus::Leaving as i32),
+                budget,
+                &format!("D=Leaving on node {name}"),
+            )
+            .await;
+            wait_for(
+                || status_on(handler, "E").is_some_and(|status| status != NodeStatus::Alive as i32),
+                budget,
+                &format!("E not Alive on node {name}"),
             )
             .await;
         }
