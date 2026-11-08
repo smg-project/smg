@@ -55,6 +55,7 @@ mod assemble;
 mod capability;
 mod config;
 mod detect;
+pub(crate) mod ec_push;
 mod encoder_budget;
 mod inflight;
 mod item_limits;
