@@ -50,8 +50,9 @@
     count is over balance_rel_threshold times the healthy-fleet mean AND over
     the mean by the absolute margin (balance_abs_threshold, capped at the
     larger of the count's natural swing and the held prefix's price; see
-    absolute_margin). A spilled request goes to LeastLoad's atomic expected-wait
-    winner among the workers under the same gate, and so does a request with
+    absolute_margin). A spilled request goes to LeastLoad's expected-wait winner (one call,
+    the choice and its credit; see `select_expected_wait`) among the workers
+    under the same gate, and so does a request with
     no cache match (ungated_candidates). Cache affinity is abandoned fleet-wide
     only under backend KV pressure (is_kv_imbalanced: the KV-usage spread or
     the overload ceiling, both read from backend token usage); without token
@@ -210,7 +211,8 @@ pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
     /// Expected-wait selector used after cache affinity has narrowed the
     /// candidate set. It owns backend snapshots and since-poll dispatch credit,
-    /// keeping selection and credit atomic under concurrent arrivals.
+    /// one call chooses and credits the final worker (see `select_expected_wait`
+    /// for what its write guard covers).
     load_scorer: LeastLoadPolicy,
     /// Selection policy run over the per-worker inputs gathered for each
     /// request (`cost` module); the default, the one the catalog holds,
