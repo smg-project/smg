@@ -4570,7 +4570,7 @@ fn every_catalog_policy_routes_event_driven_hits_and_misses() {
             },
         );
         assert_eq!(hit, Some(1), "{name}: the holder of every block must win");
-        policy.on_request_complete("http://w2:8000", true);
+        policy.on_request_complete("http://w2:8000");
 
         let miss = policy.select_worker(
             &workers,
@@ -4594,7 +4594,7 @@ fn every_catalog_policy_routes_tree_matches() {
         policy.init_workers(&workers);
         let text = "a shared system prompt that is long enough to match";
         let first = route_text(&policy, &workers, text).unwrap();
-        policy.on_request_complete(workers[first].url(), true);
+        policy.on_request_complete(workers[first].url());
         let second = route_text(&policy, &workers, text).unwrap();
         assert_eq!(first, second, "{name}: an idle holder keeps its prefix");
     }
@@ -4641,7 +4641,7 @@ fn accounting_books_the_dispatch_until_completion() {
     .collect();
     assert_eq!(accounting.predicted_overlaps(&sibling)[0].1, 1.0);
 
-    policy.on_request_complete("http://w1:8000", true);
+    policy.on_request_complete("http://w1:8000");
     assert_eq!(accounting.pending_prefill_tokens("http://w1:8000"), 0);
 }
 
@@ -4809,7 +4809,7 @@ fn a_large_pool_miss_spreads_over_the_pool() {
             .select_worker(&workers, &tokens_info(&tokens))
             .unwrap();
         picked.insert(idx);
-        policy.on_request_complete(workers[idx].url(), true);
+        policy.on_request_complete(workers[idx].url());
     }
     assert!(
         picked.len() > 2 * FLEET_SAMPLE,
@@ -4906,7 +4906,7 @@ fn a_fleet_wide_tie_is_drawn_from_not_scored_whole() {
             .select_worker(&workers, &tokens_info(&[1, 2, 3, 4]))
             .unwrap();
         picked.insert(idx);
-        policy.on_request_complete(workers[idx].url(), true);
+        policy.on_request_complete(workers[idx].url());
     }
     assert!(
         picked.len() > 2 * FLEET_SAMPLE,

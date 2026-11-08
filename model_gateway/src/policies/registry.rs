@@ -49,7 +49,7 @@ impl RequestCompletionSink for PolicyCompletionSink {
         };
         registry
             .policy_for_worker(worker)
-            .on_request_complete(worker.url(), true);
+            .on_request_complete(worker.url());
     }
 }
 
@@ -2626,7 +2626,7 @@ mod tests {
             (!workers.is_empty()).then_some(0)
         }
 
-        fn on_request_complete(&self, worker_url: &str, _success: bool) {
+        fn on_request_complete(&self, worker_url: &str) {
             self.completed.lock().unwrap().push(worker_url.to_string());
         }
 

@@ -1575,20 +1575,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         self.select_worker_scanned(workers, info)
     }
 
-    fn on_request_complete(&self, worker_url: &str, success: bool) {
+    fn on_request_complete(&self, worker_url: &str) {
         if let Some(accounting) = &self.accounting {
             accounting.release(worker_url);
         }
         self.selection.on_request_complete(worker_url);
-        // Could track success rates per worker for more intelligent routing
-        if !success {
-            // Optionally reduce affinity for failed requests
-            tracing::debug!(
-                "Request to {} completed with success={}",
-                worker_url,
-                success
-            );
-        }
     }
 
     fn name(&self) -> &'static str {
