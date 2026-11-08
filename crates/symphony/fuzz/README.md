@@ -77,9 +77,9 @@ JSON; from there `verbatim-after-break` asks that every fragment be the model's 
 `pythonic-cut-call-closed` is a pythonic call that ended without its own `)` and had its object
 closed for it (one that said nothing and left it open is a breach of the whole-JSON names, so no
 event carries two names). A name is a shape, from any reader on every target, not a reader's own.
-The nightly workflow allows one class, [on record below](#the-classes-the-nightly-allows) with the
-names that left, named in `symphony-fuzz.yml`; a name leaves the allowance with its fix, and a new
-reader's breach of an allowed shape surfaces then.
+The nightly workflow allows no class; the classes it allowed are
+[on record below](#the-classes-the-nightly-allows), and a name enters `symphony-fuzz.yml` with its
+report and leaves with its fix, so a new reader's breach of a shape once allowed surfaces at once.
 
 One target by hand, with libFuzzer's own options after `--`:
 
@@ -110,26 +110,29 @@ cut is the fragment case of the test beside it,
 no input there, its shape is `prefix_breach`'s.
 
 - `tolerated-json` (left the allowance on 2026-11-08): arguments that strict JSON refuses but that
-  the readers hand on. The name is
-  given by two judges that agree on the shapes: at a fragment, where the crate's prefix judge
-  refuses the text and the partial parser takes it whole; at the call's end, where the arguments'
-  shape closed but the whole-JSON check fails. A scalar cut short (`0e`, `n`, `1.`) is the prefix of
-  a longer value, so the prefix judge accepts it at every fragment and the name comes at the call's
-  end alone; the same scalar cut short before a delimiter (`{"a": 1.}`, from the `TOLERATED` table
-  in `../src/json/prefix.rs`) is named at the fragment. The other shapes are a value left out
-  (`{"city": "Paris", "days": ,}`), a trailing comma (`{"a": 1,}`), an escape JSON lacks (`"\h"`), a
-  short `\u` escape at a cut (`{"a": ["\u1"]`) and whitespace outside JSON's. The fix decides per
-  shape whether the readers refuse it (`Malformed { InvalidArguments }` at the fragment that brings
-  it, or at the call's end for a scalar cut short, which stays a valid prefix while it arrives) or
-  the judge accepts it as the engines' own JSON readers do, and makes the readers and the judge
-  agree. What ended it: the readers that take whole JSON arguments (the JSON, JSON-list and shaped
-  syntaxes) say `Malformed { InvalidArguments }` at the fragment that brings every shape above
-  (#3790, #5004), so the harness sees the word before the end; the readers that type a value by the
-  declared schema (the keyed, attributed, tagged, pythonic and Gemma syntaxes) hand the harness a
-  value already spelled as JSON, which the prefix judge takes. Runs on main without any allowance
-  found no breach of any class: on 2026-11-08 the nine targets ran three minutes each (5.1 million executions) and the four readers that still read values through the tolerant parser (`pythonic_calls`, `gemma_calls`, `xml_calls`, `any_table`) fifteen minutes each (7.1 million executions), 87 target-minutes with no crash and no class named. The typed readers' own reading of a value JSON refuses
-  (a trailing comma dropped, an unreadable value kept as a string) is a question of parity with
-  each engine's own parser, on record as its own report, not a breach of this promise.
+  the readers hand on. The name is given by two judges that agree on the shapes: at a fragment,
+  where the crate's prefix judge refuses the text and the partial parser takes it whole; at the
+  call's end, where the arguments' shape closed but the whole-JSON check fails. A scalar cut short
+  (`0e`, `n`, `1.`) is the prefix of a longer value, so the prefix judge accepts it at every
+  fragment and the name comes at the call's end alone; the same scalar cut short before a delimiter
+  (`{"a": 1.}`, from the `TOLERATED` table in `../src/json/prefix.rs`) is named at the fragment. The
+  other shapes are a value left out (`{"city": "Paris", "days": ,}`), a trailing comma (`{"a":
+  1,}`), an escape JSON lacks (`"\h"`), a short `\u` escape at a cut (`{"a": ["\u1"]`) and
+  whitespace outside JSON's. The fix decides per shape whether the readers refuse it (`Malformed {
+  InvalidArguments }` at the fragment that brings it, or at the call's end for a scalar cut short,
+  which stays a valid prefix while it arrives) or the judge accepts it as the engines' own JSON
+  readers do, and makes the readers and the judge agree. What ended it: the readers that take whole
+  JSON arguments (the JSON, JSON-list and shaped syntaxes) say `Malformed { InvalidArguments }` at
+  the fragment that brings every shape above (#3790, #5004), so the harness sees the word before the
+  end; the readers that type a value by the declared schema (the keyed, attributed, tagged, pythonic
+  and Gemma syntaxes) hand the harness a value already spelled as JSON, which the prefix judge
+  takes. Runs on main without any allowance found no breach of any class: on 2026-11-08 the nine
+  targets ran three minutes each (5.1 million executions) and the four readers that still read
+  values through the tolerant parser (`pythonic_calls`, `gemma_calls`, `xml_calls`, `any_table`)
+  fifteen minutes each (7.1 million executions), 87 target-minutes with no crash and no class named.
+  The typed readers' own reading of a value JSON refuses (a trailing comma dropped, an unreadable
+  value kept as a string) is a question of parity with each engine's own parser, on record as its
+  own report, not a breach of this promise.
 - `empty-arguments` (left the allowance on 2026-11-08): a call that ended with no arguments fragment
   at all and no `Malformed` word inside it other than a stop's (an `OpenAtTheStop` or
   `OpenAtTheMarker` of no bytes), where the contract asks for `Malformed` before the end of a cut
