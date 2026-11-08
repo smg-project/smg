@@ -1,7 +1,10 @@
 //! Consistent hashing routing policy with header-based routing support
 //!
 //! Supports two routing mechanisms via HTTP headers:
-//! - `X-SMG-Target-Worker`: Direct routing by worker index (0-based), returns None if unavailable
+//! - `X-SMG-Target-Worker`: Direct routing by worker index (0-based) into the
+//!   workers the caller hands the policy. Placement hands it the workers
+//!   available when the request arrives, so the index counts those and an
+//!   index past them is a miss (no worker, never another one).
 //! - `X-SMG-Routing-Key`: Consistent hash routing for session affinity
 //!
 //! ## Consistent Hashing
