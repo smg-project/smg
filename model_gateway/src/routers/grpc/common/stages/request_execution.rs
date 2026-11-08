@@ -835,7 +835,7 @@ async fn execute_batch_dispatch(
 /// pinned. A key whose rank is not below `pinnable_ranks` (on vLLM, one at
 /// or past the first index the group's engines lack) is left to the
 /// connector's pick, which takes any engine, rather than pinned where the
-/// connector may refuse it.
+/// connector may refuse it; each such request is logged at debug.
 fn pin_grouped_dp_rank(
     plan: &mut ExecutionPlan,
     workers: &WorkerSelection,
@@ -866,6 +866,16 @@ fn pin_grouped_dp_rank(
     };
     if pinnable_ranks.is_none_or(|ranks| rank < ranks) {
         request.set_data_parallel_rank(rank as i32);
+    } else {
+        debug!(
+            request_id = request.request_id(),
+            worker = worker.redacted_url(),
+            rank,
+            size,
+            pinnable_ranks,
+            "Sticky key's grouped data-parallel rank is past the ranks its worker's connection \
+             places a pin on; the request keeps the connector's pick"
+        );
     }
 }
 
@@ -4430,8 +4440,9 @@ pub(crate) mod tests {
     /// A key whose rank the worker's connection places no pin on (on vLLM, one
     /// at or past the first index the group's engines lack) is left to the
     /// connector's pick, which takes any engine, rather than pinned where the
-    /// connector may refuse it; a key whose rank the connection places keeps
-    /// it.
+    /// connector may refuse it, and each such request is logged at debug; a
+    /// key whose rank the connection places keeps it.
+    #[tracing_test::traced_test]
     #[test]
     fn a_key_whose_rank_the_connection_cannot_place_is_left_to_the_connector() {
         let workers = grouped_worker("ipc:///tmp/partial.ipc", 4);
@@ -4449,6 +4460,32 @@ pub(crate) mod tests {
             assert_eq!(hash(0, &key), None, "{key}, none placed");
         }
         assert!((1..32).contains(&left), "keys on either side: {left} left");
+        // One debug line per request left to the connector, naming the
+        // worker, its size and the ranks its connection places.
+        logs_assert(|lines: &[&str]| {
+            let logged: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("keeps the connector's pick"))
+                .collect();
+            let placing = |ranks: usize| {
+                let ranks = format!("pinnable_ranks={ranks}");
+                logged
+                    .iter()
+                    .filter(|line| {
+                        line.contains("ipc:///tmp/partial.ipc")
+                            && line.contains("size=4")
+                            && line.contains(&ranks)
+                    })
+                    .count()
+            };
+            if (logged.len(), placing(2), placing(0)) == (left + 32, left, 32) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{left} lines placing 2 and 32 placing none expected: {logged:?}"
+                ))
+            }
+        });
     }
 
     /// A worker given no count has no `dp_size`: its ranks are the ones its
