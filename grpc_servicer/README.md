@@ -928,9 +928,12 @@ workers that share a host do not collide; an explicit configuration is kept as
 given, its endpoint and off included, and `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0`
 leaves the publisher off. An encode worker (`--disaggregation-mode encode`) has
 no KV cache and is left as given. A hybrid model (Gated DeltaNet, Mamba or KDA
-layers) keeps its recurrent state in State groups of TokenSpeed's cache, which
-span no tokens, and TokenSpeed's KV-event drain aborts the engine on such a
-group: for a model whose layer labels the engine's own cache recipes map to a
+layers) keeps its recurrent state in State groups of TokenSpeed's cache. An
+engine whose KV events name their cache group (`KVEvent.BlockStored` carries
+`group_idx`) publishes such a model's history chain beside its checkpoints and
+is served. An engine whose events carry no group publishes a boundary only
+while every group holds it, so the model's history chain would never reach the
+router: for a model whose layer labels the engine's own cache recipes map to a
 State group, the servicer leaves the publisher off and logs why once
 (`KV event publishing left off: ...`); `--kv-events-config` turns it on anyway.
 
