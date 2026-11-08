@@ -267,7 +267,7 @@ pub(crate) fn select_from(
         request_text: inputs.text,
         tokens: inputs.tokens,
         headers: inputs.headers,
-        routing_key: policies.resolve_routing_key(inputs.headers),
+        routing_key: policies.sticky_header_key(inputs.headers),
         rid_key: inputs.rid_key,
         cache_namespace: inputs.cache_namespace,
         // Cached hash ring for consistent hashing (O(log n) lookup).
@@ -1125,7 +1125,7 @@ pub(crate) fn select_pair(
         request_text: inputs.text,
         tokens: inputs.tokens,
         headers: inputs.headers,
-        routing_key: policies.resolve_routing_key(inputs.headers),
+        routing_key: policies.sticky_header_key(inputs.headers),
         rid_key: inputs.rid_key,
         cache_namespace: inputs.cache_namespace,
         hash_ring,
@@ -1249,7 +1249,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::types::{PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
+        config::types::{
+            ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig,
+        },
         observability::logging::test_support::test_subscriber,
         policies::{CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, RoundRobinPolicy},
         worker::{runtime::StallReason, BasicWorkerBuilder, ModelCard, PdWire, WorkerType},
@@ -2967,6 +2969,63 @@ mod tests {
             registry.set_overload_shed(true);
             assert_ne!(pick(&registry, &policies, inputs).url(), owner.url());
         }
+    }
+
+    /// A header key with turn and retry suffixes under the routing-key
+    /// override: placement derives the key once, lineage-stripped, so the
+    /// policies that place by the key themselves (consistent hashing, the
+    /// sticky map) see the key the load guard counts, and every turn of
+    /// `conv` lands on the owner of `conv`. Without the override the key is
+    /// raw: a new turn is a new key.
+    #[test]
+    fn a_header_keys_turns_share_one_owner_under_the_override() {
+        let keyed = |key: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-routing-key", key.parse().unwrap());
+            headers
+        };
+        let manual = || PolicyConfig::Manual {
+            eviction_interval_secs: 0,
+            max_idle_secs: 0,
+            assignment_mode: ManualAssignmentMode::MinLoad,
+        };
+        let turns = ["conv_t1", "conv_t2", "conv_t3_r1", "conv_r2"];
+        for config in [PolicyConfig::ConsistentHashing, manual()] {
+            let policies = PolicyRegistry::with_override(
+                config,
+                RoutingKeyOverrideConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+            let name = policies.get_default_policy().name();
+            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+            let base = keyed("conv");
+            let owner = pick(&registry, &policies, with_headers(&base));
+            // A vacant sticky key would go to a lighter worker.
+            owner.increment_load();
+            for turn in turns {
+                let headers = keyed(turn);
+                assert_eq!(
+                    pick(&registry, &policies, with_headers(&headers)).url(),
+                    owner.url(),
+                    "{name}: {turn} left the owner of conv"
+                );
+            }
+        }
+
+        // Override off: the sticky map pins each raw key on its own.
+        let policies = PolicyRegistry::new(manual());
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let first = keyed("conv_t1");
+        let owner = pick(&registry, &policies, with_headers(&first));
+        owner.increment_load();
+        let second = keyed("conv_t2");
+        assert_ne!(
+            pick(&registry, &policies, with_headers(&second)).url(),
+            owner.url(),
+            "without the override a new turn is a new key"
+        );
     }
 
     /// Every worker over the thresholds, the owner the busier: the session

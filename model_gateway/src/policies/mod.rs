@@ -422,9 +422,11 @@ pub struct SelectWorkerInfo<'a> {
     /// - X-SMG-Target-Worker: Direct routing to a specific worker by index
     /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
     pub headers: Option<&'a http::HeaderMap>,
-    /// Validated `x-smg-routing-key` hint (non-empty UTF-8, <= 128 bytes);
-    /// consistent_hashing and prefix_hash prefer it over their other keying
-    /// input.
+    /// The validated routing-key header (non-empty UTF-8, <= 128 bytes) as
+    /// `PolicyRegistry::sticky_header_key` derives it: lineage-stripped
+    /// (`conv_t2_r1` -> `conv`) under the routing-key override, raw
+    /// otherwise; the key the load guard counts under. consistent_hashing,
+    /// manual and prefix_hash prefer it over their other keying input.
     pub routing_key: Option<&'a str>,
     /// The request's cache partition (cache salt / extra key / LoRA), when
     /// set. Cache-aware routing keys its affinity under it so requests the
