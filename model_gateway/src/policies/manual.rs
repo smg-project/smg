@@ -420,31 +420,12 @@ mod tests {
     use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType};
-
-    fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
-        urls.iter()
-            .map(|url| {
-                Arc::new(
-                    BasicWorkerBuilder::new(*url)
-                        .worker_type(WorkerType::Regular)
-                        .health_config(no_health_check())
-                        .build(),
-                ) as Arc<dyn Worker>
-            })
-            .collect()
-    }
-
-    fn headers_with_routing_key(key: &str) -> http::HeaderMap {
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-smg-routing-key", key.parse().unwrap());
-        headers
-    }
+    use crate::policies::test_support::{headers_with_routing_key, make_workers};
 
     #[test]
     fn test_manual_role_namespaces_sticky_entries() {
         let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let headers = headers_with_routing_key("user-123");
 
         let prefill = SelectWorkerInfo {
@@ -472,7 +453,7 @@ mod tests {
     #[test]
     fn test_manual_header_key_outranks_rid_key() {
         let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let headers = headers_with_routing_key("conv");
         let turn1 = SelectWorkerInfo {
@@ -499,7 +480,7 @@ mod tests {
     #[test]
     fn test_manual_rid_key_namespaces_per_role() {
         let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let prefill = SelectWorkerInfo {
             rid_key: Some("conv"),
@@ -526,7 +507,7 @@ mod tests {
     #[test]
     fn test_manual_consistent_routing() {
         let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let headers = headers_with_routing_key("user-123");
         let info = SelectWorkerInfo {
@@ -552,7 +533,7 @@ mod tests {
     #[test]
     fn test_manual_different_routing_ids() {
         let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let mut distribution = HashMap::new();
         for i in 0..100 {
@@ -575,7 +556,7 @@ mod tests {
     #[test]
     fn test_manual_fallback_random() {
         let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let mut counts = HashMap::new();
         for _ in 0..100 {
@@ -593,7 +574,7 @@ mod tests {
     #[test]
     fn test_manual_with_unhealthy_workers() {
         let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         workers[0].set_status(WorkerStatus::NotReady);
 
@@ -617,7 +598,7 @@ mod tests {
     #[test]
     fn test_manual_no_healthy_workers() {
         let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000"]);
+        let workers = make_workers(&["http://w1:8000"]);
 
         workers[0].set_status(WorkerStatus::NotReady);
         let headers = headers_with_routing_key("test");
@@ -633,7 +614,7 @@ mod tests {
     #[test]
     fn test_manual_empty_routing_id() {
         let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let mut counts = HashMap::new();
         for _ in 0..100 {
@@ -659,7 +640,7 @@ mod tests {
     #[test]
     fn test_manual_remaps_when_worker_becomes_unhealthy() {
         let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let headers = headers_with_routing_key("sticky-user");
         let info = SelectWorkerInfo {
@@ -706,7 +687,7 @@ mod tests {
     #[test]
     fn test_manual_single_worker() {
         let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000"]);
+        let workers = make_workers(&["http://w1:8000"]);
 
         let headers = headers_with_routing_key("single-test");
         let info = SelectWorkerInfo {
@@ -728,7 +709,7 @@ mod tests {
     #[test]
     fn test_manual_worker_recovery() {
         let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let headers = headers_with_routing_key("recovery-test");
         let info = SelectWorkerInfo {
@@ -761,7 +742,7 @@ mod tests {
     #[test]
     fn test_manual_max_candidate_workers_eviction() {
         let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let headers = headers_with_routing_key("eviction-test");
         let info = SelectWorkerInfo {
@@ -831,7 +812,7 @@ mod tests {
 
     #[test]
     fn test_manual_find_healthy_worker_priority() {
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let urls = vec![
             "http://w1:8000".to_string(),
@@ -865,7 +846,7 @@ mod tests {
 
     #[test]
     fn test_manual_find_worker_index_by_url() {
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         assert_eq!(
             find_worker_index_by_url(&workers, "http://w1:8000"),
@@ -903,7 +884,7 @@ mod tests {
     #[test]
     fn test_manual_last_access_updates() {
         let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let headers = headers_with_routing_key("test-key");
         let info = SelectWorkerInfo {
             headers: Some(&headers),
@@ -946,7 +927,7 @@ mod tests {
             assignment_mode: ManualAssignmentMode::Random,
         };
         let policy = ManualPolicy::with_config(config);
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let headers = headers_with_routing_key("key-0");
         let info = SelectWorkerInfo {
@@ -969,7 +950,7 @@ mod tests {
             ..Default::default()
         };
         let policy = ManualPolicy::with_config(config);
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         for i in 0..9 {
             let routing_key = format!("key-{i}");
@@ -1009,7 +990,7 @@ mod tests {
             ..Default::default()
         };
         let policy = ManualPolicy::with_config(config);
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         workers[0].increment_routing_key_load("existing-1");
         workers[0].increment_routing_key_load("existing-2");
@@ -1037,7 +1018,7 @@ mod tests {
             ..Default::default()
         };
         let policy = ManualPolicy::with_config(config);
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         workers[0].increment_load();
         workers[0].increment_load();
@@ -1065,7 +1046,7 @@ mod tests {
             ..Default::default()
         };
         let policy = ManualPolicy::with_config(config);
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         workers[0].increment_routing_key_load("key-0");
         workers[1].increment_routing_key_load("key-1");
@@ -1120,7 +1101,7 @@ mod tests {
     #[test]
     fn test_peek_pin_states() {
         let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let healthy = [0, 1];
 
         assert_eq!(
@@ -1149,7 +1130,7 @@ mod tests {
             assignment_mode: ManualAssignmentMode::Delegate,
             ..Default::default()
         });
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         workers[0].increment_load();
 
         let info = SelectWorkerInfo::default();
@@ -1165,7 +1146,7 @@ mod tests {
             ..Default::default()
         };
         let policy = ManualPolicy::with_config(config);
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         workers[0].increment_routing_key_load("key-1");
         workers[0].increment_routing_key_load("key-2");
