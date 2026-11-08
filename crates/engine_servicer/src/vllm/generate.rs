@@ -21,7 +21,7 @@ use llm_tokenizer::stop::StopSequenceDecoder;
 use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
 
-use super::{media::process_media_refs, State};
+use super::{encoder_cache, media::process_media_refs, State};
 use crate::{
     load_tracker::{rank_of, ChoiceLoad, PendingGuard, PrefillProbe},
     metrics::{complete_finish_reason, ChoiceMetrics},
@@ -51,13 +51,25 @@ pub(super) async fn generate(
 }
 
 /// The refusal of a request that carries encoder-cache transfer parameters
-/// (`ec_transfer_params_json`): this servicer runs no encoder-cache
-/// connector, which the Router reads off the `supports_ec_transfer` label
-/// this servicer leaves unset; the shape is the Python servicer's refusal of
-/// a media reference with processing off (`media::PROCESSOR_OFF`).
+/// (`ec_transfer_params_json`) on an engine without an encoder-cache
+/// connector (the launcher reports none off `ec_transfer_config`, and the
+/// Router reads it off the `supports_ec_transfer` label left unset); the
+/// shape is the Python servicer's refusal of a media reference with
+/// processing off (`media::PROCESSOR_OFF`).
 const NO_ENCODER_CACHE: &str = "ec_transfer_params_json sent but this worker runs no \
                                 encoder-cache connector; check this worker's \
                                 supports_ec_transfer label";
+
+/// Whether the request carries encoder-cache transfer parameters: a non-empty
+/// `ec_transfer_params_json` (the encoder's request names the consumer's
+/// destination, or an empty object for a pull connector; the prefill side's
+/// names the encoder's handles). An empty field is no parameters, as the
+/// Python servicer reads it.
+pub(super) fn ec_transfer_params_sent(req: &vllm::GenerateRequest) -> bool {
+    req.ec_transfer_params_json
+        .as_deref()
+        .is_some_and(|params| !params.is_empty())
+}
 
 /// The tracing target of the per-request line: a reader that wants it raises
 /// this target alone (`RUST_LOG=info,engine_servicer::request=debug`); the
@@ -250,22 +262,32 @@ async fn submit(
         ));
     }
     // An encode-prefill-decode leg (the encoder's request with the consumer's
-    // destination, or the prefill side's with the encoder's handles) names a
-    // handoff this servicer does not run: no encoder-cache connector is
-    // configured through it and `GetServerInfo` advertises none, so a Router
-    // selects it for neither side. One that arrives all the same is refused
-    // here, before the media stage or the engine sees it (the engine would
-    // run it as a plain request and the caller would read a completion
-    // without the handles), in the shape a media reference is refused on a
-    // worker whose processor is off. An empty field is no parameters, as the
-    // Python servicer reads it.
-    if req
-        .ec_transfer_params_json
-        .as_deref()
-        .is_some_and(|params| !params.is_empty())
-    {
+    // destination, or the prefill side's with the encoder's handles) rides
+    // the engine's encoder-cache connector, which the launcher reports off
+    // `ec_transfer_config` and `GetServerInfo` advertises, so a Router selects
+    // an engine without one for neither side. A leg that arrives there all
+    // the same is refused here, before the media stage or the engine sees it
+    // (the engine would run it as a plain request and the caller would read
+    // a completion without the handles), in the shape a media reference is
+    // refused on a worker whose processor is off.
+    if !state.model.supports_ec_transfer && ec_transfer_params_sent(&req) {
         return Err(Status::invalid_argument(NO_ENCODER_CACHE));
     }
+    // On an engine with a connector, the leg's parameters (a JSON object; a
+    // malformed field is refused by the adapter's parse) are checked as the
+    // Python servicer checks them: a consumer's pixel-less batches need a
+    // usable handle per media item before the engine sees the request.
+    let ec_params = (state.model.supports_ec_transfer && ec_transfer_params_sent(&req))
+        .then(|| {
+            req.ec_transfer_params_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        })
+        .flatten();
+    if let Some(params) = ec_params.as_ref() {
+        encoder_cache::check_consumer_handoff(&req, &state.model, params)?;
+    }
+    let ec_producer_leg = ec_params.is_some() && encoder_cache::is_producer(&state.model);
     let request_id = req.request_id.clone();
     // Register before anything slow: an `Abort` landing while the media is
     // processed must find the entry, and a duplicate id is refused up front.
@@ -289,6 +311,14 @@ async fn submit(
         Some((media, identity)) => (Some(media), identity.map(Arc::new)),
         None => (None, None),
     };
+    // An encoder's leg with router-preprocessed batches gets its identity
+    // from the batches themselves (the media stage saw no reference).
+    let media_identity = media_identity.or_else(|| {
+        ec_producer_leg
+            .then(|| encoder_cache::producer_identity(&req, &state.model))
+            .flatten()
+            .map(Arc::new)
+    });
     let streaming = req.stream;
     let skip_special_tokens = req
         .sampling_params
@@ -372,6 +402,7 @@ async fn submit(
             streaming,
             min_tokens,
             media_identity.clone(),
+            ec_producer_leg,
             request_id.clone(),
             metrics.choice(),
         ));
@@ -403,6 +434,10 @@ struct ChoiceStream {
     /// A PD prefill side's account of the media it processed, stamped on
     /// every `Complete` of the request for the decode side.
     media_identity: Option<Arc<vllm::MediaIdentity>>,
+    /// Whether this is an encoder's encoder-cache leg: its terminal
+    /// `Complete` must return the connector's handle for every media item of
+    /// the identity (`encoder_cache::check_producer_handles`).
+    ec_producer_leg: bool,
     /// The request this choice belongs to, for the load tracker.
     request_id: String,
     /// This choice's share of the load tracker's bookkeeping; its prefill
@@ -419,11 +454,13 @@ impl ChoiceStream {
         streaming: bool,
         min_tokens: u32,
         media_identity: Option<Arc<vllm::MediaIdentity>>,
+        ec_producer_leg: bool,
         request_id: String,
         metrics: ChoiceMetrics,
     ) -> Self {
         Self {
             media_identity,
+            ec_producer_leg,
             request_id,
             load: ChoiceLoad::new(
                 rank_of(inner.engine_index()),
@@ -555,6 +592,19 @@ impl Stream for ChoiceStream {
                         complete.cached_tokens,
                     );
                     ended = true;
+                    if this.ec_producer_leg {
+                        if let Some(identity) = this.media_identity.as_deref() {
+                            if let Err(status) = encoder_cache::check_producer_handles(
+                                &this.state.model,
+                                identity,
+                                complete,
+                            ) {
+                                this.inner = None;
+                                this.metrics.failed(status.code());
+                                return Poll::Ready(Some(Err(status)));
+                            }
+                        }
+                    }
                 }
                 let response = this.stamped(item);
                 if ended {

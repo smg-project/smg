@@ -324,13 +324,14 @@ fn identity_cache_salt(batches: &[vllm::MultimodalInputs]) -> Option<String> {
 /// become on the wire: per-item `mm_features` in prompt order, or, for a
 /// tensor-less identity payload, the `cache_salt` carrying the hashes. The
 /// rules are the Python servicer's: a pixel-less (grid-only) batch is a PD
-/// decode side and needs remote KV, or the engine would run the encoder with
-/// nothing to encode.
+/// decode side's or an encoder-cache consumer's and needs a remote transfer
+/// (KV or encoder cache), or the engine would run the encoder with nothing to
+/// encode.
 pub(crate) fn translate_batches(
     batches: Vec<vllm::MultimodalInputs>,
     prompt_token_ids: &[u32],
     model_dtype: ModelDtype,
-    has_kv_transfer: bool,
+    has_remote_transfer: bool,
 ) -> Result<(Option<MmFeatures>, Option<String>), String> {
     if batches.is_empty() {
         return Ok((None, None));
@@ -338,14 +339,15 @@ pub(crate) fn translate_batches(
     if !batches.iter().any(has_preprocessed_payload) {
         return Ok((None, identity_cache_salt(&batches)));
     }
-    if !has_kv_transfer
+    if !has_remote_transfer
         && batches
             .iter()
             .any(|batch| has_preprocessed_payload(batch) && batch.pixel_values.is_none())
     {
         return Err(
             "multimodal payload carries grid tensors but no pixel_values and no \
-                    kv_transfer_params; a pixel-less leg requires remote KV"
+                    kv_transfer_params or ec_transfer_params; a pixel-less leg requires a \
+                    handoff"
                 .to_string(),
         );
     }
@@ -1035,7 +1037,7 @@ mod tests {
         };
         let err = translate_batches(vec![grid_only()], &[0; 9], ModelDtype::BFloat16, false)
             .expect_err("needs remote KV");
-        assert!(err.contains("requires remote KV"), "{err}");
+        assert!(err.contains("requires a handoff"), "{err}");
         let (features, _) =
             translate_batches(vec![grid_only()], &[0; 9], ModelDtype::BFloat16, true)
                 .expect("decode side");

@@ -75,6 +75,84 @@ fn model_info() -> VllmModelInfo {
     }
 }
 
+/// The model info of an engine with an encoder-cache connector in the given
+/// role (a Mooncake consumer's address per rank included, as the launcher
+/// reports them).
+fn ec_model_info(role: &str) -> VllmModelInfo {
+    VllmModelInfo {
+        supports_ec_transfer: true,
+        ec_connector: "ECMooncakeConnector".to_string(),
+        ec_role: role.to_string(),
+        ec_zmq_addrs: vec!["tcp://10.0.0.9:14579".to_string()],
+        ..model_info()
+    }
+}
+
+/// The model info of an engine with a CPU encoder-cache connector in the
+/// given role.
+fn ec_cpu_model_info(role: &str) -> VllmModelInfo {
+    VllmModelInfo {
+        ec_connector: "ECCPUConnector".to_string(),
+        ec_zmq_addrs: Vec::new(),
+        ..ec_model_info(role)
+    }
+}
+
+/// A pixel-less batch naming its media by hash alone: a consumer's leg.
+fn pixel_less_batch(hashes: &[&str]) -> vllm::MultimodalInputs {
+    vllm::MultimodalInputs {
+        mm_hashes: hashes.iter().map(|hash| hash.to_string()).collect(),
+        mm_placeholders: vec![vllm::PlaceholderRange {
+            offset: 1,
+            length: 3,
+        }],
+        modality: common::Modality::Image as i32,
+        ..Default::default()
+    }
+}
+
+/// A router-preprocessed image batch of two items whose pixels sit in a fresh
+/// `/dev/shm` file (read and unlinked once by the servicer).
+#[cfg(target_os = "linux")]
+fn shm_pixel_batch(tag: &str) -> vllm::MultimodalInputs {
+    let name = format!(
+        "smg-servicer-test-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let payload: Vec<u8> = (0..8).flat_map(|v| (v as f32).to_le_bytes()).collect();
+    fs::write(std::path::Path::new("/dev/shm").join(&name), &payload).expect("write shm file");
+    vllm::MultimodalInputs {
+        pixel_values: Some(vllm::TensorData {
+            shape: vec![2, 4],
+            dtype: "float32".to_string(),
+            payload: Some(vllm::tensor_data::Payload::Shm(common::ShmHandle {
+                name,
+                offset: 0,
+                nbytes: payload.len() as u64,
+                owner_id: "smg:test".to_string(),
+            })),
+        }),
+        mm_placeholders: vec![
+            vllm::PlaceholderRange {
+                offset: 1,
+                length: 3,
+            },
+            vllm::PlaceholderRange {
+                offset: 6,
+                length: 3,
+            },
+        ],
+        mm_hashes: vec!["h0".to_string(), "h1".to_string()],
+        batched_keys: vec!["pixel_values".to_string()],
+        modality: common::Modality::Image as i32,
+        ..Default::default()
+    }
+}
+
 fn config(dir: &std::path::Path, handshake: &str, model: VllmModelInfo) -> VllmServicerConfig {
     VllmServicerConfig {
         servicer: servicer_config(dir, handshake),
@@ -1205,6 +1283,234 @@ async fn encoder_cache_transfer_parameters_are_refused_before_the_engine() {
         .expect("an empty field is a plain request")
         .into_inner();
     assert_eq!(recv_add(&mut h.engine_in).await.request_id, "ec-empty");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// With an encoder-cache connector in the engine, the four info fields are
+/// advertised as the launcher reports them, a leg's transfer parameters go
+/// to the engine as the connector's extra argument (a pull connector's empty
+/// object included, beside no KV params) and the connector's answer comes
+/// back on the `Complete`, as the Python servicer carries them.
+#[tokio::test]
+async fn encoder_cache_transfer_parameters_pass_through_both_ways() {
+    let mut h = harness(ec_model_info("ec_consumer"), None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest::default())
+        .await
+        .expect("server info")
+        .into_inner();
+    assert!(info.supports_ec_transfer, "{info:?}");
+    assert_eq!(
+        (info.ec_connector.as_str(), info.ec_role.as_str()),
+        ("ECMooncakeConnector", "ec_consumer")
+    );
+    assert_eq!(info.ec_zmq_addrs, vec!["tcp://10.0.0.9:14579"]);
+    for (id, params) in [
+        (
+            "ec-prefill",
+            r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600,"size_bytes":128}}"#,
+        ),
+        ("ec-encode-pull", "{}"),
+    ] {
+        let mut request = generate_request(id, false, Vec::new());
+        request.ec_transfer_params_json = Some(params.to_string());
+        let mut stream = h
+            .client
+            .generate(request)
+            .await
+            .expect("admitted on an engine with a connector")
+            .into_inner();
+        let engine_request = recv_add(&mut h.engine_in).await;
+        assert_eq!(engine_request.request_id, id);
+        let extra = engine_request
+            .sampling_params
+            .as_ref()
+            .and_then(|sp| sp.extra_args.as_ref())
+            .expect("extra_args carry the connector params");
+        let sent: serde_json::Value = serde_json::from_str(params).unwrap();
+        assert_eq!(extra.get("ec_transfer_params"), Some(&sent), "{id}");
+        assert!(extra.get("kv_transfer_params").is_none(), "{id}");
+
+        let mut outputs = batch(id, vec![7], Some(EngineCoreFinishReason::Length), None);
+        if let EngineCoreOutputs::RequestBatch(batch) = &mut outputs {
+            batch.outputs[0].ec_transfer_params = Some(Box::new(serde_json::json!({
+                "h1": {"peer_host": "10.0.0.2", "peer_port": 5700, "size_bytes": 128},
+            })));
+        }
+        h.engine_out.send_outputs(&outputs).await.unwrap();
+        let finished = complete(stream.message().bounded().await.unwrap().unwrap());
+        assert_eq!(finished.finish_reason, "length", "{id}");
+        let returned: serde_json::Value = serde_json::from_str(
+            finished
+                .ec_transfer_params_json
+                .as_deref()
+                .expect("json params"),
+        )
+        .unwrap();
+        assert_eq!(returned["h1"]["peer_port"], 5700, "{id}");
+        assert!(finished.kv_transfer_params_json.is_none(), "{id}");
+        assert!(stream.message().bounded().await.unwrap().is_none());
+    }
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A consumer's leg (the prefill side of an encode-prefill-decode fleet)
+/// brings pixel-less batches: the engine fetches their encodings by the
+/// handles in the transfer parameters, so a leg whose handles do not cover
+/// every item is refused before the engine, in the Python servicer's words
+/// (an empty object, a CPU handle without an address, a Mooncake transfer
+/// id short of one occurrence); one whose handles cover them goes through.
+#[tokio::test]
+async fn encoder_cache_consumer_needs_a_handle_for_every_pixel_less_item() {
+    let mut h = harness(ec_cpu_model_info("ec_consumer"), None).await;
+    let refused = [
+        ("ec-c-empty", "{}"),
+        (
+            "ec-c-short",
+            r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600}}"#,
+        ),
+        (
+            "ec-c-no-port",
+            r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600},"h2":{"peer_host":"10.0.0.1"}}"#,
+        ),
+    ];
+    for (id, params) in refused {
+        let mut request = generate_request(id, false, Vec::new());
+        request.mm_inputs = Some(pixel_less_batch(&["h1", "h2"]));
+        request.ec_transfer_params_json = Some(params.to_string());
+        let status = h.client.generate(request).await.expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument, "{id}");
+        assert!(
+            status
+                .message()
+                .contains("not usable for every pixel-less media item"),
+            "{id}: {}",
+            status.message()
+        );
+    }
+    assert_engine_idle(&mut h.engine_in).await;
+    let mut request = generate_request("ec-c-ok", false, Vec::new());
+    request.mm_inputs = Some(pixel_less_batch(&["h1", "h2"]));
+    request.ec_transfer_params_json = Some(
+        r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600},"h2":{"peer_host":"10.0.0.1","peer_port":5601}}"#
+            .to_string(),
+    );
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("covered handles go through")
+        .into_inner();
+    let engine_request = recv_add(&mut h.engine_in).await;
+    assert_eq!(engine_request.request_id, "ec-c-ok");
+    assert!(
+        engine_request.mm_features.is_none(),
+        "a pixel-less leg carries no features"
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    // Mooncake consumes one transfer id per occurrence of a hash.
+    let mut h = harness(ec_model_info("ec_consumer"), None).await;
+    let mut request = generate_request("ec-m-short", false, Vec::new());
+    request.mm_inputs = Some(pixel_less_batch(&["h1", "h1"]));
+    request.ec_transfer_params_json =
+        Some(r#"{"ec_items":[{"mm_hash":"h1","transfer_id":"t1"}]}"#.to_string());
+    let status = h
+        .client
+        .generate(request)
+        .await
+        .expect_err("one id for two");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    let mut request = generate_request("ec-m-ok", false, Vec::new());
+    request.mm_inputs = Some(pixel_less_batch(&["h1", "h1"]));
+    request.ec_transfer_params_json = Some(
+        r#"{"ec_items":[{"mm_hash":"h1","transfer_id":"t1"},{"mm_hash":"h1","transfer_id":"t2"}]}"#
+            .to_string(),
+    );
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("one id per occurrence goes through")
+        .into_inner();
+    assert_eq!(recv_add(&mut h.engine_in).await.request_id, "ec-m-ok");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// An encoder's leg with router-preprocessed pixels: its `Complete` carries
+/// the media identity (the prompt's ids, the batch without its pixels) beside
+/// the connector's handles, and on a CPU connector a completion short of a
+/// handle for one of the items is refused instead of becoming a handoff.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn encoder_cache_producer_completion_carries_the_identity_and_the_cpu_handles() {
+    let mut h = harness(ec_cpu_model_info("ec_producer"), None).await;
+    let handles = |short: bool| {
+        let mut handles = serde_json::json!({
+            "h0": {"peer_host": "10.0.0.2", "peer_port": 5700, "size_bytes": 64},
+            "h1": {"peer_host": "10.0.0.2", "peer_port": 5700, "size_bytes": 64},
+        });
+        if short {
+            handles["h1"] = serde_json::json!({"size_bytes": 64});
+        }
+        handles
+    };
+    for (id, short) in [("ec-p-full", false), ("ec-p-short", true)] {
+        let mut request = generate_request(id, false, Vec::new());
+        request.input = Some(vllm::generate_request::Input::Tokenized(
+            vllm::TokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![0; 9],
+            },
+        ));
+        request.mm_inputs = Some(shm_pixel_batch(id));
+        request.ec_transfer_params_json = Some("{}".to_string());
+        let mut stream = h
+            .client
+            .generate(request)
+            .await
+            .expect("an encoder's leg is admitted")
+            .into_inner();
+        let engine_request = recv_add(&mut h.engine_in).await;
+        assert_eq!(engine_request.request_id, id);
+        assert!(
+            engine_request.mm_features.is_some(),
+            "the pixels reach the engine"
+        );
+        let mut outputs = batch(id, vec![7], Some(EngineCoreFinishReason::Length), None);
+        if let EngineCoreOutputs::RequestBatch(batch) = &mut outputs {
+            batch.outputs[0].ec_transfer_params = Some(Box::new(handles(short)));
+        }
+        h.engine_out.send_outputs(&outputs).await.unwrap();
+        let item = stream.message().bounded().await;
+        if short {
+            let status = item.expect_err("a handle short of an address is refused");
+            assert_eq!(status.code(), Code::Internal, "{id}");
+            assert!(
+                status
+                    .message()
+                    .contains("incomplete ECCPU transfer handle"),
+                "{id}: {}",
+                status.message()
+            );
+            continue;
+        }
+        let finished = complete(item.unwrap().expect("the encoder's completion"));
+        let identity = finished.media_identity.expect("the encoder's identity");
+        assert_eq!(identity.prompt_token_ids, vec![0; 9]);
+        let batch = identity.mm_inputs.expect("the batch");
+        assert_eq!(batch.mm_hashes, vec!["h0", "h1"]);
+        assert!(
+            batch.pixel_values.is_none(),
+            "the identity carries no pixels"
+        );
+        assert_eq!(batch.mm_placeholders.len(), 2);
+        let returned: serde_json::Value =
+            serde_json::from_str(finished.ec_transfer_params_json.as_deref().unwrap()).unwrap();
+        assert_eq!(returned["h1"]["peer_port"], 5700);
+        assert!(stream.message().bounded().await.unwrap().is_none());
+    }
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
