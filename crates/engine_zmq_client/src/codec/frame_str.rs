@@ -114,7 +114,23 @@ impl<'de> Deserialize<'de> for FrameStr {
             type Value = FrameStr;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a string")
+                f.write_str("a string, as text or as UTF-8 bytes")
+            }
+
+            // A bytes-typed id is read as a `String` would read it: checked
+            // as UTF-8, then kept the same way as text.
+            fn visit_borrowed_bytes<E: serde::de::Error>(
+                self,
+                bytes: &'de [u8],
+            ) -> Result<FrameStr, E> {
+                let text = std::str::from_utf8(bytes).map_err(E::custom)?;
+                self.visit_borrowed_str(text)
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<FrameStr, E> {
+                std::str::from_utf8(bytes)
+                    .map(FrameStr::from)
+                    .map_err(E::custom)
             }
 
             fn visit_borrowed_str<E: serde::de::Error>(
@@ -140,7 +156,10 @@ impl<'de> Deserialize<'de> for FrameStr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{decode_msgpack, encode_msgpack, tensor::decode_within_frame};
+    use crate::codec::{
+        decode_msgpack, encode_msgpack,
+        tensor::{decode_within_frame, lies_within},
+    };
 
     /// Decoded within its frame, a string is a view of the frame's buffer;
     /// decoded from a plain slice, it is a copy. Both read the same text.
@@ -161,6 +180,17 @@ mod tests {
 
     /// The string round-trips through the encoder as a plain msgpack string
     /// and reads as one in every comparison and format.
+    #[test]
+    fn a_bytes_typed_id_decodes_as_text_and_refuses_other_bytes() {
+        // msgpack bin8 of "req-bin", the shape a `String` field also accepts.
+        let frame = Bytes::from_static(b"\xc4\x07req-bin");
+        let id: FrameStr = decode_within_frame(&frame, || decode_msgpack(&frame)).expect("decode");
+        assert_eq!(id, "req-bin");
+        assert!(lies_within(&frame, id.0.as_ref()));
+        let broken = Bytes::from_static(b"\xc4\x02\xff\xfe");
+        assert!(decode_msgpack::<FrameStr>(&broken).is_err());
+    }
+
     #[test]
     fn a_frame_string_encodes_and_compares_as_a_string() {
         let text = FrameStr::from("req-1");
