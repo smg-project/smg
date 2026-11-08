@@ -11,7 +11,6 @@ use common::grpc_harness::{
     serve_canned_worker, Canned,
 };
 use openai_protocol::{
-    completion::CompletionRequest,
     model_card::ModelCard,
     worker::{HealthCheckConfig, WorkerStatus},
 };
@@ -25,6 +24,7 @@ use smg::{
     workflow::Job,
 };
 
+use super::{completion_request, prefill_worker_for};
 use crate::common;
 
 const MODEL: &str = "pd-prefill-removal-test-model";
@@ -117,20 +117,6 @@ async fn build_bed(prefill_ports: &[u16], decode_port: u16, drain_settle_secs: u
     }
 }
 
-#[expect(
-    clippy::unwrap_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
-fn completion_request(words: usize) -> CompletionRequest {
-    serde_json::from_value(serde_json::json!({
-        "model": MODEL,
-        "prompt": "test ".repeat(words),
-        "max_tokens": 8,
-        "stream": false,
-    }))
-    .unwrap()
-}
-
 fn tenant() -> TenantRequestMeta {
     TenantRequestMeta::new(TenantKey::new("pd-prefill-removal-test-tenant"))
 }
@@ -143,7 +129,7 @@ fn tenant() -> TenantRequestMeta {
 async fn route(bed: &Bed, words: usize) -> (http::StatusCode, String) {
     let response = bed
         .router
-        .route_completion(None, &tenant(), completion_request(words), MODEL)
+        .route_completion(None, &tenant(), completion_request(MODEL, words), MODEL)
         .await;
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
@@ -261,46 +247,6 @@ async fn requests_in_a_removed_prefill_workers_size_range_still_find_a_worker() 
     }
 }
 
-/// Route one completion of `words` tokens, asking for its decision record,
-/// and return the prefill worker the bucket policy chose for it.
-#[expect(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
-async fn prefill_worker_for(bed: &Bed, words: usize) -> String {
-    let mut headers = http::HeaderMap::new();
-    headers.insert("x-smg-cache-trace", http::HeaderValue::from_static("1"));
-    let response = bed
-        .router
-        .route_completion(Some(&headers), &tenant(), completion_request(words), MODEL)
-        .await;
-    let status = response.status();
-    let trace = response
-        .headers()
-        .get("x-smg-cache-trace")
-        .map(|value| value.to_str().unwrap().to_owned());
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-        .await
-        .expect("response body");
-    assert_eq!(
-        status,
-        http::StatusCode::OK,
-        "{words} tokens: {}",
-        String::from_utf8_lossy(&bytes)
-    );
-    let trace: serde_json::Value =
-        serde_json::from_str(&trace.expect("the request asked for its decision record")).unwrap();
-    trace["selections"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|selection| selection["policy"] == "bucket")
-        .and_then(|selection| selection["worker"].as_str())
-        .map(str::to_owned)
-        .expect("the record names the prefill worker the bucket policy chose")
-}
-
 /// The removal drains the worker first: for its drain window it is still
 /// listed by the bucket but no longer offered to the policy. From the first
 /// draining moment on, a request of the middle size goes to the previous
@@ -321,9 +267,18 @@ async fn a_draining_prefill_workers_size_range_goes_to_its_neighbour_at_once() {
         bed.prefill_urls[1].clone(),
         bed.prefill_urls[2].clone(),
     );
-    assert_eq!(prefill_worker_for(&bed, IN_THE_FIRST_RANGE).await, first);
-    assert_eq!(prefill_worker_for(&bed, IN_THE_MIDDLE_RANGE).await, middle);
-    assert_eq!(prefill_worker_for(&bed, IN_THE_LAST_RANGE).await, last);
+    assert_eq!(
+        prefill_worker_for(bed.router.as_ref(), &tenant(), MODEL, IN_THE_FIRST_RANGE).await,
+        first
+    );
+    assert_eq!(
+        prefill_worker_for(bed.router.as_ref(), &tenant(), MODEL, IN_THE_MIDDLE_RANGE).await,
+        middle
+    );
+    assert_eq!(
+        prefill_worker_for(bed.router.as_ref(), &tenant(), MODEL, IN_THE_LAST_RANGE).await,
+        last
+    );
 
     submit_removal(&bed, &middle).await;
     wait_for_status(&bed, &middle, WorkerStatus::Draining).await;
@@ -334,14 +289,24 @@ async fn a_draining_prefill_workers_size_range_goes_to_its_neighbour_at_once() {
         .get_by_url(&middle)
         .is_some()
     {
-        during_the_drain.push(prefill_worker_for(&bed, IN_THE_MIDDLE_RANGE).await);
-        assert_eq!(prefill_worker_for(&bed, IN_THE_FIRST_RANGE).await, first);
-        assert_eq!(prefill_worker_for(&bed, IN_THE_LAST_RANGE).await, last);
+        during_the_drain.push(
+            prefill_worker_for(bed.router.as_ref(), &tenant(), MODEL, IN_THE_MIDDLE_RANGE).await,
+        );
+        assert_eq!(
+            prefill_worker_for(bed.router.as_ref(), &tenant(), MODEL, IN_THE_FIRST_RANGE).await,
+            first
+        );
+        assert_eq!(
+            prefill_worker_for(bed.router.as_ref(), &tenant(), MODEL, IN_THE_LAST_RANGE).await,
+            last
+        );
     }
     await_removed(&bed, &middle).await;
     let mut after_the_removal = Vec::new();
     for _ in 0..3 {
-        after_the_removal.push(prefill_worker_for(&bed, IN_THE_MIDDLE_RANGE).await);
+        after_the_removal.push(
+            prefill_worker_for(bed.router.as_ref(), &tenant(), MODEL, IN_THE_MIDDLE_RANGE).await,
+        );
     }
 
     assert!(
