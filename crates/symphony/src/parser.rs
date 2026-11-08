@@ -9,10 +9,10 @@ use crate::{event::Events, input::Input};
 /// streaming and non-streaming share one implementation.
 ///
 /// On `Err`, everything already pushed into `out` is final. The one error, a `Lifecycle` misuse,
-/// says the caller fed the steps out of order: the stream is already over or was never started,
-/// and the parser holds nothing and emits nothing more. A parser never fails on the output's
-/// bytes: what it cannot read it returns as `Malformed` events, and the end of the stream closes
-/// what it still held.
+/// rejects a step fed out of order (a `Prompt` after the first step, any step after `End`): the
+/// rejected step emits nothing and leaves the parser as it was, so an open stream goes on and an
+/// ended one stays closed. A parser never fails on the output's bytes: what it cannot read it
+/// returns as `Malformed` events, and the end of the stream closes what it still held.
 pub trait Parser: Send {
     /// Feed one lifecycle step and append the resulting events to `out`. The events may borrow
     /// the input's text for the life of `out` (`'d`): a text run the parser passed through
@@ -20,7 +20,7 @@ pub trait Parser: Send {
     fn feed<'d>(&mut self, input: Input<'d>, out: &mut Events<'d>) -> Result<(), ParseError>;
 }
 
-/// Why a parser could not continue: the caller's order of steps, never the output's bytes.
+/// Why a parser refused a step: the caller's order of steps, never the output's bytes.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ParseError {
     /// The caller fed inputs out of order (a `Delta` after `End`, a second `Prompt`).
