@@ -42,7 +42,16 @@ messages (a role is `disaggregation_mode` in the server args on the TokenSpeed
 and SGLang wires, with `disaggregation_transfer_backend` mooncake, and
 `kv_role` behind `kv_connector` MooncakeConnector on the vLLM one, whose info
 is a struct of named fields the admin API's info patch sets by name: the mock
-moves no KV cache and names Mooncake as its transport on every wire).
+moves no KV cache and names Mooncake as its transport on every wire). The
+encode role (`--worker-type encode`) is the vLLM wire's alone: the worker
+advertises `ec_role` ec_producer behind `ec_connector` ECCPUConnector (a prefill
+worker on that wire advertises the consumer side), reads as vision-capable with
+a worker-side media processor (`mm_processor` mock, so the gateway forwards
+media references to it), and answers every `Generate` that carries
+`ec_transfer_params_json` with the encoder's token-less completion, the media
+identity (the prompt ids as sent, one hash per media item) and one pull handle
+per hash naming its own address; the TokenSpeed encoder is a separate service
+the mock does not serve, and the SGLang wire has no encode role.
 `--capture` records the TokenSpeed wire's requests only. Beside the scheduler
 service the server hosts the standard `grpc.health.v1` service (`Check`,
 `Watch`): the empty name and the served scheduler service are SERVING exactly

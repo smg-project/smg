@@ -738,6 +738,17 @@ impl MockScheduler {
         self.ranks.len().max(1)
     }
 
+    /// The port this worker serves on, read off its fleet name
+    /// (`grpc:<port>`): what an encode worker names as its own address in
+    /// the transfer handles it hands out.
+    pub(crate) fn port(&self) -> u16 {
+        self.name
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(0)
+    }
+
     /// The `server_args` of the wires whose server info carries a struct of
     /// them: the configured args, with the admin API's overrides on top (what
     /// the gateway flattens into this worker's labels). A multi-rank worker

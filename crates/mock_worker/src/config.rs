@@ -108,13 +108,16 @@ pub struct Config {
     /// The gRPC workers' role in a disaggregated fleet (`--worker-type`): a
     /// prefill worker answers every request with the prompt side's
     /// completion alone and binds its bootstrap port, a decode worker
-    /// generates as a regular one; both advertise the role in their server
-    /// args as the engines do (`disaggregation_mode`). `None` is a regular
-    /// worker.
+    /// generates as a regular one, an encode worker (the vLLM wire alone)
+    /// answers the encoder's completion with the media identity and a
+    /// transfer handle per item; each advertises the role in its server
+    /// info as the engines do (`disaggregation_mode`, or `kv_role` and
+    /// `ec_role` behind their connectors on the vLLM wire). `None` is a
+    /// regular worker.
     pub role: Option<Role>,
-    /// First bootstrap port of the prefill workers (`--bootstrap-base-port`):
-    /// worker `i` binds `base + i`, where a decode partner's engine would
-    /// rendezvous for the KV handoff, and advertises it
+    /// First bootstrap port of the prefill or encode workers
+    /// (`--bootstrap-base-port`): worker `i` binds `base + i`, where a
+    /// partner's engine would rendezvous for the handoff, and advertises it
     /// (`disaggregation_bootstrap_port`); the gateway probes it. `None` binds
     /// and advertises nothing.
     pub bootstrap_base_port: Option<u16>,
@@ -151,6 +154,14 @@ pub enum Role {
     Prefill,
     /// Generates as a regular worker: the side whose output the client reads.
     Decode,
+    /// Answers every request with the encoder's completion alone (no output,
+    /// the media identity, one encoder-cache transfer handle per media item)
+    /// and binds its bootstrap port when given one: the side a gateway in
+    /// encode-prefill-decode mode sends a request's media to first. The vLLM
+    /// wire alone serves it (its scheduler proto carries the encoder-cache
+    /// handoff); the TokenSpeed encoder is a separate service this mock does
+    /// not serve, and the SGLang wire has no encode role.
+    Encode,
 }
 
 impl Role {
@@ -159,7 +170,15 @@ impl Role {
         match self {
             Self::Prefill => "prefill",
             Self::Decode => "decode",
+            Self::Encode => "encode",
         }
+    }
+
+    /// Whether this role binds a bootstrap port when given one: the sides a
+    /// partner's engine comes to for a handoff (a decode partner to the
+    /// prefill side's, a prefill partner to the encoder's).
+    pub fn hosts_rendezvous(self) -> bool {
+        matches!(self, Self::Prefill | Self::Encode)
     }
 }
 
@@ -170,7 +189,10 @@ impl std::str::FromStr for Role {
         match raw {
             "prefill" => Ok(Self::Prefill),
             "decode" => Ok(Self::Decode),
-            other => Err(format!("--worker-type must be prefill|decode, got {other}")),
+            "encode" => Ok(Self::Encode),
+            other => Err(format!(
+                "--worker-type must be prefill|decode|encode, got {other}"
+            )),
         }
     }
 }
@@ -549,10 +571,18 @@ impl Config {
                 );
             }
         }
-        if cfg.bootstrap_base_port.is_some() && cfg.role != Some(Role::Prefill) {
+        if cfg.role == Some(Role::Encode) && cfg.grpc_wire != SchedulerWire::Vllm {
+            return Err(format!(
+                "--worker-type encode answers the vLLM wire's encoder-cache handoff: pass \
+                 --grpc-wire vllm, not {} (the TokenSpeed encoder is a separate service this \
+                 mock does not serve; the SGLang wire has no encode role)",
+                cfg.grpc_wire.as_str()
+            ));
+        }
+        if cfg.bootstrap_base_port.is_some() && !cfg.role.is_some_and(Role::hosts_rendezvous) {
             return Err(
-                "--bootstrap-base-port needs --worker-type prefill: only a prefill worker binds \
-                 a bootstrap port"
+                "--bootstrap-base-port needs --worker-type prefill or encode: only the side a \
+                 partner comes to binds a bootstrap port"
                     .to_string(),
             );
         }
@@ -563,9 +593,9 @@ impl Config {
 impl Config {
     /// The bootstrap port of gRPC worker number `index` (its offset from
     /// `--grpc-base-port`): `--bootstrap-base-port` plus the offset for a
-    /// prefill worker given one, `None` for every other worker.
+    /// prefill or encode worker given one, `None` for every other worker.
     pub fn bootstrap_port_for(&self, index: u16) -> Option<u16> {
-        if self.role != Some(Role::Prefill) {
+        if !self.role.is_some_and(Role::hosts_rendezvous) {
             return None;
         }
         self.bootstrap_base_port?.checked_add(index)
@@ -751,14 +781,18 @@ pub fn usage() -> String {
                                 engine's silence against\n\
        --admin-port <port>      process-wide admin API: fleet, request records with the\n\
                                 arrival-time oracle, cache dumps, resets (default off)\n\
-       --worker-type <prefill|decode>  the gRPC workers' role in a disaggregated fleet (default\n\
-                                none): a prefill worker answers every request with the prompt\n\
-                                side's completion alone (no output, no script) and a decode\n\
-                                worker generates as a regular one; both advertise the role in\n\
-                                their server args (disaggregation_mode)\n\
-       --bootstrap-base-port <port>  first bootstrap port of the prefill workers: worker i binds\n\
-                                base+i, accepts and closes each connection (the gateway's probe)\n\
-                                and advertises it (disaggregation_bootstrap_port) (default none)\n\
+       --worker-type <prefill|decode|encode>  the gRPC workers' role in a disaggregated fleet\n\
+                                (default none): a prefill worker answers every request with the\n\
+                                prompt side's completion alone (no output, no script), a decode\n\
+                                worker generates as a regular one, an encode worker (the vllm\n\
+                                wire alone) answers the encoder's completion with the media\n\
+                                identity and a transfer handle per item; each advertises the\n\
+                                role in its server info (disaggregation_mode; kv_role and\n\
+                                ec_role behind their connectors on the vllm wire)\n\
+       --bootstrap-base-port <port>  first bootstrap port of the prefill or encode workers: worker\n\
+                                i binds base+i, accepts and closes each connection (the gateway's\n\
+                                probe) and advertises it (disaggregation_bootstrap_port)\n\
+                                (default none)\n\
        --drain-timeout-secs <s> on SIGTERM or SIGINT, how long the requests in flight may\n\
                                 finish before the process exits regardless (default 5)\n\
      \n\
@@ -1135,8 +1169,57 @@ mod tests {
         assert_eq!(cfg.replay.script, Some(PathBuf::from("/tmp/answers.jsonl")));
     }
 
+    /// The encode role is the vLLM wire's: it parses there, binds a bootstrap
+    /// port when given one as a prefill worker does, and is refused on the
+    /// other two wires with the reason.
     #[test]
-    fn a_role_is_prefill_or_decode_on_the_grpc_workers_alone() {
+    fn the_encode_role_is_the_vllm_wires_alone() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "2"];
+        let encode = parse(
+            &[
+                &grpc[..],
+                &["--grpc-wire", "vllm", "--worker-type", "encode"],
+            ]
+            .concat(),
+        )
+        .expect("encode workers on the vllm wire");
+        assert_eq!(encode.role, Some(Role::Encode));
+        assert_eq!(encode.bootstrap_port_for(0), None, "no port given");
+        let hosting = parse(
+            &[
+                &grpc[..],
+                &[
+                    "--grpc-wire",
+                    "vllm",
+                    "--worker-type",
+                    "encode",
+                    "--bootstrap-base-port",
+                    "8998",
+                ],
+            ]
+            .concat(),
+        )
+        .expect("an encode worker hosts the rendezvous when told to");
+        assert_eq!(
+            (hosting.bootstrap_port_for(0), hosting.bootstrap_port_for(1)),
+            (Some(8998), Some(8999))
+        );
+        for wire in ["tokenspeed", "sglang"] {
+            let refused =
+                parse(&[&grpc[..], &["--grpc-wire", wire, "--worker-type", "encode"]].concat())
+                    .expect_err("the encode role is refused off the vllm wire");
+            assert!(
+                refused.contains("pass --grpc-wire vllm") && refused.contains(wire),
+                "{refused}"
+            );
+        }
+        assert!(parse(&[&grpc[..], &["--worker-type", "encode"]].concat())
+            .expect_err("the default wire is tokenspeed")
+            .contains("pass --grpc-wire vllm"));
+    }
+
+    #[test]
+    fn the_prefill_and_decode_roles_are_grpc_workers_alone() {
         let grpc = ["--grpc-base-port", "19000", "--grpc-count", "2"];
         let cfg = parse(&grpc).expect("gRPC flags parse");
         assert_eq!((cfg.role, cfg.bootstrap_base_port), (None, None));
@@ -1165,9 +1248,9 @@ mod tests {
         assert_eq!(decode.role, Some(Role::Decode));
         assert_eq!(decode.bootstrap_port_for(0), None, "a decode binds no port");
 
-        assert!(parse(&[&grpc[..], &["--worker-type", "encode"]].concat())
-            .expect_err("no encode role")
-            .contains("--worker-type must be prefill|decode"));
+        assert!(parse(&[&grpc[..], &["--worker-type", "embed"]].concat())
+            .expect_err("no such role")
+            .contains("--worker-type must be prefill|decode|encode"));
         assert!(parse(&["--http-count", "1", "--worker-type", "prefill"])
             .expect_err("a role needs gRPC workers")
             .contains("pass --grpc-count"));
@@ -1184,7 +1267,7 @@ mod tests {
             .concat()
         )
         .expect_err("a decode binds no bootstrap port")
-        .contains("needs --worker-type prefill"));
+        .contains("needs --worker-type prefill or encode"));
         assert!(
             parse(&[&grpc[..], &["--bootstrap-base-port", "8998"]].concat()).is_err(),
             "a regular worker binds no bootstrap port"
