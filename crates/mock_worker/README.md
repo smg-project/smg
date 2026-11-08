@@ -162,7 +162,7 @@ experiments against it transfer to engines:
 | `--admin-port` | off | process-wide admin API (below) |
 | `--drain-timeout-secs` | 5 | on SIGTERM or SIGINT: stop accepting, let the requests in flight finish for this long, then exit 0 either way |
 | `--kv-events-zmq-base-port` | off | ZMQ KV-event publishers on vLLM's or SGLang's wire (below) |
-| `--kv-cache-groups` | `full_attention` | the KV cache groups a realistic engine publishes, `kind[:window],...`, the first its main-attention group; a hybrid engine adds `sliding_window:<tokens>` or `mamba` groups: every group's events carry its index, kind and window, a window group stores only the window tail ending at the prompt's aligned replay boundary and a Mamba group the one state block there (vLLM 0.31.0's default retention), a sparse store's `token_ids` on the vLLM wire spanning the whole step as the engine writes it, and an eviction is published once per group; one group only on the SGLang wire |
+| `--kv-cache-groups` | `full_attention` | the KV cache groups a realistic engine publishes, `kind[:window],...`, the first its main-attention group; a hybrid engine adds `sliding_window:<tokens>` or `mamba` groups: every group's events carry its index, kind and window, a window group stores only the window tail ending at the prompt's aligned replay boundary and a Mamba group the one state block there (vLLM 0.31.0's default retention), a sparse store's `token_ids` on the vLLM wire spanning the whole step as the engine writes it, and an eviction is published once per group, every group's in one batch from the mock's one pool where the engine's per-group pools may stagger them; one group only on the SGLang wire |
 
 ```bash
 cargo run --release -p mock-worker -- \

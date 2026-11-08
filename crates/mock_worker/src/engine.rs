@@ -461,10 +461,11 @@ pub struct EngineParams {
 /// retention: the main group keeps every full block; a sliding-window group
 /// keeps only the `ceil((window - 1) / block_size)` blocks ending at the
 /// prompt's aligned replay boundary (what a later request can resume from);
-/// a Mamba group keeps the one state block ending there. A hybrid engine's
-/// window stores span the whole step in vLLM while naming the kept hashes
-/// only; the mock names the kept blocks with their own tokens, whole blocks
-/// on both wires.
+/// a Mamba group keeps the one state block ending there. vLLM writes a
+/// sparse group's store with the step's whole token span and the kept hashes
+/// only; so does the mock's vLLM wire ([`Published::spans`]), while its gRPC
+/// stream, the shape of a relay's output, carries the kept blocks with their
+/// own tokens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KvCacheGroup {
     pub kind: String,
@@ -481,7 +482,9 @@ impl KvCacheGroup {
     }
 
     /// Whether this group keeps the block at `index` of a request whose
-    /// prompt's aligned replay boundary ends block `boundary_block`.
+    /// prompt's aligned replay boundary (the last block boundary at or before
+    /// its last prompt token) starts block `boundary_block`: a retained tail
+    /// ends at block `boundary_block - 1`.
     fn retains(&self, index: usize, boundary_block: usize, block_size: usize) -> bool {
         match self.kind.as_str() {
             "sliding_window" | "sliding_window_mla" => {

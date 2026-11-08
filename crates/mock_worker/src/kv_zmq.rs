@@ -807,7 +807,8 @@ mod tests {
                 stored.kv_cache_spec_sliding_window = window_tokens;
             }
         }
-        // vLLM lists the window groups' stores before the main group's.
+        // The relay's answer does not depend on the order within the batch:
+        // the window groups' stores go first here.
         batch.events.push(window);
         batch.events.push(state);
         batch.events.push(full);
