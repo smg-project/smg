@@ -281,8 +281,8 @@ impl KvEventMonitor {
                 }
                 _ => {}
             }
-            Self::apply_event(event, worker_id, indexer, &mut state.index);
         }
+        Self::apply_events(&batch.events, worker_id, indexer, &mut state.index);
         Metrics::record_kv_event_apply(worker_url, started.elapsed().as_secs_f64());
         Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
         if stored_blocks > 0 {
@@ -377,8 +377,8 @@ impl KvEventMonitor {
                 if let Some(kv_cache_event::Data::Stored(stored)) = &event.data {
                     snapshot_blocks += stored.blocks.len();
                 }
-                Self::apply_event(event, worker_id, indexer, &mut state.index);
             }
+            Self::apply_events(&batch.events, worker_id, indexer, &mut state.index);
             Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
             if snapshot_blocks > 0 {
                 Metrics::record_kv_event_blocks(worker_url, "snapshot", snapshot_blocks);

@@ -1,13 +1,17 @@
-//! One event into the index: which tiers, cache groups, localities and
-//! owners are indexed, content hashing under the event's namespace, and the
-//! physical copies of a block counted per worker so a removal evicts the
-//! block only when its last copy goes.
+//! One event into the index: which tiers, localities and owners are indexed,
+//! which cache groups go to the index and which to the worker's group view
+//! beside it, content hashing under the event's namespace, and the physical
+//! copies of a block counted per worker so a removal evicts the block only
+//! when its last copy goes.
 
-use std::collections::{hash_map::Entry, HashMap};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    sync::Arc,
+};
 
 use kv_index::{
     salt::{content_hash_with_seed, namespace_seed},
-    ApplyError, SequenceHash, StoredBlock,
+    ApplyError, ContentHash, GroupKind, SequenceHash, StoredBlock, WorkerGroups,
 };
 use smg_grpc_client::common_proto::{
     kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent, KvCacheLocality,
@@ -32,41 +36,97 @@ impl KvEventMonitor {
 
         match data {
             kv_cache_event::Data::Stored(stored) => {
-                Self::apply_stored(stored, worker_id, indexer, worker_blocks);
+                match worker_blocks.admit(
+                    stored.kv_cache_spec_kind.as_deref(),
+                    stored.group_idx,
+                    stored.locality,
+                    stored.ownership.as_deref(),
+                ) {
+                    Admission::Main => {
+                        Self::apply_stored(stored, worker_id, indexer, worker_blocks);
+                    }
+                    Admission::Group(mask) => {
+                        Self::apply_group_stored(stored, mask, worker_id, indexer, worker_blocks);
+                    }
+                    Admission::Skip => {}
+                }
             }
             kv_cache_event::Data::Removed(removed) => {
-                Self::apply_removed(removed, worker_id, indexer, worker_blocks);
+                match worker_blocks.admit(
+                    None,
+                    removed.group_idx,
+                    removed.locality,
+                    removed.ownership.as_deref(),
+                ) {
+                    Admission::Main => {
+                        Self::apply_removed(removed, worker_id, indexer, worker_blocks);
+                    }
+                    Admission::Group(mask) => {
+                        Self::apply_group_removed(removed, mask, worker_blocks);
+                    }
+                    Admission::Skip => {}
+                }
             }
             kv_cache_event::Data::Cleared(cleared) => {
-                if worker_blocks.admits(None, None, None, cleared.ownership.as_deref()) {
+                if worker_blocks.admit(None, None, None, cleared.ownership.as_deref())
+                    == Admission::Main
+                {
                     Self::apply_cleared(worker_id, indexer, worker_blocks);
                 }
             }
         }
     }
 
+    /// Apply a batch's events in their order, except that the stores of
+    /// cache groups other than main attention come last: the engines
+    /// publish them ahead of the main group's store of the same blocks, and
+    /// the worker's view places them through the main blocks the index holds.
+    /// A batch carrying one gives the worker its view before anything is
+    /// applied, so the batch's main stores are named in it whichever came
+    /// first on the wire.
+    pub(crate) fn apply_events(
+        events: &[KvCacheEvent],
+        worker_id: u32,
+        indexer: &KvIndex,
+        worker_blocks: &mut WorkerIndexState,
+    ) {
+        if worker_blocks.groups.is_none()
+            && events.iter().any(|event| match &event.data {
+                Some(kv_cache_event::Data::Stored(stored)) => worker_blocks.is_group_store(stored),
+                _ => false,
+            })
+        {
+            worker_blocks.view(indexer, worker_id);
+        }
+        let mut deferred = Vec::new();
+        for event in events {
+            if let Some(kv_cache_event::Data::Stored(stored)) = &event.data {
+                if worker_blocks.is_group_store(stored) {
+                    deferred.push(event);
+                    continue;
+                }
+            }
+            Self::apply_event(event, worker_id, indexer, worker_blocks);
+        }
+        for event in deferred {
+            Self::apply_event(event, worker_id, indexer, worker_blocks);
+        }
+    }
+
     /// Convert proto `KvBlocksStored` and apply to the indexer.
     ///
-    /// Blocks on the disk and external tiers, in cache groups other than main
-    /// attention, not local to the worker, or owned by a residency agent are
-    /// counted and skipped, as is a store of blocks narrower than the worker's
-    /// block of record ([`WorkerIndexState::sub_block`]). Content hashes are
-    /// computed under the event's LoRA name and cache salt, so a salted block
-    /// matches only a request hashed under the same namespace.
+    /// Blocks on the disk and external tiers are counted and skipped, as is a
+    /// store of blocks narrower than the worker's block of record
+    /// ([`WorkerIndexState::sub_block`]). Content hashes are computed under
+    /// the event's LoRA name and cache salt, so a salted block matches only a
+    /// request hashed under the same namespace. A worker with a group view
+    /// learns the blocks' names there too, as the index placed them.
     fn apply_stored(
         stored: &KvBlocksStored,
         worker_id: u32,
         indexer: &KvIndex,
         worker_blocks: &mut WorkerIndexState,
     ) {
-        if !worker_blocks.admits(
-            stored.kv_cache_spec_kind.as_deref(),
-            stored.group_idx,
-            stored.locality,
-            stored.ownership.as_deref(),
-        ) {
-            return;
-        }
         let first_level = stored.blocks.first().and_then(|block| block.cache_level);
         let Some(tier) = indexed_tier(stored.tier, first_level) else {
             worker_blocks.counters.untracked_tier += 1;
@@ -86,27 +146,113 @@ impl KvEventMonitor {
 
         let parent_seq_hash = stored.parent_block_hash.map(SequenceHash::from);
 
-        match indexer.apply_stored(
+        let placed_after = match indexer.apply_stored(
             worker_id,
             &blocks,
             parent_seq_hash,
             &mut worker_blocks.blocks,
         ) {
-            Ok(()) => {}
+            Ok(()) => Some(parent_seq_hash),
             Err(ApplyError::WorkerNotTracked | ApplyError::ParentBlockNotFound) => {
                 // Cold start or parent evicted — retry without parent to start a new chain.
                 worker_blocks.counters.parentless_stores += 1;
                 worker_blocks.counters.parentless_blocks += blocks.len() as u64;
-                if let Err(e) =
-                    indexer.apply_stored(worker_id, &blocks, None, &mut worker_blocks.blocks)
-                {
-                    warn!(
-                        worker_id = worker_id,
-                        error = %e,
-                        "Failed to apply stored event after fallback"
-                    );
+                match indexer.apply_stored(worker_id, &blocks, None, &mut worker_blocks.blocks) {
+                    Ok(()) => Some(None),
+                    Err(e) => {
+                        warn!(
+                            worker_id = worker_id,
+                            error = %e,
+                            "Failed to apply stored event after fallback"
+                        );
+                        None
+                    }
                 }
             }
+        };
+        if let (Some(parent), Some(view)) = (placed_after, &worker_blocks.groups) {
+            let named: Vec<(SequenceHash, ContentHash)> = blocks
+                .iter()
+                .map(|block| (block.seq_hash, block.content_hash))
+                .collect();
+            worker_blocks.counters.group_blocks += view.main_stored(parent, &named) as u64;
+        }
+    }
+
+    /// A store of cache groups other than main attention (`mask`, one bit
+    /// per group index: one bit for an engine that publishes per group, the
+    /// groups keeping a boundary's hashes for one that publishes them once):
+    /// its blocks are placed in the worker's view beside the index, through
+    /// the main blocks the index holds ([`WorkerGroups::stored`]). A store
+    /// narrower than the worker's block of record is a prefix entry at the
+    /// engine's hash granularity, counted with the main group's.
+    fn apply_group_stored(
+        stored: &KvBlocksStored,
+        mask: u16,
+        worker_id: u32,
+        indexer: &KvIndex,
+        worker_blocks: &mut WorkerIndexState,
+    ) {
+        let first_level = stored.blocks.first().and_then(|block| block.cache_level);
+        if indexed_tier(stored.tier, first_level).is_none() {
+            worker_blocks.counters.untracked_tier += 1;
+            return;
+        }
+        let width = stored
+            .blocks
+            .first()
+            .map_or(0, |block| block.block_size)
+            .max(0);
+        if width > 0 && worker_blocks.block_of_record > 0 && width < worker_blocks.block_of_record {
+            worker_blocks.counters.sub_block_stores += 1;
+            worker_blocks.counters.sub_block_blocks += stored.blocks.len() as u64;
+            return;
+        }
+        let view = worker_blocks.view(indexer, worker_id);
+        // A store of one group names its kind; a masked store names the
+        // groups alone (their kinds come with their own stores).
+        let kind = (mask.count_ones() == 1)
+            .then(|| {
+                group_kind(
+                    stored.kv_cache_spec_kind.as_deref(),
+                    stored.kv_cache_spec_sliding_window,
+                )
+            })
+            .flatten();
+        for group in (0..u16::BITS).filter(|group| mask & (1 << group) != 0) {
+            view.learn(group, kind, width as u32);
+        }
+        let hashes: Vec<SequenceHash> = stored
+            .blocks
+            .iter()
+            .map(|block| SequenceHash::from(block.block_hash))
+            .collect();
+        let (placed, unplaced) = view.stored(mask, &hashes);
+        worker_blocks.counters.group_stores += 1;
+        worker_blocks.counters.group_blocks += placed as u64;
+        worker_blocks.counters.group_unplaced += unplaced as u64;
+    }
+
+    /// A removal from cache groups other than main attention (`mask` as in
+    /// [`Self::apply_group_stored`]): the groups let go of the blocks in the
+    /// worker's view.
+    fn apply_group_removed(
+        removed: &KvBlocksRemoved,
+        mask: u16,
+        worker_blocks: &mut WorkerIndexState,
+    ) {
+        if indexed_tier(removed.tier, removed.cache_level).is_none() {
+            worker_blocks.counters.untracked_tier += 1;
+            return;
+        }
+        worker_blocks.counters.group_removals += 1;
+        if let Some(view) = &worker_blocks.groups {
+            let hashes: Vec<SequenceHash> = removed
+                .block_hashes
+                .iter()
+                .map(|&hash| SequenceHash::from(hash))
+                .collect();
+            view.removed(mask, &hashes);
         }
     }
 
@@ -120,14 +266,6 @@ impl KvEventMonitor {
         indexer: &KvIndex,
         worker_blocks: &mut WorkerIndexState,
     ) {
-        if !worker_blocks.admits(
-            None,
-            removed.group_idx,
-            removed.locality,
-            removed.ownership.as_deref(),
-        ) {
-            return;
-        }
         let Some(tier) = indexed_tier(removed.tier, removed.cache_level) else {
             worker_blocks.counters.untracked_tier += 1;
             return;
@@ -144,6 +282,9 @@ impl KvEventMonitor {
             };
 
         indexer.apply_removed(worker_id, &seq_hashes, &mut worker_blocks.blocks);
+        if let Some(view) = &worker_blocks.groups {
+            view.main_removed(&seq_hashes);
+        }
     }
 
     /// Drop every block of a worker from the indexer and forget its copies
@@ -159,6 +300,9 @@ impl KvEventMonitor {
         worker_blocks: &mut WorkerIndexState,
     ) {
         indexer.apply_cleared(worker_id, &mut worker_blocks.blocks);
+        if let Some(view) = &worker_blocks.groups {
+            view.clear();
+        }
         worker_blocks.copies.clear();
         worker_blocks.record_before_clear = worker_blocks.block_of_record;
         worker_blocks.block_of_record = 0;
@@ -203,9 +347,53 @@ fn indexed_tier(tier: Option<i32>, cache_level: Option<i32>) -> Option<IndexedTi
     }
 }
 
-/// Cache-group kinds whose blocks hold the main attention KV, the ones
-/// prefix matching is about. Sliding-window and Mamba groups are skipped.
+/// Cache-group kinds whose blocks hold the main attention KV, the ones the
+/// prefix index is built from. Every other kind goes to the worker's group
+/// view, where the sliding-window and state kinds bound a hit the way the
+/// engine does ([`WorkerGroups::cap`]).
 const MAIN_ATTENTION_KINDS: [&str; 3] = ["full_attention", "mla_attention", "sink_full_attention"];
+
+/// Cache-group kinds that keep a sliding window of the sequence.
+const WINDOW_KINDS: [&str; 2] = ["sliding_window", "sliding_window_mla"];
+
+/// The cache-group kind that keeps a recurrent state per block.
+const STATE_KIND: &str = "mamba";
+
+/// What a store's group kind means to the reuse rule; `None` when the store
+/// names no kind. A sliding-window group's window comes with its kind.
+fn group_kind(kind: Option<&str>, window: Option<u32>) -> Option<GroupKind> {
+    let kind = kind?;
+    Some(if MAIN_ATTENTION_KINDS.contains(&kind) {
+        GroupKind::Main
+    } else if WINDOW_KINDS.contains(&kind) {
+        GroupKind::SlidingWindow {
+            window: window.unwrap_or(0),
+        }
+    } else if kind == STATE_KIND {
+        GroupKind::State
+    } else {
+        GroupKind::Unknown
+    })
+}
+
+/// Where an event goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    /// The main attention group: the index.
+    Main,
+    /// Other cache groups, one bit per group index: the worker's view. An
+    /// engine publishing per group sets one bit; one publishing a boundary's
+    /// hashes once with the groups that keep them would set several.
+    Group(u16),
+    /// Neither: counted, not kept.
+    Skip,
+}
+
+/// The mask bit of a group index; a group past the view's last bit is
+/// counted as unplaced there.
+fn group_mask(group: u32) -> u16 {
+    1u16.checked_shl(group).unwrap_or(0)
+}
 
 /// The most physical copies of one block counted per tier. vLLM's opt-in
 /// `kv_cache_report_mode: full` re-announces whole hit chains without
@@ -219,8 +407,17 @@ const COPIES_CAP: u8 = 8;
 pub(crate) struct WorkerIndexCounters {
     /// Stores and removals on tiers the index does not track.
     pub(crate) untracked_tier: u64,
-    /// Events for cache groups other than main attention.
-    pub(crate) non_main_group: u64,
+    /// Stores and removals of cache groups other than main attention, kept
+    /// in the worker's group view beside the index; the blocks of those
+    /// stores the view placed through the index, and the ones it could not
+    /// when the store came (their main block was not indexed yet: they wait
+    /// in the view and count as placed when it comes).
+    pub(crate) group_stores: u64,
+    pub(crate) group_blocks: u64,
+    pub(crate) group_unplaced: u64,
+    pub(crate) group_removals: u64,
+    /// Stores of a kind other than main attention that name no group.
+    pub(crate) group_nameless: u64,
     /// Events for blocks not local to the worker.
     pub(crate) remote: u64,
     /// Events owned by a residency agent rather than the engine.
@@ -308,8 +505,9 @@ pub(crate) struct WorkerIndexState {
     pub(crate) blocks: WorkerBlocks,
     /// Copies per tier of blocks with a host copy or more than one copy.
     copies: HashMap<SequenceHash, Copies>,
-    /// Cache groups whose kind is not main attention.
-    non_main_groups: Vec<u32>,
+    /// The worker's cache groups other than main attention, in the index's
+    /// registry: created at the worker's first store of such a group.
+    groups: Option<Arc<WorkerGroups>>,
     /// Tokens per block of the widest block the worker's stores carried so
     /// far, 0 until a store names a width: the worker's block of record.
     block_of_record: i32,
@@ -321,42 +519,60 @@ pub(crate) struct WorkerIndexState {
 }
 
 impl WorkerIndexState {
-    /// Whether an event with these attributes belongs in the index. A store
-    /// names its group's kind; later events for that group may omit it, so
-    /// non-main groups are remembered.
-    fn admits(
+    /// Where an event with these attributes goes. A store names its group's
+    /// kind; later events for that group may omit it, so the groups the view
+    /// learned decide for them, and an unlearned group without a kind is the
+    /// main group (an engine with one group names nothing).
+    fn admit(
         &mut self,
         kind: Option<&str>,
         group_idx: Option<u32>,
         locality: Option<i32>,
         ownership: Option<&str>,
-    ) -> bool {
+    ) -> Admission {
         if ownership.is_some_and(|owner| owner.eq_ignore_ascii_case("kvcr")) {
             self.counters.foreign_owner += 1;
-            return false;
+            return Admission::Skip;
         }
         if locality.is_some_and(|locality| locality == KvCacheLocality::Remote as i32) {
             self.counters.remote += 1;
-            return false;
+            return Admission::Skip;
         }
-        let main = match kind {
-            Some(kind) => {
-                let main = MAIN_ATTENTION_KINDS.contains(&kind);
-                if let Some(group) = group_idx {
-                    if main {
-                        self.non_main_groups.retain(|&known| known != group);
-                    } else if !self.non_main_groups.contains(&group) {
-                        self.non_main_groups.push(group);
-                    }
-                }
-                main
+        match (kind, group_idx) {
+            (Some(kind), _) if MAIN_ATTENTION_KINDS.contains(&kind) => Admission::Main,
+            (Some(_), Some(group)) => Admission::Group(group_mask(group)),
+            (Some(_), None) => {
+                self.counters.group_nameless += 1;
+                Admission::Skip
             }
-            None => !group_idx.is_some_and(|group| self.non_main_groups.contains(&group)),
-        };
-        if !main {
-            self.counters.non_main_group += 1;
+            (None, Some(group)) if self.knows_group(group) => Admission::Group(group_mask(group)),
+            (None, _) => Admission::Main,
         }
-        main
+    }
+
+    /// Whether the worker's view has learned `group` as other than main attention.
+    fn knows_group(&self, group: u32) -> bool {
+        self.groups.as_ref().is_some_and(|view| view.knows(group))
+    }
+
+    /// Whether a store belongs to a cache group other than main attention
+    /// ([`Self::admit`] without the counting): the stores a batch applies
+    /// last.
+    fn is_group_store(&self, stored: &KvBlocksStored) -> bool {
+        match (stored.kv_cache_spec_kind.as_deref(), stored.group_idx) {
+            (Some(kind), Some(_)) => !MAIN_ATTENTION_KINDS.contains(&kind),
+            (None, Some(group)) => self.knows_group(group),
+            _ => false,
+        }
+    }
+
+    /// The worker's group view, created in the index's registry at its first
+    /// batch carrying a store of a cache group other than main attention.
+    fn view(&mut self, indexer: &KvIndex, worker_id: u32) -> Arc<WorkerGroups> {
+        Arc::clone(
+            self.groups
+                .get_or_insert_with(|| indexer.groups().get_or_create(worker_id)),
+        )
     }
 
     /// Whether a store names blocks narrower than the worker's block of
@@ -461,7 +677,7 @@ impl WorkerIndexState {
 mod tests {
     use kv_index::{
         compute_content_hash, compute_request_content_hashes,
-        salt::namespaced_request_content_hashes, ContentHash, XXH3_SEED,
+        salt::namespaced_request_content_hashes, ContentHash, GroupCap, XXH3_SEED,
     };
     use smg_grpc_client::common_proto::KvCacheCleared;
 
@@ -918,37 +1134,293 @@ mod tests {
         assert_eq!(wb.counters.untracked_tier, 3);
     }
 
+    fn store_event(stored: KvBlocksStored) -> KvCacheEvent {
+        KvCacheEvent {
+            event_id: 1,
+            data: Some(kv_cache_event::Data::Stored(stored)),
+        }
+    }
+
+    fn remove_event(removed: KvBlocksRemoved) -> KvCacheEvent {
+        KvCacheEvent {
+            event_id: 1,
+            data: Some(kv_cache_event::Data::Removed(removed)),
+        }
+    }
+
+    /// A store of `group` of `kind` naming `hashes` without tokens, the way
+    /// the relay forwards a group other than main attention.
+    fn group_store(
+        group: u32,
+        kind: Option<&str>,
+        window: Option<u32>,
+        hashes: &[i64],
+    ) -> KvCacheEvent {
+        store_event(KvBlocksStored {
+            blocks: hashes
+                .iter()
+                .map(|&hash| KvBlock {
+                    block_hash: hash,
+                    token_ids: Vec::new(),
+                    block_size: 4,
+                    lora_id: None,
+                    cache_level: None,
+                    ..Default::default()
+                })
+                .collect(),
+            parent_block_hash: None,
+            group_idx: Some(group),
+            kv_cache_spec_kind: kind.map(str::to_string),
+            kv_cache_spec_sliding_window: window,
+            ..Default::default()
+        })
+    }
+
+    /// The index's overlap for `hashes` on `worker`, after the cache groups'
+    /// rule, with the holders the rule shrank.
+    fn capped(
+        indexer: &KvIndex,
+        worker: u32,
+        hashes: &[ContentHash],
+        block_size: usize,
+    ) -> (Option<u32>, Vec<GroupCap>) {
+        let mut overlap = indexer.find_matches(hashes, false);
+        let caps = indexer.cap_by_groups(hashes, block_size, &mut overlap);
+        (overlap.scores.get(&worker).copied(), caps)
+    }
+
+    /// A hybrid worker: the window group's store precedes the main store of
+    /// the same blocks in a batch and is placed through it; a kind-less event
+    /// on the learned group follows the group; the main group's chain is the
+    /// index's, the window group's blocks the view's.
     #[test]
-    fn non_main_attention_groups_are_skipped_once_their_kind_is_known() {
+    fn non_main_attention_groups_are_kept_in_the_worker_view() {
         let indexer = KvIndex::chain();
         let w1 = indexer.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerIndexState::default();
-
-        let mut sliding = stored_event(1, &TOKENS);
-        sliding.group_idx = Some(1);
-        sliding.kv_cache_spec_kind = Some("sliding_window".to_string());
-        KvEventMonitor::apply_stored(&sliding, w1, &indexer, &mut wb);
-        assert_eq!(indexer.current_size(), 0);
-
-        let mut full = stored_event(2, &TOKENS);
+        let mut full = stored_event(1, &TOKENS);
         full.group_idx = Some(0);
         full.kv_cache_spec_kind = Some("full_attention".to_string());
-        KvEventMonitor::apply_stored(&full, w1, &indexer, &mut wb);
-        assert_eq!(indexer.current_size(), 1);
+        let mut second = stored_event(2, &[50, 60, 70, 80]);
+        second.parent_block_hash = Some(1);
+        let batch = [
+            group_store(1, Some("sliding_window"), Some(5), &[1, 2]),
+            store_event(full),
+            store_event(second),
+        ];
+        KvEventMonitor::apply_events(&batch, w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 2, "the main chain alone is indexed");
+        assert_eq!(indexer.groups().len(), 1);
+        let view = indexer.groups().get(w1).expect("the view");
+        assert_eq!(view.retained_blocks(), 2, "both window blocks placed");
+        assert_eq!(
+            (
+                wb.counters.group_stores,
+                wb.counters.group_blocks,
+                wb.counters.group_unplaced
+            ),
+            (1, 2, 0)
+        );
 
-        // Later events for group 1 omit the kind; the group is remembered.
-        let mut later = stored_event(3, &[50, 60, 70, 80]);
+        let hashes = compute_request_content_hashes(&[10, 20, 30, 40, 50, 60, 70, 80], 4);
+        assert_eq!(capped(&indexer, w1, &hashes, 4), (Some(2), Vec::new()));
+
+        // A kind-less removal on the learned group takes the block out of the
+        // view, not the index: a window of 5 tokens needs two blocks, so the
+        // hit falls to the leading block.
+        let mut gone = removed_event(2);
+        gone.group_idx = Some(1);
+        KvEventMonitor::apply_event(&remove_event(gone), w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 2);
+        assert_eq!(view.retained_blocks(), 1);
+        assert_eq!(wb.counters.group_removals, 1);
+        let (depth, caps) = capped(&indexer, w1, &hashes, 4);
+        assert_eq!(depth, Some(1));
+        assert_eq!(
+            caps,
+            vec![GroupCap {
+                worker: w1,
+                uncapped: 2,
+                capped: 1,
+                group: 1
+            }]
+        );
+
+        // A kind-less store on the learned group follows the group.
+        let mut later = stored_event(2, &[]);
         later.group_idx = Some(1);
-        KvEventMonitor::apply_stored(&later, w1, &indexer, &mut wb);
-        let mut removal = removed_event(2);
-        removal.group_idx = Some(1);
-        KvEventMonitor::apply_removed(&removal, w1, &indexer, &mut wb);
-        assert_eq!(indexer.current_size(), 1);
-        assert_eq!(wb.counters.non_main_group, 3);
+        later.blocks[0].token_ids.clear();
+        KvEventMonitor::apply_event(&store_event(later), w1, &indexer, &mut wb);
+        assert_eq!(view.retained_blocks(), 2);
+        assert_eq!(capped(&indexer, w1, &hashes, 4).0, Some(2));
 
-        removal.group_idx = Some(0);
-        KvEventMonitor::apply_removed(&removal, w1, &indexer, &mut wb);
+        // A group store naming blocks the index does not hold is counted, not placed.
+        KvEventMonitor::apply_event(&group_store(1, None, None, &[77]), w1, &indexer, &mut wb);
+        assert_eq!(
+            (wb.counters.group_blocks, wb.counters.group_unplaced),
+            (3, 1)
+        );
+
+        // The main group's removal keeps the window block's name while the
+        // window retains it; a clear empties the view with the index.
+        let mut main_gone = removed_event(2);
+        main_gone.group_idx = Some(0);
+        KvEventMonitor::apply_event(&remove_event(main_gone), w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 1);
+        assert_eq!(view.named_blocks(), 2);
+        KvEventMonitor::apply_cleared(w1, &indexer, &mut wb);
+        assert_eq!((view.retained_blocks(), view.named_blocks()), (0, 0));
+        assert!(view.knows(1));
+
+        // The worker's removal drops its view.
+        indexer.remove_worker(w1, wb.blocks);
+        assert!(indexer.groups().is_empty());
+    }
+
+    /// The main store first in the batch (an engine that publishes the main
+    /// group first), or in a batch of its own after the window group's store
+    /// (a relay snapshot replays the group lanes first): the window's blocks
+    /// are placed either way, in the batch that names them.
+    #[test]
+    fn a_group_store_is_placed_whichever_side_of_the_main_store_it_comes() {
+        let hashes = compute_request_content_hashes(&[10, 20, 30, 40, 50, 60, 70, 80], 4);
+        let mut second = stored_event(2, &[50, 60, 70, 80]);
+        second.parent_block_hash = Some(1);
+
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        KvEventMonitor::apply_events(
+            &[
+                store_event(stored_event(1, &TOKENS)),
+                store_event(second.clone()),
+                group_store(1, Some("sliding_window"), Some(5), &[1, 2]),
+            ],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        let view = indexer.groups().get(w1).expect("the view");
+        assert_eq!((view.retained_blocks(), view.pending_blocks()), (2, 0));
+        assert_eq!(
+            (wb.counters.group_blocks, wb.counters.group_unplaced),
+            (2, 0)
+        );
+        assert_eq!(capped(&indexer, w1, &hashes, 4), (Some(2), Vec::new()));
+
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        KvEventMonitor::apply_events(
+            &[group_store(1, Some("sliding_window"), Some(5), &[1, 2])],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        let view = indexer.groups().get(w1).expect("the view");
+        assert_eq!((view.retained_blocks(), view.pending_blocks()), (0, 2));
+        assert_eq!(
+            (wb.counters.group_blocks, wb.counters.group_unplaced),
+            (0, 2),
+            "counted as they wait"
+        );
+        KvEventMonitor::apply_events(
+            &[store_event(stored_event(1, &TOKENS))],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert_eq!(
+            capped(&indexer, w1, &hashes, 4),
+            (Some(1), Vec::new()),
+            "one block named: the leading run"
+        );
+        KvEventMonitor::apply_events(&[store_event(second)], w1, &indexer, &mut wb);
+        assert_eq!((view.retained_blocks(), view.pending_blocks()), (2, 0));
+        assert_eq!(
+            (wb.counters.group_blocks, wb.counters.group_unplaced),
+            (2, 2),
+            "placed as the main stores came"
+        );
+        assert_eq!(capped(&indexer, w1, &hashes, 4), (Some(2), Vec::new()));
+    }
+
+    /// A group a window store names before any main store of its blocks
+    /// places nothing when the main store never comes (another rank's cache,
+    /// a sub-block entry): the rule then leaves the worker's overlap standing
+    /// rather than take it away on a group it cannot read.
+    #[test]
+    fn a_group_that_never_placed_a_block_leaves_the_overlap_standing() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        KvEventMonitor::apply_events(
+            &[
+                group_store(1, Some("sliding_window"), Some(5), &[9]),
+                store_event(stored_event(1, &TOKENS)),
+            ],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert_eq!(
+            (wb.counters.group_blocks, wb.counters.group_unplaced),
+            (0, 1)
+        );
+        let hashes = compute_request_content_hashes(&TOKENS, 4);
+        assert_eq!(capped(&indexer, w1, &hashes, 4), (Some(1), Vec::new()));
+
+        // An unknown kind places its blocks and is left out of the rule too.
+        KvEventMonitor::apply_event(
+            &group_store(2, Some("chunked_local"), None, &[1]),
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert_eq!(capped(&indexer, w1, &hashes, 4), (Some(1), Vec::new()));
+        // A state group that retains nothing on the path shrinks it to nothing: the holder leaves.
+        KvEventMonitor::apply_event(
+            &group_store(3, Some("mamba"), None, &[1]),
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert_eq!(capped(&indexer, w1, &hashes, 4).0, Some(1));
+        let mut gone = removed_event(1);
+        gone.group_idx = Some(3);
+        KvEventMonitor::apply_event(&remove_event(gone), w1, &indexer, &mut wb);
+        let (depth, caps) = capped(&indexer, w1, &hashes, 4);
+        assert_eq!(depth, None, "capped to nothing: no longer a holder");
+        assert_eq!(caps[0].capped, 0);
+        assert_eq!(
+            indexer.current_size(),
+            1,
+            "the index still holds the main block"
+        );
+    }
+
+    /// A store of a kind other than main attention without a group index
+    /// names nothing the view can keep; a plain worker never gets a view.
+    #[test]
+    fn a_nameless_group_store_is_counted_and_a_plain_worker_has_no_view() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let mut nameless = stored_event(1, &TOKENS);
+        nameless.kv_cache_spec_kind = Some("sliding_window".to_string());
+        KvEventMonitor::apply_event(&store_event(nameless), w1, &indexer, &mut wb);
         assert_eq!(indexer.current_size(), 0);
+        assert_eq!(wb.counters.group_nameless, 1);
+        KvEventMonitor::apply_event(
+            &store_event(stored_event(1, &TOKENS)),
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert_eq!(indexer.current_size(), 1);
+        assert!(indexer.groups().is_empty(), "no view without a group");
+        let hashes = compute_request_content_hashes(&TOKENS, 4);
+        assert_eq!(capped(&indexer, w1, &hashes, 4), (Some(1), Vec::new()));
     }
 
     #[test]
@@ -959,10 +1431,10 @@ mod tests {
 
         let mut remote = stored_event(1, &TOKENS);
         remote.locality = Some(KvCacheLocality::Remote as i32);
-        KvEventMonitor::apply_stored(&remote, w1, &indexer, &mut wb);
+        KvEventMonitor::apply_event(&store_event(remote), w1, &indexer, &mut wb);
         let mut agent = stored_event(1, &TOKENS);
         agent.ownership = Some("kvcr".to_string());
-        KvEventMonitor::apply_stored(&agent, w1, &indexer, &mut wb);
+        KvEventMonitor::apply_event(&store_event(agent), w1, &indexer, &mut wb);
         assert_eq!(indexer.current_size(), 0);
 
         KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), w1, &indexer, &mut wb);
