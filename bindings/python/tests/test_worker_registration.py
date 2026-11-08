@@ -92,6 +92,16 @@ def get_json(url):
         return json.load(response)
 
 
+def check_completion(request, model):
+    """Assert the selected worker's identity; response mismatches must never be retried."""
+    with urllib.request.urlopen(request, timeout=2) as response:
+        assert response.status == 200
+        completion = json.load(response)
+    assert completion["model"] == model
+    assert completion["choices"][0]["message"]["content"] == model
+    return True
+
+
 def wait_for(process, log, probe):
     """Wait for asynchronous startup, reporting gateway logs on timeout or early exit."""
     deadline = time.monotonic() + 30
@@ -99,6 +109,10 @@ def wait_for(process, log, probe):
         try:
             if probe():
                 return
+        except urllib.error.HTTPError as error:
+            if error.code != 503:
+                raise
+            error.close()  # Models can be listed before workers are ready for inference.
         except (urllib.error.URLError, TimeoutError):
             pass  # The listener and worker registration start asynchronously.
         time.sleep(0.1)
@@ -184,11 +198,7 @@ def test_python_launcher_registers_workers(tmp_path, igw, static_workers):
                                 ).encode(),
                                 {"Content-Type": "application/json"},
                             )
-                            with urllib.request.urlopen(request, timeout=2) as response:
-                                assert response.status == 200
-                                completion = json.load(response)
-                            assert completion["model"] == model
-                            assert completion["choices"][0]["message"]["content"] == model
+                            wait_for(process, log, lambda: check_completion(request, model))
                 finally:
                     process.terminate()
                     try:
