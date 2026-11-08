@@ -937,13 +937,13 @@ fn interval_clips_report_the_loaders_sampled_rate() {
         sampling: FrameSampling::Interval,
         ..VideoFetchConfig::default()
     };
-    let one_second = super::FrameSelection::new(30.0, 30, vec![0, 29]);
+    let one_second = super::FrameSelection::new(30.0, 30, 30, vec![0, 29]);
     assert_eq!(
         super::clip_sample_fps(Some(&one_second), Some(1.0), interval),
         2.0
     );
     assert_eq!(effective_sample_fps(Some(1.0), interval), 4.0);
-    let long = super::FrameSelection::new(1.0, 800, (0..800).collect());
+    let long = super::FrameSelection::new(1.0, 800, 800, (0..800).collect());
     assert_eq!(
         super::clip_sample_fps(Some(&long), Some(800.0), interval),
         1.0
