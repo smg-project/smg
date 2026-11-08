@@ -716,14 +716,13 @@ impl LeastLoadPolicy {
         let snapshot = self.snapshot();
         let snapshot = snapshot.as_deref();
 
-        // Each candidate is read once under the read guard, its report and
-        // its credit after the report's sample; every pass below scores from
-        // this, with the guard released.
-        // Up to `HELD_GUARD_CANDIDATES` candidates the write guard is held
-        // across the decision: the scoring is short, and a second guard
-        // handoff costs more than it frees. Above it the credit is read under
-        // the read guard, the scores run with no guard held and the write
-        // guard covers the release and the credit alone.
+        // Up to `HELD_GUARD_CANDIDATES` candidates one write guard is held
+        // across the decision: each candidate is read under it, the scoring
+        // is short, and a second guard handoff costs more than it frees.
+        // Above it each candidate is read once under the read guard, its
+        // report and its credit after the report's sample, every pass below
+        // scores from this with the guard released, and the write guard
+        // covers the release and the credit alone.
         let mut held = (candidates.len() <= HELD_GUARD_CANDIDATES).then(|| {
             self.tally
                 .write()
@@ -807,10 +806,12 @@ impl LeastLoadPolicy {
         let best = best.idx;
 
         // In-flight correction: credit the chosen worker with this request's
-        // token-work until its next poll refreshes the snapshot. The write
-        // guard covers the release of the dispatches the reports read above
-        // reflect, and the credit; nothing else. The key is allocated the
-        // first time a worker is dispatched to, never after.
+        // token-work until its next poll refreshes the snapshot. Above
+        // `HELD_GUARD_CANDIDATES` the write guard taken here covers the
+        // release of the dispatches the reports read above reflect, and the
+        // credit; the guard held across a smaller decision covered the
+        // scores too. The key is allocated the first time a worker is
+        // dispatched to, never after.
         let req_tokens = credit.map_or_else(|| self.request_tokens(info), |credit| credit(best));
         let mut tally = match held.take() {
             Some(guard) => guard,

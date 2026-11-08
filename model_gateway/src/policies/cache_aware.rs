@@ -13,7 +13,9 @@
     -------------------------------------------
     Uses the KV index's overlap scoring from KvEventMonitor. Routes based
     on actual backend KV cache state. Selects the worker with the highest
-    overlap count; LeastLoad breaks equal-affinity ties atomically.
+    overlap count; LeastLoad breaks equal-affinity ties in one call, the
+    choice and its credit together (above eight candidates the scores are
+    read without the tally's write guard).
     Falls back to LeastLoad when no cache overlap exists. Over a pool larger
     than 32 workers the decision reads the holders of the request's blocks
     and a sample of 16 others, not the pool (see `FLEET_SAMPLE`).
@@ -1698,7 +1700,8 @@ impl CacheAwarePolicy {
         // replacing the former separate passes whose per-worker guard traffic
         // dominated routing CPU at scale. Collects eligible indices, the load
         // sum (for the per-request pressure gate). Final selection and credit
-        // are delegated atomically to LeastLoad after affinity is resolved.
+        // are delegated to one LeastLoad call after affinity is resolved
+        // (`select_expected_wait` says what its write guard covers).
         let mut healthy_indices: Vec<usize> = Vec::with_capacity(workers.len());
         let mut load_sum = 0usize;
         for (idx, worker) in workers.iter().enumerate() {
@@ -1977,10 +1980,13 @@ impl CacheAwarePolicy {
     }
 
     /// Select one final worker with LeastLoad's expected-wait algorithm and
-    /// credit it (the scores are read without the tally's write guard, the
-    /// credit lands under it). CacheAware must call this exactly once per
-    /// successful dispatch, after cache affinity and spill logic have fixed
-    /// the candidate set.
+    /// credit it, in one call. Up to `HELD_GUARD_CANDIDATES` candidates (the
+    /// usual spill or holder set) one write guard covers the scores and the
+    /// credit; above it the scores are read without the tally's write guard
+    /// and the credit lands under it, so two decisions in flight can pick
+    /// the same worker before either credit lands. CacheAware must call this
+    /// exactly once per successful dispatch, after cache affinity and spill
+    /// logic have fixed the candidate set.
     fn select_expected_wait(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -3502,9 +3508,9 @@ impl CacheAwarePolicy {
         let (keyed, marker_len) = self.keyed_tokens(info, tokens);
         let keyed: &[u32] = &keyed;
 
-        // One fused descent: match first, atomically choose+credit the final
-        // worker from the affinity/spill candidate set, then insert only that
-        // worker before the closure returns.
+        // One fused descent: match first, choose and credit the final worker
+        // from the affinity/spill candidate set in one LeastLoad call, then
+        // insert only that worker before the closure returns.
         let mut selected_idx: Option<usize> = None;
         let result = tree.match_and_insert_with(keyed, |result| {
             let matched = result.matched_token_count.saturating_sub(marker_len);

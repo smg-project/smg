@@ -4140,7 +4140,7 @@ fn healthy_url_index_preserves_duplicate_equal_affinity_candidates() {
     assert_eq!(url_to_idx["http://w1:8000"], vec![0, 1]);
     assert_eq!(url_to_idx["http://w2:8000"], vec![2]);
 
-    // Equal loads stay tied so LeastLoad can resolve them atomically.
+    // Equal loads stay tied so LeastLoad resolves them in its one call.
     let tied = make_workers(&["http://w1:8000", "http://w1:8000"]);
     assert_eq!(
         CacheAwarePolicy::healthy_url_index(&tied, &[0, 1])["http://w1:8000"],
