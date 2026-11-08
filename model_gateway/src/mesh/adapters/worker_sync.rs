@@ -52,17 +52,20 @@
 //! rebinds to the new id without waiting for a pass, and the owner's later
 //! tombstone of that id reaches the import.
 //!
-//! Remaining gaps: a key of this node's name whose endpoint the new life
-//! never registers again (it left the configuration across the crash) is
-//! imported as a `Mesh` worker on this node and on every peer and tombstoned
-//! by nobody (it is in no outbound `published` set and it is no leftover by
-//! the rule above), so it stays in each registry for as long as its owner is
-//! live: routable while its probes pass, demoted to `Failed` once they fail
-//! (a `Mesh` worker is never removed for failed probes), and imported again
-//! from the store after a restart; a pass that tombstones a `Mesh` import
-//! whose key names this node, once the start-up jobs are done, is its rule.
-//! Tombstone metadata accrues per removed worker (time-based collection would
-//! resurrect deleted keys; it is only sound at causal stability).
+//! A key of this node's name whose endpoint the new life never registers
+//! again (it left the configuration across the crash) imports as a `Mesh`
+//! worker here and on every peer like any other, and nobody else may
+//! tombstone it. This node does, once no `Local` worker of this process has
+//! held its id for `UNCLAIMED_OWN_KEY_GRACE` after it was first seen: the
+//! start-up jobs and a discovery's first pass register the configured
+//! endpoints well within it, and a claim keeps the id, so the key is this
+//! life's own from then on. The tombstone takes the import out of every
+//! registry; an endpoint that registers later publishes a fresh key under a
+//! new id and its peers rebind to that one.
+//!
+//! Remaining gaps: tombstone metadata accrues per removed worker (time-based
+//! collection would resurrect deleted keys; it is only sound at causal
+//! stability).
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -96,6 +99,14 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 /// consecutive passes is dead by the second.
 const DEAD_OWNER_GRACE: Duration = Duration::from_secs(20);
 
+/// How long a live key of this node's name may go without a `Local` worker
+/// of this process holding its id before this node tombstones it as the
+/// leftover of an earlier life: three reconcile passes, so the start-up jobs
+/// and a discovery's first pass have registered the configured endpoints (a
+/// claim keeps the key's id and ends the count). An endpoint whose
+/// registration lands later publishes a fresh key under a new id.
+const UNCLAIMED_OWN_KEY_GRACE: Duration = Duration::from_secs(3 * RECONCILE_INTERVAL.as_secs());
+
 /// How a key's owner stands in the membership view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OwnerLiveness {
@@ -124,6 +135,10 @@ pub struct WorkerSyncAdapter {
     /// When each peer was first seen `Down` or `Leaving`, refreshed once per
     /// reconcile pass; a peer that is alive again drops out.
     down_since: Mutex<HashMap<String, Instant>>,
+    /// When each live key of this node's name was first seen with no `Local`
+    /// worker of this process holding its id; an id a registration claims,
+    /// and a key that is gone, drop out.
+    unclaimed_since: Mutex<HashMap<String, Instant>>,
     /// Endpoints this gateway removed locally, with the instance that held
     /// each; a peer's state for them is held back until a fresh local
     /// registration re-admits the endpoint.
@@ -195,6 +210,7 @@ impl WorkerSyncAdapter {
             node_name,
             cluster_state,
             down_since: Mutex::new(HashMap::new()),
+            unclaimed_since: Mutex::new(HashMap::new()),
             retired: Mutex::new(RetiredEndpoints::default()),
         })
     }
@@ -324,6 +340,9 @@ impl WorkerSyncAdapter {
         // to test membership, and feeds the backfill below so the
         // namespace is scanned once per pass.
         let live: HashSet<String> = self.workers.keys("").into_iter().collect();
+        self.unclaimed_since
+            .lock()
+            .retain(|id, _| live.contains(&format!("{PREFIX}{id}")));
         for (id, worker) in self.worker_registry.get_all_with_ids() {
             let key = format!("{PREFIX}{}", id.as_str());
             if live.contains(&key) {
@@ -507,6 +526,29 @@ impl WorkerSyncAdapter {
         true
     }
 
+    /// Whether `state` is a key of this node's name that no `Local` worker of
+    /// this process has held for [`UNCLAIMED_OWN_KEY_GRACE`] since it was first
+    /// seen: the leftover of an earlier life whose endpoint this life never
+    /// registered again. The first sighting starts the count; a claim
+    /// (`register_or_replace` keeps the id and makes the worker `Local`) ends
+    /// it, as this node's own live keys never start one. Inside the grace the
+    /// key imports as before, so the start-up upsert finds the import to claim.
+    fn is_unclaimed_own_key_past_grace(&self, worker_id: &str, state: &WorkerState) -> bool {
+        if state.owner != self.node_name {
+            return false;
+        }
+        let id = WorkerId::from_string(worker_id.to_string());
+        let mut since = self.unclaimed_since.lock();
+        if self.worker_registry.origin_of(&id) == Some(WorkerOrigin::Local) {
+            since.remove(worker_id);
+            return false;
+        }
+        let first_seen = *since
+            .entry(worker_id.to_string())
+            .or_insert_with(Instant::now);
+        first_seen.elapsed() >= UNCLAIMED_OWN_KEY_GRACE
+    }
+
     /// Whether this node should export the worker to the cluster. Only
     /// locally-owned workers are ours to publish, and a `Zmq` worker is
     /// host-local by construction — its `ipc://` endpoint names a socket on
@@ -616,7 +658,8 @@ impl WorkerSyncAdapter {
     }
 
     /// A live key's state into the registry: a leftover of this node's
-    /// earlier life is tombstoned, a later state of a key this node claimed
+    /// earlier life is tombstoned (its endpoint held under another id, or its
+    /// id unclaimed past the grace), a later state of a key this node claimed
     /// is published over, a dead owner's import dropped, a gone owner's left
     /// alone inside the grace, a live owner's imported or refreshed unless
     /// this node retired the endpoint.
@@ -632,6 +675,18 @@ impl WorkerSyncAdapter {
             return;
         }
         if self.republish_above_own_key(worker_id, state) {
+            return;
+        }
+        if self.is_unclaimed_own_key_past_grace(worker_id, state) {
+            self.unclaimed_since.lock().remove(worker_id);
+            info!(
+                worker_id,
+                url = %Endpoint::redacted_str(&state.url),
+                grace_secs = UNCLAIMED_OWN_KEY_GRACE.as_secs(),
+                "tombstoning a key of this node's name that no registration of this life claimed \
+                 within the grace: left by an earlier life of the node"
+            );
+            self.on_worker_removed(worker_id);
             return;
         }
         match self.owner_liveness(&state.owner) {
@@ -2219,6 +2274,143 @@ mod tests {
         assert!(
             registry.get(&id).is_some(),
             "and the worker stays registered"
+        );
+    }
+
+    /// The earlier life's key and a peer that imported it; the handles the
+    /// restart tests below share.
+    fn earlier_life_and_peer(url: &str) -> (Arc<CrdtNamespace>, WorkerId, Arc<WorkerRegistry>) {
+        let mesh = MeshKV::new("node-p".into());
+        let ns = worker_namespace(&mesh);
+        let first_registry = Arc::new(WorkerRegistry::new());
+        let first_life = WorkerSyncAdapter::new(
+            ns.clone(),
+            first_registry.clone(),
+            "node-p".into(),
+            empty_cluster(),
+        );
+        let first_id = first_registry.register(local_worker(url)).unwrap();
+        first_life.resync_local(&mut HashMap::new());
+        drop(first_life);
+        drop(first_registry);
+        let peer_registry = Arc::new(WorkerRegistry::new());
+        let peer = WorkerSyncAdapter::new(
+            ns.clone(),
+            peer_registry.clone(),
+            "node-s".into(),
+            empty_cluster(),
+        );
+        peer.start();
+        (ns, first_id, peer_registry)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_key_of_this_nodes_name_that_no_registration_claims_is_tombstoned_after_the_grace() {
+        // The endpoint left the configuration across the crash, so the new
+        // life registers nothing at it. Inside the grace the key of the
+        // earlier life imports here as before; once the grace has passed with
+        // no claim, this node tombstones it as its owner, and the import goes
+        // from its own registry and from the peer's.
+        let url = "http://engine:8080";
+        let (ns, first_id, peer_registry) = earlier_life_and_peer(url);
+        let first_key = format!("worker:{}", first_id.as_str());
+        assert!(
+            wait_for(|| peer_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
+            "the peer imported the worker under the owner's first id"
+        );
+
+        let second_registry = Arc::new(WorkerRegistry::new());
+        let second_life = WorkerSyncAdapter::new(
+            ns.clone(),
+            second_registry.clone(),
+            "node-p".into(),
+            empty_cluster(),
+        );
+        second_life.start();
+        assert!(
+            wait_for(|| second_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
+            "inside the grace the new life imports the key of its earlier life"
+        );
+        assert_eq!(
+            second_registry.origin_of(&first_id),
+            Some(WorkerOrigin::Mesh)
+        );
+        second_life.reconcile_once();
+        assert!(
+            ns.get(&first_key).is_some(),
+            "a pass inside the grace keeps the key"
+        );
+
+        tokio::time::advance(UNCLAIMED_OWN_KEY_GRACE).await;
+        second_life.reconcile_once();
+        assert!(
+            ns.get(&first_key).is_none(),
+            "the owner tombstones the key no registration of this life claimed"
+        );
+        assert!(
+            wait_for(|| second_registry.get_by_url(url).is_none()).await,
+            "the import goes from the owner's registry"
+        );
+        assert!(
+            wait_for(|| peer_registry.get_by_url(url).is_none()).await,
+            "and from the peer's"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_key_of_this_nodes_name_claimed_inside_the_grace_stays_past_it() {
+        // The start-up upsert claims the earlier life's key under its id
+        // inside the grace: the key is this life's own from then on, and no
+        // pass after the grace tombstones it.
+        let url = "http://engine:8080";
+        let (ns, first_id, peer_registry) = earlier_life_and_peer(url);
+        let first_key = format!("worker:{}", first_id.as_str());
+        assert!(
+            wait_for(|| peer_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
+            "the peer imported the worker under the owner's first id"
+        );
+
+        let second_registry = Arc::new(WorkerRegistry::new());
+        let second_life = WorkerSyncAdapter::new(
+            ns.clone(),
+            second_registry.clone(),
+            "node-p".into(),
+            empty_cluster(),
+        );
+        second_life.start();
+        assert!(
+            wait_for(|| second_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
+            "the key imports inside the grace"
+        );
+        assert_eq!(
+            second_registry.register_or_replace(local_worker(url)),
+            first_id,
+            "the claim keeps the id"
+        );
+
+        // Every write to the namespace from here on, as the peers see them:
+        // a tombstone that the pass after it re-asserts leaves the key in
+        // place and shows as a `None` event all the same.
+        let mut writes = ns.subscribe("");
+        tokio::time::advance(UNCLAIMED_OWN_KEY_GRACE).await;
+        second_life.reconcile_once();
+        // Under the paused clock the sleep fires once every task is idle:
+        // the echoes of the passes are drained.
+        sleep(Duration::from_millis(10)).await;
+        while let Ok((key, snapshot)) = writes.receiver.try_recv() {
+            assert!(
+                key != first_key || snapshot.is_some(),
+                "no pass of this life tombstones the claimed key"
+            );
+        }
+        assert!(
+            ns.get(&first_key).is_some(),
+            "a claimed key is this life's own and stays past the grace"
+        );
+        assert_eq!(
+            peer_registry.get_id_by_url(url).as_ref(),
+            Some(&first_id),
+            "the peer's import never moved"
         );
     }
 
