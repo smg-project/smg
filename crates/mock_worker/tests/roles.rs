@@ -8,16 +8,18 @@ use std::{
 
 use mock_worker::{
     admin,
-    config::{Config, Role},
+    config::{Config, Role, SchedulerWire},
+    drain,
     grpc::serve_with_listener,
     script,
 };
 use serde_json::json;
-use smg_grpc_client::{tokenspeed_proto as ts, TokenSpeedSchedulerClient};
+use smg_grpc_client::{tokenspeed_proto as ts, vllm_proto as vllm, TokenSpeedSchedulerClient};
 use tokio::{
     io::AsyncReadExt,
     net::{TcpListener, TcpStream},
 };
+use tonic::transport::Channel;
 use ts::generate_response::Response as GenResp;
 
 mod common;
@@ -208,6 +210,13 @@ async fn start_realistic_prefill() -> (TokenSpeedSchedulerClient, reqwest::Clien
     let client = TokenSpeedSchedulerClient::connect(&format!("http://127.0.0.1:{port}"))
         .await
         .expect("connect to the mock worker");
+    let (http, fault) = fault_route(port).await;
+    (client, http, fault)
+}
+
+/// The admin API beside the worker on gRPC `port`: an HTTP client and the
+/// worker's fault route, up.
+async fn fault_route(port: u16) -> (reqwest::Client, String) {
     let admin_port = free_port();
     #[expect(
         clippy::disallowed_methods,
@@ -225,7 +234,94 @@ async fn start_realistic_prefill() -> (TokenSpeedSchedulerClient, reqwest::Clien
         assert!(Instant::now() < deadline, "the admin API did not come up");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    (client, http, fault)
+    (http, fault)
+}
+
+/// A realistic encode worker on the vLLM wire (the wire with an encode role)
+/// and the admin API beside it: the gateway's client and the fault route.
+async fn start_realistic_encoder() -> (
+    vllm::vllm_engine_client::VllmEngineClient<Channel>,
+    reqwest::Client,
+    String,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a free port");
+    let port = listener.local_addr().expect("listener address").port();
+    let cfg = Config {
+        model_id: "roles-test".to_string(),
+        grpc_base_port: port,
+        grpc_count: 1,
+        grpc_wire: SchedulerWire::Vllm,
+        realistic: true,
+        role: Some(Role::Encode),
+        ..Config::default()
+    };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the server serves until the test process exits"
+    )]
+    let _server = tokio::spawn(serve_with_listener(Arc::new(cfg), listener));
+    let channel = Channel::from_shared(format!("http://127.0.0.1:{port}"))
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect to the mock worker");
+    let (http, fault) = fault_route(port).await;
+    (
+        vllm::vllm_engine_client::VllmEngineClient::new(channel),
+        http,
+        fault,
+    )
+}
+
+/// What the gateway sends an encoder: a tokenized prompt with one media
+/// item under a placeholder and the pull connector's empty parameters.
+fn encode_request(id: &str) -> vllm::GenerateRequest {
+    vllm::GenerateRequest {
+        request_id: id.to_string(),
+        input: Some(vllm::generate_request::Input::Tokenized(
+            vllm::TokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![1, 2, 3],
+            },
+        )),
+        sampling_params: Some(vllm::SamplingParams {
+            max_tokens: Some(1),
+            ..Default::default()
+        }),
+        mm_inputs: Some(vllm::MultimodalInputs {
+            mm_hashes: vec!["roles-image".to_string()],
+            mm_placeholders: vec![vllm::PlaceholderRange {
+                offset: 1,
+                length: 1,
+            }],
+            ..Default::default()
+        }),
+        ec_transfer_params_json: Some("{}".to_string()),
+        ..Default::default()
+    }
+}
+
+/// The encoder's one frame: its completion.
+async fn encoder_completion(
+    client: &mut vllm::vllm_engine_client::VllmEngineClient<Channel>,
+    id: &str,
+) -> vllm::GenerateComplete {
+    let mut stream = client
+        .generate(encode_request(id))
+        .await
+        .expect("the encoder's stream")
+        .into_inner();
+    let frame = stream
+        .message()
+        .await
+        .expect("a frame")
+        .expect("the encoder's completion");
+    let Some(vllm::generate_response::Response::Complete(complete)) = frame.response else {
+        panic!("a Complete, not {frame:?}");
+    };
+    complete
 }
 
 /// The worker's fault counters (`failed_total`, `cut_total`).
@@ -308,4 +404,66 @@ async fn a_realistic_prefill_worker_ends_the_prompt_side_with_error_on_an_armed_
         .expect("the cut's status, not a stream");
     assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
     assert_eq!(fault_counts(&http, &fault).await, (0, 2));
+}
+
+#[tokio::test]
+async fn a_realistic_encode_worker_takes_the_fault_hooks_and_counts_in_flight() {
+    let (mut client, http, fault) = start_realistic_encoder().await;
+
+    // One 503 armed: the encoder refuses before it answers, as the prompt
+    // side of a prefill worker does, and the failure is counted.
+    let armed = http
+        .post(format!("{fault}/fail?status=503&count=1"))
+        .send()
+        .await
+        .expect("arm the fault");
+    assert_eq!(armed.status(), 200);
+    let refused = client
+        .generate(encode_request("ec-f1"))
+        .await
+        .expect_err("the armed status, not a stream");
+    assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
+    assert_eq!(fault_counts(&http, &fault).await, (1, 0));
+
+    // An armed cut: the encoder's completion ends with `error` and the cut
+    // is counted; the handles still come, the gateway reads the reason.
+    let armed = http
+        .post(format!("{fault}/fail?finish=error&status=503&count=1"))
+        .send()
+        .await
+        .expect("arm the fault");
+    assert_eq!(armed.status(), 200);
+    let complete = encoder_completion(&mut client, "ec-e1").await;
+    assert_eq!(complete.finish_reason, "error");
+    assert_eq!(fault_counts(&http, &fault).await, (1, 1));
+
+    // A stall: the request counts in flight while it waits, and no longer
+    // once its completion is out. Sampled over the stall, so a request of
+    // another worker in this process passing by cannot stand in for it.
+    let armed = http
+        .post(format!("{fault}/fail?status=0&stall_ms=1500&count=1"))
+        .send()
+        .await
+        .expect("arm the stall");
+    assert_eq!(armed.status(), 200);
+    let (complete, during) = tokio::join!(encoder_completion(&mut client, "ec-s1"), async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut during = usize::MAX;
+        for _ in 0..5 {
+            let now = drain::in_flight();
+            assert!(now >= 1, "the stalled request is not counted in flight");
+            during = during.min(now);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        during
+    });
+    assert_eq!(complete.finish_reason, "stop");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while drain::in_flight() >= during {
+        assert!(
+            Instant::now() < deadline,
+            "the completion is out but the request still counts in flight"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
