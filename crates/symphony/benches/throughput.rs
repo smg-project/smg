@@ -30,6 +30,7 @@ use slices::{Slice, FAMILIES};
 use symphony::{
     adapt::{chat, messages},
     formats::Table,
+    grammar::{GrammarStart, Options},
     Declared, Engine, EngineFinish, Event, Events, Input, Parser,
 };
 
@@ -293,7 +294,7 @@ fn events_of(table: Table, slice: &Slice, declared: &Declared) -> Vec<Event<'sta
 }
 
 /// The request's tools: a string and an integer, a string and an object.
-fn declared() -> Declared {
+fn tools() -> Vec<Tool> {
     let tool = |name: &str, parameters: serde_json::Value| Tool {
         tool_type: "function".to_string(),
         function: Function {
@@ -304,7 +305,7 @@ fn declared() -> Declared {
             extra: Default::default(),
         },
     };
-    Declared::of(&[
+    vec![
         tool(
             "get_weather",
             json!({"type": "object", "properties": {
@@ -319,7 +320,12 @@ fn declared() -> Declared {
                 "new_preferences": {"type": "object"},
             }}),
         ),
-    ])
+    ]
+}
+
+/// The request's tools typed for an engine ([`tools`]).
+fn declared() -> Declared {
+    Declared::of(&tools())
 }
 
 /// `text` cut into pieces of at least `size` bytes, each ending on a character boundary.
@@ -451,7 +457,8 @@ fn prose_only(c: &mut Criterion) {
 }
 
 fn setup(c: &mut Criterion) {
-    let tools = declared();
+    let typed = declared();
+    let tools = tools();
     let mut group = c.benchmark_group("setup");
     for subject in SUBJECTS {
         let name = subject.table.name();
@@ -463,7 +470,27 @@ fn setup(c: &mut Criterion) {
             b.iter(|| black_box(format.validate()));
         });
         group.bench_with_input(BenchmarkId::new("engine", name), subject, |b, subject| {
-            b.iter(|| black_box(engine(subject.table, subject.prompt, &tools)));
+            b.iter(|| black_box(engine(subject.table, subject.prompt, &typed)));
+        });
+        // The constraint of a forced call, built once per request that forces one (a required
+        // or named `tool_choice`): the grammar over the request's tools and its text for the
+        // engine's compiler, which a gateway builds in its request preparation.
+        group.bench_with_input(BenchmarkId::new("grammar", name), subject, |b, subject| {
+            let format = subject.table.format();
+            let options = Options {
+                at_least_one: true,
+                reasoning_open: false,
+                thought_closed: false,
+                one_call: false,
+                start: GrammarStart::Unknown,
+            };
+            b.iter(|| {
+                black_box(
+                    format
+                        .grammar_for(&tools, options)
+                        .map(|grammar| grammar.payload_text()),
+                )
+            });
         });
     }
     group.bench_function("declared", |b| b.iter(|| black_box(declared())));
