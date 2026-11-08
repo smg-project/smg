@@ -26,8 +26,8 @@ use crate::{
         grpc::{
             backend_client::BackendClient,
             context::{
-                stage_output, AttemptStamp, ClientSelection, ExecutionPlan, RequestContext,
-                RequestType, WorkerSelection,
+                stage_output, AttemptStamp, ClientSelection, EncodeOutputs, ExecutionPlan,
+                RequestContext, RequestType, WorkerSelection,
             },
             multimodal::{
                 assemble_media_refs, assemble_multimodal_data,
@@ -962,8 +962,12 @@ pub(crate) async fn assemble_prompt_media(
         return Ok(None);
     };
     let builder = builder_client(ctx.state.clients.as_ref(), function)?;
-    // `encode_outputs` set by EncodeStage selects the pixel-drop assembly path.
-    let assembled = if ctx.state.encode_outputs.is_some() {
+    // A rendezvous plan from EncodeStage selects the pixel-drop assembly path;
+    // a push plan keeps the pixels, its encoder takes the built prompt.
+    let assembled = if matches!(
+        ctx.state.encode_outputs,
+        Some(EncodeOutputs::Rendezvous { .. })
+    ) {
         assemble_multimodal_data_after_encode(intermediate, builder, ctx.state.workers.as_ref())
             .await
     } else {
@@ -1009,8 +1013,10 @@ pub(crate) fn finish_generate_request(
         }
     }
 
-    if let Some(outputs) = ctx.state.encode_outputs.as_mut() {
-        proto_request.set_encode_bootstrap_info(std::mem::take(&mut outputs.bootstrap_info));
+    if let Some(EncodeOutputs::Rendezvous { bootstrap_info, .. }) =
+        ctx.state.encode_outputs.as_mut()
+    {
+        proto_request.set_encode_bootstrap_info(std::mem::take(bootstrap_info));
     }
 
     if let Some(workers) = ctx.state.workers.as_ref() {

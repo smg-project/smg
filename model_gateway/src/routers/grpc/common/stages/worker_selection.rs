@@ -3184,7 +3184,6 @@ mod tests {
             sticky_key: None,
             clients: None,
             encode_outputs: None,
-            image_anchor: None,
             dispatch: None,
             load_guards: None,
             multimodal_inflight: None,

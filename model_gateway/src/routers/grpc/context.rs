@@ -37,7 +37,10 @@ use super::{
             RateLimitCell,
         },
     },
-    multimodal::{InflightPermit, MediaPlan, MultimodalComponents, MultimodalIntermediate},
+    multimodal::{
+        ec_push::PushEncodePlan, InflightPermit, MediaPlan, MultimodalComponents,
+        MultimodalIntermediate,
+    },
     proto_wrapper::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
         ProtoInputLogProbs, ProtoRequest, ProtoStream,
@@ -304,8 +307,10 @@ pub(crate) struct ProcessingState {
     pub media_refs_pipeline: PipelinePin,
 
     /// `Some` iff the request is multimodal EPD and worker selection produced
-    /// encode assignments. Request building injects the bootstrap info and drops
-    /// prefill pixels; request execution `take()`s the dispatch plan.
+    /// encode assignments: the encode stage's plan, by handoff. Request building
+    /// injects a rendezvous plan's bootstrap info and drops the prefill pixels;
+    /// request execution `take()`s the plan (a push plan's encode call runs before
+    /// the prefill/decode dispatch).
     pub encode_outputs: Option<EncodeOutputs>,
 
     /// Share of the in-flight media budget this request holds until the
@@ -438,11 +443,11 @@ pub(crate) struct DispatchContext {
     pub workers: Option<WorkerSelection>,
     pub sticky_key: Option<String>,
     pub clients: Option<ClientSelection>,
-    /// Consumed by the first dispatch; retries re-dispatch only the
-    /// prefill/decode sides against the already-running encode jobs.
+    /// Consumed by the first dispatch; a rendezvous retry re-dispatches only the
+    /// prefill/decode sides against the already-running encode jobs (a push plan
+    /// carrying media is not retried).
     pub encode_outputs: Option<EncodeOutputs>,
     pub multimodal_inflight: Option<InflightPermit>,
-    pub image_anchor: Option<u32>,
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
     /// Prefill admission slot for the next PD/EPD dispatch; a retry's
@@ -534,18 +539,25 @@ pub(crate) struct AttemptStamp {
     pub inject_pd_metadata: bool,
 }
 
-/// Per-item bootstrap rendezvous info for prefill, plus the dispatch plan that
-/// fans out to encode workers.
+/// What the encode stage planned for an EPD request, by its handoff.
 ///
 /// Not `#[derive(Debug)]`: `EncodeDispatchPlan` transitively holds
 /// non-`Debug` raw proto payloads (`TokenSpeedMultimodalItem`).
-///
-/// Owns the encode jobs' SHM/RDMA Drop guards: dropping this before request
-/// execution dispatches (early return / cancellation) reclaims the staged
-/// `/dev/shm` segments via `PreparedEncodeItem`'s `Drop`.
-pub(crate) struct EncodeOutputs {
-    pub bootstrap_info: Vec<EncodeItemBootstrapInfo>,
-    pub dispatch: EncodeDispatchPlan,
+pub(crate) enum EncodeOutputs {
+    /// Per-item bootstrap rendezvous info for the prefill request, plus the
+    /// dispatch plan that fans out to the encode workers beside the
+    /// prefill/decode pair. Owns the encode jobs' SHM/RDMA Drop guards:
+    /// dropping this before request execution dispatches (early return /
+    /// cancellation) reclaims the staged `/dev/shm` segments via
+    /// `PreparedEncodeItem`'s `Drop`.
+    Rendezvous {
+        bootstrap_info: Vec<EncodeItemBootstrapInfo>,
+        dispatch: EncodeDispatchPlan,
+    },
+    /// The encoder the built prompt goes to first, at dispatch (under an image
+    /// anchor, the encoders its images fan out to), and the consumer
+    /// destination its transfers go to.
+    Push(PushEncodePlan),
 }
 
 /// Execution shape produced by request building. Retained until the retry
@@ -1180,7 +1192,6 @@ impl RequestContext {
             clients: state.clients,
             encode_outputs: state.encode_outputs,
             multimodal_inflight: state.multimodal_inflight,
-            image_anchor: state.image_anchor,
             dispatch: None,
             load_guards: None,
             pd_prefill_guard: state.pd_prefill_guard,

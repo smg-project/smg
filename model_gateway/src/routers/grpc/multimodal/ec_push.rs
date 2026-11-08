@@ -1,6 +1,8 @@
-//! The push handoff of an encode-prefill-decode request: the consumer's
-//! destination, the encoder's completion applied to the prefill request, and
-//! the release of pushed transfers the prefill side never took.
+//! The push handoff of an encode-prefill-decode request: the plan the encode
+//! stage makes for it, the encode call that runs it at dispatch (the encoder's
+//! copy of the built prompt, its completion applied to the prefill request),
+//! the consumer's destination, and the release of pushed transfers the
+//! prefill side never took.
 //!
 //! An encode worker under this handoff answers first, with the prompt's
 //! expanded identity and one transfer handle per media hash; the prefill side
@@ -11,14 +13,145 @@
 //! encoder-cache fields, the consumer's `ec_zmq_addrs` label by DP rank, and
 //! the consumer's JSON control protocol over ZMQ REQ sockets.
 
+use std::sync::Arc;
+
 use axum::response::Response;
 use serde_json::json;
 use smg_grpc_client::vllm_proto as vllm;
+use uuid::Uuid;
 
 use crate::{
-    routers::{error, grpc::proto_wrapper::ProtoGenerateRequest},
+    routers::{
+        error,
+        grpc::{
+            context::EncodeWorkerAssignment,
+            proto_wrapper::{ProtoGenerateRequest, ProtoGenerateResponse},
+            utils::tonic_ext::TonicStatusExt,
+        },
+    },
     worker::Worker,
 };
+
+mod images;
+
+/// The push handoff planned for one prompt: the encoder that takes the built
+/// prompt first, the consumer destination its transfers go to (`None` for a
+/// pull connector, whose handles come back from the encoder), and the fan-out
+/// of an image-only prompt whose images spread over several encoders.
+pub(crate) struct PushEncodePlan {
+    pub(crate) encoder: Arc<dyn Worker>,
+    pub(crate) destination: Option<String>,
+    pub(crate) fanout: Option<ImageFanout>,
+}
+
+/// An image-only prompt's fan-out: the anchor token its images sit behind and
+/// the encoder each image goes to; the groups split and merge on the anchor
+/// (see `images`).
+pub(crate) struct ImageFanout {
+    pub(crate) anchor: u32,
+    pub(crate) assignments: Vec<EncodeWorkerAssignment>,
+}
+
+impl PushEncodePlan {
+    /// Encode the built prompt, then rewrite it for the prefill side from the
+    /// completion: the identity replaces the media, the handles name the
+    /// transfers. Under a fan-out each image group goes to its encoder and the
+    /// groups' prompts merge back on the anchor; a processor that edits tokens
+    /// outside the anchors declines the merge, and the whole prompt goes to the
+    /// one encoder instead. The returned guards own the pushed reservations
+    /// until the prefill/decode dispatch takes them.
+    pub(crate) async fn encode(
+        self,
+        request: &mut ProtoGenerateRequest,
+    ) -> Result<Vec<PushCleanup>, Response> {
+        if let Some(mut groups) = self
+            .fanout
+            .as_ref()
+            .and_then(|fanout| images::split(request, &fanout.assignments, fanout.anchor))
+        {
+            let cleanups = futures::future::try_join_all(
+                groups
+                    .iter_mut()
+                    .map(|group| self.encode_on(group.worker.as_ref(), &mut group.request)),
+            )
+            .await?;
+            if let Some(merged) = images::merge(
+                request,
+                &groups,
+                self.fanout.as_ref().map(|fanout| fanout.anchor),
+            ) {
+                *request = merged;
+                return Ok(cleanups);
+            }
+            // A processor may update tokens outside the image anchor. Preserve its
+            // full-prompt behavior rather than guessing how to splice those edits.
+            tracing::debug!("Encoder prompt updates require single-worker encoding");
+            drop(cleanups);
+        }
+        self.encode_on(self.encoder.as_ref(), request)
+            .await
+            .map(|cleanup| vec![cleanup])
+    }
+
+    /// Encode `request` (the built prompt, or one image group's share of it)
+    /// on `worker` and apply the completion to it.
+    async fn encode_on(
+        &self,
+        worker: &dyn Worker,
+        request: &mut ProtoGenerateRequest,
+    ) -> Result<PushCleanup, Response> {
+        let ProtoGenerateRequest::Vllm(original) = request else {
+            return Err(error::internal_error(
+                "ec_request_type",
+                "Expected a vLLM request",
+            ));
+        };
+        let (encoder, mut params) = encoder_request(original, worker, self.destination.as_deref());
+        let cleanup = PushCleanup::new(&params);
+        let backend = worker
+            .get_backend_client()
+            .await
+            .map_err(|e| error::service_unavailable("ec_encoder_connection", e.to_string()))?
+            .ok_or_else(|| {
+                error::service_unavailable("ec_encoder_connection", "Encoder is not connected")
+            })?;
+        let mut client = backend.as_ref().clone();
+        let mut stream = client
+            .generate(ProtoGenerateRequest::Vllm(Box::new(encoder)))
+            .await
+            .map_err(|e| e.to_http_error("ec_encode_failed", e.message().to_string()))?;
+        while let Some(reply) = stream.next().await {
+            let reply =
+                reply.map_err(|e| e.to_http_error("ec_encode_failed", e.message().to_string()))?;
+            let ProtoGenerateResponse::Vllm(reply) = reply else {
+                return Err(error::internal_error(
+                    "ec_encode_response",
+                    "Expected a vLLM encoder reply",
+                ));
+            };
+            let Some(vllm::generate_response::Response::Complete(complete)) = reply.response else {
+                continue;
+            };
+            if complete.finish_reason == "error" {
+                return Err(error::bad_gateway("ec_encode_failed", "Encoder failed"));
+            }
+            let connector = worker
+                .metadata()
+                .spec
+                .labels
+                .get("ec_connector")
+                .map(String::as_str)
+                .unwrap_or("");
+            apply_completion(request, complete, &mut params, connector)?;
+            stream.mark_completed();
+            return Ok(cleanup);
+        }
+        Err(error::bad_gateway(
+            "ec_encode_incomplete",
+            "Encoder closed without a completion",
+        ))
+    }
+}
 
 /// A Mooncake consumer must advertise a destination before E reserves buffers.
 pub(crate) fn push_destination(prefill: &dyn Worker) -> Result<Option<String>, Response> {
@@ -58,6 +191,51 @@ fn consumer_address(addrs: &[String], rank: Option<usize>) -> Option<&str> {
     let mut managed = addrs.iter().filter(|addr| !addr.is_empty());
     let addr = managed.next()?;
     managed.next().is_none().then_some(addr.as_str())
+}
+
+/// The encoder's copy of the built prompt: its own request id, no stream, no
+/// KV transfer, the encoder's DP rank, one token of sampling, and the transfer
+/// params (a push destination reserves one gateway-minted transfer id per
+/// media item; a pull connector gets an empty object and returns its handles).
+fn encoder_request(
+    original: &vllm::GenerateRequest,
+    worker: &dyn Worker,
+    destination: Option<&str>,
+) -> (vllm::GenerateRequest, serde_json::Value) {
+    let mut encoder = original.clone();
+    encoder.request_id = format!("{}-encode-{}", encoder.request_id, Uuid::now_v7());
+    encoder.stream = false;
+    encoder.kv_transfer_params = None;
+    encoder.kv_transfer_params_json = None;
+    encoder.data_parallel_rank = worker.dp_rank().map(|rank| rank as i32);
+    encoder.sampling_params = Some(vllm::SamplingParams {
+        max_tokens: Some(1),
+        n: 1,
+        ignore_eos: true,
+        ..Default::default()
+    });
+    let mut params = json!({});
+    // Mooncake PUSH needs the exact selected DP replica, not the HTTP endpoint.
+    // PULL connectors leave this list empty and return their handles from E.
+    if let Some(addr) = destination {
+        params["consumer_zmq"] = json!(addr);
+        let count = encoder.media_refs.as_ref().map_or_else(
+            || {
+                encoder
+                    .mm_inputs
+                    .iter()
+                    .chain(&encoder.extra_mm_inputs)
+                    .map(|mm| mm.mm_hashes.len())
+                    .sum()
+            },
+            |refs| refs.items.len(),
+        );
+        params["ec_items"] = (0..count)
+            .map(|_| json!({"transfer_id": Uuid::now_v7().to_string()}))
+            .collect();
+    }
+    encoder.ec_transfer_params_json = Some(params.to_string());
+    (encoder, params)
 }
 
 /// Validate the completion atomically before replacing the request's pixels or refs.
@@ -269,6 +447,46 @@ async fn control_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The encoder's copy of the prompt carries its own id, no stream, no KV
+    /// transfer, one token of sampling, and one minted transfer id per media
+    /// hash when the consumer has a push destination; a pull connector's copy
+    /// carries an empty object.
+    #[test]
+    fn the_encoders_copy_of_the_prompt_mints_one_transfer_id_per_media_hash() {
+        use crate::worker::BasicWorkerBuilder;
+        let original = vllm::GenerateRequest {
+            request_id: "req-1".into(),
+            stream: true,
+            kv_transfer_params_json: Some("{}".into()),
+            mm_inputs: Some(vllm::MultimodalInputs {
+                mm_hashes: vec!["a".into(), "b".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let encoder: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("grpc://127.0.0.1:9000").build());
+        let (request, params) =
+            encoder_request(&original, encoder.as_ref(), Some("tcp://127.0.0.1:9001"));
+        assert!(request.request_id.starts_with("req-1-encode-"));
+        assert!(!request.stream);
+        assert!(request.kv_transfer_params.is_none() && request.kv_transfer_params_json.is_none());
+        let sampling = request.sampling_params.expect("sampling params");
+        assert_eq!(
+            (sampling.max_tokens, sampling.n, sampling.ignore_eos),
+            (Some(1), 1, true)
+        );
+        assert_eq!(params["consumer_zmq"], "tcp://127.0.0.1:9001");
+        assert_eq!(params["ec_items"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            request.ec_transfer_params_json.as_deref(),
+            Some(params.to_string().as_str())
+        );
+        let (request, params) = encoder_request(&original, encoder.as_ref(), None);
+        assert_eq!(params, json!({}));
+        assert_eq!(request.ec_transfer_params_json.as_deref(), Some("{}"));
+    }
 
     /// A duplicate image retains two distinct PUSH reservations.
     fn completion(handles: &str) -> vllm::GenerateComplete {
