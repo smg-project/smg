@@ -22,7 +22,7 @@ use kube::{
 use rustls::crypto::ring;
 use smg_mesh::{
     gossip::{NodeState, NodeStatus},
-    ClusterState,
+    member_transition_line, status_of, ClusterState,
 };
 use tokio::task;
 use tracing::{debug, error, info, warn};
@@ -176,7 +176,9 @@ fn build_watcher_config(label_selector: &str) -> Config {
 
 /// Apply one router-watcher event to the mesh cluster state. A hard delete
 /// or a set deletion timestamp marks the node Down; the mesh SWIM/CRDT layer
-/// owns convergence, so no store snapshot is needed here.
+/// owns convergence, so no store snapshot is needed here. A status change
+/// writes the membership's transition line, as the gossip loop and the
+/// probe handler do; an event that changes no status writes nothing at info.
 fn apply_router_event(
     event: &Event<Pod>,
     config: &MeshDiscoveryConfig,
@@ -199,9 +201,16 @@ fn apply_router_event(
     if is_delete || pod.metadata.deletion_timestamp.is_some() {
         let mut state = cluster_state.write();
         if let Some(node) = state.get_mut(&pod_info.name) {
+            let held = status_of(node);
             node.status = NodeStatus::Down as i32;
             node.version += 1;
-            info!("Router node {} marked as Down (pod deleted)", pod_info.name);
+            if held != NodeStatus::Down {
+                info!(
+                    "{}",
+                    member_transition_line(node, format_args!("a deleted pod; was {held:?}"))
+                );
+            }
+            debug!("Router node {} marked as Down (pod deleted)", pod_info.name);
         } else {
             debug!(
                 "Router node {} not found in cluster state (already removed)",
@@ -212,7 +221,9 @@ fn apply_router_event(
         let mesh_port = pod_info.mesh_port.unwrap_or(default_mesh_port);
         let node_address = SocketAddr::new(pod_info.ip, mesh_port).to_string();
         let mut state = cluster_state.write();
-        let existing_version = state.get(&pod_info.name).map(|n| n.version).unwrap_or(0);
+        let existing = state.get(&pod_info.name);
+        let held = existing.map(|node| (status_of(node), node.address.clone()));
+        let existing_version = existing.map_or(0, |node| node.version);
 
         let node_state = NodeState {
             name: pod_info.name.clone(),
@@ -223,7 +234,28 @@ fn apply_router_event(
         };
 
         state.insert(pod_info.name.clone(), node_state.clone());
-        info!(
+        // A ready pod seen again at its address changes nothing. One at another
+        // address while the table held it `Alive` is a change the peers dial
+        // (a pod replaced while the watch was away: the relist brings the new
+        // pod and no delete of the old), so it is written, naming the address
+        // held before.
+        let unchanged = held.as_ref().is_some_and(|(status, address)| {
+            *status == NodeStatus::Alive && *address == node_state.address
+        });
+        if !unchanged {
+            info!(
+                "{}",
+                member_transition_line(
+                    &node_state,
+                    format_args!(
+                        "a ready pod at {}{}",
+                        node_state.address,
+                        was(held.as_ref(), &node_state.address)
+                    )
+                )
+            );
+        }
+        debug!(
             "Router node {} added/updated in mesh cluster (address: {})",
             pod_info.name, node_state.address
         );
@@ -231,14 +263,31 @@ fn apply_router_event(
         let mut state = cluster_state.write();
         if let Some(node) = state.get_mut(&pod_info.name) {
             if node.status != NodeStatus::Down as i32 {
+                let held = status_of(node);
                 node.status = NodeStatus::Suspected as i32;
                 node.version += 1;
+                if held != NodeStatus::Suspected {
+                    info!(
+                        "{}",
+                        member_transition_line(node, format_args!("a pod not ready; was {held:?}"))
+                    );
+                }
                 debug!(
                     "Router node {} marked as Suspected (pod not healthy)",
                     pod_info.name
                 );
             }
         }
+    }
+}
+
+/// The `was` clause of a transition line: the status held before, when the
+/// member was in the table, and the address held before, when it moved.
+fn was(held: Option<&(NodeStatus, String)>, address: &str) -> String {
+    match held {
+        None => String::new(),
+        Some((status, held_address)) if held_address == address => format!("; was {status:?}"),
+        Some((status, held_address)) => format!("; was {status:?} at {held_address}"),
     }
 }
 
@@ -373,6 +422,89 @@ mod tests {
             cluster_state.read().get("r1").unwrap().status,
             NodeStatus::Down as i32
         );
+    }
+
+    /// A membership change the discovery watcher makes writes the same
+    /// transition line as the gossip loop and the probe handler, once per
+    /// change and naming the status held before: a ready pod that joins, a
+    /// ready pod at another address (the address held before is named), a
+    /// pod no longer ready, a pod ready again at its address, a deleted pod,
+    /// a replacement pod at another address after a delete. A ready pod seen
+    /// again at its address changes nothing and writes no second line.
+    #[traced_test]
+    #[test]
+    fn a_pod_event_that_changes_the_membership_writes_the_transition_line() {
+        let (config, mut pod) = router_config_and_pod();
+        let cluster_state: ClusterState = Arc::default();
+
+        apply_router_event(&Event::Apply(pod.clone()), &config, &cluster_state, 7000);
+        assert!(logs_contain(
+            "Member r1 is Alive at version 1 (a ready pod at 10.1.0.1:7100)"
+        ));
+        apply_router_event(&Event::Apply(pod.clone()), &config, &cluster_state, 7000);
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|line| line.contains("Member r1 is Alive"))
+                .count()
+            {
+                1 => Ok(()),
+                n => Err(format!("{n} lines for one join")),
+            }
+        });
+
+        if let Some(status) = pod.status.as_mut() {
+            status.pod_ip = Some("10.1.0.2".to_string());
+        }
+        apply_router_event(&Event::Apply(pod.clone()), &config, &cluster_state, 7000);
+        assert!(logs_contain(
+            "Member r1 is Alive at version 3 (a ready pod at 10.1.0.2:7100; was Alive at 10.1.0.1:7100)"
+        ));
+
+        if let Some(status) = pod.status.as_mut() {
+            status.conditions = Some(vec![PodCondition {
+                type_: "Ready".to_string(),
+                status: "False".to_string(),
+                last_probe_time: None,
+                last_transition_time: None,
+                message: None,
+                reason: None,
+                observed_generation: None,
+            }]);
+        }
+        apply_router_event(&Event::Apply(pod.clone()), &config, &cluster_state, 7000);
+        assert!(logs_contain(
+            "Member r1 is Suspected at version 4 (a pod not ready; was Alive)"
+        ));
+
+        if let Some(status) = pod.status.as_mut() {
+            status.conditions = Some(vec![PodCondition {
+                type_: "Ready".to_string(),
+                status: "True".to_string(),
+                last_probe_time: None,
+                last_transition_time: None,
+                message: None,
+                reason: None,
+                observed_generation: None,
+            }]);
+        }
+        apply_router_event(&Event::Apply(pod.clone()), &config, &cluster_state, 7000);
+        assert!(logs_contain(
+            "Member r1 is Alive at version 5 (a ready pod at 10.1.0.2:7100; was Suspected)"
+        ));
+
+        apply_router_event(&Event::Delete(pod.clone()), &config, &cluster_state, 7000);
+        assert!(logs_contain(
+            "Member r1 is Down at version 6 (a deleted pod; was Alive)"
+        ));
+
+        if let Some(status) = pod.status.as_mut() {
+            status.pod_ip = Some("10.1.0.3".to_string());
+        }
+        apply_router_event(&Event::Apply(pod), &config, &cluster_state, 7000);
+        assert!(logs_contain(
+            "Member r1 is Alive at version 7 (a ready pod at 10.1.0.3:7100; was Down at 10.1.0.2:7100)"
+        ));
     }
 
     #[test]

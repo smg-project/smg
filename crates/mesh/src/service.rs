@@ -403,8 +403,21 @@ impl PreparedMeshServer {
 
 /// The status a table entry carries, for the log lines (an unknown value
 /// reads as `Init`).
-pub(crate) fn status_of(entry: &NodeState) -> NodeStatus {
+pub fn status_of(entry: &NodeState) -> NodeStatus {
     NodeStatus::try_from(entry.status).unwrap_or(NodeStatus::Init)
+}
+
+/// The one info line a member's status change writes, whoever changes the
+/// table: `Member <name> is <Status> at version <n> (<how>)`. `how` names
+/// what changed it (the README's table of log lines lists the spellings);
+/// the caller writes the line only when the status held before differs.
+pub fn member_transition_line(entry: &NodeState, how: impl std::fmt::Display) -> String {
+    format!(
+        "Member {} is {:?} at version {} ({how})",
+        entry.name,
+        status_of(entry),
+        entry.version
+    )
 }
 
 /// Broadcast node state updates to target nodes, each dialed through
@@ -830,6 +843,30 @@ mod tests {
             server_key_path: certs.node_key_path.clone(),
             require_client_cert: true,
         }
+    }
+
+    /// The transition line every writer of the membership shares: the member,
+    /// its status, the version and the cause the writer names.
+    #[test]
+    fn a_member_transition_line_names_the_member_its_status_the_version_and_the_cause() {
+        let entry = NodeState {
+            name: "r1".to_string(),
+            address: "10.1.0.1:7100".to_string(),
+            status: NodeStatus::Suspected as i32,
+            version: 3,
+            metadata: Default::default(),
+        };
+        assert_eq!(
+            member_transition_line(
+                &entry,
+                format_args!("a peer's table; was {:?}", NodeStatus::Alive)
+            ),
+            "Member r1 is Suspected at version 3 (a peer's table; was Alive)"
+        );
+        assert_eq!(
+            member_transition_line(&entry, "joined this node's table"),
+            "Member r1 is Suspected at version 3 (joined this node's table)"
+        );
     }
 
     fn node_state(name: &str, addr: SocketAddr) -> NodeState {
