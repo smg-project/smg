@@ -28,6 +28,10 @@ futures.workspace = true
 futures-util = "0.3"
 http.workspace = true
 http-body-util = "0.1"
+# The metrics a test case emits, captured by a recorder local to the case (the
+# gateway's own versions).
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 openssl = "0.10.81"
 rand.workspace = true
 reqwest = { workspace = true, features = ["stream", "blocking", "json", "rustls-no-provider", "multipart", "http2"] }

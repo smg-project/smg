@@ -58,7 +58,6 @@
 //! decode worker and nothing on the prefill.
 
 use std::{
-    future::Future,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -75,9 +74,9 @@ use common::{
         build_grpc_router, grpc_router_config, grpc_worker, serve_canned_worker, serve_engine,
         Canned,
     },
+    metrics_capture::render_after,
 };
 use futures::future::join_all;
-use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::model_card::ModelCard;
 use smg::{
     middleware::TenantRequestMeta,
@@ -658,29 +657,6 @@ fn assert_all_answered_past_the_bound(answers: &[(http::StatusCode, String, Dura
         slowest < TURN * u32::try_from(QUEUED_CALLS).unwrap_or(u32::MAX) + SLACK,
         "answered once its turn came: {slowest:?}"
     );
-}
-
-/// Run `case` on a current-thread runtime under a thread-local recorder and
-/// return the rendered `/metrics` text.
-#[expect(
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
-fn render_after<F, Fut>(case: F) -> String
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let handle = recorder.handle();
-    metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("current-thread runtime");
-        rt.block_on(case());
-    });
-    handle.render()
 }
 
 /// The value of the `smg_worker_errors_total` sample for `worker_type` and

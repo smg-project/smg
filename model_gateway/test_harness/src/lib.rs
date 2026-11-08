@@ -9,6 +9,7 @@ pub mod held_worker;
 /// `src/hub_fetch.rs`), re-exported so a test binary that links both crates has
 /// one module and one download lock.
 pub use smg::test_support::hub_fetch;
+pub mod metrics_capture;
 pub mod mock_mcp_server;
 #[cfg(feature = "provider-openai")]
 pub mod mock_openai_server;
