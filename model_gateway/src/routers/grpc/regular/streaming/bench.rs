@@ -175,6 +175,8 @@ impl StreamBench {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            span: tracing::Span::none(),
+            marked: Arc::default(),
         });
         let completion_request: CompletionRequest = serde_json::from_value(json!({
             "model": MODEL, "prompt": COMPLETION_PROMPT, "stream": true
