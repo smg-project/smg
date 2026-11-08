@@ -28,7 +28,6 @@ use openai_protocol::{
     completion::CompletionRequest, model_card::ModelCard, responses::ResponsesRequest,
     worker::HealthCheckConfig,
 };
-use portpicker::pick_unused_port;
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage, ResponseId,
 };
@@ -64,6 +63,7 @@ use crate::{
                 responses::{route_responses, route_responses_background_stream},
                 symphony::template::Templates,
             },
+            test_engine::serve_on_loopback,
             utils::tonic_ext::TonicStatusExt,
         },
     },
@@ -453,30 +453,10 @@ impl TokenSpeedScheduler for GatedScheduler {
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "test helper; the stub server lives for the test process"
-)]
+/// The stub engine served on a loopback port bound before it is handed out.
 async fn spawn_stub(scheduler: GatedScheduler) -> u16 {
-    let port = pick_unused_port().expect("no free port for release-test stub");
-    let addr = format!("127.0.0.1:{port}").parse().expect("stub addr");
-    tokio::spawn(async move {
-        Server::builder()
-            .add_service(TokenSpeedSchedulerServer::new(scheduler))
-            .serve(addr)
-            .await
-            .expect("release-test stub server");
-    });
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
-            return port;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("release-test stub on port {port} never came up");
+    let router = Server::builder().add_service(TokenSpeedSchedulerServer::new(scheduler));
+    serve_on_loopback(router).await.0.port()
 }
 
 fn register_worker(
