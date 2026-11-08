@@ -1551,8 +1551,8 @@ fn supervise_discovery(
 /// listener addresses can still fail the start after this, with these
 /// listeners bound) and before the admin and HTTP listeners: the O(1)
 /// readiness state the probes read (maintained from
-/// WorkerRegistry events plus a short checkpoint for broadcast-bypassing
-/// mutations, served by `/readiness` on the main listener and on the optional
+/// WorkerRegistry events plus a short checkpoint for what no event carries,
+/// served by `/readiness` on the main listener and on the optional
 /// probe listener); the metrics listener (the recorder exists since the top of
 /// start-up, the port binds only now, eagerly, so a conflict or a bad address
 /// fails the start before the HTTP listener) with the Tokio runtime observer

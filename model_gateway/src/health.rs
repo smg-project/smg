@@ -18,11 +18,13 @@
 //!    [`ReadinessSnapshot`] behind an [`ArcSwap`]. Probe handlers load the
 //!    snapshot (one atomic pointer load) and never touch the registry. The
 //!    maintainer recomputes on every `WorkerEvent` (bursts coalesced) and on
-//!    a short checkpoint interval. The checkpoint covers the status
-//!    mutations that bypass the registry broadcast — `set_status()` called
-//!    directly by `ActivateWorkersStep`, the mesh inbound health refresh in
-//!    `WorkerRegistry::on_remote_worker_state`, FFI bindings — and tokenizer
-//!    registrations, which emit no worker event at all.
+//!    a short checkpoint interval. Every status write on a registered worker
+//!    goes through `WorkerRegistry::transition_under_lock` and emits
+//!    `StatusChanged` (`ActivateWorkersStep`, the worker manager's health
+//!    state machine, the mesh inbound refresh in
+//!    `WorkerRegistry::on_remote_worker_state`), so the checkpoint covers
+//!    what no event carries: tokenizer registrations and removals. (A
+//!    lagged broadcast recomputes in the event arm itself.)
 //!
 //! 2. **Dedicated probe listener.** When `--health-check-port` (config
 //!    `health_check_port`) is set, `/liveness`, `/readiness`, and `/health`
@@ -83,11 +85,10 @@ use crate::{
 };
 
 /// How often the maintainer re-derives readiness from the registry even
-/// without worker events. This bounds the staleness of mutations that
-/// bypass the `WorkerRegistry` broadcast (direct `set_status()` callers,
-/// tokenizer registrations) and is deliberately shorter than the metrics
-/// collectors' 3s checkpoint: readiness gates traffic, so a flip should
-/// land within one probe interval.
+/// without worker events. This bounds the staleness of what no event
+/// carries (tokenizer registrations and removals) and is deliberately
+/// shorter than the metrics collectors' 3s checkpoint: readiness gates
+/// traffic, so a flip should land within one probe interval.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Result of one readiness evaluation. Field semantics are identical to the
@@ -533,11 +534,11 @@ fn mark_probe(mut response: Response) -> Response {
 
 /// Spawn the readiness maintainer: recomputes the snapshot on every
 /// `WorkerRegistry` event (bursts coalesced into one recompute) and on a
-/// checkpoint interval that catches broadcast-bypassing mutations and
-/// tokenizer registrations. The loop runs on the caller's runtime — if that
-/// runtime is starved the snapshot goes stale but probes still answer in
-/// O(1), which is the failure mode we want (stale-but-served, never timed
-/// out).
+/// checkpoint interval that catches what no event carries: tokenizer
+/// registrations and removals (a lagged broadcast recomputes in the event
+/// arm itself). The loop runs on the caller's runtime — if that runtime is
+/// starved the snapshot goes stale but probes still answer in O(1), which
+/// is the failure mode we want (stale-but-served, never timed out).
 ///
 /// The initial snapshot is computed synchronously, after subscribing (so no
 /// event can fall between snapshot and subscription): workers registered
@@ -599,8 +600,8 @@ pub fn spawn_readiness_maintainer(
                     }
                 }
                 _ = checkpoint.tick() => {
-                    // Catch changes that bypass the broadcast channel and
-                    // tokenizer registrations (which emit no worker event).
+                    // Catch what no event carries: tokenizer registrations
+                    // and removals.
                 }
             }
 
@@ -1774,9 +1775,9 @@ mod tests {
         handle.abort();
     }
 
-    /// The checkpoint exists for the mutations that bypass the registry's
-    /// broadcast: a status set on the worker itself emits no event, and the
-    /// next checkpoint still re-derives readiness from the live workers.
+    /// The checkpoint also catches a status set on the worker itself, which
+    /// emits no event: the next checkpoint still re-derives readiness from
+    /// the live workers.
     #[tokio::test(start_paused = true)]
     async fn maintainer_checkpoint_sees_a_status_set_on_the_worker_itself() {
         let state = probe_state();
