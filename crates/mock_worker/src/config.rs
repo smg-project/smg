@@ -45,6 +45,19 @@ pub struct Config {
     /// one message per token as it comes, the shape the tests have read so
     /// far.
     pub zmq_step_ms: u64,
+    /// Whether the ZMQ ranks of this process step as one lockstep
+    /// data-parallel group (`--zmq-lockstep`): they advertise the group's
+    /// size at the handshake, sync every step, park together when no rank
+    /// has work (each reports the drained wave) and wake on the frontend's
+    /// wave start, the engine side of the wave protocol the gateway's
+    /// connector drives. Off, the default, every rank is an independent
+    /// engine.
+    pub zmq_lockstep: bool,
+    /// How long after reading an add a ZMQ rank's loop sees it, in
+    /// milliseconds (`--zmq-add-delay-ms`): an engine's input thread decodes
+    /// and preprocesses a request before its loop does, a wave start it hands
+    /// over at once. Zero, the default, hands an add over as it is read.
+    pub zmq_add_delay_ms: u64,
     /// Model id advertised by every worker (one model, many replicas).
     pub model_id: String,
     /// Tokenizer path advertised by gRPC workers (for gateway autoload).
@@ -289,6 +302,8 @@ impl Default for Config {
             zmq_count: 0,
             zmq_start_index: 0,
             zmq_step_ms: 0,
+            zmq_lockstep: false,
+            zmq_add_delay_ms: 0,
             model_id: "mock-model".to_string(),
             tokenizer_path: String::new(),
             default_sampling_params_json: String::new(),
@@ -352,6 +367,10 @@ impl Config {
                 "--zmq-step-ms" => cfg.zmq_step_ms = parse(value(&mut args, &flag)?, &flag)?,
                 "--zmq-start-index" => {
                     cfg.zmq_start_index = parse(value(&mut args, &flag)?, &flag)?
+                }
+                "--zmq-lockstep" => cfg.zmq_lockstep = true,
+                "--zmq-add-delay-ms" => {
+                    cfg.zmq_add_delay_ms = parse(value(&mut args, &flag)?, &flag)?
                 }
                 "--model" => cfg.model_id = value(&mut args, &flag)?,
                 "--tokenizer" => cfg.tokenizer_path = value(&mut args, &flag)?,
@@ -528,6 +547,18 @@ impl Config {
         if cfg.zmq_count > 0 && cfg.zmq_handshake.is_none() {
             return Err("--zmq-handshake <ipc://…> is required when --zmq-count > 0".to_string());
         }
+        if cfg.zmq_lockstep && cfg.zmq_count < 2 {
+            return Err(
+                "--zmq-lockstep needs --zmq-count of 2 or more: a lockstep group is several ranks"
+                    .to_string(),
+            );
+        }
+        if cfg.zmq_lockstep && cfg.zmq_step_ms == 0 {
+            return Err(
+                "--zmq-lockstep needs --zmq-step-ms above 0: the group syncs once per step"
+                    .to_string(),
+            );
+        }
         if cfg.replay.capture.is_some() && cfg.grpc_wire != SchedulerWire::TokenSpeed {
             return Err(format!(
                 "--capture records the request's fields as the tokenspeed wire names them: it \
@@ -692,6 +723,13 @@ pub fn usage() -> String {
        --zmq-step-ms <ms>       the ranks' step period: one output message per period with the next\n\
                                 token of every running request (an engine's step; a faster request\n\
                                 waits its turn); 0 sends one message per token (default 0)\n\
+       --zmq-lockstep           the ranks step as one lockstep data-parallel group: they sync every\n\
+                                step, park together when idle and wake on the frontend's wave start\n\
+                                (needs --zmq-count of 2 or more and --zmq-step-ms); off, every rank\n\
+                                is an independent engine\n\
+       --zmq-add-delay-ms <ms>  how long after reading an add a rank's loop sees it, as an engine's\n\
+                                input thread preprocesses a request first (a wave start lands at\n\
+                                once; default 0)\n\
        --model <id|dir>         advertised model id, or a model directory whose\n\
                                 generation_config.json gives the sampling defaults gRPC\n\
                                 workers report (default mock-model)\n\
@@ -1222,5 +1260,51 @@ mod tests {
         let refused = parse(&[&zmq[..], &["--zmq-step-ms", "soon"]].concat())
             .expect_err("not a number of milliseconds");
         assert!(refused.contains("--zmq-step-ms"), "{refused}");
+    }
+
+    /// A lockstep group is several ranks syncing at one step period; the add
+    /// hand-over delay is milliseconds and the ranks are independent without
+    /// the flag.
+    #[test]
+    fn zmq_lockstep_needs_two_ranks_and_a_step_period() {
+        let two = [
+            "--zmq-handshake",
+            "ipc:///tmp/mock-handshake",
+            "--zmq-count",
+            "2",
+        ];
+        assert!(!parse(&two).expect("independent ranks").zmq_lockstep);
+        let group = parse(
+            &[
+                &two[..],
+                &[
+                    "--zmq-lockstep",
+                    "--zmq-step-ms",
+                    "5",
+                    "--zmq-add-delay-ms",
+                    "20",
+                ],
+            ]
+            .concat(),
+        )
+        .expect("a group");
+        assert!(group.zmq_lockstep);
+        assert_eq!(group.zmq_add_delay_ms, 20);
+        let one_rank = parse(
+            &[
+                "--zmq-handshake",
+                "ipc:///tmp/mock-handshake",
+                "--zmq-count",
+                "1",
+                "--zmq-lockstep",
+                "--zmq-step-ms",
+                "5",
+            ][..],
+        )
+        .expect_err("one rank is no group");
+        assert!(one_rank.contains("--zmq-count"), "{one_rank}");
+        let no_period =
+            parse(&[&two[..], &["--zmq-lockstep"]].concat()).expect_err("no step period");
+        assert!(no_period.contains("--zmq-step-ms"), "{no_period}");
     }
 }
