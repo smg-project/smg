@@ -443,6 +443,56 @@ pub struct EngineParams {
     /// (`KvEventBatch.dp_rank`): 0 for a single-rank engine, the rank's index
     /// for one of a gRPC worker's `--grpc-dp-size` ranks.
     pub dp_rank: i32,
+    /// The KV cache groups the engine publishes, the first being its
+    /// main-attention group (one group of full attention by default). A
+    /// hybrid engine names more: every group's events carry its index, kind
+    /// and window ([`KvCacheGroup`]).
+    pub kv_cache_groups: Vec<KvCacheGroup>,
+}
+
+/// One KV cache group of a hybrid engine, as vLLM's hybrid KV-cache manager
+/// has them: an attention kind (`full_attention`, `mla_attention`,
+/// `sliding_window`, `sliding_window_mla`, `mamba`, ...) and, for a window
+/// group, its window in tokens.
+///
+/// Every group shares the block size and the block hashes (vLLM hashes a
+/// block without its group; the group is a field of the event). What differs
+/// is which blocks a group keeps, and the mock follows vLLM 0.31.0's default
+/// retention: the main group keeps every full block; a sliding-window group
+/// keeps only the `ceil((window - 1) / block_size)` blocks ending at the
+/// prompt's aligned replay boundary (what a later request can resume from);
+/// a Mamba group keeps the one state block ending there. A hybrid engine's
+/// window stores span the whole step in vLLM while naming the kept hashes
+/// only; the mock names the kept blocks with their own tokens, whole blocks
+/// on both wires.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvCacheGroup {
+    pub kind: String,
+    pub sliding_window: u32,
+}
+
+impl KvCacheGroup {
+    /// The main-attention group every engine has.
+    pub fn full_attention() -> Self {
+        Self {
+            kind: "full_attention".to_string(),
+            sliding_window: 0,
+        }
+    }
+
+    /// Whether this group keeps the block at `index` of a request whose
+    /// prompt's aligned replay boundary ends block `boundary_block`.
+    fn retains(&self, index: usize, boundary_block: usize, block_size: usize) -> bool {
+        match self.kind.as_str() {
+            "sliding_window" | "sliding_window_mla" => {
+                let window = self.sliding_window.max(1) as usize;
+                let need = (window - 1).div_ceil(block_size.max(1)).max(1);
+                index < boundary_block && index + need >= boundary_block
+            }
+            "mamba" => index + 1 == boundary_block,
+            _ => true,
+        }
+    }
 }
 
 impl Default for EngineParams {
@@ -464,6 +514,7 @@ impl Default for EngineParams {
             kv_replay_capacity: 4096,
             output_prefix: Vec::new(),
             dp_rank: 0,
+            kv_cache_groups: vec![KvCacheGroup::full_attention()],
         }
     }
 }
@@ -1533,6 +1584,9 @@ struct BlockPool {
     free_lru: BTreeSet<(u64, u64)>,
     tick: u64,
     allocated: u64,
+    /// The KV cache groups that stored each cached block, one bit per group
+    /// index, so an eviction is published once per group as vLLM does.
+    groups: HashMap<u64, u8>,
 }
 
 impl BlockPool {
@@ -1685,6 +1739,14 @@ struct Completed {
     index: usize,
     key: u64,
     tokens: Vec<u32>,
+}
+
+/// A contiguous run of blocks a request completed in one pass, with the
+/// block before the run's first (the chain parent of its stored event) and
+/// each block's index in the request's sequence.
+struct CompletedRun {
+    parent: Option<u64>,
+    blocks: Vec<(usize, common::KvBlock)>,
 }
 
 /// Making room for a running request's next tokens preempted the request
@@ -2362,6 +2424,9 @@ impl SchedulerState {
         stored
     }
 
+    /// `Removed` events for evicted blocks: one per KV cache group that
+    /// stored them, the main group's first, as vLLM publishes an eviction per
+    /// hash and group.
     fn push_removed(
         &mut self,
         kv: &mut Vec<common::KvCacheEvent>,
@@ -2371,21 +2436,39 @@ impl SchedulerState {
         if freed.is_empty() || !p.prefix_cache {
             return;
         }
-        self.kv_event_id += 1;
-        kv.push(common::KvCacheEvent {
-            event_id: self.kv_event_id,
-            data: Some(common::kv_cache_event::Data::Removed(
-                common::KvBlocksRemoved {
-                    block_hashes: freed.into_iter().map(|k| k as i64).collect(),
-                    cache_level: None,
-                    ..Default::default()
-                },
-            )),
-        });
+        let group_count = p.kv_cache_groups.len().clamp(1, 8);
+        let mut per_group: Vec<Vec<i64>> = vec![Vec::new(); group_count];
+        for key in freed {
+            let mask = self.pool.groups.remove(&key).unwrap_or(1);
+            for (group, hashes) in per_group.iter_mut().enumerate() {
+                if mask & (1u8 << group) != 0 {
+                    hashes.push(key as i64);
+                }
+            }
+        }
+        for (group, block_hashes) in per_group.into_iter().enumerate() {
+            if block_hashes.is_empty() {
+                continue;
+            }
+            self.kv_event_id += 1;
+            kv.push(common::KvCacheEvent {
+                event_id: self.kv_event_id,
+                data: Some(common::kv_cache_event::Data::Removed(
+                    common::KvBlocksRemoved {
+                        block_hashes,
+                        cache_level: None,
+                        group_idx: Some(group as u32),
+                        ..Default::default()
+                    },
+                )),
+            });
+        }
     }
 
     /// `Stored` events for the blocks `running[idx]` completed this pass: one
-    /// per contiguous run, chained to the block before the run's first.
+    /// per contiguous run and KV cache group, chained to the block before the
+    /// run's first; a group other than the main one names only the blocks it
+    /// retains ([`KvCacheGroup::retains`]).
     fn push_stored(
         &mut self,
         kv: &mut Vec<common::KvCacheEvent>,
@@ -2396,40 +2479,68 @@ impl SchedulerState {
         if completed.is_empty() || !p.prefix_cache {
             return;
         }
-        let held = &self.running[idx].held;
-        let mut runs: Vec<(Option<u64>, Vec<common::KvBlock>)> = Vec::new();
+        let block_size = p.block_size.max(1) as usize;
+        let request = &self.running[idx];
+        let held = &request.held;
+        // The prompt's aligned replay boundary, in blocks: the position a
+        // later request replaying this prompt resumes at, which is where the
+        // sparse groups keep their state.
+        let boundary_block = (request.prompt_tokens.max(1) as usize - 1) / block_size;
+        let mut runs: Vec<CompletedRun> = Vec::new();
         let mut last_index: Option<usize> = None;
         for c in completed {
             let contiguous = last_index.is_some_and(|prev| prev + 1 == c.index);
             if !contiguous || runs.is_empty() {
                 let parent = c.index.checked_sub(1).map(|pos| held[pos]);
-                runs.push((parent, Vec::new()));
+                runs.push(CompletedRun {
+                    parent,
+                    blocks: Vec::new(),
+                });
             }
             last_index = Some(c.index);
-            runs.last_mut()
-                .expect("run exists")
-                .1
-                .push(common::KvBlock {
+            runs.last_mut().expect("run exists").blocks.push((
+                c.index,
+                common::KvBlock {
                     block_hash: c.key as i64,
                     token_ids: c.tokens,
                     block_size: p.block_size as i32,
                     lora_id: None,
                     cache_level: None,
                     ..Default::default()
-                });
+                },
+            ));
         }
-        for (parent, blocks) in runs {
-            self.kv_event_id += 1;
-            kv.push(common::KvCacheEvent {
-                event_id: self.kv_event_id,
-                data: Some(common::kv_cache_event::Data::Stored(
-                    common::KvBlocksStored {
-                        blocks,
-                        parent_block_hash: parent.map(|k| k as i64),
-                        ..Default::default()
-                    },
-                )),
-            });
+        let groups = p.kv_cache_groups.iter().take(8).enumerate();
+        for CompletedRun { parent, blocks } in runs {
+            for (group_idx, group) in groups.clone() {
+                let kept: Vec<common::KvBlock> = blocks
+                    .iter()
+                    .filter(|(index, _)| group.retains(*index, boundary_block, block_size))
+                    .map(|(_, block)| block.clone())
+                    .collect();
+                if kept.is_empty() {
+                    continue;
+                }
+                for block in &kept {
+                    *self.pool.groups.entry(block.block_hash as u64).or_insert(0) |=
+                        1u8 << group_idx;
+                }
+                self.kv_event_id += 1;
+                kv.push(common::KvCacheEvent {
+                    event_id: self.kv_event_id,
+                    data: Some(common::kv_cache_event::Data::Stored(
+                        common::KvBlocksStored {
+                            blocks: kept,
+                            parent_block_hash: parent.map(|k| k as i64),
+                            group_idx: Some(group_idx as u32),
+                            kv_cache_spec_kind: Some(group.kind.clone()),
+                            kv_cache_spec_sliding_window: (group.sliding_window > 0)
+                                .then_some(group.sliding_window),
+                            ..Default::default()
+                        },
+                    )),
+                });
+            }
         }
     }
 }
@@ -3566,6 +3677,135 @@ mod tests {
         assert_eq!(stored[0].blocks.len(), 1, "only the third block is new");
         let second_key = Engine::block_keys(&(0..8).collect::<Vec<_>>(), 4)[1];
         assert_eq!(stored[0].parent_block_hash, Some(second_key as i64));
+    }
+
+    #[test]
+    fn a_hybrid_engine_stores_the_window_tail_and_the_state_block_beside_full_attention() {
+        let p = EngineParams {
+            block_size: 4,
+            kv_cache_groups: vec![
+                KvCacheGroup::full_attention(),
+                KvCacheGroup {
+                    kind: "sliding_window".to_string(),
+                    sliding_window: 8,
+                },
+                KvCacheGroup {
+                    kind: "mamba".to_string(),
+                    sliding_window: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut st = SchedulerState::new();
+        // 25 prompt tokens: six full blocks; the aligned replay boundary (24)
+        // ends block 5.
+        let (r, _rx) = req("x", (0..25).collect(), 1);
+        st.enqueue(r, &p);
+        let batch = st.step(&p).batch.expect("stored events expected");
+        let stored = stored_events(&batch);
+        assert_eq!(stored.len(), 3, "one store per group");
+        let keys = Engine::block_keys(&(0..24).collect::<Vec<_>>(), 4);
+        assert_eq!(stored[0].group_idx, Some(0));
+        assert_eq!(
+            stored[0].kv_cache_spec_kind.as_deref(),
+            Some("full_attention")
+        );
+        assert_eq!(
+            stored[0].blocks.len(),
+            6,
+            "full attention keeps every block"
+        );
+        assert_eq!(stored[1].group_idx, Some(1));
+        assert_eq!(
+            stored[1].kv_cache_spec_kind.as_deref(),
+            Some("sliding_window")
+        );
+        assert_eq!(stored[1].kv_cache_spec_sliding_window, Some(8));
+        assert_eq!(
+            stored[1]
+                .blocks
+                .iter()
+                .map(|b| b.block_hash)
+                .collect::<Vec<_>>(),
+            vec![keys[4] as i64, keys[5] as i64],
+            "a window of 8 over blocks of 4 keeps the two blocks ending at the boundary"
+        );
+        assert_eq!(
+            stored[1].parent_block_hash, stored[0].parent_block_hash,
+            "the step's chain parent, as the engine publishes it"
+        );
+        assert_eq!(stored[2].group_idx, Some(2));
+        assert_eq!(stored[2].kv_cache_spec_kind.as_deref(), Some("mamba"));
+        assert_eq!(stored[2].kv_cache_spec_sliding_window, None);
+        assert_eq!(
+            stored[2]
+                .blocks
+                .iter()
+                .map(|b| b.block_hash)
+                .collect::<Vec<_>>(),
+            vec![keys[5] as i64],
+            "the state block ending at the boundary"
+        );
+    }
+
+    #[test]
+    fn an_evicted_block_is_removed_from_every_group_that_stored_it() {
+        // 8 blocks of 4 tokens; each prompt takes 3 full blocks plus a tail.
+        let p = EngineParams {
+            block_size: 4,
+            kv_capacity_tokens: 32,
+            max_running: 64,
+            kv_cache_groups: vec![
+                KvCacheGroup::full_attention(),
+                KvCacheGroup {
+                    kind: "mamba".to_string(),
+                    sliding_window: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut st = SchedulerState::new();
+        let mut rxs = Vec::new();
+        let mut removed: Vec<(Option<u32>, Vec<i64>)> = Vec::new();
+        for i in 0..6 {
+            let base = (i as u32) * 1000;
+            let (r, rx) = req(&format!("r{i}"), (base..base + 13).collect(), 1);
+            st.enqueue(r, &p);
+            rxs.push(rx);
+            for _ in 0..4 {
+                if let Some(batch) = st.step(&p).batch {
+                    for event in &batch.events {
+                        if let Some(common::kv_cache_event::Data::Removed(r)) = &event.data {
+                            removed.push((r.group_idx, r.block_hashes.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        let main: Vec<i64> = removed
+            .iter()
+            .filter(|(g, _)| *g == Some(0))
+            .flat_map(|(_, h)| h.clone())
+            .collect();
+        let state: Vec<i64> = removed
+            .iter()
+            .filter(|(g, _)| *g == Some(1))
+            .flat_map(|(_, h)| h.clone())
+            .collect();
+        assert!(!main.is_empty(), "the main group's evictions: {removed:?}");
+        assert!(
+            !state.is_empty(),
+            "the state group's eviction of its boundary block: {removed:?}"
+        );
+        assert!(
+            state.iter().all(|h| main.contains(h)),
+            "a state block is a main block too"
+        );
+        assert!(
+            removed.iter().all(|(g, _)| g.is_some()),
+            "every removal names its group"
+        );
+        drop(rxs);
     }
 
     #[test]

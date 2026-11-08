@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::engine::{Calibration, EngineParams, LoadsLike, OutputSeed, TimingModel};
+use crate::engine::{Calibration, EngineParams, KvCacheGroup, LoadsLike, OutputSeed, TimingModel};
 
 /// Configuration shared by every mocked HTTP and gRPC worker in the process.
 #[derive(Debug, Clone)]
@@ -436,6 +436,10 @@ impl Config {
                     cfg.kv_events_buffer_steps = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--kv-events-wire" => cfg.kv_events_wire = value(&mut args, &flag)?.parse()?,
+                "--kv-cache-groups" => {
+                    cfg.engine.kv_cache_groups =
+                        parse_kv_cache_groups(value(&mut args, &flag)?, &flag)?;
+                }
                 "--loads-like" => cfg.loads_like = value(&mut args, &flag)?.parse()?,
                 "--step-reports" => cfg.step_reports = parse(value(&mut args, &flag)?, &flag)?,
                 "--block-size" => {
@@ -606,6 +610,36 @@ fn parse_ids(raw: String, flag: &str) -> Result<Vec<u32>, String> {
         .collect()
 }
 
+/// `kind[:window],...`: the KV cache groups a realistic engine publishes,
+/// the first being its main-attention group (`full_attention` alone by
+/// default; a hybrid engine adds `sliding_window:<tokens>` or `mamba` groups).
+fn parse_kv_cache_groups(raw: String, flag: &str) -> Result<Vec<KvCacheGroup>, String> {
+    let invalid = || format!("invalid value for {flag}: {raw}");
+    let groups = raw
+        .split(',')
+        .map(|item| {
+            let item = item.trim();
+            let (kind, window) = item.split_once(':').unwrap_or((item, ""));
+            if kind.is_empty() {
+                return Err(invalid());
+            }
+            let sliding_window = if window.is_empty() {
+                0
+            } else {
+                window.parse().map_err(|_| invalid())?
+            };
+            Ok(KvCacheGroup {
+                kind: kind.to_string(),
+                sliding_window,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if groups.is_empty() || groups.len() > 8 {
+        return Err(format!("{flag} takes one to eight groups"));
+    }
+    Ok(groups)
+}
+
 /// The flags, as `--help` prints them.
 pub fn usage() -> String {
     "mock-worker — multi-port mock HTTP/gRPC inference workers for SMG scale testing\n\n\
@@ -675,6 +709,11 @@ pub fn usage() -> String {
        --kv-events-topic <s>    topic frame (default empty, as vLLM)\n\
        --kv-events-buffer-steps <n>  batches kept for replay (default 10000)\n\
        --kv-events-wire <vllm|sglang>  which engine's publisher to imitate (default vllm)\n\
+       --kv-cache-groups <kind[:window],...>  the KV cache groups a realistic engine publishes, the
+                                first its main-attention group (default full_attention): a hybrid
+                                engine adds sliding_window:<tokens> or mamba groups, whose stores
+                                name the window tail or the state block at the prompt's replay
+                                boundary, as vLLM 0.31.0 retains them by default\n\
        --loads-like <mock|vllm>  load report: everything the simulator knows, or only what the\n\
                                 vLLM servicer reports (running, waiting, token_usage, maxima)\n\
        --step-reports <bool>    the load record says the wire reports every scheduler step (as\n\

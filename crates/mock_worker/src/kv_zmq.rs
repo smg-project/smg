@@ -18,9 +18,11 @@
 //! vLLM wire (`Wire::Vllm`): events in vLLM's field order with its
 //! `omit_defaults`: a `BlockStored` carries `block_hashes`,
 //! `parent_block_hash`, `token_ids`, `block_size`, `lora_id`, `medium`,
-//! `lora_name` (required, nil when unset) and then `group_idx` and
-//! `kv_cache_spec_kind`; a `BlockRemoved` carries `block_hashes`, `medium`,
-//! `group_idx`; hashes are unsigned 64-bit integers; replay replies are
+//! `lora_name` (required, nil when unset) and then `group_idx`,
+//! `kv_cache_spec_kind` and, for a window group, `kv_cache_spec_sliding_window`
+//! (a hybrid engine publishes one store per cache group, see
+//! `crate::engine::KvCacheGroup`); a `BlockRemoved` carries `block_hashes`,
+//! `medium`, `group_idx`; hashes are unsigned 64-bit integers; replay replies are
 //! `[routing…, topic, seq, payload]` and `[routing…, b"", END, b""]`.
 //!
 //! SGLang wire (`Wire::Sglang`): hashes are signed 64-bit integers (SGLang
@@ -364,7 +366,7 @@ fn stored_map(stored: &common::KvBlocksStored) -> Value {
         .iter()
         .flat_map(|b| b.token_ids.iter().map(|t| Value::from(*t)))
         .collect();
-    Value::Map(vec![
+    let mut entries = vec![
         (key("type"), Value::String("BlockStored".into())),
         (
             key("block_hashes"),
@@ -388,12 +390,23 @@ fn stored_map(stored: &common::KvBlocksStored) -> Value {
         (key("lora_id"), Value::Nil),
         (key("medium"), Value::String("GPU".into())),
         (key("lora_name"), Value::Nil),
-        (key("group_idx"), Value::from(0)),
+        (key("group_idx"), Value::from(stored.group_idx.unwrap_or(0))),
         (
             key("kv_cache_spec_kind"),
-            Value::String("full_attention".into()),
+            Value::String(
+                stored
+                    .kv_cache_spec_kind
+                    .clone()
+                    .unwrap_or_else(|| "full_attention".to_string())
+                    .into(),
+            ),
         ),
-    ])
+    ];
+    // vLLM omits the window field unless the group has one.
+    if let Some(window) = stored.kv_cache_spec_sliding_window {
+        entries.push((key("kv_cache_spec_sliding_window"), Value::from(window)));
+    }
+    Value::Map(entries)
 }
 
 fn removed_map(removed: &common::KvBlocksRemoved) -> Value {
@@ -410,7 +423,10 @@ fn removed_map(removed: &common::KvBlocksRemoved) -> Value {
             ),
         ),
         (key("medium"), Value::String("GPU".into())),
-        (key("group_idx"), Value::from(0)),
+        (
+            key("group_idx"),
+            Value::from(removed.group_idx.unwrap_or(0)),
+        ),
     ])
 }
 
@@ -633,6 +649,41 @@ mod tests {
         assert_eq!(field(&events[1], "type").as_str(), Some("BlockRemoved"));
         assert_eq!(keys(&events[2]), ["type"]);
         assert_eq!(field(&events[2], "type").as_str(), Some("AllBlocksCleared"));
+    }
+
+    #[test]
+    fn a_window_group_store_carries_its_group_kind_and_window_on_the_wire() {
+        let mut batch = sample_batch();
+        if let Some(common::kv_cache_event::Data::Stored(stored)) = &mut batch.events[0].data {
+            stored.group_idx = Some(2);
+            stored.kv_cache_spec_kind = Some("sliding_window".to_string());
+            stored.kv_cache_spec_sliding_window = Some(1024);
+        }
+        if let Some(common::kv_cache_event::Data::Removed(removed)) = &mut batch.events[1].data {
+            removed.group_idx = Some(2);
+        }
+        let payload = encode_batch(&batch, 0, Wire::Vllm);
+        let Value::Array(root) =
+            rmpv::decode::read_value(&mut payload.as_slice()).expect("msgpack")
+        else {
+            panic!("array");
+        };
+        let events = root[1].as_array().expect("events");
+        assert_eq!(
+            keys(&events[0]).last().map(String::as_str),
+            Some("kv_cache_spec_sliding_window"),
+            "the window field follows the kind, as vLLM's field order has it"
+        );
+        assert_eq!(field(&events[0], "group_idx").as_i64(), Some(2));
+        assert_eq!(
+            field(&events[0], "kv_cache_spec_kind").as_str(),
+            Some("sliding_window")
+        );
+        assert_eq!(
+            field(&events[0], "kv_cache_spec_sliding_window").as_i64(),
+            Some(1024)
+        );
+        assert_eq!(field(&events[1], "group_idx").as_i64(), Some(2));
     }
 
     #[test]
