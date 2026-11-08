@@ -187,6 +187,47 @@ fn shm_pixel_batch(tag: &str) -> vllm::MultimodalInputs {
     }
 }
 
+/// An int64 tensor with its bytes on the wire.
+fn inline_i64_tensor(shape: Vec<u32>, values: &[i64]) -> vllm::TensorData {
+    vllm::TensorData {
+        shape,
+        dtype: "int64".to_string(),
+        payload: Some(vllm::tensor_data::Payload::Inline(
+            values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>()
+                .into(),
+        )),
+    }
+}
+
+/// An int64 tensor whose bytes sit in a fresh `/dev/shm` file (read and
+/// unlinked once by the servicer).
+#[cfg(target_os = "linux")]
+fn shm_i64_tensor(tag: &str, shape: Vec<u32>, values: &[i64]) -> vllm::TensorData {
+    let name = format!(
+        "smg-servicer-test-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let payload: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    fs::write(std::path::Path::new("/dev/shm").join(&name), &payload).expect("write shm file");
+    vllm::TensorData {
+        shape,
+        dtype: "int64".to_string(),
+        payload: Some(vllm::tensor_data::Payload::Shm(common::ShmHandle {
+            name,
+            offset: 0,
+            nbytes: payload.len() as u64,
+            owner_id: "smg:test".to_string(),
+        })),
+    }
+}
+
 fn config(dir: &std::path::Path, handshake: &str, model: VllmModelInfo) -> VllmServicerConfig {
     VllmServicerConfig {
         servicer: servicer_config(dir, handshake),
@@ -1527,7 +1568,28 @@ async fn encoder_cache_producer_completion_carries_the_identity_and_the_cpu_hand
                 input_ids: vec![0; 9],
             },
         ));
-        request.mm_inputs = Some(shm_pixel_batch(id));
+        // Beside the pixels: a grid inline (kept by the identity), a grid in
+        // shared memory (dropped: unlinked once read) and a non-grid tensor
+        // (dropped: not part of the identity), all batched one row per item.
+        let mut mm = shm_pixel_batch(id);
+        mm.model_specific_tensors.insert(
+            "image_grid_thw".to_string(),
+            inline_i64_tensor(vec![2, 3], &[1, 2, 2, 1, 2, 2]),
+        );
+        mm.model_specific_tensors.insert(
+            "video_grid_thw".to_string(),
+            shm_i64_tensor(&format!("{id}-grid"), vec![2, 3], &[1, 2, 2, 1, 2, 2]),
+        );
+        mm.model_specific_tensors.insert(
+            "patches_per_image".to_string(),
+            inline_i64_tensor(vec![2], &[4, 4]),
+        );
+        mm.batched_keys.extend(
+            ["image_grid_thw", "video_grid_thw", "patches_per_image"]
+                .iter()
+                .map(|key| key.to_string()),
+        );
+        request.mm_inputs = Some(mm);
         request.ec_transfer_params_json = Some("{}".to_string());
         let mut stream = h
             .client
@@ -1569,6 +1631,16 @@ async fn encoder_cache_producer_completion_carries_the_identity_and_the_cpu_hand
             "the identity carries no pixels"
         );
         assert_eq!(batch.mm_placeholders.len(), 2);
+        let mut kept: Vec<&String> = batch.model_specific_tensors.keys().collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            ["image_grid_thw"],
+            "the identity keeps the inline grid alone: not the grid in shared memory, not a \
+             non-grid tensor"
+        );
+        assert_eq!(batch.batched_keys, vec!["image_grid_thw"]);
+        assert!(batch.flat_keys.is_empty() && batch.keep_on_cpu_keys.is_empty());
         let returned: serde_json::Value =
             serde_json::from_str(finished.ec_transfer_params_json.as_deref().unwrap()).unwrap();
         assert_eq!(returned["h1"]["peer_port"], 5700);

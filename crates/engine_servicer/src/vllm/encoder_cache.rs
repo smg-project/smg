@@ -4,6 +4,8 @@
 //! the request's media identity, and a CPU connector's producer must return a
 //! fetch address for every item it encoded.
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
@@ -12,6 +14,16 @@ use super::VllmModelInfo;
 
 const CPU_CONNECTOR: &str = "ECCPUConnector";
 const MOONCAKE_CONNECTOR: &str = "ECMooncakeConnector";
+
+/// The per-item tensors a prefill side needs besides pixels: the M-RoPE
+/// grids and the video timing that goes with them, in both spellings (the
+/// Python servicer's `GRID_KEYS`, the Router's `VLLM_MROPE_GRID_KEYS`).
+const GRID_KEYS: [&str; 4] = [
+    "image_grid_thw",
+    "video_grid_thw",
+    "second_per_grid_ts",
+    "video_second_per_grid",
+];
 
 /// The refusal of a consumer's leg whose handles do not cover its pixel-less
 /// media, in the Python servicer's words.
@@ -124,7 +136,7 @@ fn handles_cover(missing: &[&vllm::MultimodalInputs], connector: &str, params: &
 /// A producer's completion carries the media identity the Router hands the
 /// prefill side: the prompt's token ids and the request's batches without
 /// their pixels (the hashes, the placeholders, the image token id, the
-/// modality and the grid tensors batched one row per item), for a request
+/// modality and the grid tensors with inline payloads), for a request
 /// whose batches all carry pixels and hashes. A media-reference request gets
 /// its identity from the media stage instead; a request without batches, or
 /// a pixel-less one (the consumer's leg), gets none.
@@ -150,20 +162,56 @@ pub(super) fn producer_identity(
     })
 }
 
-/// The batch as the identity carries it: the pixels dropped, the tensors
-/// batched one row per item kept (what the decode side reads), the flat
-/// ones dropped with the pixels; every other field as the request sent it.
+/// The batch as the identity carries it, the shape the Python servicer's
+/// `build_media_identity` and the Router's PD-decode identity give it: the
+/// hashes, the placeholders, the image token id and the modality as sent,
+/// the grid tensors with inline payloads (a shared-memory segment is unlinked
+/// once the adapter has read it, so a handle to it would reach the prefill
+/// side dead) with the size tensors of the flat ones, every other tensor
+/// dropped with the pixels, and the key lists trimmed to what stays.
 fn without_pixels(batch: &vllm::MultimodalInputs) -> vllm::MultimodalInputs {
-    let mut stripped = batch.clone();
-    stripped.pixel_values = None;
-    stripped
-        .model_specific_tensors
-        .retain(|key, _| batch.batched_keys.contains(key));
-    stripped.flat_keys.clear();
-    stripped
-        .keep_on_cpu_keys
-        .retain(|key| batch.batched_keys.contains(key));
-    stripped
+    let inline = |key: &str| {
+        batch
+            .model_specific_tensors
+            .get(key)
+            .filter(|tensor| matches!(tensor.payload, Some(vllm::tensor_data::Payload::Inline(_))))
+            .cloned()
+    };
+    let mut tensors: HashMap<String, vllm::TensorData> = GRID_KEYS
+        .iter()
+        .filter_map(|key| inline(key).map(|tensor| (key.to_string(), tensor)))
+        .collect();
+    let mut flat_keys = HashMap::new();
+    for (key, sizes_key) in &batch.flat_keys {
+        if !tensors.contains_key(key) {
+            continue;
+        }
+        match inline(sizes_key) {
+            Some(sizes) => {
+                tensors.insert(sizes_key.clone(), sizes);
+                flat_keys.insert(key.clone(), sizes_key.clone());
+            }
+            None => {
+                tensors.remove(key);
+            }
+        }
+    }
+    let retained = |keys: &[String]| -> Vec<String> {
+        keys.iter()
+            .filter(|key| tensors.contains_key(*key))
+            .cloned()
+            .collect()
+    };
+    let batched_keys = retained(&batch.batched_keys);
+    let keep_on_cpu_keys = retained(&batch.keep_on_cpu_keys);
+    vllm::MultimodalInputs {
+        pixel_values: None,
+        batched_keys,
+        keep_on_cpu_keys,
+        flat_keys,
+        model_specific_tensors: tensors,
+        ..batch.clone()
+    }
 }
 
 /// A CPU connector's producer must return a fetch address for every media
