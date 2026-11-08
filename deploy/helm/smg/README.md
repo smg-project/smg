@@ -301,7 +301,7 @@ shutdowns and local Ctrl+C exits. A value of 0 skips the propagation wait
 
 Readiness itself is a kubelet signal: with kube-state-metrics in the cluster, `kube_pod_status_ready` on the router pods complements `SmgGatewayDown`.
 
-The rules have unit tests under `tests/rules`: `tests/rules/run.sh` (needs `helm` and `promtool`) renders the chart's rules and replays each test file's traffic shape against them.
+The rules have unit tests under `tests/rules`: `tests/rules/run.sh` (needs `helm` and `promtool`) renders the chart's rules and replays each test file's traffic shape against them. The `PR Helm Chart` workflow (`.github/workflows/pr-helm.yml`) lints the chart and runs them on every pull request that touches it.
 
 #### Readiness Deadlines
 
