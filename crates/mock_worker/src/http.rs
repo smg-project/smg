@@ -45,6 +45,11 @@ use crate::{
     script::{self, Answer},
 };
 
+/// The bootstrap port a scheduler takes without being told one, and the
+/// one the gateway probes for a prefill worker registered without a port:
+/// what a missing or null `bootstrap_port` in a request means.
+const DEFAULT_BOOTSTRAP_PORT: u16 = 8998;
+
 /// Per-listener HTTP state: shared config plus an optional engine simulator.
 struct AppState {
     cfg: Arc<Config>,
@@ -330,18 +335,23 @@ fn bootstrap_of(request: &Value, own_port: Option<u16>) -> Result<(), String> {
     let Some(own) = own_port else {
         return Ok(());
     };
+    // A missing or null port is the engines' default: a scheduler fills it
+    // with its own bootstrap port (8998 unless told otherwise), and the
+    // gateway, which sends null for a prefill worker registered without a
+    // port, probes that default for it. A worker on another port refuses
+    // it, as the pairing would send the decode side elsewhere.
+    let names_own = |port: &Value| match port {
+        Value::Null => own == DEFAULT_BOOTSTRAP_PORT,
+        port => port.as_u64() == Some(u64::from(own)),
+    };
     let named: &[Value] = match request.get("bootstrap_port") {
         Some(Value::Array(ports)) => ports,
         Some(port) => std::slice::from_ref(port),
-        None => &[],
+        None => &[Value::Null],
     };
-    if named.is_empty()
-        || named
-            .iter()
-            .any(|port| port.as_u64() != Some(u64::from(own)))
-    {
+    if named.is_empty() || !named.iter().all(names_own) {
         return Err(format!(
-            "bootstrap_port {} is not this worker's {own}",
+            "bootstrap_port {} is not this worker's {own} (a missing port means {DEFAULT_BOOTSTRAP_PORT})",
             request.get("bootstrap_port").unwrap_or(&Value::Null)
         ));
     }
@@ -1599,17 +1609,21 @@ mod tests {
     }
 
     /// A prefill worker that bound its port takes requests naming that port
-    /// alone (one, or one per prompt of a batch); one that bound none is
-    /// told nothing to check.
+    /// alone (one, or one per prompt of a batch). A missing or null port is
+    /// the engines' default, 8998: the worker on that port takes it, one on
+    /// another refuses it. One that bound none is told nothing to check.
     #[tokio::test]
     async fn a_prefill_worker_takes_the_bootstrap_port_it_bound_alone() {
         let bound = state_of(Some(Role::Prefill), Some(8998), "http:port-test");
         for (port, status) in [
             (json!(8998), StatusCode::OK),
             (json!([8998, 8998]), StatusCode::OK),
+            (json!(null), StatusCode::OK),
+            (json!([null, 8998]), StatusCode::OK),
             (json!(8999), StatusCode::BAD_REQUEST),
             (json!([8998, 8999]), StatusCode::BAD_REQUEST),
             (json!("8998"), StatusCode::BAD_REQUEST),
+            (json!([]), StatusCode::BAD_REQUEST),
         ] {
             let response = handle(
                 Endpoint::Chat,
@@ -1625,7 +1639,25 @@ mod tests {
             disaggregated_chat(Some(1), None, false),
         )
         .await;
-        assert_eq!(missing.status(), StatusCode::BAD_REQUEST, "no port named");
+        assert_eq!(
+            missing.status(),
+            StatusCode::OK,
+            "no port named: the default"
+        );
+        let elsewhere = state_of(Some(Role::Prefill), Some(9001), "http:elsewhere-test");
+        for port in [Some(json!(null)), None] {
+            let response = handle(
+                Endpoint::Chat,
+                Arc::clone(&elsewhere),
+                disaggregated_chat(Some(1), port.clone(), false),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "bootstrap_port {port:?} on a worker off the default port"
+            );
+        }
         let unbound = state_of(Some(Role::Prefill), None, "http:unbound-test");
         assert_eq!(
             handle(
