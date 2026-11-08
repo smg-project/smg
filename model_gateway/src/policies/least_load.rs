@@ -650,9 +650,10 @@ impl LeastLoadPolicy {
     /// reflect are released and the winner is credited. No decision pairs a
     /// report with a credit the report already reflects, or a new dispatch
     /// with an old report. Decisions on other threads read between one
-    /// decision's read and its write, so two in flight at once can both
-    /// pick the least-loaded worker before either credit lands; both
-    /// credits land.
+    /// decision's read and its write, so every decision in flight at once
+    /// can pick the least-loaded worker before any of their credits lands:
+    /// a herd of at most one decision per runtime thread, inside one
+    /// scoring window; every credit lands.
     pub(super) fn select_min_expected_wait(
         &self,
         workers: &[Arc<dyn Worker>],

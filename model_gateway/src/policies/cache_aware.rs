@@ -1976,8 +1976,9 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Select and credit one final worker atomically with LeastLoad's
-    /// expected-wait algorithm. CacheAware must call this exactly once per
+    /// Select one final worker with LeastLoad's expected-wait algorithm and
+    /// credit it (the scores are read without the tally's write guard, the
+    /// credit lands under it). CacheAware must call this exactly once per
     /// successful dispatch, after cache affinity and spill logic have fixed
     /// the candidate set.
     fn select_expected_wait(
