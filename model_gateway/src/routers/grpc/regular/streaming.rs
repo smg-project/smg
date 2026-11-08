@@ -35,6 +35,7 @@ use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, Re
 use serde::Serialize;
 use serde_json::{json, Value};
 use symphony::{adapt, EngineFinish, Event, Events};
+use tokio::sync::mpsc::error::TrySendError;
 use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
 use tracing::{debug, error, warn, Instrument, Span};
 
@@ -83,7 +84,7 @@ use self::{
     completion::{CompletionStream, CompletionStreamOutcome, CompletionStreamUnit},
     frames::{
         assistant_choice, forces_tool_call, opening_choice, text_delta, ChatChunkFrame,
-        CompletionChunkFrame, FrameSink, TextDelta, CHUNK_FLUSH_BYTES,
+        CompletionChunkFrame, FrameSink, TextDelta, CHUNK_FLUSH_BYTES, FRAME_ROOM,
     },
 };
 
@@ -285,16 +286,6 @@ struct GenerateLogprobs<'a> {
     input_token_logprobs: Option<&'a [Vec<Option<f64>>]>,
     output_token_logprobs: Option<&'a [Vec<Option<f64>>]>,
 }
-
-/// The room of a generate stream's frame buffer: two frames. Every generate
-/// event carries the text so far, so the frames of a long answer reach
-/// [`CHUNK_FLUSH_BYTES`] back to back; with this room the frame being written
-/// fills the half behind the frame in flight, and at the next bound the
-/// buffer's `reserve` takes the whole allocation back once the connection has
-/// dropped the sent frame (`BytesMut` reclaims a buffer no other handle
-/// shares): a frame costs a short copy to the front, and an allocation of its
-/// own only while the frame before it is still in flight.
-const GENERATE_FRAME_ROOM: usize = 2 * CHUNK_FLUSH_BYTES;
 
 /// Shared streaming processor for both single and prefill/decode dispatch modes
 #[derive(Clone)]
@@ -782,9 +773,16 @@ impl StreamingProcessor {
         let mut choices: HashMap<u32, GenerateChoice> = HashMap::new();
         let mut usage = GenerateStreamUsage::default();
         // The frame being written: the events ready at one poll share it
-        // (the packed read, as the chat, completion and Messages loops), with
-        // the room of `GENERATE_FRAME_ROOM`.
-        let mut sse_buffer = BytesMut::with_capacity(GENERATE_FRAME_ROOM);
+        // (the packed read, as the chat, completion and Messages loops). It
+        // starts with the chat stream's room, which a stream whose frames
+        // stay small (an engine pacing its tokens, one event per frame; an
+        // answer of a few tokens) keeps. Every generate event carries the
+        // text so far, so a long answer's frames reach the flush bound back
+        // to back: the buffer takes the room for two frames as its first
+        // full frame leaves it (`flush_when_full`), and from then on each
+        // frame is written into room of its own while the frame before it
+        // is still in flight: one allocation per frame, not one per event.
+        let mut sse_buffer = BytesMut::with_capacity(4096);
         let mut first_token_out = false;
 
         loop {
@@ -1026,9 +1024,16 @@ impl StreamingProcessor {
             HashMap::new();
         let mut usage = GenerateStreamUsage::default();
         // The frame being written: the events ready at one poll share it
-        // (the packed read, as the chat, completion and Messages loops), with
-        // the room of `GENERATE_FRAME_ROOM`.
-        let mut sse_buffer = BytesMut::with_capacity(GENERATE_FRAME_ROOM);
+        // (the packed read, as the chat, completion and Messages loops). It
+        // starts with the chat stream's room, which a stream whose frames
+        // stay small (an engine pacing its tokens, one event per frame; an
+        // answer of a few tokens) keeps. Every generate event carries the
+        // text so far, so a long answer's frames reach the flush bound back
+        // to back: the buffer takes the room for two frames as its first
+        // full frame leaves it (`flush_when_full`), and from then on each
+        // frame is written into room of its own while the frame before it
+        // is still in flight: one allocation per frame, not one per event.
+        let mut sse_buffer = BytesMut::with_capacity(4096);
         let mut first_token_out = false;
 
         loop {
@@ -1577,10 +1582,15 @@ impl StreamingProcessor {
     }
 
     /// Hand the buffered chunks to the channel as one frame once they hold
-    /// [`CHUNK_FLUSH_BYTES`], so one frame stays a bounded burst.
+    /// [`CHUNK_FLUSH_BYTES`], so one frame stays a bounded burst, and keep
+    /// [`FRAME_ROOM`] for the frame after it. The sent frame holds the
+    /// allocation it shared with the buffer until the connection has written
+    /// it, and a buffer grown against a frame in flight grows by exact-size
+    /// allocations, so the room is taken here, once per full frame.
     async fn flush_when_full(tx: &SseSender, buffer: &mut BytesMut) -> Result<(), ()> {
         if buffer.len() >= CHUNK_FLUSH_BYTES {
             tx.send(Ok(buffer.split().freeze())).await.map_err(|_| ())?;
+            buffer.reserve(FRAME_ROOM);
         }
         Ok(())
     }
@@ -1687,8 +1697,12 @@ impl StreamingProcessor {
     /// parks, so no text waits for the engine. The frame carrying the first
     /// token leaves before the engine is polled again, whatever is ready
     /// behind it: the client's first token waits for nothing. The one poll
-    /// registers the reader's wake where the message will come from; `next`
-    /// resumes it after the flush. `first_token_out` turns true once that
+    /// registers the reader's wake where the message will come from; when
+    /// the engine has nothing ready the frame leaves from inside that poll
+    /// ([`Self::flush_in_poll`]) and the reader parks on its wake, so a
+    /// stream whose engine paces its tokens costs one poll per message, as
+    /// the plain read did; `next` resumes the read only after a flush that
+    /// had to wait for the channel. `first_token_out` turns true once that
     /// frame has left (`first_token_seen`: the stream has produced its first
     /// token); the yields there hand the frame to the connection through the
     /// body driving this reading (see `DrivenBody`): one lets the body hand
@@ -1712,25 +1726,57 @@ impl StreamingProcessor {
         first_frame_is_first_token: bool,
     ) -> Result<Option<Result<ProtoGenerateResponse, tonic::Status>>, String> {
         let mut next = std::pin::pin!(grpc_stream.next());
-        let ready = if *first_token_out {
-            std::future::poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await
-        } else {
-            Poll::Pending
-        };
-        match ready {
-            Poll::Ready(item) => Ok(item),
-            Poll::Pending => {
-                let frame_out = !buffer.is_empty();
-                Self::flush_chunks(tx, buffer).await?;
-                if frame_out && !*first_token_out && first_token_seen {
-                    *first_token_out = true;
+        if !*first_token_out {
+            let frame_out = !buffer.is_empty();
+            Self::flush_chunks(tx, buffer).await?;
+            if frame_out && first_token_seen {
+                *first_token_out = true;
+                tokio::task::yield_now().await;
+                if !first_frame_is_first_token {
                     tokio::task::yield_now().await;
-                    if !first_frame_is_first_token {
-                        tokio::task::yield_now().await;
-                    }
                 }
-                Ok(next.await)
             }
+            return Ok(next.await);
+        }
+        let mut waiting = None;
+        let polled = std::future::poll_fn(|cx| match next.as_mut().poll(cx) {
+            Poll::Ready(item) => Poll::Ready(Ok(Some(item))),
+            Poll::Pending => match Self::flush_in_poll(tx, buffer) {
+                Ok(None) => Poll::Pending,
+                Ok(Some(frame)) => {
+                    waiting = Some(frame);
+                    Poll::Ready(Ok(None))
+                }
+                Err(error) => Poll::Ready(Err(error)),
+            },
+        })
+        .await?;
+        if let Some(item) = polled {
+            return Ok(item);
+        }
+        if let Some(frame) = waiting {
+            tx.send(Ok(frame))
+                .await
+                .map_err(|_| "Failed to send chunks".to_string())?;
+        }
+        Ok(next.await)
+    }
+
+    /// The flush of the frame being written from inside the poll that found
+    /// the engine with nothing ready: the frame takes a free slot of the
+    /// channel without a wait, so the reader parks on that one poll's wake.
+    /// `None` once the frame has left, or when there was none to send; the
+    /// frame back when the channel has no free slot (the connection behind),
+    /// for the caller to send with a wait. A closed channel is the client's
+    /// end.
+    fn flush_in_poll(tx: &SseSender, buffer: &mut BytesMut) -> Result<Option<Bytes>, String> {
+        if buffer.is_empty() {
+            return Ok(None);
+        }
+        match tx.try_send(Ok(buffer.split().freeze())) {
+            Ok(()) => Ok(None),
+            Err(TrySendError::Full(Ok(frame))) => Ok(Some(frame)),
+            Err(_) => Err("Failed to send chunks".to_string()),
         }
     }
 
@@ -3369,31 +3415,55 @@ impl<'a> ChatStream<'a> {
                 // the engine is polled again, whatever is ready behind it:
                 // the client's first token waits for nothing. The one poll
                 // registers the reader's wake where the message will come
-                // from; `next` resumes it after the flush.
+                // from; when the engine has nothing ready the frame leaves
+                // from inside that poll (`flush_in_poll`) and the reader
+                // parks on its wake, one poll per message on a paced
+                // engine; `next` resumes the read only after a flush that
+                // had to wait for the channel.
                 let item = {
                     let mut next = std::pin::pin!(grpc_stream.next());
-                    let ready = if self.first_token_out {
-                        std::future::poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await
-                    } else {
-                        Poll::Pending
-                    };
-                    match ready {
-                        Poll::Ready(item) => item,
-                        Poll::Pending => {
-                            let frame_out = !self.sse_buffer.is_empty();
-                            StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
-                            if frame_out && !self.first_token_out && self.first_token_time.is_some()
-                            {
-                                self.first_token_out = true;
-                                // The first token's frame reaches the
-                                // connection before the engine is read
-                                // again: the body driving this reading
-                                // hands it out on this yield and writes it
-                                // (see `DrivenBody`).
-                                tokio::task::yield_now().await;
+                    if self.first_token_out {
+                        let mut waiting = None;
+                        let polled = std::future::poll_fn(|cx| match next.as_mut().poll(cx) {
+                            Poll::Ready(item) => Poll::Ready(Ok(Some(item))),
+                            Poll::Pending => match StreamingProcessor::flush_in_poll(
+                                self.tx,
+                                &mut self.sse_buffer,
+                            ) {
+                                Ok(None) => Poll::Pending,
+                                Ok(Some(frame)) => {
+                                    waiting = Some(frame);
+                                    Poll::Ready(Ok(None))
+                                }
+                                Err(error) => Poll::Ready(Err(error)),
+                            },
+                        })
+                        .await?;
+                        match polled {
+                            Some(item) => item,
+                            None => {
+                                if let Some(frame) = waiting {
+                                    self.tx
+                                        .send(Ok(frame))
+                                        .await
+                                        .map_err(|_| "Failed to send chunks".to_string())?;
+                                }
+                                next.await
                             }
-                            next.await
                         }
+                    } else {
+                        let frame_out = !self.sse_buffer.is_empty();
+                        StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
+                        if frame_out && self.first_token_time.is_some() {
+                            self.first_token_out = true;
+                            // The first token's frame reaches the
+                            // connection before the engine is read
+                            // again: the body driving this reading
+                            // hands it out on this yield and writes it
+                            // (see `DrivenBody`).
+                            tokio::task::yield_now().await;
+                        }
+                        next.await
                     }
                 };
                 if item.is_none() && grpc_stream.client_left() {

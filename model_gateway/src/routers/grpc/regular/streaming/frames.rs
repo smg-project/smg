@@ -48,6 +48,12 @@ impl io::Write for FrameSink<'_> {
 /// while the engine keeps more ready, so one frame stays a bounded burst.
 pub(super) const CHUNK_FLUSH_BYTES: usize = 16 * 1024;
 
+/// The room a frame buffer keeps once a frame has left it full: two frames, so
+/// the frame after it is written without growing the buffer while the sent
+/// frame still holds the allocation they shared (a buffer grown against a
+/// frame in flight grows by exact-size allocations, not by doubling).
+pub(super) const FRAME_ROOM: usize = 2 * CHUNK_FLUSH_BYTES;
+
 /// The SSE frame of the per-token chat chunks of one stream.
 ///
 /// Every chunk of a stream repeats the same `id`, `object`, `created`,
