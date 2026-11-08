@@ -48,9 +48,13 @@ impl io::Write for FrameSink<'_> {
 /// while the engine keeps more ready, so one frame stays a bounded burst.
 pub(super) const CHUNK_FLUSH_BYTES: usize = 16 * 1024;
 
-/// The room the generate loops' frame buffer takes at its first write after a
-/// full frame left it: two frames, so the frame after it is written without
-/// growing the buffer step by step. Taken at that write and not at the flush:
+/// The least room the generate loops' frame buffer takes at its first write
+/// after a full frame left it: two frames, so the frame after it is written
+/// without growing the buffer step by step; a frame that left larger than a
+/// bound makes the room owed its own length plus one bound (every generate
+/// event carries the text so far, so the next frame is about as large and an
+/// event past this room still fits in one allocation). Taken at that write
+/// and not at the flush:
 /// a paced engine's connection has dropped the sent frame by then and the
 /// buffer takes the allocation they shared back in place, while a burst's next
 /// write comes with the frame still in flight and allocates a fresh room (a

@@ -779,13 +779,14 @@ impl StreamingProcessor {
         // answer of a few tokens) keeps. Every generate event carries the
         // text so far, so a long answer's frames reach the flush bound: once
         // a full frame has left (`flush_generate_frame`), the first write
-        // after it takes the room for two frames (`write_generate_event`,
+        // after it takes the room for two frames, or for the frame that left
+        // plus one more bound when that is more (`write_generate_event`,
         // `FRAME_ROOM`): a burst writes at once, with the frame in flight,
         // into a fresh room, one allocation per frame and not one per event;
         // a paced engine writes 20 ms later, the frame dropped, into the
         // same allocation taken back in place.
         let mut sse_buffer = BytesMut::with_capacity(4096);
-        let mut room_owed = false;
+        let mut room_owed = 0;
         let mut first_token_out = false;
 
         loop {
@@ -1041,13 +1042,14 @@ impl StreamingProcessor {
         // answer of a few tokens) keeps. Every generate event carries the
         // text so far, so a long answer's frames reach the flush bound: once
         // a full frame has left (`flush_generate_frame`), the first write
-        // after it takes the room for two frames (`write_generate_event`,
+        // after it takes the room for two frames, or for the frame that left
+        // plus one more bound when that is more (`write_generate_event`,
         // `FRAME_ROOM`): a burst writes at once, with the frame in flight,
         // into a fresh room, one allocation per frame and not one per event;
         // a paced engine writes 20 ms later, the frame dropped, into the
         // same allocation taken back in place.
         let mut sse_buffer = BytesMut::with_capacity(4096);
-        let mut room_owed = false;
+        let mut room_owed = 0;
         let mut first_token_out = false;
 
         loop {
@@ -1615,16 +1617,20 @@ impl StreamingProcessor {
     /// The generate loops' [`Self::flush_when_full`]: a full frame that
     /// leaves here holds the buffer's allocation until the connection has
     /// written it, so the room for the next frame is not taken now but owed
-    /// (`room_owed`) to the first write after it, see
-    /// [`Self::write_generate_event`].
+    /// (`room_owed`, in bytes) to the first write after it, see
+    /// [`Self::write_generate_event`]. The room owed is [`FRAME_ROOM`] or the
+    /// frame that left plus one more bound, whichever is more: every event
+    /// carries the text so far, so the next frame is about the size of the
+    /// last one, and an event past the room still fits in one allocation.
     async fn flush_generate_frame(
         tx: &SseSender,
         buffer: &mut BytesMut,
-        room_owed: &mut bool,
+        room_owed: &mut usize,
     ) -> Result<(), ()> {
         if buffer.len() >= CHUNK_FLUSH_BYTES {
-            tx.send(Ok(buffer.split().freeze())).await.map_err(|_| ())?;
-            *room_owed = true;
+            let frame = buffer.split().freeze();
+            *room_owed = FRAME_ROOM.max(frame.len() + CHUNK_FLUSH_BYTES);
+            tx.send(Ok(frame)).await.map_err(|_| ())?;
         }
         Ok(())
     }
@@ -1636,18 +1642,19 @@ impl StreamingProcessor {
     /// leaves the buffer at the event's start, so the events ahead of it still
     /// leave whole. The frame leaves by [`Self::flush_generate_frame`] once it
     /// holds [`CHUNK_FLUSH_BYTES`], or by [`Self::flush_chunks`] at the read's
-    /// end. The first write after a full frame left takes the room for the
-    /// next two frames ([`FRAME_ROOM`]): in place when the connection has
-    /// dropped the sent frame by now (a paced engine), a fresh room while the
-    /// frame is still in flight (a burst).
+    /// end. The first write after a full frame left takes the room owed for
+    /// the next frame (`room_owed`, see [`Self::flush_generate_frame`]): in
+    /// place when the connection has dropped the sent frame by now (a paced
+    /// engine), a fresh room while the frame is still in flight (a burst).
     fn write_generate_event(
         buffer: &mut BytesMut,
-        room_owed: &mut bool,
+        room_owed: &mut usize,
         event: &GenerateEvent<'_>,
         what: &str,
     ) -> Result<(), String> {
-        if std::mem::take(room_owed) {
-            buffer.reserve(FRAME_ROOM);
+        let room = std::mem::take(room_owed);
+        if room > 0 {
+            buffer.reserve(room);
         }
         let start = buffer.len();
         buffer.extend_from_slice(b"data: ");
