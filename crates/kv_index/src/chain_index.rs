@@ -64,7 +64,10 @@
 //! Memory: 16 bytes per distinct block on a chain (its content hash and its engine hash, shared
 //! by every worker that holds it, with about 12% slack for growth) plus a 64-byte run header, the
 //! coverage words and a child table per branching run, against the 16-byte lane-map slot each
-//! lane keeps per held block for removals.
+//! lane keeps per held block for removals. The arena takes its memory from the process allocator
+//! a whole chunk (8 MiB) at a time and keeps every chunk once taken: what a process holds for the
+//! index moves in steps of one chunk (`arena_chunk_bytes`), while the words handed out
+//! (`arena_bytes`) move with the blocks.
 
 use std::{
     collections::BTreeSet,
