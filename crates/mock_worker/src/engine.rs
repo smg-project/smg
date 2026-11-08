@@ -471,7 +471,8 @@ pub struct EngineParams {
 /// hit is the fixed point over its groups, which the mock does not model yet.
 ///
 /// The kinds the flag takes are [`KvCacheGroup::KINDS_HELP`]: the dense
-/// main-attention kinds and `mamba` take no window, the window kinds need one.
+/// main-attention kinds and `mamba` take no window, the window kinds need one,
+/// and the first group is a main-attention kind ([`KvCacheGroup::MAIN_KINDS`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KvCacheGroup {
     pub kind: String,
@@ -479,6 +480,11 @@ pub struct KvCacheGroup {
 }
 
 impl KvCacheGroup {
+    /// The main-attention kinds, the gateway's list: the first group is one
+    /// of them, the dense group every block is stored in (the pool's default
+    /// mask of an unrecorded block is group 0 alone).
+    pub const MAIN_KINDS: [&'static str; 3] =
+        ["full_attention", "mla_attention", "sink_full_attention"];
     /// The kinds whose stores keep a window tail; a window in tokens is required.
     pub const WINDOW_KINDS: [&'static str; 2] = ["sliding_window", "sliding_window_mla"];
     /// The kinds without a window: the dense main-attention kinds and the Mamba state group.
@@ -2473,6 +2479,8 @@ impl SchedulerState {
         let group_count = p.kv_cache_groups.len().clamp(1, 8);
         let mut per_group: Vec<Vec<i64>> = vec![Vec::new(); group_count];
         for key in freed {
+            // A block without a recorded mask was stored by group 0 alone: the
+            // main-attention group the flag requires first, which keeps every block.
             let mask = self.pool.groups.remove(&key).unwrap_or(1);
             for (group, hashes) in per_group.iter_mut().enumerate() {
                 if mask & (1u8 << group) != 0 {

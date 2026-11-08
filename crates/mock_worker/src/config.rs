@@ -657,6 +657,13 @@ fn parse_kv_cache_groups(raw: String, flag: &str) -> Result<Vec<KvCacheGroup>, S
     if groups.is_empty() || groups.len() > 8 {
         return Err(format!("{flag} takes one to eight groups"));
     }
+    if !KvCacheGroup::MAIN_KINDS.contains(&groups[0].kind.as_str()) {
+        return Err(format!(
+            "{flag}: the first group is the main-attention group (one of {}), not {}",
+            KvCacheGroup::MAIN_KINDS.join(", "),
+            groups[0].kind
+        ));
+    }
     Ok(groups)
 }
 
@@ -730,8 +737,8 @@ pub fn usage() -> String {
        --kv-events-buffer-steps <n>  batches kept for replay (default 10000)\n\
        --kv-events-wire <vllm|sglang>  which engine's publisher to imitate (default vllm)\n\
        --kv-cache-groups <kind[:window],...>  the KV cache groups a realistic engine publishes, the
-                                first its main-attention group (default full_attention), one to
-                                eight of full_attention, mla_attention, sink_full_attention,
+                                first one of the main-attention kinds (default full_attention), one
+                                to eight of full_attention, mla_attention, sink_full_attention,
                                 sliding_window:<tokens>, sliding_window_mla:<tokens> and mamba: a
                                 window group's stores name the window tail and a Mamba group's the
                                 state block at the prompt's replay boundary, as vLLM 0.31.0 retains
@@ -884,6 +891,15 @@ mod tests {
             ("full_attention:64", "has no window"),
             ("swa:128", "unknown cache group kind"),
             ("sliding-window:128", "unknown cache group kind"),
+            ("mamba", "the first group is the main-attention group"),
+            (
+                "sliding_window:64,full_attention",
+                "the first group is the main-attention group",
+            ),
+            (
+                "mamba,full_attention",
+                "the first group is the main-attention group",
+            ),
         ] {
             let err = with(&["--kv-cache-groups", spec]).expect_err(spec);
             assert!(err.contains(reason), "{spec}: {err}");
