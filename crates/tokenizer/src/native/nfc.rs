@@ -4,15 +4,22 @@
 //! library's check (`unicode_normalization_alignments::is_nfc_quick`) asks
 //! its perfect-hash tables both questions for every character, 15-20 ns a
 //! character on text that is not ASCII (a Cyrillic prompt spent half of its
-//! encode there: measured); here each is one bit of 16 KiB that stays in the
-//! first cache levels, and ASCII is skipped eight bytes at a time. The
-//! answers are the library's own, read from its functions once when the
-//! tables are built, and what the tables cannot settle (a Maybe, a character
-//! outside the plane) is handed back to the library.
+//! encode there: measured); here each is one bit of an 8 KiB bitmap (24 KiB
+//! for the three) that stays in the first cache levels, and ASCII is skipped
+//! eight bytes at a time. Nearly every character is Yes with combining class
+//! 0, so the third bitmap holds those and the walk reads that one bit per
+//! such character after a lead-byte decode (the two bitmaps and a character
+//! decode per character were a third of a short Cyrillic encode: measured).
+//! The answers are the library's own,
+//! read from its functions once when the tables are built, and what the
+//! tables cannot settle (a Maybe, a character outside the plane) is handed
+//! back to the library.
 
 use unicode_normalization_alignments::{
     char::canonical_combining_class, is_nfc_quick, IsNormalized,
 };
+
+use super::scan::char_beyond_ascii;
 
 /// Code points of the plane.
 const PLANE: usize = 0x1_0000;
@@ -23,6 +30,9 @@ const NON_ASCII: u64 = 0x8080_8080_8080_8080;
 
 /// The quick check's tables for the plane; see the module documentation.
 pub(super) struct NfcQuick {
+    /// Characters the quick check calls Yes whose canonical combining class
+    /// is zero: the one bit the walk reads for nearly every character.
+    plain: Box<[u64]>,
     /// Characters the quick check calls Yes.
     yes: Box<[u64]>,
     /// Characters whose canonical combining class is not zero.
@@ -33,6 +43,7 @@ impl NfcQuick {
     /// The tables, read from the library's functions for every character of
     /// the plane.
     pub(super) fn read() -> Self {
+        let mut plain = vec![0u64; WORDS];
         let mut yes = vec![0u64; WORDS];
         let mut marked = vec![0u64; WORDS];
         for code in 0..PLANE as u32 {
@@ -40,14 +51,20 @@ impl NfcQuick {
                 continue;
             };
             let (word, bit) = (code as usize / 64, 1u64 << (code % 64));
-            if is_nfc_quick(std::iter::once(ch)) == IsNormalized::Yes {
+            let is_yes = is_nfc_quick(std::iter::once(ch)) == IsNormalized::Yes;
+            let is_marked = canonical_combining_class(ch) != 0;
+            if is_yes {
                 yes[word] |= bit;
             }
-            if canonical_combining_class(ch) != 0 {
+            if is_marked {
                 marked[word] |= bit;
+            }
+            if is_yes && !is_marked {
+                plain[word] |= bit;
             }
         }
         Self {
+            plain: plain.into_boxed_slice(),
             yes: yes.into_boxed_slice(),
             marked: marked.into_boxed_slice(),
         }
@@ -97,15 +114,19 @@ impl NfcQuick {
                 last = 0;
                 continue;
             }
-            // `at` is on the lead byte of a character: a continuation byte
+            // `at` is on the lead byte of a character (a continuation byte
             // follows a lead byte only, and the steps here are whole
-            // characters.
-            let ch = text
-                .get(at..)
-                .and_then(|rest| rest.chars().next())
-                .ok_or(cut)?;
-            at += ch.len_utf8();
-            let code = ch as usize;
+            // characters), which gives its length. A character that is Yes
+            // with combining class 0, nearly every one, is one bit read; the
+            // rest take both tables and the class.
+            let (code, len) = char_beyond_ascii(bytes, at, bytes[at]);
+            at += len;
+            let code = code as usize;
+            if code < PLANE && Self::bit(&self.plain, code) {
+                last = 0;
+                continue;
+            }
+            let ch = char::from_u32(code as u32).ok_or(cut)?;
             let (yes, marked) = if code < PLANE {
                 (Self::bit(&self.yes, code), Self::bit(&self.marked, code))
             } else {
@@ -162,6 +183,11 @@ mod tests {
             assert_eq!(
                 NfcQuick::bit(&quick.marked, code as usize),
                 is_marked,
+                "U+{code:04X}"
+            );
+            assert_eq!(
+                NfcQuick::bit(&quick.plain, code as usize),
+                is_yes && !is_marked,
                 "U+{code:04X}"
             );
             yes += usize::from(is_yes);
