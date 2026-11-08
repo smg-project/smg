@@ -1,6 +1,7 @@
 //! The secrets the command line, the environment or a file can give (the
-//! serving key, the tenant keys, the store URLs): the names of their sources
-//! and the one resolution rule, with the environment lookup as a parameter.
+//! serving key, the tenant keys, the control-plane keys, the store URLs):
+//! the names of their sources and the one resolution rule, with the
+//! environment lookup as a parameter.
 
 use std::path::{Path, PathBuf};
 
@@ -25,6 +26,9 @@ pub(crate) struct SecretSetting {
     file_flag: &'static str,
     /// The environment variable naming that file.
     file_env: &'static str,
+    /// The shape of one entry of a list-valued secret, named in its
+    /// refusals; a single-valued secret has none.
+    entry: &'static str,
 }
 
 pub(crate) const API_KEY_SETTING: SecretSetting = SecretSetting {
@@ -34,6 +38,7 @@ pub(crate) const API_KEY_SETTING: SecretSetting = SecretSetting {
     env: "SMG_API_KEY",
     file_flag: "--api-key-file",
     file_env: "SMG_API_KEY_FILE",
+    entry: "",
 };
 
 pub(crate) const TENANT_API_KEYS_SETTING: SecretSetting = SecretSetting {
@@ -43,6 +48,17 @@ pub(crate) const TENANT_API_KEYS_SETTING: SecretSetting = SecretSetting {
     env: "SMG_TENANT_API_KEYS",
     file_flag: "--tenant-api-keys-file",
     file_env: "SMG_TENANT_API_KEYS_FILE",
+    entry: "tenant_id:key",
+};
+
+pub(crate) const CONTROL_PLANE_API_KEYS_SETTING: SecretSetting = SecretSetting {
+    what: "the control-plane API keys",
+    file_field: "control-plane-api-keys-file",
+    flag: "--control-plane-api-keys",
+    env: "CONTROL_PLANE_API_KEYS",
+    file_flag: "--control-plane-api-keys-file",
+    file_env: "CONTROL_PLANE_API_KEYS_FILE",
+    entry: "id:name:role:key",
 };
 
 pub(crate) const POSTGRES_DB_URL_SETTING: SecretSetting = SecretSetting {
@@ -52,6 +68,7 @@ pub(crate) const POSTGRES_DB_URL_SETTING: SecretSetting = SecretSetting {
     env: "SMG_POSTGRES_DB_URL",
     file_flag: "--postgres-db-url-file",
     file_env: "SMG_POSTGRES_DB_URL_FILE",
+    entry: "",
 };
 
 pub(crate) const REDIS_URL_SETTING: SecretSetting = SecretSetting {
@@ -61,6 +78,7 @@ pub(crate) const REDIS_URL_SETTING: SecretSetting = SecretSetting {
     env: "SMG_REDIS_URL",
     file_flag: "--redis-url-file",
     file_env: "SMG_REDIS_URL_FILE",
+    entry: "",
 };
 
 /// An environment lookup: the value of a variable, `None` when it is not
@@ -198,8 +216,8 @@ impl SecretSetting {
                             field: self.env.to_string(),
                             value: "<empty>".to_string(),
                             reason: format!(
-                                "set but holds no entry; {} are tenant_id:key entries separated by ',' or a newline",
-                                self.what
+                                "set but holds no entry; {} are {} entries separated by ',' or a newline",
+                                self.what, self.entry
                             ),
                         });
                     }
@@ -220,7 +238,10 @@ impl SecretSetting {
                 if entries.is_empty() {
                     return Err(self.bad_file(
                         &path,
-                        "the file holds no entry; one tenant_id:key per line, blank and # lines skipped",
+                        &format!(
+                            "the file holds no entry; one {} per line, blank and # lines skipped",
+                            self.entry
+                        ),
                     ));
                 }
                 Ok(Some((entries, SecretSource::File)))

@@ -18,10 +18,7 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use http_body_util::BodyExt;
-use openai_protocol::{
-    chat::ChatCompletionRequest,
-    transcription::{AudioFile, TranscriptionRequest},
-};
+use openai_protocol::transcription::{AudioFile, TranscriptionRequest};
 use serde_json::json;
 use smg::{
     routers::{pd_router::PDRouter, router::Router as HttpRouter, RouterTrait},
@@ -30,6 +27,7 @@ use smg::{
 };
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 
+use super::streaming_chat_request;
 use crate::common::test_app::create_test_app_context;
 
 /// Sends on drop, so the test observes the moment the upstream response body
@@ -171,19 +169,6 @@ async fn http_router_for(upstream_url: &str) -> HttpRouter {
 
 fn tenant_meta() -> smg::middleware::TenantRequestMeta {
     RouteRequestMeta::new(TenantKey::from("test-tenant"))
-}
-
-#[expect(
-    clippy::unwrap_used,
-    reason = "test infrastructure - panicking on failure is intentional"
-)]
-fn streaming_chat_request() -> ChatCompletionRequest {
-    serde_json::from_value(json!({
-        "model": "mock-model",
-        "messages": [{"role": "user", "content": "Hello"}],
-        "stream": true
-    }))
-    .unwrap()
 }
 
 /// Client disconnects while the upstream has produced no chunk yet (the

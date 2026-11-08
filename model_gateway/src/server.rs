@@ -39,7 +39,8 @@ use openai_protocol::{
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
     validated::ValidatedJson,
     worker::{
-        ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerSpec, WorkerUpdateRequest,
+        ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerListFormat, WorkerSpec,
+        WorkerUpdateRequest,
     },
 };
 use serde::Deserialize;
@@ -85,7 +86,7 @@ use crate::{
         connection_limit::ConnectionLimitAcceptor,
         connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
     },
-    service_discovery::{start_service_discovery, RuntimeDiscoveryConfig},
+    service_discovery::{export_manifest, start_service_discovery, RuntimeDiscoveryConfig},
     tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
@@ -870,7 +871,10 @@ async fn list_workers_rest(
     let mut result = state
         .context
         .worker_service
-        .list_workers(query.model.as_deref());
+        .list_workers(query.model.as_deref(), query.origin);
+    if query.format == Some(WorkerListFormat::Manifest) {
+        return Json(export_manifest(&result.workers)).into_response();
+    }
     if let Some(monitor) = state.context.worker_monitor.as_ref() {
         let snapshot = monitor.load_snapshot();
         for info in &mut result.workers {

@@ -333,7 +333,9 @@ pub(super) async fn process_media_refs(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0),
-        want_identity: req.kv_transfer_params_json.is_some() || req.kv_transfer_params.is_some(),
+        want_identity: req.kv_transfer_params_json.is_some()
+            || req.kv_transfer_params.is_some()
+            || super::generate::ec_transfer_params_sent(req),
     };
     let waited = Instant::now();
     let permit = gate.acquire().await.map_err(refused)?;

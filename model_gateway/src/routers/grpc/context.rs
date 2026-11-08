@@ -33,6 +33,7 @@ use super::{
         stages::{
             encode::EncodeDispatchPlan,
             helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask, ToolConstraintStamp},
+            pd_protocol::{EncodeHandoff, PdProtocol},
             RateLimitCell,
         },
     },
@@ -571,11 +572,19 @@ pub(crate) enum ExecutionPlanKind {
 }
 
 impl ExecutionPlan {
-    /// Encoding rewrites a clone with replica-bound EC handles; the retained
-    /// pre-encode plan cannot replay those handles after any attempt failure.
-    pub(crate) fn has_replica_bound_ec_handoff(&self) -> bool {
+    /// Whether a retry of this plan would replay a replica-bound encode
+    /// handoff: under a push handoff (`handoff`, the selected runtime's
+    /// row) the encoder rewrites an attempt's clone with handles bound to
+    /// the prefill replica it reserved on, and the retained pre-encode plan
+    /// cannot replay them after any attempt failure. A plan without media
+    /// encodes nothing, and a rendezvous handoff keeps its rooms across a
+    /// re-selected pair.
+    pub(crate) fn replays_replica_bound_handoff(&self, handoff: Option<EncodeHandoff>) -> bool {
+        if handoff != Some(EncodeHandoff::Push) {
+            return false;
+        }
         let carries_media = |request: &ProtoGenerateRequest| {
-            request.is_vllm() && (request.has_mm_inputs() || request.has_vllm_media_refs())
+            request.has_mm_inputs() || request.has_vllm_media_refs()
         };
         match self {
             Self::EncodePrefillDecode { request } => carries_media(request),
@@ -1523,6 +1532,14 @@ impl WorkerSelection {
             Self::Single { .. } => None,
         }
     }
+
+    /// The encode handoff of the selected runtime's EPD form (its row of
+    /// the disaggregation table); `None` for a single worker or a runtime
+    /// without an encode role.
+    pub fn encode_handoff(&self) -> Option<EncodeHandoff> {
+        self.disaggregated_runtime_type()
+            .and_then(|runtime| PdProtocol::encode_handoff(*runtime))
+    }
 }
 
 impl ClientSelection {
@@ -1749,9 +1766,14 @@ mod tests {
     use crate::routers::grpc::{client::GrpcClient, test_engine::mock_engine};
 
     /// Only multimodal vLLM EPD owns EC state absent from its retained plan.
+    /// The plan's kind, its media and the handoff kind each decide it
+    /// alone: a text-only plan encoded nothing, a rendezvous handoff keeps
+    /// its rooms across a re-selected pair, and no handoff has nothing to
+    /// replay.
     #[test]
-    fn replica_bound_ec_policy_preserves_other_retry_shapes() {
+    fn only_an_epd_plan_with_media_under_a_push_handoff_replays_a_replica_bound_handoff() {
         use smg_grpc_client::{tokenspeed_proto, vllm_proto};
+        let push = Some(EncodeHandoff::Push);
         let media = ProtoGenerateRequest::Vllm(Box::new(vllm_proto::GenerateRequest {
             media_refs: Some(vllm_proto::MediaRefs::default()),
             ..Default::default()
@@ -1762,18 +1784,29 @@ mod tests {
             ExecutionPlanKind::EncodePrefillDecode,
         ] {
             assert_eq!(
-                ExecutionPlan::generate(kind, media.clone()).has_replica_bound_ec_handoff(),
+                ExecutionPlan::generate(kind, media.clone()).replays_replica_bound_handoff(push),
                 kind == ExecutionPlanKind::EncodePrefillDecode
             );
         }
-        for request in [
-            ProtoGenerateRequest::Vllm(Box::default()),
-            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
-                mm_inputs: Some(tokenspeed_proto::MultimodalInputs::default()),
-                ..Default::default()
-            })),
-        ] {
-            assert!(!ExecutionPlan::EncodePrefillDecode { request }.has_replica_bound_ec_handoff());
+        assert!(ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::EncodePrefillDecode,
+            shared_request_id: "batch".to_string(),
+            requests: vec![media],
+        }
+        .replays_replica_bound_handoff(push));
+        assert!(!ExecutionPlan::EncodePrefillDecode {
+            request: ProtoGenerateRequest::Vllm(Box::default()),
+        }
+        .replays_replica_bound_handoff(push));
+        let items = ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
+            mm_inputs: Some(tokenspeed_proto::MultimodalInputs::default()),
+            ..Default::default()
+        }));
+        for handoff in [Some(EncodeHandoff::Rendezvous), None] {
+            assert!(!ExecutionPlan::EncodePrefillDecode {
+                request: items.clone(),
+            }
+            .replays_replica_bound_handoff(handoff));
         }
     }
 

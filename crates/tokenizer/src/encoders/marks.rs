@@ -13,12 +13,13 @@
 //! family's reference library encodes them), and hands out the flat prompt
 //! (the marks removed) for logs, routing and parity.
 
-use std::{borrow::Cow, ops::Range};
+use std::{borrow::Cow, collections::HashMap, ops::Range};
 
 use anyhow::{bail, Result};
 use serde_json::Value;
 
 use super::PromptSegment;
+use crate::{native::AddedTokens, traits::SpecialTokens};
 
 /// The mark before a control token the renderer wrote.
 pub(crate) const START: char = '\u{FDD0}';
@@ -73,34 +74,56 @@ pub(crate) fn mark(spelling: &str) -> String {
     marked
 }
 
-/// The request messages with the marks removed from every string in them
-/// (keys included), however deep; borrowed when no string carries one.
+/// The request messages (or tools, or documents) with the marks removed
+/// from every string in them (keys included), however deep; borrowed when
+/// no string carries one.
 pub(crate) fn without_marks(messages: &[Value]) -> Cow<'_, [Value]> {
-    fn carries_marks(value: &Value) -> bool {
-        match value {
-            Value::String(text) => has_marks(text),
-            Value::Array(items) => items.iter().any(carries_marks),
-            Value::Object(map) => map
-                .iter()
-                .any(|(key, value)| has_marks(key) || carries_marks(value)),
-            Value::Null | Value::Bool(_) | Value::Number(_) => false,
-        }
-    }
-    fn stripped(value: &Value) -> Value {
-        match value {
-            Value::String(text) => Value::String(strip(text).into_owned()),
-            Value::Array(items) => Value::Array(items.iter().map(stripped).collect()),
-            Value::Object(map) => map
-                .iter()
-                .map(|(key, value)| (strip(key).into_owned(), stripped(value)))
-                .collect(),
-            other => other.clone(),
-        }
-    }
     if messages.iter().any(carries_marks) {
         Cow::Owned(messages.iter().map(stripped).collect())
     } else {
         Cow::Borrowed(messages)
+    }
+}
+
+/// The request's template keyword arguments with the marks removed the
+/// same way; borrowed when no string carries one.
+pub(crate) fn kwargs_without_marks(
+    kwargs: &HashMap<String, Value>,
+) -> Cow<'_, HashMap<String, Value>> {
+    if kwargs
+        .iter()
+        .any(|(key, value)| has_marks(key) || carries_marks(value))
+    {
+        Cow::Owned(
+            kwargs
+                .iter()
+                .map(|(key, value)| (strip(key).into_owned(), stripped(value)))
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(kwargs)
+    }
+}
+
+fn carries_marks(value: &Value) -> bool {
+    match value {
+        Value::String(text) => has_marks(text),
+        Value::Array(items) => items.iter().any(carries_marks),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| has_marks(key) || carries_marks(value)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+fn stripped(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(strip(text).into_owned()),
+        Value::Array(items) => Value::Array(items.iter().map(stripped).collect()),
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| (strip(key).into_owned(), stripped(value)))
+            .collect(),
+        other => other.clone(),
     }
 }
 
@@ -169,6 +192,48 @@ pub(crate) fn flatten(marked: &str) -> Result<(String, Vec<Range<usize>>)> {
     }
     text.push_str(rest);
     Ok((text, controls))
+}
+
+/// `source`, a chat template, with every control spelling `controls` knows
+/// written between the marks: compiled so, the template writes control
+/// tokens where it writes the spellings, while the same spellings in request
+/// text (stripped of marks before the render) stay text. Borrowed when the
+/// template writes none.
+pub(crate) fn mark_controls<'a>(source: &'a str, controls: &AddedTokens) -> Cow<'a, str> {
+    let mut out = String::new();
+    let mut cursor = 0;
+    for range in controls.ranges(source) {
+        out.push_str(&source[cursor..range.start]);
+        out.push(START);
+        out.push_str(&source[range.clone()]);
+        out.push(END);
+        cursor = range.end;
+    }
+    if out.is_empty() {
+        return Cow::Borrowed(source);
+    }
+    out.push_str(&source[cursor..]);
+    Cow::Owned(out)
+}
+
+/// The special tokens a marked template reads (`bos_token`, `eos_token` and
+/// the rest), each between the marks.
+pub(crate) fn marked_special_tokens(tokens: &SpecialTokens) -> SpecialTokens {
+    let marked = |token: &Option<String>| token.as_deref().map(mark);
+    SpecialTokens {
+        bos_token: marked(&tokens.bos_token),
+        eos_token: marked(&tokens.eos_token),
+        unk_token: marked(&tokens.unk_token),
+        sep_token: marked(&tokens.sep_token),
+        pad_token: marked(&tokens.pad_token),
+        cls_token: marked(&tokens.cls_token),
+        mask_token: marked(&tokens.mask_token),
+        additional_special_tokens: tokens
+            .additional_special_tokens
+            .iter()
+            .map(|token| mark(token))
+            .collect(),
+    }
 }
 
 #[cfg(test)]

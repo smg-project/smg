@@ -32,6 +32,22 @@
 # run is slower than every base run). Whether the insert rows should be gated at all, gated at the
 # rule's numbers, or run with more repeats is an open decision; this header records the numbers.
 
+#
+# Placement. The workflow's benchmark job builds its binaries, the gate's pair and the summary
+# run's, with every function on a 64-byte boundary (RUSTFLAGS:
+# `-C llvm-args=-align-all-functions=6`, beside the outliner flag of .cargo/config.toml).
+# symphony.toml records why: identical code sits in one of two speed states chosen by where its
+# unchanged hot functions land modulo 64, and a pull request's code size alone moved them. Under the
+# flags this gate's null read (the same bytes twice, three interleaved runs a side on one core, 72
+# ids) read 0 failed, 0 suspect with a largest change of medians of +14.6 %, so the thresholds
+# stand. An inserted regression on the path the rows run (one dependent multiply-add per 12 input
+# bytes in the string tree walks, per 4 tokens in the token tree walks and 96 per chain-index key)
+# is caught: 41 of 72 failed, string insert +53 to +95 %, string match 8 of 9 at +30 to +35 %, token
+# insert +45 to +61 %, token match +38 to +67 %, the 10-worker chain-index lookups +29 to +51 %.
+# Under the 25 % threshold: string_match_10w_4096c at +24.8 %, the 100-worker lookups at +10 to +12
+# % and the 500-worker lookups at +2 to +3 % (their cost is the worker scoring), and the store rows
+# within 6 % (allocation and generation).
+
 repeats = 3
 filter = "^benchmark_summary/(indexer|string|token)_(match|insert|store)_"
 

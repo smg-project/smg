@@ -214,27 +214,28 @@ impl ModelWorkerSnapshot {
             .get_or_init(|| {
                 let (prefill, decode) = wire.pools();
                 Arc::new(PdPairIndex::build(
-                    self.pool(prefill),
-                    self.pool(decode),
+                    Arc::clone(self.pool(prefill)),
+                    Arc::clone(self.pool(decode)),
                     mode,
                 ))
             })
             .clone()
     }
 
-    pub(crate) fn pool(&self, pool: RoutingPool) -> WorkerSnapshot {
-        self.pools[pool.index()]
-            .get_or_init(|| {
-                if self.all.iter().all(|worker| pool.matches(worker)) {
-                    return Arc::clone(&self.all);
-                }
-                self.all
-                    .iter()
-                    .filter(|worker| pool.matches(worker))
-                    .cloned()
-                    .collect()
-            })
-            .clone()
+    /// The workers of `pool`, projected once per snapshot and borrowed from
+    /// it: a length or membership read costs no refcount step. A caller that
+    /// keeps the pool past the snapshot clones the `Arc` itself.
+    pub(crate) fn pool(&self, pool: RoutingPool) -> &WorkerSnapshot {
+        self.pools[pool.index()].get_or_init(|| {
+            if self.all.iter().all(|worker| pool.matches(worker)) {
+                return Arc::clone(&self.all);
+            }
+            self.all
+                .iter()
+                .filter(|worker| pool.matches(worker))
+                .cloned()
+                .collect()
+        })
     }
 }
 
@@ -652,7 +653,7 @@ impl WorkerRegistry {
         pool: RoutingPool,
     ) -> Arc<[Arc<dyn Worker>]> {
         if model_id == UNKNOWN_MODEL_ID {
-            return self.current_global_routing_snapshot().pool(pool);
+            return Arc::clone(self.current_global_routing_snapshot().pool(pool));
         }
         self.get_model_routing_pool(model_id, pool)
     }
@@ -670,7 +671,7 @@ impl WorkerRegistry {
     ) -> Arc<[Arc<dyn Worker>]> {
         self.model_routing_snapshot(model_id).map_or_else(
             || Arc::from(Self::EMPTY_WORKERS),
-            |snapshot| snapshot.pool(pool),
+            |snapshot| Arc::clone(snapshot.pool(pool)),
         )
     }
 

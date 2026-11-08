@@ -35,5 +35,9 @@ regex = "1.12"
 name = "throughput"
 harness = false
 
+[[bench]]
+name = "grammar"
+harness = false
+
 [lints]
 workspace = true

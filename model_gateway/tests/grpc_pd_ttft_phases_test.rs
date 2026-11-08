@@ -19,6 +19,7 @@
 use std::{future::Future, time::Duration};
 
 use common::{
+    decode_stream::produce_after,
     engine_answers::{VllmAnswers, VllmGenerateStream},
     grpc_harness::{
         build_grpc_router, grpc_router_config, grpc_workers, serve_canned_worker, serve_engine,
@@ -26,7 +27,6 @@ use common::{
     },
 };
 use metrics_exporter_prometheus::PrometheusBuilder;
-use proto::generate_response::Response as GenResp;
 use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
@@ -50,8 +50,6 @@ const DECODE_DELAY: Duration = Duration::from_millis(400);
 /// absorbed the other worker's delay fails its upper bound.
 const SLACK: Duration = Duration::from_millis(250);
 
-type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
-
 /// A sequential-dispatch mock engine: every generate call answers with
 /// `OUTPUT_TOKENS` chunks and a completion after `delay`. With `hold_headers`
 /// the call itself waits out the delay before it returns the stream, like an
@@ -61,48 +59,6 @@ type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
 struct DelayedEngine {
     delay: Duration,
     hold_headers: bool,
-}
-
-fn chunk(id: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Chunk(proto::GenerateStreamChunk {
-            token_ids: vec![id],
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-fn complete() -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Complete(proto::GenerateComplete {
-            output_ids: (1..=OUTPUT_TOKENS).collect(),
-            finish_reason: "stop".to_string(),
-            prompt_tokens: 1,
-            completion_tokens: OUTPUT_TOKENS,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-/// Feed one generate stream: the tokens after `delay`, then the completion.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "test mock; the producer task ends with its stream"
-)]
-fn produce_after(tx: GenerateTx, delay: Duration) {
-    tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        for id in 1..=OUTPUT_TOKENS {
-            if tx.send(Ok(chunk(id))).await.is_err() {
-                return;
-            }
-        }
-        let _ = tx.send(Ok(complete())).await;
-    });
 }
 
 #[tonic::async_trait]
@@ -118,7 +74,7 @@ impl VllmAnswers for DelayedEngine {
         } else {
             self.delay
         };
-        produce_after(tx, in_stream_delay);
+        produce_after(tx, in_stream_delay, OUTPUT_TOKENS);
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }

@@ -418,7 +418,7 @@ fn url_source(url: &str) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use llm_multimodal::PreProcessorConfig;
@@ -438,7 +438,8 @@ mod tests {
     /// anchor first.
     type Tokens = &'static [(&'static str, u32)];
 
-    fn image_urls(count: usize) -> MediaPlan {
+    /// `count` image parts, each at its own URL.
+    pub(crate) fn image_urls(count: usize) -> MediaPlan {
         MediaPlan::new((0..count).map(|i| MediaContentPart::ImageUrl {
             url: format!("https://example.com/{i}.png"),
             detail: None,

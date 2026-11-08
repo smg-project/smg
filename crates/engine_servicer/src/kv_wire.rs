@@ -126,6 +126,12 @@ pub struct EventTail {
     pub locality: Option<String>,
     pub ownership: Option<String>,
     pub session_id: Option<String>,
+    /// The cache groups the event is about, bit i for the engine's group i:
+    /// on a store the groups that hold the boundary after it, on a removal
+    /// the groups that dropped it. Written by a publisher that reports a
+    /// boundary once for every group (after the reference layout's last
+    /// slot); absent from one that reports each group on its own.
+    pub group_mask: Option<u64>,
 }
 
 /// Token ids of a store: plain ids, or the (token, next token) bigrams a
@@ -299,6 +305,13 @@ impl Loose {
         }
     }
 
+    fn unsigned64(self) -> Option<u64> {
+        match self {
+            Loose::Unsigned(value) => Some(value),
+            _ => None,
+        }
+    }
+
     fn signed(self) -> Option<i64> {
         match self {
             Loose::Unsigned(value) => i64::try_from(value).ok(),
@@ -413,10 +426,10 @@ struct Fields {
     lora_name: Option<Loose>,
     cache_salt: Option<Loose>,
     extra_keys: Option<Loose>,
-    tail: [Option<Loose>; 7],
+    tail: [Option<Loose>; 8],
 }
 
-const TAIL_KEYS: [&str; 7] = [
+const TAIL_KEYS: [&str; 8] = [
     "medium",
     "group_idx",
     "kv_cache_spec_kind",
@@ -424,10 +437,11 @@ const TAIL_KEYS: [&str; 7] = [
     "locality",
     "ownership",
     "session_id",
+    "group_mask",
 ];
 
-fn tail_from(slots: [Option<Loose>; 7]) -> EventTail {
-    let [medium, group_idx, kind, sliding, locality, ownership, session_id] = slots;
+fn tail_from(slots: [Option<Loose>; 8]) -> EventTail {
+    let [medium, group_idx, kind, sliding, locality, ownership, session_id, group_mask] = slots;
     EventTail {
         medium: medium.and_then(Loose::text),
         group_idx: group_idx.and_then(Loose::unsigned32),
@@ -436,6 +450,7 @@ fn tail_from(slots: [Option<Loose>; 7]) -> EventTail {
         locality: locality.and_then(Loose::text),
         ownership: ownership.and_then(Loose::text),
         session_id: session_id.and_then(Loose::text),
+        group_mask: group_mask.and_then(Loose::unsigned64),
     }
 }
 
@@ -475,7 +490,7 @@ impl Fields {
                 None => WireEvent::Malformed("block_hashes"),
             },
             "AllBlocksCleared" => {
-                let [_, _, _, _, _, ownership, _] = self.tail;
+                let [_, _, _, _, _, ownership, _, _] = self.tail;
                 WireEvent::AllBlocksCleared {
                     ownership: ownership.and_then(Loose::text),
                 }
@@ -526,7 +541,9 @@ impl<'de> Deserialize<'de> for WireEvent {
             /// extra_keys, group_idx, kind, sliding_window, locality,
             /// ownership, session_id]`, a removal `[tag, block_hashes,
             /// medium, group_idx, locality, ownership]`, a clear `[tag]`;
-            /// trailing defaults are omitted. SGLang's legacy arrays put
+            /// trailing defaults are omitted. A publisher that reports a
+            /// boundary once for every group appends `group_mask` after the
+            /// layout's last slot of a store and of a removal. SGLang's legacy arrays put
             /// `cache_salt` where vLLM has `lora_name`; the two are not
             /// distinguishable there, and SGLang has published maps since it
             /// added the field.
@@ -556,13 +573,13 @@ impl<'de> Deserialize<'de> for WireEvent {
                         fields.lora_name = lora_name.map(Loose::Text);
                         fields.cache_salt = cache_salt.map(Loose::Text);
                         fields.extra_keys = Some(next());
-                        for slot in 1..=6 {
+                        for slot in 1..=7 {
                             fields.tail[slot] = Some(next());
                         }
                     }
                     "BlockRemoved" => {
                         fields.block_hashes = Some(next());
-                        for slot in [0, 1, 4, 5] {
+                        for slot in [0, 1, 4, 5, 7] {
                             fields.tail[slot] = Some(next());
                         }
                     }
@@ -1290,6 +1307,7 @@ impl Normalizer {
             kv_cache_spec_sliding_window,
             ownership,
             session_id,
+            group_mask,
             ..
         } = stored.tail;
         Ok(kv_cache_event::Data::Stored(common::KvBlocksStored {
@@ -1305,6 +1323,7 @@ impl Normalizer {
             session_id,
             lora_name: namespace.lora_name,
             cache_salt: namespace.cache_salt,
+            group_mask,
         }))
     }
 
@@ -1359,6 +1378,7 @@ impl Normalizer {
             medium,
             group_idx,
             ownership,
+            group_mask,
             ..
         } = removed.tail;
         Ok(kv_cache_event::Data::Removed(common::KvBlocksRemoved {
@@ -1369,6 +1389,7 @@ impl Normalizer {
             group_idx,
             locality: Some(locality as i32),
             ownership,
+            group_mask,
         }))
     }
 }

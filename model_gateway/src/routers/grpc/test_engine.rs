@@ -1,11 +1,16 @@
-//! A mock engine for the tests of the gRPC router: the `mock_worker` crate's
-//! gRPC server on a loopback port, so a test's client has an engine to
-//! connect to. The test supplies the frames it reads itself, or sends the
-//! engine nothing, and aborts the server task when it is done.
+//! Engines for the tests of the gRPC routers, on loopback ports: the
+//! `mock_worker` crate's gRPC server, so a test's client has an engine to
+//! connect to, and the serving of a test's own scripted engine. Both bind the
+//! port before they hand it out: a port picked first and bound later is
+//! another test's in between on a loaded host, and the stub then fails with
+//! "address in use". The test supplies the frames it reads itself, or sends
+//! the engine nothing, and aborts the server task when it is done or leaves
+//! it to end with the test process.
 
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::{net::TcpListener, task::JoinHandle};
+use tonic::transport::server::{Router, TcpIncoming};
 
 /// A mock engine serving `model_id` on a loopback port, as its URL and its
 /// server task.
@@ -39,4 +44,28 @@ pub(crate) async fn mock_engine(model_id: &str) -> (String, JoinHandle<()>) {
     });
     let server = tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
     (format!("http://127.0.0.1:{port}"), server)
+}
+
+/// `router` (a tonic server with its services added) served on a loopback
+/// port that is bound before this returns, as the address and the server
+/// task. A connection made right after this returns waits in the listener's
+/// backlog until the task accepts it, so no caller polls for the port. The
+/// accepted connections carry `TCP_NODELAY`, as `serve(addr)` sets it through
+/// the builder's default; tonic leaves a caller-provided stream as given.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bounded test fixture; the caller aborts the server task or lets it end with the test"
+)]
+pub(crate) async fn serve_on_loopback(router: Router) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let addr = listener.local_addr().expect("the bound address");
+    let server = tokio::spawn(async move {
+        router
+            .serve_with_incoming(TcpIncoming::from(listener).with_nodelay(Some(true)))
+            .await
+            .expect("the test's engine server");
+    });
+    (addr, server)
 }

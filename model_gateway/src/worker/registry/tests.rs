@@ -1467,7 +1467,7 @@ fn global_snapshot_never_publishes_a_torn_generation() {
                     continue;
                 }
                 assert!(
-                    generation(&prefill) >= generation(&decode),
+                    generation(prefill) >= generation(decode),
                     "torn snapshot: decode generation passed prefill"
                 );
             }

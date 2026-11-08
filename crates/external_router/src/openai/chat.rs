@@ -358,18 +358,7 @@ mod tests {
     use axum::body::to_bytes;
 
     use super::*;
-
-    fn upstream(
-        status: u16,
-        content_type: Option<&str>,
-        body: impl Into<reqwest::Body>,
-    ) -> reqwest::Response {
-        let mut builder = http::Response::builder().status(status);
-        if let Some(ct) = content_type {
-            builder = builder.header(CONTENT_TYPE, ct);
-        }
-        reqwest::Response::from(builder.body(body.into()).expect("a response"))
-    }
+    use crate::test_support::upstream;
 
     async fn bytes_of(response: Response) -> Vec<u8> {
         to_bytes(response.into_body(), usize::MAX)
@@ -477,9 +466,9 @@ mod tests {
     async fn a_buffered_body_the_request_timeout_cuts_is_the_final_504() {
         let url = stalled_upstream().await;
         let client = client_with_timeout(std::time::Duration::from_millis(200));
-        let upstream = client.post(url).send().await.unwrap();
+        let answer = client.post(url).send().await.unwrap();
 
-        let response = buffered_body(upstream, StatusCode::OK).await;
+        let response = buffered_body(answer, StatusCode::OK).await;
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(

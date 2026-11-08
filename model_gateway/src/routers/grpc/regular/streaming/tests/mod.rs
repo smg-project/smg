@@ -5,6 +5,7 @@ mod failure;
 mod generate_bytes;
 mod generate_decode;
 mod generate_finish;
+mod generate_frames;
 mod generate_tokens;
 mod isolation;
 mod local_stop;

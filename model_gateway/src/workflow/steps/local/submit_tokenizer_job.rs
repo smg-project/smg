@@ -184,23 +184,15 @@ fn tokenizer_source<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::tokenizer_source;
-
-    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect()
-    }
+    use crate::workflow::steps::local::test_support::labels_of;
 
     /// A worker that names its model by id only, with neither a path label
     /// nor a router flag: the id is the source (a local load that fails on
     /// it falls back to the worker's bundle); an empty id is no source.
     #[test]
     fn tokenizer_source_is_the_model_id_when_nothing_else_names_a_path() {
-        let id_only = labels(&[("model_id", "/engines/served")]);
+        let id_only = labels_of(&[("model_id", "/engines/served")]);
         assert_eq!(
             tokenizer_source(&id_only, None, None),
             Some("/engines/served")
@@ -210,10 +202,10 @@ mod tests {
             Some("/engines/served")
         );
         assert_eq!(
-            tokenizer_source(&labels(&[("model_id", "")]), None, None),
+            tokenizer_source(&labels_of(&[("model_id", "")]), None, None),
             None
         );
-        assert_eq!(tokenizer_source(&labels(&[]), None, None), None);
+        assert_eq!(tokenizer_source(&labels_of(&[]), None, None), None);
     }
 
     /// The operator's flags and the worker's path labels keep their
@@ -222,7 +214,7 @@ mod tests {
     /// wins over the flags as before.
     #[test]
     fn tokenizer_source_reads_the_model_id_only_after_the_flags_and_path_labels() {
-        let id_only = labels(&[("model_id", "/engines/served")]);
+        let id_only = labels_of(&[("model_id", "/engines/served")]);
         assert_eq!(
             tokenizer_source(&id_only, Some("/opt/tok"), None),
             Some("/opt/tok")
@@ -236,7 +228,7 @@ mod tests {
             Some("/opt/tok")
         );
 
-        let with_paths = labels(&[
+        let with_paths = labels_of(&[
             ("model_id", "/engines/served"),
             ("model_path", "/engines/weights"),
             ("tokenizer_path", "/engines/tok"),
@@ -245,7 +237,7 @@ mod tests {
             tokenizer_source(&with_paths, Some("/opt/tok"), None),
             Some("/engines/tok")
         );
-        let with_model_path = labels(&[
+        let with_model_path = labels_of(&[
             ("model_id", "/engines/served"),
             ("model_path", "/engines/weights"),
         ]);

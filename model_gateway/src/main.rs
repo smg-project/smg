@@ -1751,11 +1751,19 @@ struct IntegrationArgs {
     jwt_role_mapping: Vec<String>,
 
     /// API keys for control plane access (format: id:name:role:key; role `admin` reaches every
-    /// control plane route, `user` the read-only GET/HEAD routes)
-    #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS", hide_env_values = true, help_heading = "Control Plane Authentication")]
+    /// control plane route, `user` the read-only GET/HEAD routes). Also read from the environment
+    /// (CONTROL_PLANE_API_KEYS, entries separated by ',' or a newline) or a file
+    /// (--control-plane-api-keys-file); the flag beats the environment, and entries together
+    /// with a file are refused
+    #[arg(long = "control-plane-api-keys", action = ArgAction::Append, help_heading = "Control Plane Authentication")]
     control_plane_api_keys: Vec<String>,
 
-    /// Disable audit logging for control plane operations
+    /// File holding the control-plane API keys, one id:name:role:key per line (blank lines and
+    /// lines starting with # are skipped), such as a mounted secret (env: CONTROL_PLANE_API_KEYS_FILE)
+    #[arg(long, help_heading = "Control Plane Authentication")]
+    control_plane_api_keys_file: Option<PathBuf>,
+
+    /// Disable the control-plane audit lines (the admission line and the mutation outcome line)
     #[arg(
         long,
         default_value_t = false,
@@ -4602,6 +4610,10 @@ mod tests {
                 "SMG_REDIS_URL",
                 "redis://:env-redis-pass@cache.example:6379/0",
             ),
+            (
+                "CONTROL_PLANE_API_KEYS",
+                "ops:Ops:admin:env-ops-key, ro:Read:user:env-ro-key",
+            ),
         ];
 
         let cli = resolved(&["--history-backend", "postgres"], &vars).expect("resolves");
@@ -4609,6 +4621,10 @@ mod tests {
         assert_eq!(
             cli.integrations.tenant_api_keys,
             vec!["red:env-red", "blue:env-blue", "green:env-green"]
+        );
+        assert_eq!(
+            cli.integrations.control_plane_api_keys,
+            vec!["ops:Ops:admin:env-ops-key", "ro:Read:user:env-ro-key"]
         );
         assert_eq!(
             cli.integrations.postgres_db_url.as_deref(),
@@ -4619,9 +4635,21 @@ mod tests {
             SecretSources {
                 api_key: Some(SecretSource::Environment),
                 tenant_api_keys: Some((SecretSource::Environment, 3)),
+                control_plane_api_keys: Some((SecretSource::Environment, 2)),
                 postgres_db_url: Some(SecretSource::Environment),
                 redis_url: None,
             }
+        );
+        let control_plane = cli
+            .build_control_plane_auth_config()
+            .expect("the resolved entries build the control-plane configuration");
+        assert_eq!(
+            control_plane
+                .api_keys
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ops", "ro"]
         );
         let config = cli
             .to_router_config(vec![], vec![])
@@ -4732,6 +4760,7 @@ mod tests {
         let vars = [
             ("SMG_API_KEY", "env-shared-key"),
             ("SMG_TENANT_API_KEYS", "red:env-red"),
+            ("CONTROL_PLANE_API_KEYS", "ops:Ops:admin:env-ops-key"),
             (
                 "SMG_POSTGRES_DB_URL",
                 "postgresql://u:env@db.example:5432/smg",
@@ -4743,6 +4772,8 @@ mod tests {
                 "flag-shared-key",
                 "--tenant-api-key",
                 "blue:flag-blue",
+                "--control-plane-api-keys",
+                "ci:CI:admin:flag-ci-key",
                 "--history-backend",
                 "postgres",
                 "--postgres-db-url",
@@ -4755,6 +4786,10 @@ mod tests {
         assert_eq!(cli.integrations.api_key.as_deref(), Some("flag-shared-key"));
         assert_eq!(cli.integrations.tenant_api_keys, vec!["blue:flag-blue"]);
         assert_eq!(
+            cli.integrations.control_plane_api_keys,
+            vec!["ci:CI:admin:flag-ci-key"]
+        );
+        assert_eq!(
             cli.integrations.postgres_db_url.as_deref(),
             Some("postgresql://u:flag@db.example:5432/smg")
         );
@@ -4763,6 +4798,7 @@ mod tests {
             SecretSources {
                 api_key: Some(SecretSource::Flag),
                 tenant_api_keys: Some((SecretSource::Flag, 1)),
+                control_plane_api_keys: Some((SecretSource::Flag, 1)),
                 postgres_db_url: Some(SecretSource::Flag),
                 redis_url: None,
             }
@@ -4776,6 +4812,7 @@ mod tests {
 
         assert_eq!(cli.integrations.api_key, None);
         assert!(cli.integrations.tenant_api_keys.is_empty());
+        assert!(cli.integrations.control_plane_api_keys.is_empty());
         assert_eq!(cli.integrations.postgres_db_url, None);
         assert_eq!(cli.integrations.redis_url, None);
         assert_eq!(cli.integrations.secret_sources, SecretSources::default());
@@ -4793,7 +4830,13 @@ mod tests {
         let tenants = dir.path().join("tenants");
         let pg = dir.path().join("pg-url");
         let redis = dir.path().join("redis-url");
+        let operators = dir.path().join("control-plane-keys");
         std::fs::write(&api_key, "file-shared-key\n").unwrap();
+        std::fs::write(
+            &operators,
+            "# the operators\n\nops:Ops:admin:file-ops-key\r\n  ro:Read:user:file-ro-key  \n",
+        )
+        .unwrap();
         std::fs::write(
             &tenants,
             "# the tenants\r\n\nred:file-red\r\n  blue : file-blue  \n\n# trailing comment\n",
@@ -4801,11 +4844,12 @@ mod tests {
         .unwrap();
         std::fs::write(&pg, "postgresql://u:file-pg@db.example:5432/smg").unwrap();
         std::fs::write(&redis, "  redis://:file-redis@cache.example:6379/1\n\n").unwrap();
-        let (api_key, tenants, pg, redis) = (
+        let (api_key, tenants, pg, redis, operators) = (
             api_key.to_str().unwrap(),
             tenants.to_str().unwrap(),
             pg.to_str().unwrap(),
             redis.to_str().unwrap(),
+            operators.to_str().unwrap(),
         );
 
         let by_flag = resolved(
@@ -4814,6 +4858,8 @@ mod tests {
                 api_key,
                 "--tenant-api-keys-file",
                 tenants,
+                "--control-plane-api-keys-file",
+                operators,
                 "--history-backend",
                 "postgres",
                 "--postgres-db-url-file",
@@ -4831,6 +4877,10 @@ mod tests {
             vec!["red:file-red", "blue : file-blue"]
         );
         assert_eq!(
+            by_flag.integrations.control_plane_api_keys,
+            vec!["ops:Ops:admin:file-ops-key", "ro:Read:user:file-ro-key"]
+        );
+        assert_eq!(
             by_flag.integrations.postgres_db_url.as_deref(),
             Some("postgresql://u:file-pg@db.example:5432/smg")
         );
@@ -4839,10 +4889,16 @@ mod tests {
             SecretSources {
                 api_key: Some(SecretSource::File),
                 tenant_api_keys: Some((SecretSource::File, 2)),
+                control_plane_api_keys: Some((SecretSource::File, 2)),
                 postgres_db_url: Some(SecretSource::File),
                 redis_url: None,
             }
         );
+        let control_plane = by_flag
+            .build_control_plane_auth_config()
+            .expect("the file's entries build the control-plane configuration");
+        assert_eq!(control_plane.api_keys.len(), 2);
+        assert_eq!(control_plane.api_keys[1].id, "ro");
         let config = by_flag.to_router_config(vec![], vec![]).expect("builds");
         assert_eq!(
             config
@@ -4858,6 +4914,7 @@ mod tests {
             &[
                 ("SMG_API_KEY_FILE", api_key),
                 ("SMG_TENANT_API_KEYS_FILE", tenants),
+                ("CONTROL_PLANE_API_KEYS_FILE", operators),
                 ("SMG_REDIS_URL_FILE", redis),
             ],
         )
@@ -4867,6 +4924,7 @@ mod tests {
             Some("file-shared-key")
         );
         assert_eq!(by_env.integrations.tenant_api_keys.len(), 2);
+        assert_eq!(by_env.integrations.control_plane_api_keys.len(), 2);
         assert_eq!(
             by_env.integrations.redis_url.as_deref(),
             Some("redis://:file-redis@cache.example:6379/1")
@@ -4876,6 +4934,7 @@ mod tests {
             SecretSources {
                 api_key: Some(SecretSource::File),
                 tenant_api_keys: Some((SecretSource::File, 2)),
+                control_plane_api_keys: Some((SecretSource::File, 2)),
                 postgres_db_url: None,
                 redis_url: Some(SecretSource::File),
             }
@@ -4932,6 +4991,21 @@ mod tests {
             ),
             (
                 vec![
+                    "--control-plane-api-keys",
+                    "ci:CI:admin:flag-secret",
+                    "--control-plane-api-keys-file",
+                    file,
+                ],
+                vec![],
+                "--control-plane-api-keys",
+            ),
+            (
+                vec!["--control-plane-api-keys-file", file],
+                vec![("CONTROL_PLANE_API_KEYS", "ci:CI:admin:env-secret")],
+                "--control-plane-api-keys",
+            ),
+            (
+                vec![
                     "--history-backend",
                     "postgres",
                     "--postgres-db-url",
@@ -4969,7 +5043,10 @@ mod tests {
                     "{args:?}: {named} missing from {text}"
                 );
             }
-            assert!(text.contains("SMG_"), "{args:?}: {text}");
+            assert!(
+                text.contains("SMG_") || text.contains("CONTROL_PLANE_API_KEYS"),
+                "{args:?}: {text}"
+            );
             for secret in ["flag-secret", "env-secret", "file-secret"] {
                 assert!(!text.contains(secret), "{args:?}: {text}");
             }
@@ -5015,6 +5092,16 @@ mod tests {
             (
                 vec!["--tenant-api-keys-file".into(), path(&missing)],
                 "tenant-api-keys-file",
+                "cannot be read",
+            ),
+            (
+                vec!["--control-plane-api-keys-file".into(), path(&comments_only)],
+                "control-plane-api-keys-file",
+                "holds no entry",
+            ),
+            (
+                vec!["--control-plane-api-keys-file".into(), path(&missing)],
+                "control-plane-api-keys-file",
                 "cannot be read",
             ),
             (
@@ -5126,6 +5213,7 @@ mod tests {
             SecretSources {
                 api_key: Some(SecretSource::File),
                 tenant_api_keys: Some((SecretSource::Environment, 1)),
+                control_plane_api_keys: None,
                 postgres_db_url: None,
                 redis_url: None,
             }
@@ -5146,16 +5234,15 @@ mod tests {
         use clap::CommandFactory;
 
         let mut command = Cli::command();
-        for id in ["oracle_password", "control_plane_api_keys"] {
-            let arg = command
-                .get_arguments()
-                .find(|arg| arg.get_id().as_str() == id)
-                .unwrap_or_else(|| panic!("{id} is an argument"));
-            assert!(
-                arg.is_hide_env_values_set(),
-                "{id} would show its environment value in the help"
-            );
-        }
+        let id = "oracle_password";
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id().as_str() == id)
+            .unwrap_or_else(|| panic!("{id} is an argument"));
+        assert!(
+            arg.is_hide_env_values_set(),
+            "{id} would show its environment value in the help"
+        );
         let help = command.render_long_help().to_string();
 
         for named in [
@@ -5169,7 +5256,9 @@ mod tests {
             "SMG_REDIS_URL",
             "--redis-url-file",
             "[env: ATP_PASSWORD]",
-            "[env: CONTROL_PLANE_API_KEYS]",
+            "CONTROL_PLANE_API_KEYS",
+            "--control-plane-api-keys-file",
+            "CONTROL_PLANE_API_KEYS_FILE",
         ] {
             assert!(help.contains(named), "{named} missing from the help");
         }

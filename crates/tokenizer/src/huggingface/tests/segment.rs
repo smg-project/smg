@@ -369,6 +369,7 @@ fn count(ids: &[u32], id: u32) -> usize {
 fn segment_ids(tok: &HuggingFaceTokenizer, messages: &[Value]) -> Vec<u32> {
     let marked = tok
         .render_marked(messages, chat_params())
+        .map(|(marked, _)| marked)
         .expect("the marked rendering");
     tok.core
         .encode_segments(&marks::segments(&marked).expect("paired marks"))
@@ -520,6 +521,7 @@ fn a_control_token_the_vocabulary_lacks_is_text_as_the_flat_encode_made_it() {
     // follows the user turn's assistant header and think token).
     let marked = tok
         .render_marked(&messages, chat_params())
+        .map(|(marked, _)| marked)
         .expect("the marked rendering");
     let segments = marks::segments(&marked).expect("paired marks");
     let joined = tok
@@ -667,6 +669,7 @@ fn the_recorded_prompts_of_the_real_vocabulary_encode_the_same_by_segments() {
             .unwrap_or_else(|| case.messages.clone());
         let marked = tok
             .render_marked(&messages, params)
+            .map(|(marked, _)| marked)
             .unwrap_or_else(|e| panic!("case {}: {e}", case.name));
         let segments = marks::segments(&marked).expect("paired marks");
         let (text, controls) = marks::flatten(&marked).expect("paired marks");

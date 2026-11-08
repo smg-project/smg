@@ -12,6 +12,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use smg_auth::AuditResource;
 use uuid::Uuid;
 
 use crate::{
@@ -154,8 +155,18 @@ pub async fn add_wasm_module(
         }
     }
 
-    let response = WasmModuleAddResponse { modules };
-    (status, Json(response)).into_response()
+    let added: Vec<String> = modules
+        .iter()
+        .filter_map(|module| match &module.add_result {
+            Some(WasmModuleAddResult::Success(uuid)) => Some(uuid.to_string()),
+            Some(WasmModuleAddResult::Error(_)) | None => None,
+        })
+        .collect();
+    let response = (status, Json(WasmModuleAddResponse { modules })).into_response();
+    if added.is_empty() {
+        return response;
+    }
+    AuditResource::name(response, added.join(","))
 }
 
 pub async fn remove_wasm_module(
@@ -190,7 +201,10 @@ pub async fn remove_wasm_module(
             // Wait for job completion (timeout: 1 minute)
             let timeout = Duration::from_secs(60);
             match wait_for_job_completion(job_queue, &worker_url, timeout).await {
-                Ok(_) => (StatusCode::OK, "Module removed successfully").into_response(),
+                Ok(_) => AuditResource::name(
+                    (StatusCode::OK, "Module removed successfully").into_response(),
+                    module_uuid.to_string(),
+                ),
                 Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
             }
         }

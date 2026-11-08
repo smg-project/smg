@@ -22,7 +22,10 @@ use crate::{
     routers::{
         common::placement::{self, PipelinePin, NO_MEDIA_REF_CAPABLE_WORKER_CODE},
         error,
-        grpc::context::WorkerSelection,
+        grpc::{
+            common::stages::pd_protocol::{EncodeHandoff, PdProtocol},
+            context::WorkerSelection,
+        },
     },
     worker::{ConnectionMode, RuntimeType, Worker, WorkerRegistry, WorkerType},
 };
@@ -506,19 +509,21 @@ pub(crate) fn resolve_mm_processing(
                 // Every registered worker, healthy or not: a health flap must
                 // not flip a model between modes request to request.
                 let workers = registry.get_by_model(model_id);
-                // vLLM EC encoders process references themselves; their P/D
-                // workers consume metadata and need no media processor.
+                // An encode pool whose encoders take references under a
+                // push handoff processes them itself; its prefill/decode
+                // workers consume the identity and need no media processor.
                 let epd = pool_has_encode_worker(workers.iter());
-                let vllm_encode = epd
+                let push_encode = epd
                     && workers
                         .iter()
                         .filter(|worker| *worker.worker_type() == WorkerType::Encode)
                         .all(|worker| {
-                            worker.metadata().spec.runtime_type == RuntimeType::Vllm
+                            PdProtocol::encode_handoff(worker.metadata().spec.runtime_type)
+                                == Some(EncodeHandoff::Push)
                                 && worker_supports_ec_transfer(worker.as_ref())
                                 && worker_accepts_media_refs(worker.as_ref())
                         });
-                let uniform = vllm_encode
+                let uniform = push_encode
                     || (!workers.is_empty()
                         && !epd
                         && workers

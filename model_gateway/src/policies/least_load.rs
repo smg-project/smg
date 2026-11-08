@@ -809,7 +809,7 @@ mod tests {
         policies::test_support::{fed_pair, make_worker},
         worker::{
             load_state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
-            test_support::no_health_check,
+            test_support::{no_health_check, worker_of},
             BasicWorkerBuilder, WorkerType,
         },
     };
@@ -937,14 +937,7 @@ mod tests {
             let feed = TestFeed::attached_to(&policy);
             let workers: Vec<Arc<dyn Worker>> = ["http://p1:1", "http://p2:2"]
                 .into_iter()
-                .map(|url| {
-                    Arc::new(
-                        BasicWorkerBuilder::new(url)
-                            .worker_type(WorkerType::Prefill)
-                            .health_config(no_health_check())
-                            .build(),
-                    ) as Arc<dyn Worker>
-                })
+                .map(|url| worker_of(url, WorkerType::Prefill))
                 .collect();
             feed.publish(&HashMap::from([
                 (workers[0].url().to_string(), measured_fast.clone()),
@@ -974,14 +967,7 @@ mod tests {
         let feed = TestFeed::attached_to(&policy);
         let workers: Vec<Arc<dyn Worker>> = ["http://prefill:1", "http://missing:2"]
             .into_iter()
-            .map(|url| {
-                Arc::new(
-                    BasicWorkerBuilder::new(url)
-                        .worker_type(WorkerType::Prefill)
-                        .health_config(no_health_check())
-                        .build(),
-                ) as Arc<dyn Worker>
-            })
+            .map(|url| worker_of(url, WorkerType::Prefill))
             .collect();
         workers[1].increment_load();
         for generated in [0.0, 0.5, 10_000.0] {

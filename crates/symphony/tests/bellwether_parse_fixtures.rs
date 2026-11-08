@@ -63,6 +63,19 @@
 //! plans, each delta carrying its tokens' pieces as bellwether records them in `output_pieces`, and
 //! checks that every token is counted once, in the event that carries its first byte.
 //!
+//! A case may carry witnesses beside its reference: what other readers said of it, keyed by
+//! reader, written by `bellwether witness`. An engine's witness names a version and an image and
+//! reads nothing; a library's carries the message the vendor's own output library read from the
+//! case's token ids and its finish reason, or the text with which the library refused the case's
+//! request. The DeepSeek V4 and V4.1 sets carry the vendor's library (`deepseek-recipe`). The
+//! parser has to read every case a library read as the library did, bitwise once the library's
+//! empty reasoning string for an answer without a thought is read as the reference's absent one;
+//! a case it reads differently fails the run, whatever the reference says of it, unless the case
+//! is listed in [`KNOWN_DIFFERENCES`] (a marker inside text, which each reader reads its own way:
+//! the library's reading of it is reported, not held against the parser), and a request the
+//! library refused is counted. Each set's summary line is followed by one per library that
+//! witnessed a case of it.
+//!
 //! A fourth test corrupts the recorded outputs: three seeded corruptions of every sampled case of
 //! every recorded model (a span deleted or doubled, one of the table's own markers or a cut one
 //! inserted, the tail cut, a character swapped), each read through the model's table after its
@@ -1481,6 +1494,10 @@ struct Fixture {
     /// Chunk sizes in tokens by plan name; `whole` and `per_token` carry none and are derived.
     #[serde(default)]
     chunk_plans: BTreeMap<String, Option<Vec<usize>>>,
+    /// What other readers said of the case, by reader (`bellwether witness`); absent before
+    /// bellwether recorded any.
+    #[serde(default)]
+    witnesses: BTreeMap<String, Witness>,
 }
 
 /// The parts of the case's request the replay needs: the tools, which type a tagged call's values,
@@ -1553,6 +1570,37 @@ struct ReferenceFunction {
     arguments: String,
 }
 
+/// What another reader said of a case: a library's message read from the output ids with its
+/// finish reason, or the text with which it refused the request; an engine's witness carries
+/// neither (its version and image are not read here).
+#[derive(Deserialize)]
+struct Witness {
+    message: Option<ReferenceMessage>,
+    finish_reason: Option<String>,
+    rejected: Option<String>,
+}
+
+impl Witness {
+    /// What the reader said the output means, in the reference's terms; `None` when it read
+    /// nothing. A library writes an empty reasoning string for an answer without a thought, where
+    /// the reference writes none; both say the same, so the empty string is read as none.
+    fn said(&self) -> Option<Said> {
+        let said = Said::of_message(self.message.as_ref()?, self.finish_reason.as_deref()?);
+        Some(Said {
+            reasoning: said.reasoning.filter(|reasoning| !reasoning.is_empty()),
+            ..said
+        })
+    }
+}
+
+/// What a library's witness said of a set's cases, against what the parser said.
+#[derive(Default)]
+struct Witnessed {
+    as_the_parser: usize,
+    differently: usize,
+    refused: usize,
+}
+
 /// What the parser said an output means, in the terms the reference uses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Said {
@@ -1585,16 +1633,19 @@ impl Said {
     }
 
     fn of_reference(reference: &Reference) -> Self {
+        Self::of_message(&reference.message, &reference.finish_reason)
+    }
+
+    fn of_message(message: &ReferenceMessage, finish_reason: &str) -> Self {
         Self {
-            content: reference.message.content.clone().filter(|c| !c.is_empty()),
-            reasoning: reference.message.reasoning_content.clone(),
-            calls: reference
-                .message
+            content: message.content.clone().filter(|c| !c.is_empty()),
+            reasoning: message.reasoning_content.clone(),
+            calls: message
                 .tool_calls
                 .iter()
                 .map(|call| (call.function.name.clone(), call.function.arguments.clone()))
                 .collect(),
-            finish: reference.finish_reason.clone(),
+            finish: finish_reason.to_string(),
         }
     }
 
@@ -2079,6 +2130,7 @@ fn parity(
         (0, 0, 0, 0, 0);
     let (mut unreadable, mut undeclared_after_content) = (0, 0);
     let (mut token_plans_run, mut without_pieces, mut content_off_whole) = (0, 0, 0);
+    let mut by_library: BTreeMap<&str, Witnessed> = BTreeMap::new();
     for fixture in fixtures {
         let text = &*fixture.reference.text;
         let expected = Said::of_reference(&fixture.reference);
@@ -2252,6 +2304,51 @@ fn parity(
         if let Some(listed_case) = known(&fixture.id) {
             out.push_str(&format!("  {:34} {}\n", "", listed_case.reason));
         }
+        // A library that read the case has to have read it as the parser did, whatever the
+        // reference says of the case; a library that refused the request read nothing, and an
+        // engine's witness reads nothing either.
+        for (library, witness) in &fixture.witnesses {
+            let tally = by_library.entry(library).or_default();
+            match witness.said() {
+                Some(read) if read == said => {
+                    tally.as_the_parser += 1;
+                    if known(&fixture.id).is_some() {
+                        out.push_str(&format!(
+                            "  {:34} {library} reads it as the parser does\n",
+                            ""
+                        ));
+                    }
+                }
+                Some(read) => {
+                    tally.differently += 1;
+                    out.push_str(&format!(
+                        "  {:34} {library} reads it differently: {read:?}\n",
+                        ""
+                    ));
+                    // A listed case puts a marker inside text, and each reader reads such a
+                    // marker its own way; the list declares the parser's, so the library's is
+                    // reported and not held against it.
+                    if known(&fixture.id).is_none() {
+                        failures.push(format!(
+                            "{}: differs from the reading of {library}\n    said:    {said:?}\n    \
+                             library: {read:?}",
+                            fixture.id
+                        ));
+                    }
+                }
+                None => {
+                    if let Some(reason) = &witness.rejected {
+                        tally.refused += 1;
+                        let reason: Vec<&str> = reason.split_whitespace().collect();
+                        out.push_str(&format!(
+                            "  {:34} {library} refused the request: {}\n",
+                            "",
+                            reason.join(" ")
+                        ));
+                    }
+                }
+            }
+        }
     }
     // A listed case that is no longer among the fixtures would let the list rot. The check reads
     // every id the set files hold, before the sample thinned them, so it holds for a sampled run.
@@ -2279,13 +2376,22 @@ fn parity(
     } else {
         String::new()
     };
-    let totals = format!(
+    let mut totals = format!(
         "{} cases{sample}: {bitwise} bitwise, {separators_only} separators only, {respelled} \
          respelled, {listed} listed, {allowed_count} allowed for the corpus{unreadable}{undeclared}; \
          {token_plans_run} token plans replayed, {without_pieces} cases without output_pieces, \
          {content_off_whole} cases whose streamed content differs from the whole answer's\n",
         fixtures.len()
     );
+    for (library, witnessed) in &by_library {
+        if witnessed.as_the_parser + witnessed.differently + witnessed.refused > 0 {
+            totals.push_str(&format!(
+                "{library} read {} cases as the parser did and {} differently, and refused {} \
+                 requests\n",
+                witnessed.as_the_parser, witnessed.differently, witnessed.refused
+            ));
+        }
+    }
     out.push_str(&totals);
     Parity {
         report: out,

@@ -309,16 +309,10 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
+    use crate::routers::grpc::testing::tool;
 
     fn chat_request(value: Value) -> ChatCompletionRequest {
         serde_json::from_value(value).expect("request deserializes")
-    }
-
-    fn tool(name: &str) -> Value {
-        json!({
-            "type": "function",
-            "function": {"name": name, "parameters": {"type": "object", "properties": {}}}
-        })
     }
 
     fn tool_names(spec: &ChatResponseSpec) -> Vec<String> {

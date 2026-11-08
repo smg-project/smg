@@ -163,21 +163,9 @@ pub async fn answer_error(resp: reqwest::Response, model: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::text_of;
+    use crate::test_support::{text_of, upstream};
 
     const UPSTREAM_REFUSAL: &str = r#"{"error":{"message":"Rate limit reached for model in organization org-abc123 project proj_xyz789","type":"rate_limit","code":"rate_limit_exceeded"}}"#;
-
-    fn upstream(
-        status: u16,
-        content_type: Option<&str>,
-        body: impl Into<reqwest::Body>,
-    ) -> reqwest::Response {
-        let mut builder = http::Response::builder().status(status);
-        if let Some(ct) = content_type {
-            builder = builder.header(CONTENT_TYPE, ct);
-        }
-        reqwest::Response::from(builder.body(body.into()).expect("a response"))
-    }
 
     /// A provider's refusal reaches the caller under its status and content
     /// type with the operator's organization and project gone.

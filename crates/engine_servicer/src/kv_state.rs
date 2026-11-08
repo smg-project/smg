@@ -88,6 +88,7 @@ pub(crate) struct StoredTail {
     pub session_id: Option<String>,
     pub lora_name: Option<String>,
     pub cache_salt: Option<String>,
+    pub group_mask: Option<u64>,
 }
 
 impl StoredTail {
@@ -96,6 +97,7 @@ impl StoredTail {
             tier: stored.tier,
             medium: stored.medium.clone(),
             group_idx: stored.group_idx,
+            group_mask: stored.group_mask,
             kv_cache_spec_kind: stored.kv_cache_spec_kind.clone(),
             kv_cache_spec_sliding_window: stored.kv_cache_spec_sliding_window,
             locality: stored.locality,
@@ -118,6 +120,7 @@ impl StoredTail {
             && self.session_id == stored.session_id
             && self.lora_name == stored.lora_name
             && self.cache_salt == stored.cache_salt
+            && self.group_mask == stored.group_mask
     }
 }
 
@@ -876,6 +879,7 @@ fn stored_event(run: &[Arc<LiveBlock>]) -> common::KvCacheEvent {
             session_id: tail.session_id.clone(),
             lora_name: tail.lora_name.clone(),
             cache_salt: tail.cache_salt.clone(),
+            group_mask: tail.group_mask,
         })),
     }
 }
@@ -970,6 +974,51 @@ mod tests {
 
     fn chunks_of(state: &LiveState, through: u64) -> Vec<common::KvEventBatch> {
         SnapshotChunks::at(state.snapshot(), through, 2.0, 0).collect()
+    }
+
+    /// A store's tail as the replay hands it out: `(hashes, group_mask)` per
+    /// stored event of the chunks, in emission order.
+    fn replayed_masks(chunks: &[common::KvEventBatch]) -> Vec<(Vec<i64>, Option<u64>)> {
+        let mut out = Vec::new();
+        for chunk in chunks {
+            for event in &chunk.events {
+                if let Some(kv_cache_event::Data::Stored(stored)) = &event.data {
+                    out.push((
+                        stored.blocks.iter().map(|block| block.block_hash).collect(),
+                        stored.group_mask,
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_snapshot_replays_each_stores_group_mask() {
+        let device = KvCacheTier::Device;
+        let masked = |parent: Option<i64>, hashes: &[i64], mask: u64| {
+            let mut event = stored(parent, hashes, device);
+            if let Some(kv_cache_event::Data::Stored(stored)) = &mut event.data {
+                stored.group_mask = Some(mask);
+            }
+            event
+        };
+        let mut state = LiveState::new();
+        // A chain whose boundaries three groups hold, one the first group
+        // alone, then a publisher that names no mask at all.
+        state.apply(&batch(1, Some(0), vec![masked(None, &[1, 2], 0b111)]));
+        state.apply(&batch(2, Some(0), vec![masked(Some(2), &[3], 0b001)]));
+        state.apply(&batch(3, Some(0), vec![stored(Some(3), &[4], device)]));
+        let replayed = replayed_masks(&chunks_of(&state, 3));
+        assert_eq!(
+            replayed,
+            vec![
+                (vec![1, 2], Some(0b111)),
+                (vec![3], Some(0b001)),
+                (vec![4], None),
+            ],
+            "the replay keeps every store's mask and splits a run where the mask changes"
+        );
     }
 
     #[test]

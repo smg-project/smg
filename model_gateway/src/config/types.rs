@@ -1462,7 +1462,9 @@ pub enum PolicyConfig {
     /// Consistent hashing policy using hash ring for session affinity:
     /// - X-SMG-Target-Worker: Direct routing to a specific worker by its index
     ///   (0-based) among the workers available when the request arrives; an
-    ///   index past them is answered as no available worker
+    ///   index past them is answered as no available worker, except in a pool
+    ///   with every worker vetoed, which the all-vetoed fallback serves without
+    ///   reading the header
     /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
     /// - Provides O(log n) lookup with minimal redistribution (~1/N keys) on topology change
     #[serde(rename = "consistent_hashing")]

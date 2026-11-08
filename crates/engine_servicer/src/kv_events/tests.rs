@@ -444,6 +444,8 @@ async fn start_lab(history_batches: usize, with_replay: bool) -> Lab {
 struct StubLoads {
     record: Mutex<common::EngineLoad>,
     asked: AtomicU64,
+    /// Live batches the relay reported as the engine's progress.
+    progress: AtomicU64,
 }
 
 impl StubLoads {
@@ -462,6 +464,7 @@ impl StubLoads {
                 ..Default::default()
             }),
             asked: AtomicU64::new(0),
+            progress: AtomicU64::new(0),
         })
     }
 
@@ -469,6 +472,11 @@ impl StubLoads {
         let mut record = self.record.lock().unwrap_or_else(PoisonError::into_inner);
         record.running_requests = running;
         record.waiting_requests = waiting;
+    }
+
+    /// Live batches reported as the engine's progress so far.
+    fn progress(&self) -> u64 {
+        self.progress.load(Ordering::Relaxed)
     }
 }
 
@@ -482,6 +490,24 @@ impl LoadSource for StubLoads {
                 .clone(),
         )
     }
+
+    fn note_engine_progress(&self) {
+        self.progress.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Wait until `loads` heard of `count` live batches.
+async fn wait_progress(loads: &StubLoads, count: u64) {
+    for _ in 0..250 {
+        if loads.progress() >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "the load source heard of {} live batches, not {count}",
+        loads.progress()
+    );
 }
 
 /// A relay with a load source and short record intervals (`tick`,
@@ -710,6 +736,69 @@ fn a_growing_engine_silence_changes_the_record_once_a_second() {
     assert!(load_changed(&last, &current), "a whole second crossed");
     current.engine_silence_ms = None;
     assert!(load_changed(&last, &current), "the silence ending");
+}
+
+/// A batch read live off the publisher is the engine's progress and the
+/// load source hears of it once per batch; a duplicate, the relay's own
+/// `load_only` heartbeats and the batches the engine's replay gives back
+/// for a late join are not, and it hears nothing of them.
+#[tokio::test]
+async fn a_live_batch_is_the_engines_progress_a_duplicate_a_heartbeat_and_a_replay_are_not() {
+    let loads = StubLoads::new(2, 0);
+    let mut lab = start_lab_with_loads(
+        Arc::clone(&loads),
+        Duration::from_millis(20),
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+    )
+    .await;
+    // The prime's first sequence 0 was live; its repeats were duplicates.
+    wait_progress(&loads, 1).await;
+    let batch2 = golden::bytes(golden::BATCH2);
+    lab.publish(1, &batch2).await;
+    lab.wait_relayed(2).await;
+    wait_progress(&loads, 2).await;
+    // Heartbeats to a subscriber are the relay's own, not the engine's.
+    let mut stream = lab.subscribe(0).expect("history");
+    let mut beats = 0;
+    while beats < 2 {
+        if load_only_marker(&read(&mut stream).await) {
+            beats += 1;
+        }
+    }
+    // The publisher repeating its last sequence.
+    lab.publish(1, &batch2).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(lab.relay.counts().relayed, 2, "a duplicate is not relayed");
+    assert_eq!(
+        loads.progress(),
+        2,
+        "two heartbeats and a duplicate are not progress"
+    );
+    // A relay that joins a publisher late fills the start from the engine's
+    // replay: those batches are history; the live one is progress.
+    let late_loads = StubLoads::new(1, 0);
+    let mut late = start_lab(100, true).await;
+    late.relay
+        .set_load_source(Arc::<StubLoads>::clone(&late_loads));
+    let request = late.publish_until_replay_requested(3, &batch2, 0).await;
+    late.send_replay(
+        &request,
+        &[
+            (0, batch2.clone()),
+            (1, batch2.clone()),
+            (2, batch2.clone()),
+        ],
+    )
+    .await;
+    late.wait_relayed(4).await;
+    wait_progress(&late_loads, 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        late_loads.progress(),
+        1,
+        "one live batch among the four relayed"
+    );
 }
 
 /// A relay whose replay socket is not bound yet: the relay keeps asking

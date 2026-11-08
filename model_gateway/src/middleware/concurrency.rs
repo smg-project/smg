@@ -366,7 +366,11 @@ mod tests {
         app_context::AppContext,
         config::RouterConfig,
         health::ProbeState,
-        middleware::{edge_body::at_the_edge, HttpMetricsLayer},
+        middleware::{
+            edge_body::at_the_edge,
+            test_support::{echo_request, echo_route},
+            HttpMetricsLayer,
+        },
         observability::inflight_tracker::InFlightRequestTracker,
         policies::PolicyRegistry,
         routers::gateway::Gateway,
@@ -413,17 +417,9 @@ mod tests {
     /// builds the one body wrapper that holds the token).
     fn echo_app(app_state: Arc<AppState>) -> Router {
         Router::new()
-            .route("/echo", post(|body: Bytes| async move { body }))
+            .route("/echo", echo_route())
             .layer(ConcurrencyLimitLayer::new(app_state))
             .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
-    }
-
-    fn echo_request(body: Body) -> Request<Body> {
-        Request::builder()
-            .method("POST")
-            .uri("/echo")
-            .body(body)
-            .unwrap()
     }
 
     /// App with a one-shot channel-fed streaming route plus `/echo`,
@@ -441,7 +437,7 @@ mod tests {
         };
         let app = Router::new()
             .route("/stream", post(stream))
-            .route("/echo", post(|body: Bytes| async move { body }))
+            .route("/echo", echo_route())
             .layer(ConcurrencyLimitLayer::new(test_app_state(bucket, None)))
             .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()));
         (app, frame_tx)
@@ -763,7 +759,7 @@ mod tests {
         };
         let app = Router::new()
             .route("/hold", post(hold))
-            .route("/echo", post(|body: Bytes| async move { body }))
+            .route("/echo", echo_route())
             .layer(ConcurrencyLimitLayer::new(test_app_state(
                 bucket,
                 Some(queue),
