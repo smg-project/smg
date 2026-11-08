@@ -487,6 +487,51 @@ pub(crate) fn service_name(wire: SchedulerWire) -> &'static str {
 }
 
 impl MockScheduler {
+    /// The realistic engine's fault and admission hooks for a side that
+    /// serves no tokens (the prefill role's prompt-side completion, the
+    /// encode role's encoder completion), as the regular path counts them:
+    /// the stall, a status before admission (a failure, or a cut when it
+    /// names a token count), the admission delay and rate, then the canned
+    /// delay. `Ok(true)` when the fault asks for a `finish=error` completion,
+    /// counted as a cut. The engine never runs the prompt: nothing is
+    /// admitted, no record is left.
+    pub(crate) async fn admit_without_tokens(
+        &self,
+        request_id: &str,
+        pin: Option<i32>,
+    ) -> Result<bool, Status> {
+        let mut finish_error = false;
+        if !self.ranks.is_empty() {
+            let (rank, _placed) = self.place(pin)?;
+            if self.ranks.len() > 1 {
+                let line = rank_line(request_id, pin, rank);
+                tracing::info!("{line}");
+            }
+            let engine = &self.ranks[rank].engine;
+            if let Some(fault) = engine.inject() {
+                if !fault.stall.is_zero() {
+                    tokio::time::sleep(fault.stall).await;
+                }
+                if fault.finish_error {
+                    engine.cut_counter().fetch_add(1, Ordering::Relaxed);
+                    finish_error = true;
+                } else if fault.status != 0 {
+                    if fault.after_tokens.is_some() {
+                        engine.cut_counter().fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        engine.record_failure();
+                    }
+                    return Err(injected_status(fault.status));
+                }
+            }
+            engine.admit().await;
+        }
+        if !self.cfg.gen_delay.is_zero() {
+            tokio::time::sleep(self.cfg.gen_delay).await;
+        }
+        Ok(finish_error)
+    }
+
     /// The generate stream of one request, as every wire's `Generate` answers
     /// it, in wire-neutral frames. In flight from here until the stream is
     /// done (or dropped by the gateway), so a shutdown knows what it waits
@@ -502,43 +547,18 @@ impl MockScheduler {
         // the pair has the prompt and generates the output, so nothing is
         // scripted here and nothing counts as a miss; the canned delay paces
         // it as it paces a canned answer. The realistic engine's fault and
-        // admission hooks apply as to any request (the stall, a status
-        // before admission, the admission delay and rate), counted as the
-        // regular path counts them: `finish=error` ends the prompt side with
-        // `error` whatever the status and counts as a cut; with no output to
-        // cut after, a status cut fires at once, as a cut; a status before
-        // admission is a failure. The engine never runs the prompt: nothing
-        // is admitted, no record is left.
+        // admission hooks apply as to any request (`admit_without_tokens`):
+        // `finish=error` ends the prompt side with `error` whatever the
+        // status; with no output to cut after, a status cut fires at once.
         if self.cfg.role == Some(Role::Prefill) {
-            let mut finish_reason = "stop";
-            if !self.ranks.is_empty() {
-                let (rank, _placed) = self.place(input.pin)?;
-                if self.ranks.len() > 1 {
-                    let line = rank_line(&input.request_id, input.pin, rank);
-                    tracing::info!("{line}");
-                }
-                let engine = &self.ranks[rank].engine;
-                if let Some(fault) = engine.inject() {
-                    if !fault.stall.is_zero() {
-                        tokio::time::sleep(fault.stall).await;
-                    }
-                    if fault.finish_error {
-                        engine.cut_counter().fetch_add(1, Ordering::Relaxed);
-                        finish_reason = "error";
-                    } else if fault.status != 0 {
-                        if fault.after_tokens.is_some() {
-                            engine.cut_counter().fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            engine.record_failure();
-                        }
-                        return Err(injected_status(fault.status));
-                    }
-                }
-                engine.admit().await;
-            }
-            if !self.cfg.gen_delay.is_zero() {
-                tokio::time::sleep(self.cfg.gen_delay).await;
-            }
+            let finish_reason = if self
+                .admit_without_tokens(&input.request_id, input.pin)
+                .await?
+            {
+                "error"
+            } else {
+                "stop"
+            };
             let complete = Frame::Complete(Complete {
                 output_ids: Vec::new(),
                 finish_reason: finish_reason.to_string(),

@@ -24,6 +24,7 @@ use vllm::{
 use super::{Frame, GenerateInput, LogProbs, MockScheduler, TokenizerStream};
 use crate::{
     config::{Config, Role},
+    drain::InFlight,
     engine::KvEventStream,
     script::MatchedStop,
 };
@@ -63,11 +64,25 @@ impl VllmEngine for MockScheduler {
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let req = request.into_inner();
         // An encode worker answers the encoder's completion alone: nothing
-        // reaches the core, no script is read, no load is counted.
+        // reaches the core and no script is read, but the realistic engine's
+        // fault and admission hooks apply as to the prefill role, and the
+        // request counts in flight until its completion is out.
         if self.cfg.role == Some(Role::Encode) {
-            let complete = encoder_completion(&self.cfg, self.port(), req)?;
+            let in_flight = InFlight::enter_on(&self.in_flight);
+            let finish_error = self
+                .admit_without_tokens(&req.request_id, req.data_parallel_rank)
+                .await?;
+            let mut complete = encoder_completion(&self.cfg, self.port(), req)?;
+            if finish_error {
+                if let Some(vllm::generate_response::Response::Complete(complete)) =
+                    complete.response.as_mut()
+                {
+                    complete.finish_reason = "error".to_string();
+                }
+            }
             self.ops.record_encode();
-            let stream: GenStream = Box::pin(futures::stream::once(async move { Ok(complete) }));
+            let stream: GenStream =
+                Box::pin(in_flight.until_done(futures::stream::once(async move { Ok(complete) })));
             return Ok(Response::new(stream));
         }
         let (prompt_ids, rendered) = match req.input {
@@ -876,7 +891,7 @@ mod tests {
                 grpc_wire: SchedulerWire::Vllm,
                 ..Config::default()
             },
-            65_208,
+            65_210,
         );
         let info = encode
             .get_server_info(Request::new(vllm::GetServerInfoRequest {}))
@@ -944,7 +959,7 @@ mod tests {
                 grpc_wire: SchedulerWire::Vllm,
                 ..Config::default()
             },
-            65_209,
+            65_211,
         );
         let refs = |urls: &[&str]| vllm::MediaRefs {
             items: urls
@@ -1007,7 +1022,7 @@ mod tests {
         for hash in &batch.mm_hashes {
             let handle = &handles[hash];
             assert_eq!(handle["peer_host"], "127.0.0.1");
-            assert_eq!(handle["peer_port"], 65_209);
+            assert_eq!(handle["peer_port"], 65_211);
             assert!(handle["size_bytes"].as_u64().is_some_and(|size| size > 0));
         }
 
