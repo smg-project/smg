@@ -63,7 +63,7 @@ def _registered_workers(gateway) -> list[dict]:
 
 
 def _by_role(gateway) -> dict[str, dict]:
-    return {worker.get("worker_type"): worker for worker in _registered_workers(gateway)}
+    return {worker["worker_type"]: worker for worker in _registered_workers(gateway)}
 
 
 def _encodes_served() -> int:
