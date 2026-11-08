@@ -63,11 +63,14 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// * `info` - Additional information for routing decisions
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize>;
 
-    /// Update policy state after request completion
+    /// Update policy state when a request ends.
     ///
-    /// This is called when a request completes (successfully or not) to allow
-    /// policies to update their internal state.
-    fn on_request_complete(&self, _worker_url: &str, _success: bool) {
+    /// Called when the request's load guard on `_worker_url` drops, whatever
+    /// the outcome, so a policy releases what it booked at dispatch. The
+    /// outcome itself is not carried here: it reaches the worker's circuit
+    /// breaker through `record_outcome`, and a policy that wants a failure
+    /// signal reads the worker's breaker state.
+    fn on_request_complete(&self, _worker_url: &str) {
         // Default: no-op for stateless policies
     }
 
