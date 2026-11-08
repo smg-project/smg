@@ -337,6 +337,16 @@ impl<B> MakeSpan<B> for RequestSpan {
             response_bytes = Empty,
             response_bytes_sent = Empty,
             worker = Empty,
+            // What the Symphony reader leaves of an output it did not read
+            // clean (`regular::symphony::telemetry::Mark`), recorded when
+            // the output ends, never for a clean one.
+            symphony.table = Empty,
+            symphony.outcome = Empty,
+            symphony.choice = Empty,
+            symphony.reason = Empty,
+            symphony.bytes = Empty,
+            symphony.malformed_bytes = Empty,
+            symphony.finish = Empty,
             module = "smg"
         );
 

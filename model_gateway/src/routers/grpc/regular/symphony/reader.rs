@@ -13,7 +13,7 @@ use symphony::{
     Declared, DropReason, Engine, EngineFinish, Event, Events, Format, Input, Parser as _, Text,
     TokenSpan,
 };
-use tracing::debug;
+use tracing::{debug, Span};
 
 use super::{
     constraint::Asks,
@@ -43,6 +43,11 @@ pub(crate) struct Assignment {
     /// the reader reads and delivers like the rest, and a marker of the table kept as text in it
     /// is no failure of the table's reading ([`Tally::new`]).
     pub past_the_end: bool,
+    /// The request's span, current where the assignment is made ([`assignment`]), for the record
+    /// a reading that was not clean leaves on it ([`Reader::end`], [`Reader::failed`]). A streamed
+    /// response's reading runs outside the span (the response body drives it), so the span
+    /// travels with the assignment rather than being looked up where the output ends.
+    pub span: Span,
 }
 
 impl Assignment {
@@ -52,7 +57,8 @@ impl Assignment {
     }
 }
 
-/// The assignment of `format` to a response, with the part of `prompt` the engine replays.
+/// The assignment of `format` to a response, with the part of `prompt` the engine replays,
+/// under the span current here: the request's.
 pub(super) fn assignment(
     format: Arc<Format>,
     model: &str,
@@ -67,6 +73,7 @@ pub(super) fn assignment(
         prompt,
         forbids_calls,
         past_the_end,
+        span: Span::current(),
     }
 }
 
@@ -337,6 +344,9 @@ pub(crate) struct Reader {
     /// request's isolation is driven end to end. `None` in every other process: one branch per
     /// step.
     trap: Option<&'static str>,
+    /// The request's span ([`Assignment::span`]): an output that ends other than clean leaves its
+    /// reading on it ([`Tally::mark`]).
+    span: Span,
 }
 
 impl Reader {
@@ -365,6 +375,7 @@ impl Reader {
             framing: Vec::new(),
             framing_text: String::new(),
             trap: isolation::test_trap(),
+            span: assignment.span.clone(),
         };
         // The prompt's events carry no text of the prompt (a thought it opens or closes), so they
         // move from the replay's own buffer into the caller's one by one, whatever delta that one
@@ -504,6 +515,7 @@ impl Reader {
             release_before_the_finish(released, out);
         }
         self.tally.report(self.table, who);
+        self.tally.mark(&self.span, self.table, who.choice);
         Ok(())
     }
 
@@ -514,11 +526,12 @@ impl Reader {
 
     /// The error of an output the reader could not read whole, which the request fails with:
     /// the decoder refused a token or the text it held, or the table refused the output
-    /// ([`Self::feed`]). The output is recorded as failed for the table and is over: its end
-    /// counts nothing more.
+    /// ([`Self::feed`]). The output is recorded as failed for the table, left on the request's
+    /// span with the bytes read so far, and is over: its end counts nothing more.
     pub(crate) fn failed(&mut self, why: String) -> SymphonyError {
         self.ended = true;
         telemetry::record_failed(self.table);
+        telemetry::mark_failed(&self.span, self.table, self.read);
         SymphonyError::Read(why)
     }
 
@@ -766,6 +779,7 @@ mod tests {
             prompt: prompt.to_string(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
         };
         // A step's events borrow its delta, as a stream's do: each piece is a step of its own,
         // its events taken owned before the next.
@@ -1895,6 +1909,7 @@ mod tests {
             prompt: "<|message_model|>".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
         };
         let json = "{\"city\": \"Oslo\", \"country\": \"Norway\"}";
         let thought = "<|content_thinking|>plan<|end_message|><|message_model|><|content_text|>";
@@ -1967,6 +1982,7 @@ mod tests {
             prompt: GLM4_PROMPT.to_string(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
         };
         let pieces = [
             "\n<think></think>\n<tool_call>answer_string\n<arg_key>answer</arg_key>\n<arg_value>",
@@ -2024,6 +2040,7 @@ mod tests {
             prompt: String::new(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
         };
         let mut events = Events::new();
         let mut reader = Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
@@ -2041,12 +2058,59 @@ mod tests {
     }
 
     #[test]
+    fn an_assignment_carries_the_span_current_where_it_is_made_and_a_failed_output_marks_it() {
+        let lines = json_lines(|| {
+            let span = request_span();
+            assert!(span.id().is_some(), "the subscriber takes the span");
+            let assignment = span.in_scope(|| {
+                assignment(
+                    Arc::new(qwen3(CallSyntax::Json)),
+                    "Qwen/Qwen3-8B",
+                    PROMPT,
+                    false,
+                    false,
+                )
+            });
+            assert_eq!(assignment.span.id(), span.id());
+            let tokenizer: Arc<dyn Tokenizer> = Arc::new(Refusing::default());
+            let mut decoder = StopSequenceDecoder::new(
+                tokenizer,
+                llm_tokenizer::StopSequenceConfig::default(),
+                false,
+            );
+            let mut events = Events::new();
+            let mut reader =
+                Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
+            // One byte read whole, then the token no character carries: the output fails after
+            // one byte, outside the span, as a stream's reading runs.
+            let mut delta = Delta::default();
+            reader
+                .read(&mut decoder, &[u32::from('H')], &mut delta, &mut events)
+                .expect("a byte");
+            let mut failing = Delta::default();
+            let mut after = Events::new();
+            reader
+                .read(&mut decoder, &[Refusing::REFUSED], &mut failing, &mut after)
+                .expect_err("the token no character carries");
+            let _entered = span.enter();
+            tracing::info!(target: "smg::response", "finished processing request");
+        });
+        let span = &lines.last().expect("the access log line")["span"];
+        assert_eq!(span["name"], "http_request");
+        assert_eq!(span["symphony.outcome"], "failed");
+        assert_eq!(span["symphony.table"], "qwen3");
+        assert_eq!(span["symphony.bytes"], 1);
+        assert!(span.get("symphony.finish").is_none(), "{span}");
+    }
+
+    #[test]
     fn a_token_the_decoder_refuses_fails_the_output_and_counts_it_once() {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
         };
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(Refusing::default());
         let mut decoder = StopSequenceDecoder::new(
@@ -2172,6 +2236,7 @@ mod tests {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
         };
         let calls = |first_only: bool| {
             let mut events = Events::new();
@@ -2203,6 +2268,7 @@ mod tests {
             prompt: String::new(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
         };
         let first_run_at = |steps: &[&str]| -> (Option<usize>, usize) {
             let mut events = Events::new();
@@ -2251,6 +2317,7 @@ mod tests {
             prompt: String::new(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
         };
         let mut events = Events::new();
         let mut reader = Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
@@ -2285,6 +2352,7 @@ mod tests {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: true,
             past_the_end: false,
+            span: Span::none(),
         };
         let mut events = Vec::new();
         let scrape = rendered(|| {
@@ -2335,6 +2403,7 @@ mod tests {
         let allowed = Assignment {
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
             ..assignment
         };
         let mut out = Events::new();
@@ -2529,6 +2598,7 @@ mod tests {
                 prompt: prompt.to_string(),
                 forbids_calls: false,
                 past_the_end: false,
+                span: Span::none(),
             };
             let mut replayed = Events::new();
             let mut reader =
