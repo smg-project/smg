@@ -1098,10 +1098,10 @@ class RouterArgs:
             help=(
                 "Cache-aware KV-usage SPREAD threshold (0.0-1.0): the hottest minus"
                 " coldest backend KV utilization above which cache affinity is"
-                " abandoned for shortest-queue. Catches long-context KV imbalance that"
-                " in-flight request counts miss, and is invariant to gateway replica"
-                " count. Backend must report token_usage. Finite and > 0.0; >= 1.0"
-                " disables it. Defaults to 1.0 (disabled)."
+                " abandoned for expected-wait routing. Catches long-context KV"
+                " imbalance that in-flight request counts miss, and is invariant to"
+                " gateway replica count. Backend must report token_usage. Finite and"
+                " > 0.0; >= 1.0 disables it. Defaults to 1.0 (disabled)."
             ),
         )
         routing_group.add_argument(

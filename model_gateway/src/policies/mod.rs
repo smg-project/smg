@@ -232,13 +232,13 @@ pub struct CacheAwareConfig {
     /// Must match the backend's block size. Default: 16 (one engine's page size).
     pub block_size: usize,
     /// KV-usage **spread** (hottest minus coldest backend, 0.0–1.0) above which
-    /// the pool is treated as imbalanced and cache affinity is abandoned for
-    /// shortest-queue. This is the balance signal for long-context workloads
-    /// where a few requests saturate one engine's KV without tripping the
-    /// request-count thresholds; being backend-reported, it is invariant to the
-    /// number of gateway replicas. Requires the backend to report `token_usage`
-    /// (gRPC/`GetLoads`); falls back to the count spread when unavailable.
-    /// `>= 1.0` disables it (default).
+    /// cache affinity is abandoned fleet-wide for the expected-wait winner.
+    /// This is the balance signal for long-context workloads where a few
+    /// requests saturate one engine's KV without tripping the per-candidate
+    /// count gate; being backend-reported, it is invariant to the number of
+    /// gateway replicas. Requires the backend to report `token_usage` in its
+    /// load reports; without it the trigger is inert and the count gate is
+    /// the only balance. `>= 1.0` disables it (default).
     pub balance_token_usage_threshold: f32,
     /// Backend KV-cache utilization **ceiling** (0.0–1.0): when the hottest
     /// engine exceeds it the pool is treated as imbalanced regardless of spread,

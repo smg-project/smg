@@ -395,7 +395,7 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 5, help_heading = "Routing Policy")]
     bucket_adjust_interval_secs: usize,
 
-    /// Abandon cache affinity for shortest-queue when the KV-usage spread
+    /// Abandon cache affinity for expected-wait routing when the KV-usage spread
     /// (hottest minus coldest backend, 0.0-1.0) exceeds this — catches
     /// long-context KV imbalance that request counts miss. Backend must
     /// report token_usage. Finite and > 0.0; >= 1.0 disables it.
