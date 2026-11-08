@@ -38,7 +38,7 @@ struct Axis {
     taps: Vec<i16>,
     /// The taps of the width axis in the vector width pass's layout (sixteen
     /// lanes per group of four taps), read by that pass only; empty for the
-    /// height axis.
+    /// height axis and for a width axis the scalar loops read.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     taps_wide: Vec<i16>,
     precision: u32,
@@ -63,8 +63,35 @@ enum Rows {
     Scalar,
 }
 
+/// On a vector architecture only: every caller sits behind the same `cfg`,
+/// and a build for another target has no vector rows to ask about.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+impl Rows {
+    /// Whether the passes run the vector rows: the detected rows on a host
+    /// whose unit is present. The width axis builds its wide taps and the
+    /// passes pick their loops on this one answer, so a scalar run never
+    /// allocates a table it does not read.
+    #[inline]
+    fn vector(self) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self == Rows::Detected && std::arch::is_x86_feature_detected!("avx2")
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self == Rows::Detected && std::arch::is_aarch64_feature_detected!("neon")
+        }
+    }
+}
+
 impl Axis {
-    fn new(in_size: usize, out_size: usize, filter: PilResizeFilter, pass: Pass) -> Self {
+    fn new(
+        in_size: usize,
+        out_size: usize,
+        filter: PilResizeFilter,
+        pass: Pass,
+        rows: Rows,
+    ) -> Self {
         let kernel = FixedKernel::new(in_size, out_size, filter, KernelQuantization::TorchUint8);
         let stride = kernel
             .taps
@@ -90,17 +117,17 @@ impl Axis {
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         let taps_wide = match pass {
-            Pass::Width => taps
+            Pass::Width if rows.vector() => taps
                 .as_chunks::<4>()
                 .0
                 .iter()
                 .copied()
                 .flat_map(wide_taps)
                 .collect(),
-            Pass::Height => Vec::new(),
+            Pass::Width | Pass::Height => Vec::new(),
         };
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        let _ = pass;
+        let _ = (pass, rows);
         Self {
             bounds: kernel.bounds,
             stride,
@@ -176,8 +203,8 @@ fn resize_rgb_with(
     path: Rows,
 ) -> Vec<u8> {
     debug_assert_eq!(data.len(), in_w * in_h * 3);
-    let width_axis = || Axis::new(in_w, out_w, filter, Pass::Width);
-    let height_axis = || Axis::new(in_h, out_h, filter, Pass::Height);
+    let width_axis = || Axis::new(in_w, out_w, filter, Pass::Width, path);
+    let height_axis = || Axis::new(in_h, out_h, filter, Pass::Height, path);
     match (in_w != out_w, in_h != out_h) {
         // A zero-sized target has no pixels (the passes would band a zero
         // chunk); the fallible entry point refuses it, the infallible one
@@ -241,25 +268,25 @@ fn horizontal_rows(
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let _ = path;
     #[cfg(target_arch = "x86_64")]
-    if path == Rows::Detected && std::arch::is_x86_feature_detected!("avx2") {
+    if path.vector() {
         // Scratch for the input row as four bytes per pixel, padded by the
         // widest read of a tap group (three pixels past the row's end).
         let mut rgbx = vec![0u8; (in_w + 4) * 4];
         for (i, out_row) in band.chunks_exact_mut(out_w * 3).enumerate() {
             let row = &src[(y0 + i) * row_in..(y0 + i + 1) * row_in];
-            // SAFETY: AVX2 was detected above.
+            // SAFETY: `vector` holds only when AVX2 was detected.
             unsafe { avx2::horizontal_row(row, &mut rgbx, axis, out_row) };
         }
         return;
     }
     #[cfg(target_arch = "aarch64")]
-    if path == Rows::Detected && std::arch::is_aarch64_feature_detected!("neon") {
+    if path.vector() {
         // Scratch for the input row as four bytes per pixel, padded by the
         // widest read of a tap group (three pixels past the row's end).
         let mut rgbx = vec![0u8; (in_w + 4) * 4];
         for (i, out_row) in band.chunks_exact_mut(out_w * 3).enumerate() {
             let row = &src[(y0 + i) * row_in..(y0 + i + 1) * row_in];
-            // SAFETY: NEON was detected above.
+            // SAFETY: `vector` holds only when NEON was detected.
             unsafe { neon::horizontal_row(row, &mut rgbx, axis, out_row) };
         }
         return;
@@ -323,23 +350,23 @@ fn vertical_rows(src: &[u8], row_len: usize, axis: &Axis, y0: usize, band: &mut 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let _ = path;
     #[cfg(target_arch = "x86_64")]
-    if path == Rows::Detected && std::arch::is_x86_feature_detected!("avx2") {
+    if path.vector() {
         for (i, out_row) in band.chunks_exact_mut(row_len).enumerate() {
             let (start, n) = axis.bounds[y0 + i];
             let taps = &axis.taps[(y0 + i) * axis.stride..(y0 + i) * axis.stride + n];
             let rows = &src[start * row_len..(start + n) * row_len];
-            // SAFETY: AVX2 was detected above.
+            // SAFETY: `vector` holds only when AVX2 was detected.
             unsafe { avx2::vertical_row(rows, taps, axis, out_row) };
         }
         return;
     }
     #[cfg(target_arch = "aarch64")]
-    if path == Rows::Detected && std::arch::is_aarch64_feature_detected!("neon") {
+    if path.vector() {
         for (i, out_row) in band.chunks_exact_mut(row_len).enumerate() {
             let (start, n) = axis.bounds[y0 + i];
             let taps = &axis.taps[(y0 + i) * axis.stride..(y0 + i) * axis.stride + n];
             let rows = &src[start * row_len..(start + n) * row_len];
-            // SAFETY: NEON was detected above.
+            // SAFETY: `vector` holds only when NEON was detected.
             unsafe { neon::vertical_row(rows, taps, axis, out_row) };
         }
         return;
@@ -760,5 +787,40 @@ mod tests {
             resize_rgb(&data, 9, 4, 9, 4, PilResizeFilter::Bicubic),
             data
         );
+    }
+
+    /// The wide taps serve the vector width pass alone: a width axis the
+    /// scalar loops read carries none and allocates none, so a host without
+    /// the vector unit (or the scalar arm above) builds no table it never
+    /// reads. A height axis never has them; the vector width axis holds four
+    /// lanes per tap.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn a_width_axis_the_scalar_loops_read_carries_no_wide_taps() {
+        let axis = |pass, rows| Axis::new(640, 320, PilResizeFilter::Bicubic, pass, rows);
+        let scalar = axis(Pass::Width, Rows::Scalar);
+        assert!(
+            scalar.taps_wide.is_empty(),
+            "wide taps built for the scalar loops: {} lanes",
+            scalar.taps_wide.len()
+        );
+        assert_eq!(
+            scalar.taps_wide.capacity(),
+            0,
+            "a wide-tap buffer allocated for the scalar loops"
+        );
+        let height = axis(Pass::Height, Rows::Detected);
+        assert!(
+            height.taps_wide.is_empty(),
+            "wide taps built for a height axis"
+        );
+        if Rows::Detected.vector() {
+            let vector = axis(Pass::Width, Rows::Detected);
+            assert_eq!(
+                vector.taps_wide.len(),
+                vector.taps.len() * 4,
+                "the vector width pass reads four lanes per tap"
+            );
+        }
     }
 }
