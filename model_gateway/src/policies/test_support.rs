@@ -3,18 +3,11 @@
 use std::sync::Arc;
 
 use super::LoadBalancingPolicy;
-use crate::worker::{
-    load_state::TestFeed, test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerType,
-};
+use crate::worker::{load_state::TestFeed, test_support::worker_of, Worker, WorkerType};
 
 /// A healthy worker (health checks disabled) at `url`.
 pub(crate) fn make_worker(url: &str) -> Arc<dyn Worker> {
-    Arc::new(
-        BasicWorkerBuilder::new(url)
-            .worker_type(WorkerType::Regular)
-            .health_config(no_health_check())
-            .build(),
-    )
+    worker_of(url, WorkerType::Regular)
 }
 
 /// Healthy workers (health checks disabled) for the given URLs.

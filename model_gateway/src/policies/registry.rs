@@ -1181,19 +1181,10 @@ mod tests {
     use crate::{
         policies::{BucketConfig, CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
         worker::{
-            load_state::LoadSnapshot, test_support::no_health_check, BasicWorkerBuilder, HashRing,
-            Worker, WorkerLoadGuard, WorkerType,
+            load_state::LoadSnapshot, test_support::worker_of, HashRing, Worker, WorkerLoadGuard,
+            WorkerType,
         },
     };
-
-    fn worker(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(worker_type)
-                .health_config(no_health_check())
-                .build(),
-        )
-    }
 
     fn cache_aware_policy() -> Arc<dyn LoadBalancingPolicy> {
         Arc::new(CacheAwarePolicy::with_config(CacheAwareConfig {
@@ -1232,9 +1223,9 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-            worker("http://w3", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
+            worker_of("http://w3", WorkerType::Regular),
         ];
         let headers = headers_with_key("session-A");
         let info = SelectWorkerInfo {
@@ -1260,11 +1251,11 @@ mod tests {
         let policy = reg.get_default_policy();
         let pools = [
             vec![
-                worker("http://a1", WorkerType::Regular),
-                worker("http://a2", WorkerType::Regular),
+                worker_of("http://a1", WorkerType::Regular),
+                worker_of("http://a2", WorkerType::Regular),
             ],
-            vec![worker("http://b1", WorkerType::Regular)],
-            vec![worker("http://c1", WorkerType::Regular)],
+            vec![worker_of("http://b1", WorkerType::Regular)],
+            vec![worker_of("http://c1", WorkerType::Regular)],
         ];
         let info = SelectWorkerInfo {
             rid_key: Some("session-42"),
@@ -1310,10 +1301,10 @@ mod tests {
             let name = policy.name();
             assert!(!PolicyRegistry::routing_key_override_applies(name));
             let workers = vec![
-                worker("http://w1", WorkerType::Regular),
-                worker("http://w2", WorkerType::Regular),
-                worker("http://w3", WorkerType::Regular),
-                worker("http://w4", WorkerType::Regular),
+                worker_of("http://w1", WorkerType::Regular),
+                worker_of("http://w2", WorkerType::Regular),
+                worker_of("http://w3", WorkerType::Regular),
+                worker_of("http://w4", WorkerType::Regular),
             ];
             let hash_ring = Some(Arc::new(HashRing::new(workers.iter().map(|w| w.url()))));
             let headers = headers_with_key("conversation-42");
@@ -1362,8 +1353,8 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
         ];
         let info = SelectWorkerInfo::default(); // no key header
                                                 // RoundRobin alternates -> proves the configured policy is used, not sticky.
@@ -1590,8 +1581,8 @@ mod tests {
         let reg = PolicyRegistry::new(PolicyConfig::RoundRobin); // override off
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
         ];
         let headers = headers_with_key("session-A");
         let info = SelectWorkerInfo {
@@ -1698,9 +1689,9 @@ mod tests {
         let reg = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-            worker("http://w3", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
+            worker_of("http://w3", WorkerType::Regular),
         ];
         let t1 = headers_with_key("conv_t1");
         let info_t1 = SelectWorkerInfo {
@@ -1726,9 +1717,9 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-            worker("http://w3", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
+            worker_of("http://w3", WorkerType::Regular),
         ];
         let headers = headers_with("x-routing-key", "session-A");
         let info = SelectWorkerInfo {
@@ -1775,8 +1766,8 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
         ];
         (reg, policy, workers)
     }
@@ -1932,8 +1923,8 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
         ];
         policy
             .as_any()
@@ -2128,8 +2119,8 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
         ];
         let info = SelectWorkerInfo {
             rid_key: Some("convC"),
@@ -2196,7 +2187,7 @@ mod tests {
         let policy = reg.get_default_policy();
         // Single worker: the respill has nowhere to go, so the branch flips
         // purely on the key's in-flight count.
-        let workers = vec![worker("http://w1", WorkerType::Regular)];
+        let workers = vec![worker_of("http://w1", WorkerType::Regular)];
         let info = SelectWorkerInfo {
             rid_key: Some("convF"),
             ..Default::default()
@@ -2320,8 +2311,8 @@ mod tests {
         let later = registry.on_worker_added("m", Some("least_load"));
 
         let workers = vec![
-            worker("http://a:8000", WorkerType::Regular),
-            worker("http://b:8000", WorkerType::Regular),
+            worker_of("http://a:8000", WorkerType::Regular),
+            worker_of("http://b:8000", WorkerType::Regular),
         ];
         for policy in [registry.get_default_policy(), later] {
             for _ in 0..20 {
@@ -2582,12 +2573,12 @@ mod tests {
         registry.set_decode_policy(cache_aware_policy());
 
         let prefill_workers = vec![
-            worker("http://prefill-1:8000", WorkerType::Prefill),
-            worker("http://prefill-2:8000", WorkerType::Prefill),
+            worker_of("http://prefill-1:8000", WorkerType::Prefill),
+            worker_of("http://prefill-2:8000", WorkerType::Prefill),
         ];
         let decode_workers = vec![
-            worker("http://decode-1:8000", WorkerType::Decode),
-            worker("http://decode-2:8000", WorkerType::Decode),
+            worker_of("http://decode-1:8000", WorkerType::Decode),
+            worker_of("http://decode-2:8000", WorkerType::Decode),
         ];
 
         registry.init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
@@ -2798,9 +2789,9 @@ mod tests {
             ..Default::default()
         })));
         let prefill = vec![
-            worker("http://prefill-1:8000", WorkerType::Prefill),
-            worker("http://prefill-2:8000", WorkerType::Prefill),
-            worker("http://prefill-3:8000", WorkerType::Prefill),
+            worker_of("http://prefill-1:8000", WorkerType::Prefill),
+            worker_of("http://prefill-2:8000", WorkerType::Prefill),
+            worker_of("http://prefill-3:8000", WorkerType::Prefill),
         ];
         registry.init_pd_bucket_policies(&prefill);
 
@@ -2845,7 +2836,7 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers: Vec<Arc<dyn Worker>> = (0..8)
-            .map(|i| worker(&format!("http://w{i}"), WorkerType::Regular))
+            .map(|i| worker_of(&format!("http://w{i}"), WorkerType::Regular))
             .collect();
         let keys: Vec<String> = (0..16).map(|i| format!("conv{i}_t{}", i % 3)).collect();
         let mut picks = Vec::with_capacity(RECORDED.len());

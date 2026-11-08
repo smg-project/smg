@@ -1,7 +1,8 @@
 //! What the crate's tests build their workers with: a health-check
 //! configuration that leaves the worker as the test built it, a ready
-//! worker built with it, a labelled gRPC worker and the registry holding
-//! a test's workers, and the admission attempt that selects one worker.
+//! worker and a worker of a given role built with it, a labelled gRPC
+//! worker and the registry holding a test's workers, and the admission
+//! attempt that selects one worker.
 
 use std::sync::Arc;
 
@@ -35,6 +36,17 @@ pub(crate) fn ready_worker(url: &str, model: &str) -> Arc<dyn Worker> {
         .build();
     worker.set_status(WorkerStatus::Ready);
     Arc::new(worker)
+}
+
+/// A worker of `worker_type` at `url` with no health checker behind it: what
+/// the policy registry and the attempt-ledger tests fill their pools with.
+pub(crate) fn worker_of(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
+    Arc::new(
+        BasicWorkerBuilder::new(url)
+            .worker_type(worker_type)
+            .health_config(no_health_check())
+            .build(),
+    )
 }
 
 /// The attempt a test makes when it wants exactly `worker`: it is selected,
