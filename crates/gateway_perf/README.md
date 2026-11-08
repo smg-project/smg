@@ -104,7 +104,7 @@ per cell, so name it with a smaller count (`PERF_REQUESTS=5000` is about 15 minu
 stays a whole number at `--rate-scale 0.5`. Its answer fits the load client's 120 s drain with
 about 15 s to spare (a longer or slower paced path needs the drain made a knob first; a cell whose
 last requests the drain cuts off warns, as a cell with failed requests does), and `live` on it
-needs `--slo-e2e-p99-ms` above about 100,000.
+needs `--slo-e2e-p99-ms` above about 110,000: above the answer's own 105 s, under the drain.
 
 The logprobs path's rate is the gateway's load, not a frame-rate match: a logprobs answer costs
 the gateway about 3.5 times the instructions and 13 times the allocation calls of the plain

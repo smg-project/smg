@@ -278,8 +278,10 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
         // streams are open at once, and a cell of 10,000 requests runs about
         // half an hour (a recipe names a smaller `--requests`). The answer's
         // pauses (about 105 s with the timer's granularity) fit the load
-        // client's 120 s drain with about 15 s to spare; a longer or slower
-        // paced path needs the drain made a knob first.
+        // client's 120 s drain with about 15 s to spare, and a `live` ramp on
+        // it needs `--slo-e2e-p99-ms` above about 110,000 (above the answer,
+        // under the drain); a longer or slower paced path needs the drain
+        // made a knob first.
         PathSpec {
             name: "generate_stream_spaced_long",
             rate: 6.0,
