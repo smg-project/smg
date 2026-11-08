@@ -264,7 +264,7 @@ async fn an_answer_above_the_cap_is_a_502_and_the_body_is_not_kept() {
 async fn a_request_timeout_while_the_body_is_read_ends_the_request_as_a_504() {
     let upstream_url = spawn_stalled_worker().await;
     let client = Arc::new(
-        smg::clients::http_client_builder()
+        smg::server::http_client_builder()
             .no_proxy()
             .timeout(Duration::from_millis(200))
             .build()

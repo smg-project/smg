@@ -48,7 +48,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
     let wasm_manager = Arc::new(WasmModuleManager::with_default_config());
 
     // Create AppContext with wasm_manager from the start
-    let client = smg::clients::http_client();
+    let client = smg::server::http_client();
 
     let tokenizer_registry = Arc::new(TokenizerRegistry::new());
     let worker_registry = Arc::new(WorkerRegistry::new());

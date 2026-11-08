@@ -94,7 +94,7 @@ impl GrpcWorker {
             circuit_breaker: CircuitBreaker::new(),
             metadata,
             api_key: None,
-            http_client: Arc::new(smg::clients::http_client()),
+            http_client: Arc::new(smg::server::http_client()),
             resilience: ResolvedResilience::default(),
             weight_version: fingerprint_of(None),
         }
@@ -345,7 +345,7 @@ pub unsafe extern "C" fn sgl_multi_client_create(
 ) -> *mut MultiWorkerClientHandle {
     // The workers' HTTP clients use the process-level TLS provider the
     // gateway binary installs at start-up; this library has no start-up.
-    smg::clients::install_crypto_provider();
+    smg::server::install_crypto_provider();
     if endpoints.is_null() || tokenizer_path.is_null() || policy_name.is_null() {
         set_error_message(error_out, "Invalid arguments: null pointer");
         return ptr::null_mut();
@@ -706,7 +706,7 @@ mod tests {
     fn connect(endpoint: &str) -> Arc<SglangSchedulerClient> {
         // The worker's HTTP client wants the process-level TLS provider the
         // create entry point installs.
-        smg::clients::install_crypto_provider();
+        smg::server::install_crypto_provider();
         Arc::new(
             RUNTIME
                 .block_on(SglangSchedulerClient::connect(endpoint))

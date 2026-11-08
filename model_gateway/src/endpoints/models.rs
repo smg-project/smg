@@ -591,7 +591,7 @@ mod tests {
         );
         registry.register(internal_worker);
 
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
         let gateway_auth = AuthConfig::with_tenant_keys(
             Some("shared-secret".to_string()),
             &[TenantApiKeyEntry {
@@ -712,7 +712,7 @@ mod tests {
             "runtime_type": "external",
             "provider": "anthropic",
         })));
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
         let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
 
         let mut openai_style = HeaderMap::new();
@@ -810,7 +810,7 @@ mod tests {
             headers: &HeaderMap,
             query: Option<&str>,
         ) -> Response {
-            let client = crate::clients::http_client();
+            let client = crate::server::http_client();
             let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
             list_models_with(registry, &client, &gateway_auth, headers, query, rid()).await
         }
@@ -895,7 +895,7 @@ mod tests {
             "runtime_type": "external",
             "provider": "anthropic",
         })));
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
         let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
         let mut headers = HeaderMap::new();
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
@@ -1045,7 +1045,7 @@ mod tests {
         let mut card = ModelCard::new("m1");
         card.display_name = Some("Model One".to_owned());
         let registry = registry_with(vec![card]);
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
         let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
 
         let openai = json_of(
@@ -1114,7 +1114,7 @@ mod tests {
             headers: &HeaderMap,
             query: Option<&str>,
         ) -> (StatusCode, Value) {
-            let client = crate::clients::http_client();
+            let client = crate::server::http_client();
             let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
             let response =
                 list_models_with(registry, &client, &gateway_auth, headers, query, rid()).await;

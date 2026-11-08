@@ -680,7 +680,7 @@ impl AppContextBuilder {
         }
 
         let make_builder = || {
-            let mut client_builder = crate::clients::http_client_builder()
+            let mut client_builder = crate::server::http_client_builder()
                 .pool_idle_timeout(pool_idle_timeout)
                 .pool_max_idle_per_host(500)
                 .timeout(Duration::from_secs(timeout_secs))
@@ -1497,7 +1497,7 @@ pub(crate) mod testing {
 
         Arc::new(AppContext {
             gateway_auth: AuthConfig::new(None),
-            client: crate::clients::http_client(),
+            client: crate::server::http_client(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,

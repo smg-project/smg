@@ -1184,7 +1184,7 @@ async fn zmq_update_preserves_transport_state_and_the_live_client() {
 /// entry the old worker was keeping alive.
 #[tokio::test]
 async fn http_update_adopts_the_materialized_shared_client() {
-    let client = Arc::new(crate::clients::http_client());
+    let client = Arc::new(crate::server::http_client());
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://w:8080")
             .http_client(Arc::clone(&client))
@@ -1210,7 +1210,7 @@ async fn http_update_adopts_the_materialized_shared_client() {
 async fn http_update_preserves_http2() {
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://w:8080")
-            .http_client(Arc::new(crate::clients::http_client()))
+            .http_client(Arc::new(crate::server::http_client()))
             .http2(true)
             .status(WorkerStatus::Ready)
             .build(),

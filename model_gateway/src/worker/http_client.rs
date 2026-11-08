@@ -187,7 +187,7 @@ impl WorkerHttpClientCache {
             .map_err(|e| format!("Failed to add CA certificate: {e}"))?;
 
         let make_builder = || {
-            let mut builder = crate::clients::http_client_builder()
+            let mut builder = crate::server::http_client_builder()
                 .pool_max_idle_per_host(key.pool_max_idle_per_host)
                 .pool_idle_timeout(pool_idle_timeout)
                 .timeout(Duration::from_secs(key.timeout_secs))
@@ -348,7 +348,7 @@ impl LazyHttpClient {
 
     fn init(&self) -> &Arc<reqwest::Client> {
         self.cell
-            .get_or_init(|| Arc::new(crate::clients::http_client()))
+            .get_or_init(|| Arc::new(crate::server::http_client()))
     }
 }
 

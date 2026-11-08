@@ -890,7 +890,7 @@ mod tests {
     /// An HTTP/2 client over the plain port, with prior knowledge; one
     /// connection, kept alive between requests.
     fn http2_client() -> reqwest::Client {
-        crate::clients::http_client_builder()
+        crate::server::http_client_builder()
             .http2_prior_knowledge()
             .build()
             .expect("the HTTP/2 client")
