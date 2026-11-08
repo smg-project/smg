@@ -41,7 +41,14 @@
 //! 2048 default the same strips never schedule (a stall the gateway cannot
 //! see), so the bound is the gateway's own admission line, like the
 //! per-request image count; inside it every image is the engine's bit for
-//! bit.
+//! bit. The square pad is the one allocation the rule makes before the cap,
+//! and it has the image's own long side: a 100000 x 31 image pads a
+//! 100000 x 100000 square (30 GB) that caps to the 3024 view and counts the
+//! published maximum exactly. The square's bytes are held to the allocation
+//! limit the loader reserves every decoded image against (512 MiB): a square
+//! over 13377 px is refused before any pixel moves, with the square, its
+//! bytes and the limit named, and a 10000 x 10 image's 300 MB square is
+//! inside it, as before.
 //!
 //! The output carries the global views as the encoder input
 //! `[N, 3, 728, 728]`, the crops as `patch_pixel_values` `[P, 3, 504, 504]`
@@ -281,10 +288,11 @@ impl Step3VLProcessor {
     }
 
     /// The plan the processor carries out for a `width` x `height` image: a
-    /// zero side (decoded, or after the cap) and a plan past
-    /// [`MAX_IMAGE_TOKENS`] are refused here, before any pixel moves, so the
-    /// token count and the preprocessing agree on every image (the gateway's
-    /// own admission line; see the module doc).
+    /// zero side (decoded, or after the cap), a square pad over the image
+    /// decoder's allocation limit and a plan past [`MAX_IMAGE_TOKENS`] are
+    /// refused here, before any pixel moves, so the token count and the
+    /// preprocessing agree on every image (the gateway's own admission line;
+    /// see the module doc).
     fn checked_plan(&self, width: u32, height: u32) -> Result<CropPlan, TransformError> {
         if width == 0 || height == 0 {
             return Err(TransformError::ShapeError(format!(
@@ -292,6 +300,24 @@ impl Step3VLProcessor {
             )));
         }
         let plan = self.plan(width, height);
+        if let Some(side) = plan.square {
+            // The square is pasted in full before the resize, as the reference
+            // pastes it, with the image's own long side: it is held to the
+            // allocation limit the loader reserves every decoded image against
+            // (`image::Limits::default()`, the decoder's), so a strip's long
+            // side can ask for no more memory than a decoded image may.
+            let bytes = u64::from(side)
+                .saturating_mul(u64::from(side))
+                .saturating_mul(3);
+            if let Some(limit) = image::Limits::default()
+                .max_alloc
+                .filter(|limit| *limit < bytes)
+            {
+                return Err(TransformError::ShapeError(format!(
+                    "a {width}x{height} image pads a {side}x{side} square of {bytes} bytes before its resize, above the {limit} bytes the image decoder admits for one decoded image"
+                )));
+            }
+        }
         if plan.view.0 == 0 || plan.view.1 == 0 {
             return Err(TransformError::ShapeError(format!(
                 "a {width}x{height} image is {}x{} under the {MAX_IMAGE_SIZE} px cap: no side to resize",
@@ -803,5 +829,57 @@ mod tests {
         assert!(processor.preprocess(&[&thin]).is_err());
         let edge = DynamicImage::new_rgb8(96_768, 32);
         assert!(processor.preprocess(&[&edge]).is_err());
+    }
+
+    #[test]
+    fn a_thin_images_square_pad_is_held_to_the_decoders_allocation_limit() {
+        let processor = Step3VLProcessor::new();
+        // The budget is the decoder's own: the limit every decoded image is
+        // reserved against.
+        let limit = image::Limits::default().max_alloc.unwrap();
+        assert_eq!(limit, 512 * 1024 * 1024);
+        // The accepted rows stay: a 10000 x 10 strip pads a 300 MB square.
+        assert_eq!(processor.plan(10_000, 10).square, Some(10_000));
+        assert_eq!(
+            processor.calculate_num_tokens(10_000, 10).unwrap(),
+            MAX_IMAGE_TOKENS
+        );
+        // The last square inside the limit (536832387 bytes) and the first
+        // past it.
+        assert_eq!(
+            processor.calculate_num_tokens(13_377, 31).unwrap(),
+            MAX_IMAGE_TOKENS
+        );
+        let error = processor
+            .calculate_num_tokens(13_378, 31)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("13378x31")
+                && error.contains("13378x13378 square")
+                && error.contains("536912652 bytes")
+                && error.contains("536870912"),
+            "{error}"
+        );
+        // A 100000 x 31 strip pads a 30 GB square; a JPEG at the format's
+        // 65535 px maximum 12.9 GB.
+        let error = processor
+            .calculate_num_tokens(100_000, 31)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("100000x100000 square") && error.contains("30000000000 bytes"),
+            "{error}"
+        );
+        let error = processor
+            .calculate_num_tokens(65_535, 31)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("12884508675 bytes"), "{error}");
+        // The preprocessing refuses them before the square is allocated.
+        for (width, height) in [(100_000, 31), (65_535, 31), (31, 100_000)] {
+            let strip = DynamicImage::new_rgb8(width, height);
+            assert!(processor.preprocess(&[&strip]).is_err(), "{width}x{height}");
+        }
     }
 }
