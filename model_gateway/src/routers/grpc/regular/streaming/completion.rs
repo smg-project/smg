@@ -334,7 +334,9 @@ impl<'a> CompletionStream<'a> {
                 }
             };
 
-            let read = match gen_response.into_response() {
+            // As on the chat path: the variant stays here, the readers borrow it.
+            let response = gen_response.into_response();
+            let read = match &response {
                 ProtoResponseVariant::Chunk(chunk) => self.read_chunk(chunk).await,
                 ProtoResponseVariant::Complete(complete) => self.read_complete(complete).await,
                 ProtoResponseVariant::None => continue,
@@ -376,7 +378,7 @@ impl<'a> CompletionStream<'a> {
     /// failure.
     async fn read_chunk(
         &mut self,
-        chunk: ProtoGenerateStreamChunk,
+        chunk: &ProtoGenerateStreamChunk,
     ) -> Result<(), utils::StreamFailure> {
         if self.first_token_time.is_none() {
             self.first_token_time = Some(Instant::now());
@@ -399,7 +401,7 @@ impl<'a> CompletionStream<'a> {
             return Ok(());
         }
 
-        self.total_completion.record_chunk(&chunk);
+        self.total_completion.record_chunk(chunk);
 
         let stop_decoder = choice.stop_decoder.get_or_insert_with(|| {
             StopSequenceDecoder::with_rules(
@@ -421,7 +423,7 @@ impl<'a> CompletionStream<'a> {
 
         // The chunk's logprobs when the request asked for them: a chunk
         // whose tokens made no text yet carries them all the same.
-        let logprobs = chunk_logprobs(self.spec, &self.tokenizer, &mut choice.text_offset, &chunk);
+        let logprobs = chunk_logprobs(self.spec, &self.tokenizer, &mut choice.text_offset, chunk);
         if !text.is_empty() || logprobs.is_some() {
             StreamingProcessor::write_completion_chunk(
                 self.tx,
@@ -504,7 +506,7 @@ impl<'a> CompletionStream<'a> {
     /// finish chunk.
     async fn read_complete(
         &mut self,
-        complete: ProtoGenerateComplete,
+        complete: &ProtoGenerateComplete,
     ) -> Result<(), utils::StreamFailure> {
         let index = self.index_offset + complete.index();
         let choice = utils::choice_mut(&mut self.choices, complete.index())?;
@@ -521,7 +523,7 @@ impl<'a> CompletionStream<'a> {
         self.total_prompt = self.total_prompt.max(complete.prompt_tokens());
         self.total_cached = self.total_cached.max(complete.cached_tokens());
         choice.reasoning_tokens = complete.reasoning_tokens();
-        self.total_completion.record_complete(&complete);
+        self.total_completion.record_complete(complete);
 
         if choice.stopped {
             return Ok(());
