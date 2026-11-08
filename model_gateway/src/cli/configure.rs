@@ -30,8 +30,8 @@ use smg_mesh::{MTLSConfig, MeshServerConfig};
 
 use super::{
     secrets::{
-        EnvLookup, API_KEY_SETTING, POSTGRES_DB_URL_SETTING, REDIS_URL_SETTING,
-        TENANT_API_KEYS_SETTING,
+        EnvLookup, API_KEY_SETTING, CONTROL_PLANE_API_KEYS_SETTING, POSTGRES_DB_URL_SETTING,
+        REDIS_URL_SETTING, TENANT_API_KEYS_SETTING,
     },
     value::{parse_control_plane_api_key, parse_role_mapping, parse_tenant_api_key},
 };
@@ -68,6 +68,14 @@ impl CliArgs {
         )? {
             sources.tenant_api_keys = Some((source, entries.len()));
             self.integrations.tenant_api_keys = entries;
+        }
+        if let Some((entries, source)) = CONTROL_PLANE_API_KEYS_SETTING.resolve_entries(
+            &self.integrations.control_plane_api_keys,
+            self.integrations.control_plane_api_keys_file.as_deref(),
+            env,
+        )? {
+            sources.control_plane_api_keys = Some((source, entries.len()));
+            self.integrations.control_plane_api_keys = entries;
         }
         if self.model.history_backend == "postgres" {
             if let Some((value, source)) = POSTGRES_DB_URL_SETTING.resolve_value(
