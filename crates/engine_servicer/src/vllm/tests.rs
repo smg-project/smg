@@ -1147,6 +1147,63 @@ async fn media_refs_are_refused_and_extra_batches_translated() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// An encode-prefill-decode leg carries encoder-cache transfer parameters:
+/// the encoder's request with the consumer's destination and transfer ids,
+/// or the prefill side's with the encoder's handles. This servicer runs no
+/// encoder-cache connector and advertises none, so either is refused before
+/// the engine sees it, naming the label the Router reads; an empty field is
+/// no parameters and the request goes through.
+#[tokio::test]
+async fn encoder_cache_transfer_parameters_are_refused_before_the_engine() {
+    let mut h = harness(model_info(), None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest::default())
+        .await
+        .expect("server info")
+        .into_inner();
+    assert!(
+        !info.supports_ec_transfer
+            && info.ec_connector.is_empty()
+            && info.ec_role.is_empty()
+            && info.ec_zmq_addrs.is_empty(),
+        "no encoder-cache capability is advertised: {info:?}"
+    );
+    for (id, params) in [
+        (
+            "ec-encode",
+            r#"{"consumer_zmq":"tcp://10.0.0.2:5700","ec_items":[{"transfer_id":"t1"}]}"#,
+        ),
+        (
+            "ec-prefill",
+            r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600,"size_bytes":128}}"#,
+        ),
+    ] {
+        let mut request = generate_request(id, false, Vec::new());
+        request.ec_transfer_params_json = Some(params.to_string());
+        let status = h.client.generate(request).await.expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument, "{id}");
+        assert_eq!(
+            status.message(),
+            "ec_transfer_params_json sent but this worker runs no encoder-cache connector; \
+             check this worker's supports_ec_transfer label",
+            "{id}"
+        );
+    }
+    assert_engine_idle(&mut h.engine_in).await;
+
+    let mut request = generate_request("ec-empty", false, Vec::new());
+    request.ec_transfer_params_json = Some(String::new());
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("an empty field is a plain request")
+        .into_inner();
+    assert_eq!(recv_add(&mut h.engine_in).await.request_id, "ec-empty");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// vLLM checks string stops only once the output exceeds `min_tokens`, and
 /// the text up to that point never matches: the early "Hello world" is
 /// ignored, the later one ends the choice.

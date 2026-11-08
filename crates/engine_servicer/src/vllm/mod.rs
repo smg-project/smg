@@ -13,6 +13,14 @@
 //! params pass through to the engine and back, and `GetServerInfo` carries
 //! the connector, role, engine id and pairing facts the Router matches on.
 //!
+//! Encoder-cache disaggregation (the encoder of an encode-prefill-decode
+//! fleet, and the prefill side that consumes its handles) is not served yet:
+//! `GetServerInfo` leaves `supports_ec_transfer`, `ec_connector`, `ec_role`
+//! and `ec_zmq_addrs` unset, so the Router selects this engine for neither
+//! side, and a request that carries `ec_transfer_params_json` all the same is
+//! refused up front (`generate.rs`). The Python servicer serves both sides,
+//! per connector.
+//!
 //! `Embed`, `FlushCache` (a ZMQ utility call), `GetTokenizer` (the tokenizer
 //! directory zipped as the Python servicer zips it) and `SubscribeKvEvents`
 //! (vLLM's ZMQ KV-event publisher relayed) are served too. Worker-side media

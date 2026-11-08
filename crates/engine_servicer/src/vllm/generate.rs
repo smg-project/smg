@@ -50,6 +50,15 @@ pub(super) async fn generate(
     submit(state, client, req, trace_headers, arrival).await
 }
 
+/// The refusal of a request that carries encoder-cache transfer parameters
+/// (`ec_transfer_params_json`): this servicer runs no encoder-cache
+/// connector, which the Router reads off the `supports_ec_transfer` label
+/// this servicer leaves unset; the shape is the Python servicer's refusal of
+/// a media reference with processing off (`media::PROCESSOR_OFF`).
+const NO_ENCODER_CACHE: &str = "ec_transfer_params_json sent but this worker runs no \
+                                encoder-cache connector; check this worker's \
+                                supports_ec_transfer label";
+
 /// The tracing target of the per-request line: a reader that wants it raises
 /// this target alone (`RUST_LOG=info,engine_servicer::request=debug`); the
 /// production filter leaves it off, and an event below the filter costs the
@@ -239,6 +248,23 @@ async fn submit(
         return Err(Status::invalid_argument(
             "This model does not support generation",
         ));
+    }
+    // An encode-prefill-decode leg (the encoder's request with the consumer's
+    // destination, or the prefill side's with the encoder's handles) names a
+    // handoff this servicer does not run: no encoder-cache connector is
+    // configured through it and `GetServerInfo` advertises none, so a Router
+    // selects it for neither side. One that arrives all the same is refused
+    // here, before the media stage or the engine sees it (the engine would
+    // run it as a plain request and the caller would read a completion
+    // without the handles), in the shape a media reference is refused on a
+    // worker whose processor is off. An empty field is no parameters, as the
+    // Python servicer reads it.
+    if req
+        .ec_transfer_params_json
+        .as_deref()
+        .is_some_and(|params| !params.is_empty())
+    {
+        return Err(Status::invalid_argument(NO_ENCODER_CACHE));
     }
     let request_id = req.request_id.clone();
     // Register before anything slow: an `Abort` landing while the media is
