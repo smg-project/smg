@@ -2937,7 +2937,7 @@ mod tests {
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
         routers::common::sse::SSE_CHANNEL_BUFFER,
         tenant::TenantKey,
-        test_support::RefusedAddress,
+        test_support::{json_of, RefusedAddress},
         worker::{circuit_breaker::CircuitState, BasicWorkerBuilder, WorkerType},
     };
 
@@ -2955,10 +2955,7 @@ mod tests {
 
     /// The message of the error envelope `response` carries.
     async fn error_message(response: Response) -> String {
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
+        let body = json_of(response).await;
         body["error"]["message"].as_str().unwrap().to_string()
     }
 

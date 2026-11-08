@@ -20,6 +20,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use axum::response::Response;
 use k8s_openapi::{
     api::core::v1::{Pod, PodCondition, PodSpec, PodStatus},
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
@@ -412,6 +413,30 @@ impl Tokenizer for CharacterTokenizer {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+/// The whole body of `response`, read as JSON.
+#[expect(
+    clippy::expect_used,
+    reason = "a test reader: a body that is not the JSON the test expects is a test failure"
+)]
+pub async fn json_of(response: Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    serde_json::from_slice(&bytes).expect("a JSON body")
+}
+
+/// The whole body of `response`, read as text.
+#[expect(
+    clippy::expect_used,
+    reason = "a test reader: a body that is not the text the test expects is a test failure"
+)]
+pub async fn text_of(response: Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    String::from_utf8(bytes.to_vec()).expect("a UTF-8 body")
 }
 
 #[cfg(test)]

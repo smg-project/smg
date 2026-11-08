@@ -3030,6 +3030,7 @@ mod tests {
     use super::*;
     use crate::{
         routers::common::{attempt_ledger::FailedSide, retry::is_retryable_response},
+        test_support::text_of,
         worker::{
             BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, RuntimeType, Worker,
             WorkerType,
@@ -5166,10 +5167,7 @@ mod tests {
     async fn sequential_pd_decode_form_rejects_incompatible_pairings() {
         async fn refusal(response: Response) -> String {
             assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("body");
-            let text = String::from_utf8(body.to_vec()).expect("utf-8 body");
+            let text = text_of(response).await;
             assert!(
                 text.contains("no decode worker with a vision encoder is paired"),
                 "{text}"

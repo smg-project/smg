@@ -786,6 +786,7 @@ mod tests {
     use smg_data_connector::{MemoryConversationItemStorage, MemoryConversationStorage};
 
     use super::*;
+    use crate::test_support::json_of;
 
     /// A client-supplied item id longer than the stores' id columns is refused
     /// at the handler, before any store is asked, so every backend answers the
@@ -900,13 +901,6 @@ mod tests {
 
     const A: Option<&str> = Some("header:tenant-a");
     const B: Option<&str> = Some("header:tenant-b");
-
-    async fn json_of(response: Response) -> Value {
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        serde_json::from_slice(&bytes).unwrap()
-    }
 
     /// A conversation created by tenant a with one item; the stores and the ids.
     async fn conversation_of_a() -> (
