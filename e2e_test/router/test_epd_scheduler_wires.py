@@ -25,7 +25,7 @@ from pathlib import Path
 import httpx
 import pytest
 from fixtures.mock_answers import class_workers
-from infra.worker import WorkerType
+from infra.constants import WorkerType
 
 # The mock engine reads this model's tokenizer and chat template; an image
 # turn needs a template with an image placeholder, so the model is the
