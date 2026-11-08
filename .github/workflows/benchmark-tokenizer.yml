@@ -94,6 +94,7 @@ jobs:
         timeout-minutes: 45
         run: |
           set -o pipefail
+          lscpu | grep -m1 'Model name' || true
           python3 scripts/bench_gate.py run --gates .github/bench-gates/tokenizer.toml \
             --base "$RUNNER_TEMP/bench-gate/base" --pr "$RUNNER_TEMP/bench-gate/pr" \
             --cwd model_gateway --out bench-gate 2>&1 | tee benchmark_output.txt
