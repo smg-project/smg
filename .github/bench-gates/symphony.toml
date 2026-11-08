@@ -37,9 +37,8 @@
 # tighten the setup rows further. The last entry catches a row added later at the provisional 25 %.
 #
 # Placement. The workflow's benchmark job builds its binaries, the gate's pair and the summary
-# run's, with every function and every loop on a 64-byte boundary (RUSTFLAGS: `-C
-# llvm-args=-align-all-functions=6 -C llvm-args=-align-loops=64`, beside the outliner flag of
-# .cargo/config.toml). Without it the
+# run's, with every function on a 64-byte boundary (RUSTFLAGS: `-C
+# llvm-args=-align-all-functions=6`, beside the outliner flag of .cargo/config.toml). Without it the
 # prose/whole rows of six marker tables (gemma4, glm, kimi_k3, lfm2.5, qwen3, qwen3_tagged) have two
 # states, about 540 and 790 ns, chosen by where the unchanged scanner code lands: the same bytes
 # linked 32 bytes later read +46 to +48 % on all six and flat elsewhere, linked 16 or 48 bytes later
