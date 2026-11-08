@@ -2316,12 +2316,20 @@ fn interval_walk(total_frames: usize, fps: f64, rate: f64) -> impl Iterator<Item
 /// path and with headroom. Live across the decode: its index (8 bytes), its
 /// entry in the unique list (16), its copy in the sampling info (8), the
 /// decoded frame's record (24) and at most one seek segment (8): 64. While
-/// the select filter is built: the distinct-index list and the spread's
-/// described list (8 each): 80 at the peak. A long interval selection is
-/// described in constant size, never listed (its picks are a fixed stride
+/// the select filter is built: for a described selection the distinct-index
+/// list and the spread's described list (8 each), 80 at the peak; for a
+/// listed one its term, the joined text and the formatted argument (about
+/// 30 more), under the 128 charged. A long interval selection is described
+/// in constant size while its stride is stable (its picks are a fixed stride
 /// plus the last frame, which [`FrameSelection::spread_select_filter`]
-/// reproduces), and a listed one has at most [`FFMPEG_MAX_SELECT_TERMS`]
-/// terms, so the filter's text does not grow with the picks.
+/// reproduces); when the stride sits by a whole number it flips between two
+/// values under floating point (a request rate of 1.9996 at 30 fps, a
+/// container rate of 30.003 at the default 1 fps), no spread reproduces the
+/// picks, and the filter lists every one of them past
+/// [`FFMPEG_MAX_SELECT_TERMS`] as well. Such a list is bounded by this budget
+/// like every other record, and by the argument length the process may be
+/// given (about 8,700 terms on Linux), past which the decode fails before it
+/// starts: a known limit of the listed form.
 const PICK_RECORD_BYTES: usize = 128;
 
 /// Refuses, with the decoded-bytes budget's own error, a clip whose interval
@@ -3999,7 +4007,9 @@ impl FrameSelection {
     ///
     /// Anything over a minute or two would be a list of hundreds of terms, so
     /// those are described instead of enumerated where a spread formula
-    /// reproduces them exactly.
+    /// reproduces them exactly. A selection no spread reproduces (an interval
+    /// walk whose stride sits by a whole number) stays a list, which the
+    /// argument length bounds at about 8,700 terms ([`PICK_RECORD_BYTES`]).
     fn select_filter(&self) -> String {
         if self.unique_frames.len() > FFMPEG_MAX_SELECT_TERMS {
             if let Some(filter) = self.spread_select_filter() {

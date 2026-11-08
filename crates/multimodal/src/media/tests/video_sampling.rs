@@ -831,13 +831,17 @@ fn a_long_selection_is_described_rather_than_listed() {
     }
 }
 
-/// A long interval selection is described, not listed, whatever the source
-/// rate: its picks are a fixed stride from the first frame plus the clip's
+/// A long interval selection is described, not listed, while its stride is
+/// stable: its picks are a fixed stride from the first frame plus the clip's
 /// last frame, so the filter is the spread of its own frames plus one
 /// trailing term, a string of constant size (what [`PICK_RECORD_BYTES`]
-/// counts on, since the listed form would grow with the picks).
+/// counts on for these clips). A stride that sits by a whole number (a
+/// request rate of 1.999600079984003 at 30 fps, a container rate of
+/// 30.003000300030003 at 1 fps) flips between two values and is listed
+/// instead; that path is priced in the same constant and bounded by the
+/// argument length, a known limit.
 #[test]
-fn a_long_interval_selection_is_described_in_constant_size_at_every_rate() {
+fn a_long_interval_selection_is_described_in_constant_size_at_a_stable_stride() {
     let interval = VideoFetchConfig {
         sampling: FrameSampling::Interval,
         sample_fps: 1.0,
