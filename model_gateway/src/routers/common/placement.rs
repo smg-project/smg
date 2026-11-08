@@ -2180,6 +2180,66 @@ mod tests {
         }
     }
 
+    /// An explicit target counts the workers available when the request
+    /// arrives. With the worker at index 1 out (not ready, overloaded, or
+    /// its breaker open), index 1 names the worker that was at index 2 and
+    /// index 2 names nobody. Back in, the indexes read as before.
+    #[test]
+    fn an_explicit_target_indexes_the_available_workers() {
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let target = |index: usize| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", index.to_string().parse().unwrap());
+            select_single(
+                &registry,
+                &policies,
+                MODEL,
+                RoutingPool::HttpRegular,
+                None,
+                PlacementInputs {
+                    headers: Some(&headers),
+                    ..Default::default()
+                },
+            )
+        };
+        let by_index: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|index| target(index).expect("a healthy pool answers every index"))
+            .collect();
+        assert_ne!(by_index[0].url(), by_index[1].url());
+        assert_ne!(by_index[1].url(), by_index[2].url());
+        assert_ne!(by_index[0].url(), by_index[2].url());
+
+        let out = &by_index[1];
+        let shifted = |veto: &str| {
+            assert_eq!(
+                target(1).map(|worker| worker.url().to_string()),
+                Some(by_index[2].url().to_string()),
+                "{veto}: index 1 names the next available worker"
+            );
+            assert!(
+                target(2).is_none(),
+                "{veto}: index 2 is past the available workers"
+            );
+            assert_eq!(target(0).unwrap().url(), by_index[0].url(), "{veto}");
+        };
+        out.set_status(WorkerStatus::NotReady);
+        shifted("not ready");
+        out.set_status(WorkerStatus::Ready);
+        assert!(out.set_overloaded(true));
+        shifted("overloaded");
+        assert!(out.set_overloaded(false));
+        for _ in 0..16 {
+            out.record_circuit_breaker_outcome(false);
+        }
+        assert!(!out.circuit_breaker_can_execute());
+        shifted("breaker open");
+        out.reset_circuit_breaker();
+        assert!(out.circuit_breaker_can_execute());
+        assert_eq!(target(1).unwrap().url(), by_index[1].url());
+        assert_eq!(target(2).unwrap().url(), by_index[2].url());
+    }
+
     /// Round robin never re-selects a tried worker while another is left,
     /// and a single-worker pool keeps retrying its one worker.
     #[test]
