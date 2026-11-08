@@ -39,7 +39,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::common;
+use crate::common::{self, grpc_harness::free_port};
 
 const MODEL: &str = "restart-test-model";
 
@@ -120,19 +120,6 @@ async fn bind(port: u16) -> TcpListener {
             }
         }
     }
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test helper: a port the OS cannot hand out fails the fixture"
-)]
-async fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("ephemeral port address")
-        .port()
 }
 
 #[expect(
