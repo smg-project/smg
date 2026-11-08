@@ -1981,12 +1981,13 @@ impl CacheAwarePolicy {
 
     /// Select one final worker with LeastLoad's expected-wait algorithm and
     /// credit it, in one call. Up to `HELD_GUARD_CANDIDATES` candidates (the
-    /// usual spill or holder set) one write guard covers the scores and the
-    /// credit; above it the scores are read without the tally's write guard
-    /// and the credit lands under it, so two decisions in flight can pick
-    /// the same worker before either credit lands. CacheAware must call this
-    /// exactly once per successful dispatch, after cache affinity and spill
-    /// logic have fixed the candidate set.
+    /// usual holder set) one write guard covers the scores and the credit;
+    /// above it (a spill set on most pools) the scores are read without the
+    /// tally's write guard and the credit lands under it, so every decision
+    /// in flight at once can pick the same worker before any of their
+    /// credits lands (see `select_min_expected_wait`). CacheAware must call
+    /// this exactly once per successful dispatch, after cache affinity and
+    /// spill logic have fixed the candidate set.
     fn select_expected_wait(
         &self,
         workers: &[Arc<dyn Worker>],
