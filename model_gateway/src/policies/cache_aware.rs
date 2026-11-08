@@ -1396,6 +1396,9 @@ struct OverlapCandidate {
     idx: usize,
     raw_score: f64,
     effective_score: f64,
+    /// The overlap the index scored and the cache group that bound it, when
+    /// the worker's group view shrank the score ([`KvIndex::cap_by_groups`]).
+    group_cap: Option<(u32, u32)>,
 }
 
 /// One routing pool's workers by their KV index ids, built once per pool
@@ -2640,6 +2643,7 @@ impl CacheAwarePolicy {
                     idx,
                     raw_score: matched_blocks,
                     effective_score: 1.0,
+                    group_cap: None,
                 });
             }
         }
@@ -2846,10 +2850,22 @@ impl CacheAwarePolicy {
             "Event-driven routing"
         );
         if cache_trace::enabled() {
-            cache_trace::prediction(serde_json::json!({
+            let mut prediction = serde_json::json!({
                 "source": "event_index_overlap", "branch": branch,
                 "overlap_blocks": overlap_blocks, "request_blocks": content_hashes.len(), "block_size": block_size,
-            }));
+            });
+            // The index's overlap before the chosen worker's cache groups
+            // bounded it, and the group that did: what a join against the
+            // engine's cached tokens reads on a hybrid model.
+            let group_cap = candidates
+                .iter()
+                .find(|candidate| candidate.idx == idx)
+                .and_then(|candidate| candidate.group_cap);
+            if let Some((uncapped, group)) = group_cap {
+                prediction["uncapped_blocks"] = uncapped.into();
+                prediction["capped_by_group"] = group.into();
+            }
+            cache_trace::prediction(prediction);
         }
         Some(idx)
     }
@@ -2879,6 +2895,7 @@ impl CacheAwarePolicy {
             &content_hashes,
             &table,
             indexer,
+            block_size,
             Gather::All { cap: None },
             &SelectWorkerInfo::default(),
         );
@@ -2910,8 +2927,15 @@ impl CacheAwarePolicy {
         gather: Gather,
         info: &SelectWorkerInfo,
     ) -> Vec<OverlapCandidate> {
-        let mut candidates =
-            Self::overlap_holders(workers, content_hashes, table, indexer, gather, info);
+        let mut candidates = Self::overlap_holders(
+            workers,
+            content_hashes,
+            table,
+            indexer,
+            block_size,
+            gather,
+            info,
+        );
         if candidates.is_empty() {
             return candidates;
         }
@@ -2930,12 +2954,16 @@ impl CacheAwarePolicy {
     /// The eligible holders of the request's blocks with their undecayed
     /// overlap, in slice order: the index names them by id, the pool table
     /// places them, and eligibility is read for them alone, so the cost
-    /// follows the holders gathered and not the pool.
+    /// follows the holders gathered and not the pool. A holder with a group
+    /// view (a hybrid model's worker) is scored at what its cache groups can
+    /// serve of the index's overlap, the engine's own rule, before the
+    /// holders are gathered ([`KvIndex::cap_by_groups`]).
     fn overlap_holders(
         workers: &[Arc<dyn Worker>],
         content_hashes: &[ContentHash],
         table: &PoolTable,
         indexer: &KvIndex,
+        block_size: usize,
         gather: Gather,
         info: &SelectWorkerInfo,
     ) -> Vec<OverlapCandidate> {
@@ -2944,8 +2972,12 @@ impl CacheAwarePolicy {
         }
 
         let started = Instant::now();
-        let overlap = indexer.find_matches(content_hashes, false);
+        let mut overlap = indexer.find_matches(content_hashes, false);
         Metrics::record_kv_index_lookup(indexer.name(), started.elapsed().as_secs_f64());
+        if overlap.scores.is_empty() {
+            return Vec::new();
+        }
+        let caps = indexer.cap_by_groups(content_hashes, block_size, &mut overlap);
         if overlap.scores.is_empty() {
             return Vec::new();
         }
@@ -2954,6 +2986,14 @@ impl CacheAwarePolicy {
             Gather::TopGroup { cap } => Self::top_group(workers, table, &overlap, cap, info),
             Gather::All { cap } => Self::all_holders(workers, table, &overlap, cap, info),
         };
+        for cap in &caps {
+            let Some(idx) = table.position(cap.worker, workers) else {
+                continue;
+            };
+            if let Some(candidate) = candidates.iter_mut().find(|candidate| candidate.idx == idx) {
+                candidate.group_cap = Some((cap.uncapped, cap.group));
+            }
+        }
         // Downstream reads candidates in slice order: the all-workers merge
         // in `resolve_selection` and the tie-breaks.
         candidates.sort_unstable_by_key(|candidate| candidate.idx);
@@ -3020,6 +3060,7 @@ impl CacheAwarePolicy {
                 idx,
                 raw_score: f64::from(depth),
                 effective_score: f64::from(depth),
+                group_cap: None,
             });
         }
         group
@@ -3065,6 +3106,7 @@ impl CacheAwarePolicy {
                 idx,
                 raw_score: f64::from(score),
                 effective_score: f64::from(score),
+                group_cap: None,
             });
         }
         if let Some(cap) = cap {
