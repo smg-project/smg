@@ -47,8 +47,9 @@ fn overlap_affinity_group(
 use crate::{
     observability::metrics::CACHE_AWARE_MATCH_RATIO_BUCKETS,
     worker::{
-        runtime::StallReason, test_support::no_health_check, BasicWorkerBuilder, WorkerBlocks,
-        WorkerType,
+        runtime::StallReason,
+        test_support::{no_health_check, worker_of},
+        BasicWorkerBuilder, WorkerBlocks, WorkerType,
     },
 };
 
@@ -872,14 +873,7 @@ fn prefill_miss_ignores_generation_rate() {
         let policy = CacheAwarePolicy::with_config(test_config());
         let workers: Vec<Arc<dyn Worker>> = ["http://p1:8000", "http://p2:8000"]
             .into_iter()
-            .map(|url| {
-                Arc::new(
-                    BasicWorkerBuilder::new(url)
-                        .worker_type(WorkerType::Prefill)
-                        .health_config(no_health_check())
-                        .build(),
-                ) as Arc<dyn Worker>
-            })
+            .map(|url| worker_of(url, WorkerType::Prefill))
             .collect();
         policy.init_workers(&workers);
         let feed = TestFeed::attached_to(&policy.load_scorer);
@@ -4951,14 +4945,7 @@ fn prefill_miss_uses_input_capacity_without_generation_rate_bias() {
             let policy = CacheAwarePolicy::with_config(test_config());
             let workers: Vec<Arc<dyn Worker>> = ["http://p1:8000", "http://p2:8000"]
                 .into_iter()
-                .map(|url| {
-                    Arc::new(
-                        BasicWorkerBuilder::new(url)
-                            .worker_type(WorkerType::Prefill)
-                            .health_config(no_health_check())
-                            .build(),
-                    ) as Arc<dyn Worker>
-                })
+                .map(|url| worker_of(url, WorkerType::Prefill))
                 .collect();
             policy.init_workers(&workers);
             let mut less_work = expected_wait_load(2_000, 0.0, generated);
