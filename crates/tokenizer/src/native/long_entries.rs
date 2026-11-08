@@ -86,8 +86,7 @@ impl LongEntryFilter {
     }
 
     /// Bytes the filter holds, for the load log.
-    #[cfg(test)]
-    fn bytes(&self) -> usize {
+    pub(super) fn bytes(&self) -> usize {
         size_of_val(&*self.words)
     }
 }

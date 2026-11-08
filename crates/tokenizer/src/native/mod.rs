@@ -746,9 +746,10 @@ pub(crate) struct NativeEncoder {
     seed_covers_short_entries: bool,
     /// The vocabulary's entries longer than the seed's keys as a filter,
     /// read with the seed when the pass read every entry (`None` on the
-    /// paths without the pass and for a vocabulary with gaps, whose entries
-    /// past the range went unread): the whole-piece lookup `ignore_merges`
-    /// asks for on a long piece is spared when the filter refuses it (see
+    /// paths without the pass, on the sentencepiece path, whose pass reads
+    /// no long entry, and for a vocabulary with gaps, whose entries past the
+    /// range went unread): the whole-piece lookup `ignore_merges` asks for
+    /// on a long piece is spared when the filter refuses it (see
     /// `long_entries` and [`Self::tokenize_piece`]).
     long_entries: Option<LongEntryFilter>,
     /// The model's merges as a table a piece neither the thread's cache nor
@@ -1301,11 +1302,12 @@ impl NativeEncoder {
             entries = table.len(),
             slots = table.slots(),
             long_entries = long,
+            long_entry_bytes = filter.bytes(),
             covers_short_entries = covers,
             ms = started.elapsed().as_millis() as u64,
             "the native encoder's vocabulary pieces"
         );
-        (table, covers, covers.then_some(filter))
+        (table, covers, (covers && !chars).then_some(filter))
     }
 
     /// This path's encoder for a tiktoken vocabulary, `ranks` as the file
