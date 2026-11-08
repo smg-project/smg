@@ -437,47 +437,6 @@ impl TokenSpeedAnswers for QueuedEngine {
         }
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
-
-    async fn health_check(
-        &self,
-        _request: Request<ts::HealthCheckRequest>,
-    ) -> Result<Response<ts::HealthCheckResponse>, Status> {
-        Ok(Response::new(ts::HealthCheckResponse {
-            healthy: true,
-            message: "ok".to_string(),
-        }))
-    }
-
-    async fn abort(
-        &self,
-        _request: Request<ts::AbortRequest>,
-    ) -> Result<Response<ts::AbortResponse>, Status> {
-        Ok(Response::new(ts::AbortResponse {
-            success: true,
-            message: String::new(),
-        }))
-    }
-
-    async fn get_model_info(
-        &self,
-        _request: Request<ts::GetModelInfoRequest>,
-    ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
-        Ok(Response::new(ts::GetModelInfoResponse::default()))
-    }
-
-    async fn get_server_info(
-        &self,
-        _request: Request<ts::GetServerInfoRequest>,
-    ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
-        Ok(Response::new(ts::GetServerInfoResponse::default()))
-    }
-
-    async fn get_loads(
-        &self,
-        _request: Request<ts::GetLoadsRequest>,
-    ) -> Result<Response<ts::GetLoadsResponse>, Status> {
-        Ok(Response::new(ts::GetLoadsResponse::default()))
-    }
 }
 
 /// Serve a queued parallel-dispatch mock engine in-process; returns its port
@@ -571,47 +530,6 @@ impl TokenSpeedAnswers for CutEngine {
                 .await;
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
-    }
-
-    async fn health_check(
-        &self,
-        _request: Request<ts::HealthCheckRequest>,
-    ) -> Result<Response<ts::HealthCheckResponse>, Status> {
-        Ok(Response::new(ts::HealthCheckResponse {
-            healthy: true,
-            message: "ok".to_string(),
-        }))
-    }
-
-    async fn abort(
-        &self,
-        _request: Request<ts::AbortRequest>,
-    ) -> Result<Response<ts::AbortResponse>, Status> {
-        Ok(Response::new(ts::AbortResponse {
-            success: true,
-            message: String::new(),
-        }))
-    }
-
-    async fn get_model_info(
-        &self,
-        _request: Request<ts::GetModelInfoRequest>,
-    ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
-        Ok(Response::new(ts::GetModelInfoResponse::default()))
-    }
-
-    async fn get_server_info(
-        &self,
-        _request: Request<ts::GetServerInfoRequest>,
-    ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
-        Ok(Response::new(ts::GetServerInfoResponse::default()))
-    }
-
-    async fn get_loads(
-        &self,
-        _request: Request<ts::GetLoadsRequest>,
-    ) -> Result<Response<ts::GetLoadsResponse>, Status> {
-        Ok(Response::new(ts::GetLoadsResponse::default()))
     }
 }
 
