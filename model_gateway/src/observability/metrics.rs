@@ -101,7 +101,11 @@ mod handles {
     /// Handles by method, then matched path.
     pub(super) type ByMethodAndPath<H> = FxHashMap<&'static str, ByPath<H>>;
     /// Response counters by matched path, then status code, then error code.
-    pub(super) type ByPathStatusAndError = FxHashMap<String, FxHashMap<u16, ByPath<Counter>>>;
+    /// The error-code level keeps the standard hasher: a worker's own error
+    /// code can reach it through the response middleware, so that key is not
+    /// one the gateway controls.
+    pub(super) type ByPathStatusAndError =
+        FxHashMap<String, FxHashMap<u16, HashMap<String, Counter>>>;
 
     /// The static labels of the stream-timing set.
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
