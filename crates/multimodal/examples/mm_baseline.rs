@@ -621,13 +621,11 @@ fn prepare(class: &Class, connector: &Arc<MediaConnector>) -> Result<Work, Fault
             }
         }
         "video" => {
-            let video_config = configs.video.as_ref();
+            // The sampler reads the config the processor is built from, as the gateway
+            // does: the checkpoint's video config, else its shared one.
+            let video_config = configs.video.as_ref().unwrap_or(&configs.image);
             let processor = spec
-                .vision_processor(
-                    &configs.config,
-                    video_config.unwrap_or(&configs.image),
-                    Modality::Video,
-                )
+                .vision_processor(&configs.config, video_config, Modality::Video)
                 .map_err(|e| e.to_string())?;
             let mut config = VideoFetchConfig {
                 sampling: spec.video_frame_sampling_with(video_config),

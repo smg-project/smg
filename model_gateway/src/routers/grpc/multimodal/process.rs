@@ -9,8 +9,8 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 use anyhow::{Context, Result};
 use futures::{future::try_join_all, StreamExt, TryStreamExt};
 use llm_multimodal::{
-    AsyncMultiModalTracker, AudioClip, EncoderDtype, EncoderFieldLayouts, ImageFrame,
-    MediaItemInfo, Modality, ModelMetadata, ModelProcessorSpec, PlaceholderRange,
+    AsyncMultiModalTracker, AudioClip, EncoderDtype, EncoderFieldLayouts, FrameSampling,
+    ImageFrame, MediaItemInfo, Modality, ModelMetadata, ModelProcessorSpec, PlaceholderRange,
     PreProcessorConfig, PreprocessedEncoderInputs, PromptReplacement, TrackedMedia, TrackerOutput,
     TransparencyPolicy, VideoClip, VideoClipOptions, VisionPreProcessor,
 };
@@ -284,22 +284,40 @@ pub(crate) async fn process_multimodal_plan(
     })
 }
 
+/// The spec's view of a clip for this model: its sampling rate and frame
+/// placement, read from the config its video processor is built from (see
+/// [`preprocessor_config_for`]) so the frames the connector picks and the
+/// frames the processor groups answer one config whatever files the
+/// checkpoint ships; the placement under the engine's frame budget.
+fn video_sampling(
+    spec: &dyn ModelProcessorSpec,
+    model_config: &MultimodalModelConfig,
+    frame_budget: Option<usize>,
+) -> (Option<f64>, FrameSampling) {
+    let config = preprocessor_config_for(model_config, Modality::Video);
+    (
+        spec.default_video_sample_fps_with(config),
+        spec.video_frame_sampling_with(config)
+            .with_frame_budget(frame_budget),
+    )
+}
+
 /// Fetch and decode the plan's media through the tracker, under the spec's
 /// video sampling and the frames' transparency policy.
 async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> {
-    let video_config = ctx.model_config.video_preprocessor_config.as_ref();
+    let (sample_fps, frame_sampling) = video_sampling(
+        ctx.spec,
+        ctx.model_config,
+        ctx.components.video_frame_budget,
+    );
     let mut tracker = AsyncMultiModalTracker::new(ctx.components.media_connector.clone())
         .with_drain_on_error(ctx.components.drain_fetches_on_error)
         .with_fetch_observer(
             Metrics::interned_model_label(ctx.model_id),
             Metrics::record_mm_fetch,
         )
-        .with_default_video_sample_fps(ctx.spec.default_video_sample_fps_with(video_config))
-        .with_video_frame_sampling(
-            ctx.spec
-                .video_frame_sampling_with(video_config)
-                .with_frame_budget(ctx.components.video_frame_budget),
-        )
+        .with_default_video_sample_fps(sample_fps)
+        .with_video_frame_sampling(frame_sampling)
         .with_image_transparency(ctx.transparency)
         .with_minimax_sglang_resize(
             ctx.spec.name() == "minimax_m3"
@@ -1071,7 +1089,9 @@ fn explicit_feature_ranges(
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use llm_multimodal::{ImageDetail, ImageSource, VideoSamplingInfo, VideoSource};
+    use llm_multimodal::{
+        ImageDetail, ImageSource, ModelRegistry, Tokenizer, VideoSamplingInfo, VideoSource,
+    };
 
     use super::*;
 
@@ -1184,6 +1204,70 @@ mod tests {
         assert_eq!(temporal(&with_video, Modality::Image), Some(2));
         assert_eq!(temporal(&with_video, Modality::Audio), Some(2));
         assert_eq!(temporal(&without_video, Modality::Video), Some(2));
+    }
+
+    /// The samplers read the config the video processor is built from: the
+    /// checkpoint's video config when it ships one, else its shared one, so a
+    /// family whose reference reads its rate and frame budget from that config
+    /// samples a clip the way its processor groups it.
+    #[test]
+    fn video_sampling_reads_the_processors_config() {
+        struct NoTokenizer;
+        impl Tokenizer for NoTokenizer {
+            fn token_to_id(&self, _token: &str) -> Option<u32> {
+                None
+            }
+            fn id_to_token(&self, _id: u32) -> Option<String> {
+                None
+            }
+            fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
+                None
+            }
+        }
+        let model = serde_json::json!({
+            "model_type": "muse_spark", "image_token_id": 1, "video_token_id": 2
+        });
+        let registry = ModelRegistry::new();
+        let spec = registry
+            .lookup(&ModelMetadata {
+                model_id: "muse-spark",
+                tokenizer: &NoTokenizer,
+                config: &model,
+            })
+            .expect("a family whose sampler reads its processor config");
+        let config = |fps: f64, num_frames: usize| {
+            PreProcessorConfig::from_value(
+                serde_json::json!({"fps": fps, "num_frames": num_frames}),
+            )
+            .unwrap()
+        };
+        let shared_only = MultimodalModelConfig::new(serde_json::json!({}), config(1.0, 8), None);
+        let with_video = MultimodalModelConfig::new(
+            serde_json::json!({}),
+            config(1.0, 8),
+            Some(config(2.0, 600)),
+        );
+
+        assert_eq!(
+            video_sampling(spec, &shared_only, None),
+            (
+                Some(1.0),
+                FrameSampling::TemporalGroups {
+                    frame_factor: 2,
+                    max_frames: 8,
+                }
+            )
+        );
+        assert_eq!(
+            video_sampling(spec, &with_video, None),
+            (
+                Some(2.0),
+                FrameSampling::TemporalGroups {
+                    frame_factor: 2,
+                    max_frames: 600,
+                }
+            )
+        );
     }
 
     #[test]

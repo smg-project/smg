@@ -67,10 +67,10 @@ fn grid(output: &llm_multimodal::PreprocessedEncoderInputs) -> Vec<i64> {
 }
 
 /// The family's sampling under its checkpoint's video processor config: the
-/// family's own frame sampler at the config's rate (2 frames a second), at
+/// family's own frame sampler at its loader's rate (2 frames a second), at
 /// most 2,048 frames, its walk scaled by the temporal patch size of 2.
 fn family_sampling(spec: &dyn ModelProcessorSpec, config: &PreProcessorConfig) -> VideoFetchConfig {
-    let sampling = spec.video_frame_sampling_with(Some(config));
+    let sampling = spec.video_frame_sampling_with(config);
     assert_eq!(
         sampling,
         FrameSampling::RateWalk {
@@ -79,7 +79,7 @@ fn family_sampling(spec: &dyn ModelProcessorSpec, config: &PreProcessorConfig) -
         }
     );
     let sample_fps = spec
-        .default_video_sample_fps_with(Some(config))
+        .default_video_sample_fps_with(config)
         .expect("the family's sampling rate");
     assert_eq!(sample_fps, 2.0);
     VideoFetchConfig {
@@ -257,15 +257,15 @@ fn clips_longer_than_the_generic_loader_budget_keep_the_engines_count() {
     );
 }
 
-/// The rate the checkpoint's video processor config carries reaches the picks
-/// as the double the reference reads: a config naming 0.3 frames a second is
-/// `0.3` at the sampler, not the `0.300000011920929` of the rate narrowed to
-/// binary32 on the way. The generic loader rule's resample at that rate picks
-/// `[0, 11]` of 20 frames at 3 fps, as the reference's `sample_frames` does,
-/// not the `[0, 10]` of the narrowed rate; the family's own rule picks
-/// `trunc(6.67 s x 0.3) = 2` frames of the same clip, `[0, 19]`.
+/// The samplers compute a non-dyadic rate in double precision: at 0.3 frames
+/// a second the generic loader rule's resample picks `[0, 11]` of 20 frames
+/// at 3 fps, as the reference's `sample_frames` does, not the `[0, 10]` of
+/// that rate narrowed to binary32; the family's own rule picks
+/// `trunc(6.67 s x 0.3) = 2` frames of the same clip, `[0, 19]`. The rate the
+/// processor config states never reaches the family's walk: its loader
+/// samples at its own rate.
 #[test]
-fn the_configs_rate_reaches_the_picks_as_the_double_the_reference_reads() {
+fn the_samplers_compute_a_non_dyadic_rate_in_double_precision() {
     let tokenizer = MarkerTokenizer;
     let model_config = serde_json::json!({"model_type": "glm53_flash", "image_token_id": IMAGE_ID});
     let metadata = ModelMetadata {
@@ -276,10 +276,8 @@ fn the_configs_rate_reaches_the_picks_as_the_double_the_reference_reads() {
     let registry = ModelRegistry::new();
     let spec = registry.lookup(&metadata).expect("the family's spec");
     let config = PreProcessorConfig::from_json(r#"{"fps":0.3}"#).expect("video processor config");
-    let rate = spec
-        .default_video_sample_fps_with(Some(&config))
-        .expect("the config's rate");
-    assert_eq!(rate, 0.3);
+    assert_eq!(spec.default_video_sample_fps_with(&config), Some(2.0));
+    let rate = 0.3;
     let generic = VideoFetchConfig {
         sample_fps: rate,
         sampling: FrameSampling::UpToThenRate {
@@ -291,7 +289,7 @@ fn the_configs_rate_reaches_the_picks_as_the_double_the_reference_reads() {
     assert_eq!(sampled_frame_indices(20, 3.0, generic), [0, 11]);
     let family = VideoFetchConfig {
         sample_fps: rate,
-        sampling: spec.video_frame_sampling_with(Some(&config)),
+        sampling: spec.video_frame_sampling_with(&config),
         ..VideoFetchConfig::default()
     };
     assert_eq!(sampled_frame_indices(20, 3.0, family), [0, 19]);
