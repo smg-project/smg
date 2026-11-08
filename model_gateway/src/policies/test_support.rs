@@ -1,4 +1,5 @@
-//! What the policy tests line their workers up with.
+//! What the policy tests line their workers up with, and the routing-key
+//! header they send.
 
 use std::sync::Arc;
 
@@ -13,6 +14,13 @@ pub(crate) fn make_worker(url: &str) -> Arc<dyn Worker> {
 /// Healthy workers (health checks disabled) for the given URLs.
 pub(crate) fn make_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
     urls.iter().map(|url| make_worker(url)).collect()
+}
+
+/// The request headers that carry `key` as the routing key.
+pub(crate) fn headers_with_routing_key(key: &str) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-smg-routing-key", key.parse().unwrap());
+    headers
 }
 
 /// The `a`/`b` worker pair under `policy` with a test feed attached; the
