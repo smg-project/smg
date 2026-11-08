@@ -1366,6 +1366,67 @@ impl WorkerRegistry {
         self.register(worker).unwrap_or_default()
     }
 
+    /// Whether `url` is held by a worker this node registered itself.
+    ///
+    /// A URL held by an import of a peer's publication is not: a
+    /// create-only registration of that address is a claim
+    /// ([`Self::register_or_claim`]), not a duplicate. A reserved URL with
+    /// no worker yet is not held either.
+    pub fn is_held_locally(&self, url: &str) -> bool {
+        self.resolve_url_to_id(url)
+            .is_some_and(|id| self.origin_of(&id) == Some(WorkerOrigin::Local))
+    }
+
+    /// Attempts a create-only registration makes before it reports its URL
+    /// as held: a miss is a gossip event on the key between two reads, and
+    /// the next attempt sees its result.
+    const CLAIM_ATTEMPTS: usize = 3;
+
+    /// Register a worker this node creates, claiming the URL when an import
+    /// of a peer's publication holds it (create-only otherwise).
+    ///
+    /// Returns the `WorkerId` on success, or `None` when a worker this node
+    /// registered itself holds the URL. The import is replaced at the
+    /// revision it was read at and promoted to `Local` under the per-worker
+    /// mutation lock, as [`Self::register_or_replace`] does for the start-up
+    /// and discovery paths: a node back under its name finds its earlier
+    /// life's workers imported from a peer, and the worker API that
+    /// registers them again is create-only. A replacement that lands in
+    /// between moves the revision and fails the claim, so a worker this node
+    /// registered is never written over. The claim is tried
+    /// `CLAIM_ATTEMPTS` times from the registration on: an import that a
+    /// gossip event removes or rebuilds between two reads (its owner's
+    /// tombstone, a later publication of its key) frees the URL or moves
+    /// the revision, and the next attempt takes the URL as it is then. A URL
+    /// not taken after the last attempt is reported as held. Emits
+    /// `Registered` or `Replaced`.
+    pub fn register_or_claim(&self, worker: Arc<dyn Worker>) -> Option<WorkerId> {
+        for _ in 0..Self::CLAIM_ATTEMPTS {
+            if let Some(id) = self.register(worker.clone()) {
+                return Some(id);
+            }
+            let Some(held_id) = self.url_to_id.get(worker.url()).map(|entry| entry.clone()) else {
+                continue;
+            };
+            if self.origin_of(&held_id) == Some(WorkerOrigin::Local) {
+                return None;
+            }
+            let Some(revision) = self.workers.get(&held_id).map(|held| held.revision()) else {
+                continue;
+            };
+            if self.replace_inner(
+                &held_id,
+                worker.clone(),
+                Some(WorkerOrigin::Local),
+                Some(revision),
+                None,
+            ) {
+                return Some(held_id);
+            }
+        }
+        None
+    }
+
     /// Replace an existing worker with a new one (overwrite-then-diff).
     ///
     /// Updates the worker object in-place and diffs the model index to avoid
@@ -2070,28 +2131,74 @@ impl WorkerRegistry {
     /// mesh import; the outbound mesh sync consults it so imported workers
     /// are never re-published (which would version-bump the CRDT in a loop).
     fn register_inner(&self, worker: Arc<dyn Worker>, origin: WorkerOrigin) -> Option<WorkerId> {
-        // Resolve (or reserve) the worker_id from url_to_id. The entry
-        // API is atomic per bucket, so concurrent callers either reuse
-        // the same existing_id or serialize on vacant insertion.
-        let worker_id = match self.url_to_id.entry(worker.url().to_string()) {
-            Entry::Occupied(entry) => entry.get().clone(),
-            Entry::Vacant(entry) => {
-                let new_id = WorkerId::new();
-                entry.insert(new_id.clone());
-                new_id
+        loop {
+            // Resolve (or reserve) the worker_id from url_to_id. The entry
+            // API is atomic per bucket, so concurrent callers either reuse
+            // the same existing_id or serialize on vacant insertion.
+            let worker_id = match self.url_to_id.entry(worker.url().to_string()) {
+                Entry::Occupied(entry) => entry.get().clone(),
+                Entry::Vacant(entry) => {
+                    let new_id = WorkerId::new();
+                    entry.insert(new_id.clone());
+                    new_id
+                }
+            };
+
+            // The test pause of `TransitionTestHooks`, here between the id read
+            // and the lock entry: the window in which a whole removal lands
+            // before this registration's entry.
+            #[cfg(test)]
+            {
+                let pause = self.transition_test_hooks.lock().before_lock.take();
+                if let Some((reached, resume)) = pause {
+                    reached.send(()).expect("transition observer is listening");
+                    resume
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("test releases the paused transition");
+                }
             }
-        };
 
-        // Acquire the per-worker mutation lock BEFORE making the worker
-        // visible in `workers`. The lock is keyed on `worker_id`, so
-        // concurrent registrations for the same URL serialize here.
-        let lock = self
-            .worker_mutation_locks
-            .entry(worker_id.clone())
-            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
-            .clone();
-        let _guard = lock.lock();
+            // Acquire the per-worker mutation lock BEFORE making the worker
+            // visible in `workers`. The lock is keyed on `worker_id`, so
+            // concurrent registrations for the same URL serialize here.
+            let lock = self
+                .worker_mutation_locks
+                .entry(worker_id.clone())
+                .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+                .clone();
+            let _guard = lock.lock();
 
+            // The id was read before the lock. A removal of the URL's worker
+            // that held the lock meanwhile dropped the mapping and the lock
+            // entry on its way out (`remove_inner`), and a registration under
+            // its id would be a worker no URL lookup finds; a mapping that
+            // names another id now is a registration that got there first.
+            // Either way the pair is resolved again.
+            let mapped = self
+                .url_to_id
+                .get(worker.url())
+                .is_some_and(|held| *held == worker_id);
+            if !mapped {
+                // The entry taken under a stale id would stay for ever: no
+                // removal runs for an id nothing maps to. This call's own
+                // entry goes, never one a worker under the id uses.
+                self.worker_mutation_locks.remove_if(&worker_id, |_, held| {
+                    Arc::ptr_eq(held, &lock) && !self.workers.contains_key(&worker_id)
+                });
+                continue;
+            }
+            return self.register_locked(worker, origin, worker_id);
+        }
+    }
+
+    /// The registration proper, under the URL's per-worker lock with the id
+    /// [`Self::register_inner`] resolved and checked.
+    fn register_locked(
+        &self,
+        worker: Arc<dyn Worker>,
+        origin: WorkerOrigin,
+        worker_id: WorkerId,
+    ) -> Option<WorkerId> {
         // Under the lock, reject if the URL already has an active
         // worker. A pre-reserved ID (from `reserve_id_for_url`) or a
         // same-ID re-entry from a racing caller both hit this check.

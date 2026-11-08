@@ -60,11 +60,10 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 WorkflowError::ContextValueNotFound("connection_mode".to_string())
             })?;
 
+        // An address held by an import of a peer's publication is claimed by
+        // the registration step, not refused here.
         if context.data.registration_mode == WorkerRegistrationMode::CreateOnly
-            && app_context
-                .worker_registry
-                .get_by_url(&config.url)
-                .is_some()
+            && app_context.worker_registry.is_held_locally(&config.url)
         {
             return Err(WorkflowError::StepFailed {
                 step_id: StepId::new("create_worker"),
@@ -1460,6 +1459,76 @@ mod tests {
         assert_eq!(spec.labels["tier"], "gold");
         assert_eq!(spec.dp_rank, None);
         assert_eq!(spec.dp_size, None);
+    }
+
+    /// The worker API registers create-only. An address held by an import
+    /// of a peer's publication passes this step's duplicate check (the
+    /// registration step claims it); one held by a worker this node
+    /// registered itself is refused here, before anything is built.
+    #[tokio::test]
+    async fn a_create_only_registration_passes_an_address_imported_from_a_peer() {
+        use openai_protocol::worker::WorkerModels;
+        use wfaas::WorkflowInstanceId;
+
+        use crate::{
+            app_context::testing::app_context_for_tests,
+            workflow::steps::create_worker_workflow_data,
+        };
+
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.on_remote_worker_state(&smg_mesh::WorkerState {
+            worker_id: "peer-w1".to_string(),
+            model_id: "m".to_string(),
+            url: "http://worker:8000".to_string(),
+            health: true,
+            load: 0.0,
+            version: 1,
+            spec: vec![],
+            owner: "peer".to_string(),
+        });
+        let app_context = app_context_for_tests(
+            crate::config::RouterConfig::builder()
+                .worker_startup_timeout_secs(1)
+                .build_unchecked(),
+            Arc::clone(&registry),
+            None,
+        );
+        let data_for = |url: &str| {
+            let mut spec = WorkerSpec::new(url);
+            spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+            let mut data = create_worker_workflow_data(
+                spec,
+                WorkerRegistrationMode::CreateOnly,
+                Arc::clone(&app_context),
+            );
+            data.worker_kind = Some(WorkerKind::Local);
+            data.connection_mode = Some(ConnectionMode::Http);
+            data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
+            data
+        };
+
+        let mut ctx =
+            WorkflowContext::new(WorkflowInstanceId::new(), data_for("http://worker:8000"));
+        assert_eq!(
+            CreateLocalWorkerStep
+                .execute(&mut ctx)
+                .await
+                .expect("an imported address is claimed, not a duplicate"),
+            StepResult::Success
+        );
+
+        let holder: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://held:8000")
+                .model(ModelCard::new("m"))
+                .build(),
+        );
+        registry.register(holder).unwrap();
+        let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data_for("http://held:8000"));
+        let err = CreateLocalWorkerStep
+            .execute(&mut ctx)
+            .await
+            .expect_err("an address a worker of this node holds is a duplicate");
+        assert!(matches!(err, WorkflowError::StepFailed { .. }), "{err:?}");
     }
 
     /// What a registration records as engine-discovered is the engine's

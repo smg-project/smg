@@ -2276,6 +2276,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_create_only_registration_after_a_restart_claims_and_publishes_the_key() {
+        // The worker API registers create-only. A node back under its name
+        // imports its earlier life's key first, and a `POST` for that
+        // address was refused as a duplicate: the operator had to delete the
+        // import or `PUT` under its id. The registration claims the import
+        // as the start-up path does, the claim publishes above the earlier
+        // life's version, and the peer's import follows it.
+        let mesh = MeshKV::new("node-p".into());
+        let ns = worker_namespace(&mesh);
+        let url = "http://engine:8080";
+        let first_registry = Arc::new(WorkerRegistry::new());
+        let first_life = WorkerSyncAdapter::new(
+            ns.clone(),
+            first_registry.clone(),
+            "node-p".into(),
+            empty_cluster(),
+        );
+        let first_id = first_registry
+            .register(local_worker_of(url, "model-a"))
+            .unwrap();
+        first_life.resync_local(&mut HashMap::new());
+        let first_key = format!("worker:{}", first_id.as_str());
+        let first_version = version_of(&ns, &first_key).expect("the first life's key");
+        drop(first_life);
+        drop(first_registry);
+
+        let peer_registry = Arc::new(WorkerRegistry::new());
+        let peer = WorkerSyncAdapter::new(
+            ns.clone(),
+            peer_registry.clone(),
+            "node-s".into(),
+            empty_cluster(),
+        );
+        peer.start();
+        assert!(
+            wait_for(|| peer_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
+            "the peer imported the worker under the owner's first id"
+        );
+
+        let second_registry = Arc::new(WorkerRegistry::new());
+        let second_life = WorkerSyncAdapter::new(
+            ns.clone(),
+            second_registry.clone(),
+            "node-p".into(),
+            empty_cluster(),
+        );
+        second_life.start();
+        assert!(
+            wait_for(|| second_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
+            "the new life imports the key of its earlier life"
+        );
+        assert!(
+            !second_registry.is_held_locally(url),
+            "the import does not hold the address against this node"
+        );
+        assert_eq!(
+            second_registry.register_or_claim(local_worker_of(url, "model-b")),
+            Some(first_id.clone()),
+            "the create-only registration claims the import under its id"
+        );
+        assert_eq!(
+            second_registry.origin_of(&first_id),
+            Some(WorkerOrigin::Local)
+        );
+        assert!(
+            wait_for(|| version_of(&ns, &first_key).is_some_and(|v| v > first_version)).await,
+            "the claim publishes above the earlier life's version {first_version}: {:?}",
+            version_of(&ns, &first_key)
+        );
+        assert!(
+            wait_for(|| {
+                peer_registry
+                    .get_by_url(url)
+                    .is_some_and(|worker| worker.model_id() == "model-b")
+            })
+            .await,
+            "the peer's import follows the claim: {:?}",
+            peer_registry
+                .get_by_url(url)
+                .map(|worker| worker.model_id().to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn a_claim_after_a_restart_publishes_above_the_earlier_lifes_version() {
         // The published version is the owner's worker revision, which
         // restarts at zero with the process; the key outlives it. A life

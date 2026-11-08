@@ -523,10 +523,20 @@ impl WorkerService {
         let worker_url = config.url.clone();
         let queue = self.get_job_queue()?;
 
-        // Reserve (or retrieve) a stable ID for the 202 response.
-        // If this URL already has an active worker, reject with 409.
+        // Reserve (or retrieve) a stable ID for the 202 response. A URL held
+        // by a worker this node registered itself is a 409; one held by an
+        // import of a peer's publication is claimed by the registration, as
+        // the start-up path claims it (`WorkerRegistry::register_or_claim`),
+        // so a node back under its name re-registers its own addresses.
+        // An import's id is the 202's id but no reservation: an import that
+        // its owner tombstones, or the dead-owner rule drops, before the
+        // registration step runs frees the URL, and the step registers under
+        // a new id, so the 202's location answers 404 for that worker. The
+        // earlier life's keys name this node as their owner, which no peer
+        // tombstones and the liveness rule reads as live, so the restart
+        // case keeps its id.
         let worker_id = self.worker_registry.reserve_id_for_url(&worker_url);
-        if self.worker_registry.get(&worker_id).is_some() {
+        if self.worker_registry.is_held_locally(&worker_url) {
             return Err(WorkerServiceError::Conflict {
                 url: worker_url,
                 worker_id,
@@ -915,10 +925,9 @@ mod tests {
         assert!(matches!(err, WorkerServiceError::QueueNotInitialized));
     }
 
-    #[tokio::test]
-    async fn create_worker_releases_reservation_when_submission_fails() {
-        let registry = Arc::new(WorkerRegistry::new());
-        // A queue whose AppContext is gone rejects every submission.
+    /// A service over a queue whose AppContext is gone: it rejects every
+    /// submission, so `create_worker` runs its checks and stops at the submit.
+    fn service_with_a_dead_queue(registry: &Arc<WorkerRegistry>) -> WorkerService {
         let queue = Arc::new(std::sync::OnceLock::new());
         queue
             .set(JobQueue::new(
@@ -926,7 +935,13 @@ mod tests {
                 std::sync::Weak::new(),
             ))
             .ok();
-        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
+        WorkerService::new(Arc::clone(registry), queue, RouterConfig::default())
+    }
+
+    #[tokio::test]
+    async fn create_worker_releases_reservation_when_submission_fails() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let service = service_with_a_dead_queue(&registry);
         // Idempotent, so this is the id create_worker will hand out.
         let reserved = registry.reserve_id_for_url("grpc://10.0.0.5:8000");
 
@@ -938,6 +953,60 @@ mod tests {
 
         // The 202 was never sent, so nothing may keep the URL reserved (#1533).
         assert!(registry.get_url_by_id(&reserved).is_none());
+    }
+
+    #[tokio::test]
+    async fn create_worker_claims_an_address_imported_from_a_peer() {
+        // A node back under its name imports its earlier life's worker from
+        // a peer. A `POST` for that address is the operator registering it
+        // again: it passes the conflict check and the registration claims
+        // the import. Here it stops at the dead queue, past the check.
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.on_remote_worker_state(&smg_mesh::WorkerState {
+            worker_id: "peer-w1".to_string(),
+            model_id: "llama-3".to_string(),
+            url: "http://10.0.0.9:8000".to_string(),
+            health: true,
+            load: 0.0,
+            version: 1,
+            spec: vec![],
+            owner: "peer".to_string(),
+        });
+        let import_id = registry.get_id_by_url("http://10.0.0.9:8000").unwrap();
+        let service = service_with_a_dead_queue(&registry);
+
+        let err = service
+            .create_worker(worker_spec("http://10.0.0.9:8000"))
+            .await
+            .expect_err("the dead queue refuses the submission");
+        assert!(
+            matches!(err, WorkerServiceError::QueueSubmitFailed { .. }),
+            "a POST for an imported address is a claim, not a conflict: {err}"
+        );
+        // The failed submit releases the reservation; the live import keeps
+        // its address.
+        assert_eq!(
+            registry.get_id_by_url("http://10.0.0.9:8000"),
+            Some(import_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_worker_answers_409_for_an_address_this_node_registered() {
+        let registry = Arc::new(WorkerRegistry::new());
+        register_worker(&registry, "http://10.0.0.9:8000", Some("llama-3"));
+        let holder = registry.get_id_by_url("http://10.0.0.9:8000").unwrap();
+        let service = service_with_a_dead_queue(&registry);
+
+        let err = service
+            .create_worker(worker_spec("http://10.0.0.9:8000"))
+            .await
+            .expect_err("a duplicate POST is refused");
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        match err {
+            WorkerServiceError::Conflict { worker_id, .. } => assert_eq!(worker_id, holder),
+            other => panic!("expected a 409 for a held address, got {other}"),
+        }
     }
 
     /// A registration whose labels or fields the routers could not read is

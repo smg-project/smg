@@ -42,8 +42,11 @@ fn check_batch(
     match registration_mode {
         WorkerRegistrationMode::CreateOnly => {
             let mut batch_urls = HashSet::with_capacity(workers.len());
+            // A URL held by an import of a peer's publication is claimed by
+            // the registration, so only a worker this node registered itself
+            // refuses the batch.
             for worker in workers {
-                if registry.get_by_url(worker.url()).is_some() {
+                if registry.is_held_locally(worker.url()) {
                     return Err(step_failed(format!(
                         "Worker {} already exists",
                         worker.url()
@@ -81,7 +84,7 @@ fn register_worker(
 ) -> WorkflowResult<WorkerId> {
     match registration_mode {
         WorkerRegistrationMode::CreateOnly => registry
-            .register(worker.clone())
+            .register_or_claim(worker.clone())
             .ok_or_else(|| step_failed(format!("Worker {} already exists", worker.redacted_url()))),
         WorkerRegistrationMode::Upsert => Ok(registry.register_or_replace(worker)),
         WorkerRegistrationMode::ReplaceById {
@@ -295,6 +298,44 @@ mod tests {
         );
         assert_eq!(registry.get_by_model("original-model").len(), 1);
         assert!(registry.get_by_model("replacement-model").is_empty());
+    }
+
+    #[test]
+    fn create_only_claims_an_address_imported_from_a_peer() {
+        // A node back under its name imports its earlier life's worker
+        // before the operator registers it again through the worker API.
+        // The create-only batch check passes the address and the
+        // registration claims the import under its id.
+        let registry = WorkerRegistry::new();
+        registry.on_remote_worker_state(&smg_mesh::WorkerState {
+            worker_id: "peer-w1".to_string(),
+            model_id: "original-model".to_string(),
+            url: "http://worker:8080".to_string(),
+            health: true,
+            load: 0.0,
+            version: 1,
+            spec: vec![],
+            owner: "peer".to_string(),
+        });
+        let import_id = registry.get_id_by_url("http://worker:8080").unwrap();
+
+        let batch = vec![worker("replacement-model")];
+        check_batch(&registry, &batch, &WorkerRegistrationMode::CreateOnly)
+            .expect("a registration of an imported address is a claim, not a duplicate");
+        let registered = register_worker(
+            &registry,
+            batch[0].clone(),
+            &WorkerRegistrationMode::CreateOnly,
+        )
+        .expect("the claim registers the worker");
+
+        assert_eq!(registered, import_id, "the claim keeps the import's id");
+        assert_eq!(
+            registry.origin_of(&import_id),
+            Some(crate::worker::WorkerOrigin::Local)
+        );
+        assert_eq!(registry.get_by_model("replacement-model").len(), 1);
+        assert!(registry.get_by_model("original-model").is_empty());
     }
 
     #[test]

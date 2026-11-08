@@ -415,6 +415,187 @@ fn mesh_import_adopts_publisher_worker_id() {
 }
 
 #[test]
+fn a_create_only_registration_claims_the_import_of_its_own_address() {
+    // A node back under its name imports its earlier life's worker from a
+    // peer before the operator registers it again through the worker API,
+    // which is create-only. The import holds nothing against this node: the
+    // registration claims it under the import's id, as the start-up path
+    // does, and the worker is this node's from then on.
+    let registry = WorkerRegistry::new();
+    registry.on_remote_worker_state(&remote_state("peer-w1", "http://w:8080", true, vec![]));
+    let id = registry.get_id_by_url("http://w:8080").unwrap();
+    assert!(
+        !registry.is_held_locally("http://w:8080"),
+        "an import does not hold the address against this node"
+    );
+
+    let local: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://w:8080")
+            .model(ModelCard::new("llama-3"))
+            .build(),
+    );
+    assert_eq!(
+        registry.register_or_claim(local),
+        Some(id.clone()),
+        "the claim keeps the import's id"
+    );
+    assert_eq!(registry.origin_of(&id), Some(WorkerOrigin::Local));
+    assert!(registry.is_held_locally("http://w:8080"));
+    assert!(
+        registry.remove_remote(&id).is_none(),
+        "a peer tombstone can no longer delete the claimed worker"
+    );
+}
+
+/// A registration reads the URL's id before it takes the per-worker lock. A
+/// removal of the URL's worker that holds the lock drops the record, then
+/// the URL mapping and the lock entry (`remove_inner`); a registration that
+/// went on under the stale id would be a worker no URL lookup finds (a
+/// second registration of the address would pass, a delete of either would
+/// drop the other's mapping). The registration resolves its id again under
+/// the lock and registers under a fresh one, mapped.
+#[test]
+fn a_registration_that_meets_a_removal_under_the_lock_is_found_by_its_url() {
+    let registry = WorkerRegistry::new();
+    let url = "http://w:8080";
+    let first: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new("model-a"))
+            .build(),
+    );
+    let stale = registry.register(first).unwrap();
+    // The removal's lock, held while the record and the mapping go.
+    let lock = registry
+        .worker_mutation_locks
+        .get(&stale)
+        .map(|entry| Arc::clone(entry.value()))
+        .expect("the registered worker's lock entry");
+    let held = lock.lock();
+
+    let registered = std::thread::scope(|scope| {
+        let registration = scope.spawn(|| {
+            let second: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new("model-b"))
+                    .build(),
+            );
+            registry.register(second)
+        });
+        // The registration has read the mapping (still the stale id) and
+        // waits for the lock; the removal finishes as `remove_inner` does.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        registry.workers.remove(&stale);
+        registry.url_to_id.remove(url);
+        registry.worker_mutation_locks.remove(&stale);
+        registry.worker_origins.remove(&stale);
+        drop(held);
+        registration.join().expect("the registration thread")
+    });
+
+    let fresh = registered.expect("registered under a fresh id");
+    assert_ne!(
+        fresh, stale,
+        "the stale id is not reused without its mapping"
+    );
+    assert_eq!(
+        registry
+            .get_by_url(url)
+            .map(|worker| worker.model_id().to_string()),
+        Some("model-b".to_string()),
+        "the registered worker is found by its URL"
+    );
+    assert!(registry.is_held_locally(url));
+    assert_eq!(
+        registry.get(&fresh).map(|worker| worker.url().to_string()),
+        Some(url.to_string())
+    );
+}
+
+/// A registration that reads the URL's id and then loses the window before
+/// its lock entry to a whole removal: the removal drops the record, the
+/// mapping and the lock entry, so the registration takes a fresh entry
+/// under an id nothing maps to. It resolves again under a fresh id, and
+/// the entry it took under the stale id goes with it: no removal would
+/// ever run for that id.
+#[test]
+fn a_registration_that_loses_its_window_to_a_removal_leaves_no_lock_entry_behind() {
+    let registry = WorkerRegistry::new();
+    let url = "http://w:8080";
+    let first: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new("model-a"))
+            .build(),
+    );
+    let stale = registry.register(first).unwrap();
+
+    let registered = registry.with_another_write_before_the_lock(
+        |registry| {
+            let second: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new("model-b"))
+                    .build(),
+            );
+            registry.register(second)
+        },
+        |registry| {
+            // The whole removal, as `remove_inner` does it.
+            registry.workers.remove(&stale);
+            registry.url_to_id.remove(url);
+            registry.worker_mutation_locks.remove(&stale);
+            registry.worker_origins.remove(&stale);
+        },
+    );
+
+    let fresh = registered.expect("registered under a fresh id");
+    assert_ne!(
+        fresh, stale,
+        "the stale id is not reused without its mapping"
+    );
+    assert!(
+        !registry.worker_mutation_locks.contains_key(&stale),
+        "the lock entry taken under the stale id is gone"
+    );
+    assert!(registry.worker_mutation_locks.contains_key(&fresh));
+    assert_eq!(
+        registry
+            .get_by_url(url)
+            .map(|worker| worker.model_id().to_string()),
+        Some("model-b".to_string()),
+        "the registered worker is found by its URL"
+    );
+}
+
+#[test]
+fn a_create_only_registration_leaves_a_local_holder_in_place() {
+    // The duplicate `POST` the create-only mode exists for: a worker this
+    // node registered itself holds the address, and the second registration
+    // is refused with the holder untouched. A reserved address with no
+    // worker yet is not held.
+    let registry = WorkerRegistry::new();
+    let holder: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://w:8080")
+            .model(ModelCard::new("model-a"))
+            .build(),
+    );
+    let id = registry.register(holder).unwrap();
+    assert!(registry.is_held_locally("http://w:8080"));
+    registry.reserve_id_for_url("http://reserved:8080");
+    assert!(!registry.is_held_locally("http://reserved:8080"));
+
+    let second: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://w:8080")
+            .model(ModelCard::new("model-b"))
+            .build(),
+    );
+    assert_eq!(registry.register_or_claim(second), None);
+    assert_eq!(
+        registry.get(&id).map(|held| held.model_id().to_string()),
+        Some("model-a".to_string()),
+        "the holder stands"
+    );
+}
+
+#[test]
 fn mesh_state_for_zmq_worker_is_never_imported() {
     // ZMQ is same-host: an `ipc://` endpoint published by a peer names a
     // socket path on that peer's machine, so importing it would advertise
