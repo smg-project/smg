@@ -8,12 +8,11 @@ use crate::{event::Events, input::Input};
 /// them, then one `End`. Whole-output parsing is the same sequence with a single `Delta`, so
 /// streaming and non-streaming share one implementation.
 ///
-/// On `Err`, everything already pushed into `out` is final. After a `BufferOverflow` or
-/// `Internal` error the caller feeds `End`, and the parser reports what it still held as a
-/// `Malformed` event, so the bytes are returned rather than lost. An error raised by `End` itself is
-/// final: the parser has already closed the stream in `out`, `Finish` last, and nothing more may be
-/// fed. After a `Lifecycle` error the stream is already over or was never started; the parser holds
-/// nothing and emits nothing more.
+/// On `Err`, everything already pushed into `out` is final. The one error, a `Lifecycle` misuse,
+/// says the caller fed the steps out of order: the stream is already over or was never started,
+/// and the parser holds nothing and emits nothing more. A parser never fails on the output's
+/// bytes: what it cannot read it returns as `Malformed` events, and the end of the stream closes
+/// what it still held.
 pub trait Parser: Send {
     /// Feed one lifecycle step and append the resulting events to `out`. The events may borrow
     /// the input's text for the life of `out` (`'d`): a text run the parser passed through
@@ -21,19 +20,10 @@ pub trait Parser: Send {
     fn feed<'d>(&mut self, input: Input<'d>, out: &mut Events<'d>) -> Result<(), ParseError>;
 }
 
-/// Why a parser could not continue.
+/// Why a parser could not continue: the caller's order of steps, never the output's bytes.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ParseError {
-    /// The parser would have to hold more bytes than its limit allows.
-    #[error("buffered output exceeded {limit} bytes")]
-    BufferOverflow {
-        /// The limit in bytes.
-        limit: usize,
-    },
     /// The caller fed inputs out of order (a `Delta` after `End`, a second `Prompt`).
     #[error("lifecycle misuse: {0}")]
     Lifecycle(String),
-    /// A defect in a parser, described for the report; never expected in production.
-    #[error("internal parser error: {0}")]
-    Internal(String),
 }
