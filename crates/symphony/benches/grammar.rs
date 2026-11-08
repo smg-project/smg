@@ -92,7 +92,8 @@ fn grammar(c: &mut Criterion) {
                 black_box(
                     format
                         .grammar_for(&tools, options)
-                        .map(|grammar| grammar.payload_text()),
+                        .expect("every subject builds a required call's grammar")
+                        .payload_text(),
                 )
             });
         });
