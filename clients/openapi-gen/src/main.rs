@@ -566,8 +566,12 @@ fn main() -> anyhow::Result<()> {
         PathItem {
             get: Some(operation(
                 "listWorkers",
-                "List all workers",
-                None,
+                "List the workers, or with format=manifest the file provider's manifest",
+                Some(vec![
+                    optional_query_param("model"),
+                    optional_query_param("format"),
+                    optional_query_param("origin"),
+                ]),
                 None,
                 worker_list_responses,
             )),

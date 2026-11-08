@@ -369,6 +369,22 @@ impl Endpoint {
         }
     }
 
+    /// Whether the address carries userinfo: a username, a password or a
+    /// token.
+    pub fn has_credentials(&self) -> bool {
+        self.userinfo.is_some()
+    }
+
+    /// The address without its userinfo: what is written where an address
+    /// must be read back and may not carry a credential (the manifest
+    /// export). The scheme, host, port and path stay.
+    pub fn without_credentials(&self) -> Self {
+        Self {
+            userinfo: None,
+            ..self.clone()
+        }
+    }
+
     /// Render this endpoint with the workflow's rank suffix.
     pub fn render_with_rank(&self, rank: usize) -> String {
         format!("{}@{rank}", self.render())
