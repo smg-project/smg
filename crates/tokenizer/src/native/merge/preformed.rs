@@ -24,7 +24,6 @@
 //! pre-form characters under the same three conditions.
 
 use rustc_hash::FxHashMap;
-use tokenizers::models::bpe::BPE;
 
 use super::{Merge, MergeTable};
 
@@ -121,31 +120,17 @@ impl Preformed {
                 .sum::<usize>()
     }
 
-    /// The pre-formable characters of `bpe`'s vocabulary under `table`:
-    /// `byte_of` maps an alphabet character to its byte; `min_operand`
-    /// holds, per id, the least rank of a merge that takes the id as an
-    /// operand (`u32::MAX` for none).
+    /// The pre-formable characters of a vocabulary under `table`: `raws`
+    /// are its tokens as the raw bytes they stand for, with their ids (a
+    /// model's alphabet spellings mapped back, a rank file's bytes as they
+    /// are); `min_operand` holds, per id, the least rank of a merge that
+    /// takes the id as an operand (`u32::MAX` for none).
     pub(super) fn analyse(
         table: &MergeTable,
-        bpe: &BPE,
-        byte_of: &[Option<u8>],
+        mut raws: Vec<(u32, Vec<u8>)>,
         min_operand: &[u32],
     ) -> Self {
-        let raw_of = |token: &str| -> Option<Vec<u8>> {
-            token
-                .chars()
-                .map(|c| byte_of.get(c as usize).copied().flatten())
-                .collect()
-        };
-        let mut raws: Vec<(u32, Vec<u8>)> = bpe
-            .get_vocab()
-            .into_iter()
-            .filter_map(|(token, id)| {
-                raw_of(&token)
-                    .filter(|raw| !raw.is_empty())
-                    .map(|raw| (id, raw))
-            })
-            .collect();
+        raws.retain(|(_, raw)| !raw.is_empty());
         raws.sort_unstable_by_key(|(id, _)| *id);
         // The fragment tokens: leading continuation bytes -> the rest;
         // a trailing incomplete character -> the bytes before it.
