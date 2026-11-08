@@ -1148,11 +1148,12 @@ async fn media_refs_are_refused_and_extra_batches_translated() {
 }
 
 /// An encode-prefill-decode leg carries encoder-cache transfer parameters:
-/// the encoder's request with the consumer's destination and transfer ids,
-/// or the prefill side's with the encoder's handles. This servicer runs no
-/// encoder-cache connector and advertises none, so either is refused before
-/// the engine sees it, naming the label the Router reads; an empty field is
-/// no parameters and the request goes through.
+/// the encoder's request (a pull connector's empty object, or a push
+/// connector's consumer destination and transfer ids), or the prefill side's
+/// with the encoder's handles. This servicer runs no encoder-cache connector
+/// and advertises none, so each is refused before the engine sees it, naming
+/// the label the Router reads; an empty field is no parameters and the
+/// request goes through.
 #[tokio::test]
 async fn encoder_cache_transfer_parameters_are_refused_before_the_engine() {
     let mut h = harness(model_info(), None).await;
@@ -1178,6 +1179,9 @@ async fn encoder_cache_transfer_parameters_are_refused_before_the_engine() {
             "ec-prefill",
             r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600,"size_bytes":128}}"#,
         ),
+        // The encoder leg of a pull connector: an empty object, the payload
+        // the Router sends most often, is parameters all the same.
+        ("ec-encode-pull", "{}"),
     ] {
         let mut request = generate_request(id, false, Vec::new());
         request.ec_transfer_params_json = Some(params.to_string());
