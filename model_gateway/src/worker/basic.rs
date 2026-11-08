@@ -989,7 +989,8 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// superseded by a replacement. `BasicWorker` aborts the detached ZMQ
     /// handshake driver: it holds the handshake and data-plane socket binds
     /// until it lands, so an orphaned driver would keep them for up to the
-    /// connect timeout and collide with a same-URL re-registration.
+    /// connect timeout and collide with a same-URL re-registration. It also
+    /// stops writing the shared state code, which a replacement reads.
     fn abort_background_tasks(&self) {}
     async fn grpc_health_check(&self) -> WorkerResult<bool>;
     /// Liveness check for a ZMQ worker. Unlike gRPC there is no health RPC on
@@ -1173,6 +1174,12 @@ pub struct BasicWorker {
     /// releases the sockets the in-flight handshake has bound instead of
     /// leaving them held until it times out. `None` until a driver is spawned.
     pub zmq_connect_abort: Arc<ArcSwapOption<AbortHandle>>,
+    /// Set when the registry retires this instance (a removal, or a same-URL
+    /// replacement that took over the shared runtime). A retired instance no
+    /// longer writes the shared state code: the replacement's routing reads
+    /// answer from that code, and a replacement built with another breaker
+    /// config keeps a breaker of its own.
+    pub superseded: AtomicBool,
     /// Wakes the manager the instant the ZMQ handshake completes so it can
     /// promote the worker without waiting for the next health poll. Set only
     /// for ZMQ workers built through the registration path; `None` elsewhere
@@ -1216,6 +1223,7 @@ impl Clone for BasicWorker {
             kv_engine_id_unconfirmed: Arc::new(AtomicBool::new(
                 self.kv_engine_id_unconfirmed.load(Ordering::Relaxed),
             )),
+            superseded: AtomicBool::new(self.superseded.load(Ordering::Relaxed)),
             http_client: Arc::clone(&self.http_client),
             resilience: self.resilience.clone(),
         }
@@ -1352,8 +1360,13 @@ impl BasicWorker {
     /// called, so the last publish in lock order reads every fact that
     /// moved, and the series end on the pair the facts give. The breaker is
     /// read as stored: its timeout's move belongs to the routing decision's
-    /// read ([`Self::breaker_allows`]), which publishes it.
+    /// read ([`Self::breaker_allows`]), which publishes it. An instance the
+    /// registry retired writes nothing: its replacement, which may keep a
+    /// breaker of its own, answers its routing reads from this code.
     fn publish_state_under(&self, rt: &WorkerRuntime, forget_previous: bool) {
+        if self.superseded.load(Ordering::Acquire) {
+            return;
+        }
         let _publish = rt.publish_lock();
         if forget_previous {
             rt.swap_published_state(0);
@@ -2169,6 +2182,7 @@ impl Worker for BasicWorker {
     }
 
     fn abort_background_tasks(&self) {
+        self.superseded.store(true, Ordering::Release);
         if let Some(handle) = self.zmq_connect_abort.swap(None) {
             handle.abort();
             // The bound sockets are released with the cancelled future; reset

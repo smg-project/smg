@@ -1965,3 +1965,52 @@ fn a_veto_the_published_code_does_not_carry_is_still_read() {
     assert!(!state.eligible_ignoring_overload());
     assert!(!worker.is_available());
 }
+
+/// A retired instance no longer writes the shared state code. A same-URL
+/// replacement built with another breaker config keeps a breaker of its own;
+/// the retired instance's breaker moves must not publish over the
+/// replacement's veto, which the routing reads answer from.
+#[test]
+fn a_retired_worker_does_not_publish_over_its_replacement() {
+    let retired = BasicWorkerBuilder::new("http://worker:8000")
+        .health_config(no_health_check())
+        .circuit_breaker_config(CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_duration: Duration::from_millis(50),
+            ..CircuitBreakerConfig::default()
+        })
+        .build();
+    retired.set_status(WorkerStatus::Ready);
+    let replacement = BasicWorkerBuilder::new("http://worker:8000")
+        .health_config(no_health_check())
+        .circuit_breaker_config(CircuitBreakerConfig {
+            failure_threshold: 2,
+            ..CircuitBreakerConfig::default()
+        })
+        .build();
+    assert!(replacement.inherit_shared_state_from(&retired));
+    retired.abort_background_tasks();
+
+    // The retired instance's own breaker opens; the replacement trips its own
+    // and publishes `circuit_open` on the shared runtime.
+    retired.record_circuit_breaker_outcome(false);
+    replacement.record_circuit_breaker_outcome(false);
+    replacement.record_circuit_breaker_outcome(false);
+    assert!(!replacement.circuit_breaker_can_execute());
+    assert_eq!(
+        replacement.runtime.load().published_state(),
+        CIRCUIT_OPEN_CODE
+    );
+
+    // The retired breaker's timeout moves it to half-open on a routing read, a
+    // move that publishes `available` from an instance the registry holds.
+    thread::sleep(Duration::from_millis(60));
+    assert!(retired.routing_state().can_execute);
+    assert_eq!(
+        replacement.runtime.load().published_state(),
+        CIRCUIT_OPEN_CODE,
+        "a retired instance does not publish"
+    );
+    assert!(!replacement.routing_state().can_execute);
+    assert!(!replacement.is_available());
+}
