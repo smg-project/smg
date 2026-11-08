@@ -865,29 +865,13 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::config::test_support::{epd_routing_mode, regular_routing_mode};
 
     const SQUEUE_23_11: &str = include_str!("testdata/slurm/squeue-23.11.json");
     const SQUEUE_24_11: &str = include_str!("testdata/slurm/squeue-24.11.json");
     const SQUEUE_21_08: &str = include_str!("testdata/slurm/squeue-21.08.json");
     const NODES_23_11: &str = include_str!("testdata/slurm/scontrol-nodes-23.11.json");
     const NODES_24_11: &str = include_str!("testdata/slurm/scontrol-nodes-24.11.json");
-
-    fn regular() -> RoutingMode {
-        RoutingMode::Regular {
-            worker_urls: vec![],
-        }
-    }
-
-    fn epd() -> RoutingMode {
-        RoutingMode::EncodePrefillDecode {
-            encode_urls: vec![],
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            encode_policy: None,
-            prefill_policy: None,
-            decode_policy: None,
-        }
-    }
 
     fn discovery_config(job_names: &[&str]) -> SlurmDiscoveryConfig {
         SlurmDiscoveryConfig {
@@ -905,7 +889,7 @@ mod tests {
     }
 
     fn config(job_names: &[&str]) -> SlurmProviderConfig {
-        SlurmProviderConfig::new(&discovery_config(job_names), &regular()).unwrap()
+        SlurmProviderConfig::new(&discovery_config(job_names), &regular_routing_mode()).unwrap()
     }
 
     fn job(jobs: &Jobs, id: u64) -> &Job {
@@ -1205,7 +1189,7 @@ mod tests {
                 bootstrap_port: Some(8998),
                 ..discovery_config(&[])
             },
-            &epd(),
+            &epd_routing_mode(),
         )
         .unwrap();
         let mut workers: Vec<(String, WorkerType, Option<u16>)> = poll(&slurm, &config)

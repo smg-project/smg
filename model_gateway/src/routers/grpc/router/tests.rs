@@ -19,7 +19,10 @@ use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
 use super::*;
 use crate::{
-    config::{ParserChoice, RoutingMode},
+    config::{
+        test_support::{epd_routing_mode, pd_routing_mode, regular_routing_mode},
+        ParserChoice, RoutingMode,
+    },
     rate_limit::{
         RateLimitBackend, ReserveOutcome, ReserveRequest, SharedReservationHandle, UsageSettlement,
     },
@@ -35,32 +38,6 @@ use crate::{
         WorkerWorkflowData, WorkflowEngines,
     },
 };
-
-fn regular_routing_mode() -> RoutingMode {
-    RoutingMode::Regular {
-        worker_urls: vec![],
-    }
-}
-
-fn pd_routing_mode() -> RoutingMode {
-    RoutingMode::PrefillDecode {
-        prefill_urls: vec![],
-        decode_urls: vec![],
-        prefill_policy: None,
-        decode_policy: None,
-    }
-}
-
-fn epd_routing_mode() -> RoutingMode {
-    RoutingMode::EncodePrefillDecode {
-        encode_urls: vec![],
-        prefill_urls: vec![],
-        decode_urls: vec![],
-        encode_policy: None,
-        prefill_policy: None,
-        decode_policy: None,
-    }
-}
 
 /// A mode that does not serve an endpoint refuses it with the JSON error
 /// object under the endpoint's code, as the router trait's default does.
