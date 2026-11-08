@@ -43,7 +43,9 @@ const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 enum ScopeKey {
     TenantGlobal(TenantKey),
-    ModelRule(TenantKey, String),
+    /// The tenant and the rule's id, the id shared with the compiled policy
+    /// so a reservation under a rule copies nothing to name its bucket.
+    ModelRule(TenantKey, Arc<str>),
 }
 
 /// What was actually debited for a reservation, kept around so
@@ -193,14 +195,17 @@ impl LocalRateLimitBackend {
     }
 }
 
-#[async_trait]
-impl RateLimitBackend for LocalRateLimitBackend {
-    async fn reserve(&self, request: ReserveRequest<'_>) -> ReserveOutcome {
+/// The contract's four calls, answered without waiting: nothing in this
+/// backend awaits, so the manager and the handles call these directly and
+/// build no boxed future per reservation. The trait's methods below wrap
+/// them for a caller that holds the backend as a trait object.
+impl LocalRateLimitBackend {
+    pub(crate) fn reserve_now(&self, request: ReserveRequest<'_>) -> ReserveOutcome {
         // Idempotent per request_charge_id: a retry reuses the same
         // charge_id and must not be debited twice. Claim the slot before
         // any bucket work so a duplicate (even concurrent) call just
         // confirms the existing reservation. Holding entry()'s lock here
-        // is safe since nothing below awaits.
+        // is safe since nothing below waits.
         let active_entry = match self.active.entry(request.request_charge_id) {
             Entry::Occupied(_) => return ReserveOutcome::Admitted,
             Entry::Vacant(entry) => entry,
@@ -218,7 +223,7 @@ impl RateLimitBackend for LocalRateLimitBackend {
             .and_then(|model_id| tenant_policy.matching_rule(model_id))
             .map(|rule| {
                 let rule_key =
-                    ScopeKey::ModelRule(request.tenant_key.clone(), rule.rule_id.clone());
+                    ScopeKey::ModelRule(request.tenant_key.clone(), Arc::clone(&rule.rule_id));
                 self.bucket_for(rule_key, rule.limits)
             });
 
@@ -261,7 +266,7 @@ impl RateLimitBackend for LocalRateLimitBackend {
         ReserveOutcome::Admitted
     }
 
-    async fn settle_success(&self, request_charge_id: Uuid, usage: UsageSettlement) {
+    pub(crate) fn settle_success_now(&self, request_charge_id: Uuid, usage: UsageSettlement) {
         let Some((_, reservation)) = self.active.remove(&request_charge_id) else {
             return;
         };
@@ -276,17 +281,36 @@ impl RateLimitBackend for LocalRateLimitBackend {
         }
     }
 
-    async fn close_reserved_only(&self, request_charge_id: Uuid) {
+    pub(crate) fn close_reserved_only_now(&self, request_charge_id: Uuid) {
         // The reserved-input debit already happened at reserve() time;
         // nothing further to debit. Just drop the bookkeeping entry.
         self.active.remove(&request_charge_id);
     }
 
-    async fn abandon(&self, request_charge_id: Uuid) {
+    pub(crate) fn abandon_now(&self, request_charge_id: Uuid) {
         // Same as close_reserved_only: the reserved-input debit is kept,
         // deliberately not refunded (see
         // `SharedReservationHandle::abandon_if_open`).
         self.active.remove(&request_charge_id);
+    }
+}
+
+#[async_trait]
+impl RateLimitBackend for LocalRateLimitBackend {
+    async fn reserve(&self, request: ReserveRequest<'_>) -> ReserveOutcome {
+        self.reserve_now(request)
+    }
+
+    async fn settle_success(&self, request_charge_id: Uuid, usage: UsageSettlement) {
+        self.settle_success_now(request_charge_id, usage);
+    }
+
+    async fn close_reserved_only(&self, request_charge_id: Uuid) {
+        self.close_reserved_only_now(request_charge_id);
+    }
+
+    async fn abandon(&self, request_charge_id: Uuid) {
+        self.abandon_now(request_charge_id);
     }
 }
 

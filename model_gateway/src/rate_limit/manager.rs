@@ -8,11 +8,10 @@
 use std::sync::Arc;
 
 use tracing::info;
+use uuid::Uuid;
 
-#[cfg(test)]
-use super::backend::UsageSettlement;
 use super::{
-    backend::{RateLimitBackend, ReserveOutcome, ReserveRequest},
+    backend::{RateLimitBackend, ReserveOutcome, ReserveRequest, UsageSettlement},
     config::RateLimitYaml,
     local_backend::LocalRateLimitBackend,
     policy::CompiledPolicySet,
@@ -28,21 +27,70 @@ pub enum Reservation {
     Denied { retry_after_secs: u64 },
 }
 
+/// The backend a manager and its handles call. The in-memory one is called
+/// by static dispatch: none of its calls waits, so a reservation taken and
+/// settled on it builds no boxed future. Any other implementation of the
+/// [`RateLimitBackend`] contract is called through the trait object.
+#[derive(Clone)]
+pub(crate) enum Backend {
+    Local(Arc<LocalRateLimitBackend>),
+    Dyn(Arc<dyn RateLimitBackend>),
+}
+
+impl Backend {
+    pub(crate) async fn reserve(&self, request: ReserveRequest<'_>) -> ReserveOutcome {
+        match self {
+            Self::Local(backend) => backend.reserve_now(request),
+            Self::Dyn(backend) => backend.reserve(request).await,
+        }
+    }
+
+    pub(crate) async fn settle_success(&self, request_charge_id: Uuid, usage: UsageSettlement) {
+        match self {
+            Self::Local(backend) => backend.settle_success_now(request_charge_id, usage),
+            Self::Dyn(backend) => backend.settle_success(request_charge_id, usage).await,
+        }
+    }
+
+    pub(crate) async fn close_reserved_only(&self, request_charge_id: Uuid) {
+        match self {
+            Self::Local(backend) => backend.close_reserved_only_now(request_charge_id),
+            Self::Dyn(backend) => backend.close_reserved_only(request_charge_id).await,
+        }
+    }
+
+    pub(crate) async fn abandon(&self, request_charge_id: Uuid) {
+        match self {
+            Self::Local(backend) => backend.abandon_now(request_charge_id),
+            Self::Dyn(backend) => backend.abandon(request_charge_id).await,
+        }
+    }
+}
+
+impl From<Arc<dyn RateLimitBackend>> for Backend {
+    fn from(backend: Arc<dyn RateLimitBackend>) -> Self {
+        Self::Dyn(backend)
+    }
+}
+
 /// Call [`Self::reserve`] once per logical request, before any internal
 /// retry loop, and resolve the returned handle exactly once at the end.
 /// Each call builds an independent handle, so calling it again mid-retry
 /// risks one handle abandoning a reservation another still intends to
 /// settle.
 pub struct RateLimitManager {
-    backend: Arc<dyn RateLimitBackend>,
+    backend: Backend,
 }
 
 impl RateLimitManager {
-    /// A manager over `backend`: the in-memory backend [`Self::from_config`]
-    /// builds, or another implementation of the [`RateLimitBackend`]
-    /// contract (a test's, an external one's).
+    /// A manager over `backend`, an implementation of the
+    /// [`RateLimitBackend`] contract other than the in-memory one (a
+    /// test's, an external one's); [`Self::from_config`] builds the
+    /// in-memory one.
     pub fn new(backend: Arc<dyn RateLimitBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend: Backend::Dyn(backend),
+        }
     }
 
     pub fn from_config(rc: &RouterConfig) -> Result<Option<Arc<Self>>, String> {
@@ -70,15 +118,17 @@ impl RateLimitManager {
             }
         }
         let compiled = CompiledPolicySet::compile(&yaml).map_err(|e| e.to_string())?;
-        let backend: Arc<dyn RateLimitBackend> = LocalRateLimitBackend::start(compiled)?;
-        Ok(Self::new(backend))
+        let backend = LocalRateLimitBackend::start(compiled)?;
+        Ok(Self {
+            backend: Backend::Local(backend),
+        })
     }
 
     pub async fn reserve(&self, request: ReserveRequest<'_>) -> Reservation {
         let request_charge_id = request.request_charge_id;
         match self.backend.reserve(request).await {
             ReserveOutcome::Admitted => Reservation::Admitted(Arc::new(
-                SharedReservationHandle::new(Arc::clone(&self.backend), request_charge_id),
+                SharedReservationHandle::new(self.backend.clone(), request_charge_id),
             )),
             ReserveOutcome::Denied { retry_after_secs } => Reservation::Denied { retry_after_secs },
         }
@@ -111,8 +161,9 @@ mod tests {
             tenants: Vec::new(),
         };
         let compiled = CompiledPolicySet::compile(&yaml).unwrap();
-        let backend: Arc<dyn RateLimitBackend> = Arc::new(LocalRateLimitBackend::new(compiled));
-        RateLimitManager::new(backend)
+        RateLimitManager {
+            backend: Backend::Local(Arc::new(LocalRateLimitBackend::new(compiled))),
+        }
     }
 
     fn request(tenant: &str, tokens: u32) -> ReserveRequest<'static> {
