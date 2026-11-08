@@ -62,17 +62,20 @@ impl VllmEngine for MockScheduler {
         &self,
         request: Request<vllm::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        let req = request.into_inner();
+        let mut req = request.into_inner();
         // An encode worker answers the encoder's completion alone: nothing
         // reaches the core and no script is read, but the realistic engine's
         // fault and admission hooks apply as to the prefill role, and the
-        // request counts in flight until its completion is out.
+        // request counts in flight until its completion is out. The
+        // completion's own checks come first, as the prefill role checks its
+        // input before the hooks: a request sent to the wrong pool is refused
+        // without spending an armed fault.
         if self.cfg.role == Some(Role::Encode) {
             let in_flight = InFlight::enter_on(&self.in_flight);
-            let finish_error = self
-                .admit_without_tokens(&req.request_id, req.data_parallel_rank)
-                .await?;
+            let request_id = std::mem::take(&mut req.request_id);
+            let pin = req.data_parallel_rank;
             let mut complete = encoder_completion(&self.cfg, self.port(), req)?;
+            let finish_error = self.admit_without_tokens(&request_id, pin).await?;
             if finish_error {
                 if let Some(vllm::generate_response::Response::Complete(complete)) =
                     complete.response.as_mut()

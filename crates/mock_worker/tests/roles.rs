@@ -467,3 +467,112 @@ async fn a_realistic_encode_worker_takes_the_fault_hooks_and_counts_in_flight() 
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+#[tokio::test]
+async fn a_realistic_encode_worker_checks_the_request_before_it_spends_a_fault() {
+    let (mut client, http, fault) = start_realistic_encoder().await;
+    let armed = http
+        .post(format!("{fault}/fail?status=503&count=1"))
+        .send()
+        .await
+        .expect("arm the fault");
+    assert_eq!(armed.status(), 200);
+
+    // A request without transfer parameters went to the wrong pool: refused
+    // as such, the armed fault and its counters untouched.
+    let mut wrong_pool = encode_request("ec-w1");
+    wrong_pool.ec_transfer_params_json = None;
+    let refused = client
+        .generate(wrong_pool)
+        .await
+        .expect_err("the wrong pool, not a stream");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+    assert_eq!(fault_counts(&http, &fault).await, (0, 0));
+
+    // The fault still waits for the next encode request.
+    let refused = client
+        .generate(encode_request("ec-w2"))
+        .await
+        .expect_err("the armed status, not a stream");
+    assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
+    assert_eq!(fault_counts(&http, &fault).await, (1, 0));
+}
+
+/// A canned encode worker on the vLLM wire that holds each request for
+/// `gen_delay` before its completion: the gateway's client.
+async fn start_canned_encoder(
+    gen_delay: Duration,
+) -> vllm::vllm_engine_client::VllmEngineClient<Channel> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a free port");
+    let port = listener.local_addr().expect("listener address").port();
+    let cfg = Config {
+        model_id: "roles-test".to_string(),
+        grpc_base_port: port,
+        grpc_count: 1,
+        grpc_wire: SchedulerWire::Vllm,
+        role: Some(Role::Encode),
+        gen_delay,
+        ..Config::default()
+    };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the server serves until the test process exits"
+    )]
+    let _server = tokio::spawn(serve_with_listener(Arc::new(cfg), listener));
+    let channel = Channel::from_shared(format!("http://127.0.0.1:{port}"))
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect to the mock worker");
+    vllm::vllm_engine_client::VllmEngineClient::new(channel)
+}
+
+/// The worker's own running count, as its load report tells the gateway.
+async fn running_reqs(client: &mut vllm::vllm_engine_client::VllmEngineClient<Channel>) -> i32 {
+    client
+        .get_loads(vllm::GetLoadsRequest {
+            dp_rank: None,
+            ..Default::default()
+        })
+        .await
+        .expect("the load report")
+        .into_inner()
+        .loads
+        .remove(0)
+        .num_running_reqs
+}
+
+#[tokio::test]
+async fn a_canned_encode_worker_reports_its_held_request_as_running() {
+    let mut client = start_canned_encoder(Duration::from_millis(1500)).await;
+    let mut poller = client.clone();
+    assert_eq!(running_reqs(&mut poller).await, 0);
+
+    // Held for the canned delay, the request is the worker's one running
+    // request in its own load report (whatever the process's other workers
+    // carry), and the report reads idle again once the completion is out.
+    let (complete, during) = tokio::join!(encoder_completion(&mut client, "ec-l1"), async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            seen.push(running_reqs(&mut poller).await);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        seen
+    });
+    assert_eq!(complete.finish_reason, "stop");
+    assert_eq!(
+        during, [1; 5],
+        "the held request is not the worker's one running request"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while running_reqs(&mut poller).await != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the completion is out but the worker still reports it running"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
