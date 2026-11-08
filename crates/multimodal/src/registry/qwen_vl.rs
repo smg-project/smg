@@ -19,24 +19,24 @@ pub(super) const IMAGE_PAD_TOKEN: &str = "<|image_pad|>";
 /// token the expansion repeats; `video_token_id` in the config names its id.
 const VIDEO_PAD_TOKEN: &str = "<|video_pad|>";
 
-/// Frames per temporal group of the family's vision encoder, the default of
-/// its processor configs.
-const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
+/// Frames per temporal group of the family's own video loader: the default of
+/// the loader's sampling kwargs, which the servicer refuses to override for
+/// this family. The loader never reads the processor config's
+/// `temporal_patch_size`; that one groups the frames the loader hands on, in
+/// the processor, padding the last group.
+const LOADER_TEMPORAL_PATCH_SIZE: usize = 2;
 
 /// The most frames the family's own video loader hands its processor.
 const LOADER_MAX_FRAMES: usize = 768;
 
 /// The frames the Qwen2-VL line's own video loader hands its processor
 /// ([`FrameSampling::SteppedGroups`]): `total / fps x 2` frames clamped to
-/// [4, 768] in whole temporal groups, at a constant step from the first
-/// frame; the group is the processor config's `temporal_patch_size` where
-/// the checkpoint states one. Qwen3-Omni (`super::qwen3_omni`) is served
-/// by the same loader and answers the same rule.
-pub(super) fn loader_frame_sampling(config: Option<&PreProcessorConfig>) -> FrameSampling {
+/// [4, 768] in whole temporal groups of two, at a constant step from the
+/// first frame. Qwen3-Omni (`super::qwen3_omni`) is served by the same
+/// loader and answers the same rule.
+pub(super) fn loader_frame_sampling() -> FrameSampling {
     FrameSampling::SteppedGroups {
-        temporal_patch_size: config
-            .and_then(|config| config.temporal_patch_size)
-            .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
+        temporal_patch_size: LOADER_TEMPORAL_PATCH_SIZE,
         max_frames: LOADER_MAX_FRAMES,
     }
 }
@@ -230,15 +230,9 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
     }
 
     /// The family's own video loader samples a clip before its processor sees
-    /// it ([`loader_frame_sampling`]).
+    /// it ([`loader_frame_sampling`]), whatever the processor config states.
     fn video_frame_sampling(&self) -> FrameSampling {
-        loader_frame_sampling(None)
-    }
-
-    /// The temporal group is the processor config's `temporal_patch_size`
-    /// where the checkpoint states one.
-    fn video_frame_sampling_with(&self, config: Option<&PreProcessorConfig>) -> FrameSampling {
-        loader_frame_sampling(config)
+        loader_frame_sampling()
     }
 
     /// One layout per modality for the gateway's assembly: a video batch
@@ -469,14 +463,17 @@ mod tests {
                 max_frames: 768,
             }
         );
+        // The processor config's temporal group does not reach the loader's
+        // rule: the loader groups by its own default and the processor pads
+        // the frames it is handed to the config's group.
         let config = PreProcessorConfig {
             temporal_patch_size: Some(4),
             ..PreProcessorConfig::default()
         };
         assert_eq!(
-            spec.video_frame_sampling_with(Some(&config)),
+            spec.video_frame_sampling_with(&config),
             FrameSampling::SteppedGroups {
-                temporal_patch_size: 4,
+                temporal_patch_size: 2,
                 max_frames: 768,
             }
         );

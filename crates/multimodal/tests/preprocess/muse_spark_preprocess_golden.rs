@@ -337,7 +337,7 @@ fn clips_match_the_reference_sampling_fingerprints_and_stamps() {
     let processor = spec
         .vision_processor(&model_config, &config, Modality::Video)
         .expect("the family's video processor");
-    let sampling = spec.video_frame_sampling_with(Some(&config));
+    let sampling = spec.video_frame_sampling_with(&config);
     assert_eq!(
         sampling,
         FrameSampling::TemporalGroups {
@@ -347,7 +347,7 @@ fn clips_match_the_reference_sampling_fingerprints_and_stamps() {
     );
     let fetch = VideoFetchConfig {
         sample_fps: spec
-            .default_video_sample_fps_with(Some(&config))
+            .default_video_sample_fps_with(&config)
             .expect("the reference's rate"),
         sampling,
         ..VideoFetchConfig::default()
