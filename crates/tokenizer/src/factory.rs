@@ -53,12 +53,15 @@ pub fn create_tokenizer_with_chat_template(
         // may ship beside it: the file is what the family's reference reads
         // (BOS on request, every special id by its spelling), and the
         // conversion carries no frame. The loader reads tokenizer_config.json
-        // and the chat template beside the file itself.
+        // beside the file; the chat template resolves as it does for the
+        // conversion (the caller's path, else the directory's).
         if tekken::has_tekken_file(path) {
+            let final_chat_template =
+                resolve_and_log_chat_template(chat_template_path, path, file_path);
             return Ok(Arc::new(
                 TiktokenTokenizer::from_tekken_file_with_chat_template(
                     &path.join(tekken::FILE_NAME),
-                    chat_template_path,
+                    final_chat_template.as_deref(),
                 )?,
             ));
         }
@@ -464,10 +467,13 @@ fn create_tokenizer_from_downloaded_dir(
     chat_template_path: Option<&str>,
 ) -> Result<Arc<dyn traits::Tokenizer>> {
     if tekken::has_tekken_file(cache_dir) {
+        // The chat template resolves as it does for the conversion below.
+        let final_chat_template =
+            resolve_and_log_chat_template(chat_template_path, cache_dir, model_name_or_path);
         return Ok(Arc::new(
             TiktokenTokenizer::from_tekken_file_with_chat_template(
                 &cache_dir.join(tekken::FILE_NAME),
-                chat_template_path,
+                final_chat_template.as_deref(),
             )?,
         ));
     }
@@ -644,6 +650,55 @@ mod tests {
             get_tokenizer_info(path.join("tokenizer.json").to_str().unwrap()).unwrap(),
             TokenizerType::HuggingFace(_)
         ));
+    }
+
+    /// A checkpoint that ships both files renders the chat template the
+    /// conversion beside it would: the caller's template path first, else
+    /// the one the directory holds, resolved the same way by every arm
+    /// (the directory and the Hub download).
+    #[test]
+    fn a_checkpoint_that_ships_both_files_resolves_its_chat_template_like_the_conversion() {
+        use std::sync::Arc;
+
+        use crate::{chat_template::ChatTemplateParams, tekken::testing, traits::Tokenizer};
+        let dir = testing::dir_with(&testing::minimal());
+        let path = dir.path();
+        std::fs::write(
+            path.join("tokenizer.json"),
+            r#"{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+                "normalizer": null, "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null,
+                "decoder": null, "model": {"type": "WordLevel", "vocab": {"hello": 0, "<unk>": 1},
+                "unk_token": "<unk>"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            path.join("chat_template.jinja"),
+            "{% for message in messages %}[{{ message['role'] }}]{{ message['content'] }}{% endfor %}",
+        )
+        .unwrap();
+        let other = path.join("other.jinja");
+        std::fs::write(&other, "{{ messages[0]['content'] }}!").unwrap();
+        let messages = [json!({"role": "user", "content": "hello"})];
+        let render = |tokenizer: Arc<dyn Tokenizer>| {
+            tokenizer
+                .apply_chat_template(&messages, ChatTemplateParams::default())
+                .unwrap()
+        };
+        // The directory's template, from the directory and from a download.
+        for loaded in [
+            create_tokenizer(path.to_str().unwrap()).unwrap(),
+            create_tokenizer_from_downloaded_dir(path, "org/model", None).unwrap(),
+        ] {
+            assert_eq!(render(loaded), "[user]hello");
+        }
+        // The caller's path first, by both arms.
+        for loaded in [
+            super::create_tokenizer_with_chat_template(path.to_str().unwrap(), other.to_str())
+                .unwrap(),
+            create_tokenizer_from_downloaded_dir(path, "org/model", other.to_str()).unwrap(),
+        ] {
+            assert_eq!(render(loaded), "hello!");
+        }
     }
 
     /// A downloaded checkpoint that ships `vocab.json` + `merges.txt` and no
