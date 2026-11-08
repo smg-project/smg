@@ -52,7 +52,7 @@ impl From<SchedulerStats> for EngineLoad {
 
 impl EngineOutput for EngineCoreOutput {
     fn request_id(&self) -> &str {
-        &self.request_id
+        self.request_id.as_str()
     }
 
     fn finished(&self) -> bool {

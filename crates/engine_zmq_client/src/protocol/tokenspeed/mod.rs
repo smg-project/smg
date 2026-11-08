@@ -29,7 +29,11 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 
 use crate::{
-    codec::{encode_msgpack, tensor::encode_with_aux_frames, OpaqueValue},
+    codec::{
+        encode_msgpack,
+        tensor::{decode_within_frame, encode_with_aux_frames},
+        OpaqueValue,
+    },
     error::Result,
     protocol::{
         control::{CONTROL_REPLY_SLIM_TAG, CONTROL_REPLY_WIRE_FIELDS},
@@ -179,8 +183,10 @@ impl EngineProtocol for TokenSpeedProtocol {
                  has no tensor fields)"
             );
         }
-        let payload = frames.first().map(AsRef::as_ref).unwrap_or_default();
-        let batch = match decode_wire_output(payload, layout)? {
+        let empty = Bytes::new();
+        let frame = frames.first().unwrap_or(&empty);
+        // Within the frame's scope, so every request id is a view of it, not a copy.
+        let batch = match decode_within_frame(frame, || decode_wire_output(frame, layout))? {
             TokenSpeedWireOutput::Tokens(batch) => *batch,
             TokenSpeedWireOutput::ControlReply(reply) => {
                 return Ok(EngineBatch {
@@ -206,10 +212,11 @@ impl EngineProtocol for TokenSpeedProtocol {
         // TokenSpeed has no out-of-band finish channel: every finish is carried
         // by its own output. Reporting them here anyway keeps the batch shape
         // self-describing for consumers that only read the finished list.
+        // The one owned copy of an id, made at the finish alone.
         let finished_request_ids = outputs
             .iter()
             .filter(|output| output.finish_reason.is_some())
-            .map(|output| output.request_id.clone())
+            .map(|output| String::from(&output.request_id))
             .collect();
         Ok(EngineBatch {
             engine_index,

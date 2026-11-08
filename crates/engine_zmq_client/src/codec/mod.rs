@@ -15,7 +15,10 @@ use serde::{
 use crate::error::{Error, Result};
 
 pub mod dtype;
+pub mod frame_str;
 pub mod tensor;
+
+pub use frame_str::FrameStr;
 
 /// Dynamic msgpack value used for schema positions that are preserved but not
 /// yet strongly typed.

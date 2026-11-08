@@ -324,7 +324,7 @@ pub(crate) fn lies_within(frame: &Bytes, view: &[u8]) -> bool {
 
 /// `view` as [`Bytes`]: a slice of the frame under decode when it lies inside
 /// that frame's buffer, a copy otherwise.
-fn raw_view_bytes(view: &[u8]) -> Bytes {
+pub(crate) fn frame_view_bytes(view: &[u8]) -> Bytes {
     DECODING_FRAME.with(|current| {
         current
             .borrow()
@@ -337,7 +337,7 @@ fn raw_view_bytes(view: &[u8]) -> Bytes {
     })
 }
 
-/// The payload of a raw-view ext as [`Bytes`], through [`raw_view_bytes`].
+/// The payload of a raw-view ext as [`Bytes`], through [`frame_view_bytes`].
 struct RawViewPayload(Bytes);
 
 impl<'de> Deserialize<'de> for RawViewPayload {
@@ -358,7 +358,7 @@ impl<'de> Deserialize<'de> for RawViewPayload {
                 self,
                 view: &'de [u8],
             ) -> std::result::Result<Self::Value, E> {
-                Ok(RawViewPayload(raw_view_bytes(view)))
+                Ok(RawViewPayload(frame_view_bytes(view)))
             }
 
             fn visit_bytes<E: de::Error>(self, view: &[u8]) -> std::result::Result<Self::Value, E> {

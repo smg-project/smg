@@ -305,7 +305,7 @@ fn step_frames(wire: Wire, running: &[(String, u32)], tokens: u32) -> Vec<Bytes>
                 outputs: running
                     .iter()
                     .map(|(rid, sent)| EngineCoreOutput {
-                        request_id: rid.clone(),
+                        request_id: rid.clone().into(),
                         new_token_ids: vec![sent + 9],
                         finish_reason: (*sent == tokens).then_some(EngineCoreFinishReason::Length),
                         ..Default::default()
@@ -316,7 +316,7 @@ fn step_frames(wire: Wire, running: &[(String, u32)], tokens: u32) -> Vec<Bytes>
             }))
         }
         Wire::Sglang | Wire::Trtllm => encode_msgpack(&BatchTokenIDSlimOutput {
-            rids,
+            rids: rids.into_iter().map(Into::into).collect(),
             output_ids,
             finished_reasons,
             finished_messages: vec![None; count],
@@ -335,7 +335,7 @@ fn step_frames(wire: Wire, running: &[(String, u32)], tokens: u32) -> Vec<Bytes>
             ..Default::default()
         }),
         Wire::TokenSpeed => encode_msgpack(&BatchTokenIDOutSlim {
-            rids,
+            rids: rids.into_iter().map(Into::into).collect(),
             output_ids,
             finished_reasons,
             prompt_tokens: vec![3; count],

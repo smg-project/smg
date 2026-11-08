@@ -144,7 +144,7 @@ fn wave_control(engine_index: u32, control: DpControlMessage) -> Vec<Bytes> {
 fn batch(engine_index: u32, output: EngineCoreOutput) -> Vec<Bytes> {
     let finished = output.finish_reason.map(|_| {
         let mut set = std::collections::BTreeSet::new();
-        set.insert(output.request_id.clone());
+        set.insert(String::from(&output.request_id));
         set
     });
     let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
@@ -977,7 +977,7 @@ async fn a_request_reported_at_intervals_counts_no_silence() {
             ..TokenizedGenerateReqInput::default()
         };
     let done = |rid: &str, prompt_tokens: u32| BatchTokenIDOutSlim {
-        rids: vec![rid.to_string()],
+        rids: vec![rid.into()],
         output_ids: vec![vec![11]],
         finished_reasons: vec!["stop".into()],
         prompt_tokens: vec![prompt_tokens],
@@ -1105,7 +1105,7 @@ async fn an_sglang_request_reported_at_intervals_counts_no_silence() {
         })
     };
     let done = |rid: &str, prompt_tokens: u32| BatchTokenIDSlimOutput {
-        rids: vec![rid.to_string()],
+        rids: vec![rid.into()],
         output_ids: vec![vec![11]],
         finished_reasons: vec!["stop".into()],
         finished_messages: vec![None],
@@ -1157,7 +1157,7 @@ async fn an_sglang_request_reported_at_intervals_counts_no_silence() {
     assert_eq!(client.prefill_pending_tokens(), 7);
     // Its result ends it, and the silence with it.
     let result = BatchEmbeddingSlimOutput {
-        rids: vec!["sg-embed".to_string()],
+        rids: vec!["sg-embed".into()],
         embeddings: vec![vec![0.5]],
         prompt_tokens: vec![2],
         cached_tokens: vec![0],
@@ -3348,7 +3348,7 @@ fn tokenspeed_request(
 fn tokenspeed_done(rid: &str, prompt_tokens: u32) -> Vec<Bytes> {
     use crate::protocol::tokenspeed::output::BatchTokenIDOutSlim;
     let done = BatchTokenIDOutSlim {
-        rids: vec![rid.to_string()],
+        rids: vec![rid.into()],
         output_ids: vec![vec![11]],
         finished_reasons: vec!["stop".into()],
         prompt_tokens: vec![prompt_tokens],
@@ -3392,7 +3392,7 @@ async fn a_pending_prompt_extends_the_bound_on_the_sglang_wire() {
         },
         |rid, prompt_tokens| {
             let done = BatchTokenIDSlimOutput {
-                rids: vec![rid.to_string()],
+                rids: vec![rid.into()],
                 output_ids: vec![vec![11]],
                 finished_reasons: vec!["stop".into()],
                 finished_messages: vec![None],

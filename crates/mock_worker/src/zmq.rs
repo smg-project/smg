@@ -998,7 +998,7 @@ async fn scripted_request(
         let batch = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index,
             outputs: vec![EngineCoreOutput {
-                request_id: request_id.clone(),
+                request_id: request_id.clone().into(),
                 new_token_ids: frame.ids,
                 new_logprobs,
                 finish_reason,
@@ -1089,7 +1089,7 @@ fn token_batch(
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index,
         outputs: vec![EngineCoreOutput {
-            request_id,
+            request_id: request_id.into(),
             new_token_ids,
             finish_reason,
             ..Default::default()
@@ -1149,12 +1149,13 @@ impl StepQueue {
         let finished = batch.finished_requests.unwrap_or_default();
         let mut named = BTreeSet::new();
         for output in batch.outputs {
-            let done = finished.contains(&output.request_id);
-            named.insert(output.request_id.clone());
-            self.queue_of(output.request_id.clone()).push_back(Pending {
-                output: Some(output),
-                finished: done,
-            });
+            let done = finished.contains(output.request_id.as_str());
+            named.insert(String::from(&output.request_id));
+            self.queue_of(String::from(&output.request_id))
+                .push_back(Pending {
+                    output: Some(output),
+                    finished: done,
+                });
         }
         for request_id in finished.into_iter().filter(|id| !named.contains(id)) {
             self.queue_of(request_id).push_back(Pending {
