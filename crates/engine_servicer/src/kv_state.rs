@@ -80,6 +80,7 @@ pub(crate) struct StoredTail {
     pub session_id: Option<String>,
     pub lora_name: Option<String>,
     pub cache_salt: Option<String>,
+    pub group_mask: Option<u64>,
 }
 
 impl StoredTail {
@@ -88,6 +89,7 @@ impl StoredTail {
             tier: stored.tier,
             medium: stored.medium.clone(),
             group_idx: stored.group_idx,
+            group_mask: stored.group_mask,
             kv_cache_spec_kind: stored.kv_cache_spec_kind.clone(),
             kv_cache_spec_sliding_window: stored.kv_cache_spec_sliding_window,
             locality: stored.locality,
@@ -770,6 +772,7 @@ fn stored_event(run: &[Arc<LiveBlock>]) -> common::KvCacheEvent {
             session_id: tail.session_id.clone(),
             lora_name: tail.lora_name.clone(),
             cache_salt: tail.cache_salt.clone(),
+            group_mask: tail.group_mask,
         })),
     }
 }
