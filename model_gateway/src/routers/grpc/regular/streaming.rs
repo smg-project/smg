@@ -84,7 +84,7 @@ use self::{
     completion::{CompletionStream, CompletionStreamOutcome, CompletionStreamUnit},
     frames::{
         assistant_choice, forces_tool_call, opening_choice, text_delta, ChatChunkFrame,
-        CompletionChunkFrame, FrameSink, TextDelta, CHUNK_FLUSH_BYTES, FRAME_ROOM,
+        CompletionChunkFrame, EscapedText, FrameSink, TextDelta, CHUNK_FLUSH_BYTES, FRAME_ROOM,
     },
 };
 
@@ -233,33 +233,54 @@ impl GenerateStreamUsage {
     }
 }
 
-/// What a generate stream keeps per choice: the choice's whole text so far
-/// (the `/generate` protocol's `text` is cumulative, so every event of the
-/// choice carries it) and the choice's id, formatted once.
+/// What a generate stream keeps per choice: the choice's whole text so far,
+/// escaped once per chunk ([`EscapedText`]; the `/generate` protocol's `text`
+/// is cumulative, so every event of the choice carries it) and the choice's
+/// id, formatted once.
 struct GenerateChoice {
-    text: String,
+    text: EscapedText,
     id: String,
 }
 
 impl GenerateChoice {
     fn new(request_id: &str, index: u32) -> Self {
         Self {
-            text: String::new(),
+            text: EscapedText::default(),
             id: format!("{request_id}-{index}"),
         }
     }
 }
 
-/// One event of a generate stream, serialized from what the loop holds: the
+/// One event of a generate stream, written from what the loop holds: the
 /// text and the ids are borrowed, not copied into a JSON tree per chunk (a
 /// 2,000-token answer at four characters a token copied about 16 MB per
-/// request that way). The fields are in the order the events always had.
-#[derive(Serialize)]
+/// request that way), and the text goes out in its escaped form, so the event
+/// costs the escape of its chunk, not of the whole answer again. The fields
+/// are in the order the events always had; [`Self::write_into`] writes them.
 struct GenerateEvent<'a> {
-    text: &'a str,
+    text: &'a EscapedText,
     output_ids: &'a [u32],
     meta_info: GenerateMetaInfo<'a>,
     index: u32,
+}
+
+impl GenerateEvent<'_> {
+    /// Append the event's JSON to `buffer`: the bytes serde writes for the
+    /// struct (its keys as literals, the text's literal from the choice, the
+    /// ids, the `meta_info` and the index through serde), pinned by
+    /// `tests::generate_event_frames_write_the_bytes_of_the_serialized_event`.
+    fn write_into(&self, buffer: &mut BytesMut) -> serde_json::Result<()> {
+        buffer.extend_from_slice(b"{\"text\":");
+        self.text.write_literal(buffer);
+        buffer.extend_from_slice(b",\"output_ids\":");
+        serde_json::to_writer(FrameSink(buffer), self.output_ids)?;
+        buffer.extend_from_slice(b",\"meta_info\":");
+        serde_json::to_writer(FrameSink(buffer), &self.meta_info)?;
+        buffer.extend_from_slice(b",\"index\":");
+        serde_json::to_writer(FrameSink(buffer), &self.index)?;
+        buffer.extend_from_slice(b"}");
+        Ok(())
+    }
 }
 
 /// The `meta_info` of a generate event: the logprob fields on the stream that
@@ -1651,7 +1672,8 @@ impl StreamingProcessor {
     /// Write one generate event (`what`: its chunk or its finish) into
     /// `buffer` as its `data:` frame, straight into the frame being written:
     /// the bytes the shared SSE encoder makes, without the event-sized copy
-    /// it hands back (the event is the text so far). A failed serialization
+    /// it hands back and without escaping the text so far again
+    /// ([`GenerateEvent::write_into`]). A failed serialization
     /// leaves the buffer at the event's start, so the events ahead of it still
     /// leave whole. The frame leaves by [`Self::flush_generate_frame`] once it
     /// holds [`CHUNK_FLUSH_BYTES`], or by [`Self::flush_chunks`] at the read's
@@ -1671,7 +1693,7 @@ impl StreamingProcessor {
         }
         let start = buffer.len();
         buffer.extend_from_slice(b"data: ");
-        if let Err(error) = serde_json::to_writer(FrameSink(buffer), event) {
+        if let Err(error) = event.write_into(buffer) {
             buffer.truncate(start);
             return Err(format!("Failed to serialize generate {what}: {error}"));
         }
