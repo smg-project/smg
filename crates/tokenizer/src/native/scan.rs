@@ -167,28 +167,6 @@ impl Roles {
         pos
     }
 
-    /// The end of the run of characters holding none of `bits` that starts
-    /// at `pos`.
-    #[inline(always)]
-    pub(super) fn run_end_without(&self, text: &str, mut pos: usize, bits: Bits) -> usize {
-        let bytes = text.as_bytes();
-        while let Some(&lead) = bytes.get(pos) {
-            if lead < 0x80 {
-                if self.bytes[usize::from(lead)] & bits != 0 {
-                    break;
-                }
-                pos += 1;
-            } else {
-                let (held, len) = self.beyond(bytes, pos, lead);
-                if held & bits != 0 {
-                    break;
-                }
-                pos += len;
-            }
-        }
-        pos
-    }
-
     /// The end of the run of characters holding `bit` that starts at `pos`,
     /// and the end of the last character of that run which also holds
     /// `marked`, if any.
@@ -271,9 +249,6 @@ mod tests {
         ] {
             assert_eq!(roles.run_end(text, 0, letters), end, "{text:?}");
         }
-        assert_eq!(roles.run_end_without("abc  d", 0, spaces), 3);
-        assert_eq!(roles.run_end_without("  ab", 0, spaces), 0);
-        assert_eq!(roles.run_end_without("中文 x", 0, spaces), 6);
         assert_eq!(roles.run_end_marked("abc ", 0, letters, spaces), (3, None));
         assert_eq!(
             roles.run_end_marked("a b", 0, letters | spaces, spaces),
