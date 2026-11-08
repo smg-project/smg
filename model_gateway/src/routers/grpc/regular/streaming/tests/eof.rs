@@ -33,7 +33,12 @@ use crate::{
 };
 
 pub(crate) fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
-    let token_ids: Vec<_> = text.chars().map(u32::from).collect();
+    chunk_of_ids(index, text.chars().map(u32::from).collect())
+}
+
+/// A chunk of raw token ids: an id that is no character (a surrogate) is one
+/// the character tokenizer cannot decode.
+pub(crate) fn chunk_of_ids(index: u32, token_ids: Vec<u32>) -> proto::GenerateResponse {
     proto::GenerateResponse {
         response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
             index,
