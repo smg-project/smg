@@ -1932,21 +1932,31 @@ impl NativeEncoder {
         let keep_gaps = stage.keep_gaps;
         let mut cursor = 0;
         let mut fallback = None;
-        stage.pattern.for_each_match(text, |start, end| {
-            if keep_gaps && cursor < start {
+        // The probe compiles into the scanner's loop. As a closure of its
+        // own it was a call per piece: a six-register frame, a reload of
+        // every captured reference and the spills the slow path needs, 135
+        // instructions for a hit of which the probe is about 50 (counted on
+        // the long warm cells). The gap piece stays out of line: a scanner's
+        // alternatives tile the text, so a gap is the rare case there.
+        stage.pattern.for_each_match(
+            text,
+            #[inline(always)]
+            |start, end| {
+                if keep_gaps && cursor < start {
+                    if let Err(declined) =
+                        self.tokenize_gap(model, text, cursor..start, mapped, ids, cache)
+                    {
+                        fallback = Some(declined);
+                    }
+                }
                 if let Err(declined) =
-                    self.tokenize_piece_at(model, text, cursor..start, mapped, ids, cache)
+                    self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
                 {
                     fallback = Some(declined);
                 }
-            }
-            if let Err(declined) =
-                self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
-            {
-                fallback = Some(declined);
-            }
-            cursor = end;
-        });
+                cursor = end;
+            },
+        );
         if keep_gaps && cursor < text.len() {
             if let Err(declined) =
                 self.tokenize_piece_at(model, text, cursor..text.len(), mapped, ids, cache)
@@ -1979,6 +1989,24 @@ impl NativeEncoder {
             }
         }
         self.tokenize_piece_slow(model, &text[piece], key, mapped, ids, cache)
+    }
+
+    /// [`Self::tokenize_piece_at`] for a gap between two matches of a
+    /// single-stage encoder, out of line: the scanners' alternatives tile
+    /// the text, so the gap is the rare piece and its code stays out of the
+    /// per-piece loop.
+    #[cold]
+    #[inline(never)]
+    fn tokenize_gap(
+        &self,
+        model: Option<&ModelWrapper>,
+        text: &str,
+        piece: Range<usize>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        self.tokenize_piece_at(model, text, piece, mapped, ids, cache)
     }
 
     /// The rest of [`Self::tokenize_piece`], out of line: the longer pieces'
