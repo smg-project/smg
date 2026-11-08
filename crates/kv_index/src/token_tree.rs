@@ -96,6 +96,27 @@ fn page_key_of(tokens: &[TokenId], page_size: usize) -> TokenPageKey {
     acc
 }
 
+/// Length of the common prefix of `a` and `b` in whole pages (a multiple of
+/// `page_size`). The walks round the common prefix down to the page in any
+/// case, so the pages are compared as slices instead of the tokens one by
+/// one: the trailing partial page a token-wise count would have found is the
+/// one the rounding discards. The usual outcome is that one run is a prefix
+/// of the other (a re-insert, a hit on a full node): one compare of the
+/// whole aligned span settles it, and only a diverging node counts pages.
+#[inline]
+fn common_page_prefix(a: &[TokenId], b: &[TokenId], page_size: usize) -> usize {
+    let span = align_to_page(a.len().min(b.len()), page_size);
+    if a[..span] == b[..span] {
+        return span;
+    }
+    let pages = a
+        .chunks_exact(page_size)
+        .zip(b.chunks_exact(page_size))
+        .take_while(|(a, b)| a == b)
+        .count();
+    pages * page_size
+}
+
 /// A fast hasher for token page keys.
 /// Uses FxHash-style multiplication mixing for excellent distribution.
 #[derive(Default)]
@@ -553,14 +574,8 @@ impl TokenTree {
                     let child_tokens = child.tokens.read();
                     let child_len = child_tokens.len();
 
-                    // Find common prefix length (page-aligned)
-                    let common_len = remaining
-                        .iter()
-                        .zip(child_tokens.iter())
-                        .take_while(|(a, b)| a == b)
-                        .count();
-                    // Align common length to page boundary
-                    let common_len = align_to_page(common_len, page_size);
+                    // The common prefix, in whole pages
+                    let common_len = common_page_prefix(remaining, &child_tokens, page_size);
 
                     if common_len == 0 {
                         // No page-aligned match despite same page key (shouldn't happen)
@@ -796,14 +811,8 @@ impl TokenTree {
                         break 'probe MatchStep::Retry;
                     }
 
-                    // Count matching tokens
-                    let match_len = remaining
-                        .iter()
-                        .zip(child_tokens.iter())
-                        .take_while(|(a, b)| a == b)
-                        .count();
-                    // Align match length to page boundary
-                    let match_len = align_to_page(match_len, page_size);
+                    // The matched prefix, in whole pages
+                    let match_len = common_page_prefix(remaining, &child_tokens, page_size);
 
                     if match_len == 0 {
                         MatchStep::Done
@@ -1013,12 +1022,7 @@ impl TokenTree {
                         std::hint::spin_loop();
                         break 'probe MatchStep::Retry;
                     }
-                    let match_len = remaining
-                        .iter()
-                        .zip(child_tokens.iter())
-                        .take_while(|(a, b)| a == b)
-                        .count();
-                    let match_len = align_to_page(match_len, page_size);
+                    let match_len = common_page_prefix(remaining, &child_tokens, page_size);
 
                     if match_len == 0 {
                         drop(child_tokens);
