@@ -159,7 +159,10 @@ pub enum FrameSampling {
     /// Spread evenly from the first frame to the last.
     #[default]
     Even,
-    /// One frame per sampling interval from the start, plus the last frame.
+    /// One frame per sampling interval from the start, plus the last frame:
+    /// the walk of the family's own video loader, which has no frame floor
+    /// or cap, so `min_frames` and `max_frames` do not apply (a clip whose
+    /// rate is unknown falls back to `Even`, which keeps them).
     Interval,
     /// `trunc(duration x rate)` frames, at least `min_frames`, at most
     /// `max_frames` and never more than the clip has, each the nearest frame
@@ -1478,6 +1481,24 @@ where
     let fps = capture
         .get(videoio::CAP_PROP_FPS)
         .map_err(opencv_decode_error)?;
+    let width = capture
+        .get(videoio::CAP_PROP_FRAME_WIDTH)
+        .map_err(opencv_decode_error)?;
+    let height = capture
+        .get(videoio::CAP_PROP_FRAME_HEIGHT)
+        .map_err(opencv_decode_error)?;
+    let frame_size = if width > 0.0 && height > 0.0 {
+        rawvideo_frame_size(width as u32, height as u32)?
+    } else {
+        0
+    };
+    ensure_interval_picks_fit(
+        total_frames,
+        fps,
+        frame_size,
+        cfg,
+        video_max_decoded_bytes(),
+    )?;
     let frame_indices = sampled_frame_indices(total_frames, fps, cfg);
     if frame_indices.is_empty() {
         return Err(MediaConnectorError::VideoDecode(
@@ -1608,7 +1629,7 @@ where
         .into_bytes();
     let source_fps = (fps.is_finite() && fps > 0.0).then_some(fps);
     let sample_fps = match (cfg.sampling, source_fps) {
-        (FrameSampling::SteppedGroups { .. }, Some(source_fps)) => {
+        (FrameSampling::SteppedGroups { .. } | FrameSampling::Interval, Some(source_fps)) => {
             loader_sampled_fps(frame_indices.len(), total_frames, source_fps)
         }
         _ => effective_sample_fps(source_fps.map(|fps| total_frames as f64 / fps), cfg),
@@ -1744,8 +1765,9 @@ fn adaptive_decoder_threads(available_cpus: usize, active_decodes: usize) -> i32
 }
 
 /// Source index per output frame of a clip of `total_frames` at `fps` under
-/// `cfg`, in order, duplicates kept; the `Even` and `Interval` rules repeat
-/// frames up to `min_frames` on short clips.
+/// `cfg`, in order, duplicates kept; the `Even` rule repeats frames up to
+/// `min_frames` on short clips, the `Interval` walk takes what its loader
+/// takes.
 pub fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
     match cfg.sampling {
         FrameSampling::UpTo { max_frames } => up_to_frame_indices(total_frames, max_frames),
@@ -2241,62 +2263,146 @@ fn spread_evenly_rounded(total_frames: usize, count: usize) -> Vec<usize> {
 }
 
 /// One frame per sampling interval from the start, the last frame always
-/// included, thinned evenly when over `max_frames`.
+/// included: the walk of the family's own video loader, which takes the
+/// first frame, then the first frame at or past each next instant
+/// `1 / rate` seconds on (an epsilon early, as the loader counts), and the
+/// clip's last frame when it lies past the last pick. The picks are the
+/// loader's whatever their number: a short clip gives one or two frames and
+/// a long one every interval of its length, with no floor at `min_frames`
+/// and no thinning at `max_frames` (both are the generic connector's
+/// bounds, which the loader does not have). A clip whose rate is unknown
+/// takes the `Even` rule, bounds included.
 fn interval_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
     if !(fps.is_finite() && fps > 0.0) || cfg.sample_fps <= 0.0 {
         return even_frame_indices(total_frames, fps, cfg);
     }
-    const EPS: f64 = 1e-4;
-    let interval = 1.0 / cfg.sample_fps;
-    let last_index = total_frames - 1;
+    let mut indices: Vec<usize> = interval_walk(total_frames, fps, cfg.sample_fps).collect();
+    if indices.is_empty() {
+        indices.push(0);
+    }
+    indices
+}
 
-    let mut indices: Vec<usize> = Vec::new();
+/// The interval walk one pick at a time: the first frame, then the first
+/// frame at or past each next instant `1 / rate` seconds on (an epsilon
+/// early, as the loader counts), and the clip's last frame when it lies past
+/// the last pick. Lazy, so a count of the picks can stop at a bound without
+/// holding them ([`ensure_interval_picks_fit`]).
+fn interval_walk(total_frames: usize, fps: f64, rate: f64) -> impl Iterator<Item = usize> {
+    const EPS: f64 = 1e-4;
+    let interval = 1.0 / rate;
     let mut previous_seconds = f64::NEG_INFINITY;
-    loop {
-        let next = match indices.last() {
+    let mut previous: Option<usize> = None;
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let next = match previous {
             None => 0,
-            Some(&last) => {
+            Some(previous) => {
                 let target = ((previous_seconds + interval - EPS) * fps).ceil();
                 let target = if target.is_finite() && target > 0.0 {
                     target as usize
                 } else {
                     0
                 };
-                target.max(last + 1)
+                target.max(previous + 1)
             }
         };
-        if next >= total_frames {
-            break;
+        if next < total_frames {
+            previous_seconds = next as f64 / fps;
+            previous = Some(next);
+            return Some(next);
         }
-        indices.push(next);
-        previous_seconds = next as f64 / fps;
-    }
-    if indices.last().is_some_and(|&last| last != last_index)
-        && last_index as f64 / fps - previous_seconds > EPS
-    {
-        indices.push(last_index);
-    }
-    if indices.is_empty() {
-        indices.push(0);
-    }
+        done = true;
+        let last_index = total_frames.checked_sub(1)?;
+        (previous.is_some_and(|previous| previous != last_index)
+            && last_index as f64 / fps - previous_seconds > EPS)
+            .then_some(last_index)
+    })
+}
 
-    if cfg.max_frames > 0 && indices.len() > cfg.max_frames {
-        let last = indices[indices.len() - 1];
-        indices = if cfg.max_frames == 1 {
-            vec![last]
-        } else {
-            let step = indices.len() as f64 / (cfg.max_frames - 1) as f64;
-            let mut thinned: Vec<usize> = (0..cfg.max_frames - 1)
-                .map(|i| indices[(i as f64 * step) as usize])
-                .collect();
-            thinned.push(last);
-            thinned
-        };
+/// What a pick costs in memory besides its frame, at the peak of the ffmpeg
+/// path and with headroom. Live across the decode: its index (8 bytes), its
+/// entry in the unique list (16), its copy in the sampling info (8), the
+/// decoded frame's record (24) and at most one seek segment (8): 64. While
+/// the select filter is built: for a described selection the distinct-index
+/// list and the spread's described list (8 each), 80 at the peak; for a
+/// listed one its term's string (24 and a 16-byte heap granule) and its
+/// copies in the joined text and the formatted argument (14 each), about
+/// 100, under the 128 charged. A long interval selection is described
+/// in constant size while its stride is stable (its picks are a fixed stride
+/// plus the last frame, which [`FrameSelection::spread_select_filter`]
+/// reproduces); when the stride sits by a whole number it flips between two
+/// values under floating point (a request rate of 1.9996 at 30 fps, a
+/// container rate of 30.003 at the default 1 fps), no spread reproduces the
+/// picks, and the filter lists every one of them past
+/// [`FFMPEG_MAX_SELECT_TERMS`] as well. Such a list is bounded by this budget
+/// like every other record and, before it is built, by
+/// [`FFMPEG_MAX_LISTED_FILTER_BYTES`], the length the decoder can be given it
+/// at.
+const PICK_RECORD_BYTES: usize = 128;
+
+/// Refuses, with the decoded-bytes budget's own error, a clip whose interval
+/// picks cannot fit `limit` (the budget), before any vector is sized by the
+/// container's frame claim: the walk is counted, not collected, and the count
+/// stops at the first pick past the budget, so a claim of any size costs the
+/// budget's picks in iterations and no memory. A pick costs its frame at
+/// source resolution and its records ([`PICK_RECORD_BYTES`]), so the bound is
+/// the later byte check's with the records added, and it holds for an unsized
+/// probe (`frame_size` 0) and for the smallest frames through the records
+/// alone. The other rules are bounded by their frame caps, and a clip whose
+/// rate is unknown takes the bounded `Even` rule.
+fn ensure_interval_picks_fit(
+    total_frames: usize,
+    fps: f64,
+    frame_size: usize,
+    cfg: VideoFetchConfig,
+    limit: usize,
+) -> Result<(), MediaConnectorError> {
+    if !matches!(cfg.sampling, FrameSampling::Interval)
+        || !(fps.is_finite() && fps > 0.0)
+        || cfg.sample_fps <= 0.0
+    {
+        return Ok(());
     }
-    if indices.len() < cfg.min_frames {
-        return spread_evenly(total_frames, cfg.min_frames);
+    let pick_bytes = frame_size.saturating_add(PICK_RECORD_BYTES);
+    let budget_picks = limit / pick_bytes;
+    if interval_walk(total_frames, fps, cfg.sample_fps)
+        .nth(budget_picks)
+        .is_some()
+    {
+        return ensure_decoded_bytes_within(
+            budget_picks.saturating_add(1).saturating_mul(pick_bytes),
+            limit,
+        );
     }
-    indices
+    Ok(())
+}
+
+/// [`ensure_interval_picks_fit`] on a probe, over the frames and rate its
+/// selection would be built from (a probe without them builds no selection);
+/// an unsized probe counts its picks' records alone.
+fn ensure_probed_interval_picks_fit(
+    probed: VideoMetadata,
+    cfg: VideoFetchConfig,
+) -> Result<(), MediaConnectorError> {
+    let (Some(total_frames), Some(fps)) = (probed.total_frames, probed.source_fps) else {
+        return Ok(());
+    };
+    let frame_size = if probed.is_unsized() {
+        0
+    } else {
+        rawvideo_frame_size(probed.width, probed.height)?
+    };
+    ensure_interval_picks_fit(
+        total_frames,
+        fps,
+        frame_size,
+        cfg,
+        video_max_decoded_bytes(),
+    )
 }
 
 /// Distinct indices in order, each with its repeat count.
@@ -2407,6 +2513,12 @@ async fn decode_video_with_ffmpeg(
     if let Some(reason) = metadata.and_then(|probed| refused_by_the_familys_rule(probed, cfg)) {
         return Err(MediaConnectorError::VideoDecode(reason));
     }
+    let metadata = match metadata {
+        Some(probed) => {
+            Some(interval_picks_fit_on_the_decoders_size(probed, cfg, input_path).await?)
+        }
+        None => None,
+    };
     let Some((mut probed, selection)) = metadata.and_then(|probed| {
         FrameSelection::from_metadata(probed, cfg).map(|selection| (probed, selection))
     }) else {
@@ -2882,20 +2994,18 @@ fn ensure_decode_work_limit(
     )))
 }
 
-/// The work cap judged on `metadata`'s size ([`ensure_decode_work_limit`])
-/// and, where that size is the container's and the cap refuses, judged again
-/// on the probe's size, the decoder's, read once for it: a sample entry that
-/// overstates the stream's size does not refuse a decode the budget fits. A
-/// probe that cannot run, or states no size, leaves the container's refusal
-/// standing (the `0x0` clip keeps its own route, and its cap counts no
-/// pixels). Returns the metadata the decode goes on with.
-async fn decode_work_limit_on_the_decoders_size(
-    frames: usize,
-    selection: &FrameSelection,
+/// `judge` on `metadata`'s size and, where that size is the container's and
+/// the judgment refuses, again on the probe's size, the decoder's, read once
+/// for it: a sample entry that overstates the stream's size does not refuse
+/// a decode the budget fits. A probe that cannot run, or states no size,
+/// leaves the container's refusal standing (the `0x0` clip keeps its own
+/// route). Returns the metadata the decode goes on with.
+async fn judged_on_the_decoders_size(
     metadata: VideoMetadata,
     input_path: &Path,
+    judge: impl Fn(VideoMetadata) -> Result<(), MediaConnectorError>,
 ) -> Result<VideoMetadata, MediaConnectorError> {
-    let refusal = match ensure_decode_work_limit(frames, selection, metadata) {
+    let refusal = match judge(metadata) {
         Ok(()) => return Ok(metadata),
         Err(refusal) if metadata.from_container => refusal,
         Err(refusal) => return Err(refusal),
@@ -2905,19 +3015,49 @@ async fn decode_work_limit_on_the_decoders_size(
         .and_then(|info| video_metadata_from(info, false))
     {
         Ok(probed) if !probed.is_unsized() => {
-            ensure_decode_work_limit(frames, selection, probed)?;
+            judge(probed)?;
             Ok(probed)
         }
         probed => {
             if let Err(error) = probed {
                 info!(
                     error = %error,
-                    "video probe after a work-cap refusal on the container's size failed; the container's size stands"
+                    "video probe after a refusal on the container's size failed; the container's size stands"
                 );
             }
             Err(refusal)
         }
     }
+}
+
+/// The work cap ([`ensure_decode_work_limit`]) judged on `metadata`'s size
+/// and, where that is the container's, on the decoder's
+/// ([`judged_on_the_decoders_size`]); its cap counts no pixels for a `0x0`
+/// clip.
+async fn decode_work_limit_on_the_decoders_size(
+    frames: usize,
+    selection: &FrameSelection,
+    metadata: VideoMetadata,
+    input_path: &Path,
+) -> Result<VideoMetadata, MediaConnectorError> {
+    judged_on_the_decoders_size(metadata, input_path, |metadata| {
+        ensure_decode_work_limit(frames, selection, metadata)
+    })
+    .await
+}
+
+/// The interval picks' budget ([`ensure_probed_interval_picks_fit`]) judged on
+/// the probe's size and, where that is the container's, on the decoder's
+/// ([`judged_on_the_decoders_size`]).
+async fn interval_picks_fit_on_the_decoders_size(
+    probed: VideoMetadata,
+    cfg: VideoFetchConfig,
+    input_path: &Path,
+) -> Result<VideoMetadata, MediaConnectorError> {
+    judged_on_the_decoders_size(probed, input_path, |probed| {
+        ensure_probed_interval_picks_fit(probed, cfg)
+    })
+    .await
 }
 
 /// The error of a decode that ran past the process budget, in the clip's
@@ -2939,7 +3079,11 @@ fn decode_budget_exceeded(
 }
 
 fn ensure_decoded_byte_limit(bytes: usize) -> Result<(), MediaConnectorError> {
-    let limit = video_max_decoded_bytes();
+    ensure_decoded_bytes_within(bytes, video_max_decoded_bytes())
+}
+
+/// [`ensure_decoded_byte_limit`] against a given `limit`.
+fn ensure_decoded_bytes_within(bytes: usize, limit: usize) -> Result<(), MediaConnectorError> {
     if bytes > limit {
         return Err(MediaConnectorError::DecodedTooLarge {
             media: "video RGB",
@@ -2979,12 +3123,17 @@ const VIDEO_DECODED_BYTES_KNOB: &str = "SMG_VIDEO_MAX_DECODED_BYTES";
 const VIDEO_MAX_DECODE_PIXELS_KNOB: &str = "SMG_VIDEO_MAX_DECODE_PIXELS";
 
 /// `true` for the error of a decode refused for its size (the typed
-/// refusal) or its work (named in the decoder's message), or ended for its
-/// time: a budget no other runner over the same stream, and no resampling of
-/// it, can answer, so it ends the decode instead of starting the next runner.
+/// refusals: the bytes it would decode to, the frame list its picks need) or
+/// its work (named in the decoder's message), or ended for its time: a budget
+/// no other runner over the same stream, and no resampling of it, can answer,
+/// so it ends the decode instead of starting the next runner.
 fn is_video_budget_error(error: &MediaConnectorError) -> bool {
     is_video_command_timeout(error)
-        || matches!(error, MediaConnectorError::DecodedTooLarge { .. })
+        || matches!(
+            error,
+            MediaConnectorError::DecodedTooLarge { .. }
+                | MediaConnectorError::FrameListTooLong { .. }
+        )
         || matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_MAX_DECODE_PIXELS_KNOB))
 }
 
@@ -3028,7 +3177,7 @@ async fn decode_video_with_ffmpeg_ppm(
     metadata: VideoMetadata,
     selection: Option<&FrameSelection>,
 ) -> Result<DecodedRgbVideo, MediaConnectorError> {
-    let frame_args = FfmpegFrameArgs::for_metadata(selection, metadata, cfg).await;
+    let frame_args = FfmpegFrameArgs::for_metadata(selection, metadata, cfg).await?;
     let frame_size = rawvideo_frame_size(metadata.width, metadata.height)?;
     let target_frames = selection.map_or_else(
         || expected_sampled_frame_count(metadata, cfg),
@@ -3089,7 +3238,7 @@ async fn decode_video_with_ffmpeg_raw(
     metadata: VideoMetadata,
     selection: Option<&FrameSelection>,
 ) -> Result<DecodedRgbVideo, MediaConnectorError> {
-    let frame_args = FfmpegFrameArgs::for_metadata(selection, metadata, cfg).await;
+    let frame_args = FfmpegFrameArgs::for_metadata(selection, metadata, cfg).await?;
     let frame_size = rawvideo_frame_size(metadata.width, metadata.height)?;
     let target_frames = selection.map_or_else(
         || expected_sampled_frame_count(metadata, cfg),
@@ -3168,7 +3317,7 @@ async fn decode_video_with_ffmpeg_png(
 ) -> Result<(Vec<image::DynamicImage>, f64), MediaConnectorError> {
     let (frame_args, sample_fps) = match selection.zip(metadata) {
         Some((selection, metadata)) => (
-            FfmpegFrameArgs::selected(selection).await,
+            FfmpegFrameArgs::selected(selection).await?,
             clip_sample_fps(Some(selection), metadata.duration_seconds, cfg),
         ),
         None => {
@@ -3713,22 +3862,25 @@ fn effective_sample_fps(duration_seconds: Option<f64>, cfg: VideoFetchConfig) ->
 }
 
 /// The rate the decoded frames stand for, which the processor turns into the
-/// seconds per temporal group: under the stepped groups the rate the engine's
-/// loader reports for its picks ([`loader_sampled_fps`]; the clamps and the
-/// group alignment move it off the target rate on short and long clips),
-/// under every other rule the target rate bounded by the clip
-/// ([`effective_sample_fps`]).
+/// seconds per temporal group: under the stepped groups and the interval walk
+/// the rate the engine's loader reports for its picks ([`loader_sampled_fps`];
+/// the clamps and the group alignment move the one, the kept last frame the
+/// other, off the target rate on short and long clips), under every other
+/// rule, and under those two without a selection, the target rate bounded by
+/// the clip ([`effective_sample_fps`]).
 fn clip_sample_fps(
     selection: Option<&FrameSelection>,
     duration_seconds: Option<f64>,
     cfg: VideoFetchConfig,
 ) -> f64 {
     match (cfg.sampling, selection) {
-        (FrameSampling::SteppedGroups { .. }, Some(selection)) => loader_sampled_fps(
-            selection.frame_indices.len(),
-            selection.total_frames,
-            selection.source_fps,
-        ),
+        (FrameSampling::SteppedGroups { .. } | FrameSampling::Interval, Some(selection)) => {
+            loader_sampled_fps(
+                selection.frame_indices.len(),
+                selection.total_frames,
+                selection.source_fps,
+            )
+        }
         _ => effective_sample_fps(duration_seconds, cfg),
     }
 }
@@ -3753,6 +3905,18 @@ const FFMPEG_MAX_SELECT_TERMS: usize = 100;
 /// Explicit frames a described selection may add to its spread formula (a
 /// rate-based selection ends on the clip's last frame, one past its spread).
 const FFMPEG_SPREAD_EXTRA_TERMS: usize = 8;
+/// The longest select list the filter may be, refused past it before it is
+/// built ([`MediaConnectorError::FrameListTooLong`]). ffmpeg is given the
+/// filter as one argument, which Linux bounds at 128 KiB (`MAX_ARG_STRLEN`);
+/// 1 KiB under it leaves room for the pixel-format conversion appended to the
+/// filter. Past the kernel's bound the process could not be started and the
+/// selection fell to the rate resampler: the clip was served with the generic
+/// sampler's frames under a warning, a silent change of the family's sampling
+/// rule; under the bound a list of any length is served with the loader's
+/// exact picks, as before. Only an interval selection no spread describes
+/// ([`PICK_RECORD_BYTES`]) is listed at such lengths: some 9,000 terms of
+/// six-digit indices, over an hour of picks at two a second.
+const FFMPEG_MAX_LISTED_FILTER_BYTES: usize = 128 * 1024 - 1024;
 
 /// What the stream's visible frame count makes of a loader-following
 /// selection ([`FrameSelection::sized_to_visible`]).
@@ -3898,19 +4062,43 @@ impl FrameSelection {
     ///
     /// Anything over a minute or two would be a list of hundreds of terms, so
     /// those are described instead of enumerated where a spread formula
-    /// reproduces them exactly.
-    fn select_filter(&self) -> String {
+    /// reproduces them exactly. A selection no spread reproduces (an interval
+    /// walk whose stride sits by a whole number) stays a list, refused before
+    /// it is built ([`MediaConnectorError::FrameListTooLong`]) when it would
+    /// be longer than the decoder can be given
+    /// ([`FFMPEG_MAX_LISTED_FILTER_BYTES`]).
+    fn select_filter(&self) -> Result<String, MediaConnectorError> {
         if self.unique_frames.len() > FFMPEG_MAX_SELECT_TERMS {
             if let Some(filter) = self.spread_select_filter() {
-                return filter;
+                return Ok(filter);
             }
+        }
+        let bytes = self.listed_filter_len();
+        if bytes > FFMPEG_MAX_LISTED_FILTER_BYTES {
+            return Err(MediaConnectorError::FrameListTooLong {
+                picks: self.unique_frames.len(),
+                bytes,
+                limit: FFMPEG_MAX_LISTED_FILTER_BYTES,
+            });
         }
         let terms: Vec<String> = self
             .unique_frames
             .iter()
             .map(|(idx, _)| format!("eq(n\\,{idx})"))
             .collect();
-        format!("select='{}'", terms.join("+"))
+        Ok(format!("select='{}'", terms.join("+")))
+    }
+
+    /// The length of the listed filter, counted before any of it is built:
+    /// `select=''` around the terms, each `eq(n\,{index})` (8 bytes and the
+    /// index's digits) joined by `+`.
+    fn listed_filter_len(&self) -> usize {
+        let terms: usize = self
+            .unique_frames
+            .iter()
+            .map(|(index, _)| 8 + index.checked_ilog10().map_or(1, |log| log as usize + 1))
+            .sum();
+        9 + terms - usize::from(!self.unique_frames.is_empty())
     }
 
     /// The same frames as a fixed-size expression.
@@ -4088,12 +4276,15 @@ struct FfmpegFrameArgs {
 }
 
 impl FfmpegFrameArgs {
-    async fn selected(selection: &FrameSelection) -> Self {
-        Self {
-            filter: selection.select_filter(),
+    /// The selection's frames; refused ([`MediaConnectorError::FrameListTooLong`])
+    /// when their list would be longer than the decoder can be given
+    /// ([`FFMPEG_MAX_LISTED_FILTER_BYTES`]).
+    async fn selected(selection: &FrameSelection) -> Result<Self, MediaConnectorError> {
+        Ok(Self {
+            filter: selection.select_filter()?,
             frames: selection.unique_count().to_string(),
             sync: Some(ffmpeg_passthrough_flag().await),
-        }
+        })
     }
 
     fn resampled(fps_filter: String, cfg: VideoFetchConfig) -> Self {
@@ -4108,10 +4299,10 @@ impl FfmpegFrameArgs {
         selection: Option<&FrameSelection>,
         metadata: VideoMetadata,
         cfg: VideoFetchConfig,
-    ) -> Self {
+    ) -> Result<Self, MediaConnectorError> {
         match selection {
             Some(selection) => Self::selected(selection).await,
-            None => Self::resampled(fps_filter_for_metadata(metadata, cfg), cfg),
+            None => Ok(Self::resampled(fps_filter_for_metadata(metadata, cfg), cfg)),
         }
     }
 

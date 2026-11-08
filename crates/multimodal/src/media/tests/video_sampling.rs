@@ -10,37 +10,81 @@ fn cfg() -> VideoFetchConfig {
     }
 }
 
-fn interval_cfg(sample_fps: f64, max_frames: usize) -> VideoFetchConfig {
+/// The interval walk under the connector's default bounds (`min_frames` 4,
+/// `max_frames` 768), as a request reaches it.
+fn interval_cfg(sample_fps: f64) -> VideoFetchConfig {
     VideoFetchConfig {
-        min_frames: 1,
-        max_frames,
         sample_fps,
-        max_long_side_pixel: None,
         sampling: FrameSampling::Interval,
+        ..VideoFetchConfig::default()
     }
 }
 
 #[test]
 fn interval_sampling_takes_one_frame_per_interval_and_keeps_the_last() {
     assert_eq!(
-        sampled_frame_indices(360, 30.0, interval_cfg(1.0, 768)),
+        sampled_frame_indices(360, 30.0, interval_cfg(1.0)),
         vec![0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 359]
     );
     assert_eq!(
-        sampled_frame_indices(60, 30.0, interval_cfg(1.0, 768)),
+        sampled_frame_indices(60, 30.0, interval_cfg(1.0)),
         vec![0, 30, 59]
     );
     assert_eq!(
-        sampled_frame_indices(100, 25.0, interval_cfg(0.5, 768)),
+        sampled_frame_indices(100, 25.0, interval_cfg(0.5)),
         vec![0, 50, 99]
     );
     assert_eq!(
-        sampled_frame_indices(300, 29.97, interval_cfg(2.0, 768)),
+        sampled_frame_indices(300, 29.97, interval_cfg(2.0)),
         vec![
             0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180, 195, 210, 225, 240, 255, 270,
             285, 299
         ]
     );
+}
+
+/// The walk's picks are its loader's whatever their number: a clip shorter
+/// than four intervals gives the frames the loader takes (no four-frame
+/// floor), a clip of more than 768 intervals every one of them (no thinning).
+/// The picks are the family's video loader's own on these clips.
+#[test]
+fn interval_sampling_takes_the_loaders_count_below_the_floor_and_above_the_cap() {
+    // Half a second, one second and two seconds at 30 fps: the first frame,
+    // then the last.
+    assert_eq!(
+        sampled_frame_indices(15, 30.0, interval_cfg(1.0)),
+        vec![0, 14]
+    );
+    assert_eq!(
+        sampled_frame_indices(30, 30.0, interval_cfg(1.0)),
+        vec![0, 29]
+    );
+    assert_eq!(
+        sampled_frame_indices(60, 30.0, interval_cfg(1.0)),
+        vec![0, 30, 59]
+    );
+    // Three seconds at 24 fps and five seconds at the NTSC rate.
+    assert_eq!(
+        sampled_frame_indices(72, 24.0, interval_cfg(1.0)),
+        vec![0, 24, 48, 71]
+    );
+    assert_eq!(
+        sampled_frame_indices(150, 29.97, interval_cfg(1.0)),
+        vec![0, 30, 60, 90, 120, 149]
+    );
+    // A single frame, and a clip of two frames at 1 fps.
+    assert_eq!(sampled_frame_indices(1, 30.0, interval_cfg(1.0)), vec![0]);
+    assert_eq!(sampled_frame_indices(2, 1.0, interval_cfg(1.0)), vec![0, 1]);
+    // A clip of 800 seconds at 1 fps: every frame is a pick, past the 768 bound.
+    let long = sampled_frame_indices(800, 1.0, interval_cfg(1.0));
+    assert_eq!(long.len(), 800);
+    assert_eq!(&long[..4], &[0, 1, 2, 3]);
+    assert_eq!(&long[796..], &[796, 797, 798, 799]);
+    // Twenty minutes at 30 fps: 1200 intervals and the last frame.
+    let twenty_minutes = sampled_frame_indices(36_000, 30.0, interval_cfg(1.0));
+    assert_eq!(twenty_minutes.len(), 1201);
+    assert_eq!(&twenty_minutes[..3], &[0, 30, 60]);
+    assert_eq!(&twenty_minutes[1198..], &[35_940, 35_970, 35_999]);
 }
 
 fn up_to_then_rate_cfg(sample_fps: f64) -> VideoFetchConfig {
@@ -540,20 +584,26 @@ fn the_loader_sizes_a_clip_by_what_it_can_see() {
     assert_eq!(loader_frame_indices(60, 0, 32), Vec::<usize>::new());
 }
 
+/// The connector's bounds, however tight or wide, leave the walk's picks
+/// alone: a budget of 10 frames does not thin a 100 s clip, the 768 default
+/// does not thin a 30 minute one, and the four-frame minimum does not pad a
+/// two-frame clip; an empty clip has no picks.
 #[test]
-fn interval_sampling_thins_to_the_frame_budget_and_fills_to_the_minimum() {
-    assert_eq!(
-        sampled_frame_indices(3000, 30.0, interval_cfg(1.0, 10)),
-        vec![0, 330, 660, 990, 1320, 1680, 2010, 2340, 2670, 2999]
-    );
-    let long = sampled_frame_indices(54_000, 30.0, interval_cfg(1.0, 768));
-    assert_eq!(long.len(), 768);
+fn interval_sampling_ignores_the_frame_budget_and_the_minimum() {
+    let tight = VideoFetchConfig {
+        min_frames: 4,
+        max_frames: 10,
+        ..interval_cfg(1.0)
+    };
+    let hundred_seconds = sampled_frame_indices(3000, 30.0, tight);
+    assert_eq!(hundred_seconds.len(), 101);
+    assert_eq!(&hundred_seconds[..3], &[0, 30, 60]);
+    assert_eq!(&hundred_seconds[99..], &[2970, 2999]);
+    let long = sampled_frame_indices(54_000, 30.0, interval_cfg(1.0));
+    assert_eq!(long.len(), 1801);
     assert_eq!(long.last(), Some(&53_999));
-
-    let mut short = interval_cfg(1.0, 768);
-    short.min_frames = 4;
-    assert_eq!(sampled_frame_indices(2, 30.0, short), vec![0, 0, 0, 1]);
-    assert_eq!(sampled_frame_indices(0, 30.0, short), Vec::<usize>::new());
+    assert_eq!(sampled_frame_indices(2, 30.0, tight), vec![0, 1]);
+    assert_eq!(sampled_frame_indices(0, 30.0, tight), Vec::<usize>::new());
 }
 
 fn metadata(source_fps: Option<f64>, total_frames: Option<usize>) -> VideoMetadata {
@@ -842,12 +892,15 @@ fn select_filter_escapes_commas_and_lists_each_distinct_index_once() {
         .expect("frame rate and count are known");
     assert_eq!(selection.frame_indices, vec![0, 0, 0, 1]);
     assert_eq!(selection.unique_count(), 2);
-    assert_eq!(selection.select_filter(), r"select='eq(n\,0)+eq(n\,1)'");
+    assert_eq!(
+        selection.select_filter().expect("two terms are listed"),
+        r"select='eq(n\,0)+eq(n\,1)'"
+    );
 
     let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(60)), cfg())
         .expect("frame rate and count are known");
     assert_eq!(
-        selection.select_filter(),
+        selection.select_filter().expect("four terms are listed"),
         r"select='eq(n\,0)+eq(n\,19)+eq(n\,39)+eq(n\,59)'"
     );
 }
@@ -878,11 +931,46 @@ fn a_long_selection_is_described_rather_than_listed() {
             .expect("frame rate and count are known");
         assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS);
 
-        let filter = selection.select_filter();
+        let filter = selection.select_filter().expect("described");
         assert_eq!(filter, expected, "{sampling:?}");
         assert!(
             filter.matches('+').count() < FFMPEG_MAX_SELECT_TERMS,
             "a selection past the cutoff is described, not listed"
+        );
+    }
+}
+
+/// A long interval selection is described, not listed, while its stride is
+/// stable: its picks are a fixed stride from the first frame plus the clip's
+/// last frame, so the filter is the spread of its own frames plus one
+/// trailing term, a string of constant size (what [`PICK_RECORD_BYTES`]
+/// counts on for these clips). A stride that sits by a whole number (a
+/// request rate of 1.999600079984003 at 30 fps, a container rate of
+/// 30.003000300030003 at 1 fps) flips between two values and is listed
+/// instead; that path is priced in the same constant and bounded by the
+/// argument length, a known limit.
+#[test]
+fn a_long_interval_selection_is_described_in_constant_size_at_a_stable_stride() {
+    let interval = VideoFetchConfig {
+        sampling: FrameSampling::Interval,
+        sample_fps: 1.0,
+        ..cfg()
+    };
+    for fps in [30.0, 29.97, 25.0, 24.0, 23.976, 60.0, 15.0] {
+        let selection =
+            FrameSelection::from_metadata(metadata(Some(fps), Some(1_080_000)), interval)
+                .expect("frame rate and count are known");
+        assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS, "{fps}");
+        let filter = selection.select_filter().expect("described");
+        assert!(
+            filter.starts_with("select='eq(n\\,floor("),
+            "{fps}: described, not listed: {filter}"
+        );
+        assert!(
+            filter.matches('+').count() <= FFMPEG_SPREAD_EXTRA_TERMS && filter.len() < 256,
+            "{fps}: {} explicit terms, {} bytes: {filter}",
+            filter.matches('+').count(),
+            filter.len()
         );
     }
 }
@@ -995,7 +1083,7 @@ async fn the_selection_picks_the_same_frames_through_ffmpeg() {
         ("loader spread", up_to_cfg(300), 0),
         (
             "rate spread ending on the last frame",
-            interval_cfg(15.0, 768),
+            interval_cfg(15.0),
             1,
         ),
         (
@@ -1015,7 +1103,7 @@ async fn the_selection_picks_the_same_frames_through_ffmpeg() {
             "{label}: {} distinct frames are past the list limit",
             selection.unique_count()
         );
-        let filter = selection.select_filter();
+        let filter = selection.select_filter().expect("described");
         assert!(
             filter.starts_with("select='eq(n\\,floor("),
             "{label}: described, not listed: {filter}"
@@ -1029,6 +1117,7 @@ async fn the_selection_picks_the_same_frames_through_ffmpeg() {
         command.arg(&path);
         FfmpegFrameArgs::selected(&selection)
             .await
+            .expect("described, under the list bound")
             .apply(&mut command);
         command.args([
             "-f",
@@ -1420,7 +1509,7 @@ fn a_nearest_frame_tie_is_described_to_even() {
         .expect("a tie to even is described");
     assert!(described.contains("mod(floor("), "{described}");
     assert_eq!(
-        selection.select_filter(),
+        selection.select_filter().expect("five terms are listed"),
         r"select='eq(n\,0)+eq(n\,2)+eq(n\,4)+eq(n\,7)+eq(n\,9)'"
     );
 }
@@ -1498,12 +1587,15 @@ fn a_selection_the_formula_misses_keeps_the_explicit_list() {
         .map(|index| (index * 3 + index % 2, 1))
         .collect();
     assert!(selection.spread_select_filter().is_none());
-    assert!(selection.select_filter().starts_with(r"select='eq(n\,0)+"));
+    assert!(selection
+        .select_filter()
+        .expect("a short list is built")
+        .starts_with(r"select='eq(n\,0)+"));
 
     selection.unique_frames = (0..FFMPEG_MAX_SELECT_TERMS + 1)
         .map(|index| (index * 3, 1))
         .collect();
-    let filter = selection.select_filter();
+    let filter = selection.select_filter().expect("described");
     assert_eq!(
         filter,
         r"select='eq(n\,floor(round(n*99/297)*297/99))*lte(n\,297)+eq(n\,300)'"
@@ -1524,10 +1616,64 @@ fn a_frame_count_the_container_made_up_still_builds_a_filter() {
     )
     .expect("frame rate and count are known");
 
-    let filter = selection.select_filter();
+    let filter = selection.select_filter().expect("described");
     assert!(
         filter.contains("floor(round("),
         "described, not listed: {filter}"
+    );
+}
+
+/// A rate that puts the interval's stride by a whole number (two picks a
+/// second less a hair, at 30 fps: strides of 15 and 16) lists every pick. A
+/// list longer than the decoder can be given is refused before it is built,
+/// with its own error naming the picks, the list's length and the bound; a
+/// list under the bound is built, past 64 KiB as under it.
+#[test]
+fn a_listed_selection_longer_than_the_decoder_can_be_given_is_refused() {
+    let rate = 1.999_600_079_984_003;
+    let long =
+        FrameSelection::from_metadata(metadata(Some(30.0), Some(600_000)), interval_cfg(rate))
+            .expect("frame rate and count are known");
+    assert!(long.spread_select_filter().is_none());
+    let listed = format!(
+        "select='{}'",
+        long.unique_indices()
+            .iter()
+            .map(|index| format!("eq(n\\,{index})"))
+            .collect::<Vec<_>>()
+            .join("+")
+    );
+    assert!(listed.len() > FFMPEG_MAX_LISTED_FILTER_BYTES);
+    let error = long.select_filter().expect_err("too long to be given");
+    assert!(
+        matches!(
+            error,
+            MediaConnectorError::FrameListTooLong { picks, bytes, limit }
+                if picks == long.unique_count()
+                    && bytes == listed.len()
+                    && limit == FFMPEG_MAX_LISTED_FILTER_BYTES
+        ),
+        "{error}"
+    );
+    assert_eq!(error.fault(), crate::error::MediaFault::Client);
+    assert_eq!(error.code().as_str(), "media_too_large");
+
+    let mut lengths = Vec::new();
+    for total_frames in [60_000, 120_000] {
+        let short = FrameSelection::from_metadata(
+            metadata(Some(30.0), Some(total_frames)),
+            interval_cfg(rate),
+        )
+        .expect("frame rate and count are known");
+        assert!(short.unique_count() > FFMPEG_MAX_SELECT_TERMS);
+        let filter = short.select_filter().expect("under the bound, listed");
+        assert_eq!(filter.len(), short.listed_filter_len());
+        assert!(filter.starts_with(r"select='eq(n\,0)+eq(n\,"), "{filter}");
+        lengths.push(filter.len());
+    }
+    assert!(
+        lengths[0] < 64 * 1024 && lengths[1] > 64 * 1024,
+        "a list past 64 KiB is built like one under it: {lengths:?}"
     );
 }
 

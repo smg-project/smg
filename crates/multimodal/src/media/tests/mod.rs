@@ -926,6 +926,92 @@ fn stepped_group_clips_report_the_loaders_sampled_rate() {
     assert_eq!(super::clip_sample_fps(Some(&short), Some(5.0), even), 2.0);
 }
 
+/// The interval walk's clips report the rate of its picks the same way: a 1 s
+/// clip at 30 fps gives `[0, 29]`, 2 fps (1 s a group of two), where the
+/// target-rate estimate under the connector's bounds says 4 fps; an 800 s clip
+/// at 1 fps gives 800 picks, 1 fps, where the estimate says 0.96. Without a
+/// selection the estimate stands.
+#[test]
+fn interval_clips_report_the_loaders_sampled_rate() {
+    let interval = VideoFetchConfig {
+        sampling: FrameSampling::Interval,
+        ..VideoFetchConfig::default()
+    };
+    let one_second = super::FrameSelection::new(30.0, 30, vec![0, 29]);
+    assert_eq!(
+        super::clip_sample_fps(Some(&one_second), Some(1.0), interval),
+        2.0
+    );
+    assert_eq!(effective_sample_fps(Some(1.0), interval), 4.0);
+    let long = super::FrameSelection::new(1.0, 800, (0..800).collect());
+    assert_eq!(
+        super::clip_sample_fps(Some(&long), Some(800.0), interval),
+        1.0
+    );
+    assert_eq!(effective_sample_fps(Some(800.0), interval), 0.96);
+    assert_eq!(super::clip_sample_fps(None, Some(1.0), interval), 4.0);
+}
+
+/// A container's frame claim sizes the interval walk's picks. A claim whose
+/// picks at source resolution cannot fit the decoded-bytes budget is refused
+/// with that budget's own error before any pick is held, and the count stops
+/// at the budget, so the claim's size is no cost: two billion frames at 30
+/// fps in full HD are refused after the budget's 172 picks, and the same
+/// claim in one-pixel frames or from an unsized probe after the picks the
+/// budget holds in records alone. A clip within the budget, the other rules
+/// (bounded by their caps) and an unknown rate (the bounded `Even` fallback)
+/// pass.
+#[test]
+fn an_interval_claim_past_the_decoded_bytes_budget_is_refused_before_its_picks() {
+    let interval = VideoFetchConfig {
+        sampling: FrameSampling::Interval,
+        ..VideoFetchConfig::default()
+    };
+    let full_hd = 1920 * 1080 * 3;
+    let budget = super::video_max_decoded_bytes();
+    for (total_frames, fps) in [(1usize << 31, 30.0), (1_000, 1.0)] {
+        let refused =
+            super::ensure_interval_picks_fit(total_frames, fps, full_hd, interval, budget);
+        assert!(
+            matches!(
+                refused,
+                Err(MediaConnectorError::DecodedTooLarge {
+                    media: "video RGB",
+                    knob: "SMG_VIDEO_MAX_DECODED_BYTES",
+                    ..
+                })
+            ),
+            "{total_frames} frames at {fps} fps: {refused:?}"
+        );
+    }
+    // The smallest frames and an unsized probe are bounded through the picks'
+    // records alone: the claim is refused, a clip within the budget passes.
+    for frame_size in [3, 0] {
+        let refused = super::ensure_interval_picks_fit(1 << 31, 30.0, frame_size, interval, budget);
+        assert!(
+            matches!(refused, Err(MediaConnectorError::DecodedTooLarge { .. })),
+            "frame size {frame_size}: {refused:?}"
+        );
+        assert!(super::ensure_interval_picks_fit(1_000, 1.0, frame_size, interval, budget).is_ok());
+    }
+    assert!(super::ensure_interval_picks_fit(150, 30.0, full_hd, interval, budget).is_ok());
+    let even = VideoFetchConfig::default();
+    assert!(super::ensure_interval_picks_fit(1 << 31, 30.0, full_hd, even, budget).is_ok());
+    assert!(super::ensure_interval_picks_fit(1 << 31, f64::NAN, full_hd, interval, budget).is_ok());
+    // The boundary, pinned with a small budget and no allocation: at 1 fps
+    // every frame is a pick, so the count is the frame count; the records
+    // alone price an unsized pick at 128 bytes, a one-pixel pick at 131.
+    let small = 1usize << 20;
+    for (frame_size, fits, refused) in [(0, 8_192, 8_193), (3, 8_004, 8_005)] {
+        assert!(super::ensure_interval_picks_fit(fits, 1.0, frame_size, interval, small).is_ok());
+        let error = super::ensure_interval_picks_fit(refused, 1.0, frame_size, interval, small);
+        assert!(
+            matches!(error, Err(MediaConnectorError::DecodedTooLarge { limit, .. }) if limit == small),
+            "frame size {frame_size}: {error:?}"
+        );
+    }
+}
+
 #[test]
 fn ffmpeg_decodes_carry_the_thread_budget_ahead_of_the_input() {
     let args = |autorotate: bool| {
