@@ -655,7 +655,10 @@ mod tests {
     /// A checkpoint that ships both files renders the chat template the
     /// conversion beside it would: the caller's template path first, else
     /// the one the directory holds, resolved the same way by every arm
-    /// (the directory and the Hub download).
+    /// (the directory and the Hub download). The directory also names a
+    /// template in `tokenizer_config.json`: an arm that hands the loader no
+    /// path lets the loader take that one and renders `config` here, the
+    /// resolving arms render the `.jinja` beside it as the conversion does.
     #[test]
     fn a_checkpoint_that_ships_both_files_resolves_its_chat_template_like_the_conversion() {
         use std::sync::Arc;
@@ -663,6 +666,11 @@ mod tests {
         use crate::{chat_template::ChatTemplateParams, tekken::testing, traits::Tokenizer};
         let dir = testing::dir_with(&testing::minimal());
         let path = dir.path();
+        std::fs::write(
+            path.join("tokenizer_config.json"),
+            r#"{"chat_template": "config"}"#,
+        )
+        .unwrap();
         std::fs::write(
             path.join("tokenizer.json"),
             r#"{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
