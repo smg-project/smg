@@ -595,7 +595,9 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
 /// bars among `<` tokens (the chain shape), one of tokens beyond ASCII only,
 /// one with more than three first bytes (tab and newline runs, `<`, `[` and
 /// runs of a mark beyond ASCII), one whose prefixes stand whole (every
-/// token shorter than the prefix length), and two sets of added words whose
+/// token shorter than the prefix length), one the library declines as it
+/// stands (one-byte tab and newline tokens among twenty-two prefixes: the
+/// tokens' five first bytes stand in), and two sets of added words whose
 /// prefixes would be under the floor (they keep the automaton's search).
 #[test]
 fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
@@ -645,6 +647,8 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
         "<t>",
         "<t",
         "</tx",
+        "<u3>",
+        "<u1",
         "<\u{FF5C}x",
         "<\u{FF5C}x\u{FF5C}>",
         "<\u{FF5C}xy\u{FF5C}>",
@@ -697,12 +701,21 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
             ]
         })
         .collect();
+    // A set the library declines as it stands (one-byte tab and newline
+    // tokens among twenty-two prefixes): the tokens' five first bytes stand
+    // in, and the anchored automaton decides at each.
+    let tags: Vec<String> = (0..16).map(|i| format!("<u{i}>")).collect();
+    let declined: Vec<&str> = ["\t", "\t\t", "\n", "\n\n", "[b]", "\u{2581}\u{2581}"]
+        .into_iter()
+        .chain(tags.iter().map(String::as_str))
+        .collect();
     let mut all: Vec<(Vec<&str>, bool)> = sets
         .iter()
         .map(|(tokens, by_prefixes)| (tokens.to_vec(), *by_prefixes))
         .collect();
     all.push((words_one.iter().map(String::as_str).collect(), false));
     all.push((words_two.iter().map(String::as_str).collect(), false));
+    all.push((declined, true));
     let mut state = 0x2545_F491_4F6C_DD1Du64;
     for (tokens, by_prefixes) in &all {
         let list: Vec<(String, u32)> = tokens

@@ -491,7 +491,14 @@ pub(crate) struct AddedTokens {
 /// [`Self::MAX_COUNT`] of them (a token shorter than the length stands
 /// whole), so a hit is as close to a token as the set allows. A set whose
 /// prefixes would be shorter than [`Self::MIN_LEN`] bytes keeps the
-/// automaton's own search.
+/// automaton's own search. When the library declines the prefixes that fit
+/// (its SIMD searcher takes a one-byte pattern among at most sixteen, and a
+/// set with newline or tab runs among its tokens has such prefixes), the
+/// tokens' distinct first bytes stand in when there are at most
+/// [`Self::MAX_FIRST_BYTES`]: a hit then is a byte that starts some token,
+/// and the automaton anchored there decides, where the unanchored automaton
+/// walked every byte of the text (measured at about thirty instructions per
+/// byte on a 6,415-token set).
 struct Prefixes {
     searcher: packed::Searcher,
 }
@@ -500,6 +507,7 @@ impl Prefixes {
     const MAX_LEN: usize = 16;
     const MIN_LEN: usize = 3;
     const MAX_COUNT: usize = 64;
+    const MAX_FIRST_BYTES: usize = 16;
 
     /// Whether the automaton's start-byte scan declines `tokens`: a first
     /// byte beyond ASCII, or more than three distinct first bytes.
@@ -539,12 +547,23 @@ impl Prefixes {
         if prefixes.len() > Self::MAX_COUNT || (cut_short && len < Self::MIN_LEN) {
             return None;
         }
-        let searcher = packed::Config::new()
+        let searcher = Self::searcher(&prefixes).or_else(|| {
+            let firsts = distinct(1);
+            (firsts.len() <= Self::MAX_FIRST_BYTES)
+                .then(|| Self::searcher(&firsts))
+                .flatten()
+        })?;
+        Some(Self { searcher })
+    }
+
+    /// The library's packed searcher over `patterns`, none when it declines
+    /// them.
+    fn searcher(patterns: &[&[u8]]) -> Option<packed::Searcher> {
+        packed::Config::new()
             .match_kind(packed::MatchKind::LeftmostFirst)
             .builder()
-            .extend(&prefixes)
-            .build()?;
-        Some(Self { searcher })
+            .extend(patterns)
+            .build()
     }
 
     /// The first position at or after `from` where a prefix stands.
