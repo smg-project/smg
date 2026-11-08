@@ -715,6 +715,9 @@ pub struct SoakRecord {
     pub sent: u64,
     pub ok: u64,
     pub failed: u64,
+    /// Requests still open when the client's drain ran out, summed over the windows.
+    #[serde(default)]
+    pub unfinished: u64,
     pub client_rc: i64,
     pub script: ScriptCounts,
     pub warnings: Vec<String>,
@@ -790,6 +793,7 @@ pub fn soak_record(
         sent: summaries.iter().map(|s| count(s, "sent")).sum(),
         ok: summaries.iter().map(|s| count(s, "ok")).sum(),
         failed,
+        unfinished,
         client_rc: summaries
             .iter()
             .map(|s| s.get("client_rc").and_then(Value::as_i64).unwrap_or(0))
@@ -1379,6 +1383,7 @@ pub(crate) mod tests {
         let record = soak_record("pr", spec, "r1", Path::new("/d"), measured, 1, 10).unwrap();
         assert_eq!(record.sent, 20);
         assert_eq!(record.failed, 3);
+        assert_eq!(record.unfinished, 1);
         assert_eq!(record.script, counts);
         assert_eq!(
             record.warnings,
@@ -1398,6 +1403,7 @@ pub(crate) mod tests {
         let value = serde_json::to_value(&record).unwrap();
         assert_eq!(value["rows"][0]["after"], "start");
         assert_eq!(value["rows"][0]["status"]["VmRSS"], 1024);
+        assert_eq!(value["unfinished"], 1);
     }
 
     #[test]
