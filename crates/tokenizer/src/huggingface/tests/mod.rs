@@ -1,4 +1,5 @@
 mod segment;
+mod structural;
 
 use std::{collections::HashMap, fs};
 

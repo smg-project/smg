@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     ops::Range,
     path::Path,
@@ -121,6 +122,18 @@ pub struct HuggingFaceTokenizer {
     /// per-id table: the generic window then holds the bytes of an
     /// unfinished character, and the stream's end judges a cut from them.
     byte_level_chain: bool,
+    /// The checkpoint ships the family's own vocabulary file beside the
+    /// conversion (`tekken.json`): the file's own reader, the family's
+    /// reference library, writes the control tokens of a request
+    /// structurally and BPE-encodes every request string as plain text, so a
+    /// control spelling typed inside a message stays text there. The
+    /// conversion's added-token matcher reads the same spelling as the
+    /// control token wherever it stands, so the render tells the two apart
+    /// for such a checkpoint (see `apply_chat_template_with_encoding`).
+    structural_controls: bool,
+    /// The special tokens between the marks, for the marked template's
+    /// context (`Some` with `structural_controls`).
+    special_tokens_marked: Option<SpecialTokens>,
 }
 
 /// Logs, once per load, which path a tokenizer's full decode takes: the
@@ -897,7 +910,7 @@ impl HuggingFaceTokenizer {
             .and_then(|checkpoint| checkpoint.renderer(chat_template_str.as_deref()))
             .map(Renderer::Glm53)
             .unwrap_or(renderer);
-        let chat_template = ChatTemplateState::from_checkpoint(
+        let mut chat_template = ChatTemplateState::from_checkpoint(
             ConfigChatTemplates {
                 default: chat_template_str,
                 tool_use: tool_use_template,
@@ -917,12 +930,24 @@ impl HuggingFaceTokenizer {
             byte_level.is_none() && tokenizer.get_decoder().is_some_and(has_byte_level_member);
         let pieces = PieceTable::build(&tokenizer);
         log_decode_path(&tokenizer, byte_level.is_some(), pieces.is_some());
+        let core = Arc::new(EncoderCore::new(tokenizer, encoders.native));
+        let structural_controls = tokenizer_path
+            .parent()
+            .is_some_and(|dir| dir.join("tekken.json").is_file());
+        let special_tokens_marked = if structural_controls {
+            if let Some(controls) = core.added() {
+                chat_template.mark_controls(controls)?;
+            }
+            Some(marks::marked_special_tokens(&special_tokens))
+        } else {
+            None
+        };
         Ok(HuggingFaceTokenizer {
             byte_level,
             pieces,
             #[cfg(feature = "tokenizers-v1")]
             v1: encoders.v1,
-            core: Arc::new(EncoderCore::new(tokenizer, encoders.native)),
+            core,
             special_tokens,
             vocab,
             reverse_vocab,
@@ -938,6 +963,8 @@ impl HuggingFaceTokenizer {
             has_byte_fallback,
             byte_fallback_values,
             byte_level_chain,
+            structural_controls,
+            special_tokens_marked,
         })
     }
 
@@ -1249,6 +1276,8 @@ impl HuggingFaceTokenizer {
             has_byte_fallback,
             byte_fallback_values,
             byte_level_chain,
+            structural_controls: false,
+            special_tokens_marked: None,
         }
     }
 
@@ -1370,8 +1399,41 @@ impl HuggingFaceTokenizer {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<(String, bool)> {
+        // A marked template (see `structural_controls`) writes its control
+        // tokens between marks, the special tokens it reads included, and
+        // reads every request string with its marks removed, so no request
+        // can forge one.
+        let marked = self.chat_template.marked();
+        let stripped_messages;
+        let messages: &[serde_json::Value] = if marked {
+            stripped_messages = marks::without_marks(messages);
+            &stripped_messages
+        } else {
+            messages
+        };
+        let stripped_tools;
+        let mut tools = params.tools;
+        let mut prepared_tools = params.prepared_tools;
+        if marked {
+            if let Some(Cow::Owned(stripped)) = params.tools.map(marks::without_marks) {
+                stripped_tools = stripped;
+                tools = Some(stripped_tools.as_slice());
+                prepared_tools = None;
+            }
+        }
+        let marked_tokens;
+        let special_tokens = match (&self.special_tokens_marked, params.special_tokens) {
+            (Some(ours), None) => Some(ours),
+            (Some(_), Some(given)) => {
+                marked_tokens = marks::marked_special_tokens(given);
+                Some(&marked_tokens)
+            }
+            (None, given) => given.or(Some(&self.special_tokens)),
+        };
         let params = ChatTemplateParams {
-            special_tokens: params.special_tokens.or(Some(&self.special_tokens)),
+            tools,
+            special_tokens,
+            prepared_tools,
             ..params
         };
         // A template that writes nothing for the request's tools gets them
@@ -2243,14 +2305,23 @@ impl HuggingFaceTokenizer {
         &self,
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
-    ) -> Result<String> {
+    ) -> Result<(String, bool)> {
         match self.renderer {
+            // The template compiled marked: whether it continued the final
+            // message comes with the render.
+            Renderer::Jinja if self.chat_template.marked() => self.apply_jinja(messages, params),
             Renderer::Jinja | Renderer::Glm53(_) => Err(Error::msg(
                 "the Jinja and GLM renderers render no marked prompt",
             )),
-            Renderer::DeepseekV32 => apply_deepseek_v32(messages, &params),
-            Renderer::DeepseekV4 => apply_deepseek_v4(messages, &params),
-            Renderer::DeepseekV41(table) => apply_deepseek_v41(messages, &params, table),
+            Renderer::DeepseekV32 => {
+                apply_deepseek_v32(messages, &params).map(|marked| (marked, false))
+            }
+            Renderer::DeepseekV4 => {
+                apply_deepseek_v4(messages, &params).map(|marked| (marked, false))
+            }
+            Renderer::DeepseekV41(table) => {
+                apply_deepseek_v41(messages, &params, table).map(|marked| (marked, false))
+            }
         }
     }
 
@@ -2270,14 +2341,18 @@ impl HuggingFaceTokenizer {
         // after their own preprocessing), and from the final message's role
         // for V3.2, which writes the header inside every user, developer and
         // tool-result render, before any trailing system text.
-        let continued_final_message = matches!(self.renderer, Renderer::DeepseekV41(_))
+        let generation_prompt_unless_continued = params.generation_prompt_unless_continued();
+        let continued_by_encoder = matches!(self.renderer, Renderer::DeepseekV41(_))
             && continues_final_assistant_message(messages, &params);
-        let mut marked = self.render_marked(messages, params)?;
+        let (mut marked, continued_by_template) = self.render_marked(messages, params)?;
+        let continued_final_message = continued_by_encoder || continued_by_template;
         let generation_prompt = match self.renderer {
             Renderer::DeepseekV32 => !final_message_is_assistant(messages),
             Renderer::DeepseekV4 | Renderer::DeepseekV41(_) => ends_with_generation_header(&marked),
+            // The template's header is the flag it rendered under.
+            Renderer::Jinja => generation_prompt_unless_continued && !continued_final_message,
             // No marked prompt: `render_marked` refused above.
-            Renderer::Jinja | Renderer::Glm53(_) => false,
+            Renderer::Glm53(_) => false,
         };
         if let Some(prefix) = assistant_prefix {
             // Request text: a mark a client wrote into it is no mark.
@@ -2368,23 +2443,27 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         params: ChatTemplateParams,
     ) -> Result<String> {
         match self.renderer {
-            Renderer::Jinja => self.apply_jinja(messages, params).map(|(text, _)| text),
+            Renderer::Jinja if !self.chat_template.marked() => {
+                self.apply_jinja(messages, params).map(|(text, _)| text)
+            }
             Renderer::Glm53(template) => self
                 .apply_glm53(messages, params, template)
                 .map(|(text, _)| text),
             _ => self
                 .render_marked(messages, params)
-                .map(|marked| marks::strip(&marked).into_owned()),
+                .map(|(marked, _)| marks::strip(&marked).into_owned()),
         }
     }
 
-    /// The Jinja and GLM renderers encode from their text. A renderer with an encoder
-    /// of its own renders its control tokens marked (see `encoders::marks`)
-    /// and the prompt is encoded by segments, so that a control-token
-    /// spelling typed in a message stays text: as text all the same when the
-    /// flat encode would cut out exactly the renderer's control tokens (the
-    /// ids are then the same, and the text takes every path and cache a flat
-    /// encode takes), else as a deferred encode of the segments.
+    /// The Jinja renderer of a plain checkpoint and the GLM renderer encode
+    /// from their text. A renderer with an encoder of its own, and the Jinja
+    /// renderer of a checkpoint with `structural_controls`, render their
+    /// control tokens marked (see `encoders::marks`) and the prompt is
+    /// encoded by segments, so that a control-token spelling typed in a
+    /// message stays text: as text all the same when the flat encode would
+    /// cut out exactly the renderer's control tokens (the ids are then the
+    /// same, and the text takes every path and cache a flat encode takes),
+    /// else as a deferred encode of the segments.
     fn apply_chat_template_with_encoding(
         &self,
         messages: &[serde_json::Value],
@@ -2398,7 +2477,9 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         // keeps the field's value over a `template_kwargs` entry of that name).
         let generation_prompt_unless_continued = params.generation_prompt_unless_continued();
         let (mut text, continued_final_message) = match self.renderer {
-            Renderer::Jinja => self.apply_jinja(messages, params)?,
+            Renderer::Jinja if !self.chat_template.marked() => {
+                self.apply_jinja(messages, params)?
+            }
             Renderer::Glm53(template) => self.apply_glm53(messages, params, template)?,
             _ => return self.apply_marked_with_encoding(messages, params, assistant_prefix),
         };
@@ -2472,6 +2553,11 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             .as_ref()
             .and_then(|checkpoint| checkpoint.renderer(Some(&template)));
         self.chat_template.set(template)?;
+        if self.structural_controls {
+            if let Some(controls) = self.core.added() {
+                self.chat_template.mark_controls(controls)?;
+            }
+        }
         if self.glm.is_some() {
             self.renderer = glm_renderer.map_or(Renderer::Jinja, Renderer::Glm53);
             self.profile = self.renderer.profile();
