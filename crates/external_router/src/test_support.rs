@@ -1,7 +1,8 @@
 //! What the crate's capture tests drive a request through: a worker at an
 //! address of the test's choosing, a worker source over such workers, the
-//! HTTP client they share, an address nothing answers at, and how a test
-//! reads an answer's body back as text.
+//! HTTP client they share, an address nothing answers at, a provider's
+//! answer of the test's making, and how a test reads an answer's body back
+//! as text.
 
 use std::{
     fmt,
@@ -11,7 +12,11 @@ use std::{
 };
 
 use async_trait::async_trait;
-use axum::{body::to_bytes, http::HeaderMap, response::Response};
+use axum::{
+    body::to_bytes,
+    http::{header::CONTENT_TYPE, HeaderMap},
+    response::Response,
+};
 use openai_protocol::worker::ProviderType;
 use rustls::crypto::ring::default_provider;
 use tokio::net::TcpSocket;
@@ -41,6 +46,20 @@ pub(crate) fn http_client() -> reqwest::Client {
         .timeout(Duration::from_secs(5))
         .build()
         .expect("a client")
+}
+
+/// A provider's answer of the test's making: `status`, the content type
+/// when one is given, and `body`.
+pub(crate) fn upstream(
+    status: u16,
+    content_type: Option<&str>,
+    body: impl Into<reqwest::Body>,
+) -> reqwest::Response {
+    let mut builder = http::Response::builder().status(status);
+    if let Some(ct) = content_type {
+        builder = builder.header(CONTENT_TYPE, ct);
+    }
+    reqwest::Response::from(builder.body(body.into()).expect("a response"))
 }
 
 /// The whole body of `response`, as text.
