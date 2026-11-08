@@ -2,7 +2,6 @@
 //! each side answers, what it advertises, and the port a prefill worker binds.
 
 use std::{
-    net::TcpListener as StdTcpListener,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -22,16 +21,7 @@ use tokio::{
 use ts::generate_response::Response as GenResp;
 
 mod common;
-use common::generate;
-
-/// A port nothing listens on right now (bound and released).
-fn free_port() -> u16 {
-    StdTcpListener::bind("127.0.0.1:0")
-        .expect("bind a free port")
-        .local_addr()
-        .expect("listener address")
-        .port()
-}
+use common::{free_port, generate};
 
 /// Serve one canned worker of `role` on a free port, as worker 0 of its
 /// process (its gRPC port is the base port, so its bootstrap port is the

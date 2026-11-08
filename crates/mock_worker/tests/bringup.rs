@@ -24,21 +24,15 @@ use engine_zmq_client::{
 };
 use futures::StreamExt;
 
+mod common;
+use common::free_port;
+
 const BIN: &str = env!("CARGO_BIN_EXE_mock-worker");
 
 /// The binary under test: this build's, or the one `MOCK_WORKER_BIN` names
 /// (to run the suite against another build for a before/after).
 fn binary() -> String {
     std::env::var("MOCK_WORKER_BIN").unwrap_or_else(|_| BIN.to_string())
-}
-
-/// A port nothing listens on right now.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind a free port")
-        .local_addr()
-        .expect("listener address")
-        .port()
 }
 
 /// A port held by this test, so a worker told to bind it cannot.

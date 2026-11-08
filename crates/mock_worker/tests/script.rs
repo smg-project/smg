@@ -3,7 +3,6 @@
 //! what a request no script covers still gets.
 
 use std::{
-    net::TcpListener as StdTcpListener,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -32,7 +31,7 @@ use tokio::net::TcpListener;
 use ts::generate_response::Response as GenResp;
 
 mod common;
-use common::generate;
+use common::{free_port, generate};
 
 const MODEL: &str = "script-test";
 
@@ -56,15 +55,6 @@ fn script_file(dir: &Path, name: &str, answers: &[Value]) -> PathBuf {
     let text: String = answers.iter().map(|a| format!("{a}\n")).collect();
     std::fs::write(&path, text).expect("write the script");
     path
-}
-
-/// A port nothing listens on right now (bound and released).
-fn free_port() -> u16 {
-    StdTcpListener::bind("127.0.0.1:0")
-        .expect("bind a free port")
-        .local_addr()
-        .expect("listener address")
-        .port()
 }
 
 // ── gRPC ────────────────────────────────────────────────────────────────────
