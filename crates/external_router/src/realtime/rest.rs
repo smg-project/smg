@@ -162,9 +162,10 @@ pub async fn proxy_response(resp: reqwest::Response, model: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use axum::{body::to_bytes, http::header::CONTENT_TYPE};
+    use axum::http::header::CONTENT_TYPE;
 
     use super::*;
+    use crate::test_support::text_of;
 
     /// The provider's error envelope as its realtime REST endpoints answer
     /// it: the message names the operator's organization and project.
@@ -178,13 +179,6 @@ mod tests {
                 .body(reqwest::Body::from(body))
                 .expect("a response"),
         )
-    }
-
-    async fn text_of(response: Response) -> String {
-        let bytes = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("a body");
-        String::from_utf8(bytes.to_vec()).expect("utf-8")
     }
 
     /// A refusal of a realtime REST call reaches the caller under its status
