@@ -19,9 +19,12 @@
 //!
 //! The run is opt-in: `BELLWETHER_FIXTURES` points at the `fixtures/` directory of a bellwether
 //! checkout; without it the test prints a skip notice and passes. `SYMPHONY_SAMPLE_EVERY=n`
-//! replays every n-th case of each recorded set, the same slice every run, for a CI job that
-//! cannot afford a benchmark-scale set whole, and the hand-written sets (`common`, `turns`)
-//! whole; a run that leaves it unset or empty replays every case. A second parity test replays
+//! replays every n-th case of each recorded set, the same slice every run, for a run over a tree
+//! that holds the benchmark-scale sets whole (what `bellwether unpack` writes without `--plain`:
+//! every compressed set fetched and written plain), and the hand-written sets (`common`, `turns`)
+//! whole; a run that leaves it unset or empty replays every case, as the fixture job does over
+//! the tree it unpacks with `--plain --sample-sets 3500` (the hand-written sets and one
+//! compressed set in 3,500). A second parity test replays
 //! every Qwen checkpoint bellwether has recorded ([`MODELS`]): the Qwen3 table with the JSON call
 //! syntax, the same table with the tagged syntax (Qwen 3.5 and later, Qwen3-Coder), typed by each
 //! case's request tools, and the Qwen2.5 table, each after the turn opener the registry names
@@ -107,10 +110,10 @@ use symphony::{
 
 const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
 /// Replay every n-th case of each recorded set, counted from the set's first, when this is set
-/// and not empty: a deterministic slice of a benchmark-scale set, so CI can replay a set of fifty
-/// thousand cases in minutes, and a nightly run, which leaves it unset, replays them all. The
-/// hand-written sets ([`HAND_WRITTEN_SETS`]) are replayed whole whatever the step. The run says
-/// so.
+/// and not empty: a deterministic slice of a benchmark-scale set, so a run over a tree that holds
+/// the sets whole (one can be fifty thousand cases) ends in minutes. The fixture job, whose unpack
+/// keeps one compressed set in 3,500, leaves it unset and replays every case. The hand-written
+/// sets ([`HAND_WRITTEN_SETS`]) are replayed whole whatever the step. The run says so.
 const SAMPLE_ENV: &str = "SYMPHONY_SAMPLE_EVERY";
 /// Set to anything but empty or `0`, the per-case report is printed on stdout as well.
 const VERBOSE_ENV: &str = "BELLWETHER_VERBOSE";
