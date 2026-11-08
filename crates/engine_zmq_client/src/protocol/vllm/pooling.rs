@@ -222,7 +222,7 @@ mod tests {
     use rmpv::Value;
 
     use super::*;
-    use crate::codec::{decode_msgpack, decode_value, encode_msgpack, unhex};
+    use crate::codec::{decode_msgpack, decode_value, encode_msgpack, hex};
 
     /// `msgspec.msgpack.encode(PoolingParams(task="embed", use_activation=True,
     /// skip_reading_prefix_cache=False))` on vLLM 0.30.1rc1: the form the
@@ -236,15 +236,15 @@ mod tests {
     fn embed_params_encode_byte_for_byte_like_vllm() {
         assert_eq!(
             encode_msgpack(&PoolingParams::embed()).unwrap(),
-            unhex(VLLM_EMBED_PARAMS)
+            hex(VLLM_EMBED_PARAMS)
         );
         let raw = PoolingParams {
             task: Some(PoolingTask::Embed),
             ..PoolingParams::default()
         };
-        assert_eq!(encode_msgpack(&raw).unwrap(), unhex(VLLM_RAW_EMBED_PARAMS));
+        assert_eq!(encode_msgpack(&raw).unwrap(), hex(VLLM_RAW_EMBED_PARAMS));
         // Spot-check the positions against the Python field order.
-        let Value::Array(array) = decode_value(&unhex(VLLM_EMBED_PARAMS)).unwrap() else {
+        let Value::Array(array) = decode_value(&hex(VLLM_EMBED_PARAMS)).unwrap() else {
             panic!("expected array");
         };
         assert_eq!(array.len(), 10);
@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn pooling_params_decode_full_and_truncated_arrays() {
         assert_eq!(
-            decode_msgpack::<PoolingParams>(&unhex(VLLM_EMBED_PARAMS)).unwrap(),
+            decode_msgpack::<PoolingParams>(&hex(VLLM_EMBED_PARAMS)).unwrap(),
             PoolingParams::embed()
         );
         // A shorter array (older encoder) falls back to the Python defaults.

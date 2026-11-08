@@ -709,7 +709,6 @@ mod tests {
         codec::{
             decode_value, encode_msgpack, hex,
             tensor::{lies_within, WireArrayData, WireNdArray},
-            unhex,
         },
         protocol::vllm::logprobs::{PositionLogprobs, TokenLogprob},
     };
@@ -726,7 +725,7 @@ mod tests {
 
     #[test]
     fn decode_vllm_pooling_output_inline() {
-        let frame = Bytes::from(unhex(VLLM_POOLING_OUTPUTS_INLINE));
+        let frame = Bytes::from(hex(VLLM_POOLING_OUTPUTS_INLINE));
         let batch = decode_engine_core_outputs(std::slice::from_ref(&frame))
             .unwrap()
             .into_request_batch()
@@ -762,7 +761,7 @@ mod tests {
                 .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<_>>(),
         );
-        let frames = vec![Bytes::from(unhex(VLLM_POOLING_OUTPUTS_AUX)), aux.clone()];
+        let frames = vec![Bytes::from(hex(VLLM_POOLING_OUTPUTS_AUX)), aux.clone()];
         let batch = decode_engine_core_outputs(&frames)
             .unwrap()
             .into_request_batch()

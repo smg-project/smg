@@ -692,7 +692,7 @@ fn load_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{decode_msgpack, encode_msgpack};
+    use crate::codec::{decode_msgpack, encode_msgpack, hex};
 
     /// `msgspec.msgpack.encode` of the plugin's slim batch for rids a/b with
     /// b finished on token 42 with logprobs and two ranked candidates on its
@@ -722,13 +722,6 @@ mod tests {
     const PYTHON_SLIM28: &str = "dc001cb64261746368546f6b656e4944536c696d4f757470757492a161a16292910a911492a0a473746f7092c0c092c02a92030392010192000092909092909001020028cd019092c0c092909092909092000092909092909092909092909092909092909092c0c092c09492cb3fe0000000000000cbbfe000000000000092cb3fd0000000000000cb3fe800000000000092cb3ff0000000000000cb000000000000000092cbbff0000000000000cb4000000000000000";
     /// The plugin's terminal abort for rid `x`: its `n=2` rejection, status 400.
     const PYTHON_ABORT: &str = "dc0013b64261746368546f6b656e4944536c696d4f757470757491a178919091a561626f727491d9396e3d32206973206e6f7420736572766564206f6e207468697320776972653b20534d472066616e73206f7574206e203e203120697473656c6691c091009100910091909190000000000091cd019091909190";
-
-    fn hex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
 
     /// The 19-element pin predates the appended prompt-logprob and reasoning
     /// columns: it decodes with them empty, and re-encoding (24 elements)
