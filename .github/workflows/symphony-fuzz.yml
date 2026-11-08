@@ -3,11 +3,10 @@ name: symphony fuzz campaign
 # The Symphony crate's coverage-guided fuzz targets (crates/symphony/fuzz, cargo-fuzz on nightly)
 # run here nightly, bounded: nine targets, three at a time, ten minutes each; a crash fails the job
 # and uploads its artifact for the report crates/symphony/fuzz/README.md describes. The run looks
-# past the one breach class on record in that README, "The classes the nightly allows"
-# (tolerated-json, by name through SYMPHONY_FUZZ_ALLOW; the section holds what is known of it and
-# what it waits for, and the record of the names that left): a night's red is a shape not yet
-# reported, and a name leaves the allowance with its fix, from both lines that write it (the
-# scheduled run's list below and the dispatch input's default).
+# past no breach class: the record of the names that were allowed and left is in that README,
+# "The classes the nightly allows". A night's red is a shape not yet reported; a class a report
+# allows for a while is named through SYMPHONY_FUZZ_ALLOW from both lines that write it (the
+# scheduled run's list below and the dispatch input's default), and leaves them with its fix.
 
 on:
   schedule:
@@ -22,7 +21,7 @@ on:
         default: ""
       allow:
         description: "Breach names the run looks past (comma separated; empty for none)"
-        default: "tolerated-json"
+        default: ""
 
 concurrency:
   group: symphony-fuzz
@@ -85,9 +84,9 @@ jobs:
           ALLOW_INPUT: ${{ github.event.inputs.allow }}
         run: |
           # A dispatch's allowance is its own, an empty one included (an expression's `||` would
-          # put the default back); a scheduled run looks past the class on record in
-          # crates/symphony/fuzz/README.md, "The classes the nightly allows".
-          if [ "$EVENT" = workflow_dispatch ]; then ALLOW=$ALLOW_INPUT; else ALLOW=tolerated-json; fi
+          # put the default back); a scheduled run allows nothing, the record of the classes that
+          # were allowed is in crates/symphony/fuzz/README.md, "The classes the nightly allows".
+          if [ "$EVENT" = workflow_dispatch ]; then ALLOW=$ALLOW_INPUT; else ALLOW=; fi
           # shellcheck disable=SC2086
           crates/symphony/fuzz/run.sh --minutes "$MINUTES" --jobs 3 ${ALLOW:+--allow "$ALLOW"} $TARGETS
       - name: Upload crashes and logs
