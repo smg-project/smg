@@ -129,7 +129,7 @@ pub trait TokenSpeedAnswers: Send + Sync + 'static {
 }
 
 /// The TokenSpeed scheduler service over a mock's answers.
-pub struct TokenSpeedService<A>(pub A);
+pub struct TokenSpeedService<A>(A);
 
 #[tonic::async_trait]
 impl<A: TokenSpeedAnswers> TokenSpeedScheduler for TokenSpeedService<A> {
@@ -317,7 +317,7 @@ pub trait VllmAnswers: Send + Sync + 'static {
 }
 
 /// The vLLM engine service over a mock's answers.
-pub struct VllmService<A>(pub A);
+pub struct VllmService<A>(A);
 
 #[tonic::async_trait]
 impl<A: VllmAnswers> VllmEngine for VllmService<A> {

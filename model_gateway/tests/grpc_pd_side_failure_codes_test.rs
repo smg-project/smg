@@ -20,7 +20,9 @@
 use std::time::Duration;
 
 use common::{
-    engine_answers::{VllmAnswers, VllmGenerateStream},
+    engine_answers::{
+        TokenSpeedAnswers, TokenSpeedGenerateStream, VllmAnswers, VllmGenerateStream,
+    },
     grpc_harness::{
         build_grpc_router, grpc_router_config, grpc_workers, serve_canned_worker, serve_engine,
         Canned,
@@ -33,14 +35,11 @@ use smg::{
     tenant::TenantKey,
     worker::{RuntimeType, WorkerType},
 };
-use smg_grpc_client::{
-    common_proto as grpc_common, tokenspeed_scheduler::tokenspeed_proto as ts, vllm_proto as proto,
-};
+use smg_grpc_client::{tokenspeed_scheduler::tokenspeed_proto as ts, vllm_proto as proto};
 use smg_test_harness as common;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request, Response, Status};
-use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
 
 const MODEL: &str = "pd-side-failure-codes-test-model";
 /// Tokens an engine that completes produces; ids 1..=3 are in the mock
@@ -155,11 +154,7 @@ struct CutPrefill {
 }
 
 #[tonic::async_trait]
-impl TokenSpeedScheduler for CutPrefill {
-    type GenerateStream = ReceiverStream<Result<ts::GenerateResponse, Status>>;
-    type GetTokenizerStream = ReceiverStream<Result<grpc_common::GetTokenizerChunk, Status>>;
-    type SubscribeKvEventsStream = ReceiverStream<Result<grpc_common::KvEventBatch, Status>>;
-
+impl TokenSpeedAnswers for CutPrefill {
     #[expect(
         clippy::disallowed_methods,
         reason = "test mock; the producer task ends with its two items"
@@ -167,7 +162,7 @@ impl TokenSpeedScheduler for CutPrefill {
     async fn generate(
         &self,
         request: Request<ts::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<TokenSpeedGenerateStream>, Status> {
         let request_id = request.into_inner().request_id;
         let code = self.code;
         let (tx, rx) = mpsc::channel(2);
@@ -189,7 +184,7 @@ impl TokenSpeedScheduler for CutPrefill {
             }
             let _ = tx.send(Err(Status::new(code, REASON))).await;
         });
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     async fn health_check(
@@ -231,41 +226,6 @@ impl TokenSpeedScheduler for CutPrefill {
         _request: Request<ts::GetLoadsRequest>,
     ) -> Result<Response<ts::GetLoadsResponse>, Status> {
         Ok(Response::new(ts::GetLoadsResponse::default()))
-    }
-
-    async fn flush_cache(
-        &self,
-        _request: Request<grpc_common::FlushCacheRequest>,
-    ) -> Result<Response<grpc_common::FlushCacheResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn start_profile(
-        &self,
-        _request: Request<grpc_common::StartProfileRequest>,
-    ) -> Result<Response<grpc_common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn stop_profile(
-        &self,
-        _request: Request<grpc_common::StopProfileRequest>,
-    ) -> Result<Response<grpc_common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn get_tokenizer(
-        &self,
-        _request: Request<grpc_common::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn subscribe_kv_events(
-        &self,
-        _request: Request<grpc_common::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
     }
 }
 
@@ -513,9 +473,12 @@ async fn a_decode_stream_that_fails_after_the_response_began_ends_with_the_typed
 /// sequential shape's drain gives it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_parallel_prefill_cut_after_it_began_is_its_stream_failure_on_a_collected_answer() {
-    let prefill_port = serve_engine(TokenSpeedSchedulerServer::new(CutPrefill {
-        code: Code::Internal,
-    }))
+    let prefill_port = serve_engine(
+        CutPrefill {
+            code: Code::Internal,
+        }
+        .into_server(),
+    )
     .await;
     let decode_port = serve_canned_worker(Canned {
         model: MODEL,
