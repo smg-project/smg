@@ -3,6 +3,7 @@
 
 pub mod admin;
 pub mod admin_ops;
+pub mod bootstrap;
 pub mod config;
 pub mod drain;
 pub mod engine;

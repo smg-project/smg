@@ -123,18 +123,12 @@ pub async fn serve_with_listener_until(
         .map(|a| a.port())
         .and_then(|port| port.checked_sub(cfg.grpc_base_port))
         .and_then(|index| cfg.bootstrap_port_for(index));
-    let bootstrap = match bootstrap_port {
-        Some(port) => match TcpListener::bind((cfg.host.as_str(), port)).await {
-            Ok(listener) => Some(listener),
-            Err(e) => {
-                tracing::error!(
-                    "grpc worker {addr:?} bootstrap port bind {}:{port} failed: {e}",
-                    cfg.host
-                );
-                return;
-            }
-        },
-        None => None,
+    let bootstrap = match crate::bootstrap::bind(&cfg.host, bootstrap_port).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("grpc worker {addr:?} {e}");
+            return;
+        }
     };
     let max_message_bytes = cfg.grpc_max_message_bytes;
     // The stop reaches the service's streams that have no end of their own
@@ -152,7 +146,8 @@ pub async fn serve_with_listener_until(
         stopped: stopped.clone(),
         wire,
     };
-    let bootstrap = bootstrap.map(|listener| accept_and_close(listener, stopped.clone()));
+    let bootstrap =
+        bootstrap.map(|listener| crate::bootstrap::accept_and_close(listener, stopped.clone()));
     let service = MockScheduler {
         cfg,
         name,
@@ -236,34 +231,6 @@ pub async fn serve_with_listener_until(
     tokio::select! {
         () = &mut server => {}
         () = sides => server.await,
-    }
-}
-
-/// A prefill worker's bootstrap port: where a decode partner's engine would
-/// rendezvous for the KV handoff, which the mock never performs (the decode
-/// side has the prompt). Each connection is accepted and closed, which is
-/// all the gateway's probe of the port asks, until the worker stops.
-async fn accept_and_close(listener: TcpListener, mut stopped: watch::Receiver<bool>) {
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((connection, _)) => drop(connection),
-                Err(e) => {
-                    tracing::warn!(
-                        "bootstrap port {:?}: accept failed: {e}",
-                        listener.local_addr().ok()
-                    );
-                    // A listener out of descriptors would fail every accept
-                    // at once; a pause keeps the loop from spinning on it.
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            },
-            // The wait's guard stays inside its own future: a select arm
-            // that yielded it would hold it across the loop's awaits.
-            () = async {
-                let _ = stopped.wait_for(|stop| *stop).await;
-            } => break,
-        }
     }
 }
 
@@ -489,12 +456,9 @@ pub(crate) fn service_name(wire: SchedulerWire) -> &'static str {
 impl MockScheduler {
     /// The realistic engine's fault and admission hooks for a side that
     /// serves no tokens (the prefill role's prompt-side completion, the
-    /// encode role's encoder completion), as the regular path counts them:
-    /// the stall, a status before admission (a failure, or a cut when it
-    /// names a token count), the admission delay and rate, then the canned
-    /// delay. `Ok(true)` when the fault asks for a `finish=error` completion,
-    /// counted as a cut. The engine never runs the prompt: nothing is
-    /// admitted, no record is left.
+    /// encode role's encoder completion), as the regular path counts them
+    /// ([`Engine::admit_without_tokens`]), then the canned delay. `Ok(true)`
+    /// when the fault asks for a `finish=error` completion, counted as a cut.
     pub(crate) async fn admit_without_tokens(
         &self,
         request_id: &str,
@@ -507,24 +471,11 @@ impl MockScheduler {
                 let line = rank_line(request_id, pin, rank);
                 tracing::info!("{line}");
             }
-            let engine = &self.ranks[rank].engine;
-            if let Some(fault) = engine.inject() {
-                if !fault.stall.is_zero() {
-                    tokio::time::sleep(fault.stall).await;
-                }
-                if fault.finish_error {
-                    engine.cut_counter().fetch_add(1, Ordering::Relaxed);
-                    finish_error = true;
-                } else if fault.status != 0 {
-                    if fault.after_tokens.is_some() {
-                        engine.cut_counter().fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        engine.record_failure();
-                    }
-                    return Err(injected_status(fault.status));
-                }
-            }
-            engine.admit().await;
+            finish_error = self.ranks[rank]
+                .engine
+                .admit_without_tokens()
+                .await
+                .map_err(injected_status)?;
         }
         if !self.cfg.gen_delay.is_zero() {
             tokio::time::sleep(self.cfg.gen_delay).await;
