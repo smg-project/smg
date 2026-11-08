@@ -1359,6 +1359,34 @@ pub struct ListWorkersQuery {
     /// Only return workers serving this model, e.g. `?model=moonshotai/Kimi-K2.5`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The shape of the answer: the worker records when absent, or
+    /// `manifest`, the file discovery provider's manifest, which a second
+    /// gateway reads with `--discovery-provider file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<WorkerListFormat>,
+    /// Only the workers of this origin: `local`, registered at start-up or
+    /// through this API, or `discovery`, registered by a discovery provider
+    /// that re-registers them on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<WorkerListOrigin>,
+}
+
+/// The shape `GET /workers` answers in, when not the worker records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerListFormat {
+    /// The file discovery provider's manifest: `{"version": 1, "workers": [...]}`.
+    Manifest,
+}
+
+/// Who registered a worker, as `GET /workers?origin=` filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerListOrigin {
+    /// The start-up flags or the worker API.
+    Local,
+    /// A discovery provider: Kubernetes, a file, Slurm or Consul.
+    Discovery,
 }
 
 // ── Response types ──────────────────────────────────────────────────
