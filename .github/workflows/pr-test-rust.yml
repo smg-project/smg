@@ -2049,9 +2049,11 @@ jobs:
           # multi-turn and sampling-defaults classes, the constraint-failure
           # and the reader-panic classes, the completions classes, the
           # context-length and load-report classes (the disaggregated ones
-          # included), the disaggregated topology, pairing-protocol,
-          # runtime-assembled fleet, Messages and Responses classes on mock
-          # prefill and decode workers, the Responses local
+          # included), the disaggregated topology (its gRPC rows, and its
+          # HTTP rows on the mock's HTTP prefill and decode workers),
+          # pairing-protocol, runtime-assembled fleet, Messages and
+          # Responses classes on mock prefill and decode workers, the
+          # Responses local
           # classes (state, background, streaming events, sampling
           # parameters, item references, the object shape), and the gpt-oss
           # classes of chat and Responses on the Harmony token stream (the

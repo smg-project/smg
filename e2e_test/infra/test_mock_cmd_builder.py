@@ -118,10 +118,24 @@ def test_an_encode_worker_takes_the_vllm_wire_and_a_bootstrap_port():
     assert _last_flag(stated, "--grpc-wire") == "sglang"
 
 
+def test_the_prefill_and_decode_roles_reach_the_http_command_with_the_bootstrap_port():
+    prefill = _worker(ConnectionMode.HTTP, worker_type=WorkerType.PREFILL, bootstrap_port=31900)
+    cmd = prefill._build_cmd()
+    assert _flag(cmd, "--http-base-port") == "31001", "an HTTP worker on its own port"
+    assert _flag(cmd, "--worker-type") == "prefill"
+    assert _flag(cmd, "--bootstrap-base-port") == "31900", "the port the gateway is told of"
+    assert "--grpc-wire" not in cmd, "an HTTP worker speaks no scheduler wire"
+    decode = _worker(ConnectionMode.HTTP, worker_type=WorkerType.DECODE)
+    cmd = decode._build_cmd()
+    assert _flag(cmd, "--worker-type") == "decode"
+    assert "--bootstrap-base-port" not in cmd, "a decode worker binds no bootstrap port"
+
+
 def test_a_role_on_another_wire_is_refused():
-    with pytest.raises(ValueError, match="gRPC workers"):
-        _worker(ConnectionMode.HTTP, worker_type=WorkerType.DECODE)._build_cmd()
-    with pytest.raises(ValueError, match="gRPC workers"):
+    # The ZMQ workers take no role; the encode role is the gRPC vLLM wire's.
+    with pytest.raises(ValueError, match="HTTP or gRPC workers"):
+        _worker(ConnectionMode.ZMQ, worker_type=WorkerType.DECODE)._build_cmd()
+    with pytest.raises(ValueError, match="gRPC worker"):
         _worker(ConnectionMode.HTTP, worker_type=WorkerType.ENCODE)._build_cmd()
 
 
