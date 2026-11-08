@@ -57,19 +57,26 @@ pub(crate) fn convert_proto_logprobs(
     }
 }
 
+/// The candidates per position a chat answer carries for the request's
+/// `top_logprobs`: exactly that many, none when the request named none. The
+/// engine may report more, e.g. the chosen token when only its own logprob
+/// was requested; every chat path cuts to this count before it decodes, so
+/// the rule lives here once.
+pub(crate) fn requested_alternatives(top_logprobs: Option<u32>) -> usize {
+    top_logprobs.unwrap_or(0) as usize
+}
+
 /// Convert OutputLogProbs to OpenAI ChatLogProbs format using a Tokenizer.
 ///
 /// `top_logprobs` is the number of alternatives the request asked for per
-/// token (`None` when it asked for none). The engine may report more, e.g.
-/// the chosen token when only its own logprob was requested; the OpenAI API
-/// returns exactly the requested alternatives, an empty list when none were,
-/// and only those are decoded.
+/// token (`None` when it asked for none); [`requested_alternatives`] turns it
+/// into the candidates the answer carries, and only those are decoded.
 pub(crate) fn convert_proto_to_openai_logprobs(
     proto_logprobs: ProtoOutputLogProbs<'_>,
     tokenizer: &Arc<dyn Tokenizer>,
     top_logprobs: Option<u32>,
 ) -> ChatLogProbs {
-    let requested = Some(top_logprobs.unwrap_or(0) as usize);
+    let requested = Some(requested_alternatives(top_logprobs));
     convert_proto_logprobs(proto_logprobs, requested, |token_id| {
         tokenizer
             .decode(&[token_id], false)
