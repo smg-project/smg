@@ -91,6 +91,7 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         _request: Request<ts::GetModelInfoRequest>,
     ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
+        self.overrides.model_info().refusal("model info")?;
         Ok(Response::new(ts::GetModelInfoResponse {
             model_path: self.cfg.model_id.clone(),
             tokenizer_path: self.cfg.tokenizer_path.clone(),
@@ -114,6 +115,7 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         _request: Request<ts::GetServerInfoRequest>,
     ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
+        self.overrides.server_info().refusal("server info")?;
         Ok(Response::new(ts::GetServerInfoResponse {
             server_args: self.server_args(),
             scheduler_info: None,
