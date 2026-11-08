@@ -14,7 +14,7 @@
     Uses the KV index's overlap scoring from KvEventMonitor. Routes based
     on actual backend KV cache state. Selects the worker with the highest
     overlap count; LeastLoad breaks equal-affinity ties in one call, the
-    choice and its credit together (above eight candidates the scores are
+    choice and its credit together (from eight candidates up the scores are
     read without the tally's write guard).
     Falls back to LeastLoad when no cache overlap exists. Over a pool larger
     than 32 workers the decision reads the holders of the request's blocks

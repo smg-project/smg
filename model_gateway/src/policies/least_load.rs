@@ -38,13 +38,17 @@ const TIE_EPSILON_SECS: f64 = 1e-6;
 /// The candidate count up to which one write guard is held across the
 /// decision. Above it the credit is read under the read guard, the scores
 /// run with no guard held and the write guard covers the release and the
-/// credit alone. Measured on 64 concurrent decisions over eight cores: at
-/// two candidates the split costs 8 to 17 % of the decisions per second,
-/// while the held guard, with the candidates' scratch thread-local instead
-/// of shared under it, reads 11 to 24 % better than one shared scratch did;
-/// from 16 candidates up the split returns 1.5 to 4.6 times the decisions
-/// per second, and eight is flat either way.
-const HELD_GUARD_CANDIDATES: usize = 8;
+/// credit alone. Measured on 64 concurrent decisions over eight cores in
+/// three sessions: at two and four candidates the split costs 18 to 23 %
+/// of the decisions per second and one held guard, with the candidates'
+/// scratch thread-local instead of shared under it, reads at main or
+/// above; at eight the held guard ties main while the split reads ahead
+/// in two sessions of three (by 23 and 52 %, alike in the first); from 16
+/// candidates up the split returns 1.3 to 4.6 times. Five to seven are
+/// unmeasured and sit on the shape that ties main at both measured
+/// neighbours; the quiet-box measurement of candidates four to eight one
+/// by one is tracked as item #350 and may move this down.
+const HELD_GUARD_CANDIDATES: usize = 7;
 
 /// Since-report dispatch tally for one worker: the token-work and request
 /// count of the dispatches no report has reflected yet, with each dispatch's
@@ -2186,13 +2190,13 @@ mod tests {
         assert_eq!(requests, 8 * 250);
     }
 
-    /// The two guard shapes meet at [`HELD_GUARD_CANDIDATES`]: eight
-    /// candidates hold one write guard, nine split the read, the scoring and
+    /// The two guard shapes meet at [`HELD_GUARD_CANDIDATES`]: seven
+    /// candidates hold one write guard, eight split the read, the scoring and
     /// the write. On the same inputs both pick the same worker, twice, and
     /// leave the same tally.
     #[test]
-    fn eight_and_nine_candidates_take_the_two_guard_shapes_and_agree() {
-        assert_eq!(HELD_GUARD_CANDIDATES, 8);
+    fn seven_and_eight_candidates_take_the_two_guard_shapes_and_agree() {
+        assert_eq!(HELD_GUARD_CANDIDATES, 7);
         let decide_twice = |candidates: usize| {
             let policy = LeastLoadPolicy::new();
             let feed = TestFeed::attached_to(&policy);
@@ -2223,11 +2227,14 @@ mod tests {
                 .collect();
             (first, second, tally)
         };
+        let seven = decide_twice(7);
         let eight = decide_twice(8);
-        let nine = decide_twice(9);
+        assert_eq!(seven.0, Some(5));
         assert_eq!(eight.0, Some(5));
-        assert_eq!(nine.0, Some(5));
-        assert_eq!(eight.1, nine.1, "the second pick, after one credit, agrees");
-        assert_eq!(eight.2, nine.2, "the tallies agree");
+        assert_eq!(
+            seven.1, eight.1,
+            "the second pick, after one credit, agrees"
+        );
+        assert_eq!(seven.2, eight.2, "the tallies agree");
     }
 }
