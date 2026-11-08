@@ -25,6 +25,15 @@ pub fn http_client() -> reqwest::Client {
     reqwest::Client::new()
 }
 
+/// A port nothing listens on right now (bound and released).
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind a free port")
+        .local_addr()
+        .expect("listener address")
+        .port()
+}
+
 /// Serve `cfg` on a free port and connect the gateway's client to it.
 pub async fn start(cfg: Config) -> TokenSpeedSchedulerClient {
     let listener = TcpListener::bind("127.0.0.1:0")
