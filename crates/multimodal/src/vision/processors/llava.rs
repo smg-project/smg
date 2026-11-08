@@ -802,30 +802,22 @@ fn resize_and_pad_image(
     let paste_x = (target_width - new_width) / 2;
     let paste_y = (target_height - new_height) / 2;
 
-    match &*resized {
-        // The paste of an opaque image onto a black canvas is a copy: the
-        // canvas is built from rows.
-        DynamicImage::ImageRgb8(rgb) => DynamicImage::ImageRgb8(paste_rgb(
-            rgb,
-            target_width,
-            target_height,
-            paste_x,
-            paste_y,
-            [0, 0, 0],
-        )),
-        // Any other layout is pasted pixel by pixel, as the generic paste
-        // blends it (an alpha channel over the black canvas).
-        other => {
-            let mut new_image = DynamicImage::new_rgb8(target_width, target_height);
-            image::imageops::overlay(
-                &mut new_image,
-                other,
-                i64::from(paste_x),
-                i64::from(paste_y),
-            );
-            new_image
-        }
-    }
+    // The paste onto the black canvas copies the stored colours: an alpha
+    // channel is dropped the way the reference's RGB conversion drops it,
+    // whatever the image's size (the reference resize hands a same-size
+    // image back as it is), so no layout blends over the canvas.
+    let rgb = match &*resized {
+        DynamicImage::ImageRgb8(rgb) => Cow::Borrowed(rgb),
+        other => Cow::Owned(other.to_rgb8()),
+    };
+    DynamicImage::ImageRgb8(paste_rgb(
+        &rgb,
+        target_width,
+        target_height,
+        paste_x,
+        paste_y,
+        [0, 0, 0],
+    ))
 }
 
 /// The size of the reference's shortest-edge resize: the shorter side becomes
@@ -1137,6 +1129,27 @@ mod tests {
                 i64::from((target.1 - new_h) / 2),
             );
             assert_eq!(padded.dimensions(), (target.0, target.1));
+            assert_eq!(padded.as_bytes(), expected.as_bytes(), "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn an_image_with_alpha_is_pasted_by_its_stored_colours_at_every_size() {
+        // A same-size image comes back from the reference resize as it is, a
+        // resized one as RGB: both canvases hold the stored colours, the alpha
+        // dropped as the reference's RGB conversion drops it, not blended over
+        // the black canvas.
+        for (width, height) in [(672u32, 672u32), (673, 672)] {
+            let rgba = image::RgbaImage::from_fn(width, height, |x, y| {
+                image::Rgba([(x % 256) as u8, (y % 256) as u8, 200, 0])
+            });
+            let opaque = DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(rgba.clone()).to_rgb8());
+            let padded = resize_and_pad_image(
+                &DynamicImage::ImageRgba8(rgba),
+                (672, 672),
+                FilterType::CatmullRom,
+            );
+            let expected = resize_and_pad_image(&opaque, (672, 672), FilterType::CatmullRom);
             assert_eq!(padded.as_bytes(), expected.as_bytes(), "{width}x{height}");
         }
     }
