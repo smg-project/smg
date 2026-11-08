@@ -34,8 +34,9 @@
 
 #
 # Placement. The workflow's benchmark job builds its binaries, the gate's pair and the summary
-# run's, with every function on a 64-byte boundary (RUSTFLAGS:
-# `-C llvm-args=-align-all-functions=6`, beside the outliner flag of .cargo/config.toml).
+# run's, with every function and every loop on a 64-byte boundary (RUSTFLAGS:
+# `-C llvm-args=-align-all-functions=6 -C llvm-args=-align-loops=64`, beside the outliner flag
+# of .cargo/config.toml).
 # symphony.toml records why: identical code sits in one of two speed states chosen by where its
 # unchanged hot functions land modulo 64, and a pull request's code size alone moved them. Under the
 # flags this gate's null read (the same bytes twice, three interleaved runs a side on one core, 72
@@ -47,6 +48,13 @@
 # Under the 25 % threshold: string_match_10w_4096c at +24.8 %, the 100-worker lookups at +10 to +12
 # % and the 500-worker lookups at +2 to +3 % (their cost is the worker scoring), and the store rows
 # within 6 % (allocation and generation).
+# The loop flag came after the function flag, from a pull request whose token insert did main's
+# work (+10 instructions per 4,096-token re-insert by differencing, the same 7-instruction compare
+# loop under line tables) and read the six 1024/4096 token_insert ids +27.8 to +33.1 % on the
+# hosted runner: its smaller code in front of the 21-byte compare loop had moved the loop from
+# bytes 32-52 of a 64-byte line to across a line boundary, which the function flag does not govern
+# (LLVM places loops on 16 bytes). With both flags the same two sources read +2.9 to +10.0 % on
+# those ids (five interleaved runs a side on one core).
 
 repeats = 3
 filter = "^benchmark_summary/(indexer|string|token)_(match|insert|store)_"

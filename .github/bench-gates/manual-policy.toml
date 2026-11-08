@@ -22,8 +22,9 @@
 
 #
 # Placement. The workflow's benchmark job builds its binaries, the gate's pair and the summary
-# run's, with every function on a 64-byte boundary (RUSTFLAGS:
-# `-C llvm-args=-align-all-functions=6`, beside the outliner flag of .cargo/config.toml).
+# run's, with every function and every loop on a 64-byte boundary (RUSTFLAGS:
+# `-C llvm-args=-align-all-functions=6 -C llvm-args=-align-loops=64`, beside the outliner flag
+# of .cargo/config.toml).
 # symphony.toml records why: identical code sits in one of two speed states chosen by where its
 # unchanged hot functions land modulo 64, and a pull request's code size alone moved them. Under the
 # flags this gate's null read (the same bytes twice, three interleaved runs a side on one core, 16
