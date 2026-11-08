@@ -365,11 +365,10 @@ fn hash_value(hash: i64) -> Value {
     Value::from(hash as u64)
 }
 
-/// `BlockStored` as vLLM encodes it: the block_size of the first block, the
-/// token ids of every block in order.
-/// A store as vLLM's `BlockStored`. A sparse cache-group store carries
-/// `span`, the step's whole token range, as the engine writes it under a block
-/// mask; otherwise `token_ids` is the blocks' own tokens.
+/// A store as vLLM's `BlockStored`: the block_size of the first block and,
+/// for a sparse cache-group store, `span`, the step's whole token range, as
+/// the engine writes it under a block mask; otherwise `token_ids` is the
+/// blocks' own tokens in order.
 fn stored_map(stored: &common::KvBlocksStored, span: Option<&[u32]>) -> Value {
     let block_size = stored
         .blocks

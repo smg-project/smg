@@ -463,9 +463,15 @@ pub struct EngineParams {
 /// prompt's aligned replay boundary (what a later request can resume from);
 /// a Mamba group keeps the one state block ending there. vLLM writes a
 /// sparse group's store with the step's whole token span and the kept hashes
-/// only; so does the mock's vLLM wire (`Published::spans`), while its gRPC
-/// stream, the shape of a relay's output, carries the kept blocks with their
-/// own tokens.
+/// only; so does the mock's vLLM wire (`Published::spans`). The gRPC stream
+/// carries every group's events unfiltered, the kept blocks with their own
+/// tokens: a servicer's relay forwards the main group alone today, and the
+/// gateway admits main-attention kinds only. The mock's own prefix hit and
+/// `cached_tokens` still come from the full-attention pool: a hybrid engine's
+/// hit is the fixed point over its groups, which the mock does not model yet.
+///
+/// The kinds the flag takes are [`KvCacheGroup::KINDS_HELP`]: the dense
+/// main-attention kinds and `mamba` take no window, the window kinds need one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KvCacheGroup {
     pub kind: String,
@@ -473,6 +479,19 @@ pub struct KvCacheGroup {
 }
 
 impl KvCacheGroup {
+    /// The kinds whose stores keep a window tail; a window in tokens is required.
+    pub const WINDOW_KINDS: [&'static str; 2] = ["sliding_window", "sliding_window_mla"];
+    /// The kinds without a window: the dense main-attention kinds and the Mamba state group.
+    pub const UNWINDOWED_KINDS: [&'static str; 4] = [
+        "full_attention",
+        "mla_attention",
+        "sink_full_attention",
+        "mamba",
+    ];
+    /// The accepted specs, as the flag's help and errors list them.
+    pub const KINDS_HELP: &'static str = "full_attention, mla_attention, sink_full_attention, \
+                                          sliding_window:<tokens>, sliding_window_mla:<tokens>, mamba";
+
     /// The main-attention group every engine has.
     pub fn full_attention() -> Self {
         Self {

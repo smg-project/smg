@@ -628,14 +628,26 @@ fn parse_kv_cache_groups(raw: String, flag: &str) -> Result<Vec<KvCacheGroup>, S
         .map(|item| {
             let item = item.trim();
             let (kind, window) = item.split_once(':').unwrap_or((item, ""));
-            if kind.is_empty() {
-                return Err(invalid());
+            let windowed = KvCacheGroup::WINDOW_KINDS.contains(&kind);
+            if !windowed && !KvCacheGroup::UNWINDOWED_KINDS.contains(&kind) {
+                return Err(format!(
+                    "{flag}: unknown cache group kind {kind:?} (one of {})",
+                    KvCacheGroup::KINDS_HELP
+                ));
             }
-            let sliding_window = if window.is_empty() {
+            let sliding_window: u32 = if window.is_empty() {
                 0
             } else {
                 window.parse().map_err(|_| invalid())?
             };
+            if windowed && sliding_window == 0 {
+                return Err(format!(
+                    "{flag}: {kind} needs its window in tokens, as {kind}:<tokens>"
+                ));
+            }
+            if !windowed && !window.is_empty() {
+                return Err(format!("{flag}: {kind} has no window"));
+            }
             Ok(KvCacheGroup {
                 kind: kind.to_string(),
                 sliding_window,
@@ -718,10 +730,12 @@ pub fn usage() -> String {
        --kv-events-buffer-steps <n>  batches kept for replay (default 10000)\n\
        --kv-events-wire <vllm|sglang>  which engine's publisher to imitate (default vllm)\n\
        --kv-cache-groups <kind[:window],...>  the KV cache groups a realistic engine publishes, the
-                                first its main-attention group (default full_attention): a hybrid
-                                engine adds sliding_window:<tokens> or mamba groups, whose stores
-                                name the window tail or the state block at the prompt's replay
-                                boundary, as vLLM 0.31.0 retains them by default (one group on the SGLang wire)\n\
+                                first its main-attention group (default full_attention), one to
+                                eight of full_attention, mla_attention, sink_full_attention,
+                                sliding_window:<tokens>, sliding_window_mla:<tokens> and mamba: a
+                                window group's stores name the window tail and a Mamba group's the
+                                state block at the prompt's replay boundary, as vLLM 0.31.0 retains
+                                them by default (one group on the SGLang wire)\n\
        --loads-like <mock|vllm>  load report: everything the simulator knows, or only what the\n\
                                 vLLM servicer reports (running, waiting, token_usage, maxima)\n\
        --step-reports <bool>    the load record says the wire reports every scheduler step (as\n\
@@ -863,6 +877,17 @@ mod tests {
             .is_ok(),
             "one group is the SGLang wire's shape"
         );
+        for (spec, reason) in [
+            ("sliding_window", "needs its window"),
+            ("full_attention,sliding_window_mla:0", "needs its window"),
+            ("mamba:128", "has no window"),
+            ("full_attention:64", "has no window"),
+            ("swa:128", "unknown cache group kind"),
+            ("sliding-window:128", "unknown cache group kind"),
+        ] {
+            let err = with(&["--kv-cache-groups", spec]).expect_err(spec);
+            assert!(err.contains(reason), "{spec}: {err}");
+        }
     }
 
     /// The gRPC workers serve the tokenspeed wire unless `--grpc-wire` names
