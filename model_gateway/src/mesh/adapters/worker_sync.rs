@@ -475,7 +475,9 @@ impl WorkerSyncAdapter {
     /// this node's own state with another health at the same version (a
     /// status change the outbound loop has not put yet) is left to that loop,
     /// an echo of this node's own publication is left alone, and a lower
-    /// version is outranked already.
+    /// version is outranked already. A state at the maximum version is left
+    /// alone with a warning: no publication outranks it, and the revision is
+    /// raised only to a version that does.
     fn republish_above_own_key(&self, worker_id: &str, state: &WorkerState) -> bool {
         if state.owner != self.node_name {
             return false;
@@ -493,7 +495,17 @@ impl WorkerSyncAdapter {
         if !stored_outranks {
             return false;
         }
-        worker.raise_revision_to(state.version + 1);
+        let Some(above) = state.version.checked_add(1) else {
+            warn!(
+                worker_id,
+                url = %Endpoint::redacted_str(&state.url),
+                stored = state.version,
+                "leaving a claimed worker below a later state of its key: the key's version space \
+                 is exhausted, no publication outranks it"
+            );
+            return false;
+        };
+        worker.raise_revision_to(above);
         let raised = worker_state_of(&id, &worker, &self.node_name);
         info!(
             worker_id,
@@ -2518,6 +2530,46 @@ mod tests {
             "another specification at the same version is outranked"
         );
         assert_eq!(version_of(&ns, &key), Some(revision + 1));
+    }
+
+    #[tokio::test]
+    async fn a_later_state_at_the_maximum_version_is_left_alone() {
+        // The version comes from a peer's bytes. Nothing publishes above the
+        // maximum, so a later state there is left where it is, with a
+        // warning, and the worker's revision does not move: a raise to the
+        // maximum would publish at that version, which no peer follows, and
+        // every later sighting of the state would publish again.
+        let (ns, registry, adapter) = setup();
+        let worker = local_worker("http://local:8080");
+        let id = registry.register(worker.clone()).unwrap();
+        worker.set_status(WorkerStatus::Ready);
+        adapter.resync_local(&mut HashMap::new());
+        let key = format!("worker:{}", id.as_str());
+        let published = worker_state_of(&id, &worker, "node-a");
+        let revision = worker.revision();
+        assert_eq!(version_of(&ns, &key), Some(revision));
+
+        let foreign = WorkerState {
+            model_id: "other-model".to_string(),
+            version: u64::MAX,
+            ..published
+        };
+        adapter.apply_state(id.as_str(), &foreign);
+        assert_eq!(
+            worker.revision(),
+            revision,
+            "a state at the maximum version raises nothing"
+        );
+        assert_eq!(
+            version_of(&ns, &key),
+            Some(revision),
+            "and this node publishes nothing over it"
+        );
+        assert_eq!(
+            registry.get(&id).map(|held| held.model_id().to_string()),
+            Some("llama-3".to_string()),
+            "the local worker stands"
+        );
     }
 
     /// A locally registered worker as discovery registers it: the provider's

@@ -920,8 +920,21 @@ impl WorkerRuntime {
         self.revision.load(Ordering::Acquire)
     }
 
+    /// Bump the revision by one and return the new value, saturating at the
+    /// maximum. A claim of a record at the maximum version leaves the
+    /// revision there (`raise_revision_to`), and a later replacement of that
+    /// worker must neither panic nor wrap it to zero, where every later
+    /// publication would sit below every peer's record. At the maximum the
+    /// counter is exhausted: replacements no longer move it, so the revision
+    /// check of a replace-by-id cannot tell them apart there.
     pub fn bump_revision(&self) -> u64 {
-        self.revision.fetch_add(1, Ordering::AcqRel) + 1
+        let previous = self
+            .revision
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
+                Some(revision.saturating_add(1))
+            })
+            .unwrap_or_else(|revision| revision);
+        previous.saturating_add(1)
     }
 
     /// Raise the revision to at least `floor`; it never goes down. A claim

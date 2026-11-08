@@ -1593,9 +1593,12 @@ impl WorkerRegistry {
             // the latest it imported. A later publication of the earlier
             // life that a peer saw first reaches this node after the claim
             // and is answered by the worker-sync adapter, which raises the
-            // revision past it and publishes the worker again.
+            // revision past it and publishes the worker again. A record at
+            // the maximum version is claimed at that version: nothing
+            // publishes above it, and a later replacement keeps it there
+            // (`WorkerRuntime::bump_revision` saturates).
             if let Some((_, record)) = self.import_records.remove(worker_id) {
-                new_worker.raise_revision_to(record.version + 1);
+                new_worker.raise_revision_to(record.version.saturating_add(1));
             }
         }
         if let Some(record) = import {

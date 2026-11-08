@@ -758,6 +758,58 @@ fn register_or_replace_promotes_mesh_origin_to_local() {
     );
 }
 
+#[test]
+fn a_claim_of_an_import_at_the_maximum_version_keeps_that_version() {
+    // The version comes from a peer's bytes. A claim raises the worker's
+    // revision one past the record's version, so its publication outranks
+    // the record; at the maximum no such version exists. The claim keeps
+    // the maximum instead of overflowing: nothing publishes above it, and
+    // the worker is this node's from here on.
+    let registry = WorkerRegistry::new();
+    registry.on_remote_worker_state(&smg_mesh::WorkerState {
+        version: u64::MAX,
+        ..remote_state("peer-w1", "http://w:8080", true, vec![])
+    });
+    let id = registry.get_id_by_url("http://w:8080").unwrap();
+    assert_eq!(registry.origin_of(&id), Some(WorkerOrigin::Mesh));
+
+    let local: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://w:8080")
+            .model(ModelCard::new("llama-3"))
+            .build(),
+    );
+    assert_eq!(
+        registry.register_or_replace(local.clone()),
+        id,
+        "the claim keeps the id"
+    );
+    assert_eq!(registry.origin_of(&id), Some(WorkerOrigin::Local));
+    assert_eq!(
+        local.revision(),
+        u64::MAX,
+        "a record at the maximum version is claimed at that version"
+    );
+
+    // A later replacement of the claimed worker bumps the revision it
+    // inherits. At the maximum the bump saturates instead of wrapping to
+    // zero or panicking, and the replacement lands.
+    let replacement: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://w:8080")
+            .model(ModelCard::new("llama-3-b"))
+            .build(),
+    );
+    assert_eq!(registry.register_or_replace(replacement.clone()), id);
+    assert_eq!(
+        replacement.revision(),
+        u64::MAX,
+        "a replacement at the maximum keeps the maximum"
+    );
+    assert_eq!(
+        registry.get(&id).map(|held| held.model_id().to_string()),
+        Some("llama-3-b".to_string())
+    );
+}
+
 /// The spec a publisher's state carries, as the outbound sync encodes it.
 fn spec_bytes(url: &str, model: &str, worker_type: WorkerType) -> Vec<u8> {
     let worker = BasicWorkerBuilder::new(url)
