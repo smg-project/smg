@@ -9,7 +9,6 @@
 //! tokens ends with the error event under the same code, then `[DONE]`.
 
 use std::{
-    pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -18,7 +17,8 @@ use std::{
 };
 
 use axum::{body::to_bytes, http::StatusCode};
-use futures::{stream, Stream};
+use common::engine_answers::{TokenSpeedAnswers, TokenSpeedGenerateStream, TokenSpeedService};
+use futures::stream;
 use openai_protocol::{
     chat::ChatCompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
 };
@@ -33,17 +33,14 @@ use smg::{
         WorkerType,
     },
 };
-use smg_grpc_client::{
-    common_proto, constraint_failed_status, tokenspeed_scheduler::tokenspeed_proto as ts,
-};
+use smg_grpc_client::{constraint_failed_status, tokenspeed_scheduler::tokenspeed_proto as ts};
 use tokio::{net::TcpListener, time::timeout};
 use tonic::{transport::Server, Request, Response, Status};
 use ts::{
-    generate_response::Response as GenResp,
-    token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer},
+    generate_response::Response as GenResp, token_speed_scheduler_server::TokenSpeedSchedulerServer,
 };
 
-use crate::{common, scripted_worker};
+use crate::common;
 
 const MODEL: &str = "constraint-failure-model";
 /// The engine's own words, as the wires keep them.
@@ -66,22 +63,14 @@ enum ReportAt {
 struct ConstraintFailingWorker {
     report_at: ReportAt,
     calls: AtomicUsize,
-    served: scripted_worker::ScriptedWorker,
 }
 
-type Served = scripted_worker::ScriptedWorker;
-type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
-
 #[tonic::async_trait]
-impl TokenSpeedScheduler for ConstraintFailingWorker {
-    type GenerateStream = GenStream;
-    type SubscribeKvEventsStream = <Served as TokenSpeedScheduler>::SubscribeKvEventsStream;
-    type GetTokenizerStream = <Served as TokenSpeedScheduler>::GetTokenizerStream;
-
+impl TokenSpeedAnswers for ConstraintFailingWorker {
     async fn generate(
         &self,
         request: Request<ts::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<TokenSpeedGenerateStream>, Status> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let request_id = request.into_inner().request_id;
         let report = constraint_failed_status(ENGINE_WORDS);
@@ -108,76 +97,6 @@ impl TokenSpeedScheduler for ConstraintFailingWorker {
             .collect();
         items.push(Err(report));
         Ok(Response::new(Box::pin(stream::iter(items))))
-    }
-
-    async fn health_check(
-        &self,
-        request: Request<ts::HealthCheckRequest>,
-    ) -> Result<Response<ts::HealthCheckResponse>, Status> {
-        self.served.health_check(request).await
-    }
-
-    async fn abort(
-        &self,
-        request: Request<ts::AbortRequest>,
-    ) -> Result<Response<ts::AbortResponse>, Status> {
-        self.served.abort(request).await
-    }
-
-    async fn get_model_info(
-        &self,
-        request: Request<ts::GetModelInfoRequest>,
-    ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
-        self.served.get_model_info(request).await
-    }
-
-    async fn get_server_info(
-        &self,
-        request: Request<ts::GetServerInfoRequest>,
-    ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
-        self.served.get_server_info(request).await
-    }
-
-    async fn get_loads(
-        &self,
-        request: Request<ts::GetLoadsRequest>,
-    ) -> Result<Response<ts::GetLoadsResponse>, Status> {
-        self.served.get_loads(request).await
-    }
-
-    async fn subscribe_kv_events(
-        &self,
-        request: Request<common_proto::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        self.served.subscribe_kv_events(request).await
-    }
-
-    async fn flush_cache(
-        &self,
-        request: Request<common_proto::FlushCacheRequest>,
-    ) -> Result<Response<common_proto::FlushCacheResponse>, Status> {
-        self.served.flush_cache(request).await
-    }
-
-    async fn start_profile(
-        &self,
-        request: Request<common_proto::StartProfileRequest>,
-    ) -> Result<Response<common_proto::ProfileResponse>, Status> {
-        self.served.start_profile(request).await
-    }
-
-    async fn stop_profile(
-        &self,
-        request: Request<common_proto::StopProfileRequest>,
-    ) -> Result<Response<common_proto::ProfileResponse>, Status> {
-        self.served.stop_profile(request).await
-    }
-
-    async fn get_tokenizer(
-        &self,
-        request: Request<common_proto::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        self.served.get_tokenizer(request).await
     }
 }
 
@@ -222,16 +141,10 @@ async fn answers_of(
 ) -> (Vec<Answer>, usize, Arc<dyn Worker>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let worker_impl = Arc::new(ConstraintFailingWorker {
+    let worker_impl = Arc::new(TokenSpeedService(ConstraintFailingWorker {
         report_at,
         calls: AtomicUsize::new(0),
-        served: scripted_worker::ScriptedWorker {
-            output_tokens: 2,
-            finish_reasons: vec!["stop"],
-            generation: Default::default(),
-            requests: Default::default(),
-        },
-    });
+    }));
     let calls = Arc::clone(&worker_impl);
     let worker_task = tokio::spawn(async move {
         Server::builder()
@@ -320,7 +233,7 @@ async fn answers_of(
         answers.push(answer);
     }
     worker_task.abort();
-    (answers, calls.calls.load(Ordering::SeqCst), worker)
+    (answers, calls.0.calls.load(Ordering::SeqCst), worker)
 }
 
 fn assert_constraint_failed_body(answer: &Answer, name: &str) {

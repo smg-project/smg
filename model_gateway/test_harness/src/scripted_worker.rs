@@ -1,21 +1,17 @@
 //! Scripted gRPC worker for terminal-state contract tests.
-use std::{
-    pin::Pin,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
-    },
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
 };
 
-use futures::{stream, Stream};
-use smg_grpc_client::{common_proto as common, tokenspeed_scheduler::tokenspeed_proto as ts};
+use futures::stream;
+use smg_grpc_client::tokenspeed_scheduler::tokenspeed_proto as ts;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{transport::Server, Request, Response, Status};
-use ts::{
-    generate_response::Response as GenResp,
-    token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer},
-};
+use ts::generate_response::Response as GenResp;
+
+use crate::engine_answers::{TokenSpeedAnswers, TokenSpeedGenerateStream};
 
 pub struct ScriptedWorker {
     pub output_tokens: u32,
@@ -35,25 +31,18 @@ impl ScriptedWorker {
     )]
     pub async fn serve(self, listener: TcpListener) {
         Server::builder()
-            .add_service(TokenSpeedSchedulerServer::new(self))
+            .add_service(self.into_server())
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .expect("scripted gRPC worker failed");
     }
 }
-type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
-type KvStream = Pin<Box<dyn Stream<Item = Result<common::KvEventBatch, Status>> + Send>>;
-type TokenizerStream =
-    Pin<Box<dyn Stream<Item = Result<common::GetTokenizerChunk, Status>> + Send>>;
 #[tonic::async_trait]
-impl TokenSpeedScheduler for ScriptedWorker {
-    type GenerateStream = GenStream;
-    type SubscribeKvEventsStream = KvStream;
-    type GetTokenizerStream = TokenizerStream;
+impl TokenSpeedAnswers for ScriptedWorker {
     async fn generate(
         &self,
         request: Request<ts::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<TokenSpeedGenerateStream>, Status> {
         // Match ScriptedTokenizer: generated token IDs begin at 100.
         let request = request.into_inner();
         if let Ok(mut requests) = self.requests.lock() {
@@ -130,75 +119,5 @@ impl TokenSpeedScheduler for ScriptedWorker {
         }));
 
         Ok(Response::new(Box::pin(stream::iter(items))))
-    }
-
-    async fn health_check(
-        &self,
-        _: Request<ts::HealthCheckRequest>,
-    ) -> Result<Response<ts::HealthCheckResponse>, Status> {
-        Err(Status::unimplemented("scripted worker"))
-    }
-
-    async fn abort(
-        &self,
-        _: Request<ts::AbortRequest>,
-    ) -> Result<Response<ts::AbortResponse>, Status> {
-        Err(Status::unimplemented("scripted worker"))
-    }
-
-    async fn get_model_info(
-        &self,
-        _: Request<ts::GetModelInfoRequest>,
-    ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
-        Err(Status::unimplemented("scripted worker"))
-    }
-
-    async fn get_server_info(
-        &self,
-        _: Request<ts::GetServerInfoRequest>,
-    ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
-        Err(Status::unimplemented("scripted worker"))
-    }
-
-    async fn get_loads(
-        &self,
-        _: Request<ts::GetLoadsRequest>,
-    ) -> Result<Response<ts::GetLoadsResponse>, Status> {
-        Err(Status::unimplemented("scripted worker"))
-    }
-
-    async fn subscribe_kv_events(
-        &self,
-        _: Request<common::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented("scripted worker"))
-    }
-
-    async fn flush_cache(
-        &self,
-        _: Request<common::FlushCacheRequest>,
-    ) -> Result<Response<common::FlushCacheResponse>, Status> {
-        Err(Status::unimplemented("scripted worker"))
-    }
-
-    async fn start_profile(
-        &self,
-        _: Request<common::StartProfileRequest>,
-    ) -> Result<Response<common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("scripted worker"))
-    }
-
-    async fn stop_profile(
-        &self,
-        _: Request<common::StopProfileRequest>,
-    ) -> Result<Response<common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("scripted worker"))
-    }
-
-    async fn get_tokenizer(
-        &self,
-        _: Request<common::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented("scripted worker"))
     }
 }
