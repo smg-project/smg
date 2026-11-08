@@ -2173,3 +2173,47 @@ def test_model_info_carries_the_structural_tag_vocabulary_of_an_older_xgrammar(m
     assert rust.model_info_from_config(config)["structural_tag_vocabulary"] == ""
     monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.2.7")
     assert rust.model_info_from_config(_config())["structural_tag_vocabulary"] == ""
+
+
+def test_model_info_advertises_the_encoder_cache_connector():
+    # Without an encoder-cache connector the four fields are bare (and the
+    # Rust servicer refuses a leg that names one).
+    bare = rust.model_info_from_config(_config())
+    assert (
+        bare["supports_ec_transfer"],
+        bare["ec_connector"],
+        bare["ec_role"],
+        bare["ec_zmq_addrs"],
+    ) == (False, "", "", [])
+    # A Mooncake consumer names one ZMQ address per data-parallel rank, as the
+    # Python servicer does: ec_port + rank * tensor_parallel_size on ec_ip.
+    config = _config()
+    config.parallel_config = SimpleNamespace(data_parallel_size=2, tensor_parallel_size=4)
+    config.ec_transfer_config = SimpleNamespace(
+        ec_connector="ECMooncakeConnector",
+        ec_role="ec_consumer",
+        is_ec_consumer=True,
+        ec_ip="10.0.0.9",
+        ec_port=14579,
+    )
+    info = rust.model_info_from_config(config)
+    assert (info["supports_ec_transfer"], info["ec_connector"], info["ec_role"]) == (
+        True,
+        "ECMooncakeConnector",
+        "ec_consumer",
+    )
+    assert info["ec_zmq_addrs"] == ["tcp://10.0.0.9:14579", "tcp://10.0.0.9:14583"]
+    # A producer, or a CPU connector, names no address.
+    config.ec_transfer_config = SimpleNamespace(
+        ec_connector="ECCPUConnector",
+        ec_role="ec_producer",
+        is_ec_consumer=False,
+        ec_ip="10.0.0.9",
+        ec_port=14579,
+    )
+    info = rust.model_info_from_config(config)
+    assert (info["supports_ec_transfer"], info["ec_role"], info["ec_zmq_addrs"]) == (
+        True,
+        "ec_producer",
+        [],
+    )
