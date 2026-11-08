@@ -2520,7 +2520,7 @@ mod rank_window_tests {
     use crate::{
         routers::grpc::client::ServerInfo,
         worker::{basic::merge_labels, BasicWorkerBuilder, ConnectionMode, Worker},
-        workflow::steps::local::discover_dp::dp_info_from_labels,
+        workflow::steps::local::{discover_dp::dp_info_from_labels, test_support::labels_of},
     };
 
     #[test]
@@ -2560,7 +2560,7 @@ mod rank_window_tests {
                     assert!(worker.try_admit_pd(window, window));
                     assert!(!worker.try_admit_pd(1, window));
 
-                    let override_labels = labels(&[("max_running_requests", "32")]);
+                    let override_labels = labels_of(&[("max_running_requests", "32")]);
                     let merged = merge_labels(&engine, &override_labels);
                     let overridden = BasicWorkerBuilder::new("grpc://w:30000")
                         .labels(labels_for_rank(&merged, rank, &override_labels))
@@ -2569,13 +2569,6 @@ mod rank_window_tests {
                 }
             }
         }
-    }
-
-    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect()
     }
 
     /// The rank's labels when every label was discovered (none set by hand).
@@ -2595,8 +2588,8 @@ mod rank_window_tests {
     /// operator's on top.
     #[test]
     fn a_window_the_operator_set_by_hand_is_the_workers_only_window() {
-        let by_hand = labels(&[("max_running_requests", "512"), ("served_model_name", "m")]);
-        let replicas = labels(&[
+        let by_hand = labels_of(&[("max_running_requests", "512"), ("served_model_name", "m")]);
+        let replicas = labels_of(&[
             ("max_num_seqs", "256"),
             ("dp_size", "4"),
             ("served_model_name", "engine"),
@@ -2604,7 +2597,7 @@ mod rank_window_tests {
         let merged = merge_labels(&replicas, &by_hand);
         assert_eq!(
             merged,
-            labels(&[
+            labels_of(&[
                 ("max_running_requests", "512"),
                 ("dp_size", "4"),
                 ("served_model_name", "m"),
@@ -2613,15 +2606,15 @@ mod rank_window_tests {
         assert_eq!(labels_for_rank(&merged, Some((1, 4)), &by_hand), merged);
         assert_eq!(labels_for_rank(&merged, None, &by_hand), merged);
 
-        let by_hand = labels(&[("max_num_seqs", "512")]);
-        let attention = labels(&[("max_running_requests", "16384"), ("attn_dp_size", "8")]);
+        let by_hand = labels_of(&[("max_num_seqs", "512")]);
+        let attention = labels_of(&[("max_running_requests", "16384"), ("attn_dp_size", "8")]);
         let merged = merge_labels(&attention, &by_hand);
         assert_eq!(merged.get("max_running_requests"), None);
         let rank = labels_for_rank(&merged, Some((0, 8)), &by_hand);
         assert_eq!(rank.get("max_num_seqs").map(String::as_str), Some("512"));
 
-        let nothing_by_hand = labels(&[("served_model_name", "m")]);
-        let both = labels(&[("max_running_requests", "2048"), ("max_num_seqs", "256")]);
+        let nothing_by_hand = labels_of(&[("served_model_name", "m")]);
+        let both = labels_of(&[("max_running_requests", "2048"), ("max_num_seqs", "256")]);
         let merged = merge_labels(&both, &nothing_by_hand);
         assert_eq!(
             merged.get("max_running_requests").map(String::as_str),
@@ -2639,7 +2632,7 @@ mod rank_window_tests {
     /// dp-aware width of every rank.
     #[test]
     fn an_attention_dp_engines_window_is_each_ranks_share() {
-        let engine = labels(&[
+        let engine = labels_of(&[
             ("max_running_requests", "16384"),
             ("enable_dp_attention", "true"),
             ("dp_size", "8"),
@@ -2650,14 +2643,14 @@ mod rank_window_tests {
             Some("2048")
         );
         assert_eq!(rank.get("dp_size").map(String::as_str), Some("8"));
-        let newer = labels(&[("max_running_requests", "16384"), ("attn_dp_size", "8")]);
+        let newer = labels_of(&[("max_running_requests", "16384"), ("attn_dp_size", "8")]);
         assert_eq!(
             discovered(&newer, Some((0, 8)))
                 .get("max_running_requests")
                 .map(String::as_str),
             Some("2048")
         );
-        let replicas_of_groups = labels(&[
+        let replicas_of_groups = labels_of(&[
             ("max_running_requests", "4096"),
             ("dp_size", "2"),
             ("attn_dp_size", "4"),
@@ -2676,11 +2669,11 @@ mod rank_window_tests {
     /// whole window.
     #[test]
     fn a_per_rank_window_and_an_unexpanded_worker_keep_their_labels() {
-        let replicas = labels(&[("max_running_requests", "2048"), ("dp_size", "8")]);
+        let replicas = labels_of(&[("max_running_requests", "2048"), ("dp_size", "8")]);
         assert_eq!(discovered(&replicas, Some((1, 8))), replicas);
-        let per_rank = labels(&[("max_num_seqs", "256"), ("dp_size", "4")]);
+        let per_rank = labels_of(&[("max_num_seqs", "256"), ("dp_size", "4")]);
         assert_eq!(discovered(&per_rank, Some((0, 4))), per_rank);
-        let attention = labels(&[
+        let attention = labels_of(&[
             ("max_running_requests", "16384"),
             ("enable_dp_attention", "true"),
         ]);
