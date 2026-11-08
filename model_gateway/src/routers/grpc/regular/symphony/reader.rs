@@ -2125,14 +2125,16 @@ mod tests {
         // The streamed order: the access line goes out first, then two choices' readers built
         // from one assignment end outside the span, the first with an unterminated call and the
         // second with nothing. The first output's line is written inside the request span with
-        // the fields just marked, and the second reading leaves the first's mark.
+        // the fields just marked, and the second reading leaves the first's mark. The table is
+        // one no other test of this binary reads, so its line buckets hold both lines, and each
+        // line is found by its own fields: a suppressed line fails the test instead of passing it.
         let lines = json_lines(|| {
             let span = request_span();
             let assignment = span.in_scope(|| {
                 assignment(
-                    Arc::new(qwen3(CallSyntax::Json)),
-                    "Qwen/Qwen3-8B",
-                    PROMPT,
+                    Arc::new(symphony::formats::qwen2_5()),
+                    "Qwen/Qwen2.5-7B-Instruct",
+                    "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
                     false,
                     false,
                 )
@@ -2146,7 +2148,7 @@ mod tests {
             let mut delta = Delta::default();
             unterminated
                 .tail(
-                    "</think>\n\nHi <tool_call>\n{\"name\": \"get_weather\"".to_string(),
+                    "Hi <tool_call>\n{\"name\": \"get_weather\"".to_string(),
                     &mut delta,
                     &mut events,
                 )
@@ -2161,20 +2163,29 @@ mod tests {
                 .end(EngineFinish::Stop, Who { choice: 1, ..who() }, &mut events)
                 .expect("ended");
         });
-        let access = &lines[0]["span"];
-        assert_eq!(access["name"], "http_request");
-        assert!(access.get("symphony.outcome").is_none(), "{access}");
-        let line = lines
-            .iter()
-            .find(|line| line["span"].get("symphony.outcome").is_some())
-            .expect("the first output's line, inside the span");
+        let position = |field: &str, value: &str| {
+            lines
+                .iter()
+                .position(|line| line[field] == value)
+                .unwrap_or_else(|| panic!("no line with {field} {value}: {lines:#?}"))
+        };
+        let access = position("message", "finished processing request");
+        let first = position("outcome", "malformed");
+        let second = position("outcome", "empty");
+        assert!(access < first && first < second, "{lines:#?}");
+        let span = &lines[access]["span"];
+        assert_eq!(span["name"], "http_request");
+        assert!(span.get("symphony.outcome").is_none(), "{span}");
+        let line = &lines[first];
+        assert_eq!(line["choice"], 0);
         assert_eq!(line["span"]["name"], "http_request");
         assert_eq!(line["span"]["symphony.outcome"], "malformed");
         assert_eq!(line["span"]["symphony.reason"], "unterminated_region");
         assert_eq!(line["span"]["symphony.choice"], 0);
-        let last = &lines.last().expect("a line")["span"];
-        assert_eq!(last["symphony.outcome"], "malformed", "{last}");
-        assert_eq!(last["symphony.choice"], 0, "{last}");
+        let line = &lines[second];
+        assert_eq!(line["choice"], 1);
+        assert_eq!(line["span"]["symphony.outcome"], "malformed", "{line}");
+        assert_eq!(line["span"]["symphony.choice"], 0, "{line}");
     }
 
     #[test]
