@@ -1,9 +1,10 @@
 /*
     Cache-Aware Load Balancing Router
 
-    When load is balanced, uses cache-aware routing. When imbalanced, uses
-    LeastLoad expected-wait routing. A system is imbalanced when both:
-        (max - min) > abs_threshold  AND  max > rel_threshold * min
+    Routes by cache affinity. Count pressure is judged per candidate, not
+    fleet-wide: an affinity pick loaded well past the pool's mean spills to
+    LeastLoad's expected-wait winner (see "Load Balancing" below), and cache
+    affinity is abandoned fleet-wide only under backend KV pressure.
 
     Three types of cache-aware routing (mutually exclusive, selected by
     worker connection mode and KV event availability):
@@ -42,8 +43,17 @@
 
     Load Balancing (Expected Wait)
     -------------------------------------------
-    When the system is imbalanced, routes to LeastLoad's atomic expected-wait
-    winner regardless of cache affinity.
+    The count-pressure gate is applied per candidate (over_count_pressure_gate,
+    candidate_requires_spill): the selected holder spills when its in-flight
+    count is over balance_rel_threshold times the healthy-fleet mean AND over
+    the mean by the absolute margin (balance_abs_threshold, capped at the
+    larger of the count's natural swing and the held prefix's price; see
+    absolute_margin). A spilled request goes to LeastLoad's atomic expected-wait
+    winner among the workers under the same gate, and so does a request with
+    no cache match (ungated_candidates). Cache affinity is abandoned fleet-wide
+    only under backend KV pressure (is_kv_imbalanced: the KV-usage spread or
+    the overload ceiling, both read from backend token usage); without token
+    usage those triggers are inert.
 
     Hash Index Under-Layer (cache_index = hash)
     -------------------------------------------
@@ -182,8 +192,10 @@ impl PrefixUnit {
 
 /// Cache-aware routing policy
 ///
-/// Routes requests based on cache affinity when load is balanced,
-/// switches to LeastLoad expected-wait routing when load is imbalanced.
+/// Routes requests by cache affinity; a pick on a worker loaded well past
+/// the pool's mean spills to LeastLoad expected-wait routing (the
+/// per-candidate count gate), and backend KV pressure abandons affinity
+/// fleet-wide.
 /// Maintains separate trees per model for multi-model support.
 /// Supports mesh synchronization of tree operations across cluster nodes.
 /// When mesh is not enabled, the policy works independently without synchronization.
@@ -874,8 +886,9 @@ impl CacheAwarePolicy {
 
     /// Min and max backend KV-cache utilization (0.0–1.0) across healthy workers
     /// that have a `WorkerMonitor` snapshot entry, as `(min, max)`. `None` when
-    /// no receiver is wired or no healthy worker has a load entry (→ caller
-    /// relies on the request-count spread).
+    /// no receiver is wired or no healthy worker has a load entry: the KV
+    /// triggers are then inert, and the per-candidate count gate is the only
+    /// balance.
     fn backend_token_usage_bounds(
         &self,
         workers: &[Arc<dyn Worker>],
