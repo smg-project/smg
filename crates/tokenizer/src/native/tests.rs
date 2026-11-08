@@ -587,6 +587,160 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
     }
 }
 
+/// The added-token search through the tokens' prefixes finds what the
+/// automaton's unanchored leftmost-longest search finds: the same ranges and
+/// the same tokens, on texts made of the tokens, their prefixes, other text
+/// and characters sharing a token's first bytes; for a set of ASCII first
+/// bytes only (the automaton's own search), one with a token in fullwidth
+/// bars among `<` tokens (the chain shape), one of tokens beyond ASCII only,
+/// one with more than three first bytes (tab and newline runs, `<`, `[` and
+/// runs of a mark beyond ASCII), one whose prefixes stand whole (every
+/// token shorter than the prefix length), and two sets of added words whose
+/// prefixes would be under the floor (they keep the automaton's search).
+#[test]
+fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
+    let sets: [(&[&str], bool); 5] = [
+        (&["<a>", "<ab>", "<abc>", "<|x|>", "<"], false),
+        (
+            &[
+                "<a>",
+                "<ab>",
+                "<abc>",
+                "<\u{FF5C}x\u{FF5C}>",
+                "<\u{FF5C}xy\u{FF5C}>",
+                "\u{FF5C}x\u{FF5C}",
+                "</t>",
+                "<t>",
+            ],
+            true,
+        ),
+        (&["\u{FF5C}x\u{FF5C}", "\u{FF0C}", "\u{4E2D}\u{6587}"], true),
+        (
+            &[
+                "\t\t",
+                "\t\t\t",
+                "\n\n",
+                "\n\n\n",
+                "<a>",
+                "[b]",
+                "\u{2581}\u{2581}",
+                "\u{2581}\u{2581}\u{2581}",
+            ],
+            true,
+        ),
+        (
+            &["<a>", "\u{4E2D}", "\u{0416}a", "\u{00E9}", "e\u{FF5C}"],
+            true,
+        ),
+    ];
+    let parts = [
+        "<a>",
+        "<ab>",
+        "<abc>",
+        "<|x|>",
+        "<",
+        "<a",
+        "<ab",
+        "</t>",
+        "<t>",
+        "<t",
+        "</tx",
+        "<\u{FF5C}x",
+        "<\u{FF5C}x\u{FF5C}>",
+        "<\u{FF5C}xy\u{FF5C}>",
+        "\u{FF5C}",
+        "\u{FF5C}x",
+        "\u{FF5C}x\u{FF5C}",
+        "\u{FF0C}",
+        "[b]",
+        "[",
+        "\t",
+        "\t\t",
+        "\t\t\t\t",
+        "\n",
+        "\n\n",
+        "\n\n\n\n",
+        "\u{2581}",
+        "\u{2581}\u{2581}",
+        "\u{2581}\u{2581}\u{2581}\u{2581}",
+        "\u{201C}",
+        "\u{4E2D}",
+        "\u{4E2D}\u{6587}",
+        "\u{6587}",
+        "\u{0416}",
+        "\u{0416}a",
+        "\u{00E9}",
+        "e\u{FF5C}",
+        "xyz",
+        " ",
+        "a",
+        "e",
+        "abing",
+        "ab",
+        "ing",
+        "zaed",
+        "ed",
+        "qa",
+    ];
+    // Sets of added words: the prefixes that fit are one byte (70 words with
+    // distinct two-byte prefixes) or two bytes (60 pairs sharing one), under
+    // the floor, so both keep the automaton's own search.
+    let letter = |i: usize| (b'a' + (i % 26) as u8) as char;
+    let words_one: Vec<String> = (0..70)
+        .map(|i| format!("{}{}ing", letter(i), letter(i / 26)))
+        .collect();
+    let words_two: Vec<String> = (0..60)
+        .flat_map(|i| {
+            [
+                format!("{}{}ing", letter(i), letter(i / 26)),
+                format!("{}{}ed", letter(i), letter(i / 26)),
+            ]
+        })
+        .collect();
+    let mut all: Vec<(Vec<&str>, bool)> = sets
+        .iter()
+        .map(|(tokens, by_prefixes)| (tokens.to_vec(), *by_prefixes))
+        .collect();
+    all.push((words_one.iter().map(String::as_str).collect(), false));
+    all.push((words_two.iter().map(String::as_str).collect(), false));
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    for (tokens, by_prefixes) in &all {
+        let list: Vec<(String, u32)> = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, token)| ((*token).to_owned(), 1000 + i as u32))
+            .collect();
+        let added = AddedTokens::build(&list)
+            .expect("the tokens form an automaton")
+            .expect("a non-empty set");
+        assert_eq!(added.prefixes.is_some(), *by_prefixes, "{tokens:?}");
+        let reference = AhoCorasick::builder()
+            .match_kind(MatchKind::LeftmostLongest)
+            .build(tokens)
+            .expect("the reference automaton");
+        for round in 0..3000 {
+            let text: String = (0..1 + round % 12)
+                .map(|_| parts[(pseudo_random(&mut state) % parts.len() as u64) as usize])
+                .collect();
+            let expected: Vec<(Range<usize>, usize)> = reference
+                .find_iter(&text)
+                .map(|found| (found.range(), found.pattern().as_usize()))
+                .collect();
+            assert_eq!(
+                added.matches(&text).collect::<Vec<_>>(),
+                expected,
+                "{tokens:?} on {text:?}"
+            );
+            assert!(
+                added
+                    .ranges(&text)
+                    .eq(expected.iter().map(|(range, _)| range.clone())),
+                "{tokens:?} on {text:?}"
+            );
+        }
+    }
+}
+
 /// An added token matched after normalization whose inner space is the
 /// first cut candidate past the chunk size: it comes out as a unit of its
 /// own before any cut, so the pooled ids are the one-piece ids.
