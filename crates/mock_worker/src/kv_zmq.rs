@@ -486,7 +486,7 @@ fn cleared_map() -> Value {
 mod tests {
     use std::time::Duration;
 
-    use engine_servicer::kv_wire::{Normalizer, WireBatch};
+    use engine_servicer::kv_wire::{DropReason, Normalizer, WireBatch};
     use tokio::time::timeout;
     use zeromq::{DealerSocket, SubSocket};
 
@@ -722,6 +722,74 @@ mod tests {
             unreachable!()
         };
         assert_eq!(removed.block_hashes, [11]);
+    }
+
+    /// What the relay makes of a hybrid engine's batch today: the main group's
+    /// store and removal go through, every other group's event is dropped and
+    /// counted, and nothing is stored twice under the shared hash.
+    #[test]
+    fn the_relay_forwards_a_hybrid_batch_main_group_alone_and_counts_the_rest() {
+        let mut batch = sample_batch();
+        batch.events.clear();
+        let mut full = stored(&[11, -2], Some(10), &[&[1, 2, 3, 4], &[5, 6, 7, 8]]);
+        let mut window = stored(&[-2], Some(10), &[&[5, 6, 7, 8]]);
+        let mut state = stored(&[-2], Some(10), &[&[5, 6, 7, 8]]);
+        for (event, group, kind, window_tokens) in [
+            (&mut full, 0, "full_attention", None),
+            (&mut window, 1, "sliding_window", Some(8)),
+            (&mut state, 2, "mamba", None),
+        ] {
+            if let Some(common::kv_cache_event::Data::Stored(stored)) = &mut event.data {
+                stored.group_idx = Some(group);
+                stored.kv_cache_spec_kind = Some(kind.to_string());
+                stored.kv_cache_spec_sliding_window = window_tokens;
+            }
+        }
+        // vLLM lists the window groups' stores before the main group's.
+        batch.events.push(window);
+        batch.events.push(state);
+        batch.events.push(full);
+        for group in 0..3u32 {
+            let mut gone = removed(&[-2]);
+            if let Some(common::kv_cache_event::Data::Removed(removed)) = &mut gone.data {
+                removed.group_idx = Some(group);
+            }
+            batch.events.push(gone);
+        }
+        let payload = encode_batch(&batch, 0, Wire::Vllm);
+        let wire: WireBatch = rmp_serde::from_slice(&payload).expect("the relay decodes it");
+        let mut relay = Normalizer::new();
+        let mut event_id = 0;
+        let relayed = relay.normalize_batch(wire, 3, &mut event_id);
+        let stored_groups: Vec<Option<u32>> = relayed
+            .events
+            .iter()
+            .filter_map(|e| match &e.data {
+                Some(common::kv_cache_event::Data::Stored(stored)) => Some(stored.group_idx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stored_groups,
+            [Some(0)],
+            "the main-attention group's store alone is forwarded"
+        );
+        let removed_groups: Vec<Option<u32>> = relayed
+            .events
+            .iter()
+            .filter_map(|e| match &e.data {
+                Some(common::kv_cache_event::Data::Removed(removed)) => Some(removed.group_idx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(removed_groups, [Some(0)], "and its removal");
+        assert_eq!(
+            relay.counts().dropped(DropReason::NonMainAttentionGroup),
+            4,
+            "two window-group stores and two removals dropped, not indexed under the shared hash"
+        );
+        assert_eq!(relay.counts().forwarded_stored, 1);
+        assert_eq!(relay.counts().forwarded_removed, 1);
     }
 
     #[test]
