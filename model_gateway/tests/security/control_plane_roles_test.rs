@@ -18,7 +18,7 @@ use crate::common::{
     TestWorkerConfig,
 };
 
-const ADMIN_KEY: &str = "matrix-admin-key";
+pub(super) const ADMIN_KEY: &str = "matrix-admin-key";
 const USER_KEY: &str = "matrix-user-key";
 
 /// Read-only control-plane routes: the `user` role reaches them.
@@ -40,7 +40,7 @@ const WRITE_ROUTES: &[(&str, &str)] = &[
     ("POST", "/heap_profile"),
 ];
 
-fn control_plane_auth() -> ControlPlaneAuthState {
+pub(super) fn control_plane_auth() -> ControlPlaneAuthState {
     ControlPlaneAuthState::new(
         ControlPlaneAuthConfig {
             jwt: None,
@@ -58,7 +58,12 @@ fn control_plane_auth() -> ControlPlaneAuthState {
     clippy::unwrap_used,
     reason = "test helper: a malformed request is a test bug"
 )]
-async fn status(app: &Router, method: &str, path: &str, key: Option<&str>) -> StatusCode {
+pub(super) async fn status(
+    app: &Router,
+    method: &str,
+    path: &str,
+    key: Option<&str>,
+) -> StatusCode {
     let mut request = Request::builder()
         .method(method)
         .uri(path)

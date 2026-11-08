@@ -1409,7 +1409,7 @@ pub struct WorkerErrorResponse {
 }
 
 /// Result from flush cache operations across workers
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct FlushCacheResult {
     pub successful: Vec<String>,
     pub failed: Vec<(String, String)>,
@@ -1431,7 +1431,7 @@ pub struct FlushCacheResult {
 /// Mirrors the engines' native profile parameters: serialized verbatim as
 /// the JSON body for HTTP workers and mapped to the `StartProfile` RPC for
 /// gRPC workers. Unset fields fall back to backend defaults.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ProfileOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1450,7 +1450,7 @@ pub struct ProfileOptions {
 }
 
 /// Result from profile start/stop operations across workers
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ProfileResult {
     pub successful: Vec<String>,
     pub failed: Vec<(String, String)>,
@@ -1461,7 +1461,7 @@ pub struct ProfileResult {
 /// Request body for the gateway `/start_profile` route: profile options
 /// plus an optional worker URL to target a single worker (e.g. one
 /// PD-disaggregation role). All workers are profiled when `url` is unset.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct StartProfileRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1472,7 +1472,7 @@ pub struct StartProfileRequest {
 
 /// Request body for the gateway `/stop_profile` route: optional worker URL
 /// to target a single worker.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct StopProfileRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
