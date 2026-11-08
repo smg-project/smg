@@ -276,13 +276,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-
-    fn tool(name: &str) -> Value {
-        json!({
-            "type": "function",
-            "function": {"name": name, "parameters": {"type": "object", "properties": {}}}
-        })
-    }
+    use crate::routers::grpc::testing::tool;
 
     /// A system message declaring `tools`, as the profiles that read such
     /// declarations take it.
