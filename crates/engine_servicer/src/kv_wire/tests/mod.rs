@@ -381,11 +381,12 @@ fn a_clear_in_the_batch_keeps_the_learned_groups() {
 }
 
 /// The relay's record of the reset step, as a snapshot hands it to a
-/// subscriber that joins afterwards: the window group's two blocks as a
-/// store of their own lane first, then the whole prompt as one run under
-/// the main group. (Recorded as copies of the main lane, the blocks the
-/// window named would be left out of the main group's run: a fresh
-/// subscriber would score the prompt's first blocks only.)
+/// subscriber that joins afterwards: one of the window group's blocks as a
+/// store of its own lane first, the whole prompt as one run under the main
+/// group, then the window group's other block. (Recorded as copies of the
+/// main lane, the blocks the window named would be left out of the main
+/// group's run: a fresh subscriber would score the prompt's first blocks
+/// only.)
 #[test]
 fn a_snapshot_after_a_reset_step_holds_the_prompt_under_the_main_group() {
     use crate::kv_state::{LiveState, SnapshotChunks};
@@ -420,7 +421,7 @@ fn a_snapshot_after_a_reset_step_holds_the_prompt_under_the_main_group() {
         chunk.events[0].data,
         Some(kv_cache_event::Data::Cleared(_))
     ));
-    assert_eq!(chunk.events.len(), 3, "{:?}", chunk.events);
+    assert_eq!(chunk.events.len(), 4, "{:?}", chunk.events);
     let run = stored(&chunk.events[2]);
     assert_eq!(run.parent_block_hash, None);
     assert_eq!(run.group_idx, Some(0));
@@ -432,21 +433,24 @@ fn a_snapshot_after_a_reset_step_holds_the_prompt_under_the_main_group() {
             .collect::<Vec<_>>(),
         vec![1, 2, 3, 4, 5, 6]
     );
-    let window_run = stored(&chunk.events[1]);
-    assert_eq!(window_run.group_idx, Some(1));
-    assert_eq!(
-        window_run.kv_cache_spec_kind.as_deref(),
-        Some("sliding_window")
-    );
-    assert_eq!(window_run.kv_cache_spec_sliding_window, Some(8));
-    assert_eq!(
-        window_run
-            .blocks
-            .iter()
-            .map(|block| (block.block_hash, block.token_ids.len()))
-            .collect::<Vec<_>>(),
-        vec![(5, 0), (6, 0)]
-    );
+    let window_blocks: Vec<(i64, usize)> = [1usize, 3]
+        .into_iter()
+        .flat_map(|at| {
+            let window_run = stored(&chunk.events[at]);
+            assert_eq!(window_run.group_idx, Some(1));
+            assert_eq!(
+                window_run.kv_cache_spec_kind.as_deref(),
+                Some("sliding_window")
+            );
+            assert_eq!(window_run.kv_cache_spec_sliding_window, Some(8));
+            window_run
+                .blocks
+                .iter()
+                .map(|block| (block.block_hash, block.token_ids.len()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(window_blocks, vec![(5, 0), (6, 0)]);
 }
 
 #[test]

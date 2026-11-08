@@ -719,17 +719,18 @@ fn cut_chunks(
     cuts
 }
 
-/// One rank's entries in emission order, one unit per physical copy: the
-/// group lanes first, in store order (a group's memberships hang on nothing
-/// but their hashes; the engine publishes a window group's store ahead of
-/// the main group's, and the gateway names the main blocks of a batch in a
-/// worker's group view only once a group's store has given it one, so left
-/// among the main lane they would hoist a main block ahead of its own
-/// parent, and after it they would find the main blocks of the first chunks
-/// unnamed); then the main lane in store order with the live ancestors of a
-/// block hoisted ahead of it when they were stored later (a parent evicted
-/// and stored again under a surviving child), so the gateway's index derives
-/// every position from a parent it already holds.
+/// One rank's entries in emission order, one unit per physical copy: one
+/// group-lane entry first when the rank has any, then the main lane in store
+/// order with the live ancestors of a block hoisted ahead of it when they
+/// were stored later (a parent evicted and stored again under a surviving
+/// child), so the gateway's index derives every position from a parent it
+/// already holds, then the remaining group lanes in store order. The gateway
+/// names a batch's main blocks in a worker's group view only once a group's
+/// store has given it one, so the leading entry puts the view in the first
+/// chunk and every main block is named in chain order; the group entries
+/// that follow the main lane then land on named blocks, and the leading one
+/// waits for its own. Left among the main lane they would hoist a main block
+/// ahead of its own parent; all ahead of it, a whole lane would wait.
 fn order_rank(entries: Vec<SnapshotEntry>) -> Vec<Arc<LiveBlock>> {
     let (mut entries, mut grouped): (Vec<SnapshotEntry>, Vec<SnapshotEntry>) = entries
         .into_iter()
@@ -746,10 +747,10 @@ fn order_rank(entries: Vec<SnapshotEntry>) -> Vec<Arc<LiveBlock>> {
         .map(|entry| entry.copies as usize)
         .sum();
     let mut out = Vec::with_capacity(units);
-    for entry in &grouped {
-        for _ in 0..entry.copies {
-            out.push(Arc::clone(&entry.block));
-        }
+    let mut grouped = grouped.into_iter();
+    let leading = grouped.next();
+    if let Some(entry) = &leading {
+        out.push(Arc::clone(&entry.block));
     }
     let mut done = vec![false; entries.len()];
     let mut path: Vec<i64> = Vec::new();
@@ -791,6 +792,16 @@ fn order_rank(entries: Vec<SnapshotEntry>) -> Vec<Arc<LiveBlock>> {
                 done[sibling] = true;
                 push_units(sibling, &mut out);
             }
+        }
+    }
+    if let Some(entry) = &leading {
+        for _ in 1..entry.copies {
+            out.push(Arc::clone(&entry.block));
+        }
+    }
+    for entry in grouped {
+        for _ in 0..entry.copies {
+            out.push(Arc::clone(&entry.block));
         }
     }
     out
@@ -1045,11 +1056,11 @@ mod tests {
     /// A hybrid model's window and state groups publish their blocks under
     /// the main group's hashes: each group's block is an entry on the
     /// group's own lane, not a second copy of the main one, its removal
-    /// takes only its own entry, and a snapshot replays the group lanes
-    /// first (as the engine publishes the window group's store ahead of the
-    /// main group's) as stores of their own and the main lane after them.
+    /// takes only its own entry, and a snapshot replays one group-lane
+    /// entry first, the main lane, and the other group lanes after it, each
+    /// as stores of their own.
     #[test]
-    fn group_lanes_are_kept_apart_from_the_main_lane_and_replayed_ahead_of_it() {
+    fn group_lanes_are_kept_apart_from_the_main_lane_and_one_entry_leads_it() {
         let device = KvCacheTier::Device;
         let mut state = LiveState::new();
         state.apply(&batch(
@@ -1089,19 +1100,19 @@ mod tests {
             })
             .collect();
         assert_eq!(stores.len(), 3, "{stores:#?}");
-        assert_eq!(stores[2].group_idx, Some(0), "the main lane comes last");
+        assert_eq!(stores[1].group_idx, Some(0), "the main lane comes second");
         assert_eq!(
-            stores[2]
+            stores[1]
                 .blocks
                 .iter()
                 .map(|block| block.block_hash)
                 .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
-        assert_eq!(stores[2].blocks[0].token_ids, block(1).token_ids);
+        assert_eq!(stores[1].blocks[0].token_ids, block(1).token_ids);
         type LaneRow<'a> = (Option<u32>, Option<&'a str>, Option<u32>, Vec<(i64, usize)>);
-        let lanes: Vec<LaneRow> = stores[..2]
-            .iter()
+        let lanes: Vec<LaneRow> = [&stores[0], &stores[2]]
+            .into_iter()
             .map(|stored| {
                 (
                     stored.group_idx,
@@ -1121,7 +1132,7 @@ mod tests {
                 (Some(1), Some("sliding_window"), Some(8), vec![(3, 0)]),
                 (Some(2), Some("mamba"), None, vec![(3, 0)]),
             ],
-            "the group lanes lead, hashes only, the removed block gone"
+            "one group entry leads and the other follows, hashes only, the removed block gone"
         );
         // The main lane's removal leaves the group lanes' entries alone.
         state.apply(&batch(3, Some(0), vec![removed(&[3], device)]));
