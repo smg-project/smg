@@ -777,12 +777,15 @@ impl StreamingProcessor {
         // starts with the chat stream's room, which a stream whose frames
         // stay small (an engine pacing its tokens, one event per frame; an
         // answer of a few tokens) keeps. Every generate event carries the
-        // text so far, so a long answer's frames reach the flush bound back
-        // to back: the buffer takes the room for two frames as its first
-        // full frame leaves it (`flush_when_full`), and from then on each
-        // frame is written into room of its own while the frame before it
-        // is still in flight: one allocation per frame, not one per event.
+        // text so far, so a long answer's frames reach the flush bound: once
+        // a full frame has left (`flush_generate_frame`), the first write
+        // after it takes the room for two frames (`write_generate_event`,
+        // `FRAME_ROOM`): a burst writes at once, with the frame in flight,
+        // into a fresh room, one allocation per frame and not one per event;
+        // a paced engine writes 20 ms later, the frame dropped, into the
+        // same allocation taken back in place.
         let mut sse_buffer = BytesMut::with_capacity(4096);
+        let mut room_owed = false;
         let mut first_token_out = false;
 
         loop {
@@ -862,8 +865,13 @@ impl StreamingProcessor {
                             index,
                         };
 
-                        Self::write_generate_event(&mut sse_buffer, &chunk_response, "chunk")?;
-                        Self::flush_when_full(tx, &mut sse_buffer)
+                        Self::write_generate_event(
+                            &mut sse_buffer,
+                            &mut room_owed,
+                            &chunk_response,
+                            "chunk",
+                        )?;
+                        Self::flush_generate_frame(tx, &mut sse_buffer, &mut room_owed)
                             .await
                             .map_err(|()| "Failed to send chunk".to_string())?;
                     }
@@ -900,8 +908,13 @@ impl StreamingProcessor {
                             index,
                         };
 
-                        Self::write_generate_event(&mut sse_buffer, &finish_response, "finish")?;
-                        Self::flush_when_full(tx, &mut sse_buffer)
+                        Self::write_generate_event(
+                            &mut sse_buffer,
+                            &mut room_owed,
+                            &finish_response,
+                            "finish",
+                        )?;
+                        Self::flush_generate_frame(tx, &mut sse_buffer, &mut room_owed)
                             .await
                             .map_err(|()| "Failed to send finish chunk".to_string())?;
 
@@ -1028,12 +1041,15 @@ impl StreamingProcessor {
         // starts with the chat stream's room, which a stream whose frames
         // stay small (an engine pacing its tokens, one event per frame; an
         // answer of a few tokens) keeps. Every generate event carries the
-        // text so far, so a long answer's frames reach the flush bound back
-        // to back: the buffer takes the room for two frames as its first
-        // full frame leaves it (`flush_when_full`), and from then on each
-        // frame is written into room of its own while the frame before it
-        // is still in flight: one allocation per frame, not one per event.
+        // text so far, so a long answer's frames reach the flush bound: once
+        // a full frame has left (`flush_generate_frame`), the first write
+        // after it takes the room for two frames (`write_generate_event`,
+        // `FRAME_ROOM`): a burst writes at once, with the frame in flight,
+        // into a fresh room, one allocation per frame and not one per event;
+        // a paced engine writes 20 ms later, the frame dropped, into the
+        // same allocation taken back in place.
         let mut sse_buffer = BytesMut::with_capacity(4096);
+        let mut room_owed = false;
         let mut first_token_out = false;
 
         loop {
@@ -1139,8 +1155,13 @@ impl StreamingProcessor {
                             index,
                         };
 
-                        Self::write_generate_event(&mut sse_buffer, &chunk_response, "chunk")?;
-                        Self::flush_when_full(tx, &mut sse_buffer)
+                        Self::write_generate_event(
+                            &mut sse_buffer,
+                            &mut room_owed,
+                            &chunk_response,
+                            "chunk",
+                        )?;
+                        Self::flush_generate_frame(tx, &mut sse_buffer, &mut room_owed)
                             .await
                             .map_err(|()| "Failed to send chunk".to_string())?;
                     }
@@ -1186,8 +1207,13 @@ impl StreamingProcessor {
                             index,
                         };
 
-                        Self::write_generate_event(&mut sse_buffer, &finish_response, "finish")?;
-                        Self::flush_when_full(tx, &mut sse_buffer)
+                        Self::write_generate_event(
+                            &mut sse_buffer,
+                            &mut room_owed,
+                            &finish_response,
+                            "finish",
+                        )?;
+                        Self::flush_generate_frame(tx, &mut sse_buffer, &mut room_owed)
                             .await
                             .map_err(|()| "Failed to send finish chunk".to_string())?;
 
@@ -1582,15 +1608,27 @@ impl StreamingProcessor {
     }
 
     /// Hand the buffered chunks to the channel as one frame once they hold
-    /// [`CHUNK_FLUSH_BYTES`], so one frame stays a bounded burst, and keep
-    /// [`FRAME_ROOM`] for the frame after it. The sent frame holds the
-    /// allocation it shared with the buffer until the connection has written
-    /// it, and a buffer grown against a frame in flight grows by exact-size
-    /// allocations, so the room is taken here, once per full frame.
+    /// [`CHUNK_FLUSH_BYTES`], so one frame stays a bounded burst.
     async fn flush_when_full(tx: &SseSender, buffer: &mut BytesMut) -> Result<(), ()> {
         if buffer.len() >= CHUNK_FLUSH_BYTES {
             tx.send(Ok(buffer.split().freeze())).await.map_err(|_| ())?;
-            buffer.reserve(FRAME_ROOM);
+        }
+        Ok(())
+    }
+
+    /// The generate loops' [`Self::flush_when_full`]: a full frame that
+    /// leaves here holds the buffer's allocation until the connection has
+    /// written it, so the room for the next frame is not taken now but owed
+    /// (`room_owed`) to the first write after it, see
+    /// [`Self::write_generate_event`].
+    async fn flush_generate_frame(
+        tx: &SseSender,
+        buffer: &mut BytesMut,
+        room_owed: &mut bool,
+    ) -> Result<(), ()> {
+        if buffer.len() >= CHUNK_FLUSH_BYTES {
+            tx.send(Ok(buffer.split().freeze())).await.map_err(|_| ())?;
+            *room_owed = true;
         }
         Ok(())
     }
@@ -1600,14 +1638,21 @@ impl StreamingProcessor {
     /// the bytes the shared SSE encoder makes, without the event-sized copy
     /// it hands back (the event is the text so far). A failed serialization
     /// leaves the buffer at the event's start, so the events ahead of it still
-    /// leave whole. The frame leaves by [`Self::flush_when_full`] once it
+    /// leave whole. The frame leaves by [`Self::flush_generate_frame`] once it
     /// holds [`CHUNK_FLUSH_BYTES`], or by [`Self::flush_chunks`] at the read's
-    /// end.
+    /// end. The first write after a full frame left takes the room for the
+    /// next two frames ([`FRAME_ROOM`]): in place when the connection has
+    /// dropped the sent frame by now (a paced engine), a fresh room while the
+    /// frame is still in flight (a burst).
     fn write_generate_event(
         buffer: &mut BytesMut,
+        room_owed: &mut bool,
         event: &GenerateEvent<'_>,
         what: &str,
     ) -> Result<(), String> {
+        if std::mem::take(room_owed) {
+            buffer.reserve(FRAME_ROOM);
+        }
         let start = buffer.len();
         buffer.extend_from_slice(b"data: ");
         if let Err(error) = serde_json::to_writer(FrameSink(buffer), event) {

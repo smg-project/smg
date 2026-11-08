@@ -5,9 +5,11 @@
 //! frame is the first token's, so the body's own yield after it makes the
 //! two); the chunks ready behind the first token share one frame; and a
 //! chunk the tokenizer cannot decode fails the stream after the chunks
-//! written ahead of it have left. The events are the ones the loops wrote
-//! when every event had a frame of its own: `generate_bytes` pins their
-//! bytes.
+//! written ahead of it have left; and a burst past the flush bound leaves
+//! its full frame through the bound's flush and its remainder through the
+//! one poll's flush with the channel full, before the engine's next message
+//! is read. The events are the ones the loops wrote when every event had a
+//! frame of its own: `generate_bytes` pins their bytes.
 
 use std::{
     pin::Pin,
@@ -22,11 +24,11 @@ use futures::{Stream, StreamExt as _};
 use llm_tokenizer::traits::Tokenizer;
 use serde_json::Value;
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
-use tokio::task::JoinHandle;
+use tokio::{sync::oneshot, task::JoinHandle};
 
 use super::{
     super::*,
-    eof::{chunk, complete, scripted_stream, CharacterTokenizer},
+    eof::{chunk, complete, gated_stream, scripted_stream, CharacterTokenizer},
 };
 
 const MODEL: &str = "generate-frames-test";
@@ -76,6 +78,15 @@ async fn driven_body(
     responses: Vec<proto::GenerateResponse>,
 ) -> (DrivenBody, Arc<AtomicBool>, JoinHandle<()>) {
     let (stream, server) = scripted_stream(responses, "0").await;
+    driven_body_of(with_logprobs, stream, server)
+}
+
+/// [`driven_body`] over `stream` (the mock server behind it in `server`).
+fn driven_body_of(
+    with_logprobs: bool,
+    stream: ProtoStream,
+    server: JoinHandle<()>,
+) -> (DrivenBody, Arc<AtomicBool>, JoinHandle<()>) {
     let (tx, rx) = driven_channel();
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let ctx = ctx(with_logprobs);
@@ -202,6 +213,73 @@ async fn a_chunk_that_cannot_be_decoded_fails_the_generate_stream_after_the_chun
         assert!(
             failed.load(Ordering::SeqCst),
             "the undecodable chunk fails the stream (logprobs {with_logprobs})"
+        );
+        server.abort();
+    }
+}
+
+/// A burst past the flush bound behind the first token leaves its full frame
+/// in the channel's one slot through the bound's flush; the remainder behind
+/// it finds the slot still full when the engine goes quiet and leaves through
+/// the awaited send after the one poll (the full-channel hand-back of
+/// `flush_in_poll`), before the engine's next message is read; the frames
+/// joined are the events' bytes in order.
+#[tokio::test]
+async fn the_remainder_behind_a_full_frame_leaves_before_the_next_engine_message_on_the_generate_stream(
+) {
+    for with_logprobs in [false, true] {
+        // Every event carries the text so far, one character more per chunk:
+        // the burst's frames pass CHUNK_FLUSH_BYTES well before its end.
+        let burst: Vec<_> = (0..200).map(|_| chunk(0, "a")).collect();
+        let (open, gate) = oneshot::channel();
+        let (stream, server) = gated_stream(burst, gate, vec![complete(0, "stop")], "0").await;
+        let (mut body, failed, server) = driven_body_of(with_logprobs, stream, server);
+        // The frames until the body is pending twice in a row: the reading
+        // parked on the quiet engine, every frame it had written out.
+        let mut frames: Vec<Bytes> = Vec::new();
+        let mut pending_in_a_row = 0;
+        while pending_in_a_row < 2 {
+            match pull(&mut body).await {
+                Poll::Ready(Some(Ok(frame))) => {
+                    pending_in_a_row = 0;
+                    frames.push(frame);
+                }
+                Poll::Pending => pending_in_a_row += 1,
+                other @ Poll::Ready(_) => panic!(
+                    "a frame or pending while the engine is quiet (logprobs {with_logprobs}): {other:?}"
+                ),
+            }
+        }
+        let texts: Vec<String> = frames.iter().flat_map(|frame| texts_of(frame)).collect();
+        let expected: Vec<String> = (1..=200).map(|n| "a".repeat(n)).collect();
+        assert_eq!(
+            texts, expected,
+            "the frames joined are the burst's events in order (logprobs {with_logprobs})"
+        );
+        assert!(
+            frames.iter().any(|frame| frame.len() >= CHUNK_FLUSH_BYTES),
+            "a full frame left at the bound (logprobs {with_logprobs})"
+        );
+        let remainder = frames.last().expect("the remainder's frame");
+        assert!(
+            remainder.len() < CHUNK_FLUSH_BYTES,
+            "the remainder leaves as a partial frame before the engine's next message (logprobs {with_logprobs}): {} bytes",
+            remainder.len()
+        );
+        // The engine's next message: only now.
+        open.send(()).expect("the gate");
+        let rest: Vec<Vec<String>> = body
+            .map(|frame| texts_of(&frame.expect("a write")))
+            .collect()
+            .await;
+        assert_eq!(
+            rest,
+            [["a".repeat(200)]],
+            "the finish's frame follows alone (logprobs {with_logprobs})"
+        );
+        assert!(
+            !failed.load(Ordering::SeqCst),
+            "the stream ends without a failure (logprobs {with_logprobs})"
         );
         server.abort();
     }
