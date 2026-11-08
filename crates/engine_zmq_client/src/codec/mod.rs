@@ -123,21 +123,14 @@ pub fn decode_value(bytes: &[u8]) -> Result<Value> {
     Ok(rmpv::decode::read_value(&mut Cursor::new(bytes))?)
 }
 
-/// Golden wire bytes from a hex string (tests only).
+/// The bytes of a hex pin captured from an engine's own encoder; spaces and
+/// line breaks between the digits are ignored (tests only).
 #[cfg(test)]
 pub(crate) fn hex(text: &str) -> Vec<u8> {
-    (0..text.len())
+    let digits: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    (0..digits.len())
         .step_by(2)
-        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap())
-        .collect()
-}
-
-/// Bytes of a hex string: the golden wire samples captured from vLLM.
-#[cfg(test)]
-pub(crate) fn unhex(hex: &str) -> Vec<u8> {
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex digit"))
+        .map(|i| u8::from_str_radix(&digits[i..i + 2], 16).expect("a hex digit pair"))
         .collect()
 }
 

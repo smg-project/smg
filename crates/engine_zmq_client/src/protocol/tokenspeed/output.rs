@@ -631,10 +631,7 @@ mod tests {
     use rmpv::Value;
 
     use super::*;
-    use crate::{
-        codec::{decode_msgpack, decode_value, encode_msgpack},
-        protocol::positional::vector_bytes,
-    };
+    use crate::codec::{decode_msgpack, decode_value, encode_msgpack, hex};
 
     /// A slim output batch captured from the Python msgspec encoder: rids
     /// ["vec-1"], output_ids [[10, 11]], finished_reasons ["length"], prompt 3
@@ -659,7 +656,7 @@ mod tests {
          6774689103910291019192cbbfe0000000000000cbbfd000000000000091920a0b";
 
     fn python_output_bytes() -> Vec<u8> {
-        vector_bytes(PYTHON_OUTPUT_VECTOR)
+        hex(PYTHON_OUTPUT_VECTOR)
     }
 
     fn vector_batch() -> BatchTokenIDOutSlim {
@@ -734,7 +731,7 @@ mod tests {
     #[test]
     fn pre_dp_nine_element_batch_decodes_as_rank_zero() {
         let decoded: BatchTokenIDOutSlim =
-            decode_msgpack(&vector_bytes(PYTHON_OUTPUT_VECTOR_PRE_DP)).unwrap();
+            decode_msgpack(&hex(PYTHON_OUTPUT_VECTOR_PRE_DP)).unwrap();
         assert_eq!(
             decoded,
             BatchTokenIDOutSlim {
@@ -753,7 +750,7 @@ mod tests {
     #[test]
     fn pre_load_ten_element_batch_decodes_with_zero_snapshot() {
         let decoded: BatchTokenIDOutSlim =
-            decode_msgpack(&vector_bytes(PYTHON_OUTPUT_VECTOR_PRE_LOAD)).unwrap();
+            decode_msgpack(&hex(PYTHON_OUTPUT_VECTOR_PRE_LOAD)).unwrap();
         assert_eq!(
             decoded,
             BatchTokenIDOutSlim {

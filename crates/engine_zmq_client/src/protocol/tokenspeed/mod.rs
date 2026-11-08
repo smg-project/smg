@@ -535,7 +535,7 @@ mod tests {
     /// one that does not.
     #[test]
     fn control_calls_ride_the_control_frame_and_replies_resolve_by_call_id() {
-        use crate::protocol::{control::ControlReplySlim, positional::vector_bytes};
+        use crate::{codec::hex, protocol::control::ControlReplySlim};
 
         let (frame, payload) =
             TokenSpeedProtocol::encode_utility(7, "flush_cache", &[OpaqueValue::F64(1.5)])
@@ -550,9 +550,9 @@ mod tests {
         // Byte for byte what the scheduler's msgspec decoder of the triple
         // takes, and what its `ControlReplySlim` struct emits for an accepted
         // flush and for a refused profiler stop: the captured vectors.
-        assert_eq!(payload, vector_bytes(FLUSH_CALL_VECTOR));
+        assert_eq!(payload, hex(FLUSH_CALL_VECTOR));
         let accepted = TokenSpeedProtocol::decode_batch(
-            &[Bytes::from(vector_bytes(CONTROL_REPLY_ACCEPTED_VECTOR))],
+            &[Bytes::from(hex(CONTROL_REPLY_ACCEPTED_VECTOR))],
             &SlimOutputLayout::default(),
         )
         .unwrap();
@@ -566,8 +566,7 @@ mod tests {
                 (OpaqueValue::from("message"), OpaqueValue::Nil),
             ]
         );
-        let refused: ControlReplySlim =
-            decode_msgpack(&vector_bytes(CONTROL_REPLY_REFUSED_VECTOR)).unwrap();
+        let refused: ControlReplySlim = decode_msgpack(&hex(CONTROL_REPLY_REFUSED_VECTOR)).unwrap();
         assert_eq!(
             refused,
             ControlReplySlim {
@@ -585,7 +584,7 @@ mod tests {
         };
         assert_eq!(
             encode_msgpack(&accepted_reply).unwrap(),
-            vector_bytes(CONTROL_REPLY_ACCEPTED_VECTOR)
+            hex(CONTROL_REPLY_ACCEPTED_VECTOR)
         );
 
         let reply = ControlReplySlim {

@@ -791,7 +791,7 @@ mod tests {
     use rmpv::Value;
 
     use super::*;
-    use crate::codec::unhex;
+    use crate::codec::hex;
 
     /// A raw-view array decoded as part of its message's frame shares the
     /// frame's buffer; decoded from a plain slice, it is copied.
@@ -970,7 +970,7 @@ mod tests {
     /// `(dtype, shape, raw-view ext)` with the dtype as the torch name.
     #[test]
     fn decode_tensor_f32_reads_vllm_encoded_torch_tensors() {
-        for (hex, dtype) in [
+        for (pin, dtype) in [
             (
                 "93a7666c6f617433329103c70c030000803e0000c0bf00004040",
                 "float32",
@@ -978,7 +978,7 @@ mod tests {
             ("93a862666c6f617431369103c70603803ec0bf4040", "bfloat16"),
             ("93a7666c6f617431369103c70603003400be0042", "float16"),
         ] {
-            let bytes = unhex(hex);
+            let bytes = hex(pin);
             let wire: WireNdArray = rmp_serde::from_slice(&bytes).expect("wire tensor");
             assert_eq!(wire.dtype, dtype);
             assert_eq!(wire.shape, vec![3]);
@@ -993,7 +993,7 @@ mod tests {
     #[test]
     fn decode_tensor_f32_follows_an_aux_frame_index() {
         let wire: WireNdArray =
-            rmp_serde::from_slice(&unhex("93a7666c6f61743332916001")).expect("wire tensor");
+            rmp_serde::from_slice(&hex("93a7666c6f61743332916001")).expect("wire tensor");
         assert_eq!(wire.data, WireArrayData::AuxIndex(1));
         let values: Vec<f32> = (0..96).map(|i| i as f32 / 8.0).collect();
         let frame = Bytes::from(
