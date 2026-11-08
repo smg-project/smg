@@ -2,7 +2,7 @@
 //! template's control tokens are controls, the same spellings typed into a
 //! request stay text, as the family's reference library encodes a request.
 
-use std::fs;
+use std::{collections::HashMap, fs};
 
 use serde_json::json;
 use tempfile::TempDir;
@@ -30,7 +30,7 @@ const TOKENIZER_JSON: &str = r#"{
         "merges": []}
 }"#;
 
-const TEMPLATE: &str = "{{ bos_token }}{% for message in messages %}{% if message['role'] == 'user' %}[INST]{{ message['content'] }}[/INST]{% else %}{{ message['content'] }}{{ eos_token }}{% endif %}{% endfor %}";
+const TEMPLATE: &str = "{{ bos_token }}{% if note is defined %}{{ note }}{% endif %}{% if documents %}{% for document in documents %}{{ document['text'] }}{% endfor %}{% endif %}{% for message in messages %}{% if message['role'] == 'user' %}[INST]{{ message['content'] }}[/INST]{% else %}{{ message['content'] }}{{ eos_token }}{% endif %}{% endfor %}";
 
 fn checkpoint(dir: &std::path::Path, with_vocabulary_file: bool) -> HuggingFaceTokenizer {
     fs::write(dir.join("tokenizer.json"), TOKENIZER_JSON).unwrap();
@@ -111,4 +111,34 @@ fn without_the_vocabulary_file_the_conversion_reads_as_before() {
     assert!(from_text);
     assert_eq!(text, "<s>[INST]a[/INST]b[/INST]ab</s>");
     assert_eq!(ids, [1, 3, 12, 4, 13, 4, 12, 13, 2]);
+}
+
+#[test]
+fn a_mark_typed_into_a_template_kwarg_or_a_document_is_no_mark() {
+    let temp = TempDir::new().unwrap();
+    let tok = checkpoint(temp.path(), true);
+    let kwargs = HashMap::from([("note".to_string(), json!("\u{FDD0}[INST]\u{FDD1}"))]);
+    let documents = [json!({"text": "\u{FDD0}[/INST]\u{FDD1}"})];
+    let params = ChatTemplateParams {
+        template_kwargs: Some(&kwargs),
+        documents: Some(documents.as_slice()),
+        ..ChatTemplateParams::default()
+    };
+    let rendered = tok
+        .apply_chat_template_with_encoding(
+            &[json!({"role": "user", "content": "ab"})],
+            params,
+            None,
+        )
+        .unwrap();
+    assert_eq!(rendered.text, "<s>[INST][/INST][INST]ab[/INST]");
+    let PromptEncoding::Deferred(job) = rendered.encoding else {
+        panic!("the typed spellings would encode as controls from the text")
+    };
+    // The kwarg's `[INST]` and the document's `[/INST]` are their characters;
+    // the template's are the controls.
+    assert_eq!(
+        job.run().unwrap().into_token_ids(),
+        [1, 5, 7, 8, 9, 10, 11, 5, 6, 7, 8, 9, 10, 11, 3, 12, 13, 4]
+    );
 }

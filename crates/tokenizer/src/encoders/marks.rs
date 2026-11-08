@@ -13,7 +13,7 @@
 //! family's reference library encodes them), and hands out the flat prompt
 //! (the marks removed) for logs, routing and parity.
 
-use std::{borrow::Cow, ops::Range};
+use std::{borrow::Cow, collections::HashMap, ops::Range};
 
 use anyhow::{bail, Result};
 use serde_json::Value;
@@ -74,34 +74,56 @@ pub(crate) fn mark(spelling: &str) -> String {
     marked
 }
 
-/// The request messages with the marks removed from every string in them
-/// (keys included), however deep; borrowed when no string carries one.
+/// The request messages (or tools, or documents) with the marks removed
+/// from every string in them (keys included), however deep; borrowed when
+/// no string carries one.
 pub(crate) fn without_marks(messages: &[Value]) -> Cow<'_, [Value]> {
-    fn carries_marks(value: &Value) -> bool {
-        match value {
-            Value::String(text) => has_marks(text),
-            Value::Array(items) => items.iter().any(carries_marks),
-            Value::Object(map) => map
-                .iter()
-                .any(|(key, value)| has_marks(key) || carries_marks(value)),
-            Value::Null | Value::Bool(_) | Value::Number(_) => false,
-        }
-    }
-    fn stripped(value: &Value) -> Value {
-        match value {
-            Value::String(text) => Value::String(strip(text).into_owned()),
-            Value::Array(items) => Value::Array(items.iter().map(stripped).collect()),
-            Value::Object(map) => map
-                .iter()
-                .map(|(key, value)| (strip(key).into_owned(), stripped(value)))
-                .collect(),
-            other => other.clone(),
-        }
-    }
     if messages.iter().any(carries_marks) {
         Cow::Owned(messages.iter().map(stripped).collect())
     } else {
         Cow::Borrowed(messages)
+    }
+}
+
+/// The request's template keyword arguments with the marks removed the
+/// same way; borrowed when no string carries one.
+pub(crate) fn kwargs_without_marks(
+    kwargs: &HashMap<String, Value>,
+) -> Cow<'_, HashMap<String, Value>> {
+    if kwargs
+        .iter()
+        .any(|(key, value)| has_marks(key) || carries_marks(value))
+    {
+        Cow::Owned(
+            kwargs
+                .iter()
+                .map(|(key, value)| (strip(key).into_owned(), stripped(value)))
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(kwargs)
+    }
+}
+
+fn carries_marks(value: &Value) -> bool {
+    match value {
+        Value::String(text) => has_marks(text),
+        Value::Array(items) => items.iter().any(carries_marks),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| has_marks(key) || carries_marks(value)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+fn stripped(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(strip(text).into_owned()),
+        Value::Array(items) => Value::Array(items.iter().map(stripped).collect()),
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| (strip(key).into_owned(), stripped(value)))
+            .collect(),
+        other => other.clone(),
     }
 }
 

@@ -132,7 +132,8 @@ pub struct HuggingFaceTokenizer {
     /// for such a checkpoint (see `apply_chat_template_with_encoding`).
     structural_controls: bool,
     /// The special tokens between the marks, for the marked template's
-    /// context (`Some` with `structural_controls`).
+    /// context (`Some` with `structural_controls`, read while the template
+    /// is marked).
     special_tokens_marked: Option<SpecialTokens>,
 }
 
@@ -1401,8 +1402,8 @@ impl HuggingFaceTokenizer {
     ) -> Result<(String, bool)> {
         // A marked template (see `structural_controls`) writes its control
         // tokens between marks, the special tokens it reads included, and
-        // reads every request string with its marks removed, so no request
-        // can forge one.
+        // reads every request string (messages, tools, documents, template
+        // kwargs) with its marks removed, so no request can forge one.
         let marked = self.chat_template.marked();
         let stripped_messages;
         let messages: &[serde_json::Value] = if marked {
@@ -1414,15 +1415,32 @@ impl HuggingFaceTokenizer {
         let stripped_tools;
         let mut tools = params.tools;
         let mut prepared_tools = params.prepared_tools;
+        let stripped_documents;
+        let mut documents = params.documents;
+        let stripped_kwargs;
+        let mut template_kwargs = params.template_kwargs;
         if marked {
             if let Some(Cow::Owned(stripped)) = params.tools.map(marks::without_marks) {
                 stripped_tools = stripped;
                 tools = Some(stripped_tools.as_slice());
                 prepared_tools = None;
             }
+            if let Some(Cow::Owned(stripped)) = params.documents.map(marks::without_marks) {
+                stripped_documents = stripped;
+                documents = Some(stripped_documents.as_slice());
+            }
+            if let Some(Cow::Owned(stripped)) =
+                params.template_kwargs.map(marks::kwargs_without_marks)
+            {
+                stripped_kwargs = stripped;
+                template_kwargs = Some(&stripped_kwargs);
+            }
         }
         let marked_tokens;
-        let special_tokens = match (&self.special_tokens_marked, params.special_tokens) {
+        let special_tokens = match (
+            self.special_tokens_marked.as_ref().filter(|_| marked),
+            params.special_tokens,
+        ) {
             (Some(ours), None) => Some(ours),
             (Some(_), Some(given)) => {
                 marked_tokens = marks::marked_special_tokens(given);
@@ -1432,6 +1450,8 @@ impl HuggingFaceTokenizer {
         };
         let params = ChatTemplateParams {
             tools,
+            documents,
+            template_kwargs,
             special_tokens,
             prepared_tools,
             ..params
