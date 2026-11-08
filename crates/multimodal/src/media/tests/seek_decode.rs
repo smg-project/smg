@@ -27,6 +27,12 @@ fn long_clip_metadata() -> VideoMetadata {
 /// 100 s of 64x48 at 30 fps as an mp4, a keyframe every 48 frames with
 /// two B-frames between references; `false` when ffmpeg is not on PATH.
 async fn generate_clip(path: &Path) -> bool {
+    generate_clip_at(path, "30").await
+}
+
+/// [`generate_clip`] at the source rate `rate` (a lavfi rate, `30003/1000`
+/// for 30.003 fps).
+async fn generate_clip_at(path: &Path, rate: &str) -> bool {
     Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -36,7 +42,7 @@ async fn generate_clip(path: &Path) -> bool {
             "-f",
             "lavfi",
             "-i",
-            "testsrc=size=64x48:rate=30:duration=100",
+            &format!("testsrc=size=64x48:rate={rate}:duration=100"),
             "-c:v",
             "mpeg4",
             "-g",
@@ -463,10 +469,12 @@ async fn an_overstated_container_size_is_judged_again_for_the_interval_picks_bud
     assert_eq!((kept.width, kept.height), (64, 48));
 }
 
-/// A listed selection longer than the decoder can be given is refused on the
-/// decode path itself: the refusal is a budget error to the runner pass and
-/// to the selection's fallbacks, so the clip is not resampled by rate under
-/// a warning (the generic sampler's frames in place of the loader's picks).
+/// A listed selection longer than the decoder can be given is refused by the
+/// runner pass itself: the refusal is a budget error to it and to the
+/// selection's fallbacks, so the clip is not resampled by rate under a
+/// warning (the generic sampler's frames in place of the picks). No rule
+/// builds such a list today (the interval walk is stated as itself), so the
+/// selection is built by hand from the walk's picks.
 #[tokio::test]
 async fn a_frame_list_past_the_decoders_bound_refuses_the_decode_instead_of_resampling() {
     let interval = VideoFetchConfig {
@@ -474,35 +482,97 @@ async fn a_frame_list_past_the_decoders_bound_refuses_the_decode_instead_of_resa
         sampling: FrameSampling::Interval,
         ..VideoFetchConfig::default()
     };
-    let probed = ProbedVideoInfo {
-        width: Some(64),
-        height: Some(48),
+    let metadata = VideoMetadata {
         duration_seconds: Some(20_000.0),
-        source_fps: Some(30.0),
         total_frames: Some(600_000),
         container_frames: Some(600_000),
+        ..long_clip_metadata()
     };
-    let picks = FrameSelection::from_metadata(
-        video_metadata_from(probed, false).expect("a stated size and rate"),
+    let listed = FrameSelection::new(
+        30.0,
+        600_000,
+        600_000,
+        sampled_frame_indices(600_000, 30.0, interval),
+    );
+    let result = decode_video_with_ffmpeg_runners(
+        Path::new("listed.mp4"),
+        0,
         interval,
+        Some(metadata),
+        Some(&listed),
     )
-    .expect("frame rate and count are known")
-    .unique_count();
-    probe_switch::ANSWER.with(|answer| answer.set(Some(probed)));
-    let result = decode_video_with_ffmpeg(Path::new("listed.mp4"), 0, interval).await;
-    probe_switch::ANSWER.with(|answer| answer.set(None));
+    .await;
     let Err(error) = result else {
         panic!("the frame list is past the decoder's bound: decoded");
     };
     assert!(
         matches!(
             error,
-            MediaConnectorError::FrameListTooLong { picks: refused, limit: FFMPEG_MAX_LISTED_FILTER_BYTES, .. }
-                if refused == picks
+            MediaConnectorError::FrameListTooLong { picks, limit: FFMPEG_MAX_LISTED_FILTER_BYTES, .. }
+                if picks == listed.unique_count()
         ),
         "{error}"
     );
     assert!(is_video_budget_error(&error));
+}
+
+/// The walk stated as a `select` expression picks the same frames as the
+/// walk's own picks listed explicitly: the decoder evaluates the walk's step
+/// frame by frame in the same doubles. Two clips whose strides flip at two
+/// picks a second less a hair (30 fps: strides of 15 and 16; 24 fps: 12 and
+/// 13) are decoded by the expression and, chunk by chunk, by short lists of
+/// the same picks, and compared byte for byte. Skipped when ffmpeg or
+/// ffprobe is not on PATH.
+#[tokio::test]
+async fn an_interval_walk_stated_as_itself_decodes_the_walks_own_frames() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    if !have_probe_tool().await {
+        return;
+    }
+    for (name, lavfi_rate, sample_fps) in [
+        ("thirty.mp4", "30", 1.999_600_079_984_003),
+        ("twenty_four.mp4", "24", 1.999_600_079_984_003),
+    ] {
+        let path = dir.path().join(name);
+        if !generate_clip_at(&path, lavfi_rate).await {
+            return;
+        }
+        let metadata = probe_video_metadata(&path).await.expect("metadata");
+        let cfg = VideoFetchConfig {
+            sample_fps,
+            sampling: FrameSampling::Interval,
+            ..VideoFetchConfig::default()
+        };
+        let stated = FrameSelection::from_metadata(metadata, cfg).expect("a selection");
+        assert!(stated.unique_count() > FFMPEG_MAX_SELECT_TERMS, "{name}");
+        let filter = stated.select_filter().expect("stated");
+        assert!(filter.contains("prev_selected_n"), "{name}: {filter}");
+        let as_walk = decode_video_with_ffmpeg_ppm(&path, cfg, metadata, Some(&stated))
+            .await
+            .expect("decode by the walk's expression");
+        // The ground truth: the same picks as explicit lists short enough for
+        // every ffmpeg build to parse (a 201-term list does not parse on
+        // 8.1.3), decoded chunk by chunk and joined.
+        let mut as_lists = Vec::new();
+        for chunk in stated.frame_indices.chunks(FFMPEG_MAX_SELECT_TERMS) {
+            let listed = FrameSelection::new(
+                stated.source_fps,
+                stated.claimed_frames,
+                stated.total_frames,
+                chunk.to_vec(),
+            );
+            assert!(listed
+                .select_filter()
+                .expect("listed")
+                .starts_with(r"select='eq(n\,"));
+            let decoded = decode_video_with_ffmpeg_ppm(&path, cfg, metadata, Some(&listed))
+                .await
+                .expect("decode by the list");
+            as_lists.extend(frame_bytes(&decoded));
+        }
+        assert_eq!(as_walk.frames.len(), stated.frame_indices.len(), "{name}");
+        assert_eq!(frame_bytes(&as_walk), as_lists, "{name}");
+    }
 }
 
 #[test]

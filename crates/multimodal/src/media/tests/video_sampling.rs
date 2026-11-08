@@ -1623,17 +1623,71 @@ fn a_frame_count_the_container_made_up_still_builds_a_filter() {
     );
 }
 
-/// A rate that puts the interval's stride by a whole number (two picks a
-/// second less a hair, at 30 fps: strides of 15 and 16) lists every pick. A
-/// list longer than the decoder can be given is refused before it is built,
-/// with its own error naming the picks, the list's length and the bound; a
-/// list under the bound is built, past 64 KiB as under it.
+/// An interval walk no spread describes (two picks a second less a hair, at
+/// 30 fps: strides of 15 and 16) is stated as the walk itself, in constant
+/// size whatever the clip's length, the first frame named outright (not
+/// through the start value of `prev_selected_n`, which differs between
+/// ffmpeg builds) and the clip's last frame named when the walk kept it; a
+/// walk a spread describes keeps the spread.
 #[test]
-fn a_listed_selection_longer_than_the_decoder_can_be_given_is_refused() {
+fn an_interval_walk_no_spread_describes_is_stated_as_the_walk() {
     let rate = 1.999_600_079_984_003;
     let long =
         FrameSelection::from_metadata(metadata(Some(30.0), Some(600_000)), interval_cfg(rate))
             .expect("frame rate and count are known");
+    assert!(long.spread_select_filter().is_none());
+    assert_eq!(long.unique_frames.last(), Some(&(599_999, 1)));
+    let filter = long.select_filter().expect("stated, not listed");
+    assert_eq!(
+        filter,
+        r"select='eq(n\,0)+eq(n\,max(ceil(((prev_selected_n/30.0)+(1/1.999600079984003)-0.0001)*30.0)\,prev_selected_n+1))+eq(n\,599999)'"
+    );
+    assert!(filter.len() < 180, "{}", filter.len());
+    // The same length for a clip a thousand times shorter.
+    let short =
+        FrameSelection::from_metadata(metadata(Some(30.0), Some(6_000)), interval_cfg(rate))
+            .expect("frame rate and count are known");
+    assert_eq!(
+        short.select_filter().expect("stated").len(),
+        filter.len() - 2,
+        "two digits fewer in the last frame"
+    );
+    // A stable stride keeps the proven spread.
+    let stable =
+        FrameSelection::from_metadata(metadata(Some(30.0), Some(600_000)), interval_cfg(1.0))
+            .expect("frame rate and count are known");
+    assert!(stable
+        .select_filter()
+        .expect("described")
+        .starts_with(r"select='eq(n\,floor("));
+    // Under the term cutoff the picks are listed as before.
+    let few = FrameSelection::from_metadata(metadata(Some(30.0), Some(900)), interval_cfg(rate))
+        .expect("frame rate and count are known");
+    assert!(few.unique_count() <= FFMPEG_MAX_SELECT_TERMS);
+    assert!(few
+        .select_filter()
+        .expect("listed")
+        .starts_with(r"select='eq(n\,0)+eq(n\,"));
+    // A selection built without the walk's rate (the OpenCV path's, a test's)
+    // is not stated as the walk.
+    let unmarked = FrameSelection::new(30.0, 600_000, 600_000, long.frame_indices.clone());
+    assert!(unmarked.interval_walk_filter().is_none());
+}
+
+/// A list longer than the decoder can be given is refused before it is
+/// built, with its own error naming the picks, the list's length and the
+/// bound; a list under the bound is built, past 64 KiB as under it. No rule
+/// builds such a list today (the interval walk is stated as itself), so the
+/// selection is built by hand from the walk's picks.
+#[test]
+fn a_listed_selection_longer_than_the_decoder_can_be_given_is_refused() {
+    let rate = 1.999_600_079_984_003;
+    let long = FrameSelection::new(
+        30.0,
+        600_000,
+        600_000,
+        sampled_frame_indices(600_000, 30.0, interval_cfg(rate)),
+    );
     assert!(long.spread_select_filter().is_none());
     let listed = format!(
         "select='{}'",
@@ -1660,11 +1714,12 @@ fn a_listed_selection_longer_than_the_decoder_can_be_given_is_refused() {
 
     let mut lengths = Vec::new();
     for total_frames in [60_000, 120_000] {
-        let short = FrameSelection::from_metadata(
-            metadata(Some(30.0), Some(total_frames)),
-            interval_cfg(rate),
-        )
-        .expect("frame rate and count are known");
+        let short = FrameSelection::new(
+            30.0,
+            total_frames,
+            total_frames,
+            sampled_frame_indices(total_frames, 30.0, interval_cfg(rate)),
+        );
         assert!(short.unique_count() > FFMPEG_MAX_SELECT_TERMS);
         let filter = short.select_filter().expect("under the bound, listed");
         assert_eq!(filter.len(), short.listed_filter_len());
