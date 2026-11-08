@@ -991,6 +991,26 @@ fn remove_in(hashes: &[i64], group: u32) -> Value {
     with(remove(hashes), "group_idx", json!(group))
 }
 
+/// A publisher that reports a boundary once for every group puts the group
+/// mask on a window group's store too. The group lane forwards it as the
+/// main lane does.
+#[test]
+fn a_group_lanes_store_carries_its_group_mask() {
+    let (batches, _) = normalize_all(vec![one(vec![
+        with(window(&[1], None, &[1, 2, 3, 4]), "group_mask", json!(2)),
+        with(store(&[2], None, &[1, 2, 3, 4]), "group_mask", json!(3)),
+    ])]);
+    assert_eq!(batches[0].events.len(), 2, "{:?}", batches[0].events);
+    let on_the_group_lane = stored(&batches[0].events[0]);
+    assert_eq!(on_the_group_lane.group_idx, Some(1));
+    assert_eq!(on_the_group_lane.group_mask, Some(2));
+    assert!(
+        on_the_group_lane.blocks[0].token_ids.is_empty(),
+        "a group lane's store"
+    );
+    assert_eq!(stored(&batches[0].events[1]).group_mask, Some(3));
+}
+
 #[test]
 fn two_groups_with_identical_hashes_keep_their_lanes_apart() {
     // vLLM's hybrid manager publishes every block in both groups under

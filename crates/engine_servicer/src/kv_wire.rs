@@ -1102,6 +1102,7 @@ impl Normalizer {
             kv_cache_spec_sliding_window,
             ownership,
             session_id,
+            group_mask,
             ..
         } = stored.tail;
         Ok(kv_cache_event::Data::Stored(common::KvBlocksStored {
@@ -1117,6 +1118,7 @@ impl Normalizer {
             session_id,
             lora_name: stored.lora_name.filter(|name| !name.is_empty()),
             cache_salt: stored.cache_salt.filter(|salt| !salt.is_empty()),
+            group_mask,
         }))
     }
 
