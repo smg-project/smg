@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::engine::{Calibration, EngineParams, LoadsLike, OutputSeed, TimingModel};
+use crate::engine::{Calibration, EngineParams, KvCacheGroup, LoadsLike, OutputSeed, TimingModel};
 
 /// Configuration shared by every mocked HTTP and gRPC worker in the process.
 #[derive(Debug, Clone)]
@@ -436,6 +436,10 @@ impl Config {
                     cfg.kv_events_buffer_steps = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--kv-events-wire" => cfg.kv_events_wire = value(&mut args, &flag)?.parse()?,
+                "--kv-cache-groups" => {
+                    cfg.engine.kv_cache_groups =
+                        parse_kv_cache_groups(value(&mut args, &flag)?, &flag)?;
+                }
                 "--loads-like" => cfg.loads_like = value(&mut args, &flag)?.parse()?,
                 "--step-reports" => cfg.step_reports = parse(value(&mut args, &flag)?, &flag)?,
                 "--block-size" => {
@@ -505,6 +509,14 @@ impl Config {
         }
         if cfg.grpc_dp_size > 1 && !cfg.realistic {
             return Err("--grpc-dp-size above 1 needs --engine realistic".to_string());
+        }
+        if cfg.kv_events_wire == crate::kv_zmq::Wire::Sglang && cfg.engine.kv_cache_groups.len() > 1
+        {
+            return Err(
+                "--kv-cache-groups names several groups, but the SGLang wire (--kv-events-wire \
+                 sglang) publishes one cache group"
+                    .to_string(),
+            );
         }
         if cfg.grpc_dp_size > 1 && cfg.kv_events_zmq_base_port.is_some() {
             return Err(
@@ -606,6 +618,55 @@ fn parse_ids(raw: String, flag: &str) -> Result<Vec<u32>, String> {
         .collect()
 }
 
+/// `kind[:window],...`: the KV cache groups a realistic engine publishes,
+/// the first being its main-attention group (`full_attention` alone by
+/// default; a hybrid engine adds `sliding_window:<tokens>` or `mamba` groups).
+fn parse_kv_cache_groups(raw: String, flag: &str) -> Result<Vec<KvCacheGroup>, String> {
+    let invalid = || format!("invalid value for {flag}: {raw}");
+    let groups = raw
+        .split(',')
+        .map(|item| {
+            let item = item.trim();
+            let (kind, window) = item.split_once(':').unwrap_or((item, ""));
+            let windowed = KvCacheGroup::WINDOW_KINDS.contains(&kind);
+            if !windowed && !KvCacheGroup::UNWINDOWED_KINDS.contains(&kind) {
+                return Err(format!(
+                    "{flag}: unknown cache group kind {kind:?} (one of {})",
+                    KvCacheGroup::KINDS_HELP
+                ));
+            }
+            let sliding_window: u32 = if window.is_empty() {
+                0
+            } else {
+                window.parse().map_err(|_| invalid())?
+            };
+            if windowed && sliding_window == 0 {
+                return Err(format!(
+                    "{flag}: {kind} needs its window in tokens, as {kind}:<tokens>"
+                ));
+            }
+            if !windowed && !window.is_empty() {
+                return Err(format!("{flag}: {kind} has no window"));
+            }
+            Ok(KvCacheGroup {
+                kind: kind.to_string(),
+                sliding_window,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if groups.is_empty() || groups.len() > 8 {
+        return Err(format!("{flag} takes one to eight groups"));
+    }
+    if !KvCacheGroup::MAIN_KINDS.contains(&groups[0].kind.as_str()) {
+        return Err(format!(
+            "{flag}: the first group is the main-attention group (one of {}), not {}",
+            KvCacheGroup::MAIN_KINDS.join(", "),
+            groups[0].kind
+        ));
+    }
+    Ok(groups)
+}
+
 /// The flags, as `--help` prints them.
 pub fn usage() -> String {
     "mock-worker — multi-port mock HTTP/gRPC inference workers for SMG scale testing\n\n\
@@ -675,6 +736,13 @@ pub fn usage() -> String {
        --kv-events-topic <s>    topic frame (default empty, as vLLM)\n\
        --kv-events-buffer-steps <n>  batches kept for replay (default 10000)\n\
        --kv-events-wire <vllm|sglang>  which engine's publisher to imitate (default vllm)\n\
+       --kv-cache-groups <kind[:window],...>  the KV cache groups a realistic engine publishes, the
+                                first one of the main-attention kinds (default full_attention), one
+                                to eight of full_attention, mla_attention, sink_full_attention,
+                                sliding_window:<tokens>, sliding_window_mla:<tokens> and mamba: a
+                                window group's stores name the window tail and a Mamba group's the
+                                state block at the prompt's replay boundary, as vLLM 0.31.0 retains
+                                them by default (one group on the SGLang wire)\n\
        --loads-like <mock|vllm>  load report: everything the simulator knows, or only what the\n\
                                 vLLM servicer reports (running, waiting, token_usage, maxima)\n\
        --step-reports <bool>    the load record says the wire reports every scheduler step (as\n\
@@ -771,6 +839,71 @@ mod tests {
 
     fn parse(flags: &[&str]) -> Result<Config, String> {
         Config::parse(flags.iter().map(|flag| (*flag).to_string()))
+    }
+
+    /// `--kv-cache-groups` names each group's kind and window in order; the
+    /// SGLang wire has no cache groups, so several are refused there.
+    #[test]
+    fn the_kv_cache_groups_flag_names_each_group_and_stays_single_on_the_sglang_wire() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        let with = |flags: &[&str]| parse(&[&grpc[..], flags].concat());
+        let cfg = with(&[
+            "--kv-cache-groups",
+            "full_attention,sliding_window:128,mamba",
+        ])
+        .expect("three groups");
+        assert_eq!(
+            cfg.engine.kv_cache_groups,
+            vec![
+                KvCacheGroup::full_attention(),
+                KvCacheGroup {
+                    kind: "sliding_window".to_string(),
+                    sliding_window: 128,
+                },
+                KvCacheGroup {
+                    kind: "mamba".to_string(),
+                    sliding_window: 0,
+                },
+            ]
+        );
+        let err = with(&[
+            "--kv-events-wire",
+            "sglang",
+            "--kv-cache-groups",
+            "full_attention,mamba",
+        ])
+        .expect_err("one group on the SGLang wire");
+        assert!(err.contains("one cache group"), "{err}");
+        assert!(
+            with(&[
+                "--kv-events-wire",
+                "sglang",
+                "--kv-cache-groups",
+                "full_attention"
+            ])
+            .is_ok(),
+            "one group is the SGLang wire's shape"
+        );
+        for (spec, reason) in [
+            ("sliding_window", "needs its window"),
+            ("full_attention,sliding_window_mla:0", "needs its window"),
+            ("mamba:128", "has no window"),
+            ("full_attention:64", "has no window"),
+            ("swa:128", "unknown cache group kind"),
+            ("sliding-window:128", "unknown cache group kind"),
+            ("mamba", "the first group is the main-attention group"),
+            (
+                "sliding_window:64,full_attention",
+                "the first group is the main-attention group",
+            ),
+            (
+                "mamba,full_attention",
+                "the first group is the main-attention group",
+            ),
+        ] {
+            let err = with(&["--kv-cache-groups", spec]).expect_err(spec);
+            assert!(err.contains(reason), "{spec}: {err}");
+        }
     }
 
     /// The gRPC workers serve the tokenspeed wire unless `--grpc-wire` names

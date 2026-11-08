@@ -162,6 +162,7 @@ experiments against it transfer to engines:
 | `--admin-port` | off | process-wide admin API (below) |
 | `--drain-timeout-secs` | 5 | on SIGTERM or SIGINT: stop accepting, let the requests in flight finish for this long, then exit 0 either way |
 | `--kv-events-zmq-base-port` | off | ZMQ KV-event publishers on vLLM's or SGLang's wire (below) |
+| `--kv-cache-groups` | `full_attention` | the KV cache groups a realistic engine publishes, `kind[:window],...`, one to eight of `full_attention`, `mla_attention`, `sink_full_attention`, `sliding_window:<tokens>`, `sliding_window_mla:<tokens>` and `mamba` (the first one of the three main-attention kinds, a window kind with its window, the others without): every group's events carry its index, kind and window, a window group stores only the window tail ending at the prompt's aligned replay boundary and a Mamba group the one state block there (vLLM 0.31.0's default retention), a sparse store's `token_ids` on the vLLM wire spanning the whole step as the engine writes it, and an eviction is published once per group, every group's in one batch from the mock's one pool where the engine's per-group pools may stagger them; one group only on the SGLang wire. The gRPC stream carries every group's events unfiltered (a servicer's relay forwards the main group alone, and the gateway admits main-attention kinds only), and the mock's own prefix hit still comes from the full-attention pool, not the engine's fixed point over its groups |
 
 ```bash
 cargo run --release -p mock-worker -- \
@@ -209,8 +210,12 @@ then ZMQ ranks) publishes on `base + 2i` and answers replay on `base + 2i + 1`.
 - Payload: vLLM's `EventBatch`, `[ts, events, data_parallel_rank]`; events are
   tagged maps in vLLM's field order with its `omit_defaults`: `BlockStored`
   (`type`, `block_hashes`, `parent_block_hash`, `token_ids`, `block_size`,
-  `lora_id`, `medium: "GPU"`, `lora_name`, `group_idx: 0`,
-  `kv_cache_spec_kind: "full_attention"`), `BlockRemoved` (`type`,
+  `lora_id`, `medium: "GPU"`, `lora_name`, `group_idx`,
+  `kv_cache_spec_kind` and, for a window group, `kv_cache_spec_sliding_window`;
+  one store per cache group of `--kv-cache-groups`, a sparse group's store
+  carrying the step's whole `token_ids` span while its `block_hashes` name
+  only the blocks the group retains, as the engine's `cache_full_blocks`
+  writes a masked group), `BlockRemoved` (`type`,
   `block_hashes`, `medium`, `group_idx`), `AllBlocksCleared` (`type`). Block
   hashes are unsigned 64-bit integers (vLLM's int form of the same bits the
   gRPC stream carries signed).
