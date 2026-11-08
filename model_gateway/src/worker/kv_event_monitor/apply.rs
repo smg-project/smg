@@ -1226,8 +1226,8 @@ mod tests {
         assert_eq!(capped(&indexer, w1, &hashes, 4), (Some(2), Vec::new()));
 
         // A kind-less removal on the learned group takes the block out of the
-        // view, not the index: a window of 5 tokens needs two blocks, so the
-        // hit falls to the leading block.
+        // view, not the index: a window of 5 tokens over 4-token blocks needs
+        // one block ending at the hit; block 2 gone, the hit ends at block 1.
         let mut gone = removed_event(2);
         gone.group_idx = Some(1);
         KvEventMonitor::apply_event(&remove_event(gone), w1, &indexer, &mut wb);

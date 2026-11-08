@@ -614,6 +614,36 @@ mod tests {
         );
     }
 
+    /// The window's block count is the engine's own: `cdiv(window - 1, block)`, the blocks
+    /// holding the tokens the window reads before the next one. A window one token past a
+    /// block multiple needs one block, not two: with block 16, one retained block ending at the
+    /// hit serves a 17-token window whole, and a window of 18 tokens needs two. The expected
+    /// values are the engine's lookup rule read at that boundary, not this code's.
+    #[test]
+    fn a_window_one_token_past_a_block_multiple_needs_one_block() {
+        let path = prefixes(4);
+        // (window tokens, blocks the rule needs) -> the hit with one retained block at the end
+        let cells = [(16, 1, 4), (17, 1, 4), (18, 2, 0), (32, 2, 0), (33, 2, 0)];
+        for (window, need, want) in cells {
+            let view = view(1, GroupKind::SlidingWindow { window }, 4, &[3]);
+            assert_eq!(
+                view.cap(&path, 4, 16).depth,
+                want,
+                "window {window}: {need} block(s), one retained at the hit"
+            );
+        }
+        // Two retained blocks ending at the hit serve the windows of up to 33 tokens (two
+        // blocks), not 34 (three).
+        for (window, want) in [(17, 4), (18, 4), (32, 4), (33, 4), (34, 0)] {
+            let view = view(1, GroupKind::SlidingWindow { window }, 4, &[2, 3]);
+            assert_eq!(
+                view.cap(&path, 4, 16).depth,
+                want,
+                "window {window}, two retained"
+            );
+        }
+    }
+
     #[test]
     fn a_state_group_ends_the_hit_at_its_rightmost_retained_block() {
         let path = prefixes(10);
