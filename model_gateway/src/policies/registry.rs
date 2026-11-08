@@ -307,9 +307,10 @@ impl PolicyRegistry {
         }
     }
 
-    /// The header-derived sticky key: the resolved routing key,
-    /// lineage-stripped when the override is enabled (matching selection),
-    /// raw otherwise.
+    /// The one header-derived key: the resolved routing key, lineage-stripped
+    /// when the override is enabled, raw otherwise. Placement hands it to
+    /// every policy as `SelectWorkerInfo::routing_key` and the load guard
+    /// counts under it, so selection and accounting agree by construction.
     pub fn sticky_header_key<'a>(&self, headers: Option<&'a HeaderMap>) -> Option<&'a str> {
         let raw = self.resolve_routing_key(headers)?;
         Some(if self.routing_key_sticky.is_some() {
@@ -336,16 +337,18 @@ impl PolicyRegistry {
     }
 
     /// Resolve the effective sticky key: a valid configured routing-key header
-    /// wins, with the rid-derived key as fallback. Header keys get the same
-    /// lineage stripping as rid keys, so a
-    /// proxy forwarding `conv_t2` as a header pins the entry `conv`.
+    /// wins, with the rid-derived key as fallback. `info.routing_key` is the
+    /// header key as placement derived it ([`Self::sticky_header_key`]:
+    /// lineage-stripped under the override, so a proxy forwarding `conv_t2`
+    /// pins the entry `conv`); a caller that left it empty gets the same
+    /// derivation from the headers here. Nothing strips twice.
     fn effective_sticky_key<'a>(
         &self,
         info: &SelectWorkerInfo<'a>,
     ) -> Option<(&'a str, &'static str)> {
         info.routing_key
-            .or_else(|| self.resolve_routing_key(info.headers))
-            .map(|raw| (Self::strip_header_key(raw), "header"))
+            .or_else(|| self.sticky_header_key(info.headers))
+            .map(|key| (key, "header"))
             .or_else(|| info.rid_key.map(|key| (key, "rid")))
     }
 
