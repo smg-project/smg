@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 use axum::http::StatusCode;
 use openapi_gen::CONTROL_PLANE_ROUTES;
+use smg::server::GATED_ROUTES;
 
 use super::control_plane_roles_test::{control_plane_auth, status, ADMIN_KEY};
 use crate::common::{
@@ -89,7 +90,15 @@ fn registered_routes() -> BTreeSet<(String, String)> {
 
 #[test]
 fn every_route_the_table_registers_is_listed() {
-    let registered = registered_routes();
+    // The gated group is a function of its own, outside the parsed region;
+    // the gated-routes test pins its list against the route table, so the
+    // list stands in for the group here.
+    let mut registered = registered_routes();
+    registered.extend(
+        GATED_ROUTES
+            .iter()
+            .map(|(method, path)| (method.to_string(), path.to_string())),
+    );
     let listed: BTreeSet<(String, String)> = CONTROL_PLANE_ROUTES
         .iter()
         .map(|(method, path)| (method.to_string(), path.to_string()))
