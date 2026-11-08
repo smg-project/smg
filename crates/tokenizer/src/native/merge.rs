@@ -348,8 +348,8 @@ impl MergeTable {
     /// a whole piece up before it merges; the table does not, so every token
     /// must be the merge of its bytes for the two to agree on every piece).
     /// The table pre-forms characters as a model's does (see `preformed`):
-    /// the tokens are raw bytes already, and a split's rank is the least
-    /// rank a merge takes either half at.
+    /// the tokens are raw bytes already, and an id's least operand rank is
+    /// the least rank of a split that takes it as either half.
     pub(super) fn from_ranks(ranks: &FxHashMap<Vec<u8>, u32>) -> Result<Self, Declined> {
         let mut byte_ids = [0u32; 256];
         for (byte, id) in byte_ids.iter_mut().enumerate() {

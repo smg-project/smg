@@ -424,15 +424,6 @@ fn the_table_from_ranks_equals_the_table_from_the_equivalent_model() {
         let piece = text.as_bytes();
         let expected: Vec<u32> = own.encode_ordinary(&text);
         assert_eq!(table_ids(&from_ranks, piece), expected, "ranks: {text:?}");
-        // The rank table's pre-formed path, where it answers, gives the same
-        // ids (it pre-forms fewer characters than the model's table may: every
-        // split of a token is a merge to it, so a character's operand
-        // condition is read over more merges).
-        assert_eq!(
-            table_ids_preformed(&from_ranks, piece).0,
-            expected,
-            "ranks, pre-formed: {text:?}"
-        );
         // The model's ids name the same tokens by their alphabet spelling.
         let via_model: Vec<Vec<u8>> = table_ids(&from_model, piece)
             .iter()
@@ -1237,7 +1228,9 @@ fn a_character_pre_forms_only_under_the_three_conditions() {
 }
 
 /// A rank vocabulary pre-forms a character under the same three conditions
-/// as a model's, to the file's own encoder's ids.
+/// as a model's, to the file's own encoder's ids; the model table of the
+/// same vocabulary pre-forms the same character and answers the same
+/// pieces, token for token.
 #[test]
 fn a_rank_vocabulary_pre_forms_its_characters() {
     let (_, alphabet) = alphabet_vocab();
@@ -1246,17 +1239,31 @@ fn a_rank_vocabulary_pre_forms_its_characters() {
     let e4b8 = format!("{e4}{b8}");
     // (1) and (2) hold, no fragment: pre-formed, and the pre-formed path
     // answers a run of the character to the encoder's ids.
-    let ranks = ranks_of(
-        &[(&e4, &b8), (&e4b8, &ad), (&zhong, &zhong)].map(|(a, b)| (a.as_str(), b.as_str())),
-        false,
-    );
+    let merges =
+        [(&e4, &b8), (&e4b8, &ad), (&zhong, &zhong)].map(|(a, b)| (a.as_str(), b.as_str()));
+    let ranks = ranks_of(&merges, false);
     let table = MergeTable::from_ranks(&ranks).expect("a complete table");
     assert_eq!(table.preformed_characters(), 1);
+    let model = model_with(&merges, false);
+    let from_model = table_of(&model);
+    assert_eq!(from_model.preformed_characters(), 1);
     let own = own_encoder(&ranks);
+    let token_of_rank: FxHashMap<u32, &Vec<u8>> =
+        ranks.iter().map(|(token, &rank)| (rank, token)).collect();
     for text in ["中", "中中", "中中中", "a中", "中a中"] {
         let (ids, answered) = table_ids_preformed(&table, text.as_bytes());
         assert!(answered, "{text}");
         assert_eq!(ids, own.encode_ordinary(text), "{text}");
+        // The model table answers the same pieces to the same tokens (its
+        // ids name them by their alphabet spelling).
+        let (model_ids, model_answered) = table_ids_preformed(&from_model, text.as_bytes());
+        assert!(model_answered, "model: {text}");
+        let via_model: Vec<Vec<u8>> = model_ids
+            .iter()
+            .map(|&id| unmapped(&alphabet, &model.id_to_token(id).expect("a token")))
+            .collect();
+        let via_ranks: Vec<Vec<u8>> = ids.iter().map(|id| token_of_rank[id].to_vec()).collect();
+        assert_eq!(via_model, via_ranks, "model: {text}");
     }
     // (2) fails: (中, 中) ranks before (E4B8, AD): the character is not
     // pre-formed, the bytes merge as the encoder's do.
