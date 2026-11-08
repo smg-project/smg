@@ -66,7 +66,9 @@ use std::{
     time::Instant,
 };
 
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use aho_corasick::{
+    packed, AhoCorasick, AhoCorasickBuilder, Anchored, Input, MatchKind, Span, StartKind,
+};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
@@ -467,10 +469,90 @@ struct Stage {
 type AddedTokenList = Vec<(String, u32)>;
 
 /// One set of added tokens, matched leftmost-longest as `AddedVocabulary`
-/// matches them.
+/// matches them. The automaton's own search scans a text for the tokens'
+/// first bytes when there are at most three of them, all ASCII; a set the
+/// scan cannot take (a token starting beyond ASCII, or more than three
+/// first bytes) it searches by the tokens' rarest bytes instead, which for a
+/// vocabulary of a thousand `<` tokens and one fenced in fullwidth bars were
+/// the bars' continuation bytes, frequent in CJK text: that search was a
+/// third of a 2 KB encode (measured). Such a set takes its candidates from
+/// the library's packed searcher over the tokens' distinct prefixes
+/// ([`Prefixes`]), one pass with the prefix verified, and asks the automaton
+/// anchored at each: nothing on text without the prefixes, the tokens
+/// themselves on text with them.
 pub(crate) struct AddedTokens {
     automaton: AhoCorasick,
     ids: Vec<u32>,
+    prefixes: Option<Prefixes>,
+}
+
+/// The distinct prefixes of a set's tokens as a packed searcher: the longest
+/// length up to [`Self::MAX_LEN`] bytes at which there are at most
+/// [`Self::MAX_COUNT`] of them (a token shorter than the length stands
+/// whole), so a hit is as close to a token as the set allows. A set whose
+/// prefixes would be shorter than [`Self::MIN_LEN`] bytes keeps the
+/// automaton's own search.
+struct Prefixes {
+    searcher: packed::Searcher,
+}
+
+impl Prefixes {
+    const MAX_LEN: usize = 16;
+    const MIN_LEN: usize = 3;
+    const MAX_COUNT: usize = 64;
+
+    /// Whether the automaton's start-byte scan declines `tokens`: a first
+    /// byte beyond ASCII, or more than three distinct first bytes.
+    fn wanted(tokens: &[(String, u32)]) -> bool {
+        let mut firsts: Vec<u8> = tokens
+            .iter()
+            .filter_map(|(content, _)| content.bytes().next())
+            .collect();
+        firsts.sort_unstable();
+        firsts.dedup();
+        firsts.len() > 3 || firsts.iter().any(|first| !first.is_ascii())
+    }
+
+    /// The searcher over the prefixes of `tokens`; none when the prefixes
+    /// that fit are shorter than [`Self::MIN_LEN`] bytes for a token longer
+    /// than them (a set of added words: the pass would stop at nearly every
+    /// byte of ordinary text, where the automaton's own walk is cheaper),
+    /// when even the one-byte prefixes exceed [`Self::MAX_COUNT`], or when
+    /// the library declines the set.
+    fn of(tokens: &[(String, u32)]) -> Option<Self> {
+        let distinct = |len: usize| {
+            let mut prefixes: Vec<&[u8]> = tokens
+                .iter()
+                .map(|(content, _)| &content.as_bytes()[..content.len().min(len)])
+                .collect();
+            prefixes.sort_unstable();
+            prefixes.dedup();
+            prefixes
+        };
+        let mut len = Self::MAX_LEN;
+        let mut prefixes = distinct(len);
+        while prefixes.len() > Self::MAX_COUNT && len > 1 {
+            len -= 1;
+            prefixes = distinct(len);
+        }
+        let cut_short = tokens.iter().any(|(content, _)| content.len() > len);
+        if prefixes.len() > Self::MAX_COUNT || (cut_short && len < Self::MIN_LEN) {
+            return None;
+        }
+        let searcher = packed::Config::new()
+            .match_kind(packed::MatchKind::LeftmostFirst)
+            .builder()
+            .extend(&prefixes)
+            .build()?;
+        Some(Self { searcher })
+    }
+
+    /// The first position at or after `from` where a prefix stands.
+    fn next(&self, text: &str, from: usize) -> Option<usize> {
+        self.searcher
+            .find_in(text, Span::from(from..text.len()))
+            .map(|found| found.start())
+    }
 }
 
 impl AddedTokens {
@@ -479,33 +561,64 @@ impl AddedTokens {
         if tokens.is_empty() {
             return Ok(None);
         }
+        let prefixes = Prefixes::wanted(tokens)
+            .then(|| Prefixes::of(tokens))
+            .flatten();
         let automaton = AhoCorasickBuilder::new()
             .match_kind(MatchKind::LeftmostLongest)
+            .start_kind(if prefixes.is_some() {
+                StartKind::Anchored
+            } else {
+                StartKind::Unanchored
+            })
             .build(tokens.iter().map(|(content, _)| content.as_bytes()))
             .map_err(|e| Declined::from(format!("the added tokens form no automaton: {e}")))?;
         Ok(Some(Self {
             automaton,
             ids: tokens.iter().map(|(_, id)| *id).collect(),
+            prefixes,
         }))
+    }
+
+    /// The added tokens in `text`, in order, each as its byte range and its
+    /// index in the list: the leftmost-longest matches, each continuing after
+    /// the last. With prefixes, a token starts only where a prefix stands, so
+    /// the first prefix at or after the last match that begins a token begins
+    /// the next one, and the longest token there is the match.
+    fn matches<'a>(&'a self, text: &'a str) -> impl Iterator<Item = (Range<usize>, usize)> + 'a {
+        let mut at = 0;
+        std::iter::from_fn(move || loop {
+            let Some(prefixes) = &self.prefixes else {
+                let input = Input::new(text).range(at..);
+                let found = self.automaton.find(input)?;
+                at = found.end();
+                return Some((found.range(), found.pattern().as_usize()));
+            };
+            let start = prefixes.next(text, at)?;
+            let input = Input::new(text).range(start..).anchored(Anchored::Yes);
+            if let Some(found) = self.automaton.find(input) {
+                at = found.end();
+                return Some((found.range(), found.pattern().as_usize()));
+            }
+            at = start + 1;
+        })
     }
 
     /// The byte ranges of the added tokens in `text`, in order.
     pub(crate) fn ranges<'a>(&'a self, text: &'a str) -> impl Iterator<Item = Range<usize>> + 'a {
-        self.automaton
-            .find_iter(text)
-            .map(|found| found.start()..found.end())
+        self.matches(text).map(|(range, _)| range)
     }
 
     /// Calls `f` with each segment in order: an added token's id, or a text
     /// span between added tokens.
     fn split<'t>(&self, text: &'t str, mut f: impl FnMut(Segment<'t>)) {
         let mut cursor = 0;
-        for found in self.automaton.find_iter(text) {
-            if cursor < found.start() {
-                f(Segment::Text(&text[cursor..found.start()]));
+        for (range, index) in self.matches(text) {
+            if cursor < range.start {
+                f(Segment::Text(&text[cursor..range.start]));
             }
-            f(Segment::Added(self.ids[found.pattern().as_usize()]));
-            cursor = found.end();
+            f(Segment::Added(self.ids[index]));
+            cursor = range.end;
         }
         if cursor < text.len() {
             f(Segment::Text(&text[cursor..]));
