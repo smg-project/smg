@@ -4,7 +4,9 @@
 //! - `X-SMG-Target-Worker`: Direct routing by worker index (0-based) into the
 //!   workers the caller hands the policy. Placement hands it the workers
 //!   available when the request arrives, so the index counts those and an
-//!   index past them is a miss (no worker, never another one).
+//!   index past them is a miss, not another worker. The one exception is a
+//!   pool with every worker vetoed, which placement's all-vetoed fallback
+//!   serves without reading the header.
 //! - `X-SMG-Routing-Key`: Consistent hash routing for session affinity
 //!
 //! ## Consistent Hashing

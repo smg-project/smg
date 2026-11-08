@@ -2226,9 +2226,9 @@ mod tests {
         out.set_status(WorkerStatus::NotReady);
         shifted("not ready");
         out.set_status(WorkerStatus::Ready);
-        assert!(out.set_overloaded(true));
+        assert!(registry.set_worker_overloaded(out, true));
         shifted("overloaded");
-        assert!(out.set_overloaded(false));
+        assert!(registry.set_worker_overloaded(out, false));
         for _ in 0..16 {
             out.record_circuit_breaker_outcome(false);
         }
@@ -2238,6 +2238,20 @@ mod tests {
         assert!(out.circuit_breaker_can_execute());
         assert_eq!(target(1).unwrap().url(), by_index[1].url());
         assert_eq!(target(2).unwrap().url(), by_index[2].url());
+
+        // The documented exception: a pool with every worker vetoed is served
+        // by the all-vetoed fallback, which does not read the header.
+        for worker in &by_index {
+            assert!(registry.set_worker_overloaded(worker, true));
+        }
+        assert!(
+            target(5).is_some(),
+            "an all-vetoed pool serves an index past the pool through the fallback"
+        );
+        for worker in &by_index {
+            assert!(registry.set_worker_overloaded(worker, false));
+        }
+        assert_eq!(target(1).unwrap().url(), by_index[1].url());
     }
 
     /// Round robin never re-selects a tried worker while another is left,
