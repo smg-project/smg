@@ -2505,7 +2505,8 @@ async fn decode_video_with_ffmpeg(
     }
     // A container claiming more frames than its stream holds leaves the
     // selection short. The engine's loader then sizes the clip by the frames
-    // it can see; the rate-based samplings resample instead.
+    // it can see, against the container's own claim; the rate-based samplings
+    // resample instead.
     if cfg.sampling.follows_the_loader() {
         let resized = match probe_decoded_frame_count(input_path).await {
             Ok(visible) => selection.sized_to_visible(visible, cfg),
@@ -3783,6 +3784,9 @@ fn is_short_selection(error: &MediaConnectorError) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 struct FrameSelection {
     source_fps: f64,
+    /// The frames the container claims, as the selection was read: what the
+    /// recovery after a short decode sizes by ([`Self::sized_to_visible`]).
+    claimed_frames: usize,
     /// Frames in the source, needed to state the selection as a formula.
     total_frames: usize,
     /// Source index per output frame, duplicates included.
@@ -3801,8 +3805,8 @@ impl FrameSelection {
     /// beforehand ([`refused_by_the_familys_rule`]).
     fn from_metadata(metadata: VideoMetadata, cfg: VideoFetchConfig) -> Option<Self> {
         let source_fps = metadata.source_fps?;
+        let claimed = metadata.container_frames.unwrap_or(0);
         let (total_frames, frame_indices) = if cfg.sampling.follows_the_loader() {
-            let claimed = metadata.container_frames.unwrap_or(0);
             let visible = metadata.total_frames.unwrap_or(claimed);
             loader_frames(claimed, visible, source_fps, cfg)
         } else {
@@ -3815,30 +3819,39 @@ impl FrameSelection {
         if frame_indices.is_empty() {
             return None;
         }
-        Some(Self::new(source_fps, total_frames, frame_indices))
+        Some(Self::new(source_fps, claimed, total_frames, frame_indices))
     }
 
-    fn new(source_fps: f64, total_frames: usize, frame_indices: Vec<usize>) -> Self {
+    fn new(
+        source_fps: f64,
+        claimed_frames: usize,
+        total_frames: usize,
+        frame_indices: Vec<usize>,
+    ) -> Self {
         let unique_frames = counted_frame_indices(&frame_indices);
         Self {
             source_fps,
+            claimed_frames,
             total_frames,
             frame_indices,
             unique_frames,
         }
     }
 
-    /// The selection once the stream turns out to hold `visible` frames:
-    /// unchanged when that changes nothing or the sampling is rate-based;
-    /// empty when the rate walk picks no frame of the visible clip (the
-    /// engine's loader hands its processor none either, so the caller refuses
-    /// as it would have before any decode instead of resampling by rate).
+    /// The selection once the stream turns out to hold `visible` frames of
+    /// the claim it was read with (the container's, not the length it was
+    /// first cut to: the loader's tolerance of a claim one frame long applies
+    /// to the claim itself): unchanged when that changes nothing or the
+    /// sampling is rate-based; empty when the rate walk picks no frame of the
+    /// visible clip (the engine's loader hands its processor none either, so
+    /// the caller refuses as it would have before any decode instead of
+    /// resampling by rate).
     fn sized_to_visible(&self, visible: usize, cfg: VideoFetchConfig) -> Resized {
         if !cfg.sampling.follows_the_loader() {
             return Resized::Unchanged;
         }
         let (total_frames, frame_indices) =
-            loader_frames(self.total_frames, visible, self.source_fps, cfg);
+            loader_frames(self.claimed_frames, visible, self.source_fps, cfg);
         if frame_indices.is_empty() {
             // A probe that decoded no frame at all says nothing about the clip's length: the
             // decode goes on as before and reports its own errors; only a visible clip the
@@ -3856,7 +3869,12 @@ impl FrameSelection {
         if frame_indices == self.frame_indices {
             return Resized::Unchanged;
         }
-        Resized::Selection(Self::new(self.source_fps, total_frames, frame_indices))
+        Resized::Selection(Self::new(
+            self.source_fps,
+            self.claimed_frames,
+            total_frames,
+            frame_indices,
+        ))
     }
 
     fn unique_count(&self) -> usize {

@@ -702,6 +702,15 @@ fn up_to_selection_follows_the_container_claim_and_the_stream_length() {
     .expect("frame rate and counts");
     assert_eq!(selection.total_frames, 60);
     assert_eq!(selection.frame_indices, spread_evenly(60, 32));
+    // A decode one frame under the stream's estimate: the recovery sizes the
+    // clip against the container's claim of 77, which the loader cuts to the
+    // 59 frames seen, not against the 60 it was first cut to (a claim one
+    // frame long would stand and keep the pick past the end out instead).
+    let Resized::Selection(cut) = selection.sized_to_visible(59, cfg) else {
+        panic!("one frame under the estimate: a selection over the visible frames");
+    };
+    assert_eq!(cut.total_frames, 59);
+    assert_eq!(cut.frame_indices, spread_evenly(59, 32));
     // Longer by one frame: the claim stands, the pick past the end is left out.
     let selection = FrameSelection::from_metadata(
         VideoMetadata {
@@ -799,6 +808,11 @@ fn up_to_selection_follows_the_container_claim_and_the_stream_length() {
     .expect("frame rate and counts");
     assert_eq!(selection.total_frames, 60);
     assert_eq!(selection.frame_indices, vec![0, 20, 39, 59]);
+    let Resized::Selection(cut) = selection.sized_to_visible(59, rounded) else {
+        panic!("one frame under the estimate: a selection over the visible frames");
+    };
+    assert_eq!(cut.total_frames, 59);
+    assert_eq!(cut.frame_indices, vec![0, 19, 39, 58]);
     let selection = FrameSelection::from_metadata(
         VideoMetadata {
             total_frames: Some(60),
