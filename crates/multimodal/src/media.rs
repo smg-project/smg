@@ -3103,12 +3103,17 @@ const VIDEO_DECODED_BYTES_KNOB: &str = "SMG_VIDEO_MAX_DECODED_BYTES";
 const VIDEO_MAX_DECODE_PIXELS_KNOB: &str = "SMG_VIDEO_MAX_DECODE_PIXELS";
 
 /// `true` for the error of a decode refused for its size (the typed
-/// refusal) or its work (named in the decoder's message), or ended for its
-/// time: a budget no other runner over the same stream, and no resampling of
-/// it, can answer, so it ends the decode instead of starting the next runner.
+/// refusals: the bytes it would decode to, the frame list its picks need) or
+/// its work (named in the decoder's message), or ended for its time: a budget
+/// no other runner over the same stream, and no resampling of it, can answer,
+/// so it ends the decode instead of starting the next runner.
 fn is_video_budget_error(error: &MediaConnectorError) -> bool {
     is_video_command_timeout(error)
-        || matches!(error, MediaConnectorError::DecodedTooLarge { .. })
+        || matches!(
+            error,
+            MediaConnectorError::DecodedTooLarge { .. }
+                | MediaConnectorError::FrameListTooLong { .. }
+        )
         || matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_MAX_DECODE_PIXELS_KNOB))
 }
 
@@ -3881,15 +3886,17 @@ const FFMPEG_MAX_SELECT_TERMS: usize = 100;
 /// rate-based selection ends on the clip's last frame, one past its spread).
 const FFMPEG_SPREAD_EXTRA_TERMS: usize = 8;
 /// The longest select list the filter may be, refused past it before it is
-/// built, with the decoded-bytes budget's own error. ffmpeg is given the
+/// built ([`MediaConnectorError::FrameListTooLong`]). ffmpeg is given the
 /// filter as one argument, which Linux bounds at 128 KiB (`MAX_ARG_STRLEN`);
-/// past that the process cannot be started, and the request would be answered
-/// with the decoder's failure instead of its own. Half the bound keeps the
-/// list clear of it with the pixel-format conversion appended: some 4,700
-/// terms of six-digit indices, over an hour of picks a second apart, so the
-/// refusal reaches only an interval selection no spread describes
-/// ([`PICK_RECORD_BYTES`]) past that length.
-const FFMPEG_MAX_LISTED_FILTER_BYTES: usize = 64 * 1024;
+/// 1 KiB under it leaves room for the pixel-format conversion appended to the
+/// filter. Past the kernel's bound the process could not be started and the
+/// selection fell to the rate resampler: the clip was served with the generic
+/// sampler's frames under a warning, a silent change of the family's sampling
+/// rule; under the bound a list of any length is served with the loader's
+/// exact picks, as before. Only an interval selection no spread describes
+/// ([`PICK_RECORD_BYTES`]) is listed at such lengths: some 9,000 terms of
+/// six-digit indices, over an hour of picks at two a second.
+const FFMPEG_MAX_LISTED_FILTER_BYTES: usize = 128 * 1024 - 1024;
 
 /// What the stream's visible frame count makes of a loader-following
 /// selection ([`FrameSelection::sized_to_visible`]).
@@ -4019,9 +4026,10 @@ impl FrameSelection {
     /// Anything over a minute or two would be a list of hundreds of terms, so
     /// those are described instead of enumerated where a spread formula
     /// reproduces them exactly. A selection no spread reproduces (an interval
-    /// walk whose stride sits by a whole number) stays a list, refused with
-    /// the decoded-bytes budget's error before it is built when it would be
-    /// longer than [`FFMPEG_MAX_LISTED_FILTER_BYTES`].
+    /// walk whose stride sits by a whole number) stays a list, refused before
+    /// it is built ([`MediaConnectorError::FrameListTooLong`]) when it would
+    /// be longer than the decoder can be given
+    /// ([`FFMPEG_MAX_LISTED_FILTER_BYTES`]).
     fn select_filter(&self) -> Result<String, MediaConnectorError> {
         if self.unique_frames.len() > FFMPEG_MAX_SELECT_TERMS {
             if let Some(filter) = self.spread_select_filter() {
@@ -4030,11 +4038,10 @@ impl FrameSelection {
         }
         let bytes = self.listed_filter_len();
         if bytes > FFMPEG_MAX_LISTED_FILTER_BYTES {
-            return Err(MediaConnectorError::DecodedTooLarge {
-                media: "video select list",
+            return Err(MediaConnectorError::FrameListTooLong {
+                picks: self.unique_frames.len(),
                 bytes,
                 limit: FFMPEG_MAX_LISTED_FILTER_BYTES,
-                knob: "FFMPEG_MAX_LISTED_FILTER_BYTES",
             });
         }
         let terms: Vec<String> = self
@@ -4212,7 +4219,7 @@ struct FfmpegFrameArgs {
 }
 
 impl FfmpegFrameArgs {
-    /// The selection's frames; refused with the decoded-bytes budget's error
+    /// The selection's frames; refused ([`MediaConnectorError::FrameListTooLong`])
     /// when their list would be longer than the decoder can be given
     /// ([`FFMPEG_MAX_LISTED_FILTER_BYTES`]).
     async fn selected(selection: &FrameSelection) -> Result<Self, MediaConnectorError> {

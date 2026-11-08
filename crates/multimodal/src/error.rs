@@ -118,6 +118,18 @@ pub enum MediaConnectorError {
         limit: usize,
         knob: &'static str,
     },
+    /// The list of a video's picks would be longer than the decoder's
+    /// process can be given in one argument: a size refusal, the request's
+    /// own ([`MediaFault::Client`], [`MediaErrorCode::TooLarge`]), answered
+    /// by another sampling rate or a shorter clip.
+    #[error(
+        "the clip's {picks} picks at this sampling rate need a frame list of {bytes} bytes, over the decoder's bound of {limit}; use another rate or a shorter clip"
+    )]
+    FrameListTooLong {
+        picks: usize,
+        bytes: usize,
+        limit: usize,
+    },
     #[error("media decode task failed: {0}")]
     Blocking(#[from] tokio::task::JoinError),
     /// This process's own I/O after the bytes arrived: the scratch file a
@@ -201,7 +213,9 @@ pub enum MediaErrorCode {
     /// `media_too_large`: the media is over a size cap: its input bytes
     /// ([`MediaConnectorError::PayloadTooLarge`]), the bytes it would decode
     /// to ([`MediaConnectorError::DecodedTooLarge`]: a video's frames, an
-    /// audio clip's samples), or the image decoder's own limits. A bound on
+    /// audio clip's samples), the frame list a video's picks would need
+    /// ([`MediaConnectorError::FrameListTooLong`]), or the image decoder's
+    /// own limits. A bound on
     /// decode work rather than on size (`SMG_VIDEO_MAX_DECODE_PIXELS`) is
     /// not one: a clip over it is a fetch failure.
     TooLarge,
@@ -233,6 +247,7 @@ impl MediaConnectorError {
             Self::PixelBudgetExceeded { .. }
             | Self::PayloadTooLarge { .. }
             | Self::DecodedTooLarge { .. }
+            | Self::FrameListTooLong { .. }
             | Self::Image(image::ImageError::Limits(_)) => MediaErrorCode::TooLarge,
             Self::InvalidImageLongSideCap { .. }
             | Self::InvalidSglangLongSideCap { .. }
@@ -292,6 +307,7 @@ impl MediaConnectorError {
             | Self::PixelBudgetExceeded { .. }
             | Self::PayloadTooLarge { .. }
             | Self::DecodedTooLarge { .. }
+            | Self::FrameListTooLong { .. }
             | Self::Image(_)
             | Self::AudioDecode(_)
             | Self::VideoDecode(_) => MediaFault::Client,

@@ -1424,10 +1424,10 @@ fn a_frame_count_the_container_made_up_still_builds_a_filter() {
 }
 
 /// A rate that puts the interval's stride by a whole number (two picks a
-/// second less a hair, at 30 fps: strides of 15 and 16) lists every pick,
-/// and an hour-long clip's list would be longer than the decoder can be
-/// given: refused before it is built, with the budget's error naming the
-/// list's length and the bound, where a list under the bound is built.
+/// second less a hair, at 30 fps: strides of 15 and 16) lists every pick. A
+/// list longer than the decoder can be given is refused before it is built,
+/// with its own error naming the picks, the list's length and the bound; a
+/// list under the bound is built, past 64 KiB as under it.
 #[test]
 fn a_listed_selection_longer_than_the_decoder_can_be_given_is_refused() {
     let rate = 1.999_600_079_984_003;
@@ -1448,20 +1448,33 @@ fn a_listed_selection_longer_than_the_decoder_can_be_given_is_refused() {
     assert!(
         matches!(
             error,
-            MediaConnectorError::DecodedTooLarge { media: "video select list", bytes, limit, .. }
-                if bytes == listed.len() && limit == FFMPEG_MAX_LISTED_FILTER_BYTES
+            MediaConnectorError::FrameListTooLong { picks, bytes, limit }
+                if picks == long.unique_count()
+                    && bytes == listed.len()
+                    && limit == FFMPEG_MAX_LISTED_FILTER_BYTES
         ),
         "{error}"
     );
     assert_eq!(error.fault(), crate::error::MediaFault::Client);
+    assert_eq!(error.code().as_str(), "media_too_large");
 
-    let short =
-        FrameSelection::from_metadata(metadata(Some(30.0), Some(60_000)), interval_cfg(rate))
-            .expect("frame rate and count are known");
-    assert!(short.unique_count() > FFMPEG_MAX_SELECT_TERMS);
-    let filter = short.select_filter().expect("under the bound, listed");
-    assert_eq!(filter.len(), short.listed_filter_len());
-    assert!(filter.starts_with(r"select='eq(n\,0)+eq(n\,"), "{filter}");
+    let mut lengths = Vec::new();
+    for total_frames in [60_000, 120_000] {
+        let short = FrameSelection::from_metadata(
+            metadata(Some(30.0), Some(total_frames)),
+            interval_cfg(rate),
+        )
+        .expect("frame rate and count are known");
+        assert!(short.unique_count() > FFMPEG_MAX_SELECT_TERMS);
+        let filter = short.select_filter().expect("under the bound, listed");
+        assert_eq!(filter.len(), short.listed_filter_len());
+        assert!(filter.starts_with(r"select='eq(n\,0)+eq(n\,"), "{filter}");
+        lengths.push(filter.len());
+    }
+    assert!(
+        lengths[0] < 64 * 1024 && lengths[1] > 64 * 1024,
+        "a list past 64 KiB is built like one under it: {lengths:?}"
+    );
 }
 
 #[test]

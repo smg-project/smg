@@ -463,6 +463,48 @@ async fn an_overstated_container_size_is_judged_again_for_the_interval_picks_bud
     assert_eq!((kept.width, kept.height), (64, 48));
 }
 
+/// A listed selection longer than the decoder can be given is refused on the
+/// decode path itself: the refusal is a budget error to the runner pass and
+/// to the selection's fallbacks, so the clip is not resampled by rate under
+/// a warning (the generic sampler's frames in place of the loader's picks).
+#[tokio::test]
+async fn a_frame_list_past_the_decoders_bound_refuses_the_decode_instead_of_resampling() {
+    let interval = VideoFetchConfig {
+        sample_fps: 1.999_600_079_984_003,
+        sampling: FrameSampling::Interval,
+        ..VideoFetchConfig::default()
+    };
+    let probed = ProbedVideoInfo {
+        width: Some(64),
+        height: Some(48),
+        duration_seconds: Some(20_000.0),
+        source_fps: Some(30.0),
+        total_frames: Some(600_000),
+        container_frames: Some(600_000),
+    };
+    let picks = FrameSelection::from_metadata(
+        video_metadata_from(probed, false).expect("a stated size and rate"),
+        interval,
+    )
+    .expect("frame rate and count are known")
+    .unique_count();
+    probe_switch::ANSWER.with(|answer| answer.set(Some(probed)));
+    let result = decode_video_with_ffmpeg(Path::new("listed.mp4"), 0, interval).await;
+    probe_switch::ANSWER.with(|answer| answer.set(None));
+    let Err(error) = result else {
+        panic!("the frame list is past the decoder's bound: decoded");
+    };
+    assert!(
+        matches!(
+            error,
+            MediaConnectorError::FrameListTooLong { picks: refused, limit: FFMPEG_MAX_LISTED_FILTER_BYTES, .. }
+                if refused == picks
+        ),
+        "{error}"
+    );
+    assert!(is_video_budget_error(&error));
+}
+
 #[test]
 fn a_run_past_the_process_budget_is_reported_in_the_clips_terms() {
     let metadata = long_clip_metadata();
