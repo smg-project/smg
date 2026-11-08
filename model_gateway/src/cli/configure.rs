@@ -9,11 +9,13 @@ use std::collections::HashMap;
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        bind_socket_addr, validate_mesh_server_name, CacheIndexKind, CircuitBreakerConfig,
-        ConfigError, ConfigResult, ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig,
-        HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode,
-        MemoryConfig, MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig,
-        PolicyConfig, PostgresConfig, ReadinessRoleConfig, RedisConfig, RetryConfig, RouterConfig,
+        bind_socket_addr,
+        secrets::{parse_control_plane_api_key, parse_tenant_api_key},
+        validate_mesh_server_name, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
+        ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig, HealthCheckConfig,
+        HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode, MemoryConfig,
+        MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
+        PostgresConfig, ReadinessRoleConfig, RedisConfig, RetryConfig, RouterConfig,
         RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, SlurmDiscoveryConfig,
         TokenizerCacheConfig, TraceConfig, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
     },
@@ -33,7 +35,7 @@ use super::{
         EnvLookup, API_KEY_SETTING, CONTROL_PLANE_API_KEYS_SETTING, POSTGRES_DB_URL_SETTING,
         REDIS_URL_SETTING, TENANT_API_KEYS_SETTING,
     },
-    value::{parse_control_plane_api_key, parse_role_mapping, parse_tenant_api_key},
+    value::parse_role_mapping,
 };
 use crate::{Backend, CliArgs, DiscoveryProvider};
 
