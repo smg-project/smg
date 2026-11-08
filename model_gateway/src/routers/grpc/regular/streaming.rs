@@ -3313,10 +3313,14 @@ impl<'a> ChatStream<'a> {
             };
             let mut final_chunk = response.is_none();
 
+            // The variant stays in this frame and the readers borrow it:
+            // moving it into a reader's future by value would memmove the
+            // whole variant once per message.
+            let response = response.map(|response| response.into_response());
             // Text the stop decoder produced for this response, if any. Per-chunk
             // text and the end-of-stream flush both funnel into the shared emission
             // below, so neither can reach the client without being parsed.
-            let pending = match response.map(|response| response.into_response()) {
+            let pending = match &response {
                 Some(ProtoResponseVariant::Chunk(chunk)) => self.read_chunk(chunk).await?,
                 Some(ProtoResponseVariant::Complete(complete)) => {
                     self.read_complete(complete).await?
@@ -3347,7 +3351,7 @@ impl<'a> ChatStream<'a> {
     /// yet counted with it.
     async fn read_chunk(
         &mut self,
-        chunk: ProtoGenerateStreamChunk,
+        chunk: &ProtoGenerateStreamChunk,
     ) -> Result<Option<PendingText>, utils::StreamFailure> {
         // Track TTFT immediately on first chunk received from backend
         self.note_first_token();
@@ -3366,9 +3370,9 @@ impl<'a> ChatStream<'a> {
             return Ok(None);
         }
 
-        self.completion_tokens.record_chunk(&chunk);
+        self.completion_tokens.record_chunk(chunk);
         if let Some(usage) = &mut self.continuous_usage {
-            usage.record_chunk(&chunk);
+            usage.record_chunk(chunk);
         }
 
         self.open_choice(index).await?;
@@ -3462,7 +3466,7 @@ impl<'a> ChatStream<'a> {
                 }
             }
             let usage = self.usage_snapshot();
-            let choice_logprobs = self.logprobs_of(&chunk);
+            let choice_logprobs = self.logprobs_of(chunk);
             StreamingProcessor::push_events(
                 self.tx,
                 &mut self.sse_buffer,
@@ -3491,7 +3495,7 @@ impl<'a> ChatStream<'a> {
             // The chunk's logprobs still reach the client, on a chunk with
             // an empty delta, as the engine's own server sends a step whose
             // text made no delta: every generated token's entry goes out once.
-            let logprobs = self.logprobs_of(&chunk);
+            let logprobs = self.logprobs_of(chunk);
             if utils::has_entries(logprobs.as_ref()) {
                 let usage = self.usage_snapshot();
                 self.push_bare_logprobs(index, logprobs, usage.as_ref())
@@ -3501,7 +3505,7 @@ impl<'a> ChatStream<'a> {
         }
 
         // Process logprobs if present
-        let choice_logprobs = self.logprobs_of(&chunk);
+        let choice_logprobs = self.logprobs_of(chunk);
 
         let chunk_tokens = chunk.token_ids().len() as u32
             + std::mem::take(&mut self.choices[index as usize].held_tokens);
@@ -3515,7 +3519,7 @@ impl<'a> ChatStream<'a> {
     /// engine streamed past its local stop adds only its speculative counts.
     async fn read_complete(
         &mut self,
-        complete: ProtoGenerateComplete,
+        complete: &ProtoGenerateComplete,
     ) -> Result<Option<PendingText>, utils::StreamFailure> {
         let index = complete.index();
         let request_id = &self.dispatch.request_id;
@@ -3572,9 +3576,9 @@ impl<'a> ChatStream<'a> {
         *completed = true;
         *prompt_tokens = Some(complete.prompt_tokens());
 
-        self.completion_tokens.record_complete(&complete);
+        self.completion_tokens.record_complete(complete);
         if let Some(usage) = &mut self.continuous_usage {
-            usage.record_complete(&complete);
+            usage.record_complete(complete);
         }
 
         // A choice's first engine output may be its Complete (a
@@ -4849,7 +4853,9 @@ impl<'a> MessagesStream<'a> {
             };
             final_chunk = response.is_none() && self.decoder_finished_at_eof;
 
-            let pending = match response.map(|response| response.into_response()) {
+            // As on the chat path: the variant stays here, the readers borrow it.
+            let response = response.map(|response| response.into_response());
+            let pending = match &response {
                 Some(ProtoResponseVariant::Chunk(chunk)) => self.read_chunk(chunk).await,
                 Some(ProtoResponseVariant::Complete(complete)) => {
                     self.read_complete(complete).await
@@ -4896,7 +4902,7 @@ impl<'a> MessagesStream<'a> {
     /// counted with it.
     async fn read_chunk(
         &mut self,
-        chunk: ProtoGenerateStreamChunk,
+        chunk: &ProtoGenerateStreamChunk,
     ) -> Result<Option<MessagesPendingText>, utils::StreamFailure> {
         if self.first_token_time.is_none() {
             self.first_token_time = Some(Instant::now());
@@ -4915,7 +4921,7 @@ impl<'a> MessagesStream<'a> {
             return Ok(None);
         }
 
-        self.completion_tokens.record_chunk(&chunk);
+        self.completion_tokens.record_chunk(chunk);
         let mut chunk_tokens = chunk.token_ids().len() as u32;
 
         if let Some((reader, machine)) = self.symphony.as_mut() {
@@ -4941,7 +4947,7 @@ impl<'a> MessagesStream<'a> {
             self.delta = delta;
             if should_stop {
                 self.note_local_stop();
-                self.close_on_local_stop(&chunk);
+                self.close_on_local_stop(chunk);
             }
             return Ok(None);
         }
@@ -4955,7 +4961,7 @@ impl<'a> MessagesStream<'a> {
             // first). Pre-stop text in `chunk_text` is still emitted
             // below; Phase 4 derives StopSequence from `matched_stop`.
             self.note_local_stop();
-            self.close_on_local_stop(&chunk);
+            self.close_on_local_stop(chunk);
         }
 
         if chunk_text.is_empty() {
@@ -4972,7 +4978,7 @@ impl<'a> MessagesStream<'a> {
     /// "stop"); under Symphony the reader ends the message here.
     async fn read_complete(
         &mut self,
-        complete: ProtoGenerateComplete,
+        complete: &ProtoGenerateComplete,
     ) -> Result<Option<MessagesPendingText>, utils::StreamFailure> {
         let tail = self
             .stop_decoder
@@ -4993,7 +4999,7 @@ impl<'a> MessagesStream<'a> {
 
         self.prompt_tokens = complete.prompt_tokens();
         self.saw_complete = true;
-        self.completion_tokens.record_complete(&complete);
+        self.completion_tokens.record_complete(complete);
         self.engine_thinking_tokens = complete.reasoning_tokens();
         self.cached_tokens = complete.cached_tokens();
         // A local stop-decoder match already pinned "stop"; don't let
