@@ -2260,6 +2260,7 @@ const PIL_WIDTH_ROWS: usize = 4;
 struct BandedPasses<'a, const C: usize> {
     src: &'a [u8],
     in_w: usize,
+    in_h: usize,
     out_w: usize,
     width: &'a FixedKernel,
     height: &'a FixedKernel,
@@ -2272,7 +2273,6 @@ impl<const C: usize> BandedPasses<'_, C> {
     /// Output rows `[y0, y0 + out.len() / (out_w * C))`, a band at a time.
     fn rows(&self, y0: usize, mut out: &mut [u8]) {
         let row_len = self.out_w * C;
-        let in_h = self.src.len() / (self.in_w * C);
         // The width-pass rows `mid` holds: source rows `[mid_start, mid_end)`.
         let mut mid = Vec::new();
         let (mut mid_start, mut mid_end) = (0, 0);
@@ -2297,7 +2297,7 @@ impl<const C: usize> BandedPasses<'_, C> {
             // The band's rows end on a block; those already in `mid` move to
             // its front (windows start in order, so the band starts at or
             // after the buffer's rows) and the width pass fills in the rest.
-            let stop = stop.next_multiple_of(PIL_WIDTH_ROWS).min(in_h);
+            let stop = stop.next_multiple_of(PIL_WIDTH_ROWS).min(self.in_h);
             let kept = mid_end.clamp(start, stop);
             if kept > start {
                 mid.copy_within(
@@ -2326,15 +2326,14 @@ impl<const C: usize> BandedPasses<'_, C> {
     }
 }
 
-/// `src` (`in_w` interleaved pixels of `C` channels per row) resampled on
+/// `src` (`in_w` x `in_h` interleaved pixels of `C` channels) resampled on
 /// both axes to `out_w` x `out_h` by [`BandedPasses`] in bands of about
 /// `band_bytes`; the output rows are banded across the pool, each task with a
 /// buffer of its own.
 fn pil_resample_both<const C: usize>(
     src: &[u8],
-    in_w: usize,
-    out_w: usize,
-    out_h: usize,
+    (in_w, in_h): (usize, usize),
+    (out_w, out_h): (usize, usize),
     width: &FixedKernel,
     height: &FixedKernel,
     band_bytes: usize,
@@ -2344,6 +2343,7 @@ fn pil_resample_both<const C: usize>(
     let passes = &BandedPasses::<C> {
         src,
         in_w,
+        in_h,
         out_w,
         width,
         height,
@@ -2413,6 +2413,11 @@ pub fn resize_bicubic_pil_rgb(
         return Err(TransformError::ShapeError(format!(
             "PIL bicubic RGB source has {} bytes, expected {expected} for {width}x{height}",
             data.len()
+        )));
+    }
+    if width == 0 || height == 0 {
+        return Err(TransformError::ShapeError(format!(
+            "PIL bicubic RGB source {width}x{height} must be non-empty"
         )));
     }
     if out_w == 0 || out_h == 0 {
@@ -2627,7 +2632,14 @@ fn resize_pil_bytes<const C: usize>(
     } else {
         let width = FixedKernel::new(in_w, out_w, filter, quantization);
         let height = FixedKernel::new(in_h, out_h, filter, quantization);
-        pil_resample_both::<C>(data, in_w, out_w, out_h, &width, &height, PIL_BAND_BYTES)
+        pil_resample_both::<C>(
+            data,
+            (in_w, in_h),
+            (out_w, out_h),
+            &width,
+            &height,
+            PIL_BAND_BYTES,
+        )
     }
 }
 
@@ -4304,8 +4316,14 @@ mod tests {
                 PIL_BAND_BYTES,
                 usize::MAX,
             ] {
-                let actual =
-                    pil_resample_both::<C>(data, in_w, out_w, out_h, &width, &height, band_bytes);
+                let actual = pil_resample_both::<C>(
+                    data,
+                    (in_w, in_h),
+                    (out_w, out_h),
+                    &width,
+                    &height,
+                    band_bytes,
+                );
                 assert_same_bytes(
                     &actual,
                     &expected,
@@ -4616,6 +4634,19 @@ mod tests {
         for (out_w, out_h) in [(0, 480), (480, 0)] {
             assert!(matches!(
                 resize_bicubic_pil_rgb(&data, 2, 2, out_w, out_h),
+                Err(TransformError::ShapeError(_))
+            ));
+        }
+    }
+
+    /// A source with no pixels is refused before the passes run (its byte
+    /// count matches an empty buffer, so the length check lets it through);
+    /// the banded passes would otherwise take their row count from it.
+    #[test]
+    fn resize_bicubic_pil_rgb_rejects_an_empty_source() {
+        for (width, height) in [(0, 4), (4, 0), (0, 0)] {
+            assert!(matches!(
+                resize_bicubic_pil_rgb(&[], width, height, 2, 2),
                 Err(TransformError::ShapeError(_))
             ));
         }
