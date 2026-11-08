@@ -1,7 +1,7 @@
 //! Compiles a validated [`RateLimitYaml`] into an immutable, cheap-to-look-up
 //! policy set.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use super::config::{ModelMatcherSpec, RateLimitConfigError, RateLimitYaml, TenantPolicySpec};
 use crate::tenant::TenantKey;
@@ -14,7 +14,9 @@ pub struct ScopeLimits {
 
 #[derive(Debug, Clone)]
 pub(crate) struct CompiledModelRule {
-    pub rule_id: String,
+    /// Shared, so every reservation the rule scopes names its bucket by
+    /// this id without a copy.
+    pub rule_id: Arc<str>,
     pub limits: ScopeLimits,
 }
 
@@ -57,7 +59,7 @@ impl CompiledTenantPolicy {
 
         for r in &spec.model_rules {
             let rule = CompiledModelRule {
-                rule_id: r.rule_id.clone(),
+                rule_id: Arc::from(r.rule_id.as_str()),
                 limits: ScopeLimits {
                     tokens_per_minute: r.tokens_per_minute,
                     requests_per_minute: r.requests_per_minute,
@@ -194,7 +196,7 @@ mod tests {
         let compiled = CompiledPolicySet::compile(&yaml).unwrap();
         let policy = compiled.policy_for(&TenantKey::new("anonymous"));
         let matched = policy.matching_rule("gpt-4").unwrap();
-        assert_eq!(matched.rule_id, "exact");
+        assert_eq!(&*matched.rule_id, "exact");
     }
 
     #[test]
@@ -220,7 +222,7 @@ mod tests {
         let compiled = CompiledPolicySet::compile(&yaml).unwrap();
         let policy = compiled.policy_for(&TenantKey::new("anonymous"));
         let matched = policy.matching_rule("gpt-4-turbo").unwrap();
-        assert_eq!(matched.rule_id, "long");
+        assert_eq!(&*matched.rule_id, "long");
     }
 
     #[test]
