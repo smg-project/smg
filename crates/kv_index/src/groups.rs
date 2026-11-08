@@ -45,8 +45,10 @@ const COPIES_CAP: u8 = 8;
 /// The most group blocks one view keeps waiting for their main block, by the worker's hash: a
 /// store a group published ahead of the main group's waits here until the main store names it or
 /// the group removes it. The bound keeps a producer naming blocks the index never takes (another
-/// rank's, entries below the block of record) from growing the view without end.
-const PENDING_CAP: usize = 1 << 16;
+/// rank's, entries below the block of record) from growing the view without end; a block past it
+/// is counted as dropped ([`WorkerGroups::dropped_blocks`]). A relay snapshot sends one group
+/// entry ahead of the main lane and the rest after it, so a resync keeps one block waiting.
+const PENDING_CAP: usize = 1 << 20;
 
 /// What a cache group is to the reuse rule, as the engine names it on its stores.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +144,15 @@ struct Memberships {
     /// The groups retaining blocks the view has no name for yet, by the worker's hash: placed
     /// under the block's prefix hash when the main store comes.
     pending: FxHashMap<SequenceHash, u16>,
+    /// Blocks of group stores refused by the wait's bound, and main blocks the view could not
+    /// name because it did not know their parent (a view created after the parent was indexed).
+    dropped: u64,
+    unnamed: u64,
+    /// Whether every main block the index holds for the worker is named here. A view created
+    /// after the worker's first main stores were indexed is not, and neither is one that could
+    /// not name a block: a path through an unnamed block would read its retained tails as
+    /// absent, so the rule leaves the overlap standing until a clear names everything anew.
+    incomplete: bool,
     /// Physical copies beyond the first, per block and group: present only for a block a group
     /// stored again before removing (the engines keep up to two copies and remove them one at
     /// a time), so a worker that never duplicates pays nothing here.
@@ -212,14 +223,27 @@ impl WorkerGroups {
     /// block the worker already holds under another name moves to the store's place, as the
     /// index keeps one place per hash, and its memberships move with it; a block a group
     /// retained through the main copy's absence comes back under its name. A block whose group
-    /// stores came first takes their memberships now; returns how many did.
+    /// stores came first takes their memberships now; returns how many did. A parent the index
+    /// knew and the view does not (the view came after the parent was indexed) names nothing:
+    /// the blocks are counted unnamed rather than chained from the first position under a wrong
+    /// name.
     pub fn main_stored(
         &self,
         parent: Option<SequenceHash>,
         blocks: &[(SequenceHash, ContentHash)],
     ) -> usize {
         let inner = &mut *self.inner.write();
-        let mut prev = parent.and_then(|parent| inner.by_engine.get(&parent).copied());
+        let mut prev = match parent {
+            Some(parent) => match inner.by_engine.get(&parent).copied() {
+                Some(prefix) => Some(prefix),
+                None => {
+                    inner.unnamed += blocks.len() as u64;
+                    inner.incomplete = true;
+                    return 0;
+                }
+            },
+            None => None,
+        };
         let mut placed = 0;
         for &(hash, content) in blocks {
             let prefix = match prev {
@@ -291,6 +315,8 @@ impl WorkerGroups {
                 unplaced += 1;
                 if inner.pending.len() < PENDING_CAP || inner.pending.contains_key(&hash) {
                     *inner.pending.entry(hash).or_insert(0) |= mask;
+                } else {
+                    inner.dropped += 1;
                 }
                 continue;
             };
@@ -350,7 +376,8 @@ impl WorkerGroups {
     }
 
     /// The worker's cache is empty: every block goes, the groups stay (they describe the
-    /// model, not the cache).
+    /// model, not the cache), and the view is complete again (every block from here on is named
+    /// as it is indexed).
     pub fn clear(&self) {
         let inner = &mut *self.inner.write();
         inner.by_engine.clear();
@@ -358,6 +385,22 @@ impl WorkerGroups {
         inner.retained.clear();
         inner.pending.clear();
         inner.extra_copies.clear();
+        inner.incomplete = false;
+    }
+
+    /// The view was created while the index already held `blocks` of the worker's main blocks,
+    /// none of them named here: with any, the rule leaves the worker's overlap standing until a
+    /// clear ([`Self::is_complete`]).
+    pub fn created_over(&self, blocks: usize) {
+        if blocks > 0 {
+            self.inner.write().incomplete = true;
+        }
+    }
+
+    /// Whether the rule reads this view: every main block the index holds for the worker is
+    /// named here.
+    pub fn is_complete(&self) -> bool {
+        !self.inner.read().incomplete
     }
 
     /// Blocks some non-main group retains.
@@ -374,6 +417,17 @@ impl WorkerGroups {
     /// Blocks of group stores waiting for the main store that names them.
     pub fn pending_blocks(&self) -> usize {
         self.inner.read().pending.len()
+    }
+
+    /// Blocks of group stores the wait's bound refused: they are never placed, so a group that
+    /// retains them reads as not retaining them.
+    pub fn dropped_blocks(&self) -> u64 {
+        self.inner.read().dropped
+    }
+
+    /// Main blocks the view could not name because it did not know their parent.
+    pub fn unnamed_blocks(&self) -> u64 {
+        self.inner.read().unnamed
     }
 
     /// The non-main groups learned so far.
@@ -393,6 +447,9 @@ impl WorkerGroups {
     pub fn cap(&self, prefixes: &[SequenceHash], depth: u32, block_size: usize) -> Cap {
         let block_size = block_size.max(1);
         let inner = self.inner.read();
+        if inner.incomplete {
+            return Cap { depth, by: None };
+        }
         let mut cur = (depth as usize).min(prefixes.len());
         let mut by = None;
         if cur == 0 {
@@ -952,6 +1009,51 @@ mod tests {
             view.group_stored(2, &[SequenceHash(hash)]);
         }
         assert_eq!(view.pending_blocks(), PENDING_CAP, "the wait is bounded");
+        assert_eq!(view.dropped_blocks(), 8, "the refused blocks are counted");
+    }
+
+    /// A main store under a parent the index knew and the view does not (the view came after
+    /// the parent was indexed) names nothing: a child chained from the first position would
+    /// carry a name no request computes, so it is counted instead.
+    #[test]
+    fn a_block_under_a_parent_the_view_does_not_know_is_not_named() {
+        let view = WorkerGroups::new();
+        assert_eq!(
+            view.main_stored(Some(engine(0)), &[(engine(1), ContentHash(101))]),
+            0
+        );
+        assert_eq!((view.named_blocks(), view.unnamed_blocks()), (0, 1));
+        view.main_stored(None, &[(engine(0), ContentHash(100))]);
+        view.main_stored(Some(engine(0)), &[(engine(1), ContentHash(101))]);
+        assert_eq!((view.named_blocks(), view.unnamed_blocks()), (2, 1));
+        view.learn(1, Some(WINDOW), 0);
+        view.group_stored(1, &[engine(0), engine(1)]);
+        assert_eq!(view.cap(&prefixes(2), 2, 16).depth, 2);
+    }
+
+    /// A view created after the worker's first main stores were indexed, or one that could not
+    /// name a block, reads nothing: the rule leaves the overlap standing until a clear.
+    #[test]
+    fn an_incomplete_view_leaves_the_overlap_standing_until_a_clear() {
+        let path = prefixes(4);
+        let view = view(1, WINDOW, 4, &[0]);
+        assert_eq!(
+            view.cap(&path, 4, 16).depth,
+            1,
+            "a complete view reads the window"
+        );
+        view.created_over(3);
+        assert!(!view.is_complete());
+        assert_eq!(view.cap(&path, 4, 16), Cap { depth: 4, by: None });
+        view.clear();
+        assert!(view.is_complete());
+        view.created_over(0);
+        assert!(
+            view.is_complete(),
+            "nothing indexed before the view: complete"
+        );
+        view.main_stored(Some(engine(9)), &[(engine(1), ContentHash(101))]);
+        assert!(!view.is_complete(), "a block it could not name: incomplete");
     }
 
     #[test]
