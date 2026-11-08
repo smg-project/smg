@@ -2273,15 +2273,32 @@ fn spread_evenly_rounded(total_frames: usize, count: usize) -> Vec<usize> {
 /// bounds, which the loader does not have). A clip whose rate is unknown
 /// takes the `Even` rule, bounds included.
 fn interval_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
-    if !(fps.is_finite() && fps > 0.0) || cfg.sample_fps <= 0.0 {
+    let Some(rate) = interval_walk_rate(fps, cfg) else {
         return even_frame_indices(total_frames, fps, cfg);
-    }
-    let mut indices: Vec<usize> = interval_walk(total_frames, fps, cfg.sample_fps).collect();
+    };
+    let mut indices: Vec<usize> = interval_walk(total_frames, fps, rate).collect();
     if indices.is_empty() {
         indices.push(0);
     }
     indices
 }
+
+/// The rate the interval walk runs at under `cfg`, `None` when the walk does
+/// not apply: another sampling rule, a source rate that is not a positive
+/// finite number, or a rate that is not positive (the clip then takes the
+/// `Even` rule, bounds included).
+fn interval_walk_rate(fps: f64, cfg: VideoFetchConfig) -> Option<f64> {
+    (matches!(cfg.sampling, FrameSampling::Interval)
+        && fps.is_finite()
+        && fps > 0.0
+        && cfg.sample_fps > 0.0)
+        .then_some(cfg.sample_fps)
+}
+
+/// How early the interval walk counts each instant, in seconds: the loader's
+/// own allowance for a frame's timestamp landing a hair late. The walk's
+/// filter states the same number ([`FrameSelection::interval_walk_filter`]).
+const INTERVAL_WALK_EPS: f64 = 1e-4;
 
 /// The interval walk one pick at a time: the first frame, then the first
 /// frame at or past each next instant `1 / rate` seconds on (an epsilon
@@ -2289,7 +2306,7 @@ fn interval_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) 
 /// the last pick. Lazy, so a count of the picks can stop at a bound without
 /// holding them ([`ensure_interval_picks_fit`]).
 fn interval_walk(total_frames: usize, fps: f64, rate: f64) -> impl Iterator<Item = usize> {
-    const EPS: f64 = 1e-4;
+    const EPS: f64 = INTERVAL_WALK_EPS;
     let interval = 1.0 / rate;
     let mut previous_seconds = f64::NEG_INFINITY;
     let mut previous: Option<usize> = None;
@@ -2337,11 +2354,12 @@ fn interval_walk(total_frames: usize, fps: f64, rate: f64) -> impl Iterator<Item
 /// reproduces); when the stride sits by a whole number it flips between two
 /// values under floating point (a request rate of 1.9996 at 30 fps, a
 /// container rate of 30.003 at the default 1 fps), no spread reproduces the
-/// picks, and the filter lists every one of them past
-/// [`FFMPEG_MAX_SELECT_TERMS`] as well. Such a list is bounded by this budget
-/// like every other record and, before it is built, by
-/// [`FFMPEG_MAX_LISTED_FILTER_BYTES`], the length the decoder can be given it
-/// at.
+/// picks, and the filter states the walk itself in constant size instead
+/// ([`FrameSelection::interval_walk_filter`]), so an interval selection is
+/// never listed past [`FFMPEG_MAX_SELECT_TERMS`]. A list (another rule's
+/// selection no spread describes) is bounded by this budget like every other
+/// record and, before it is built, by [`FFMPEG_MAX_LISTED_FILTER_BYTES`], the
+/// length the decoder can be given it at.
 const PICK_RECORD_BYTES: usize = 128;
 
 /// Refuses, with the decoded-bytes budget's own error, a clip whose interval
@@ -3898,9 +3916,10 @@ fn loader_sampled_fps(picks: usize, total_frames: usize, source_fps: f64) -> f64
 /// Past this many distinct frames the selection is described by a fixed-size
 /// spread expression (plus at most [`FFMPEG_SPREAD_EXTRA_TERMS`] explicit
 /// frames) when one reproduces it, instead of a list that grows with the clip:
-/// ffmpeg 5.1 refuses a list of hundreds of terms (a 451-term list fails to
-/// parse on 5.1.9; 8.0 takes it). A selection no spread describes stays a
-/// list past the cutoff and depends on the ffmpeg build.
+/// ffmpeg refuses a list of hundreds of terms (a 451-term list fails to parse
+/// on 5.1.9, a 201-term one on 8.1.3). A selection no spread describes and
+/// no walk states stays a list past the cutoff and depends on the ffmpeg
+/// build.
 const FFMPEG_MAX_SELECT_TERMS: usize = 100;
 /// Explicit frames a described selection may add to its spread formula (a
 /// rate-based selection ends on the clip's last frame, one past its spread).
@@ -3913,9 +3932,11 @@ const FFMPEG_SPREAD_EXTRA_TERMS: usize = 8;
 /// selection fell to the rate resampler: the clip was served with the generic
 /// sampler's frames under a warning, a silent change of the family's sampling
 /// rule; under the bound a list of any length is served with the loader's
-/// exact picks, as before. Only an interval selection no spread describes
-/// ([`PICK_RECORD_BYTES`]) is listed at such lengths: some 9,000 terms of
-/// six-digit indices, over an hour of picks at two a second.
+/// exact picks, as before. No selection a rule builds reaches it today: the
+/// interval walk, the one rule without a frame cap, is stated as itself when
+/// no spread describes it ([`FrameSelection::interval_walk_filter`]), and the
+/// other rules' selections are capped at `max_frames`; the bound guards the
+/// list for whatever is listed, some 9,000 terms of six-digit indices.
 const FFMPEG_MAX_LISTED_FILTER_BYTES: usize = 128 * 1024 - 1024;
 
 /// What the stream's visible frame count makes of a loader-following
@@ -3957,6 +3978,10 @@ struct FrameSelection {
     frame_indices: Vec<usize>,
     /// Distinct indices in stream order, each with its repeat count.
     unique_frames: Vec<(usize, usize)>,
+    /// The rate of the interval walk these frames are, when they are its
+    /// picks ([`interval_walk_rate`]): the filter can then state the walk
+    /// itself instead of listing them.
+    interval_rate: Option<f64>,
 }
 
 impl FrameSelection {
@@ -3983,7 +4008,9 @@ impl FrameSelection {
         if frame_indices.is_empty() {
             return None;
         }
-        Some(Self::new(source_fps, claimed, total_frames, frame_indices))
+        let mut selection = Self::new(source_fps, claimed, total_frames, frame_indices);
+        selection.interval_rate = interval_walk_rate(source_fps, cfg);
+        Some(selection)
     }
 
     fn new(
@@ -3999,6 +4026,7 @@ impl FrameSelection {
             total_frames,
             frame_indices,
             unique_frames,
+            interval_rate: None,
         }
     }
 
@@ -4062,14 +4090,18 @@ impl FrameSelection {
     ///
     /// Anything over a minute or two would be a list of hundreds of terms, so
     /// those are described instead of enumerated where a spread formula
-    /// reproduces them exactly. A selection no spread reproduces (an interval
-    /// walk whose stride sits by a whole number) stays a list, refused before
-    /// it is built ([`MediaConnectorError::FrameListTooLong`]) when it would
-    /// be longer than the decoder can be given
+    /// reproduces them exactly, and an interval walk no spread reproduces
+    /// (its stride sits by a whole number) is stated as the walk itself
+    /// ([`Self::interval_walk_filter`]). What is still a list is refused
+    /// before it is built ([`MediaConnectorError::FrameListTooLong`]) when it
+    /// would be longer than the decoder can be given
     /// ([`FFMPEG_MAX_LISTED_FILTER_BYTES`]).
     fn select_filter(&self) -> Result<String, MediaConnectorError> {
         if self.unique_frames.len() > FFMPEG_MAX_SELECT_TERMS {
             if let Some(filter) = self.spread_select_filter() {
+                return Ok(filter);
+            }
+            if let Some(filter) = self.interval_walk_filter() {
                 return Ok(filter);
             }
         }
@@ -4087,6 +4119,39 @@ impl FrameSelection {
             .map(|(idx, _)| format!("eq(n\\,{idx})"))
             .collect();
         Ok(format!("select='{}'", terms.join("+")))
+    }
+
+    /// The interval walk stated as a `select` expression of constant size,
+    /// `None` for any other selection. ffmpeg evaluates `select` once per
+    /// frame with the previously selected frame at hand (`prev_selected_n`,
+    /// NaN before the first), so the walk's own step, the first frame at or
+    /// past the previous pick's instant plus `1 / rate` seconds less
+    /// [`INTERVAL_WALK_EPS`], is computed by the decoder frame by frame in
+    /// the same doubles and the same order as [`interval_walk`] computes it
+    /// (a division, two sums, a product, a ceiling, a maximum), with the
+    /// rates printed so that they parse back to the same numbers; the clip's
+    /// last frame is named when the walk kept it. The decoder's picks were
+    /// measured equal to the walk's on 49 clips over nine source rates and
+    /// five request rates, whole-number strides included; `-frames:v` caps
+    /// the output at the selection's count, and a decode that comes back
+    /// with another count fails as a short selection does.
+    fn interval_walk_filter(&self) -> Option<String> {
+        let rate = self.interval_rate?;
+        let last = self.total_frames.checked_sub(1)?;
+        let fps = self.source_fps;
+        let eps = INTERVAL_WALK_EPS;
+        let mut filter = format!(
+            "select='if(isnan(prev_selected_n)\\,eq(n\\,0)\\,eq(n\\,max(ceil(((prev_selected_n/{fps:?})+(1/{rate:?})-{eps:?})*{fps:?})\\,prev_selected_n+1)))"
+        );
+        if self
+            .unique_frames
+            .last()
+            .is_some_and(|(index, _)| *index == last)
+        {
+            filter.push_str(&format!("+eq(n\\,{last})"));
+        }
+        filter.push('\'');
+        Some(filter)
     }
 
     /// The length of the listed filter, counted before any of it is built:
