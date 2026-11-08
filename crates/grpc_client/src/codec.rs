@@ -1,20 +1,27 @@
 //! The gRPC codec of the engine clients: prost's, with the encode buffer
-//! sized once and the message walked once more than it is written, not twice.
+//! reserved once for a message that carries inline tensors, and every
+//! message written in one pass.
 //!
 //! tonic's prost encoder writes a message into a growing `BytesMut`, so a
 //! multi-megabyte pixel tensor is copied again at every doubling of the
-//! buffer, into fresh pages each time. Here the buffer is reserved to the
-//! message's encoded length before the write, so the payload is written
-//! once into one allocation. The write is prost's `encode_raw`, the writer
-//! behind its `encode` and `encode_to_vec`: `encode` walks every field's
-//! length a second time for a capacity check (as long a walk as the first on
-//! a request of a thousand prompt ids, with no byte written), and the check
-//! cannot fail against a buffer that grows on demand, so it is not paid.
-//! Decoding is prost's own decoder, unchanged. tonic builds the encode
-//! buffer itself; the tests below drive the codec through tonic's own
-//! request body, as a client call does.
+//! buffer, into fresh pages each time. Here a request that carries multimodal
+//! inputs or media references has the buffer reserved to its encoded length
+//! before the write, so the payload is written once into one allocation. A
+//! request that carries a prompt and neither is written without the
+//! reservation: the
+//! length walk it would take costs about nine instructions per prompt id,
+//! more than the doublings it spares (a copy at a fraction of an instruction
+//! per byte, and none at all under tonic's eager buffer). Every other message
+//! reserves as before; its length is a few fields' worth to walk. The write
+//! is prost's `encode_raw`, the writer behind its `encode` and
+//! `encode_to_vec`: `encode` walks every field's length for a capacity check
+//! (as long a walk as the reservation's on a request of a thousand prompt
+//! ids, with no byte written), and the check cannot fail against a buffer
+//! that grows on demand, so it is not paid. Decoding is prost's own decoder,
+//! unchanged. tonic builds the encode buffer itself; the tests below drive
+//! the codec through tonic's own request body, as a client call does.
 
-use std::marker::PhantomData;
+use std::{any::Any, marker::PhantomData};
 
 use prost::Message;
 use tonic::{
@@ -23,8 +30,10 @@ use tonic::{
 };
 use tonic_prost::{ProstCodec, ProstDecoder};
 
-/// A [`Codec`] for `T` requests and `U` responses that reserves each encoded
-/// message's length before writing it.
+use crate::{mlx_proto, sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto};
+
+/// A [`Codec`] for `T` requests and `U` responses that reserves the encoded
+/// length of a message carrying inline tensors before writing it.
 #[derive(Debug, Clone)]
 pub struct SizedProstCodec<T, U> {
     _pd: PhantomData<(T, U)>,
@@ -55,21 +64,24 @@ where
     }
 }
 
-/// prost's encoding into a buffer reserved to the message's length first.
+/// prost's encoding, into a buffer reserved to the message's length first
+/// when the message carries inline tensors.
 #[derive(Debug, Clone)]
 pub struct SizedProstEncoder<T> {
     _pd: PhantomData<T>,
 }
 
-impl<T: Message> Encoder for SizedProstEncoder<T> {
+impl<T: Message + 'static> Encoder for SizedProstEncoder<T> {
     type Item = T;
     type Error = Status;
 
     fn encode(&mut self, item: Self::Item, buf: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
-        buf.reserve(item.encoded_len());
+        if reserves_for(&item) {
+            buf.reserve(item.encoded_len());
+        }
         // The buffer is `BytesMut`-backed and grows on demand, so the write
-        // cannot run out of room: prost's `encode` would only repeat the
-        // length walk above to tell us so.
+        // cannot run out of room: prost's `encode` would only walk the
+        // message's length to tell us so.
         item.encode_raw(buf);
         Ok(())
     }
@@ -77,6 +89,38 @@ impl<T: Message> Encoder for SizedProstEncoder<T> {
     fn buffer_settings(&self) -> BufferSettings {
         BufferSettings::default()
     }
+}
+
+/// Whether the encode buffer is reserved to `item`'s length before the
+/// write. A request that carries a prompt reserves only when it also carries
+/// multimodal inputs or media references (a media reference may be a data URL
+/// of many megabytes), the shapes whose inline payloads the reservation is
+/// for; every other message reserves as before. The encoder is instantiated
+/// per message type, so each type check here folds at compile time and a
+/// text request pays one field read.
+fn reserves_for<T: 'static>(item: &T) -> bool {
+    let item: &dyn Any = item;
+    if let Some(request) = item.downcast_ref::<tokenspeed_proto::GenerateRequest>() {
+        return request.mm_inputs.is_some();
+    }
+    if let Some(request) = item.downcast_ref::<vllm_proto::GenerateRequest>() {
+        return request.mm_inputs.is_some()
+            || !request.extra_mm_inputs.is_empty()
+            || request.media_refs.is_some();
+    }
+    if let Some(request) = item.downcast_ref::<sglang_proto::GenerateRequest>() {
+        return request.mm_inputs.is_some() || !request.extra_mm_inputs.is_empty();
+    }
+    if let Some(request) = item.downcast_ref::<sglang_proto::EmbedRequest>() {
+        return request.mm_inputs.is_some();
+    }
+    if let Some(request) = item.downcast_ref::<trtllm_proto::GenerateRequest>() {
+        return request.multimodal_input.is_some();
+    }
+    // The prompt-carrying requests whose wire has no multimodal field.
+    !(item.is::<vllm_proto::EmbedRequest>()
+        || item.is::<trtllm_proto::EmbedRequest>()
+        || item.is::<mlx_proto::GenerateRequest>())
 }
 
 #[cfg(test)]
@@ -93,9 +137,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        sglang_proto, tokenspeed_proto,
+        mlx_proto, sglang_proto, tokenspeed_encoder_proto, tokenspeed_proto,
         tokenspeed_scheduler::tokenspeed_proto::{tensor_data::Payload, TensorData},
-        vllm_proto,
+        trtllm_proto, vllm_proto,
     };
 
     fn tensor() -> TensorData {
@@ -178,10 +222,112 @@ mod tests {
         "a rendered conversation ".repeat(bytes / 24 + 1)[..bytes].to_string()
     }
 
+    fn inline_payload(bytes: usize) -> Bytes {
+        Bytes::from(vec![9u8; bytes])
+    }
+
+    /// Multimodal inputs on each wire that carries inline tensors: one
+    /// float32 tensor of `bytes` bytes as the payload.
+    fn tokenspeed_multimodal(bytes: usize) -> tokenspeed_proto::MultimodalInputs {
+        tokenspeed_proto::MultimodalInputs {
+            items: vec![tokenspeed_proto::MultimodalItem {
+                encoder_input: Some(TensorData {
+                    shape: vec![1, 1, bytes as u32 / 4],
+                    dtype: "float32".to_string(),
+                    payload: Some(Payload::Inline(inline_payload(bytes))),
+                }),
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn vllm_multimodal(bytes: usize) -> vllm_proto::MultimodalInputs {
+        vllm_proto::MultimodalInputs {
+            pixel_values: Some(vllm_proto::TensorData {
+                shape: vec![1, 1, bytes as u32 / 4],
+                dtype: "float32".to_string(),
+                payload: Some(vllm_proto::tensor_data::Payload::Inline(inline_payload(
+                    bytes,
+                ))),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn sglang_multimodal(bytes: usize) -> sglang_proto::MultimodalInputs {
+        sglang_proto::MultimodalInputs {
+            pixel_values: Some(sglang_proto::TensorData {
+                data: inline_payload(bytes),
+                shape: vec![1, 1, bytes as u32 / 4],
+                dtype: "float32".to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The reservation follows the message's shape: a request that carries a
+    /// prompt reserves only when it also carries multimodal inputs or media
+    /// references; every other message reserves.
+    #[test]
+    fn the_reservation_follows_the_message_shape() {
+        assert!(!reserves_for(&tokenspeed_proto::GenerateRequest::default()));
+        assert!(!reserves_for(&vllm_proto::GenerateRequest::default()));
+        assert!(!reserves_for(&sglang_proto::GenerateRequest::default()));
+        assert!(!reserves_for(&trtllm_proto::GenerateRequest::default()));
+        assert!(!reserves_for(&mlx_proto::GenerateRequest::default()));
+        assert!(!reserves_for(&vllm_proto::EmbedRequest::default()));
+        assert!(!reserves_for(&sglang_proto::EmbedRequest::default()));
+        assert!(!reserves_for(&trtllm_proto::EmbedRequest::default()));
+
+        assert!(reserves_for(&tokenspeed_proto::GenerateRequest {
+            mm_inputs: Some(tokenspeed_multimodal(8)),
+            ..Default::default()
+        }));
+        assert!(reserves_for(&vllm_proto::GenerateRequest {
+            mm_inputs: Some(vllm_multimodal(8)),
+            ..Default::default()
+        }));
+        assert!(reserves_for(&vllm_proto::GenerateRequest {
+            extra_mm_inputs: vec![vllm_multimodal(8)],
+            ..Default::default()
+        }));
+        assert!(reserves_for(&vllm_proto::GenerateRequest {
+            media_refs: Some(vllm_proto::MediaRefs {
+                items: vec![vllm_proto::MediaRef {
+                    modality: crate::common_proto::Modality::Image as i32,
+                    url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+                }],
+            }),
+            ..Default::default()
+        }));
+        assert!(reserves_for(&sglang_proto::GenerateRequest {
+            mm_inputs: Some(Box::new(sglang_multimodal(8))),
+            ..Default::default()
+        }));
+        assert!(reserves_for(&sglang_proto::GenerateRequest {
+            extra_mm_inputs: vec![sglang_multimodal(8)],
+            ..Default::default()
+        }));
+        assert!(reserves_for(&sglang_proto::EmbedRequest {
+            mm_inputs: Some(sglang_multimodal(8)),
+            ..Default::default()
+        }));
+        assert!(reserves_for(&trtllm_proto::GenerateRequest {
+            multimodal_input: Some(trtllm_proto::MultimodalInput::default()),
+            ..Default::default()
+        }));
+
+        assert!(reserves_for(
+            &tokenspeed_encoder_proto::EncodeRequest::default()
+        ));
+        assert!(reserves_for(&tensor()));
+        assert!(reserves_for(&vllm_proto::HealthCheckRequest::default()));
+    }
+
     /// Every engine's generate request, at the size of a tool-call turn (a
     /// thousand prompt ids, a few kilobytes of rendered text), frames as
-    /// prost's bytes behind the five-byte header: the one-pass write changes
-    /// nothing the engine reads.
+    /// prost's bytes behind the five-byte header: the one-pass write without
+    /// a reservation changes nothing the engine reads.
     #[test]
     fn a_generate_request_frames_as_prosts_bytes_behind_the_five_byte_header() {
         let request_id = "chatcmpl-0123456789abcdef0123456789abcdef".to_string();
@@ -231,9 +377,47 @@ mod tests {
         });
     }
 
+    /// A generate request that carries multimodal inputs, with an inline
+    /// tensor beyond tonic's eager buffer, frames as prost's bytes on every
+    /// wire that carries one: the reserved write changes nothing the engine
+    /// reads.
+    #[test]
+    fn a_request_with_multimodal_inputs_frames_as_prosts_bytes() {
+        let request_id = "chatcmpl-0123456789abcdef0123456789abcdef".to_string();
+        frames_as_prost_does(tokenspeed_proto::GenerateRequest {
+            request_id: request_id.clone(),
+            tokenized: Some(tokenspeed_proto::TokenizedInput {
+                input_ids: prompt_ids(77),
+                original_text: prompt_text(448),
+            }),
+            mm_inputs: Some(tokenspeed_multimodal(64 * 1024)),
+            ..Default::default()
+        });
+        frames_as_prost_does(vllm_proto::GenerateRequest {
+            request_id: request_id.clone(),
+            input: Some(vllm_proto::generate_request::Input::Tokenized(
+                vllm_proto::TokenizedInput {
+                    original_text: prompt_text(448),
+                    input_ids: prompt_ids(77),
+                },
+            )),
+            mm_inputs: Some(vllm_multimodal(64 * 1024)),
+            ..Default::default()
+        });
+        frames_as_prost_does(sglang_proto::GenerateRequest {
+            request_id,
+            tokenized: Some(sglang_proto::TokenizedInput {
+                original_text: prompt_text(448),
+                input_ids: prompt_ids(77),
+            }),
+            mm_inputs: Some(Box::new(sglang_multimodal(64 * 1024))),
+            ..Default::default()
+        });
+    }
+
     /// A message larger than tonic's eager encode buffer, as ids (a long
-    /// prompt) and as one payload (a tensor): the reservation path frames
-    /// the same bytes.
+    /// prompt, written into the growing buffer) and as one payload (a tensor,
+    /// written into the reserved one): both frame the same bytes.
     #[test]
     fn a_message_beyond_the_eager_buffer_frames_the_same_bytes() {
         frames_as_prost_does(tokenspeed_proto::GenerateRequest {
