@@ -1,6 +1,6 @@
-//! What the decode of an output with logprobs allocates, pinned at today's
-//! count, so the next change that adds a copy fails a test rather than
-//! moving a bench inside its noise. A separate executable, so it can declare
+//! What the decode of an output with logprobs and the encode of an
+//! add-request allocate, pinned at today's counts, so the next change that
+//! adds a copy fails a test rather than moving a bench inside its noise. A separate executable, so it can declare
 //! the counting allocator the pin needs. `ZMQ_DECODE_COUNTED=<n>` runs the
 //! decode `n` times and exits, for a counter-based reading (`perf stat`).
 
@@ -12,18 +12,31 @@
 
 mod common;
 
-use std::hint::black_box;
+use std::{hint::black_box, sync::atomic::Ordering};
 
 use bytes::Bytes;
-use common::counting_alloc::{calls, Counting};
+use common::counting_alloc::{calls, Counting, ALLOCATED};
 use engine_zmq_client::{
     codec::encode_msgpack,
-    protocol::vllm::{
-        logprobs::{Logprobs, PositionLogprobs, TokenLogprob},
-        output::{
-            decode_engine_core_outputs, EngineCoreFinishReason, EngineCoreOutput,
-            EngineCoreOutputs, RequestBatchOutputs,
+    protocol::{
+        sglang::{
+            request::{SglangRequest, TokenizedGenerateReqInput as SglangGenerate},
+            SglangLayout, SglangProtocol,
         },
+        tokenspeed::{
+            request::TokenizedGenerateReqInput as TokenSpeedGenerate, TokenSpeedProtocol,
+        },
+        trtllm::{request::TrtllmGenerateReqInput, TrtllmProtocol},
+        vllm::{
+            logprobs::{Logprobs, PositionLogprobs, TokenLogprob},
+            output::{
+                decode_engine_core_outputs, EngineCoreFinishReason, EngineCoreOutput,
+                EngineCoreOutputs, RequestBatchOutputs,
+            },
+            request::EngineCoreRequest,
+            VllmProtocol,
+        },
+        EngineProtocol,
     },
 };
 
@@ -99,5 +112,104 @@ fn counted_decodes() {
     let frames = one_token_five_candidates();
     for _ in 0..count {
         black_box(decode_engine_core_outputs(black_box(&frames)).expect("decode"));
+    }
+}
+
+/// The prompt of the encode pins: 8,192 token ids, a long prompt, spread over
+/// the id range so the ids take their usual three bytes each.
+const PINNED_PROMPT_TOKENS: u32 = 8192;
+
+fn prompt_ids() -> Vec<u32> {
+    (0..PINNED_PROMPT_TOKENS)
+        .map(|position| 1_000 + (position * 7_919) % 150_000)
+        .collect()
+}
+
+/// A request id of the length the gateway mints.
+const PINNED_REQUEST_ID: &str = "req-0123456789abcdef0123456789abcdef012345";
+
+/// One warm encode, then the counted one: the payload, the allocation calls
+/// and the bytes requested by one add-request encode on wire `P`.
+fn encode_allocations<P: EngineProtocol>(
+    request: &P::Request,
+    layout: &P::Layout,
+) -> (Vec<u8>, usize, usize) {
+    P::encode_add(request, layout).expect("encode");
+    let bytes_before = ALLOCATED.load(Ordering::Relaxed);
+    let (encoded, allocations) = allocations_during(|| P::encode_add(request, layout));
+    let bytes = ALLOCATED.load(Ordering::Relaxed) - bytes_before;
+    let (payload, aux_frames) = encoded.expect("encode");
+    assert!(
+        aux_frames.is_empty(),
+        "a text request rides in its one frame"
+    );
+    (payload, allocations, bytes)
+}
+
+/// Encoding one add-request of 8,192 token ids allocates its payload buffer
+/// once on every wire: the buffer is sized from the prompt before the write.
+/// A buffer grown from empty costs one allocation per doubling instead
+/// (twelve for this prompt) and asks the allocator for a third more bytes
+/// than the payload. The bytes on the wire are the request's plain msgpack
+/// encoding either way.
+#[test]
+fn encoding_an_add_request_allocates_once_on_every_wire() {
+    let mut rows = Vec::new();
+    let request = EngineCoreRequest {
+        request_id: PINNED_REQUEST_ID.to_string(),
+        prompt_token_ids: Some(prompt_ids()),
+        sampling_params: Some(Default::default()),
+        ..Default::default()
+    };
+    let (payload, allocations, bytes) = encode_allocations::<VllmProtocol>(&request, &());
+    assert_eq!(payload, rmp_serde::to_vec_named(&request).expect("encode"));
+    rows.push(("vllm", payload.len(), allocations, bytes));
+
+    let request = SglangRequest::Generate(SglangGenerate {
+        rid: PINNED_REQUEST_ID.to_string(),
+        input_ids: prompt_ids(),
+        ..Default::default()
+    });
+    for tensor_aux_frames in [true, false] {
+        let layout = SglangLayout { tensor_aux_frames };
+        let (payload, allocations, bytes) = encode_allocations::<SglangProtocol>(&request, &layout);
+        assert_eq!(payload, rmp_serde::to_vec_named(&request).expect("encode"));
+        let wire = if tensor_aux_frames {
+            "sglang, aux-frame layout"
+        } else {
+            "sglang, inline layout"
+        };
+        rows.push((wire, payload.len(), allocations, bytes));
+    }
+
+    let request = TokenSpeedGenerate {
+        rid: PINNED_REQUEST_ID.to_string(),
+        input_ids: prompt_ids(),
+        ..Default::default()
+    };
+    let (payload, allocations, bytes) =
+        encode_allocations::<TokenSpeedProtocol>(&request, &Default::default());
+    assert_eq!(payload, rmp_serde::to_vec_named(&request).expect("encode"));
+    rows.push(("tokenspeed", payload.len(), allocations, bytes));
+
+    let request = TrtllmGenerateReqInput {
+        rid: PINNED_REQUEST_ID.to_string(),
+        input_ids: prompt_ids(),
+        ..Default::default()
+    };
+    let (payload, allocations, bytes) = encode_allocations::<TrtllmProtocol>(&request, &());
+    assert_eq!(payload, rmp_serde::to_vec_named(&request).expect("encode"));
+    rows.push(("trtllm", payload.len(), allocations, bytes));
+
+    for (wire, payload_bytes, allocations, bytes) in &rows {
+        eprintln!(
+            "allocation calls per add-request encode, {wire}: {allocations} ({bytes} bytes requested for a {payload_bytes}-byte payload)"
+        );
+    }
+    for (wire, _, allocations, _) in &rows {
+        assert_eq!(
+            *allocations, 1,
+            "allocation calls per add-request encode, {wire}"
+        );
     }
 }
