@@ -2272,6 +2272,7 @@ impl Router {
                 // The launcher resolved the secrets' sources in Python; the
                 // record is the CLI's.
                 secret_sources: Default::default(),
+                secret_files: Default::default(),
             }))
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))

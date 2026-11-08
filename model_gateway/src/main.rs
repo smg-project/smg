@@ -29,6 +29,7 @@ use smg::{
         AccessLogField, PowerOfTwoLoadMetric, TurboJpegPolicy, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     observability::metrics::register_jemalloc_as_global_allocator,
+    secrets::SecretFiles,
     server::{self, posture::SecretSources, ServerConfig},
     version,
 };
@@ -1792,6 +1793,12 @@ struct IntegrationArgs {
     /// `resolve_secret_sources` for the start-up record; not a flag.
     #[arg(skip)]
     secret_sources: SecretSources,
+
+    /// The files the keys above were read from, where a file was the
+    /// source, filled by `resolve_secret_sources` for the reload route; not
+    /// a flag.
+    #[arg(skip)]
+    secret_files: SecretFiles,
 
     // ==================== Mesh Server ====================
     /// Start the mesh: several gateways find each other, keep one membership

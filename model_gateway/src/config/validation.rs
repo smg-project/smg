@@ -668,13 +668,26 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validates `tenant_api_keys`: non-empty `tenant_id`/`key`, and no two
-    /// credentials (including the shared `api_key`) sharing a secret value —
-    /// duplicates would silently attribute one tenant's traffic to another.
-    /// Runs regardless of construction path, since `TenantApiKeyEntry` is a
-    /// public deserializable struct. Compares hashes only; errors never
-    /// include a raw key value.
+    /// Validates `tenant_api_keys` against the shared `api_key`: the rules
+    /// of [`Self::tenant_credentials`] over the start's configuration. Runs
+    /// regardless of construction path, since `TenantApiKeyEntry` is a
+    /// public deserializable struct.
     fn validate_tenant_api_keys(config: &RouterConfig) -> ConfigResult<()> {
+        Self::tenant_credentials(config.api_key.as_deref(), &config.tenant_api_keys)
+    }
+
+    /// The rules of a serving key set, the shared key and the tenant
+    /// entries that are in force together: non-empty `tenant_id`/`key`
+    /// without surrounding whitespace, a `tenant_id` within its column, and
+    /// no two credentials (the shared key included) sharing a secret value —
+    /// duplicates would silently attribute one tenant's traffic to another.
+    /// The start runs it over its configuration, and a reload over the set
+    /// it is about to put in force. Compares hashes only; errors never
+    /// include a raw key value.
+    pub(crate) fn tenant_credentials(
+        api_key: Option<&str>,
+        entries: &[TenantApiKeyEntry],
+    ) -> ConfigResult<()> {
         fn hash(key: &str) -> [u8; 32] {
             Sha256::digest(key.as_bytes()).into()
         }
@@ -682,11 +695,11 @@ impl ConfigValidator {
         let mut seen: std::collections::HashMap<[u8; 32], String> =
             std::collections::HashMap::new();
 
-        if let Some(api_key) = &config.api_key {
+        if let Some(api_key) = api_key {
             seen.insert(hash(api_key), "the shared api_key".to_string());
         }
 
-        for entry in &config.tenant_api_keys {
+        for entry in entries {
             let trimmed_tenant_id = entry.tenant_id.trim();
             if trimmed_tenant_id.is_empty() {
                 return Err(ConfigError::ValidationFailed {

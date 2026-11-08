@@ -388,6 +388,7 @@ fn get_endpoint(op_id: &str, summary: &str, resp_name: &str) -> PathItem {
 pub const CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
     ("GET", "/inflight"),
     ("GET", "/config"),
+    ("POST", "/secrets/reload"),
     ("POST", "/flush_cache"),
     ("POST", "/start_profile"),
     ("POST", "/stop_profile"),
@@ -903,6 +904,61 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                         "required": ["build", "secret_sources", "config"]
                     }),
                 ),
+            )),
+            ..PathItem::default()
+        },
+    );
+
+    paths.insert(
+        "/secrets/reload".to_string(),
+        PathItem {
+            post: Some(operation(
+                "reloadSecrets",
+                "Read the key files the start read again and put their keys in force: the admin role alone, mounted only with control-plane authentication",
+                None,
+                None,
+                {
+                    let mut responses = inline_response(
+                        "The files read with their entry counts, and whether the serving and the control-plane key sets changed",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "files": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "setting": {"type": "string"},
+                                            "path": {"type": "string"},
+                                            "entries": {"type": "integer"}
+                                        },
+                                        "required": ["setting", "path", "entries"]
+                                    }
+                                },
+                                "serving_changed": {"type": "boolean"},
+                                "control_plane_changed": {"type": "boolean"}
+                            },
+                            "required": ["files", "serving_changed", "control_plane_changed"]
+                        }),
+                    );
+                    responses.insert(
+                        "409".to_string(),
+                        Response {
+                            description: "No key was read from a file at start; nothing to reload"
+                                .to_string(),
+                            content: None,
+                        },
+                    );
+                    responses.insert(
+                        "422".to_string(),
+                        Response {
+                            description: "A file could not be used (unreadable, unparsable, or a key set the start's rules refuse); every key in force stands. The body names the field and the path, never the content"
+                                .to_string(),
+                            content: None,
+                        },
+                    );
+                    responses
+                },
             )),
             ..PathItem::default()
         },

@@ -22,7 +22,11 @@ use smg::{
     mesh::discovery::MeshDiscoveryConfig,
     observability::metrics::PrometheusConfig,
     policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
-    server::{posture::SecretSources, ServerConfig},
+    secrets::SecretFiles,
+    server::{
+        posture::{SecretSource, SecretSources},
+        ServerConfig,
+    },
     service_discovery::RuntimeDiscoveryConfig,
     version,
     worker::{ConnectionMode, RuntimeType},
@@ -55,6 +59,8 @@ impl CliArgs {
     /// parameter so a test need not touch the process environment.
     pub(crate) fn resolve_secret_sources(&mut self, env: EnvLookup<'_>) -> ConfigResult<()> {
         let mut sources = SecretSources::default();
+        let mut files = SecretFiles::default();
+        let from_file = SecretSource::File;
         if let Some((value, source)) = API_KEY_SETTING.resolve_value(
             self.integrations.api_key.as_deref(),
             self.integrations.api_key_file.as_deref(),
@@ -62,6 +68,10 @@ impl CliArgs {
         )? {
             self.integrations.api_key = Some(value);
             sources.api_key = Some(source);
+            if source == from_file {
+                files.api_key =
+                    API_KEY_SETTING.file(self.integrations.api_key_file.as_deref(), env)?;
+            }
         }
         if let Some((entries, source)) = TENANT_API_KEYS_SETTING.resolve_entries(
             &self.integrations.tenant_api_keys,
@@ -70,6 +80,10 @@ impl CliArgs {
         )? {
             sources.tenant_api_keys = Some((source, entries.len()));
             self.integrations.tenant_api_keys = entries;
+            if source == from_file {
+                files.tenant_api_keys = TENANT_API_KEYS_SETTING
+                    .file(self.integrations.tenant_api_keys_file.as_deref(), env)?;
+            }
         }
         if let Some((entries, source)) = CONTROL_PLANE_API_KEYS_SETTING.resolve_entries(
             &self.integrations.control_plane_api_keys,
@@ -78,6 +92,12 @@ impl CliArgs {
         )? {
             sources.control_plane_api_keys = Some((source, entries.len()));
             self.integrations.control_plane_api_keys = entries;
+            if source == from_file {
+                files.control_plane_api_keys = CONTROL_PLANE_API_KEYS_SETTING.file(
+                    self.integrations.control_plane_api_keys_file.as_deref(),
+                    env,
+                )?;
+            }
         }
         if self.model.history_backend == "postgres" {
             if let Some((value, source)) = POSTGRES_DB_URL_SETTING.resolve_value(
@@ -100,6 +120,7 @@ impl CliArgs {
             }
         }
         self.integrations.secret_sources = sources;
+        self.integrations.secret_files = files;
         Ok(())
     }
 }
@@ -1319,6 +1340,7 @@ impl CliArgs {
             webrtc_bind_addr: self.integrations.webrtc_bind_addr,
             webrtc_stun_server: self.integrations.webrtc_stun_server.clone(),
             secret_sources: self.integrations.secret_sources,
+            secret_files: self.integrations.secret_files.clone(),
         })
     }
 
