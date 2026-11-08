@@ -1187,6 +1187,11 @@ pub(crate) fn init_metrics() {
         "Bytes of the chain index's word arena sitting in free lists, by model"
     );
     describe_gauge!(
+        "smg_kv_index_arena_chunk_bytes",
+        "Bytes the chain index's word arena holds from the allocator: whole 8 MiB chunks, \
+         each kept once taken, by model"
+    );
+    describe_gauge!(
         "smg_kv_index_slab_bytes",
         "Bytes the chain index's run slab holds from the allocator, by model"
     );
@@ -3351,6 +3356,8 @@ impl Metrics {
         gauge!("smg_kv_index_arena_bytes", "model" => model.clone()).set(stats.arena_bytes as f64);
         gauge!("smg_kv_index_arena_free_bytes", "model" => model.clone())
             .set(stats.arena_free_bytes as f64);
+        gauge!("smg_kv_index_arena_chunk_bytes", "model" => model.clone())
+            .set(stats.arena_chunk_bytes as f64);
         gauge!("smg_kv_index_slab_bytes", "model" => model.clone()).set(stats.slab_bytes as f64);
         gauge!("smg_kv_index_moved_hashes", "model" => model.clone())
             .set(stats.moved_hashes as f64);
