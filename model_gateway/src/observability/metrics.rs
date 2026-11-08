@@ -1188,8 +1188,8 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_kv_index_arena_chunk_bytes",
-        "Bytes the chain index's word arena holds from the allocator: arena_bytes rounded \
-         up to whole chunks of 8 MiB, each kept once taken, by model"
+        "Bytes the chain index's word arena holds from the allocator: whole 8 MiB chunks, \
+         each kept once taken, by model"
     );
     describe_gauge!(
         "smg_kv_index_slab_bytes",

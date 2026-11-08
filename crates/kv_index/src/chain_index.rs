@@ -65,9 +65,9 @@
 //! by every worker that holds it, with about 12% slack for growth) plus a 64-byte run header, the
 //! coverage words and a child table per branching run, against the 16-byte lane-map slot each
 //! lane keeps per held block for removals. The arena takes its memory from the process allocator
-//! a whole chunk (8 MiB) at a time and keeps every chunk once taken: what a process holds for the
-//! index moves in steps of one chunk (`arena_chunk_bytes`), while the words handed out
-//! (`arena_bytes`) move with the blocks.
+//! a whole chunk (8 MiB) at a time and keeps every chunk once taken: what the arena holds moves
+//! in steps of one chunk (`arena_chunk_bytes`), while the words handed out (`arena_bytes`) move
+//! with the blocks.
 
 use std::{
     collections::BTreeSet,
@@ -176,8 +176,8 @@ pub struct ChainIndexStats {
     pub arena_bytes: usize,
     /// Bytes of the word arena sitting in free lists.
     pub arena_free_bytes: usize,
-    /// Bytes the word arena holds from the process allocator: `arena_bytes` rounded up to whole
-    /// chunks (8 MiB each).
+    /// Bytes the word arena holds from the process allocator: whole chunks (8 MiB each), the
+    /// first taken by the first array or table and each kept once taken.
     pub arena_chunk_bytes: usize,
     /// Bytes of run headers, coverage words included (all allocated runs).
     pub header_bytes: usize,

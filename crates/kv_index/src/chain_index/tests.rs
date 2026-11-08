@@ -40,9 +40,10 @@ fn array_classes_round_up_and_back() {
 
 /// The arena takes memory from the process allocator a whole chunk at a time and keeps it: at a
 /// chunk boundary one more small array moves the bytes held by a chunk while the bytes handed
-/// out move by the array. A process whose index sits near a boundary therefore holds one of two
+/// out move by the array. An index whose arena sits near a boundary therefore holds one of two
 /// amounts a chunk apart for the same blocks, which `arena_chunk_bytes` names beside
-/// `arena_bytes`: the held bytes are the handed-out words rounded up to whole chunks.
+/// `arena_bytes`: nothing before the first array (the reserved word 0 is handed out, no chunk is
+/// held), then the handed-out words rounded up to whole chunks.
 #[test]
 fn the_arena_holds_whole_chunks_and_keeps_them() {
     const CHUNK_BYTES: usize = WORD_CHUNK * size_of::<AtomicU64>();
