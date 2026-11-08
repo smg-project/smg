@@ -1,21 +1,19 @@
 use std::{
-    pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use futures::Stream;
 use opentelemetry::trace::TraceContextExt;
 use portpicker::pick_unused_port;
 use serial_test::serial;
 use smg::{observability::otel_trace, routers::grpc::client::GrpcClient};
-use smg_grpc_client::{common_proto, tokenspeed_proto as ts};
+use smg_grpc_client::tokenspeed_proto as ts;
+use smg_test_harness::engine_answers::{TokenSpeedAnswers, TokenSpeedGenerateStream};
 use tokio::sync::oneshot;
 use tonic::{metadata::MetadataMap, transport::Server, Request as TonicRequest, Response, Status};
 use tracing::{info_span, instrument::WithSubscriber, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::prelude::*;
-use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
 
 use crate::collector::start_collector;
 
@@ -143,11 +141,6 @@ async fn test_grpc_trace_context_injection() {
 // The engine clients the gateway connects carry the trace context
 // ============================================================================
 
-type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
-type KvEventStream = Pin<Box<dyn Stream<Item = Result<common_proto::KvEventBatch, Status>> + Send>>;
-type TokenizerStream =
-    Pin<Box<dyn Stream<Item = Result<common_proto::GetTokenizerChunk, Status>> + Send>>;
-
 /// A TokenSpeed engine stub that records the `traceparent` of every generate
 /// call's metadata and answers nothing else.
 #[derive(Clone, Default)]
@@ -156,15 +149,11 @@ struct MetadataStub {
 }
 
 #[tonic::async_trait]
-impl TokenSpeedScheduler for MetadataStub {
-    type GenerateStream = GenStream;
-    type SubscribeKvEventsStream = KvEventStream;
-    type GetTokenizerStream = TokenizerStream;
-
+impl TokenSpeedAnswers for MetadataStub {
     async fn generate(
         &self,
         request: TonicRequest<ts::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<TokenSpeedGenerateStream>, Status> {
         let traceparent = request
             .metadata()
             .get("traceparent")
@@ -196,62 +185,6 @@ impl TokenSpeedScheduler for MetadataStub {
             message: String::new(),
         }))
     }
-
-    async fn get_model_info(
-        &self,
-        _request: TonicRequest<ts::GetModelInfoRequest>,
-    ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
-        Err(Status::unimplemented("metadata stub"))
-    }
-
-    async fn get_server_info(
-        &self,
-        _request: TonicRequest<ts::GetServerInfoRequest>,
-    ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
-        Err(Status::unimplemented("metadata stub"))
-    }
-
-    async fn get_loads(
-        &self,
-        _request: TonicRequest<ts::GetLoadsRequest>,
-    ) -> Result<Response<ts::GetLoadsResponse>, Status> {
-        Err(Status::unimplemented("metadata stub"))
-    }
-
-    async fn subscribe_kv_events(
-        &self,
-        _request: TonicRequest<common_proto::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented("metadata stub"))
-    }
-
-    async fn flush_cache(
-        &self,
-        _request: TonicRequest<common_proto::FlushCacheRequest>,
-    ) -> Result<Response<common_proto::FlushCacheResponse>, Status> {
-        Err(Status::unimplemented("metadata stub"))
-    }
-
-    async fn start_profile(
-        &self,
-        _request: TonicRequest<common_proto::StartProfileRequest>,
-    ) -> Result<Response<common_proto::ProfileResponse>, Status> {
-        Err(Status::unimplemented("metadata stub"))
-    }
-
-    async fn stop_profile(
-        &self,
-        _request: TonicRequest<common_proto::StopProfileRequest>,
-    ) -> Result<Response<common_proto::ProfileResponse>, Status> {
-        Err(Status::unimplemented("metadata stub"))
-    }
-
-    async fn get_tokenizer(
-        &self,
-        _request: TonicRequest<common_proto::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented("metadata stub"))
-    }
 }
 
 #[expect(
@@ -265,7 +198,7 @@ async fn spawn_metadata_stub(stub: MetadataStub) -> u16 {
     let addr = format!("127.0.0.1:{port}").parse().expect("stub addr");
     tokio::spawn(async move {
         Server::builder()
-            .add_service(TokenSpeedSchedulerServer::new(stub))
+            .add_service(stub.into_server())
             .serve(addr)
             .await
             .expect("metadata stub server");

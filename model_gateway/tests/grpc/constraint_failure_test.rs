@@ -17,7 +17,7 @@ use std::{
 };
 
 use axum::{body::to_bytes, http::StatusCode};
-use common::engine_answers::{TokenSpeedAnswers, TokenSpeedGenerateStream, TokenSpeedService};
+use common::engine_answers::{TokenSpeedAnswers, TokenSpeedGenerateStream};
 use futures::stream;
 use openai_protocol::{
     chat::ChatCompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
@@ -36,9 +36,7 @@ use smg::{
 use smg_grpc_client::{constraint_failed_status, tokenspeed_scheduler::tokenspeed_proto as ts};
 use tokio::{net::TcpListener, time::timeout};
 use tonic::{transport::Server, Request, Response, Status};
-use ts::{
-    generate_response::Response as GenResp, token_speed_scheduler_server::TokenSpeedSchedulerServer,
-};
+use ts::generate_response::Response as GenResp;
 
 use crate::common;
 
@@ -62,7 +60,7 @@ enum ReportAt {
 /// constraint, reporting it at `report_at`; every call counted.
 struct ConstraintFailingWorker {
     report_at: ReportAt,
-    calls: AtomicUsize,
+    calls: Arc<AtomicUsize>,
 }
 
 #[tonic::async_trait]
@@ -141,14 +139,14 @@ async fn answers_of(
 ) -> (Vec<Answer>, usize, Arc<dyn Worker>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let worker_impl = Arc::new(TokenSpeedService(ConstraintFailingWorker {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let engine = ConstraintFailingWorker {
         report_at,
-        calls: AtomicUsize::new(0),
-    }));
-    let calls = Arc::clone(&worker_impl);
+        calls: Arc::clone(&calls),
+    };
     let worker_task = tokio::spawn(async move {
         Server::builder()
-            .add_service(TokenSpeedSchedulerServer::from_arc(worker_impl))
+            .add_service(engine.into_server())
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
             .expect("constraint-failing gRPC worker failed");
@@ -233,7 +231,7 @@ async fn answers_of(
         answers.push(answer);
     }
     worker_task.abort();
-    (answers, calls.0.calls.load(Ordering::SeqCst), worker)
+    (answers, calls.load(Ordering::SeqCst), worker)
 }
 
 fn assert_constraint_failed_body(answer: &Answer, name: &str) {

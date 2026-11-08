@@ -67,7 +67,9 @@ use std::{
 };
 
 use common::{
-    engine_answers::{VllmAnswers, VllmGenerateStream},
+    engine_answers::{
+        TokenSpeedAnswers, TokenSpeedGenerateStream, VllmAnswers, VllmGenerateStream,
+    },
     grpc_harness::{
         build_grpc_router, grpc_router_config, grpc_worker, serve_canned_worker, serve_engine,
         Canned,
@@ -86,13 +88,10 @@ use smg::{
         RuntimeType, Worker, WorkerType,
     },
 };
-use smg_grpc_client::{
-    common_proto as grpc_common, tokenspeed_scheduler::tokenspeed_proto as ts, vllm_proto as proto,
-};
+use smg_grpc_client::{tokenspeed_scheduler::tokenspeed_proto as ts, vllm_proto as proto};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
 
 use crate::common;
 
@@ -391,15 +390,11 @@ impl QueuedEngine {
 }
 
 #[tonic::async_trait]
-impl TokenSpeedScheduler for QueuedEngine {
-    type GenerateStream = ReceiverStream<Result<ts::GenerateResponse, Status>>;
-    type GetTokenizerStream = ReceiverStream<Result<grpc_common::GetTokenizerChunk, Status>>;
-    type SubscribeKvEventsStream = ReceiverStream<Result<grpc_common::KvEventBatch, Status>>;
-
+impl TokenSpeedAnswers for QueuedEngine {
     async fn generate(
         &self,
         request: Request<ts::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<TokenSpeedGenerateStream>, Status> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, rx) = mpsc::channel(8);
         let request_id = request.into_inner().request_id;
@@ -440,7 +435,7 @@ impl TokenSpeedScheduler for QueuedEngine {
                 }
             }
         }
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     async fn health_check(
@@ -483,41 +478,6 @@ impl TokenSpeedScheduler for QueuedEngine {
     ) -> Result<Response<ts::GetLoadsResponse>, Status> {
         Ok(Response::new(ts::GetLoadsResponse::default()))
     }
-
-    async fn flush_cache(
-        &self,
-        _request: Request<grpc_common::FlushCacheRequest>,
-    ) -> Result<Response<grpc_common::FlushCacheResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn start_profile(
-        &self,
-        _request: Request<grpc_common::StartProfileRequest>,
-    ) -> Result<Response<grpc_common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn stop_profile(
-        &self,
-        _request: Request<grpc_common::StopProfileRequest>,
-    ) -> Result<Response<grpc_common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn get_tokenizer(
-        &self,
-        _request: Request<grpc_common::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn subscribe_kv_events(
-        &self,
-        _request: Request<grpc_common::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
 }
 
 /// Serve a queued parallel-dispatch mock engine in-process; returns its port
@@ -528,7 +488,7 @@ async fn start_queued_grpc_worker(shape: ParallelShape) -> (u16, QueuedEngine) {
         shape,
         calls: Arc::new(AtomicUsize::new(0)),
     };
-    let port = serve_engine(TokenSpeedSchedulerServer::new(engine.clone())).await;
+    let port = serve_engine(engine.clone().into_server()).await;
     (port, engine)
 }
 
@@ -543,7 +503,7 @@ async fn start_cold_queued_grpc_worker(cold: Duration) -> (u16, QueuedEngine) {
         shape: ParallelShape::Queued,
         calls: Arc::new(AtomicUsize::new(0)),
     };
-    let port = serve_engine(TokenSpeedSchedulerServer::new(engine.clone())).await;
+    let port = serve_engine(engine.clone().into_server()).await;
     (port, engine)
 }
 
@@ -566,7 +526,7 @@ async fn start_late_grpc_worker(
         },
         calls: Arc::new(AtomicUsize::new(0)),
     };
-    let port = serve_engine(TokenSpeedSchedulerServer::new(engine.clone())).await;
+    let port = serve_engine(engine.clone().into_server()).await;
     (port, engine)
 }
 
@@ -595,11 +555,7 @@ async fn start_mock_grpc_worker(delay: Duration) -> u16 {
 struct CutEngine;
 
 #[tonic::async_trait]
-impl TokenSpeedScheduler for CutEngine {
-    type GenerateStream = ReceiverStream<Result<ts::GenerateResponse, Status>>;
-    type GetTokenizerStream = ReceiverStream<Result<grpc_common::GetTokenizerChunk, Status>>;
-    type SubscribeKvEventsStream = ReceiverStream<Result<grpc_common::KvEventBatch, Status>>;
-
+impl TokenSpeedAnswers for CutEngine {
     #[expect(
         clippy::disallowed_methods,
         reason = "test mock; the producer task ends with its one item"
@@ -607,14 +563,14 @@ impl TokenSpeedScheduler for CutEngine {
     async fn generate(
         &self,
         _request: Request<ts::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<TokenSpeedGenerateStream>, Status> {
         let (tx, rx) = mpsc::channel(1);
         tokio::spawn(async move {
             let _ = tx
                 .send(Err(Status::unavailable("the engine dropped the request")))
                 .await;
         });
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     async fn health_check(
@@ -657,46 +613,11 @@ impl TokenSpeedScheduler for CutEngine {
     ) -> Result<Response<ts::GetLoadsResponse>, Status> {
         Ok(Response::new(ts::GetLoadsResponse::default()))
     }
-
-    async fn flush_cache(
-        &self,
-        _request: Request<grpc_common::FlushCacheRequest>,
-    ) -> Result<Response<grpc_common::FlushCacheResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn start_profile(
-        &self,
-        _request: Request<grpc_common::StartProfileRequest>,
-    ) -> Result<Response<grpc_common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn stop_profile(
-        &self,
-        _request: Request<grpc_common::StopProfileRequest>,
-    ) -> Result<Response<grpc_common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn get_tokenizer(
-        &self,
-        _request: Request<grpc_common::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn subscribe_kv_events(
-        &self,
-        _request: Request<grpc_common::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
 }
 
 /// Serve a [`CutEngine`] in-process; returns its port.
 async fn start_cut_grpc_worker() -> u16 {
-    serve_engine(TokenSpeedSchedulerServer::new(CutEngine)).await
+    serve_engine(CutEngine.into_server()).await
 }
 
 /// A PD gRPC router over the given workers, registered as `runtime` (which picks
