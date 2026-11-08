@@ -69,7 +69,7 @@ spaced paths ask of the engine: the numbers are the gateway's.
 | `json` | chat with `response_format: json_schema` | a JSON object | 500/s |
 | `messages` | `POST /v1/messages`, `max_tokens` 8 | 8 tokens | 500/s |
 
-Nine streamed shapes are opt-in (name them in `PERF_PATHS`; their rates keep the frames
+Ten streamed shapes are opt-in (name them in `PERF_PATHS`; their rates keep the frames
 per second near the `stream` path's, except where said):
 
 | path | request | answer | rate |
@@ -82,6 +82,7 @@ per second near the `stream` path's, except where said):
 | `stream_spaced` | the `stream` request, the engine pausing 20 ms between frames | 128 tokens, one per frame 20 ms apart | 250/s |
 | `completion_stream_spaced` | the `completion_stream` request, the engine pausing 20 ms between frames | 300 tokens, one `text` delta per frame 20 ms apart | 100/s |
 | `messages_stream_spaced` | the `messages_stream` request, the engine pausing 20 ms between frames | 300 tokens, one per event 20 ms apart | 100/s |
+| `generate_stream_spaced_long` | the `generate_stream` request with `max_new_tokens` 5000, the engine pausing 20 ms between frames | 5,000 tokens, one per frame 20 ms apart, the whole text so far in every frame | 6/s |
 | `stream_logprobs` | the `stream` request with `logprobs: true, top_logprobs: 5` | 128 tokens, one per frame, the sampled logprob and 5 candidates each, `length` | 100/s |
 
 The spaced paths read the stream loops as a decoding engine drives them, one frame at a time
@@ -89,6 +90,18 @@ The spaced paths read the stream loops as a decoding engine drives them, one fra
 at once. Their pause is engine time by design: a 300-frame answer takes about six seconds, so
 they serve the cost cells (`cpu`, `alloc`, `mem`), and `live` on one of them needs
 `--slo-e2e-p99-ms` above about 6,000 to hold a step.
+
+`generate_stream_spaced_long` is the spaced generate path on a long answer: its text passes
+the gateway's 16 KiB frame bound about two thirds of the way through, so each of the last 1,700
+or so events fills a frame of its own with 20 ms between them, where `generate_stream_long`
+fills its frames from a burst (its events stay under 10 KiB; two or three make a frame) and the
+300-frame spaced path never reaches the bound. It
+reads what a whole-text-per-event stream loop's frame buffer does between full frames at an
+engine's pace: the allocation calls, the KiB and the allocations of 16 KiB and above per
+request, and the RSS after the window, beside the instruction count. An answer takes about 100 s and about 600
+streams are open at once at 6/s; 10,000 requests at that rate are about 28 minutes of window
+per cell, so name it with a smaller count (`PERF_REQUESTS=5000` is about 15 minutes); its rate
+stays a whole number at `--rate-scale 0.5`.
 
 The logprobs path's rate is the gateway's load, not a frame-rate match: a logprobs answer costs
 the gateway about 3.5 times the instructions and 13 times the allocation calls of the plain
