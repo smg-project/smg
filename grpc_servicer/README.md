@@ -419,8 +419,12 @@ pending prefill, those of the requests the engine has accepted and produced
 nothing for yet, extend that bound by the time they take at this rate, 500 s
 per million tokens; a wire that says nothing until a prompt's first token is
 silent through a whole prefill, and a batch of long prompts prefills for
-longer than any fixed bound; a low rate is a bound on how slowly a healthy
-engine may prefill, not an estimate of how fast it does; 0 allows nothing),
+longer than any fixed bound; a KV event the engine publishes
+(`--kv-events-config`) counts as a sign of life the way an output does, so
+an engine that stores the blocks of a chunked prefill chunk by chunk is not
+silent through it while its publisher runs; a low rate is a bound on how
+slowly a healthy engine may prefill, not an estimate of how fast it does; 0
+allows nothing),
 `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
 (default 1, for the one runtime `server.rs` builds for the vLLM, SGLang and
 TokenSpeed Rust servicers alike: one runtime worker carries about 100k output
@@ -1015,9 +1019,11 @@ time it polls it, so a slow but living start completes, under the ceiling, and
 300) and `SMG_TOKENSPEED_SERVICER_PREFILL_TOKENS_PER_SEC` (default 2000; the
 connected scheduler's silence bound and its prefill allowance as for vLLM
 above: this wire carries token batches only, so a batch of long prompts is
-silent for as long as its prefill takes, and the allowance, 500 s per million
-pending prompt tokens at the default rate, is what keeps that from reading as
-a dead scheduler), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
+silent for as long as its prefill takes; the KV events the scheduler
+publishes through it (`--kv-events-config`) count as signs of life, and the
+allowance, 500 s per million pending prompt tokens at the default rate, is
+what keeps a prefill from reading as a dead scheduler when it publishes
+none), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
 (default 1, for the one runtime `server.rs` builds for the vLLM, SGLang and
 TokenSpeed Rust servicers alike: one runtime worker carries about 100k output
 tokens/s on one connection with its lock uncontended; raise it to 2-4 when one
@@ -1325,7 +1331,8 @@ time it polls it, so a slow but living start completes, under the ceiling, and
 0 lifts the ceiling), `SMG_SGLANG_SERVICER_SILENCE_TIMEOUT_SECS` (default 300)
 and `SMG_SGLANG_SERVICER_PREFILL_TOKENS_PER_SEC` (default 2000; the connected
 scheduler's silence bound and its prefill allowance as for TokenSpeed above:
-this wire too carries token batches only), `SMG_ZMQ_SOCKET_DIR`,
+this wire too carries token batches only, and the scheduler's KV events count
+as signs of life the same way), `SMG_ZMQ_SOCKET_DIR`,
 `SMG_SERVICER_WORKER_THREADS`.
 
 #### Metrics (`--metrics-port`)
