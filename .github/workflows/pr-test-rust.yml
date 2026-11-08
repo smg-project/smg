@@ -1962,6 +1962,7 @@ jobs:
         deepseek-ai/DeepSeek-R1-Distill-Qwen-7B@916b56a44061fd5cd7d6a8fb632557ed4f724f60
         Qwen/Qwen2.5-14B-Instruct@cf98f3b3bbb457ad9e2bb7baf9a0125b6b88caa8
         openai/gpt-oss-20b@6cee5e81ee83917806bbde320786a8fb61efebee
+        Qwen/Qwen3-VL-8B-Instruct@0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
       SHOW_ROUTER_LOGS: "1"
     steps:
       - name: Checkout code
@@ -2040,7 +2041,7 @@ jobs:
         env:
           SHOW_WORKER_LOGS: "0"
           E2E_LOG_DIR: e2e-logs
-          # floor ≈ 95% of the 532 cases the mock marker selects: the chat
+          # floor ≈ 95% of the 539 cases the mock marker selects: the chat
           # completion, request-id, concurrency, reasoning-content, EOS
           # stripping, function-calling, tool-choice (three models),
           # multi-turn and sampling-defaults classes, the constraint-failure
@@ -2057,10 +2058,12 @@ jobs:
           # streamed and a tool-call turn through the gateway on each of the
           # three gRPC protos the mock serves), the disaggregated
           # scheduler-wire classes (a chat and a streamed turn on a prefill
-          # and a decode worker on the sglang and the vllm wires), and the
-          # worker API classes (the list routes, IGW mode,
+          # and a decode worker on the sglang and the vllm wires), the
+          # encode-prefill-decode scheduler-wire class (a text and an image
+          # turn on an encode, a prefill and a decode worker on the vllm
+          # wire), and the worker API classes (the list routes, IGW mode,
           # disable-health-check, the REST semantics)
-          E2E_MIN_SELECTED: "505"
+          E2E_MIN_SELECTED: "512"
           MOCK_WORKER_BIN: ${{ github.workspace }}/target/debug/mock-worker
           ROUTER_LOCAL_MODEL_PATH: ${{ runner.temp }}/models
           TIKTOKEN_ENCODINGS_BASE: ${{ runner.temp }}/models/tiktoken
