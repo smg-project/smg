@@ -1298,16 +1298,17 @@ impl NativeEncoder {
                 Seeded::Long(bytes) => filter.insert(bytes),
             }
         }
+        let filter = (covers && !chars).then_some(filter);
         tracing::debug!(
             entries = table.len(),
             slots = table.slots(),
             long_entries = long,
-            long_entry_bytes = filter.bytes(),
+            long_entry_bytes = filter.as_ref().map_or(0, LongEntryFilter::bytes),
             covers_short_entries = covers,
             ms = started.elapsed().as_millis() as u64,
             "the native encoder's vocabulary pieces"
         );
-        (table, covers, (covers && !chars).then_some(filter))
+        (table, covers, filter)
     }
 
     /// This path's encoder for a tiktoken vocabulary, `ranks` as the file
