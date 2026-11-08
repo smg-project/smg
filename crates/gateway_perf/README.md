@@ -101,7 +101,10 @@ engine's pace: the allocation calls, the KiB and the allocations of 16 KiB and a
 request, and the RSS after the window, beside the instruction count. An answer takes about 100 s and about 600
 streams are open at once at 6/s; 10,000 requests at that rate are about 28 minutes of window
 per cell, so name it with a smaller count (`PERF_REQUESTS=5000` is about 15 minutes); its rate
-stays a whole number at `--rate-scale 0.5`.
+stays a whole number at `--rate-scale 0.5`. Its answer fits the load client's 120 s drain with
+about 15 s to spare (a longer or slower paced path needs the drain made a knob first; a cell whose
+last requests the drain cuts off warns, as a cell with failed requests does), and `live` on it
+needs `--slo-e2e-p99-ms` above about 100,000.
 
 The logprobs path's rate is the gateway's load, not a frame-rate match: a logprobs answer costs
 the gateway about 3.5 times the instructions and 13 times the allocation calls of the plain

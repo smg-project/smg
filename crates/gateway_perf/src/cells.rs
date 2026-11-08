@@ -126,6 +126,9 @@ pub struct CellRecord {
     pub ok: u64,
     pub failed: u64,
     pub skipped: u64,
+    /// Requests still open when the client's drain ran out, cut off before their
+    /// last frame: a warning, as failed requests are.
+    pub unfinished: u64,
     pub statuses: Value,
     pub errors: Value,
     pub achieved_rps: Option<f64>,
@@ -352,14 +355,16 @@ pub fn cell(
 }
 
 /// The record's fields from what was measured, and its warnings: failed requests,
-/// script misses (answers served by the engine simulator), unreadable script counters
-/// and a lost allocator print mean the cell did not measure what it should.
+/// requests the client's drain cut off, script misses (answers served by the engine
+/// simulator), unreadable script counters and a lost allocator print mean the cell did
+/// not measure what it should.
 fn fill_record(record: &mut CellRecord, loaded: bool, m: &Measured, gateway_log: &str) {
     let s = &m.summary;
     record.sent = count(s, "sent");
     record.ok = count(s, "ok");
     record.failed = count(s, "failed");
     record.skipped = count(s, "skipped");
+    record.unfinished = count(s, "unfinished");
     record.statuses = s.get("statuses").cloned().unwrap_or_else(|| json!({}));
     record.errors = s.get("errors").cloned().unwrap_or_else(|| json!({}));
     record.achieved_rps = number(s, &["achieved_rps"]);
@@ -382,6 +387,12 @@ fn fill_record(record: &mut CellRecord, loaded: bool, m: &Measured, gateway_log:
     let mut bad = Vec::new();
     if loaded && record.failed > 0 {
         bad.push(format!("{} failed requests", record.failed));
+    }
+    if loaded && record.unfinished > 0 {
+        bad.push(format!(
+            "{} requests cut off at the client's drain",
+            record.unfinished
+        ));
     }
     if let Some(script) = &m.script {
         if loaded && script.misses > 0 {
@@ -712,7 +723,7 @@ pub struct SoakRecord {
 /// The soak's record from its rows and its client summaries: RSS after the first and
 /// the last window, the growth per 10,000 requests, the peak after the burst and the
 /// allocator's live bytes; the request counts and the warnings as a cell's, so a soak
-/// with failed requests or script misses fails the run.
+/// with failed requests, requests cut off at the drain or script misses fails the run.
 pub fn soak_record(
     side: &str,
     spec: &PathSpec,
@@ -745,9 +756,15 @@ pub fn soak_record(
         (key("allocator_live_mb_after_last_window"), last.live_mb()),
     ]);
     let failed: u64 = summaries.iter().map(|s| count(s, "failed")).sum();
+    let unfinished: u64 = summaries.iter().map(|s| count(s, "unfinished")).sum();
     let mut bad = Vec::new();
     if failed > 0 {
         bad.push(format!("{failed} failed requests"));
+    }
+    if unfinished > 0 {
+        bad.push(format!(
+            "{unfinished} requests cut off at the client's drain"
+        ));
     }
     if script.misses > 0 {
         bad.push(format!(
@@ -1276,6 +1293,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_cell_whose_requests_the_drain_cut_off_warns_like_one_with_failed_requests() {
+        let measured = |summary: Value| Measured {
+            summary,
+            s0: Snapshot::default(),
+            s1: Snapshot::default(),
+            counters: BTreeMap::new(),
+            script: None,
+        };
+        let drain_warning = "2 requests cut off at the client's drain".to_string();
+        let mut cut = CellRecord::default();
+        fill_record(
+            &mut cut,
+            true,
+            &measured(json!({"sent": 10, "ok": 8, "failed": 0, "unfinished": 2})),
+            "",
+        );
+        assert_eq!(
+            (cut.sent, cut.ok, cut.failed, cut.unfinished),
+            (10, 8, 0, 2)
+        );
+        assert!(cut.warnings.contains(&drain_warning), "{:?}", cut.warnings);
+        let mut whole = CellRecord::default();
+        fill_record(
+            &mut whole,
+            true,
+            &measured(json!({"sent": 10, "ok": 10, "failed": 0, "unfinished": 0})),
+            "",
+        );
+        assert_eq!(whole.unfinished, 0);
+        assert!(
+            !whole.warnings.contains(&drain_warning),
+            "{:?}",
+            whole.warnings
+        );
+        let mut idle = CellRecord::default();
+        fill_record(&mut idle, false, &measured(json!({"unfinished": 2})), "");
+        assert!(
+            !idle.warnings.contains(&drain_warning),
+            "an idle cell sends nothing: {:?}",
+            idle.warnings
+        );
+    }
+
+    #[test]
     fn mem_soak_record_warns_on_failed_requests_and_script_misses() {
         let snap = |rss: u64| Snapshot {
             status: BTreeMap::from([("VmRSS".to_string(), rss), ("VmHWM".to_string(), 2048)]),
@@ -1307,7 +1368,7 @@ pub(crate) mod tests {
         };
         let summaries = [
             json!({"sent": 10, "ok": 9, "failed": 1}),
-            json!({"sent": 10, "ok": 8, "failed": 2}),
+            json!({"sent": 10, "ok": 7, "failed": 2, "unfinished": 1}),
         ];
         let spec = crate::paths::path_named("stream").unwrap();
         let measured = SoakMeasured {
@@ -1323,6 +1384,7 @@ pub(crate) mod tests {
             record.warnings,
             [
                 "3 failed requests",
+                "1 requests cut off at the client's drain",
                 "2 script misses (answers served by the engine simulator)",
                 "1 script counters unreadable (misses unknown)",
             ]
