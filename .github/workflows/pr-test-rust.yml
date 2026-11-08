@@ -2041,7 +2041,7 @@ jobs:
         env:
           SHOW_WORKER_LOGS: "0"
           E2E_LOG_DIR: e2e-logs
-          # floor ≈ 95% of the 535 cases the mock marker selects: the chat
+          # floor ≈ 95% of the 539 cases the mock marker selects: the chat
           # completion, request-id, concurrency, reasoning-content, EOS
           # stripping, function-calling, tool-choice (three models),
           # multi-turn and sampling-defaults classes, the constraint-failure
@@ -2063,7 +2063,7 @@ jobs:
           # turn on an encode, a prefill and a decode worker on the vllm
           # wire), and the worker API classes (the list routes, IGW mode,
           # disable-health-check, the REST semantics)
-          E2E_MIN_SELECTED: "508"
+          E2E_MIN_SELECTED: "512"
           MOCK_WORKER_BIN: ${{ github.workspace }}/target/debug/mock-worker
           ROUTER_LOCAL_MODEL_PATH: ${{ runner.temp }}/models
           TIKTOKEN_ENCODINGS_BASE: ${{ runner.temp }}/models/tiktoken
