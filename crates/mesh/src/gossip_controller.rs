@@ -85,6 +85,10 @@ fn is_join_peer(name: &str) -> bool {
     name == INIT_PEER_NAME || name.starts_with(&format!("{INIT_PEER_NAME}_"))
 }
 
+/// The period of the node's tick: one round is one probe of one random
+/// member and one collection of the stream round.
+pub(crate) const ROUND_PERIOD: Duration = Duration::from_secs(1);
+
 /// The per-node event loop driver. Holds the cluster-state reference,
 /// self-identity, init-peer address, mTLS config, the live set of
 /// outbound sync_stream task handles, and the shared `RoundBatch` slot.
@@ -169,7 +173,7 @@ impl GossipController {
                     break;
                 }
 
-                () = tokio::time::sleep(Duration::from_secs(1)) => {
+                () = tokio::time::sleep(ROUND_PERIOD) => {
                     let Some(peer) = peer else {
                         log::debug!("No peer address available to connect");
                         continue;
