@@ -28,6 +28,7 @@ use smg::{
 use smg_grpc_client::tokenspeed_scheduler::tokenspeed_proto as ts;
 use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
 
+use super::{events, read, tokens};
 use crate::{common, scripted_tokenizer, scripted_worker};
 
 const MODEL: &str = "response-template-model";
@@ -66,25 +67,6 @@ fn qwen3_5_chat_template() -> String {
         .as_str()
         .expect("a Jinja template")
         .to_string()
-}
-
-/// Model output as tokens: each `<|...|>` alone, other text four characters at a time.
-fn tokens(output: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut rest = output;
-    while !rest.is_empty() {
-        let len = if rest.starts_with("<|") {
-            rest.find("|>").map_or(rest.len(), |end| end + 2)
-        } else {
-            let special = rest.find("<|").unwrap_or(rest.len());
-            rest.char_indices()
-                .nth(4)
-                .map_or(special, |(at, _)| at.min(special))
-        };
-        tokens.push(rest[..len].to_string());
-        rest = &rest[len..];
-    }
-    tokens
 }
 
 struct Setup {
@@ -312,18 +294,6 @@ fn tenant() -> TenantRequestMeta {
     TenantRequestMeta::new(TenantKey::new("test-tenant"))
 }
 
-#[expect(clippy::unwrap_used, clippy::expect_used, reason = "test helper")]
-async fn read(response: impl std::future::Future<Output = Response>) -> String {
-    let response = timeout(Duration::from_secs(30), response)
-        .await
-        .expect("request should finish");
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-    let body = String::from_utf8(bytes.to_vec()).unwrap();
-    assert_eq!(status, StatusCode::OK, "{body}");
-    body
-}
-
 /// The status and `error` object of a response the gateway refuses.
 #[expect(clippy::unwrap_used, clippy::expect_used, reason = "test helper")]
 async fn refusal(response: impl std::future::Future<Output = Response>) -> (StatusCode, Value) {
@@ -334,16 +304,6 @@ async fn refusal(response: impl std::future::Future<Output = Response>) -> (Stat
     let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     (status, body["error"].clone())
-}
-
-/// JSON payloads of an SSE body.
-#[expect(clippy::unwrap_used, reason = "test helper")]
-fn events(body: &str) -> Vec<Value> {
-    body.lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter(|data| *data != "[DONE]")
-        .map(|data| serde_json::from_str(data).unwrap())
-        .collect()
 }
 
 fn tools() -> Value {
