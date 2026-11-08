@@ -5,8 +5,17 @@
 //! Security features:
 //! - Input sanitization to prevent log injection attacks
 //! - Structured logging for safe parsing
+//!
+//! Two lines per control-plane call, both on target `smg::audit` and both
+//! silenced by one switch. `control_plane_audit` is written before the
+//! handler, when the request is admitted or refused. `control_plane_mutation`
+//! is written after the handler of a request that is not a read (GET, HEAD)
+//! has answered: it carries the status and the resource the handler named
+//! through [`AuditResource`].
 
+use axum::response::Response;
 use chrono::{DateTime, Utc};
+use http::StatusCode;
 use serde::Serialize;
 use tracing::{info, span, Level};
 
@@ -54,6 +63,8 @@ pub enum AuditOutcome {
     Success,
     /// Operation denied (authorization failure)
     Denied,
+    /// The handler answered an error status (a mutation's outcome line)
+    Failed,
 }
 
 impl std::fmt::Display for AuditOutcome {
@@ -61,6 +72,7 @@ impl std::fmt::Display for AuditOutcome {
         match self {
             AuditOutcome::Success => write!(f, "success"),
             AuditOutcome::Denied => write!(f, "denied"),
+            AuditOutcome::Failed => write!(f, "failed"),
         }
     }
 }
@@ -92,6 +104,10 @@ pub struct AuditEvent {
 
     /// Operation outcome
     pub outcome: AuditOutcome,
+
+    /// The status the handler answered, on a mutation's outcome line
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
 
     /// Request ID for correlation
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -140,6 +156,21 @@ impl<'a> AuditContext<'a> {
     }
 }
 
+/// The resource a control-plane handler acted on, for the outcome line of a
+/// mutation: a worker id, a tokenizer id, a module uuid. A handler returns
+/// its response through [`AuditResource::name`]; a response without one is
+/// audited by its path alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditResource(pub String);
+
+impl AuditResource {
+    /// `response` with the resource it acted on in its extensions.
+    pub fn name(mut response: Response, resource: impl Into<String>) -> Response {
+        response.extensions_mut().insert(Self(resource.into()));
+        response
+    }
+}
+
 impl AuditEvent {
     /// Create a new audit event from context.
     fn from_context(
@@ -157,6 +188,7 @@ impl AuditEvent {
             path: sanitize_for_log(ctx.path),
             resource: resource.map(sanitize_for_log),
             outcome,
+            status: None,
             request_id: ctx.request_id.map(sanitize_for_log),
             details: details.map(sanitize_for_log),
         }
@@ -173,6 +205,7 @@ impl AuditEvent {
             path: sanitize_for_log(path),
             resource: None,
             outcome: AuditOutcome::Denied,
+            status: None,
             request_id: request_id.map(sanitize_for_log),
             details: Some(sanitize_for_log(reason)),
         }
@@ -196,8 +229,27 @@ impl AuditLogger {
         self.enabled
     }
 
-    /// Log an audit event.
+    /// Log an audit event: the admission line, `control_plane_audit`.
     pub fn log(&self, event: &AuditEvent) {
+        self.emit(event, "control_plane_audit");
+    }
+
+    /// Log the outcome of a mutation once its handler has answered: the
+    /// `control_plane_mutation` line with the status, `success` for a 2xx
+    /// and `failed` otherwise, and the resource when the handler named one.
+    pub fn log_outcome(&self, ctx: &AuditContext<'_>, status: StatusCode, resource: Option<&str>) {
+        let outcome = if status.is_success() {
+            AuditOutcome::Success
+        } else {
+            AuditOutcome::Failed
+        };
+        let mut event = AuditEvent::from_context(ctx, outcome, resource, None);
+        event.status = Some(status.as_u16());
+        self.emit(&event, "control_plane_mutation");
+    }
+
+    /// Write `event` as the line `name`, when enabled.
+    fn emit(&self, event: &AuditEvent, name: &str) {
         if !self.enabled {
             return;
         }
@@ -228,9 +280,10 @@ impl AuditLogger {
             path = %event.path,
             resource = event.resource.as_deref(),
             outcome = %event.outcome,
+            status = event.status,
             request_id = event.request_id.as_deref(),
             details = event.details.as_deref(),
-            "control_plane_audit"
+            "{name}"
         );
     }
 
@@ -269,7 +322,7 @@ impl AuditLogger {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -300,16 +353,25 @@ mod tests {
         assert_eq!(AuditOutcome::Denied.to_string(), "denied");
     }
 
-    /// A subscriber that keeps how each field of an event was recorded: as a
-    /// string value (`record_str`) or as `Debug` text (`record_debug`).
+    /// A subscriber that keeps, per audit line, how each field was recorded:
+    /// as a string value (`record_str`) or as `Debug` text (`record_debug`).
+    /// Lines on other targets (the middleware's own debug and warn lines)
+    /// are not kept.
     #[derive(Default)]
-    struct FieldCapture {
-        fields: std::sync::Mutex<Vec<(String, String)>>,
+    pub(crate) struct FieldCapture {
+        pub(crate) events: std::sync::Mutex<Vec<Vec<(String, String)>>>,
     }
 
     impl tracing::Subscriber for FieldCapture {
-        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-            true
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "smg::audit"
         }
 
         fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
@@ -339,8 +401,9 @@ mod tests {
                 }
             }
 
-            let mut fields = self.fields.lock().unwrap();
+            let mut fields = Vec::new();
             event.record(&mut Visitor(&mut fields));
+            self.events.lock().unwrap().push(fields);
         }
 
         fn enter(&self, _: &span::Id) {}
@@ -348,15 +411,116 @@ mod tests {
         fn exit(&self, _: &span::Id) {}
     }
 
-    fn recorded_fields(log: impl FnOnce()) -> Vec<(String, String)> {
+    /// The audit lines `log` wrote, each as its recorded fields in order.
+    pub(crate) fn recorded_events(log: impl FnOnce()) -> Vec<Vec<(String, String)>> {
         let capture = std::sync::Arc::new(FieldCapture::default());
         tracing::subscriber::with_default(capture.clone(), log);
-        let fields = capture.fields.lock().unwrap();
-        fields
-            .iter()
-            .filter(|(name, _)| ["resource", "request_id", "details"].contains(&name.as_str()))
-            .cloned()
+        let events = capture.events.lock().unwrap();
+        events.clone()
+    }
+
+    /// The value of `name` in one line's fields, without the `str:` or
+    /// `debug:` prefix that says how it was recorded.
+    pub(crate) fn field<'a>(line: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        line.iter()
+            .find(|(field, _)| field == name)
+            .map(|(_, value)| value.split_once(':').map_or(value.as_str(), |(_, v)| v))
+    }
+
+    /// The optional fields of every line `log` wrote, flattened.
+    fn recorded_fields(log: impl FnOnce()) -> Vec<(String, String)> {
+        recorded_events(log)
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| {
+                ["resource", "request_id", "details", "status"].contains(&name.as_str())
+            })
             .collect()
+    }
+
+    fn mutation_context() -> AuditContext<'static> {
+        AuditContext::new(
+            "admin",
+            "api_key",
+            Role::Admin,
+            "POST",
+            "/workers",
+            Some("req-7"),
+        )
+    }
+
+    #[test]
+    fn the_outcome_line_carries_the_status_and_the_resource_as_plain_values() {
+        let logger = AuditLogger::new(true);
+
+        let events = recorded_events(|| {
+            logger.log_outcome(
+                &mutation_context(),
+                StatusCode::ACCEPTED,
+                Some("worker-123"),
+            );
+        });
+
+        assert_eq!(events.len(), 1, "one line per outcome: {events:?}");
+        let line = &events[0];
+        assert_eq!(
+            field(line, "message"),
+            Some("control_plane_mutation"),
+            "{line:?}"
+        );
+        assert_eq!(field(line, "status"), Some("202"), "{line:?}");
+        assert_eq!(field(line, "outcome"), Some("success"), "{line:?}");
+        assert_eq!(field(line, "resource"), Some("worker-123"), "{line:?}");
+        assert_eq!(field(line, "request_id"), Some("req-7"), "{line:?}");
+        assert_eq!(field(line, "principal"), Some("admin"), "{line:?}");
+        assert!(
+            !line.iter().any(|(_, value)| value.contains("Some(")),
+            "Debug text in the outcome line: {line:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_mutation_is_logged_as_failed_with_its_status_and_no_resource() {
+        let logger = AuditLogger::new(true);
+
+        let events = recorded_events(|| {
+            logger.log_outcome(&mutation_context(), StatusCode::BAD_REQUEST, None);
+        });
+
+        let line = &events[0];
+        assert_eq!(field(line, "status"), Some("400"), "{line:?}");
+        assert_eq!(field(line, "outcome"), Some("failed"), "{line:?}");
+        assert_eq!(field(line, "resource"), None, "{line:?}");
+    }
+
+    #[test]
+    fn the_admission_line_carries_no_status() {
+        let logger = AuditLogger::new(true);
+
+        let events = recorded_events(|| logger.log_success(&mutation_context(), None));
+
+        let line = &events[0];
+        assert_eq!(
+            field(line, "message"),
+            Some("control_plane_audit"),
+            "{line:?}"
+        );
+        assert_eq!(field(line, "status"), None, "{line:?}");
+    }
+
+    #[test]
+    fn a_disabled_logger_writes_no_outcome_line() {
+        let logger = AuditLogger::new(false);
+
+        let events = recorded_events(|| {
+            logger.log_outcome(
+                &mutation_context(),
+                StatusCode::ACCEPTED,
+                Some("worker-123"),
+            );
+        });
+
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]

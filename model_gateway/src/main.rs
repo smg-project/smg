@@ -1755,7 +1755,7 @@ struct IntegrationArgs {
     #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS", hide_env_values = true, help_heading = "Control Plane Authentication")]
     control_plane_api_keys: Vec<String>,
 
-    /// Disable audit logging for control plane operations
+    /// Disable the control-plane audit lines (the admission line and the mutation outcome line)
     #[arg(
         long,
         default_value_t = false,

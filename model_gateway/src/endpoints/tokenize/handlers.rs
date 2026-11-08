@@ -16,6 +16,7 @@ use openai_protocol::tokenize::{
     ListTokenizersResponse, RemoveTokenizerResponse, TextResult, TokenizeRequest, TokenizeResponse,
     TokenizerInfo, TokensResult,
 };
+use smg_auth::AuditResource;
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -248,19 +249,22 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
 
     // Submit the job
     match job_queue.submit(job).await {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(AddTokenizerResponse {
-                id: tokenizer_id,
-                status: "pending".to_string(),
-                message: format!(
-                    "Tokenizer '{}' registration job submitted. Loading from: {}",
-                    request.name, request.source
-                ),
-                vocab_size: None,
-            }),
-        )
-            .into_response(),
+        Ok(()) => AuditResource::name(
+            (
+                StatusCode::ACCEPTED,
+                Json(AddTokenizerResponse {
+                    id: tokenizer_id.clone(),
+                    status: "pending".to_string(),
+                    message: format!(
+                        "Tokenizer '{}' registration job submitted. Loading from: {}",
+                        request.name, request.source
+                    ),
+                    vocab_size: None,
+                }),
+            )
+                .into_response(),
+            tokenizer_id,
+        ),
         Err(e) => {
             error!("Failed to submit tokenizer job: {}", e);
             (
@@ -311,14 +315,17 @@ pub async fn remove_tokenizer(context: &Arc<AppContext>, tokenizer_id: &str) -> 
             &entry.name,
         );
         debug!("Removed tokenizer '{}' (id: {})", entry.name, entry.id);
-        (
-            StatusCode::OK,
-            Json(RemoveTokenizerResponse {
-                success: true,
-                message: format!("Tokenizer '{}' removed successfully", entry.name),
-            }),
+        AuditResource::name(
+            (
+                StatusCode::OK,
+                Json(RemoveTokenizerResponse {
+                    success: true,
+                    message: format!("Tokenizer '{}' removed successfully", entry.name),
+                }),
+            )
+                .into_response(),
+            entry.id,
         )
-            .into_response()
     } else {
         warn!("Tokenizer '{}' not found", tokenizer_id);
         (

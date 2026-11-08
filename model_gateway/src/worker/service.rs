@@ -13,6 +13,7 @@ use axum::{
 };
 use openai_protocol::worker::{WorkerErrorResponse, WorkerInfo, WorkerSpec, WorkerUpdateRequest};
 use serde_json::json;
+use smg_auth::AuditResource;
 use tracing::warn;
 
 use crate::{
@@ -366,12 +367,15 @@ impl IntoResponse for CreateWorkerResult {
             "location": self.location,
             "message": "Worker addition queued for background processing"
         });
-        (
-            StatusCode::ACCEPTED,
-            [(http::header::LOCATION, self.location)],
-            Json(response),
+        AuditResource::name(
+            (
+                StatusCode::ACCEPTED,
+                [(http::header::LOCATION, self.location)],
+                Json(response),
+            )
+                .into_response(),
+            self.worker_id.as_str(),
         )
-            .into_response()
     }
 }
 
@@ -389,7 +393,10 @@ impl IntoResponse for DeleteWorkerResult {
             "worker_id": self.worker_id.as_str(),
             "message": "Worker removal queued for background processing"
         });
-        (StatusCode::ACCEPTED, Json(response)).into_response()
+        AuditResource::name(
+            (StatusCode::ACCEPTED, Json(response)).into_response(),
+            self.worker_id.as_str(),
+        )
     }
 }
 
@@ -407,7 +414,10 @@ impl IntoResponse for UpdateWorkerResult {
             "worker_id": self.worker_id.as_str(),
             "message": "Worker update queued for background processing"
         });
-        (StatusCode::ACCEPTED, Json(response)).into_response()
+        AuditResource::name(
+            (StatusCode::ACCEPTED, Json(response)).into_response(),
+            self.worker_id.as_str(),
+        )
     }
 }
 
