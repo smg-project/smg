@@ -43,12 +43,15 @@ struct ProfileRun {
     started_unix_ms: u128,
 }
 
-/// What the admin operations did on one worker.
+/// What the admin operations did on one worker, and what an encode worker
+/// served (its completions reach no engine and no script, so the admin API
+/// is where a bed reads that the encode leg ran).
 pub struct AdminOps {
     name: String,
     flushes: AtomicU64,
     profiles_started: AtomicU64,
     profiles_stopped: AtomicU64,
+    encodes: AtomicU64,
     running: Mutex<Option<ProfileRun>>,
     last_trace: Mutex<Option<PathBuf>>,
 }
@@ -79,6 +82,7 @@ impl AdminOps {
             flushes: AtomicU64::new(0),
             profiles_started: AtomicU64::new(0),
             profiles_stopped: AtomicU64::new(0),
+            encodes: AtomicU64::new(0),
             running: Mutex::new(None),
             last_trace: Mutex::new(None),
         });
@@ -106,6 +110,13 @@ impl AdminOps {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// One encoder completion served by an encode worker (`encodes` in the
+    /// status): the gateway's own per-worker request count does not see the
+    /// vLLM encode leg, so a bed reads it here.
+    pub fn record_encode(&self) {
+        self.encodes.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The flush: every engine of the worker clears its cache and publishes
@@ -202,6 +213,7 @@ impl AdminOps {
             "flushes": self.flushes.load(Ordering::Relaxed),
             "profiles_started": self.profiles_started.load(Ordering::Relaxed),
             "profiles_stopped": self.profiles_stopped.load(Ordering::Relaxed),
+            "encodes": self.encodes.load(Ordering::Relaxed),
             "profiling": running.is_some(),
             "last_trace": last_trace.as_ref().map(|p| p.display().to_string()),
         })
