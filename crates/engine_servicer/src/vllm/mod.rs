@@ -20,8 +20,9 @@
 //! `ec_zmq_addrs`), a request's `ec_transfer_params_json` goes to the engine
 //! as the connector's extra argument, the connector's answer comes back on
 //! the `Complete` with the request's media identity, and an engine without a
-//! connector refuses such a request up front (`generate.rs`). The Python
-//! servicer's per-connector checks of a consumer's handles are not run here.
+//! connector refuses such a request up front (`generate.rs`). A consumer's
+//! handles and a producer's completion pass the Python servicer's
+//! per-connector checks (`encoder_cache.rs`).
 //!
 //! `Embed`, `FlushCache` (a ZMQ utility call), `GetTokenizer` (the tokenizer
 //! directory zipped as the Python servicer zips it) and `SubscribeKvEvents`

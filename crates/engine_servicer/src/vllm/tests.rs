@@ -111,6 +111,40 @@ fn pixel_less_batch(hashes: &[&str]) -> vllm::MultimodalInputs {
     }
 }
 
+/// A prefill side's realistic payload: the grid tensor of two items and their
+/// hashes, no pixels (the encoder ran elsewhere).
+fn grid_only_batch(hashes: &[&str]) -> vllm::MultimodalInputs {
+    let grid: Vec<u8> = [1i64, 2, 2, 1, 2, 2]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    vllm::MultimodalInputs {
+        mm_hashes: hashes.iter().map(|hash| hash.to_string()).collect(),
+        mm_placeholders: vec![
+            vllm::PlaceholderRange {
+                offset: 1,
+                length: 3,
+            },
+            vllm::PlaceholderRange {
+                offset: 6,
+                length: 3,
+            },
+        ],
+        model_specific_tensors: [(
+            "image_grid_thw".to_string(),
+            vllm::TensorData {
+                shape: vec![2, 3],
+                dtype: "int64".to_string(),
+                payload: Some(vllm::tensor_data::Payload::Inline(grid.into())),
+            },
+        )]
+        .into(),
+        batched_keys: vec!["image_grid_thw".to_string()],
+        modality: common::Modality::Image as i32,
+        ..Default::default()
+    }
+}
+
 /// A router-preprocessed image batch of two items whose pixels sit in a fresh
 /// `/dev/shm` file (read and unlinked once by the servicer).
 #[cfg(target_os = "linux")]
@@ -1407,6 +1441,35 @@ async fn encoder_cache_consumer_needs_a_handle_for_every_pixel_less_item() {
     assert!(
         engine_request.mm_features.is_none(),
         "a pixel-less leg carries no features"
+    );
+
+    // The prefill side's realistic payload, grid tensors and hashes without
+    // pixels: admitted on the encoder-cache parameters alone (no KV
+    // parameters), as the Python servicer admits it, the grid riding to the
+    // engine as the items' features.
+    let mut request = generate_request("ec-c-grid", false, Vec::new());
+    request.input = Some(vllm::generate_request::Input::Tokenized(
+        vllm::TokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![1; 9],
+        },
+    ));
+    request.mm_inputs = Some(grid_only_batch(&["h1", "h2"]));
+    request.ec_transfer_params_json = Some(
+        r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600},"h2":{"peer_host":"10.0.0.1","peer_port":5601}}"#
+            .to_string(),
+    );
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("a grid-only batch on an encoder-cache leg goes through")
+        .into_inner();
+    let engine_request = recv_add(&mut h.engine_in).await;
+    assert_eq!(engine_request.request_id, "ec-c-grid");
+    assert!(
+        engine_request.mm_features.is_some(),
+        "the grid rides as the items' features"
     );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 
