@@ -35,6 +35,10 @@ pub struct PathSpec {
     pub client: &'static [&'static str],
     pub answer: String,
     pub finish: &'static str,
+    /// The pause between the frames of a streamed answer, in milliseconds: 0
+    /// hands a whole answer over at once (an engine's burst), a pause spaces
+    /// the frames as an engine decoding one token per step does.
+    pub frame_pause_ms: u64,
     pub label: &'static str,
 }
 
@@ -46,6 +50,7 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             client: &["--mode", "chat", "--max-tokens", "8", "--seed", "101"],
             answer: words(8),
             finish: "stop",
+            frame_pause_ms: 0,
             label: "chat, non-stream, 64-word prompt, 8 output tokens",
         },
         PathSpec {
@@ -62,6 +67,7 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             ],
             answer: words(128),
             finish: "length",
+            frame_pause_ms: 0,
             label: "chat stream, 128 deltas of one token",
         },
         PathSpec {
@@ -81,6 +87,7 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             ],
             answer: TOOL_CALL_ANSWER.to_string(),
             finish: "stop",
+            frame_pause_ms: 0,
             label: "tool call: 4 schemas, 2 earlier rounds, the answer parsed into tool_calls",
         },
         PathSpec {
@@ -97,6 +104,7 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             ],
             answer: JSON_ANSWER.to_string(),
             finish: "stop",
+            frame_pause_ms: 0,
             label: "json_schema answer",
         },
         PathSpec {
@@ -105,6 +113,7 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             client: &["--mode", "messages", "--max-tokens", "8", "--seed", "105"],
             answer: words(8),
             finish: "stop",
+            frame_pause_ms: 0,
             label: "Messages API, non-stream, 8 output tokens",
         },
         // The streamed answers below are not in `DEFAULT_PATHS`: each prices
@@ -124,6 +133,7 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             ],
             answer: words(300),
             finish: "length",
+            frame_pause_ms: 0,
             label: "Messages stream, 300 deltas of one token",
         },
         PathSpec {
@@ -140,6 +150,7 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             ],
             answer: words(300),
             finish: "length",
+            frame_pause_ms: 0,
             label: "generate stream, 300 frames of one token, the whole text in every frame",
         },
         PathSpec {
@@ -156,6 +167,7 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             ],
             answer: words(300),
             finish: "length",
+            frame_pause_ms: 0,
             label: "completion stream, 300 deltas of one token",
         },
         PathSpec {
@@ -172,7 +184,85 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             ],
             answer: words(2000),
             finish: "length",
+            frame_pause_ms: 0,
             label: "generate stream, 2,000 frames of one token, the whole text in every frame",
+        },
+        // The generate wire at an engine's pace: the same 300 frames with a
+        // 20 ms pause between them (50 tokens a second per stream), at the rate
+        // that keeps the frames per second at `generate_stream`'s, so about
+        // 600 streams are open at once. The paths above hand a whole answer
+        // over at once (an engine's burst); this one reads the stream loops
+        // as a decoding engine drives them, one frame at a time.
+        PathSpec {
+            name: "generate_stream_spaced",
+            rate: 100.0,
+            client: &[
+                "--mode",
+                "generate",
+                "--stream",
+                "--max-tokens",
+                "300",
+                "--seed",
+                "110",
+            ],
+            answer: words(300),
+            finish: "length",
+            frame_pause_ms: 20,
+            label: "generate stream, 300 frames of one token 20 ms apart, the whole text in every frame",
+        },
+        // The paced twins of the other streamed shapes: the same answers, 20 ms
+        // between frames, the rates of the burst paths (so the frames per second
+        // hold and the open streams multiply the same way).
+        PathSpec {
+            name: "stream_spaced",
+            rate: 250.0,
+            client: &[
+                "--mode",
+                "chat",
+                "--stream",
+                "--max-tokens",
+                "128",
+                "--seed",
+                "111",
+            ],
+            answer: words(128),
+            finish: "length",
+            frame_pause_ms: 20,
+            label: "chat stream, 128 deltas of one token 20 ms apart",
+        },
+        PathSpec {
+            name: "completion_stream_spaced",
+            rate: 100.0,
+            client: &[
+                "--mode",
+                "completion",
+                "--stream",
+                "--max-tokens",
+                "300",
+                "--seed",
+                "112",
+            ],
+            answer: words(300),
+            finish: "length",
+            frame_pause_ms: 20,
+            label: "completion stream, 300 deltas of one token 20 ms apart",
+        },
+        PathSpec {
+            name: "messages_stream_spaced",
+            rate: 100.0,
+            client: &[
+                "--mode",
+                "messages",
+                "--stream",
+                "--max-tokens",
+                "300",
+                "--seed",
+                "113",
+            ],
+            answer: words(300),
+            finish: "length",
+            frame_pause_ms: 20,
+            label: "Messages stream, 300 deltas of one token 20 ms apart",
         },
         // The stream with the sampled logprob and five candidates per token,
         // the gateway reading, converting and decoding six token ids per
@@ -198,6 +288,7 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             ],
             answer: words(128),
             finish: "length",
+            frame_pause_ms: 0,
             label:
                 "chat stream, 128 deltas of one token, the sampled logprob and 5 candidates each",
         },
@@ -239,15 +330,16 @@ pub fn parse_paths(text: &str) -> Result<Vec<PathSpec>> {
 
 /// The scripted answers of one cell: `count` copies, served in order to the next
 /// requests of every worker (the mock worker's shared queue), the text encoded by the
-/// worker with the bed's tokenizer; one token per streamed frame, no pause. A path
-/// whose requests ask for logprobs gets the worker's made-up sampled logprobs, one
-/// per token, and the candidates the worker draws from the answer's own tokens.
+/// worker with the bed's tokenizer; one token per streamed frame, the path's pause
+/// between frames (none on the burst paths). A path whose requests ask for logprobs
+/// gets the worker's made-up sampled logprobs, one per token, and the candidates the
+/// worker draws from the answer's own tokens.
 pub fn answers(spec: &PathSpec, count: usize) -> Vec<Value> {
     let mut answer = json!({
         "output_text": spec.answer,
         "finish_reason": spec.finish,
         "chunk_tokens": 1,
-        "delay_ms": 0,
+        "delay_ms": spec.frame_pause_ms,
     });
     if spec.client.contains(&"--logprobs") {
         answer["logprobs"] = json!("sampled");
@@ -303,6 +395,10 @@ mod tests {
             ("generate_stream", 300),
             ("completion_stream", 300),
             ("generate_stream_long", 2000),
+            ("generate_stream_spaced", 300),
+            ("stream_spaced", 128),
+            ("completion_stream_spaced", 300),
+            ("messages_stream_spaced", 300),
         ] {
             let spec = path_named(name).unwrap();
             assert_eq!(spec.finish, "length", "{name}");
@@ -343,6 +439,24 @@ mod tests {
                 .count(),
             8
         );
+    }
+
+    #[test]
+    fn the_spaced_streams_pace_their_frames_and_the_burst_paths_do_not() {
+        for name in [
+            "generate_stream_spaced",
+            "stream_spaced",
+            "completion_stream_spaced",
+            "messages_stream_spaced",
+        ] {
+            let spaced = path_named(name).unwrap();
+            assert_eq!(spaced.frame_pause_ms, 20, "{name}");
+            assert_eq!(answers(spaced, 1)[0]["delay_ms"], json!(20), "{name}");
+        }
+        for spec in PATHS.iter().filter(|p| !p.name.ends_with("_spaced")) {
+            assert_eq!(spec.frame_pause_ms, 0, "{}", spec.name);
+            assert_eq!(answers(spec, 1)[0]["delay_ms"], json!(0), "{}", spec.name);
+        }
     }
 
     #[test]
