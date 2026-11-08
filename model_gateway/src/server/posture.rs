@@ -27,6 +27,9 @@ pub enum SecretSource {
     Environment,
     /// Read from a file the command line or the environment named.
     File,
+    /// Given as a value by the launcher that started this gateway, from
+    /// its flag or its environment, which the binding does not see.
+    Launcher,
 }
 
 impl SecretSource {
@@ -36,6 +39,7 @@ impl SecretSource {
             Self::Flag => "flag",
             Self::Environment => "env",
             Self::File => "file",
+            Self::Launcher => "launcher",
         }
     }
 }
@@ -73,7 +77,7 @@ pub(crate) const SOURCES_HEADLINE: &str =
     "CREDENTIAL SOURCES: where this start read its secrets (the values are never logged)";
 
 /// Logs the sources record, one INFO, when a secret was given: one field per
-/// secret naming its source, `flag`, `env` or `file`, and whether the key
+/// secret naming its source, `flag`, `env`, `file` or `launcher`, and whether the key
 /// files are watched for changes (`secrets_auto_reload`: `off`, or `on` with
 /// the count of files watched).
 pub(crate) fn log_secret_sources(sources: &SecretSources, secrets_auto_reload: &str) {
@@ -523,6 +527,13 @@ mod tests {
         assert!(logs_contain("control_plane_api_keys=\"file (2 entries)\""));
         assert!(logs_contain("postgres_db_url=\"flag\""));
         assert!(!logs_contain("redis_url="));
+    }
+
+    /// The launcher's word in the record, beside the command line's three.
+    #[test]
+    fn a_launcher_given_secret_reads_launcher() {
+        assert_eq!(SecretSource::Launcher.as_str(), "launcher");
+        assert_eq!(SecretSource::Flag.as_str(), "flag");
     }
 
     /// The gated-routes record says whether the routes are mounted and

@@ -2328,6 +2328,67 @@ class TestSecretSources:
         assert args.postgres_db_url == "postgresql://u:new@db.example:5432/smg"
         assert args.redis_url == "redis://new.example:6379"
 
+    def test_the_key_files_reach_the_arguments_as_paths(self, tmp_path, monkeypatch):
+        """A key read from a file leaves the file's path on the arguments beside
+        the value, by the flag or the environment: the target of the key
+        reload. A key given as a value leaves no path."""
+        api_key = tmp_path / "api-key"
+        api_key.write_text("file-shared-key\n")
+        tenants = tmp_path / "tenants"
+        tenants.write_text("red:file-red\n")
+        operators = tmp_path / "control-plane-keys"
+        operators.write_text("ops:Ops:admin:file-ops-key\n")
+
+        by_flag = parse_router_args(
+            [
+                "--api-key-file",
+                str(api_key),
+                "--tenant-api-keys-file",
+                str(tenants),
+                "--control-plane-api-keys-file",
+                str(operators),
+            ]
+        )
+        assert by_flag.api_key_file == str(api_key)
+        assert by_flag.tenant_api_keys_file == str(tenants)
+        assert by_flag.control_plane_api_keys_file == str(operators)
+        assert by_flag.api_key == "file-shared-key"
+
+        monkeypatch.setenv("SMG_API_KEY_FILE", str(api_key))
+        by_env = parse_router_args([])
+        assert by_env.api_key_file == str(api_key)
+        assert by_env.api_key == "file-shared-key"
+        monkeypatch.delenv("SMG_API_KEY_FILE")
+
+        by_value = parse_router_args(["--api-key", "flag-key", "--tenant-api-key", "red:flag-red"])
+        assert by_value.api_key_file is None
+        assert by_value.tenant_api_keys_file is None
+        assert by_value.control_plane_api_keys_file is None
+
+    def test_a_key_file_without_its_value_is_refused_by_the_binding(self, tmp_path):
+        """A direct RouterArgs naming a key file without the key read from it
+        would start the gateway without that key while the record named the
+        file: the binding refuses it by name. With the value beside the file,
+        as from_cli_args passes them, it is taken."""
+        key_file = tmp_path / "api-key"
+        key_file.write_text("file-shared-key\n")
+        worker_urls = ["http://localhost:8000"]
+        with pytest.raises(ValueError, match=r"^api_key_file names a key file without the key"):
+            Router.from_args(RouterArgs(worker_urls=worker_urls, api_key_file=str(key_file)))
+        with pytest.raises(ValueError, match=r"^tenant_api_keys_file names a key file"):
+            Router.from_args(
+                RouterArgs(worker_urls=worker_urls, tenant_api_keys_file=str(key_file))
+            )
+        Router.from_args(
+            RouterArgs(
+                worker_urls=worker_urls, api_key="file-shared-key", api_key_file=str(key_file)
+            )
+        )
+
+    def test_the_key_files_are_watched_only_when_asked(self):
+        assert parse_router_args([]).secrets_auto_reload is False
+        assert parse_router_args(["--secrets-auto-reload"]).secrets_auto_reload is True
+
     def test_secrets_are_read_from_files(self, tmp_path, monkeypatch):
         """A secret file is read whole with its trailing newline dropped, a
         tenant key file one entry per line with blank and comment lines

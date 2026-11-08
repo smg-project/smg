@@ -65,7 +65,7 @@ The serving keys and the store URLs need not be on the command line, where other
 - `SMG_TENANT_API_KEYS` holds `tenant_id:key` entries separated by `,` or a newline; the file holds one entry per line, blank lines and lines starting with `#` skipped. A source that is set but holds no entry is refused.
 - A store URL file is read for the selected `--history-backend` alone. The launcher still reads the older `POSTGRES_DB_URL` and `REDIS_URL` names when the `SMG_` names are unset.
 - The Oracle credentials have no file source; the launcher and the binary (`--oracle-dsn`, `--oracle-user`, `--oracle-password`) read the `ATP_*` variables when the flags are absent, as they always did, and use them exactly as set, with no trimming: a Secret for them is made with `--from-literal`, or from a file that ends without a newline (a password that ends in one is a wrong password to the database).
-- No value is echoed: a refusal names the sources and the path, and `--help` shows no value of a variable. The Rust binary's start-up record (`CREDENTIAL SOURCES`) names each secret's source as `flag`, `env` or `file`; the Python launcher emits no such record.
+- No value is echoed: a refusal names the sources and the path, and `--help` shows no value of a variable. The start-up record (`CREDENTIAL SOURCES`) names each secret's source as `flag`, `env` or `file`; a launcher-started gateway writes the same record, with `launcher` for a key, or the selected history backend's store URL, that the launcher gave as a value (the binding does not see whether a flag or the environment gave it) and `file` for a key read from a file.
 
 ## Tokenizer
 
