@@ -116,7 +116,7 @@ pub(super) struct DsmlTags {
 /// renderers, each of which re-exports it under its own path as the error
 /// of its `encode_messages`. The first three variants are the refusals
 /// every dialect's reference raises with the same sentence; the rest are
-/// one dialect's own, grouped by dialect.
+/// grouped by the dialects that raise them (V3.2; V4 and V4.1; V4.1).
 ///
 /// `pub`, not `pub(super)`: `deepseek_common` itself stays a private module,
 /// so this is only ever reachable through the renderers' re-exports, never
