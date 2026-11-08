@@ -23,7 +23,7 @@
 //! which makes it deterministically unit-testable with no real timers.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -465,10 +465,11 @@ pub struct EngineParams {
 /// sparse group's store with the step's whole token span and the kept hashes
 /// only; so does the mock's vLLM wire (`Published::spans`). The gRPC stream
 /// carries every group's events unfiltered, the kept blocks with their own
-/// tokens: a servicer's relay forwards the main group alone today, and the
-/// gateway admits main-attention kinds only. The mock's own prefix hit and
-/// `cached_tokens` still come from the full-attention pool: a hybrid engine's
-/// hit is the fixed point over its groups, which the mock does not model yet.
+/// tokens: a servicer's relay forwards every group (a sparse group's store
+/// as its hashes), the gateway indexes the main group and keeps the other
+/// groups' blocks in a per-worker view that bounds its overlap the way the
+/// engine does. The mock's own prefix hit and `cached_tokens` are that
+/// engine rule: the fixed point over its groups (`hit_over_groups`).
 ///
 /// The kinds the flag takes are [`KvCacheGroup::KINDS_HELP`]: the dense
 /// main-attention kinds and `mamba` take no window, the window kinds need one,
@@ -635,12 +636,15 @@ struct EngineShared {
     kv_replay: Mutex<VecDeque<common::KvEventBatch>>,
     prefix_cache: bool,
     block_size: u32,
+    /// The engine's KV cache groups, for the prefix hit over the mirror.
+    kv_cache_groups: Vec<KvCacheGroup>,
     /// Worker name for records and the admin API (`grpc:<port>` / `http:<port>`).
     name: String,
-    /// Mirror of the actor's cache block keys, so sibling engines and the
-    /// admin API can read it without entering the actor: the fleet oracle
-    /// ("which worker holds the most of this prompt") is a read over these.
-    cache_mirror: RwLock<HashSet<u64>>,
+    /// Mirror of the actor's cache block keys with the groups that keep each
+    /// (one bit per group index), so sibling engines and the admin API can
+    /// read it without entering the actor: the fleet oracle ("which worker
+    /// holds the most of this prompt") is a read over these.
+    cache_mirror: RwLock<HashMap<u64, u8>>,
     /// Fault hooks, switched on through the admin API.
     faults: Faults,
     /// Wakes a paused actor.
@@ -942,8 +946,9 @@ impl Engine {
             kv_replay: Mutex::new(VecDeque::new()),
             prefix_cache: params.prefix_cache,
             block_size: params.block_size,
+            kv_cache_groups: params.kv_cache_groups.clone(),
             name,
-            cache_mirror: RwLock::new(HashSet::new()),
+            cache_mirror: RwLock::new(HashMap::new()),
             faults: Faults::default(),
             resume: Notify::new(),
             output_clock: Instant::now(),
@@ -1212,14 +1217,22 @@ impl Engine {
         &self.shared.name
     }
 
-    /// Number of consecutive blocks from the start of `keys` this engine holds.
+    /// Blocks from the start of `keys` this engine would serve from cache:
+    /// the engine's hit over its KV cache groups ([`hit_over_groups`]).
     fn match_prefix(&self, keys: &[u64]) -> usize {
         let mirror = self
             .shared
             .cache_mirror
             .read()
             .unwrap_or_else(|p| p.into_inner());
-        keys.iter().take_while(|k| mirror.contains(k)).count()
+        let main = keys.iter().take_while(|k| mirror.contains_key(k)).count();
+        hit_over_groups(
+            main,
+            keys,
+            &self.shared.kv_cache_groups,
+            self.shared.block_size.max(1) as usize,
+            |key| mirror.get(&key).copied().unwrap_or(1),
+        )
     }
 
     /// A copy of the cached block keys.
@@ -1228,7 +1241,7 @@ impl Engine {
             .cache_mirror
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .iter()
+            .keys()
             .copied()
             .collect()
     }
@@ -1473,7 +1486,14 @@ fn handle_msg(
                         .cache_mirror
                         .read()
                         .unwrap_or_else(|p| p.into_inner());
-                    keys.iter().take_while(|k| own.contains(k)).count()
+                    let main = keys.iter().take_while(|k| own.contains_key(k)).count();
+                    hit_over_groups(
+                        main,
+                        &keys,
+                        &params.kv_cache_groups,
+                        params.block_size.max(1) as usize,
+                        |key| own.get(&key).copied().unwrap_or(1),
+                    )
                 };
                 (fleet_best.max(own_best) as u32 * params.block_size)
                     .min(req.prompt_token_ids.len() as u32)
@@ -1629,11 +1649,21 @@ impl BlockPool {
         self.refs.len()
     }
 
-    /// Number of consecutive cached blocks from the start of `keys`.
-    fn match_prefix(&self, keys: &[u64]) -> usize {
-        keys.iter()
+    /// Blocks from the start of `keys` the engine serves from cache: the
+    /// main group's leading run of cached blocks, bounded by what the other
+    /// groups keep ([`hit_over_groups`]).
+    fn match_prefix(&self, keys: &[u64], p: &EngineParams) -> usize {
+        let main = keys
+            .iter()
             .take_while(|k| self.refs.contains_key(k))
-            .count()
+            .count();
+        hit_over_groups(
+            main,
+            keys,
+            &p.kv_cache_groups,
+            p.block_size.max(1) as usize,
+            |key| self.groups.get(&key).copied().unwrap_or(1),
+        )
     }
 
     /// Reserve `n` anonymous blocks, evicting idle cached blocks (LRU first)
@@ -1764,8 +1794,9 @@ struct Step {
     /// event index (see `Published::spans`).
     spans: Vec<(usize, Vec<u32>)>,
     snapshot: LoadSnapshot,
-    /// Cache deltas this pass, for the actor's mirror.
-    inserted: Vec<u64>,
+    /// Cache deltas this pass, for the actor's mirror: the inserted keys with
+    /// the groups that keep them.
+    inserted: Vec<(u64, u8)>,
     evicted: Vec<u64>,
     cleared: bool,
     admitted: Vec<Admitted>,
@@ -1895,7 +1926,7 @@ impl SchedulerState {
         let prompt_tokens = req.prompt_token_ids.len() as u32;
         let (keys, rolling_hash, _) = prompt_blocks(&req.prompt_token_ids, p.block_size as usize);
         let cached_blocks = if p.prefix_cache {
-            self.pool.match_prefix(&keys)
+            self.pool.match_prefix(&keys, p)
         } else {
             0
         };
@@ -2063,7 +2094,7 @@ impl SchedulerState {
             };
             let prompt_len = front.req.prompt_token_ids.len() as u32;
             let mut cached_blocks = if p.prefix_cache {
-                self.pool.match_prefix(&front.keys)
+                self.pool.match_prefix(&front.keys, p)
             } else {
                 0
             };
@@ -2292,6 +2323,10 @@ impl SchedulerState {
             })
         };
 
+        let inserted = inserted
+            .into_iter()
+            .map(|key| (key, self.pool.groups.get(&key).copied().unwrap_or(1)))
+            .collect();
         Step {
             duration,
             sends,
@@ -2354,7 +2389,7 @@ impl SchedulerState {
         let (keys, rolling_hash, _) = prompt_blocks(&seq, p.block_size.max(1) as usize);
         let len = seq.len() as u32;
         let cached = if p.prefix_cache {
-            (self.pool.match_prefix(&keys) as u32 * p.block_size).min(len)
+            (self.pool.match_prefix(&keys, p) as u32 * p.block_size).min(len)
         } else {
             0
         };
@@ -2686,6 +2721,61 @@ fn fnv_hash_str(s: &str) -> u64 {
 /// cumulative-prefix content key, the rolling hash after all tokens, and the
 /// trailing partial block. The partial (< block_size) tail is never a block —
 /// matching real engines, which only cache full pages.
+/// The engine's prefix hit over its KV cache groups, vLLM's fixed point over
+/// its single-type managers: `main` leading blocks of `keys` are cached in
+/// the main group; every other group shrinks the candidate to what it keeps
+/// (`mask_of` a key: one bit per group index), and the rule repeats until
+/// nothing moves. A sliding-window group needs `ceil((window - 1) /
+/// block_size)` contiguous kept blocks ending at the hit, searched from the
+/// candidate down, else the leading run of kept blocks from the first; a
+/// Mamba group needs the rightmost kept block at or below the candidate. A
+/// kind without a rule (the main-attention kinds) leaves the candidate.
+fn hit_over_groups(
+    main: usize,
+    keys: &[u64],
+    groups: &[KvCacheGroup],
+    block_size: usize,
+    mask_of: impl Fn(u64) -> u8,
+) -> usize {
+    let mut cur = main.min(keys.len());
+    if cur == 0 || groups.len() <= 1 {
+        return cur;
+    }
+    loop {
+        let start = cur;
+        for (index, group) in groups.iter().enumerate().take(8) {
+            let bit = 1u8 << index;
+            let kept = |at: usize| mask_of(keys[at]) & bit != 0;
+            let hit = match group.kind.as_str() {
+                "sliding_window" | "sliding_window_mla" => {
+                    let window = group.sliding_window.max(1) as usize;
+                    let need = (window - 1).div_ceil(block_size.max(1)).max(1);
+                    let mut run = 0usize;
+                    let mut found = None;
+                    for at in (0..cur).rev() {
+                        if kept(at) {
+                            run += 1;
+                            if run >= need {
+                                found = Some(at + run);
+                                break;
+                            }
+                        } else {
+                            run = 0;
+                        }
+                    }
+                    found.unwrap_or(run)
+                }
+                "mamba" => (0..cur).rev().find(|&at| kept(at)).map_or(0, |at| at + 1),
+                _ => cur,
+            };
+            cur = cur.min(hit);
+        }
+        if cur == start || cur == 0 {
+            return cur;
+        }
+    }
+}
+
 fn prompt_blocks(ids: &[u32], block_size: usize) -> (Vec<u64>, u64, Vec<u32>) {
     let mut h = FNV_OFFSET;
     let mut keys = Vec::new();
@@ -3192,7 +3282,7 @@ mod tests {
         );
         let (keys, _, _) = prompt_blocks(&second_prompt, p.block_size as usize);
         assert_eq!(
-            st.pool.match_prefix(&keys),
+            st.pool.match_prefix(&keys, &p),
             0,
             "nothing of the dropped request's prompt was computed"
         );
@@ -3694,6 +3784,79 @@ mod tests {
             (0.0..5.0).contains(&age),
             "fresh wall-clock stamp: {age} s old"
         );
+    }
+
+    /// The engine's hit over its groups, block 4: cells of the sliding-window
+    /// and Mamba rules the gateway's view mirrors, read right to left.
+    #[test]
+    fn the_hit_is_the_fixed_point_over_the_groups() {
+        let groups = vec![
+            KvCacheGroup::full_attention(),
+            KvCacheGroup {
+                kind: "sliding_window".to_string(),
+                sliding_window: 8,
+            },
+            KvCacheGroup {
+                kind: "mamba".to_string(),
+                sliding_window: 0,
+            },
+        ];
+        let keys: Vec<u64> = (0..10).collect();
+        // (window blocks, state blocks, main hit) -> hit
+        type Cell<'a> = (&'a [u64], &'a [u64], usize, usize, &'a str);
+        let cells: [Cell; 8] = [
+            (
+                &[8, 9],
+                &[9],
+                10,
+                10,
+                "the tail and the state end at the depth",
+            ),
+            (
+                &[8, 9],
+                &[9],
+                9,
+                0,
+                "a depth below the tail: no tail at or below it, no state",
+            ),
+            (
+                &[4, 5],
+                &[5],
+                10,
+                6,
+                "the rightmost tail below the depth, the state there",
+            ),
+            (
+                &[4, 5],
+                &[9],
+                10,
+                0,
+                "the state at 9 is out of reach once the window says 6",
+            ),
+            (
+                &[0, 1, 2],
+                &[2],
+                10,
+                3,
+                "a leading run, the state at its end",
+            ),
+            (&[0], &[0], 10, 1, "one leading block"),
+            (&[9], &[9], 10, 0, "one block is no tail and not leading"),
+            (&[], &[], 10, 0, "nothing kept by the sparse groups"),
+        ];
+        for (window, state, main, want, note) in cells {
+            let mask = |key: u64| {
+                1u8 | u8::from(window.contains(&key)) << 1 | u8::from(state.contains(&key)) << 2
+            };
+            assert_eq!(
+                hit_over_groups(main, &keys, &groups, 4, mask),
+                want,
+                "{note}"
+            );
+        }
+        let plain = vec![KvCacheGroup::full_attention()];
+        assert_eq!(hit_over_groups(7, &keys, &plain, 4, |_| 1), 7);
+        assert_eq!(hit_over_groups(12, &keys, &plain, 4, |_| 1), 10);
     }
 
     #[test]
