@@ -1625,8 +1625,10 @@ fn a_frame_count_the_container_made_up_still_builds_a_filter() {
 
 /// An interval walk no spread describes (two picks a second less a hair, at
 /// 30 fps: strides of 15 and 16) is stated as the walk itself, in constant
-/// size whatever the clip's length, with the clip's last frame named when
-/// the walk kept it; a walk a spread describes keeps the spread.
+/// size whatever the clip's length, the first frame named outright (not
+/// through the start value of `prev_selected_n`, which differs between
+/// ffmpeg builds) and the clip's last frame named when the walk kept it; a
+/// walk a spread describes keeps the spread.
 #[test]
 fn an_interval_walk_no_spread_describes_is_stated_as_the_walk() {
     let rate = 1.999_600_079_984_003;
@@ -1638,7 +1640,7 @@ fn an_interval_walk_no_spread_describes_is_stated_as_the_walk() {
     let filter = long.select_filter().expect("stated, not listed");
     assert_eq!(
         filter,
-        r"select='if(isnan(prev_selected_n)\,eq(n\,0)\,eq(n\,max(ceil(((prev_selected_n/30.0)+(1/1.999600079984003)-0.0001)*30.0)\,prev_selected_n+1)))+eq(n\,599999)'"
+        r"select='eq(n\,0)+eq(n\,max(ceil(((prev_selected_n/30.0)+(1/1.999600079984003)-0.0001)*30.0)\,prev_selected_n+1))+eq(n\,599999)'"
     );
     assert!(filter.len() < 180, "{}", filter.len());
     // The same length for a clip a thousand times shorter.

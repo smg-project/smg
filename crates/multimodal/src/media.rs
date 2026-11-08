@@ -2370,8 +2370,11 @@ const PICK_RECORD_BYTES: usize = 128;
 /// source resolution and its records ([`PICK_RECORD_BYTES`]), so the bound is
 /// the later byte check's with the records added, and it holds for an unsized
 /// probe (`frame_size` 0) and for the smallest frames through the records
-/// alone. The other rules are bounded by their frame caps, and a clip whose
-/// rate is unknown takes the bounded `Even` rule.
+/// alone. Whether the walk applies, and at what rate, is
+/// [`interval_walk_rate`]'s one answer, the same the selection is built
+/// from, so the count is of exactly the walk that would be built. The other
+/// rules are bounded by their frame caps, and a clip whose rate is unknown
+/// takes the bounded `Even` rule.
 fn ensure_interval_picks_fit(
     total_frames: usize,
     fps: f64,
@@ -2379,15 +2382,12 @@ fn ensure_interval_picks_fit(
     cfg: VideoFetchConfig,
     limit: usize,
 ) -> Result<(), MediaConnectorError> {
-    if !matches!(cfg.sampling, FrameSampling::Interval)
-        || !(fps.is_finite() && fps > 0.0)
-        || cfg.sample_fps <= 0.0
-    {
+    let Some(rate) = interval_walk_rate(fps, cfg) else {
         return Ok(());
-    }
+    };
     let pick_bytes = frame_size.saturating_add(PICK_RECORD_BYTES);
     let budget_picks = limit / pick_bytes;
-    if interval_walk(total_frames, fps, cfg.sample_fps)
+    if interval_walk(total_frames, fps, rate)
         .nth(budget_picks)
         .is_some()
     {
@@ -4123,25 +4123,29 @@ impl FrameSelection {
 
     /// The interval walk stated as a `select` expression of constant size,
     /// `None` for any other selection. ffmpeg evaluates `select` once per
-    /// frame with the previously selected frame at hand (`prev_selected_n`,
-    /// NaN before the first), so the walk's own step, the first frame at or
-    /// past the previous pick's instant plus `1 / rate` seconds less
-    /// [`INTERVAL_WALK_EPS`], is computed by the decoder frame by frame in
-    /// the same doubles and the same order as [`interval_walk`] computes it
-    /// (a division, two sums, a product, a ceiling, a maximum), with the
-    /// rates printed so that they parse back to the same numbers; the clip's
-    /// last frame is named when the walk kept it. The decoder's picks were
-    /// measured equal to the walk's on 49 clips over nine source rates and
-    /// five request rates, whole-number strides included; `-frames:v` caps
-    /// the output at the selection's count, and a decode that comes back
-    /// with another count fails as a short selection does.
+    /// frame with the previously selected frame at hand (`prev_selected_n`),
+    /// so the walk's own step, the first frame at or past the previous pick's
+    /// instant plus `1 / rate` seconds less [`INTERVAL_WALK_EPS`], is
+    /// computed by the decoder frame by frame in the same doubles and the
+    /// same order as [`interval_walk`] computes it (a division, two sums, a
+    /// product, a ceiling, a maximum), with the rates printed so that they
+    /// parse back to the same numbers. The first frame is named outright,
+    /// not through the start value of `prev_selected_n`: every build
+    /// documents it as NaN before the first selection, but 6.1 starts it at
+    /// zero (a step from zero names the second pick and the first frame is
+    /// skipped) and 8.1 at NaN; the clip's last frame is named when the walk
+    /// kept it. The decoder's picks were measured equal to the walk's on 51
+    /// clips over nine source rates and five request rates, whole-number
+    /// strides included, on ffmpeg 6.1.3 and 8.1.3; `-frames:v` caps the
+    /// output at the selection's count, and a decode that comes back with
+    /// another count fails as a short selection does.
     fn interval_walk_filter(&self) -> Option<String> {
         let rate = self.interval_rate?;
         let last = self.total_frames.checked_sub(1)?;
         let fps = self.source_fps;
         let eps = INTERVAL_WALK_EPS;
         let mut filter = format!(
-            "select='if(isnan(prev_selected_n)\\,eq(n\\,0)\\,eq(n\\,max(ceil(((prev_selected_n/{fps:?})+(1/{rate:?})-{eps:?})*{fps:?})\\,prev_selected_n+1)))"
+            "select='eq(n\\,0)+eq(n\\,max(ceil(((prev_selected_n/{fps:?})+(1/{rate:?})-{eps:?})*{fps:?})\\,prev_selected_n+1))"
         );
         if self
             .unique_frames
