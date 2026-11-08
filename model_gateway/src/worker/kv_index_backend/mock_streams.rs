@@ -361,7 +361,8 @@ impl Generator {
         if let Some(bytes) = self.host.as_mut().and_then(|host| host.write_back(&batch)) {
             self.stream.payloads.push(Payload { rank, bytes });
         }
-        let bytes = encode_batch(&batch, rank as i32, self.shape.wire());
+        // Full-attention events carry no sparse spans.
+        let bytes = encode_batch(&batch, rank as i32, self.shape.wire(), &[]);
         self.stream.payloads.push(Payload { rank, bytes });
         if self.checkpoint_due && self.caught_up() {
             self.checkpoint();
