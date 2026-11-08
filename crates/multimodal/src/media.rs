@@ -2505,10 +2505,12 @@ async fn decode_video_with_ffmpeg(
     }
     // A container claiming more frames than its stream holds leaves the
     // selection short. The engine's loader then sizes the clip by the frames
-    // it can see; the rate-based samplings resample instead.
+    // it can see, against the container's own claim; the rate-based samplings
+    // resample instead.
     if cfg.sampling.follows_the_loader() {
+        let claimed = probed.container_frames.unwrap_or(0);
         let resized = match probe_decoded_frame_count(input_path).await {
-            Ok(visible) => selection.sized_to_visible(visible, cfg),
+            Ok(visible) => selection.sized_to_visible(claimed, visible, cfg),
             Err(_) => Resized::Unchanged,
         };
         match resized {
@@ -3828,17 +3830,19 @@ impl FrameSelection {
         }
     }
 
-    /// The selection once the stream turns out to hold `visible` frames:
-    /// unchanged when that changes nothing or the sampling is rate-based;
-    /// empty when the rate walk picks no frame of the visible clip (the
-    /// engine's loader hands its processor none either, so the caller refuses
-    /// as it would have before any decode instead of resampling by rate).
-    fn sized_to_visible(&self, visible: usize, cfg: VideoFetchConfig) -> Resized {
+    /// The selection once the stream turns out to hold `visible` frames of
+    /// the `claimed` the container states (the claim the selection was read
+    /// with, not the length it was first cut to: the loader's tolerance of a
+    /// claim one frame long applies to the claim itself): unchanged when that
+    /// changes nothing or the sampling is rate-based; empty when the rate walk
+    /// picks no frame of the visible clip (the engine's loader hands its
+    /// processor none either, so the caller refuses as it would have before
+    /// any decode instead of resampling by rate).
+    fn sized_to_visible(&self, claimed: usize, visible: usize, cfg: VideoFetchConfig) -> Resized {
         if !cfg.sampling.follows_the_loader() {
             return Resized::Unchanged;
         }
-        let (total_frames, frame_indices) =
-            loader_frames(self.total_frames, visible, self.source_fps, cfg);
+        let (total_frames, frame_indices) = loader_frames(claimed, visible, self.source_fps, cfg);
         if frame_indices.is_empty() {
             // A probe that decoded no frame at all says nothing about the clip's length: the
             // decode goes on as before and reports its own errors; only a visible clip the

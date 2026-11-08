@@ -702,6 +702,15 @@ fn up_to_selection_follows_the_container_claim_and_the_stream_length() {
     .expect("frame rate and counts");
     assert_eq!(selection.total_frames, 60);
     assert_eq!(selection.frame_indices, spread_evenly(60, 32));
+    // A decode one frame under the stream's estimate: the recovery sizes the
+    // clip against the container's claim of 77, which the loader cuts to the
+    // 59 frames seen, not against the 60 it was first cut to (a claim one
+    // frame long would stand and keep the pick past the end out instead).
+    let Resized::Selection(cut) = selection.sized_to_visible(77, 59, cfg) else {
+        panic!("one frame under the estimate: a selection over the visible frames");
+    };
+    assert_eq!(cut.total_frames, 59);
+    assert_eq!(cut.frame_indices, spread_evenly(59, 32));
     // Longer by one frame: the claim stands, the pick past the end is left out.
     let selection = FrameSelection::from_metadata(
         VideoMetadata {
@@ -719,14 +728,14 @@ fn up_to_selection_follows_the_container_claim_and_the_stream_length() {
     let claimed = FrameSelection::from_metadata(metadata(Some(30.0), Some(58)), cfg)
         .expect("frame rate and count");
     assert_eq!(claimed.frame_indices, spread_evenly(58, 32));
-    let Resized::Selection(resized) = claimed.sized_to_visible(40, cfg) else {
+    let Resized::Selection(resized) = claimed.sized_to_visible(58, 40, cfg) else {
         panic!("shorter than claimed: a selection over the visible frames");
     };
     assert_eq!(resized.total_frames, 40);
     assert_eq!(resized.frame_indices, spread_evenly(40, 32));
     assert_eq!(resized.unique_count(), 32);
-    assert_eq!(claimed.sized_to_visible(58, cfg), Resized::Unchanged);
-    assert_eq!(claimed.sized_to_visible(0, cfg), Resized::Unchanged);
+    assert_eq!(claimed.sized_to_visible(58, 58, cfg), Resized::Unchanged);
+    assert_eq!(claimed.sized_to_visible(58, 0, cfg), Resized::Unchanged);
     // The rate walk: a visible clip shorter than one sampling interval is
     // empty, told apart from unchanged, so the decode refuses it the way a
     // probe of the true length would instead of resampling it by rate.
@@ -741,17 +750,17 @@ fn up_to_selection_follows_the_container_claim_and_the_stream_length() {
     let walked = FrameSelection::from_metadata(metadata(Some(30.0), Some(300)), walk)
         .expect("frame rate and count");
     assert_eq!(
-        walked.sized_to_visible(10, walk),
+        walked.sized_to_visible(300, 10, walk),
         Resized::Empty { total_frames: 10 },
         "10 frames at 30 fps is 0.33 s, under the 0.5 s interval at 2 fps"
     );
     assert!(matches!(
-        walked.sized_to_visible(60, walk),
+        walked.sized_to_visible(300, 60, walk),
         Resized::Selection(_)
     ));
     // A probe that decoded no frame says nothing about the length: unchanged, so the
     // decode reports its own errors instead of a length refusal.
-    assert_eq!(walked.sized_to_visible(0, walk), Resized::Unchanged);
+    assert_eq!(walked.sized_to_visible(300, 0, walk), Resized::Unchanged);
     assert!(the_familys_rule_picks_nothing(10, 30.0, walk).ends_with("(0.500 s)"));
     // The rate is shown as configured, not widened.
     let tenth = VideoFetchConfig {
@@ -778,7 +787,10 @@ fn up_to_selection_follows_the_container_claim_and_the_stream_length() {
     );
     let even = FrameSelection::from_metadata(metadata(Some(30.0), Some(60)), self::cfg())
         .expect("frame rate and count");
-    assert_eq!(even.sized_to_visible(40, self::cfg()), Resized::Unchanged);
+    assert_eq!(
+        even.sized_to_visible(60, 40, self::cfg()),
+        Resized::Unchanged
+    );
     // The rounded even spread follows its loader like the budgeted rules: the
     // container's claim cut to the stream where that runs two or more frames
     // shorter, a claim one frame too long kept with the pick past the end
@@ -799,6 +811,11 @@ fn up_to_selection_follows_the_container_claim_and_the_stream_length() {
     .expect("frame rate and counts");
     assert_eq!(selection.total_frames, 60);
     assert_eq!(selection.frame_indices, vec![0, 20, 39, 59]);
+    let Resized::Selection(cut) = selection.sized_to_visible(77, 59, rounded) else {
+        panic!("one frame under the estimate: a selection over the visible frames");
+    };
+    assert_eq!(cut.total_frames, 59);
+    assert_eq!(cut.frame_indices, vec![0, 19, 39, 58]);
     let selection = FrameSelection::from_metadata(
         VideoMetadata {
             total_frames: Some(60),
@@ -813,13 +830,16 @@ fn up_to_selection_follows_the_container_claim_and_the_stream_length() {
     let claimed = FrameSelection::from_metadata(metadata(Some(30.0), Some(58)), rounded)
         .expect("frame rate and count");
     assert_eq!(claimed.frame_indices, vec![0, 19, 38, 57]);
-    let Resized::Selection(resized) = claimed.sized_to_visible(40, rounded) else {
+    let Resized::Selection(resized) = claimed.sized_to_visible(58, 40, rounded) else {
         panic!("shorter than claimed: a selection over the visible frames");
     };
     assert_eq!(resized.total_frames, 40);
     assert_eq!(resized.frame_indices, vec![0, 13, 26, 39]);
-    assert_eq!(claimed.sized_to_visible(58, rounded), Resized::Unchanged);
-    assert_eq!(claimed.sized_to_visible(0, rounded), Resized::Unchanged);
+    assert_eq!(
+        claimed.sized_to_visible(58, 58, rounded),
+        Resized::Unchanged
+    );
+    assert_eq!(claimed.sized_to_visible(58, 0, rounded), Resized::Unchanged);
 }
 
 #[test]
