@@ -774,6 +774,12 @@ pub(crate) struct CacheTruth {
 #[derive(Clone, Debug)]
 pub(crate) struct Published {
     pub batch: common::KvEventBatch,
+    /// The whole token span of each sparse cache-group store in `batch`, by
+    /// event index: what the engine's `cache_full_blocks` writes as a
+    /// masked group's `token_ids` (the step's full range) while the store's
+    /// hashes name only the blocks the group retains. The vLLM wire writes
+    /// it; the gRPC stream, the relay's output, carries the blocks alone.
+    pub spans: Vec<(usize, Vec<u32>)>,
     /// Lost on the wire by a drop hook: not delivered live, kept for replay.
     pub dropped: bool,
     /// The publisher generation the batch belongs to.
@@ -1383,6 +1389,7 @@ async fn run(
                 Instant::now() + Duration::from_millis(faults.delay_ms.load(Ordering::Relaxed));
             let item = Published {
                 batch,
+                spans: step.spans,
                 dropped,
                 generation: faults.generation.load(Ordering::Relaxed),
             };
@@ -1725,6 +1732,9 @@ struct Step {
     duration: Duration,
     sends: Vec<(mpsc::UnboundedSender<GenEvent>, GenEvent)>,
     batch: Option<common::KvEventBatch>,
+    /// The whole token span of each sparse cache-group store of `batch`, by
+    /// event index (see [`Published::spans`]).
+    spans: Vec<(usize, Vec<u32>)>,
     snapshot: LoadSnapshot,
     /// Cache deltas this pass, for the actor's mirror.
     inserted: Vec<u64>,
@@ -1927,6 +1937,7 @@ impl SchedulerState {
     /// pass visible at its end.
     fn step(&mut self, p: &EngineParams) -> Step {
         let mut kv: Vec<common::KvCacheEvent> = Vec::new();
+        let mut spans: Vec<(usize, Vec<u32>)> = Vec::new();
         let mut inserted: Vec<u64> = Vec::new();
         let mut evicted: Vec<u64> = Vec::new();
         let mut sends: Vec<(mpsc::UnboundedSender<GenEvent>, GenEvent)> = Vec::new();
@@ -1992,7 +2003,7 @@ impl SchedulerState {
                     completed.extend(self.emit_token(i, &mut sends, p));
                 }
                 inserted.extend(completed.iter().map(|c| c.key));
-                self.push_stored(&mut kv, i, completed, p);
+                self.push_stored(&mut kv, &mut spans, i, completed, p);
             } else if !p.prefill_first {
                 let mut freed = Vec::new();
                 if self.ensure(i, 1, p, &mut freed).is_err() {
@@ -2006,7 +2017,7 @@ impl SchedulerState {
                 decode_tokens += 1;
                 budget -= 1;
                 inserted.extend(completed.iter().map(|c| c.key));
-                self.push_stored(&mut kv, i, completed, p);
+                self.push_stored(&mut kv, &mut spans, i, completed, p);
             }
             i += 1;
         }
@@ -2144,7 +2155,7 @@ impl SchedulerState {
                 completed.extend(self.emit_token(idx, &mut sends, p));
             }
             inserted.extend(completed.iter().map(|c| c.key));
-            self.push_stored(&mut kv, idx, completed, p);
+            self.push_stored(&mut kv, &mut spans, idx, completed, p);
         }
 
         // ---- 3. Prefill-first engines decode only in passes without prefill ----
@@ -2171,7 +2182,7 @@ impl SchedulerState {
                 decode_tokens += 1;
                 budget -= 1;
                 inserted.extend(completed.iter().map(|c| c.key));
-                self.push_stored(&mut kv, i, completed, p);
+                self.push_stored(&mut kv, &mut spans, i, completed, p);
                 i += 1;
             }
         }
@@ -2257,6 +2268,7 @@ impl SchedulerState {
             duration,
             sends,
             batch,
+            spans,
             snapshot: self.snapshot(p),
             inserted,
             evicted,
@@ -2472,6 +2484,7 @@ impl SchedulerState {
     fn push_stored(
         &mut self,
         kv: &mut Vec<common::KvCacheEvent>,
+        spans: &mut Vec<(usize, Vec<u32>)>,
         idx: usize,
         completed: Vec<Completed>,
         p: &EngineParams,
@@ -2524,6 +2537,15 @@ impl SchedulerState {
                 for block in &kept {
                     *self.pool.groups.entry(block.block_hash as u64).or_insert(0) |=
                         1u8 << group_idx;
+                }
+                if kept.len() < blocks.len() {
+                    // The engine writes a masked group's store with the
+                    // step's whole token range and the retained hashes only.
+                    let span = blocks
+                        .iter()
+                        .flat_map(|(_, block)| block.token_ids.iter().copied())
+                        .collect();
+                    spans.push((kv.len(), span));
                 }
                 self.kv_event_id += 1;
                 kv.push(common::KvCacheEvent {
@@ -3701,7 +3723,8 @@ mod tests {
         // ends block 5.
         let (r, _rx) = req("x", (0..25).collect(), 1);
         st.enqueue(r, &p);
-        let batch = st.step(&p).batch.expect("stored events expected");
+        let step = st.step(&p);
+        let batch = step.batch.expect("stored events expected");
         let stored = stored_events(&batch);
         assert_eq!(stored.len(), 3, "one store per group");
         let keys = Engine::block_keys(&(0..24).collect::<Vec<_>>(), 4);
@@ -3746,6 +3769,15 @@ mod tests {
             vec![keys[5] as i64],
             "the state block ending at the boundary"
         );
+        assert_eq!(
+            step.spans
+                .iter()
+                .map(|(at, span)| (*at, span.len()))
+                .collect::<Vec<_>>(),
+            vec![(1, 24), (2, 24)],
+            "the two sparse stores carry the step's whole span for the vLLM wire"
+        );
+        assert_eq!(step.spans[0].1, (0..24).collect::<Vec<u32>>());
     }
 
     #[test]

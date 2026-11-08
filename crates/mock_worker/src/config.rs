@@ -510,6 +510,14 @@ impl Config {
         if cfg.grpc_dp_size > 1 && !cfg.realistic {
             return Err("--grpc-dp-size above 1 needs --engine realistic".to_string());
         }
+        if cfg.kv_events_wire == crate::kv_zmq::Wire::Sglang && cfg.engine.kv_cache_groups.len() > 1
+        {
+            return Err(
+                "--kv-cache-groups names several groups, but the SGLang wire (--kv-events-wire \
+                 sglang) publishes one cache group"
+                    .to_string(),
+            );
+        }
         if cfg.grpc_dp_size > 1 && cfg.kv_events_zmq_base_port.is_some() {
             return Err(
                 "--grpc-dp-size above 1 does not publish over --kv-events-zmq-base-port \
@@ -713,7 +721,7 @@ pub fn usage() -> String {
                                 first its main-attention group (default full_attention): a hybrid
                                 engine adds sliding_window:<tokens> or mamba groups, whose stores
                                 name the window tail or the state block at the prompt's replay
-                                boundary, as vLLM 0.31.0 retains them by default\n\
+                                boundary, as vLLM 0.31.0 retains them by default (one group on the SGLang wire)\n\
        --loads-like <mock|vllm>  load report: everything the simulator knows, or only what the\n\
                                 vLLM servicer reports (running, waiting, token_usage, maxima)\n\
        --step-reports <bool>    the load record says the wire reports every scheduler step (as\n\
@@ -810,6 +818,51 @@ mod tests {
 
     fn parse(flags: &[&str]) -> Result<Config, String> {
         Config::parse(flags.iter().map(|flag| (*flag).to_string()))
+    }
+
+    /// `--kv-cache-groups` names each group's kind and window in order; the
+    /// SGLang wire has no cache groups, so several are refused there.
+    #[test]
+    fn the_kv_cache_groups_flag_names_each_group_and_stays_single_on_the_sglang_wire() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        let with = |flags: &[&str]| parse(&[&grpc[..], flags].concat());
+        let cfg = with(&[
+            "--kv-cache-groups",
+            "full_attention,sliding_window:128,mamba",
+        ])
+        .expect("three groups");
+        assert_eq!(
+            cfg.engine.kv_cache_groups,
+            vec![
+                KvCacheGroup::full_attention(),
+                KvCacheGroup {
+                    kind: "sliding_window".to_string(),
+                    sliding_window: 128,
+                },
+                KvCacheGroup {
+                    kind: "mamba".to_string(),
+                    sliding_window: 0,
+                },
+            ]
+        );
+        let err = with(&[
+            "--kv-events-wire",
+            "sglang",
+            "--kv-cache-groups",
+            "full_attention,mamba",
+        ])
+        .expect_err("one group on the SGLang wire");
+        assert!(err.contains("one cache group"), "{err}");
+        assert!(
+            with(&[
+                "--kv-events-wire",
+                "sglang",
+                "--kv-cache-groups",
+                "full_attention"
+            ])
+            .is_ok(),
+            "one group is the SGLang wire's shape"
+        );
     }
 
     /// The gRPC workers serve the tokenspeed wire unless `--grpc-wire` names

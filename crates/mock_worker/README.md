@@ -162,7 +162,7 @@ experiments against it transfer to engines:
 | `--admin-port` | off | process-wide admin API (below) |
 | `--drain-timeout-secs` | 5 | on SIGTERM or SIGINT: stop accepting, let the requests in flight finish for this long, then exit 0 either way |
 | `--kv-events-zmq-base-port` | off | ZMQ KV-event publishers on vLLM's or SGLang's wire (below) |
-| `--kv-cache-groups` | `full_attention` | the KV cache groups a realistic engine publishes, `kind[:window],...`, the first its main-attention group; a hybrid engine adds `sliding_window:<tokens>` or `mamba` groups: every group's events carry its index, kind and window, a window group stores only the window tail ending at the prompt's aligned replay boundary and a Mamba group the one state block there (vLLM 0.31.0's default retention), and an eviction is published once per group |
+| `--kv-cache-groups` | `full_attention` | the KV cache groups a realistic engine publishes, `kind[:window],...`, the first its main-attention group; a hybrid engine adds `sliding_window:<tokens>` or `mamba` groups: every group's events carry its index, kind and window, a window group stores only the window tail ending at the prompt's aligned replay boundary and a Mamba group the one state block there (vLLM 0.31.0's default retention), a sparse store's `token_ids` on the vLLM wire spanning the whole step as the engine writes it, and an eviction is published once per group; one group only on the SGLang wire |
 
 ```bash
 cargo run --release -p mock-worker -- \
@@ -212,7 +212,10 @@ then ZMQ ranks) publishes on `base + 2i` and answers replay on `base + 2i + 1`.
   (`type`, `block_hashes`, `parent_block_hash`, `token_ids`, `block_size`,
   `lora_id`, `medium: "GPU"`, `lora_name`, `group_idx`,
   `kv_cache_spec_kind` and, for a window group, `kv_cache_spec_sliding_window`;
-  one store per cache group of `--kv-cache-groups`), `BlockRemoved` (`type`,
+  one store per cache group of `--kv-cache-groups`, a sparse group's store
+  carrying the step's whole `token_ids` span while its `block_hashes` name
+  only the blocks the group retains, as the engine's `cache_full_blocks`
+  writes a masked group), `BlockRemoved` (`type`,
   `block_hashes`, `medium`, `group_idx`), `AllBlocksCleared` (`type`). Block
   hashes are unsigned 64-bit integers (vLLM's int form of the same bits the
   gRPC stream carries signed).
