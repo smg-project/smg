@@ -2318,8 +2318,9 @@ fn interval_walk(total_frames: usize, fps: f64, rate: f64) -> impl Iterator<Item
 /// decoded frame's record (24) and at most one seek segment (8): 64. While
 /// the select filter is built: for a described selection the distinct-index
 /// list and the spread's described list (8 each), 80 at the peak; for a
-/// listed one its term, the joined text and the formatted argument (about
-/// 30 more), under the 128 charged. A long interval selection is described
+/// listed one its term's string (24 and a 16-byte heap granule) and its
+/// copies in the joined text and the formatted argument (14 each), about
+/// 100, under the 128 charged. A long interval selection is described
 /// in constant size while its stride is stable (its picks are a fixed stride
 /// plus the last frame, which [`FrameSelection::spread_select_filter`]
 /// reproduces); when the stride sits by a whole number it flips between two
@@ -2327,9 +2328,9 @@ fn interval_walk(total_frames: usize, fps: f64, rate: f64) -> impl Iterator<Item
 /// container rate of 30.003 at the default 1 fps), no spread reproduces the
 /// picks, and the filter lists every one of them past
 /// [`FFMPEG_MAX_SELECT_TERMS`] as well. Such a list is bounded by this budget
-/// like every other record, and by the argument length the process may be
-/// given (about 8,700 terms on Linux), past which the decode fails before it
-/// starts: a known limit of the listed form.
+/// like every other record and, before it is built, by
+/// [`FFMPEG_MAX_LISTED_FILTER_BYTES`], the length the decoder can be given it
+/// at.
 const PICK_RECORD_BYTES: usize = 128;
 
 /// Refuses, with the decoded-bytes budget's own error, a clip whose interval
@@ -3151,7 +3152,7 @@ async fn decode_video_with_ffmpeg_ppm(
     metadata: VideoMetadata,
     selection: Option<&FrameSelection>,
 ) -> Result<DecodedRgbVideo, MediaConnectorError> {
-    let frame_args = FfmpegFrameArgs::for_metadata(selection, metadata, cfg).await;
+    let frame_args = FfmpegFrameArgs::for_metadata(selection, metadata, cfg).await?;
     let frame_size = rawvideo_frame_size(metadata.width, metadata.height)?;
     let target_frames = selection.map_or_else(
         || expected_sampled_frame_count(metadata, cfg),
@@ -3212,7 +3213,7 @@ async fn decode_video_with_ffmpeg_raw(
     metadata: VideoMetadata,
     selection: Option<&FrameSelection>,
 ) -> Result<DecodedRgbVideo, MediaConnectorError> {
-    let frame_args = FfmpegFrameArgs::for_metadata(selection, metadata, cfg).await;
+    let frame_args = FfmpegFrameArgs::for_metadata(selection, metadata, cfg).await?;
     let frame_size = rawvideo_frame_size(metadata.width, metadata.height)?;
     let target_frames = selection.map_or_else(
         || expected_sampled_frame_count(metadata, cfg),
@@ -3291,7 +3292,7 @@ async fn decode_video_with_ffmpeg_png(
 ) -> Result<(Vec<image::DynamicImage>, f64), MediaConnectorError> {
     let (frame_args, sample_fps) = match selection.zip(metadata) {
         Some((selection, metadata)) => (
-            FfmpegFrameArgs::selected(selection).await,
+            FfmpegFrameArgs::selected(selection).await?,
             clip_sample_fps(Some(selection), metadata.duration_seconds, cfg),
         ),
         None => {
@@ -3879,6 +3880,16 @@ const FFMPEG_MAX_SELECT_TERMS: usize = 100;
 /// Explicit frames a described selection may add to its spread formula (a
 /// rate-based selection ends on the clip's last frame, one past its spread).
 const FFMPEG_SPREAD_EXTRA_TERMS: usize = 8;
+/// The longest select list the filter may be, refused past it before it is
+/// built, with the decoded-bytes budget's own error. ffmpeg is given the
+/// filter as one argument, which Linux bounds at 128 KiB (`MAX_ARG_STRLEN`);
+/// past that the process cannot be started, and the request would be answered
+/// with the decoder's failure instead of its own. Half the bound keeps the
+/// list clear of it with the pixel-format conversion appended: some 4,700
+/// terms of six-digit indices, over an hour of picks a second apart, so the
+/// refusal reaches only an interval selection no spread describes
+/// ([`PICK_RECORD_BYTES`]) past that length.
+const FFMPEG_MAX_LISTED_FILTER_BYTES: usize = 64 * 1024;
 
 /// What the stream's visible frame count makes of a loader-following
 /// selection ([`FrameSelection::sized_to_visible`]).
@@ -4008,20 +4019,42 @@ impl FrameSelection {
     /// Anything over a minute or two would be a list of hundreds of terms, so
     /// those are described instead of enumerated where a spread formula
     /// reproduces them exactly. A selection no spread reproduces (an interval
-    /// walk whose stride sits by a whole number) stays a list, which the
-    /// argument length bounds at about 8,700 terms ([`PICK_RECORD_BYTES`]).
-    fn select_filter(&self) -> String {
+    /// walk whose stride sits by a whole number) stays a list, refused with
+    /// the decoded-bytes budget's error before it is built when it would be
+    /// longer than [`FFMPEG_MAX_LISTED_FILTER_BYTES`].
+    fn select_filter(&self) -> Result<String, MediaConnectorError> {
         if self.unique_frames.len() > FFMPEG_MAX_SELECT_TERMS {
             if let Some(filter) = self.spread_select_filter() {
-                return filter;
+                return Ok(filter);
             }
+        }
+        let bytes = self.listed_filter_len();
+        if bytes > FFMPEG_MAX_LISTED_FILTER_BYTES {
+            return Err(MediaConnectorError::DecodedTooLarge {
+                media: "video select list",
+                bytes,
+                limit: FFMPEG_MAX_LISTED_FILTER_BYTES,
+                knob: "FFMPEG_MAX_LISTED_FILTER_BYTES",
+            });
         }
         let terms: Vec<String> = self
             .unique_frames
             .iter()
             .map(|(idx, _)| format!("eq(n\\,{idx})"))
             .collect();
-        format!("select='{}'", terms.join("+"))
+        Ok(format!("select='{}'", terms.join("+")))
+    }
+
+    /// The length of the listed filter, counted before any of it is built:
+    /// `select=''` around the terms, each `eq(n\,{index})` (8 bytes and the
+    /// index's digits) joined by `+`.
+    fn listed_filter_len(&self) -> usize {
+        let terms: usize = self
+            .unique_frames
+            .iter()
+            .map(|(index, _)| 8 + index.checked_ilog10().map_or(1, |log| log as usize + 1))
+            .sum();
+        9 + terms - usize::from(!self.unique_frames.is_empty())
     }
 
     /// The same frames as a fixed-size expression.
@@ -4179,12 +4212,15 @@ struct FfmpegFrameArgs {
 }
 
 impl FfmpegFrameArgs {
-    async fn selected(selection: &FrameSelection) -> Self {
-        Self {
-            filter: selection.select_filter(),
+    /// The selection's frames; refused with the decoded-bytes budget's error
+    /// when their list would be longer than the decoder can be given
+    /// ([`FFMPEG_MAX_LISTED_FILTER_BYTES`]).
+    async fn selected(selection: &FrameSelection) -> Result<Self, MediaConnectorError> {
+        Ok(Self {
+            filter: selection.select_filter()?,
             frames: selection.unique_count().to_string(),
             sync: Some(ffmpeg_passthrough_flag().await),
-        }
+        })
     }
 
     fn resampled(fps_filter: String, cfg: VideoFetchConfig) -> Self {
@@ -4199,10 +4235,10 @@ impl FfmpegFrameArgs {
         selection: Option<&FrameSelection>,
         metadata: VideoMetadata,
         cfg: VideoFetchConfig,
-    ) -> Self {
+    ) -> Result<Self, MediaConnectorError> {
         match selection {
             Some(selection) => Self::selected(selection).await,
-            None => Self::resampled(fps_filter_for_metadata(metadata, cfg), cfg),
+            None => Ok(Self::resampled(fps_filter_for_metadata(metadata, cfg), cfg)),
         }
     }
 

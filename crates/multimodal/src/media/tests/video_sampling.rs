@@ -786,12 +786,15 @@ fn select_filter_escapes_commas_and_lists_each_distinct_index_once() {
         .expect("frame rate and count are known");
     assert_eq!(selection.frame_indices, vec![0, 0, 0, 1]);
     assert_eq!(selection.unique_count(), 2);
-    assert_eq!(selection.select_filter(), r"select='eq(n\,0)+eq(n\,1)'");
+    assert_eq!(
+        selection.select_filter().expect("two terms are listed"),
+        r"select='eq(n\,0)+eq(n\,1)'"
+    );
 
     let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(60)), cfg())
         .expect("frame rate and count are known");
     assert_eq!(
-        selection.select_filter(),
+        selection.select_filter().expect("four terms are listed"),
         r"select='eq(n\,0)+eq(n\,19)+eq(n\,39)+eq(n\,59)'"
     );
 }
@@ -822,7 +825,7 @@ fn a_long_selection_is_described_rather_than_listed() {
             .expect("frame rate and count are known");
         assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS);
 
-        let filter = selection.select_filter();
+        let filter = selection.select_filter().expect("described");
         assert_eq!(filter, expected, "{sampling:?}");
         assert!(
             filter.matches('+').count() < FFMPEG_MAX_SELECT_TERMS,
@@ -852,7 +855,7 @@ fn a_long_interval_selection_is_described_in_constant_size_at_a_stable_stride() 
             FrameSelection::from_metadata(metadata(Some(fps), Some(1_080_000)), interval)
                 .expect("frame rate and count are known");
         assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS, "{fps}");
-        let filter = selection.select_filter();
+        let filter = selection.select_filter().expect("described");
         assert!(
             filter.starts_with("select='eq(n\\,floor("),
             "{fps}: described, not listed: {filter}"
@@ -994,7 +997,7 @@ async fn the_selection_picks_the_same_frames_through_ffmpeg() {
             "{label}: {} distinct frames are past the list limit",
             selection.unique_count()
         );
-        let filter = selection.select_filter();
+        let filter = selection.select_filter().expect("described");
         assert!(
             filter.starts_with("select='eq(n\\,floor("),
             "{label}: described, not listed: {filter}"
@@ -1008,6 +1011,7 @@ async fn the_selection_picks_the_same_frames_through_ffmpeg() {
         command.arg(&path);
         FfmpegFrameArgs::selected(&selection)
             .await
+            .expect("described, under the list bound")
             .apply(&mut command);
         command.args([
             "-f",
@@ -1335,7 +1339,7 @@ fn a_nearest_frame_tie_is_described_to_even() {
         .expect("a tie to even is described");
     assert!(described.contains("mod(floor("), "{described}");
     assert_eq!(
-        selection.select_filter(),
+        selection.select_filter().expect("five terms are listed"),
         r"select='eq(n\,0)+eq(n\,2)+eq(n\,4)+eq(n\,7)+eq(n\,9)'"
     );
 }
@@ -1383,12 +1387,15 @@ fn a_selection_the_formula_misses_keeps_the_explicit_list() {
         .map(|index| (index * 3 + index % 2, 1))
         .collect();
     assert!(selection.spread_select_filter().is_none());
-    assert!(selection.select_filter().starts_with(r"select='eq(n\,0)+"));
+    assert!(selection
+        .select_filter()
+        .expect("a short list is built")
+        .starts_with(r"select='eq(n\,0)+"));
 
     selection.unique_frames = (0..FFMPEG_MAX_SELECT_TERMS + 1)
         .map(|index| (index * 3, 1))
         .collect();
-    let filter = selection.select_filter();
+    let filter = selection.select_filter().expect("described");
     assert_eq!(
         filter,
         r"select='eq(n\,floor(round(n*99/297)*297/99))*lte(n\,297)+eq(n\,300)'"
@@ -1409,11 +1416,52 @@ fn a_frame_count_the_container_made_up_still_builds_a_filter() {
     )
     .expect("frame rate and count are known");
 
-    let filter = selection.select_filter();
+    let filter = selection.select_filter().expect("described");
     assert!(
         filter.contains("floor(round("),
         "described, not listed: {filter}"
     );
+}
+
+/// A rate that puts the interval's stride by a whole number (two picks a
+/// second less a hair, at 30 fps: strides of 15 and 16) lists every pick,
+/// and an hour-long clip's list would be longer than the decoder can be
+/// given: refused before it is built, with the budget's error naming the
+/// list's length and the bound, where a list under the bound is built.
+#[test]
+fn a_listed_selection_longer_than_the_decoder_can_be_given_is_refused() {
+    let rate = 1.999_600_079_984_003;
+    let long =
+        FrameSelection::from_metadata(metadata(Some(30.0), Some(600_000)), interval_cfg(rate))
+            .expect("frame rate and count are known");
+    assert!(long.spread_select_filter().is_none());
+    let listed = format!(
+        "select='{}'",
+        long.unique_indices()
+            .iter()
+            .map(|index| format!("eq(n\\,{index})"))
+            .collect::<Vec<_>>()
+            .join("+")
+    );
+    assert!(listed.len() > FFMPEG_MAX_LISTED_FILTER_BYTES);
+    let error = long.select_filter().expect_err("too long to be given");
+    assert!(
+        matches!(
+            error,
+            MediaConnectorError::DecodedTooLarge { media: "video select list", bytes, limit, .. }
+                if bytes == listed.len() && limit == FFMPEG_MAX_LISTED_FILTER_BYTES
+        ),
+        "{error}"
+    );
+    assert_eq!(error.fault(), crate::error::MediaFault::Client);
+
+    let short =
+        FrameSelection::from_metadata(metadata(Some(30.0), Some(60_000)), interval_cfg(rate))
+            .expect("frame rate and count are known");
+    assert!(short.unique_count() > FFMPEG_MAX_SELECT_TERMS);
+    let filter = short.select_filter().expect("under the bound, listed");
+    assert_eq!(filter.len(), short.listed_filter_len());
+    assert!(filter.starts_with(r"select='eq(n\,0)+eq(n\,"), "{filter}");
 }
 
 #[test]
