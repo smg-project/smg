@@ -2944,7 +2944,7 @@ mod tests {
     /// A call that never reached its worker, with the worker's URL on the
     /// error as reqwest attaches it.
     async fn call_refused_by(addr: std::net::SocketAddr) -> reqwest::Error {
-        crate::clients::http_client_builder()
+        crate::server::http_client_builder()
             .build()
             .unwrap()
             .get(format!("http://{addr}/generate"))
@@ -3004,7 +3004,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let worker = BasicWorkerBuilder::new(format!("http://{addr}")).build();
-        let error = crate::clients::http_client_builder()
+        let error = crate::server::http_client_builder()
             .timeout(std::time::Duration::from_millis(100))
             .build()
             .unwrap()
@@ -3568,7 +3568,7 @@ mod tests {
                 ..Default::default()
             };
             let client = Arc::new(
-                crate::clients::http_client_builder()
+                crate::server::http_client_builder()
                     .timeout(std::time::Duration::from_secs(1))
                     .build()
                     .unwrap(),
@@ -3672,7 +3672,7 @@ mod tests {
             ..Default::default()
         };
         let client = Arc::new(
-            crate::clients::http_client_builder()
+            crate::server::http_client_builder()
                 .timeout(std::time::Duration::from_secs(1))
                 .build()
                 .unwrap(),
@@ -3970,7 +3970,7 @@ mod tests {
         for head_sent in [false, true] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = Arc::new(
-                crate::clients::http_client_builder()
+                crate::server::http_client_builder()
                     .timeout(std::time::Duration::from_millis(100))
                     .build()
                     .unwrap(),

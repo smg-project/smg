@@ -59,7 +59,7 @@ pub(crate) fn live_app_context() -> Arc<AppContext> {
     let context = Arc::new(
         AppContext::builder()
             .router_config(config.clone())
-            .client(crate::clients::http_client())
+            .client(crate::server::http_client())
             .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
             .worker_registry(Arc::new(WorkerRegistry::new()))
             .policy_registry(Arc::new(PolicyRegistry::new(config.policy.clone())))
