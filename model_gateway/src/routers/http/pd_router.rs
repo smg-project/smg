@@ -760,7 +760,11 @@ impl PDRouter {
         )
         .await;
 
-        // Record Layer 2 metrics
+        // Record Layer 2 metrics: the duration on a success, else the error
+        // class and reason of the answer. The answer is the request's whether
+        // it was definitive at once or the last retryable one before the
+        // retries ran out, so it counts once either way; the exhaustion
+        // counters above record the spent retries beside it.
         let duration = start_time.elapsed();
         if response.status().is_success() {
             Metrics::record_router_duration(
@@ -771,7 +775,7 @@ impl PDRouter {
                 endpoint,
                 duration,
             );
-        } else if !is_retryable_response(&response) {
+        } else {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_PD,
@@ -4472,6 +4476,70 @@ mod tests {
         // A prefill 5xx stays a status the retry layer and the client can act
         // on, not a 200 carrying an in-band stream error.
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The pair's last retryable answer, once the request's retries are
+    /// spent, is the request's failure: counted once in the router error
+    /// family beside the exhaustion counters, as the regular router counts
+    /// its own. One attempt here (retries off), ended by the prefill side's
+    /// 503.
+    #[test]
+    fn an_exhausted_requests_last_retryable_answer_counts_as_its_error() {
+        use crate::observability::metrics::test_support::render_with_recorder;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let rendered = render_with_recorder(|| {
+            runtime.block_on(async {
+                let prefill = axum::Router::new().route(
+                    "/v1/chat/completions",
+                    axum::routing::post(|| async {
+                        (StatusCode::SERVICE_UNAVAILABLE, r#"{"error":"busy"}"#)
+                    }),
+                );
+                let decode = axum::Router::new().route(
+                    "/v1/chat/completions",
+                    axum::routing::post(|| async {
+                        ([(CONTENT_TYPE, "text/event-stream")], DECODE_SSE)
+                    }),
+                );
+                let mut router = create_test_pd_router();
+                router.retry_config.max_retries = 1;
+                register_pd_pair(&router, spawn_stub(prefill).await, spawn_stub(decode).await);
+                let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+                let response = router
+                    .route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID)
+                    .await;
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            });
+        });
+        let errors: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_router_request_errors_total{"))
+            .collect();
+        assert!(
+            errors.iter().any(|line| {
+                line.contains("router_type=\"http\"")
+                    && line.contains("backend_type=\"pd\"")
+                    && line.contains("endpoint=\"chat\"")
+                    && line.contains("error_type=\"backend_error\"")
+                    && line.ends_with(" 1")
+            }),
+            "the request's last answer counts once as its error:\n{rendered}"
+        );
+        assert_eq!(errors.len(), 1, "one sample, one label set:\n{rendered}");
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_worker_retries_exhausted_total{")
+                    && line.contains("worker_type=\"prefill\"")
+                    && line.contains("endpoint=\"chat\"")
+                    && line.ends_with(" 1")
+            }),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

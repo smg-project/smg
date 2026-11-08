@@ -77,8 +77,7 @@ use crate::{
             },
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{
-                is_request_timeout, is_retryable_response, is_retryable_status,
-                request_timeout_response, RetryExecutor,
+                is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
             },
             sse_rechunk::{NoopObserver, SseRechunker},
             worker_selection::{SelectWorkerRequest, WorkerSelector},
@@ -1869,9 +1868,11 @@ impl RouteOutcome<'_> {
     }
 
     /// [`Self::answered`] for the typed route, whose answer may be replayed:
-    /// the duration on a success, the response's own error class and reason
-    /// on a definitive failure, nothing on a retryable answer (the retry
-    /// executor's exhaustion counter is the record of those).
+    /// the duration on a success, else the response's own error class and
+    /// reason. The response is the request's answer whether it was
+    /// definitive at once or the last retryable one before the retries ran
+    /// out, so it counts once either way; the retry executor's exhaustion
+    /// counter records the spent retries beside it.
     fn answered_typed(&self, response: &Response, start: Instant) {
         if response.status().is_success() {
             let duration = start.elapsed();
@@ -1883,7 +1884,7 @@ impl RouteOutcome<'_> {
                 self.endpoint,
                 duration,
             );
-        } else if !is_retryable_response(response) {
+        } else {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_REGULAR,
@@ -2305,10 +2306,16 @@ impl Router {
         events::RequestReceivedEvent {}.emit();
         let status = response.status();
         let error_code = extract_error_code_from_response(&response);
-        if error_code != STREAMED_BODY_STALLED
-            && error_code != STREAMED_BODY_TOO_LARGE
-            && error_code != STREAMED_BODY_ABORTED
-        {
+        // The three streamed-body codes are the client's own faults (an
+        // upload that stalled, grew past the limit or broke off before it was
+        // forwarded): no worker answered, so they are neither the worker's
+        // outcome nor the router's error. The edge family counts them by
+        // status and code.
+        let client_body_fault = matches!(
+            error_code,
+            STREAMED_BODY_STALLED | STREAMED_BODY_TOO_LARGE | STREAMED_BODY_ABORTED
+        );
+        if !client_body_fault {
             // A streamed head's success was recorded before its relay task
             // was spawned (see `forward_worker_response`).
             if !head_success_recorded(&response) {
@@ -2327,6 +2334,10 @@ impl Router {
             status.as_u16(),
             error_code,
         );
+        // The duration on a success, else the error class and reason of the
+        // answer. This path sends once and never retries, so a worker's
+        // retryable status is the request's final answer too and counts like
+        // any other; the client's own body faults above do not.
         if status.is_success() {
             Metrics::record_router_duration(
                 metrics_labels::ROUTER_HTTP,
@@ -2336,7 +2347,7 @@ impl Router {
                 endpoint,
                 start.elapsed(),
             );
-        } else if !is_retryable_status(status) {
+        } else if !client_body_fault {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_REGULAR,
@@ -4156,8 +4167,14 @@ mod tests {
         assert_eq!(body.as_ref(), b"data: hi\n\n");
     }
 
+    /// An oversized upload must map to the excluded 413 code. The size is the
+    /// client's own fault, so it is no router error either: only the
+    /// upstream-response family sees the 413.
     #[tokio::test]
     async fn oversized_streamed_body_yields_413() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let (url, _captured) = spawn_capture_stub("application/json", "{}").await;
         let router = streaming_router(least_load_policy(), 8, vec![plain_worker(&url)]);
 
@@ -4171,13 +4188,31 @@ mod tests {
             extract_error_code_from_response(&response),
             "request_body_too_large"
         );
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("smg_router_request_errors_total"),
+            "a client's oversized upload is not the router's error:\n{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_router_upstream_responses_total{")
+                    && line.contains("status_code=\"413\"")
+                    && line.contains("error_code=\"request_body_too_large\"")
+            }),
+            "{rendered}"
+        );
     }
 
     /// A stalled uploader must abort with 408 and leave the worker's circuit
     /// breaker untouched: 408 is a retryable status, so recording it as a
-    /// worker outcome would trip a threshold-1 breaker here.
+    /// worker outcome would trip a threshold-1 breaker here. The stall is the
+    /// client's own fault, so it is no router error either: only the
+    /// upstream-response family sees the 408.
     #[tokio::test(start_paused = true)]
     async fn stalled_streamed_body_yields_408_without_breaker_sample() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let (url, _captured) = spawn_capture_stub("application/json", "{}").await;
         let worker = BasicWorkerBuilder::new(&url)
             .worker_type(WorkerType::Regular)
@@ -4216,12 +4251,29 @@ mod tests {
             worker.circuit_breaker_can_execute(),
             "a client-caused stall must not record a breaker failure"
         );
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("smg_router_request_errors_total"),
+            "a client's stall is not the router's error:\n{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_router_upstream_responses_total{")
+                    && line.contains("status_code=\"408\"")
+                    && line.contains("error_code=\"request_body_stalled\"")
+            }),
+            "{rendered}"
+        );
     }
 
     /// A client abort mid-upload must map to the excluded 400 code and leave
-    /// the worker's threshold-1 circuit breaker untouched.
+    /// the worker's threshold-1 circuit breaker untouched. The abort is the
+    /// client's own fault, so it is no router error either.
     #[tokio::test]
     async fn aborted_streamed_body_yields_400_without_breaker_sample() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let (url, _captured) = spawn_capture_stub("application/json", "{}").await;
         let worker = BasicWorkerBuilder::new(&url)
             .worker_type(WorkerType::Regular)
@@ -4262,6 +4314,19 @@ mod tests {
         assert!(
             worker.circuit_breaker_can_execute(),
             "a client abort must not record a breaker failure"
+        );
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("smg_router_request_errors_total"),
+            "a client's abort is not the router's error:\n{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_router_upstream_responses_total{")
+                    && line.contains("status_code=\"400\"")
+                    && line.contains("error_code=\"request_body_aborted\"")
+            }),
+            "{rendered}"
         );
     }
 
@@ -5810,6 +5875,173 @@ mod tests {
             .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
         assert!(line.contains("error_type=\"unavailable\""), "{line}");
         assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// A request whose every attempt came back retryable (two workers, each
+    /// answering 503) is answered with the last attempt's status once its
+    /// retries are spent. That answer is the request's failure: counted once
+    /// in the router error family under the status's class and reason,
+    /// beside the exhaustion counter, as the gRPC pipeline counts the same
+    /// outcome. The duration family stays empty: nothing succeeded.
+    #[test]
+    fn an_exhausted_requests_last_retryable_answer_counts_as_its_error() {
+        use crate::observability::metrics::test_support::render_with_recorder;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let rendered = render_with_recorder(|| {
+            runtime.block_on(async {
+                let mut workers = Vec::new();
+                for _ in 0..2 {
+                    let hits = Arc::clone(&hits);
+                    let app = axum::Router::new().route(
+                        "/generate",
+                        axum::routing::post(move || {
+                            let hits = Arc::clone(&hits);
+                            async move {
+                                hits.fetch_add(1, AtomicOrdering::SeqCst);
+                                (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    [(CONTENT_TYPE, "application/json")],
+                                    r#"{"error":"busy"}"#,
+                                )
+                                    .into_response()
+                            }
+                        }),
+                    );
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "test stub server lives for the duration of the test process"
+                    )]
+                    tokio::spawn(async move {
+                        axum::serve(listener, app).await.unwrap();
+                    });
+                    workers.push(plain_worker(&format!("http://{addr}")));
+                }
+                let mut router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, workers);
+                router.retry_config = fast_retry_config(2);
+                let request: GenerateRequest =
+                    serde_json::from_value(json!({ "text": "hello" })).unwrap();
+                let response = router
+                    .route_typed_request(
+                        None,
+                        None,
+                        request,
+                        "/generate",
+                        crate::worker::UNKNOWN_MODEL_ID,
+                    )
+                    .await;
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            });
+        });
+        assert_eq!(
+            hits.load(AtomicOrdering::SeqCst),
+            2,
+            "one attempt per worker"
+        );
+        let errors: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_router_request_errors_total{"))
+            .collect();
+        assert!(
+            errors.iter().any(|line| {
+                line.contains("router_type=\"http\"")
+                    && line.contains("backend_type=\"regular\"")
+                    && line.contains("endpoint=\"generate\"")
+                    && line.contains("error_type=\"backend_error\"")
+                    && line.contains("reason=\"engine_unavailable\"")
+                    && line.ends_with(" 1")
+            }),
+            "the exhausted request's last answer counts once as its error:\n{rendered}"
+        );
+        assert_eq!(errors.len(), 1, "one sample, one label set:\n{rendered}");
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_worker_retries_exhausted_total{")
+                    && line.contains("endpoint=\"generate\"")
+                    && line.ends_with(" 1")
+            }),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("smg_router_request_duration_seconds"),
+            "nothing succeeded, so no duration:\n{rendered}"
+        );
+    }
+
+    /// The streamed-body route sends once and never retries, so a worker's
+    /// retryable status is the request's final answer too: counted once in
+    /// the router error family under the status's class and reason, with no
+    /// exhaustion recorded (there was no retry budget to spend).
+    #[test]
+    fn a_streamed_requests_retryable_answer_counts_as_its_error() {
+        use crate::observability::metrics::test_support::render_with_recorder;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let rendered = render_with_recorder(|| {
+            runtime.block_on(async {
+                let app = axum::Router::new().route(
+                    "/generate",
+                    axum::routing::post(|| async {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [(CONTENT_TYPE, "application/json")],
+                            r#"{"error":"busy"}"#,
+                        )
+                            .into_response()
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test stub server lives for the duration of the test process"
+                )]
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let router = streaming_router(
+                    least_load_policy(),
+                    1024 * 1024,
+                    vec![plain_worker(&format!("http://{addr}"))],
+                );
+                let response = router
+                    .route_streaming_request(
+                        streamed_request(&[b"{\"text\":\"hello\"}"]),
+                        "/generate",
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            });
+        });
+        let errors: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_router_request_errors_total{"))
+            .collect();
+        assert_eq!(errors.len(), 1, "one sample, one label set:\n{rendered}");
+        assert!(
+            errors[0].contains("router_type=\"http\"")
+                && errors[0].contains("backend_type=\"regular\"")
+                && errors[0].contains("endpoint=\"generate\"")
+                && errors[0].contains("error_type=\"backend_error\"")
+                && errors[0].contains("reason=\"engine_unavailable\"")
+                && errors[0].ends_with(" 1"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("smg_worker_retries_exhausted_total"),
+            "no retry budget was spent:\n{rendered}"
+        );
     }
 
     // --- Streamed deltas per provider profile ---------------------------------
