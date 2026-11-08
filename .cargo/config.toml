@@ -10,7 +10,10 @@
 # OnceLock initialisation); nothing of this workspace or its dependencies is
 # marked for size, so turning the pass off leaves hot code untouched and
 # x86_64 byte-identical. Cargo does not merge this list with the per-target
-# lists below, which is why the flag is repeated there.
+# lists below, which is why the flag is repeated there. A RUSTFLAGS variable
+# replaces this list as a whole: the Symphony benchmark job sets one (see
+# .github/workflows/benchmark-symphony.yml), so a flag added here is added to
+# that job's env block as well.
 rustflags = ["-C", "llvm-args=-enable-machine-outliner=never"]
 incremental = true
 
