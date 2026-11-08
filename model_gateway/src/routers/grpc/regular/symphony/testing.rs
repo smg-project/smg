@@ -32,7 +32,8 @@ pub(super) fn request(extra: Value) -> ChatCompletionRequest {
     serde_json::from_value(request).expect("chat request")
 }
 
-pub(super) fn tools() -> Vec<Tool> {
+/// The `lookup` tool the tests' requests declare and their outputs call.
+pub(crate) fn tools() -> Vec<Tool> {
     serde_json::from_value(json!([{
         "type": "function", "function": {
             "name": "lookup", "parameters": {"type": "object", "properties": {}}

@@ -208,10 +208,6 @@ jobs:
           retention-days: 1
           if-no-files-found: ignore
 
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
-
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
@@ -265,8 +261,25 @@ jobs:
           pip install ./crates/grpc_client/python msgspec pydantic numpy pyzmq
           pytest -q grpc_servicer/tests -rs
 
+      # The release tests drive scripts/release/release.sh, which runs `make`; this
+      # runner's image ships no build tools (go-unit-tests installs its own too).
+      - name: Install the tools the tooling tests drive
+        run: |
+          bash scripts/ci_apt_mirror.sh
+          bash scripts/ci_apt_update.sh sudo
+          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y --no-install-recommends make
+
+      # Every test under scripts/tests runs: the Python files as one pytest run, the
+      # shell tests one by one. The tools the step above can install come from there; a
+      # test that needs one it cannot skips itself and says so under -rs. A new test
+      # file runs from its first commit instead of waiting for a name here;
+      # scripts/tests/test_ci_tooling_tests.py pins this step. `python -m pytest`, not
+      # the console script: it puts the repository root on sys.path, which the tests
+      # that import `scripts.<module>` need to collect.
       - name: Run CI tooling unit tests
-        run: pytest -q scripts/tests/test_ci_node_health.py scripts/tests/test_ci_prepared_backend_env.py scripts/tests/test_ci_tokenspeed_scheduler_pin.py scripts/tests/test_ci_tokenspeed_image_tag.py scripts/tests/test_ci_gpu_runner_image.py scripts/tests/test_bench_gate.py scripts/tests/test_ci_reap_job_processes.py scripts/tests/test_check_release_versions.py scripts/tests/test_ci_rust_tests.py scripts/tests/test_ci_apt_update.py scripts/tests/test_ci_gpu_guard.py
+        run: |
+          python -m pytest -q -rs scripts/tests
+          for test in scripts/tests/test_*.sh; do bash "$test"; done
 
       # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
       # ZMQ/EPD command builders, ZMQ-lane collection filter). --noconftest keeps
@@ -363,10 +376,6 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           bash scripts/ci_rust_tests.sh check
-
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
 
   # One job per shard of scripts/ci_rust_tests.sh that a pull request can
   # affect: detect-changes maps its rust-* path filters to the shard table and
@@ -467,10 +476,6 @@ jobs:
       - name: Cleanup Postgres test database
         if: always() && contains(matrix.needs, 'postgres')
         run: bash scripts/ci_agentic_svc_deps.sh cleanup-postgres-db postgres-db
-
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
 
   # --- Dependency audit ---
 
@@ -2035,7 +2040,7 @@ jobs:
         env:
           SHOW_WORKER_LOGS: "0"
           E2E_LOG_DIR: e2e-logs
-          # floor ≈ 95% of the 471 cases the mock marker selects: the chat
+          # floor ≈ 95% of the 532 cases the mock marker selects: the chat
           # completion, request-id, concurrency, reasoning-content, EOS
           # stripping, function-calling, tool-choice (three models),
           # multi-turn and sampling-defaults classes, the constraint-failure
@@ -2048,8 +2053,14 @@ jobs:
           # parameters, item references, the object shape), and the gpt-oss
           # classes of chat and Responses on the Harmony token stream (the
           # mock's tokenizer turns a scripted answer's channel markers into
-          # the special tokens)
-          E2E_MIN_SELECTED: "447"
+          # the special tokens), the scheduler-wire classes (a chat, a
+          # streamed and a tool-call turn through the gateway on each of the
+          # three gRPC protos the mock serves), the disaggregated
+          # scheduler-wire classes (a chat and a streamed turn on a prefill
+          # and a decode worker on the sglang and the vllm wires), and the
+          # worker API classes (the list routes, IGW mode,
+          # disable-health-check, the REST semantics)
+          E2E_MIN_SELECTED: "505"
           MOCK_WORKER_BIN: ${{ github.workspace }}/target/debug/mock-worker
           ROUTER_LOCAL_MODEL_PATH: ${{ runner.temp }}/models
           TIKTOKEN_ENCODINGS_BASE: ${{ runner.temp }}/models/tiktoken
@@ -2070,10 +2081,6 @@ jobs:
           path: e2e-logs/
           retention-days: 7
           if-no-files-found: ignore
-
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
 
   # --- Vendor E2E: CPU-only cloud backend tests ---
 

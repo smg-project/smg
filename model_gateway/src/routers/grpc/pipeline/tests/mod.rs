@@ -1,9 +1,10 @@
 mod alias_pipeline;
 mod build_parity;
+mod chat_logit_bias;
 mod generate_body;
-mod generate_pretokenized;
 mod glm53;
 mod model_label;
+mod pretokenized;
 mod rate_limit_reserve;
 
 use std::{
@@ -46,7 +47,7 @@ use super::*;
 use crate::{
     config::types::PolicyConfig,
     routers::{
-        common::openai_bridge::FormatRegistry,
+        common::{openai_bridge::FormatRegistry, test_support::fast_retry_config},
         grpc::{
             client::ModelInfo,
             common::responses::{
@@ -67,6 +68,7 @@ use crate::{
         },
     },
     tenant::TenantKey,
+    test_support,
     worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         BasicWorkerBuilder, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType,
@@ -97,6 +99,8 @@ fn label_pairs(labels: &[(String, String)]) -> Vec<(&str, &str)> {
 
 /// The `(offset, length)` placeholder ranges of one generate call.
 type PlaceholderRanges = Vec<(u32, u32)>;
+/// A bias map as the stub received it, sorted by token.
+type ReceivedBias = Vec<(String, f32)>;
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
 type KvEventStream = Pin<Box<dyn Stream<Item = Result<common::KvEventBatch, Status>> + Send>>;
 type TokenizerStream =
@@ -118,8 +122,8 @@ type TokenizerStream =
 /// `answer_after` stalls the generate RPC, standing in for an engine that
 /// answers only at its own deadline; `frame_gap` paces the response frames,
 /// for a stream that outlasts its dispatch. Every call's input token ids,
-/// prompt text, stop sequences and engine request id are recorded, as is
-/// every aborted request id.
+/// prompt text, stop sequences, bias map and engine request id are
+/// recorded, as is every aborted request id.
 #[derive(Clone, Default)]
 struct GatedScheduler {
     probe: Option<Weak<CompletionRequest>>,
@@ -145,6 +149,7 @@ struct GatedScheduler {
     seen_mm_placeholders: Arc<Mutex<Vec<PlaceholderRanges>>>,
     seen_request_ids: Arc<Mutex<Vec<String>>>,
     seen_stops: Arc<Mutex<Vec<Vec<String>>>>,
+    seen_logit_bias: Arc<Mutex<Vec<ReceivedBias>>>,
     aborted_request_ids: Arc<Mutex<Vec<String>>>,
 }
 
@@ -253,6 +258,24 @@ impl TokenSpeedScheduler for GatedScheduler {
                     .sampling_params
                     .as_ref()
                     .map(|params| params.stop.clone())
+                    .unwrap_or_default(),
+            );
+        self.seen_logit_bias
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(
+                request
+                    .sampling_params
+                    .as_ref()
+                    .map(|params| {
+                        let mut bias: ReceivedBias = params
+                            .logit_bias
+                            .iter()
+                            .map(|(token, bias)| (token.clone(), *bias))
+                            .collect();
+                        bias.sort_by(|a, b| a.0.cmp(&b.0));
+                        bias
+                    })
                     .unwrap_or_default(),
             );
         if self.fail_always || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0) {
@@ -970,16 +993,6 @@ fn completion_pipeline_with_policy(
         Duration::from_secs(60),
     );
     RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps).expect("completion pipeline")
-}
-
-fn fast_retry_config(max_retries: u32) -> RetryConfig {
-    RetryConfig {
-        max_retries,
-        initial_backoff_ms: 1,
-        max_backoff_ms: 2,
-        backoff_multiplier: 1.0,
-        jitter_factor: 0.0,
-    }
 }
 
 /// A request pinned by a routing key whose engine cannot start it
@@ -2242,6 +2255,22 @@ async fn cancelled_grpc_stream_reports_the_completion_during_prefill() {
     drop(hold);
 }
 
+/// `response`'s body read by a client of its own, as a connection reads it:
+/// a streamed body's reading runs when the body is polled (see
+/// `DrivenBody`), so a response held unread would hold the engine's stream
+/// unread too. Aborting the client's task drops the body, as the client's
+/// leaving does.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test client reading the body; aborting it is the client's leaving"
+)]
+fn read_body(response: Response) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut body = response.into_body().into_data_stream();
+        while body.next().await.is_some() {}
+    })
+}
+
 /// Wait until the processor has read the first response of `worker`'s
 /// one stream: the stream's output ticket is open from that response on
 /// (see `Worker::output_silence`), and the processor waits on the engine
@@ -2303,6 +2332,7 @@ async fn a_client_that_leaves_a_stalled_stream_aborts_it_on_the_engine_at_once()
     let components = components(Arc::clone(&worker_registry)).await;
 
     let response = start_stream(&pipeline, components).await;
+    let client = read_body(response);
     first_response_read(&worker).await;
     assert!(
         scheduler
@@ -2314,7 +2344,8 @@ async fn a_client_that_leaves_a_stalled_stream_aborts_it_on_the_engine_at_once()
     );
     assert_eq!(worker.load(), 1);
 
-    drop(response);
+    // The client leaves: its task goes, and the body with it.
+    client.abort();
 
     let deadline = Instant::now() + Duration::from_secs(2);
     wait_for_abort(&scheduler, deadline).await;
@@ -2346,6 +2377,7 @@ async fn a_client_that_leaves_a_stalled_pd_stream_aborts_the_decode_side_at_once
     let components = components(Arc::clone(&worker_registry)).await;
 
     let response = start_stream(&pipeline, components).await;
+    let client = read_body(response);
     first_response_read(&decode).await;
     assert!(
         decode_scheduler
@@ -2356,7 +2388,8 @@ async fn a_client_that_leaves_a_stalled_pd_stream_aborts_the_decode_side_at_once
         "nothing is aborted while the client reads"
     );
 
-    drop(response);
+    // The client leaves: its task goes, and the body with it.
+    client.abort();
 
     let deadline = Instant::now() + Duration::from_secs(2);
     wait_for_abort(&decode_scheduler, deadline).await;
@@ -2944,9 +2977,9 @@ async fn cancelled_pd_stream_with_admitted_prefill_reports_and_frees_the_slot() 
 
 // ------------------------------------------------------------------
 // DeepSeek-V4.1 parity through the pipeline with the real checkpoint
-// tokenizer. Needs `DEEPSEEK_V41_MODEL_DIR` (or the tokenizer crate's
-// download cache); skips otherwise, like the tokenizer crate's parity
-// test.
+// tokenizer: `DEEPSEEK_V41_MODEL_DIR`, else the tokenizer files fetched
+// once into the package's cache; skips only when the hub is unreachable,
+// like the tokenizer crate's parity test.
 // ------------------------------------------------------------------
 
 const V41_RENDER_FIXTURES: &str = include_str!(
@@ -2964,14 +2997,12 @@ const V41_IMAGE_TOKEN_ID: u32 = 129264;
 /// the multimodal crate's goldens.
 const V41_CORN_TOKENS: usize = 189;
 
-fn deepseek_v41_model_dir() -> Option<PathBuf> {
-    let dir = std::env::var_os("DEEPSEEK_V41_MODEL_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../crates/tokenizer/.tokenizer_cache/deepseek_v41")
-        });
-    (dir.join("tokenizer.json").is_file() && dir.join("config.json").is_file()).then_some(dir)
+/// The checkpoint's tokenizer directory, fetched on a blocking thread: the
+/// download blocks, and must not run on the runtime.
+async fn deepseek_v41_model_dir() -> Option<PathBuf> {
+    tokio::task::spawn_blocking(test_support::ensure_deepseek_v41_cached)
+        .await
+        .expect("the download thread")
 }
 
 #[expect(
@@ -2979,7 +3010,10 @@ fn deepseek_v41_model_dir() -> Option<PathBuf> {
     reason = "test diagnostic: says why the parity test did not run"
 )]
 fn skip_no_tokenizer() {
-    eprintln!("skipping: no DeepSeek-V4.1 tokenizer (set DEEPSEEK_V41_MODEL_DIR)");
+    eprintln!(
+        "skipping: no DeepSeek-V4.1 tokenizer (the hub is unreachable; set {})",
+        test_support::DEEPSEEK_V41_MODEL_DIR_ENV
+    );
 }
 
 /// The recorded request (`messages`, kwargs) and reference ids of one
@@ -3112,7 +3146,7 @@ async fn v41_run_chat_on(
 /// renderer writes that revision's effort budget.
 #[tokio::test]
 async fn deepseek_v41_prompt_ids_match_the_reference_through_the_pipeline() {
-    let Some(dir) = deepseek_v41_model_dir() else {
+    let Some(dir) = deepseek_v41_model_dir().await else {
         skip_no_tokenizer();
         return;
     };
@@ -3171,7 +3205,7 @@ async fn deepseek_v41_prompt_ids_match_the_reference_through_the_pipeline() {
 /// the client's mistake, so it surfaces as 400, not 500.
 #[tokio::test]
 async fn deepseek_v41_invalid_effort_is_a_bad_request() {
-    let Some(dir) = deepseek_v41_model_dir() else {
+    let Some(dir) = deepseek_v41_model_dir().await else {
         skip_no_tokenizer();
         return;
     };
@@ -3197,7 +3231,7 @@ async fn deepseek_v41_invalid_effort_is_a_bad_request() {
 /// instead of refusing the request.
 #[tokio::test]
 async fn deepseek_v41_medium_effort_renders_the_checkpoints_budget() {
-    let Some(dir) = deepseek_v41_model_dir() else {
+    let Some(dir) = deepseek_v41_model_dir().await else {
         skip_no_tokenizer();
         return;
     };
@@ -3242,7 +3276,7 @@ async fn deepseek_v41_medium_effort_renders_the_checkpoints_budget() {
 /// example), and the worker is told that span as the placeholder range.
 #[tokio::test]
 async fn deepseek_v41_image_expands_to_the_reference_span() {
-    let Some(dir) = deepseek_v41_model_dir() else {
+    let Some(dir) = deepseek_v41_model_dir().await else {
         skip_no_tokenizer();
         return;
     };
@@ -3380,7 +3414,7 @@ fn a_router_error_carries_the_reason_behind_its_class() {
 /// dispatched (the engine would admit the request and never schedule it).
 #[tokio::test]
 async fn deepseek_v41_image_to_a_language_model_only_worker_is_refused() {
-    let Some(dir) = deepseek_v41_model_dir() else {
+    let Some(dir) = deepseek_v41_model_dir().await else {
         skip_no_tokenizer();
         return;
     };
@@ -3418,7 +3452,7 @@ async fn deepseek_v41_image_to_a_language_model_only_worker_is_refused() {
 /// `false` refuses it.
 #[tokio::test]
 async fn deepseek_v41_image_follows_the_servicer_vision_verdict() {
-    let Some(dir) = deepseek_v41_model_dir() else {
+    let Some(dir) = deepseek_v41_model_dir().await else {
         skip_no_tokenizer();
         return;
     };

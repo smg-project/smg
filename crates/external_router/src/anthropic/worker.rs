@@ -325,12 +325,12 @@ pub(crate) mod probe {
 
 #[cfg(test)]
 mod tests {
-    use axum::{body::to_bytes, http::StatusCode};
+    use axum::http::StatusCode;
     use metrics_exporter_prometheus::PrometheusBuilder;
 
     use super::{probe::counted_failure, *};
     use crate::test_support::{
-        RefusedAddress, StubWorker, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL,
+        text_of, RefusedAddress, StubWorker, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL,
     };
 
     const UPSTREAM_REFUSAL: &str = r#"{"error":{"message":"Rate limit reached for model in organization org-abc123 project proj_xyz789","type":"rate_limit","code":"rate_limit_exceeded"}}"#;
@@ -347,10 +347,7 @@ mod tests {
         );
         let response = handle_error_response(upstream, "m", Instant::now()).await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("a body");
-        let text = std::str::from_utf8(&body).expect("utf-8");
+        let text = text_of(response).await;
         assert!(!text.contains("org-abc123"), "{text}");
         assert!(!text.contains("proj_xyz789"), "{text}");
         assert!(text.contains("Rate limit reached for model"), "{text}");

@@ -149,16 +149,20 @@ mod own_thread_tests {
     }
 }
 
-/// Convert ProtoOutputLogProbs to OpenAI ChatLogProbs format using Harmony's tokenizer
+/// Convert an output's logprobs, read in place on the engine message, to the
+/// OpenAI ChatLogProbs format using Harmony's tokenizer.
 ///
 /// Delegates to the shared `convert_proto_logprobs` with Harmony's built-in tokenizer
 /// for token ID decoding.
 pub(crate) fn convert_harmony_logprobs(
     encoding: &HarmonyEncoding,
-    proto_logprobs: &ProtoOutputLogProbs,
+    proto_logprobs: ProtoOutputLogProbs<'_>,
 ) -> ChatLogProbs {
     let tokenizer = encoding.tokenizer();
-    utils::convert_proto_logprobs(proto_logprobs, |token_id| {
+    // Every candidate the engine sent: this path does not cut them to the request's
+    // `top_logprobs` yet, where the regular path does; the cut changes what a client
+    // gets, so it is a change of its own.
+    utils::convert_proto_logprobs(proto_logprobs, None, |token_id| {
         tokenizer
             .decode_utf8([token_id])
             .unwrap_or_else(|_| format!("<token_{token_id}>"))
@@ -235,7 +239,7 @@ impl ToolLike for Tool {
         Some(ToolDescription::new(
             self.function.name.clone(),
             self.function.description.clone().unwrap_or_default(),
-            Some(self.function.parameters.clone()),
+            Some(self.function.parameters_schema().clone()),
         ))
     }
 }
@@ -282,7 +286,7 @@ impl ToolLike for ResponseTool {
             ResponseTool::Function(ft) => Some(ToolDescription::new(
                 ft.function.name.clone(),
                 ft.function.description.clone().unwrap_or_default(),
-                Some(ft.function.parameters.clone()),
+                Some(ft.function.parameters_schema().clone()),
             )),
             ResponseTool::ImageGeneration(_) => Some(image_generation_tool_description()),
             _ => None,
@@ -1101,15 +1105,15 @@ impl HarmonyBuilder {
                     content,
                     name,
                     tool_calls,
-                    reasoning_content,
+                    reasoning,
                     ..
                 } => {
                     if let Some(calls) = tool_calls.as_ref().filter(|c| !c.is_empty()) {
                         // Per Harmony spec: when tool calls are present, include
                         // previous reasoning as a separate analysis channel message
                         // because the model calls tools as part of its chain-of-thought.
-                        if let Some(reasoning) = reasoning_content {
-                            if !reasoning.is_empty() {
+                        if let Some(text) = &reasoning.text {
+                            if !text.is_empty() {
                                 let analysis_msg = HarmonyMessage {
                                     author: Author {
                                         role: Role::Assistant,
@@ -1117,7 +1121,7 @@ impl HarmonyBuilder {
                                     },
                                     recipient: None,
                                     content: vec![Content::Text(TextContent {
-                                        text: reasoning.clone(),
+                                        text: text.clone(),
                                     })],
                                     channel: Some("analysis".to_string()),
                                     content_type: None,
@@ -1204,7 +1208,7 @@ impl HarmonyBuilder {
                         },
                         recipient: Some("assistant".to_string()),
                         content: vec![Content::Text(TextContent {
-                            text: content.clone(),
+                            text: content.clone().unwrap_or_default(),
                         })],
                         channel: None,
                         content_type: None,
@@ -1661,13 +1665,13 @@ mod tests {
                     function: Function {
                         name: "image_generation".to_string(),
                         description: Some("mcp-exposed duplicate".to_string()),
-                        parameters: json!({
+                        parameters: Some(json!({
                             "type": "object",
                             "properties": {
                                 "prompt": {"type": "string"}
                             },
                             "required": ["prompt"]
-                        }),
+                        })),
                         strict: None,
                         extra: Default::default(),
                     },

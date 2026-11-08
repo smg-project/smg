@@ -876,7 +876,7 @@ fn test_validate_tool_choice_requires_tools() {
             function: Function {
                 name: "test_func".to_string(),
                 description: None,
-                parameters: json!({}),
+                parameters: Some(json!({})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1149,7 +1149,7 @@ fn test_normalize_tool_choice_auto() {
             function: Function {
                 name: "test_func".to_string(),
                 description: None,
-                parameters: json!({}),
+                parameters: Some(json!({})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1211,7 +1211,7 @@ fn test_normalize_tool_choice_no_override() {
             function: Function {
                 name: "test_func".to_string(),
                 description: None,
-                parameters: json!({}),
+                parameters: Some(json!({})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1242,7 +1242,7 @@ fn test_normalize_parallel_tool_calls() {
             function: Function {
                 name: "test_func".to_string(),
                 description: None,
-                parameters: json!({}),
+                parameters: Some(json!({})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1295,7 +1295,7 @@ fn test_normalize_parallel_tool_calls_no_override() {
             function: Function {
                 name: "test_func".to_string(),
                 description: None,
-                parameters: json!({}),
+                parameters: Some(json!({})),
                 strict: None,
                 extra: Default::default(),
             },

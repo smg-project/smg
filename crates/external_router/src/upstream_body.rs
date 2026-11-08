@@ -162,9 +162,8 @@ pub async fn answer_error(resp: reqwest::Response, model: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use axum::body::to_bytes;
-
     use super::*;
+    use crate::test_support::text_of;
 
     const UPSTREAM_REFUSAL: &str = r#"{"error":{"message":"Rate limit reached for model in organization org-abc123 project proj_xyz789","type":"rate_limit","code":"rate_limit_exceeded"}}"#;
 
@@ -178,13 +177,6 @@ mod tests {
             builder = builder.header(CONTENT_TYPE, ct);
         }
         reqwest::Response::from(builder.body(body.into()).expect("a response"))
-    }
-
-    async fn text_of(response: Response) -> String {
-        let bytes = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("a body");
-        String::from_utf8(bytes.to_vec()).expect("utf-8")
     }
 
     /// A provider's refusal reaches the caller under its status and content

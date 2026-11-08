@@ -35,14 +35,14 @@ fn update_task_tools() -> Vec<Tool> {
         function: Function {
             name: "update_task".to_string(),
             description: None,
-            parameters: json!({
+            parameters: Some(json!({
                 "type": "object",
                 "properties": {
                     "taskId":  {"type": "string"},
                     "subject": {"type": "string"}
                 },
                 "required": ["taskId", "subject"]
-            }),
+            })),
             strict: None,
             extra: Default::default(),
         },
@@ -166,7 +166,7 @@ async fn test_m3_nested_schema_types_respected() {
         function: Function {
             name: "create_task".to_string(),
             description: None,
-            parameters: json!({
+            parameters: Some(json!({
                 "type": "object",
                 "properties": {
                     "meta": {
@@ -178,7 +178,7 @@ async fn test_m3_nested_schema_types_respected() {
                         "items": {"type": "string"}
                     }
                 }
-            }),
+            })),
             strict: None,
             extra: Default::default(),
         },
@@ -263,7 +263,7 @@ async fn test_m3_nested_object_and_array_arguments() {
         function: Function {
             name: "create_order".to_string(),
             description: None,
-            parameters: json!({
+            parameters: Some(json!({
                 "type": "object",
                 "properties": {
                     "user_id": { "type": "integer" },
@@ -279,7 +279,7 @@ async fn test_m3_nested_object_and_array_arguments() {
                         "items": { "type": "object" }
                     }
                 }
-            }),
+            })),
             strict: None,
             extra: Default::default(),
         },
@@ -935,14 +935,14 @@ fn container_tools() -> Vec<Tool> {
         function: Function {
             name: "plan_route".to_string(),
             description: None,
-            parameters: json!({
+            parameters: Some(json!({
                 "type": "object",
                 "properties": {
                     "avoid_aisles": {"type": "array", "items": {"type": "string"}},
                     "options":      {"type": "object"},
                     "note":         {"type": "string"}
                 }
-            }),
+            })),
             strict: None,
             extra: Default::default(),
         },
@@ -1064,7 +1064,7 @@ fn composite_schema_tools(combinator: &str) -> Vec<Tool> {
         function: Function {
             name: "composite_schema".to_string(),
             description: None,
-            parameters,
+            parameters: Some(parameters),
             strict: None,
             extra: Default::default(),
         },
@@ -1180,7 +1180,7 @@ async fn test_m3_missing_empty_container_close_in_nested_array() {
         function: Function {
             name: "plan".into(),
             description: None,
-            parameters: json!({"type": "object", "properties": {
+            parameters: Some(json!({"type": "object", "properties": {
                 "days": {"type": "array", "items": {
                     "type": "object", "properties": {
                         "name": {"type": "string"},
@@ -1188,7 +1188,7 @@ async fn test_m3_missing_empty_container_close_in_nested_array() {
                     }
                 }},
                 "timezone": {"type": "string"}
-            }}),
+            }})),
             strict: None,
             extra: Default::default(),
         },
@@ -1283,11 +1283,11 @@ async fn test_m3_empty_container_recovery_requires_schema_and_parent_close() {
             function: Function {
                 name: "test".into(),
                 description: None,
-                parameters: json!({"type": "object", "properties": {
+                parameters: Some(json!({"type": "object", "properties": {
                     "parent": {"type": "object", "properties": {
                         "empty": {"type": kind}
                     }}
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1367,9 +1367,9 @@ async fn test_m3_composed_container_recovery() {
             function: Function {
                 name: "test".into(),
                 description: None,
-                parameters: json!({"type": "object", "properties": {
+                parameters: Some(json!({"type": "object", "properties": {
                     "rows": wrap(json!({"type": "array", "items": item_schema}))
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1433,9 +1433,9 @@ async fn test_m3_composed_container_recovery_rejects_ambiguous_schemas() {
             function: Function {
                 name: "test".into(),
                 description: None,
-                parameters: json!({"type": "object", "properties": {
+                parameters: Some(json!({"type": "object", "properties": {
                     "parent": {"type": "object", "properties": {"empty": schema}}
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1515,7 +1515,7 @@ fn constraint_tools() -> Vec<Tool> {
         function: Function {
             name: name.to_string(),
             description: None,
-            parameters,
+            parameters: Some(parameters),
             strict: None,
             extra: Default::default(),
         },
@@ -1694,7 +1694,7 @@ fn m3_references_and_nulls_in_lists_follow_the_schema() {
         function: Function {
             name: "t".to_string(),
             description: None,
-            parameters: json!({
+            parameters: Some(json!({
                 "type": "object",
                 "$defs": {
                     "Point": {"type": "object", "properties": {"x": {"type": "integer"}}},
@@ -1706,7 +1706,7 @@ fn m3_references_and_nulls_in_lists_follow_the_schema() {
                     "holes": {"type": "array", "items": {"type": "null"}},
                 },
                 "required": ["at", "count", "holes"],
-            }),
+            })),
             strict: None,
             extra: Default::default(),
         },
@@ -1967,7 +1967,7 @@ fn schema_tool(parameters: serde_json::Value) -> Tool {
         function: Function {
             name: "t".to_string(),
             description: None,
-            parameters,
+            parameters: Some(parameters),
             strict: None,
             extra: Default::default(),
         },

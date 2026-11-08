@@ -49,7 +49,7 @@ impl RequestCompletionSink for PolicyCompletionSink {
         };
         registry
             .policy_for_worker(worker)
-            .on_request_complete(worker.url(), true);
+            .on_request_complete(worker.url());
     }
 }
 
@@ -307,9 +307,10 @@ impl PolicyRegistry {
         }
     }
 
-    /// The header-derived sticky key: the resolved routing key,
-    /// lineage-stripped when the override is enabled (matching selection),
-    /// raw otherwise.
+    /// The one header-derived key: the resolved routing key, lineage-stripped
+    /// when the override is enabled, raw otherwise. Placement hands it to
+    /// every policy as `SelectWorkerInfo::routing_key` and the load guard
+    /// counts under it, so selection and accounting agree by construction.
     pub fn sticky_header_key<'a>(&self, headers: Option<&'a HeaderMap>) -> Option<&'a str> {
         let raw = self.resolve_routing_key(headers)?;
         Some(if self.routing_key_sticky.is_some() {
@@ -336,16 +337,18 @@ impl PolicyRegistry {
     }
 
     /// Resolve the effective sticky key: a valid configured routing-key header
-    /// wins, with the rid-derived key as fallback. Header keys get the same
-    /// lineage stripping as rid keys, so a
-    /// proxy forwarding `conv_t2` as a header pins the entry `conv`.
+    /// wins, with the rid-derived key as fallback. `info.routing_key` is the
+    /// header key as placement derived it ([`Self::sticky_header_key`]:
+    /// lineage-stripped under the override, so a proxy forwarding `conv_t2`
+    /// pins the entry `conv`); a caller that left it empty gets the same
+    /// derivation from the headers here. Nothing strips twice.
     fn effective_sticky_key<'a>(
         &self,
         info: &SelectWorkerInfo<'a>,
     ) -> Option<(&'a str, &'static str)> {
         info.routing_key
-            .or_else(|| self.resolve_routing_key(info.headers))
-            .map(|raw| (Self::strip_header_key(raw), "header"))
+            .or_else(|| self.sticky_header_key(info.headers))
+            .map(|key| (key, "header"))
             .or_else(|| info.rid_key.map(|key| (key, "rid")))
     }
 
@@ -437,13 +440,13 @@ impl PolicyRegistry {
             result
         };
 
-        let healthy = get_healthy_worker_indices(workers, info);
-        if healthy.is_empty() {
-            return finish(None, ExecutionBranch::NoHealthyWorkers);
-        }
         let delegate = sticky.assignment_mode() == ManualAssignmentMode::Delegate;
 
-        let pin = sticky.peek_pin(workers, key, &healthy);
+        // A hit reads the pin's candidates alone; the eligible list is built
+        // only where a worker has to be chosen from it.
+        let pin = sticky.peek_pin(workers, key, |idx| {
+            info.admits(workers[idx].routing_state())
+        });
         if let PinState::Pinned(idx) = pin {
             if !over_cap(idx) {
                 return finish(Some(idx), ExecutionBranch::OccupiedHit);
@@ -458,12 +461,23 @@ impl PolicyRegistry {
                     None => return finish(None, ExecutionBranch::CapRespill),
                 }
             } else {
+                // The pin was admitted by a live read above; the pool can lose
+                // every eligible worker before this second read.
+                let healthy = get_healthy_worker_indices(workers, info);
+                if healthy.is_empty() {
+                    return finish(None, ExecutionBranch::NoHealthyWorkers);
+                }
                 sticky.assign_index(workers, &healthy)
             };
             if new_idx != idx && !over_cap(new_idx) {
                 sticky.pin_front(key, workers[new_idx].url());
             }
             return finish(Some(new_idx), ExecutionBranch::CapRespill);
+        }
+
+        let healthy = get_healthy_worker_indices(workers, info);
+        if healthy.is_empty() {
+            return finish(None, ExecutionBranch::NoHealthyWorkers);
         }
 
         if delegate {
@@ -617,8 +631,9 @@ impl PolicyRegistry {
 
     /// The policy that places requests on `worker`: the prefill, decode or
     /// encode policy by worker type, else the model's policy. Completion
-    /// reports and in-flight reconciliation both go there.
-    fn policy_for_worker(&self, worker: &dyn Worker) -> Arc<dyn LoadBalancingPolicy> {
+    /// reports and in-flight reconciliation both go there, and the worker's
+    /// stream is chosen by what it needs (see `UpdatePoliciesStep`).
+    pub(crate) fn policy_for_worker(&self, worker: &dyn Worker) -> Arc<dyn LoadBalancingPolicy> {
         match worker.worker_type() {
             WorkerType::Prefill => self.get_prefill_policy(),
             WorkerType::Decode => self.get_decode_policy(),
@@ -2614,7 +2629,7 @@ mod tests {
             (!workers.is_empty()).then_some(0)
         }
 
-        fn on_request_complete(&self, worker_url: &str, _success: bool) {
+        fn on_request_complete(&self, worker_url: &str) {
             self.completed.lock().unwrap().push(worker_url.to_string());
         }
 
@@ -2808,5 +2823,50 @@ mod tests {
                 "size {size}"
             );
         }
+    }
+
+    /// The keyed decisions of a replay under the delegating override: eight
+    /// regular workers behind a round-robin registry, sixteen session keys
+    /// picked over three rounds, two workers vetoed for the second round and
+    /// back for the third (a pin whose worker is vetoed respills and
+    /// follows the respill). The sequence was recorded from the override
+    /// that built its eligible list before reading the pin and copied the
+    /// key per lookup; the override that reads the pin borrowed and lists
+    /// only to assign must pick the same.
+    #[test]
+    fn the_replayed_keyed_requests_pick_the_recorded_sequence() {
+        const RECORDED: [usize; 48] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 1, 3, 4, 3, 6, 7, 0, 1, 4, 3, 4,
+            6, 6, 7, 0, 1, 1, 3, 4, 3, 6, 7, 0, 1, 4, 3, 4, 6, 6, 7,
+        ];
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| worker(&format!("http://w{i}"), WorkerType::Regular))
+            .collect();
+        let keys: Vec<String> = (0..16).map(|i| format!("conv{i}_t{}", i % 3)).collect();
+        let mut picks = Vec::with_capacity(RECORDED.len());
+        for round in 0..3 {
+            for vetoed in [2, 5] {
+                workers[vetoed].set_overloaded(round == 1);
+            }
+            for key in &keys {
+                let info = SelectWorkerInfo {
+                    rid_key: Some(key),
+                    ..Default::default()
+                };
+                picks.push(
+                    reg.select_worker(&policy, &workers, &info)
+                        .expect("six workers stay eligible"),
+                );
+            }
+        }
+        assert_eq!(
+            picks, RECORDED,
+            "the replay picked {picks:?}; the recorded sequence is the decision"
+        );
     }
 }

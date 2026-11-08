@@ -495,6 +495,7 @@ struct RoutingState {
 
 /// One frame queued for the engines' shared input socket.
 struct InputFrame {
+    retained: RetainedInput,
     engine_id: EngineId,
     request_type: Bytes,
     payload: Bytes,
@@ -505,6 +506,40 @@ struct InputFrame {
     /// The payload bytes the queue bound counts while the frame waits:
     /// `Some` for an add-request, `None` for a control frame.
     counted: Option<usize>,
+}
+
+/// Logical payload bytes held by queued frames and the active input writer.
+/// Shared allocations can count more than once. This excludes transport-owned
+/// references after local admission, codec/kernel buffers, and process RSS.
+struct RetainedInput {
+    total: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl RetainedInput {
+    /// Reserve atomically, rejecting both budget exhaustion and integer overflow.
+    fn reserve(total: &Arc<AtomicUsize>, bytes: usize, limit: usize) -> Result<Self> {
+        total
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(bytes).filter(|next| *next <= limit)
+            })
+            .map_err(|retained_bytes| Error::EngineInputBytesFull {
+                retained_bytes,
+                request_bytes: bytes,
+                limit_bytes: limit,
+            })?;
+        Ok(Self {
+            total: Arc::clone(total),
+            bytes,
+        })
+    }
+}
+
+impl Drop for RetainedInput {
+    /// Release on send completion, failure, or destruction of queued/active work.
+    fn drop(&mut self) {
+        self.total.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
 }
 
 /// The bound on add-request frames waiting behind a blocked input (see
@@ -587,6 +622,11 @@ struct ClientInner<P: EngineProtocol> {
     /// written) and their payload bytes, for the bound.
     waiting_adds: AtomicUsize,
     waiting_add_bytes: AtomicUsize,
+    /// Logical payload bytes held by queued frames and the active write.
+    retained_input_bytes: Arc<AtomicUsize>,
+    /// Data allowance: [`ENGINE_INPUT_RETAINED_BYTES`] unless
+    /// [`Client::set_input_byte_limit`] changed it. Controls bypass this limit.
+    input_byte_limit: AtomicUsize,
     /// When the input writer began the write it is in, if any: a write
     /// pending for a whole send window is the sign of a blocked input.
     writing_since: Mutex<Option<Instant>>,
@@ -613,12 +653,16 @@ struct ClientInner<P: EngineProtocol> {
     /// only: vLLM reserves negative ids for notices it sends unprompted.
     next_call_id: AtomicI64,
     /// The engine's last output of any kind (a token, a completion, a
-    /// stats-only step), in milliseconds on `output_clock`; reset at the
-    /// first submission the engine reports every step after a spell without
-    /// one, so the silence such a request sees counts from its own dispatch.
-    /// Read by [`Client::output_silence`].
+    /// stats-only step), in milliseconds on `output_clock`; 0 before the
+    /// first. Read by [`Client::last_output_at`] and, beside
+    /// `step_reports_since_ms`, by [`Client::output_silence`].
     output_clock: Instant,
     last_output_ms: AtomicU64,
+    /// When the first request the engine reports every step was dispatched
+    /// after a spell without one, in milliseconds on `output_clock`: the
+    /// silence such a request sees counts from its own dispatch, not from an
+    /// output the engine gave before it had anything to say.
+    step_reports_since_ms: AtomicU64,
     /// The engine has sent a scheduler step without any token (a stats-only
     /// step report): its silence is then the scheduler's own, not a prefill
     /// in progress. Read by [`Client::reports_steps`].
@@ -716,10 +760,17 @@ impl<P: EngineProtocol> ClientInner<P> {
         }
     }
 
-    /// Stamp an output from the engine (or a dispatch onto an idle one) now.
+    /// Milliseconds on `output_clock` now.
+    fn clock_ms(&self) -> u64 {
+        u64::try_from(self.output_clock.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Stamp an output from the engine now: never 0, which
+    /// [`Client::last_output_at`] reads as no output yet, so a batch within
+    /// the clock's first millisecond reads as its first.
     fn note_output(&self) {
-        let millis = u64::try_from(self.output_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.last_output_ms.store(millis, Ordering::Relaxed);
+        self.last_output_ms
+            .store(self.clock_ms().max(1), Ordering::Relaxed);
     }
 
     /// Retire in-flight request ids from a rank. Idempotent: an id already
@@ -809,7 +860,9 @@ impl<P: EngineProtocol> ClientInner<P> {
         payload: Vec<u8>,
         aux_frames: Vec<Bytes>,
     ) -> Result<()> {
-        let bytes = payload.len() + aux_frames.iter().map(Bytes::len).sum::<usize>();
+        let bytes = aux_frames.iter().fold(payload.len(), |total, frame| {
+            total.saturating_add(frame.len())
+        });
         self.admit_add(bytes)?;
         self.send_frame(engine_id, P::add_frame(), payload, aux_frames, Some(bytes))
             .await
@@ -827,7 +880,9 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// a whole window sooner than one that waits; the error names the
     /// request's size. The check is not synchronized with the
     /// queue, so a burst can overshoot the bound by a few frames; a burst to
-    /// an engine that reads is never refused, whatever its size.
+    /// an engine that reads is never refused by this check. Independently,
+    /// enqueueing enforces [`Client::set_input_byte_limit`] even on healthy
+    /// engines and can return [`Error::EngineInputBytesFull`].
     fn admit_add(&self, bytes: usize) -> Result<()> {
         let send_timeout = *self.send_timeout.lock();
         let blocked = self
@@ -931,7 +986,9 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// Queue a frame for the input writer, behind every frame queued before
     /// it; `done`, if any, receives the result of the write, and `counted`
     /// bytes are held against the queue bound until the writer takes the
-    /// frame.
+    /// frame. Independently reserves payload bytes through the active write
+    /// against [`Client::set_input_byte_limit`]; `counted: None` controls bypass
+    /// that limit but still contribute to the retained total.
     fn queue_frame(
         &self,
         engine_id: &EngineId,
@@ -941,12 +998,31 @@ impl<P: EngineProtocol> ClientInner<P> {
         done: Option<oneshot::Sender<Result<()>>>,
         counted: Option<usize>,
     ) -> Result<()> {
+        let bytes = aux_frames.iter().try_fold(payload.len(), |used, frame| {
+            used.checked_add(frame.len())
+                .ok_or_else(|| Error::EngineInputBytesFull {
+                    retained_bytes: self.retained_input_bytes.load(Ordering::Relaxed),
+                    request_bytes: usize::MAX,
+                    limit_bytes: self.input_byte_limit.load(Ordering::Relaxed),
+                })
+        })?;
+        // Control messages must still pass when the data budget is full.
+        let retained = RetainedInput::reserve(
+            &self.retained_input_bytes,
+            bytes,
+            if counted.is_some() {
+                self.input_byte_limit.load(Ordering::Relaxed)
+            } else {
+                usize::MAX
+            },
+        )?;
         if let Some(bytes) = counted {
             self.waiting_adds.fetch_add(1, Ordering::AcqRel);
             self.waiting_add_bytes.fetch_add(bytes, Ordering::AcqRel);
         }
         self.input_tx
             .send(InputFrame {
+                retained,
                 engine_id: engine_id.clone(),
                 request_type,
                 payload: payload.into(),
@@ -1222,6 +1298,8 @@ impl<P: EngineProtocol> Client<P> {
             input_budget: Arc::new(InputBudget::default()),
             waiting_adds: AtomicUsize::new(0),
             waiting_add_bytes: AtomicUsize::new(0),
+            retained_input_bytes: Arc::new(AtomicUsize::new(0)),
+            input_byte_limit: AtomicUsize::new(ENGINE_INPUT_RETAINED_BYTES),
             writing_since: Mutex::new(None),
             refused: AtomicUsize::new(0),
             engines,
@@ -1234,6 +1312,7 @@ impl<P: EngineProtocol> Client<P> {
             next_call_id: AtomicI64::new(1),
             output_clock: Instant::now(),
             last_output_ms: AtomicU64::new(0),
+            step_reports_since_ms: AtomicU64::new(0),
             steps_reported: AtomicBool::new(false),
             kv_transfer_wanted: AtomicBool::new(false),
         });
@@ -1429,6 +1508,18 @@ impl<P: EngineProtocol> Client<P> {
         self.inner.input_budget.released.notify_one();
     }
 
+    /// Bound logical payload bytes queued or being sent by this client (8 GiB
+    /// by default, capped at usize::MAX). Unlike the blocked-queue limit, this
+    /// check is unconditional and atomic; oversized adds are refused with
+    /// [`Error::EngineInputBytesFull`]. Control frames bypass the limit but count
+    /// toward usage. Cancellation of a caller does not release its queued frame.
+    /// Lowering the limit does not evict existing work. This is not an RSS cap:
+    /// transport-owned frames after admission have their own separate budget,
+    /// and codec/kernel buffers and allocations before enqueueing are excluded.
+    pub fn set_input_byte_limit(&self, bytes: usize) {
+        self.inner.input_byte_limit.store(bytes, Ordering::Relaxed);
+    }
+
     /// The latest per-rank load for one engine index (DP routing signal), if
     /// any batch has been seen from it yet.
     pub fn engine_load(&self, engine_index: u32) -> Option<EngineLoad> {
@@ -1468,8 +1559,24 @@ impl<P: EngineProtocol> Client<P> {
         if self.inner.registry.lock().reported_every_step() == 0 {
             return None;
         }
-        let since = Duration::from_millis(self.inner.last_output_ms.load(Ordering::Relaxed));
+        let since = Duration::from_millis(
+            self.inner
+                .last_output_ms
+                .load(Ordering::Relaxed)
+                .max(self.inner.step_reports_since_ms.load(Ordering::Relaxed)),
+        );
         Some(self.inner.output_clock.elapsed().saturating_sub(since))
+    }
+
+    /// When the engine last sent an output batch of any kind (a token, a
+    /// completion, a stats-only step), to the millisecond; `None` before
+    /// the first. Read whether or not anything is in flight, and never moved
+    /// by a dispatch: a caller that submitted a request of its own at some
+    /// instant reads a later one here as the engine having spoken since,
+    /// whichever request it spoke for (the servicers' deep health probe).
+    pub fn last_output_at(&self) -> Option<Instant> {
+        let millis = self.inner.last_output_ms.load(Ordering::Relaxed);
+        (millis > 0).then(|| self.inner.output_clock + Duration::from_millis(millis))
     }
 
     /// Whether the engine's wire reports every scheduler step: it has shown
@@ -1546,7 +1653,9 @@ impl<P: EngineProtocol> Client<P> {
             // with nothing it reports every step had nothing to say until
             // now.
             if quiet && every_step {
-                self.inner.note_output();
+                self.inner
+                    .step_reports_since_ms
+                    .store(self.inner.clock_ms(), Ordering::Relaxed);
             }
             receiver
         };
@@ -1651,6 +1760,8 @@ impl<P: EngineProtocol> Client<P> {
     /// `ClientInner::admit_add`): once the engine has stopped reading for
     /// a whole send window, a frame that would take the waiting payload past
     /// the bound is refused at once rather than parked and delivered later.
+    /// The unconditional [`Self::set_input_byte_limit`] also applies, returning
+    /// [`Error::EngineInputBytesFull`] even if input is not blocked.
     pub async fn send_typed(
         &self,
         engine_id: &EngineId,
@@ -1658,7 +1769,9 @@ impl<P: EngineProtocol> Client<P> {
         payload: Vec<u8>,
         aux_frames: Vec<Bytes>,
     ) -> Result<()> {
-        let bytes = payload.len() + aux_frames.iter().map(Bytes::len).sum::<usize>();
+        let bytes = aux_frames.iter().fold(payload.len(), |total, frame| {
+            total.saturating_add(frame.len())
+        });
         self.inner.admit_add(bytes)?;
         self.inner
             .send_frame(engine_id, request_type, payload, aux_frames, Some(bytes))
@@ -1813,6 +1926,9 @@ const DRAIN_REWAKES_PER_PROMPT: u8 = 3;
 /// failed are not.
 const ENGINE_INPUT_DEATH_TIMEOUT: Duration = ENGINE_SILENCE_DEATH_TIMEOUT;
 
+/// Default logical payload allowance for queued frames and the active writer.
+const ENGINE_INPUT_RETAINED_BYTES: usize = 8usize.saturating_mul(1 << 30);
+
 /// The bound on add-requests waiting behind a blocked input, in frames and in
 /// payload bytes: once a send window has elapsed with a frame unaccepted, a
 /// submission that would take the waiting add-requests past either is refused
@@ -1882,6 +1998,11 @@ impl<P: EngineProtocol> Dispatcher<P> {
         self.consecutive_decode_errors = 0;
         let inner = &self.inner;
         inner.note_output();
+        // A batch with neither outputs nor finished requests is a stats-only
+        // step report when it carries a load tail (the engine's wire reports
+        // every step); without one it is the engine's bare liveness signal
+        // (a scheduler answering a health probe it could not queue): an
+        // output like any other, and no step report.
         if batch.outputs.is_empty() && batch.finished_request_ids.is_empty() && batch.load.is_some()
         {
             inner.steps_reported.store(true, Ordering::Relaxed);
@@ -2091,8 +2212,7 @@ async fn run_input_writer<P: EngineProtocol>(
         let death_timeout = *inner.input_death_timeout.lock();
         *inner.writing_since.lock() = Some(Instant::now());
         let write = async {
-            let bytes =
-                frame.payload.len() + frame.aux_frames.iter().map(Bytes::len).sum::<usize>();
+            let bytes = frame.retained.bytes;
             let credit = inner.reserve_input(bytes).await;
             send_message(
                 &mut input_send,
@@ -2108,6 +2228,7 @@ async fn run_input_writer<P: EngineProtocol>(
             .await
         };
         let result = tokio::time::timeout(death_timeout, write).await;
+        drop(frame.retained);
         *inner.writing_since.lock() = None;
         let result = match result {
             Ok(result) => result,

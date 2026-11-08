@@ -42,8 +42,9 @@ from infra import (
     get_runtime,
     launch_cloud_gateway,
 )
-from infra.constants import vllm_kv_backend
+from infra.constants import vllm_kv_backend, zmq_backend
 from infra.model_specs import get_model_spec
+from infra.process_utils import ProcessExitedError
 from infra.worker import stop_workers
 from infra.worker_pool import get_pool
 
@@ -86,11 +87,13 @@ _WORKER_DEFAULTS = {
 _worker_start_failures: dict[str, int] = {}  # engine -> count
 _MAX_WORKER_START_FAILURES = 3  # fail fast after this many failures (matches --reruns 2)
 
-# Engines that speak the direct-ZMQ backend wire in e2e. Pairing ZMQ with any
-# other engine can't work, so we reject it up front instead of timing out on a
-# worker that never becomes ready.
+# Engines that speak the direct-ZMQ backend wire in e2e: the three engines and
+# the mock worker, whose ZMQ ranks speak the vLLM wire (the gateway is pinned
+# to it, ``zmq_backend``). Pairing ZMQ with any other engine can't work, so we
+# reject it up front instead of timing out on a worker that never becomes
+# ready.
 ZMQ_CAPABLE_ENGINES = frozenset(
-    {Runtime.VLLM.value, Runtime.TOKENSPEED.value, Runtime.SGLANG.value}
+    {Runtime.VLLM.value, Runtime.TOKENSPEED.value, Runtime.SGLANG.value, Runtime.MOCK.value}
 )
 
 
@@ -509,14 +512,27 @@ def _setup_local(
     # the mock engine.
     set_class_workers(workers)
     try:
-        _start_gateway(
-            gateway,
-            gateway_config,
-            worker_urls=[w.base_url for w in workers],
-            workers=workers,
-            model_path=model_path,
-            backend=engine if is_zmq else None,
-        )
+        try:
+            _start_gateway(
+                gateway,
+                gateway_config,
+                worker_urls=[w.base_url for w in workers],
+                workers=workers,
+                model_path=model_path,
+                backend=zmq_backend(engine) if is_zmq else None,
+            )
+        except ProcessExitedError:
+            raise
+        except (TimeoutError, RuntimeError):
+            # A ZMQ engine's start-up wait is this gate (its spawn returned
+            # at once), so an engine that died in it, or that it waited out,
+            # failed to start. Counted as the pool counts a worker that fails
+            # its own gate, a death or the bound alike: the session stops
+            # after _MAX_WORKER_START_FAILURES such failures instead of
+            # running every later class of the engine into the same one.
+            if is_zmq:
+                _worker_start_failures[engine] = _worker_start_failures.get(engine, 0) + 1
+            raise
         logger.info("%s backend ready at %s", backend_name, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     finally:
@@ -940,7 +956,7 @@ def backend_router(request: pytest.FixtureRequest):
             worker_urls=[w.base_url for w in workers],
             workers=workers,
             model_path=model_path,
-            backend=engine if is_zmq else None,
+            backend=zmq_backend(engine) if is_zmq else None,
             # ZMQ loads the model inside the gateway's readiness gate; cover it.
             timeout=_gateway_readiness_timeout(connection_mode, model_id, DEFAULT_ROUTER_TIMEOUT),
         )

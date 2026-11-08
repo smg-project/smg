@@ -634,8 +634,11 @@ fn native_media_options(
     };
     // The engine's own video frame budget (`0`: every frame); absent when
     // the launcher could not tell, which leaves each spec to its constant.
-    // `video_loader_rule` names a loader rule the pipeline cannot follow; the
-    // pipeline refuses it for a spec that samples the way the loader does.
+    // `video_loader_rule` carries the engine's loader rules as the launcher
+    // reported them; the pipeline refuses the entries that reach the family
+    // (every rule the default loader reads for a family on that loader, the
+    // flag rules for a family whose loader the engine registers for its
+    // processor class, none for a sampler that never followed a loader).
     let video_frame_budget = count("video_frame_budget")?;
     // The engine's encoder budget, the most feature tokens one item may
     // carry; absent when the launcher could not tell, which leaves an item's

@@ -21,7 +21,7 @@ use smg::observability::metrics::SERVER_MALLOC_CONF;
     reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
 )]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8; 72] = SERVER_MALLOC_CONF;
+pub static MALLOC_CONF: &[u8; 100] = SERVER_MALLOC_CONF;
 
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg::{
@@ -395,7 +395,7 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 5, help_heading = "Routing Policy")]
     bucket_adjust_interval_secs: usize,
 
-    /// Abandon cache affinity for shortest-queue when the KV-usage spread
+    /// Abandon cache affinity for expected-wait routing when the KV-usage spread
     /// (hottest minus coldest backend, 0.0-1.0) exceeds this — catches
     /// long-context KV imbalance that request counts miss. Backend must
     /// report token_usage. Finite and > 0.0; >= 1.0 disables it.
@@ -469,10 +469,10 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
     selection_temperature: f32,
 
-    /// Worker selection policy for cache_aware, run over the per-worker
-    /// inputs the router gathers (prefix overlap, in-flight requests,
-    /// backend load reports); cache-aware-default, the affinity-group
-    /// decision, is the one policy
+    /// Worker selection policy for cache_aware, run over each worker's
+    /// prefix overlap and decayed affinity score and the fleet's mean
+    /// in-flight count; cache-aware-default, the affinity-group decision,
+    /// is the one policy
     #[arg(
         long,
         default_value = "cache-aware-default",
@@ -493,7 +493,10 @@ struct RoutingArgs {
 
     /// Maximum total size of each model's approximation tree for cache-aware
     /// routing (chars for HTTP, tokens for gRPC), shared across all workers;
-    /// eviction keeps every tree at or under this bound
+    /// eviction keeps every tree at or under this bound. With mesh enabled,
+    /// eviction also keeps a model's string and token prefix hash indexes
+    /// each within this bound, in entries and in stored bytes or tokens,
+    /// dropping older entries first
     #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
 
@@ -680,7 +683,7 @@ struct WorkerArgs {
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
     pd_disaggregation: bool,
 
-    /// Enable EPD (Encode-Prefill-Decode) disaggregated mode (gRPC + TokenSpeed only).
+    /// Enable EPD (Encode-Prefill-Decode) disaggregated mode (gRPC vLLM or TokenSpeed).
     /// Encode workers run the vision tower and ship embeddings to prefill over Mooncake;
     /// prefill/decode reuse the PD path. Encode urls are given via `--encode <url> [bootstrap_port]`.
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
@@ -1317,7 +1320,8 @@ struct ServingArgs {
     tenant_rate_limit_config: Option<String>,
 
     // ==================== Retry Configuration ====================
-    /// Maximum number of retry attempts
+    /// Default attempts per request in all, the first one included (1 disables retries).
+    /// A worker's per-model retry override takes precedence.
     #[arg(long, default_value_t = 5, help_heading = "Retry Configuration")]
     retry_max_retries: u32,
 
@@ -1784,9 +1788,16 @@ struct IntegrationArgs {
     secret_sources: SecretSources,
 
     // ==================== Mesh Server ====================
+    /// Start the mesh: several gateways find each other, keep one membership
+    /// table and replicate the workers each of them registered locally.
     #[arg(long, default_value_t = false)]
     enable_mesh: bool,
 
+    /// This node's name in the mesh: the owner stamped on the worker keys it
+    /// publishes, the `peer` of its metrics and log lines. Give it a name
+    /// that survives restarts (the chart passes the pod's); the default,
+    /// `Mesh_` and four random characters, does not, and the old name stays
+    /// in the members' tables.
     #[arg(long)]
     mesh_server_name: Option<String>,
 
@@ -1800,10 +1811,17 @@ struct IntegrationArgs {
     #[arg(long)]
     mesh_advertise_host: Option<String>,
 
+    /// The mesh listener's port, advertised with `--mesh-advertise-host`;
+    /// must differ from the other listeners' ports and cannot be 0.
     #[arg(long, default_value_t = 39527)]
     mesh_port: u16,
 
-    #[arg(long, num_args = 0..)]
+    /// Where to join, as `ip:port` of other members' mesh listeners,
+    /// space- or comma-separated: while the membership table holds nobody
+    /// else, the entries are dialed in turn under the retry backoff until
+    /// one answers, and the rest of the mesh is learned from that member. On
+    /// Kubernetes `--router-selector` finds the members instead.
+    #[arg(long, num_args = 0.., value_delimiter = ',')]
     mesh_peer_urls: Vec<String>,
 
     /// The CA certificate (PEM) the mesh peers' certificates chain to. With
@@ -2480,6 +2498,80 @@ mod tests {
                 other => panic!("expected {value} refused by name, got {other:?}"),
             }
         }
+    }
+
+    /// Every `--mesh-peer-urls` entry is a join peer, in the order given; an
+    /// entry that is no socket address is refused by name, whatever its
+    /// position.
+    #[test]
+    fn every_mesh_peer_url_is_a_join_peer_and_a_bad_one_is_refused_by_name() {
+        let mesh = cli_args_from(&[
+            "--enable-mesh",
+            "--mesh-host",
+            "127.0.0.1",
+            "--mesh-peer-urls",
+            "10.0.0.2:39527",
+            "10.0.0.3:39527",
+        ])
+        .build_mesh_server_config()
+        .expect("a valid mesh configuration")
+        .expect("the mesh is on");
+        let expected: Vec<std::net::SocketAddr> = vec![
+            "10.0.0.2:39527".parse().unwrap(),
+            "10.0.0.3:39527".parse().unwrap(),
+        ];
+        assert_eq!(mesh.init_peers, expected, "every entry, in order");
+
+        let err = cli_args_from(&[
+            "--enable-mesh",
+            "--mesh-host",
+            "127.0.0.1",
+            "--mesh-peer-urls",
+            "10.0.0.2:39527",
+            "not-an-address",
+        ])
+        .build_mesh_server_config()
+        .err()
+        .expect("a second entry that is no socket address must be refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("mesh_peer_urls") && text.contains("not-an-address"),
+            "the refusal names the field and the value: {text}"
+        );
+    }
+
+    /// The peer URLs may stand as separate values or as one comma-separated
+    /// list; both read as the same join peers, in the order given.
+    #[test]
+    fn mesh_peer_urls_parse_the_same_comma_separated_and_as_separate_values() {
+        let init_peers = |peer_args: &[&str]| {
+            let mut args = vec![
+                "--enable-mesh",
+                "--mesh-host",
+                "127.0.0.1",
+                "--mesh-peer-urls",
+            ];
+            args.extend_from_slice(peer_args);
+            cli_args_from(&args)
+                .build_mesh_server_config()
+                .expect("a valid mesh configuration")
+                .expect("the mesh is on")
+                .init_peers
+        };
+        let expected: Vec<std::net::SocketAddr> = vec![
+            "10.0.0.2:39527".parse().unwrap(),
+            "10.0.0.3:39527".parse().unwrap(),
+        ];
+        assert_eq!(
+            init_peers(&["10.0.0.2:39527", "10.0.0.3:39527"]),
+            expected,
+            "separate values, in order"
+        );
+        assert_eq!(
+            init_peers(&["10.0.0.2:39527,10.0.0.3:39527"]),
+            expected,
+            "one comma-separated list reads as the same join peers"
+        );
     }
 
     /// Mesh bind and advertise hosts go through the shared bind-host rule, so

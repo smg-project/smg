@@ -335,15 +335,16 @@ pub(crate) struct ProcessingState {
     pub response: ResponseState,
 }
 
-/// Worker-selection inputs that outlive the parsed request.
+/// Worker-selection inputs that outlive the parsed request. The prompt's
+/// token ids are not kept: a retry reads them off the retained plan
+/// ([`ExecutionPlan::routing_token_ids`]).
 #[derive(Default)]
 pub(crate) struct RoutingSnapshot {
     /// Exact context checks retained for initial selection and retries.
     pub context_requirements: super::common::stages::ContextRequirements,
-    /// Captured only when a configured policy actually consumes request text.
+    /// Captured when the prompt has no token ids, or when a configured policy
+    /// reads request text next to them.
     pub routing_text: Option<String>,
-    /// Routing-affinity token proxy (first prompt for batched completions).
-    pub token_ids: Vec<u32>,
     /// rid-derived sticky key, derived once at first selection.
     pub rid_key: Option<String>,
     /// The request's cache namespace, derived once at first selection.
@@ -418,6 +419,10 @@ pub(crate) struct DispatchContext {
     /// boundary.
     pub dispatch_model: String,
     pub streaming: bool,
+    /// The request's wall-clock second (the `created` its responses report):
+    /// the request's one wall-clock read, taken when its charge id was minted
+    /// at the edge (see `helpers::request_wall_clock`).
+    pub created: u64,
     pub headers: Option<HeaderMap>,
     pub rate_limit_cell: Option<Arc<RateLimitCell>>,
     pub routing: RoutingSnapshot,
@@ -566,6 +571,23 @@ pub(crate) enum ExecutionPlanKind {
 }
 
 impl ExecutionPlan {
+    /// Encoding rewrites a clone with replica-bound EC handles; the retained
+    /// pre-encode plan cannot replay those handles after any attempt failure.
+    pub(crate) fn has_replica_bound_ec_handoff(&self) -> bool {
+        let carries_media = |request: &ProtoGenerateRequest| {
+            request.is_vllm() && (request.has_mm_inputs() || request.has_vllm_media_refs())
+        };
+        match self {
+            Self::EncodePrefillDecode { request } => carries_media(request),
+            Self::Batch {
+                kind: ExecutionPlanKind::EncodePrefillDecode,
+                requests,
+                ..
+            } => requests.iter().any(carries_media),
+            _ => false,
+        }
+    }
+
     pub(crate) fn generate(kind: ExecutionPlanKind, request: ProtoGenerateRequest) -> Self {
         match kind {
             ExecutionPlanKind::Single => Self::Single(ProtoRequest::Generate(request)),
@@ -654,6 +676,19 @@ impl ExecutionPlan {
                     "Id stamp does not match the plan shape",
                 ))
             }
+        }
+    }
+
+    /// The prompt's token ids as a retry's routing hint (a batch's first
+    /// prompt, as the first selection used): the plan is retained for as long
+    /// as a retry can happen, so the routing snapshot keeps no copy of them.
+    pub(crate) fn routing_token_ids(&self) -> &[u32] {
+        match self {
+            Self::Single(request) => request.token_ids(),
+            Self::PrefillDecode(request) | Self::EncodePrefillDecode { request } => {
+                request.token_ids()
+            }
+            Self::Batch { requests, .. } => requests.first().map_or(&[], |r| r.token_ids()),
         }
     }
 
@@ -1103,6 +1138,8 @@ impl RequestContext {
         let request_id =
             super::common::stages::helpers::middleware_request_id(tenant_request_meta.as_ref())
                 .map(str::to_owned);
+        let (created, _) =
+            super::common::stages::helpers::request_wall_clock(tenant_request_meta.as_ref());
         Ok(DispatchContext {
             root_request_id: if cache_trace::enabled() {
                 request_id.clone()
@@ -1118,6 +1155,7 @@ impl RequestContext {
             model_id,
             dispatch_model,
             streaming,
+            created,
             headers,
             rate_limit_cell,
             routing,
@@ -1710,6 +1748,35 @@ mod tests {
     use super::*;
     use crate::routers::grpc::{client::GrpcClient, test_engine::mock_engine};
 
+    /// Only multimodal vLLM EPD owns EC state absent from its retained plan.
+    #[test]
+    fn replica_bound_ec_policy_preserves_other_retry_shapes() {
+        use smg_grpc_client::{tokenspeed_proto, vllm_proto};
+        let media = ProtoGenerateRequest::Vllm(Box::new(vllm_proto::GenerateRequest {
+            media_refs: Some(vllm_proto::MediaRefs::default()),
+            ..Default::default()
+        }));
+        for kind in [
+            ExecutionPlanKind::Single,
+            ExecutionPlanKind::PrefillDecode,
+            ExecutionPlanKind::EncodePrefillDecode,
+        ] {
+            assert_eq!(
+                ExecutionPlan::generate(kind, media.clone()).has_replica_bound_ec_handoff(),
+                kind == ExecutionPlanKind::EncodePrefillDecode
+            );
+        }
+        for request in [
+            ProtoGenerateRequest::Vllm(Box::default()),
+            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
+                mm_inputs: Some(tokenspeed_proto::MultimodalInputs::default()),
+                ..Default::default()
+            })),
+        ] {
+            assert!(!ExecutionPlan::EncodePrefillDecode { request }.has_replica_bound_ec_handoff());
+        }
+    }
+
     /// The status of a failure a stage reports and the code of its JSON
     /// error object.
     async fn failure_shape(failure: axum::response::Response) -> (http::StatusCode, String) {
@@ -2091,6 +2158,74 @@ mod tests {
         assert_eq!(plan.request_id(), "cmpl_shared");
         assert_eq!(plan.request_type(), "generate");
         assert_eq!(plan.mode_label(), "prefill_decode");
+    }
+
+    /// The ids a retry routes by, per plan shape: what the first selection
+    /// used (a batch's first prompt), and none for a prompt that went as text.
+    #[test]
+    fn a_retry_routes_by_the_plans_prompt_ids_whatever_the_plans_shape() {
+        use smg_grpc_client::vllm_proto as vllm;
+        let tokenized = |ids: &[u32]| {
+            ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+                request_id: "r".to_string(),
+                input: Some(vllm::generate_request::Input::Tokenized(
+                    vllm::TokenizedInput {
+                        original_text: String::new(),
+                        input_ids: ids.to_vec(),
+                    },
+                )),
+                ..Default::default()
+            }))
+        };
+        let as_text = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: "r".to_string(),
+            input: Some(vllm::generate_request::Input::Text("as text".to_string())),
+            ..Default::default()
+        }));
+        let embed = ProtoEmbedRequest::Vllm(Box::new(vllm::EmbedRequest {
+            tokenized: Some(vllm::TokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![4, 5],
+            }),
+            ..Default::default()
+        }));
+        let batch = |requests: Vec<ProtoGenerateRequest>| ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::Single,
+            shared_request_id: "b".to_string(),
+            requests,
+        };
+        let cases: [(&str, ExecutionPlan, &[u32]); 7] = [
+            (
+                "a single request",
+                ExecutionPlan::generate(ExecutionPlanKind::Single, tokenized(&[1, 2, 3])),
+                &[1, 2, 3],
+            ),
+            (
+                "a single request that went as text",
+                ExecutionPlan::generate(ExecutionPlanKind::Single, as_text),
+                &[],
+            ),
+            (
+                "prefill-decode",
+                ExecutionPlan::generate(ExecutionPlanKind::PrefillDecode, tokenized(&[6])),
+                &[6],
+            ),
+            (
+                "encode-prefill-decode",
+                ExecutionPlan::generate(ExecutionPlanKind::EncodePrefillDecode, tokenized(&[7])),
+                &[7],
+            ),
+            ("an embed request", ExecutionPlan::embed(embed), &[4, 5]),
+            (
+                "a batch: its first prompt",
+                batch(vec![tokenized(&[8, 9]), tokenized(&[10])]),
+                &[8, 9],
+            ),
+            ("an empty batch", batch(Vec::new()), &[]),
+        ];
+        for (shape, plan, expected) in cases {
+            assert_eq!(plan.routing_token_ids(), expected, "{shape}");
+        }
     }
 
     #[test]

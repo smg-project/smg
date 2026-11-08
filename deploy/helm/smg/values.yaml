@@ -42,7 +42,7 @@ router:
   mesh:
     enabled: false
     port: 39527               # mesh gossip port
-    # peerUrls: []            # auto-generated from StatefulSet pod DNS
+    # peerUrls: []            # ip:port entries, one flag each; a hostname is refused
     # Without peerUrls the routers find each other among the release's router
     # pods through the Kubernetes API, which the gateway runs only inside
     # Kubernetes discovery; with the file, slurm or consul discovery
@@ -430,17 +430,33 @@ grafana:
 # =============================================================================
 # Prometheus alerting rules (a PrometheusRule for the Prometheus Operator)
 # =============================================================================
-# Ten alerts over the families the router already exposes; the thresholds are
+# Eleven alerts over the families the router already exposes; the thresholds are
 # starting points for a serving fleet, not laws: set them to the deployment's
 # SLOs. The rationale of each default:
 #   errorRatio 0.05 for 5m: one response in twenty failing server-side for five
 #     minutes is an outage to a retrying client; a shorter window pages on one
-#     worker's restart.
+#     worker's restart. The probe routes (/health, /readiness, /liveness) are
+#     out of the ratio: the readiness probe answers 503 for the whole of an
+#     engine's bring-up with no client in sight, and once the fleet serves the
+#     probes' 200s would dilute the share of failing client responses.
+#     The same threshold and window bound the router's server-side failed
+#     share of its requests (SmgHighRouterErrorRatio), which sees the stream
+#     that fails after its first token: a 200 at the edge, a router error. The
+#     client's own refusals (a malformed request, a model nobody serves, a
+#     tenant over its limit, a grammar of its own) are not counted there.
 #   ttftP99Seconds 5 for 10m: time to first token is the wait a user sees; a
 #     p99 above five seconds for ten minutes means queues are building in
-#     front of the engines (set it to the SLO once there is one).
+#     front of the engines (set it to the SLO once there is one). The family
+#     holds the gRPC router's streamed answers alone: the HTTP router records
+#     none, a collected answer records no first token (nor does a streamed
+#     Responses answer on the Harmony pipeline), so a deployment on the HTTP
+#     router or whose clients do not stream has an empty alert.
 #   noHealthyWorkerFor 1m: nothing can be served; one minute rides out the
-#     overlap of a rolling restart.
+#     overlap of a rolling restart. The alert also fires when the gateway has
+#     no worker series at all while its scrape is up (none registered yet, or
+#     every one removed): a fresh install pages from its first minute until
+#     its first engine reports healthy, which for a large checkpoint is tens of
+#     minutes (README, Readiness Deadlines); silence it for a planned bring-up.
 #   kvUsage 0.9 for 10m: above ninety percent of its KV cache an engine
 #     preempts and recomputes; sustained, the fleet is undersized.
 #   scrapeMissingFor 2m: a target down for two scrape intervals is a pod that
@@ -450,8 +466,10 @@ grafana:
 #     its timeout, so a worker that fails requests while passing its health
 #     probes cycles open -> half-open -> open; five minutes in either state
 #     is that worker, not one failed call.
-#   admissionRejectionsFor 5m: rejections at the admission queue for five
-#     minutes are sustained overload, not a burst.
+#   admissionRejectionsFor 5m: rejections at admission for five minutes are
+#     sustained overload, not a burst; the alert reads whichever limiter is
+#     live, the concurrency limit's queue or the priority scheduler's
+#     per-class queues.
 #   eventLoopStalls 5 per 10m: a stall is a wake drift over 5 ms on the
 #     runtime's canary; a handful in ten minutes is a blocked thread or CPU
 #     starvation.

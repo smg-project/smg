@@ -173,10 +173,13 @@ pub(crate) const TOKENSPEED_DISABLED_MESSAGE: &str = "KV cache events not enable
      TokenSpeed with --kv-events-config '{\"enable_kv_cache_events\": true, \"publisher\": \
      \"zmq\"}'";
 
-/// The TensorRT-LLM servicer's refusal: its wire relays no KV events yet (the
-/// engine's Python servicer does not implement the RPC either).
+/// The TensorRT-LLM servicer's refusal of a full subscription: the server
+/// relays KV events only when handed a publisher endpoint, and this engine's
+/// launcher hands none (the wire has no publisher yet); the load records
+/// alone (`loads_only`) are served, as on every wire.
 pub(crate) const TRTLLM_DISABLED_MESSAGE: &str = "KV cache events are not relayed for this \
-     engine yet: SubscribeKvEvents is not implemented by its servicer";
+     engine: its launcher hands the servicer no publisher endpoint. The load records are \
+     served to a loads_only subscription";
 
 /// When the relay subscribes to the publisher: at the servicer's start
 /// (default, any other value) or `lazy`, at the first `SubscribeKvEvents`.
@@ -386,7 +389,9 @@ fn starts_at_boot(value: Option<&str>) -> bool {
     !value.is_some_and(|value| value.trim().eq_ignore_ascii_case("lazy"))
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
+/// `name` from the environment as a count, `default` when unset, empty or
+/// not a number (said once in the log).
+pub(crate) fn env_usize(name: &str, default: usize) -> usize {
     match std::env::var(name) {
         Ok(value) if !value.trim().is_empty() => match value.trim().parse::<usize>() {
             Ok(parsed) => parsed,
@@ -1177,13 +1182,21 @@ impl Subscriber {
         self.last_sequence = Some(batch.sequence_number);
         self.last_sent_at = Instant::now();
         self.idle_heartbeats = 0;
-        batch.load = self.record(batch.dp_rank, false);
+        batch.load = self
+            .current(batch.dp_rank)
+            .map(|record| self.record(record, false));
         batch
     }
 
-    /// The next record for `rank` from the source, numbered.
-    fn record(&mut self, rank: Option<i32>, load_only: bool) -> Option<common::EngineLoad> {
-        let mut record = self.source.as_ref()?.load(rank)?;
+    /// The source's record for `rank` as it stands now, unnumbered; `None`
+    /// without a source or while it knows nothing.
+    fn current(&self, rank: Option<i32>) -> Option<common::EngineLoad> {
+        self.source.as_ref()?.load(rank)
+    }
+
+    /// `record`, read by [`current`](Self::current), numbered as the next
+    /// one sent on this stream and kept for the change check.
+    fn record(&mut self, mut record: common::EngineLoad, load_only: bool) -> common::EngineLoad {
         self.sample += 1;
         record.sample = self.sample;
         record.load_only = load_only;
@@ -1193,7 +1206,7 @@ impl Subscriber {
             smg_grpc_client::engine_load::core_only(&mut record);
         }
         self.last_record = Some(record.clone());
-        Some(record)
+        record
     }
 
     /// A `load_only` batch when the record moved since the last one sent,
@@ -1211,7 +1224,7 @@ impl Subscriber {
             None if self.records_before_first_batch => 0,
             None => return None,
         };
-        let current = self.source.as_ref()?.load(self.last_rank)?;
+        let current = self.current(self.last_rank)?;
         let changed = self
             .last_record
             .as_ref()
@@ -1225,7 +1238,9 @@ impl Subscriber {
             return None;
         }
         let rank = self.last_rank;
-        let record = self.record(rank, true)?;
+        // The record read for the change check is the one sent: one build
+        // per tick, whether or not it goes out.
+        let record = self.record(current, true);
         self.last_sent_at = Instant::now();
         self.idle_heartbeats = if changed {
             0

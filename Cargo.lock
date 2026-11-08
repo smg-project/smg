@@ -7698,6 +7698,7 @@ dependencies = [
  "wat",
  "wfaas",
  "xxhash-rust",
+ "zeromq",
  "zip",
 ]
 
@@ -7869,6 +7870,7 @@ dependencies = [
  "dashmap",
  "futures",
  "http",
+ "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",
  "openssl",
@@ -7883,6 +7885,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",

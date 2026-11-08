@@ -8,11 +8,14 @@ from unittest.mock import patch
 import pytest
 from infra.constants import (
     DEFAULT_HOST,
+    ENV_MOCK_WIRE,
     LOCAL_RUNTIMES,
+    MOCK_WIRES,
     RUNTIME_LABELS,
     ConnectionMode,
     Runtime,
     WorkerType,
+    get_mock_wire,
 )
 from infra.worker import Worker
 
@@ -103,11 +106,47 @@ def test_a_role_on_another_wire_or_an_encode_role_is_refused():
 
 
 def test_the_mock_is_paired_on_its_wires_one_transport():
-    # The mock moves no KV; the gateway pairs it as a worker of the scheduler
-    # wire it speaks, whose one transport is Mooncake, whatever the lane's
-    # setting for the engines that have a choice.
+    # The mock moves no KV and names Mooncake as its transport on every
+    # scheduler wire it can speak; the gateway pairs it on that, whatever the
+    # lane's setting for the engines that have a choice.
     with patch.dict(os.environ, {"E2E_VLLM_KV_BACKEND": "nixl"}):
         assert (
             _worker(ConnectionMode.GRPC, worker_type=WorkerType.PREFILL).effective_kv_backend()
             == "mooncake"
         )
+
+
+def test_the_lane_leaves_the_mocks_wire_alone_unless_it_names_one(monkeypatch):
+    # Unset or blank: the mock's own default, no flag on the command line.
+    monkeypatch.delenv(ENV_MOCK_WIRE, raising=False)
+    assert get_mock_wire() is None
+    assert "--grpc-wire" not in _worker(ConnectionMode.GRPC)._build_cmd()
+    monkeypatch.setenv(ENV_MOCK_WIRE, "  ")
+    assert get_mock_wire() is None
+    assert "--grpc-wire" not in _worker(ConnectionMode.GRPC)._build_cmd()
+
+
+@pytest.mark.parametrize("wire", MOCK_WIRES)
+def test_the_lanes_wire_reaches_the_grpc_command_whatever_its_case(monkeypatch, wire):
+    monkeypatch.setenv(ENV_MOCK_WIRE, f" {wire.upper()} ")
+    assert get_mock_wire() == wire
+    cmd = _worker(ConnectionMode.GRPC)._build_cmd()
+    assert _flag(cmd, "--grpc-wire") == wire
+    # The HTTP worker speaks no scheduler proto, so the lane's wire is not its business.
+    assert "--grpc-wire" not in _worker(ConnectionMode.HTTP)._build_cmd()
+
+
+def test_a_class_s_own_wire_comes_after_the_lanes_so_the_mock_takes_it(monkeypatch):
+    monkeypatch.setenv(ENV_MOCK_WIRE, "vllm")
+    worker = _worker(ConnectionMode.GRPC, extra_engine_args=["--grpc-wire", "sglang"])
+    cmd = worker._build_cmd()
+    flags = [cmd[i + 1] for i, flag in enumerate(cmd) if flag == "--grpc-wire"]
+    assert flags == ["vllm", "sglang"], "the lane's first, the class's last"
+
+
+def test_an_unknown_wire_raises(monkeypatch):
+    monkeypatch.setenv(ENV_MOCK_WIRE, "trtllm")
+    with pytest.raises(ValueError, match="E2E_MOCK_WIRE='trtllm'"):
+        get_mock_wire()
+    with pytest.raises(ValueError, match="E2E_MOCK_WIRE='trtllm'"):
+        _worker(ConnectionMode.GRPC)._build_cmd()

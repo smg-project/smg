@@ -47,7 +47,7 @@ pub use mock::MockTokenizer;
 pub use registry::{LoadError, LoadOutcome, TokenizerRegistry};
 pub use sequence::Sequence;
 pub use stop::{
-    SequenceDecoderOutput, SequenceDecoderStep, StopSequenceConfig, StopSequenceDecoder,
+    SequenceDecoderOutput, SequenceDecoderStep, StopRules, StopSequenceConfig, StopSequenceDecoder,
 };
 pub use stream::DecodeStream;
 pub use tiktoken::{TiktokenModel, TiktokenTokenizer};

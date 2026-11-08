@@ -84,6 +84,10 @@ impl RequestBodyTimeouts {
 /// is written to.
 fn timed(request: Request<Body>, timeouts: RequestBodyTimeouts) -> (Request<Body>, Arc<AtomicU8>) {
     let outcome = Arc::new(AtomicU8::new(READING));
+    // The request timeout counts from here, inside the admission layers: a
+    // wait for a permit is bounded by its own timeout and is not time the
+    // client had to send its body, so the deadline is read at this layer,
+    // not taken from the edge's entry stamp.
     let request =
         request.map(|body| Body::new(TimedBody::new(body, timeouts, Arc::clone(&outcome))));
     (request, outcome)
@@ -316,7 +320,7 @@ mod tests {
     use tokio::time::Instant;
     use tower::ServiceExt;
 
-    use super::*;
+    use super::{super::request_start::RequestStarted, *};
 
     fn app(timeouts: RequestBodyTimeouts) -> Router {
         Router::new()
@@ -402,6 +406,31 @@ mod tests {
         assert!(
             waited >= Duration::from_secs(20) && waited < Duration::from_secs(22),
             "ended after {waited:?}, expected the 20 s request timeout"
+        );
+    }
+
+    /// The deadline is armed where this layer is reached, inside the
+    /// admission layers: time the request spent before it (a wait for a
+    /// permit; here an entry stamp 15 s in the past) is not the client's
+    /// budget, which stays the whole request timeout.
+    #[tokio::test(start_paused = true)]
+    async fn time_before_this_layer_leaves_the_request_timeout_whole() {
+        let started = Instant::now();
+        let earlier = started
+            .into_std()
+            .checked_sub(Duration::from_secs(15))
+            .expect("the clock has been running for fifteen seconds");
+        let request = echo(trickle(usize::MAX, Duration::from_secs(1)));
+        let response = RequestStarted::at(earlier)
+            .scope(app(timeouts(5, 20)).oneshot(request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(error_code(response).await, REQUEST_BODY_TIMEOUT);
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(20) && waited < Duration::from_secs(22),
+            "ended after {waited:?}, expected the whole 20 s request timeout from this layer"
         );
     }
 

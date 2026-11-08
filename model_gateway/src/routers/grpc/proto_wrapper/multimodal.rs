@@ -317,7 +317,7 @@ impl SglangMultimodalData {
             audio_data: vec![],
             modalities: vec![self.modality],
             pixel_values: Some(sglang::TensorData {
-                data: self.pixel_values.into(),
+                data: llm_multimodal::buffer_pool::recycled_bytes(self.pixel_values),
                 shape: self.pixel_values_shape,
                 dtype: self.pixel_values_dtype,
             }),
@@ -644,6 +644,8 @@ fn resolve_mm_tensor_payload(
                 );
             }
             Metrics::record_mm_tensor(engine, "shm", nbytes);
+            // The segment holds the copy; the buffer goes back to the pool.
+            llm_multimodal::buffer_pool::recycle(data);
             MmTensorPayload::Shm(handle)
         }
         Err(error) => {
@@ -667,7 +669,9 @@ fn tokenspeed_tensor_payload(
     rdma: Option<MmRdmaExport<'_>>,
 ) -> tokenspeed::tensor_data::Payload {
     match resolve_mm_tensor_payload(data, shm_enabled, min_bytes, "tokenspeed", rdma) {
-        MmTensorPayload::Inline(data) => tokenspeed::tensor_data::Payload::Inline(data.into()),
+        MmTensorPayload::Inline(data) => tokenspeed::tensor_data::Payload::Inline(
+            llm_multimodal::buffer_pool::recycled_bytes(data),
+        ),
         MmTensorPayload::Shm(handle) => tokenspeed::tensor_data::Payload::Shm(handle),
         MmTensorPayload::Remote(handle) => tokenspeed::tensor_data::Payload::Remote(handle),
     }
@@ -680,7 +684,9 @@ fn vllm_tensor_payload(
     rdma: Option<MmRdmaExport<'_>>,
 ) -> vllm::tensor_data::Payload {
     match resolve_mm_tensor_payload(data, shm_enabled, min_bytes, "vllm", rdma) {
-        MmTensorPayload::Inline(data) => vllm::tensor_data::Payload::Inline(data.into()),
+        MmTensorPayload::Inline(data) => {
+            vllm::tensor_data::Payload::Inline(llm_multimodal::buffer_pool::recycled_bytes(data))
+        }
         MmTensorPayload::Shm(handle) => vllm::tensor_data::Payload::Shm(handle),
         MmTensorPayload::Remote(handle) => vllm::tensor_data::Payload::Remote(handle),
     }

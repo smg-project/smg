@@ -390,7 +390,9 @@ impl PrefillBook {
         self.pending = self.pending.saturating_sub(tokens);
         self.forget_prompt(tokens);
         if cached.is_some() {
-            self.last_answer_ms = now_ms;
+            // Two first responses can take their stamps in one order and
+            // this lock in the other: the latest answer stays the latest.
+            self.last_answer_ms = self.last_answer_ms.max(now_ms);
             self.longest_answered = self.longest_answered.max(tokens);
             self.run_answered = true;
             self.unanswered_ms = 0;
@@ -738,7 +740,11 @@ impl WorkerRuntime {
     }
 
     pub fn note_token_progress(&self) {
-        let now = super::liveness::now_ms();
+        self.note_token_progress_at(super::liveness::now_ms());
+    }
+
+    /// [`Self::note_token_progress`] at `now` on the gateway clock.
+    pub fn note_token_progress_at(&self, now: u64) {
         // The stamps are millisecond stamps and the wake keeps one permit, so
         // a token within the millisecond of the previous one has nothing to
         // record: it leaves with one plain load. Every stream of the worker
@@ -916,6 +922,15 @@ impl WorkerRuntime {
 
     pub fn bump_revision(&self) -> u64 {
         self.revision.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Raise the revision to at least `floor`; it never goes down. A claim
+    /// of a mesh import publishes the worker's key at this revision, which
+    /// restarts at zero with the process, and a peer follows a publication
+    /// only above the version it recorded, so the claim raises it past that
+    /// version first (see `WorkerRegistry::replace_inner`).
+    pub fn raise_revision_to(&self, floor: u64) {
+        self.revision.fetch_max(floor, Ordering::AcqRel);
     }
 
     // ── Health-check counters ───────────────────────────────────────
@@ -1243,6 +1258,21 @@ mod tests {
         assert!(
             permit(50),
             "a token in a new millisecond wakes the notifier"
+        );
+    }
+
+    #[test]
+    fn a_later_answer_stamp_stays_when_an_earlier_one_is_stored_after_it() {
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_prefill_started_at(1_000, true, 1_000);
+        runtime.note_prefill_started_at(1_000, true, 1_000);
+        // The second response stamped 1_900 reaches the lock after the one
+        // stamped 2_000: the answer age counts from 2_000.
+        runtime.note_prefill_ended_at(1_000, true, Some(0), 2_000);
+        runtime.note_prefill_ended_at(1_000, true, Some(0), 1_900);
+        assert_eq!(
+            runtime.prefill_answered_ago_at(3_000),
+            Some(Duration::from_millis(1_000))
         );
     }
 

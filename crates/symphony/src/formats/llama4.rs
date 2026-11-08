@@ -64,12 +64,12 @@ mod tests {
                 function: Function {
                     name: "get_weather".to_string(),
                     description: None,
-                    parameters: value!({"type": "object", "properties": {
+                    parameters: Some(value!({"type": "object", "properties": {
                         "city": {"type": "string"},
                         "unit": {"type": "string"},
                         "days": {"type": "integer"},
                         "detailed": {"type": "boolean"},
-                    }}),
+                    }})),
                     strict: None,
                     extra: Default::default(),
                 },
@@ -79,9 +79,9 @@ mod tests {
                 function: Function {
                     name: "get_stock_price".to_string(),
                     description: None,
-                    parameters: value!({"type": "object", "properties": {
+                    parameters: Some(value!({"type": "object", "properties": {
                         "ticker": {"type": "string"},
-                    }}),
+                    }})),
                     strict: None,
                     extra: Default::default(),
                 },
@@ -91,12 +91,12 @@ mod tests {
                 function: Function {
                     name: "save_note".to_string(),
                     description: None,
-                    parameters: value!({"type": "object", "properties": {
+                    parameters: Some(value!({"type": "object", "properties": {
                         "title": {"type": "string"},
                         "body": {"type": "string"},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "meta": {"type": "object"},
-                    }}),
+                    }})),
                     strict: None,
                     extra: Default::default(),
                 },

@@ -1,3 +1,13 @@
+mod decode_limit;
+mod exif_orientation;
+mod hop_budget;
+mod ico_png_entry;
+mod max_long_side_pixel;
+mod seek_decode;
+mod sixteen_bit_colour;
+mod sixteen_bit_grey;
+mod transparency;
+mod video_frame_cap;
 mod video_sampling;
 
 use std::{
@@ -7,38 +17,7 @@ use std::{
     process::Command,
 };
 
-/// Set to a non-empty value where the video tools must be installed (CI sets
-/// it on the shard that installs ffmpeg): the container agreement tests then
-/// fail, instead of skipping, when ffmpeg, ffprobe or an encoder they use is
-/// missing.
-const REQUIRE_VIDEO_TOOLS: &str = "SMG_REQUIRE_VIDEO_TOOLS";
-
-/// Reports that `missing` keeps a test or a case from running: a failure
-/// where [`REQUIRE_VIDEO_TOOLS`] is set, a skip said on stderr elsewhere.
-#[expect(
-    clippy::print_stderr,
-    reason = "a skip says so; the harness shows it under --nocapture"
-)]
-fn skip_for(missing: &str) {
-    let required = std::env::var_os(REQUIRE_VIDEO_TOOLS).is_some_and(|value| !value.is_empty());
-    assert!(!required, "{missing}, and {REQUIRE_VIDEO_TOOLS} is set");
-    eprintln!("{missing}: skipping; the synthetic container tests still run");
-}
-
-/// Whether ffmpeg and ffprobe run on this host.
-fn video_tools_available() -> bool {
-    let runs = |tool: &str| {
-        Command::new(tool)
-            .arg("-version")
-            .output()
-            .is_ok_and(|out| out.status.success())
-    };
-    let available = runs("ffmpeg") && runs("ffprobe");
-    if !available {
-        skip_for("ffmpeg or ffprobe is not installed");
-    }
-    available
-}
+use crate::test_support::{skip_for, video_tools_available};
 
 /// Whether this ffmpeg build carries `encoder`. `ffmpeg -h encoder=<name>`
 /// exits 0 for a name it does not know as well, so the answer is what it
@@ -821,6 +800,216 @@ fn even_rounded_sampling_picks_the_reference_processors_frames() {
         super::sampled_frame_indices(5, 0.0, cfg),
         vec![0, 1, 2, 3, 4]
     );
+}
+
+/// The frames the Qwen2-VL line's own video loader picks at its 2 fps rate,
+/// as that loader computes them (`torch.arange(0, total, total / count)`
+/// over `total / fps x 2` frames clamped to [4, 768], the count and the cap
+/// aligned down to whole temporal groups of two): the expected picks are
+/// that loader's code run on each clip's length and rate. A clip shorter
+/// than one group gets no frame, and so does a clip whose rate is unknown,
+/// which the loader refuses.
+#[test]
+fn stepped_group_sampling_picks_the_engine_loaders_frames() {
+    let cfg = VideoFetchConfig {
+        sampling: FrameSampling::SteppedGroups {
+            temporal_patch_size: 2,
+            max_frames: 768,
+        },
+        ..VideoFetchConfig::default()
+    };
+    let picks = |total: usize, fps: f64| super::sampled_frame_indices(total, fps, cfg);
+    assert_eq!(picks(30, 30.0), vec![0, 7, 15, 22], "30 frames at 30 fps");
+    assert_eq!(picks(15, 30.0), vec![0, 3, 7, 11], "15 frames at 30 fps");
+    assert_eq!(picks(5, 1.0), vec![0, 1, 2, 3], "5 frames at 1 fps");
+    assert_eq!(
+        picks(150, 30.0),
+        vec![0, 15, 30, 45, 60, 75, 90, 105, 120, 135],
+        "150 frames at 30 fps"
+    );
+    let long = picks(451, 30.0);
+    assert_eq!(long.len(), 30, "451 frames at 30 fps");
+    assert_eq!(&long[..8], &[0, 15, 30, 45, 60, 75, 90, 105]);
+    assert_eq!(long[29], 435);
+    assert_eq!(picks(24, 24.0), vec![0, 6, 12, 18], "24 frames at 24 fps");
+    assert_eq!(
+        picks(120, 24.0),
+        vec![0, 12, 24, 36, 48, 60, 72, 84, 96, 108],
+        "120 frames at 24 fps"
+    );
+    let long = picks(720, 24.0);
+    assert_eq!(long.len(), 60, "720 frames at 24 fps");
+    assert_eq!(&long[..8], &[0, 12, 24, 36, 48, 60, 72, 84]);
+    assert_eq!(long[59], 708);
+    let long = picks(14400, 24.0);
+    assert_eq!(long.len(), 768, "14400 frames at 24 fps");
+    assert_eq!(&long[..8], &[0, 18, 37, 56, 75, 93, 112, 131]);
+    assert_eq!(long[767], 14381);
+    assert_eq!(picks(3, 10.0), vec![0, 1], "3 frames at 10 fps");
+    assert_eq!(picks(1, 30.0), Vec::<usize>::new(), "1 frame at 30 fps");
+    assert_eq!(picks(2, 30.0), vec![0, 1], "2 frames at 30 fps");
+    assert_eq!(picks(7, 2.5), vec![0, 1, 3, 5], "7 frames at 2.5 fps");
+    assert_eq!(picks(60, 30.0), vec![0, 15, 30, 45], "60 frames at 30 fps");
+    let long = picks(300, 30.0);
+    assert_eq!(long.len(), 20, "300 frames at 30 fps");
+    assert_eq!(&long[..8], &[0, 15, 30, 45, 60, 75, 90, 105]);
+    assert_eq!(long[19], 285);
+    let long = picks(9000, 30.0);
+    assert_eq!(long.len(), 600, "9000 frames at 30 fps");
+    assert_eq!(&long[..8], &[0, 15, 30, 45, 60, 75, 90, 105]);
+    assert_eq!(long[599], 8985);
+    let long = picks(18000, 30.0);
+    assert_eq!(long.len(), 768, "18000 frames at 30 fps");
+    assert_eq!(&long[..8], &[0, 23, 46, 70, 93, 117, 140, 164]);
+    assert_eq!(long[767], 17976);
+    let long = picks(36000, 60.0);
+    assert_eq!(long.len(), 768, "36000 frames at 60 fps");
+    assert_eq!(&long[..8], &[0, 46, 93, 140, 187, 234, 281, 328]);
+    assert_eq!(long[767], 35953);
+    assert_eq!(
+        picks(10, 1.0),
+        vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        "10 frames at 1 fps"
+    );
+    assert_eq!(picks(4, 4.0), vec![0, 1, 2, 3], "4 frames at 4 fps");
+    assert_eq!(picks(6, 1.0), vec![0, 1, 2, 3, 4, 5], "6 frames at 1 fps");
+    assert_eq!(
+        picks(11, 1.0),
+        vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        "11 frames at 1 fps"
+    );
+    assert_eq!(
+        picks(23, 23.976),
+        vec![0, 5, 11, 17],
+        "23 frames at 23.976 fps"
+    );
+    let long = picks(1001, 29.97);
+    assert_eq!(long.len(), 66, "1001 frames at 29.97 fps");
+    assert_eq!(&long[..8], &[0, 15, 30, 45, 60, 75, 91, 106]);
+    assert_eq!(long[65], 985);
+    // An unknown rate picks nothing: the loader refuses such a clip.
+    assert_eq!(picks(150, 0.0), Vec::<usize>::new());
+    // The rule follows the loader: the container's claim, cut to the stream.
+    assert!(cfg.sampling.follows_the_loader());
+}
+
+/// Under the stepped groups a decoded clip's rate is the one the engine's
+/// loader reports for its picks, `picks / total x source rate`, which the
+/// processor turns into the seconds per temporal group: 4 of 5 frames at 1
+/// fps are 0.8 fps (2.5 s a group), where the target-rate estimate says 2
+/// fps; 10 of 150 at 30 fps are the target 2 fps. The other rules keep the
+/// estimate.
+#[test]
+fn stepped_group_clips_report_the_loaders_sampled_rate() {
+    let stepped = VideoFetchConfig {
+        sampling: FrameSampling::SteppedGroups {
+            temporal_patch_size: 2,
+            max_frames: 768,
+        },
+        ..VideoFetchConfig::default()
+    };
+    assert_eq!(super::loader_sampled_fps(4, 5, 1.0), 0.8);
+    assert_eq!(super::loader_sampled_fps(10, 150, 30.0), 2.0);
+    assert_eq!(super::loader_sampled_fps(768, 14400, 24.0), 1.28);
+    assert_eq!(super::loader_sampled_fps(0, 0, 30.0), 30.0);
+    let short = super::FrameSelection::new(1.0, 5, 5, vec![0, 1, 2, 3]);
+    assert_eq!(
+        super::clip_sample_fps(Some(&short), Some(5.0), stepped),
+        0.8
+    );
+    assert_eq!(effective_sample_fps(Some(5.0), stepped), 2.0);
+    assert_eq!(super::clip_sample_fps(None, Some(5.0), stepped), 2.0);
+    let even = VideoFetchConfig {
+        sampling: FrameSampling::EvenRounded,
+        ..VideoFetchConfig::default()
+    };
+    assert_eq!(super::clip_sample_fps(Some(&short), Some(5.0), even), 2.0);
+}
+
+/// The interval walk's clips report the rate of its picks the same way: a 1 s
+/// clip at 30 fps gives `[0, 29]`, 2 fps (1 s a group of two), where the
+/// target-rate estimate under the connector's bounds says 4 fps; an 800 s clip
+/// at 1 fps gives 800 picks, 1 fps, where the estimate says 0.96. Without a
+/// selection the estimate stands.
+#[test]
+fn interval_clips_report_the_loaders_sampled_rate() {
+    let interval = VideoFetchConfig {
+        sampling: FrameSampling::Interval,
+        ..VideoFetchConfig::default()
+    };
+    let one_second = super::FrameSelection::new(30.0, 30, 30, vec![0, 29]);
+    assert_eq!(
+        super::clip_sample_fps(Some(&one_second), Some(1.0), interval),
+        2.0
+    );
+    assert_eq!(effective_sample_fps(Some(1.0), interval), 4.0);
+    let long = super::FrameSelection::new(1.0, 800, 800, (0..800).collect());
+    assert_eq!(
+        super::clip_sample_fps(Some(&long), Some(800.0), interval),
+        1.0
+    );
+    assert_eq!(effective_sample_fps(Some(800.0), interval), 0.96);
+    assert_eq!(super::clip_sample_fps(None, Some(1.0), interval), 4.0);
+}
+
+/// A container's frame claim sizes the interval walk's picks. A claim whose
+/// picks at source resolution cannot fit the decoded-bytes budget is refused
+/// with that budget's own error before any pick is held, and the count stops
+/// at the budget, so the claim's size is no cost: two billion frames at 30
+/// fps in full HD are refused after the budget's 172 picks, and the same
+/// claim in one-pixel frames or from an unsized probe after the picks the
+/// budget holds in records alone. A clip within the budget, the other rules
+/// (bounded by their caps) and an unknown rate (the bounded `Even` fallback)
+/// pass.
+#[test]
+fn an_interval_claim_past_the_decoded_bytes_budget_is_refused_before_its_picks() {
+    let interval = VideoFetchConfig {
+        sampling: FrameSampling::Interval,
+        ..VideoFetchConfig::default()
+    };
+    let full_hd = 1920 * 1080 * 3;
+    let budget = super::video_max_decoded_bytes();
+    for (total_frames, fps) in [(1usize << 31, 30.0), (1_000, 1.0)] {
+        let refused =
+            super::ensure_interval_picks_fit(total_frames, fps, full_hd, interval, budget);
+        assert!(
+            matches!(
+                refused,
+                Err(MediaConnectorError::DecodedTooLarge {
+                    media: "video RGB",
+                    knob: "SMG_VIDEO_MAX_DECODED_BYTES",
+                    ..
+                })
+            ),
+            "{total_frames} frames at {fps} fps: {refused:?}"
+        );
+    }
+    // The smallest frames and an unsized probe are bounded through the picks'
+    // records alone: the claim is refused, a clip within the budget passes.
+    for frame_size in [3, 0] {
+        let refused = super::ensure_interval_picks_fit(1 << 31, 30.0, frame_size, interval, budget);
+        assert!(
+            matches!(refused, Err(MediaConnectorError::DecodedTooLarge { .. })),
+            "frame size {frame_size}: {refused:?}"
+        );
+        assert!(super::ensure_interval_picks_fit(1_000, 1.0, frame_size, interval, budget).is_ok());
+    }
+    assert!(super::ensure_interval_picks_fit(150, 30.0, full_hd, interval, budget).is_ok());
+    let even = VideoFetchConfig::default();
+    assert!(super::ensure_interval_picks_fit(1 << 31, 30.0, full_hd, even, budget).is_ok());
+    assert!(super::ensure_interval_picks_fit(1 << 31, f64::NAN, full_hd, interval, budget).is_ok());
+    // The boundary, pinned with a small budget and no allocation: at 1 fps
+    // every frame is a pick, so the count is the frame count; the records
+    // alone price an unsized pick at 128 bytes, a one-pixel pick at 131.
+    let small = 1usize << 20;
+    for (frame_size, fits, refused) in [(0, 8_192, 8_193), (3, 8_004, 8_005)] {
+        assert!(super::ensure_interval_picks_fit(fits, 1.0, frame_size, interval, small).is_ok());
+        let error = super::ensure_interval_picks_fit(refused, 1.0, frame_size, interval, small);
+        assert!(
+            matches!(error, Err(MediaConnectorError::DecodedTooLarge { limit, .. }) if limit == small),
+            "frame size {frame_size}: {error:?}"
+        );
+    }
 }
 
 #[test]

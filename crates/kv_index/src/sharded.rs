@@ -350,22 +350,10 @@ impl Default for ShardedChainIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reference::{request_prefix_hashes, ReferenceIndexer};
-
-    fn content(stream: u64, position: usize) -> ContentHash {
-        crate::compute_content_hash(&[stream as u32, (stream >> 32) as u32, position as u32])
-    }
-
-    fn blocks_of(contents: &[ContentHash]) -> Vec<StoredBlock> {
-        contents
-            .iter()
-            .zip(request_prefix_hashes(contents))
-            .map(|(&content_hash, seq_hash)| StoredBlock {
-                seq_hash,
-                content_hash,
-            })
-            .collect()
-    }
+    use crate::{
+        chain_index::tests::{blocks_of, content},
+        reference::ReferenceIndexer,
+    };
 
     fn sorted(scores: OverlapScores) -> Vec<(u32, u32)> {
         let mut v: Vec<(u32, u32)> = scores.scores.into_iter().collect();

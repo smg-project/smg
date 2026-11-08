@@ -17,7 +17,7 @@ categories = ["text-processing", "parsing"]
 name = "llm_tokenizer"
 
 [features]
-# Opt-in encoding and full ByteLevel decode acceleration; streaming stays unchanged.
+# Opt-in encoding through the tokenizers v1 pipeline; decoding and streaming are the same in every build.
 tokenizers-v1 = ["dep:tokenizers-v1"]
 
 [dependencies]

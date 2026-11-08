@@ -36,6 +36,28 @@ pip install smg-grpc-servicer[sglang]
 vllm serve meta-llama/Llama-2-7b-hf --grpc
 ```
 
+#### Encoder disaggregation
+
+The Python vLLM servicer accepts opaque `ec_transfer_params_json` on Generate
+and returns EC handles and placeholder metadata in the completion, including
+encoder-only requests which generate no tokens. EC consumers may receive
+pixel-less preprocessed inputs without a remote KV handoff.
+
+Select the Python implementation with `--servicer-impl python` (or
+`SMG_VLLM_SERVICER_IMPL=python`); the Rust implementation does not yet carry
+this EC contract. Use a matching `smg-grpc-proto` build. Workers advertise
+`supports_ec_transfer` through GetServerInfo. Use `--mm-processor inprocess`
+on E; its returned media identity preserves the encoder-cache hashes for P/D.
+
+SMG can route these workers directly with `--epd-disaggregation --mm-processing
+worker --backend vllm --encode grpc://E:50051 --prefill grpc://P:50052 --decode
+grpc://D:50053`. E runs `--mm-processor inprocess`; P and D can keep media
+processing off. E returns the expanded prompt and pixel-less media identity
+before P runs, and SMG relays P's KV handoff to D. Mooncake consumers advertise
+their per-DP EC endpoints through GetServerInfo; PULL EC connectors return
+their transfer handles from E instead. Multimodal EPD requests currently
+require `n=1`; failed transfers are not replayed onto another P replica.
+
 Without `--kv-events-config`, the servicer turns vLLM's ZMQ KV-event publisher
 on by itself, under either implementation, before the engine is built, at a
 port found free on the host rather than vLLM's fixed default (one per
@@ -83,9 +105,10 @@ The worker then advertises `mm_processor=inprocess` and `mm_media_ref_schemes`
 through `GetServerInfo`; a router with media-reference support forwards
 `media_refs` only to workers that advertise, and a router without it ignores the
 labels and keeps sending preprocessed tensors. Whatever the processor mode, a
-multimodal engine also advertises its resolved `--limit-mm-per-prompt` as
-`mm_item_limits` (`image=8,video=2`), so a router that preprocesses media
-itself holds requests to the engine's limits, and its encoder budget as
+multimodal engine also advertises its resolved `--limit-mm-per-prompt` for
+audio, image and video as `mm_item_limits` (`audio=1,image=8,video=2`), so a
+router that preprocesses media itself holds requests to the engine's limits,
+and its encoder budget as
 `mm_encoder_budget` (the `budget of N tokens` of the engine's encoder-cache
 start-up line, derived at launch with vLLM's own helper): the most feature
 tokens one media item may carry and still be scheduled, so the router refuses
@@ -289,12 +312,14 @@ the engine connects (a scrape during the engine's start answers
 the warm-up's own requests only) reads `warming_up`, a drain `draining`), runs
 on its own thread, and closes
 with the servicer; a port equal to `--port` is refused before the engine
-starts, and the flag needs `--servicer-impl rust` (the Python servicer exposes
-no endpoint). A planned warm-up's own requests go through the request path
-and are counted like any other, so the first scrapes include them.
+starts. The endpoint is the Rust servicer's (the default); the deprecated
+Python servicer (`--servicer-impl python`) exposes none, and the flag (or its
+variable) is refused under it the same way. A planned warm-up's own requests
+go through the request path and are counted like any other, so the first
+scrapes include them.
 
 ```bash
-vllm serve Qwen/Qwen3-0.6B --grpc --port 50051 --servicer-impl rust --metrics-port 29100
+vllm serve Qwen/Qwen3-0.6B --grpc --port 50051 --metrics-port 29100
 curl -s http://127.0.0.1:29100/metrics | grep smg_servicer_requests_total
 ```
 
@@ -618,12 +643,20 @@ Worker-side media processing uses the same `--mm-processor` /
   cap the in-process and Redis processors apply, so an unbounded count stays
   bounded in `smg` mode too (a cap below the engine's count then samples fewer
   frames than the engine's own server would, as intended), and a loader rule
-  the pipeline cannot follow (`video_backend` in the engine's media kwargs,
-  else `VLLM_VIDEO_LOADER_BACKEND`, other than `opencv`, or a `video.fps` above
-  zero, which thins frames by duration) is refused at launch for a family that
-  samples the way the loader does (Gemma 4) and serves video at all; the
-  families with a rate-based sampler of their own never followed the loader and
-  start as before. An engine that normalizes pixels on
+  the pipeline cannot follow (an explicit `video_backend` in the engine's media
+  kwargs, else a `VLLM_VIDEO_LOADER_BACKEND` other than `opencv`, and every
+  sampling key of the video kwargs that an engine loader reads: `fps`,
+  `max_frames`, `min_frames`, `temporal_patch_size`) is refused at launch, per
+  family, for a worker that serves video at all: for a family that samples the
+  way the engine's default loader does (Gemma 4), the rules that loader reads
+  (a kwarg naming `opencv` is that loader, a non-positive `fps` is no rate to
+  it, and it never reads the three keys of the per-class loaders, so those
+  pass); for a family whose loader the engine registers for its processor
+  class (the Qwen2-VL line, Qwen3-Omni, the GLM-5 family and the Qwen3-VL
+  family: `VLLM_VIDEO_LOADER_BACKEND` never reaches that loader, while an
+  explicit kwarg, `opencv` included, swaps it), the `--media-io-kwargs` rules
+  alone; and none for the families with a sampler of their own, which never
+  followed the loader and start as before. An engine that normalizes pixels on
   device
   (vLLM's `mm_device_do_normalize`, on by default for the Qwen-VL family)
   takes raw `uint8` pixels, and the pipeline writes those for it; a model
@@ -1294,9 +1327,9 @@ this wire too carries token batches only), `SMG_ZMQ_SOCKET_DIR`,
 
 #### Metrics (`--metrics-port`)
 
-With `--servicer-impl rust`, `--metrics-port <port>` (and `--metrics-host`,
-defaulting to the gRPC `--host`) serves the Rust servicer's Prometheus metrics
-on a listener of its own; `SMG_SGLANG_SERVICER_METRICS_PORT` /
+Under the Rust servicer (the default), `--metrics-port <port>` (and
+`--metrics-host`, defaulting to the gRPC `--host`) serves its Prometheus
+metrics on a listener of its own; `SMG_SGLANG_SERVICER_METRICS_PORT` /
 `SMG_SGLANG_SERVICER_METRICS_HOST` are the environment forms the flags
 override, and without either there is no endpoint. The flags are this package's
 (the same plugin that adds `--servicer-impl`); a `SGLANG_PLUGINS` whitelist
@@ -1309,7 +1342,7 @@ servicer, which exposes no endpoint (SGLang's own HTTP sidecar is not started
 on the Rust path either).
 
 ```bash
-sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000 --servicer-impl rust --metrics-port 29100
+sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000 --metrics-port 29100
 ```
 
 #### Headless over ZMQ (no SGLang change)

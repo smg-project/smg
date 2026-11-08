@@ -37,11 +37,6 @@ use crate::{
 const MAX_SAMPLED_FRAMES: usize = 32;
 /// The rate the engine assumes for timestamps when the decoder reported none.
 const FALLBACK_FPS: f64 = 24.0;
-/// The engine leaves both counts unlimited for this family; these caps are the
-/// per-request defaults a deployment raises or lowers with
-/// `SMG_IMAGE_MAX_COUNT` / `SMG_VIDEO_MAX_COUNT` or the worker's item cap.
-const MAX_IMAGES_PER_REQUEST: usize = 128;
-const MAX_VIDEOS_PER_REQUEST: usize = 8;
 
 pub(super) struct Gemma4Spec;
 
@@ -300,6 +295,29 @@ impl ModelProcessorSpec for Gemma4Spec {
         Self::config_token_id(metadata, "image_token_id")
     }
 
+    /// The family sets no per-request media count of its own for any of its
+    /// three modalities: its serving engines read all three as unlimited (the
+    /// family's processing info declares `image: None` and `video: None`, and
+    /// `audio: None` for a checkpoint with an audio tower), the checkpoint's
+    /// processor config bounds an image's soft tokens, a clip's sampled
+    /// frames and a recording's length, not how many of each, and the context
+    /// length is the practical bound. Each modality the checkpoint carries
+    /// stays declared (an undeclared modality is refused as unsupported)
+    /// without a bound of the spec's, so the effective limit per modality is
+    /// the engine's advertised one, else the deployment's
+    /// `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`,
+    /// `SMG_VIDEO_MAX_COUNT` or `SMG_AUDIO_MAX_COUNT`.
+    ///
+    /// What still bounds such a request, and where it lives. Before any
+    /// fetch: the per-request limit the model's workers advertise for their
+    /// engine, which caps the router's own limit in the gateway's limit
+    /// resolution, and the deployment's `SMG_IMAGE_MAX_COUNT` /
+    /// `SMG_VIDEO_MAX_COUNT` / `SMG_AUDIO_MAX_COUNT` (and
+    /// `--mm-per-request-image-limit` for images), read in the same
+    /// resolution. At or after the fetch: the gateway's cap on media bytes
+    /// in flight (`multimodal_max_inflight_bytes`), the engine's advertised
+    /// encoder budget and the context length. A number of the spec's own
+    /// would be a declared default again, not a bound of the family's.
     fn modality_limits(
         &self,
         metadata: &ModelMetadata,
@@ -311,9 +329,9 @@ impl ModelProcessorSpec for Gemma4Spec {
             && metadata.config_u32(&["boi_token_id"]).is_some()
             && metadata.config_u32(&["eoi_token_id"]).is_some()
         {
-            limits.insert(Modality::Image, MAX_IMAGES_PER_REQUEST);
+            limits.insert(Modality::Image, usize::MAX);
             if metadata.config_u32(&["video_token_id"]).is_some() {
-                limits.insert(Modality::Video, MAX_VIDEOS_PER_REQUEST);
+                limits.insert(Modality::Video, usize::MAX);
             }
         }
         if metadata
@@ -322,7 +340,6 @@ impl ModelProcessorSpec for Gemma4Spec {
             .is_some_and(Value::is_object)
             && metadata.config_u32(&["audio_token_id"]).is_some()
         {
-            // The native worker enforces its configured item count before fetching.
             limits.insert(Modality::Audio, usize::MAX);
         }
         Ok(limits)
@@ -742,8 +759,8 @@ mod tests {
         assert_eq!(
             spec.modality_limits(&metadata).unwrap(),
             HashMap::from([
-                (Modality::Image, MAX_IMAGES_PER_REQUEST),
-                (Modality::Video, MAX_VIDEOS_PER_REQUEST),
+                (Modality::Image, usize::MAX),
+                (Modality::Video, usize::MAX),
                 (Modality::Audio, usize::MAX),
             ])
         );
@@ -780,6 +797,42 @@ mod tests {
         ));
     }
 
+    /// The family bounds its images and video by context, not by count: the
+    /// spec declares both without a limit of its own (the 128 images and 8
+    /// clips it carried were declared defaults, never counts of the family's),
+    /// so a deployment knob or the engine's advertised limit is the only
+    /// router-side bound for each; audio was already declared that way.
+    #[test]
+    fn gemma4_declares_images_and_video_without_a_count_of_its_own() {
+        let tokenizer = tokenizer();
+        let config = config();
+        let metadata = metadata(&tokenizer, &config);
+        let spec = Gemma4Spec;
+
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap(),
+            HashMap::from([(Modality::Image, usize::MAX), (Modality::Video, usize::MAX)])
+        );
+        for (modality, cap) in [(Modality::Image, 128), (Modality::Video, 8)] {
+            for count in [cap + 1, 1_000] {
+                spec.validate_media_request(&metadata, &[(modality, count)])
+                    .unwrap_or_else(|error| panic!("{count} {modality} items: {error}"));
+            }
+            // A deployment's own cap (the flag or the environment override, or
+            // the engine's advertised limit the gateway passes in) still binds.
+            let capped = HashMap::from([(modality, cap)]);
+            assert_eq!(
+                spec.validate_media_request_with_limits(&metadata, &[(modality, cap + 1)], &capped),
+                Err(ModelRegistryError::ModalityLimitExceeded {
+                    spec: "gemma4",
+                    modality,
+                    limit: cap,
+                    requested: cap + 1,
+                })
+            );
+        }
+    }
+
     #[test]
     fn limits_layouts_and_hooks() {
         let tokenizer = tokenizer();
@@ -788,13 +841,13 @@ mod tests {
         let spec = Gemma4Spec;
         assert_eq!(
             spec.modality_limits(&metadata).unwrap(),
-            HashMap::from([(Modality::Image, 128), (Modality::Video, 8)])
+            HashMap::from([(Modality::Image, usize::MAX), (Modality::Video, usize::MAX)])
         );
         let image_only = json!({"model_type": "gemma4", "image_token_id": IMAGE_ID, "boi_token_id": BEGIN_ID, "eoi_token_id": END_ID});
         assert_eq!(
             spec.modality_limits(&metadata_for(&tokenizer, &image_only))
                 .unwrap(),
-            HashMap::from([(Modality::Image, 128)])
+            HashMap::from([(Modality::Image, usize::MAX)])
         );
         let text_only = json!({"model_type": "gemma4"});
         assert!(spec

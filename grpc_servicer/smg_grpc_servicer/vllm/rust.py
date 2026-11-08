@@ -238,13 +238,16 @@ def smg_media_options(
     tokens as on the engine's own server for the families whose processor
     takes the loader's frames (unless ``SMG_VLLM_MM_MAX_VIDEO_FRAMES`` caps the
     budget below the engine's count, when the pipeline samples fewer frames
-    than the engine's server would, as the cap intends); a sampling rule of
-    the loader the pipeline cannot follow goes along by name
-    (``video_loader_rule``), and the pipeline refuses it for those families
-    only. The engine's encoder budget goes along as well (``encoder_budget``
-    when the caller derived it, else derived here): the pipeline refuses an
-    item above it before the engine, which would admit the item and never
-    schedule it.
+    than the engine's server would, as the cap intends); the sampling rules
+    of the engine's loader go along by name (``video_loader_rule``, which
+    says which rule reaches which family), and the pipeline refuses the
+    entries that reach the family (every rule the default loader reads for a
+    family on that loader, the flag rules for a family whose loader the engine
+    registers for its processor class, none for a sampler that never followed
+    a loader) and passes the rest. The engine's encoder budget goes along as
+    well (``encoder_budget`` when the caller derived it, else derived here):
+    the pipeline refuses an item above it before the engine, which would admit
+    the item and never schedule it.
     """
     from smg_grpc_servicer.vllm.mm_processor import SOURCE_DEFAULT as MEDIA_SOURCE_DEFAULT
 
@@ -341,41 +344,63 @@ def video_frame_budget(model_config, environ: Mapping[str, str] | None = None) -
     return max(int(num_frames), 0)
 
 
+# The sampling keys of the ``--media-io-kwargs`` video dict that an engine
+# loader reads: vLLM forwards every key that is not a codec option to the
+# loader's frame picker; the default loader reads ``fps`` alone (``num_frames``
+# is the frame budget ``video_frame_budget`` reports and the pipeline follows),
+# the loaders the engine registers for a processor class read ``fps``,
+# ``max_frames``, ``min_frames`` and ``temporal_patch_size``. Reported as
+# given, values included: which of them reach a family, and what a value means
+# to its loader (a non-positive ``fps`` is no rate to the default loader and
+# ``min_frames`` per clip to the others), is the pipeline's call per family.
+VIDEO_SAMPLING_KEYS = ("fps", "max_frames", "min_frames", "temporal_patch_size")
+
+
 def video_loader_rule(model_config, environ: Mapping[str, str] | None = None) -> str | None:
-    """A sampling rule of the engine's video loader that the smg pipeline
-    cannot follow, named the way the launcher was given it, or ``None``: a
-    loader other than the default ``opencv`` (``video.video_backend`` in
-    ``--media-io-kwargs``, else ``VLLM_VIDEO_LOADER_BACKEND``, in vLLM's own
-    order of precedence), or a ``video.fps``
-    above zero, which thins the frames by the clip's duration (vLLM's default
-    ``-1`` and ``0`` do not). The pipeline refuses the rule at launch for a
-    family that samples the way the loader does (Gemma 4); the families with a
-    rate-based sampler of their own never followed the loader and start as
-    before, so a fleet-wide loader setting does not block them."""
+    """The sampling rules of the engine's video loader that the smg pipeline
+    cannot follow, each named the way the launcher was given it, or ``None``:
+    an explicit ``video.video_backend`` in ``--media-io-kwargs``, whatever its
+    value (vLLM's media connector adds the loader it registers for a processor
+    class only when the kwargs name none, so an explicit kwarg wins over that
+    loader and over the environment, ``opencv`` included), else a
+    ``VLLM_VIDEO_LOADER_BACKEND`` other than the default ``opencv``, and every
+    sampling key of the video kwargs that an engine loader reads
+    (``VIDEO_SAMPLING_KEYS``), whatever its value; several rules are joined by
+    ``"; "``, each spelled the way it was given (the flag rules with the
+    flag's name, the environment rule with the variable's). The pipeline
+    refuses them at launch per family: for a family that samples the way the
+    engine's default loader does (Gemma 4), the rules that loader reads (a
+    kwarg naming ``opencv`` is its own loader, a non-positive ``fps`` is no
+    rate to it, and it never reads the three keys of the per-class loaders, so
+    those pass); for a family whose loader the engine registers for its
+    processor class (the Qwen2-VL line, Qwen3-Omni, the GLM-5 family and the
+    Qwen3-VL family: the environment variable never reaches that loader, an
+    explicit ``opencv`` swaps it), the flag rules alone; and none for the
+    families with a sampler of their own, which never followed the loader and
+    start as before, so a fleet-wide loader setting does not block them."""
     source = os.environ if environ is None else environ
     mm_config = multimodal_config(model_config)
     kwargs = getattr(mm_config, "media_io_kwargs", None) or {}
     video = kwargs.get("video") if isinstance(kwargs, Mapping) else None
     video = video if isinstance(video, Mapping) else {}
     rules: list[str] = []
-    # vLLM takes the kwarg over the environment (`kwargs.pop("video_backend")
-    # or envs.VLLM_VIDEO_LOADER_BACKEND`), so only the loader it ends up with
-    # counts: a kwarg naming opencv silences a fleet-wide environment setting.
+    # vLLM takes the kwarg over the loader it registers for a processor class
+    # (the connector fills `video_backend` only when the kwargs carry none) and
+    # over the environment (`kwargs.pop("video_backend") or
+    # envs.VLLM_VIDEO_LOADER_BACKEND`), so an explicit kwarg is reported
+    # whatever its value: whether `opencv` is a family's own loader or a swap
+    # is the pipeline's call per family. The environment setting counts only
+    # without a kwarg, and only when it names another loader than the default.
     backend = video.get("video_backend")
     loader = (source.get("VLLM_VIDEO_LOADER_BACKEND") or "").strip()
     if backend is not None:
-        if str(backend).strip().lower() != "opencv":
-            rules.append(f"--media-io-kwargs video.video_backend={backend}")
+        rules.append(f"--media-io-kwargs video.video_backend={backend}")
     elif loader and loader.lower() != "opencv":
         rules.append(f"VLLM_VIDEO_LOADER_BACKEND={loader}")
-    fps = video.get("fps")
-    if fps is not None:
-        try:
-            thins = float(fps) > 0
-        except (TypeError, ValueError):
-            thins = True
-        if thins:
-            rules.append(f"--media-io-kwargs video.fps={fps}")
+    for key in VIDEO_SAMPLING_KEYS:
+        value = video.get(key)
+        if value is not None:
+            rules.append(f"--media-io-kwargs video.{key}={value}")
     return "; ".join(rules) or None
 
 

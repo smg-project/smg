@@ -1,6 +1,7 @@
 //! Message response processing stage: streaming and non-streaming response processing
 //!
-//! - For streaming: Spawns background task and returns SSE response (early exit)
+//! - For streaming: Builds the reading of the engine's answer and returns the SSE response
+//!   whose body drives it (early exit)
 //! - For non-streaming: Collects the backend response, converts it to an Anthropic `Message`,
 //!   and stores it as FinalResponse::Messages.
 

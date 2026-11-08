@@ -10,23 +10,44 @@
 
 use std::time::Duration;
 
+use bytes::Bytes;
 use criterion::{
     criterion_group, criterion_main,
     measurement::{Measurement, ValueFormatter},
-    BenchmarkGroup, BenchmarkId, Criterion, Throughput,
+    BenchmarkGroup, BenchmarkId, Criterion, SamplingMode, Throughput,
 };
-use image::{imageops::FilterType, DynamicImage, RgbImage};
+use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage, RgbImage};
 use llm_multimodal::{
-    encoder_inputs::EncoderDtype,
+    buffer_pool,
+    encoder_inputs::{EncoderDtype, EncoderInput, PreprocessedEncoderInputs},
+    jpeg_turbo,
+    types::{ImageDetail, ImageFrame, ImageSize, ImageSource},
     vision::{
         preprocessor_config::PreProcessorConfig,
         processors::{
-            DeepseekV41Processor, Llama4VisionProcessor, Qwen2VLProcessor, Qwen3VLProcessor,
+            DeepseekV41Processor, KimiK3Processor, Llama4VisionProcessor, Qwen2VLProcessor,
+            Qwen3VLProcessor,
         },
-        transforms, VisionPreProcessor,
+        transforms, VideoClipOptions, VisionPreProcessor,
     },
     Modality,
 };
+
+/// Returns an iteration's output buffer to the crate's pool, as a request does
+/// once its tensor has been sent: the patch tensor or the wire goes back
+/// through the crate's own return path, a float tensor is dropped. Without
+/// this every iteration takes the pool's cold path (a class-sized zeroed
+/// allocation that the bench's allocator maps fresh each time), which is not
+/// what a request pays after the first one of its class.
+fn returned(inputs: PreprocessedEncoderInputs) {
+    match inputs.encoder_input {
+        EncoderInput::U8 { patches, .. } => {
+            buffer_pool::recycle(patches.into_raw_vec_and_offset().0);
+        }
+        EncoderInput::Wire { bytes, .. } => buffer_pool::recycle(bytes),
+        EncoderInput::F32(_) => {}
+    }
+}
 
 /// Create a synthetic RGB image with some variation (not all zeros).
 fn make_test_image(width: u32, height: u32) -> DynamicImage {
@@ -70,7 +91,7 @@ fn bench_qwen3_vl(c: &mut Criterion) {
             BenchmarkId::new("single", format!("{w}x{h}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs).unwrap());
+                b.iter(|| returned(processor.preprocess(imgs).unwrap()));
             },
         );
     }
@@ -87,7 +108,7 @@ fn bench_qwen3_vl(c: &mut Criterion) {
             BenchmarkId::new("640x480", format!("batch{batch_size}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs).unwrap());
+                b.iter(|| returned(processor.preprocess(imgs).unwrap()));
             },
         );
     }
@@ -106,8 +127,38 @@ fn bench_qwen3_vl(c: &mut Criterion) {
         let image = make_test_image(w, h);
         let images = [&image];
         group.bench_with_input(BenchmarkId::new("single", label), &images, |b, imgs| {
-            b.iter(|| processor.preprocess(imgs).unwrap());
+            b.iter(|| returned(processor.preprocess(imgs).unwrap()));
         });
+    }
+    group.finish();
+}
+
+/// A clip's frames through the video path at three frame sizes off the family's
+/// 32-pixel grid, so that every frame is resized to it (a frame already on the
+/// grid is patchified from its borrowed bytes and never reaches the resize),
+/// the frames patchified two by two into one pooled buffer. The throughput is
+/// per frame, in the process's CPU time.
+fn bench_qwen3_vl_video(c: &mut Criterion<CpuTime>) {
+    const FRAMES: usize = 8;
+    let config = PreProcessorConfig::from_json(
+        r#"{"do_resize": true, "size": {"shortest_edge": 3136, "longest_edge": 12845056}, "temporal_patch_size": 2}"#,
+    )
+    .unwrap();
+    let processor = Qwen3VLProcessor::from_config_for(&config, Modality::Video);
+    let clip = VideoClipOptions::sampled_at(2.0);
+
+    let mut group = c.benchmark_group("qwen3_vl_video");
+    group.sampling_mode(SamplingMode::Flat);
+    group.throughput(Throughput::Elements(FRAMES as u64));
+    for &(w, h) in &[(650, 490), (1000, 750), (1920, 1080)] {
+        let frames: Vec<DynamicImage> = (0..FRAMES).map(|_| make_test_image(w, h)).collect();
+        group.bench_with_input(
+            BenchmarkId::new("frame", format!("{w}x{h}")),
+            &frames,
+            |b, frames| {
+                b.iter(|| returned(processor.preprocess_video(frames, &clip).unwrap()));
+            },
+        );
     }
     group.finish();
 }
@@ -132,7 +183,7 @@ fn bench_qwen2_vl(c: &mut Criterion) {
             BenchmarkId::new("single", format!("{w}x{h}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs).unwrap());
+                b.iter(|| returned(processor.preprocess(imgs).unwrap()));
             },
         );
     }
@@ -166,7 +217,7 @@ fn bench_llama4(c: &mut Criterion) {
             BenchmarkId::new("single", format!("{w}x{h}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs).unwrap());
+                b.iter(|| returned(processor.preprocess(imgs).unwrap()));
             },
         );
     }
@@ -256,7 +307,7 @@ fn bench_llama4_steps(c: &mut Criterion) {
             &image,
             |b, img| {
                 let imgs = [img];
-                b.iter(|| processor.preprocess(&imgs).unwrap());
+                b.iter(|| returned(processor.preprocess(&imgs).unwrap()));
             },
         );
 
@@ -298,7 +349,7 @@ criterion_group!(
 criterion_group!(
     name = wire_benches;
     config = Criterion::default().with_measurement(CpuTime);
-    targets = bench_wire_write, bench_deepseek_v41
+    targets = bench_wire_write, bench_deepseek_v41, bench_decode_preprocess, bench_qwen3_vl_video
 );
 criterion_main!(benches, wire_benches);
 
@@ -492,7 +543,7 @@ const WIRE_DTYPES: [EncoderDtype; 2] = [EncoderDtype::BFloat16, EncoderDtype::Fl
 /// One image class through both arms, per wire dtype: the two passes
 /// (`preprocess` to the patch bytes, then the write in the wire's dtype, as
 /// assembly performs it) and the one pass (`preprocess_wire`). Both arms end
-/// with the owned wire bytes; the bytes are the same.
+/// with the wire bytes going back to the pool; the bytes are the same.
 fn bench_wire_arms<P: VisionPreProcessor>(
     group: &mut BenchmarkGroup<'_, CpuTime>,
     processor: &P,
@@ -516,12 +567,14 @@ fn bench_wire_arms<P: VisionPreProcessor>(
             images,
             |b, imgs| {
                 b.iter(|| {
-                    processor
-                        .preprocess(imgs)
-                        .unwrap()
-                        .encoder_input
-                        .into_bytes_as(dtype)
-                        .unwrap()
+                    buffer_pool::recycle(
+                        processor
+                            .preprocess(imgs)
+                            .unwrap()
+                            .encoder_input
+                            .into_bytes_as(dtype)
+                            .unwrap(),
+                    );
                 });
             },
         );
@@ -530,13 +583,15 @@ fn bench_wire_arms<P: VisionPreProcessor>(
             images,
             |b, imgs| {
                 b.iter(|| {
-                    processor
-                        .preprocess_wire(imgs, dtype)
-                        .expect("the pixel-byte processors write wires")
-                        .unwrap()
-                        .encoder_input
-                        .into_bytes_as(dtype)
-                        .unwrap()
+                    buffer_pool::recycle(
+                        processor
+                            .preprocess_wire(imgs, dtype)
+                            .expect("the pixel-byte processors write wires")
+                            .unwrap()
+                            .encoder_input
+                            .into_bytes_as(dtype)
+                            .unwrap(),
+                    );
                 });
             },
         );
@@ -595,7 +650,100 @@ fn bench_deepseek_v41(c: &mut Criterion<CpuTime>) {
                 ),
             ),
             &images,
-            |b, imgs| b.iter(|| processor.preprocess(imgs).unwrap()),
+            |b, imgs| b.iter(|| returned(processor.preprocess(imgs).unwrap())),
+        );
+    }
+    group.finish();
+}
+
+// ── One image request at one thread: decode and preprocess ───────
+
+/// `image` encoded as a baseline JPEG at quality 90, the form most requests
+/// carry.
+fn jpeg_bytes(image: &DynamicImage) -> Bytes {
+    let mut encoded = Vec::new();
+    JpegEncoder::new_with_quality(&mut encoded, 90)
+        .encode_image(image)
+        .unwrap();
+    Bytes::from(encoded)
+}
+
+/// The crate's share of one image request, as a request pays it: the encoded
+/// bytes become a frame, the frame decodes on first use (through TurboJPEG
+/// when its library loads, else the pure-Rust decoder), the family's
+/// processor writes the bfloat16 wire in one pass where it has one (else the
+/// patch tensor and then the wire), and the wire bytes go back to the pool.
+fn decode_and_preprocess<P: VisionPreProcessor>(processor: &P, encoded: &Bytes, size: ImageSize) {
+    let frame = ImageFrame::encoded(
+        encoded.clone(),
+        ImageDetail::Auto,
+        ImageSource::InlineBytes,
+        String::new(),
+        size,
+        None,
+    );
+    let images = [frame.image().unwrap()];
+    let inputs = processor
+        .preprocess_wire(&images, EncoderDtype::BFloat16)
+        .unwrap_or_else(|| processor.preprocess(&images))
+        .unwrap();
+    buffer_pool::recycle(
+        inputs
+            .encoder_input
+            .into_bytes_as(EncoderDtype::BFloat16)
+            .unwrap(),
+    );
+}
+
+/// One 1024x768 image through decode and preprocess per family, as a colour
+/// JPEG and as a greyscale JPEG, in CPU time at one thread: the class a
+/// comparison with the published crate once read slower at one thread while
+/// the larger sizes read faster, so a change to the decode or the wire path
+/// shows here before it shows in a service. The source is the synthetic
+/// image of the other groups, encoded here (the greyscale from its luma).
+#[expect(
+    clippy::print_stderr,
+    reason = "the decoder the rows ran through is printed once beside them"
+)]
+fn bench_decode_preprocess(c: &mut Criterion<CpuTime>) {
+    eprintln!(
+        "decode_preprocess rows decode through {}",
+        if jpeg_turbo::turbojpeg_available() {
+            "TurboJPEG"
+        } else {
+            "the pure-Rust JPEG decoder (libturbojpeg.so.0 did not load)"
+        }
+    );
+    let (w, h) = (1024, 768);
+    let colour = make_test_image(w, h);
+    let grey = DynamicImage::ImageLuma8(colour.to_luma8());
+    let size = ImageSize::new(w, h);
+    let classes = [
+        ("jpeg", jpeg_bytes(&colour)),
+        ("jpeg_grey", jpeg_bytes(&grey)),
+    ];
+    let deepseek = DeepseekV41Processor::from_preprocessor_config(
+        &PreProcessorConfig::from_json(
+            r#"{"patch_size": 14, "min_pixels": 295936, "downsample_ratio": 3, "max_image_tokens": 1024}"#,
+        )
+        .unwrap(),
+    );
+    let kimi = KimiK3Processor::from_preprocessor_config(&PreProcessorConfig::default());
+    let mut group = c.benchmark_group("decode_preprocess");
+    group
+        .sample_size(20)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(2));
+    for (class, encoded) in &classes {
+        group.bench_with_input(
+            BenchmarkId::new(format!("deepseek_v41_{class}"), format!("{w}x{h}")),
+            encoded,
+            |b, encoded| b.iter(|| decode_and_preprocess(&deepseek, encoded, size)),
+        );
+        group.bench_with_input(
+            BenchmarkId::new(format!("kimi_k3_{class}"), format!("{w}x{h}")),
+            encoded,
+            |b, encoded| b.iter(|| decode_and_preprocess(&kimi, encoded, size)),
         );
     }
     group.finish();

@@ -839,59 +839,402 @@ mod tests {
         assert_eq!(both.get("tp_size").map(String::as_str), Some("8"));
     }
 
-    #[expect(clippy::print_stderr)]
-    fn dump_labels(title: &str, labels: &HashMap<String, String>) {
-        eprintln!("\n=== {title} ({} labels) ===", labels.len());
-        let mut keys: Vec<_> = labels.keys().collect();
-        keys.sort();
-        for key in keys {
-            eprintln!("  {key}: {}", labels[key]);
+    fn label<'a>(labels: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+        labels.get(key).map(String::as_str)
+    }
+
+    /// The SGLang HTTP read asks `/server_info`, `/model_info` and
+    /// `/v1/models` and combines them: the engine's own labels first, the
+    /// model list filling in what they left out.
+    #[tokio::test]
+    async fn the_sglang_http_read_combines_the_three_endpoints_with_the_engines_own_labels_first() {
+        use http::StatusCode;
+
+        use crate::test_support::serve_json_routes;
+
+        let base = serve_json_routes(vec![
+            (
+                "/server_info",
+                StatusCode::OK,
+                serde_json::json!({
+                    "model_path": "org/model-a", "tp_size": 4, "dp_size": 1,
+                    "max_running_requests": 256, "version": "0.5.0",
+                }),
+            ),
+            (
+                "/model_info",
+                StatusCode::OK,
+                serde_json::json!({
+                    "model_path": "org/model-a", "tokenizer_path": "org/model-a-tokenizer",
+                    "is_generation": true,
+                }),
+            ),
+            (
+                "/v1/models",
+                StatusCode::OK,
+                serde_json::json!({"data": [
+                    {"id": "served-a", "root": "org/model-a-root", "max_model_len": 32768}
+                ]}),
+            ),
+        ])
+        .await;
+
+        let labels = fetch_sglang_http_metadata(&crate::clients::http_client(), &base, None).await;
+        assert_eq!(
+            label(&labels, "model_path"),
+            Some("org/model-a"),
+            "the engine's own model path, not the model list's root: {labels:?}"
+        );
+        assert_eq!(
+            label(&labels, "tokenizer_path"),
+            Some("org/model-a-tokenizer")
+        );
+        assert_eq!(label(&labels, "tp_size"), Some("4"));
+        assert_eq!(label(&labels, "max_running_requests"), Some("256"));
+        assert_eq!(label(&labels, "version"), Some("0.5.0"));
+        assert_eq!(label(&labels, "is_generation"), Some("true"));
+        assert_eq!(
+            label(&labels, "served_model_name"),
+            Some("served-a"),
+            "the model list fills in the served name the engine's info left out"
+        );
+        assert_eq!(label(&labels, "max_model_len"), Some("32768"));
+    }
+
+    /// An endpoint gone to 404 is read at its older `/get_` spelling; one
+    /// that answers 404 under both spellings is one the engine does not
+    /// offer, tolerated by the strict read as by registration.
+    #[tokio::test]
+    async fn the_sglang_http_read_takes_the_older_spelling_and_tolerates_an_endpoint_not_offered() {
+        use http::StatusCode;
+
+        use crate::test_support::serve_json_routes;
+
+        let base = serve_json_routes(vec![
+            (
+                "/get_server_info",
+                StatusCode::OK,
+                serde_json::json!({"model_path": "org/model-b", "tp_size": 2}),
+            ),
+            (
+                "/v1/models",
+                StatusCode::OK,
+                serde_json::json!({"data": [{"id": "served-b"}]}),
+            ),
+        ])
+        .await;
+        let client = crate::clients::http_client();
+
+        let tolerant = fetch_sglang_http_metadata(&client, &base, None).await;
+        assert_eq!(label(&tolerant, "model_path"), Some("org/model-b"));
+        assert_eq!(label(&tolerant, "tp_size"), Some("2"));
+        assert_eq!(label(&tolerant, "served_model_name"), Some("served-b"));
+        assert_eq!(
+            label(&tolerant, "tokenizer_path"),
+            None,
+            "an endpoint not offered leaves no label: {tolerant:?}"
+        );
+
+        let strict = fetch_sglang_http_metadata_checked(&client, &base, None, true)
+            .await
+            .expect("an endpoint the engine does not offer fails no read");
+        assert_eq!(strict, tolerant);
+    }
+
+    /// An endpoint that fails leaves a gap in the registration read and
+    /// fails a strict read, named.
+    #[tokio::test]
+    async fn an_endpoint_that_fails_leaves_a_gap_for_registration_and_fails_a_strict_read_by_name()
+    {
+        use http::StatusCode;
+
+        use crate::test_support::serve_json_routes;
+
+        let base = serve_json_routes(vec![
+            (
+                "/server_info",
+                StatusCode::OK,
+                serde_json::json!({"model_path": "org/model-c"}),
+            ),
+            (
+                "/model_info",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"error": "down"}),
+            ),
+            (
+                "/v1/models",
+                StatusCode::OK,
+                serde_json::json!({"data": []}),
+            ),
+        ])
+        .await;
+        let client = crate::clients::http_client();
+
+        let tolerant = fetch_sglang_http_metadata(&client, &base, None).await;
+        assert_eq!(label(&tolerant, "model_path"), Some("org/model-c"));
+        assert_eq!(label(&tolerant, "tokenizer_path"), None, "{tolerant:?}");
+
+        let error = fetch_sglang_http_metadata_checked(&client, &base, None, true)
+            .await
+            .expect_err("a strict read fails on a failing endpoint");
+        assert!(
+            error.starts_with("model_info: status 500"),
+            "the error names the endpoint and its answer: {error}"
+        );
+    }
+
+    /// The vLLM HTTP read takes the model's identity and window from
+    /// `/v1/models` and the build from `/version`; a `/version` the engine
+    /// does not offer leaves no label and fails no read.
+    #[tokio::test]
+    async fn the_vllm_http_read_takes_the_model_list_and_the_version() {
+        use http::StatusCode;
+
+        use crate::test_support::serve_json_routes;
+
+        let models = serde_json::json!({"data": [
+            {"id": "served-d", "root": "org/model-d", "max_model_len": 8192}
+        ]});
+        let client = crate::clients::http_client();
+
+        let base = serve_json_routes(vec![
+            ("/v1/models", StatusCode::OK, models.clone()),
+            (
+                "/version",
+                StatusCode::OK,
+                serde_json::json!({"version": "0.31.0"}),
+            ),
+        ])
+        .await;
+        let labels = fetch_vllm_http_metadata(&client, &base, None).await;
+        assert_eq!(label(&labels, "model_path"), Some("org/model-d"));
+        assert_eq!(label(&labels, "served_model_name"), Some("served-d"));
+        assert_eq!(label(&labels, "max_model_len"), Some("8192"));
+        assert_eq!(label(&labels, "version"), Some("0.31.0"));
+
+        let without_version = serve_json_routes(vec![("/v1/models", StatusCode::OK, models)]).await;
+        let labels = fetch_vllm_http_metadata_checked(&client, &without_version, None, true)
+            .await
+            .expect("a version endpoint the engine does not offer fails no read");
+        assert_eq!(label(&labels, "model_path"), Some("org/model-d"));
+        assert_eq!(label(&labels, "version"), None, "{labels:?}");
+    }
+
+    /// An engine that refuses the connection leaves registration with no
+    /// labels and fails a strict read on the first endpoint, named.
+    #[tokio::test]
+    async fn an_engine_that_refuses_the_connection_leaves_registration_empty_and_fails_a_strict_read(
+    ) {
+        use crate::test_support::RefusedAddress;
+
+        let refused = RefusedAddress::reserve();
+        let base = refused.http_url();
+        let client = crate::clients::http_client();
+
+        assert!(fetch_vllm_http_metadata(&client, &base, None)
+            .await
+            .is_empty());
+        assert!(fetch_sglang_http_metadata(&client, &base, None)
+            .await
+            .is_empty());
+
+        let error = fetch_vllm_http_metadata_checked(&client, &base, None, true)
+            .await
+            .expect_err("a strict read fails on an engine it cannot reach");
+        assert!(error.starts_with("/v1/models: "), "{error}");
+        let error = fetch_sglang_http_metadata_checked(&client, &base, None, true)
+            .await
+            .expect_err("a strict read fails on an engine it cannot reach");
+        assert!(error.starts_with("server_info: "), "{error}");
+    }
+
+    /// The crate's mock gRPC engine of each proto, as the probes' tests use
+    /// it: its model id names its model, tokenizer and served name.
+    const MOCK_MODEL: &str = "probe-model";
+    /// The mock engine's context length, as it reports it.
+    const MOCK_CONTEXT: &str = "32768";
+
+    /// The gRPC read of each proto: the model info's fields become labels,
+    /// the server info adds its own (a vLLM engine's KV connector, an SGLang
+    /// engine's version), and the runtime read is the one asked for.
+    #[tokio::test]
+    async fn the_grpc_read_takes_the_model_info_and_the_server_info_of_each_proto() {
+        use mock_worker::config::SchedulerWire;
+
+        use crate::workflow::steps::util::mock_grpc_engine_on;
+
+        let (vllm, engine) = mock_grpc_engine_on(SchedulerWire::Vllm).await;
+        let server_label = with_server_label(&engine, "vllm");
+        let (labels, runtime) = fetch_grpc_metadata(&vllm, "vllm", true)
+            .await
+            .expect("the vLLM read");
+        assert_eq!(runtime, "vllm");
+        assert_eq!(label(&labels, "model_path"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "tokenizer_path"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "served_model_name"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "max_context_length"), Some(MOCK_CONTEXT));
+        assert_eq!(label(&labels, server_label), Some("MooncakeConnector"));
+
+        let (sglang, engine) = mock_grpc_engine_on(SchedulerWire::Sglang).await;
+        let server_label = with_server_label(&engine, "sglang");
+        let (labels, runtime) = fetch_grpc_metadata(&sglang, "sglang", true)
+            .await
+            .expect("the SGLang read");
+        assert_eq!(runtime, "sglang");
+        assert_eq!(label(&labels, "model_path"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "tokenizer_path"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "served_model_name"), Some(MOCK_MODEL));
+        assert_eq!(label(&labels, "max_context_length"), Some(MOCK_CONTEXT));
+        assert_eq!(label(&labels, server_label), Some("mock"));
+    }
+
+    /// A server-info label each proto's engine reports when its server info
+    /// is served, so a read without one shows the gap. The vLLM mock sends
+    /// an empty KV connector, which the flattening drops, so the connector
+    /// is patched in first; the SGLang mock sends its version. The served
+    /// read's test takes its label here too, so the gap proofs' label is
+    /// one a served read is shown to carry.
+    fn with_server_label(
+        engine: &mock_worker::overrides::WorkerOverrides,
+        runtime: &str,
+    ) -> &'static str {
+        if runtime == "vllm" {
+            let mut patch = serde_json::Map::new();
+            patch.insert(
+                "kv_connector".to_string(),
+                serde_json::Value::String("MooncakeConnector".to_string()),
+            );
+            engine.patch_info(&patch);
+            "kv_connector"
+        } else {
+            "version"
         }
     }
 
+    /// An engine without a server info (an `Unimplemented` answer) keeps its
+    /// model labels on a plain read and on a strict one, and has no server
+    /// label: the call is a gap, not a failure, on both protos.
     #[tokio::test]
-    #[ignore = "needs a live engine on a local port; run with --ignored"]
-    async fn test_sglang_http_metadata() {
-        let labels = fetch_sglang_http_metadata(
-            &crate::clients::http_client(),
-            "http://0.0.0.0:30000",
-            None,
-        )
-        .await;
-        dump_labels("SGLang HTTP combined", &labels);
-        assert!(labels.contains_key("model_path"));
-        assert!(labels.contains_key("tokenizer_path"));
+    async fn an_engine_without_server_info_keeps_its_model_labels_on_a_plain_and_a_strict_read() {
+        use mock_worker::{config::SchedulerWire, overrides::InfoAnswer};
+
+        use crate::workflow::steps::util::mock_grpc_engine_on;
+
+        let mut engines = Vec::new();
+        for (wire, runtime) in [
+            (SchedulerWire::Vllm, "vllm"),
+            (SchedulerWire::Sglang, "sglang"),
+        ] {
+            let (url, engine) = mock_grpc_engine_on(wire).await;
+            let server_label = with_server_label(&engine, runtime);
+            engine.set_server_info(InfoAnswer::Unimplemented);
+            engines.push((url, runtime, server_label));
+        }
+        for (url, runtime, server_label) in &engines {
+            for strict in [false, true] {
+                let (labels, _) = fetch_grpc_metadata(url, runtime, strict)
+                    .await
+                    .unwrap_or_else(|error| panic!("{runtime} strict={strict}: {error}"));
+                assert_eq!(
+                    label(&labels, "model_path"),
+                    Some(MOCK_MODEL),
+                    "{runtime} strict={strict}"
+                );
+                assert_eq!(
+                    label(&labels, server_label),
+                    None,
+                    "{runtime} strict={strict}: {labels:?}"
+                );
+            }
+        }
     }
 
+    /// A server info that fails leaves a gap on a plain read (the model
+    /// labels, no server label) and fails a strict read, named, on both
+    /// protos.
     #[tokio::test]
-    #[ignore = "needs a live engine on a local port; run with --ignored"]
-    async fn test_vllm_http_metadata() {
-        let labels =
-            fetch_vllm_http_metadata(&crate::clients::http_client(), "http://0.0.0.0:20000", None)
-                .await;
-        dump_labels("vLLM HTTP", &labels);
-        assert!(labels.contains_key("model_path"));
-        assert!(labels.contains_key("version"));
+    async fn a_failing_server_info_leaves_a_gap_for_registration_and_fails_a_strict_read_by_name() {
+        use mock_worker::{config::SchedulerWire, overrides::InfoAnswer};
+
+        use crate::workflow::steps::util::mock_grpc_engine_on;
+
+        let mut engines = Vec::new();
+        for (wire, runtime) in [
+            (SchedulerWire::Vllm, "vllm"),
+            (SchedulerWire::Sglang, "sglang"),
+        ] {
+            let (url, engine) = mock_grpc_engine_on(wire).await;
+            let server_label = with_server_label(&engine, runtime);
+            engine.set_server_info(InfoAnswer::Failing);
+            engines.push((url, runtime, server_label));
+        }
+        for (url, runtime, server_label) in &engines {
+            let (labels, _) = fetch_grpc_metadata(url, runtime, false)
+                .await
+                .unwrap_or_else(|error| panic!("{runtime}: {error}"));
+            assert_eq!(label(&labels, "model_path"), Some(MOCK_MODEL), "{runtime}");
+            assert_eq!(label(&labels, server_label), None, "{runtime}: {labels:?}");
+
+            let error = fetch_grpc_metadata(url, runtime, true)
+                .await
+                .expect_err("a strict read fails on a failing server info");
+            assert!(
+                error.starts_with("Failed to fetch gRPC server info: "),
+                "{runtime}: {error}"
+            );
+        }
     }
 
+    /// A model info that fails fails the read, named, strict or not: the
+    /// model's fields are what registration reads, so there is no gap to
+    /// leave, on both protos.
     #[tokio::test]
-    #[ignore = "needs a live engine on a local port; run with --ignored"]
-    async fn test_sglang_grpc_metadata() {
-        let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:30001", "sglang", false)
-            .await
-            .expect("grpc metadata");
-        dump_labels("SGLang gRPC", &labels);
-        assert!(labels.contains_key("model_path"));
+    async fn a_failing_model_info_fails_the_grpc_read_by_name() {
+        use mock_worker::{config::SchedulerWire, overrides::InfoAnswer};
+
+        use crate::workflow::steps::util::mock_grpc_engine_on;
+
+        let mut engines = Vec::new();
+        for (wire, runtime) in [
+            (SchedulerWire::Vllm, "vllm"),
+            (SchedulerWire::Sglang, "sglang"),
+        ] {
+            let (url, engine) = mock_grpc_engine_on(wire).await;
+            engine.set_model_info(InfoAnswer::Failing);
+            engines.push((url, runtime));
+        }
+        for (url, runtime) in &engines {
+            for strict in [false, true] {
+                let error = fetch_grpc_metadata(url, runtime, strict)
+                    .await
+                    .expect_err("a read of an engine whose model info fails");
+                assert!(
+                    error.starts_with("Failed to fetch gRPC model info: "),
+                    "{runtime} strict={strict}: {error}"
+                );
+            }
+        }
     }
 
+    /// An engine that refuses the connection fails the read at the dial,
+    /// named, strict or not.
     #[tokio::test]
-    #[ignore = "needs a live engine on a local port; run with --ignored"]
-    async fn test_vllm_grpc_metadata() {
-        let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:20001", "vllm", false)
-            .await
-            .expect("grpc metadata");
-        dump_labels("vLLM gRPC", &labels);
-        assert!(!labels.is_empty());
+    async fn an_engine_that_refuses_the_connection_fails_the_grpc_read_at_the_dial() {
+        use crate::test_support::RefusedAddress;
+
+        let refused = RefusedAddress::reserve();
+        let url = format!("grpc://{}", refused.addr());
+        for runtime in ["vllm", "sglang"] {
+            for strict in [false, true] {
+                let error = fetch_grpc_metadata(&url, runtime, strict)
+                    .await
+                    .expect_err("a read of an engine that refuses the connection");
+                assert!(
+                    error.starts_with("Failed to connect to gRPC: "),
+                    "{runtime} strict={strict}: {error}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -975,12 +1318,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_sglang_http_metadata_uses_models_identity() {
-        use axum::{routing::get, Json, Router};
+        use http::StatusCode;
         use serde_json::json;
-        use tokio::net::TcpListener;
 
-        async fn models() -> Json<serde_json::Value> {
-            Json(json!({
+        use crate::test_support::serve_json_routes;
+
+        let base = serve_json_routes(vec![(
+            "/v1/models",
+            StatusCode::OK,
+            json!({
                 "data": [{
                     "id": "test-model",
                     "max_model_len": 4096,
@@ -989,28 +1335,11 @@ mod tests {
                     "root": "test-root"
                 }],
                 "object": "list"
-            }))
-        }
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test-only mock /v1/models server; handle is aborted at test end"
-        )]
-        let server = tokio::spawn(async move {
-            axum::serve(listener, Router::new().route("/v1/models", get(models)))
-                .await
-                .unwrap();
-        });
-
-        let labels = fetch_sglang_http_metadata(
-            &crate::clients::http_client(),
-            &format!("http://{addr}"),
-            None,
-        )
+            }),
+        )])
         .await;
-        server.abort();
+
+        let labels = fetch_sglang_http_metadata(&crate::clients::http_client(), &base, None).await;
 
         assert_eq!(
             labels.get("served_model_name").map(String::as_str),

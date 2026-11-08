@@ -3,6 +3,7 @@
 mod constraint_failure_test;
 mod decisions_grpc_test;
 mod grpc_chat_logprobs_test;
+mod grpc_completion_logprobs_test;
 mod grpc_context_length_test;
 mod grpc_context_routing_test;
 mod grpc_message_declared_tools_test;

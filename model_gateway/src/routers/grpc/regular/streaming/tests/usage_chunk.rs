@@ -65,6 +65,18 @@ async fn streamed_payloads(spec: ChatResponseSpec) -> Vec<String> {
         .collect()
 }
 
+/// The `usage` field of every chunk before the one that closes the stream:
+/// `None` where the key is absent, `Some(Value::Null)` for the placeholder.
+fn earlier_usage_fields(payloads: &[String]) -> Vec<Option<Value>> {
+    payloads[..payloads.len() - 2]
+        .iter()
+        .map(|payload| {
+            let chunk: Value = serde_json::from_str(payload).expect("a chunk");
+            chunk.get("usage").cloned()
+        })
+        .collect()
+}
+
 /// The usage object of the event before `[DONE]`, if that event carries one.
 fn closing_usage(payloads: &[String]) -> Option<Value> {
     assert_eq!(
@@ -85,6 +97,14 @@ async fn a_minimax_stream_sent_without_stream_options_ends_with_a_usage_chunk() 
     let usage = closing_usage(&payloads).expect("the usage chunk before [DONE]");
     assert!(usage["completion_tokens"].is_u64(), "{usage}");
     assert!(usage["prompt_tokens"].is_u64(), "{usage}");
+    // The profile's default is the client's `include_usage`: the earlier
+    // chunks carry the placeholder, as that vendor's API writes it.
+    let earlier = earlier_usage_fields(&payloads);
+    assert!(!earlier.is_empty(), "{payloads:?}");
+    assert!(
+        earlier.iter().all(|usage| *usage == Some(Value::Null)),
+        "{payloads:?}"
+    );
 }
 
 #[tokio::test]
@@ -114,4 +134,17 @@ async fn a_plain_served_models_stream_carries_usage_only_when_asked() {
     ))
     .await;
     assert!(closing_usage(&payloads).is_some(), "{payloads:?}");
+    // Under `include_usage` the public API writes `usage: null` on every
+    // chunk before the usage-only one; without the option the key is absent.
+    let earlier = earlier_usage_fields(&payloads);
+    assert!(!earlier.is_empty(), "{payloads:?}");
+    assert!(
+        earlier.iter().all(|usage| *usage == Some(Value::Null)),
+        "{payloads:?}"
+    );
+    let payloads = streamed_payloads(spec_for("self-hosted-model", serde_json::json!({}))).await;
+    assert!(
+        earlier_usage_fields(&payloads).iter().all(Option::is_none),
+        "{payloads:?}"
+    );
 }

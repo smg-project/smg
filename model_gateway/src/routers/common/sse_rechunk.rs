@@ -20,6 +20,11 @@
 //! is forwarded as it came, after any buffered text so the order never
 //! changes: comments, `[DONE]`, malformed frames, events with several
 //! choices, events carrying `logprobs` or fields this module does not know.
+//! A `usage: null` placeholder on the latest event (what a stream under
+//! `include_usage` writes on every chunk before the usage-only one; a closing
+//! event's usage object leaves the earlier text's placeholder in place) rides
+//! each synthesized slice, after its choices, so the re-sliced stream keeps
+//! the public shape.
 //!
 //! The HTTP relay drives [`SseRechunker`] inline; the gRPC pipeline wraps
 //! its own channel in `rechunk_stream`.
@@ -83,6 +88,10 @@ pub struct SseRechunker<O = NoopObserver> {
     /// serialized as the start of an object (`{"id":"x",`), so synthesized
     /// events look like the upstream ones.
     envelope: Vec<u8>,
+    /// The latest text-bearing event carried the `usage: null` placeholder
+    /// (a usage object, which closes the stream, leaves the flag as it was):
+    /// every synthesized slice writes the placeholder after its choices.
+    usage_null: bool,
     scratch: Vec<u8>,
     fields: [Pending; PAYLOAD_FIELDS.len()],
     tool_args: BTreeMap<Option<u64>, Pending>,
@@ -206,6 +215,7 @@ impl<O: DeltaObserver> SseRechunker<O> {
             partial: Vec::new(),
             scanned: 0,
             envelope: b"{".to_vec(),
+            usage_null: false,
             scratch: Vec::new(),
             fields: Default::default(),
             tool_args: BTreeMap::new(),
@@ -492,12 +502,20 @@ impl<O: DeltaObserver> SseRechunker<O> {
         }
     }
 
-    /// Keeps the envelope in step with the latest event.
+    /// Keeps the envelope, and the placeholder flag, in step with the latest
+    /// event. A usage object leaves the flag as it was: that event closes the
+    /// stream and goes out whole after the flush, so the flag keeps describing
+    /// the text buffered before it.
     fn update_envelope(&mut self, event: &RawObject<'_>) {
         self.scratch.clear();
         self.scratch.push(b'{');
+        let mut usage_null = Some(false);
         for (key, value) in &event.entries {
-            if key == "choices" || key == "usage" {
+            if key == "choices" {
+                continue;
+            }
+            if key == "usage" {
+                usage_null = is_null(value).then_some(true);
                 continue;
             }
             write_json(&mut self.scratch, key.as_ref());
@@ -507,6 +525,9 @@ impl<O: DeltaObserver> SseRechunker<O> {
         }
         if self.scratch != self.envelope {
             std::mem::swap(&mut self.scratch, &mut self.envelope);
+        }
+        if let Some(usage_null) = usage_null {
+            self.usage_null = usage_null;
         }
     }
 
@@ -549,7 +570,14 @@ impl<O: DeltaObserver> SseRechunker<O> {
     fn emit_ready(&mut self, out: &mut Vec<u8>) -> Result<(), StreamStop> {
         for (field, pending) in PAYLOAD_FIELDS.iter().zip(&mut self.fields) {
             while pending.chars >= EMIT_THRESHOLD {
-                emit_text(&self.envelope, &mut self.observer, field, pending, out)?;
+                emit_text(
+                    &self.envelope,
+                    self.usage_null,
+                    &mut self.observer,
+                    field,
+                    pending,
+                    out,
+                )?;
             }
         }
         for (index, pending) in &mut self.tool_args {
@@ -558,6 +586,7 @@ impl<O: DeltaObserver> SseRechunker<O> {
             while pending.chars >= EMIT_THRESHOLD + MIN_TAIL_CHARS {
                 emit_arguments(
                     &self.envelope,
+                    self.usage_null,
                     &mut self.observer,
                     *index,
                     pending,
@@ -592,7 +621,14 @@ impl<O: DeltaObserver> SseRechunker<O> {
         for (field, pending) in PAYLOAD_FIELDS.iter().zip(&mut self.fields) {
             if pending.chars >= min_chars {
                 while pending.chars > 0 {
-                    emit_text(&self.envelope, &mut self.observer, field, pending, out)?;
+                    emit_text(
+                        &self.envelope,
+                        self.usage_null,
+                        &mut self.observer,
+                        field,
+                        pending,
+                        out,
+                    )?;
                 }
             }
         }
@@ -601,6 +637,7 @@ impl<O: DeltaObserver> SseRechunker<O> {
                 while pending.chars > held {
                     emit_arguments(
                         &self.envelope,
+                        self.usage_null,
                         &mut self.observer,
                         *index,
                         pending,
@@ -745,7 +782,7 @@ struct Structural<'s, 'a> {
 enum Variant {
     Whole,
     /// The event minus what ends the stream: `finish_reason` becomes null
-    /// and `usage` is left out.
+    /// and a usage object is left out (the `usage: null` placeholder stays).
     Opening,
     /// The event with an empty delta.
     Closing,
@@ -762,7 +799,7 @@ fn write_event(structural: &Structural<'_, '_>, variant: Variant, out: &mut Vec<
                 write_choice(choice, structural, variant, out);
                 out.push(b']');
             }
-            ("usage", _) if variant == Variant::Opening => {}
+            ("usage", _) if variant == Variant::Opening && !is_null(value) => {}
             _ => comma.raw(out, key, value),
         }
     }
@@ -865,6 +902,7 @@ fn write_function(function: &RawObject<'_>, out: &mut Vec<u8>) {
 /// unless the observer ends the stream on it.
 fn emit_text<O: DeltaObserver>(
     envelope: &[u8],
+    usage_null: bool,
     observer: &mut O,
     field: &'static str,
     pending: &mut Pending,
@@ -878,7 +916,8 @@ fn emit_text<O: DeltaObserver>(
     write_json(out, field);
     out.push(b':');
     write_json(out, &pending.text[..bytes]);
-    out.extend_from_slice(b"},\"finish_reason\":null}]}\n\n");
+    out.extend_from_slice(b"},\"finish_reason\":null}]");
+    close_synthesized(usage_null, out);
     pending.cut(bytes, chars);
     Ok(())
 }
@@ -888,6 +927,7 @@ fn emit_text<O: DeltaObserver>(
 /// The slice leaves `keep` characters in the buffer.
 fn emit_arguments<O: DeltaObserver>(
     envelope: &[u8],
+    usage_null: bool,
     observer: &mut O,
     index: Option<u64>,
     pending: &mut Pending,
@@ -910,9 +950,20 @@ fn emit_arguments<O: DeltaObserver>(
     }
     out.extend_from_slice(b"\"function\":{\"arguments\":");
     write_json(out, &pending.text[..bytes]);
-    out.extend_from_slice(b"}}]},\"finish_reason\":null}]}\n\n");
+    out.extend_from_slice(b"}}]},\"finish_reason\":null}]");
+    close_synthesized(usage_null, out);
     pending.cut(bytes, chars);
     Ok(())
+}
+
+/// Ends a synthesized event after its choices: the `usage: null` placeholder
+/// when the latest event carried one (see `SseRechunker::usage_null`), then
+/// the frame's end.
+fn close_synthesized(usage_null: bool, out: &mut Vec<u8>) {
+    if usage_null {
+        out.extend_from_slice(b",\"usage\":null");
+    }
+    out.extend_from_slice(b"}\n\n");
 }
 
 /// Shows a slice to the observer; the stop it ends the stream with, if so.
@@ -1449,6 +1500,58 @@ mod tests {
         let frames = [null_logprobs; 50];
         let sizes = content_sizes(&events(&run(&frames)));
         assert!(sizes.iter().all(|&s| s >= 5), "sizes: {sizes:?}");
+    }
+
+    /// A stream under `include_usage` writes `usage: null` on every chunk
+    /// before the usage-only one: the slices synthesized from such chunks
+    /// carry the placeholder after their choices, an opening keeps it, and
+    /// no slice invents one for a stream without it.
+    #[test]
+    fn the_usage_placeholder_rides_every_synthesized_slice() {
+        let text = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"abcdefghij\"},\"finish_reason\":null}],\"usage\":null}\n\n";
+        let last = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"end\"},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n";
+        let mut frames = vec![text; 30];
+        frames.push(last);
+        let bytes = run(&frames);
+        let evs = events(&bytes);
+        assert!(evs.len() > 2, "{evs:?}");
+        assert!(
+            evs.iter().all(|e| e.get("usage") == Some(&Value::Null)),
+            "{evs:?}"
+        );
+        assert_eq!(
+            evs.last().unwrap()["choices"][0]["finish_reason"],
+            Value::from("stop")
+        );
+        let text_bytes = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text_bytes.contains("}],\"usage\":null}\n\n"),
+            "{text_bytes}"
+        );
+        assert!(
+            !text_bytes.contains("\"usage\":null,\"choices\""),
+            "{text_bytes}"
+        );
+
+        let plain = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"abcdefghij\"},\"finish_reason\":null}]}\n\n";
+        let evs = events(&run(&[plain; 30]));
+        assert!(evs.len() > 1, "{evs:?}");
+        assert!(evs.iter().all(|e| e.get("usage").is_none()), "{evs:?}");
+
+        // A closing event with a usage object: the text buffered before it
+        // keeps its placeholder, the closing event keeps its object.
+        let closing = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"end\"},\"finish_reason\":\"stop\"}],\"usage\":{\"total_tokens\":5}}\n\n";
+        let mut frames = vec![text; 30];
+        frames.push(closing);
+        let evs = events(&run(&frames));
+        let (last, earlier) = evs.split_last().expect("events");
+        assert!(earlier.len() > 1, "{evs:?}");
+        assert!(
+            earlier.iter().all(|e| e.get("usage") == Some(&Value::Null)),
+            "{evs:?}"
+        );
+        assert_eq!(last["usage"]["total_tokens"], Value::from(5), "{last}");
+        assert_eq!(last["choices"][0]["finish_reason"], Value::from("stop"));
     }
 
     #[test]

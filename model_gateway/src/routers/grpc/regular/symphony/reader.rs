@@ -992,11 +992,13 @@ mod tests {
 
     /// A call whose elements nest past the bound the JSON reader applies to every syntax
     /// (`PartialJson::DEFAULT_MAX_DEPTH` containers, the arguments object counted) still reaches
-    /// the client as a call: its arguments close whole without the member that crossed the
-    /// bound, so a strict reader takes them, and the output counts as malformed under
-    /// `invalid_arguments`, once.
+    /// the client as a call, and as no whole one: the member that crossed the bound is refused,
+    /// something the model put in the call that the client will not get, so no close is made up
+    /// for the call (the rule of every tagged syntax): its arguments are the containers the
+    /// reader took, open, which a strict reader refuses, and the output counts as malformed
+    /// under `invalid_arguments`, once.
     #[test]
-    fn a_call_nested_past_the_bound_reaches_the_client_whole_and_counts_as_malformed() {
+    fn a_call_nested_past_the_bound_reaches_the_client_as_no_whole_call_and_counts_as_malformed() {
         use symphony::{adapt::chat::message, formats::minimax_m3, json::PartialJson};
         let levels = PartialJson::DEFAULT_MAX_DEPTH + 1;
         let body = format!("{}1{}", "<d>".repeat(levels), "</d>".repeat(levels))
@@ -1011,19 +1013,21 @@ mod tests {
             let calls = choice.message.tool_calls.expect("the call");
             assert_eq!(calls.len(), 1, "{events:?}");
             assert_eq!(calls[0].function.name, "lookup");
-            let arguments: Value =
-                serde_json::from_str(calls[0].function.arguments.as_deref().expect("arguments"))
-                    .expect("arguments a strict reader takes");
-            // The arguments object and the containers below it, as many as the reader takes:
-            // the deepest closes empty, the member that would have crossed the bound unwritten.
-            let mut depth = 0;
-            let mut value = &arguments;
-            while let Some(inner) = value.get("d") {
-                depth += 1;
-                value = inner;
-            }
-            assert_eq!(depth, PartialJson::DEFAULT_MAX_DEPTH - 1, "{arguments}");
-            assert_eq!(value, &serde_json::json!({}), "{arguments}");
+            let arguments = calls[0].function.arguments.as_deref().expect("arguments");
+            // The arguments object and the containers below it, as many as the reader takes,
+            // all open: no close is made up for a call the syntax refused bytes in, and the
+            // member that would have crossed the bound is unwritten.
+            assert_eq!(
+                arguments,
+                format!(
+                    "{{{}",
+                    "\"d\": {".repeat(PartialJson::DEFAULT_MAX_DEPTH - 1)
+                )
+            );
+            assert!(
+                serde_json::from_str::<Value>(arguments).is_err(),
+                "{arguments} reads as a whole value"
+            );
             assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
         });
         let outputs = line_with(

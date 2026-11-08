@@ -19,7 +19,7 @@ pub(super) fn calls(markers: &CallMarkers<'_>, tools: &[&Tool], count: Count<'_>
             Tag::new(
                 format!("{}\n{{\"name\": {name}, \"arguments\": ", markers.call_open),
                 Grammar::JsonSchema {
-                    schema: tool.function.parameters.clone(),
+                    schema: tool.function.parameters_schema().clone(),
                     style: None,
                     excludes: Vec::new(),
                     whitespace: Whitespace::Free,
@@ -62,7 +62,7 @@ pub(super) fn named_calls(
             Tag::new(
                 format!("{marker}{{\"name\":{quoted},\"args\":"),
                 Grammar::JsonSchema {
-                    schema: tool.function.parameters.clone(),
+                    schema: tool.function.parameters_schema().clone(),
                     style: None,
                     excludes: Vec::new(),
                     whitespace: Whitespace::Free,
@@ -104,7 +104,7 @@ pub(super) fn named_arguments_calls(
 ) -> Option<Grammar> {
     let marker = syntax.marker;
     let arguments = |tool: &Tool| Grammar::JsonSchema {
-        schema: tool.function.parameters.clone(),
+        schema: tool.function.parameters_schema().clone(),
         style: None,
         excludes: Vec::new(),
         whitespace: Whitespace::Free,
@@ -165,7 +165,7 @@ fn list_open(tools: &[&Tool], count: Count<'_>) -> Vec<Grammar> {
                 Grammar::Sequence(vec![
                     Grammar::ConstString(format!("{{\"name\": {name}, \"arguments\": ")),
                     Grammar::JsonSchema {
-                        schema: tool.function.parameters.clone(),
+                        schema: tool.function.parameters_schema().clone(),
                         style: None,
                         excludes: Vec::new(),
                         whitespace: Whitespace::Free,

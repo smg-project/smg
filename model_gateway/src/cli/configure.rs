@@ -258,10 +258,10 @@ impl CliArgs {
             format!("Mesh_{random_string}")
         };
 
-        let peer = self
+        let init_peers = self
             .integrations
             .mesh_peer_urls
-            .first()
+            .iter()
             .map(|url| {
                 url.parse::<std::net::SocketAddr>()
                     .map_err(|e| ConfigError::InvalidValue {
@@ -270,7 +270,7 @@ impl CliArgs {
                         reason: format!("invalid socket address: {e}"),
                     })
             })
-            .transpose()?;
+            .collect::<ConfigResult<Vec<_>>>()?;
 
         // Port 0 parses fine as a socket address, but it is meaningless as an
         // advertised one: peers gossip this port and cannot dial an ephemeral
@@ -319,7 +319,7 @@ impl CliArgs {
             self_name,
             bind_addr,
             advertise_addr,
-            init_peer: peer,
+            init_peers,
             mtls_config: self.mesh_mtls_config()?,
         }))
     }

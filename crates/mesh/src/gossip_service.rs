@@ -49,18 +49,18 @@ use super::{
     crdt_kv::CrdtWatermark,
     dialer::Dialer,
     metrics::{peer_connection_opened, record_ack, record_nack, record_peer_reconnect},
-    partition::PartitionDetector,
     service::{
         gossip::{
             self,
             gossip_server::{Gossip, GossipServer},
-            GossipMessage, NodeState, NodeStatus, NodeUpdate, PingReq, StreamMessage,
+            GossipMessage, NodeState, NodeStatus, NodeUpdate, Ping, PingReq, StreamMessage,
         },
         ClusterState,
     },
     transport::{
         limits::MAX_MESSAGE_SIZE,
         peer_stream::{handle_frame, next_frame, send_round, Frame, RoundOutcome, SenderState},
+        sync_stream::build_heartbeat,
     },
 };
 
@@ -110,7 +110,6 @@ pub struct GossipService {
     listen_addr: SocketAddr,
     advertise_addr: SocketAddr,
     self_name: String,
-    partition_detector: Option<Arc<PartitionDetector>>,
     /// The node's dials: the relayed probes go through it, and the listener's
     /// TLS configuration comes from the identity it holds.
     dialer: Arc<Dialer>,
@@ -126,6 +125,13 @@ pub struct GossipService {
     mesh_kv: Option<Arc<crate::kv::MeshKV>>,
 }
 
+/// The HTTP/2 flow-control credit one stream on an accepted connection may
+/// hold (the server default).
+const STREAM_WINDOW_BYTES: u32 = 1 << 20;
+/// The credit of the whole accepted connection: the sync stream from a peer
+/// and that peer's probes share it, so it is four streams' worth, not one.
+const CONNECTION_WINDOW_BYTES: u32 = 4 << 20;
+
 impl GossipService {
     pub fn new(
         state: ClusterState,
@@ -138,7 +144,6 @@ impl GossipService {
             listen_addr,
             advertise_addr,
             self_name: self_name.to_string(),
-            partition_detector: None,
             dialer: Dialer::new(None),
             current_stream_batch: None,
             mesh_kv: None,
@@ -167,11 +172,6 @@ impl GossipService {
         self
     }
 
-    pub fn with_partition_detector(mut self, partition_detector: Arc<PartitionDetector>) -> Self {
-        self.partition_detector = Some(partition_detector);
-        self
-    }
-
     /// The node's dialer, shared with the gossip controller and the handler:
     /// with the node's TLS identity, the listener serves TLS.
     pub(crate) fn with_dialer(mut self, dialer: Arc<Dialer>) -> Self {
@@ -184,7 +184,17 @@ impl GossipService {
     /// manager reads, so material that exists but cannot be used fails here,
     /// not where the server is polled.
     async fn server_builder(&self) -> Result<Server> {
-        let mut server = Server::builder();
+        // The sync stream a peer dials runs on the channel its probes use,
+        // so the two share this connection's flow-control window. The
+        // server default gives the connection no more credit than one
+        // stream may take (1 MiB each), and a stream whose reader is busy
+        // with a large batch or a full reply queue would hold the whole
+        // window while the peer's probe waits for credit, until its deadline
+        // marked this node Suspected. The connection gets four times what a
+        // stream may take, so the probes keep their headroom.
+        let mut server = Server::builder()
+            .initial_stream_window_size(STREAM_WINDOW_BYTES)
+            .initial_connection_window_size(CONNECTION_WINDOW_BYTES);
         if let Some(mtls_manager) = self.dialer.mtls_manager() {
             let tls = mtls_manager
                 .server_tls_config()
@@ -303,9 +313,9 @@ impl Gossip for GossipService {
         let message = request.into_inner();
         match message.payload {
             Some(gossip::gossip_message::Payload::Ping(ping)) => {
-                log::info!("Received {:?}", ping);
+                log::trace!("Received {:?}", ping);
                 if let Some(stat_sync) = ping.state_sync {
-                    log::info!("Merging state from Ping: {} nodes", stat_sync.nodes.len());
+                    log::debug!("Merging state from Ping: {} nodes", stat_sync.nodes.len());
                     self.merge_state(stat_sync.nodes);
                 }
                 // Return current status of self node (could be Alive or Leaving)
@@ -323,8 +333,12 @@ impl Gossip for GossipService {
                 }))
             }
             Some(gossip::gossip_message::Payload::PingReq(PingReq { node: Some(node) })) => {
-                log::info!("PingReq to node {} addr:{}", node.name, node.address);
-                let res = self.dialer.ping(&node, None).await?;
+                log::debug!("PingReq to node {} addr:{}", node.name, node.address);
+                // The probe sent on the asker's behalf carries no table: the
+                // asker's is not this node's to send, and the target's own
+                // answer is what the asker is waiting for.
+                let probe = gossip::gossip_message::Payload::Ping(Ping { state_sync: None });
+                let res = self.dialer.ping(&node, Some(probe)).await?;
                 Ok(Response::new(res))
             }
             _ => Err(Status::invalid_argument("Invalid message payload")),
@@ -455,13 +469,23 @@ impl Gossip for GossipService {
                 )
                 .await;
                 match frame {
+                    // The dialer names itself with a heartbeat; answering it
+                    // is the acceptor's part, once per heartbeat received.
+                    Frame::Heartbeat => {
+                        if tx
+                            .send(Ok(build_heartbeat(sequence, &self_name)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     Frame::Continue | Frame::Ack { success: None, .. } => {}
                     Frame::Ack {
                         success: Some(success),
                         ..
                     } => record_ack(&peer_id, success),
                     Frame::Nack { .. } => record_nack(&peer_id),
-                    Frame::Closed => break,
                 }
             }
 
@@ -717,12 +741,11 @@ mod tests {
         assert_eq!(node.version, 5);
     }
 
-    /// A mesh node on an ephemeral loopback port, joining `init_peer` when
-    /// given.
-    async fn node(name: &str, init_peer: Option<SocketAddr>) -> (SocketAddr, MeshServerHandler) {
+    /// A mesh node on an ephemeral loopback port, joining `init_peers`.
+    async fn node(name: &str, init_peers: Vec<SocketAddr>) -> (SocketAddr, MeshServerHandler) {
         let (listener, addr) = bind_node().await;
         let (server, handler) =
-            MeshServerBuilder::new(name.to_string(), addr, addr, init_peer).build();
+            MeshServerBuilder::new(name.to_string(), addr, addr, init_peers).build();
         #[expect(
             clippy::disallowed_methods,
             reason = "test node runs in the background for the duration of the assertion"
@@ -742,8 +765,8 @@ mod tests {
     #[test]
     fn the_peer_gauge_carries_the_dialers_name_and_no_empty_label() {
         let rendered = metrics_of(|metrics| async move {
-            let (addr_a, handler_a) = node("A", None).await;
-            let (_addr_b, handler_b) = node("B", Some(addr_a)).await;
+            let (addr_a, handler_a) = node("A", Vec::new()).await;
+            let (_addr_b, handler_b) = node("B", vec![addr_a]).await;
             wait_for(
                 || {
                     peer_gauge_lines(&metrics.render())
@@ -771,7 +794,7 @@ mod tests {
     #[test]
     fn a_stream_closed_before_naming_its_peer_leaves_no_series() {
         let rendered = metrics_of(|_| async move {
-            let (addr, handler) = node("A", None).await;
+            let (addr, handler) = node("A", Vec::new()).await;
             wait_for(
                 || std::net::TcpStream::connect(addr).is_ok(),
                 Duration::from_secs(5),
@@ -810,7 +833,7 @@ mod tests {
     #[test]
     fn a_named_stream_that_closed_reads_zero_under_its_name() {
         let rendered = metrics_of(|_| async move {
-            let (addr, handler) = node("A", None).await;
+            let (addr, handler) = node("A", Vec::new()).await;
             wait_for(
                 || std::net::TcpStream::connect(addr).is_ok(),
                 Duration::from_secs(5),
@@ -866,7 +889,7 @@ mod tests {
     fn overlapping_streams_of_one_dialer_add_up() {
         let (_, (while_both_open, after_first_closed)) =
             metrics_and_result_of(|metrics| async move {
-                let (addr, handler) = node("A", None).await;
+                let (addr, handler) = node("A", Vec::new()).await;
                 wait_for(
                     || std::net::TcpStream::connect(addr).is_ok(),
                     Duration::from_secs(5),

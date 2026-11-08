@@ -58,7 +58,8 @@ the rest; the driver finds the bed script under `--repo` (the current directory 
 Every cell drives one path: 64 distinct deterministic prompts of 64 words (a shared head
 from a pool of 16, a unique tail), the client's seed per path, and ONE scripted answer for
 every request of the cell, handed to the mock engines before the cell starts (the worker's
-admin queue) and served by the wire with no engine time: the numbers are the gateway's.
+admin queue) and served by the wire with no engine time, except the pause between frames the
+spaced paths ask of the engine: the numbers are the gateway's.
 
 | path | request | answer | rate |
 |---|---|---|---|
@@ -68,14 +69,33 @@ admin queue) and served by the wire with no engine time: the numbers are the gat
 | `json` | chat with `response_format: json_schema` | a JSON object | 500/s |
 | `messages` | `POST /v1/messages`, `max_tokens` 8 | 8 tokens | 500/s |
 
-Three streamed shapes are opt-in (name them in `PERF_PATHS`; their rates keep the frames
-per second near the `stream` path's):
+Nine streamed shapes are opt-in (name them in `PERF_PATHS`; their rates keep the frames
+per second near the `stream` path's, except where said):
 
 | path | request | answer | rate |
 |---|---|---|---|
 | `messages_stream` | `POST /v1/messages`, `stream: true`, `max_tokens` 300 | 300 tokens, one per event, `length` | 100/s |
 | `generate_stream` | `POST /generate`, `stream: true`, `max_new_tokens` 300 | 300 tokens, one per frame, the whole text so far in every frame, `length` | 100/s |
+| `completion_stream` | `POST /v1/completions`, `stream: true`, `max_tokens` 300 | 300 tokens, one `text` delta per frame, `length` | 100/s |
 | `generate_stream_long` | the same, `max_new_tokens` 2000 | 2,000 tokens, one per frame | 16/s |
+| `generate_stream_spaced` | the same, `max_new_tokens` 300, the engine pausing 20 ms between frames | 300 tokens, one per frame 20 ms apart, the whole text so far in every frame | 100/s |
+| `stream_spaced` | the `stream` request, the engine pausing 20 ms between frames | 128 tokens, one per frame 20 ms apart | 250/s |
+| `completion_stream_spaced` | the `completion_stream` request, the engine pausing 20 ms between frames | 300 tokens, one `text` delta per frame 20 ms apart | 100/s |
+| `messages_stream_spaced` | the `messages_stream` request, the engine pausing 20 ms between frames | 300 tokens, one per event 20 ms apart | 100/s |
+| `stream_logprobs` | the `stream` request with `logprobs: true, top_logprobs: 5` | 128 tokens, one per frame, the sampled logprob and 5 candidates each, `length` | 100/s |
+
+The spaced paths read the stream loops as a decoding engine drives them, one frame at a time
+(about 600 streams open at once at their rates), where the burst paths hand a whole answer over
+at once. Their pause is engine time by design: a 300-frame answer takes about six seconds, so
+they serve the cost cells (`cpu`, `alloc`, `mem`), and `live` on one of them needs
+`--slo-e2e-p99-ms` above about 6,000 to hold a step.
+
+The logprobs path's rate is the gateway's load, not a frame-rate match: a logprobs answer costs
+the gateway about 3.5 times the instructions and 13 times the allocation calls of the plain
+128-token stream, so at 100/s the cell runs about 1.4 times the `stream` cell's gateway
+instructions per second and about five times its allocation calls, where the `stream` rate would
+run 3.5 and 13 times them; the cell is read against its own base spreads, not balanced with
+`stream`.
 
 The long path's cells are long at the Makefile's default `PERF_REQUESTS` (10,000 requests at
 16/s is 625 s per cell, twice that at `--rate-scale 0.5`): pass a smaller count when naming it,

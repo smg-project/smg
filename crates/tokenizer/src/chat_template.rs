@@ -7,7 +7,10 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     fs, io, iter,
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock, PoisonError,
+    },
 };
 
 use anyhow::{anyhow, Result};
@@ -16,7 +19,6 @@ use chrono::{
     DateTime, FixedOffset, Local, TimeZone,
 };
 use minijinja::{
-    context,
     machinery::{
         ast::{BinOpKind, Call, CallArg, Expr, ForLoop, IfCond, Macro, Set, Stmt, UnaryOpKind},
         parse, WhitespaceConfig,
@@ -2412,9 +2414,10 @@ fn render_continuing_final_message(
     env: &Environment<'_>,
     messages: &[JsonValue],
     params: ChatTemplateParams,
+    output_len: &RenderedLength,
 ) -> Result<(String, bool)> {
     continue_final_message(messages, params, |messages, params| {
-        render_messages(env, messages.iter(), params).map(|(text, _)| text)
+        render_messages(env, messages.iter(), params, output_len).map(|(text, _)| text)
     })
 }
 
@@ -2488,11 +2491,12 @@ fn render_chat_template(
     env: &Environment<'_>,
     messages: &[serde_json::Value],
     params: ChatTemplateParams,
+    output_len: &RenderedLength,
 ) -> Result<(String, bool)> {
     if params.continue_final_message {
-        return render_continuing_final_message(env, messages, params);
+        return render_continuing_final_message(env, messages, params, output_len);
     }
-    render_messages(env, messages.iter(), params)
+    render_messages(env, messages.iter(), params, output_len)
 }
 
 /// Render `messages` through the template with the generation prompt the
@@ -2501,6 +2505,7 @@ fn render_messages<'a>(
     env: &Environment<'_>,
     messages: impl Iterator<Item = &'a JsonValue>,
     params: ChatTemplateParams,
+    output_len: &RenderedLength,
 ) -> Result<(String, bool)> {
     let tmpl = env
         .get_template("chat")
@@ -2543,34 +2548,157 @@ fn render_messages<'a>(
     let pad_value =
         special_token_value(params.special_tokens.and_then(|st| st.pad_token.as_deref()));
 
-    let base_context = context! {
-        messages => &minijinja_messages,
-        add_generation_prompt => params.add_generation_prompt,
-        strftime_now => strftime_now,
-        tools => tools_value,
-        documents => documents_value,
-        bos_token => bos_value,
-        eos_token => eos_value,
-        unk_token => unk_value,
-        pad_token => pad_value,
-    };
+    // The render's names as one object (no map built per render): its own
+    // names are read first, a caller's kwargs for a name left undefined or
+    // not set, as the merge of two maps read them.
+    let ctx = Value::from_object(RenderContext {
+        messages: Value::from_object(minijinja_messages),
+        add_generation_prompt: Value::from(params.add_generation_prompt),
+        strftime_now,
+        tools: tools_value,
+        documents: documents_value,
+        bos_token: bos_value,
+        eos_token: eos_value,
+        unk_token: unk_value,
+        pad_token: pad_value,
+        kwargs: params.template_kwargs.map(Value::from_serialize),
+    });
 
-    // Merge with template_kwargs if provided (caller kwargs override special tokens)
-    let ctx = if let Some(kwargs) = params.template_kwargs {
-        context! {
-            ..base_context,
-            ..Value::from_serialize(kwargs)
-        }
-    } else {
-        base_context
-    };
-
-    // Render the template
-    let rendered = tmpl
-        .render(&ctx)
+    // Render into a buffer sized by the last render through this template:
+    // the text grows past no capacity on the way.
+    let mut rendered = Vec::with_capacity(output_len.hint());
+    tmpl.render_captured_to(&ctx, &mut rendered)
         .map_err(|e| anyhow!("Failed to render template: {e}"))?;
+    let mut rendered = String::from_utf8(rendered)
+        .map_err(|e| anyhow!("Failed to render template: the output is not UTF-8: {e}"))?;
+    output_len.record(rendered.len());
+    // The text travels with the request: a render much shorter than the hint
+    // gives the slack back, or a short prompt after a long one would carry the
+    // long one's buffer until its request drops.
+    if rendered.capacity() > 2 * rendered.len() + RENDERED_SLACK {
+        rendered.shrink_to_fit();
+    }
 
     Ok((rendered, false))
+}
+
+/// The names a template reads, as the render's root context: the nine the
+/// render sets, read first, then the caller's `template_kwargs` for a name
+/// the render leaves undefined (an unset special token) or does not set, as
+/// the merge of the two context maps read them (the render's map first, so a
+/// kwarg never replaces the request's own fields). One object per render
+/// instead of a map of pairs grown and hashed per render; a lookup is a match
+/// on the name.
+#[derive(Debug)]
+struct RenderContext {
+    messages: Value,
+    add_generation_prompt: Value,
+    strftime_now: Value,
+    tools: Value,
+    documents: Value,
+    bos_token: Value,
+    eos_token: Value,
+    unk_token: Value,
+    pad_token: Value,
+    /// The caller's `template_kwargs` as one map value, when it gave any.
+    kwargs: Option<Value>,
+}
+
+/// The names [`RenderContext`] sets, in the order a map built of them held.
+const RENDER_CONTEXT_NAMES: &[&str] = &[
+    "messages",
+    "add_generation_prompt",
+    "strftime_now",
+    "tools",
+    "documents",
+    "bos_token",
+    "eos_token",
+    "unk_token",
+    "pad_token",
+];
+
+impl RenderContext {
+    fn base(&self, name: &str) -> Option<&Value> {
+        Some(match name {
+            "messages" => &self.messages,
+            "add_generation_prompt" => &self.add_generation_prompt,
+            "strftime_now" => &self.strftime_now,
+            "tools" => &self.tools,
+            "documents" => &self.documents,
+            "bos_token" => &self.bos_token,
+            "eos_token" => &self.eos_token,
+            "unk_token" => &self.unk_token,
+            "pad_token" => &self.pad_token,
+            _ => return None,
+        })
+    }
+}
+
+impl Object for RenderContext {
+    fn get_value_by_str(self: &Arc<Self>, key: &str) -> Option<Value> {
+        let base = self.base(key);
+        let Some(kwargs) = &self.kwargs else {
+            return base.cloned();
+        };
+        if let Some(value) = base.filter(|value| !value.is_undefined()) {
+            return Some(value.clone());
+        }
+        kwargs
+            .get_attr(key)
+            .ok()
+            .filter(|value| !value.is_undefined())
+    }
+
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        self.get_value_by_str(key.as_str()?)
+    }
+
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        let Some(kwargs) = &self.kwargs else {
+            return Enumerator::Str(RENDER_CONTEXT_NAMES);
+        };
+        let mut names: Vec<Value> = RENDER_CONTEXT_NAMES
+            .iter()
+            .copied()
+            .map(Value::from)
+            .collect();
+        if let Ok(keys) = kwargs.try_iter() {
+            names.extend(keys.filter(|key| {
+                !key.as_str()
+                    .is_some_and(|name| RENDER_CONTEXT_NAMES.contains(&name))
+            }));
+        }
+        Enumerator::Values(names)
+    }
+}
+
+/// The length of the last text a template rendered, the capacity the next
+/// render starts from: a prompt is about as long as the previous one through
+/// the same template, so the output grows past no capacity on the way. Capped,
+/// so one very long prompt does not size every render after it; a render much
+/// shorter than the hint gives the slack back (`RENDERED_SLACK`), so the text
+/// that travels with a request is never much larger than itself.
+#[derive(Debug, Default)]
+pub(crate) struct RenderedLength(AtomicUsize);
+
+/// The most a render pre-allocates from the hint, whatever the last length.
+const RENDERED_LENGTH_CAP: usize = 64 * 1024;
+
+/// The capacity a rendered text keeps beyond twice its length; more than that
+/// is given back before the text leaves the render.
+const RENDERED_SLACK: usize = 4 * 1024;
+
+impl RenderedLength {
+    /// The capacity the next render starts from.
+    fn hint(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Records a render's length for the next one.
+    fn record(&self, len: usize) {
+        self.0
+            .store(len.min(RENDERED_LENGTH_CAP), Ordering::Relaxed);
+    }
 }
 
 /// The messages with every string `content` of a non-tool message replaced by
@@ -2605,6 +2733,8 @@ pub(crate) fn string_content_as_text_parts(
 /// Chat template processor using Jinja2 - simple wrapper like HuggingFace
 pub struct ChatTemplateProcessor {
     env: Environment<'static>,
+    /// The last rendered length, the next render's starting capacity.
+    output_len: RenderedLength,
 }
 
 impl ChatTemplateProcessor {
@@ -2615,7 +2745,10 @@ impl ChatTemplateProcessor {
     /// found" error on the first render.
     pub fn new(template: String) -> Result<Self> {
         let env = build_environment(template)?;
-        Ok(ChatTemplateProcessor { env })
+        Ok(ChatTemplateProcessor {
+            env,
+            output_len: RenderedLength::default(),
+        })
     }
 
     /// Apply the chat template to a list of messages
@@ -2628,7 +2761,8 @@ impl ChatTemplateProcessor {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
-        render_chat_template(&self.env, messages, params).map(|(prompt, _)| prompt)
+        render_chat_template(&self.env, messages, params, &self.output_len)
+            .map(|(prompt, _)| prompt)
     }
 }
 
@@ -2809,6 +2943,8 @@ pub struct ChatTemplateState {
     /// when the request declares tools, as the engine's chat utils render.
     /// The accessors answer for the default template.
     tool_use: Option<Box<ChatTemplateState>>,
+    /// The last rendered length, the next render's starting capacity.
+    output_len: RenderedLength,
     /// The processor's template of a checkpoint that ships one beside the
     /// tokenizer's and differs from it (see [`Self::from_checkpoint`]),
     /// rendered in place of the default one when the request declares no
@@ -2858,6 +2994,7 @@ impl ChatTemplateState {
             root_role_supported,
             raw_tool_call_arguments: false,
             tool_use: None,
+            output_len: RenderedLength::default(),
             processor: None,
         };
         state.raw_tool_call_arguments = state.writes_tool_call_arguments_as_text();
@@ -2992,6 +3129,7 @@ impl ChatTemplateState {
             root_role_supported: true,
             raw_tool_call_arguments: false,
             tool_use: None,
+            output_len: RenderedLength::default(),
             processor: None,
         }
     }
@@ -3144,11 +3282,11 @@ impl ChatTemplateState {
                     thinking: None,
                     ..params
                 };
-                return render_chat_template(env, messages, params);
+                return render_chat_template(env, messages, params, &self.output_len);
             }
         }
 
-        render_chat_template(env, messages, params)
+        render_chat_template(env, messages, params, &self.output_len)
     }
 
     pub fn set(&mut self, template: String) -> Result<()> {

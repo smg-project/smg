@@ -272,7 +272,7 @@ async fn a_local_stop_ends_the_completion_read_and_the_engine_request() {
         "max_tokens": 4096, "stop": "STOP"
     }))
     .unwrap();
-    let spec = CompletionResponseSpec::from(&request);
+    let spec = CompletionResponseSpec::new(&request, Vec::new());
     let (gate_tx, stream, server) = stream_past_a_local_stop().await;
     let (tx, rx) = sse_channel();
     let outcome = timeout(
@@ -286,6 +286,7 @@ async fn a_local_stop_ends_the_completion_read_and_the_engine_request() {
             "",
             0,
             &tx,
+            None,
         ),
     )
     .await
@@ -315,6 +316,10 @@ async fn a_local_stop_ends_the_completion_read_and_the_engine_request() {
 async fn a_local_stop_ends_the_messages_read_and_the_engine_request() {
     let (gate_tx, stream, server) = stream_past_a_local_stop().await;
     let (tx, rx) = sse_channel();
+    // The spec carries the rendered prompt's count, as request building
+    // sets it: the seven tokens the engine below counts.
+    let mut spec = messages_spec(false);
+    spec.prompt_tokens = 7;
     let result = timeout(
         Duration::from_secs(5),
         processor(false).process_messages_streaming_chunks(
@@ -322,7 +327,7 @@ async fn a_local_stop_ends_the_messages_read_and_the_engine_request() {
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
             stop_string("STOP"),
-            messages_spec(false),
+            spec,
             &tx,
             None,
         ),
@@ -339,6 +344,14 @@ async fn a_local_stop_ends_the_messages_read_and_the_engine_request() {
         .filter_map(|event| event["delta"]["text"].as_str())
         .collect();
     assert_eq!(text, "abc");
+    // The start reports the rendered prompt's count before the engine has
+    // said anything, and no output yet.
+    let start = events
+        .iter()
+        .find(|event| event["type"] == "message_start")
+        .expect("message_start");
+    assert_eq!(start["message"]["usage"]["input_tokens"], 7, "{start}");
+    assert_eq!(start["message"]["usage"]["output_tokens"], 0, "{start}");
     let final_delta = events
         .iter()
         .find(|event| event["type"] == "message_delta")
@@ -702,7 +715,7 @@ async fn a_stop_the_engine_ends_the_completion_choice_on_is_read_to_the_engines_
         "model": "eof-test", "prompt": "test", "stream": true, "max_tokens": 4096
     }))
     .unwrap();
-    let spec = CompletionResponseSpec::from(&request);
+    let spec = CompletionResponseSpec::new(&request, Vec::new());
     let (stream, server) = scripted_stream(ended_on_the_stop(9), "0").await;
     let (tx, rx) = sse_channel();
     let outcome = timeout(
@@ -716,6 +729,7 @@ async fn a_stop_the_engine_ends_the_completion_choice_on_is_read_to_the_engines_
             "",
             0,
             &tx,
+            None,
         ),
     )
     .await

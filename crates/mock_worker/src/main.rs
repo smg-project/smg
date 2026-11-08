@@ -2,11 +2,12 @@
 //! process to scale-test the SMG gateway's routing and runtime behavior.
 //!
 //! Workers are protocol-accurate stand-ins for vLLM/SGLang engines: HTTP
-//! workers answer the probe + chat/generate surface; gRPC workers implement the
-//! TokenSpeed scheduler service (the gateway tokenizes and speaks token ids).
+//! workers answer the probe + chat/generate surface; gRPC workers serve one
+//! engine's scheduler service (`--grpc-wire`; the gateway tokenizes and speaks
+//! token ids).
 //! All responses are canned — there is no real model.
 
-use std::{pin::pin, process::ExitCode, sync::Arc};
+use std::{io::IsTerminal, pin::pin, process::ExitCode, sync::Arc};
 
 use mock_worker::{admin, config::Config, drain, grpc, http, replay::Capture, zmq};
 use tokio::sync::watch;
@@ -16,8 +17,11 @@ async fn main() -> ExitCode {
     // The process-level TLS crypto provider, before anything builds a TLS
     // configuration or an HTTP client.
     mock_worker::tls::install_crypto_provider();
+    // Coloured on a terminal only: a log file or a pipe holds plain lines, so
+    // a launcher that reads the level words of the last lines finds them.
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
 
     // Help goes to stdout and succeeds, so `mock-worker --help` also shows
@@ -85,8 +89,11 @@ async fn main() -> ExitCode {
 
     // Spawn each worker as its own task so they run across the whole runtime
     // (join_all would poll them all on a single task) and an unexpected exit is
-    // surfaced instead of silently masked.
+    // surfaced instead of silently masked. The admin API is a set of its own:
+    // it serves the workers' operators, not the gateway, so it is not counted
+    // as a worker and does not keep the process up once none is left.
     let mut workers = tokio::task::JoinSet::new();
+    let mut admin = tokio::task::JoinSet::new();
     for i in 0..cfg.http_count {
         let Some(port) = cfg.http_base_port.checked_add(i) else {
             tracing::warn!("http port range overflowed u16 at offset {i}; stopping early");
@@ -112,7 +119,7 @@ async fn main() -> ExitCode {
         ));
     }
     if let Some(port) = cfg.admin_port {
-        workers.spawn(admin::serve_until(
+        admin.spawn(admin::serve_until(
             cfg.clone(),
             cfg.host.clone(),
             port,
@@ -136,21 +143,41 @@ async fn main() -> ExitCode {
         workers.len()
     );
 
-    // A single worker exiting (e.g. a port already in use) is logged but must
-    // not tear down the whole fleet — the remaining workers keep serving. Only
-    // a termination signal stops the process. When the set is empty
-    // `join_next` yields None, so that select arm is disabled and we wait on
-    // the signal.
+    // A worker exiting on its own (a port already in use, a ZMQ rank whose
+    // frontend never answered) is logged and must not tear down the fleet:
+    // the remaining workers keep serving. The last worker's exit ends the
+    // process with a failure status: a fleet that serves nothing is a failed
+    // start, and a launcher that waits for it to answer would otherwise wait
+    // until its own bound. That line is a warning: the worker's own last
+    // line said why it stopped, and a launcher that quotes a log's last
+    // error line should quote that one. Otherwise only a termination signal
+    // stops the process. When a set is empty `join_next` yields None, so that
+    // select arm is disabled and we wait on the signal.
     let signal = {
         let mut next = pin!(signals.next());
         loop {
             tokio::select! {
                 Some(joined) = workers.join_next() => {
+                    if let Err(e) = joined {
+                        tracing::error!("mock worker task panicked: {e}");
+                    }
+                    if workers.is_empty() {
+                        tracing::warn!(
+                            "the last mock worker stopped; nothing left to serve, exiting with a failure status"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    tracing::warn!(
+                        "a mock worker stopped (likely a port bind failure); {} still serving",
+                        workers.len()
+                    );
+                }
+                Some(joined) = admin.join_next() => {
                     match joined {
                         Ok(()) => tracing::warn!(
-                            "a mock worker stopped (likely a port bind failure); others keep serving"
+                            "the admin API stopped (likely a port bind failure); the workers keep serving"
                         ),
-                        Err(e) => tracing::error!("mock worker task panicked: {e}"),
+                        Err(e) => tracing::error!("admin API task panicked: {e}"),
                     }
                 }
                 signal = &mut next => break signal,
@@ -174,6 +201,11 @@ async fn main() -> ExitCode {
         while let Some(joined) = workers.join_next().await {
             if let Err(e) = joined {
                 tracing::error!("mock worker task panicked: {e}");
+            }
+        }
+        while let Some(joined) = admin.join_next().await {
+            if let Err(e) = joined {
+                tracing::error!("admin API task panicked: {e}");
             }
         }
     };

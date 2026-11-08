@@ -75,11 +75,11 @@ fn qwen3_tagged() -> Box<dyn Parser> {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "city": {"type": "string"},
                     "days": {"type": "integer"},
                     "note": {"type": ["string", "null"]},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -99,11 +99,11 @@ fn seed_oss() -> Box<dyn Parser> {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "city": {"type": "string"},
                     "days": {"type": "integer"},
                     "note": {"type": ["string", "null"]},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -124,11 +124,11 @@ fn keyed_tools() -> Declared {
         function: Function {
             name: "get_weather".to_string(),
             description: None,
-            parameters: value!({"type": "object", "properties": {
+            parameters: Some(value!({"type": "object", "properties": {
                 "city": {"type": "string"},
                 "days": {"type": "integer"},
                 "note": {"type": ["string", "null"]},
-            }}),
+            }})),
             strict: None,
             extra: Default::default(),
         },
@@ -300,12 +300,12 @@ fn minimax_m3() -> Box<dyn Parser> {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "city": {"type": "string"},
                     "days": {"type": "integer"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "opts": {"type": "object", "properties": {"unit": {"type": "string"}}},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -365,7 +365,7 @@ fn tool(name: &str, parameters: serde_json::Value) -> Tool {
         function: Function {
             name: name.to_string(),
             description: None,
-            parameters,
+            parameters: Some(parameters),
             strict: None,
             extra: Default::default(),
         },
@@ -1324,6 +1324,8 @@ const KIMI_K3_OUTPUTS: &[&str] = &[
      <|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>",
     "<|open|>think<|sep|>Janet sells 9 eggs.\nShe makes $18.<|close|>think<|sep|>\
      <|open|>response<|sep|>18<|close|>response<|sep|><|close|>message<|sep|>",
+    // The reply written straight into the prefilled thought and closed by the answer's closer.
+    "<|open|>think<|sep|>The answer is 42.<|close|>response<|sep|><|close|>message<|sep|>",
     "<|open|>think<|sep|><|close|>think<|sep|>\
      <|open|>response<|sep|><|close|>response<|sep|>\
      <|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>\
@@ -1803,6 +1805,8 @@ const IQUEST_OUTPUTS: &[&str] = &[
 /// Outputs in DeepSeek's DSML: the recorded shapes, and the cuts and faults the assembler and the
 /// table name.
 const DSML_OUTPUTS: &[&str] = &[
+    // An invoke written outside a block: a call.
+    "<｜DSML｜ invoke name=\"add_integers\">\n<｜DSML｜ parameter name=\"a\" string=\"false\">6</｜DSML｜ parameter>\n</｜DSML｜ invoke>",
     "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter \
      name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" \
      string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke \
@@ -1970,6 +1974,10 @@ const QWEN3_TAGGED_DIRECT_OUTPUTS: &[&str] = &[
 /// blank line before the block, a third newline and a space before it, a thought cut short,
 /// content alone, and two cut short.
 const DEEPSEEK_V4_OUTPUTS: &[&str] = &[
+    // An invoke written outside a block, alone and then written again inside a block (a
+    // recorded draw): a call, and the model's text and two calls.
+    "<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">6</｜DSML｜parameter>\n</｜DSML｜invoke>",
+    "\n\n:tool\n<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">6</｜DSML｜parameter>\n</｜DSML｜invoke>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">6</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
     "<think>The user asks.</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Beijing</｜DSML｜parameter>\n<｜DSML｜parameter name=\"unit\" string=\"true\">celsius</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">17</｜DSML｜parameter>\n<｜DSML｜parameter name=\"b\" string=\"false\">25</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
     "Sure.\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Rome</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
@@ -1992,6 +2000,8 @@ const DEEPSEEK_V4_OUTPUTS: &[&str] = &[
 /// content in thinking and in chat mode with the blank line before the block, a third newline and
 /// a space before it, a thought cut short, content alone, and one cut short.
 const DEEPSEEK_V3_2_OUTPUTS: &[&str] = &[
+    // An invoke written outside a block: a call.
+    "<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">6</｜DSML｜parameter>\n</｜DSML｜invoke>",
     "<think>The user asks.</think>\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Beijing</｜DSML｜parameter>\n<｜DSML｜parameter name=\"unit\" string=\"true\">celsius</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
     "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">17</｜DSML｜parameter>\n<｜DSML｜parameter name=\"b\" string=\"false\">true</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
     "Sure.\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Rome</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",

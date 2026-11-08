@@ -1349,7 +1349,7 @@ pub enum PolicyConfig {
         #[serde(default = "default_block_size")]
         block_size: usize,
         /// KV-usage spread (hottest minus coldest backend, 0.0–1.0) above which
-        /// cache affinity is abandoned for shortest-queue. `>= 1.0` disables.
+        /// cache affinity is abandoned for expected-wait routing. `>= 1.0` disables.
         #[serde(default = "default_balance_token_usage_threshold")]
         balance_token_usage_threshold: f32,
         /// Backend KV-utilization ceiling (0.0–1.0): a single engine above it

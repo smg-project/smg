@@ -88,7 +88,7 @@ use crate::block::{
 mod arena;
 mod slab;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod walk;
 
 use arena::*;

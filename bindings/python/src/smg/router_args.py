@@ -1098,10 +1098,10 @@ class RouterArgs:
             help=(
                 "Cache-aware KV-usage SPREAD threshold (0.0-1.0): the hottest minus"
                 " coldest backend KV utilization above which cache affinity is"
-                " abandoned for shortest-queue. Catches long-context KV imbalance that"
-                " in-flight request counts miss, and is invariant to gateway replica"
-                " count. Backend must report token_usage. Finite and > 0.0; >= 1.0"
-                " disables it. Defaults to 1.0 (disabled)."
+                " abandoned for expected-wait routing. Catches long-context KV"
+                " imbalance that in-flight request counts miss, and is invariant to"
+                " gateway replica count. Backend must report token_usage. Finite and"
+                " > 0.0; >= 1.0 disables it. Defaults to 1.0 (disabled)."
             ),
         )
         routing_group.add_argument(
@@ -1342,7 +1342,9 @@ class RouterArgs:
             help="Maximum total size of each model's approximation tree for "
             "cache-aware routing (chars for HTTP, tokens for gRPC), shared "
             "across all workers; eviction keeps every tree at or under this "
-            "bound",
+            "bound. With mesh enabled, eviction also keeps a model's string and "
+            "token prefix hash indexes each within this bound, in entries and in "
+            "stored bytes or tokens, dropping older entries first",
         )
         routing_group.add_argument(
             f"--{prefix}block-size",
@@ -2326,7 +2328,11 @@ class RouterArgs:
             f"--{prefix}retry-max-retries",
             type=int,
             default=RouterArgs.retry_max_retries,
-            help="Maximum number of retry attempts for failed requests",
+            help=(
+                "Default attempts per request in all, the first one "
+                "included (1 disables retries). A worker's per-model "
+                "retry override takes precedence."
+            ),
         )
         retry_group.add_argument(
             f"--{prefix}retry-initial-backoff-ms",
@@ -3068,7 +3074,10 @@ class RouterArgs:
             nargs="*",
             action="extend",
             default=[],
-            help="Peer mesh server addresses to join (format: host:port)",
+            help=(
+                "Mesh listeners of other members to join, as ip:port (a hostname is"
+                " refused), separate values or one comma-separated list"
+            ),
         )
         mesh_group.add_argument(
             f"--{prefix}mesh-tls-ca-cert",

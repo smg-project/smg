@@ -1,6 +1,7 @@
 //! What the crate's capture tests drive a request through: a worker at an
 //! address of the test's choosing, a worker source over such workers, the
-//! HTTP client they share, and an address nothing answers at.
+//! HTTP client they share, an address nothing answers at, and how a test
+//! reads an answer's body back as text.
 
 use std::{
     fmt,
@@ -10,7 +11,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use axum::{http::HeaderMap, response::Response};
+use axum::{body::to_bytes, http::HeaderMap, response::Response};
 use openai_protocol::worker::ProviderType;
 use rustls::crypto::ring::default_provider;
 use tokio::net::TcpSocket;
@@ -40,6 +41,14 @@ pub(crate) fn http_client() -> reqwest::Client {
         .timeout(Duration::from_secs(5))
         .build()
         .expect("a client")
+}
+
+/// The whole body of `response`, as text.
+pub(crate) async fn text_of(response: Response) -> String {
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("a body");
+    String::from_utf8(bytes.to_vec()).expect("utf-8")
 }
 
 /// A worker at one address, serving model `m`, with no API key of its own.

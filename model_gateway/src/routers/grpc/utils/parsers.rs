@@ -906,20 +906,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        routers::grpc::utils::{chat_utils, message_utils},
+        routers::grpc::{
+            testing::worker,
+            utils::{chat_utils, message_utils},
+        },
         worker::{BasicWorkerBuilder, WorkerType},
     };
-
-    fn worker(labels: &[(&str, &str)]) -> WorkerSelection {
-        let mut builder =
-            BasicWorkerBuilder::new("grpc://engine:50051").worker_type(WorkerType::Regular);
-        for (key, value) in labels {
-            builder = builder.label(*key, *value);
-        }
-        WorkerSelection::Single {
-            worker: Arc::new(builder.build()),
-        }
-    }
 
     fn forced_call_on_a_thinking_prompt(factory: &ToolParserFactory) -> (String, String) {
         let tools: Vec<Tool> = serde_json::from_value(serde_json::json!([{

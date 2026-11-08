@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::engine::{Calibration, EngineParams, LoadsLike, OutputSeed, TimingModel};
+use crate::engine::{Calibration, EngineParams, KvCacheGroup, LoadsLike, OutputSeed, TimingModel};
 
 /// Configuration shared by every mocked HTTP and gRPC worker in the process.
 #[derive(Debug, Clone)]
@@ -27,6 +27,10 @@ pub struct Config {
     /// requests of its own otherwise, and reports one `GetLoads` entry and one
     /// KV-event stream per rank. 1 (the default) is a single-rank engine.
     pub grpc_dp_size: u16,
+    /// The scheduler proto the gRPC workers serve (`--grpc-wire`). The
+    /// gateway tells a worker's runtime by the proto whose health check it
+    /// answers, so a worker serves exactly one.
+    pub grpc_wire: SchedulerWire,
     /// Frontend handshake `ipc://` address ZMQ mock engines connect to (they
     /// dial the SMG/test frontend, which binds the sockets).
     pub zmq_handshake: Option<String>,
@@ -34,6 +38,13 @@ pub struct Config {
     pub zmq_count: u16,
     /// Engine index of the first ZMQ rank; ranks use `[start, start+count)`.
     pub zmq_start_index: u32,
+    /// A ZMQ rank's step period in milliseconds. When set, the rank sends an
+    /// engine's steps: one message per period carrying the next output of
+    /// every request that has one; a request that produced faster than the
+    /// period waits its turn, one output per step. Zero, the default, sends
+    /// one message per token as it comes, the shape the tests have read so
+    /// far.
+    pub zmq_step_ms: u64,
     /// Model id advertised by every worker (one model, many replicas).
     pub model_id: String,
     /// Tokenizer path advertised by gRPC workers (for gateway autoload).
@@ -164,6 +175,44 @@ impl std::str::FromStr for Role {
     }
 }
 
+/// The scheduler proto a gRPC worker serves (`--grpc-wire`): one of the
+/// three engine wires the gateway's gRPC client speaks. The canned and
+/// scripted answers, the realistic engine, the rank placement and the roles
+/// are the same behind each; the wire module shapes the messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SchedulerWire {
+    #[default]
+    TokenSpeed,
+    Vllm,
+    Sglang,
+}
+
+impl SchedulerWire {
+    /// The wire as the flag spells it, and as the gateway names the runtime.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TokenSpeed => "tokenspeed",
+            Self::Vllm => "vllm",
+            Self::Sglang => "sglang",
+        }
+    }
+}
+
+impl std::str::FromStr for SchedulerWire {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "tokenspeed" => Ok(Self::TokenSpeed),
+            "vllm" => Ok(Self::Vllm),
+            "sglang" => Ok(Self::Sglang),
+            other => Err(format!(
+                "--grpc-wire must be tokenspeed|vllm|sglang, got {other}"
+            )),
+        }
+    }
+}
+
 /// Timing flags collected while parsing; resolved into one [`TimingModel`]
 /// at the end so flag order does not matter.
 #[derive(Default)]
@@ -235,9 +284,11 @@ impl Default for Config {
             grpc_base_port: 0,
             grpc_count: 0,
             grpc_dp_size: 1,
+            grpc_wire: SchedulerWire::TokenSpeed,
             zmq_handshake: None,
             zmq_count: 0,
             zmq_start_index: 0,
+            zmq_step_ms: 0,
             model_id: "mock-model".to_string(),
             tokenizer_path: String::new(),
             default_sampling_params_json: String::new(),
@@ -295,8 +346,10 @@ impl Config {
                 "--grpc-base-port" => cfg.grpc_base_port = parse(value(&mut args, &flag)?, &flag)?,
                 "--grpc-count" => cfg.grpc_count = parse(value(&mut args, &flag)?, &flag)?,
                 "--grpc-dp-size" => cfg.grpc_dp_size = parse(value(&mut args, &flag)?, &flag)?,
+                "--grpc-wire" => cfg.grpc_wire = value(&mut args, &flag)?.parse()?,
                 "--zmq-handshake" => cfg.zmq_handshake = Some(value(&mut args, &flag)?),
                 "--zmq-count" => cfg.zmq_count = parse(value(&mut args, &flag)?, &flag)?,
+                "--zmq-step-ms" => cfg.zmq_step_ms = parse(value(&mut args, &flag)?, &flag)?,
                 "--zmq-start-index" => {
                     cfg.zmq_start_index = parse(value(&mut args, &flag)?, &flag)?
                 }
@@ -383,6 +436,10 @@ impl Config {
                     cfg.kv_events_buffer_steps = parse(value(&mut args, &flag)?, &flag)?;
                 }
                 "--kv-events-wire" => cfg.kv_events_wire = value(&mut args, &flag)?.parse()?,
+                "--kv-cache-groups" => {
+                    cfg.engine.kv_cache_groups =
+                        parse_kv_cache_groups(value(&mut args, &flag)?, &flag)?;
+                }
                 "--loads-like" => cfg.loads_like = value(&mut args, &flag)?.parse()?,
                 "--step-reports" => cfg.step_reports = parse(value(&mut args, &flag)?, &flag)?,
                 "--block-size" => {
@@ -453,6 +510,14 @@ impl Config {
         if cfg.grpc_dp_size > 1 && !cfg.realistic {
             return Err("--grpc-dp-size above 1 needs --engine realistic".to_string());
         }
+        if cfg.kv_events_wire == crate::kv_zmq::Wire::Sglang && cfg.engine.kv_cache_groups.len() > 1
+        {
+            return Err(
+                "--kv-cache-groups names several groups, but the SGLang wire (--kv-events-wire \
+                 sglang) publishes one cache group"
+                    .to_string(),
+            );
+        }
         if cfg.grpc_dp_size > 1 && cfg.kv_events_zmq_base_port.is_some() {
             return Err(
                 "--grpc-dp-size above 1 does not publish over --kv-events-zmq-base-port \
@@ -462,6 +527,13 @@ impl Config {
         }
         if cfg.zmq_count > 0 && cfg.zmq_handshake.is_none() {
             return Err("--zmq-handshake <ipc://…> is required when --zmq-count > 0".to_string());
+        }
+        if cfg.replay.capture.is_some() && cfg.grpc_wire != SchedulerWire::TokenSpeed {
+            return Err(format!(
+                "--capture records the request's fields as the tokenspeed wire names them: it \
+                 needs --grpc-wire tokenspeed, not {}",
+                cfg.grpc_wire.as_str()
+            ));
         }
         if cfg.role.is_some() {
             if cfg.grpc_count == 0 {
@@ -546,6 +618,55 @@ fn parse_ids(raw: String, flag: &str) -> Result<Vec<u32>, String> {
         .collect()
 }
 
+/// `kind[:window],...`: the KV cache groups a realistic engine publishes,
+/// the first being its main-attention group (`full_attention` alone by
+/// default; a hybrid engine adds `sliding_window:<tokens>` or `mamba` groups).
+fn parse_kv_cache_groups(raw: String, flag: &str) -> Result<Vec<KvCacheGroup>, String> {
+    let invalid = || format!("invalid value for {flag}: {raw}");
+    let groups = raw
+        .split(',')
+        .map(|item| {
+            let item = item.trim();
+            let (kind, window) = item.split_once(':').unwrap_or((item, ""));
+            let windowed = KvCacheGroup::WINDOW_KINDS.contains(&kind);
+            if !windowed && !KvCacheGroup::UNWINDOWED_KINDS.contains(&kind) {
+                return Err(format!(
+                    "{flag}: unknown cache group kind {kind:?} (one of {})",
+                    KvCacheGroup::KINDS_HELP
+                ));
+            }
+            let sliding_window: u32 = if window.is_empty() {
+                0
+            } else {
+                window.parse().map_err(|_| invalid())?
+            };
+            if windowed && sliding_window == 0 {
+                return Err(format!(
+                    "{flag}: {kind} needs its window in tokens, as {kind}:<tokens>"
+                ));
+            }
+            if !windowed && !window.is_empty() {
+                return Err(format!("{flag}: {kind} has no window"));
+            }
+            Ok(KvCacheGroup {
+                kind: kind.to_string(),
+                sliding_window,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if groups.is_empty() || groups.len() > 8 {
+        return Err(format!("{flag} takes one to eight groups"));
+    }
+    if !KvCacheGroup::MAIN_KINDS.contains(&groups[0].kind.as_str()) {
+        return Err(format!(
+            "{flag}: the first group is the main-attention group (one of {}), not {}",
+            KvCacheGroup::MAIN_KINDS.join(", "),
+            groups[0].kind
+        ));
+    }
+    Ok(groups)
+}
+
 /// The flags, as `--help` prints them.
 pub fn usage() -> String {
     "mock-worker — multi-port mock HTTP/gRPC inference workers for SMG scale testing\n\n\
@@ -560,11 +681,17 @@ pub fn usage() -> String {
                                 rank, an unpinned one on the rank with the fewest of its own requests,\n\
                                 GetLoads and the KV-event stream report per rank; no\n\
                                 --kv-events-zmq-base-port publisher (it would carry rank 0 alone)\n\
+       --grpc-wire <tokenspeed|vllm|sglang>  the scheduler proto the gRPC workers serve (default\n\
+                                tokenspeed): the same answers, engine, ranks and roles behind each;\n\
+                                the gateway detects the runtime from it (--capture: tokenspeed only)\n\
        --grpc-max-message-bytes <n>  largest gRPC message a worker decodes or encodes, in bytes\n\
                                 (default none, as the engine servicers; tonic's own default is 4 MiB)\n\
        --zmq-handshake <addr>   frontend ipc:// handshake addr (required if --zmq-count > 0)\n\
        --zmq-count <n>          number of ZMQ mock EngineCore ranks (default 0)\n\
        --zmq-start-index <n>    engine index of the first ZMQ rank (default 0)\n\
+       --zmq-step-ms <ms>       the ranks' step period: one output message per period with the next\n\
+                                token of every running request (an engine's step; a faster request\n\
+                                waits its turn); 0 sends one message per token (default 0)\n\
        --model <id|dir>         advertised model id, or a model directory whose\n\
                                 generation_config.json gives the sampling defaults gRPC\n\
                                 workers report (default mock-model)\n\
@@ -609,6 +736,13 @@ pub fn usage() -> String {
        --kv-events-topic <s>    topic frame (default empty, as vLLM)\n\
        --kv-events-buffer-steps <n>  batches kept for replay (default 10000)\n\
        --kv-events-wire <vllm|sglang>  which engine's publisher to imitate (default vllm)\n\
+       --kv-cache-groups <kind[:window],...>  the KV cache groups a realistic engine publishes, the
+                                first one of the main-attention kinds (default full_attention), one
+                                to eight of full_attention, mla_attention, sink_full_attention,
+                                sliding_window:<tokens>, sliding_window_mla:<tokens> and mamba: a
+                                window group's stores name the window tail and a Mamba group's the
+                                state block at the prompt's replay boundary, as vLLM 0.31.0 retains
+                                them by default (one group on the SGLang wire)\n\
        --loads-like <mock|vllm>  load report: everything the simulator knows, or only what the\n\
                                 vLLM servicer reports (running, waiting, token_usage, maxima)\n\
        --step-reports <bool>    the load record says the wire reports every scheduler step (as\n\
@@ -705,6 +839,122 @@ mod tests {
 
     fn parse(flags: &[&str]) -> Result<Config, String> {
         Config::parse(flags.iter().map(|flag| (*flag).to_string()))
+    }
+
+    /// `--kv-cache-groups` names each group's kind and window in order; the
+    /// SGLang wire has no cache groups, so several are refused there.
+    #[test]
+    fn the_kv_cache_groups_flag_names_each_group_and_stays_single_on_the_sglang_wire() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        let with = |flags: &[&str]| parse(&[&grpc[..], flags].concat());
+        let cfg = with(&[
+            "--kv-cache-groups",
+            "full_attention,sliding_window:128,mamba",
+        ])
+        .expect("three groups");
+        assert_eq!(
+            cfg.engine.kv_cache_groups,
+            vec![
+                KvCacheGroup::full_attention(),
+                KvCacheGroup {
+                    kind: "sliding_window".to_string(),
+                    sliding_window: 128,
+                },
+                KvCacheGroup {
+                    kind: "mamba".to_string(),
+                    sliding_window: 0,
+                },
+            ]
+        );
+        let err = with(&[
+            "--kv-events-wire",
+            "sglang",
+            "--kv-cache-groups",
+            "full_attention,mamba",
+        ])
+        .expect_err("one group on the SGLang wire");
+        assert!(err.contains("one cache group"), "{err}");
+        assert!(
+            with(&[
+                "--kv-events-wire",
+                "sglang",
+                "--kv-cache-groups",
+                "full_attention"
+            ])
+            .is_ok(),
+            "one group is the SGLang wire's shape"
+        );
+        for (spec, reason) in [
+            ("sliding_window", "needs its window"),
+            ("full_attention,sliding_window_mla:0", "needs its window"),
+            ("mamba:128", "has no window"),
+            ("full_attention:64", "has no window"),
+            ("swa:128", "unknown cache group kind"),
+            ("sliding-window:128", "unknown cache group kind"),
+            ("mamba", "the first group is the main-attention group"),
+            (
+                "sliding_window:64,full_attention",
+                "the first group is the main-attention group",
+            ),
+            (
+                "mamba,full_attention",
+                "the first group is the main-attention group",
+            ),
+        ] {
+            let err = with(&["--kv-cache-groups", spec]).expect_err(spec);
+            assert!(err.contains(reason), "{spec}: {err}");
+        }
+    }
+
+    /// The gRPC workers serve the tokenspeed wire unless `--grpc-wire` names
+    /// another; a wire the gateway's client does not speak is refused, and
+    /// the last flag wins, as a class's own argument after a lane's.
+    #[test]
+    fn the_grpc_wire_defaults_to_tokenspeed_and_takes_the_three_names() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        assert_eq!(
+            parse(&grpc).expect("defaults").grpc_wire,
+            SchedulerWire::TokenSpeed
+        );
+        for (name, wire) in [
+            ("tokenspeed", SchedulerWire::TokenSpeed),
+            ("vllm", SchedulerWire::Vllm),
+            ("sglang", SchedulerWire::Sglang),
+        ] {
+            let cfg = parse(&[&grpc[..], &["--grpc-wire", name]].concat()).expect(name);
+            assert_eq!(cfg.grpc_wire, wire);
+            assert_eq!(cfg.grpc_wire.as_str(), name);
+        }
+        let last = parse(&[&grpc[..], &["--grpc-wire", "vllm", "--grpc-wire", "sglang"]].concat())
+            .expect("two flags");
+        assert_eq!(last.grpc_wire, SchedulerWire::Sglang);
+        let refused =
+            parse(&[&grpc[..], &["--grpc-wire", "trtllm"]].concat()).expect_err("an unknown wire");
+        assert!(
+            refused.contains("--grpc-wire must be tokenspeed|vllm|sglang, got trtllm"),
+            "{refused}"
+        );
+    }
+
+    /// The capture file's keys are the tokenspeed request's field names, so a
+    /// capture on another wire is refused rather than misnamed.
+    #[test]
+    fn a_capture_needs_the_tokenspeed_wire() {
+        let flags = [
+            "--grpc-base-port",
+            "19000",
+            "--grpc-count",
+            "1",
+            "--capture",
+            "/tmp/requests.jsonl",
+        ];
+        assert!(parse(&flags).is_ok(), "the default wire captures");
+        let refused = parse(&[&flags[..], &["--grpc-wire", "vllm"]].concat())
+            .expect_err("a capture on the vllm wire");
+        assert!(
+            refused.contains("--capture") && refused.contains("not vllm"),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -954,5 +1204,23 @@ mod tests {
         let cfg = parse(&[&grpc[..], &["--grpc-max-message-bytes", "4194304"]].concat())
             .expect("--grpc-max-message-bytes parses");
         assert_eq!(cfg.grpc_max_message_bytes, 4_194_304);
+    }
+
+    /// A ZMQ rank sends one message per token unless `--zmq-step-ms` gives
+    /// it a step period.
+    #[test]
+    fn zmq_step_ms_default_zero_and_takes_milliseconds() {
+        let zmq = [
+            "--zmq-handshake",
+            "ipc:///tmp/mock-handshake",
+            "--zmq-count",
+            "1",
+        ];
+        assert_eq!(parse(&zmq).expect("defaults").zmq_step_ms, 0);
+        let stepping = parse(&[&zmq[..], &["--zmq-step-ms", "5"]].concat()).expect("a period");
+        assert_eq!(stepping.zmq_step_ms, 5);
+        let refused = parse(&[&zmq[..], &["--zmq-step-ms", "soon"]].concat())
+            .expect_err("not a number of milliseconds");
+        assert!(refused.contains("--zmq-step-ms"), "{refused}");
     }
 }

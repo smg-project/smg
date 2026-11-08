@@ -205,22 +205,13 @@ impl std::fmt::Debug for VllmServicerConfig {
 /// attaches to every batch it streams.
 impl crate::kv_events::RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
-        let response = info::loads(self).ok()?;
-        let load = match dp_rank {
-            // A connected rank reads its own entry (zero-filled until its
-            // first scheduler step, whichever rank reported first), never
-            // another rank's figures; a rank past the connected ones gets
-            // no record.
-            Some(rank) => response.loads.iter().find(|load| load.dp_rank == rank)?,
-            None => response
-                .loads
-                .iter()
-                .find(|load| load.dp_rank == 0)
-                .or_else(|| response.loads.first())?,
-        };
+        // A connected rank reads its own entry (zero-filled until its first
+        // scheduler step, whichever rank reported first), never another
+        // rank's figures; a rank past the connected ones gets no record.
+        let load = info::rank_load(self, dp_rank)?;
         // The queued token-work is this servicer's own estimate for the
-        // rank (see `info::loads`), so every rank's record reports it.
-        let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
+        // rank (see `info::rank_load`), so every rank's record reports it.
+        let mut record = smg_grpc_client::common_proto::EngineLoad::from(&load);
         record.waiting_uncached_tokens =
             Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
         Some(record)

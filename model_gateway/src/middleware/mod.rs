@@ -14,6 +14,7 @@ pub mod logging;
 pub mod messages_errors;
 pub mod metrics;
 pub mod request_id;
+pub mod request_start;
 pub mod scheduler;
 pub mod sse_keepalive;
 pub mod storage_context;
@@ -36,6 +37,7 @@ pub use messages_errors::{
 };
 pub use metrics::{HttpMetricsLayer, HttpMetricsMiddleware};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};
+pub use request_start::RequestStarted;
 pub use sse_keepalive::{sse_keepalive_middleware, SseKeepAlive, SseKeepAliveLayer};
 pub use storage_context::storage_context_middleware;
 pub use tenant_resolution::{

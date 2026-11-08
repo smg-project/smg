@@ -835,3 +835,30 @@ def test_the_sidecar_note_on_the_rust_servicer_names_metrics_and_warns_when_aske
     (warning,) = launch(True)
     assert warning.levelno == logging.WARNING
     assert warning.getMessage() == note.getMessage()
+
+
+def test_the_handshake_vocabulary_is_the_loaded_model_configs_not_a_constant(server_mod):
+    """The gateway bounds a pretokenized prompt's ids by the ``vocab_size`` label
+    this model info becomes. The scheduler's ready message carries no vocabulary
+    (status, running figures, start-up time), so the figure is the loaded model
+    config's, whatever the model serves; a constant of one model family would let
+    an id past a smaller table reach the engine as an out-of-range index."""
+    server_args = SimpleNamespace(model_path="org/model", context_length=None)
+    ready = {
+        "status": "ready",
+        "max_total_num_tokens": 4096,
+        "max_req_input_len": 2048,
+        "startup_time": 1.0,
+    }
+    facts = SimpleNamespace(
+        vocab_size=32000, model_type="llama", architectures=["X"], id2label=None, num_labels=0
+    )
+
+    info = server_mod.handshake_model_info(server_args, ready, facts)
+
+    assert info["vocab_size"] == 32000
+    assert info["max_context_length"] == 4096
+    assert info["max_req_input_len"] == 2048
+    # A ready message that does carry a vocabulary is the engine's own figure.
+    told = server_mod.handshake_model_info(server_args, {**ready, "vocab_size": 151936}, facts)
+    assert told["vocab_size"] == 151936

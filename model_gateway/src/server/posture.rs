@@ -394,7 +394,7 @@ mod tests {
             self_name: "node-a".to_string(),
             bind_addr: addr,
             advertise_addr: addr,
-            init_peer: None,
+            init_peers: Vec::new(),
             mtls_config: mtls,
         }
     }

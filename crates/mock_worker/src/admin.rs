@@ -13,6 +13,9 @@
 //!   `.../restart-publisher`, `.../pause`, `.../resume`,
 //!   `.../fail?status=S[&count=N|&secs=T][&after_tokens=K][&stall_ms=M]` and
 //!   `GET /admin/fault/{worker}`: the fault hooks (see the README).
+//! - `GET /admin/ops/{worker}`: what the gateway's admin fan-out reached on
+//!   the worker: its flushes, its profiling runs and the last trace written
+//!   (`all`: every worker).
 //! - `POST /admin/truth/{worker}` with `{"token_ids": [...]}`: what the
 //!   worker would serve from cache for that prompt right now;
 //!   `GET /admin/truth`: per worker, what it served over every admitted
@@ -23,9 +26,13 @@
 //!   worker answers to that prompt; `GET` reads the queue length and the hit
 //!   and miss counts, `DELETE` drops the queue ([`crate::script`]); a name no
 //!   worker of the process has is a 404, as on the fault routes.
+//! - `GET /admin/zmq/{worker}`: a ZMQ rank's `batch_messages` (the output
+//!   messages that carried request outputs) and `outputs` (the outputs in
+//!   them) since it connected: cumulative, a reset does not clear them; a
+//!   rank name, not `all`.
 //!
 //! Worker names are `grpc:<port>` / `http:<port>` / `zmq:<index>`; `all`
-//! addresses every worker.
+//! addresses every worker on the routes that take it.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -45,6 +52,7 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use crate::{
+    admin_ops::AdminOps,
     config::Config,
     engine::{self, Engine, FaultScope, RequestFault},
     script,
@@ -75,6 +83,7 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/pause", post(fault_pause))
         .route("/admin/fault/{worker}/resume", post(fault_resume))
         .route("/admin/fault/{worker}/fail", post(fault_fail))
+        .route("/admin/ops/{worker}", get(ops_status))
         .route("/admin/truth", get(truth_served))
         .route("/admin/truth/{worker}", post(truth_prompt))
         .route(
@@ -86,6 +95,7 @@ fn router(state: Arc<AdminState>) -> Router {
         // labels. For beds that change an engine's reported settings between
         // two health transitions.
         .route("/admin/serving/{port}", get(serving_get).post(serving_set))
+        .route("/admin/zmq/{worker}", get(zmq_rank))
         .route("/admin/info/{port}", get(info_get).post(info_patch))
         .with_state(state)
 }
@@ -405,6 +415,25 @@ fn injected_failures() -> Value {
     Value::Object(workers)
 }
 
+/// What a ZMQ rank has pushed since it connected: the messages that carried
+/// request outputs and the outputs in them, cumulative (a reset does not
+/// clear them), so a test tells an engine's step of many outputs from one
+/// message per token.
+async fn zmq_rank(Path(worker): Path<String>) -> Response {
+    match crate::zmq::rank_output_counts(&worker) {
+        Some(counts) => {
+            let (batch_messages, outputs) = counts.read();
+            Json(json!({
+                "worker": worker,
+                "batch_messages": batch_messages,
+                "outputs": outputs,
+            }))
+            .into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "unknown ZMQ rank").into_response(),
+    }
+}
+
 async fn cache(Path(worker): Path<String>) -> Response {
     match find(&worker) {
         Some(e) => {
@@ -429,6 +458,18 @@ async fn reset_one(Path(worker): Path<String>) -> Response {
             Json(json!({ "reset": names })).into_response()
         }
         Err(response) => response,
+    }
+}
+
+/// The flush and profile operations the gateway fanned out to the worker.
+async fn ops_status(Path(worker): Path<String>) -> Response {
+    if worker == "all" {
+        let workers: Vec<Value> = AdminOps::all().iter().map(|ops| ops.status()).collect();
+        return Json(json!({ "workers": workers })).into_response();
+    }
+    match AdminOps::find(&worker) {
+        Some(ops) => Json(ops.status()).into_response(),
+        None => (StatusCode::NOT_FOUND, "unknown worker").into_response(),
     }
 }
 

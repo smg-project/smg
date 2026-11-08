@@ -106,7 +106,7 @@ impl LoadSnapshot {
 
     /// Test-only: a snapshot with the given loads and no live sources, each
     /// report sampled now unless it says otherwise.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn from_loads_for_test(loads: Vec<(String, WorkerLoadResponse)>) -> Arc<Self> {
         let published_at = Instant::now();
         let entries = loads
@@ -125,14 +125,14 @@ impl LoadSnapshot {
     }
 }
 
-/// Test-only publisher standing in for the monitor: hands a policy the feed
-/// and publishes each map of reports as the whole snapshot.
-#[cfg(test)]
-pub(crate) struct TestFeed(watch::Sender<Arc<LoadSnapshot>>);
+/// Publisher standing in for the monitor in tests and benchmarks: hands a
+/// policy the feed and publishes each map of reports as the whole snapshot.
+#[cfg(any(test, feature = "test-util"))]
+pub struct TestFeed(watch::Sender<Arc<LoadSnapshot>>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl TestFeed {
-    pub(crate) fn attached_to(policy: &dyn crate::policies::LoadBalancingPolicy) -> Self {
+    pub fn attached_to(policy: &dyn crate::policies::LoadBalancingPolicy) -> Self {
         let (tx, rx) = watch::channel(Arc::new(LoadSnapshot::default()));
         policy.set_load_receiver(Some(rx));
         Self(tx)
@@ -140,7 +140,7 @@ impl TestFeed {
 
     /// Publish `loads` as the current snapshot; a report without a sample
     /// instant is sampled now.
-    pub(crate) fn publish(&self, loads: &HashMap<String, WorkerLoadResponse>) {
+    pub fn publish(&self, loads: &HashMap<String, WorkerLoadResponse>) {
         let loads = loads
             .iter()
             .map(|(url, load)| (url.clone(), load.clone()))
@@ -152,8 +152,8 @@ impl TestFeed {
 
 /// One DP rank with the given queued uncached tokens, KV utilization and
 /// live throughput; one request is running, so a rate gauge counts.
-#[cfg(test)]
-pub(crate) fn one_rank_load(
+#[cfg(any(test, feature = "test-util"))]
+pub fn one_rank_load(
     num_waiting_uncached_tokens: i32,
     token_usage: f64,
     gen_throughput: f64,

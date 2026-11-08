@@ -176,7 +176,7 @@ impl KimiK3Parser {
         let call_formats: Vec<Value> = tools
             .iter()
             .filter(|tool| !tool.function.name.is_empty())
-            .map(|tool| build_call_format(&tool.function.name, &tool.function.parameters))
+            .map(|tool| build_call_format(&tool.function.name, tool.function.parameters_schema()))
             .collect();
 
         let call_choice = if call_formats.is_empty() {

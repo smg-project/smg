@@ -265,7 +265,7 @@ fn decode_tensor(
             return Err(format!("cast tensor {name:?} lost its raw view"));
         };
         return Ok(Decoded {
-            dtype: cast.dtype,
+            dtype: cast.dtype.into_owned(),
             shape,
             bytes,
         });
@@ -898,7 +898,7 @@ mod tests {
         let tensor = tensor_of(&item["pixel_values"]);
         // Batched: one row per item, the batch dim removed.
         assert_eq!(tensor.shape, vec![4]);
-        assert_eq!(tensor.dtype.as_str(), "bfloat16");
+        assert_eq!(tensor.dtype, "bfloat16");
         assert!(!path.exists(), "shm file is unlinked after the read");
 
         // A short file is a length mismatch, not a silently padded tensor.
@@ -958,7 +958,7 @@ mod tests {
         mm.pixel_values = Some(inline_tensor(vec![2, 4], "bfloat16", bf16_payload.clone()));
         let features = build_mm_features(mm, &[0; 9], ModelDtype::BFloat16).expect("built");
         let tensor = tensor_of(&features[0].data.as_ref().unwrap()["pixel_values"]);
-        assert_eq!(tensor.dtype.as_str(), "bfloat16");
+        assert_eq!(tensor.dtype, "bfloat16");
         let WireArrayData::RawView(bytes) = &tensor.data else {
             panic!("raw view");
         };
@@ -968,7 +968,7 @@ mod tests {
         mm.pixel_values = Some(inline_tensor(vec![2, 4], "float16", f16_payload));
         let features = build_mm_features(mm, &[0; 9], ModelDtype::BFloat16).expect("built");
         let tensor = tensor_of(&features[0].data.as_ref().unwrap()["pixel_values"]);
-        assert_eq!(tensor.dtype.as_str(), "bfloat16");
+        assert_eq!(tensor.dtype, "bfloat16");
         let WireArrayData::RawView(bytes) = &tensor.data else {
             panic!("raw view");
         };

@@ -14,9 +14,12 @@
 //! The ring is built once when workers are added/removed, not per-request.
 //! This ensures O(log n) lookup performance.
 //!
-//! Complexity: O(log n) binary search + O(k) walk where k = consecutive unhealthy workers.
+//! Complexity per request: O(log n) binary search + O(k) walk where k =
+//! consecutive unhealthy workers, each probed node read for eligibility and
+//! found in the pool by one scan of its URLs; nothing is allocated for the
+//! translation.
 
-use std::sync::Arc;
+use std::{cell::Cell, sync::Arc};
 
 use rand::RngExt as _;
 
@@ -66,42 +69,52 @@ impl ConsistentHashingPolicy {
     /// The ring returns a worker URL, which we then map to an index in the workers array.
     /// This correctly handles filtered worker arrays since we match by URL, not by index.
     ///
-    /// Complexity: O(n) to build healthy URL map + O(log n) ring lookup + O(k) walk
+    /// Complexity: O(log n) ring lookup + O(k) walk, each probed node read for
+    /// eligibility and found in the pool by a scan of its URLs (the last
+    /// eligible worker at that URL, as the map this replaced answered).
     fn find_by_consistent_hash(
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
         key: &str,
     ) -> Option<usize> {
-        // Build URL→index map for healthy workers: O(n) once, O(1) lookups
         // A lifted overload veto keeps an owner over the thresholds.
-        let healthy_url_to_idx: std::collections::HashMap<&str, usize> = workers
-            .iter()
-            .enumerate()
-            .filter(|(_, w)| {
-                if info.overload_lifted {
-                    w.routing_state().eligible_ignoring_overload()
-                } else {
-                    w.is_healthy_and_eligible()
-                }
-            })
-            .map(|(i, w)| (w.url(), i))
-            .collect();
-
-        if healthy_url_to_idx.is_empty() {
-            return None;
-        }
+        let eligible = |worker: &Arc<dyn Worker>| {
+            if info.overload_lifted {
+                worker.routing_state().eligible_ignoring_overload()
+            } else {
+                worker.is_healthy_and_eligible()
+            }
+        };
 
         // Use pre-computed ring if available
         if let Some(ref ring) = info.hash_ring {
-            // O(1) lookup per URL checked instead of O(n)
-            let url = ring.find_healthy_url(key, |url| healthy_url_to_idx.contains_key(url))?;
-            return healthy_url_to_idx.get(url).copied();
+            let eligible_at = |url: &str| {
+                workers
+                    .iter()
+                    .rposition(|worker| worker.url() == url && eligible(worker))
+            };
+            // The probe that accepts the ring's answer keeps the position it
+            // found: one scan and one eligibility read per probed node, and
+            // the answer cannot disagree with the probe that admitted it.
+            let found = Cell::new(None);
+            ring.find_healthy_url(key, |url| {
+                found.set(eligible_at(url));
+                found.get().is_some()
+            })?;
+            return found.get();
         }
 
         // Fallback: no ring provided, use simple modulo (less optimal but functional)
         // This shouldn't happen in normal operation as WorkerSelectionStage provides the ring
-        let mut healthy_indices: Vec<usize> = healthy_url_to_idx.values().copied().collect();
-        healthy_indices.sort_unstable(); // Ensure deterministic order
+        let healthy_indices: Vec<usize> = workers
+            .iter()
+            .enumerate()
+            .filter(|(_, worker)| eligible(worker))
+            .map(|(idx, _)| idx)
+            .collect();
+        if healthy_indices.is_empty() {
+            return None;
+        }
 
         // Use blake3 for consistent hashing in fallback too
         let hash = blake3::hash(key.as_bytes());
@@ -789,5 +802,59 @@ mod tests {
     fn test_policy_name() {
         let policy = ConsistentHashingPolicy::new();
         assert_eq!(policy.name(), "consistent_hashing");
+    }
+
+    /// Sixteen workers on a ring and forty-eight session keys: every key lands
+    /// where it did when a per-request URL map translated the ring's answer,
+    /// with every worker eligible and with three of them not ready (their keys
+    /// move to the next eligible owner clockwise, the rest stay). The
+    /// placement is the ring's; the translation must not move it.
+    #[test]
+    fn the_recorded_key_set_lands_where_the_ring_placed_it() {
+        const RECORDED_ALL_ELIGIBLE: [usize; 48] = [
+            7, 4, 2, 15, 13, 12, 9, 12, 5, 12, 11, 0, 3, 0, 2, 8, 4, 6, 6, 4, 2, 13, 12, 6, 14, 8,
+            5, 4, 14, 6, 6, 5, 2, 3, 1, 7, 15, 11, 11, 13, 8, 6, 2, 3, 0, 10, 10, 13,
+        ];
+        const RECORDED_THREE_NOT_READY: [usize; 48] = [
+            4, 4, 2, 15, 13, 12, 9, 12, 5, 12, 5, 0, 10, 0, 2, 8, 4, 6, 6, 4, 2, 13, 12, 6, 14, 8,
+            5, 4, 14, 6, 6, 5, 2, 6, 1, 5, 15, 6, 4, 13, 8, 6, 2, 6, 0, 10, 10, 13,
+        ];
+        let policy = ConsistentHashingPolicy::new();
+        let urls: Vec<String> = (0..16).map(|i| format!("http://w{i:02}:8000")).collect();
+        let workers = make_workers(&urls.iter().map(String::as_str).collect::<Vec<_>>());
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+        let keys: Vec<String> = (0..48).map(|i| format!("session-{i}")).collect();
+        let placements = |workers: &[Arc<dyn Worker>]| -> Vec<usize> {
+            keys.iter()
+                .map(|key| {
+                    let info = SelectWorkerInfo {
+                        routing_key: Some(key),
+                        hash_ring: Some(ring.clone()),
+                        ..Default::default()
+                    };
+                    let (result, branch) = policy.select_worker_impl(workers, &info);
+                    assert_eq!(branch, Branch::RoutingKeyHit, "key {key}");
+                    result.expect("an eligible owner exists")
+                })
+                .collect()
+        };
+        assert_eq!(
+            placements(&workers),
+            RECORDED_ALL_ELIGIBLE,
+            "with every worker eligible the keys placed {:?}",
+            placements(&workers)
+        );
+        for not_ready in [3, 7, 11] {
+            workers[not_ready].set_status(WorkerStatus::NotReady);
+        }
+        let moved = placements(&workers);
+        assert!(
+            !moved.contains(&3) && !moved.contains(&7) && !moved.contains(&11),
+            "a not-ready worker owns a key: {moved:?}"
+        );
+        assert_eq!(
+            moved, RECORDED_THREE_NOT_READY,
+            "with three workers not ready the keys placed {moved:?}"
+        );
     }
 }

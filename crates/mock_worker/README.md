@@ -22,22 +22,56 @@ Two modes:
 - `POST /v1/chat/completions` · `/v1/completions` · `/generate` — non-stream JSON
   or SSE (`data: {chunk}\n\n … data: [DONE]\n\n`)
 - `GET /v1/loads?include=core` → `WorkerLoadResponse` (load-aware policies)
+- `POST /flush_cache` · `/start_profile` · `/stop_profile` — the gateway's admin
+  fan-out: the flush clears the engine's cache (a canned worker has none) and
+  answers 200; a profiling run starts with the body's options and ends with one
+  trace file in its output directory (a run already in progress, or a stop with
+  none, is a 409)
 
-**gRPC** (TokenSpeed scheduler — the gateway tokenizes, the worker speaks token
-ids): `HealthCheck`, `GetModelInfo`, `GetServerInfo`, `Generate` (streamed
-chunks + complete), `GetLoads`, `Abort`, and (realistic mode only)
-`SubscribeKvEvents`; other admin RPCs return `unimplemented`. Beside the
-scheduler service the server hosts the standard `grpc.health.v1` service
-(`Check`, `Watch`): the empty name and the scheduler service are SERVING
-exactly when `HealthCheck` answers healthy (`POST /admin/serving/{port}` flips
-both), any other name is unknown.
+**gRPC** (one engine's scheduler service, `--grpc-wire tokenspeed|vllm|sglang`,
+TokenSpeed by default — the gateway tokenizes, the worker speaks token ids):
+`HealthCheck`, `GetModelInfo`, `GetServerInfo`, `Generate` (streamed chunks +
+complete), `GetLoads`, `Abort`, and (realistic mode only) `SubscribeKvEvents`, and
+the admin fan-out's `FlushCache` (every rank's cache cleared at once,
+`success: true`), `StartProfile` and `StopProfile` (a run in progress refused
+with `success: false`, the trace file written at the stop), the same on each
+wire; the other RPCs (`GetTokenizer`, embeddings, LoRA) return `unimplemented`. The canned
+and scripted answers, the realistic engine, the data-parallel ranks and the
+prefill/decode roles are the same behind each wire; each shapes its own
+messages (a role is `disaggregation_mode` in the server args on the TokenSpeed
+and SGLang wires, with `disaggregation_transfer_backend` mooncake, and
+`kv_role` behind `kv_connector` MooncakeConnector on the vLLM one, whose info
+is a struct of named fields the admin API's info patch sets by name: the mock
+moves no KV cache and names Mooncake as its transport on every wire).
+`--capture` records the TokenSpeed wire's requests only. Beside the scheduler
+service the server hosts the standard `grpc.health.v1` service (`Check`,
+`Watch`): the empty name and the served scheduler service are SERVING exactly
+when `HealthCheck` answers healthy (`POST /admin/serving/{port}` flips both),
+any other name is unknown; the gateway detects a worker's runtime by the
+scheduler service that answers its health check, so a worker serves one.
 
 **ZMQ** (`--zmq-handshake <ipc://…> --zmq-count N [--zmq-start-index I]`):
 mock vLLM `EngineCore` ranks on the `engine-zmq-client` wire. Unlike the HTTP
 and gRPC workers, which bind and are dialed, each rank dials the frontend's
 handshake address, registers, takes `EngineCoreRequest`s and pushes
 `EngineCoreOutputs` with the engine's load as `scheduler_stats`; the admin API
-sees it as worker `zmq:<index>`.
+sees it as worker `zmq:<index>`. `--zmq-step-ms <ms>` has the ranks send an
+engine's steps: one message per period carrying the next token of every
+running request (a request that produced faster than the period waits its
+turn, one output per step), instead of one message per token;
+`GET /admin/zmq/zmq:<index>` reads what the rank pushed since it connected,
+the messages that carried request outputs and the outputs in them
+(cumulative; a reset does not clear them). A rank waits for the frontend to
+bind its handshake endpoint in three rounds of 30 s, each round it misses
+logged (a gateway binds the handshake of a worker it was started with at that
+worker's first health probe, up to one check interval after its own start),
+then gives up.
+
+A worker that stops on its own (a port already in use, a rank whose frontend
+never bound) is logged and the others keep serving; when the last one stops
+the process exits with status 1, so a launcher sees a fleet that serves
+nothing as the failed start it is instead of waiting on it. The admin API is
+not a worker: it neither counts nor keeps the process up alone.
 
 ## Run (canned)
 
@@ -128,6 +162,7 @@ experiments against it transfer to engines:
 | `--admin-port` | off | process-wide admin API (below) |
 | `--drain-timeout-secs` | 5 | on SIGTERM or SIGINT: stop accepting, let the requests in flight finish for this long, then exit 0 either way |
 | `--kv-events-zmq-base-port` | off | ZMQ KV-event publishers on vLLM's or SGLang's wire (below) |
+| `--kv-cache-groups` | `full_attention` | the KV cache groups a realistic engine publishes, `kind[:window],...`, one to eight of `full_attention`, `mla_attention`, `sink_full_attention`, `sliding_window:<tokens>`, `sliding_window_mla:<tokens>` and `mamba` (the first one of the three main-attention kinds, a window kind with its window, the others without): every group's events carry its index, kind and window, a window group stores only the window tail ending at the prompt's aligned replay boundary and a Mamba group the one state block there (vLLM 0.31.0's default retention), a sparse store's `token_ids` on the vLLM wire spanning the whole step as the engine writes it, and an eviction is published once per group, every group's in one batch from the mock's one pool where the engine's per-group pools may stagger them; one group only on the SGLang wire. The gRPC stream carries every group's events unfiltered (a servicer's relay forwards the main group alone, and the gateway admits main-attention kinds only), and the mock's own prefix hit still comes from the full-attention pool, not the engine's fixed point over its groups |
 
 ```bash
 cargo run --release -p mock-worker -- \
@@ -175,8 +210,12 @@ then ZMQ ranks) publishes on `base + 2i` and answers replay on `base + 2i + 1`.
 - Payload: vLLM's `EventBatch`, `[ts, events, data_parallel_rank]`; events are
   tagged maps in vLLM's field order with its `omit_defaults`: `BlockStored`
   (`type`, `block_hashes`, `parent_block_hash`, `token_ids`, `block_size`,
-  `lora_id`, `medium: "GPU"`, `lora_name`, `group_idx: 0`,
-  `kv_cache_spec_kind: "full_attention"`), `BlockRemoved` (`type`,
+  `lora_id`, `medium: "GPU"`, `lora_name`, `group_idx`,
+  `kv_cache_spec_kind` and, for a window group, `kv_cache_spec_sliding_window`;
+  one store per cache group of `--kv-cache-groups`, a sparse group's store
+  carrying the step's whole `token_ids` span while its `block_hashes` name
+  only the blocks the group retains, as the engine's `cache_full_blocks`
+  writes a masked group), `BlockRemoved` (`type`,
   `block_hashes`, `medium`, `group_idx`), `AllBlocksCleared` (`type`). Block
   hashes are unsigned 64-bit integers (vLLM's int form of the same bits the
   gRPC stream carries signed).
@@ -214,6 +253,9 @@ engines do not expose:
   worker, the requests the `fail` hook answered before admission (they left no
   record) and the streams it cut;
 - `GET /admin/cache/{worker}` — the worker's cached block keys;
+- `GET /admin/ops/{worker}` — what the gateway's admin fan-out reached on the
+  worker: `flushes`, `profiles_started`, `profiles_stopped`, whether a run is
+  `profiling`, the `last_trace` written (`all`: every worker);
 - `POST /admin/reset[/{worker}]` — clear caches and publish `AllBlocksCleared`
   (an engine restart, to the index).
 
@@ -255,6 +297,7 @@ path has no engine to hook.
 |----------|--------|
 | `POST /admin/truth/{worker}` with `{"token_ids": [...]}` | what the worker would serve from cache for that prompt right now: `cached_tokens`, `cached_blocks`, `block_size` (the engine's own prefix match, last-block rule included) |
 | `GET /admin/truth` | per worker, over every admitted request: `requests`, `prompt_tokens`, `cached_tokens`, `oracle_tokens`, so a gateway's hit-rate claim can be checked against what the engines actually served; `injected_failures` and `cut_streams` count what the `fail` hook refused before admission and cut after output |
+| `GET /admin/zmq/{worker}` | a ZMQ rank's output counts since it connected: `batch_messages`, the messages that carried request outputs, and `outputs`, the outputs in them (one per message without a step period, several with one; a utility reply is neither); cumulative, `POST /admin/reset` does not clear them; a rank name, not `all` |
 
 A circuit-breaker or retry drill arms `fail` on one worker (`status=503&count=N`
 for exactly N failures inside the breaker's window, `secs=T` for a worker that

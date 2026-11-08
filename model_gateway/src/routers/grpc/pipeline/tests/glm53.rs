@@ -134,6 +134,7 @@ async fn glm53_media_returns_normal_completion_and_stream_without_media_processi
 async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
     use crate::routers::grpc::{
         backend_client::BackendClient, client::GrpcClient, proto_wrapper::ProtoGenerateRequest,
+        spec::ResponseSpec,
     };
     // A transport listener is enough: construction never calls an engine RPC.
     let port = spawn_stub(GatedScheduler::default()).await;
@@ -268,6 +269,13 @@ async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
             .await
             .unwrap();
         assert!(matches!(built.plan, ExecutionPlan::PrefillDecode(_)));
+        if let ResponseSpec::Messages(spec) = &built.spec {
+            assert_eq!(
+                spec.prompt_tokens as usize,
+                token_ids.len(),
+                "the Messages spec carries the rendered prompt's count"
+            );
+        }
         for request in built.plan.generate_requests_mut() {
             let ProtoGenerateRequest::Sglang(request) = request else {
                 panic!("SGLang proto")

@@ -2,6 +2,7 @@
 //! standalone binary and in-process integration tests can drive them.
 
 pub mod admin;
+pub mod admin_ops;
 pub mod config;
 pub mod drain;
 pub mod engine;

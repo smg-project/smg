@@ -7,12 +7,16 @@ use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{common::InputIds, generate::GenerateRequest};
 use tracing::error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        context::{PreparationOutput, RequestContext},
-        utils,
+use crate::{
+    routers::{
+        error,
+        grpc::{
+            context::{PreparationOutput, RequestContext},
+            regular::stages::token_ids::{reject_unknown_token_id, reported_embedding_rows},
+            utils,
+        },
     },
+    worker::WorkerRegistry,
 };
 
 /// Generate preparation stage
@@ -43,7 +47,12 @@ impl GeneratePreparationStage {
             .map_err(|e| *e)?;
 
         let (original_text, token_ids) = match self
-            .resolve_generate_input(request, &tokenizer)
+            .resolve_generate_input(
+                request,
+                &tokenizer,
+                &ctx.components.worker_registry,
+                &ctx.input.model_id,
+            )
             .await
         {
             Ok(res) => res,
@@ -79,6 +88,8 @@ impl GeneratePreparationStage {
         &self,
         request: &GenerateRequest,
         tokenizer: &Arc<dyn Tokenizer>,
+        worker_registry: &WorkerRegistry,
+        model_id: &str,
     ) -> Result<(Option<String>, Vec<u32>), String> {
         if let Some(text) = &request.text {
             return self
@@ -90,12 +101,17 @@ impl GeneratePreparationStage {
         // Handle input_ids - validate and convert
         if let Some(input_ids) = &request.input_ids {
             return match input_ids {
-                InputIds::Single(ids) => ids
-                    .iter()
-                    .map(|&id| u32::try_from(id))
-                    .collect::<Result<Vec<u32>, _>>()
-                    .map(|converted| (None, converted))
-                    .map_err(|_| "input_ids must be non-negative".to_string()),
+                InputIds::Single(ids) => {
+                    let converted = ids
+                        .iter()
+                        .map(|&id| u32::try_from(id))
+                        .collect::<Result<Vec<u32>, _>>()
+                        .map_err(|_| "input_ids must be non-negative".to_string())?;
+                    reject_unknown_token_id(tokenizer.as_ref(), &converted, "input_ids", || {
+                        reported_embedding_rows(worker_registry, model_id)
+                    })?;
+                    Ok((None, converted))
+                }
                 InputIds::Batch(_) => {
                     Err("Batch input_ids are not supported over gRPC generate yet".to_string())
                 }
@@ -111,7 +127,7 @@ impl GeneratePreparationStage {
         text: &str,
     ) -> Result<(String, Vec<u32>), String> {
         // Don't add special tokens - raw text generation uses text as-is
-        let encoding = utils::encode_blocking(tokenizer.clone(), text.to_string(), false)
+        let encoding = utils::encode_blocking(tokenizer.clone(), text, false)
             .await
             .map_err(|e| format!("Tokenization failed: {e}"))?;
         Ok((text.to_string(), encoding.into_token_ids()))

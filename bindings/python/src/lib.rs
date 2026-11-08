@@ -21,7 +21,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
     reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
 )]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8; 72] = observability::metrics::SERVER_MALLOC_CONF;
+pub static MALLOC_CONF: &[u8; 100] = observability::metrics::SERVER_MALLOC_CONF;
 use smg::*;
 use smg_auth as auth;
 
@@ -785,6 +785,32 @@ impl Router {
             server_key_path: key.into(),
             ..smg_mesh::MTLSConfig::default()
         }))
+    }
+
+    /// The join peers of `mesh_peer_urls`, each an `ip:port`. The binary's
+    /// flag takes the entries space- or comma-separated (clap splits the
+    /// list); the Python launcher hands each argument through as typed, so
+    /// the comma list is split here for both. An empty entry (an empty
+    /// string, a trailing comma) is refused like any other bad one: dropped
+    /// in silence, it would leave the gateway outside the mesh it was
+    /// configured to join. The error is the message the binding raises as a
+    /// `ValueError`: a plain string, so the unit test needs no interpreter
+    /// (the extension module's test binary links none).
+    fn parse_mesh_peer_urls(entries: &[String]) -> Result<Vec<std::net::SocketAddr>, String> {
+        entries
+            .iter()
+            .flat_map(|entry| entry.split(','))
+            .map(|url| {
+                if url.trim().is_empty() {
+                    return Err(String::from(
+                        "Invalid mesh peer URL '': an entry of mesh_peer_urls is empty; \
+                         every entry is an ip:port",
+                    ));
+                }
+                url.parse::<std::net::SocketAddr>()
+                    .map_err(|e| format!("Invalid mesh peer URL '{url}': {e}"))
+            })
+            .collect()
     }
 
     fn parse_mesh_socket_addr(
@@ -2154,17 +2180,8 @@ impl Router {
                             .collect();
                         format!("Mesh_{random_string}")
                     });
-                    let peer = self
-                        .mesh_peer_urls
-                        .first()
-                        .map(|url| {
-                            url.parse::<std::net::SocketAddr>().map_err(|e| {
-                                pyo3::exceptions::PyValueError::new_err(format!(
-                                    "Invalid mesh peer URL '{url}': {e}"
-                                ))
-                            })
-                        })
-                        .transpose()?;
+                    let init_peers = Self::parse_mesh_peer_urls(&self.mesh_peer_urls)
+                        .map_err(pyo3::exceptions::PyValueError::new_err)?;
                     // Mirrors the CLI check in `cli/configure.rs`: port 0 parses as a
                     // socket address but is undialable once gossiped to peers,
                     // and reaches router discovery as the fallback mesh port
@@ -2197,7 +2214,7 @@ impl Router {
                         self_name,
                         bind_addr,
                         advertise_addr,
-                        init_peer: peer,
+                        init_peers,
                         mtls_config: self.mesh_mtls_config()?,
                     })
                 } else {
@@ -2354,5 +2371,32 @@ mod tests {
                 "{engine:?} is an engine backend: the disaggregation flags select its mode"
             );
         }
+    }
+
+    /// The join peers parse the same from a comma list and from separate
+    /// values, and an empty entry is refused rather than dropped.
+    #[test]
+    fn mesh_peer_urls_split_on_commas_and_refuse_an_empty_entry() {
+        let separate =
+            Router::parse_mesh_peer_urls(&["10.0.0.1:1".to_string(), "10.0.0.2:2".to_string()])
+                .expect("two entries");
+        let comma = Router::parse_mesh_peer_urls(&["10.0.0.1:1,10.0.0.2:2".to_string()])
+            .expect("a comma list");
+        assert_eq!(separate, comma);
+        assert_eq!(separate.len(), 2);
+        for bad in [
+            vec![String::new()],
+            vec!["10.0.0.1:1,".to_string()],
+            vec!["10.0.0.1:1".to_string(), " ".to_string()],
+        ] {
+            let err = Router::parse_mesh_peer_urls(&bad).expect_err("an empty entry is refused");
+            assert!(err.contains("is empty"), "{bad:?}: {err}");
+        }
+        let err = Router::parse_mesh_peer_urls(&["not-an-address".to_string()])
+            .expect_err("a bad entry is refused");
+        assert!(
+            err.contains("Invalid mesh peer URL 'not-an-address'"),
+            "{err}"
+        );
     }
 }

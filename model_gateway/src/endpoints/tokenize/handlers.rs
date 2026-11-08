@@ -20,7 +20,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     app_context::AppContext,
-    routers::grpc::utils::encode_blocking,
+    routers::grpc::utils::{encode_blocking_in_batch, InPlaceBudget},
     worker::UNKNOWN_MODEL_ID,
     workflow::{note_tokenizer_removed, Job, TokenizerConfigRequest},
 };
@@ -97,19 +97,21 @@ pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeReques
     let mut all_counts: Vec<i32> = Vec::with_capacity(texts.len());
     let mut all_char_counts: Vec<i32> = Vec::with_capacity(texts.len());
 
+    let mut budget = InPlaceBudget::default();
     for text in texts {
         // Don't add special tokens for tokenize API (matches Python behavior)
-        let encoding = match encode_blocking(tokenizer.clone(), text.to_string(), false).await {
-            Ok(enc) => enc,
-            Err(e) => {
-                error!("Tokenization failed: {}", e);
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("Tokenization failed: {e}"),
-                    "tokenization_error",
-                );
-            }
-        };
+        let encoding =
+            match encode_blocking_in_batch(tokenizer.clone(), text, false, &mut budget).await {
+                Ok(enc) => enc,
+                Err(e) => {
+                    error!("Tokenization failed: {}", e);
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("Tokenization failed: {e}"),
+                        "tokenization_error",
+                    );
+                }
+            };
 
         let token_ids: Vec<u32> = encoding.into_token_ids();
         let count = token_ids.len() as i32;

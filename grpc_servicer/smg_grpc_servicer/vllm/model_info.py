@@ -24,6 +24,7 @@ from smg_grpc_servicer.constrained_decoding import (
     CONSTRAINED_DECODING_AFTER_REASONING,
     CONSTRAINED_DECODING_FIRST_TOKEN,
 )
+from smg_grpc_servicer.mm_item_limits import MODALITIES, format_item_limits
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 from smg_grpc_servicer.vllm.config_view import EngineConfigView, ModelSection, token_ids
 from smg_grpc_servicer.vllm.config_view import hf_eos_token_ids as _hf_eos_token_ids
@@ -121,29 +122,24 @@ def mm_device_do_normalize(vllm_config: Any) -> bool:
     return EngineConfigView(vllm_config).multimodal.device_do_normalize
 
 
-# The modalities a router request can carry to a vLLM worker, whose per-prompt
-# limits the engine resolves from `--limit-mm-per-prompt`.
-MM_ITEM_LIMIT_MODALITIES = ("image", "video")
-
-
 def mm_item_limits(vllm_config: Any) -> str:
     """The engine's per-prompt media limits as the ``mm_item_limits`` label the
-    Router reads: sorted ``<modality>=<count>`` pairs (``image=8,video=2``), from
-    vLLM's resolved ``--limit-mm-per-prompt``, whose own server refuses a prompt
-    above them. Empty on a text model or a config that does not carry them,
-    which leaves the Router to its own caps."""
+    Router reads: ``<modality>=<count>`` pairs (``audio=1,image=8,video=2``)
+    for every modality the Router's media pipeline counts, from vLLM's resolved
+    ``--limit-mm-per-prompt``, whose own server refuses a prompt above them,
+    written by the one formatter every servicer's label goes through. Empty on
+    a text model or a config that does not carry them, which leaves the Router
+    to its own caps; so is a modality whose limit is no positive count."""
     get_limit = EngineConfigView(vllm_config).multimodal.limit_per_prompt
     if get_limit is None:
         return ""
-    pairs = []
-    for modality in sorted(MM_ITEM_LIMIT_MODALITIES):
+    limits: dict[str, int] = {}
+    for modality in MODALITIES:
         try:
-            limit = int(get_limit(modality))
+            limits[modality] = int(get_limit(modality))
         except (TypeError, ValueError):
             continue
-        if limit > 0:
-            pairs.append(f"{modality}={limit}")
-    return ",".join(pairs)
+    return format_item_limits(limits)
 
 
 def mm_encoder_budget(vllm_config: Any, budget_factory: Callable[[Any], Any] | None = None) -> int:

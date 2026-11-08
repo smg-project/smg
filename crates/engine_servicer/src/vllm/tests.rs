@@ -1696,6 +1696,55 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// `GetLoads` with a rank named answers that rank's entry alone, as the
+/// other three wires and the Python servicer answer it; without one, every
+/// rank's; a rank this servicer does not serve answers no entry (the shape
+/// of the three filtering wires).
+#[tokio::test]
+async fn get_loads_answers_the_named_rank_alone() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let (mut h, _rank1_in, _rank1_out) = two_rank_harness(model).await;
+    let ranks_of = |response: &vllm::GetLoadsResponse| {
+        response
+            .loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>()
+    };
+    let every = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((every.dp_rank_count, ranks_of(&every)), (2, vec![0, 1]));
+    let one = h
+        .client
+        .get_loads(vllm::GetLoadsRequest {
+            dp_rank: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((one.dp_rank_count, ranks_of(&one)), (1, vec![1]), "{one:?}");
+    let unserved = h
+        .client
+        .get_loads(vllm::GetLoadsRequest {
+            dp_rank: Some(7),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (unserved.dp_rank_count, ranks_of(&unserved)),
+        (0, Vec::new()),
+        "{unserved:?}"
+    );
+}
+
 /// Two ranks behind one servicer: the request the second rank serves is
 /// credited to that rank's hit rate and throughput, on the poll and on the
 /// pushed record, and the first rank reads idle rather than carrying the
@@ -2330,6 +2379,67 @@ async fn loads_only_streams_each_ranks_record_without_a_relay() {
             break;
         }
     }
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The record the relay reads for a rank is the entry `GetLoads` lists for
+/// it, reported or not yet (the zero-filled entry with the servicer's own
+/// figures), rank 0 for a publisher that names no rank, and nothing for a
+/// rank past the connected ones.
+#[tokio::test]
+async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
+    use crate::kv_events::RankLoads;
+
+    let (mut h, _rank1_in, mut rank1_out) = two_rank_harness(model_info()).await;
+    rank1_out
+        .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 1,
+            scheduler_stats: Some(SchedulerStats {
+                num_running_reqs: 3,
+                num_waiting_reqs: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let answer = loop {
+        let answer = h
+            .client
+            .get_loads(vllm::GetLoadsRequest::default())
+            .await
+            .expect("GetLoads answers")
+            .into_inner();
+        if answer
+            .loads
+            .iter()
+            .any(|load| load.dp_rank == 1 && load.num_waiting_reqs == 2)
+        {
+            break answer;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rank 1's figures in time: {answer:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let ranks: Vec<i32> = answer.loads.iter().map(|load| load.dp_rank).collect();
+    assert_eq!(ranks, [0, 1], "rank 0 is listed before its first step");
+    let state = &h.server.state;
+    for load in &answer.loads {
+        let mut expected = common::EngineLoad::from(load);
+        expected.waiting_uncached_tokens =
+            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+        assert_eq!(
+            state.rank_load(Some(load.dp_rank)),
+            Some(expected),
+            "rank {}",
+            load.dp_rank
+        );
+    }
+    assert_eq!(state.rank_load(None), state.rank_load(Some(0)));
+    assert!(state.rank_load(Some(2)).is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -5326,4 +5436,59 @@ async fn server_info_and_the_zero_filled_loads_count_the_connected_ranks() {
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
+}
+
+/// 256 engine-timed prefills that share one scheduled-to-first-output
+/// interval read the capacity of the whole batch: 256 x 2 computed tokens
+/// over the half second they share, counted once (the reference for the
+/// wires that measure on the servicer's clock; a ring of per-request
+/// samples read the newest 64 of them over the same half second).
+#[tokio::test]
+async fn a_burst_of_overlapping_prefills_reads_the_capacity_of_the_whole_batch() {
+    use engine_zmq_client::protocol::vllm::output::{EngineCoreEvent, EngineCoreEventType};
+    let mut h = harness(model_info(), None).await;
+    for index in 0..256 {
+        let id = format!("b{index}");
+        let mut stream = h
+            .client
+            .generate(generate_request(&id, true, vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(recv_add(&mut h.engine_in).await.request_id, id);
+        h.engine_out
+            .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+                engine_index: 0,
+                timestamp: 10.5,
+                outputs: vec![EngineCoreOutput {
+                    request_id: id.clone(),
+                    new_token_ids: vec![10],
+                    finish_reason: Some(EngineCoreFinishReason::Length),
+                    events: Some(vec![EngineCoreEvent {
+                        r#type: EngineCoreEventType::Scheduled,
+                        timestamp: 10.0,
+                    }]),
+                    prefill_stats: Some(PrefillStats {
+                        num_prompt_tokens: 3,
+                        num_cached_tokens: 1,
+                        num_computed_tokens: 2,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                scheduler_stats: Some(SchedulerStats::default()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.loads[0].prefill_throughput, Some(1_024.0));
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

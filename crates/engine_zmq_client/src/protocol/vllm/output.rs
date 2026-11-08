@@ -18,13 +18,15 @@ use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use crate::{
     codec::{
-        decode_msgpack, deserialize_tolerant_seq, tensor::WireTensor, OpaqueValue, TrailingTolerant,
+        decode_msgpack, deserialize_tolerant_seq,
+        tensor::{decode_within_frame, WireTensor},
+        OpaqueValue, TrailingTolerant,
     },
     error::{Error, Result},
     protocol::{
         kv_transfer::KvTransferStats,
         vllm::{
-            logprobs::{Logprobs, WireLogprobs},
+            logprobs::{Logprobs, LogprobsFields, WireLogprobs},
             pooling::PoolingOutput,
             stats::{PrefillStats, SchedulerStats},
         },
@@ -259,11 +261,11 @@ impl WireEngineCoreOutput {
             new_token_ids: self.new_token_ids,
             new_logprobs: self
                 .new_logprobs
-                .map(|value| value.resolve(frames, "new_logprobs"))
+                .map(|value| value.resolve(frames, &LogprobsFields::NEW_LOGPROBS))
                 .transpose()?,
             new_prompt_logprobs_tensors: self
                 .new_prompt_logprobs_tensors
-                .map(|value| value.resolve(frames, "new_prompt_logprobs_tensors"))
+                .map(|value| value.resolve(frames, &LogprobsFields::NEW_PROMPT_LOGPROBS_TENSORS))
                 .transpose()?,
             pooling_output: self
                 .pooling_output
@@ -690,10 +692,14 @@ pub fn decode_engine_core_outputs(frames: &[Bytes]) -> Result<EngineCoreOutputs>
     })?;
 
     // Decoded through `TrailingTolerant` so an envelope a newer engine grew
-    // past this struct still yields the fields this client knows.
-    decode_msgpack::<TrailingTolerant<WireEngineCoreOutputs>>(first_frame)?
-        .0
-        .into_semantic(frames)
+    // past this struct still yields the fields this client knows; within the
+    // frame's scope, so an inline array is a slice of it, not a copy: the
+    // logprobs columns are read into their vectors below, before the frame
+    // drops, and a pooled tensor takes bytes of its own (`PoolingOutput::resolve`).
+    let wire = decode_within_frame(first_frame, || {
+        decode_msgpack::<TrailingTolerant<WireEngineCoreOutputs>>(first_frame)
+    })?;
+    wire.0.into_semantic(frames)
 }
 
 #[cfg(test)]
@@ -702,7 +708,7 @@ mod tests {
     use crate::{
         codec::{
             decode_value, encode_msgpack, hex,
-            tensor::{WireArrayData, WireNdArray},
+            tensor::{lies_within, WireArrayData, WireNdArray},
             unhex,
         },
         protocol::vllm::logprobs::{PositionLogprobs, TokenLogprob},
@@ -721,7 +727,7 @@ mod tests {
     #[test]
     fn decode_vllm_pooling_output_inline() {
         let frame = Bytes::from(unhex(VLLM_POOLING_OUTPUTS_INLINE));
-        let batch = decode_engine_core_outputs(&[frame])
+        let batch = decode_engine_core_outputs(std::slice::from_ref(&frame))
             .unwrap()
             .into_request_batch()
             .expect("request batch");
@@ -738,6 +744,13 @@ mod tests {
         assert_eq!(pooled.dtype(), "float32");
         assert_eq!(pooled.shape(), &[3]);
         assert_eq!(pooled.to_vector().unwrap(), vec![0.25, -1.5, 3.0]);
+        // The pooled tensor outlives the decode: its bytes are its own, not a
+        // slice that would pin the step's frame.
+        let view = pooled.as_wire().data.as_raw_view().expect("inline view");
+        assert!(
+            !lies_within(&frame, view),
+            "the pooled bytes alias the frame"
+        );
     }
 
     #[test]
@@ -935,7 +948,7 @@ mod tests {
         );
         let ranks = Bytes::from(2_i64.to_le_bytes().to_vec());
         let aux = |index| WireNdArray {
-            dtype: "<i8".to_string(),
+            dtype: "<i8".into(),
             shape: vec![1, 2],
             data: WireArrayData::AuxIndex(index),
         };
@@ -946,12 +959,12 @@ mod tests {
                 new_logprobs: Some(Box::new(WireLogprobs {
                     logprob_token_ids: aux(1),
                     logprobs: WireNdArray {
-                        dtype: "<f4".to_string(),
+                        dtype: "<f4".into(),
                         shape: vec![1, 2],
                         data: WireArrayData::AuxIndex(2),
                     },
                     token_ranks: WireNdArray {
-                        dtype: "<i8".to_string(),
+                        dtype: "<i8".into(),
                         shape: vec![1],
                         data: WireArrayData::AuxIndex(3),
                     },

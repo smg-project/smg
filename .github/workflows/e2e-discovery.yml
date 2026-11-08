@@ -55,8 +55,6 @@ jobs:
 
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
-        with:
-          sccache-version: 'v0.10.0'
 
       - name: Build smg and mock-worker
         run: |
