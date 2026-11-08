@@ -901,34 +901,19 @@ mod tests {
     use std::sync::Arc;
 
     use llm_multimodal::MediaPartOrder;
-    use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
-    use tool_parser::ToolConstraint;
 
     use super::*;
     use crate::{
         routers::grpc::{
-            testing::worker,
+            testing::{forced_call_on_a_thinking_prompt, worker},
             utils::{chat_utils, message_utils},
         },
         worker::{BasicWorkerBuilder, WorkerType},
     };
 
-    fn forced_call_on_a_thinking_prompt(factory: &ToolParserFactory) -> (String, String) {
-        let tools: Vec<Tool> = serde_json::from_value(serde_json::json!([{
-            "type": "function",
-            "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}
-        }]))
-        .unwrap();
-        let required = ToolChoice::Value(ToolChoiceValue::Required);
-        match factory
-            .registry()
-            .generate_tool_constraint(Some("glm47_moe"), &tools, &required, true)
-            .unwrap()
-        {
-            Some(ToolConstraint::StructuralTag(tag)) => ("structural_tag".to_string(), tag),
-            other => panic!("expected a structural tag, got {other:?}"),
-        }
-    }
+    /// A parser that registers a reasoning prefix, so a forced call on a
+    /// thinking prompt takes the shape the worker's engine needs.
+    const PARSER: &str = "glm47_moe";
 
     /// The worker's constrained-decoding policy comes off its spec first, then
     /// its `constrained_decoding` label; the decode worker's under PD; a
@@ -1108,8 +1093,8 @@ mod tests {
     #[test]
     fn tool_constraints_take_the_shape_the_workers_engine_needs() {
         let factory = ToolParserFactory::new();
-        let parser = Some("glm47_moe");
-        let built = forced_call_on_a_thinking_prompt(&factory);
+        let parser = Some(PARSER);
+        let built = forced_call_on_a_thinking_prompt(&factory, PARSER);
         let built_tag: Value = serde_json::from_str(&built.1).unwrap();
         assert_eq!(built_tag["format"]["type"], "sequence");
 
