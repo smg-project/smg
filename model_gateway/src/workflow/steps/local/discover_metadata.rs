@@ -771,6 +771,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::workflow::steps::local::test_support::labels_of;
 
     /// A ZMQ worker's labels say its grammars start at the first generated
     /// token (the gateway's own link holds them there), with or without the
@@ -801,17 +802,14 @@ mod tests {
     /// canonical labels, and an existing canonical label is never overwritten.
     #[test]
     fn normalize_grpc_keys_canonicalises_every_parallelism_spelling() {
-        let mut labels: HashMap<String, String> = [
+        let mut labels = labels_of(&[
             ("attn_tp_size", "2"),
             ("pipeline_parallel_size", "1"),
             ("data_parallel_size", "4"),
             ("context_parallel_size", "1"),
             ("block_size", "16"),
             ("uptime_seconds", "12.5"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+        ]);
         normalize_grpc_keys(&mut labels);
         assert_eq!(labels.get("tp_size").map(String::as_str), Some("2"));
         assert_eq!(labels.get("pp_size").map(String::as_str), Some("1"));
@@ -823,18 +821,12 @@ mod tests {
         assert!(!labels.contains_key("uptime_seconds"));
 
         // An engine that reports both keeps its own `tp_size`.
-        let mut attn: HashMap<String, String> = [("tp_size", "8"), ("attn_tp_size", "2")]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        let mut attn = labels_of(&[("tp_size", "8"), ("attn_tp_size", "2")]);
         normalize_grpc_keys(&mut attn);
         assert_eq!(attn.get("tp_size").map(String::as_str), Some("8"));
         assert!(!attn.contains_key("attn_tp_size"));
 
-        let mut both: HashMap<String, String> = [("tp_size", "8"), ("tensor_parallel_size", "2")]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        let mut both = labels_of(&[("tp_size", "8"), ("tensor_parallel_size", "2")]);
         normalize_grpc_keys(&mut both);
         assert_eq!(both.get("tp_size").map(String::as_str), Some("8"));
     }
