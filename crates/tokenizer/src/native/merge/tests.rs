@@ -424,6 +424,15 @@ fn the_table_from_ranks_equals_the_table_from_the_equivalent_model() {
         let piece = text.as_bytes();
         let expected: Vec<u32> = own.encode_ordinary(&text);
         assert_eq!(table_ids(&from_ranks, piece), expected, "ranks: {text:?}");
+        // The rank table's pre-formed path, where it answers, gives the same
+        // ids (it pre-forms fewer characters than the model's table may: every
+        // split of a token is a merge to it, so a character's operand
+        // condition is read over more merges).
+        assert_eq!(
+            table_ids_preformed(&from_ranks, piece).0,
+            expected,
+            "ranks, pre-formed: {text:?}"
+        );
         // The model's ids name the same tokens by their alphabet spelling.
         let via_model: Vec<Vec<u8>> = table_ids(&from_model, piece)
             .iter()
@@ -1224,6 +1233,44 @@ fn a_character_pre_forms_only_under_the_three_conditions() {
             model_ids(&bpe, &alphabet, text.as_bytes()),
             "{text}"
         );
+    }
+}
+
+/// A rank vocabulary pre-forms a character under the same three conditions
+/// as a model's, to the file's own encoder's ids.
+#[test]
+fn a_rank_vocabulary_pre_forms_its_characters() {
+    let (_, alphabet) = alphabet_vocab();
+    let zhong = mapped(&alphabet, "中".as_bytes());
+    let [e4, b8, ad] = [0, 1, 2].map(|i| zhong.chars().nth(i).expect("a byte").to_string());
+    let e4b8 = format!("{e4}{b8}");
+    // (1) and (2) hold, no fragment: pre-formed, and the pre-formed path
+    // answers a run of the character to the encoder's ids.
+    let ranks = ranks_of(
+        &[(&e4, &b8), (&e4b8, &ad), (&zhong, &zhong)].map(|(a, b)| (a.as_str(), b.as_str())),
+        false,
+    );
+    let table = MergeTable::from_ranks(&ranks).expect("a complete table");
+    assert_eq!(table.preformed_characters(), 1);
+    let own = own_encoder(&ranks);
+    for text in ["中", "中中", "中中中", "a中", "中a中"] {
+        let (ids, answered) = table_ids_preformed(&table, text.as_bytes());
+        assert!(answered, "{text}");
+        assert_eq!(ids, own.encode_ordinary(text), "{text}");
+    }
+    // (2) fails: (中, 中) ranks before (E4B8, AD): the character is not
+    // pre-formed, the bytes merge as the encoder's do.
+    let ranks = ranks_of(
+        &[(&e4, &b8), (&zhong, &zhong), (&e4b8, &ad)].map(|(a, b)| (a.as_str(), b.as_str())),
+        false,
+    );
+    let table = MergeTable::from_ranks(&ranks).expect("a complete table");
+    assert_eq!(table.preformed_characters(), 0);
+    let own = own_encoder(&ranks);
+    for text in ["中中", "a中"] {
+        let (ids, answered) = table_ids_preformed(&table, text.as_bytes());
+        assert!(!answered, "{text}");
+        assert_eq!(ids, own.encode_ordinary(text), "{text}");
     }
 }
 

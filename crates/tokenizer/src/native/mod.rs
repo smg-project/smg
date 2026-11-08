@@ -1306,6 +1306,7 @@ impl NativeEncoder {
         tracing::debug!(
             merges = merges.merges(),
             bytes = merges.bytes(),
+            preformed_characters = merges.preformed_characters(),
             "the native encode path merges a tiktoken vocabulary's piece-cache misses itself"
         );
         let stages = vec![Stage {
