@@ -50,11 +50,12 @@ pub(super) const CHUNK_FLUSH_BYTES: usize = 16 * 1024;
 
 /// The least room the generate loops' frame buffer takes at its first write
 /// after a full frame left it: two frames, so the frame after it is written
-/// without growing the buffer step by step; a frame that left larger than a
-/// bound makes the room owed its own length plus one bound (every generate
-/// event carries the text so far, so the next frame is about as large and an
-/// event past this room still fits in one allocation). Taken at that write
-/// and not at the flush:
+/// without growing the buffer step by step; a frame that left larger than
+/// this room (one event, the text so far) makes the room owed its own length
+/// plus one bound (the next event is about as large and still fits in one
+/// allocation), and a frame up to the room keeps the room: a frame leaves at
+/// the flush bound, so its length plus a bound is never under it. Taken at
+/// that write and not at the flush:
 /// a paced engine's connection has dropped the sent frame by then and the
 /// buffer takes the allocation they shared back in place, while a burst's next
 /// write comes with the frame still in flight and allocates a fresh room (a

@@ -779,8 +779,8 @@ impl StreamingProcessor {
         // answer of a few tokens) keeps. Every generate event carries the
         // text so far, so a long answer's frames reach the flush bound: once
         // a full frame has left (`flush_generate_frame`), the first write
-        // after it takes the room for two frames, or for the frame that left
-        // plus one more bound when that is more (`write_generate_event`,
+        // after it takes the room for two frames, or for a frame that left
+        // larger than that room, its length plus one more bound (`write_generate_event`,
         // `FRAME_ROOM`): a burst writes at once, with the frame in flight,
         // into a fresh room, one allocation per frame and not one per event;
         // a paced engine writes 20 ms later, the frame dropped, into the
@@ -1042,8 +1042,8 @@ impl StreamingProcessor {
         // answer of a few tokens) keeps. Every generate event carries the
         // text so far, so a long answer's frames reach the flush bound: once
         // a full frame has left (`flush_generate_frame`), the first write
-        // after it takes the room for two frames, or for the frame that left
-        // plus one more bound when that is more (`write_generate_event`,
+        // after it takes the room for two frames, or for a frame that left
+        // larger than that room, its length plus one more bound (`write_generate_event`,
         // `FRAME_ROOM`): a burst writes at once, with the frame in flight,
         // into a fresh room, one allocation per frame and not one per event;
         // a paced engine writes 20 ms later, the frame dropped, into the
@@ -1618,10 +1618,12 @@ impl StreamingProcessor {
     /// leaves here holds the buffer's allocation until the connection has
     /// written it, so the room for the next frame is not taken now but owed
     /// (`room_owed`, in bytes) to the first write after it, see
-    /// [`Self::write_generate_event`]. The room owed is [`FRAME_ROOM`] or the
-    /// frame that left plus one more bound, whichever is more: every event
-    /// carries the text so far, so the next frame is about the size of the
-    /// last one, and an event past the room still fits in one allocation.
+    /// [`Self::write_generate_event`]. The room owed is [`FRAME_ROOM`], or, for
+    /// a frame that left larger than that room (one event, the text so far),
+    /// its length plus one more bound: the next event is about as large, so it
+    /// still fits in one allocation. A frame leaves at the flush bound, so its
+    /// length plus a bound is never under the room: frames up to the room keep
+    /// the room's exact size.
     async fn flush_generate_frame(
         tx: &SseSender,
         buffer: &mut BytesMut,
@@ -1629,7 +1631,14 @@ impl StreamingProcessor {
     ) -> Result<(), ()> {
         if buffer.len() >= CHUNK_FLUSH_BYTES {
             let frame = buffer.split().freeze();
-            *room_owed = FRAME_ROOM.max(frame.len() + CHUNK_FLUSH_BYTES);
+            // A frame past the room is one event (the text so far) and the next
+            // one is about as large: it gets its own length plus a bound. Any
+            // other frame left at the flush bound and keeps the room as it is.
+            *room_owed = if frame.len() > FRAME_ROOM {
+                frame.len() + CHUNK_FLUSH_BYTES
+            } else {
+                FRAME_ROOM
+            };
             tx.send(Ok(frame)).await.map_err(|_| ())?;
         }
         Ok(())
