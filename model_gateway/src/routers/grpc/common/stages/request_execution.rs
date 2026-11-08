@@ -229,7 +229,7 @@ fn pd_side_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 /// over every message on them (see [`RequestDeadline`]); `None` leaves the
 /// attempt unbounded. `grouped_dp_sticky` is `--grouped-dp-sticky`: whether,
 /// and how, a sticky request to a grouped data-parallel worker is pinned to
-/// one of its engines (see [`attempt_load_guards`]).
+/// one of its engines (see [`pin_grouped_dp_rank`]).
 pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     mut execution_plan: ExecutionPlan,
@@ -280,15 +280,17 @@ pub(crate) async fn execute_plan(
 
     ctx.load_guards = Some(LoadGuards::admitted(
         admission,
-        attempt_load_guards(
-            &mut execution_plan,
-            workers,
-            || clients.single().and_then(BackendClient::pinnable_ranks),
-            ctx.sticky_key.as_deref(),
-            sub_requests,
-            grouped_dp_sticky,
-        ),
+        LoadGuards::scaled(workers, ctx.sticky_key.as_deref(), sub_requests),
     ));
+    // A sticky request to a grouped data-parallel worker goes to its key's
+    // engine.
+    pin_grouped_dp_rank(
+        &mut execution_plan,
+        workers,
+        || clients.single().and_then(BackendClient::pinnable_ranks),
+        ctx.sticky_key.as_deref(),
+        grouped_dp_sticky,
+    );
     // The Prefill admission slot worker selection took for this attempt. It
     // is released when the Prefill phase ends, not with the load guards.
     let prefill_guard = ctx.pd_prefill_guard.take();
@@ -818,55 +820,43 @@ async fn execute_batch_dispatch(
     Ok(ExecutionResult::Batch { results })
 }
 
-/// One attempt's worker load guards (a set per sub-request), taken once a
-/// sticky request to a grouped data-parallel worker is pinned to one of its
-/// engines under `sticky`. `pinnable_ranks` reads how many ranks, from 0, the
-/// worker's connection places a pin on, when it says; only a request that
-/// may be pinned reads it (see [`pin_grouped_dp_rank`]).
-fn attempt_load_guards(
+/// A grouped data-parallel worker (one ZMQ socket set that several engines
+/// dial, no `dp_rank`) leaves each request to the connector's least-loaded
+/// pick, which scatters one conversation's turns over the ranks' separate
+/// prefix caches. With a sticky key, pin the plan's single generate request
+/// to the key's rank instead, stable per key as dp-aware expansion pins gRPC
+/// and HTTP rank workers: under `sticky`, the key's hash rank. A batch's
+/// prompts, an embedding and a disaggregated request are left as they are.
+/// The ranks are the worker's `dp_size`, or, for a worker given no count
+/// (its engines declare the group at the handshake), the ranks its
+/// connection places a pin on, fixed for the connection's life:
+/// `pinnable_ranks` reads them, when the connection says (see
+/// [`BackendClient::pinnable_ranks`]), and only for a request that may be
+/// pinned. A key whose rank is not below `pinnable_ranks` (on vLLM, one at
+/// or past the first index the group's engines lack) is left to the
+/// connector's pick, which takes any engine, rather than pinned where the
+/// connector may refuse it.
+fn pin_grouped_dp_rank(
     plan: &mut ExecutionPlan,
     workers: &WorkerSelection,
     pinnable_ranks: impl FnOnce() -> Option<usize>,
     sticky_key: Option<&str>,
-    sub_requests: usize,
     sticky: GroupedDpSticky,
-) -> LoadGuards {
-    if sticky != GroupedDpSticky::Off {
-        if let (ExecutionPlan::Single(ProtoRequest::Generate(request)), Some(key)) =
-            (plan, sticky_key)
-        {
-            pin_grouped_dp_rank(sticky, request, workers, pinnable_ranks(), key);
-        }
-    }
-    LoadGuards::scaled(workers, sticky_key, sub_requests)
-}
-
-/// A grouped data-parallel worker (one ZMQ socket set that several engines
-/// dial, no `dp_rank`) leaves each request to the connector's least-loaded
-/// pick, which scatters one conversation's turns over the ranks' separate
-/// prefix caches. With a sticky key, pin the key's rank instead, stable per
-/// key as dp-aware expansion pins gRPC and HTTP rank workers: under
-/// `sticky`, the key's hash rank. The ranks are the worker's `dp_size`, or,
-/// for a worker given no count (its engines declare the group at the
-/// handshake), the ranks its connection places a pin on (`pinnable_ranks`,
-/// when it says; see [`BackendClient::pinnable_ranks`]), fixed for the
-/// connection's life. A key whose rank is not below `pinnable_ranks` (on
-/// vLLM, one at or past the first index the group's engines lack) is left to
-/// the connector's pick, which takes any engine, rather than pinned where
-/// the connector may refuse it.
-fn pin_grouped_dp_rank(
-    sticky: GroupedDpSticky,
-    request: &mut ProtoGenerateRequest,
-    workers: &WorkerSelection,
-    pinnable_ranks: Option<usize>,
-    key: &str,
 ) {
+    if sticky == GroupedDpSticky::Off {
+        return;
+    }
+    let (ExecutionPlan::Single(ProtoRequest::Generate(request)), Some(key)) = (plan, sticky_key)
+    else {
+        return;
+    };
     let Some(worker) = workers.single() else {
         return;
     };
     if worker.dp_rank().is_some() {
         return;
     }
+    let pinnable_ranks = pinnable_ranks();
     let Some(size) = worker.dp_size().or(pinnable_ranks).filter(|&size| size > 1) else {
         return;
     };
@@ -4382,14 +4372,14 @@ pub(crate) mod tests {
     }
 
     /// One attempt of a single generate request (sticky `key`) to `workers`,
-    /// its guards taken by what `execute_plan` takes them with, under
-    /// `sticky`: the rank the request carries, and the guards. The worker's
-    /// connection does not say which ranks it places a pin on.
+    /// pinned as `execute_plan` pins it under `sticky`: the rank the request
+    /// carries. The worker's connection does not say which ranks it places a
+    /// pin on.
     fn attempt(
         sticky: GroupedDpSticky,
         workers: &WorkerSelection,
         key: Option<&str>,
-    ) -> (Option<i32>, LoadGuards) {
+    ) -> Option<i32> {
         attempt_on(sticky, workers, None, key)
     }
 
@@ -4400,13 +4390,13 @@ pub(crate) mod tests {
         workers: &WorkerSelection,
         pinnable_ranks: Option<usize>,
         key: Option<&str>,
-    ) -> (Option<i32>, LoadGuards) {
+    ) -> Option<i32> {
         let mut plan = ExecutionPlan::Single(ProtoRequest::Generate(tokenspeed_request(1, None)));
-        let guards = attempt_load_guards(&mut plan, workers, || pinnable_ranks, key, 1, sticky);
+        pin_grouped_dp_rank(&mut plan, workers, || pinnable_ranks, key, sticky);
         let ExecutionPlan::Single(ProtoRequest::Generate(request)) = &plan else {
             panic!("the plan stays a single generate request");
         };
-        (pinned_rank(request), guards)
+        pinned_rank(request)
     }
 
     /// Under `--grouped-dp-sticky off` (the default) a sticky request to a
@@ -4414,9 +4404,7 @@ pub(crate) mod tests {
     #[test]
     fn with_pinning_off_no_request_is_pinned() {
         let workers = grouped_worker("ipc:///tmp/unpinned.ipc", 2);
-        let (rank, guards) = attempt(GroupedDpSticky::Off, &workers, Some("conv"));
-        assert_eq!(rank, None);
-        assert!(matches!(guards, LoadGuards::Single { .. }));
+        assert_eq!(attempt(GroupedDpSticky::Off, &workers, Some("conv")), None);
     }
 
     /// Under hash placement a sticky key is pinned to `xxh3(key) % dp_size`,
@@ -4432,9 +4420,8 @@ pub(crate) mod tests {
             for i in 0..100 {
                 let key = format!("conv-{i}");
                 for _ in 0..2 {
-                    let (rank, guards) = attempt(GroupedDpSticky::Hash, &workers, Some(&key));
+                    let rank = attempt(GroupedDpSticky::Hash, &workers, Some(&key));
                     assert_eq!(rank, Some(hashed(&key, size)), "{key} of {size}");
-                    assert!(matches!(guards, LoadGuards::Single { .. }));
                 }
             }
         }
@@ -4449,7 +4436,7 @@ pub(crate) mod tests {
     fn a_key_whose_rank_the_connection_cannot_place_is_left_to_the_connector() {
         let workers = grouped_worker("ipc:///tmp/partial.ipc", 4);
         let hash = |ranks: usize, key: &str| {
-            attempt_on(GroupedDpSticky::Hash, &workers, Some(ranks), Some(key)).0
+            attempt_on(GroupedDpSticky::Hash, &workers, Some(ranks), Some(key))
         };
         let mut left = 0;
         for i in 0..32 {
@@ -4480,7 +4467,7 @@ pub(crate) mod tests {
             ),
         };
         let hash = |ranks: usize, key: &str| {
-            attempt_on(GroupedDpSticky::Hash, &workers, Some(ranks), Some(key)).0
+            attempt_on(GroupedDpSticky::Hash, &workers, Some(ranks), Some(key))
         };
         for i in 0..32 {
             let key = format!("conv-{i}");
@@ -4504,8 +4491,7 @@ pub(crate) mod tests {
             single(BasicWorkerBuilder::new("ipc:///tmp/one.ipc").zmq_engine_group(1)),
             tokenspeed_pair(),
         ] {
-            let (rank, _guards) = attempt(GroupedDpSticky::Hash, &workers, Some("conv"));
-            assert_eq!(rank, None);
+            assert_eq!(attempt(GroupedDpSticky::Hash, &workers, Some("conv")), None);
         }
     }
 
@@ -4514,20 +4500,22 @@ pub(crate) mod tests {
     #[test]
     fn only_a_single_generate_request_with_a_sticky_key_is_pinned() {
         let workers = grouped_worker("ipc:///tmp/unkeyed.ipc", 2);
-        let (rank, _guards) = attempt(GroupedDpSticky::Hash, &workers, None);
-        assert_eq!(rank, None, "no sticky key");
+        assert_eq!(
+            attempt(GroupedDpSticky::Hash, &workers, None),
+            None,
+            "no sticky key"
+        );
 
         let mut batch = ExecutionPlan::Batch {
             kind: ExecutionPlanKind::Single,
             shared_request_id: "batch".to_string(),
             requests: vec![tokenspeed_request(1, None), tokenspeed_request(1, None)],
         };
-        let guards = attempt_load_guards(
+        pin_grouped_dp_rank(
             &mut batch,
             &workers,
             || None,
             Some("conv"),
-            2,
             GroupedDpSticky::Hash,
         );
         assert!(
@@ -4536,6 +4524,5 @@ pub(crate) mod tests {
                 .all(|request| pinned_rank(request).is_none()),
             "a batch's prompts"
         );
-        assert!(matches!(guards, LoadGuards::Batch { .. }));
     }
 }

@@ -1,6 +1,6 @@
 //! Which engine (rank) of a grouped data-parallel worker a sticky key is
 //! pinned to under `--grouped-dp-sticky` (see
-//! `request_execution::attempt_load_guards`).
+//! `request_execution::pin_grouped_dp_rank`).
 //!
 //! Hash placement (`hash`: `xxh3(key) % dp_size`) needs no memory and gives
 //! a key the same rank in every gateway process, across restarts and
