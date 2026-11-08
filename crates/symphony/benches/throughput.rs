@@ -472,15 +472,16 @@ fn setup(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("engine", name), subject, |b, subject| {
             b.iter(|| black_box(engine(subject.table, subject.prompt, &typed)));
         });
-        // The constraint of a forced call, built once per request that forces one (a required
-        // or named `tool_choice`): the grammar over the request's tools and its text for the
-        // engine's compiler, which a gateway builds in its request preparation.
+        // The constraint of a required call (`tool_choice: required`; a named choice sets
+        // `one_call`), built once per request that asks for one: the grammar over the request's
+        // tools and its text for the engine's compiler, which a gateway builds in its request
+        // preparation, from where the subject's prompt leaves the model.
         group.bench_with_input(BenchmarkId::new("grammar", name), subject, |b, subject| {
             let format = subject.table.format();
             let options = Options {
                 at_least_one: true,
-                reasoning_open: false,
-                thought_closed: false,
+                reasoning_open: format.reasoning_open(subject.prompt),
+                thought_closed: format.thought_closed(subject.prompt),
                 one_call: false,
                 start: GrammarStart::Unknown,
             };
