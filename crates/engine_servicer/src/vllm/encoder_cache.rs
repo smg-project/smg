@@ -5,7 +5,7 @@
 //! fetch address for every item it encoded.
 
 use serde_json::Value;
-use smg_grpc_client::{vllm_media_identity, vllm_proto as vllm};
+use smg_grpc_client::{media_identity, vllm_proto as vllm};
 use tonic::Status;
 
 use super::VllmModelInfo;
@@ -123,7 +123,7 @@ fn handles_cover(missing: &[&vllm::MultimodalInputs], connector: &str, params: &
 
 /// A producer's completion carries the media identity the Router hands the
 /// prefill side: the prompt's token ids and the request's batches without
-/// their pixels (the one rule of `smg_grpc_client::vllm_media_identity`,
+/// their pixels (the one rule of `smg_grpc_client::media_identity`,
 /// which the Router's decode side reads by too), for a request
 /// whose batches all carry pixels and hashes. A media-reference request gets
 /// its identity from the media stage instead; a request without batches, or
@@ -142,7 +142,7 @@ pub(super) fn producer_identity(
         Some(vllm::generate_request::Input::Tokenized(tokenized)) => tokenized.input_ids.clone(),
         _ => return None,
     };
-    let mut stripped = batches(req).filter_map(vllm_media_identity::identity);
+    let mut stripped = batches(req).filter_map(media_identity::identity);
     Some(vllm::MediaIdentity {
         prompt_token_ids,
         mm_inputs: stripped.next(),

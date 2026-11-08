@@ -42,7 +42,7 @@ mod multimodal;
 mod request;
 mod shm;
 
-pub(crate) use smg_grpc_client::vllm_media_identity::identity as vllm_mm_identity;
+pub(crate) use smg_grpc_client::media_identity::identity as vllm_mm_identity;
 
 use self::shm::vllm_mm_hash_identity;
 pub use self::{

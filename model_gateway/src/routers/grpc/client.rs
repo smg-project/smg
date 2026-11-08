@@ -10,10 +10,11 @@ use openai_protocol::{
     worker::{ConstrainedDecoding, WorkerLoadResponse},
 };
 use smg_grpc_client::{
-    common_proto, mlx_proto, sglang_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle,
-    tokenspeed_proto, trtllm_proto, vllm_proto, BoxedTraceInjector, FormatSetAside,
-    MlxEngineClient, OutputConstraint, SglangGenerateRequestOptions, SglangSchedulerClient,
-    TokenSpeedSchedulerClient, TrtllmServiceClient, VllmEngineClient,
+    common_proto, media_identity::sglang as media_contract, mlx_proto, sglang_proto,
+    tokenizer_bundle, tokenizer_bundle::StreamBundle, tokenspeed_proto, trtllm_proto, vllm_proto,
+    BoxedTraceInjector, FormatSetAside, MlxEngineClient, OutputConstraint,
+    SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
+    TrtllmServiceClient, VllmEngineClient,
 };
 
 use super::multimodal::SUPPORTS_VISION_LABEL;
@@ -964,7 +965,7 @@ impl ServerInfo {
 
 /// Keys worth extracting from SGLang gRPC `server_args` (which contains the full config).
 const SGLANG_GRPC_KEYS: &[&str] = &[
-    smg_grpc_client::sglang_media_identity::LABEL,
+    media_contract::LABEL,
     "mm_processor",
     "mm_media_ref_schemes",
     "model_path",

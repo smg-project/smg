@@ -4130,7 +4130,7 @@ fn cpu_mm_hash_configuration_preserves_engine_opt_outs() {
 #[tokio::test]
 /// Verify early metadata delivery and Decode reuse or original-reference fallback.
 async fn media_identity_arrives_before_kv_and_decode_falls_back_when_invalid() {
-    use smg_grpc_client::sglang_media_identity as contract;
+    use smg_grpc_client::media_identity::sglang as contract;
     let mut model = model_info();
     model.server_args_json = r#"{"disaggregation_mode":"prefill"}"#.into();
     let mut p = harness_with_media_reuse(

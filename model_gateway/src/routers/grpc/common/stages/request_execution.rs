@@ -9,7 +9,9 @@ use std::{
 
 use axum::response::Response;
 use futures::future::{join_all, try_join_all};
-use smg_grpc_client::{is_transport_failure, RequestDeadline};
+use smg_grpc_client::{
+    is_transport_failure, media_identity::sglang as media_contract, RequestDeadline,
+};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info_span, warn, Instrument};
 
@@ -1105,7 +1107,7 @@ async fn execute_parallel_pd(
                 tokio::time::timeout(SGLANG_MEDIA_IDENTITY_TIMEOUT, identity_rx).await
             {
                 if let ProtoGenerateRequest::Sglang(req) = &mut decode_request {
-                    if smg_grpc_client::sglang_media_identity::validate(&identity, req, &key) {
+                    if media_contract::validate(&identity, req, &key) {
                         req.media_identity = Some(Box::new(identity));
                     }
                 }
@@ -1148,24 +1150,14 @@ fn sglang_media_reuse_key(req: &ProtoGenerateRequest, workers: &WorkerSelection)
     let ProtoGenerateRequest::Sglang(req) = req else {
         return None;
     };
-    if !smg_grpc_client::sglang_media_identity::reusable_request(req) {
+    if !media_contract::reusable_request(req) {
         return None;
     }
     let prefill = workers.prefill_worker()?;
     let decode = workers.decode_worker()?;
-    let key = prefill
-        .metadata()
-        .spec
-        .labels
-        .get(smg_grpc_client::sglang_media_identity::LABEL)?;
-    (!key.is_empty()
-        && decode
-            .metadata()
-            .spec
-            .labels
-            .get(smg_grpc_client::sglang_media_identity::LABEL)
-            == Some(key))
-    .then(|| key.clone())
+    let key = prefill.metadata().spec.labels.get(media_contract::LABEL)?;
+    (!key.is_empty() && decode.metadata().spec.labels.get(media_contract::LABEL) == Some(key))
+        .then(|| key.clone())
 }
 
 /// The parallel dispatch's two requests from the client's: the prefill side is
@@ -2180,7 +2172,7 @@ pub(crate) mod tests {
     #[test]
     /// Require matching worker contracts and preserve Decode references for failed reuse.
     fn sglang_identity_requires_matching_capabilities_and_keeps_fallback_refs() {
-        use smg_grpc_client::{sglang_media_identity as contract, sglang_proto as sg};
+        use smg_grpc_client::{media_identity::sglang as contract, sglang_proto as sg};
         let request = ProtoGenerateRequest::Sglang(Box::new(sg::GenerateRequest {
             request_id: "identity".into(),
             tokenized: Some(sg::TokenizedInput {

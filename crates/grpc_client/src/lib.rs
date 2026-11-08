@@ -19,17 +19,16 @@ pub mod codec;
 pub mod constraint_failure;
 pub mod engine_load;
 pub mod media_fault;
+pub mod media_identity;
 pub mod mlx_engine;
 pub mod request_deadline;
 mod request_fields;
-pub mod sglang_media_identity;
 pub mod sglang_scheduler;
 pub mod tokenizer_bundle;
 pub mod tokenspeed_encoder;
 pub mod tokenspeed_scheduler;
 pub mod trtllm_service;
 pub mod vllm_engine;
-pub mod vllm_media_identity;
 
 // Re-export clients
 use std::sync::Arc;

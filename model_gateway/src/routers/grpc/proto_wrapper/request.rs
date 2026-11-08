@@ -55,7 +55,7 @@ pub enum ProtoGenerateRequest {
     TokenSpeed(Box<tokenspeed::GenerateRequest>),
 }
 
-pub(crate) use smg_grpc_client::vllm_media_identity::MROPE_GRID_KEYS as VLLM_MROPE_GRID_KEYS;
+pub(crate) use smg_grpc_client::media_identity::GRID_KEYS as VLLM_MROPE_GRID_KEYS;
 
 /// A JSON answer's constraint as the worker of an attempt takes it: the table's
 /// structural tag, or the request's own schema where the table gives that

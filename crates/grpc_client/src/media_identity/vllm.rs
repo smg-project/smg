@@ -1,90 +1,55 @@
-//! The pixel-less identity of a multimodal batch on this wire, for the side
-//! that did not run the encoder: a PD decode side and an encoder-cache prefill
-//! side read it off the preprocessing side's completion. One rule for the
-//! gateway and the servicer.
+//! The vLLM wire's batch message under the rule.
 
-use std::collections::HashMap;
+use super::{Batch, Kept};
+use crate::vllm_proto::{tensor_data::Payload, MultimodalInputs};
 
-use crate::vllm_proto::{tensor_data::Payload, MultimodalInputs, TensorData};
-
-/// Per-item grid metadata the engine reads to compute M-RoPE positions
-/// (`_get_mrope_input_positions`); a few ints per item. The video timing has
-/// two spellings: `second_per_grid_ts` from the Qwen-VL processors,
-/// `video_second_per_grid` from the Qwen-Omni family and the gateway's own
-/// processors. The Python servicer's `GRID_KEYS` mirrors this list.
-pub const MROPE_GRID_KEYS: [&str; 4] = [
-    "image_grid_thw",
-    "video_grid_thw",
-    "second_per_grid_ts",
-    "video_second_per_grid",
-];
-
-/// The identity of a multimodal batch without its pixels: the hashes, the
-/// placeholders, the image token id and the modality, and the M-RoPE grid
-/// tensors with inline payloads (a shared-memory segment is unreadable once
-/// its reader has unlinked it) with the size tensors of the flat ones; every
-/// other tensor goes with the pixels and the key lists are trimmed to what
-/// stays. A hash-less batch carries no identity worth keeping.
-pub fn identity(mm: &MultimodalInputs) -> Option<MultimodalInputs> {
-    if mm.mm_hashes.is_empty() {
-        return None;
+impl Batch for MultimodalInputs {
+    fn hashed(&self) -> bool {
+        !self.mm_hashes.is_empty()
     }
-    let inline_tensor = |key: &str| {
-        mm.model_specific_tensors
+
+    /// A shared-memory segment is unreadable once its reader has unlinked
+    /// it: the inline payloads alone ride.
+    fn readable(&self, key: &str) -> bool {
+        self.model_specific_tensors
             .get(key)
-            .filter(|tensor| matches!(tensor.payload, Some(Payload::Inline(_))))
-            .cloned()
-    };
-    let mut grid_tensors: HashMap<String, TensorData> = MROPE_GRID_KEYS
-        .iter()
-        .filter_map(|key| inline_tensor(key).map(|tensor| (key.to_string(), tensor)))
-        .collect();
-    // A flat-classified grid key needs its sizes tensor to keep per-item
-    // slicing on the reading side.
-    let mut flat_keys = HashMap::new();
-    for (key, sizes_key) in &mm.flat_keys {
-        if !grid_tensors.contains_key(key) {
-            continue;
-        }
-        match inline_tensor(sizes_key) {
-            Some(sizes) => {
-                grid_tensors.insert(sizes_key.clone(), sizes);
-                flat_keys.insert(key.clone(), sizes_key.clone());
-            }
-            None => {
-                tracing::warn!(
-                    grid_key = %key,
-                    sizes_key = %sizes_key,
-                    "dropping a grid tensor from the media identity: its sizes tensor is not inline"
-                );
-                grid_tensors.remove(key);
-            }
+            .is_some_and(|tensor| matches!(tensor.payload, Some(Payload::Inline(_))))
+    }
+
+    fn sizes_key(&self, key: &str) -> Option<&str> {
+        self.flat_keys.get(key).map(String::as_str)
+    }
+
+    fn without_pixels(&self, kept: &Kept) -> Self {
+        let retained = |keys: &[String]| keys.iter().filter(|key| kept.has(key)).cloned().collect();
+        Self {
+            im_token_id: self.im_token_id,
+            mm_placeholders: self.mm_placeholders.clone(),
+            mm_hashes: self.mm_hashes.clone(),
+            modality: self.modality,
+            batched_keys: retained(&self.batched_keys),
+            keep_on_cpu_keys: retained(&self.keep_on_cpu_keys),
+            flat_keys: kept.flat_keys().clone(),
+            model_specific_tensors: self
+                .model_specific_tensors
+                .iter()
+                .filter(|(key, _)| kept.has(key))
+                .map(|(key, tensor)| (key.clone(), tensor.clone()))
+                .collect(),
+            encoder_input_key: self.encoder_input_key.clone(),
+            ..Default::default()
         }
     }
-    let retained = |keys: &[String]| {
-        keys.iter()
-            .filter(|key| grid_tensors.contains_key(*key))
-            .cloned()
-            .collect()
-    };
-    Some(MultimodalInputs {
-        im_token_id: mm.im_token_id,
-        mm_placeholders: mm.mm_placeholders.clone(),
-        mm_hashes: mm.mm_hashes.clone(),
-        modality: mm.modality,
-        batched_keys: retained(&mm.batched_keys),
-        keep_on_cpu_keys: retained(&mm.keep_on_cpu_keys),
-        flat_keys,
-        model_specific_tensors: grid_tensors,
-        encoder_input_key: mm.encoder_input_key.clone(),
-        ..Default::default()
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common_proto::ShmHandle;
+    use crate::{
+        common_proto::{Modality, ShmHandle},
+        media_identity::identity,
+        vllm_proto::{PlaceholderRange, TensorData},
+    };
 
     fn inline(shape: Vec<u32>, values: &[i64]) -> TensorData {
         TensorData {
@@ -178,6 +143,33 @@ mod tests {
         let without_sizes = identity(&mm).expect("an identity");
         assert!(without_sizes.model_specific_tensors.is_empty());
         assert!(without_sizes.flat_keys.is_empty());
+    }
+
+    /// The fields the rule carries as they are survive the cut: the token
+    /// id, the modality, the placeholders, the hashes and the encoder
+    /// input's key.
+    #[test]
+    fn the_passthrough_fields_survive() {
+        let mut mm = batch();
+        mm.im_token_id = Some(151_655);
+        mm.modality = Modality::Video as i32;
+        mm.mm_placeholders = vec![
+            PlaceholderRange {
+                offset: 3,
+                length: 8,
+            },
+            PlaceholderRange {
+                offset: 20,
+                length: 8,
+            },
+        ];
+        mm.encoder_input_key = Some("patches".to_string());
+        let stripped = identity(&mm).expect("an identity");
+        assert_eq!(stripped.im_token_id, Some(151_655));
+        assert_eq!(stripped.modality, Modality::Video as i32);
+        assert_eq!(stripped.mm_placeholders, mm.mm_placeholders);
+        assert_eq!(stripped.mm_hashes, mm.mm_hashes);
+        assert_eq!(stripped.encoder_input_key.as_deref(), Some("patches"));
     }
 
     /// A hash-less batch has no identity worth keeping.
