@@ -979,8 +979,19 @@ impl ProtoGenerateRequest {
         }
         // Below `i64::MAX - ranks`, so adding back up to `ranks - 1` cannot
         // overflow.
-        let base = info.bootstrap_room.rem_euclid(i64::MAX - ranks);
+        let minted = info.bootstrap_room;
+        let base = minted.rem_euclid(i64::MAX - ranks);
         info.bootstrap_room = base - base % ranks + rank;
+        // The minted room was logged when it was injected; name the room that
+        // is dispatched, which engines report in their KV-transfer errors.
+        tracing::debug!(
+            request_id = %req.request_id,
+            minted_room = minted,
+            room = info.bootstrap_room,
+            rank,
+            ranks,
+            "PD bootstrap room moved into the sticky key's prefill rank"
+        );
         true
     }
 }

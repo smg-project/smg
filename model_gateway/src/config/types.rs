@@ -1379,9 +1379,10 @@ pub enum GroupedDpSticky {
     /// engine.
     #[default]
     Off,
-    /// Every request of a key to its hash engine, `xxh3(key) % dp_size`: the
-    /// same engine across requests, gateway restarts and replicas, however
-    /// unevenly the keys fall.
+    /// Every request of a key to its hash engine, `xxh3(key) % ranks` (the
+    /// worker's engines; on a disaggregated pair, the engines the prefill
+    /// connection connected): the same engine across requests, gateway
+    /// restarts and replicas, however unevenly the keys fall.
     Hash,
 }
 
