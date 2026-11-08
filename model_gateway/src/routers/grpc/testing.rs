@@ -3,7 +3,8 @@
 //! factories always; an initialized MCP orchestrator, which the Responses
 //! contexts of the regular and the disaggregated modes read), and the
 //! labelled worker selection the stages' tests read a decode worker's
-//! labels from.
+//! labels from, and the forced call a thinking prompt takes under a parser,
+//! which the restamp and the parser-utility tests shape a constraint from.
 
 use std::{
     sync::{Arc, Mutex, OnceLock},
@@ -15,12 +16,13 @@ use llm_tokenizer::{
     traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer},
     MockTokenizer,
 };
+use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
 };
 use smg_mcp::{McpConfig, McpOrchestrator};
-use tool_parser::ParserFactory as ToolParserFactory;
+use tool_parser::{ParserFactory as ToolParserFactory, ToolConstraint};
 
 use crate::{
     app_context::AppContext,
@@ -120,6 +122,29 @@ pub(crate) fn worker(labels: &[(&str, &str)]) -> WorkerSelection {
     }
     WorkerSelection::Single {
         worker: Arc::new(builder.build()),
+    }
+}
+
+/// The forced call a thinking prompt takes under `parser`: the constraint's
+/// kind and the structural tag the registry builds for one `get_weather` tool
+/// under `tool_choice: required`, with the reasoning prefix armed.
+pub(crate) fn forced_call_on_a_thinking_prompt(
+    factory: &ToolParserFactory,
+    parser: &str,
+) -> (String, String) {
+    let tools: Vec<Tool> = serde_json::from_value(serde_json::json!([{
+        "type": "function",
+        "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}
+    }]))
+    .unwrap();
+    let required = ToolChoice::Value(ToolChoiceValue::Required);
+    match factory
+        .registry()
+        .generate_tool_constraint(Some(parser), &tools, &required, true)
+        .unwrap()
+    {
+        Some(ToolConstraint::StructuralTag(tag)) => ("structural_tag".to_string(), tag),
+        other => panic!("expected a structural tag, got {other:?}"),
     }
 }
 
