@@ -270,14 +270,22 @@ impl GenerateEvent<'_> {
     /// ids, the `meta_info` and the index through serde), pinned by
     /// `tests::generate_event_frames_write_the_bytes_of_the_serialized_event`.
     fn write_into(&self, buffer: &mut BytesMut) -> serde_json::Result<()> {
+        // Matched field by field with no rest pattern, so a field added to the
+        // event is a compile error here until this write says where it goes.
+        let Self {
+            text,
+            output_ids,
+            meta_info,
+            index,
+        } = self;
         buffer.extend_from_slice(b"{\"text\":");
-        self.text.write_literal(buffer);
+        text.write_literal(buffer);
         buffer.extend_from_slice(b",\"output_ids\":");
-        serde_json::to_writer(FrameSink(buffer), self.output_ids)?;
+        serde_json::to_writer(FrameSink(buffer), output_ids)?;
         buffer.extend_from_slice(b",\"meta_info\":");
-        serde_json::to_writer(FrameSink(buffer), &self.meta_info)?;
+        serde_json::to_writer(FrameSink(buffer), meta_info)?;
         buffer.extend_from_slice(b",\"index\":");
-        serde_json::to_writer(FrameSink(buffer), &self.index)?;
+        serde_json::to_writer(FrameSink(buffer), index)?;
         buffer.extend_from_slice(b"}");
         Ok(())
     }
