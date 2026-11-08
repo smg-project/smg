@@ -107,6 +107,14 @@ impl KvEventMonitor {
         }
         if hybrid && worker_blocks.groups.is_none() {
             let indexed = worker_blocks.blocks.len();
+            if indexed > 0 {
+                worker_blocks.counters.group_view_late += 1;
+                warn!(
+                    worker_id,
+                    indexed,
+                    "KV cache group view created after the worker's main blocks were indexed; its rule stays off until the worker's next clear"
+                );
+            }
             worker_blocks.view(indexer, worker_id).created_over(indexed);
         }
         let mut deferred = Vec::new();
@@ -441,6 +449,9 @@ pub(crate) struct WorkerIndexCounters {
     /// name under a parent it did not know (the view's own counts, copied).
     pub(crate) group_dropped: u64,
     pub(crate) group_unnamed: u64,
+    /// Views created after the worker's main blocks were indexed: their rule
+    /// stays off until the worker's next clear.
+    pub(crate) group_view_late: u64,
     /// Main stores with a block that carried no tokens: nothing to index under.
     pub(crate) tokenless_stores: u64,
     /// Events for blocks not local to the worker.
@@ -1539,7 +1550,10 @@ mod tests {
             0,
             "block 2 hangs on a block the view never named"
         );
-        assert_eq!(wb.counters.group_unnamed, 1);
+        assert_eq!(
+            (wb.counters.group_unnamed, wb.counters.group_view_late),
+            (1, 1)
+        );
         let hashes = compute_request_content_hashes(&[10, 20, 30, 40, 50, 60, 70, 80], 4);
         assert_eq!(
             capped(&indexer, w1, &hashes, 4),

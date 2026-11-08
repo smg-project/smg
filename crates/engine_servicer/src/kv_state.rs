@@ -543,11 +543,22 @@ impl SnapshotChunks {
     /// its rank (the stamp moves that rank's cursor at the gateway).
     pub fn new(snapshot: Snapshot, cuts: &BTreeMap<Option<i32>, RankCut>, timestamp: f64) -> Self {
         let blocks = snapshot.blocks;
-        let ranks: Vec<(Option<i32>, Vec<Arc<LiveBlock>>)> = snapshot
+        let mut ranks: Vec<(Option<i32>, Vec<Arc<LiveBlock>>)> = snapshot
             .ranks
             .into_iter()
             .map(|(rank, entries)| (rank, order_rank(entries)))
             .collect();
+        // A rank with a group-lane entry goes first: the ranks of one engine
+        // share one view at a gateway that pools them, and the view must
+        // exist before any rank's main lane is applied (its leading entry,
+        // see `order_rank`). Each rank's chunks are stamped from its own cut,
+        // so the rank order moves no cursor.
+        if let Some(first) = ranks
+            .iter()
+            .position(|(_, units)| units.first().is_some_and(|unit| unit.lane != MAIN_LANE))
+        {
+            ranks.swap(0, first);
+        }
         let cut_of = |rank: &Option<i32>| cuts.get(rank).copied().unwrap_or_default();
         let largest_units = ranks
             .iter()
@@ -726,11 +737,12 @@ fn cut_chunks(
 /// child), so the gateway's index derives every position from a parent it
 /// already holds, then the remaining group lanes in store order. The gateway
 /// names a batch's main blocks in a worker's group view only once a group's
-/// store has given it one, so the leading entry puts the view in the first
-/// chunk and every main block is named in chain order; the group entries
-/// that follow the main lane then land on named blocks, and the leading one
-/// waits for its own. Left among the main lane they would hoist a main block
-/// ahead of its own parent; all ahead of it, a whole lane would wait.
+/// store has given it one, so the leading entry puts the view in the rank's
+/// first chunk ([`SnapshotChunks::new`] puts a rank that has one first) and
+/// every main block is named in chain order; the group entries that follow
+/// the main lane then land on named blocks, and the leading one waits for
+/// its own. Left among the main lane they would hoist a main block ahead of
+/// its own parent; all ahead of it, a whole lane would wait.
 fn order_rank(entries: Vec<SnapshotEntry>) -> Vec<Arc<LiveBlock>> {
     let (mut entries, mut grouped): (Vec<SnapshotEntry>, Vec<SnapshotEntry>) = entries
         .into_iter()
@@ -1149,6 +1161,57 @@ mod tests {
         state.apply(&batch(5, Some(0), vec![kindless]));
         assert_eq!(state.group_copies(Some(0), device, 2, 9), 1);
         assert_eq!(state.copies(Some(0), device, 9), 0);
+    }
+
+    /// Two ranks of one engine, the first holding main blocks alone: the
+    /// snapshot puts the rank with a group entry first, so a gateway that
+    /// pools the ranks in one view has the view before any main lane.
+    #[test]
+    fn a_rank_with_a_group_entry_leads_a_snapshot_of_several_ranks() {
+        let device = KvCacheTier::Device;
+        let mut state = LiveState::new();
+        state.apply(&batch(1, Some(0), vec![stored(None, &[1, 2], device)]));
+        state.apply(&batch(
+            1,
+            Some(1),
+            vec![
+                group_stored(1, "sliding_window", Some(8), &[4]),
+                stored(None, &[3, 4], device),
+            ],
+        ));
+        let chunks = chunks_of(&state, 1);
+        let stores: Vec<(Option<u32>, Vec<i64>)> = chunks
+            .iter()
+            .flat_map(|chunk| chunk.events.iter())
+            .filter_map(|event| match &event.data {
+                Some(kv_cache_event::Data::Stored(stored)) => Some((
+                    stored.group_idx,
+                    stored.blocks.iter().map(|block| block.block_hash).collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stores,
+            vec![
+                (Some(1), vec![4]),
+                (Some(0), vec![3, 4]),
+                (Some(0), vec![1, 2])
+            ],
+            "the group entry of rank 1 leads, then its main lane, then rank 0"
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.dp_rank == Some(1))
+                .count()
+                + chunks
+                    .iter()
+                    .filter(|chunk| chunk.dp_rank == Some(0))
+                    .count(),
+            chunks.len(),
+            "every chunk carries its own rank"
+        );
     }
 
     #[test]
