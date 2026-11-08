@@ -130,14 +130,13 @@ pub struct TrtllmServicerConfig {
 /// for the rank, so both wires carry one field set (the token counts and
 /// the KV capacity included). A connected rank reads its own entry,
 /// zero-filled before its first load tail; a rank past the connected ones
-/// gets no record (`rank_entries`).
+/// gets no record (`info::rank_load`).
 impl crate::kv_events::RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad> {
-        let response = info::loads(self, dp_rank).ok()?;
-        let load = response.loads.first()?;
+        let load = info::rank_load(self, dp_rank)?;
         // The queued token-work is this servicer's own estimate for the
-        // rank (see `info::loads`), so every rank's record reports it.
-        let mut record = common::EngineLoad::from(load);
+        // rank (see `info::rank_load`), so every rank's record reports it.
+        let mut record = common::EngineLoad::from(&load);
         record.waiting_uncached_tokens =
             Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
         Some(record)

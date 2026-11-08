@@ -3711,3 +3711,74 @@ async fn a_burst_of_overlapping_prefills_reads_the_capacity_of_the_whole_batch()
     );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
+
+/// The record the relay attaches to a batch for a rank is the `GetLoads`
+/// entry of that rank, read alone: zero-filled before the rank's first load
+/// tail, the tail's figures after it; `None` names rank 0; a rank past the
+/// connected ones has no record.
+#[tokio::test]
+async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
+    use crate::kv_events::RankLoads;
+
+    let record_of = |load: &ts::SchedulerLoad| {
+        let mut record = common::EngineLoad::from(load);
+        record.waiting_uncached_tokens =
+            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+        record
+    };
+    let own = ts::GetLoadsRequest {
+        dp_rank: Some(0),
+        include: Vec::new(),
+    };
+    let mut h = harness(model_info(), None).await;
+    let idle = h.client.get_loads(own.clone()).await.unwrap().into_inner();
+    assert_eq!(
+        h.server.state.rank_load(Some(0)),
+        Some(record_of(&idle.loads[0])),
+        "before the first load tail"
+    );
+
+    let _stream = h
+        .client
+        .generate(generate_request("rl", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("rl", vec![10], 1, None, Some((2, 1, 10, 100))),
+    )
+    .await;
+    wait_until(|| {
+        h.server
+            .state
+            .shared
+            .engine
+            .client
+            .get()
+            .is_some_and(|client| !client.get_loads().loads.is_empty())
+    })
+    .await;
+    // The server's own poll of the chunk credits the streamed token to the
+    // rank on the tracker: the reads below run once it has.
+    wait_until(|| h.server.state.shared.loads.estimate(0, 0).gen_throughput > 0.0).await;
+    let busy = h.client.get_loads(own).await.unwrap().into_inner();
+    assert_eq!(
+        (
+            busy.loads[0].num_running_reqs,
+            busy.loads[0].num_waiting_reqs
+        ),
+        (2, 1),
+        "the tail reached the report: {busy:?}"
+    );
+    let state = &h.server.state;
+    assert_eq!(
+        state.rank_load(Some(0)),
+        Some(record_of(&busy.loads[0])),
+        "after the load tail"
+    );
+    assert_eq!(state.rank_load(None), state.rank_load(Some(0)));
+    assert!(state.rank_load(Some(1)).is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}

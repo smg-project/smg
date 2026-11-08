@@ -11,7 +11,7 @@ use tracing::info;
 
 use super::{State, HEALTHY, SERVER_TYPE};
 use crate::{
-    load_report::{rank_entries, RankFigures},
+    load_report::{rank_entries, rank_entry, RankFigures},
     servicer::proto_token_ids,
 };
 
@@ -283,18 +283,12 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<vllm::GetLoad
 pub(super) fn rank_load(state: &State, dp_rank: Option<i32>) -> Option<vllm::SchedulerLoad> {
     let client = state.shared.engine().ok()?;
     let capacity = Capacity::of(state);
-    let ranks = state.shared.rank_count(state.model.data_parallel_size);
-    let rank = dp_rank.unwrap_or(0);
-    let index = u32::try_from(rank).ok()?;
-    let entry = match client.rank_load(index) {
-        Some(load) => {
-            let figures = RankFigures::of(&load, capacity.max_total_num_tokens);
-            reported_entry(state, &load, &figures, &capacity)
-        }
-        None if usize::try_from(index).is_ok_and(|index| index < ranks) => {
-            unreported_entry(state, rank, &capacity)
-        }
-        None => return None,
-    };
-    Some(entry)
+    rank_entry(
+        |index| client.rank_load(index),
+        capacity.max_total_num_tokens,
+        state.shared.rank_count(state.model.data_parallel_size),
+        dp_rank,
+        |load, figures| reported_entry(state, load, figures, &capacity),
+        |rank| unreported_entry(state, rank, &capacity),
+    )
 }
