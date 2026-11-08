@@ -94,10 +94,10 @@ jobs:
         timeout-minutes: 45
         run: |
           set -o pipefail
-          lscpu | grep -m1 'Model name' || true
+          lscpu | grep -m1 'Model name' | tee benchmark_output.txt || true
           python3 scripts/bench_gate.py run --gates .github/bench-gates/tokenizer.toml \
             --base "$RUNNER_TEMP/bench-gate/base" --pr "$RUNNER_TEMP/bench-gate/pr" \
-            --cwd model_gateway --out bench-gate 2>&1 | tee benchmark_output.txt
+            --cwd model_gateway --out bench-gate 2>&1 | tee -a benchmark_output.txt
 
       - name: Run benchmark
         if: github.event_name != 'pull_request'
@@ -105,7 +105,8 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           set -o pipefail
-          cargo bench -p smg --features tokenizers-v1 --bench tokenizer_benchmark 2>&1 | tee benchmark_output.txt
+          lscpu | grep -m1 'Model name' | tee benchmark_output.txt || true
+          cargo bench -p smg --features tokenizers-v1 --bench tokenizer_benchmark 2>&1 | tee -a benchmark_output.txt
 
       - name: Upload benchmark results
         if: always()
