@@ -3160,10 +3160,7 @@ fn the_chain_scanner_cuts_the_fixture_and_fuzz_texts_as_its_stage_programs_do() 
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
     let check = |text: &str| {
         let mut ours = Vec::new();
-        scanner.pieces(text, &mut |piece: &str| {
-            let start = piece.as_ptr() as usize - text.as_ptr() as usize;
-            ours.push((start, start + piece.len()));
-        });
+        scanner.pieces(text, &mut |start, end| ours.push((start, end)));
         assert_eq!(ours, staged(&programs, text), "text {text:?}");
     };
     for text in &fixtures {

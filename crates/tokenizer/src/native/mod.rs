@@ -1703,16 +1703,15 @@ impl NativeEncoder {
         cache.unit_ascii = text.is_ascii();
         // One walk per unit. A single-stage encoder hands the unit to
         // `encode_single_stage`, out of line, where the scanner's own loop
-        // probes each piece in place (no recursive walk); the chain hands its
-        // pieces to the same probe through its static callback; any other
-        // shape walks.
+        // probes each piece in place (no recursive walk); the chain hands
+        // its pieces, as offsets into the unit, to the same probe through
+        // its static callback; any other shape walks.
         match (&self.chain, self.stages.as_slice()) {
             (Some(chain), _) => {
-                chain.pieces(text, &mut |piece: &str| {
-                    if piece.is_empty() {
-                        return;
-                    }
-                    if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
+                chain.pieces(text, &mut |start, end| {
+                    if let Err(declined) =
+                        self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
+                    {
                         fallback = Some(declined);
                     }
                 });
