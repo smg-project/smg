@@ -334,9 +334,9 @@ impl MediaConnectorError {
     /// task keeps the error this process's ([`Self::DecodeIo`]); two decoders
     /// that could not start leave it unavailable, so a decode that runs this
     /// one as its fallback reads it the same way. A verdict that refused the
-    /// clip for its size ([`Self::DecodedTooLarge`]) stands as it is: it
-    /// names the cap itself, and the words of the decoder that ran before it
-    /// add nothing a client can act on.
+    /// clip for its size ([`Self::DecodedTooLarge`], [`Self::FrameListTooLong`])
+    /// stands as it is: it names the cap itself, and the words of the decoder
+    /// that ran before it add nothing a client can act on.
     pub fn fallback_failed(
         first: Self,
         fallback: Self,
@@ -352,7 +352,7 @@ impl MediaConnectorError {
                 Self::DecoderUnavailable(std::io::Error::new(io.kind(), message))
             }
             Self::DecodeIo(io) => Self::DecodeIo(std::io::Error::new(io.kind(), message)),
-            verdict @ Self::DecodedTooLarge { .. } => verdict,
+            verdict @ (Self::DecodedTooLarge { .. } | Self::FrameListTooLong { .. }) => verdict,
             verdict if verdict.fault() == MediaFault::Internal => {
                 Self::DecodeIo(std::io::Error::other(message))
             }
@@ -426,6 +426,11 @@ mod tests {
                 limit: 1_073_741_824,
                 knob: "SMG_VIDEO_MAX_DECODED_BYTES",
             },
+            MediaConnectorError::FrameListTooLong {
+                picks: 40_001,
+                bytes: 552_613,
+                limit: 130_048,
+            },
             MediaConnectorError::Image(image::ImageError::Decoding(
                 image::error::DecodingError::new(
                     image::error::ImageFormatHint::Unknown,
@@ -440,9 +445,10 @@ mod tests {
     }
 
     /// A size refusal has a code of its own, whatever stage refused: the
-    /// input bytes, the bytes the clip would decode to, the image decoder's
-    /// limits. Every other failure of the media is a fetch failure to the
-    /// client, and the codes spell and parse the same.
+    /// input bytes, the bytes the clip would decode to, the frame list its
+    /// picks would need, the image decoder's limits. Every other failure of
+    /// the media is a fetch failure to the client, and the codes spell and
+    /// parse the same.
     #[test]
     fn a_size_refusal_has_its_own_code() {
         for error in [
@@ -461,6 +467,11 @@ mod tests {
                 bytes: 12,
                 limit: 8,
                 knob: "SMG_AUDIO_MAX_DECODED_BYTES",
+            },
+            MediaConnectorError::FrameListTooLong {
+                picks: 40_001,
+                bytes: 552_613,
+                limit: 130_048,
             },
             MediaConnectorError::Image(image::ImageError::Limits(
                 image::error::LimitError::from_kind(
@@ -613,6 +624,20 @@ mod tests {
                 "{refused}"
             );
             assert_eq!(refused.code(), MediaErrorCode::TooLarge);
+            // So does a frame list past the decoder's bound: the fallback's
+            // refusal keeps its code through the first decoder's failure.
+            let list_too_long = || MediaConnectorError::FrameListTooLong {
+                picks: 40_001,
+                bytes: 552_613,
+                limit: 130_048,
+            };
+            let refused = compose(bad_clip(), list_too_long(), media);
+            assert!(
+                matches!(refused, MediaConnectorError::FrameListTooLong { .. }),
+                "{refused}"
+            );
+            assert_eq!(refused.code(), MediaErrorCode::TooLarge);
+            assert_eq!(refused.fault(), MediaFault::Client);
         }
     }
 }
