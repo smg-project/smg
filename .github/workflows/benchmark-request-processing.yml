@@ -49,6 +49,14 @@ jobs:
     name: Request Processing
     if: github.repository == 'smg-project/smg' || vars.SMG_RUN_BENCHMARKS == 'true'
     runs-on: ubuntu-latest
+    env:
+      # Every bench binary of this job, the gate's pair and the summary run's,
+      # places every function on a 64-byte boundary, so a pull request's code
+      # size does not move the unchanged hot functions into another placement
+      # class (the two speed states of identical code described in
+      # .github/bench-gates/request-processing.toml). RUSTFLAGS replaces the list in
+      # .cargo/config.toml, so the outliner flag is repeated here.
+      RUSTFLAGS: -C llvm-args=-enable-machine-outliner=never -C llvm-args=-align-all-functions=6
     steps:
       - uses: actions/checkout@v7
         with:
