@@ -815,11 +815,9 @@ impl StreamingProcessor {
                 }
             };
 
-            // The message's event is written into the frame; a failure there (a
-            // piece the tokenizer cannot decode, a serialization error) returns
-            // after the chunks written ahead of it have left, as an upstream
-            // failure does. The frame then leaves if it holds a full frame.
-            let written: Result<(), String> = 'message: {
+            // The message's processing; a failure inside it returns after the
+            // chunks written ahead of it have left, as an upstream failure does.
+            let read: Result<(), String> = async {
                 match gen_response.into_response() {
                     ProtoResponseVariant::Chunk(chunk) => {
                         // Track TTFT immediately on first chunk received from backend
@@ -837,12 +835,9 @@ impl StreamingProcessor {
                         // collected generate answer: an empty piece would reach the
                         // client as the model's own text, with nothing logged or
                         // counted.
-                        let chunk_text = match tokenizer.decode(chunk.token_ids(), true) {
-                            Ok(text) => text,
-                            Err(e) => {
-                                break 'message Err(format!("Failed to decode generate chunk: {e}"))
-                            }
-                        };
+                        let chunk_text = tokenizer
+                            .decode(chunk.token_ids(), true)
+                            .map_err(|e| format!("Failed to decode generate chunk: {e}"))?;
 
                         // Accumulate text for this index
                         let choice = choices
@@ -876,7 +871,10 @@ impl StreamingProcessor {
                             &mut room_owed,
                             &chunk_response,
                             "chunk",
-                        )
+                        )?;
+                        Self::flush_generate_frame(tx, &mut sse_buffer, &mut room_owed)
+                            .await
+                            .map_err(|()| "Failed to send chunk".to_string())?;
                     }
                     ProtoResponseVariant::Complete(complete) => {
                         let index = complete.index();
@@ -916,18 +914,22 @@ impl StreamingProcessor {
                             &mut room_owed,
                             &finish_response,
                             "finish",
-                        )
+                        )?;
+                        Self::flush_generate_frame(tx, &mut sse_buffer, &mut room_owed)
+                            .await
+                            .map_err(|()| "Failed to send finish chunk".to_string())?;
+
+                        // Continue to process all completions if n>1
                     }
-                    ProtoResponseVariant::None => Ok(()),
+                    ProtoResponseVariant::None => {}
                 }
-            };
-            if let Err(failure) = written {
+                Ok(())
+            }
+            .await;
+            if let Err(failure) = read {
                 Self::flush_chunks(tx, &mut sse_buffer).await?;
                 return Err(failure.into());
             }
-            Self::flush_generate_frame(tx, &mut sse_buffer, &mut room_owed)
-                .await
-                .map_err(|()| "Failed to send chunk".to_string())?;
         }
         // The frame being written leaves at the read's end; a client that
         // left gets nothing more (as on the chat path).
@@ -1078,11 +1080,9 @@ impl StreamingProcessor {
                 }
             };
 
-            // The message's event is written into the frame; a failure there (a
-            // piece the tokenizer cannot decode, a serialization error) returns
-            // after the chunks written ahead of it have left, as an upstream
-            // failure does. The frame then leaves if it holds a full frame.
-            let written: Result<(), String> = 'message: {
+            // The message's processing; a failure inside it returns after the
+            // chunks written ahead of it have left, as an upstream failure does.
+            let read: Result<(), String> = async {
                 match gen_response.into_response() {
                     ProtoResponseVariant::Chunk(chunk) => {
                         // Track TTFT immediately on first chunk received from backend
@@ -1099,12 +1099,9 @@ impl StreamingProcessor {
 
                         // Decode tokens to text; a piece the tokenizer cannot decode
                         // fails the stream (see `process_generate_streaming`).
-                        let chunk_text = match tokenizer.decode(chunk.token_ids(), true) {
-                            Ok(text) => text,
-                            Err(e) => {
-                                break 'message Err(format!("Failed to decode generate chunk: {e}"))
-                            }
-                        };
+                        let chunk_text = tokenizer
+                            .decode(chunk.token_ids(), true)
+                            .map_err(|e| format!("Failed to decode generate chunk: {e}"))?;
 
                         // Accumulate text for this index
                         let choice = choices
@@ -1165,7 +1162,10 @@ impl StreamingProcessor {
                             &mut room_owed,
                             &chunk_response,
                             "chunk",
-                        )
+                        )?;
+                        Self::flush_generate_frame(tx, &mut sse_buffer, &mut room_owed)
+                            .await
+                            .map_err(|()| "Failed to send chunk".to_string())?;
                     }
                     ProtoResponseVariant::Complete(complete) => {
                         let index = complete.index();
@@ -1214,18 +1214,22 @@ impl StreamingProcessor {
                             &mut room_owed,
                             &finish_response,
                             "finish",
-                        )
+                        )?;
+                        Self::flush_generate_frame(tx, &mut sse_buffer, &mut room_owed)
+                            .await
+                            .map_err(|()| "Failed to send finish chunk".to_string())?;
+
+                        // Continue to process all completions if n>1
                     }
-                    ProtoResponseVariant::None => Ok(()),
+                    ProtoResponseVariant::None => {}
                 }
-            };
-            if let Err(failure) = written {
+                Ok(())
+            }
+            .await;
+            if let Err(failure) = read {
                 Self::flush_chunks(tx, &mut sse_buffer).await?;
                 return Err(failure.into());
             }
-            Self::flush_generate_frame(tx, &mut sse_buffer, &mut room_owed)
-                .await
-                .map_err(|()| "Failed to send chunk".to_string())?;
         }
         // The frame being written leaves at the read's end; a client that
         // left gets nothing more (as on the chat path).
@@ -1746,19 +1750,34 @@ impl StreamingProcessor {
     }
 
     /// The engine's next message as the packed loops read it (the
-    /// completion and Messages streams and the generate streams; the chat
-    /// loop keeps its own copy of the block, by measurement). The engine is
-    /// polled once in place before the events written into `buffer` leave: a
-    /// message it has ready joins the frame being written, so the messages
-    /// ready at one poll leave as one frame; when it has none ready, the
-    /// frame leaves from inside that poll ([`Self::flush_in_poll`]) and the
-    /// reader parks on the poll's wake, so a stream whose engine paces its
-    /// tokens costs one poll per message, as the plain read did. A channel
-    /// with no free slot hands the frame back and it is sent with a wait
-    /// before the read resumes; a closed channel is the client's end. Until
-    /// the first token's frame has left, the read is
-    /// [`Self::next_before_first_token_out`], which hands that frame to the
-    /// connection before the engine is polled again.
+    /// completion and Messages streams; the chat loop keeps its own copy of
+    /// the block, by measurement). The engine is polled once in place before
+    /// the events written into `buffer` leave: a message it has ready joins
+    /// the frame being written, so the messages ready at one poll leave as
+    /// one frame; when it has none ready, the frame leaves before the reader
+    /// parks, so no text waits for the engine. The frame carrying the first
+    /// token leaves before the engine is polled again, whatever is ready
+    /// behind it: the client's first token waits for nothing. The one poll
+    /// registers the reader's wake where the message will come from; when
+    /// the engine has nothing ready the frame leaves from inside that poll
+    /// ([`Self::flush_in_poll`]) and the reader parks on its wake, so a
+    /// stream whose engine paces its tokens costs one poll per message, as
+    /// the plain read did; `next` resumes the read only after a flush that
+    /// had to wait for the channel. `first_token_out` turns true once that
+    /// frame has left (`first_token_seen`: the stream has produced its first
+    /// token); the yields there hand the frame to the connection through the
+    /// body driving this reading (see `DrivenBody`): one lets the body hand
+    /// the frame out, a second lets the body answer the connection's next
+    /// pull with pending, so the connection writes the frame before the
+    /// reading runs on. The body yields once after its own first frame:
+    /// where the first token's frame is that frame
+    /// (`first_frame_is_first_token`: the completion stream, as the chat
+    /// stream) one yield here makes the two; where it is not (the Messages
+    /// stream, whose first frame is `message_start`) this read yields
+    /// twice. One yield short, the connection pulls the reading's next
+    /// frame first, and under a burst of engine messages that frame comes
+    /// only when the burst has been read: the first token would reach the
+    /// client behind the burst. A failed flush is the channel's end.
     async fn next_packed(
         grpc_stream: &mut ProtoStream,
         tx: &SseSender,
@@ -1767,79 +1786,41 @@ impl StreamingProcessor {
         first_token_seen: bool,
         first_frame_is_first_token: bool,
     ) -> Result<Option<Result<ProtoGenerateResponse, tonic::Status>>, String> {
-        if !*first_token_out {
-            return Self::next_before_first_token_out(
-                grpc_stream,
-                tx,
-                buffer,
-                first_token_out,
-                first_token_seen,
-                first_frame_is_first_token,
-            )
-            .await;
-        }
         let mut next = std::pin::pin!(grpc_stream.next());
-        // The flush's outcome when the poll found nothing ready: the frame
-        // the channel had no free slot for, or the channel's end.
-        let mut flushed: Result<Option<Bytes>, String> = Ok(None);
+        if !*first_token_out {
+            let frame_out = !buffer.is_empty();
+            Self::flush_chunks(tx, buffer).await?;
+            if frame_out && first_token_seen {
+                *first_token_out = true;
+                tokio::task::yield_now().await;
+                if !first_frame_is_first_token {
+                    tokio::task::yield_now().await;
+                }
+            }
+            return Ok(next.await);
+        }
+        let mut waiting = None;
         let polled = std::future::poll_fn(|cx| match next.as_mut().poll(cx) {
-            Poll::Ready(item) => Poll::Ready(Some(item)),
+            Poll::Ready(item) => Poll::Ready(Ok(Some(item))),
             Poll::Pending => match Self::flush_in_poll(tx, buffer) {
                 Ok(None) => Poll::Pending,
-                outcome => {
-                    flushed = outcome;
-                    Poll::Ready(None)
+                Ok(Some(frame)) => {
+                    waiting = Some(frame);
+                    Poll::Ready(Ok(None))
                 }
+                Err(error) => Poll::Ready(Err(error)),
             },
         })
-        .await;
+        .await?;
         if let Some(item) = polled {
             return Ok(item);
         }
-        if let Some(frame) = flushed? {
+        if let Some(frame) = waiting {
             tx.send(Ok(frame))
                 .await
                 .map_err(|_| "Failed to send chunks".to_string())?;
         }
         Ok(next.await)
-    }
-
-    /// [`Self::next_packed`] until the first token's frame has left: the
-    /// frame being written leaves before the engine is polled, whatever is
-    /// ready behind it, so the client's first token waits for nothing.
-    /// `first_token_out` turns true once that frame has left
-    /// (`first_token_seen`: the stream has produced its first token); the
-    /// yields there hand the frame to the connection through the body
-    /// driving this reading (see `DrivenBody`): one lets the body hand the
-    /// frame out, a second lets the body answer the connection's next pull
-    /// with pending, so the connection writes the frame before the reading
-    /// runs on. The body yields once after its own first frame: where the
-    /// first token's frame is that frame (`first_frame_is_first_token`: the
-    /// completion stream, as the chat stream) one yield here makes the two;
-    /// where it is not (the Messages stream, whose first frame is
-    /// `message_start`) this read yields twice. One yield short, the
-    /// connection pulls the reading's next frame first, and under a burst of
-    /// engine messages that frame comes only when the burst has been read:
-    /// the first token would reach the client behind the burst. A failed
-    /// flush is the channel's end.
-    async fn next_before_first_token_out(
-        grpc_stream: &mut ProtoStream,
-        tx: &SseSender,
-        buffer: &mut BytesMut,
-        first_token_out: &mut bool,
-        first_token_seen: bool,
-        first_frame_is_first_token: bool,
-    ) -> Result<Option<Result<ProtoGenerateResponse, tonic::Status>>, String> {
-        let frame_out = !buffer.is_empty();
-        Self::flush_chunks(tx, buffer).await?;
-        if frame_out && first_token_seen {
-            *first_token_out = true;
-            tokio::task::yield_now().await;
-            if !first_frame_is_first_token {
-                tokio::task::yield_now().await;
-            }
-        }
-        Ok(grpc_stream.next().await)
     }
 
     /// The flush of the frame being written from inside the poll that found
