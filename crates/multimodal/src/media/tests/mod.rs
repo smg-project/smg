@@ -912,7 +912,7 @@ fn stepped_group_clips_report_the_loaders_sampled_rate() {
     assert_eq!(super::loader_sampled_fps(10, 150, 30.0), 2.0);
     assert_eq!(super::loader_sampled_fps(768, 14400, 24.0), 1.28);
     assert_eq!(super::loader_sampled_fps(0, 0, 30.0), 30.0);
-    let short = super::FrameSelection::new(1.0, 5, vec![0, 1, 2, 3]);
+    let short = super::FrameSelection::new(1.0, 5, 5, vec![0, 1, 2, 3]);
     assert_eq!(
         super::clip_sample_fps(Some(&short), Some(5.0), stepped),
         0.8
