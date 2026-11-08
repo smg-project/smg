@@ -20,6 +20,7 @@
 use std::time::Duration;
 
 use common::{
+    decode_stream::{chunk, complete, GenerateTx},
     engine_answers::{
         TokenSpeedAnswers, TokenSpeedGenerateStream, VllmAnswers, VllmGenerateStream,
     },
@@ -28,7 +29,6 @@ use common::{
         Canned,
     },
 };
-use proto::generate_response::Response as GenResp;
 use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
@@ -50,8 +50,6 @@ const OUTPUT_TOKENS: u32 = 3;
 const CASE_CAP: Duration = Duration::from_secs(30);
 /// The words the failing engines put on their status.
 const REASON: &str = "the engine says no";
-
-type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
 
 /// What a mock engine does with a generate call.
 #[derive(Clone, Copy, Debug)]
@@ -76,31 +74,6 @@ struct Engine {
     behaviour: Behaviour,
 }
 
-fn chunk(id: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Chunk(proto::GenerateStreamChunk {
-            token_ids: vec![id],
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-fn complete(tokens: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Complete(proto::GenerateComplete {
-            output_ids: (1..=tokens).collect(),
-            finish_reason: "stop".to_string(),
-            prompt_tokens: 1,
-            completion_tokens: tokens,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
 /// Feed one generate stream as `behaviour` says.
 #[expect(
     clippy::disallowed_methods,
@@ -120,7 +93,7 @@ fn produce(tx: GenerateTx, behaviour: Behaviour) {
                 }
                 let last = match behaviour {
                     Behaviour::FailsAfterTokens(code) => Err(Status::new(code, REASON)),
-                    _ => Ok(complete(OUTPUT_TOKENS)),
+                    _ => Ok(complete("stop", OUTPUT_TOKENS)),
                 };
                 let _ = tx.send(last).await;
             }

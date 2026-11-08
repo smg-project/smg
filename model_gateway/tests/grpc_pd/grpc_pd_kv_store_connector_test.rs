@@ -13,12 +13,12 @@ use std::{
 };
 
 use common::{
+    decode_stream::{chunk, complete},
     engine_answers::{VllmAnswers, VllmGenerateStream},
     grpc_harness::{build_grpc_router, grpc_router_config, grpc_worker, serve_engine},
 };
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::model_card::ModelCard;
-use proto::generate_response::Response as GenResp;
 use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
@@ -75,31 +75,6 @@ impl RecordingEngine {
     }
 }
 
-fn chunk(id: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Chunk(proto::GenerateStreamChunk {
-            token_ids: vec![id],
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-fn complete() -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Complete(proto::GenerateComplete {
-            output_ids: (1..=OUTPUT_TOKENS).collect(),
-            finish_reason: "stop".to_string(),
-            prompt_tokens: 1,
-            completion_tokens: OUTPUT_TOKENS,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
 #[tonic::async_trait]
 impl VllmAnswers for RecordingEngine {
     #[expect(
@@ -121,7 +96,7 @@ impl VllmAnswers for RecordingEngine {
         for id in 1..=OUTPUT_TOKENS {
             let _ = tx.send(Ok(chunk(id))).await;
         }
-        let _ = tx.send(Ok(complete())).await;
+        let _ = tx.send(Ok(complete("stop", OUTPUT_TOKENS))).await;
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }

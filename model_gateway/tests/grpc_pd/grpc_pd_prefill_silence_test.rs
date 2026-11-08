@@ -67,6 +67,7 @@ use std::{
 };
 
 use common::{
+    decode_stream::produce_after,
     engine_answers::{
         TokenSpeedAnswers, TokenSpeedGenerateStream, VllmAnswers, VllmGenerateStream,
     },
@@ -78,7 +79,6 @@ use common::{
 use futures::future::join_all;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::model_card::ModelCard;
-use proto::generate_response::Response as GenResp;
 use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
@@ -129,8 +129,6 @@ const HANDOFF: Duration = Duration::from_millis(2_500);
 /// How long after a burst the prefill answers its first call, in the
 /// handoff cases: past the bound, an engine step after the handoff.
 const LATE_ANSWER: Duration = Duration::from_secs(4);
-
-type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
 
 /// What a sequential-dispatch mock engine does with a generate call.
 #[derive(Clone, Copy)]
@@ -194,49 +192,6 @@ impl Engine {
     }
 }
 
-fn chunk(id: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Chunk(proto::GenerateStreamChunk {
-            token_ids: vec![id],
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-fn complete() -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Complete(proto::GenerateComplete {
-            output_ids: (1..=OUTPUT_TOKENS).collect(),
-            finish_reason: "stop".to_string(),
-            prompt_tokens: 1,
-            completion_tokens: OUTPUT_TOKENS,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-/// Feed one generate stream: the tokens after `delay`, then the completion.
-/// With `delay` at [`FOREVER`] the sender is held and nothing is written.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "test mock; the producer task ends with its stream"
-)]
-fn produce_after(tx: GenerateTx, delay: Duration) {
-    tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        for id in 1..=OUTPUT_TOKENS {
-            if tx.send(Ok(chunk(id))).await.is_err() {
-                return;
-            }
-        }
-        let _ = tx.send(Ok(complete())).await;
-    });
-}
-
 #[tonic::async_trait]
 impl VllmAnswers for Engine {
     async fn generate(
@@ -249,11 +204,11 @@ impl VllmAnswers for Engine {
             Behaviour::HoldHeaders => {
                 tokio::time::sleep(FOREVER).await;
             }
-            Behaviour::EmptyStream => produce_after(tx, FOREVER),
-            Behaviour::Answer(delay) => produce_after(tx, delay),
+            Behaviour::EmptyStream => produce_after(tx, FOREVER, OUTPUT_TOKENS),
+            Behaviour::Answer(delay) => produce_after(tx, delay, OUTPUT_TOKENS),
             Behaviour::Queued => {
                 self.gate.turn().await;
-                produce_after(tx, Duration::ZERO);
+                produce_after(tx, Duration::ZERO, OUTPUT_TOKENS);
             }
             Behaviour::HoldHeadersThenFail(delay) => {
                 tokio::time::sleep(delay).await;
