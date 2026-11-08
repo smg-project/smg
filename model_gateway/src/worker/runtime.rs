@@ -112,6 +112,18 @@ const _: () = assert!(matches!(
     b"circuit_open"
 ));
 
+/// The published-state code of the `available` series (its index plus one):
+/// the one code that says no routing veto held at the last publish. The
+/// routing reads ([`Worker::routing_state`], [`Worker::is_available`]) answer
+/// from it without the breaker's guard, and read the facts on any other code.
+pub(super) const AVAILABLE_CODE: u8 = 1;
+const _: () = assert!(matches!(
+    ROUTING_STATE_SERIES[AVAILABLE_CODE as usize - 1]
+        .0
+        .as_bytes(),
+    b"available"
+));
+
 /// The index in [`ROUTING_STATE_SERIES`] of a worker with these facts: the
 /// first that excludes it, else available.
 pub(super) fn routing_state_series(

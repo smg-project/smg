@@ -34,7 +34,7 @@ use super::{
     event::WorkerConnected,
     http_client::LazyHttpClient,
     pd_pairing::PdPairing,
-    runtime::{routing_state_series, CIRCUIT_OPEN_CODE, ROUTING_STATE_SERIES},
+    runtime::{routing_state_series, AVAILABLE_CODE, CIRCUIT_OPEN_CODE, ROUTING_STATE_SERIES},
     CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult,
 };
 pub use super::{
@@ -1870,13 +1870,15 @@ impl Worker for BasicWorker {
     }
 
     fn is_available(&self) -> bool {
-        // Same two guards the pre-veto version took (`is_healthy` +
-        // `circuit_breaker_can_execute`): the vetoes ride the runtime guard.
+        // The published code answers `available` under the runtime guard
+        // alone (see `routing_state`); any other code reads the vetoes, which
+        // ride that guard, and the breaker under its own.
         let rt = self.runtime.load();
-        rt.status() == WorkerStatus::Ready
-            && !rt.is_overloaded()
-            && rt.stall_reason().is_none()
-            && self.breaker_allows(&rt)
+        rt.published_state() == AVAILABLE_CODE
+            || (rt.status() == WorkerStatus::Ready
+                && !rt.is_overloaded()
+                && rt.stall_reason().is_none()
+                && self.breaker_allows(&rt))
     }
 
     fn is_healthy_and_eligible(&self) -> bool {
@@ -1903,6 +1905,23 @@ impl Worker for BasicWorker {
         // (all live in `self.runtime`); the circuit breaker is a separate
         // ArcSwap, so it needs its own guard.
         let rt = self.runtime.load();
+        // The published `smg_worker_state` code summarises the four vetoes as
+        // of the last publish, and every writer of a veto publishes: a status
+        // change, an overload or liveness edge, a breaker move (the timeout's
+        // move to half-open is published by the read that makes it, below).
+        // `available` says none holds, so the common case answers from the
+        // code and never takes the breaker's guard. Any other code (a veto
+        // in force, or no publish yet) reads the facts.
+        if rt.published_state() == AVAILABLE_CODE {
+            return RoutingState {
+                healthy: true,
+                can_execute: true,
+                load: rt.load(),
+                processed: rt.processed_requests(),
+                overloaded: false,
+                stalled: false,
+            };
+        }
         RoutingState {
             healthy: rt.status() == WorkerStatus::Ready,
             can_execute: self.breaker_allows(&rt),

@@ -152,6 +152,11 @@ fn fed_pool(policy: &dyn LoadBalancingPolicy, workers: usize) -> (TestFeed, Vec<
             ) as Arc<dyn Worker>
         })
         .collect();
+    // A registered worker carries a published state, which the routing reads
+    // answer from; the pool reads like one.
+    for worker in &pool {
+        worker.republish_state();
+    }
     let reports: HashMap<String, WorkerLoadResponse> = pool
         .iter()
         .enumerate()
@@ -285,7 +290,7 @@ fn bench_simple_policy_pick(c: &mut Criterion) {
 
 /// `workers` ready regular workers (no health checker behind them).
 fn ready_pool(workers: usize) -> Vec<Arc<dyn Worker>> {
-    (0..workers)
+    let pool: Vec<Arc<dyn Worker>> = (0..workers)
         .map(|i| {
             Arc::new(
                 BasicWorkerBuilder::new(format!("http://worker-{i:03}:8000"))
@@ -297,7 +302,13 @@ fn ready_pool(workers: usize) -> Vec<Arc<dyn Worker>> {
                     .build(),
             ) as Arc<dyn Worker>
         })
-        .collect()
+        .collect();
+    // A registered worker carries a published state, which the routing reads
+    // answer from; the pool reads like one.
+    for worker in &pool {
+        worker.republish_state();
+    }
+    pool
 }
 
 /// A keyed hit over a ready pool: sixteen conversations pinned once, then one request per
