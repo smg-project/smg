@@ -1,6 +1,7 @@
 // These modules are used by tests and benchmarks
 #![allow(dead_code, clippy::allow_attributes, clippy::large_futures)]
 
+pub mod engine_answers;
 pub mod grpc_harness;
 pub mod held_worker;
 /// The gateway's copy of the hub fetcher (compiled by path from this crate's

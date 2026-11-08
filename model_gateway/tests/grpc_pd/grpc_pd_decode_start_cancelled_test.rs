@@ -19,7 +19,10 @@ use std::{
     time::Duration,
 };
 
-use common::grpc_harness::{build_grpc_router, grpc_router_config, grpc_workers, serve_engine};
+use common::{
+    engine_answers::{VllmAnswers, VllmGenerateStream},
+    grpc_harness::{build_grpc_router, grpc_router_config, grpc_workers, serve_engine},
+};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use proto::generate_response::Response as GenResp;
 use smg::{
@@ -119,114 +122,24 @@ fn produce(tx: GenerateTx) {
 }
 
 #[tonic::async_trait]
-impl proto::vllm_engine_server::VllmEngine for Engine {
-    async fn start_profile(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::StartProfileRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn stop_profile(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::StopProfileRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    type GenerateStream = ReceiverStream<Result<proto::GenerateResponse, Status>>;
-
+impl VllmAnswers for Engine {
     async fn generate(
         &self,
         _request: Request<proto::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<VllmGenerateStream>, Status> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if matches!(self.behaviour, Behaviour::CancelsStart) {
             return Err(Status::cancelled(CANCEL_MESSAGE));
         }
         let (tx, rx) = mpsc::channel(8);
         produce(tx);
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    async fn abort(
-        &self,
-        _request: Request<proto::AbortRequest>,
-    ) -> Result<Response<proto::AbortResponse>, Status> {
-        Ok(Response::new(proto::AbortResponse::default()))
-    }
-
-    async fn flush_cache(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::FlushCacheRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::FlushCacheResponse>, Status> {
-        Ok(Response::new(
-            smg_grpc_client::common_proto::FlushCacheResponse::default(),
-        ))
-    }
-
-    async fn embed(
-        &self,
-        _request: Request<proto::EmbedRequest>,
-    ) -> Result<Response<proto::EmbedResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn health_check(
-        &self,
-        _request: Request<proto::HealthCheckRequest>,
-    ) -> Result<Response<proto::HealthCheckResponse>, Status> {
-        Ok(Response::new(proto::HealthCheckResponse {
-            healthy: true,
-            ..Default::default()
-        }))
-    }
-
-    async fn get_model_info(
-        &self,
-        _request: Request<proto::GetModelInfoRequest>,
-    ) -> Result<Response<proto::GetModelInfoResponse>, Status> {
-        Ok(Response::new(proto::GetModelInfoResponse::default()))
-    }
-
-    async fn get_server_info(
-        &self,
-        _request: Request<proto::GetServerInfoRequest>,
-    ) -> Result<Response<proto::GetServerInfoResponse>, Status> {
-        Ok(Response::new(proto::GetServerInfoResponse::default()))
-    }
-
-    async fn get_loads(
-        &self,
-        _request: Request<proto::GetLoadsRequest>,
-    ) -> Result<Response<proto::GetLoadsResponse>, Status> {
-        Ok(Response::new(proto::GetLoadsResponse::default()))
-    }
-
-    type GetTokenizerStream =
-        ReceiverStream<Result<smg_grpc_client::common_proto::GetTokenizerChunk, Status>>;
-
-    async fn get_tokenizer(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    type SubscribeKvEventsStream =
-        ReceiverStream<Result<smg_grpc_client::common_proto::KvEventBatch, Status>>;
-
-    async fn subscribe_kv_events(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
 
 /// Serve a mock engine in-process; returns its port.
 async fn start_mock_engine(engine: Engine) -> u16 {
-    serve_engine(proto::vllm_engine_server::VllmEngineServer::new(engine)).await
+    serve_engine(engine.into_server()).await
 }
 
 /// A PD gRPC router over the given workers (sequential dispatch).
