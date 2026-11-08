@@ -51,6 +51,7 @@ jobs:
           DRAIN: "60"
           PERF_SECS: "0"
           GW_THREADS: "2"
+          BOUNDS: scripts/bench/grpc_stress/bounds.toml
         run: |
           nproc
           scripts/bench/grpc_stress/run_all.sh unary stream idle-default long tenants tools responses
@@ -76,5 +77,7 @@ jobs:
             target/grpc-stress/cells/*/summary.json
             target/grpc-stress/cells/*/samples.csv
             target/grpc-stress/cells/*/cell.json
+            target/grpc-stress/cells/*/before.prom
+            target/grpc-stress/cells/*/after.prom
             target/grpc-stress/bed/*.log
           retention-days: 30
