@@ -84,6 +84,20 @@ pub trait EngineOutput {
     fn request_id_shared(&self) -> FrameStr;
 }
 
+/// The ids of a step's finished outputs, each shared with its output, in a
+/// vector sized once: a step without a finish allocates nothing for it.
+pub(crate) fn finished_request_ids<O: EngineOutput>(outputs: &[O]) -> Vec<FrameStr> {
+    let finished = outputs.iter().filter(|output| output.finished()).count();
+    let mut ids = Vec::with_capacity(finished);
+    ids.extend(
+        outputs
+            .iter()
+            .filter(|output| output.finished())
+            .map(EngineOutput::request_id_shared),
+    );
+    ids
+}
+
 /// One decoded engine tick: the per-request outputs plus the piggybacked load
 /// signal and any out-of-band finished ids. The connector consumes this shape
 /// for every protocol.
@@ -95,8 +109,9 @@ pub struct EngineBatch<O> {
     /// Request ids finished in this tick, including ones the connector could
     /// derive from a terminal output: a protocol without an out-of-band finish
     /// channel may list them here too. The connector unions both sources, so
-    /// the overlap is harmless. Each id is shared with the output or the frame
-    /// it came from, never a copy of its own.
+    /// the overlap is harmless. An id a terminal output also carries is shared
+    /// with it; an out-of-band id (a wire's own finished set) is the decoded
+    /// string, moved in without a further copy.
     pub finished_request_ids: Vec<FrameStr>,
     /// Per-rank load signal, when the protocol carries it (`None` otherwise).
     pub load: Option<EngineLoad>,

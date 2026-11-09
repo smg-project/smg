@@ -282,11 +282,12 @@ const SGLANG_SLIM_STEP_ALLOCATIONS: usize = 45;
 const TOKENSPEED_SLIM_STEP_ALLOCATIONS: usize = 43;
 
 /// The same step with every output finished: the plain step plus one string
-/// per finish reason and the finished list's vector. Before the shared ids,
-/// every finish copied its id into the finished list once more (thirty-two
-/// more on each wire).
-const SGLANG_SLIM_FINISHED_STEP_ALLOCATIONS: usize = 81;
-const TOKENSPEED_SLIM_FINISHED_STEP_ALLOCATIONS: usize = 79;
+/// per finish reason and the finished list's one vector (45 + 32 + 1 and
+/// 43 + 32 + 1). Before the shared ids, every finish copied its id into the
+/// finished list once more and the list grew by doubling to thirty-two
+/// (thirty-two and three calls more on each wire).
+const SGLANG_SLIM_FINISHED_STEP_ALLOCATIONS: usize = 78;
+const TOKENSPEED_SLIM_FINISHED_STEP_ALLOCATIONS: usize = 76;
 
 /// The prompt of the encode pins: 8,192 token ids, a long prompt, spread over
 /// the id range so the ids take their usual three bytes each.

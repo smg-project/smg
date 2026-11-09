@@ -19,6 +19,7 @@ use crate::{
     error::{Error, Result},
     protocol::{
         control::read_control_reply_after_tag,
+        finished_request_ids,
         positional::{drain_trailing, expect_tag, next_field},
         EngineBatch, EngineLoad, EngineOutput, UtilityReply,
     },
@@ -670,12 +671,8 @@ pub(crate) fn decode_slim_batch(frames: &[Bytes]) -> Result<EngineBatch<SglangOu
             });
         }
     };
-    // The finish's id, shared with its output: no copy of its own.
-    let finished_request_ids = outputs
-        .iter()
-        .filter(|output| output.finish_reason.is_some())
-        .map(|output| output.request_id.clone())
-        .collect();
+    // Each finish's id shared with its output, the list sized once.
+    let finished_request_ids = finished_request_ids(&outputs);
     Ok(EngineBatch {
         engine_index,
         outputs,
