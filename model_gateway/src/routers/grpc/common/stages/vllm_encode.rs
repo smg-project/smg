@@ -793,8 +793,11 @@ mod images {
                 panic!()
             };
             let values: Vec<_> = bytes
-                .chunks_exact(8)
-                .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .copied()
+                .map(i64::from_le_bytes)
                 .collect();
             assert_eq!(values, [1, 2, 4, 1, 3, 4, 1, 2, 4]);
             let handles: serde_json::Value =
