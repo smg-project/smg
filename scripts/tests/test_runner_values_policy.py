@@ -65,4 +65,10 @@ def test_the_cpu_set_the_reviews_run_on_has_an_empty_runner_and_a_localhost_key_
     assert "proxy_ssl_verify on;" in template
     assert 'proxy_set_header Authorization "";' in template
     assert "unset ANTHROPIC_API_KEY OPENAI_API_KEY NGINX_TEMPLATE" in proxy["command"][2]
-    assert "worker_processes 1;" in proxy["command"][2]  # one per core OOM-kills on a 223-core node
+    command = proxy["command"][2]
+    assert "sed -i 's/^worker_processes .*/worker_processes 1;/' /etc/nginx/nginx.conf" in command
+    # a -g worker_processes duplicates the directive in nginx.conf and nginx refuses to start
+    assert (
+        "-g 'daemon off;'" in command
+        and "worker_processes 1;'" not in command.split("exec nginx")[1]
+    )

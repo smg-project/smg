@@ -10,9 +10,10 @@
 ## renders them into its config, and the environment is cleared before nginx starts. The runner
 ## reaches it at http://127.0.0.1:8787, pod-local and unreachable from outside the pod, with a
 ## placeholder key the proxy replaces on the way out; it listens on localhost only and verifies
-## the upstream certificates. It starts before the runner and stops with it. One worker: nginx's
-## default spawns one per core, and a 223-core node turned that into an OOM kill under the
-## 128 MiB limit (Init:OOMKilled / CrashLoopBackOff on 2026-11-09).
+## the upstream certificates. It starts before the runner and stops with it. One worker, set by
+## editing nginx.conf: the default spawns one per core, and a 223-core node turned that into an
+## OOM kill under the 128 MiB limit; passing the directive with -g duplicates the one in
+## nginx.conf and nginx refuses to start (both seen on 2026-11-09).
 controllerServiceAccount:
   name: arc-gha-rs-controller
   namespace: org-actions-runner
@@ -108,7 +109,8 @@ template:
       - |
         printf '%s' "$NGINX_TEMPLATE" | envsubst '${ANTHROPIC_API_KEY} ${OPENAI_API_KEY}' > /etc/nginx/conf.d/default.conf
         unset ANTHROPIC_API_KEY OPENAI_API_KEY NGINX_TEMPLATE
-        exec nginx -g 'daemon off; worker_processes 1;'
+        sed -i 's/^worker_processes .*/worker_processes 1;/' /etc/nginx/nginx.conf
+        exec nginx -g 'daemon off;'
       env:
       - name: ANTHROPIC_API_KEY
         valueFrom:
