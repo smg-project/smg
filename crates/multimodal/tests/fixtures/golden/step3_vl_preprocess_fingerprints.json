@@ -1,0 +1,533 @@
+{
+  "cases": [
+    {
+      "fnv1a_bf16": "2dc5a3fb6cb61626",
+      "fnv1a_f32": "b10b70805680f2f9",
+      "height": 48,
+      "name": "synthetic_64x48",
+      "newline_mask": [],
+      "num_patches": 0,
+      "num_tokens": 171,
+      "patches_fnv1a_bf16": "cbf29ce484222325",
+      "patches_fnv1a_f32": "cbf29ce484222325",
+      "patches_shape": [
+        0,
+        3,
+        504,
+        504
+      ],
+      "shape": [
+        1,
+        3,
+        728,
+        728
+      ],
+      "source": {
+        "seed": 0
+      },
+      "width": 64
+    },
+    {
+      "fnv1a_bf16": "d6246e07a2de8573",
+      "fnv1a_f32": "04111c6140498353",
+      "height": 100,
+      "name": "synthetic_100x100",
+      "newline_mask": [],
+      "num_patches": 0,
+      "num_tokens": 171,
+      "patches_fnv1a_bf16": "cbf29ce484222325",
+      "patches_fnv1a_f32": "cbf29ce484222325",
+      "patches_shape": [
+        0,
+        3,
+        504,
+        504
+      ],
+      "shape": [
+        1,
+        3,
+        728,
+        728
+      ],
+      "source": {
+        "seed": 3
+      },
+      "width": 100
+    },
+    {
+      "fnv1a_bf16": "7268293879c1515f",
+      "fnv1a_f32": "084ed641dd6a7123",
+      "height": 480,
+      "name": "synthetic_640x480",
+      "newline_mask": [],
+      "num_patches": 0,
+      "num_tokens": 171,
+      "patches_fnv1a_bf16": "cbf29ce484222325",
+      "patches_fnv1a_f32": "cbf29ce484222325",
+      "patches_shape": [
+        0,
+        3,
+        504,
+        504
+      ],
+      "shape": [
+        1,
+        3,
+        728,
+        728
+      ],
+      "source": {
+        "seed": 7
+      },
+      "width": 640
+    },
+    {
+      "fnv1a_bf16": "180e9dbfc9c56f2b",
+      "fnv1a_f32": "085f97bb14695b55",
+      "height": 500,
+      "name": "synthetic_727x500",
+      "newline_mask": [],
+      "num_patches": 0,
+      "num_tokens": 171,
+      "patches_fnv1a_bf16": "cbf29ce484222325",
+      "patches_fnv1a_f32": "cbf29ce484222325",
+      "patches_shape": [
+        0,
+        3,
+        504,
+        504
+      ],
+      "shape": [
+        1,
+        3,
+        728,
+        728
+      ],
+      "source": {
+        "seed": 9
+      },
+      "width": 727
+    },
+    {
+      "fnv1a_bf16": "56a9e5b177704e96",
+      "fnv1a_f32": "ea081ddf1e7c947d",
+      "height": 728,
+      "name": "synthetic_728x728",
+      "newline_mask": [
+        0,
+        1,
+        0,
+        0
+      ],
+      "num_patches": 4,
+      "num_tokens": 504,
+      "patches_fnv1a_bf16": "dc4f66eefdb60aab",
+      "patches_fnv1a_f32": "38c51dca9d566012",
+      "patches_shape": [
+        4,
+        3,
+        504,
+        504
+      ],
+      "shape": [
+        1,
+        3,
+        728,
+        728
+      ],
+      "source": {
+        "seed": 11
+      },
+      "width": 728
+    },
+    {
+      "fnv1a_bf16": "e248a7ec144f3a73",
+      "fnv1a_f32": "9c35ebd03faf8bff",
+      "height": 768,
+      "name": "synthetic_1024x768",
+      "newline_mask": [
+        0,
+        1,
+        0,
+        0
+      ],
+      "num_patches": 4,
+      "num_tokens": 504,
+      "patches_fnv1a_bf16": "372cdec0666220f7",
+      "patches_fnv1a_f32": "648dd50b6e168c1c",
+      "patches_shape": [
+        4,
+        3,
+        504,
+        504
+      ],
+      "shape": [
+        1,
+        3,
+        728,
+        728
+      ],
+      "source": {
+        "seed": 13
+      },
+      "width": 1024
+    },
+    {
+      "fnv1a_bf16": "9ad961e0290f1a7a",
+      "fnv1a_f32": "9cb85407e3b64fd0",
+      "height": 1080,
+      "name": "synthetic_1920x1080",
+      "newline_mask": [
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      "num_patches": 8,
+      "num_tokens": 836,
+      "patches_fnv1a_bf16": "eca57a55855fe63e",
+      "patches_fnv1a_f32": "dad93685b150f1e8",
+      "patches_shape": [
+        8,
+        3,
+        504,
+        504
+      ],
+      "shape": [
+        1,
+        3,
+        728,
+        728
+      ],
+      "source": {
+        "seed": 17
+      },
+      "width": 1920
+    },
+    {
+      "fnv1a_bf16": "770fd8ebdc5af33c",
+      "fnv1a_f32": "cb0e682283d826be",
+      "height": 300,
+      "name": "synthetic_600x300",
+      "newline_mask": [
+        0,
+        0
+      ],
+      "num_patches": 2,
+      "num_tokens": 337,
+      "patches_fnv1a_bf16": "59ce0f783837174b",
+      "patches_fnv1a_f32": "e5591ec6efa2c835",
+      "patches_shape": [
+        2,
+        3,
+        504,
+        504
+      ],
+      "shape": [
+        1,
+        3,
+        728,
+        728
+      ],
+      "source": {
+        "seed": 19
+      },
+      "width": 600
+    },
+    {
+      "fnv1a_bf16": "1ebdde80641cd36c",
+      "fnv1a_f32": "1e83acff1238144c",
+      "height": 300,
+      "name": "synthetic_1000x300",
+      "newline_mask": [
+        0,
+        0
+      ],
+      "num_patches": 2,
+      "num_tokens": 337,
+      "patches_fnv1a_bf16": "1feeb049fc82fd85",
+      "patches_fnv1a_f32": "20a8e1924a862869",
+      "patches_shape": [
+        2,
+        3,
+        504,
+        504
+      ],
+      "shape": [
+        1,
+        3,
+        728,
+        728
+      ],
+      "source": {
+        "seed": 23
+      },
+      "width": 1000
+    },
+    {
+      "fnv1a_bf16": "5168e2e29bf1a6ca",
+      "fnv1a_f32": "8390c7ce99ef169a",
+      "height": 84,
+      "name": "row-of-36-windows-3024x84",
+      "newline_mask": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "num_patches": 36,
+      "num_tokens": 3159,
+      "patches_fnv1a_bf16": "d18cdc42f9d3297e",
+      "patches_fnv1a_f32": "33e262fc67dbcbf8",
+      "patches_shape": [
+        36,
+        3,
+        504,
+        504
+      ],
+      "shape": [
+        1,
+        3,
+        728,
+        728
+      ],
+      "source": {
+        "seed": 29
+      },
+      "width": 3024
+    },
+    {
+      "fnv1a_bf16": "1f1e39a58c3c6982",
+      "fnv1a_f32": "17891ad1227bfb6f",
+      "height": 700,
+      "name": "synthetic_40x700",
+      "newline_mask": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        0
+      ],
+      "num_patches": 18,
+      "num_tokens": 1682,
+      "patches_fnv1a_bf16": "49d86030b0efa525",
+      "patches_fnv1a_f32": "0b4c107742808957",
+      "patches_shape": [
+        18,
+        3,
+        504,
+        504
+      ],
+      "shape": [
+        1,
+        3,
+        728,
+        728
+      ],
+      "source": {
+        "seed": 31
+      },
+      "width": 40
+    },
+    {
+      "fnv1a_bf16": "709fd0d842078a67",
+      "fnv1a_f32": "bab87e93c2139ba4",
+      "height": 15,
+      "name": "synthetic_4000x15",
+      "newline_mask": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "num_patches": 36,
+      "num_tokens": 3164,
+      "patches_fnv1a_bf16": "c80615244f41eb34",
+      "patches_fnv1a_f32": "ddc103edf8834105",
+      "patches_shape": [
+        36,
+        3,
+        504,
+        504
+      ],
+      "shape": [
+        1,
+        3,
+        728,
+        728
+      ],
+      "source": {
+        "seed": 37
+      },
+      "width": 4000
+    },
+    {
+      "fnv1a_bf16": "35a098f197074925",
+      "fnv1a_f32": "d59034245f5dd857",
+      "height": 900,
+      "name": "synthetic_3x900",
+      "newline_mask": [
+        0,
+        1,
+        0,
+        0
+      ],
+      "num_patches": 4,
+      "num_tokens": 504,
+      "patches_fnv1a_bf16": "8909e173a741c2b4",
+      "patches_fnv1a_f32": "e1aca525978800e6",
+      "patches_shape": [
+        4,
+        3,
+        504,
+        504
+      ],
+      "shape": [
+        1,
+        3,
+        728,
+        728
+      ],
+      "source": {
+        "seed": 41
+      },
+      "width": 3
+    },
+    {
+      "fnv1a_bf16": "f8e6687476f1e529",
+      "fnv1a_f32": "9082bee60bb9cdbb",
+      "height": 2000,
+      "name": "synthetic_3100x2000",
+      "newline_mask": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "num_patches": 24,
+      "num_tokens": 2166,
+      "patches_fnv1a_bf16": "660a94c7ca4ccdab",
+      "patches_fnv1a_f32": "f3e61fff500b0fa0",
+      "patches_shape": [
+        24,
+        3,
+        504,
+        504
+      ],
+      "shape": [
+        1,
+        3,
+        728,
+        728
+      ],
+      "source": {
+        "seed": 43
+      },
+      "width": 3100
+    }
+  ],
+  "reference": "vllm/transformers_utils/processors/step3_vl.py",
+  "reference_sha256": "ce0265261a6bffaf40b98911ef5b9babe30d20443af83a4c8ecf251ce6a861fa",
+  "torch": "2.13.0+cpu"
+}

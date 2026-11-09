@@ -14,9 +14,12 @@ BASELINE = (
     "e2e_test/infra/test_epd_cmd_builders.py",
 )
 COMPONENTS = (
+    ("scripts/ci_responses_evidence.py", "scripts/tests/test_ci_responses_evidence.py"),
     ("e2e_test/infra/mcp_readiness.py", "e2e_test/infra/test_mcp_readiness.py"),
     ("scripts/release/release.sh", "scripts/tests/test_release_tools.py"),
+    ("scripts/branch-name-check.sh", "scripts/tests/test_branch_name_check.py"),
     ("scripts/ci_version_only.py", "scripts/tests/test_ci_version_only.py"),
+    ("scripts/bfcl/arm_probe.py", "scripts/tests/test_bfcl_arm_probe.py"),
 )
 # Regression suites of scripts that predate them. A pair is named in the change
 # that brings the suite, and both paths must exist: a suite the tree lacks is an
@@ -40,6 +43,8 @@ REGRESSIONS = (
         "scripts/ci_verify_sglang_rocm_cohort.py",
         "scripts/tests/test_ci_engine_http_dependencies.py",
     ),
+    ("scripts/bfcl/run_ab.py", "scripts/tests/test_bfcl_run_ab.py"),
+    (".github/workflows/nightly-bfcl.yml", "scripts/tests/test_bfcl_score_caller.py"),
 )
 
 

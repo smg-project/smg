@@ -27,12 +27,12 @@ What a user of PD mode hits, in the order they hit it:
 TokenSpeed runs Qwen3.5-9B, the model its disaggregation path is proven on;
 SGLang and vLLM run Llama-3.1-8B.
 
-On the mock engine (``E2E_RUNTIME=mock``) the gRPC topologies run on scripted
-mock workers in the prefill and decode roles: the gateway's pairing, dual
-dispatch, placement, streaming and failure handling with no KV moving (the
-decode side has the prompt). A test that reads the answer states it with the
-prompt it is for (``mock_answers``, filed on every decode worker); the HTTP PD
-wire, the asymmetric-tp pairs and the engine-death case stay on the engines.
+On the mock engine (``E2E_RUNTIME=mock``) the gRPC and HTTP topologies run on
+scripted mock workers in the prefill and decode roles: the gateway's pairing,
+dual dispatch, placement, streaming and failure handling with no KV moving
+(the decode side has the prompt). A test that reads the answer states it with
+the prompt it is for (``mock_answers``, filed on every decode worker); the
+asymmetric-tp pairs and the engine-death case stay on the engines.
 
 A MoRI-IO lane (``E2E_VLLM_KV_BACKEND=moriio``, ``E2E_VLLM_MORIIO_MODE`` read
 or write) runs every topology on SMG's HTTP PD router, the one that speaks the
@@ -202,18 +202,16 @@ _TOPOLOGIES = (
         # URL carries no kv_connector, so the router passes the request
         # through and decode recomputes the prompt; vLLM's handoff is covered
         # by the gRPC rows, where the worker reports its connector. The
-        # TokenSpeed e2e worker has no HTTP frontend.
+        # TokenSpeed e2e worker has no HTTP frontend. On the mock engine the
+        # HTTP workers take the roles: the router's injected bootstrap
+        # fields, its bootstrap probe and its server-info read are answered,
+        # and no KV moves.
         pytest.param(
             ("pd_http", (p, d)),
             id=f"{p}p{d}d-http",
-            marks=[
-                pytest.mark.skip_for_runtime(
-                    "tokenspeed", reason="the TokenSpeed e2e worker has no HTTP frontend"
-                ),
-                pytest.mark.skip_for_runtime(
-                    "mock", reason="the mock engine's prefill and decode roles are gRPC workers"
-                ),
-            ],
+            marks=pytest.mark.skip_for_runtime(
+                "tokenspeed", reason="the TokenSpeed e2e worker has no HTTP frontend"
+            ),
         )
         for p, d in [(1, 1), (2, 2)]
     ]
@@ -543,9 +541,10 @@ def _fleet_idle(gateway: Gateway) -> tuple[bool, list[dict]]:
 def _require_load_reports(backend: str) -> None:
     """The idle check reads /loads; HTTP SGLang workers report none without metrics.
 
-    A MoRI-IO lane reads its engines' own metrics instead (see ``_fleet_idle``).
+    A MoRI-IO lane reads its engines' own metrics instead (see ``_fleet_idle``);
+    the mock's HTTP workers report their loads as its gRPC workers do.
     """
-    if backend == "pd_http" and not _moriio_lane():
+    if backend == "pd_http" and not _moriio_lane() and get_runtime() != "mock":
         pytest.skip("load reports need gRPC workers")
 
 
@@ -957,9 +956,12 @@ class TestPDTopology:
         choices = resp.json().get("choices", [])
         assert len(choices) == 4, f"expected 4 choices, got {len(choices)}"
         assert all(c.get("text", "").strip() for c in choices), f"empty choice in {choices}"
-        if get_runtime() == "mock":
+        if get_runtime() == "mock" and mode != "pd_http":
             # The fan-out itself: one single-sample child per choice under
-            # the one selected pair, each with its own room.
+            # the one selected pair, each with its own room. The HTTP PD
+            # router dispatches the request once instead (one room for every
+            # sample, the shape above); the mock's decode side has the
+            # prompt and serves the four choices itself.
             _wait_for_fanout(resp.json()["id"], 4)
 
     # -- failure -----------------------------------------------------------

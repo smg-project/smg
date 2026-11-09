@@ -92,6 +92,8 @@ async fn a_hanging_engine_id_read_expires_and_keeps_the_previous_id() {
     hold.abort();
 }
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use http::{header::AUTHORIZATION, HeaderMap};
 use openai_protocol::{
     model_card::ModelCard,
     worker::{HealthCheckConfig, WorkerStatus},
@@ -1187,6 +1189,8 @@ fn apply_connect_signal_ignores_unknown_url() {
     );
 }
 
+const STUB_METRICS: &str = "# HELP test_metric stub\n# TYPE test_metric gauge\ntest_metric 1\n";
+
 /// Tiny HTTP stub counting GET /metrics hits; returns its base URL.
 async fn start_metrics_stub(hits: Arc<AtomicUsize>) -> String {
     let app = axum::Router::new().route(
@@ -1195,10 +1199,64 @@ async fn start_metrics_stub(hits: Arc<AtomicUsize>) -> String {
             let hits = hits.clone();
             async move {
                 hits.fetch_add(1, Ordering::SeqCst);
-                "# HELP test_metric stub\n# TYPE test_metric gauge\ntest_metric 1\n"
+                STUB_METRICS
             }
         }),
     );
+    serve_stub(app).await
+}
+
+/// The same stub behind basic authentication: a request whose
+/// `Authorization` header is not the given user and password is answered
+/// 401. Every request counts, answered or refused.
+async fn start_metrics_stub_with_basic_auth(
+    hits: Arc<AtomicUsize>,
+    user: &str,
+    password: &str,
+) -> String {
+    let expected = format!(
+        "Basic {}",
+        BASE64_STANDARD.encode(format!("{user}:{password}"))
+    );
+    let app = axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(move |headers: HeaderMap| {
+            let hits = hits.clone();
+            let expected = expected.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let presented = headers
+                    .get(AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok());
+                if presented == Some(expected.as_str()) {
+                    (StatusCode::OK, STUB_METRICS)
+                } else {
+                    (StatusCode::UNAUTHORIZED, "")
+                }
+            }
+        }),
+    );
+    serve_stub(app).await
+}
+
+/// A stub whose engine is broken: every GET /metrics is counted and
+/// answered 500.
+async fn start_failing_stub(hits: Arc<AtomicUsize>) -> String {
+    let app = axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(move || {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::INTERNAL_SERVER_ERROR, "")
+            }
+        }),
+    );
+    serve_stub(app).await
+}
+
+/// Serves a stub router on a free local port; returns its base URL.
+async fn serve_stub(app: axum::Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind stub");
@@ -1255,6 +1313,339 @@ async fn engine_metrics_scrapes_each_distinct_base_worker() {
     assert!(matches!(result, EngineMetricsResult::Ok(_)));
     assert_eq!(hits_a.load(Ordering::SeqCst), 1);
     assert_eq!(hits_b.load(Ordering::SeqCst), 1);
+}
+
+fn grpc_worker(url: &str) -> Arc<dyn Worker> {
+    Arc::new(
+        BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+            .build(),
+    )
+}
+
+/// A mixed fleet: the HTTP worker's `/metrics` is scraped and aggregated
+/// under its `worker_addr`, the gRPC worker gets no HTTP request (its base
+/// URL is a gRPC listener) and is named in a comment line of the answer.
+/// Neither worker's credentials reach the answer: the label and the comment
+/// line carry the redacted address.
+#[tokio::test]
+async fn engine_metrics_scrapes_the_http_workers_and_names_the_others() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let base = start_metrics_stub(hits.clone()).await;
+    let http_with_secret = base.replacen("http://", "http://user:secret@", 1);
+
+    let registry = WorkerRegistry::new();
+    registry
+        .register(make_worker(&http_with_secret, 1, 1))
+        .unwrap();
+    registry
+        .register(grpc_worker("grpc://user:secret@engine-a:50051"))
+        .unwrap();
+
+    let text = match WorkerManager::get_engine_metrics(&registry).await {
+        EngineMetricsResult::Ok(text) => text,
+        EngineMetricsResult::Err(err) => panic!("a mixed fleet is scraped: {err}"),
+    };
+
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "the HTTP worker, once");
+    assert!(text.contains("test_metric"), "{text}");
+    let masked_http = base.replacen("http://", "http://***@", 1);
+    assert!(
+        text.contains(&format!("worker_addr=\"{masked_http}\"")),
+        "the label carries the redacted address:\n{text}"
+    );
+    assert!(
+        text.lines().any(|line| {
+            line.starts_with("# not scraped: grpc://***@engine-a:50051 (grpc worker)")
+        }),
+        "{text}"
+    );
+    assert!(!text.contains("secret"), "{text}");
+}
+
+/// Two registrations of one address under other credentials are one scrape
+/// target: the first in URL order answers, the second gets no request, and
+/// a comment line names the registration that answered, so the aggregate
+/// carries one `worker_addr` per address and no credential.
+#[tokio::test]
+async fn engine_metrics_scrapes_an_address_once_whatever_its_credentials() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let base = start_metrics_stub(hits.clone()).await;
+    let first = base.replacen("http://", "http://user:secret@", 1);
+    let second = base.replacen("http://", "http://other:hunter2@", 1);
+
+    let registry = WorkerRegistry::new();
+    registry.register(make_worker(&first, 1, 1)).unwrap();
+    registry.register(make_worker(&second, 1, 1)).unwrap();
+
+    let text = match WorkerManager::get_engine_metrics(&registry).await {
+        EngineMetricsResult::Ok(text) => text,
+        EngineMetricsResult::Err(err) => {
+            panic!("one address under two credentials is scraped: {err}")
+        }
+    };
+
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "one request for the address"
+    );
+    let masked = base.replacen("http://", "http://***@", 1);
+    assert_eq!(
+        text.matches(&format!("worker_addr=\"{masked}\"")).count(),
+        1,
+        "one series per address:\n{text}"
+    );
+    let named = format!(
+        "# scraped once: {masked} (2 registrations under other credentials, tried in URL order): registration 1 answered"
+    );
+    assert!(text.lines().any(|line| line == named), "{text}");
+    for secret in ["secret", "hunter2", "user:", "other:"] {
+        assert!(
+            !text.contains(secret),
+            "{secret} reached the answer:\n{text}"
+        );
+    }
+}
+
+/// One address under two credentials, the first stale: the registrations
+/// are tried in URL order, so the stale one is scraped first and answers
+/// 401, the valid one is tried next and answers. The address's series are
+/// present once, the failed scrape is a warn line and the comment line names
+/// the registration that answered. Registration order plays no part: the
+/// valid registration is registered first and still tried second.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn engine_metrics_tries_the_next_registration_when_stale_credentials_get_a_401() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let base = start_metrics_stub_with_basic_auth(hits.clone(), "valid", "p4ss-valid").await;
+    let stale = base.replacen("http://", "http://stale:p4ss-stale@", 1);
+    let valid = base.replacen("http://", "http://valid:p4ss-valid@", 1);
+
+    let registry = WorkerRegistry::new();
+    registry.register(make_worker(&valid, 1, 1)).unwrap();
+    registry.register(make_worker(&stale, 1, 1)).unwrap();
+
+    let text = match WorkerManager::get_engine_metrics(&registry).await {
+        EngineMetricsResult::Ok(text) => text,
+        EngineMetricsResult::Err(err) => {
+            panic!("a registration with valid credentials is scraped: {err}")
+        }
+    };
+
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "the stale registration first, then the valid one"
+    );
+    assert!(text.contains("test_metric"), "{text}");
+    let masked = base.replacen("http://", "http://***@", 1);
+    assert_eq!(
+        text.matches(&format!("worker_addr=\"{masked}\"")).count(),
+        1,
+        "one series per address:\n{text}"
+    );
+    let named = format!(
+        "# scraped once: {masked} (2 registrations under other credentials, tried in URL order): registration 2 answered"
+    );
+    assert!(text.lines().any(|line| line == named), "{text}");
+    assert!(
+        logs_contain("GET /metrics of an HTTP worker failed"),
+        "the refused scrape leaves a warn line"
+    );
+    for secret in ["p4ss", "stale:", "valid:"] {
+        assert!(
+            !text.contains(secret),
+            "{secret} reached the answer:\n{text}"
+        );
+    }
+}
+
+/// A credentialed registration whose engine is down: the scrape fails, the
+/// warn line names the masked address and the failure, and the credentials
+/// reach neither the line nor the answer. The HTTP client moves a URL's
+/// credentials into a header as it builds the request, and the line logs
+/// the error without its URL: neither path can carry them.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn engine_metrics_logs_a_failed_scrape_without_its_credentials() {
+    // A port nothing listens on: bound to learn its number, then released.
+    let closed = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a port to release");
+        listener.local_addr().expect("the port").port()
+    };
+    let registry = WorkerRegistry::new();
+    registry
+        .register(make_worker(
+            &format!("http://scraper:p4ss-secret@127.0.0.1:{closed}"),
+            1,
+            1,
+        ))
+        .unwrap();
+
+    let answer = match WorkerManager::get_engine_metrics(&registry).await {
+        EngineMetricsResult::Ok(text) => panic!("a down engine is a failed scrape: {text}"),
+        EngineMetricsResult::Err(err) => err,
+    };
+
+    assert_eq!(answer, "All backend requests failed");
+    assert!(logs_contain("GET /metrics of an HTTP worker failed"));
+    assert!(logs_contain(&format!("http://***@127.0.0.1:{closed}")));
+    logs_assert(|lines: &[&str]| {
+        match lines
+            .iter()
+            .find(|line| line.contains("p4ss-secret") || line.contains("scraper:"))
+        {
+            Some(line) => Err(format!("a credential reached the log: {line}")),
+            None => Ok(()),
+        }
+    });
+}
+
+/// Two registrations of one address at a host that refuses the connection
+/// (the engine down behind a port nothing listens on): a transport error
+/// says nothing of the credentials, so the first registration's failure
+/// closes the address in its round, one request and one warn line, and the
+/// comment line says so. The healthy worker beside it is answered as usual.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn engine_metrics_closes_an_address_on_a_transport_error() {
+    // A port nothing listens on: bound to learn its number, then released.
+    let closed = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a port to release");
+        listener.local_addr().expect("the port").port()
+    };
+    let healthy_hits = Arc::new(AtomicUsize::new(0));
+    let healthy = start_metrics_stub(healthy_hits.clone()).await;
+
+    let registry = WorkerRegistry::new();
+    registry
+        .register(make_worker(
+            &format!("http://alpha:p4ss-alpha@127.0.0.1:{closed}"),
+            1,
+            1,
+        ))
+        .unwrap();
+    registry
+        .register(make_worker(
+            &format!("http://beta:p4ss-beta@127.0.0.1:{closed}"),
+            1,
+            1,
+        ))
+        .unwrap();
+    registry.register(make_worker(&healthy, 1, 1)).unwrap();
+
+    let text = match WorkerManager::get_engine_metrics(&registry).await {
+        EngineMetricsResult::Ok(text) => text,
+        EngineMetricsResult::Err(err) => panic!("the healthy worker is scraped: {err}"),
+    };
+
+    assert_eq!(healthy_hits.load(Ordering::SeqCst), 1);
+    let masked = format!("# not scraped: http://***@127.0.0.1:{closed}");
+    let closed_line =
+        "registration 1 failed and closed the address, only a 401 or 403 tries the next";
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with(&masked) && line.ends_with(closed_line)),
+        "{text}"
+    );
+    logs_assert(|lines: &[&str]| {
+        let failures = lines
+            .iter()
+            .filter(|line| line.contains("GET /metrics of an HTTP worker failed"))
+            .count();
+        if failures == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "{failures} failed-scrape lines: a transport error closes the address after one request"
+            ))
+        }
+    });
+}
+
+/// Two registrations of one address whose engine answers 500: the group
+/// shares the host, so the first failure that is not a credential refusal
+/// closes the address in its round (one request, one warn line) and the
+/// comment line says so; the healthy worker beside it is answered as usual.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn engine_metrics_closes_an_address_on_a_failure_other_than_a_credential_refusal() {
+    let failing_hits = Arc::new(AtomicUsize::new(0));
+    let failing = start_failing_stub(failing_hits.clone()).await;
+    let healthy_hits = Arc::new(AtomicUsize::new(0));
+    let healthy = start_metrics_stub(healthy_hits.clone()).await;
+    let first = failing.replacen("http://", "http://alpha:p4ss-alpha@", 1);
+    let second = failing.replacen("http://", "http://beta:p4ss-beta@", 1);
+
+    let registry = WorkerRegistry::new();
+    registry.register(make_worker(&first, 1, 1)).unwrap();
+    registry.register(make_worker(&second, 1, 1)).unwrap();
+    registry.register(make_worker(&healthy, 1, 1)).unwrap();
+
+    let text = match WorkerManager::get_engine_metrics(&registry).await {
+        EngineMetricsResult::Ok(text) => text,
+        EngineMetricsResult::Err(err) => panic!("the healthy worker is scraped: {err}"),
+    };
+
+    assert_eq!(
+        failing_hits.load(Ordering::SeqCst),
+        1,
+        "a 500 closes the address: the second registration is not tried"
+    );
+    assert_eq!(healthy_hits.load(Ordering::SeqCst), 1);
+    let masked = failing.replacen("http://", "http://***@", 1);
+    let named = format!(
+        "# not scraped: {masked} (2 registrations under other credentials): registration 1 failed and closed the address, only a 401 or 403 tries the next"
+    );
+    assert!(text.lines().any(|line| line == named), "{text}");
+    logs_assert(|lines: &[&str]| {
+        let failures = lines
+            .iter()
+            .filter(|line| line.contains("GET /metrics of an HTTP worker failed"))
+            .count();
+        if failures == 1 {
+            Ok(())
+        } else {
+            Err(format!("{failures} warn lines for one closed address"))
+        }
+    });
+    for secret in ["p4ss", "alpha:", "beta:"] {
+        assert!(
+            !text.contains(secret),
+            "{secret} reached the answer:\n{text}"
+        );
+    }
+}
+
+/// A fleet with no HTTP worker is not a failed scrape: the route answers
+/// the comment lines alone, a 200 with no series.
+#[tokio::test]
+async fn engine_metrics_answers_a_fleet_without_http_workers_as_an_empty_aggregate() {
+    let registry = WorkerRegistry::new();
+    registry
+        .register(grpc_worker("grpc://engine-a:50051"))
+        .unwrap();
+
+    let text = match WorkerManager::get_engine_metrics(&registry).await {
+        EngineMetricsResult::Ok(text) => text,
+        EngineMetricsResult::Err(err) => panic!("no HTTP worker is not a server error: {err}"),
+    };
+
+    assert!(text.starts_with("# no HTTP worker registered"), "{text}");
+    assert!(
+        text.contains("# not scraped: grpc://engine-a:50051 (grpc worker)"),
+        "{text}"
+    );
+    assert!(
+        text.lines().all(|line| line.starts_with('#')),
+        "no series in the aggregate of zero HTTP workers:\n{text}"
+    );
 }
 
 fn cfg(success_threshold: u32, failure_threshold: u32) -> HealthCheckConfig {
@@ -1634,6 +2025,91 @@ fn test_reconcile_from_registry_captures_pending_and_ready_workers() {
         next_check.contains_key(&ready_id),
         "ready worker must be in the bootstrap schedule"
     );
+}
+
+/// The bootstrap schedules a worker without a verdict as a registration
+/// would: due now, not an interval out. A worker that carries a verdict
+/// keeps its interval.
+#[test]
+fn the_bootstrap_schedules_a_pending_worker_now_and_a_ready_one_an_interval_out() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let pending_worker = make_worker("http://pending:1", 2, 3);
+    assert_eq!(pending_worker.status(), WorkerStatus::Pending);
+    let pending_id = registry.register(pending_worker).unwrap();
+    let ready_worker = make_worker("http://ready:1", 2, 3);
+    ready_worker.set_status(WorkerStatus::Ready);
+    let ready_id = registry.register(ready_worker).unwrap();
+
+    let before = tokio::time::Instant::now();
+    let mut next_check = HashMap::new();
+    reconcile_from_registry(&registry, &mut next_check, &test_config());
+    let after = tokio::time::Instant::now();
+
+    assert!(
+        next_check[&pending_id] <= after,
+        "a worker without a verdict is due the moment the loop starts, not an interval later"
+    );
+    assert!(
+        next_check[&ready_id] >= before + Duration::from_secs(1),
+        "a worker that carries a verdict keeps its interval"
+    );
+}
+
+/// Through the running loop: a worker registered before the manager started
+/// (a start-up worker whose registration won the race with the manager's
+/// start) is probed on the loop's first tick, as one registered under the
+/// running loop is. With an hour between probes, the only probe this test
+/// can see is that first one.
+#[tokio::test]
+async fn a_worker_registered_before_the_manager_starts_is_probed_at_once_not_an_interval_later() {
+    let serving = Arc::new(AtomicBool::new(true));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let url = start_health_stub(serving, hits.clone()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = probed_worker(&url, ConnectionMode::Http);
+    assert_eq!(worker.status(), WorkerStatus::Pending);
+    registry.register(worker.clone()).unwrap();
+
+    let started = tokio::time::Instant::now();
+    let mut manager = manager_over(&registry);
+    wait_until(
+        started + Duration::from_secs(5),
+        "a worker already in the registry at the manager's start was not probed at once: its \
+         first read waits a whole interval",
+        || hits.load(Ordering::SeqCst) > 0,
+    )
+    .await;
+    wait_until(
+        started + Duration::from_secs(5),
+        "the first read's pass did not promote the worker",
+        || worker.status() == WorkerStatus::Ready,
+    )
+    .await;
+
+    manager.shutdown().await;
+}
+
+/// A worker the bootstrap finds with a verdict is not read at the start: its
+/// interval stands; only the workers without one are brought forward.
+#[tokio::test]
+async fn a_ready_worker_registered_before_the_manager_starts_keeps_its_interval() {
+    let serving = Arc::new(AtomicBool::new(true));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let url = start_health_stub(serving, hits.clone()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = probed_worker(&url, ConnectionMode::Http);
+    worker.set_status(WorkerStatus::Ready);
+    registry.register(worker).unwrap();
+
+    let mut manager = manager_over(&registry);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a worker that carries a verdict is read an interval after the start, not at once"
+    );
+
+    manager.shutdown().await;
 }
 
 #[tokio::test]

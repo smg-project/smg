@@ -994,11 +994,14 @@ mod repeat_tests {
     }
 
     /// Only native SGLang defers the cap to its Pillow processor; vLLM still
-    /// receives decoder-scaled frames. Explicit caps survive both paths.
+    /// receives decoder-scaled frames. Explicit caps survive both paths. Runs
+    /// where ffmpeg and ffprobe are installed, skips elsewhere.
     #[tokio::test]
-    #[ignore = "requires ffmpeg and ffprobe; run explicitly for MiniMax validation"]
     async fn minimax_video_cap_is_deferred_only_for_sglang() {
         use base64::{engine::general_purpose::STANDARD, Engine};
+        if !crate::test_support::video_tools_available() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.mp4");
         let status = std::process::Command::new("ffmpeg")

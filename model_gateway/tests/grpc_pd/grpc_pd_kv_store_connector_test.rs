@@ -7,15 +7,15 @@
 //! Each case runs on a current-thread runtime under a thread-local Prometheus
 //! recorder, so the request path's mode decision lands in the rendered text.
 
-use std::{
-    future::Future,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
-use common::grpc_harness::{build_grpc_router, grpc_router_config, grpc_worker, serve_engine};
-use metrics_exporter_prometheus::PrometheusBuilder;
+use common::{
+    decode_stream::{chunk, complete},
+    engine_answers::{VllmAnswers, VllmGenerateStream},
+    grpc_harness::{build_grpc_router, grpc_router_config, grpc_worker, serve_engine},
+    metrics_capture::render_after,
+};
 use openai_protocol::model_card::ModelCard;
-use proto::generate_response::Response as GenResp;
 use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
@@ -72,49 +72,8 @@ impl RecordingEngine {
     }
 }
 
-fn chunk(id: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Chunk(proto::GenerateStreamChunk {
-            token_ids: vec![id],
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-fn complete() -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Complete(proto::GenerateComplete {
-            output_ids: (1..=OUTPUT_TOKENS).collect(),
-            finish_reason: "stop".to_string(),
-            prompt_tokens: 1,
-            completion_tokens: OUTPUT_TOKENS,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
 #[tonic::async_trait]
-impl proto::vllm_engine_server::VllmEngine for RecordingEngine {
-    async fn start_profile(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::StartProfileRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn stop_profile(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::StopProfileRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    type GenerateStream = ReceiverStream<Result<proto::GenerateResponse, Status>>;
-
+impl VllmAnswers for RecordingEngine {
     #[expect(
         clippy::expect_used,
         reason = "test mock - panicking on failure is intentional"
@@ -122,7 +81,7 @@ impl proto::vllm_engine_server::VllmEngine for RecordingEngine {
     async fn generate(
         &self,
         request: Request<proto::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<VllmGenerateStream>, Status> {
         let request = request.into_inner();
         self.seen.lock().expect("recording lock").push(SeenParams {
             json: request.kv_transfer_params_json.clone(),
@@ -134,88 +93,14 @@ impl proto::vllm_engine_server::VllmEngine for RecordingEngine {
         for id in 1..=OUTPUT_TOKENS {
             let _ = tx.send(Ok(chunk(id))).await;
         }
-        let _ = tx.send(Ok(complete())).await;
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    async fn abort(
-        &self,
-        _request: Request<proto::AbortRequest>,
-    ) -> Result<Response<proto::AbortResponse>, Status> {
-        Ok(Response::new(proto::AbortResponse::default()))
-    }
-
-    async fn flush_cache(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::FlushCacheRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::FlushCacheResponse>, Status> {
-        Ok(Response::new(
-            smg_grpc_client::common_proto::FlushCacheResponse::default(),
-        ))
-    }
-
-    async fn embed(
-        &self,
-        _request: Request<proto::EmbedRequest>,
-    ) -> Result<Response<proto::EmbedResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn health_check(
-        &self,
-        _request: Request<proto::HealthCheckRequest>,
-    ) -> Result<Response<proto::HealthCheckResponse>, Status> {
-        Ok(Response::new(proto::HealthCheckResponse {
-            healthy: true,
-            ..Default::default()
-        }))
-    }
-
-    async fn get_model_info(
-        &self,
-        _request: Request<proto::GetModelInfoRequest>,
-    ) -> Result<Response<proto::GetModelInfoResponse>, Status> {
-        Ok(Response::new(proto::GetModelInfoResponse::default()))
-    }
-
-    async fn get_server_info(
-        &self,
-        _request: Request<proto::GetServerInfoRequest>,
-    ) -> Result<Response<proto::GetServerInfoResponse>, Status> {
-        Ok(Response::new(proto::GetServerInfoResponse::default()))
-    }
-
-    async fn get_loads(
-        &self,
-        _request: Request<proto::GetLoadsRequest>,
-    ) -> Result<Response<proto::GetLoadsResponse>, Status> {
-        Ok(Response::new(proto::GetLoadsResponse::default()))
-    }
-
-    type GetTokenizerStream =
-        ReceiverStream<Result<smg_grpc_client::common_proto::GetTokenizerChunk, Status>>;
-
-    async fn get_tokenizer(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    type SubscribeKvEventsStream =
-        ReceiverStream<Result<smg_grpc_client::common_proto::KvEventBatch, Status>>;
-
-    async fn subscribe_kv_events(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
+        let _ = tx.send(Ok(complete("stop", OUTPUT_TOKENS))).await;
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
 
 /// Serve a recording mock engine in-process; returns its port.
 async fn start_mock_engine(engine: RecordingEngine) -> u16 {
-    serve_engine(proto::vllm_engine_server::VllmEngineServer::new(engine)).await
+    serve_engine(engine.into_server()).await
 }
 
 /// One worker of the pair as it is registered: its mock engine's port, its type
@@ -282,29 +167,6 @@ async fn one_streaming_chat(router: &dyn RouterTrait) -> (http::StatusCode, Stri
         status,
         String::from_utf8(bytes.to_vec()).expect("utf-8 body"),
     )
-}
-
-/// Run `case` on a current-thread runtime under a thread-local recorder and
-/// return the rendered `/metrics` text.
-#[expect(
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
-fn render_after<F, Fut>(case: F) -> String
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let handle = recorder.handle();
-    metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("current-thread runtime");
-        rt.block_on(case());
-    });
-    handle.render()
 }
 
 /// The `smg_pd_kv_connector_mode_total` sample for `mode`, if emitted.

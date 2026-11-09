@@ -1105,18 +1105,20 @@ impl ResponseProcessor {
     /// Process non-streaming completion response
     ///
     /// Collects all responses (supports n>1 and batched prompts), decodes tokens
-    /// through the stop decoder, applies `echo` and `suffix`, and builds one
-    /// `CompletionResponse` with prompt-major global choice indices
-    /// (`prompt_index * n + choice_index`).
+    /// through the stop decoder, applies `echo` and `suffix`, lists each
+    /// choice's generated tokens' logprobs when the request asked for them,
+    /// and builds one `CompletionResponse` with prompt-major global choice
+    /// indices (`prompt_index * n + choice_index`).
     pub async fn process_non_streaming_completion_response(
         &self,
         execution_result: ExecutionResult,
         completion_req: CompletionResponseSpec,
         dispatch: DispatchMetadata,
+        tokenizer: &Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<CompletionResponse, axum::response::Response> {
         let started = Instant::now();
-        let request_logprobs = completion_req.logprobs;
+        let request_logprobs = completion_req.logprobs.is_some();
         let per_prompt_results = match execution_result {
             ExecutionResult::Batch { results } => results,
             other => vec![other],
@@ -1191,10 +1193,29 @@ impl ResponseProcessor {
                     text.push_str(sfx);
                 }
 
+                // The generated tokens' logprobs when the request asked for
+                // them, as the engine reports them; their offsets count from
+                // the end of the echoed prompt.
+                let mut text_offset = if completion_req.echo {
+                    u32::try_from(prompt_text.chars().count()).unwrap_or(u32::MAX)
+                } else {
+                    0
+                };
+                let logprobs = completion_req.logprobs.and_then(|top_logprobs| {
+                    complete.output_logprobs().map(|proto_logprobs| {
+                        utils::convert_proto_to_completion_logprobs(
+                            proto_logprobs,
+                            tokenizer,
+                            top_logprobs,
+                            &mut text_offset,
+                        )
+                    })
+                });
+
                 choices.push(CompletionChoice {
                     text,
                     index: index_offset + i as u32,
-                    logprobs: None, // TODO: wire legacy LogProbs from backend token_logprobs
+                    logprobs,
                     finish_reason: Some(finish_reason.to_string()),
                     matched_stop,
                 });

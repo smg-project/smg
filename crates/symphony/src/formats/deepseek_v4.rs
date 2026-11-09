@@ -1,6 +1,7 @@
 //! DeepSeek V4: reasoning between `<think>` and `</think>`, the calls of one turn between
 //! `<｜DSML｜tool_calls>` and `</｜DSML｜tool_calls>`, each call between `<｜DSML｜invoke name="…">`
-//! and `</｜DSML｜invoke>`, everything else content: the DSML spelling before V4.1's, with no space
+//! and `</｜DSML｜invoke>`, an invoke written outside a block a call too, as the serving engines'
+//! own parsers read it, everything else content: the DSML spelling before V4.1's, with no space
 //! after the sentinel and `tool_calls` for the block's name, as the reference encoder of
 //! `deepseek-ai/DeepSeek-V4-Flash` renders a turn:
 //!
@@ -62,6 +63,17 @@ pub fn deepseek_v4() -> Format {
         .transition("content", "separated_calls_open", "calls")
         .transition("reasoning", "separated_calls_open", "calls")
         .transition("calls", "invoke_open", "invoke")
+        // An invoke the model writes outside a block is the call, as the serving engines' own
+        // parsers for the family read it (their machines start a call at the invoke's opener from
+        // the content as from the block); before this row the table kept such an invoke as
+        // content, its two tags counted as markers out of place, and the call was lost. The
+        // close leads into the block's wrapping state, as a block's invoke's does, so a second
+        // bare invoke is the next call and prose after a bare call is text between calls; a
+        // block opener met there is wrapping, as it is to the engines' machines, so a call the
+        // model writes bare and then again inside a block is two calls and no markup.
+        .transition("content", "invoke_open", "invoke")
+        .transition("calls", "calls_open", "calls")
+        .transition("calls", "separated_calls_open", "calls")
         .transition("invoke", "invoke_close", "calls")
         .transition("invoke", "invoke_open", "invoke")
         .transition("invoke", "calls_close", "content")
@@ -79,7 +91,8 @@ mod tests {
     use crate::{
         ids::CallIds,
         testing::{
-            arguments_of, bytes, content, drive, drive_to, reasoning, the_same_at_every_cut,
+            arguments_of, bytes, content, drive, drive_to, malformed, reasoning,
+            the_same_at_every_cut, weather_tools,
         },
     };
 
@@ -1218,5 +1231,169 @@ mod tests {
         let blocks = serde_json::to_value(&message.content).expect("wire");
         assert_eq!(blocks[0]["type"], "tool_use", "{blocks}");
         assert_eq!(blocks[0]["input"], serde_json::json!({}), "{blocks}");
+    }
+
+    /// A call written without its block, as the serving engines' own parsers for the family read
+    /// it. The draw a fleet verifier saw once in several hundred answers to one prompt: `:tool` in
+    /// place of the block's opener and the invoke after it. Before the `content + invoke_open`
+    /// row the table kept the invoke as content, its two tags counted as markers out of place,
+    /// and a chat client read four lines of markup and no call; now the invoke is the call, whole
+    /// and at every cut, every byte in its event and nothing malformed, and no content delta
+    /// carries a byte of it.
+    const BARE_INVOKE: &str = concat!(
+        "<｜DSML｜invoke name=\"add_integers\">\n",
+        "<｜DSML｜parameter name=\"a\" string=\"false\">6</｜DSML｜parameter>\n",
+        "<｜DSML｜parameter name=\"b\" string=\"false\">8</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>"
+    );
+
+    /// The call of [`BARE_INVOKE`], as the table says it.
+    fn the_call() -> (String, String) {
+        (
+            "add_integers".to_string(),
+            r#"{"a": 6, "b": 8}"#.to_string(),
+        )
+    }
+
+    /// `text` in the pieces a tokenizer tends to make of DSML: a piece ends at a newline, a quote
+    /// or a tag's close.
+    fn tokenized(text: &str) -> Vec<&str> {
+        let pieces: Vec<&str> = text.split_inclusive(['\n', '"', '>']).collect();
+        assert_eq!(pieces.concat(), text);
+        pieces
+    }
+
+    #[test]
+    fn an_invoke_written_outside_a_block_is_the_call_as_the_engines_own_parsers_read_it() {
+        use crate::adapt;
+        let prompt = "<｜Assistant｜></think>";
+        let (content, reasoning, calls) = however_cut(prompt, BARE_INVOKE);
+        assert_eq!(content, "");
+        assert_eq!(reasoning, "");
+        assert_eq!(calls, [the_call()]);
+        let events = run(prompt, &[BARE_INVOKE]);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Malformed { .. })),
+            "{events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
+        // What a chat client reads: the call under `tool_calls`, no content.
+        let choice = adapt::chat::message(0, &events);
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(choice.message.content, None);
+        assert_eq!(choice.message.tool_calls.as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            content_deltas(prompt, &tokenized(BARE_INVOKE)),
+            Vec::<String>::new()
+        );
+        // After a preamble, the blank line before a bare invoke is the text's: only the block's
+        // opener owns one, as the engines' own parsers have it.
+        let output = format!("Let me check.\n\n{BARE_INVOKE}");
+        let (content, _, calls) = however_cut(prompt, &output);
+        assert_eq!(content, "Let me check.\n\n");
+        assert_eq!(calls, [the_call()]);
+        // Two bare invokes are two calls, the newline between them the template's.
+        let output = format!("{BARE_INVOKE}\n{BARE_INVOKE}");
+        let (content, _, calls) = however_cut(prompt, &output);
+        assert_eq!(content, "");
+        assert_eq!(calls, [the_call(), the_call()]);
+    }
+
+    /// The recorded draw whole: the slip, the bare invoke, then the call written again inside a
+    /// block. The engines' own servers deliver two calls for it, and so does the table, with the
+    /// model's text alone as content where the first attempt streamed as 37 deltas of markup; the
+    /// block's opener after the bare call, met in the wrapping between calls, is wrapping
+    /// (`calls + calls_open`, with the blank line the template writes before it), as the engines'
+    /// machines drop it.
+    #[test]
+    fn an_invoke_outside_the_block_and_the_block_after_it_are_two_calls_and_the_text_is_the_models()
+    {
+        let output = format!(
+            "\n\n:tool\n{BARE_INVOKE}\n\n<｜DSML｜tool_calls>\n{BARE_INVOKE}\n</｜DSML｜tool_calls>"
+        );
+        let prompt = "<｜Assistant｜></think>";
+        let (content, _, calls) = however_cut(prompt, &output);
+        assert_eq!(content, "\n\n:tool\n");
+        assert_eq!(calls, [the_call(), the_call()]);
+        let events = run(prompt, &[&output]);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Malformed { .. })),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&dropped("\n\n<｜DSML｜tool_calls>")),
+            "{events:?}"
+        );
+        // Streamed in a tokenizer's pieces, the content deltas carry the slip and no markup.
+        let deltas = content_deltas(prompt, &tokenized(&output));
+        assert_eq!(deltas.concat(), "\n\n:tool\n");
+        assert!(
+            deltas.iter().all(|delta| !delta.contains("DSML")),
+            "{deltas:?}"
+        );
+    }
+
+    /// Prose after a call written without its block is text between calls: counted, and shown
+    /// to a chat client as content, where the engines' own parsers drop everything after a call.
+    /// An invoke inside the thought stays in the thought, as under the engines' machines, which
+    /// start no call there.
+    #[test]
+    fn prose_after_a_bare_invoke_is_text_between_calls_and_one_inside_the_thought_stays_there() {
+        use crate::adapt;
+        let output = format!("{BARE_INVOKE}\nThe sum is 14.");
+        let prompt = "<｜Assistant｜></think>";
+        let (content, _, calls) = however_cut(prompt, &output);
+        assert_eq!(content, "");
+        assert_eq!(calls, [the_call()]);
+        let events = run(prompt, &[&output]);
+        let between: String = malformed(&events)
+            .into_iter()
+            .filter(|(_, why)| *why == MalformedReason::TextBetweenCalls)
+            .map(|(text, _)| text)
+            .collect();
+        assert_eq!(between, "The sum is 14.");
+        let choice = adapt::chat::message(0, &events);
+        assert_eq!(choice.message.content.as_deref(), Some("The sum is 14."));
+        assert_eq!(choice.message.tool_calls.as_ref().map(Vec::len), Some(1));
+
+        let output = format!("Let me add.{BARE_INVOKE}</think>Done.");
+        let (content, reasoning, calls) = however_cut("<｜Assistant｜><think>", &output);
+        assert_eq!(content, "Done.");
+        assert_eq!(reasoning, format!("Let me add.{BARE_INVOKE}"));
+        assert!(calls.is_empty());
+    }
+
+    /// The rows from the content into an invoke change no forced-call tag: the grammar takes the
+    /// block from the wrapping state's row alone, so a forced call is still written as the block,
+    /// the block's opener with the template's blank line first, the invoke inside it, the block's
+    /// close last.
+    #[test]
+    fn a_forced_call_is_still_written_as_the_block() {
+        let payload = deepseek_v4()
+            .grammar(&weather_tools(), true, false)
+            .expect("a grammar")
+            .payload();
+        let elements = &payload["format"]["elements"];
+        assert_eq!(
+            elements[0],
+            serde_json::json!({"type": "const_string", "value": "\n\n<｜DSML｜tool_calls>\n"}),
+            "{payload}"
+        );
+        assert_eq!(
+            elements[1]["tags"][0]["begin"], "<｜DSML｜invoke name=\"get_weather\">\n",
+            "{payload}"
+        );
+        assert_eq!(
+            elements[2],
+            serde_json::json!({"type": "const_string", "value": "</｜DSML｜tool_calls>"}),
+            "{payload}"
+        );
     }
 }

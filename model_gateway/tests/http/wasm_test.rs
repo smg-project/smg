@@ -48,7 +48,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
     let wasm_manager = Arc::new(WasmModuleManager::with_default_config());
 
     // Create AppContext with wasm_manager from the start
-    let client = smg::clients::http_client();
+    let client = smg::server::http_client();
 
     let tokenizer_registry = Arc::new(TokenizerRegistry::new());
     let worker_registry = Arc::new(WorkerRegistry::new());
@@ -195,6 +195,7 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
         gateway: None,
         mesh_handler: None,
         mesh_adapters: None,
+        secret_sources: Default::default(),
     });
 
     let request_id_headers = vec!["x-request-id".to_string(), "x-correlation-id".to_string()];
@@ -422,10 +423,8 @@ async fn test_wasm_api_list_modules() {
         .await
         .unwrap();
 
+    // The add route answers once its job has run: the module is registered.
     assert_eq!(add_response.status(), StatusCode::OK);
-
-    // Wait a bit for the job to complete
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Now list modules
     let list_response = app
@@ -497,9 +496,6 @@ async fn test_wasm_api_remove_module() {
         .unwrap();
     let response_json: WasmModuleAddResponse = serde_json::from_slice(&body).unwrap();
 
-    // Wait for job to complete
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     // Get the module UUID
     let module_uuid =
         if let Some(WasmModuleAddResult::Success(uuid)) = &response_json.modules[0].add_result {
@@ -537,9 +533,7 @@ async fn test_wasm_api_remove_module() {
         "Expected OK status for remove but got {remove_status:?}"
     );
 
-    // Wait for removal to complete
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
+    // The remove route answers once its job has run.
     // Verify module is removed
     if let Some(wasm_manager) = app_context.wasm_manager.as_ref() {
         let module = wasm_manager
@@ -609,9 +603,6 @@ async fn test_wasm_module_duplicate_sha256() {
         .unwrap();
 
     assert_eq!(response1.status(), StatusCode::OK);
-
-    // Wait for first job to complete
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Try to add the same file again (should fail due to duplicate SHA256)
     let add_request2 = WasmModuleAddRequest {

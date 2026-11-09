@@ -3,15 +3,14 @@
 
 use std::sync::Arc;
 
-use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
 use serde_json::Value;
 use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto};
-use tool_parser::ToolConstraint;
 
 use super::*;
-use crate::{
-    routers::grpc::{context::ExecutionPlanKind, proto_wrapper::ProtoRequest},
-    worker::{BasicWorkerBuilder, WorkerType},
+use crate::routers::grpc::{
+    context::ExecutionPlanKind,
+    proto_wrapper::ProtoRequest,
+    testing::{forced_call_on_a_thinking_prompt, worker},
 };
 
 /// A parser that registers a reasoning prefix, so a forced call on a
@@ -20,34 +19,6 @@ const PARSER: &str = "glm47_moe";
 const BARE_CALLS: &str = "the bare calls (grammar after the reasoning)";
 const THOUGHT_THEN_CALLS: &str = "the thought block then the calls (grammar from the first token)";
 const PREFIX_THEN_CALLS: &str = "the free-text prefix then the calls (either engine)";
-
-fn worker(labels: &[(&str, &str)]) -> WorkerSelection {
-    let mut builder =
-        BasicWorkerBuilder::new("grpc://engine:50051").worker_type(WorkerType::Regular);
-    for (key, value) in labels {
-        builder = builder.label(*key, *value);
-    }
-    WorkerSelection::Single {
-        worker: Arc::new(builder.build()),
-    }
-}
-
-fn forced_call_on_a_thinking_prompt(factory: &ToolParserFactory) -> (String, String) {
-    let tools: Vec<Tool> = serde_json::from_value(serde_json::json!([{
-        "type": "function",
-        "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}
-    }]))
-    .unwrap();
-    let required = ToolChoice::Value(ToolChoiceValue::Required);
-    match factory
-        .registry()
-        .generate_tool_constraint(Some(PARSER), &tools, &required, true)
-        .unwrap()
-    {
-        Some(ToolConstraint::StructuralTag(tag)) => ("structural_tag".to_string(), tag),
-        other => panic!("expected a structural tag, got {other:?}"),
-    }
-}
 
 /// Each backend's built request carrying `tag` where its builder places a
 /// forced call's structural tag.
@@ -141,7 +112,7 @@ fn plan_request(plan: &ExecutionPlan) -> &ProtoGenerateRequest {
 #[test]
 fn retry_reshapes_the_forced_call_for_its_own_workers_engine() {
     let factory = ToolParserFactory::new();
-    let unshaped = forced_call_on_a_thinking_prompt(&factory);
+    let unshaped = forced_call_on_a_thinking_prompt(&factory, PARSER);
     assert_eq!(shape_of(&unshaped.1), PREFIX_THEN_CALLS);
     let after_reasoning = worker(&[("constrained_decoding_start", "after_reasoning")]);
     let first_token = worker(&[("constrained_decoding_start", "first_token")]);
@@ -274,7 +245,7 @@ fn a_request_without_the_forced_calls_tag_is_left_as_built() {
     );
     // The forced call's tag that the backend dropped for the request's
     // response_format: the request carries the schema, not the tag.
-    let unshaped = forced_call_on_a_thinking_prompt(&factory);
+    let unshaped = forced_call_on_a_thinking_prompt(&factory, PARSER);
     assert!(ToolConstraintStamp::capture(Some(unshaped), Some(PARSER), false, &request).is_none());
 
     request.set_structural_tag("{}".to_string());

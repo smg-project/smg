@@ -17,7 +17,22 @@
 //! decisions with the lookup's and the hashing's own distributions beside
 //! them. `T6_WORKERS` (128) and `T6_BLOCKS_PER_WORKER` (8192) size the fleet.
 //!
-//! Run with (one pinned core, outside the measurement set):
+//! The decision's configuration comes from the environment too, one table row
+//! per run. `T6_SELECTION` names the selection policy (`cache-aware-default`).
+//! `T6_TEMPERATURE`, `T6_DECAY` and `T6_ACCOUNTING_MS` set
+//! `--selection-temperature`, `--overlap-decay` and
+//! `--selection-accounting-ttl-ms` (all 0). `T6_FEED=1` publishes a load
+//! report for every worker and puts requests in flight on them, so the
+//! expected wait scores the candidates as it does over engines that report.
+//! `T6_INDEX=tree` routes on the approximate token tree of a fleet without KV
+//! events, filled by routing every session once. `T6_THREADS` (1) runs that
+//! many decision loops on the one policy, each at `T6_RATE`, the row taking
+//! the latencies of all of them. A configuration other than the default has
+//! its own criterion id (`decision/chain/temperature-0.1/fed`), so criterion's
+//! change report compares runs of one configuration.
+//!
+//! Run with (one pinned core, outside the measurement set; a core per loop
+//! with `T6_THREADS`):
 //!   taskset -c 100 cargo bench -p smg --bench kv_index_decision
 #![expect(
     clippy::unwrap_used,
@@ -27,20 +42,24 @@
 )]
 
 use std::{
+    collections::HashMap,
     fs,
     hint::black_box,
+    str::FromStr,
     sync::Arc,
+    thread,
     time::{Duration, Instant},
 };
 
 use criterion::Criterion;
 use kv_index::{compute_content_hash, compute_request_content_hashes, request_prefix_hashes};
-use openai_protocol::worker::HealthCheckConfig;
+use openai_protocol::worker::{HealthCheckConfig, WorkerLoadResponse};
 use smg::{
-    policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
+    policies::{cost, CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
     worker::{
-        kv_event_monitor::bench_support::IndexFeed, BasicWorkerBuilder, KvEventMonitor, KvIndex,
-        Worker, WorkerType,
+        kv_event_monitor::bench_support::IndexFeed,
+        load_state::{one_rank_load, TestFeed},
+        BasicWorkerBuilder, KvEventMonitor, KvIndex, Worker, WorkerType,
     },
 };
 use smg_grpc_client::common_proto::{
@@ -60,11 +79,79 @@ const BLOCK: usize = 16;
 /// Workers whose model id is empty route under this key.
 const MODEL: &str = "unknown";
 
-fn env_or(name: &str, default: u64) -> u64 {
+fn env_or<T: FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+/// The decision under measurement, read from the environment (see the
+/// module docs).
+struct Variant {
+    selection: String,
+    temperature: f32,
+    decay: f32,
+    accounting_ms: u64,
+    feed: bool,
+    tree: bool,
+    threads: usize,
+}
+
+impl Variant {
+    fn from_env() -> Self {
+        let selection = env_or("T6_SELECTION", cost::DEFAULT_POLICY.to_string());
+        let temperature = env_or("T6_TEMPERATURE", 0.0);
+        // The policy would fall back to the default on an unknown name.
+        cost::build(&selection, temperature).expect("T6_SELECTION names a selection policy");
+        let index = env_or("T6_INDEX", "chain".to_string());
+        let tree = ["chain", "tree"]
+            .iter()
+            .position(|known| *known == index)
+            .expect("T6_INDEX is chain or tree")
+            == 1;
+        Self {
+            selection,
+            temperature,
+            decay: env_or("T6_DECAY", 0.0),
+            accounting_ms: env_or("T6_ACCOUNTING_MS", 0),
+            feed: env_or("T6_FEED", 0u8) != 0,
+            tree,
+            threads: env_or("T6_THREADS", 1usize).max(1),
+        }
+    }
+
+    fn index(&self) -> &'static str {
+        if self.tree {
+            "tree"
+        } else {
+            "chain"
+        }
+    }
+
+    /// The criterion id: `decision/chain` (or `decision/tree`) for the
+    /// default policy configuration, as before, with each setting that
+    /// differs from it appended, so criterion compares a run with the last
+    /// run of the same configuration.
+    fn criterion_id(&self) -> String {
+        let mut id = format!("decision/{}", self.index());
+        if self.selection != cost::DEFAULT_POLICY {
+            id.push_str(&format!("/{}", self.selection));
+        }
+        if self.temperature > 0.0 {
+            id.push_str(&format!("/temperature-{}", self.temperature));
+        }
+        if self.decay > 0.0 {
+            id.push_str(&format!("/decay-{}", self.decay));
+        }
+        if self.accounting_ms > 0 {
+            id.push_str(&format!("/accounting-{}ms", self.accounting_ms));
+        }
+        if self.feed {
+            id.push_str("/fed");
+        }
+        id
+    }
 }
 
 /// SplitMix64: a deterministic fleet and request stream.
@@ -216,9 +303,40 @@ struct Setup {
     memberships: usize,
     index_mb: f64,
     fill_secs: f64,
+    /// The published load reports, while the run lasts (`T6_FEED`).
+    _feed: Option<TestFeed>,
 }
 
-fn setup(worker_count: usize, blocks_per_worker: usize) -> Setup {
+/// A load report for every worker (queued token-work, running requests, KV
+/// pressure, a live rate on three of four) and up to three requests in flight
+/// on each, as `policy_selection`'s fed pool has them.
+fn feed_loads(policy: &CacheAwarePolicy, workers: &[Arc<dyn Worker>], rng: &mut Rng) -> TestFeed {
+    let feed = TestFeed::attached_to(policy);
+    let reports: HashMap<String, WorkerLoadResponse> = workers
+        .iter()
+        .map(|worker| {
+            let live_rate = if rng.below(4) == 0 {
+                0.0
+            } else {
+                500.0 + rng.below(3_500) as f64
+            };
+            let mut report = one_rank_load(
+                rng.below(8_192) as i32,
+                rng.below(95) as f64 / 100.0,
+                live_rate,
+            );
+            report.loads[0].num_running_reqs = rng.below(12) as i32;
+            for _ in 0..rng.below(4) {
+                worker.increment_load();
+            }
+            (worker.url().to_string(), report)
+        })
+        .collect();
+    feed.publish(&reports);
+    feed
+}
+
+fn setup(worker_count: usize, blocks_per_worker: usize, variant: &Variant) -> Setup {
     let rss_before = rss_mb();
     let started = Instant::now();
     // One seed: the same fleet and the same requests, run to run.
@@ -240,6 +358,11 @@ fn setup(worker_count: usize, blocks_per_worker: usize) -> Setup {
             ) as Arc<dyn Worker>
         })
         .collect();
+    // A registered worker carries a published state, which the routing reads
+    // answer from; the fleet reads like one.
+    for worker in &workers {
+        worker.republish_state();
+    }
     // Every session lives on one to four workers; each worker is filled to
     // its budget from the sessions assigned to it, the engine stream first.
     let mut assigned: Vec<Vec<usize>> = vec![Vec::new(); worker_count];
@@ -290,18 +413,44 @@ fn setup(worker_count: usize, blocks_per_worker: usize) -> Setup {
         }
         memberships += index.worker_block_count(feed.worker_id());
     }
-    let index_mb = rss_mb() - rss_before;
+    let mut index_mb = rss_mb() - rss_before;
 
-    let monitor = Arc::new(KvEventMonitor::new());
-    monitor.set_index(MODEL, Arc::clone(&index));
-    monitor.set_block_size(MODEL, BLOCK);
     let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
         eviction_interval_secs: 0,
         block_size: BLOCK,
+        overlap_decay: variant.decay,
+        selection_temperature: variant.temperature,
+        selection_policy: Some(variant.selection.clone()),
+        selection_accounting_ttl_ms: variant.accounting_ms,
         ..Default::default()
     });
     policy.init_workers(&workers);
-    policy.set_kv_event_monitor(Some(monitor));
+    if variant.tree {
+        // The index is filled all the same, so both fleets draw the same
+        // requests; the tree fleet's decision never reads it. Every session
+        // routed once: the tree holds each where the policy placed it, as a
+        // fleet without KV events learns its sessions.
+        let rss_before_tree = rss_mb();
+        memberships = 0;
+        for chain in &sessions.chains {
+            let tokens = chain.tokens(chain.token_blocks.len());
+            let info = SelectWorkerInfo {
+                tokens: Some(&tokens),
+                ..Default::default()
+            };
+            black_box(policy.select_worker(&workers, &info));
+        }
+        index_mb = rss_mb() - rss_before_tree;
+    } else {
+        let monitor = Arc::new(KvEventMonitor::new());
+        monitor.set_index(MODEL, Arc::clone(&index));
+        monitor.set_block_size(MODEL, BLOCK);
+        policy.set_kv_event_monitor(Some(monitor));
+    }
+    // Its own draws, so a fed run decides over the same requests.
+    let feed = variant
+        .feed
+        .then(|| feed_loads(&policy, &workers, &mut Rng(2)));
 
     // Requests: a new turn on a resident session (its chain plus 1 to 16 new
     // blocks), a prefix of a resident session, or a novel prompt on a shared
@@ -338,6 +487,7 @@ fn setup(worker_count: usize, blocks_per_worker: usize) -> Setup {
         memberships,
         index_mb,
         fill_secs: started.elapsed().as_secs_f64(),
+        _feed: feed,
     }
 }
 
@@ -381,6 +531,7 @@ fn sustained(
     setup: &Setup,
     rate: u64,
     secs: u64,
+    offset: usize,
     mut work: impl FnMut(&Setup, &[u32]),
 ) -> (Vec<u64>, f64) {
     let interval = Duration::from_nanos(1_000_000_000 / rate.max(1));
@@ -390,7 +541,7 @@ fn sustained(
     let mut next = start;
     let mut samples = Vec::with_capacity((rate * secs) as usize);
     let mut decisions = 0u64;
-    let mut r = 0usize;
+    let mut r = offset;
     loop {
         while Instant::now() < next {
             std::hint::spin_loop();
@@ -417,6 +568,28 @@ fn sustained(
     (samples, decisions as f64 / start.elapsed().as_secs_f64())
 }
 
+/// [`sustained`] decisions on `threads` loops at once over the one policy,
+/// each at `rate` and from its own place in the request stream: the
+/// latencies of all of them, and the rate they achieved together.
+fn sustained_decisions(setup: &Setup, threads: usize, rate: u64, secs: u64) -> (Vec<u64>, f64) {
+    if threads == 1 {
+        return sustained(setup, rate, secs, 0, decide);
+    }
+    thread::scope(|scope| {
+        let loops: Vec<_> = (0..threads)
+            .map(|t| scope.spawn(move || sustained(setup, rate, secs, t * 977, decide)))
+            .collect();
+        let mut samples = Vec::new();
+        let mut achieved = 0.0;
+        for run in loops {
+            let (latencies, rate) = run.join().unwrap();
+            samples.extend(latencies);
+            achieved += rate;
+        }
+        (samples, achieved)
+    })
+}
+
 fn decide(setup: &Setup, tokens: &[u32]) {
     let info = SelectWorkerInfo {
         tokens: Some(tokens),
@@ -434,19 +607,37 @@ fn hashing(_: &Setup, tokens: &[u32]) {
     black_box(compute_request_content_hashes(tokens, BLOCK));
 }
 
-fn report(setup: &Setup, rate: u64, secs: u64) {
-    let (decision, achieved) = sustained(setup, rate, secs, decide);
-    let (lookup_samples, _) = sustained(setup, rate, secs.min(4), lookup);
-    let (hash_samples, _) = sustained(setup, rate, secs.min(4), hashing);
+fn report(setup: &Setup, variant: &Variant, rate: u64, secs: u64) {
+    let (decision, achieved) = sustained_decisions(setup, variant.threads, rate, secs);
     let decision = dist(decision);
-    let lookup = dist(lookup_samples);
-    let hash = dist(hash_samples);
+    // The index lookup is the chain fleet's; the tree fleet's is inside the
+    // decision.
+    let lookup = if variant.tree {
+        "- | - | -".to_string()
+    } else {
+        let lookup = dist(sustained(setup, rate, secs.min(4), 0, lookup).0);
+        format!(
+            "{:.2} | {:.2} | {:.0}%",
+            lookup.p50,
+            lookup.p99,
+            100.0 * lookup.mean / decision.mean
+        )
+    };
+    let hash = dist(sustained(setup, rate, secs.min(4), 0, hashing).0);
     let mut lens: Vec<usize> = setup.requests.iter().map(Vec::len).collect();
     lens.sort_unstable();
     eprintln!(
-        "| chain | {workers} | {memberships} | {index_mb:.0} | {fill:.1} | {achieved:.0} | {n} | \
-         {d50:.2} | {d90:.2} | {d99:.2} | {d999:.2} | {dmax:.1} | {l50:.2} | {l99:.2} | {lshare:.0}% | \
+        "| {index} | {selection} | {temperature} | {decay} | {accounting} | {feed} | {threads} | \
+         {workers} | {memberships} | {index_mb:.0} | {fill:.1} | {achieved:.0} | {n} | \
+         {d50:.2} | {d90:.2} | {d99:.2} | {d999:.2} | {dmax:.1} | {lookup} | \
          {h50:.2} | {h99:.2} | {tok50} | {tok99} |",
+        index = variant.index(),
+        selection = variant.selection,
+        temperature = variant.temperature,
+        decay = variant.decay,
+        accounting = variant.accounting_ms,
+        feed = if variant.feed { "fed" } else { "dark" },
+        threads = variant.threads,
         workers = setup.workers.len(),
         memberships = setup.memberships,
         index_mb = setup.index_mb,
@@ -457,9 +648,6 @@ fn report(setup: &Setup, rate: u64, secs: u64) {
         d99 = decision.p99,
         d999 = decision.p999,
         dmax = decision.max,
-        l50 = lookup.p50,
-        l99 = lookup.p99,
-        lshare = 100.0 * lookup.mean / decision.mean,
         h50 = hash.p50,
         h99 = hash.p99,
         tok50 = lens[lens.len() / 2],
@@ -468,30 +656,34 @@ fn report(setup: &Setup, rate: u64, secs: u64) {
 }
 
 fn main() {
-    let workers = env_or("T6_WORKERS", 128) as usize;
-    let blocks_per_worker = env_or("T6_BLOCKS_PER_WORKER", 8192) as usize;
-    let rate = env_or("T6_RATE", 10_000);
-    let secs = env_or("T6_SECS", 12);
+    let workers = env_or("T6_WORKERS", 128usize);
+    let blocks_per_worker = env_or("T6_BLOCKS_PER_WORKER", 8192usize);
+    let rate = env_or("T6_RATE", 10_000u64);
+    let secs = env_or("T6_SECS", 12u64);
+    let variant = Variant::from_env();
     // A Prometheus recorder, so the decision pays for its metrics as in the gateway.
     let _recorder = metrics_exporter_prometheus::PrometheusBuilder::new()
         .install_recorder()
         .expect("recorder");
     let mut criterion = Criterion::default().configure_from_args();
     eprintln!(
-        "| index | workers | memberships | index MB | fill s | achieved/s | decisions | dec p50 us | p90 | p99 | p999 | max | \
+        "| index | selection | temperature | decay | accounting ms | loads | threads | workers | memberships | \
+         index MB | fill s | achieved/s | decisions | dec p50 us | p90 | p99 | p999 | max | \
          lookup p50 | lookup p99 | lookup share | hash p50 | hash p99 | req tokens p50 | p99 |"
     );
-    eprintln!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
-    let setup = setup(workers, blocks_per_worker);
+    eprintln!(
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+    );
+    let setup = setup(workers, blocks_per_worker, &variant);
     let mut r = 0usize;
-    criterion.bench_function("decision/chain", |b| {
+    criterion.bench_function(&variant.criterion_id(), |b| {
         b.iter(|| {
             let request = &setup.requests[r % setup.requests.len()];
             r += 1;
             decide(&setup, request);
         });
     });
-    report(&setup, rate, secs);
+    report(&setup, &variant, rate, secs);
     drop(setup);
     criterion.final_summary();
 }

@@ -2080,3 +2080,362 @@ fn test_match_and_insert_with_counts_stay_reachable_under_injected_evictions() {
         }
     }
 }
+
+// ---- the path hash a mesh delta names ---------------------------------------------------
+
+/// Every node carrying a path hash, with its root-to-node text.
+fn hashed_nodes(tree: &Tree) -> Vec<(String, NodeRef)> {
+    fn walk(node: &NodeRef, path: &mut String, out: &mut Vec<(String, NodeRef)>) {
+        for child in &node.children {
+            let child = child.value();
+            let edge = child.text.read().as_str().to_string();
+            path.push_str(&edge);
+            if child.path_hash.load(Ordering::Relaxed) != 0 {
+                out.push((path.clone(), Arc::clone(child)));
+            }
+            walk(child, path, out);
+            path.truncate(path.len() - edge.len());
+        }
+    }
+    let mut out = Vec::new();
+    if tree.root.path_hash.load(Ordering::Relaxed) != 0 {
+        out.push((String::new(), Arc::clone(&tree.root)));
+    }
+    walk(&tree.root, &mut String::new(), &mut out);
+    out
+}
+
+/// The lookup's invariant: a node carries a hash iff the map names that node
+/// under it, and the hash is the hash of the node's own path.
+fn assert_hashes_name_live_nodes(tree: &Tree) {
+    let nodes = hashed_nodes(tree);
+    assert_eq!(
+        tree.hashed.len(),
+        nodes.len(),
+        "one entry per hashed node, no stale entry"
+    );
+    for (path, node) in &nodes {
+        let hash = node.path_hash.load(Ordering::Relaxed);
+        assert_eq!(
+            hash,
+            crate::hash_node_path(path),
+            "the hash is the path's own"
+        );
+        let named = tree
+            .hashed
+            .get(&hash)
+            .and_then(|entry| entry.value().upgrade())
+            .expect("the map names a live node");
+        assert!(Arc::ptr_eq(&named, node), "the map names this node");
+    }
+}
+
+fn tenant(name: &str) -> TenantId {
+    Arc::from(name)
+}
+
+#[test]
+fn a_hashed_insert_resolves_by_hash_and_attaches_along_the_whole_path() {
+    let tree = Tree::new();
+    let hash = crate::hash_node_path("hello world");
+    tree.insert_text_with_hash("hello world", "t1", hash);
+    assert_eq!(tree.hashed_paths(), 1);
+
+    assert!(tree.insert_tenant_by_hash(hash, "t2"));
+    assert_eq!(tree.tenant_char_size(&tenant("t2")), 11);
+    let matched = tree.match_prefix_with_counts("hello world");
+    assert_eq!(matched.matched_char_count, 11);
+    assert!(matched.matched_tenants.iter().any(|t| &**t == "t2"));
+
+    assert!(!tree.insert_tenant_by_hash(crate::hash_node_path("hello there"), "t2"));
+    assert_eq!(tree.tenant_char_size(&tenant("t2")), 11);
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn a_plain_insert_records_no_hash() {
+    let tree = Tree::new();
+    tree.insert_text("hello world", "t1");
+    tree.match_and_insert("hello world", "t2");
+    tree.match_and_insert_with_hash("hello world", None, |_| Some("t3"));
+    assert_eq!(tree.hashed_paths(), 0);
+    assert!(!tree.insert_tenant_by_hash(crate::hash_node_path("hello world"), "t4"));
+}
+
+#[test]
+fn the_fused_walk_records_the_hash_at_the_node_the_path_ends_at() {
+    let tree = Tree::new();
+    let (a, b, c) = ("hello world", "hello there", "hello");
+    let (ha, hb, hc) = (
+        crate::hash_node_path(a),
+        crate::hash_node_path(b),
+        crate::hash_node_path(c),
+    );
+    // A new leaf; a split with a new branch; a path ending at the split
+    // node; a full match of the first leaf; a walk that asked for no hash.
+    tree.match_and_insert_with_hash(a, Some(ha), |_| Some("t1"));
+    tree.match_and_insert_with_hash(b, Some(hb), |_| Some("t1"));
+    tree.match_and_insert_with_hash(c, Some(hc), |_| Some("t1"));
+    tree.match_and_insert_with_hash(a, Some(ha), |_| Some("t2"));
+    tree.match_and_insert_with_hash(b, None, |_| Some("t2"));
+    assert_eq!(tree.hashed_paths(), 3);
+    assert_hashes_name_live_nodes(&tree);
+
+    for hash in [ha, hb, hc] {
+        assert!(tree.insert_tenant_by_hash(hash, "t3"));
+    }
+    // "hello" + " " + "world" + "there": the first split lands after the space,
+    // the second (for `c`) before it.
+    assert_eq!(tree.tenant_char_size(&tenant("t3")), 16);
+}
+
+#[test]
+fn a_split_leaves_the_hash_on_the_node_that_keeps_the_path() {
+    let tree = Tree::new();
+    let hash = crate::hash_node_path("hello world");
+    tree.insert_text_with_hash("hello world", "t1", hash);
+    // Splits "hello world" into "hello" + " world".
+    tree.insert_text("hello there", "t1");
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(tree.insert_tenant_by_hash(hash, "t2"));
+    assert_eq!(tree.tenant_char_size(&tenant("t2")), 11);
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn eviction_forgets_a_hash_with_its_node_oldest_first() {
+    let tree = Tree::new();
+    let older = crate::hash_node_path("alpha path");
+    let newer = crate::hash_node_path("bravo path");
+    tree.insert_text_with_hash("alpha path", "t1", older);
+    tree.insert_text_with_hash("bravo path", "t1", newer);
+
+    // Room for one of the two ten-char paths: the older leaf goes.
+    tree.evict_tenant_by_size(10);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(!tree.insert_tenant_by_hash(older, "t2"));
+    assert!(tree.insert_tenant_by_hash(newer, "t2"));
+    assert_hashes_name_live_nodes(&tree);
+
+    tree.evict_tenant_by_size(0);
+    assert_eq!(tree.hashed_paths(), 0);
+    assert!(!tree.insert_tenant_by_hash(newer, "t3"));
+}
+
+#[test]
+fn a_node_handed_a_second_hash_keeps_the_newer_one_only() {
+    // One text ends at one node, so a second hash on a node is the caller's
+    // doing here; the rule is the token tree's (two sequences that differ
+    // only inside their last page end at one node), kept in the twin.
+    let tree = Tree::new();
+    let older = crate::hash_node_path("hello world");
+    let newer = crate::hash_node_path("hello world?");
+    tree.insert_text_with_hash("hello world", "t1", older);
+    tree.insert_text_with_hash("hello world", "t1", newer);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(!tree.insert_tenant_by_hash(older, "t2"));
+    assert!(tree.insert_tenant_by_hash(newer, "t2"));
+    tree.evict_tenant_by_size(0);
+    assert_eq!(tree.hashed_paths(), 0);
+}
+
+#[test]
+fn a_repaired_path_leaves_a_requests_hash_in_place_and_names_an_unnamed_node() {
+    // The token tree's rule, kept in the twin: a repair never displaces the
+    // hash a request recorded at the node, and names a node that has none.
+    let tree = Tree::new();
+    let request = crate::hash_node_path("hello world?");
+    let repair = crate::hash_node_path("hello world");
+    tree.insert_text_with_hash("hello world", "t1", request);
+    tree.insert_text_with_hash_unless_named("hello world", "t2", repair);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert_eq!(tree.tenant_char_size(&tenant("t2")), 11);
+    assert!(tree.insert_tenant_by_hash(request, "t3"));
+    assert!(!tree.insert_tenant_by_hash(repair, "t3"));
+
+    tree.insert_text("other text", "t1");
+    tree.insert_text_with_hash_unless_named(
+        "other text",
+        "t2",
+        crate::hash_node_path("other text"),
+    );
+    assert_eq!(tree.hashed_paths(), 2);
+    assert!(tree.insert_tenant_by_hash(crate::hash_node_path("other text"), "t3"));
+}
+
+#[test]
+fn a_repair_that_loses_the_claim_to_the_same_hash_keeps_the_shared_entry() {
+    // The token tree's interleaving, kept in the twin: the request names the
+    // node (insert, swap 0 -> h), then the repair's claim loses the exchange
+    // to h itself; the shared entry stays. Lost to a different hash, the
+    // repair's entry goes.
+    let tree = Tree::new();
+    let hash = crate::hash_node_path("hello world");
+    tree.insert_text_with_hash("hello world", "t1", hash);
+    let (_, node) = hashed_nodes(&tree)
+        .pop()
+        .expect("the request named the node");
+    tree.claim_unless_named(&node, hash);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(tree.insert_tenant_by_hash(hash, "t2"));
+    assert_hashes_name_live_nodes(&tree);
+
+    let other = crate::hash_node_path("other text");
+    tree.claim_unless_named(&node, other);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(!tree.insert_tenant_by_hash(other, "t3"));
+    assert!(tree.insert_tenant_by_hash(hash, "t3"));
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn an_eviction_pass_drops_an_entry_whose_node_is_gone() {
+    // A record that crosses its node's detach leaves an entry naming a node
+    // that is gone; the next pass that evicts drops it.
+    let tree = Tree::new();
+    tree.insert_text_with_hash("hello", "t1", crate::hash_node_path("hello"));
+    tree.hashed.insert(7, Weak::new());
+    assert_eq!(tree.hashed_paths(), 2);
+    tree.evict_tenant_by_size(0);
+    assert_eq!(tree.hashed_paths(), 0);
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn a_working_set_within_the_budget_keeps_every_hash() {
+    let tree = Tree::new();
+    let paths: Vec<String> = (0..20)
+        .map(|i| format!("conversation {i}: {}", "x".repeat(50)))
+        .collect();
+    for path in &paths {
+        tree.insert_text_with_hash(path, "t1", crate::hash_node_path(path));
+    }
+    tree.evict_tenant_by_size(tree.total_char_size());
+    assert_eq!(tree.hashed_paths(), 20);
+    for path in &paths {
+        assert!(tree.insert_tenant_by_hash(crate::hash_node_path(path), "t2"));
+    }
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn re_inserting_a_path_keeps_one_entry() {
+    let tree = Tree::new();
+    let hash = crate::hash_node_path("same text");
+    for who in ["t1", "t2", "t1"] {
+        tree.insert_text_with_hash("same text", who, hash);
+    }
+    assert!(tree.insert_tenant_by_hash(hash, "t3"));
+    assert!(tree.insert_tenant_by_hash(hash, "t3"));
+    assert_eq!(tree.hashed_paths(), 1);
+    assert_eq!(tree.tenant_char_size(&tenant("t3")), 9);
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn a_multi_byte_path_reads_back_as_its_own_text() {
+    let tree = Tree::new();
+    let (a, b) = ("héllo wörld ✓", "héllo wörms ✗");
+    tree.insert_text_with_hash(a, "t1", crate::hash_node_path(a));
+    // The split lands inside multi-byte text.
+    tree.insert_text_with_hash(b, "t1", crate::hash_node_path(b));
+    assert!(tree.insert_tenant_by_hash(crate::hash_node_path(a), "t2"));
+    assert_eq!(tree.tenant_char_size(&tenant("t2")), a.chars().count());
+    let matched = tree.match_prefix_with_counts(a);
+    assert_eq!(matched.matched_char_count, a.chars().count());
+    assert!(matched.matched_tenants.iter().any(|t| &**t == "t2"));
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn removing_a_tenant_everywhere_forgets_the_hashes_of_the_nodes_it_empties() {
+    let tree = Tree::new();
+    tree.insert_text_with_hash("only mine", "t1", crate::hash_node_path("only mine"));
+    tree.insert_text_with_hash("shared text", "t1", crate::hash_node_path("shared text"));
+    tree.insert_text("shared text", "t2");
+    tree.remove_tenant_all(&tenant("t1"));
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(!tree.insert_tenant_by_hash(crate::hash_node_path("only mine"), "t3"));
+    assert!(tree.insert_tenant_by_hash(crate::hash_node_path("shared text"), "t3"));
+    assert_hashes_name_live_nodes(&tree);
+    tree.clear();
+    assert_eq!(tree.hashed_paths(), 0);
+}
+
+#[test]
+fn hashes_name_live_nodes_through_random_inserts_and_evictions() {
+    // 20,000 operations over conversation-shaped texts (prefixes shared
+    // within a conversation, heads shared across): hashed and plain inserts,
+    // lookups by hash and budget evictions. After every eviction the map
+    // names exactly the live hashed nodes, and a hash that resolves names a
+    // text the tree then matches in full.
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(1377);
+    let heads = ["alpha", "beta", "gamma", "delta"];
+    let mut pool: Vec<String> = Vec::new();
+    for conversation in 0..60 {
+        let mut text = String::new();
+        for turn in 0..5 {
+            let words = "w".repeat(1 + (conversation * 7 + turn) % 40);
+            text.push_str(&format!(
+                "{} turn {turn} of {conversation}: {words} ",
+                heads[conversation % 4]
+            ));
+            pool.push(text.clone());
+        }
+    }
+    let tenants = ["t1", "t2", "t3", "t4"];
+    let tree = Tree::new();
+    for _ in 0..20_000 {
+        let text = &pool[rng.random_range(0..pool.len())];
+        let who = tenants[rng.random_range(0..tenants.len())];
+        match rng.random_range(0..10) {
+            0 => {
+                tree.evict_tenant_by_size(rng.random_range(0..4_000));
+                assert_hashes_name_live_nodes(&tree);
+            }
+            1 | 2 => {
+                if tree.insert_tenant_by_hash(crate::hash_node_path(text), who) {
+                    assert_eq!(
+                        tree.match_prefix_with_counts(text).matched_char_count,
+                        text.chars().count()
+                    );
+                }
+            }
+            3 => tree.insert_text(text, who),
+            4..=6 => tree.insert_text_with_hash(text, who, crate::hash_node_path(text)),
+            _ => {
+                tree.match_and_insert_with_hash(text, Some(crate::hash_node_path(text)), |_| {
+                    Some(who)
+                });
+            }
+        }
+    }
+    assert_hashes_name_live_nodes(&tree);
+    for who in tenants {
+        tree.remove_tenant_all(&tenant(who));
+    }
+    assert_eq!(tree.hashed_paths(), 0);
+    assert_hashes_name_live_nodes(&tree);
+}
+
+#[test]
+fn the_empty_text_names_nothing() {
+    // The empty text ends at the root, which every tenant holds: a request
+    // that hashes it and a repair page's root entry record nothing, and the
+    // hash resolves to no node. The token tree's rule for a sequence under
+    // one page, kept in the twin.
+    let tree = Tree::new();
+    let empty = crate::hash_node_path("");
+    tree.insert_text_with_hash("", "t1", empty);
+    tree.insert_text_with_hash_unless_named("", "t1", empty);
+    tree.match_and_insert_with_hash("", Some(empty), |_| Some("t1"));
+    assert_eq!(tree.hashed_paths(), 0);
+    assert!(!tree.insert_tenant_by_hash(empty, "t2"));
+
+    let named = crate::hash_node_path("hello world");
+    tree.insert_text_with_hash("hello world", "t1", named);
+    assert_eq!(tree.hashed_paths(), 1);
+    assert!(tree.insert_tenant_by_hash(named, "t2"));
+    assert_hashes_name_live_nodes(&tree);
+}

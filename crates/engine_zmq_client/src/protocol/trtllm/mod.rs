@@ -27,7 +27,7 @@ pub mod request;
 use bytes::Bytes;
 
 use crate::{
-    codec::encode_msgpack,
+    codec::{add_request_capacity, encode_msgpack, encode_msgpack_with_capacity},
     error::{Error, Result},
     protocol::{
         handshake::EngineCoreReadyResponse,
@@ -113,9 +113,14 @@ impl EngineProtocol for TrtllmProtocol {
     }
 
     fn encode_add(request: &Self::Request, _layout: &()) -> Result<(Vec<u8>, Vec<Bytes>)> {
-        // The payload is the positional array; each image is one auxiliary
-        // frame behind it, in the order the array counts them.
-        Ok((encode_msgpack(request)?, request.images.clone()))
+        // The payload is the positional array, in a buffer sized from the
+        // prompt before the write; each image is one auxiliary frame behind
+        // it, in the order the array counts them.
+        let capacity = add_request_capacity(request.input_ids.len());
+        Ok((
+            encode_msgpack_with_capacity(request, capacity)?,
+            request.images.clone(),
+        ))
     }
 
     fn encode_abort(request_id: &str) -> Result<Vec<u8>> {

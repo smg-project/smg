@@ -1115,12 +1115,13 @@ fn answer_for_closed(raw: Value) -> Response {
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use async_trait::async_trait;
     use smg_data_connector::{MemoryResponseStorage, ResponseStorageError};
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::routers::grpc::common::responses::test_support::completed_response;
+    use crate::routers::grpc::common::responses::test_support::{
+        completed_response, response_storage_over,
+    };
 
     fn request() -> ResponsesRequest {
         serde_json::from_value(json!({
@@ -1226,8 +1227,9 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl ResponseStorage for CountingStorage {
+    response_storage_over! {
+        CountingStorage.inner;
+        passes get_response, delete_response, list_identifier_responses, delete_identifier_responses;
         async fn store_response(
             &self,
             response: StoredResponse,
@@ -1260,41 +1262,6 @@ mod tests {
                 self.stores.fetch_add(1, Ordering::SeqCst);
             }
             Ok(outcome)
-        }
-
-        async fn get_response(
-            &self,
-            response_id: &ResponseId,
-        ) -> Result<Option<StoredResponse>, ResponseStorageError> {
-            self.inner.get_response(response_id).await
-        }
-
-        async fn delete_response(
-            &self,
-            response_id: &ResponseId,
-        ) -> Result<(), ResponseStorageError> {
-            self.inner.delete_response(response_id).await
-        }
-
-        async fn list_identifier_responses(
-            &self,
-            identifier: &str,
-            tenant: Option<&str>,
-            limit: Option<usize>,
-        ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
-            self.inner
-                .list_identifier_responses(identifier, tenant, limit)
-                .await
-        }
-
-        async fn delete_identifier_responses(
-            &self,
-            identifier: &str,
-            tenant: Option<&str>,
-        ) -> Result<usize, ResponseStorageError> {
-            self.inner
-                .delete_identifier_responses(identifier, tenant)
-                .await
         }
     }
 
@@ -1357,8 +1324,9 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl ResponseStorage for FlakyStorage {
+    response_storage_over! {
+        FlakyStorage.inner;
+        passes delete_response, list_identifier_responses, delete_identifier_responses;
         async fn store_response(
             &self,
             response: StoredResponse,
@@ -1381,34 +1349,6 @@ mod tests {
             }
             self.inner.get_response(response_id).await
         }
-
-        async fn delete_response(
-            &self,
-            response_id: &ResponseId,
-        ) -> Result<(), ResponseStorageError> {
-            self.inner.delete_response(response_id).await
-        }
-
-        async fn list_identifier_responses(
-            &self,
-            identifier: &str,
-            tenant: Option<&str>,
-            limit: Option<usize>,
-        ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
-            self.inner
-                .list_identifier_responses(identifier, tenant, limit)
-                .await
-        }
-
-        async fn delete_identifier_responses(
-            &self,
-            identifier: &str,
-            tenant: Option<&str>,
-        ) -> Result<usize, ResponseStorageError> {
-            self.inner
-                .delete_identifier_responses(identifier, tenant)
-                .await
-        }
     }
 
     /// A store whose conditional writes stop at a gate once the record was
@@ -1420,15 +1360,9 @@ mod tests {
         gate: tokio::sync::Notify,
     }
 
-    #[async_trait]
-    impl ResponseStorage for GatedStorage {
-        async fn store_response(
-            &self,
-            response: StoredResponse,
-        ) -> Result<ResponseId, ResponseStorageError> {
-            self.inner.store_response(response).await
-        }
-
+    response_storage_over! {
+        GatedStorage.inner;
+        passes store_response, get_response, delete_response, list_identifier_responses, delete_identifier_responses;
         async fn store_response_if_open(
             &self,
             response: StoredResponse,
@@ -1447,41 +1381,6 @@ mod tests {
             self.gate.notified().await;
             self.inner
                 .update_response_object_if_open(id, raw_response)
-                .await
-        }
-
-        async fn get_response(
-            &self,
-            response_id: &ResponseId,
-        ) -> Result<Option<StoredResponse>, ResponseStorageError> {
-            self.inner.get_response(response_id).await
-        }
-
-        async fn delete_response(
-            &self,
-            response_id: &ResponseId,
-        ) -> Result<(), ResponseStorageError> {
-            self.inner.delete_response(response_id).await
-        }
-
-        async fn list_identifier_responses(
-            &self,
-            identifier: &str,
-            tenant: Option<&str>,
-            limit: Option<usize>,
-        ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
-            self.inner
-                .list_identifier_responses(identifier, tenant, limit)
-                .await
-        }
-
-        async fn delete_identifier_responses(
-            &self,
-            identifier: &str,
-            tenant: Option<&str>,
-        ) -> Result<usize, ResponseStorageError> {
-            self.inner
-                .delete_identifier_responses(identifier, tenant)
                 .await
         }
     }
@@ -2596,63 +2495,14 @@ mod tests {
     /// while the writes, the conditional ones included, go through.
     struct ReadFailingStorage(Arc<CountingStorage>);
 
-    #[async_trait]
-    impl ResponseStorage for ReadFailingStorage {
-        async fn store_response(
-            &self,
-            response: StoredResponse,
-        ) -> Result<ResponseId, ResponseStorageError> {
-            self.0.store_response(response).await
-        }
-
-        async fn store_response_if_open(
-            &self,
-            response: StoredResponse,
-        ) -> Result<ConditionalStore, ResponseStorageError> {
-            self.0.store_response_if_open(response).await
-        }
-
-        async fn update_response_object_if_open(
-            &self,
-            id: &ResponseId,
-            raw_response: Value,
-        ) -> Result<ConditionalStore, ResponseStorageError> {
-            self.0
-                .update_response_object_if_open(id, raw_response)
-                .await
-        }
-
+    response_storage_over! {
+        ReadFailingStorage.0;
+        passes store_response, store_response_if_open, update_response_object_if_open, delete_response, list_identifier_responses, delete_identifier_responses;
         async fn get_response(
             &self,
             _response_id: &ResponseId,
         ) -> Result<Option<StoredResponse>, ResponseStorageError> {
             Err(ResponseStorageError::Timeout("read timed out".to_string()))
-        }
-
-        async fn delete_response(
-            &self,
-            response_id: &ResponseId,
-        ) -> Result<(), ResponseStorageError> {
-            self.0.delete_response(response_id).await
-        }
-
-        async fn list_identifier_responses(
-            &self,
-            identifier: &str,
-            tenant: Option<&str>,
-            limit: Option<usize>,
-        ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
-            self.0
-                .list_identifier_responses(identifier, tenant, limit)
-                .await
-        }
-
-        async fn delete_identifier_responses(
-            &self,
-            identifier: &str,
-            tenant: Option<&str>,
-        ) -> Result<usize, ResponseStorageError> {
-            self.0.delete_identifier_responses(identifier, tenant).await
         }
     }
 

@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::{
     audio::DecodedAudio,
+    buffer_pool,
     error::MediaConnectorError,
     media::{apply_transparency, decode_image_bytes},
     vision::{execution, transforms::resize_bicubic_pil},
@@ -446,6 +447,16 @@ impl AudioClip {
 
     pub fn source(&self) -> &AudioSource {
         &self.source
+    }
+}
+
+impl Drop for ImageFrame {
+    /// The decoded pixels' buffer goes back to the pool for the next
+    /// request's decode.
+    fn drop(&mut self) {
+        if let Some(image) = self.decoded.take() {
+            buffer_pool::recycle_image(image);
+        }
     }
 }
 
@@ -1148,5 +1159,35 @@ mod tests {
         assert_eq!(ImageFrame::undecoded(&frames).len(), 2);
         assert!(ImageFrame::decode_all(&frames).is_err());
         assert!(good.image().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod buffer_pool_tests {
+    use super::*;
+    use crate::buffer_pool::{self, BufferPool};
+
+    /// A frame returns its decoded pixels to the buffer pool when it drops.
+    #[test]
+    fn a_dropped_frame_returns_its_decoded_pixels() {
+        static MINE: BufferPool = BufferPool::new();
+        buffer_pool::with_pool(&MINE, || {
+            let pixels = buffer_pool::take(1024 * 768 * 3);
+            let address = pixels.as_ptr();
+            let image =
+                DynamicImage::ImageRgb8(RgbImage::from_raw(1024, 768, pixels).expect("sized"));
+            let frame = ImageFrame::new(
+                image,
+                bytes::Bytes::new(),
+                ImageDetail::Auto,
+                ImageSource::InlineBytes,
+                String::new(),
+            );
+            assert_eq!(MINE.held(), 0);
+            drop(frame);
+            assert_eq!(MINE.held(), 4 << 20);
+            let again = buffer_pool::take(1024 * 768 * 3);
+            assert_eq!(again.as_ptr(), address);
+        });
     }
 }

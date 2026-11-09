@@ -1,5 +1,5 @@
-use openai_protocol::chat::ChatCompletionRequest;
-use serde_json::json;
+use openai_protocol::chat::{ChatCompletionRequest, ChatMessage};
+use serde_json::{json, Value};
 use validator::Validate;
 
 #[test]
@@ -88,4 +88,160 @@ fn bounds_crossed_are_named_as_the_public_api_names_them() {
         let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
         assert!(request.validate().is_ok(), "{field} within its bound");
     }
+}
+
+/// An assistant message with the given reasoning keys: `reasoning_content`,
+/// `reasoning`, or both.
+fn assistant(spellings: Value) -> Value {
+    let mut message = json!({"role": "assistant", "content": ""});
+    if let (Value::Object(message), Value::Object(spellings)) = (&mut message, spellings) {
+        message.extend(spellings);
+    }
+    message
+}
+
+fn request(messages: Vec<Value>) -> Result<ChatCompletionRequest, serde_json::Error> {
+    serde_json::from_value(json!({"model": "test-model", "messages": messages}))
+}
+
+/// Issue #5092: an agent client sends the model's reasoning under both keys.
+/// A serde alias between the two keys refused the message as a duplicate field.
+#[test]
+fn assistant_reasoning_is_read_from_either_spelling_or_both() {
+    const TEXT: &str = "I should run ls.";
+    for (spellings, expected) in [
+        (json!({"reasoning_content": TEXT}), Some(TEXT)),
+        (json!({"reasoning": TEXT}), Some(TEXT)),
+        (
+            json!({"reasoning": TEXT, "reasoning_content": TEXT}),
+            Some(TEXT),
+        ),
+        // An empty text does not count and cannot disagree.
+        (
+            json!({"reasoning": "", "reasoning_content": TEXT}),
+            Some(TEXT),
+        ),
+        (
+            json!({"reasoning": TEXT, "reasoning_content": ""}),
+            Some(TEXT),
+        ),
+        (json!({"reasoning": null, "reasoning_content": null}), None),
+        (json!({}), None),
+    ] {
+        let message = assistant(spellings);
+        let request = request(vec![message.clone()]).unwrap();
+        let ChatMessage::Assistant { reasoning, .. } = &request.messages[0] else {
+            panic!("{message}: not an assistant message");
+        };
+        assert_eq!(reasoning.text.as_deref(), expected, "{message}");
+    }
+}
+
+#[test]
+fn assistant_reasoning_in_both_spellings_with_different_text_is_refused() {
+    let error = request(vec![assistant(json!({
+        "reasoning": "I should run ls.",
+        "reasoning_content": "I should run pwd."
+    }))])
+    .unwrap_err()
+    .to_string();
+    // Opens with serde's words, so the public code is `invalid_value`. The
+    // HTTP path to the message is tested in `validated.rs`.
+    assert!(
+        error.starts_with("invalid value: `reasoning_content` and `reasoning` disagree"),
+        "{error}"
+    );
+}
+
+/// A repeated reasoning key is refused, as a repeated key of any other field
+/// of the message is. A raw body, because `json!` cannot hold a repeated key.
+#[test]
+fn a_repeated_reasoning_key_is_refused() {
+    for key in ["reasoning_content", "reasoning"] {
+        let body = format!(
+            r#"{{"model":"test-model","messages":[{{"role":"assistant","content":"","{key}":"a","{key}":"b"}}]}}"#
+        );
+        let error = serde_json::from_str::<ChatCompletionRequest>(&body)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(&format!("duplicate field `{key}`")),
+            "{key}: {error}"
+        );
+    }
+}
+
+#[test]
+fn assistant_reasoning_round_trips_as_reasoning_content_only() {
+    let request = request(vec![
+        assistant(json!({"reasoning": "I should run ls."})),
+        assistant(json!({})),
+    ])
+    .unwrap();
+    let messages = &serde_json::to_value(&request).unwrap()["messages"];
+    assert_eq!(
+        messages[0],
+        json!({"role": "assistant", "content": "", "reasoning_content": "I should run ls."})
+    );
+    assert_eq!(messages[1], json!({"role": "assistant", "content": ""}));
+}
+
+#[test]
+fn a_provider_extension_survives_beside_both_reasoning_spellings() {
+    // The reasoning reader takes only its two keys, so the Kimi extension
+    // still reads `tools`.
+    let request = request(vec![assistant(json!({
+        "reasoning": "x",
+        "reasoning_content": "x",
+        "tools": [{"type": "function", "function": {"name": "f"}}]
+    }))])
+    .unwrap();
+    let ChatMessage::Assistant { reasoning, ext, .. } = &request.messages[0] else {
+        panic!("not an assistant message");
+    };
+    assert_eq!(reasoning.text.as_deref(), Some("x"));
+    assert!(ext.tools.is_some(), "{:?}", ext.tools);
+}
+
+/// The object schemas in `value` whose `role` constant is `role`.
+fn message_schemas<'a>(value: &'a Value, role: &str, found: &mut Vec<&'a Value>) {
+    match value {
+        Value::Object(object) => {
+            if object
+                .get("properties")
+                .and_then(|p| p["role"]["const"].as_str())
+                == Some(role)
+            {
+                found.push(value);
+            }
+            for child in object.values() {
+                message_schemas(child, role, found);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                message_schemas(child, role, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The published schema, the source of the generated clients, keeps
+/// `reasoning_content` on the assistant message. It shows neither the
+/// `reasoning` key (input only, as before) nor the Rust field name.
+#[test]
+fn the_schema_keeps_reasoning_content_on_the_assistant_message() {
+    let schema = serde_json::to_value(schemars::schema_for!(ChatCompletionRequest)).unwrap();
+    let mut assistants = Vec::new();
+    message_schemas(&schema, "assistant", &mut assistants);
+    assert_eq!(assistants.len(), 1, "{schema}");
+    let properties = assistants[0]["properties"].as_object().unwrap();
+    assert_eq!(
+        properties["reasoning_content"]["type"],
+        json!(["string", "null"]),
+        "{properties:?}"
+    );
+    assert!(!properties.contains_key("reasoning"), "{properties:?}");
+    assert!(!properties.contains_key("text"), "{properties:?}");
 }

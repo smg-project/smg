@@ -6,10 +6,10 @@
 //! copy, the held bytes joined to it; inside a streamed call, a delta of the call's arguments the
 //! JSON syntax passes on whole allocates nothing of its own either, its fragment borrows the delta
 //! (the assembler's own copy of the call's bytes still grows by doubling as the value lengthens,
-//! the one cost that remains, outside the pin). What a tagged syntax still pays is pinned too: a
-//! delta of a string argument costs two strings today, the escaped text and its source, a count
-//! held so that the change which removes them flips the pin in the same commit. A separate
-//! executable, so it can declare the counting allocator the pins need.
+//! the one cost that remains, outside the pin); and a tagged syntax's streamed string argument
+//! allocates nothing per delta either, on each of the four tagged assemblers, its fragment
+//! borrowing the delta as the JSON syntax's does. A separate executable, so it can declare the
+//! counting allocator the pins need.
 
 #![expect(unsafe_code, reason = "a global allocator that counts allocations")]
 
@@ -17,6 +17,7 @@ use std::{
     alloc::{GlobalAlloc, Layout, System},
     borrow::Cow,
     cell::Cell,
+    collections::BTreeSet,
     hint::black_box,
     sync::Arc,
 };
@@ -296,100 +297,170 @@ fn a_delta_of_a_calls_arguments_read_whole_allocates_nothing() {
     );
 }
 
-/// A tagged syntax writes the call's JSON itself, so every streamed piece of a string argument
-/// is written as its escaped text and carried as its own source: two strings per delta today,
-/// where the JSON syntax's fragments borrow the delta. The pin holds that count, so the change
-/// that lets the tagged assembler's pieces borrow the delta flips it to zero in the same commit,
-/// and a third copy cannot arrive unnoticed. The attributed, keyed and XML assemblers write their
-/// strings through the same object.
-#[test]
-fn a_delta_of_a_tagged_calls_string_argument_costs_two_strings_today() {
-    let mut engine = Engine::new(Table::Qwen3Tagged.format(), Declared::shared(tools()));
+/// Drives one call whose string argument streams in four-byte deltas: `prompt` as the prompt,
+/// each of `opening` as a delta (the call's opener, its function and the parameter, whose bytes
+/// take the buffers' capacity), then five hundred deltas of `abcd`, then each of `closing`. The
+/// distinct allocation counts of the string's deltas past the first four (the warm-up), one more
+/// delta's events read for their shape (one fragment, borrowed whole), and the output's finish.
+fn streamed_string_argument(
+    table: Table,
+    prompt: &str,
+    opening: &[&str],
+    closing: &[&str],
+) -> (BTreeSet<usize>, Option<Event<'static>>) {
+    let mut engine = Engine::new(table.format(), Declared::shared(tools()));
     let mut out = Events::new();
-    engine
-        .feed(
-            Input::Prompt {
-                token_ids: &[],
-                text: "<|im_start|>assistant\n",
-            },
-            &mut out,
-        )
-        .expect("prompt");
+    let fed = engine.feed(
+        Input::Prompt {
+            token_ids: &[],
+            text: prompt,
+        },
+        &mut out,
+    );
+    assert!(fed.is_ok(), "the prompt is taken: {fed:?}");
     black_box(out.drain());
-    // The call's opener, the function and the parameter tags, and the value's first bytes: the
-    // start's events, the member's opening fragment and the buffers take their capacity here.
-    for text in [
-        "Let me look that up.\n",
-        "<tool_call>\n",
-        "<function=lookup_0>\n",
-        "<parameter=key>\n",
-        "k7-1",
-    ] {
+    // The prompt's events borrowed the prompt; the deltas below are fed through the buffer as
+    // the stream's own, recycled between them.
+    let mut out = out.recycle();
+    for text in opening {
         allocations_for_delta(&mut engine, &mut out, text);
     }
-    // The string argument streams in deltas of four bytes, 2,000 bytes in all; the first few are
-    // warm-up, the rest are the pin. No delta ends in a byte that could begin a tag or in the
-    // newline the template puts before the closing tag, so each streams whole.
+    // No delta ends in a byte that could begin a tag, or in the newline a template puts before
+    // the closing tag, so each streams whole.
     let piece = "abcd";
     let mut costs = Vec::with_capacity(500);
     for _ in 0..500 {
         costs.push(allocations_for_delta(&mut engine, &mut out, piece));
     }
-    let steady = &costs[4..];
-    assert!(
-        steady.iter().all(|&cost| cost == 2),
-        "the deltas of a tagged call's string argument allocated {:?} times (the first four \
-         {:?}): today each piece is written as one escaped JSON string and carried as one source \
-         string, two allocations per delta where the JSON syntax's fragment borrows the delta; \
-         pieces that borrow the delta take this to 0",
-        steady
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>(),
-        &costs[..4]
-    );
-    // One more piece, read for its shape: one fragment, the escaped text and its source both
-    // owned, which is where the two strings go.
+    let steady: BTreeSet<usize> = costs[4..].iter().copied().collect();
     let mut events = std::mem::take(&mut out);
-    engine
-        .feed(
-            Input::Delta {
-                token_ids: &[],
-                text: piece,
-                spans: &[],
-            },
-            &mut events,
-        )
-        .expect("the delta is taken");
+    let fed = engine.feed(
+        Input::Delta {
+            token_ids: &[],
+            text: piece,
+            spans: &[],
+        },
+        &mut events,
+    );
+    assert!(fed.is_ok(), "the delta is taken: {fed:?}");
     assert!(
         matches!(
             events.as_slice(),
-            [Event::ToolCallArguments { json: Cow::Owned(json), source, .. }]
-                if json == piece && matches!(&source.text, Cow::Owned(bytes) if bytes == piece)
+            [Event::ToolCallArguments { json: Cow::Borrowed(json), source, .. }]
+                if *json == piece && matches!(source.text, Cow::Borrowed(bytes) if bytes == piece)
         ),
-        "the arguments delta {piece:?} gave {:?}: one fragment, its text and its source each a \
-         string of its own",
+        "{}: the arguments delta {piece:?} gave {:?}: one fragment, its text and its source both \
+         slices of the delta",
+        table.name(),
         events.as_slice()
     );
     out = events.recycle();
-    for text in ["\n</parameter>\n", "</function>\n", "</tool_call>"] {
+    for text in closing {
         allocations_for_delta(&mut engine, &mut out, text);
     }
-    engine
-        .feed(
-            Input::End {
-                finish: EngineFinish::Stop,
-            },
-            &mut out,
-        )
-        .expect("end");
+    let fed = engine.feed(
+        Input::End {
+            finish: EngineFinish::Stop,
+        },
+        &mut out,
+    );
+    assert!(fed.is_ok(), "the end is taken: {fed:?}");
+    let finish = out.as_slice().last().cloned().map(Event::into_owned);
+    (steady, finish)
+}
+
+/// A tagged syntax writes the call's JSON itself, and used to write every streamed piece of a
+/// string argument as its escaped text and carry it as its own source: two strings per delta.
+/// Now a piece of the delta reaches its fragment borrowed, text and source alike, as the JSON
+/// syntax's fragments do, and a steady stream of such pieces allocates nothing per delta; the
+/// pin holds that at zero for each of the four tagged assemblers, so a copy cannot return
+/// unnoticed. The escaped copy a piece with a quote, a backslash or a control character still
+/// takes is the fragment's own text; the pieces here have none.
+fn a_tagged_calls_string_argument_streams_borrowed(
+    table: Table,
+    prompt: &str,
+    opening: &[&str],
+    closing: &[&str],
+) {
+    let (steady, finish) = streamed_string_argument(table, prompt, opening, closing);
+    assert_eq!(
+        steady,
+        BTreeSet::from([0]),
+        "{}: the deltas of a tagged call's string argument allocated {steady:?} times: each \
+         piece's fragment borrows the delta, its text and its source alike, where it was two \
+         strings, the escaped text and the source",
+        table.name()
+    );
     assert!(
-        matches!(
-            out.as_slice().last(),
-            Some(Event::Finish { tool_calls: 1, .. })
-        ),
-        "the output ends with its one call counted: {:?}",
-        out.as_slice()
+        matches!(finish, Some(Event::Finish { tool_calls: 1, .. })),
+        "{}: the output ends with its one call counted: {finish:?}",
+        table.name()
+    );
+}
+
+#[test]
+fn a_function_tagged_calls_string_argument_streams_borrowed() {
+    a_tagged_calls_string_argument_streams_borrowed(
+        Table::Qwen3Tagged,
+        "<|im_start|>assistant\n",
+        &[
+            "Let me look that up.\n",
+            "<tool_call>\n",
+            "<function=lookup_0>\n",
+            "<parameter=key>\n",
+            "k7-1",
+        ],
+        &["\n</parameter>\n", "</function>\n", "</tool_call>"],
+    );
+}
+
+#[test]
+fn an_attributed_calls_string_argument_streams_borrowed() {
+    a_tagged_calls_string_argument_streams_borrowed(
+        Table::KimiK3,
+        "<|open|>message role=\"assistant\"<|sep|>",
+        &[
+            "<|open|>tools<|sep|>",
+            "<|open|>call tool=\"lookup_0\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"key\" type=\"string\"<|sep|>",
+            "k7-1",
+        ],
+        &[
+            "<|close|>argument<|sep|>",
+            "<|close|>call<|sep|>",
+            "<|close|>tools<|sep|>",
+            "<|close|>message<|sep|>",
+        ],
+    );
+}
+
+#[test]
+fn a_keyed_calls_string_argument_streams_borrowed() {
+    a_tagged_calls_string_argument_streams_borrowed(
+        Table::Glm4,
+        "<|assistant|>",
+        &[
+            "\n<tool_call>lookup_0\n",
+            "<arg_key>key</arg_key>\n",
+            "<arg_value>",
+            "k7-1",
+        ],
+        &["</arg_value>\n", "</tool_call>"],
+    );
+}
+
+#[test]
+fn an_xml_calls_string_argument_streams_borrowed() {
+    a_tagged_calls_string_argument_streams_borrowed(
+        Table::MinimaxM3,
+        "]~b]ai\n",
+        &[
+            "<tool_call>\n",
+            "<invoke name=\"lookup_0\">",
+            "<key>",
+            "k7-1",
+        ],
+        &["</key>", "</invoke>\n", "</tool_call>"],
     );
 }
 

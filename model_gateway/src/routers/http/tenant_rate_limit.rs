@@ -23,7 +23,7 @@ use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage},
     classify::ClassifyRequest,
     common::{GenerationRequest, InputIds},
-    completion::CompletionRequest,
+    completion::{CompletionPrompt, CompletionRequest},
     decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
@@ -72,11 +72,7 @@ pub(crate) trait TenantCharge: GenerationRequest {
     /// hint says nothing the gateway can hold the tenant to, so the estimate
     /// reads the body.
     fn estimated_input_tokens(&self, routing_text: Option<&str>) -> u32 {
-        let words = match routing_text {
-            Some(text) => word_count(text),
-            None => word_count(&self.extract_text_for_routing()),
-        };
-        tokens_for_words(words + self.unrouted_words())
+        tokens_for_words(routed_words(self, routing_text) + self.unrouted_words())
     }
 
     /// The words of the request's input that its routing text leaves out.
@@ -110,7 +106,22 @@ impl TenantCharge for ChatCompletionRequest {
     }
 }
 
-impl TenantCharge for CompletionRequest {}
+/// A prompt of ids at its own count, every list of a batch (the `/generate`
+/// rule); the words of its text otherwise. The routing text of ids renders
+/// each id as a word, which the word estimate would charge at 1.3.
+impl TenantCharge for CompletionRequest {
+    fn estimated_input_tokens(&self, routing_text: Option<&str>) -> u32 {
+        let ids = match &self.prompt {
+            CompletionPrompt::TokenIds(ids) => ids.len(),
+            CompletionPrompt::TokenIdBatches(batches) => batches.iter().map(Vec::len).sum(),
+            CompletionPrompt::Text(_) | CompletionPrompt::Texts(_) => 0,
+        };
+        if ids > 0 {
+            return u32::try_from(ids).unwrap_or(u32::MAX);
+        }
+        tokens_for_words(routed_words(self, routing_text) + self.unrouted_words())
+    }
+}
 
 /// The input of each `tool_use` block in the history and the text of each
 /// `tool_result`, a string or text blocks; not their images or documents.
@@ -258,6 +269,15 @@ fn input_value_tokens(input: &Value) -> u32 {
 
 fn word_count(text: &str) -> usize {
     text.split_whitespace().count()
+}
+
+/// The words of the routing text, or of the body's own text when routing
+/// keyed on tokens.
+fn routed_words(request: &(impl GenerationRequest + ?Sized), routing_text: Option<&str>) -> usize {
+    match routing_text {
+        Some(text) => word_count(text),
+        None => word_count(&request.extract_text_for_routing()),
+    }
 }
 
 /// The words of a JSON value: of its strings and its keys, and one for each
@@ -784,6 +804,26 @@ mod tests {
         }));
         assert_eq!(chat.estimated_input_tokens(Some("one two three")), 4);
         assert_eq!(chat.estimated_input_tokens(Some("")), 0);
+    }
+
+    /// A completion prompt of ids reserves its count and a batch the sum of
+    /// its lists, whatever text routing saw; a text prompt its words.
+    #[test]
+    fn a_completion_token_prompt_reserves_its_ids() {
+        let ids: CompletionRequest = request(json!({"model": "m", "prompt": [1, 2, 3, 4, 5]}));
+        assert_eq!(ids.estimated_input_tokens(Some("1 2 3 4 5")), 5);
+        assert_eq!(ids.estimated_input_tokens(None), 5);
+
+        let batch: CompletionRequest =
+            request(json!({"model": "m", "prompt": [[1, 2], [3, 4, 5, 6]]}));
+        assert_eq!(batch.estimated_input_tokens(None), 6);
+
+        let text: CompletionRequest =
+            request(json!({"model": "m", "prompt": "one two three four five six seven"}));
+        assert_eq!(text.estimated_input_tokens(None), 10);
+        let texts: CompletionRequest =
+            request(json!({"model": "m", "prompt": ["one two", "three"]}));
+        assert_eq!(texts.estimated_input_tokens(Some("one two three")), 4);
     }
 
     /// Routing keys on the first sequence of a batch; the estimate counts

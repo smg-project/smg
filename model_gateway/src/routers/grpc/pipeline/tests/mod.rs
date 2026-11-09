@@ -1,9 +1,10 @@
 mod alias_pipeline;
 mod build_parity;
+mod chat_logit_bias;
 mod generate_body;
-mod generate_pretokenized;
 mod glm53;
 mod model_label;
+mod pretokenized;
 mod rate_limit_reserve;
 
 use std::{
@@ -27,7 +28,6 @@ use openai_protocol::{
     completion::CompletionRequest, model_card::ModelCard, responses::ResponsesRequest,
     worker::HealthCheckConfig,
 };
-use portpicker::pick_unused_port;
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage, ResponseId,
 };
@@ -46,7 +46,7 @@ use super::*;
 use crate::{
     config::types::PolicyConfig,
     routers::{
-        common::openai_bridge::FormatRegistry,
+        common::{openai_bridge::FormatRegistry, test_support::fast_retry_config},
         grpc::{
             client::ModelInfo,
             common::responses::{
@@ -63,11 +63,12 @@ use crate::{
                 responses::{route_responses, route_responses_background_stream},
                 symphony::template::Templates,
             },
+            test_engine::serve_on_loopback,
+            tokenizer_cache,
             utils::tonic_ext::TonicStatusExt,
         },
     },
     tenant::TenantKey,
-    test_support,
     worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         BasicWorkerBuilder, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType,
@@ -98,6 +99,8 @@ fn label_pairs(labels: &[(String, String)]) -> Vec<(&str, &str)> {
 
 /// The `(offset, length)` placeholder ranges of one generate call.
 type PlaceholderRanges = Vec<(u32, u32)>;
+/// A bias map as the stub received it, sorted by token.
+type ReceivedBias = Vec<(String, f32)>;
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
 type KvEventStream = Pin<Box<dyn Stream<Item = Result<common::KvEventBatch, Status>> + Send>>;
 type TokenizerStream =
@@ -119,8 +122,8 @@ type TokenizerStream =
 /// `answer_after` stalls the generate RPC, standing in for an engine that
 /// answers only at its own deadline; `frame_gap` paces the response frames,
 /// for a stream that outlasts its dispatch. Every call's input token ids,
-/// prompt text, stop sequences and engine request id are recorded, as is
-/// every aborted request id.
+/// prompt text, stop sequences, bias map and engine request id are
+/// recorded, as is every aborted request id.
 #[derive(Clone, Default)]
 struct GatedScheduler {
     probe: Option<Weak<CompletionRequest>>,
@@ -146,6 +149,7 @@ struct GatedScheduler {
     seen_mm_placeholders: Arc<Mutex<Vec<PlaceholderRanges>>>,
     seen_request_ids: Arc<Mutex<Vec<String>>>,
     seen_stops: Arc<Mutex<Vec<Vec<String>>>>,
+    seen_logit_bias: Arc<Mutex<Vec<ReceivedBias>>>,
     aborted_request_ids: Arc<Mutex<Vec<String>>>,
 }
 
@@ -254,6 +258,24 @@ impl TokenSpeedScheduler for GatedScheduler {
                     .sampling_params
                     .as_ref()
                     .map(|params| params.stop.clone())
+                    .unwrap_or_default(),
+            );
+        self.seen_logit_bias
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(
+                request
+                    .sampling_params
+                    .as_ref()
+                    .map(|params| {
+                        let mut bias: ReceivedBias = params
+                            .logit_bias
+                            .iter()
+                            .map(|(token, bias)| (token.clone(), *bias))
+                            .collect();
+                        bias.sort_by(|a, b| a.0.cmp(&b.0));
+                        bias
+                    })
                     .unwrap_or_default(),
             );
         if self.fail_always || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0) {
@@ -431,30 +453,20 @@ impl TokenSpeedScheduler for GatedScheduler {
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "test helper; the stub server lives for the test process"
-)]
+/// A current-thread runtime for a test that drives its pipeline by hand: the
+/// metrics recorder is thread-local, so what the pipeline records is read on
+/// the thread that ran it.
+fn current_thread_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime")
+}
+
+/// The stub engine served on a loopback port bound before it is handed out.
 async fn spawn_stub(scheduler: GatedScheduler) -> u16 {
-    let port = pick_unused_port().expect("no free port for release-test stub");
-    let addr = format!("127.0.0.1:{port}").parse().expect("stub addr");
-    tokio::spawn(async move {
-        Server::builder()
-            .add_service(TokenSpeedSchedulerServer::new(scheduler))
-            .serve(addr)
-            .await
-            .expect("release-test stub server");
-    });
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
-            return port;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("release-test stub on port {port} never came up");
+    let router = Server::builder().add_service(TokenSpeedSchedulerServer::new(scheduler));
+    serve_on_loopback(router).await.0.port()
 }
 
 fn register_worker(
@@ -973,16 +985,6 @@ fn completion_pipeline_with_policy(
     RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps).expect("completion pipeline")
 }
 
-fn fast_retry_config(max_retries: u32) -> RetryConfig {
-    RetryConfig {
-        max_retries,
-        initial_backoff_ms: 1,
-        max_backoff_ms: 2,
-        backoff_multiplier: 1.0,
-        jitter_factor: 0.0,
-    }
-}
-
 /// A request pinned by a routing key whose engine cannot start it
 /// (UNAVAILABLE) is retried on another engine, not replayed on the one
 /// that just refused: one call there, one on the other engine, 200.
@@ -1406,10 +1408,7 @@ fn a_decode_side_that_fails_mid_way_counts_against_its_worker_for_a_non_streamed
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     let attempts = metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
+        let rt = current_thread_runtime();
         rt.block_on(async {
             let decode_calls = Arc::new(Mutex::new(Vec::new()));
             let prefill_port = spawn_stub(GatedScheduler::default()).await;
@@ -1459,10 +1458,7 @@ fn a_prefill_side_that_fails_mid_way_counts_against_its_worker_for_a_non_streame
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
+        let rt = current_thread_runtime();
         rt.block_on(async {
             let prefill_port = spawn_stub(GatedScheduler {
                 fail_mid_stream: true,
@@ -1500,10 +1496,7 @@ fn a_decode_side_that_fails_mid_way_is_counted_once_for_a_streamed_answer() {
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
+        let rt = current_thread_runtime();
         rt.block_on(async {
             let prefill_port = spawn_stub(GatedScheduler::default()).await;
             let decode_port = spawn_stub(GatedScheduler {
@@ -1622,10 +1615,7 @@ async fn retry_replays_identical_token_ids_from_the_retained_plan() {
 /// request: the attempts are the retry families' count, not this one's.
 #[test]
 fn a_retried_request_counts_once_with_its_whole_duration_and_no_error() {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a current-thread runtime");
+    let rt = current_thread_runtime();
     let backoff = Duration::from_millis(50);
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
@@ -2243,6 +2233,22 @@ async fn cancelled_grpc_stream_reports_the_completion_during_prefill() {
     drop(hold);
 }
 
+/// `response`'s body read by a client of its own, as a connection reads it:
+/// a streamed body's reading runs when the body is polled (see
+/// `DrivenBody`), so a response held unread would hold the engine's stream
+/// unread too. Aborting the client's task drops the body, as the client's
+/// leaving does.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test client reading the body; aborting it is the client's leaving"
+)]
+fn read_body(response: Response) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut body = response.into_body().into_data_stream();
+        while body.next().await.is_some() {}
+    })
+}
+
 /// Wait until the processor has read the first response of `worker`'s
 /// one stream: the stream's output ticket is open from that response on
 /// (see `Worker::output_silence`), and the processor waits on the engine
@@ -2304,6 +2310,7 @@ async fn a_client_that_leaves_a_stalled_stream_aborts_it_on_the_engine_at_once()
     let components = components(Arc::clone(&worker_registry)).await;
 
     let response = start_stream(&pipeline, components).await;
+    let client = read_body(response);
     first_response_read(&worker).await;
     assert!(
         scheduler
@@ -2315,7 +2322,8 @@ async fn a_client_that_leaves_a_stalled_stream_aborts_it_on_the_engine_at_once()
     );
     assert_eq!(worker.load(), 1);
 
-    drop(response);
+    // The client leaves: its task goes, and the body with it.
+    client.abort();
 
     let deadline = Instant::now() + Duration::from_secs(2);
     wait_for_abort(&scheduler, deadline).await;
@@ -2347,6 +2355,7 @@ async fn a_client_that_leaves_a_stalled_pd_stream_aborts_the_decode_side_at_once
     let components = components(Arc::clone(&worker_registry)).await;
 
     let response = start_stream(&pipeline, components).await;
+    let client = read_body(response);
     first_response_read(&decode).await;
     assert!(
         decode_scheduler
@@ -2357,7 +2366,8 @@ async fn a_client_that_leaves_a_stalled_pd_stream_aborts_the_decode_side_at_once
         "nothing is aborted while the client reads"
     );
 
-    drop(response);
+    // The client leaves: its task goes, and the body with it.
+    client.abort();
 
     let deadline = Instant::now() + Duration::from_secs(2);
     wait_for_abort(&decode_scheduler, deadline).await;
@@ -2968,7 +2978,7 @@ const V41_CORN_TOKENS: usize = 189;
 /// The checkpoint's tokenizer directory, fetched on a blocking thread: the
 /// download blocks, and must not run on the runtime.
 async fn deepseek_v41_model_dir() -> Option<PathBuf> {
-    tokio::task::spawn_blocking(test_support::ensure_deepseek_v41_cached)
+    tokio::task::spawn_blocking(tokenizer_cache::ensure_deepseek_v41_cached)
         .await
         .expect("the download thread")
 }
@@ -2980,7 +2990,7 @@ async fn deepseek_v41_model_dir() -> Option<PathBuf> {
 fn skip_no_tokenizer() {
     eprintln!(
         "skipping: no DeepSeek-V4.1 tokenizer (the hub is unreachable; set {})",
-        test_support::DEEPSEEK_V41_MODEL_DIR_ENV
+        tokenizer_cache::DEEPSEEK_V41_MODEL_DIR_ENV
     );
 }
 
@@ -3493,10 +3503,7 @@ fn a_refusal_before_the_first_token_counts_against_the_worker_once_per_attempt()
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
+        let rt = current_thread_runtime();
         rt.block_on(async {
             let seen = Arc::new(Mutex::new(Vec::new()));
             let port = spawn_stub(GatedScheduler {
@@ -3536,10 +3543,7 @@ fn a_worker_stream_that_fails_mid_way_counts_against_the_worker_for_a_non_stream
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
+        let rt = current_thread_runtime();
         rt.block_on(async {
             let port = spawn_stub(GatedScheduler {
                 fail_mid_stream: true,

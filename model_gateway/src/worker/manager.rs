@@ -13,7 +13,7 @@
 //! probe from being joined by a second one.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     ops::ControlFlow,
     pin::Pin,
@@ -101,6 +101,14 @@ async fn fan_out(
         .buffer_unordered(MAX_CONCURRENT)
         .collect()
         .await
+}
+
+/// What an address's rounds ended with: the registration that answered,
+/// or the one whose failure closed the address (a transport error, a
+/// timeout, a status other than 401 or 403, an unread body).
+enum ScrapeOutcome {
+    Answered(usize),
+    Closed(usize),
 }
 
 pub enum EngineMetricsResult {
@@ -234,7 +242,9 @@ impl WorkerManager {
         // because it happened synchronously on this thread, or (b) arrives
         // as a Registered event in the broadcast buffer and is idempotently
         // applied by the event loop. The "a or b" dichotomy is what makes
-        // startup deterministic regardless of task scheduling.
+        // startup deterministic regardless of task scheduling, and both
+        // paths read a worker without a verdict at once: the bootstrap
+        // below schedules a Pending worker as the event does.
         let events_rx = registry.subscribe_events();
 
         // Run the bootstrap reconcile synchronously on the caller's thread
@@ -389,9 +399,10 @@ impl ProbeSlot {
 }
 
 /// Writes `worker_id`'s slot. A probed worker is due at once (`immediate`: a
-/// registration or replacement is probed without waiting an interval, and so
-/// is a demoted worker a contact brings forward) or after its interval; any
-/// other slot leaves the schedule. (A demoted worker's passing probe short of
+/// registration or replacement is probed without waiting an interval, so is
+/// a demoted worker a contact brings forward, and so is a worker the
+/// bootstrap finds without a verdict) or after its interval; any other slot
+/// leaves the schedule. (A demoted worker's passing probe short of
 /// its success threshold brings the next read to a probe timeout away, or
 /// leaves an earlier deadline standing; that write is the health loop's own.)
 fn schedule_at(
@@ -639,7 +650,17 @@ fn apply_registry_event(
 }
 
 /// Side-effect-free startup reconcile: rebuild the schedule from the
-/// current registry snapshot without publishing new events or removals.
+/// current registry snapshot without publishing new events or removals. A
+/// worker the snapshot holds still Pending has no verdict yet, so it is due
+/// at once, as its registration under a running loop would have made it
+/// (`apply_registry_event`): a start-up worker whose registration landed
+/// before the loop subscribed is read when the loop starts, not one interval
+/// later. For a ZMQ worker that first read starts the connect driver that
+/// binds the handshake the engine dials. A worker that carries a verdict
+/// keeps its interval. The lag-recovery rebuild (`apply_registry_event` on
+/// `RecvError::Lagged`) shares this seed: a worker still Pending after a lag
+/// is read at once too, one read toward its pending cap, as the `Registered`
+/// events the lag lost would have been.
 fn reconcile_from_registry(
     registry: &Arc<WorkerRegistry>,
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
@@ -654,7 +675,8 @@ fn reconcile_from_registry(
             config,
             should_remove_failed(registry, &descriptor.worker_id, config.remove_unhealthy),
         );
-        schedule_at(next_check, descriptor.worker_id, slot, now, false);
+        let immediate = descriptor.status == WorkerStatus::Pending;
+        schedule_at(next_check, descriptor.worker_id, slot, now, immediate);
     }
 }
 
@@ -1526,6 +1548,25 @@ impl WorkerManager {
         }
     }
 
+    /// The HTTP workers' own `/metrics`, scraped and aggregated under a
+    /// `worker_addr` label. A worker on another transport has no HTTP
+    /// server behind its base URL (a gRPC worker's is its gRPC listener, a
+    /// ZMQ worker's its socket), so it is left out and named in a comment
+    /// line of the answer; its metrics listener is scraped directly. A fleet
+    /// with no HTTP worker gets the comment lines alone, a 200: the
+    /// aggregate of zero HTTP workers, not a failed scrape.
+    ///
+    /// An address is scraped once. Under `--dp-aware` all ranks share one
+    /// base URL (#1993). Registrations of one host and port under other
+    /// credentials share the masked address the label carries, and the
+    /// aggregator refuses two series with one label set: they are tried in
+    /// the order of their URLs, one per round, until one answers or a
+    /// failure that says nothing of the credentials (anything but a 401 or
+    /// 403) closes the address, so a registration with stale credentials
+    /// never hides one that works and a hung host costs one request. Every
+    /// failed scrape is a warn line; a comment line names the registration
+    /// that answered, the one that closed the address, or an address none
+    /// answered for.
     pub async fn get_engine_metrics(worker_registry: &WorkerRegistry) -> EngineMetricsResult {
         let workers = worker_registry.get_all();
 
@@ -1533,28 +1574,124 @@ impl WorkerManager {
             return EngineMetricsResult::Err("No available workers".to_string());
         }
 
-        // Scrape each base worker once: under `--dp-aware` all ranks share
-        // the base URL, so per-rank fan-out would repeat identical scrapes
-        // (#1993).
+        // One scrape target per base URL (the DP ranks share one), grouped
+        // by the masked address the `worker_addr` label carries; a worker
+        // on another transport is named once per address.
         let mut seen = HashSet::new();
-        let workers: Vec<Arc<dyn Worker>> = workers
-            .into_iter()
-            .filter(|w| seen.insert(w.base_url().to_string()))
-            .collect();
+        let mut named = HashSet::new();
+        let mut not_scraped = String::new();
+        let mut registrations: BTreeMap<String, Vec<Arc<dyn Worker>>> = BTreeMap::new();
+        for worker in workers {
+            let base_url = worker.base_url().to_string();
+            if !seen.insert(base_url.clone()) {
+                continue;
+            }
+            let address = Endpoint::redacted_url(&base_url);
+            if *worker.connection_mode() == ConnectionMode::Http {
+                registrations.entry(address).or_default().push(worker);
+            } else if named.insert(address.clone()) {
+                not_scraped.push_str(&format!(
+                    "# not scraped: {address} ({} worker): /engine_metrics aggregates the HTTP workers' /metrics\n",
+                    worker.connection_mode()
+                ));
+            }
+        }
 
-        let responses = fan_out(&workers, "metrics", reqwest::Method::GET).await;
+        if registrations.is_empty() {
+            return EngineMetricsResult::Ok(format!(
+                "# no HTTP worker registered: /engine_metrics aggregates the HTTP workers' /metrics\n{not_scraped}"
+            ));
+        }
+        for same_address in registrations.values_mut() {
+            same_address.sort_by(|a, b| a.base_url().cmp(b.base_url()));
+        }
 
+        // Round k scrapes registration k of every address still open; the
+        // common fleet has one round. A group's registrations share the
+        // host, so only a 401 or 403, the credentials refused, opens the
+        // next registration: every other failure answers the same for all
+        // of them and closes the address in its round.
         let mut metric_packs = Vec::new();
-        for resp in responses {
-            if let Ok(r) = resp.result {
-                if r.status().is_success() {
-                    if let Ok(text) = r.text().await {
-                        metric_packs.push(MetricPack {
-                            labels: vec![("worker_addr".into(), resp.url)],
-                            metrics_text: text,
-                        });
+        let mut outcome: HashMap<String, ScrapeOutcome> = HashMap::new();
+        for round in 0.. {
+            let targets: Vec<Arc<dyn Worker>> = registrations
+                .iter()
+                .filter(|(address, _)| !outcome.contains_key(*address))
+                .filter_map(|(_, same_address)| same_address.get(round).cloned())
+                .collect();
+            if targets.is_empty() {
+                break;
+            }
+            for resp in fan_out(&targets, "metrics", reqwest::Method::GET).await {
+                let address = Endpoint::redacted_url(&resp.url);
+                let registration = round + 1;
+                let of = registrations.get(&address).map_or(1, Vec::len);
+                match resp.result {
+                    Ok(response) if response.status().is_success() => match response.text().await {
+                        Ok(text) => {
+                            outcome.insert(address.clone(), ScrapeOutcome::Answered(registration));
+                            metric_packs.push(MetricPack {
+                                labels: vec![("worker_addr".into(), address)],
+                                metrics_text: text,
+                            });
+                        }
+                        // The error's Display names its kind and the
+                        // request URL alone; the Debug form carries the
+                        // cause, and without the URL (the masked address
+                        // beside it names the target).
+                        Err(error) => {
+                            warn!(
+                                worker_url = %address,
+                                registration,
+                                of,
+                                error = ?error.without_url(),
+                                "GET /metrics of an HTTP worker answered but its body was not read"
+                            );
+                            outcome.insert(address, ScrapeOutcome::Closed(registration));
+                        }
+                    },
+                    Ok(response) => {
+                        let status = response.status();
+                        warn!(
+                            worker_url = %address,
+                            registration,
+                            of,
+                            %status,
+                            "GET /metrics of an HTTP worker failed"
+                        );
+                        if !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                            outcome.insert(address, ScrapeOutcome::Closed(registration));
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            worker_url = %address,
+                            registration,
+                            of,
+                            error = ?error.without_url(),
+                            "GET /metrics of an HTTP worker failed"
+                        );
+                        outcome.insert(address, ScrapeOutcome::Closed(registration));
                     }
                 }
+            }
+        }
+        for (address, same_address) in &registrations {
+            let of = same_address.len();
+            match outcome.get(address) {
+                Some(ScrapeOutcome::Answered(registration)) if of > 1 => not_scraped.push_str(&format!(
+                    "# scraped once: {address} ({of} registrations under other credentials, tried in URL order): registration {registration} answered\n"
+                )),
+                Some(ScrapeOutcome::Answered(_)) => {}
+                Some(ScrapeOutcome::Closed(registration)) if of > 1 => not_scraped.push_str(&format!(
+                    "# not scraped: {address} ({of} registrations under other credentials): registration {registration} failed and closed the address, only a 401 or 403 tries the next\n"
+                )),
+                None if of > 1 => not_scraped.push_str(&format!(
+                    "# not scraped: {address} ({of} registrations under other credentials, tried in URL order): none answered\n"
+                )),
+                Some(ScrapeOutcome::Closed(_)) | None => not_scraped.push_str(&format!(
+                    "# not scraped: {address}: GET /metrics failed\n"
+                )),
             }
         }
 
@@ -1563,7 +1700,15 @@ impl WorkerManager {
         }
 
         match metrics_aggregator::aggregate_metrics(metric_packs) {
-            Ok(text) => EngineMetricsResult::Ok(text),
+            Ok(mut text) => {
+                if !not_scraped.is_empty() {
+                    if !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    text.push_str(&not_scraped);
+                }
+                EngineMetricsResult::Ok(text)
+            }
             Err(e) => EngineMetricsResult::Err(format!("Failed to aggregate metrics: {e}")),
         }
     }

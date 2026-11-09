@@ -129,7 +129,9 @@ pub trait Encoder: Send + Sync {
 ///
 /// Implementations own whatever they need (pending bytes, a decode window)
 /// and must produce, over a whole stream, steps and finish together, the
-/// text [`Decoder::decode`] gives for all of its ids.
+/// text [`Decoder::decode`] gives for all of its ids, except for a character
+/// the stream's end cut short, for which the finish releases nothing (see
+/// [`finish_into`](Self::finish_into)).
 pub trait IncrementalDecoder: Send + Sync {
     /// Feed one token; returns the text that became final with it (empty when
     /// the token only extends a multi-byte character or is skipped).
@@ -147,9 +149,12 @@ pub trait IncrementalDecoder: Send + Sync {
     }
 
     /// The stream's end: appends the text the decoder still holds, rendered
-    /// as [`Decoder::decode`] renders the end of the same ids (an incomplete
-    /// trailing sequence as the replacement character), and says whether
-    /// there was any. The default is for a decoder that holds nothing back
+    /// as [`Decoder::decode`] renders the end of the same ids (a complete
+    /// character as it is, a stray invalid byte as the replacement
+    /// character), except an incomplete trailing sequence, the start of a
+    /// character the model never finished: nothing is appended for it, where
+    /// `decode` would render a replacement character. Says whether anything
+    /// was appended. The default is for a decoder that holds nothing back
     /// between steps.
     fn finish_into(&mut self, out: &mut String) -> Result<bool> {
         let _ = out;
@@ -178,6 +183,57 @@ impl DecodeStep {
     }
 }
 
+/// What one incremental decode step appended into the caller's buffer, and
+/// the report the step makes ([`DecodeStep::prefix_mismatch`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AppendedStep {
+    /// The step appended text; `false` while it holds an incomplete character.
+    pub appended: bool,
+    /// As [`DecodeStep::prefix_mismatch`].
+    pub prefix_mismatch: bool,
+}
+
+/// Appends a step's text to `out`, or hands the string itself over when `out`
+/// has no allocation yet (a cleared buffer kept for reuse, a stream's delta or
+/// the stop jail, keeps its capacity and is appended to); whether there was
+/// any.
+pub(crate) fn append_step_text(text: Option<String>, out: &mut String) -> bool {
+    match text {
+        Some(text) if !text.is_empty() => {
+            if out.capacity() == 0 {
+                *out = text;
+            } else {
+                out.push_str(&text);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// What a window's end releases: `decoded`, the window's text, past the
+/// emitted `prefix`; or, when the decode no longer starts with the emitted
+/// text, what follows their common prefix, reported as a rewritten prefix
+/// (nothing already emitted is retracted).
+pub(crate) fn past_emitted(decoded: &str, prefix: &str) -> DecodeStep {
+    let (text, prefix_mismatch) = match decoded.strip_prefix(prefix) {
+        Some(rest) => (rest.to_string(), false),
+        None => {
+            let common = decoded
+                .char_indices()
+                .zip(prefix.chars())
+                .find(|((_, a), b)| a != b)
+                .map_or_else(|| decoded.len().min(prefix.len()), |((index, _), _)| index);
+            crate::decode_activity::note_prefix_mismatch(false);
+            (decoded[common..].to_string(), true)
+        }
+    };
+    DecodeStep {
+        text: (!text.is_empty()).then_some(text),
+        prefix_mismatch,
+    }
+}
+
 /// Core decoding trait - can be implemented independently
 pub trait Decoder: Send + Sync {
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String>;
@@ -191,9 +247,14 @@ pub trait Decoder: Send + Sync {
     /// decoder whose final text no longer starts with what it emitted reports
     /// `prefix_mismatch` and returns the remainder instead of failing. The
     /// default releases what [`decode_step`](Self::decode_step) holds: the
-    /// window's decode past the emitted prefix (an incomplete trailing
-    /// character as the replacement character, the way `decode` ends it),
-    /// and leaves the window empty.
+    /// window's decode past the emitted prefix, and leaves the window empty.
+    /// A window of whole-character tokens holds back only a literal
+    /// replacement character, which is text; the decoders whose window can
+    /// hold the bytes of an unfinished character (a tiktoken vocabulary
+    /// without its per-id table, a Hugging Face vocabulary with byte fallback
+    /// or with a byte-level decoder inside a sequence) override this so that
+    /// a character the end cut short is released as nothing, not as the
+    /// replacement character `decode` renders for it.
     fn finish_decode(
         &self,
         ids: &mut Vec<TokenIdType>,
@@ -206,26 +267,7 @@ pub trait Decoder: Send + Sync {
         let step = if ids.len() <= *prefix_index {
             DecodeStep::default()
         } else {
-            let decoded = self.decode(ids, skip_special_tokens)?;
-            let (text, prefix_mismatch) = match decoded.strip_prefix(prefix.as_str()) {
-                Some(rest) => (rest.to_string(), false),
-                None => {
-                    // The decode no longer starts with the emitted text:
-                    // stream what follows their common prefix; nothing
-                    // already emitted is retracted.
-                    let common = decoded
-                        .char_indices()
-                        .zip(prefix.chars())
-                        .find(|((_, a), b)| a != b)
-                        .map_or_else(|| decoded.len().min(prefix.len()), |((index, _), _)| index);
-                    crate::decode_activity::note_prefix_mismatch(false);
-                    (decoded[common..].to_string(), true)
-                }
-            };
-            DecodeStep {
-                text: (!text.is_empty()).then_some(text),
-                prefix_mismatch,
-            }
+            past_emitted(&self.decode(ids, skip_special_tokens)?, prefix)
         };
         ids.clear();
         prefix.clear();
@@ -318,6 +360,37 @@ pub trait Decoder: Send + Sync {
         Ok(DecodeStep {
             text,
             prefix_mismatch: false,
+        })
+    }
+
+    /// [`decode_step_reporting`](Self::decode_step_reporting), with the
+    /// step's text appended to `out` instead of returned in a string of its
+    /// own: a stream that collects its text in one buffer takes each token's
+    /// text without a string per token. The default appends the reporting
+    /// step's text; a backend whose step can write the text straight from its
+    /// tables overrides it.
+    #[expect(clippy::too_many_arguments)]
+    fn decode_step_into(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+        eager: bool,
+        out: &mut String,
+    ) -> Result<AppendedStep> {
+        let step = self.decode_step_reporting(
+            token_id,
+            ids,
+            prefix,
+            prefix_index,
+            skip_special_tokens,
+            eager,
+        )?;
+        Ok(AppendedStep {
+            appended: append_step_text(step.text, out),
+            prefix_mismatch: step.prefix_mismatch,
         })
     }
 

@@ -5,6 +5,7 @@ use openai_protocol::common::{Function, Tool};
 use serde_json::{json as value, Value};
 
 use crate::{
+    adapt,
     event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
     format::Format,
     grammar::{GrammarStart, Options},
@@ -217,6 +218,109 @@ pub(crate) fn the_same_at_every_cut(
         );
     }
     whole
+}
+
+/// Every shape of an invoke a model writes outside a block on a table whose `run` reads an output
+/// after a prompt, read whole, one character at a time and at every two-way cut as the serving
+/// engines' own parsers read them: `invoke` alone is the call; bare and then again inside a block
+/// (`open` to `close`), two calls and the model's text; prose after a bare call is text between
+/// calls, shown to a chat client as content; an invoke inside the thought stays there; after a
+/// preamble the blank line before a bare invoke is the text's; two bare invokes are two calls.
+/// `chat` is the prompt that closed the thought, `thinking` the one that left it open; `invoke`
+/// calls `add_integers` with 6 and 8.
+pub(crate) fn an_invoke_outside_a_block_reads_as_the_engines_do(
+    run: impl Fn(&str, &[&str]) -> Vec<Event<'static>>,
+    invoke: &str,
+    open: &str,
+    close: &str,
+    chat: &str,
+    thinking: &str,
+) {
+    let call = (
+        "add_integers".to_string(),
+        r#"{"a": 6, "b": 8}"#.to_string(),
+    );
+    let shapes: [(&str, String, &str, usize, &str); 6] = [
+        ("the bare invoke alone", invoke.to_string(), chat, 1, ""),
+        (
+            "bare, then the block",
+            format!("\n\n:tool\n{invoke}\n\n{open}\n{invoke}\n{close}"),
+            chat,
+            2,
+            "\n\n:tool\n",
+        ),
+        (
+            "bare, then prose",
+            format!("{invoke}\nThe sum is 14."),
+            chat,
+            1,
+            "",
+        ),
+        (
+            "inside the thought",
+            format!("Let me add.{invoke}</think>Done."),
+            thinking,
+            0,
+            "Done.",
+        ),
+        (
+            "after a preamble",
+            format!("Let me check.\n\n{invoke}"),
+            chat,
+            1,
+            "Let me check.\n\n",
+        ),
+        (
+            "two bare invokes",
+            format!("{invoke}\n{invoke}"),
+            chat,
+            2,
+            "",
+        ),
+    ];
+    for (name, output, prompt, count, content) in shapes {
+        assert_eq!(bytes(&run(prompt, &[&output])), output, "{name}");
+        let said = the_same_at_every_cut(|pieces| run(prompt, pieces), &output);
+        assert_eq!(said.content, content, "{name}");
+        assert_eq!(said.calls.len(), count, "{name}: {:?}", said.calls);
+        assert!(
+            said.calls.iter().all(|c| *c == call),
+            "{name}: {:?}",
+            said.calls
+        );
+        assert_eq!(
+            said.finish.map(|(_, calls)| calls),
+            Some(count as u32),
+            "{name}"
+        );
+    }
+    // The bare invoke alone: nothing malformed, and a chat client reads the call alone.
+    let events = run(chat, &[invoke]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::Malformed { .. })),
+        "{events:?}"
+    );
+    let choice = adapt::chat::message(0, &events);
+    assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(choice.message.content, None);
+    // Prose after a bare call is text between calls, shown to a chat client as content.
+    let events = run(chat, &[&format!("{invoke}\nThe sum is 14.")]);
+    let between: String = malformed(&events)
+        .into_iter()
+        .filter(|(_, why)| *why == MalformedReason::TextBetweenCalls)
+        .map(|(text, _)| text)
+        .collect();
+    assert_eq!(between, "The sum is 14.");
+    assert_eq!(
+        adapt::chat::message(0, &events).message.content.as_deref(),
+        Some("The sum is 14.")
+    );
+    // Inside the thought, the invoke's bytes are the thought's.
+    let output = format!("Let me add.{invoke}</think>Done.");
+    let said = the_same_at_every_cut(|pieces| run(thinking, pieces), &output);
+    assert_eq!(said.reasoning, format!("Let me add.{invoke}"));
 }
 
 /// The structural tag of a forced call on `format`, a table whose layout writes `after` after

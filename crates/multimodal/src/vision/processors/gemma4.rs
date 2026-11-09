@@ -317,24 +317,29 @@ fn encode<F: RgbSource>(
     };
 
     let patch_pixels = params.patch_pixels();
-    let mut values = vec![0.0_f32; params.max_patches() * patch_pixels];
+    // The patches in reading order, then the zero padding, each element
+    // written once into a plain allocation: a zeroed allocation of this size
+    // costs the allocator's page faults per image, and the patches overwrite
+    // all of it but the padding.
+    let mut values = Vec::with_capacity(params.max_patches() * patch_pixels);
     let row_bytes = width * CHANNELS;
     for patch_y in 0..grid_h {
         for patch_x in 0..grid_w {
             // Patch elements run `[dy][dx][channel]`, the interleaved layout
             // of the source rows (the reference's `(ph, pw, p, p, c)` view).
-            let patch = &mut values[(patch_y * grid_w + patch_x) * patch_pixels..][..patch_pixels];
             for dy in 0..params.patch {
                 let source =
                     (patch_y * params.patch + dy) * row_bytes + patch_x * params.patch * CHANNELS;
                 let row = &pixels[source..source + params.patch * CHANNELS];
-                let out = &mut patch[dy * params.patch * CHANNELS..][..params.patch * CHANNELS];
-                for (out, (value, lut)) in out.iter_mut().zip(row.iter().zip(lut.iter().cycle())) {
-                    *out = lut[*value as usize];
-                }
+                values.extend(
+                    row.iter()
+                        .zip(lut.iter().cycle())
+                        .map(|(value, lut)| lut[*value as usize]),
+                );
             }
         }
     }
+    values.resize(params.max_patches() * patch_pixels, 0.0);
     // `(x, y)` per patch in reading order, `-1` for the padding.
     let mut positions = vec![-1_i64; params.max_patches() * 2];
     for (index, position) in positions[..num_patches * 2]
@@ -691,6 +696,50 @@ mod tests {
         assert_eq!(&data[96..100], &[0, 1, 1, 1]);
         assert_eq!(&data[2303 * 2..2304 * 2], &[47, 47]);
         assert!(data[2304 * 2..].iter().all(|&v| v == -1));
+    }
+
+    #[test]
+    fn the_patch_tensor_equals_its_zero_filled_form() {
+        // The patches in reading order, then zero padding to the budget, as the
+        // zero-filled tensor held them; an unresized gradient, so every patch
+        // element is checked against the index form.
+        let params = params();
+        let side = params.side_mult();
+        let (width, height) = (2 * side, side);
+        let pixels = crate::test_support::gradient_rgb(width, height, 7);
+        let frame = DynamicImage::ImageRgb8(
+            RgbImage::from_raw(width as u32, height as u32, pixels.clone()).unwrap(),
+        );
+        let pipeline = Pixels {
+            do_resize: false,
+            ..Pixels::from_config(&image_config()).unwrap()
+        };
+        let encoded = encode(&frame, params, &pipeline).unwrap();
+        let (patch, patch_pixels) = (params.patch, params.patch_pixels());
+        let (grid_w, grid_h) = (width / patch, height / patch);
+        let mut expected = vec![0.0_f32; params.max_patches() * patch_pixels];
+        for patch_y in 0..grid_h {
+            for patch_x in 0..grid_w {
+                for dy in 0..patch {
+                    for dx in 0..patch {
+                        for channel in 0..CHANNELS {
+                            let source = ((patch_y * patch + dy) * width + patch_x * patch + dx)
+                                * CHANNELS
+                                + channel;
+                            let index = (patch_y * grid_w + patch_x) * patch_pixels
+                                + (dy * patch + dx) * CHANNELS
+                                + channel;
+                            expected[index] = pipeline.lut[channel][pixels[source] as usize];
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(encoded.values, expected);
+        assert_eq!(
+            encoded.tokens,
+            grid_w * grid_h / (params.pool * params.pool)
+        );
     }
 
     #[test]

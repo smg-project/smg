@@ -13,7 +13,10 @@
 use bytes::Bytes;
 
 use self::{handshake::EngineCoreReadyResponse, kv_transfer::KvTransferStats};
-use crate::{codec::OpaqueValue, Result};
+use crate::{
+    codec::{FrameStr, OpaqueValue},
+    Result,
+};
 
 pub mod control;
 pub mod handshake;
@@ -72,6 +75,10 @@ pub trait EngineOutput {
     fn request_id(&self) -> &str;
     /// Whether this output is terminal for the request.
     fn finished(&self) -> bool;
+    /// Replace the id with the request's own copy, shared by every output
+    /// of the request: an output waiting in its stream then keeps no view of
+    /// the step frame it was decoded from.
+    fn own_request_id(&mut self, id: FrameStr);
 }
 
 /// One decoded engine tick: the per-request outputs plus the piggybacked load

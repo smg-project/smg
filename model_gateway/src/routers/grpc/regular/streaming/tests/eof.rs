@@ -1,16 +1,12 @@
 //! Test gateway parsers and SSE events with exact gRPC frames.
 
-use std::{
-    sync::atomic::{AtomicUsize, Ordering},
-    time::Duration,
-};
+use std::{sync::atomic::Ordering, time::Duration};
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use bytes::BufMut;
 use futures::{stream, StreamExt as _};
 use http_body::Frame;
 use http_body_util::StreamBody;
-use llm_tokenizer::{traits::Encoding, SpecialTokens};
 use openai_protocol::{
     chat::ChatCompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
 };
@@ -23,6 +19,7 @@ use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
 use tonic::codec::Codec;
 use tool_parser::types::ToolCallItem;
 
+pub(super) use super::super::character_tokenizer::CharacterTokenizer;
 use super::super::*;
 use crate::{
     routers::{
@@ -35,90 +32,23 @@ use crate::{
     },
 };
 
-#[derive(Default)]
-pub(super) struct CharacterTokenizer {
-    special_tokens: SpecialTokens,
-    eager_steps: AtomicUsize,
-    /// The ids `eos_token_ids` reports (none by default).
-    eos: Vec<u32>,
-}
-
-impl CharacterTokenizer {
-    /// A tokenizer whose EOS ids are `eos`: the gateway's stop decoder takes
-    /// them as stops, as it does a model's.
-    pub(super) fn with_eos(eos: Vec<u32>) -> Self {
-        Self {
-            eos,
-            ..Self::default()
-        }
-    }
-}
-
-impl llm_tokenizer::traits::Encoder for CharacterTokenizer {
-    fn encode(&self, text: &str, _add_special_tokens: bool) -> anyhow::Result<Encoding> {
-        Ok(Encoding::Plain(text.chars().map(u32::from).collect()))
-    }
-
-    fn encode_batch(
-        &self,
-        texts: &[&str],
-        add_special_tokens: bool,
-    ) -> anyhow::Result<Vec<Encoding>> {
-        texts
-            .iter()
-            .map(|text| self.encode(text, add_special_tokens))
-            .collect()
-    }
-}
-
-impl llm_tokenizer::traits::Decoder for CharacterTokenizer {
-    fn decode_step_eager(
-        &self,
-        token_id: u32,
-        ids: &mut Vec<u32>,
-        prefix: &mut String,
-        prefix_index: &mut usize,
-        skip_special_tokens: bool,
-    ) -> anyhow::Result<Option<String>> {
-        self.eager_steps.fetch_add(1, Ordering::Relaxed);
-        self.decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)
-    }
-
-    fn decode(&self, ids: &[u32], _skip_special_tokens: bool) -> anyhow::Result<String> {
-        ids.iter()
-            .map(|id| char::from_u32(*id).ok_or_else(|| anyhow::anyhow!("invalid character token")))
-            .collect()
-    }
-}
-
-impl Tokenizer for CharacterTokenizer {
-    fn vocab_size(&self) -> usize {
-        128
-    }
-
-    fn get_special_tokens(&self) -> &SpecialTokens {
-        &self.special_tokens
-    }
-
-    fn eos_token_ids(&self) -> &[u32] {
-        &self.eos
-    }
-
-    fn token_to_id(&self, token: &str) -> Option<u32> {
-        token.chars().next().map(u32::from)
-    }
-
-    fn id_to_token(&self, id: u32) -> Option<String> {
-        char::from_u32(id).map(|character| character.to_string())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
+/// A current-thread runtime for a test that drives its stream by hand: the
+/// metrics recorder is thread-local, so what the stream records is read on
+/// the thread that ran it.
+pub(super) fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime")
 }
 
 pub(crate) fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
-    let token_ids: Vec<_> = text.chars().map(u32::from).collect();
+    chunk_of_ids(index, text.chars().map(u32::from).collect())
+}
+
+/// A chunk of raw token ids: an id that is no character (a surrogate) is one
+/// the character tokenizer cannot decode.
+pub(crate) fn chunk_of_ids(index: u32, token_ids: Vec<u32>) -> proto::GenerateResponse {
     proto::GenerateResponse {
         response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
             index,
@@ -322,7 +252,7 @@ fn byte_fallback_tokenizer() -> Arc<dyn Tokenizer> {
     let definition = serde_json::json!({
         "version":"1.0", "added_tokens":[],
         "model":{"type":"WordLevel", "unk_token":"[UNK]", "vocab":{
-            "[UNK]":0, "<0x74>":1, "<0xF2>":2, " suffix":3
+            "[UNK]":0, "<0x74>":1, "<0xF2>":2, " suffix":3, "<0xA9>":4
         }},
         "decoder":{"type":"Sequence", "decoders":[
             {"type":"ByteFallback"}, {"type":"Fuse"}
@@ -336,14 +266,18 @@ fn byte_fallback_tokenizer() -> Arc<dyn Tokenizer> {
 #[tokio::test]
 async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
     let tokenizer = byte_fallback_tokenizer();
-    // `t` streams at once; a <0xF2> after it ends as a replacement character
-    // (batch decoding would rewrite `t` too, which the stream never does); a
-    // stop on that replacement character hides it.
+    // `t` streams at once. A <0xF2> after it that the end cuts is the start
+    // of a character the model never finished: nothing stands for it. A
+    // <0xA9> after it is a stray byte: the end releases its replacement
+    // character (batch decoding would rewrite `t` too, which the stream never
+    // does), and a stop on that character hides it. A run a later token
+    // closes renders as batch decoding does.
     for (ids, stop, expected) in [
         (vec![1, 2, 3], None, "t\u{FFFD} suffix"),
-        (vec![1, 2], None, "t\u{FFFD}"),
+        (vec![1, 2], None, "t"),
+        (vec![1, 4], None, "t\u{FFFD}"),
         (vec![1, 1], None, "tt"),
-        (vec![1, 2], Some("�"), "t"),
+        (vec![1, 4], Some("�"), "t"),
     ] {
         let mut frames: Vec<_> = ids
             .iter()
@@ -371,7 +305,7 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
         let response = Arc::new(processor(false))
             .process_completion_streaming_response(
                 context::ExecutionResult::Single { stream },
-                CompletionResponseSpec::from(&request),
+                CompletionResponseSpec::new(&request, Vec::new()),
                 dispatch(),
                 tokenizer.clone(),
                 None,
@@ -421,6 +355,124 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
         assert_eq!(usages[0]["usage"]["completion_tokens"], ids.len());
         assert_eq!(usages[0]["usage"]["prompt_tokens"], 1);
     }
+}
+
+/// The SSE events of a streamed completion of `request` over `frames`, read
+/// to the end of the body.
+async fn completion_events(
+    frames: Vec<proto::GenerateResponse>,
+    request: Value,
+) -> (String, Vec<Value>) {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let request: openai_protocol::completion::CompletionRequest =
+        serde_json::from_value(request).unwrap();
+    let response = Arc::new(processor(false))
+        .process_completion_streaming_response(
+            context::ExecutionResult::Single { stream },
+            CompletionResponseSpec::new(&request, Vec::new()),
+            dispatch(),
+            tokenizer,
+            None,
+            None,
+            utils::StreamSource::new(None, &dispatch(), metrics_labels::ENDPOINT_COMPLETIONS),
+        )
+        .await;
+    let body = timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 65536),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
+    let wire = String::from_utf8(body.to_vec()).unwrap();
+    let events = wire
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("data: ")
+                .filter(|json| *json != "[DONE]")
+                .map(|json| serde_json::from_str(json).unwrap())
+        })
+        .collect();
+    (wire, events)
+}
+
+/// Eight choices whose chunks come in the order 7, 2, 5, 0, 3, 6, 1, 4, each
+/// holding a character the stop `zz` may begin, and an engine that ends
+/// without a Complete: the held text goes out at the end in choice order, not
+/// in the order the chunks came in. Eight choices, so that a map's iteration
+/// order matches the choice order by chance in one run of forty thousand,
+/// not one in six.
+#[tokio::test]
+async fn completion_open_choices_finish_in_choice_order_at_eof() {
+    let (wire, events) = completion_events(
+        vec![
+            chunk(7, "hz"),
+            chunk(2, "cz"),
+            chunk(5, "fz"),
+            chunk(0, "az"),
+            chunk(3, "dz"),
+            chunk(6, "gz"),
+            chunk(1, "bz"),
+            chunk(4, "ez"),
+        ],
+        serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true, "n":8,
+            "max_tokens":4, "stop":"zz"}),
+    )
+    .await;
+    assert!(
+        !events.iter().any(|event| event.get("error").is_some()),
+        "{wire}"
+    );
+    let texts: Vec<(u64, &str)> = events
+        .iter()
+        .filter_map(|event| {
+            let choice = &event["choices"][0];
+            Some((choice["index"].as_u64()?, choice["text"].as_str()?))
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            (7, "h"),
+            (2, "c"),
+            (5, "f"),
+            (0, "a"),
+            (3, "d"),
+            (6, "g"),
+            (1, "b"),
+            (4, "e"),
+            (0, "z"),
+            (1, "z"),
+            (2, "z"),
+            (3, "z"),
+            (4, "z"),
+            (5, "z"),
+            (6, "z"),
+            (7, "z"),
+        ],
+        "the streamed characters as they came, then the held ones in choice order: {wire}"
+    );
+}
+
+/// A chunk for a choice index at or past the request's `n` is a decoding
+/// failure, as it is on the chat stream, not a choice the stream grows.
+#[tokio::test]
+async fn completion_chunk_for_a_choice_past_n_is_a_decoding_failure() {
+    let (wire, events) = completion_events(
+        vec![chunk(0, "a"), chunk(1, "b"), complete(0, "length")],
+        serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true, "max_tokens":4}),
+    )
+    .await;
+    assert!(
+        events.iter().any(|event| event.get("error").is_some()),
+        "{wire}"
+    );
+    assert!(
+        wire.contains("engine sent choice index 1; the request expects 1 choice(s)"),
+        "{wire}"
+    );
 }
 
 #[tokio::test]
@@ -498,9 +550,11 @@ async fn byte_fallback_generate_stop_token_keeps_the_engine_matched_stop() {
 #[tokio::test]
 async fn byte_fallback_generate_eof_reports_gateway_stop() {
     let tokenizer = byte_fallback_tokenizer();
+    // `t`, then a stray <0xA9> the end releases as a replacement character:
+    // the stop on that character is the gateway's, found in the tail.
     let mut terminal = complete(0, "length");
     if let Some(GenerationEvent::Complete(complete)) = &mut terminal.response {
-        complete.output_ids = vec![1, 2];
+        complete.output_ids = vec![1, 4];
         complete.completion_tokens = 2;
     }
     let (stream, server) = scripted_stream(vec![terminal], "0").await;
@@ -681,95 +735,113 @@ pub(super) fn chat_text(events: &[Value], index: u32, field: &str) -> String {
         .collect()
 }
 
-fn byte_fallback_eof_frames() -> Vec<proto::GenerateResponse> {
+fn byte_fallback_eof_frames(ids: &[u32]) -> Vec<proto::GenerateResponse> {
     let chunk = proto::GenerateResponse {
         response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
-            token_ids: vec![1, 2],
-            completion_tokens: 2,
+            token_ids: ids.to_vec(),
+            completion_tokens: ids.len() as u32,
             ..Default::default()
         })),
     };
     let mut terminal = complete(0, "length");
     if let Some(GenerationEvent::Complete(complete)) = &mut terminal.response {
-        complete.completion_tokens = 2;
+        complete.completion_tokens = ids.len() as u32;
     }
     vec![chunk, terminal]
 }
 
+/// The streams whose end holds a byte after `t` when the limit ends them:
+/// (ids, the text on the wire, whether the end releases a tail delta). A stray
+/// <0xA9> ends as its replacement character, sent before the finish; a <0xF2>
+/// the limit cut is the start of a character the model never finished, and
+/// nothing stands for it.
+const BYTE_FALLBACK_EOF_CASES: [(&[u32], &str, bool); 2] =
+    [(&[1, 4], "t\u{FFFD}", true), (&[1, 2], "t", false)];
+
 #[tokio::test]
 async fn byte_fallback_chat_eof_emits_exact_text_before_finish() {
-    let (stream, server) = scripted_stream(byte_fallback_eof_frames(), "0").await;
-    let (tx, rx) = sse_channel();
-    let mut spec = chat_spec(false);
-    spec.separate_reasoning = false;
-    spec.expected_choices = 1;
-    let result = processor(false)
-        .process_streaming_chunks(
-            stream,
-            dispatch(),
-            byte_fallback_tokenizer(),
-            (None, None, false, false, true),
-            spec,
-            &tx,
-            None,
-        )
-        .await;
-    drop(tx);
-    let events = collect_events(rx).await;
-    server.abort();
-    assert!(result.is_ok(), "{result:?}");
-    assert_eq!(chat_text(&events, 0, "content"), "t\u{FFFD}");
-    let content = events
-        .iter()
-        .position(|event| event["choices"][0]["delta"]["content"].as_str() == Some("\u{FFFD}"))
-        .unwrap();
-    let finish = events
-        .iter()
-        .position(|event| event["choices"][0]["finish_reason"].as_str() == Some("length"))
-        .unwrap();
-    assert!(content < finish);
+    for (ids, expected, tail) in BYTE_FALLBACK_EOF_CASES {
+        let (stream, server) = scripted_stream(byte_fallback_eof_frames(ids), "0").await;
+        let (tx, rx) = sse_channel();
+        let mut spec = chat_spec(false);
+        spec.separate_reasoning = false;
+        spec.expected_choices = 1;
+        let result = processor(false)
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                byte_fallback_tokenizer(),
+                (None, None, false, false, true),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{ids:?}: {result:?}");
+        assert_eq!(chat_text(&events, 0, "content"), expected, "{ids:?}");
+        let content = events
+            .iter()
+            .position(|event| event["choices"][0]["delta"]["content"].as_str() == Some("\u{FFFD}"));
+        let finish = events
+            .iter()
+            .position(|event| event["choices"][0]["finish_reason"].as_str() == Some("length"))
+            .unwrap();
+        if tail {
+            assert!(content.unwrap() < finish, "{ids:?}");
+        } else {
+            assert_eq!(content, None, "{ids:?}");
+        }
+    }
 }
 
 #[tokio::test]
 async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
-    let (stream, server) = scripted_stream(byte_fallback_eof_frames(), "0").await;
-    let (tx, rx) = sse_channel();
-    let spec = messages_spec(false);
-    let result = processor(false)
-        .process_messages_streaming_chunks(
-            stream,
-            dispatch(),
-            byte_fallback_tokenizer(),
-            (None, None, false, false, true),
-            spec,
-            &tx,
-            None,
-        )
-        .await;
-    drop(tx);
-    let events = collect_events(rx).await;
-    server.abort();
-    assert!(result.is_ok(), "{result:?}");
-    let text: String = events
-        .iter()
-        .filter_map(|event| event["delta"]["text"].as_str())
-        .collect();
-    assert_eq!(text, "t\u{FFFD}");
-    let content = events
-        .iter()
-        .position(|event| event["delta"]["text"].as_str() == Some("\u{FFFD}"))
-        .unwrap();
-    let stop = events
-        .iter()
-        .position(|event| event["type"].as_str() == Some("content_block_stop"))
-        .unwrap();
-    assert!(content < stop);
-    assert!(events.iter().any(|event| event["type"] == "message_stop"));
+    for (ids, expected, tail) in BYTE_FALLBACK_EOF_CASES {
+        let (stream, server) = scripted_stream(byte_fallback_eof_frames(ids), "0").await;
+        let (tx, rx) = sse_channel();
+        let spec = messages_spec(false);
+        let result = processor(false)
+            .process_messages_streaming_chunks(
+                stream,
+                dispatch(),
+                byte_fallback_tokenizer(),
+                (None, None, false, false, true),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{ids:?}: {result:?}");
+        let text: String = events
+            .iter()
+            .filter_map(|event| event["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(text, expected, "{ids:?}");
+        let content = events
+            .iter()
+            .position(|event| event["delta"]["text"].as_str() == Some("\u{FFFD}"));
+        let stop = events
+            .iter()
+            .position(|event| event["type"].as_str() == Some("content_block_stop"))
+            .unwrap();
+        if tail {
+            assert!(content.unwrap() < stop, "{ids:?}");
+        } else {
+            assert_eq!(content, None, "{ids:?}");
+        }
+        assert!(events.iter().any(|event| event["type"] == "message_stop"));
+    }
 }
 
 /// What the stop decoder streams for `ids` on its own (complete characters as
-/// they close, an unfinished run at the end as its replacement characters):
-/// the gateway must put exactly this on the wire.
+/// they close, a stray byte at the end as its replacement character, nothing
+/// for a character the end cut): the gateway must put exactly this on the wire.
 fn streamed_text(tokenizer: &Arc<dyn Tokenizer>, ids: &[u32]) -> String {
     let mut decoder = StopSequenceDecoder::new(
         tokenizer.clone(),
@@ -833,6 +905,7 @@ pub(crate) fn response_processor() -> ResponseProcessor {
 /// tools, no stops. The streaming tests that want nothing else build theirs here.
 pub(crate) fn messages_spec(thinking: bool) -> MessagesResponseSpec {
     MessagesResponseSpec {
+        prompt_tokens: 0,
         thinking_requested: thinking,
         thinking_text_returned: true,
         reasoning_in_prefill: false,
@@ -1027,7 +1100,7 @@ async fn byte_fallback_completion_transport_eof_preserves_text_without_complete(
         serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true, "ignore_eos":true}),
     )
     .unwrap();
-    let spec = CompletionResponseSpec::from(&request);
+    let spec = CompletionResponseSpec::new(&request, Vec::new());
     for ids in [vec![1], vec![1, 2]] {
         let (stream, server) = scripted_stream(byte_fallback_chunks(&ids), "0").await;
         let (tx, rx) = sse_channel();
@@ -1041,6 +1114,7 @@ async fn byte_fallback_completion_transport_eof_preserves_text_without_complete(
                 "",
                 0,
                 &tx,
+                None,
             )
             .await
             .unwrap();
@@ -1069,7 +1143,7 @@ async fn byte_fallback_completion_transport_eof_reports_local_stop_without_compl
                          "ignore_eos":true, "suffix":"requested-suffix"}),
     )
     .unwrap();
-    let spec = CompletionResponseSpec::from(&request);
+    let spec = CompletionResponseSpec::new(&request, Vec::new());
     for prefix in ["", "t"] {
         let source = format!("{prefix}é");
         let ids: Vec<_> = source.bytes().map(|byte| u32::from(byte) + 1).collect();
@@ -1093,6 +1167,7 @@ async fn byte_fallback_completion_transport_eof_reports_local_stop_without_compl
                     "",
                     0,
                     &tx,
+                    None,
                 )
                 .await;
             drop(tx);
@@ -1278,48 +1353,55 @@ async fn non_byte_fallback_held_stop_keeps_original_reasoning_accounting() {
 
 #[tokio::test]
 async fn byte_fallback_unary_malformed_tail_retains_canonical_reasoning() {
-    // An invalid final byte: batch decoding turns "de" + <0xF2> into three
-    // replacement characters; the response keeps "de" and ends with one.
+    // A malformed final byte: batch decoding turns "de" + the byte into three
+    // replacement characters. The response keeps "de" and ends with one for a
+    // stray <0xA9>, with nothing for a <0xF2> the limit cut (the start of a
+    // character the model never finished).
     let tokenizer = byte_fallback_reasoning_tokenizer();
-    let ids = [
-        257,
-        u32::from(b'a') + 1,
-        u32::from(b'b') + 1,
-        258,
-        u32::from(b'd') + 1,
-        u32::from(b'e') + 1,
-        0xF2 + 1,
-    ];
-    let canonical = tokenizer.decode(&ids, true).unwrap();
-    assert_eq!(canonical, "<think>ab</think>���");
-    let processor = unary_processor(utils::ParserResolver::disabled());
-    let complete = ProtoGenerateComplete::Vllm(Box::new(proto::GenerateComplete {
-        output_ids: ids.to_vec(),
-        finish_reason: "length".into(),
-        ..Default::default()
-    }));
-    let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
-    let (choice, _) = processor
-        .process_single_choice(
-            "test-request",
-            &complete,
-            0,
-            &chat_spec(false),
-            "eof-test",
-            &tokenizer,
-            &mut decoder,
-            0,
-            true,
-            false,
-            Some("qwen3"),
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(choice.message.reasoning_content.as_deref(), Some("ab"));
-    // "de" streams as it decodes; the invalid last byte ends as one
-    // replacement character (batch decoding would rewrite "de" as well).
-    assert_eq!(choice.message.content.as_deref(), Some("de\u{FFFD}"));
+    for (last, expected) in [(0xA9, "de\u{FFFD}"), (0xF2, "de")] {
+        let ids = [
+            257,
+            u32::from(b'a') + 1,
+            u32::from(b'b') + 1,
+            258,
+            u32::from(b'd') + 1,
+            u32::from(b'e') + 1,
+            last + 1,
+        ];
+        let canonical = tokenizer.decode(&ids, true).unwrap();
+        assert_eq!(canonical, "<think>ab</think>���");
+        let processor = unary_processor(utils::ParserResolver::disabled());
+        let complete = ProtoGenerateComplete::Vllm(Box::new(proto::GenerateComplete {
+            output_ids: ids.to_vec(),
+            finish_reason: "length".into(),
+            ..Default::default()
+        }));
+        let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
+        let (choice, _) = processor
+            .process_single_choice(
+                "test-request",
+                &complete,
+                0,
+                &chat_spec(false),
+                "eof-test",
+                &tokenizer,
+                &mut decoder,
+                0,
+                true,
+                false,
+                Some("qwen3"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(choice.message.reasoning_content.as_deref(), Some("ab"));
+        // "de" streams as it decodes; batch decoding would rewrite it as well.
+        assert_eq!(
+            choice.message.content.as_deref(),
+            Some(expected),
+            "{last:#X}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2212,6 +2294,7 @@ async fn messages_stream_stop_reason_follows_what_the_engine_matched() {
         let (stream, server) = scripted_stream(vec![chunk(0, "Hi."), done], "0").await;
         let (tx, rx) = sse_channel();
         let spec = MessagesResponseSpec {
+            prompt_tokens: 0,
             thinking_requested: false,
             thinking_text_returned: true,
             reasoning_in_prefill: false,
@@ -2579,6 +2662,7 @@ async fn messages_blocks_and_inputs(
     texts: &[&str],
 ) -> (Vec<String>, Vec<Value>) {
     let spec = MessagesResponseSpec {
+        prompt_tokens: 0,
         thinking_requested: true,
         thinking_text_returned: true,
         reasoning_in_prefill: false,
@@ -3625,7 +3709,7 @@ async fn the_load_guards_of_a_completion_stream_refused_before_its_first_frame_g
     let response = Arc::new(processor(false))
         .process_completion_streaming_response(
             nested,
-            CompletionResponseSpec::from(&request),
+            CompletionResponseSpec::new(&request, Vec::new()),
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
             None,

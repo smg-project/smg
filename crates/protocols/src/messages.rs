@@ -3,9 +3,16 @@
 //! This module provides Rust types for the Anthropic Messages API.
 //! See: <https://docs.anthropic.com/en/api/messages>
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    marker::PhantomData,
+};
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, value::SeqAccessDeserializer, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 use serde_json::{Map, Value};
 use validator::Validate;
 
@@ -84,8 +91,17 @@ pub struct CreateMessageRequest {
     /// Request ID forwarded to the backend for log correlation (an engine extension)
     pub rid: Option<String>,
 
-    /// The effort the response renders with, and the config's other keys.
-    pub output_config: Option<OutputConfig>,
+    /// The effort the response renders with, the format its text must fit,
+    /// and the config's other keys. Boxed, as is `output_format`: few
+    /// requests send either, and the request every call carries (the
+    /// gateway shares it behind an `Arc`) pays a pointer for each instead of
+    /// the config's and the format's own room.
+    pub output_config: Option<Box<OutputConfig>>,
+
+    /// The format the answer's text must fit, under the field's earlier
+    /// top-level name; `output_config.format` is the current one and wins
+    /// when both are sent ([`Self::output_schema`]).
+    pub output_format: Option<Box<OutputFormat>>,
 
     /// Additional fields not explicitly defined above (e.g. beta features like
     /// context_management). Captured and forwarded to backends.
@@ -98,15 +114,40 @@ impl Normalizable for CreateMessageRequest {
 }
 
 /// `output_config`: `effort` is read as a Chat `reasoning_effort` is (a
-/// string, or a number as its text; another type is refused); the other
-/// keys (a `format`, beta fields) ride through.
+/// string, or a number as its text; another type is refused); `format` is
+/// the JSON schema the answer's text must fit; the other keys (beta fields)
+/// ride through.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OutputConfig {
     #[serde(default, deserialize_with = "deserialize_reasoning_effort")]
     pub effort: Option<String>,
+    pub format: Option<OutputFormat>,
     #[serde(flatten)]
     pub other: Map<String, Value>,
+}
+
+/// The format a Messages answer's text must fit: a JSON schema, the one
+/// `type` the public API names (`output_config.format`). Another `type` is
+/// refused as an unknown variant; that the schema is an object is checked
+/// with the request's other rules (the crate's `messages_validation`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OutputFormat {
+    /// `{"type": "json_schema", "schema": {...}}`.
+    JsonSchema {
+        /// The JSON schema of the format.
+        schema: Value,
+    },
+}
+
+impl OutputFormat {
+    /// The JSON schema the format names.
+    pub fn schema(&self) -> &Value {
+        match self {
+            Self::JsonSchema { schema } => schema,
+        }
+    }
 }
 
 /// The thinking preference a prompt is rendered with: the `thinking` block,
@@ -178,21 +219,15 @@ impl CreateMessageRequest {
         template_thinking_for(provider, self.thinking_toggle(), self.reasoning_effort())
     }
 
-    /// The field the request asks for a structured output format with,
-    /// `output_format` or `output_config.format`, if any; `null` asks for none.
-    pub fn output_format_field(&self) -> Option<&'static str> {
-        let set = |value: Option<&Value>| value.is_some_and(|value| !value.is_null());
-        if set(self.other.get("output_format")) {
-            Some("output_format")
-        } else if set(self
-            .output_config
+    /// The JSON schema the answer's text must fit: `output_config.format`'s,
+    /// else the one under the field's earlier top-level name, `output_format`;
+    /// none when neither is sent (or either is `null`).
+    pub fn output_schema(&self) -> Option<&Value> {
+        self.output_config
             .as_ref()
-            .and_then(|config| config.other.get("format")))
-        {
-            Some("output_config.format")
-        } else {
-            None
-        }
+            .and_then(|config| config.format.as_ref())
+            .or(self.output_format.as_deref())
+            .map(OutputFormat::schema)
     }
 
     /// Whether the request's `tool_choice` turns parallel tool use off.
@@ -379,11 +414,68 @@ pub enum ServiceTier {
 }
 
 /// System content can be a string or an array of text blocks
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum SystemContent {
     String(String),
     Blocks(Vec<SystemContentBlock>),
+}
+
+impl<'de> Deserialize<'de> for SystemContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(
+            match string_or_blocks(deserializer, "a string or an array of text blocks")? {
+                StringOrBlocks::String(text) => Self::String(text),
+                StringOrBlocks::Blocks(blocks) => Self::Blocks(blocks),
+            },
+        )
+    }
+}
+
+/// A content field as the public API shapes it: a string, or an array of
+/// blocks of one kind. Read by hand instead of as an untagged enum, so that
+/// a block that cannot be read is refused with the block's own error (its
+/// position in the array, the unknown `type` and the accepted ones, the
+/// missing field), where an untagged enum reports "data did not match any
+/// variant" and names nothing.
+enum StringOrBlocks<B> {
+    String(String),
+    Blocks(Vec<B>),
+}
+
+/// Reads [`StringOrBlocks`]; `expecting` names the shape in a refusal of
+/// any other JSON type.
+fn string_or_blocks<'de, D, B>(
+    deserializer: D,
+    expecting: &'static str,
+) -> Result<StringOrBlocks<B>, D::Error>
+where
+    D: Deserializer<'de>,
+    B: Deserialize<'de>,
+{
+    struct StringOrBlocksVisitor<B>(&'static str, PhantomData<B>);
+
+    impl<'de, B: Deserialize<'de>> Visitor<'de> for StringOrBlocksVisitor<B> {
+        type Value = StringOrBlocks<B>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+
+        fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
+            Ok(StringOrBlocks::String(text.to_owned()))
+        }
+
+        fn visit_string<E: de::Error>(self, text: String) -> Result<Self::Value, E> {
+            Ok(StringOrBlocks::String(text))
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+            Vec::<B>::deserialize(SeqAccessDeserializer::new(seq)).map(StringOrBlocks::Blocks)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrBlocksVisitor(expecting, PhantomData))
 }
 
 /// System content block — wraps TextBlock with the required `type` discriminator
@@ -431,11 +523,22 @@ pub enum Role {
 }
 
 /// Input content can be a string or an array of content blocks
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum InputContent {
     String(String),
     Blocks(Vec<InputContentBlock>),
+}
+
+impl<'de> Deserialize<'de> for InputContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(
+            match string_or_blocks(deserializer, "a string or an array of content blocks")? {
+                StringOrBlocks::String(text) => Self::String(text),
+                StringOrBlocks::Blocks(blocks) => Self::Blocks(blocks),
+            },
+        )
+    }
 }
 
 // ============================================================================
@@ -591,11 +694,25 @@ pub struct ToolResultBlock {
 }
 
 /// Tool result content (string or blocks)
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum ToolResultContent {
     String(String),
     Blocks(Vec<ToolResultContentBlock>),
+}
+
+impl<'de> Deserialize<'de> for ToolResultContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(
+            match string_or_blocks(
+                deserializer,
+                "a string or an array of tool result content blocks",
+            )? {
+                StringOrBlocks::String(text) => Self::String(text),
+                StringOrBlocks::Blocks(blocks) => Self::Blocks(blocks),
+            },
+        )
+    }
 }
 
 /// Content blocks allowed in tool results
@@ -630,7 +747,7 @@ pub struct ThinkingBlock {
     pub signature: String,
 }
 
-fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+fn null_as_empty<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
@@ -1095,20 +1212,35 @@ pub enum ThinkingConfig {
         /// Defaults vary by model (Opus 4.7 / Mythos default to `Omitted`; others to `Summarized`).
         display: Option<ThinkingDisplay>,
     },
+    /// No thinking up front; the model may think between its tool calls.
+    /// The public API takes `type` alone here: the `/v1/messages` request
+    /// validation (`messages_validation`) refuses any other field, which is
+    /// why the variant keeps what else was sent instead of letting the
+    /// reader drop it (`count_tokens` runs no thinking validation, this rule
+    /// and the budget floor alike, and counts the request as read). Where
+    /// the gateway renders the prompt (the gRPC path) the shape reads as
+    /// thinking off; the HTTP relay hands it to the engine's own
+    /// `/v1/messages` as written, for the engine's reading.
+    BetweenTools {
+        /// Every field beside `type`, for the validation to refuse.
+        #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
+        other: Map<String, Value>,
+    },
 }
 
 impl ThinkingConfig {
-    /// `enabled` and `adaptive` ask for thinking, `disabled` turns it off.
+    /// `enabled` and `adaptive` ask for thinking, `disabled` and
+    /// `between_tools` (no thinking up front) turn it off.
     pub fn enabled(&self) -> bool {
         matches!(self, Self::Enabled { .. } | Self::Adaptive { .. })
     }
 
     /// The `display` the block states, under `enabled` and `adaptive` alike;
-    /// `disabled` states none.
+    /// `disabled` and `between_tools` state none.
     pub fn display(&self) -> Option<ThinkingDisplay> {
         match self {
             Self::Enabled { display, .. } | Self::Adaptive { display } => *display,
-            Self::Disabled => None,
+            Self::Disabled | Self::BetweenTools { .. } => None,
         }
     }
 }
@@ -1164,17 +1296,17 @@ impl ThinkingDisplay {
 /// refusal still opens with serde's words, so the public `code` follows
 /// them (`invalid_value`, `invalid_type`).
 impl<'de> Deserialize<'de> for ThinkingDisplay {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct DisplayVisitor;
 
-        impl serde::de::Visitor<'_> for DisplayVisitor {
+        impl Visitor<'_> for DisplayVisitor {
             type Value = ThinkingDisplay;
 
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(ThinkingDisplay::EXPECTED)
             }
 
-            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
                 ThinkingDisplay::VALUES
                     .iter()
                     .find(|(name, _)| *name == value)
@@ -1624,8 +1756,9 @@ pub struct CountMessageTokensRequest {
     /// Tool definitions
     pub tools: Option<Vec<Tool>>,
 
-    /// The effort the prompt is rendered with, and the config's other keys.
-    pub output_config: Option<OutputConfig>,
+    /// The effort the prompt is rendered with, and the config's other keys
+    /// (boxed as [`CreateMessageRequest::output_config`] is).
+    pub output_config: Option<Box<OutputConfig>>,
 
     /// Additional backend-specific token counting options.
     #[serde(flatten)]
@@ -1690,7 +1823,10 @@ pub struct CountMessageTokensResponse {
 // Model Info Types
 // ============================================================================
 
-/// Model information
+/// A model entry of the Anthropic-shaped inventory, the public API's
+/// `ModelInfo`: every field of the contract, the ones a served model has no
+/// value for as `null` (the vendor's catalogue fields `capabilities`, `line`,
+/// `deprecated_at`, `retires_at`).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ModelInfo {
     /// Object type (always "model")
@@ -1705,25 +1841,161 @@ pub struct ModelInfo {
 
     /// When the model was created
     pub created_at: String,
+
+    /// The model's lifecycle stage, `active`, `deprecated` or `retired`: the
+    /// retirement signal the contract tells clients to read. Every model the
+    /// gateway serves itself is `active`; an upstream's entry keeps the stage
+    /// the upstream says.
+    #[serde(default = "ModelInfo::active")]
+    pub lifecycle: String,
+
+    /// The capability map of the vendor's catalogue; none is known here.
+    #[serde(default)]
+    pub capabilities: Option<Value>,
+
+    /// The model line of the vendor's catalogue; none is known here.
+    #[serde(default)]
+    pub line: Option<String>,
+
+    /// The largest `max_tokens` the model takes: its context length, when the
+    /// card carries one (the gateway caps the output by nothing else).
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+
+    /// The model's context window in tokens, when the card carries one.
+    #[serde(default)]
+    pub max_input_tokens: Option<u32>,
+
+    /// When the model was deprecated; `null` while it is `active`.
+    #[serde(default)]
+    pub deprecated_at: Option<String>,
+
+    /// When the model is scheduled to retire; `null` while it is `active`.
+    #[serde(default)]
+    pub retires_at: Option<String>,
 }
 
 impl ModelInfo {
     /// The entry a self-hosted model card makes in the Anthropic-shaped
     /// inventory. The display name falls back to the id; a card carries no
     /// creation time, so `created_at` is the epoch, the counterpart of the
-    /// OpenAI-shaped list's `created: 0`.
+    /// OpenAI-shaped list's `created: 0`; the token limits are the card's
+    /// context length.
     pub fn from_model_card(card: &ModelCard) -> Self {
         Self {
             model_type: "model".to_owned(),
             id: card.id.clone(),
             display_name: card.display_name.clone().unwrap_or_else(|| card.id.clone()),
             created_at: UNKNOWN_CREATED_AT.to_owned(),
+            lifecycle: Self::active(),
+            capabilities: None,
+            line: None,
+            max_tokens: card.context_length,
+            max_input_tokens: card.context_length,
+            deprecated_at: None,
+            retires_at: None,
         }
+    }
+
+    /// The lifecycle stage of every served model.
+    fn active() -> String {
+        "active".to_owned()
     }
 }
 
 /// `created_at` of a model whose creation time nobody recorded.
 const UNKNOWN_CREATED_AT: &str = "1970-01-01T00:00:00Z";
+
+/// The query of `GET /v1/models` in the Anthropic shape: `limit` (1 to 1000,
+/// 20 by default), one of the cursors `after_id` and `before_id` (the id of
+/// an entry; the page is the one after or before it), and the `lifecycle`
+/// to keep (`active`, `deprecated` or `retired`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListModelsQuery {
+    pub limit: Option<u32>,
+    pub after_id: Option<String>,
+    pub before_id: Option<String>,
+    pub lifecycle: Option<String>,
+}
+
+impl ListModelsQuery {
+    /// The page size when the query names none.
+    pub const DEFAULT_LIMIT: u32 = 20;
+    /// The largest page the public API serves.
+    pub const MAX_LIMIT: u32 = 1000;
+
+    /// The query of a request's URI (`None` or empty: the defaults); a value
+    /// the contract does not take is the refusal's message, naming the
+    /// parameter. Parameters the contract does not name are ignored.
+    pub fn parse(query: Option<&str>) -> Result<Self, String> {
+        let mut parsed = Self::default();
+        for (key, value) in url::form_urlencoded::parse(query.unwrap_or("").as_bytes()) {
+            match &*key {
+                "limit" => {
+                    let limit = value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|limit| (1..=Self::MAX_LIMIT).contains(limit))
+                        .ok_or_else(|| {
+                            format!(
+                                "limit: Input should be an integer from 1 to {}, got {value:?}",
+                                Self::MAX_LIMIT
+                            )
+                        })?;
+                    parsed.limit = Some(limit);
+                }
+                "after_id" => parsed.after_id = Some(value.into_owned()),
+                "before_id" => parsed.before_id = Some(value.into_owned()),
+                "lifecycle" => {
+                    if !["active", "deprecated", "retired"].contains(&&*value) {
+                        return Err(format!(
+                            "lifecycle: Input should be 'active', 'deprecated' or 'retired', got {value:?}"
+                        ));
+                    }
+                    parsed.lifecycle = Some(value.into_owned());
+                }
+                _ => {}
+            }
+        }
+        if parsed.after_id.is_some() && parsed.before_id.is_some() {
+            return Err("after_id and before_id: only one cursor can be given".to_owned());
+        }
+        Ok(parsed)
+    }
+
+    /// The page size asked for, or the default.
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(Self::DEFAULT_LIMIT) as usize
+    }
+
+    /// Whether the query narrows the list, by a cursor or a lifecycle: then
+    /// an empty page is the list's answer (nothing past the cursor, nothing
+    /// in that stage), where an empty page of the plain list, under any
+    /// `limit`, is an empty inventory.
+    pub fn narrows(&self) -> bool {
+        self.after_id.is_some() || self.before_id.is_some() || self.lifecycle.is_some()
+    }
+
+    /// The query as a URI carries it, the parameters the contract names and
+    /// the request gave alone (empty for the defaults): what an upstream
+    /// answering a caller's own credential is asked for.
+    pub fn to_query_string(&self) -> String {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        if let Some(limit) = self.limit {
+            query.append_pair("limit", &limit.to_string());
+        }
+        for (name, value) in [
+            ("after_id", &self.after_id),
+            ("before_id", &self.before_id),
+            ("lifecycle", &self.lifecycle),
+        ] {
+            if let Some(value) = value {
+                query.append_pair(name, value);
+            }
+        }
+        query.finish()
+    }
+}
 
 /// List of models response
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1735,21 +2007,60 @@ pub struct ListModelsResponse {
 }
 
 impl ListModelsResponse {
-    /// The whole inventory in one page, deduplicated by model id (the first
-    /// card of an id wins), with the page markers the public list carries.
-    pub fn from_model_cards(cards: impl IntoIterator<Item = ModelCard>) -> Self {
+    /// The page `query` asks of the inventory, deduplicated by model id (the
+    /// first card of an id wins) in the order given: the first `limit`
+    /// entries, the ones after the `after_id` entry or the ones just before
+    /// the `before_id` entry, with the page markers the public list carries;
+    /// `has_more` says whether the inventory goes on past the page in the
+    /// direction read. Every served model is `active`, so another
+    /// `lifecycle` keeps nothing. A cursor that names no entry is the
+    /// refusal's message.
+    pub fn from_model_cards(
+        cards: impl IntoIterator<Item = ModelCard>,
+        query: &ListModelsQuery,
+    ) -> Result<Self, String> {
         let mut seen = HashSet::new();
-        let data: Vec<ModelInfo> = cards
+        let entries: Vec<ModelInfo> = cards
             .into_iter()
             .filter(|card| seen.insert(card.id.clone()))
+            .filter(|_| {
+                query
+                    .lifecycle
+                    .as_deref()
+                    .is_none_or(|stage| stage == "active")
+            })
             .map(|card| ModelInfo::from_model_card(&card))
             .collect();
-        Self {
+        let position = |field: &str, id: &str| {
+            entries
+                .iter()
+                .position(|entry| entry.id == id)
+                .ok_or_else(|| format!("{field}: no model {id:?} in the list"))
+        };
+        let limit = query.limit();
+        let (start, end, has_more) = match (&query.after_id, &query.before_id) {
+            (Some(after), _) => {
+                let start = position("after_id", after)? + 1;
+                let end = entries.len().min(start + limit);
+                (start, end, end < entries.len())
+            }
+            (None, Some(before)) => {
+                let end = position("before_id", before)?;
+                let start = end.saturating_sub(limit);
+                (start, end, start > 0)
+            }
+            (None, None) => {
+                let end = entries.len().min(limit);
+                (0, end, end < entries.len())
+            }
+        };
+        let data: Vec<ModelInfo> = entries.into_iter().skip(start).take(end - start).collect();
+        Ok(Self {
             first_id: data.first().map(|m| m.id.clone()),
             last_id: data.last().map(|m| m.id.clone()),
-            has_more: false,
+            has_more,
             data,
-        }
+        })
     }
 }
 
@@ -2542,6 +2853,103 @@ mod tests {
         );
     }
 
+    /// A content field that is neither a string nor an array of blocks, or
+    /// holds a block that cannot be read, is refused with the block's own
+    /// reason: the unknown `type` with the accepted ones, the missing field,
+    /// the wrong JSON type; never "data did not match any variant".
+    #[test]
+    fn an_unreadable_content_block_is_refused_by_its_own_reason() {
+        let refusal = |message: Value| {
+            serde_json::from_value::<InputMessage>(message)
+                .expect_err("refused")
+                .to_string()
+        };
+        let unknown_block = refusal(json!({
+            "role": "assistant",
+            "content": [{"type": "mcp_tool_use", "id": "m1", "name": "echo", "server_name": "s", "input": {}}]
+        }));
+        assert!(
+            unknown_block.starts_with(
+                "unknown variant `mcp_tool_use`, expected one of `text`, `image`, `document`, `tool_use`, `tool_result`, `thinking`"
+            ),
+            "{unknown_block}"
+        );
+        assert!(
+            unknown_block.contains("`tool_reference`"),
+            "{unknown_block}"
+        );
+        let unknown_source = refusal(json!({
+            "role": "user",
+            "content": [{"type": "image", "source": {"type": "file", "file_id": "file_1"}}]
+        }));
+        assert!(
+            unknown_source.starts_with("unknown variant `file`, expected `base64` or `url`"),
+            "{unknown_source}"
+        );
+        let missing_field = refusal(json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "content": "ok"}]
+        }));
+        assert!(
+            missing_field.starts_with("missing field `tool_use_id`"),
+            "{missing_field}"
+        );
+        let untyped = refusal(json!({"role": "user", "content": [{"text": "hi"}]}));
+        assert!(untyped.starts_with("missing field `type`"), "{untyped}");
+        let null = refusal(json!({"role": "user", "content": null}));
+        assert!(
+            null.starts_with("invalid type: null, expected a string or an array of content blocks"),
+            "{null}"
+        );
+        let number = refusal(json!({"role": "user", "content": 5}));
+        assert!(
+            number.starts_with(
+                "invalid type: integer `5`, expected a string or an array of content blocks"
+            ),
+            "{number}"
+        );
+
+        // The same for the system prompt and a tool result's content.
+        let system = serde_json::from_value::<SystemContent>(json!([{"type": "image"}]))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            system.starts_with("unknown variant `image`, expected `text`"),
+            "{system}"
+        );
+        let system = serde_json::from_value::<SystemContent>(json!({}))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            system.starts_with("invalid type: map, expected a string or an array of text blocks"),
+            "{system}"
+        );
+        let result = serde_json::from_value::<ToolResultContent>(
+            json!([{"type": "thinking", "thinking": "x"}]),
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(
+            result.starts_with(
+                "unknown variant `thinking`, expected one of `text`, `image`, `document`, `search_result`, `tool_reference`"
+            ),
+            "{result}"
+        );
+
+        // Both shapes still read, and round-trip as they are written.
+        for content in [json!("hi"), json!([{"type": "text", "text": "hi"}])] {
+            let message: InputMessage =
+                serde_json::from_value(json!({"role": "user", "content": content}))
+                    .expect("accepted");
+            assert_eq!(serde_json::to_value(&message.content).unwrap(), content);
+        }
+        let system: SystemContent = serde_json::from_value(json!("be brief")).expect("accepted");
+        assert!(matches!(system, SystemContent::String(ref s) if s == "be brief"));
+        let result: ToolResultContent =
+            serde_json::from_value(json!([{"type": "text", "text": "ok"}])).expect("accepted");
+        assert!(matches!(result, ToolResultContent::Blocks(ref b) if b.len() == 1));
+    }
+
     /// History echoed by Claude Code (a ToolSearch result) and by the Anthropic
     /// Python SDK (thinking without a signature, or with a null one) parses, and
     /// is forwarded with the reference intact and an empty signature.
@@ -2647,40 +3055,80 @@ mod tests {
                 .is_err()
         );
 
-        let with_format = body(json!({"effort": "low", "format": {"type": "json_schema"}}));
+        let with_format = body(json!({
+            "effort": "low", "format": {"type": "json_schema", "schema": {"type": "object"}},
+            "beta_key": true
+        }));
         let request: CreateMessageRequest =
             serde_json::from_value(with_format.clone()).expect("a Messages request");
         assert_eq!(
             request
                 .output_config
                 .as_ref()
-                .and_then(|config| config.other.get("format")),
-            Some(&json!({"type": "json_schema"}))
+                .and_then(|config| config.format.as_ref()),
+            Some(&OutputFormat::JsonSchema {
+                schema: json!({"type": "object"})
+            })
         );
         let back = serde_json::to_value(&request).expect("serializes");
         assert_eq!(back["output_config"], with_format["output_config"]);
     }
 
-    /// A structured output format is asked for under `output_format` or
-    /// `output_config.format`; `null` under either, an `output_config`
-    /// without `format`, and no field at all ask for none.
+    /// The output config and the format under its earlier name ride behind
+    /// a pointer each: the request every Messages call carries is 464 bytes
+    /// on 64-bit targets (688 with the two inline, 544 before they were
+    /// typed), and with the `Arc` header the gateway adds it fits the
+    /// allocator's 512-byte class (it had moved up to the 768 one). A field
+    /// that grows it past the class needs its own read of the Messages route.
     #[test]
-    fn a_request_names_the_field_its_output_format_comes_under() {
-        let request = |extra: Value| -> CreateMessageRequest {
+    fn the_output_config_and_the_output_format_ride_behind_a_pointer_each() {
+        let request: CreateMessageRequest =
+            serde_json::from_value(json!({"model": "m", "max_tokens": 8, "messages": []}))
+                .expect("the smallest valid request");
+        assert_eq!(size_of_val(&request.output_config), size_of::<usize>());
+        assert_eq!(size_of_val(&request.output_format), size_of::<usize>());
+        let arc_header = 2 * size_of::<usize>();
+        assert!(
+            size_of::<CreateMessageRequest>() + arc_header <= 512,
+            "the request is {} bytes",
+            size_of::<CreateMessageRequest>()
+        );
+    }
+
+    /// The answer's schema comes from `output_config.format`, else from the
+    /// field's earlier top-level name, `output_format`; `null` under either,
+    /// an `output_config` without `format`, and no field at all name none.
+    /// The format's one `type` is `json_schema`, with its `schema`.
+    #[test]
+    fn the_output_schema_comes_from_output_config_format_else_output_format() {
+        let request = |extra: Value| -> Result<CreateMessageRequest, serde_json::Error> {
             let mut body = json!({"model": "m", "max_tokens": 8, "messages": []});
             body.as_object_mut()
                 .expect("an object")
                 .extend(extra.as_object().expect("an object").clone());
-            serde_json::from_value(body).expect("a Messages request")
+            serde_json::from_value(body)
         };
-        let format = json!({"type": "json_schema", "schema": {"type": "object"}});
+        let schema = json!({"type": "object", "properties": {"a": {"type": "string"}}});
+        let format = json!({"type": "json_schema", "schema": schema});
+        let other = json!({"type": "json_schema", "schema": {"type": "object"}});
         assert_eq!(
-            request(json!({"output_format": format})).output_format_field(),
-            Some("output_format")
+            request(json!({"output_config": {"format": format}}))
+                .expect("parses")
+                .output_schema(),
+            Some(&schema)
         );
         assert_eq!(
-            request(json!({"output_config": {"format": format}})).output_format_field(),
-            Some("output_config.format")
+            request(json!({"output_format": format}))
+                .expect("parses")
+                .output_schema(),
+            Some(&schema)
+        );
+        assert_eq!(
+            request(json!({"output_config": {"format": format}, "output_format": other}))
+                .expect("parses")
+                .output_schema(),
+            Some(&schema),
+            "the current field wins"
         );
         for extra in [
             json!({}),
@@ -2689,10 +3137,23 @@ mod tests {
             json!({"output_config": {"effort": "high"}}),
         ] {
             assert_eq!(
-                request(extra.clone()).output_format_field(),
+                request(extra.clone()).expect("parses").output_schema(),
                 None,
                 "{extra}"
             );
+        }
+        for (extra, refused_for) in [
+            (
+                json!({"output_config": {"format": {"type": "xml", "schema": {}}}}),
+                "unknown variant `xml`",
+            ),
+            (
+                json!({"output_format": {"type": "json_schema"}}),
+                "missing field `schema`",
+            ),
+        ] {
+            let error = request(extra.clone()).expect_err("refused").to_string();
+            assert!(error.contains(refused_for), "{extra}: {error}");
         }
     }
 
@@ -2828,6 +3289,7 @@ mod tests {
     fn base_request() -> CreateMessageRequest {
         CreateMessageRequest {
             output_config: None,
+            output_format: None,
             model: "claude-test".to_string(),
             messages: vec![InputMessage {
                 role: Role::User,
@@ -3230,7 +3692,7 @@ mod tests {
                 let parsed = match &cfg {
                     ThinkingConfig::Adaptive { display }
                     | ThinkingConfig::Enabled { display, .. } => *display,
-                    ThinkingConfig::Disabled => None,
+                    ThinkingConfig::Disabled | ThinkingConfig::BetweenTools { .. } => None,
                 };
                 assert_eq!(parsed, Some(display), "{input}");
                 assert_eq!(serde_json::to_value(&cfg).unwrap(), input);
@@ -3305,7 +3767,34 @@ mod tests {
         );
         assert_eq!(display(json!({"type": "adaptive"})), None);
         assert_eq!(display(json!({"type": "disabled"})), None);
+        assert_eq!(display(json!({"type": "between_tools"})), None);
         assert_eq!(display(Value::Null), None);
+    }
+
+    /// `between_tools` is the public API's fourth thinking shape: no thinking
+    /// up front, so the request's toggle reads off as under `disabled`, no
+    /// display; it writes back as `type` alone, and what else was sent with
+    /// it is kept for the validation to refuse.
+    #[test]
+    fn between_tools_is_thinking_off_up_front() {
+        let cfg: ThinkingConfig = serde_json::from_value(json!({"type": "between_tools"})).unwrap();
+        assert!(matches!(cfg, ThinkingConfig::BetweenTools { ref other } if other.is_empty()));
+        assert!(!cfg.enabled());
+        assert_eq!(cfg.display(), None);
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap(),
+            json!({"type": "between_tools"})
+        );
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m", "max_tokens": 16, "messages": [], "thinking": {"type": "between_tools"}
+        }))
+        .unwrap();
+        assert_eq!(request.thinking_toggle(), Some(false));
+        let cfg: ThinkingConfig =
+            serde_json::from_value(json!({"type": "between_tools", "display": "omitted"})).unwrap();
+        assert!(
+            matches!(cfg, ThinkingConfig::BetweenTools { ref other } if other.contains_key("display"))
+        );
     }
 
     /// The first request of a coding agent: an adaptive thinking with
@@ -3519,11 +4008,11 @@ mod tests {
     fn anthropic_model_list_is_built_from_model_cards() {
         let mut named = ModelCard::new("m1");
         named.display_name = Some("Model One".to_owned());
-        let list = ListModelsResponse::from_model_cards(vec![
-            named,
-            ModelCard::new("m2"),
-            ModelCard::new("m1"),
-        ]);
+        let list = ListModelsResponse::from_model_cards(
+            vec![named, ModelCard::new("m2"), ModelCard::new("m1")],
+            &ListModelsQuery::default(),
+        )
+        .expect("a page");
         let v = serde_json::to_value(&list).unwrap();
         assert_eq!(v["has_more"], false);
         assert_eq!(v["first_id"], "m1");
@@ -3539,7 +4028,14 @@ mod tests {
                 "type": "model",
                 "id": "m1",
                 "display_name": "Model One",
-                "created_at": "1970-01-01T00:00:00Z"
+                "created_at": "1970-01-01T00:00:00Z",
+                "lifecycle": "active",
+                "capabilities": null,
+                "line": null,
+                "max_tokens": null,
+                "max_input_tokens": null,
+                "deprecated_at": null,
+                "retires_at": null
             })
         );
         assert_eq!(
@@ -3699,5 +4195,116 @@ mod tests {
             ]}
         ]);
         assert_eq!(request(history).history_tool_calls_count(), 3);
+    }
+
+    /// The query an upstream is asked for is the request's, the contract's
+    /// parameters alone, in the URI's form; the defaults ask for nothing.
+    #[test]
+    fn the_model_list_query_is_rewritten_for_an_upstream_as_the_contract_names_it() {
+        let query = ListModelsQuery::parse(Some("foo=bar&limit=5&after_id=a%20b&lifecycle=active"))
+            .expect("parses");
+        assert_eq!(
+            query.to_query_string(),
+            "limit=5&after_id=a+b&lifecycle=active"
+        );
+        assert!(query.narrows());
+        assert_eq!(ListModelsQuery::default().to_query_string(), "");
+        assert!(!ListModelsQuery::default().narrows());
+        assert!(!ListModelsQuery::parse(Some("limit=5"))
+            .expect("parses")
+            .narrows());
+        assert_eq!(
+            ListModelsQuery::parse(Some("before_id=m1"))
+                .expect("parses")
+                .to_query_string(),
+            "before_id=m1"
+        );
+    }
+
+    /// The Messages-shaped list pages over the deduplicated inventory as its
+    /// query asks: `limit` entries from the start, after a cursor or just
+    /// before one, `has_more` for the rest; every served model is `active`,
+    /// so another lifecycle keeps nothing. A limit outside 1 to 1000, both
+    /// cursors, an unknown lifecycle or a cursor naming no entry are refused
+    /// naming the parameter. The entry carries every field of the contract,
+    /// the card's context length as both token limits.
+    #[test]
+    fn the_model_list_pages_as_its_query_asks() {
+        let cards = || {
+            ["a", "b", "c", "d", "b"].into_iter().map(|id| {
+                let mut card = ModelCard::new(id);
+                card.context_length = Some(8192);
+                card
+            })
+        };
+        let ids = |list: &ListModelsResponse| {
+            list.data
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let page = |query: &str| {
+            ListModelsResponse::from_model_cards(
+                cards(),
+                &ListModelsQuery::parse(Some(query)).expect("a query the contract takes"),
+            )
+            .expect("a page")
+        };
+
+        let whole = page("");
+        assert_eq!(ids(&whole), ["a", "b", "c", "d"]);
+        assert!(!whole.has_more);
+        assert_eq!(
+            (whole.first_id.as_deref(), whole.last_id.as_deref()),
+            (Some("a"), Some("d"))
+        );
+        assert_eq!(
+            serde_json::to_value(&whole.data[0]).expect("serializes"),
+            json!({
+                "type": "model", "id": "a", "display_name": "a",
+                "created_at": "1970-01-01T00:00:00Z", "lifecycle": "active",
+                "capabilities": null, "line": null,
+                "max_tokens": 8192, "max_input_tokens": 8192,
+                "deprecated_at": null, "retires_at": null
+            })
+        );
+
+        let first = page("limit=2");
+        assert_eq!(ids(&first), ["a", "b"]);
+        assert!(first.has_more);
+        let next = page("after_id=b&limit=2");
+        assert_eq!(ids(&next), ["c", "d"]);
+        assert!(!next.has_more);
+        let back = page("before_id=d&limit=2");
+        assert_eq!(ids(&back), ["b", "c"]);
+        assert!(back.has_more);
+        let start = page("before_id=b&limit=5");
+        assert_eq!(ids(&start), ["a"]);
+        assert!(!start.has_more);
+        let none = page("lifecycle=retired");
+        assert!(none.data.is_empty() && !none.has_more && none.first_id.is_none());
+        assert_eq!(
+            ListModelsQuery::parse(Some("foo=bar&limit=1000"))
+                .expect("parses")
+                .limit(),
+            1000
+        );
+
+        for query in [
+            "limit=0",
+            "limit=1001",
+            "limit=x",
+            "lifecycle=bogus",
+            "after_id=a&before_id=b",
+        ] {
+            assert!(ListModelsQuery::parse(Some(query)).is_err(), "{query}");
+        }
+        let unknown = ListModelsQuery::parse(Some("after_id=nope")).expect("parses");
+        assert_eq!(
+            ListModelsResponse::from_model_cards(cards(), &unknown)
+                .expect_err("no such entry")
+                .as_str(),
+            "after_id: no model \"nope\" in the list"
+        );
     }
 }

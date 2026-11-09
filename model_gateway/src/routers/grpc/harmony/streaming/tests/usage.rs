@@ -122,13 +122,13 @@ fn chat_request(choices: u32, stream: bool) -> ChatCompletionRequest {
     serde_json::from_value(request).expect("chat request")
 }
 
-/// The `usage` of the usage-only chunk that ends a Harmony chat stream with
-/// `stream_options.include_usage`.
-async fn streamed_chat_usage(
+/// The events of a Harmony chat stream with `stream_options.include_usage`,
+/// `[DONE]` left out.
+async fn streamed_chat_events(
     frames: Vec<proto::GenerateResponse>,
     choices: u32,
     reservation: Option<Arc<SharedReservationHandle>>,
-) -> Value {
+) -> Vec<Value> {
     let (stream, server) = scripted_stream(frames, "0").await;
     let dispatch = dispatch();
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
@@ -158,11 +158,49 @@ async fn streamed_chat_usage(
         events.iter().all(|event| event.get("error").is_none()),
         "the stream completes without an error event: {events:?}"
     );
+    events
+}
+
+/// The `usage` of the usage-only chunk that ends a Harmony chat stream with
+/// `stream_options.include_usage`.
+async fn streamed_chat_usage(
+    frames: Vec<proto::GenerateResponse>,
+    choices: u32,
+    reservation: Option<Arc<SharedReservationHandle>>,
+) -> Value {
+    let events = streamed_chat_events(frames, choices, reservation).await;
     let usage_chunk = events
         .iter()
         .rfind(|event| event["choices"].as_array().is_some_and(Vec::is_empty))
         .expect("a usage-only chunk");
     usage_chunk["usage"].clone()
+}
+
+/// Under `stream_options.include_usage` every chunk before the usage-only one
+/// carries the `usage: null` placeholder the public API writes, on this
+/// pipeline as on the regular chat stream.
+#[tokio::test]
+async fn harmony_chat_chunks_before_the_usage_chunk_carry_the_placeholder() {
+    let counters = Counters {
+        prompt: 10,
+        cached: 0,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    let tokens = harmony_tokens(None, "Hello there!");
+    let events = streamed_chat_events(frames(&tokens, 1, counters), 1, None).await;
+    let (last, earlier) = events.split_last().expect("events");
+    assert!(
+        last["choices"].as_array().is_some_and(Vec::is_empty) && last["usage"].is_object(),
+        "{last}"
+    );
+    assert!(!earlier.is_empty(), "{events:?}");
+    assert!(
+        earlier
+            .iter()
+            .all(|event| event.get("usage") == Some(&Value::Null)),
+        "{events:?}"
+    );
 }
 
 /// The non-streamed answer's usage and the settlement its counters make.

@@ -144,6 +144,9 @@ impl From<&tokenspeed_proto::SchedulerLoad> for common::EngineLoad {
         Self {
             prefill_throughput: load.prefill_throughput,
             active_token_usage: load.active_token_usage,
+            num_resident_tokens: load
+                .num_resident_tokens
+                .map(|tokens| u64::try_from(tokens).unwrap_or(0)),
             cache_hit_rate: Some(load.cache_hit_rate),
             num_used_tokens: Some(load.num_used_tokens),
             max_total_num_tokens: Some(load.max_total_num_tokens),
@@ -185,6 +188,9 @@ impl From<&common::EngineLoad> for SchedulerLoadSnapshot {
         let disagg = record.disaggregation.as_ref();
         Self {
             active_token_usage: record.active_token_usage,
+            num_resident_tokens: record
+                .num_resident_tokens
+                .map(|tokens| i64::try_from(tokens).unwrap_or(i64::MAX)),
             num_running_reqs: signed(record.running_requests),
             num_waiting_reqs: signed(record.waiting_requests),
             num_waiting_uncached_tokens: record.waiting_uncached_tokens.map_or(0, signed),
@@ -412,10 +418,13 @@ mod tests {
                 paused: 0,
                 retracted: 1,
             }),
+            num_resident_tokens: Some(70_000),
         };
         let polled = SchedulerLoadSnapshot::from(rank);
         let record = common::EngineLoad::from(&rank);
         assert!(record.memory.is_some() && record.disaggregation.is_none());
+        assert_eq!(record.num_resident_tokens, Some(70_000));
+        assert_eq!(polled.num_resident_tokens, Some(70_000));
         assert_eq!(
             format!("{polled:?}"),
             format!("{:?}", pushed(&record, rank.dp_rank))

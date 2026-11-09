@@ -71,6 +71,22 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _power_of_two_load_metric(value: str) -> str:
+    """argparse type for --power-of-two-load-metric: a metric name, or
+    resident_tokens:<request_tokens> with a non-negative integer cost, refused
+    here rather than by the binding's conversion after parsing."""
+    metric = value.strip().lower()
+    cost = metric.removeprefix("resident_tokens:")
+    if metric in ("expected_wait", "requests", "least_requests") or (
+        cost != metric and cost.isdigit()
+    ):
+        return value
+    raise argparse.ArgumentTypeError(
+        "expected expected_wait, requests, least_requests or "
+        f"resident_tokens:<request_tokens>, got {value!r}"
+    )
+
+
 def _ip_address(value: str) -> str | None:
     """argparse type for a listener address the router validates as an IP address:
     a plain IPv4 or IPv6 literal, surrounding whitespace aside (blank is unset, as
@@ -121,6 +137,8 @@ class _SecretSources:
     file_env: str
     # The history backend a store URL belongs to; None for a key.
     backend: str | None = None
+    # The shape of one entry of a list-valued secret, named in its refusals.
+    entry: str = "tenant_id:key"
 
 
 _API_KEY_SOURCES = _SecretSources(
@@ -132,6 +150,14 @@ _TENANT_API_KEYS_SOURCES = _SecretSources(
     "SMG_TENANT_API_KEYS",
     "--tenant-api-keys-file",
     "SMG_TENANT_API_KEYS_FILE",
+)
+_CONTROL_PLANE_API_KEYS_SOURCES = _SecretSources(
+    "the control-plane API keys",
+    "--control-plane-api-keys",
+    "CONTROL_PLANE_API_KEYS",
+    "--control-plane-api-keys-file",
+    "CONTROL_PLANE_API_KEYS_FILE",
+    entry="id:name:role:key",
 )
 _POSTGRES_DB_URL_SOURCES = _SecretSources(
     "the PostgreSQL connection URL",
@@ -214,20 +240,20 @@ def _entries_from_environment(sources: _SecretSources) -> list[str]:
     entries = _entries_of(text, r"[,\n]")
     if not entries:
         raise ValueError(
-            f"{sources.env} is set but holds no entry; {sources.what} are tenant_id:key"
+            f"{sources.env} is set but holds no entry; {sources.what} are {sources.entry}"
             " entries separated by ',' or a newline"
         )
     return entries
 
 
-def _read_entries_file(path: str, file_flag: str) -> list[str]:
+def _read_entries_file(path: str, sources: _SecretSources) -> list[str]:
     """The entries of a list-valued secret's file, one per line; blank lines
     and lines starting with '#' are skipped. A file without an entry is
     refused."""
-    entries = _entries_of(_read_text(path, file_flag), r"\n")
+    entries = _entries_of(_read_text(path, sources.file_flag), r"\n")
     if not entries:
         raise ValueError(
-            f"{file_flag} {path!r}: the file holds no entry; one tenant_id:key per line,"
+            f"{sources.file_flag} {path!r}: the file holds no entry; one {sources.entry} per line,"
             " blank and # lines skipped"
         )
     return entries
@@ -291,7 +317,8 @@ class RouterArgs:
     api_key: str | None = None
     # Routing-key assignment; defaults: random (manual policy), delegate (override)
     assignment_mode: str | None = None
-    backend: str = "sglang"
+    # None pins no wire: the gateway detects it, as it does for the CLI without --backend
+    backend: str | None = None
     balance_abs_threshold: int = 64
     # The spill gate's price of a held prefix, in tokens per request (0: unpriced)
     balance_prefix_margin_tokens: int = 0
@@ -380,7 +407,7 @@ class RouterArgs:
     # policy (--engine-metrics)
     engine_metrics: bool = False
     epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
-    eviction_interval_secs: int = 60
+    eviction_interval_secs: int = 120
     # Seconds a request to a gRPC worker may take from its dispatch to its last
     # message; 0 (the default) arms no deadline
     grpc_request_timeout_secs: int = 0
@@ -1013,10 +1040,13 @@ class RouterArgs:
         )
         routing_group.add_argument(
             f"--{prefix}power-of-two-load-metric",
-            type=str,
-            choices=["expected_wait", "requests", "least_requests"],
+            type=_power_of_two_load_metric,
             default=RouterArgs.power_of_two_load_metric,
-            help="What power_of_two compares: expected_wait, requests or least_requests",
+            help=(
+                "What power_of_two compares: expected_wait, requests, least_requests or"
+                " resident_tokens:<request_tokens> (resident context tokens plus that many"
+                " per request)"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}pd-pairing-mode",
@@ -1098,10 +1128,10 @@ class RouterArgs:
             help=(
                 "Cache-aware KV-usage SPREAD threshold (0.0-1.0): the hottest minus"
                 " coldest backend KV utilization above which cache affinity is"
-                " abandoned for shortest-queue. Catches long-context KV imbalance that"
-                " in-flight request counts miss, and is invariant to gateway replica"
-                " count. Backend must report token_usage. Finite and > 0.0; >= 1.0"
-                " disables it. Defaults to 1.0 (disabled)."
+                " abandoned for expected-wait routing. Catches long-context KV"
+                " imbalance that in-flight request counts miss, and is invariant to"
+                " gateway replica count. Backend must report token_usage. Finite and"
+                " > 0.0; >= 1.0 disables it. Defaults to 1.0 (disabled)."
             ),
         )
         routing_group.add_argument(
@@ -2326,7 +2356,11 @@ class RouterArgs:
             f"--{prefix}retry-max-retries",
             type=int,
             default=RouterArgs.retry_max_retries,
-            help="Maximum number of retry attempts for failed requests",
+            help=(
+                "Default attempts per request in all, the first one "
+                "included (1 disables retries). A worker's per-model "
+                "retry override takes precedence."
+            ),
         )
         retry_group.add_argument(
             f"--{prefix}retry-initial-backoff-ms",
@@ -2629,10 +2663,11 @@ class RouterArgs:
             default=RouterArgs.backend,
             choices=["sglang", "vllm", "trtllm", "tokenspeed", "openai", "anthropic", "gemini"],
             help=(
-                "Backend runtime to use (default: sglang). Over ZMQ the backend names the "
-                "workers' engine and pins the wire protocol (it cannot be auto-detected): "
-                "pass vllm or tokenspeed for those engines; the default serves SGLang schedulers. "
-                "openai, anthropic and gemini select that provider's route"
+                "Backend runtime (default: none, the gateway detects it, as the Rust CLI does). "
+                "Over ZMQ the backend names the workers' engine and pins the wire protocol, "
+                "which the handshake cannot tell apart: pass sglang, vllm or tokenspeed for "
+                "that engine; an unpinned ZMQ worker gets the vLLM EngineCore wire and a "
+                "warning at start. openai, anthropic and gemini select that provider's route"
             ),
         )
         backend_group.add_argument(
@@ -2973,7 +3008,20 @@ class RouterArgs:
                 "API keys for control plane authentication. Format: 'id:name:role:key'"
                 " where role is 'admin' or 'user'."
                 " Example: --control-plane-api-keys 'key1:Service Account:admin:secret123'"
-                " 'key2:Read Only:user:secret456'"
+                " 'key2:Read Only:user:secret456'."
+                " Also read from the environment (CONTROL_PLANE_API_KEYS, entries separated"
+                " by ',' or a newline) or a file (--control-plane-api-keys-file); the flag"
+                " beats the environment, and entries together with a file are refused."
+            ),
+        )
+        auth_group.add_argument(
+            f"--{prefix}control-plane-api-keys-file",
+            type=str,
+            default=None,
+            help=(
+                "File holding the control-plane API keys, one id:name:role:key per line"
+                " (blank lines and lines starting with # are skipped), such as a mounted"
+                " secret (env: CONTROL_PLANE_API_KEYS_FILE)."
             ),
         )
         auth_group.add_argument(
@@ -3068,7 +3116,10 @@ class RouterArgs:
             nargs="*",
             action="extend",
             default=[],
-            help="Peer mesh server addresses to join (format: host:port)",
+            help=(
+                "Mesh listeners of other members to join, as ip:port (a hostname is"
+                " refused), separate values or one comma-separated list"
+            ),
         )
         mesh_group.add_argument(
             f"--{prefix}mesh-tls-ca-cert",
@@ -3213,11 +3264,6 @@ class RouterArgs:
         args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
         args_dict["worker_ports_annotation"] = "smg.ai/worker-ports"
 
-        # Parse control plane API keys
-        args_dict["control_plane_api_keys"] = cls._parse_control_plane_api_keys(
-            cli_args_dict.get(f"{prefix}control_plane_api_keys", [])
-        )
-
         # Parse JWT role mapping
         args_dict["jwt_role_mapping"] = cls._parse_jwt_role_mapping(
             cli_args_dict.get(f"{prefix}jwt_role_mapping", [])
@@ -3274,8 +3320,24 @@ class RouterArgs:
         if tenant_file is not None:
             if tenant_entries:
                 raise _given_twice(_TENANT_API_KEYS_SOURCES)
-            tenant_entries = _read_entries_file(tenant_file, _TENANT_API_KEYS_SOURCES.file_flag)
+            tenant_entries = _read_entries_file(tenant_file, _TENANT_API_KEYS_SOURCES)
         args_dict["tenant_api_keys"] = cls._parse_tenant_api_keys(tenant_entries)
+
+        # The control-plane keys under the same rule: the flag's entries, else
+        # the environment's, else the file's.
+        control_plane_entries = list(cli_args_dict.get(f"{prefix}control_plane_api_keys") or [])
+        if not control_plane_entries:
+            control_plane_entries = _entries_from_environment(_CONTROL_PLANE_API_KEYS_SOURCES)
+        control_plane_file = file_option(_CONTROL_PLANE_API_KEYS_SOURCES)
+        if control_plane_file is not None:
+            if control_plane_entries:
+                raise _given_twice(_CONTROL_PLANE_API_KEYS_SOURCES)
+            control_plane_entries = _read_entries_file(
+                control_plane_file, _CONTROL_PLANE_API_KEYS_SOURCES
+            )
+        args_dict["control_plane_api_keys"] = cls._parse_control_plane_api_keys(
+            control_plane_entries
+        )
 
         return cls(**args_dict)
 

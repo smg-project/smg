@@ -1560,7 +1560,7 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
     }
     let dir = PathBuf::from(CACHE_DIR).join(slug).join(revision);
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     download(
         &client,
         HUB,
@@ -2595,7 +2595,7 @@ fn loopback(replies: &'static [Reply]) -> io::Result<(String, Arc<AtomicUsize>)>
 fn a_rate_limited_get_is_sent_again_after_the_retry_after_wait() {
     const LIMITED: Reply = Reply::Head("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0");
     const LIMITED_EVERY_TIME: &[Reply] = &[LIMITED; RATE_LIMITED_TRIES as usize];
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     let (url, served) = loopback(&[LIMITED, Reply::Head("HTTP/1.1 200 OK")]).unwrap();
     let answer = fetch(
         &client,
@@ -2670,7 +2670,7 @@ fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
     let (url, served) = loopback(LIMITED_EVERY_TIME).unwrap();
     let failed = std::thread::spawn({
         let path = path.clone();
-        move || cached_download(&smg::clients::blocking_http_client(), &url, &path, 2)
+        move || cached_download(&smg::server::blocking_http_client(), &url, &path, 2)
     })
     .join();
     assert!(
@@ -2680,10 +2680,10 @@ fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
     assert_eq!(served.load(Ordering::SeqCst), RATE_LIMITED_TRIES as usize);
     assert!(!path.exists(), "a failed download leaves no file");
     let (url, served) = loopback(&[LIMITED, Reply::Head("HTTP/1.1 200 OK")]).unwrap();
-    cached_download(&smg::clients::blocking_http_client(), &url, &path, 2);
+    cached_download(&smg::server::blocking_http_client(), &url, &path, 2);
     assert_eq!(fs::read(&path).unwrap(), b"ok");
     assert_eq!(served.load(Ordering::SeqCst), 2);
-    cached_download(&smg::clients::blocking_http_client(), &url, &path, 2);
+    cached_download(&smg::server::blocking_http_client(), &url, &path, 2);
     assert_eq!(
         served.load(Ordering::SeqCst),
         2,
@@ -2691,13 +2691,13 @@ fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
     );
 }
 
-/// The gateway's test harness and the tokenizer crate's tests carry the same
-/// `hub_fetch.rs`, so a fix to the retry or the download lock in one reaches
+/// The gateway and the tokenizer crate's tests carry the same `hub_fetch.rs`,
+/// so a fix to the retry or the download lock in one reaches
 /// the other: the two files are checked byte for byte.
 #[test]
 fn the_hub_fetch_module_is_the_tokenizer_crate_s_copy() {
     assert_eq!(
-        include_str!("../test_harness/src/hub_fetch.rs"),
+        include_str!("../src/routers/grpc/tokenizer_cache/hub_fetch.rs"),
         include_str!("../../crates/tokenizer/tests/common/hub_fetch.rs"),
         "the two hub_fetch.rs copies have drifted"
     );
@@ -2707,7 +2707,7 @@ fn the_hub_fetch_module_is_the_tokenizer_crate_s_copy() {
 /// name, and the next run reads it without a request.
 #[test]
 fn a_file_the_checkpoint_does_not_serve_is_asked_for_once() {
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     let (url, served) = loopback(&[Reply::Head("HTTP/1.1 404 Not Found")]).unwrap();
     let dir = tempfile::tempdir().unwrap();
     for _ in 0..2 {
@@ -2726,7 +2726,7 @@ fn a_file_the_checkpoint_does_not_serve_is_asked_for_once() {
     reason = "the requests counted and the times measured are test diagnostic output"
 )]
 fn a_download_whose_body_breaks_is_sent_again_and_lands_on_the_second_try() {
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     let dir = tempfile::tempdir().unwrap();
     let (url, served) = loopback(&[Reply::CutBody, Reply::Head("HTTP/1.1 200 OK")]).unwrap();
     let started = Instant::now();
@@ -2786,7 +2786,7 @@ fn a_broken_body_reads_as_answered_and_no_answer_does_not() {
         Reply::NoAnswer,
     ];
     assert_eq!(CUT_EVERY_TIME.len(), TRANSPORT_ERROR_RETRIES as usize + 1);
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     let fetch_error = |replies: &'static [Reply]| {
         let (url, served) = loopback(replies).unwrap();
         let error = fetch(&client, &format!("{url}/org/m/resolve/r/tokenizer.json")).unwrap_err();
@@ -2826,7 +2826,7 @@ fn a_download_that_breaks_at_every_try_fails_after_the_bounded_retries() {
         BROKEN_EVERY_TIME.len(),
         TRANSPORT_ERROR_RETRIES as usize + 1
     );
-    let client = smg::clients::blocking_http_client();
+    let client = smg::server::blocking_http_client();
     let dir = tempfile::tempdir().unwrap();
     let (url, served) = loopback(BROKEN_EVERY_TIME).unwrap();
     let started = Instant::now();

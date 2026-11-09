@@ -100,30 +100,39 @@ impl<'a> Scanned<'a> {
     }
 
     /// [`Self::pieces`], with a text piece bound to the delta rather than to the scan: a slice of
-    /// the bytes fed when nothing was held before them, so a caller keeps it as long as the bytes;
-    /// a copy of its part of the join when something was held.
+    /// the bytes fed where the piece lies within them, so a caller keeps it as long as the bytes;
+    /// a copy where the piece begins in the bytes held before them, the join's part (the first
+    /// piece of a feed after a hold, at most).
     pub fn pieces_of_delta(&self) -> impl Iterator<Item = Piece<'a>> + '_ {
-        let bytes: &'a str = self.bytes;
-        let joined = (!self.joined.is_empty()).then_some(self.joined.as_str());
         self.spans.iter().map(move |span| match *span {
-            Span::Text { start, end } => Piece::Text(match joined {
-                None => Cow::Borrowed(&bytes[start..end]),
-                Some(joined) => Cow::Owned(joined[start..end].to_owned()),
-            }),
+            Span::Text { start, end } => Piece::Text(self.text_of_delta(start, end)),
             Span::Marker(index) => Piece::Marker(index),
         })
     }
 
     /// The text, when the pieces are one piece of text and nothing else: a caller takes it as one
-    /// without walking the pieces, as it takes a delta that reads as text whole. Borrowed from
-    /// the bytes fed when nothing was held before them; a copy of the join when something was.
+    /// without walking the pieces, as it takes a delta that reads as text whole. Bound to the
+    /// delta as a piece of [`Self::pieces_of_delta`] is.
     pub fn whole_text(&self) -> Option<Cow<'a, str>> {
         match *self.spans.as_slice() {
-            [Span::Text { start, end }] if self.joined.is_empty() => {
-                Some(Cow::Borrowed(&self.bytes[start..end]))
-            }
-            [Span::Text { start, end }] => Some(Cow::Owned(self.joined[start..end].to_owned())),
+            [Span::Text { start, end }] => Some(self.text_of_delta(start, end)),
             _ => None,
+        }
+    }
+
+    /// The text at `start..end` of the scan, bound to the delta: a slice of the bytes fed where
+    /// it lies within them (the whole scan when nothing was held; past the held bytes, which the
+    /// join begins with, otherwise); a copy where it begins in the held bytes.
+    fn text_of_delta(&self, start: usize, end: usize) -> Cow<'a, str> {
+        let bytes: &'a str = self.bytes;
+        if self.joined.is_empty() {
+            return Cow::Borrowed(&bytes[start..end]);
+        }
+        let held = self.joined.len() - bytes.len();
+        if start >= held {
+            Cow::Borrowed(&bytes[start - held..end - held])
+        } else {
+            Cow::Owned(self.joined[start..end].to_owned())
         }
     }
 }
@@ -702,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn a_piece_borrows_the_scan_always_and_the_delta_only_while_nothing_was_held() {
+    fn a_piece_borrows_the_scan_always_and_the_delta_where_it_lies_within_it() {
         let mut scanner = Scanner::new(QWEN);
         let scanned = scanner.feed("a<");
         assert!(
@@ -733,6 +742,10 @@ mod tests {
         assert!(
             matches!(&of_delta[0], Piece::Text(Cow::Owned(_))),
             "bound to the delta, the join's part is a copy"
+        );
+        assert!(
+            matches!(&of_delta[2], Piece::Text(Cow::Borrowed(_))),
+            "a piece past the held bytes lies within the delta and is a slice of it"
         );
         assert_eq!(scanner.held(), "<");
         assert_eq!(scanned.pieces().count(), 3, "read as often as wanted");

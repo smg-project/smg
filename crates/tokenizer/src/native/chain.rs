@@ -32,7 +32,13 @@
 //! holds, or short of its last character when a non-space follows, or
 //! whole. Each is what the backtracking engine arrives at for this shape,
 //! so the pieces are the same, and the piece's end is the end of the text
-//! for every decision, as it is for the engine.
+//! for every decision, as it is for the engine: a group or a run is cut
+//! first and the template reads it on its own, while a stretch between them
+//! is cut by the template as it is read, the next digit or run character
+//! standing in for the end of the text in every decision, so the stretch is
+//! read once, not scanned to its end and then read. A character's classes
+//! are read as role bits in one table lookup ([`Roles`]), so a run is a
+//! loop over bytes.
 //!
 //! The shape is recognized from the parsed patterns, with whatever classes
 //! stand in its places and whatever bound the digit rule has; the classes
@@ -41,12 +47,13 @@
 //! tests hold the scan against.
 
 use super::{
-    pattern::{concat, next_char, plain_class, previous_boundary, repeat, Class, Node},
+    pattern::{concat, plain_class, previous_boundary, repeat, Class, Node},
+    scan::{Bits, Roles},
     Stage,
 };
 
-/// A part of the template that one class fills: the bit of
-/// [`Scanner::ascii`] and the slot of [`Scanner::roles`] that hold it.
+/// A part of the template that one class fills: its bit in a character's
+/// role bits.
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 enum Role {
@@ -81,10 +88,16 @@ enum Role {
     Space,
 }
 
-/// The roles, so many slots of [`Scanner::roles`].
+/// The roles, so many bits of a character.
 const ROLES: usize = 14;
 
-/// The template's roles in the order [`Part::Template`] lists their classes.
+/// The characters that end a stretch between the first two stages' pieces:
+/// read as the end of the text by every decision of the template inside
+/// such a stretch.
+const STAGE_STOP: Bits = Role::Digit.bit() | Role::Run.bit();
+
+/// The template's roles in the order [`Part::Template`] lists their classes,
+/// which is the order of their bits after the two stage classes.
 const TEMPLATE_ROLES: [Role; ROLES - 2] = [
     Role::PunctLead,
     Role::PunctLetter,
@@ -102,8 +115,8 @@ const TEMPLATE_ROLES: [Role; ROLES - 2] = [
 
 impl Role {
     #[inline(always)]
-    fn bit(self) -> u16 {
-        1 << (self as u16)
+    const fn bit(self) -> Bits {
+        1 << (self as u32)
     }
 }
 
@@ -177,12 +190,9 @@ impl Part {
 /// documentation.
 #[derive(Debug, Clone)]
 pub(super) struct Scanner {
-    /// The classes of the three stages, each role's under its slot.
-    classes: Vec<Class>,
-    /// Per ASCII code point, a bit per [`Role`] whose class holds it.
-    ascii: [u16; 128],
-    /// The class of each role, read for characters beyond ASCII.
-    roles: [usize; ROLES],
+    /// The role bits of a character: the two stage classes, then the
+    /// template's roles in the order of [`TEMPLATE_ROLES`].
+    roles: Roles,
     /// The most characters of the digit class one group holds.
     digits: u32,
 }
@@ -215,50 +225,144 @@ impl Scanner {
         let Some(Part::Template(template)) = third.pattern.part() else {
             return None;
         };
-        let mut classes = Vec::with_capacity(ROLES);
-        let mut roles = [0usize; ROLES];
-        let mut take = |role: Role, class: &Class| {
-            roles[role as usize] = classes.len();
-            classes.push(class.clone());
-        };
-        take(Role::Digit, &first.pattern.classes()[*digit]);
-        take(Role::Run, &second.pattern.classes()[*run]);
+        let mut classes: Vec<&Class> = Vec::with_capacity(ROLES);
+        classes.push(&first.pattern.classes()[*digit]);
+        classes.push(&second.pattern.classes()[*run]);
         for (role, class) in TEMPLATE_ROLES.iter().zip(template) {
-            take(*role, &third.pattern.classes()[*class]);
-        }
-        let mut ascii = [0u16; 128];
-        for (code, bits) in ascii.iter_mut().enumerate() {
-            let c = char::from(code as u8);
-            for (slot, class) in roles.iter().enumerate() {
-                if classes[*class].contains(c) {
-                    *bits |= 1 << slot;
-                }
-            }
+            // the bit of a role is its place in this list
+            debug_assert_eq!(*role as usize, classes.len());
+            classes.push(&third.pattern.classes()[*class]);
         }
         Some(Self {
-            classes,
-            ascii,
-            roles,
+            roles: Roles::build(&classes),
             digits: *digits,
         })
     }
 
-    /// Whether `c` is in the class of `role`.
-    #[inline(always)]
-    fn has(&self, role: Role, c: char) -> bool {
-        let code = u32::from(c);
-        if code < 128 {
-            self.ascii[code as usize] & role.bit() != 0
-        } else {
-            self.classes[self.roles[role as usize]].contains(c)
+    /// Calls `f` with each piece of `text` as its byte range, in order; the
+    /// pieces tile the text, as three `Split` stages that keep their gaps
+    /// leave no character out.
+    pub(super) fn pieces<F: FnMut(usize, usize)>(&self, text: &str, f: &mut F) {
+        let mut pos = 0;
+        while let Some((c, len)) = self.roles.at(text, pos) {
+            let after = pos + len;
+            pos = if c & Role::Digit.bit() != 0 {
+                // The first stage: a group of up to the bound; the stages
+                // after it see the group on its own.
+                let mut end = after;
+                let mut count = 1;
+                while count < self.digits {
+                    match self.roles.at(text, end) {
+                        Some((d, n)) if d & Role::Digit.bit() != 0 => {
+                            end += n;
+                            count += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                self.group_pieces(text, pos, end, f);
+                end
+            } else if c & Role::Run.bit() != 0 {
+                // The second stage, inside a gap of the first: a run that
+                // the next digit ends, since the first stage cut there.
+                let mut end = after;
+                while let Some((d, n)) = self.roles.at(text, end) {
+                    if d & Role::Run.bit() == 0 || d & Role::Digit.bit() != 0 {
+                        break;
+                    }
+                    end += n;
+                }
+                self.template_pieces(text, pos, end, 0, f)
+            } else {
+                // A gap of both: the stretch to the next digit or run
+                // character, which the template cuts as it reads it.
+                self.template_pieces(text, pos, text.len(), STAGE_STOP, f)
+            };
         }
     }
 
-    /// The end of the run of `role`'s class that starts at `pos`.
+    /// The second and third stages over one group of the first,
+    /// `text[start..end]`: the runs of the second stage's class in it and
+    /// the stretches between them, each cut by the template. For a digit
+    /// class the template cuts nothing and the group is one piece; the
+    /// stages are applied all the same, so the pieces are theirs for any
+    /// classes.
+    fn group_pieces<F: FnMut(usize, usize)>(
+        &self,
+        text: &str,
+        start: usize,
+        end: usize,
+        f: &mut F,
+    ) {
+        let mut pos = start;
+        while pos < end {
+            let Some((c, len)) = self.roles.at(text, pos) else {
+                break;
+            };
+            let run = c & Role::Run.bit() != 0;
+            let mut piece_end = pos + len;
+            while piece_end < end {
+                match self.roles.at(text, piece_end) {
+                    Some((d, n)) if (d & Role::Run.bit() != 0) == run => piece_end += n,
+                    _ => break,
+                }
+            }
+            self.template_pieces(text, pos, piece_end, 0, f);
+            pos = piece_end;
+        }
+    }
+
+    /// The template's pieces of `text[start..end]`, a piece of the stages
+    /// before it, or, with `stop` bits, of the text from `start` up to the
+    /// first character holding one of them (a stretch between the first two
+    /// stages' pieces, which the template cuts with that character as the
+    /// end of the text): its matches, and the text between them as pieces
+    /// of their own. Answers where the piece ended.
+    fn template_pieces<F: FnMut(usize, usize)>(
+        &self,
+        text: &str,
+        start: usize,
+        end: usize,
+        stop: Bits,
+        f: &mut F,
+    ) -> usize {
+        let piece = &text[start..end];
+        let mut gap = 0;
+        let mut pos = 0;
+        while let Some((c, len)) = self.at_in(piece, pos, stop) {
+            match self.template_match(piece, pos, c, len, stop) {
+                Some(matched) => {
+                    if gap < pos {
+                        f(start + gap, start + pos);
+                    }
+                    f(start + pos, start + matched);
+                    pos = matched;
+                    gap = matched;
+                }
+                None => pos += len,
+            }
+        }
+        if gap < pos {
+            f(start + gap, start + pos);
+        }
+        start + pos
+    }
+
+    /// The role bits of the character at `pos` and its length, `None` at
+    /// the end of the text or at a character holding one of `stop`.
     #[inline(always)]
-    fn run_end(&self, text: &str, mut pos: usize, role: Role) -> usize {
-        while let Some((c, len)) = next_char(text, pos) {
-            if !self.has(role, c) {
+    fn at_in(&self, text: &str, pos: usize, stop: Bits) -> Option<(Bits, usize)> {
+        self.roles
+            .at(text, pos)
+            .filter(|(bits, _)| bits & stop == 0)
+    }
+
+    /// The end of the run of characters holding `bit` that starts at `pos`,
+    /// a character holding one of `stop` ending it as the text's end would.
+    #[inline(always)]
+    fn run_end_in(&self, text: &str, mut pos: usize, bit: Bits, stop: Bits) -> usize {
+        while let Some((bits, len)) = self.at_in(text, pos, stop) {
+            if bits & bit == 0 {
                 break;
             }
             pos += len;
@@ -266,161 +370,82 @@ impl Scanner {
         pos
     }
 
-    /// Calls `f` with each piece of `text`, in order; the pieces tile the
-    /// text, as three `Split` stages that keep their gaps leave no character
-    /// out.
-    pub(super) fn pieces<F: FnMut(&str)>(&self, text: &str, f: &mut F) {
-        let mut pos = 0;
-        while let Some((c, len)) = next_char(text, pos) {
-            let after = pos + len;
-            let end = if self.has(Role::Digit, c) {
-                // The first stage: a group of up to the bound; the stages
-                // after it see the group on its own.
-                let mut end = after;
-                let mut count = 1;
-                while count < self.digits {
-                    match next_char(text, end) {
-                        Some((d, n)) if self.has(Role::Digit, d) => {
-                            end += n;
-                            count += 1;
-                        }
-                        _ => break,
-                    }
-                }
-                self.group_pieces(&text[pos..end], f);
-                end
-            } else if self.has(Role::Run, c) {
-                // The second stage, inside a gap of the first: a run that
-                // the next digit ends, since the first stage cut there.
-                let mut end = after;
-                while let Some((d, n)) = next_char(text, end) {
-                    if !self.has(Role::Run, d) || self.has(Role::Digit, d) {
-                        break;
-                    }
-                    end += n;
-                }
-                self.template_pieces(&text[pos..end], f);
-                end
-            } else {
-                // A gap of both: the stretch to the next digit or run
-                // character, which the template cuts.
-                let mut end = after;
-                while let Some((d, n)) = next_char(text, end) {
-                    if self.has(Role::Digit, d) || self.has(Role::Run, d) {
-                        break;
-                    }
-                    end += n;
-                }
-                self.template_pieces(&text[pos..end], f);
-                end
-            };
-            pos = end;
-        }
-    }
-
-    /// The second and third stages over one group of the first: the runs of
-    /// the second stage's class in it and the stretches between them, each
-    /// cut by the template. For a digit class the template cuts nothing and
-    /// the group is one piece; the stages are applied all the same, so the
-    /// pieces are theirs for any classes.
-    fn group_pieces<F: FnMut(&str)>(&self, group: &str, f: &mut F) {
-        let mut pos = 0;
-        while let Some((c, len)) = next_char(group, pos) {
-            let run = self.has(Role::Run, c);
-            let mut piece_end = pos + len;
-            while let Some((d, n)) = next_char(group, piece_end) {
-                if self.has(Role::Run, d) != run {
-                    break;
-                }
-                piece_end += n;
-            }
-            self.template_pieces(&group[pos..piece_end], f);
-            pos = piece_end;
-        }
-    }
-
-    /// The template's pieces of one piece of the stages before it: its
-    /// matches, and the text between them as pieces of their own.
-    fn template_pieces<F: FnMut(&str)>(&self, piece: &str, f: &mut F) {
-        let mut gap = 0;
-        let mut pos = 0;
-        while let Some((c, len)) = next_char(piece, pos) {
-            match self.template_match(piece, pos, c, len) {
-                Some(end) => {
-                    if gap < pos {
-                        f(&piece[gap..pos]);
-                    }
-                    f(&piece[pos..end]);
-                    pos = end;
-                    gap = end;
-                }
-                None => pos += len,
-            }
-        }
-        if gap < piece.len() {
-            f(&piece[gap..]);
-        }
-    }
-
-    /// The end of the template's match that starts at `pos`, where `c` of
-    /// `len` bytes stands, if one does: the first of the six alternatives
-    /// that matches there, as the engine picks it.
-    fn template_match(&self, text: &str, pos: usize, c: char, len: usize) -> Option<usize> {
+    /// The end of the template's match that starts at `pos`, where a
+    /// character with the role bits `c` of `len` bytes stands, if one does:
+    /// the first of the six alternatives that matches there, as the engine
+    /// picks it; a character holding one of `stop` is the end of the text.
+    fn template_match(
+        &self,
+        text: &str,
+        pos: usize,
+        c: Bits,
+        len: usize,
+        stop: Bits,
+    ) -> Option<usize> {
         let after = pos + len;
         // 1. Punctuation followed by letters: the letter run after it.
-        if self.has(Role::PunctLead, c) {
-            if let Some((d, n)) = next_char(text, after) {
-                if self.has(Role::PunctLetter, d) {
-                    return Some(self.run_end(text, after + n, Role::PunctLetter));
+        if c & Role::PunctLead.bit() != 0 {
+            if let Some((d, n)) = self.at_in(text, after, stop) {
+                if d & Role::PunctLetter.bit() != 0 {
+                    return Some(self.run_end_in(text, after + n, Role::PunctLetter.bit(), stop));
                 }
             }
         }
         // 2. A letter run, with the lead-in when a letter follows it.
-        if self.has(Role::Lead, c) {
-            if let Some((d, n)) = next_char(text, after) {
-                if self.has(Role::Word, d) {
-                    return Some(self.run_end(text, after + n, Role::Word));
+        if c & Role::Lead.bit() != 0 {
+            if let Some((d, n)) = self.at_in(text, after, stop) {
+                if d & Role::Word.bit() != 0 {
+                    return Some(self.run_end_in(text, after + n, Role::Word.bit(), stop));
                 }
             }
         }
-        if self.has(Role::Word, c) {
-            return Some(self.run_end(text, after, Role::Word));
+        if c & Role::Word.bit() != 0 {
+            return Some(self.run_end_in(text, after, Role::Word.bit(), stop));
         }
         // 3. A punctuation run, with the space when punctuation follows it,
         //    and the line breaks after the run.
-        if self.has(Role::PunctSpace, c) {
-            if let Some((d, n)) = next_char(text, after) {
-                if self.has(Role::Punct, d) {
-                    let end = self.run_end(text, after + n, Role::Punct);
-                    return Some(self.run_end(text, end, Role::PunctBreak));
+        if c & Role::PunctSpace.bit() != 0 {
+            if let Some((d, n)) = self.at_in(text, after, stop) {
+                if d & Role::Punct.bit() != 0 {
+                    let end = self.run_end_in(text, after + n, Role::Punct.bit(), stop);
+                    return Some(self.run_end_in(text, end, Role::PunctBreak.bit(), stop));
                 }
             }
         }
-        if self.has(Role::Punct, c) {
-            let end = self.run_end(text, after, Role::Punct);
-            return Some(self.run_end(text, end, Role::PunctBreak));
+        if c & Role::Punct.bit() != 0 {
+            let end = self.run_end_in(text, after, Role::Punct.bit(), stop);
+            return Some(self.run_end_in(text, end, Role::PunctBreak.bit(), stop));
         }
         // 4. Whitespace ending in line breaks: the greedy whitespace run
-        //    gives back characters until a line break follows it.
-        let mut end = self.run_end(text, pos, Role::BreakSpace);
+        //    gives back to the last position where a line break stands,
+        //    inside the run or right after it.
+        let mut end = pos;
+        let mut last_break = None;
         loop {
-            if let Some((d, n)) = next_char(text, end) {
-                if self.has(Role::Break, d) {
-                    return Some(self.run_end(text, end + n, Role::Break));
+            match self.at_in(text, end, stop) {
+                Some((d, n)) if d & Role::BreakSpace.bit() != 0 => {
+                    if d & Role::Break.bit() != 0 {
+                        last_break = Some(end);
+                    }
+                    end += n;
                 }
+                Some((d, _)) if d & Role::Break.bit() != 0 => {
+                    last_break = Some(end);
+                    break;
+                }
+                _ => break,
             }
-            if end == pos {
-                break;
-            }
-            end = previous_boundary(text, end);
+        }
+        if let Some(start) = last_break {
+            return Some(self.run_end_in(text, start, Role::Break.bit(), stop));
         }
         // 5. Whitespace before a non-space: the greedy run gives back its
         //    last character while a non-space follows it, down to one.
-        if self.has(Role::TrailSpace, c) {
-            let mut end = self.run_end(text, after, Role::TrailSpace);
+        if c & Role::TrailSpace.bit() != 0 {
+            let mut end = self.run_end_in(text, after, Role::TrailSpace.bit(), stop);
             loop {
-                match next_char(text, end) {
-                    Some((d, _)) if self.has(Role::NotTrail, d) => {}
+                match self.at_in(text, end, stop) {
+                    Some((d, _)) if d & Role::NotTrail.bit() != 0 => {}
                     _ => return Some(end),
                 }
                 let shorter = previous_boundary(text, end);
@@ -431,8 +456,8 @@ impl Scanner {
             }
         }
         // 6. The whitespace run.
-        if self.has(Role::Space, c) {
-            return Some(self.run_end(text, after, Role::Space));
+        if c & Role::Space.bit() != 0 {
+            return Some(self.run_end_in(text, after, Role::Space.bit(), stop));
         }
         None
     }
@@ -479,10 +504,7 @@ mod tests {
     /// The pieces of the scanner, as byte ranges of `text`.
     fn scanned(scanner: &Scanner, text: &str) -> Vec<(usize, usize)> {
         let mut pieces = Vec::new();
-        scanner.pieces(text, &mut |piece: &str| {
-            let start = piece.as_ptr() as usize - text.as_ptr() as usize;
-            pieces.push((start, start + piece.len()));
-        });
+        scanner.pieces(text, &mut |start, end| pieces.push((start, end)));
         pieces
     }
 

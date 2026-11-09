@@ -1,12 +1,15 @@
 // These modules are used by tests and benchmarks
 #![allow(dead_code, clippy::allow_attributes, clippy::large_futures)]
 
+pub mod decode_stream;
+pub mod engine_answers;
 pub mod grpc_harness;
 pub mod held_worker;
-/// The gateway's copy of the hub fetcher (compiled by path from this crate's
-/// `src/hub_fetch.rs`), re-exported so a test binary that links both crates has
-/// one module and one download lock.
-pub use smg::test_support::hub_fetch;
+/// The gateway's hub fetcher (beside the checkpoint tokenizer fixtures of the
+/// gRPC router's tests), re-exported so a test binary that links both crates
+/// has one module and one download lock.
+pub use smg::routers::grpc::tokenizer_cache::hub_fetch;
+pub mod metrics_capture;
 pub mod mock_mcp_server;
 #[cfg(feature = "provider-openai")]
 pub mod mock_openai_server;
@@ -94,7 +97,7 @@ impl WorkerTestContext {
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let client = smg::clients::http_client_builder()
+        let client = smg::server::http_client_builder()
             .no_proxy()
             .build()
             .map_err(|e| format!("test client: {e}"))?;
@@ -126,7 +129,7 @@ impl WorkerTestContext {
     ) -> Result<Vec<String>, String> {
         use futures_util::StreamExt;
 
-        let client = smg::clients::http_client_builder()
+        let client = smg::server::http_client_builder()
             .no_proxy()
             .build()
             .map_err(|e| format!("test client: {e}"))?;
@@ -434,7 +437,7 @@ async fn build_test_app_context(
     use smg_mcp::McpOrchestrator;
 
     // See `test_app::create_test_app_context`: no environment proxy in a test's path.
-    let client = smg::clients::http_client_builder()
+    let client = smg::server::http_client_builder()
         .no_proxy()
         .build()
         .expect("test client");
@@ -771,8 +774,59 @@ pub fn ensure_tokenizer_cached() -> PathBuf {
     let url = std::env::var(TINYLLAMA_TOKENIZER_URL_ENV)
         .unwrap_or_else(|_| TINYLLAMA_TOKENIZER_URL.to_string());
     let path = PathBuf::from(CACHE_DIR).join(TINYLLAMA_TOKENIZER_FILENAME);
-    hub_fetch::cached_download(&smg::clients::blocking_http_client(), &url, &path, 100);
+    hub_fetch::cached_download(&smg::server::blocking_http_client(), &url, &path, 100);
     path
+}
+
+/// Waits for `done` to hold, polling it every 20 ms, within `bound`; the
+/// bound passing first fails the test naming `what`. The wait for something
+/// another task finishes (a registration, a promotion, a recovery): the
+/// condition ends it, where a fixed sleep is too long on a quiet machine and
+/// too short on a loaded one.
+pub async fn wait_until(what: &str, bound: std::time::Duration, mut done: impl FnMut() -> bool) {
+    let started = tokio::time::Instant::now();
+    while !done() {
+        assert!(started.elapsed() < bound, "{what}: not within {bound:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Waits, within `bound`, for the worker at `url` to be registered and its
+/// registration job to be over. The registration workflow inserts the worker
+/// into the registry and then activates it and updates the policies, so a
+/// worker in the registry alone may still be unready; a finished job's entry
+/// leaves the job queue's status map. A failed one's stays with the job's
+/// message, and the wait fails at once naming it.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a context without a job queue fails the fixture"
+)]
+pub async fn wait_for_worker_registration(
+    app_context: &AppContext,
+    url: &str,
+    bound: std::time::Duration,
+) {
+    let queue = app_context
+        .worker_job_queue
+        .get()
+        .expect("the context's job queue");
+    wait_until(&format!("the registration of {url}"), bound, || {
+        let failed = queue
+            .get_status(url)
+            .filter(|status| status.status == "failed");
+        assert!(
+            failed.is_none(),
+            "the registration of {url} failed: {:?}",
+            failed.and_then(|status| status.message)
+        );
+        app_context
+            .worker_registry
+            .get_all_urls()
+            .iter()
+            .any(|registered| registered == url)
+            && queue.get_status(url).is_none()
+    })
+    .await;
 }
 
 /// Common test prompts for consistency across tests

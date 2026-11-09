@@ -24,15 +24,19 @@ use crate::{
     load_tracker::{rank_of, ChoiceLoad, PendingGuard, PrefillProbe, Submission},
     metrics::{complete_finish_reason, ChoiceMetrics},
     requests::HeldTerminal,
+    servicer::RequestOrigin,
     stop_match::{stop_decoder, StopMatcher},
     stream::{poll_engine_item, Choice, Choices, RequestStream},
     BoxStream,
 };
 
-/// Handle one `Generate` request against the connected scheduler.
+/// Handle one `Generate` request against the connected scheduler. `origin`
+/// says whose request it is, which decides what is counted
+/// ([`RequestOrigin`]).
 pub(super) async fn generate(
     state: &Arc<State>,
     mut req: ts::GenerateRequest,
+    origin: RequestOrigin,
 ) -> Result<BoxStream<ts::GenerateResponse>, Status> {
     // The request's arrival, the instant its latencies are measured from.
     let arrival = Instant::now();
@@ -43,7 +47,12 @@ pub(super) async fn generate(
     let request_id: Arc<str> = Arc::from(req.request_id.as_str());
     // Register before the submit: an `Abort` landing in the gap must find the
     // entry, and a duplicate id is refused up front.
-    let (registration, cancel) = state.shared.registry.register(&request_id)?;
+    // The servicer's own probe is registered for cancellation and settling
+    // like a client's request, outside the active count the scrape reports.
+    let (registration, cancel) = match origin {
+        RequestOrigin::Client => state.shared.registry.register(&request_id)?,
+        RequestOrigin::HealthProbe => state.shared.registry.register_uncounted(&request_id)?,
+    };
     let streaming = req.stream;
     let (skip_special_tokens, min_tokens) = req
         .sampling_params
@@ -69,40 +78,45 @@ pub(super) async fn generate(
     let subs = client
         .generate_tokenspeed_streams_for_model(req, state.model.grid_tensors())
         .await?;
-    // The load tracker's view of the request: in flight on the rank its
-    // first choice went to (the choice that reports the prompt) from here
-    // until the engine's first output (or the stream's end), with a
-    // servicer-clock prefill sample when it met no queue there (this wire
-    // carries no engine timing).
-    let at = Instant::now();
-    let rank = rank_of(
-        subs.iter()
-            .find(|sub| sub.index() == 0)
-            .or_else(|| subs.first())
-            .and_then(TokenSpeedGenerateStream::engine_index),
-    );
-    let mut probe = state.shared.loads.submit(Submission {
-        request_id: &request_id,
-        rank,
-        prompt_tokens,
-        choices: n,
-        tail: u32::try_from(rank)
-            .ok()
-            .and_then(|rank| client.engine_load(rank)),
-        window: state
-            .shared
-            .running_window(state.model.max_running_requests),
-        at,
-    });
-    let loads = PendingGuard::new(Arc::clone(state), &request_id);
-    let metrics = state.shared.metrics.request(
-        arrival,
-        subs.first()
-            .and_then(TokenSpeedGenerateStream::engine_index),
-        prompt_tokens,
-        max_tokens,
-        n,
-    );
+    // A client's request is in the load tracker's view (in flight on the
+    // rank its first choice went to, the choice that reports the prompt,
+    // from here until the engine's first output or the stream's end, each
+    // choice's prefill sampled on the servicer's clock from here to its
+    // first output: this wire carries no engine timing) and in the request
+    // metrics; the servicer's own health probe is in neither.
+    let (probe, loads, metrics) = match origin {
+        RequestOrigin::Client => {
+            let at = Instant::now();
+            let rank = rank_of(
+                subs.iter()
+                    .find(|sub| sub.index() == 0)
+                    .or_else(|| subs.first())
+                    .and_then(TokenSpeedGenerateStream::engine_index),
+            );
+            (
+                state.shared.loads.submit(Submission {
+                    request_id: &request_id,
+                    rank,
+                    prompt_tokens,
+                    at,
+                }),
+                Some(PendingGuard::new(Arc::clone(state), &request_id)),
+                state.shared.metrics.request(
+                    arrival,
+                    subs.first()
+                        .and_then(TokenSpeedGenerateStream::engine_index),
+                    prompt_tokens,
+                    max_tokens,
+                    n,
+                ),
+            )
+        }
+        RequestOrigin::HealthProbe => (
+            PrefillProbe::default(),
+            None,
+            state.shared.metrics.uncounted(),
+        ),
+    };
     let mut choices = Choices::new();
     for sub in subs {
         // Each choice decodes its own text: the matcher is per sequence.
@@ -112,15 +126,12 @@ pub(super) async fn generate(
         };
         // Each choice's engine request went to its own rank (an unpinned
         // fan-out is placed per choice): its tokens are credited there.
-        let load = ChoiceLoad::new(
-            rank_of(sub.engine_index()),
-            sub.index(),
-            if sub.index() == 0 {
-                std::mem::take(&mut probe)
-            } else {
-                PrefillProbe::default()
-            },
-        );
+        let load = match origin {
+            RequestOrigin::Client => {
+                ChoiceLoad::new(rank_of(sub.engine_index()), sub.index(), probe)
+            }
+            RequestOrigin::HealthProbe => ChoiceLoad::uncounted(),
+        };
         choices.push(ChoiceStream::new(
             Arc::clone(&request_id),
             Arc::clone(state),

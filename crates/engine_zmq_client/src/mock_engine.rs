@@ -283,7 +283,6 @@ fn peer_identity(engine_id: &EngineId) -> Result<PeerIdentity> {
     })
 }
 
-/// Wait for a ZMQ endpoint to become connectable before dialing it.
 /// `step` under the mock's deadline; the error names the step that hung.
 async fn within<T>(step: &'static str, future: impl std::future::Future<Output = T>) -> Result<T> {
     timeout(MOCK_DEADLINE, future)
@@ -294,7 +293,11 @@ async fn within<T>(step: &'static str, future: impl std::future::Future<Output =
         })
 }
 
-async fn wait_for_endpoint(endpoint: &str) -> Result<()> {
+/// Wait for a ZMQ endpoint to become connectable before dialing it, for up
+/// to the mock's deadline: the frontend's bind of its socket file or its TCP
+/// port. `connect_to_frontend` waits once; a mock engine process whose dial
+/// should outlive the frontend's start waits in rounds of this first.
+pub async fn wait_for_endpoint(endpoint: &str) -> Result<()> {
     // A dial to an endpoint nothing listens on yet fails at once, so wait
     // for the frontend's bind: its socket file, or its TCP port.
     timeout(CONNECT_TIMEOUT, async {

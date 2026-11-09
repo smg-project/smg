@@ -12,7 +12,7 @@ use smg_grpc_client::{
 use tonic::{Request, Response, Status};
 
 use super::{embed, generate, info, State};
-use crate::{kv_events, rpc, BoxStream};
+use crate::{kv_events, rpc, servicer::RequestOrigin, BoxStream};
 
 /// What neither servicer serves: the msgpack wire has no adapter-loading
 /// message, and the Python servicer does not implement these RPCs either.
@@ -40,7 +40,13 @@ impl SglangScheduler for SglangService {
         request: Request<sg::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let trace_headers = crate::trace_context::trace_headers(request.metadata());
-        let stream = generate::generate(&self.state, request.into_inner(), trace_headers).await;
+        let stream = generate::generate(
+            &self.state,
+            request.into_inner(),
+            trace_headers,
+            RequestOrigin::Client,
+        )
+        .await;
         rpc::generated(&self.state, stream)
     }
 
@@ -57,7 +63,7 @@ impl SglangScheduler for SglangService {
         &self,
         _request: Request<sg::HealthCheckRequest>,
     ) -> Result<Response<sg::HealthCheckResponse>, Status> {
-        Ok(Response::new(info::health_check(&self.state)))
+        Ok(Response::new(info::health_check(&self.state).await))
     }
 
     async fn abort(

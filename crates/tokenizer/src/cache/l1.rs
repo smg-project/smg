@@ -36,7 +36,7 @@ use anyhow::anyhow;
 use blake3;
 use dashmap::DashMap;
 
-use super::activity::L1;
+use super::{activity::L1, sampler::Sampler};
 use crate::traits::{Encoder, Encoding, TokenIdType};
 
 /// Hash type for cache keys
@@ -366,12 +366,13 @@ enum Recency {
 
 /// A cached prefix entry
 /// Uses Arc<[TokenIdType]> for zero-copy access to tokens
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct CachedPrefix {
     /// The pre-computed token IDs for this prefix (Arc for zero-copy cloning)
     tokens: Arc<[TokenIdType]>,
-    /// Last access timestamp (for LRU eviction)
-    last_accessed: Arc<AtomicU64>,
+    /// Last access timestamp (for LRU eviction), stored through the entry's
+    /// shared reference: an atomic needs no box and no exclusive access.
+    last_accessed: AtomicU64,
     /// Size in bytes (for memory tracking during eviction)
     size_bytes: usize,
 }
@@ -434,8 +435,9 @@ pub struct L1Cache {
     /// Key: Blake3 hash of bytes[0..boundary]
     /// Value: Cached token IDs for that prefix
     shards: Vec<Arc<DashMap<Blake3Hash, CachedPrefix>>>,
-    /// Serializes admission, eviction and clear; busy writers skip caching.
-    admission: Mutex<()>,
+    /// The key of every entry, for uniform eviction sampling. Also the lock
+    /// that serializes admission, eviction and clear; busy writers skip caching.
+    admission: Mutex<Vec<Blake3Hash>>,
     /// Maximum retained-entry charge (boundary bytes plus token bytes).
     /// Excludes map/Arc overhead and allocations still held by readers.
     max_memory: usize,
@@ -450,6 +452,8 @@ pub struct L1Cache {
     fallbacks: AtomicU64,
     /// Monotonic counter for LRU timestamps
     access_counter: AtomicU64,
+    /// The eviction sampler's generator.
+    sampler: Sampler,
 }
 
 impl L1Cache {
@@ -459,13 +463,14 @@ impl L1Cache {
 
         Self {
             shards,
-            admission: Mutex::new(()),
+            admission: Mutex::new(Vec::new()),
             max_memory,
             current_memory: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             fallbacks: AtomicU64::new(0),
             access_counter: AtomicU64::new(0),
+            sampler: Sampler::new(),
         }
     }
 
@@ -541,7 +546,7 @@ impl L1Cache {
 
         // Search from the longest boundary to find the best match
         for (at, &seed) in seeds.iter().enumerate().rev() {
-            let shard_idx = seed.digest[0] as usize % NUM_SHARDS;
+            let shard_idx = Self::shard_of(&seed.digest);
 
             if let Some(entry) = self.shards[shard_idx].get(&seed.digest) {
                 // Update last accessed timestamp for LRU
@@ -762,6 +767,11 @@ impl L1Cache {
         self.access_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// The shard that holds `key`.
+    fn shard_of(key: &Blake3Hash) -> usize {
+        key[0] as usize % NUM_SHARDS
+    }
+
     fn insert_prefix_with(
         &self,
         hash_bytes: Blake3Hash,
@@ -779,10 +789,10 @@ impl L1Cache {
         if self.max_memory == 0 || size_bytes > self.max_memory {
             return;
         }
-        let Ok(_admission) = self.admission.try_lock() else {
+        let Ok(mut index) = self.admission.try_lock() else {
             return;
         };
-        let shard_idx = hash_bytes[0] as usize % NUM_SHARDS;
+        let shard_idx = Self::shard_of(&hash_bytes);
         // An existing hash already represents the same prefix. Avoid copying
         // or evicting it merely because another miss encoded it concurrently.
         if let Some(cached) = self.shards[shard_idx].get(&hash_bytes) {
@@ -792,9 +802,10 @@ impl L1Cache {
             return;
         }
         let current = self.current_memory.load(Ordering::Relaxed) as usize;
-        let available = self.max_memory - current;
+        // Saturating: an index that fell out of step with the shards must never read as room.
+        let available = self.max_memory.saturating_sub(current);
         if size_bytes > available {
-            self.evict_lru(size_bytes - available);
+            self.evict_lru(&mut index, size_bytes - available);
         }
         let last_accessed = match recency {
             Recency::Fresh => self.next_timestamp(),
@@ -802,70 +813,55 @@ impl L1Cache {
         };
         let cached = CachedPrefix {
             tokens: tokens.into(),
-            last_accessed: Arc::new(AtomicU64::new(last_accessed)),
+            last_accessed: AtomicU64::new(last_accessed),
             size_bytes,
         };
         self.shards[shard_idx].insert(hash_bytes, cached);
+        index.push(hash_bytes);
         self.current_memory
             .fetch_add(size_bytes as u64, Ordering::Relaxed);
     }
 
-    /// Evict least recently used entries using approximate LRU via random sampling
+    /// Evict least recently used entries using approximate LRU via uniform sampling
     ///
     /// This uses an approximate LRU strategy that's much faster than true LRU:
-    /// - Samples K random entries from the cache (K=32)
+    /// - Draws K positions of the key index uniformly (K=32), so every entry is a
+    ///   candidate at every round; every entry when the cache holds no more than K
     /// - Evicts the oldest entry among the samples
     /// - Repeats until enough space is freed
     ///
     /// This provides O(samples) complexity instead of O(total_entries * log(total_entries)),
-    /// avoiding latency spikes when eviction is triggered on large caches.
+    /// avoiding latency spikes when eviction is triggered on large caches, and a round
+    /// allocates nothing: K reads of the shards and one removal.
     ///
     /// The approximation is excellent in practice - sampling 32 entries from a large cache
     /// gives high probability of finding very old entries.
-    /// Caller holds admission, so removals and accounting cannot race writers or clear.
-    fn evict_lru(&self, space_needed: usize) {
+    /// Caller holds admission (`index` is its key list), so removals and accounting cannot
+    /// race writers or clear.
+    fn evict_lru(&self, index: &mut Vec<Blake3Hash>, space_needed: usize) {
         const SAMPLE_SIZE: usize = 32; // Number of entries to sample per eviction round
         let mut freed = 0usize;
-        let mut iteration = 0usize;
 
-        // Keep evicting until we have enough space
-        while freed < space_needed {
-            // Collect samples from shards
-            let mut samples: Vec<(usize, Blake3Hash, u64, usize)> = Vec::with_capacity(SAMPLE_SIZE);
-
-            // Sample entries across different shards
-            for i in 0..SAMPLE_SIZE {
-                // Distribute samples across shards using iteration and index for variety
-                let shard_idx = (iteration * SAMPLE_SIZE + i) % NUM_SHARDS;
-
-                // Get first entry from that shard (DashMap iteration order is arbitrary)
-                if let Some(entry) = self.shards[shard_idx].iter().next() {
-                    let hash = *entry.key();
-                    let timestamp = entry.value().last_accessed.load(Ordering::Relaxed);
-                    let size = entry.value().size_bytes;
-                    samples.push((shard_idx, hash, timestamp, size));
-                }
-            }
-
-            if samples.is_empty() {
-                // Cache is empty, nothing to evict
+        // Keep evicting until we have enough space, or the cache is empty. The oldest among the
+        // samples is the sampler's rule (`Sampler::oldest`), shared with the L0 cache.
+        while freed < space_needed && !index.is_empty() {
+            let Some(position) = self.sampler.oldest(index.len(), SAMPLE_SIZE, |position| {
+                let key = &index[position];
+                self.shards[Self::shard_of(key)]
+                    .get(key)
+                    .map_or(STALE, |entry| entry.last_accessed.load(Ordering::Relaxed))
+            }) else {
                 break;
-            }
+            };
 
-            // Find the oldest entry among samples
-            if let Some((shard_idx, hash, _, _)) =
-                samples.iter().min_by_key(|(_, _, ts, _)| ts).copied()
-            {
-                // Remove it
-                if let Some((_, removed)) = self.shards[shard_idx].remove(&hash) {
-                    L1.evict();
-                    freed += removed.size_bytes;
-                    self.current_memory
-                        .fetch_sub(removed.size_bytes as u64, Ordering::Relaxed);
-                }
+            // Remove it
+            let victim = index.swap_remove(position);
+            if let Some((_, removed)) = self.shards[Self::shard_of(&victim)].remove(&victim) {
+                L1.evict();
+                freed += removed.size_bytes;
+                self.current_memory
+                    .fetch_sub(removed.size_bytes as u64, Ordering::Relaxed);
             }
-
-            iteration += 1;
         }
     }
 
@@ -901,13 +897,14 @@ impl L1Cache {
 
     /// Clear retained entries and counters while excluding cache writers.
     pub fn clear(&self) {
-        let _admission = self
+        let mut index = self
             .admission
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         for shard in &self.shards {
             shard.clear();
         }
+        index.clear();
         self.current_memory.store(0, Ordering::Relaxed);
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
@@ -940,8 +937,8 @@ mod tests {
 
     #[test]
     fn a_speculative_entry_goes_before_the_ones_requests_matched() {
-        // Three entries fill the cache (one per shard: the sampler reads one
-        // entry per shard); the middle one is a speculation. The fourth needs
+        // Three entries fill the cache (the sampler reads every entry of a
+        // cache this small); the middle one is a speculation. The fourth needs
         // the room of one, and it is the speculation that goes.
         let tokens = [7u32; 100];
         let size = 10 + tokens.len() * size_of::<TokenIdType>();
@@ -975,6 +972,58 @@ mod tests {
         assert!(
             cache.shards[4].get(&hash(4)).is_some(),
             "the met speculation stays"
+        );
+    }
+
+    #[test]
+    fn eviction_takes_old_entries_wherever_they_sit_in_their_shards() {
+        // Sixteen entries per shard, inserted in order, so the first ones are
+        // the oldest; then sixty-four more, each needing the room of one. The
+        // sampler draws its candidates from every entry, so the newest quarter
+        // of the first ones stays and most of the oldest quarter goes. A
+        // sampler that reads each shard's first entry takes whatever sits
+        // there, and an old entry behind it is never a candidate.
+        let tokens = [7u32; 100];
+        let size = 10 + tokens.len() * size_of::<TokenIdType>();
+        let cache = L1Cache::new(256 * size);
+        let key = |shard: u8, k: u8| {
+            let mut key = [0u8; 32];
+            key[0] = shard;
+            key[1] = k;
+            key
+        };
+        for k in 0..16u8 {
+            for shard in 0..16u8 {
+                cache.insert_prefix(key(shard, k), 10, &tokens);
+            }
+        }
+        assert_eq!(cache.len(), 256);
+        for k in 16..20u8 {
+            for shard in 0..16u8 {
+                cache.insert_prefix(key(shard, k), 10, &tokens);
+            }
+        }
+        assert_eq!(
+            cache.len(),
+            256,
+            "each of the sixty-four inserts evicted one entry"
+        );
+        assert_eq!(
+            cache.admission.lock().unwrap().len(),
+            256,
+            "the key index holds exactly the shards' keys after the evictions"
+        );
+        let present = |shard: u8, k: u8| cache.shards[shard as usize].get(&key(shard, k)).is_some();
+        let quarter = |ks: std::ops::Range<u8>| {
+            (0..16u8).flat_map(move |shard| ks.clone().map(move |k| (shard, k)))
+        };
+        let newest_kept = quarter(12..16).filter(|&(s, k)| present(s, k)).count();
+        let oldest_gone = quarter(0..4).filter(|&(s, k)| !present(s, k)).count();
+        assert_eq!(newest_kept, 64, "every entry of the newest quarter stays");
+        assert!(
+            oldest_gone >= 48,
+            "{oldest_gone} of the oldest quarter's 64 entries went: the oldest of 32 uniform \
+             samples lies there almost every round"
         );
     }
 
@@ -1056,6 +1105,11 @@ mod tests {
             .sum();
         assert_eq!(cache.stats().memory_bytes, retained);
         assert!(retained <= 4096);
+        assert_eq!(
+            cache.admission.lock().unwrap().len(),
+            cache.len(),
+            "the key index holds exactly the shards' keys"
+        );
         cache.clear();
         assert_eq!(cache.stats().memory_bytes, 0);
         assert!(cache.is_empty());
@@ -1892,6 +1946,11 @@ mod tests {
                 .sum();
             assert_eq!(cache.stats().memory_bytes, retained);
             assert!(retained <= budget);
+            assert_eq!(
+                cache.admission.lock().unwrap().len(),
+                cache.len(),
+                "the key index holds exactly the shards' keys"
+            );
             cache.clear();
             assert!(cache.is_empty());
             assert_eq!(cache.stats().memory_bytes, 0);

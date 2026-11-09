@@ -29,7 +29,11 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 
 use crate::{
-    codec::{encode_msgpack, tensor::encode_with_aux_frames, OpaqueValue},
+    codec::{
+        add_request_capacity, encode_msgpack,
+        tensor::{decode_within_frame, encode_with_aux_frames},
+        OpaqueValue,
+    },
     error::Result,
     protocol::{
         control::{CONTROL_REPLY_SLIM_TAG, CONTROL_REPLY_WIRE_FIELDS},
@@ -122,12 +126,13 @@ impl EngineProtocol for TokenSpeedProtocol {
     /// frames ([`encode_with_aux_frames`]): the engine's `MsgpackDecoder`
     /// resolves a tensor's frame index against the message's frames, the
     /// payload being frame 0, as it resolves its own encoder's. A text
-    /// request, or one whose tensors are all small, keeps its one frame.
+    /// request, or one whose tensors are all small, keeps its one frame, in a
+    /// buffer sized from the prompt before the write.
     fn encode_add(
         request: &Self::Request,
         _layout: &SlimOutputLayout,
     ) -> Result<(Vec<u8>, Vec<Bytes>)> {
-        encode_with_aux_frames(request)
+        encode_with_aux_frames(request, add_request_capacity(request.input_ids.len()))
     }
 
     fn encode_abort(request_id: &str) -> Result<Vec<u8>> {
@@ -179,8 +184,10 @@ impl EngineProtocol for TokenSpeedProtocol {
                  has no tensor fields)"
             );
         }
-        let payload = frames.first().map(AsRef::as_ref).unwrap_or_default();
-        let batch = match decode_wire_output(payload, layout)? {
+        let empty = Bytes::new();
+        let frame = frames.first().unwrap_or(&empty);
+        // Within the frame's scope, so every request id is a view of it, not a copy.
+        let batch = match decode_within_frame(frame, || decode_wire_output(frame, layout))? {
             TokenSpeedWireOutput::Tokens(batch) => *batch,
             TokenSpeedWireOutput::ControlReply(reply) => {
                 return Ok(EngineBatch {
@@ -206,10 +213,11 @@ impl EngineProtocol for TokenSpeedProtocol {
         // TokenSpeed has no out-of-band finish channel: every finish is carried
         // by its own output. Reporting them here anyway keeps the batch shape
         // self-describing for consumers that only read the finished list.
+        // The one owned copy of an id, made at the finish alone.
         let finished_request_ids = outputs
             .iter()
             .filter(|output| output.finish_reason.is_some())
-            .map(|output| output.request_id.clone())
+            .map(|output| String::from(&output.request_id))
             .collect();
         Ok(EngineBatch {
             engine_index,
@@ -535,7 +543,7 @@ mod tests {
     /// one that does not.
     #[test]
     fn control_calls_ride_the_control_frame_and_replies_resolve_by_call_id() {
-        use crate::protocol::{control::ControlReplySlim, positional::vector_bytes};
+        use crate::{codec::hex, protocol::control::ControlReplySlim};
 
         let (frame, payload) =
             TokenSpeedProtocol::encode_utility(7, "flush_cache", &[OpaqueValue::F64(1.5)])
@@ -550,9 +558,9 @@ mod tests {
         // Byte for byte what the scheduler's msgspec decoder of the triple
         // takes, and what its `ControlReplySlim` struct emits for an accepted
         // flush and for a refused profiler stop: the captured vectors.
-        assert_eq!(payload, vector_bytes(FLUSH_CALL_VECTOR));
+        assert_eq!(payload, hex(FLUSH_CALL_VECTOR));
         let accepted = TokenSpeedProtocol::decode_batch(
-            &[Bytes::from(vector_bytes(CONTROL_REPLY_ACCEPTED_VECTOR))],
+            &[Bytes::from(hex(CONTROL_REPLY_ACCEPTED_VECTOR))],
             &SlimOutputLayout::default(),
         )
         .unwrap();
@@ -566,8 +574,7 @@ mod tests {
                 (OpaqueValue::from("message"), OpaqueValue::Nil),
             ]
         );
-        let refused: ControlReplySlim =
-            decode_msgpack(&vector_bytes(CONTROL_REPLY_REFUSED_VECTOR)).unwrap();
+        let refused: ControlReplySlim = decode_msgpack(&hex(CONTROL_REPLY_REFUSED_VECTOR)).unwrap();
         assert_eq!(
             refused,
             ControlReplySlim {
@@ -585,7 +592,7 @@ mod tests {
         };
         assert_eq!(
             encode_msgpack(&accepted_reply).unwrap(),
-            vector_bytes(CONTROL_REPLY_ACCEPTED_VECTOR)
+            hex(CONTROL_REPLY_ACCEPTED_VECTOR)
         );
 
         let reply = ControlReplySlim {

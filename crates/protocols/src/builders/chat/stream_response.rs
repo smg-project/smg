@@ -2,6 +2,7 @@
 //!
 //! Provides an ergonomic fluent API for constructing streaming chat completion responses.
 
+use super::response::now_unix_seconds;
 use crate::{
     chat::*,
     common::{FunctionCallDelta, ToolCallDelta, Usage},
@@ -15,7 +16,9 @@ use crate::{
 pub struct ChatCompletionStreamResponseBuilder {
     id: String,
     object: String,
-    created: u64,
+    /// `None` until set: the wall clock is read at `build()` then, not for
+    /// a caller that sets the request's own stamp.
+    created: Option<u64>,
     model: String,
     choices: Vec<ChatStreamChoice>,
     usage: Option<Usage>,
@@ -32,7 +35,7 @@ impl ChatCompletionStreamResponseBuilder {
         Self {
             id: id.into(),
             object: "chat.completion.chunk".to_string(),
-            created: chrono::Utc::now().timestamp() as u64,
+            created: None,
             model: model.into(),
             choices: Vec::new(),
             usage: None,
@@ -54,9 +57,9 @@ impl ChatCompletionStreamResponseBuilder {
         self
     }
 
-    /// Set the creation timestamp (default: current time)
+    /// Set the creation timestamp (default: the time of `build()`)
     pub fn created(mut self, timestamp: u64) -> Self {
-        self.created = timestamp;
+        self.created = Some(timestamp);
         self
     }
 
@@ -238,7 +241,7 @@ impl ChatCompletionStreamResponseBuilder {
         ChatCompletionStreamResponse {
             id: self.id,
             object: self.object,
-            created: self.created,
+            created: self.created.unwrap_or_else(now_unix_seconds),
             model: self.model,
             system_fingerprint: self.system_fingerprint,
             choices: self.choices,
@@ -312,6 +315,19 @@ mod tests {
             .build();
 
         assert_eq!(chunk.choices.len(), 4); // role + 2 content + finish
+    }
+
+    /// `created` is the time of the build unless the caller set the
+    /// request's own stamp: the clock is read only when nobody did.
+    #[test]
+    fn created_is_the_build_time_unless_set() {
+        let before = now_unix_seconds();
+        let built = ChatCompletionStreamResponseBuilder::new("chatcmpl_1", "m").build();
+        assert!((before..=now_unix_seconds()).contains(&built.created));
+        let set = ChatCompletionStreamResponseBuilder::new("chatcmpl_1", "m")
+            .created(1_700_000_000)
+            .build();
+        assert_eq!(set.created, 1_700_000_000);
     }
 
     #[test]

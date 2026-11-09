@@ -8,8 +8,8 @@ use tracing::{debug, warn};
 
 use crate::{
     request_fields::{
-        completion_constraint, plain_constraint, response_format_schema, stop_strings,
-        ConstraintKind, PlainSampling,
+        body_format, completion_constraint, logit_bias_by_token_text, plain_constraint,
+        stop_strings, ConstraintKind, FormatSetAside, OutputConstraint, PlainSampling,
     },
     BoxedTraceInjector,
 };
@@ -38,6 +38,9 @@ pub struct SglangSchedulerClient {
 pub struct SglangGenerateRequestOptions {
     pub multimodal_inputs: Option<proto::MultimodalInputs>,
     pub tool_call_constraint: Option<(String, String)>,
+    /// Which of a chat body's own format fields `tool_call_constraint`
+    /// answers, read as absent; a Messages body names none.
+    pub format_set_aside: FormatSetAside,
     pub require_reasoning: bool,
 }
 
@@ -197,8 +200,13 @@ impl SglangSchedulerClient {
         options: SglangGenerateRequestOptions,
     ) -> Result<proto::GenerateRequest, String> {
         // Build sampling params
-        let sampling_params =
-            Self::build_grpc_sampling_params_from_chat(body, options.tool_call_constraint)?;
+        let sampling_params = Self::build_grpc_sampling_params_from_chat(
+            body,
+            OutputConstraint {
+                tool: options.tool_call_constraint,
+                set_aside: options.format_set_aside,
+            },
+        )?;
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -332,7 +340,7 @@ impl SglangSchedulerClient {
     /// Build gRPC SamplingParams from ChatCompletionRequest
     fn build_grpc_sampling_params_from_chat(
         request: &ChatCompletionRequest,
-        tool_call_constraint: Option<(String, String)>,
+        constraint: OutputConstraint,
     ) -> Result<proto::SamplingParams, String> {
         let stop_sequences = stop_strings(request.stop.as_ref());
 
@@ -358,7 +366,8 @@ impl SglangSchedulerClient {
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
             n: request.n.unwrap_or(1),
-            constraint: Self::build_constraint_for_chat(request, tool_call_constraint)?,
+            logit_bias: logit_bias_by_token_text(request.logit_bias.as_ref()),
+            constraint: Self::build_constraint_for_chat(request, constraint)?,
             ..Default::default()
         })
     }
@@ -366,28 +375,29 @@ impl SglangSchedulerClient {
     /// Build constraint for structured generation
     fn build_constraint_for_chat(
         request: &ChatCompletionRequest,
-        tool_call_constraint: Option<(String, String)>,
+        OutputConstraint { tool, set_aside }: OutputConstraint,
     ) -> Result<Option<proto::sampling_params::Constraint>, String> {
         let mut constraints = Vec::new();
 
-        if let Some(schema) = response_format_schema(request)? {
+        let format = body_format(request, set_aside)?;
+        if let Some(schema) = format.schema {
             constraints.push(proto::sampling_params::Constraint::JsonSchema(schema));
         }
 
-        if let Some(ebnf) = &request.ebnf {
+        if let Some(ebnf) = format.ebnf {
             constraints.push(proto::sampling_params::Constraint::EbnfGrammar(
-                ebnf.clone(),
+                ebnf.to_string(),
             ));
         }
 
-        if let Some(regex) = &request.regex {
-            constraints.push(proto::sampling_params::Constraint::Regex(regex.clone()));
+        if let Some(regex) = format.regex {
+            constraints.push(proto::sampling_params::Constraint::Regex(regex.to_string()));
         }
 
         // Handle tool call constraint from preparation stage.
         // If response_format already set a constraint, drop the tool constraint
         // (matches SGLang HTTP behavior where response_format takes priority).
-        if let Some((constraint_type, constraint_value)) = tool_call_constraint {
+        if let Some((constraint_type, constraint_value)) = tool {
             if constraints.is_empty() {
                 let tool_constraint = match constraint_type.as_str() {
                     "structural_tag" => {
@@ -627,6 +637,7 @@ impl SglangSchedulerClient {
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
             n: request.n.unwrap_or(1),
+            logit_bias: logit_bias_by_token_text(request.logit_bias.as_ref()),
             constraint,
             ..Default::default()
         })
@@ -715,6 +726,7 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             max_total_num_tokens: load.max_total_num_tokens,
             token_usage: load.token_usage,
             active_token_usage: None,
+            num_resident_tokens: None,
             gen_throughput: load.gen_throughput,
             prefill_throughput: load.prefill_throughput,
             cache_hit_rate: load.cache_hit_rate,
@@ -790,6 +802,38 @@ mod tests {
         assert_eq!(params.repetition_penalty, 1.0);
         assert_eq!(params.n, 1);
         assert!(params.constraint.is_none() && params.logit_bias.is_empty());
+    }
+
+    /// A chat or completion request's `logit_bias` reaches the proto keyed by
+    /// the token id's text; a request without one sends an empty map.
+    #[test]
+    fn chat_and_completion_sampling_params_carry_logit_bias() {
+        let bias = json!({"1": -100, "2": 100});
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "logit_bias": bias
+        }))
+        .expect("a chat request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_chat(
+            &chat,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.logit_bias["1"], -100.0);
+        assert_eq!(params.logit_bias["2"], 100.0);
+        assert_eq!(params.logit_bias.len(), 2);
+        let completion: CompletionRequest = serde_json::from_value(json!({
+            "model": "m", "prompt": "hi", "logit_bias": bias
+        }))
+        .expect("a completion request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_completion(&completion)
+            .expect("build sampling params");
+        assert_eq!(params.logit_bias["1"], -100.0);
+        assert_eq!(params.logit_bias.len(), 2);
+        let plain: CompletionRequest =
+            serde_json::from_value(json!({"model": "m", "prompt": "hi"})).expect("a request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_completion(&plain)
+            .expect("build sampling params");
+        assert!(params.logit_bias.is_empty());
     }
 
     #[test]
@@ -1137,6 +1181,58 @@ mod tests {
     }
 
     // TODO: ModelInfo not in current proto - skip test
+
+    /// A `response_format` set aside for the builder reads as absent: the tag
+    /// stays the one constraint, where the body's schema wins when nothing is
+    /// set aside.
+    #[test]
+    fn a_response_format_set_aside_leaves_the_tag_as_the_one_constraint() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "a", "schema": {"type": "object"}}}
+        }))
+        .expect("a chat request");
+        let tag = Some(("structural_tag".to_string(), "tag".to_string()));
+        let constraint_of = |options: SglangGenerateRequestOptions| {
+            SglangSchedulerClient::build_generate_request_from_chat_parts(
+                "id".to_string(),
+                &request,
+                "hi".to_string(),
+                vec![1],
+                options,
+            )
+            .expect("built")
+            .sampling_params
+            .expect("sampling params")
+            .constraint
+        };
+
+        // The body's own format wins over a tool constraint on this engine.
+        assert_eq!(
+            constraint_of(SglangGenerateRequestOptions {
+                tool_call_constraint: tag.clone(),
+                ..Default::default()
+            }),
+            Some(proto::sampling_params::Constraint::JsonSchema(
+                r#"{"type":"object"}"#.to_string()
+            ))
+        );
+        // Set aside, it is not read, and the tag that answers it is the constraint.
+        assert_eq!(
+            constraint_of(SglangGenerateRequestOptions {
+                tool_call_constraint: tag,
+                format_set_aside: FormatSetAside {
+                    response_format: true,
+                    grammar: false,
+                },
+                ..Default::default()
+            }),
+            Some(proto::sampling_params::Constraint::StructuralTag(
+                "tag".to_string()
+            ))
+        );
+    }
 
     /// Each constraint kind reaches the engine as its own variant; none stays none.
     #[test]

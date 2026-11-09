@@ -325,12 +325,12 @@ pub(crate) mod probe {
 
 #[cfg(test)]
 mod tests {
-    use axum::{body::to_bytes, http::StatusCode};
+    use axum::http::StatusCode;
     use metrics_exporter_prometheus::PrometheusBuilder;
 
     use super::{probe::counted_failure, *};
     use crate::test_support::{
-        RefusedAddress, StubWorker, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL,
+        text_of, upstream, RefusedAddress, StubWorker, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL,
     };
 
     const UPSTREAM_REFUSAL: &str = r#"{"error":{"message":"Rate limit reached for model in organization org-abc123 project proj_xyz789","type":"rate_limit","code":"rate_limit_exceeded"}}"#;
@@ -339,18 +339,10 @@ mod tests {
     /// the operator's organization and project gone.
     #[tokio::test]
     async fn an_upstream_errors_body_loses_the_operators_identifiers() {
-        let upstream = reqwest::Response::from(
-            http::Response::builder()
-                .status(429)
-                .body(reqwest::Body::from(UPSTREAM_REFUSAL))
-                .expect("a response"),
-        );
-        let response = handle_error_response(upstream, "m", Instant::now()).await;
+        let refusal = upstream(429, None, UPSTREAM_REFUSAL);
+        let response = handle_error_response(refusal, "m", Instant::now()).await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("a body");
-        let text = std::str::from_utf8(&body).expect("utf-8");
+        let text = text_of(response).await;
         assert!(!text.contains("org-abc123"), "{text}");
         assert!(!text.contains("proj_xyz789"), "{text}");
         assert!(text.contains("Rate limit reached for model"), "{text}");

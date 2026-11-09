@@ -22,7 +22,10 @@ use crate::{
     routers::{
         common::placement::{self, PipelinePin, NO_MEDIA_REF_CAPABLE_WORKER_CODE},
         error,
-        grpc::context::WorkerSelection,
+        grpc::{
+            common::stages::pd_protocol::{EncodeHandoff, PdProtocol},
+            context::WorkerSelection,
+        },
     },
     worker::{ConnectionMode, RuntimeType, Worker, WorkerRegistry, WorkerType},
 };
@@ -219,6 +222,15 @@ pub(crate) fn worker_accepts_media_refs(worker: &dyn Worker) -> bool {
                     .eq_ignore_ascii_case(GATEWAY_PIPELINE_PROCESSOR),
                 _ => false,
             })
+}
+
+pub(crate) fn worker_supports_ec_transfer(worker: &dyn Worker) -> bool {
+    worker
+        .metadata()
+        .spec
+        .labels
+        .get("supports_ec_transfer")
+        .is_some_and(|value| value == "true")
 }
 
 /// Whether `worker` processes media references with the gateway's own
@@ -497,16 +509,26 @@ pub(crate) fn resolve_mm_processing(
                 // Every registered worker, healthy or not: a health flap must
                 // not flip a model between modes request to request.
                 let workers = registry.get_by_model(model_id);
-                // On an encode-prefill-decode pool references never travel
-                // (`pool_has_encode_worker`), whatever its workers advertise:
-                // the router processes the media itself rather than resolve
-                // to a mode selection would refuse.
+                // An encode pool whose encoders take references under a
+                // push handoff processes them itself; its prefill/decode
+                // workers consume the identity and need no media processor.
                 let epd = pool_has_encode_worker(workers.iter());
-                let uniform = !workers.is_empty()
-                    && !epd
+                let push_encode = epd
                     && workers
                         .iter()
-                        .all(|worker| worker_accepts_media_refs(worker.as_ref()));
+                        .filter(|worker| *worker.worker_type() == WorkerType::Encode)
+                        .all(|worker| {
+                            PdProtocol::encode_handoff(worker.metadata().spec.runtime_type)
+                                == Some(EncodeHandoff::Push)
+                                && worker_supports_ec_transfer(worker.as_ref())
+                                && worker_accepts_media_refs(worker.as_ref())
+                        });
+                let uniform = push_encode
+                    || (!workers.is_empty()
+                        && !epd
+                        && workers
+                            .iter()
+                            .all(|worker| worker_accepts_media_refs(worker.as_ref())));
                 // The gateway's own pipeline on every worker expands any
                 // spec's anchor; a fleet mixing it with the engine's
                 // processors keeps the spec's opt-in.
@@ -570,6 +592,13 @@ pub(crate) fn ensure_selection_supports_media_refs(
     let needs_pipeline = pin == PipelinePin::Only;
     let workers: Vec<&dyn Worker> = match workers {
         WorkerSelection::Single { worker } => vec![worker.as_ref()],
+        WorkerSelection::Disaggregated {
+            encode_assignments: Some(assignments),
+            ..
+        } if !assignments.is_empty() => assignments
+            .iter()
+            .map(|assignment| assignment.worker.as_ref())
+            .collect(),
         WorkerSelection::Disaggregated {
             prefill, decode, ..
         } => vec![prefill.as_ref(), decode.as_ref()],

@@ -642,7 +642,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType};
+    use crate::worker::{test_support::worker_of, WorkerType};
 
     #[test]
     fn test_drop_stops_adjustment_thread() {
@@ -823,14 +823,7 @@ mod tests {
 
     fn prefill_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
         urls.iter()
-            .map(|url| {
-                Arc::new(
-                    BasicWorkerBuilder::new(*url)
-                        .worker_type(WorkerType::Prefill)
-                        .health_config(no_health_check())
-                        .build(),
-                ) as Arc<dyn Worker>
-            })
+            .map(|url| worker_of(url, WorkerType::Prefill))
             .collect()
     }
 

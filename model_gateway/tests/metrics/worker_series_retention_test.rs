@@ -11,27 +11,16 @@
 //! The recorder is this binary's, installed once for all its tests (see
 //! `recorder()` in the group's `mod.rs`).
 
-#![expect(clippy::expect_used, reason = "test failures should panic")]
-
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 
 use smg::{
     observability::{metrics::Metrics, metrics_server::start_metrics_server},
     worker::{BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType},
 };
 
-const URL: &str = "grpc://[fd00::1]:50051";
+use crate::common::test_app::scrape;
 
-async fn scrape(addr: SocketAddr) -> String {
-    smg::clients::http_client()
-        .get(format!("http://{addr}/metrics"))
-        .send()
-        .await
-        .expect("metrics endpoint reachable")
-        .text()
-        .await
-        .expect("metrics body")
-}
+const URL: &str = "grpc://[fd00::1]:50051";
 
 /// The sample lines of `body` that carry the worker's label.
 fn worker_lines(body: &str) -> Vec<&str> {

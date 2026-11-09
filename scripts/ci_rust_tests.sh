@@ -151,8 +151,6 @@ commands_of() {
             # One invocation for both packages: on its own, the harness's `-p` would unify the gateway
             # down to the harness's feature set and build the gateway lib a second time.
             echo "-p smg -p smg-test-harness --lib --bin smg"
-            # Reuse the gateway unit-test build for the opt-in mixed-media video regression.
-            echo "-p smg -p smg-test-harness --lib sglang_mixed_media_preserves_interleaved_anchors :: --ignored"
             echo "-p smg --doc" ;;
         gateway-[0-9]*)
             local index=${shard#gateway-} selectors
@@ -192,7 +190,7 @@ commands_of() {
 }
 
 run_commands() {
-    local shard=$1 mode=$2 line cargo_args test_args commands
+    local shard=$1 mode=$2 line cargo_args test_args commands status=0
     # Assigned first: a process substitution would hide a failure of commands_of.
     commands=$(commands_of "$shard")
     while IFS= read -r line; do
@@ -205,14 +203,22 @@ run_commands() {
             case " $cargo_args " in *" --doc "*) continue ;; esac
             # shellcheck disable=SC2086
             (set -x; cargo test $cargo_args --no-run)
+        # A shard names several binaries per invocation and may run several
+        # invocations: without --no-fail-fast cargo stops at the first binary that
+        # fails, and under the script's errexit a failed invocation would end this
+        # function before the next one, so a red early in the shard would hide the
+        # results after it. Every binary of every invocation runs; the status of a
+        # failed one is kept and returned at the end, so the shard still fails
+        # when any binary did.
         elif [ -n "$test_args" ]; then
             # shellcheck disable=SC2086
-            (set -x; cargo test $cargo_args -- $test_args)
+            (set -x; cargo test --no-fail-fast $cargo_args -- $test_args) || status=$?
         else
             # shellcheck disable=SC2086
-            (set -x; cargo test $cargo_args)
+            (set -x; cargo test --no-fail-fast $cargo_args) || status=$?
         fi
     done <<< "$commands"
+    return "$status"
 }
 
 lint() {

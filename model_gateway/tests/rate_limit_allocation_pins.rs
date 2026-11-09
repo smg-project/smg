@@ -112,9 +112,10 @@ async fn reserve_and_settle(
 }
 
 /// A reservation that takes the tenant-global bucket and a model rule's,
-/// settled: the boxed futures of the backend's reserve and settle calls and
-/// the handle, plus the rule's scope key (its rule id) when a rule matches;
-/// nothing per bucket beyond its key.
+/// settled: the shared handle alone, with or without a rule. The in-memory
+/// backend is called by static dispatch, so its reserve and settle build no
+/// boxed future, and a rule's scope key shares the rule's id with the
+/// compiled policy; nothing per bucket beyond its key.
 ///
 /// The map of active reservations is sharded, and a shard allocates its
 /// table on its first insert; which shard a charge id lands in follows the
@@ -175,6 +176,6 @@ fn a_reservation_with_a_model_rule_allocates_this_much() {
     eprintln!(
         "allocation calls per reservation: with a model rule {ruled}, tenant-global alone {plain}"
     );
-    assert_eq!(ruled, 4, "with a model rule");
-    assert_eq!(plain, 3, "tenant-global alone");
+    assert_eq!(ruled, 1, "with a model rule");
+    assert_eq!(plain, 1, "tenant-global alone");
 }

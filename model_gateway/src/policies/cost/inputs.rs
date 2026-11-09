@@ -29,16 +29,17 @@ pub struct CandidateInputs<'a> {
     pub idx: usize,
     /// Worker URL: the stable identity for deterministic tie-breaking and hashing.
     pub url: &'a str,
-    /// Prefix blocks this worker holds on the device tier (GPU), undecayed, or the deeper
-    /// placement the optimistic accounting predicts for it.
+    /// Prefix blocks this worker holds, undecayed, or the deeper placement the optimistic
+    /// accounting predicts for it. With KV events a block counts while a copy of it is on the
+    /// device or in the host cache the engine restores from, the two tiers not told apart.
     pub device_blocks: f64,
-    /// The host's decayed affinity score (device overlap after the waiting-prefill decay); what
-    /// the cache-aware decision ranks on.
+    /// The host's decayed affinity score (the overlap after the waiting-prefill decay); what the
+    /// cache-aware decision ranks on.
     pub effective_score: f64,
 }
 
 impl CandidateInputs<'_> {
-    /// Prompt tokens this worker would still have to prefill after its device-resident prefix.
+    /// Prompt tokens this worker would still have to prefill after the prefix it holds.
     pub fn uncached_prompt_tokens(&self, request: &RequestInputs<'_>) -> usize {
         let cached = (self.device_blocks.max(0.0) * request.block_size as f64) as usize;
         request.prompt_tokens.saturating_sub(cached)

@@ -18,8 +18,7 @@ use axum::{
 };
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-    common::StringOrArray,
-    completion::CompletionRequest,
+    completion::{CompletionPrompt, CompletionRequest},
     generate::GenerateRequest,
     responses::{ResponseInput, ResponsesRequest},
 };
@@ -64,7 +63,7 @@ fn create_minimal_chat_request() -> ChatCompletionRequest {
 fn create_minimal_completion_request() -> CompletionRequest {
     CompletionRequest {
         model: "gpt-3.5-turbo".to_string(),
-        prompt: StringOrArray::String("Hello".to_string()),
+        prompt: CompletionPrompt::Text("Hello".to_string()),
         suffix: None,
         max_tokens: Some(100),
         temperature: None,
@@ -158,7 +157,7 @@ async fn test_openai_router_models() {
         .body(Body::empty())
         .unwrap();
 
-    let response = list_models(&ctx, req.headers(), "req_test".to_string()).await;
+    let response = list_models(&ctx, req.headers(), None, "req_test".to_string()).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let (_, body) = response.into_parts();
@@ -974,7 +973,7 @@ async fn test_openai_router_models_from_registry() {
         .body(Body::empty())
         .unwrap();
 
-    let response = list_models(&ctx, req.headers(), "req_test".to_string()).await;
+    let response = list_models(&ctx, req.headers(), None, "req_test".to_string()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let (_, body) = response.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();

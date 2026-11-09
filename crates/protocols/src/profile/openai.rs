@@ -142,7 +142,9 @@ fn validate_json_object_prompt(
             | ChatMessage::Tool { content, .. }
             | ChatMessage::Root { content, .. } => Some(content),
             ChatMessage::Assistant { content, .. } => content.as_ref(),
-            ChatMessage::Function { content, .. } => return contains_json(content),
+            ChatMessage::Function { content, .. } => {
+                return content.as_deref().is_some_and(contains_json)
+            }
         };
         match content {
             Some(MessageContent::Text(text)) => contains_json(text),

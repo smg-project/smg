@@ -470,7 +470,7 @@ impl MultimodalComponents {
             "media fetch policy for router-side processing"
         );
         let media_connector = build_with(
-            || crate::clients::http_client_builder().timeout(std::time::Duration::from_secs(30)),
+            || crate::server::http_client_builder().timeout(std::time::Duration::from_secs(30)),
             false,
             "media HTTP client",
             |client| MediaConnector::new(client, connector_config.clone()),

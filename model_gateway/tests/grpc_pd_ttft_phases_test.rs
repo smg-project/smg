@@ -16,13 +16,17 @@
 //! Each case runs on a current-thread runtime under a thread-local Prometheus
 //! recorder, so the request path's emissions land in the rendered text.
 
-use std::{future::Future, time::Duration};
+use std::time::Duration;
 
-use common::grpc_harness::{
-    build_grpc_router, grpc_router_config, grpc_workers, serve_canned_worker, serve_engine, Canned,
+use common::{
+    decode_stream::produce_after,
+    engine_answers::{VllmAnswers, VllmGenerateStream},
+    grpc_harness::{
+        build_grpc_router, grpc_router_config, grpc_workers, serve_canned_worker, serve_engine,
+        Canned,
+    },
+    metrics_capture::render_after,
 };
-use metrics_exporter_prometheus::PrometheusBuilder;
-use proto::generate_response::Response as GenResp;
 use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
@@ -46,8 +50,6 @@ const DECODE_DELAY: Duration = Duration::from_millis(400);
 /// absorbed the other worker's delay fails its upper bound.
 const SLACK: Duration = Duration::from_millis(250);
 
-type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
-
 /// A sequential-dispatch mock engine: every generate call answers with
 /// `OUTPUT_TOKENS` chunks and a completion after `delay`. With `hold_headers`
 /// the call itself waits out the delay before it returns the stream, like an
@@ -59,70 +61,12 @@ struct DelayedEngine {
     hold_headers: bool,
 }
 
-fn chunk(id: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Chunk(proto::GenerateStreamChunk {
-            token_ids: vec![id],
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-fn complete() -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Complete(proto::GenerateComplete {
-            output_ids: (1..=OUTPUT_TOKENS).collect(),
-            finish_reason: "stop".to_string(),
-            prompt_tokens: 1,
-            completion_tokens: OUTPUT_TOKENS,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-/// Feed one generate stream: the tokens after `delay`, then the completion.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "test mock; the producer task ends with its stream"
-)]
-fn produce_after(tx: GenerateTx, delay: Duration) {
-    tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        for id in 1..=OUTPUT_TOKENS {
-            if tx.send(Ok(chunk(id))).await.is_err() {
-                return;
-            }
-        }
-        let _ = tx.send(Ok(complete())).await;
-    });
-}
-
 #[tonic::async_trait]
-impl proto::vllm_engine_server::VllmEngine for DelayedEngine {
-    async fn start_profile(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::StartProfileRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn stop_profile(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::StopProfileRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    type GenerateStream = ReceiverStream<Result<proto::GenerateResponse, Status>>;
-
+impl VllmAnswers for DelayedEngine {
     async fn generate(
         &self,
         _request: Request<proto::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<VllmGenerateStream>, Status> {
         let (tx, rx) = mpsc::channel(8);
         let in_stream_delay = if self.hold_headers {
             tokio::time::sleep(self.delay).await;
@@ -130,88 +74,14 @@ impl proto::vllm_engine_server::VllmEngine for DelayedEngine {
         } else {
             self.delay
         };
-        produce_after(tx, in_stream_delay);
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    async fn abort(
-        &self,
-        _request: Request<proto::AbortRequest>,
-    ) -> Result<Response<proto::AbortResponse>, Status> {
-        Ok(Response::new(proto::AbortResponse::default()))
-    }
-
-    async fn flush_cache(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::FlushCacheRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::FlushCacheResponse>, Status> {
-        Ok(Response::new(
-            smg_grpc_client::common_proto::FlushCacheResponse::default(),
-        ))
-    }
-
-    async fn embed(
-        &self,
-        _request: Request<proto::EmbedRequest>,
-    ) -> Result<Response<proto::EmbedResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn health_check(
-        &self,
-        _request: Request<proto::HealthCheckRequest>,
-    ) -> Result<Response<proto::HealthCheckResponse>, Status> {
-        Ok(Response::new(proto::HealthCheckResponse {
-            healthy: true,
-            ..Default::default()
-        }))
-    }
-
-    async fn get_model_info(
-        &self,
-        _request: Request<proto::GetModelInfoRequest>,
-    ) -> Result<Response<proto::GetModelInfoResponse>, Status> {
-        Ok(Response::new(proto::GetModelInfoResponse::default()))
-    }
-
-    async fn get_server_info(
-        &self,
-        _request: Request<proto::GetServerInfoRequest>,
-    ) -> Result<Response<proto::GetServerInfoResponse>, Status> {
-        Ok(Response::new(proto::GetServerInfoResponse::default()))
-    }
-
-    async fn get_loads(
-        &self,
-        _request: Request<proto::GetLoadsRequest>,
-    ) -> Result<Response<proto::GetLoadsResponse>, Status> {
-        Ok(Response::new(proto::GetLoadsResponse::default()))
-    }
-
-    type GetTokenizerStream =
-        ReceiverStream<Result<smg_grpc_client::common_proto::GetTokenizerChunk, Status>>;
-
-    async fn get_tokenizer(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    type SubscribeKvEventsStream =
-        ReceiverStream<Result<smg_grpc_client::common_proto::KvEventBatch, Status>>;
-
-    async fn subscribe_kv_events(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
+        produce_after(tx, in_stream_delay, OUTPUT_TOKENS);
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
 
 /// Serve a sequential-dispatch mock engine in-process; returns its port.
 async fn start_mock_engine(engine: DelayedEngine) -> u16 {
-    serve_engine(proto::vllm_engine_server::VllmEngineServer::new(engine)).await
+    serve_engine(engine.into_server()).await
 }
 
 /// Serve the mock-worker crate's canned worker in-process (a parallel-dispatch
@@ -273,7 +143,7 @@ impl Route {
     clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
-async fn one_streaming_request(router: &dyn RouterTrait, route: Route) {
+async fn one_streaming_request(router: &dyn RouterTrait, route: Route) -> String {
     let response = match route {
         Route::Chat => {
             let request = serde_json::from_value(serde_json::json!({
@@ -281,6 +151,7 @@ async fn one_streaming_request(router: &dyn RouterTrait, route: Route) {
                 "messages": [{"role": "user", "content": "Hello world"}],
                 "max_tokens": 8,
                 "stream": true,
+                "stream_options": {"include_usage": true},
             }))
             .unwrap();
             router.route_chat(None, &tenant(), request, MODEL).await
@@ -319,34 +190,39 @@ async fn one_streaming_request(router: &dyn RouterTrait, route: Route) {
         Route::Messages => body.contains("event: message_stop"),
     };
     assert!(ended, "{body}");
+    body
 }
 
-/// One streaming chat through `router`, read to its `[DONE]`.
-async fn one_streaming_chat(router: &dyn RouterTrait) {
-    one_streaming_request(router, Route::Chat).await;
-}
-
-/// Run `case` on a current-thread runtime under a thread-local recorder and
-/// return the rendered `/metrics` text.
+/// A chat stream's content deltas and the completion count of its usage
+/// chunk: every `data:` line but the terminator is one chunk.
 #[expect(
     clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
+    reason = "test helper - a chunk that is not JSON fails the test"
 )]
-fn render_after<F, Fut>(case: F) -> String
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let handle = recorder.handle();
-    metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("current-thread runtime");
-        rt.block_on(case());
-    });
-    handle.render()
+fn chat_stream_counts(body: &str) -> (u32, Option<u64>) {
+    let mut deltas = 0;
+    let mut completion_tokens = None;
+    for data in body.lines().filter_map(|line| line.strip_prefix("data: ")) {
+        if data == "[DONE]" {
+            continue;
+        }
+        let chunk: serde_json::Value = serde_json::from_str(data).expect("a JSON chunk");
+        if chunk["choices"][0]["delta"]["content"]
+            .as_str()
+            .is_some_and(|content| !content.is_empty())
+        {
+            deltas += 1;
+        }
+        if let Some(count) = chunk["usage"]["completion_tokens"].as_u64() {
+            completion_tokens = Some(count);
+        }
+    }
+    (deltas, completion_tokens)
+}
+
+/// One streaming chat through `router`, read to its `[DONE]`: the body.
+async fn one_streaming_chat(router: &dyn RouterTrait) -> String {
+    one_streaming_request(router, Route::Chat).await
 }
 
 /// The `_sum` or `_count` sample of `family` whose labels contain `label`, if
@@ -430,7 +306,8 @@ fn report(label: &str, phases: &Phases) {
 /// Sequential dispatch with a worker that returns its stream at once: the
 /// prefill phase carries the prefill worker's delay, the relay phase is the
 /// gateway's own work, the decode phase carries the decode worker's delay,
-/// and the three add up to the TTFT exactly.
+/// and the three add up to the TTFT exactly. The stream carries one content
+/// delta per scripted token and the decode's completion count in its usage.
 #[test]
 fn sequential_dispatch_phases_add_up_to_the_pd_ttft() {
     let rendered = render_after(|| async {
@@ -445,7 +322,17 @@ fn sequential_dispatch_phases_add_up_to_the_pd_ttft() {
         })
         .await;
         let router = build_pd_router(prefill, decode, RuntimeType::Vllm).await;
-        one_streaming_chat(router.as_ref()).await;
+        let body = one_streaming_chat(router.as_ref()).await;
+        let (deltas, completion_tokens) = chat_stream_counts(&body);
+        assert_eq!(
+            deltas, OUTPUT_TOKENS,
+            "one content delta per scripted token: {body}"
+        );
+        assert_eq!(
+            completion_tokens,
+            Some(u64::from(OUTPUT_TOKENS)),
+            "the usage chunk carries the decode's completion count: {body}"
+        );
     });
     let phases = Phases::of(&rendered, RuntimeType::Vllm.as_str());
     report("sequential, eager headers", &phases);

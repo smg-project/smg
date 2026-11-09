@@ -156,7 +156,7 @@ fn batch(
     matched: Option<MatchedStop>,
 ) -> BatchTokenIDSlimOutput {
     BatchTokenIDSlimOutput {
-        rids: vec![rid.to_string()],
+        rids: vec![rid.into()],
         output_ids: vec![tokens],
         finished_reasons: vec![finish.unwrap_or_default().to_string()],
         finished_messages: vec![None],
@@ -756,6 +756,15 @@ async fn the_unimplemented_rpcs_say_why() {
         .expect_err("no publisher");
     assert_eq!(events.code(), Code::Unimplemented);
     assert_eq!(events.message(), kv_events::TRTLLM_DISABLED_MESSAGE);
+    // The refusal says what is served and what is not: the load records
+    // (served since the records-only stream) and the KV events, with the
+    // reason, never that the RPC is unimplemented.
+    assert!(
+        events.message().contains("loads_only")
+            && events.message().contains("no publisher endpoint")
+            && !events.message().contains("not implemented"),
+        "{events}"
+    );
     let bundle = h
         .client
         .get_tokenizer(common::GetTokenizerRequest::default())
@@ -1145,8 +1154,8 @@ async fn the_loads_and_the_record_carry_the_servicers_estimate_of_queued_work_ra
 /// calibrate the rank's input capacity on the servicer's clock, and
 /// `GetLoads` and the pushed record carry it with the figures the load tail
 /// does not (queued work, hit rate, generation rate). A request handed over
-/// behind one still in flight, or while the last tail shows the window full,
-/// takes no sample.
+/// behind one still in flight samples too: its wait is the other's prefill,
+/// which the union counts once.
 #[tokio::test]
 async fn prefill_capacity_is_measured_on_the_servicers_clock_and_published() {
     let mut h = harness(model_info()).await;
@@ -1189,8 +1198,9 @@ async fn prefill_capacity_is_measured_on_the_servicers_clock_and_published() {
     assert_eq!(record.waiting_uncached_tokens, Some(0));
     assert_eq!(record.cache_hit_rate, Some(rank0.cache_hit_rate));
 
-    // `q1` meets no queue; `q2`, handed over while `q1` is in flight, does
-    // and counts as queued work until it starts.
+    // `q1` and `q2` are handed over together: `q2` counts as queued work
+    // until it starts, and both sample, `q2` from a submit that waited
+    // behind `q1`.
     let mut first = h
         .client
         .generate(generate_request("q1", true))
@@ -1206,14 +1216,14 @@ async fn prefill_capacity_is_measured_on_the_servicers_clock_and_published() {
         .into_inner();
     recv_add(&mut h.engine_in).await;
     assert_eq!(loads.pending(), 2);
-    // A would-be sample must clear the estimator's 1 ms rule: the batches
-    // below follow their submits by more than that.
+    // A sample must clear the estimator's 1 ms rule: the batches below
+    // follow their submits by more than that.
     tokio::time::sleep(Duration::from_millis(5)).await;
     let mut step = batch("q1", vec![10], 1, None, None);
     step.num_waiting = 1;
     send(&mut h.engine_out, &step).await;
     chunk(first.message().bounded().await.unwrap().unwrap());
-    assert_eq!(loads.prefill_samples(0), 3, "q1 met no queue");
+    assert_eq!(loads.prefill_samples(0), 3, "q1 sampled");
     let busy = h
         .client
         .get_loads(trt::GetLoadsRequest::default())
@@ -1226,30 +1236,10 @@ async fn prefill_capacity_is_measured_on_the_servicers_clock_and_published() {
     step.num_running = 2;
     send(&mut h.engine_out, &step).await;
     chunk(second.message().bounded().await.unwrap().unwrap());
-    assert_eq!(loads.prefill_samples(0), 3, "q2 waited behind q1");
-    // The last tail says the window is full while q1 and q2 still run: q3
-    // has nothing of ours queued ahead of it and still cannot vouch for an
-    // immediate admission.
-    let mut full = batch("q2", vec![12], 2, None, None);
-    full.num_running = 64;
-    send(&mut h.engine_out, &full).await;
-    chunk(second.message().bounded().await.unwrap().unwrap());
-    let mut third = h
-        .client
-        .generate(generate_request("q3", true))
-        .await
-        .unwrap()
-        .into_inner();
-    recv_add(&mut h.engine_in).await;
-    tokio::time::sleep(Duration::from_millis(5)).await;
-    let mut step = batch("q3", vec![13], 1, None, None);
-    step.num_running = 3;
-    send(&mut h.engine_out, &step).await;
-    chunk(third.message().bounded().await.unwrap().unwrap());
-    assert_eq!(loads.prefill_samples(0), 3, "the window was full");
+    assert_eq!(loads.prefill_samples(0), 4, "q2 sampled behind q1");
     // Every request finishes on the shim's word (a stream dropped mid-flight
     // would send the shim an abort frame).
-    for (id, stream) in [("q1", &mut first), ("q2", &mut second), ("q3", &mut third)] {
+    for (id, stream) in [("q1", &mut first), ("q2", &mut second)] {
         send(
             &mut h.engine_out,
             &batch(id, Vec::new(), 1, Some("length"), None),
@@ -1258,5 +1248,104 @@ async fn prefill_capacity_is_measured_on_the_servicers_clock_and_published() {
         while stream.message().bounded().await.unwrap().is_some() {}
     }
     assert_eq!(loads.pending(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A burst of 256 requests handed over together and answered together after
+/// one prefill batch reads the capacity of the whole batch: every one of
+/// them is a sample, merged into one busy period as they overlap, so 256 x 3
+/// computed tokens over the batch time (50 ms or more: at most 15,360 tokens
+/// per second), never below the run's own tokens over its wall time. A rule
+/// that sampled the burst's first arrival alone read one 256th; a ring of 64
+/// per-request samples read the newest 64 over the seconds of all.
+#[tokio::test]
+async fn a_burst_of_overlapping_prefills_reads_the_capacity_of_the_whole_batch() {
+    let mut h = harness(model_info()).await;
+    // A second channel: one carries at most 200 open streams.
+    let mut second = TrtllmServiceClient::new(grpc_channel(h.server.address()).await);
+    let loads = &h.server.state.shared.loads;
+    let batch_time = Duration::from_millis(50);
+    let started = Instant::now();
+    let ids: Vec<String> = (0..256).map(|index| format!("b{index}")).collect();
+    let mut streams = Vec::new();
+    for (index, id) in ids.iter().enumerate() {
+        let client = if index % 2 == 0 {
+            &mut h.client
+        } else {
+            &mut second
+        };
+        streams.push(
+            client
+                .generate(generate_request(id, true))
+                .await
+                .unwrap()
+                .into_inner(),
+        );
+        recv_add(&mut h.engine_in).await;
+    }
+    assert_eq!(loads.pending(), 256);
+    tokio::time::sleep(batch_time).await;
+    // The batch ends: every request's first (and last) output together.
+    for id in &ids {
+        let mut done = batch(id, vec![10], 1, Some("length"), None);
+        done.num_running = 256;
+        send(&mut h.engine_out, &done).await;
+    }
+    for stream in &mut streams {
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!(loads.pending(), 0);
+    let wall = started.elapsed().as_secs_f64();
+    let samples = loads.prefill_samples(0);
+    let polled = h
+        .client
+        .get_loads(trt::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let rate = polled.loads[0]
+        .prefill_throughput
+        .expect("the burst calibrates the rank");
+    assert_eq!(
+        samples, 256,
+        "every request of the burst is a sample ({rate} tokens per second)"
+    );
+    // 256 x 3 computed tokens: over a batch of 50 ms or more at most, over
+    // the run's whole wall time at least (the union never exceeds it).
+    let floor = 768.0 / wall;
+    assert!(
+        rate <= 15_360.0 && rate >= floor,
+        "{rate} tokens per second from {samples} samples, expected within [{floor}, 15360]"
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The record the relay attaches to a batch for a rank is the `GetLoads`
+/// entry of that rank, read alone (here before any load tail: the
+/// zero-filled entry with the capacity figures and the servicer's own
+/// estimate); `None` names rank 0; a rank past the connected ones has no
+/// record.
+#[tokio::test]
+async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
+    use crate::kv_events::RankLoads;
+
+    let mut h = harness(model_info()).await;
+    let idle = h
+        .client
+        .get_loads(trt::GetLoadsRequest {
+            dp_rank: Some(0),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let load = &idle.loads[0];
+    let mut expected = common::EngineLoad::from(load);
+    expected.waiting_uncached_tokens =
+        Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+    let state = &h.server.state;
+    assert_eq!(state.rank_load(Some(0)), Some(expected));
+    assert_eq!(state.rank_load(None), state.rank_load(Some(0)));
+    assert!(state.rank_load(Some(1)).is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

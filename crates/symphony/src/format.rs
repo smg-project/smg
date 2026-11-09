@@ -333,6 +333,11 @@ pub struct Format {
     scanner_markers: Arc<[String]>,
     states: Vec<State>,
     transitions: Vec<Transition>,
+    /// Parser-only boundary tolerance; grammars retain the canonical transitions.
+    leading_transitions: Vec<Transition>,
+    /// Parser-only recovery rows, followed after text as well, for a terminal the model writes
+    /// where the canonical rows have none; grammars retain the canonical transitions.
+    recovery_transitions: Vec<Transition>,
     calls: Option<CallSyntax>,
     /// Where a call's id comes from.
     call_id: CallId,
@@ -450,6 +455,8 @@ impl Format {
             scanner_markers: Arc::from([]),
             states: Vec::new(),
             transitions: Vec::new(),
+            leading_transitions: Vec::new(),
+            recovery_transitions: Vec::new(),
             calls: None,
             call_id: CallId::Minted,
             turn_opener: None,
@@ -544,7 +551,54 @@ impl Format {
             on: self.terminal_named(on),
             to: self.state_named(to),
         };
+        assert!(
+            !self
+                .recovery_transitions
+                .iter()
+                .any(|row| row.from == transition.from && row.on == transition.on),
+            "{}: a recovery row already reads {on} in {from}",
+            self.name
+        );
         self.transitions.push(transition);
+        self
+    }
+
+    /// Override a terminal's row only before substantive text in a stay. Once text begins,
+    /// the terminal is literal. Used for M3's boundary closers, not its generated grammar.
+    pub(crate) fn leading_transition(mut self, from: &str, on: &str, to: &str) -> Self {
+        let row = Transition {
+            from: self.state_named(from),
+            on: self.terminal_named(on),
+            to: self.state_named(to),
+        };
+        assert_eq!(self.emits(row.from), Emits::Content);
+        assert_eq!(self.emits(row.to), Emits::Content);
+        self.leading_transitions.push(row);
+        self
+    }
+
+    /// `from + on = to` for the parser alone: a terminal the model writes where the canonical
+    /// rows have none, read as the row says, after text as well (Kimi K3's answer closer inside
+    /// its thought). A grammar derived from the table keeps the canonical rows, so it never asks
+    /// the model for the shape.
+    pub(crate) fn recovery_transition(mut self, from: &str, on: &str, to: &str) -> Self {
+        let row = Transition {
+            from: self.state_named(from),
+            on: self.terminal_named(on),
+            to: self.state_named(to),
+        };
+        assert!(
+            self.next(row.from, row.on).is_none(),
+            "{}: a canonical row already reads {on} in {from}",
+            self.name
+        );
+        assert!(
+            self.emits(row.from) != Emits::Arguments && self.emits(row.to) != Emits::Arguments,
+            "{}: a recovery row may not touch an arguments state ({from} + {on} = {to}); the \
+             engine reads a call's rows from the canonical table alone",
+            self.name
+        );
+        self.recovery_transitions.push(row);
         self
     }
 
@@ -1169,7 +1223,7 @@ impl Format {
             match piece {
                 Piece::Marker(index) if self.ignored(index) => {}
                 Piece::Marker(index) => {
-                    if let Some(to) = self.next(state, index) {
+                    if let Some(to) = self.next_after_text(state, index, begun) {
                         (state, begun) = (to, false);
                     }
                 }
@@ -1288,14 +1342,14 @@ impl Format {
     /// with a whole structural token and is the beginning of a terminal that, whole, would move
     /// the engine out of `state` or be dropped where it stands. The beginning of a terminal the
     /// state has no row for is text, as the whole terminal would be.
-    pub(crate) fn is_cut_tag(&self, state: usize, tail: &str) -> bool {
+    pub(crate) fn is_cut_tag(&self, state: usize, tail: &str, begun: bool) -> bool {
         self.structural_tokens
             .iter()
             .any(|token| tail.starts_with(token.as_str()))
             && self.terminals.iter().enumerate().any(|(index, terminal)| {
                 terminal.text.len() > tail.len()
                     && terminal.text.starts_with(tail)
-                    && (terminal.ignored || self.next(state, index).is_some())
+                    && (terminal.ignored || self.next_after_text(state, index, begun).is_some())
             })
     }
 
@@ -1330,6 +1384,37 @@ impl Format {
             .iter()
             .find(|transition| transition.from == from && transition.on == on)
             .map(|transition| transition.to)
+    }
+
+    /// The parser's row, including boundary tolerance; shown markers retain their original
+    /// rows so requests without reasoning separation preserve every marker.
+    pub(crate) fn next_after_text(&self, from: usize, on: usize, begun: bool) -> Option<usize> {
+        if let Some(to) = self.leading_next(from, on) {
+            return (!begun).then_some(to);
+        }
+        self.next(from, on).or_else(|| self.recovery_next(from, on))
+    }
+
+    /// A parser-only recovery row, unless the request shows the marker as text.
+    pub(crate) fn recovery_next(&self, from: usize, on: usize) -> Option<usize> {
+        if self.recovery_transitions.is_empty() || self.shown(on) {
+            return None;
+        }
+        self.recovery_transitions
+            .iter()
+            .find(|row| row.from == from && row.on == on)
+            .map(|row| row.to)
+    }
+
+    /// Find a parser-only boundary row unless the request preserves reasoning markers.
+    pub(crate) fn leading_next(&self, from: usize, on: usize) -> Option<usize> {
+        if self.leading_transitions.is_empty() || self.shown(on) {
+            return None;
+        }
+        self.leading_transitions
+            .iter()
+            .find(|row| row.from == from && row.on == on)
+            .map(|row| row.to)
     }
 
     /// Every row of the table as `(from, on, to)`, in the order the rows were added.

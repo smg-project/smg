@@ -281,6 +281,81 @@ pub(crate) fn invalid(
     e
 }
 
+/// The parameter under which a validation error of a rule checked across
+/// fields names the field the refusal is about: the error envelope's
+/// `param`. The validator crate files such a rule's error under the whole
+/// request (`__all__`), a key that names no field.
+pub(crate) const FIELD_PARAM: &str = "field";
+
+/// [`invalid`] for a rule checked across fields, naming the field the
+/// refusal is about (the envelope's `param`); the message names it too, in
+/// the public API's words.
+pub(crate) fn invalid_at(
+    field: impl Into<String>,
+    code: &'static str,
+    message: impl Into<Cow<'static, str>>,
+) -> validator::ValidationError {
+    on_field(invalid(code, message), field)
+}
+
+/// `error`, naming `field` as the field it is about (see [`invalid_at`]).
+pub(crate) fn on_field(
+    mut error: validator::ValidationError,
+    field: impl Into<String>,
+) -> validator::ValidationError {
+    error.add_param(Cow::Borrowed(FIELD_PARAM), &field.into());
+    error
+}
+
+/// Validates `logit_bias` as the public API bounds it: every key a
+/// non-negative integer token id, no two keys spelling one id (`"5"` and
+/// `"05"` would reach an engine as one entry with either bias), every bias
+/// within -100..=100 (a bias of -100 bans the token, 100 forces it). Used by
+/// the chat and the completion request; the serving path bounds the ids by
+/// the model's vocabulary before the map reaches an engine.
+pub fn validate_logit_bias(bias: &HashMap<String, f32>) -> Result<(), validator::ValidationError> {
+    // The key first seen for each token id.
+    let mut keys_by_id = HashMap::with_capacity(bias.len());
+    for (key, bias) in bias {
+        let Some(id) = key.parse::<i32>().ok().filter(|id| *id >= 0) else {
+            return Err(invalid(
+                "logit_bias_invalid_key",
+                format!(
+                    "Invalid key in 'logit_bias': '{key}'; keys must be non-negative integer token \
+                     ids"
+                ),
+            ));
+        };
+        if let Some(other) = keys_by_id.insert(id, key.as_str()) {
+            let (first, second) = if other < key.as_str() {
+                (other, key.as_str())
+            } else {
+                (key.as_str(), other)
+            };
+            return Err(invalid(
+                "logit_bias_duplicate_key",
+                format!(
+                    "Invalid key in 'logit_bias': '{first}' and '{second}' both name token {id}; \
+                     each token takes one bias"
+                ),
+            ));
+        }
+        let code = match *bias {
+            b if b > 100.0 => "integer_above_max_value",
+            b if b < -100.0 => "integer_below_min_value",
+            _ => continue,
+        };
+        return Err(invalid(
+            code,
+            format!(
+                "Invalid value for 'logit_bias': token '{key}' has bias {bias}; each bias must be \
+                 between -100 and 100."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Validates stop sequences (max 4, non-empty strings)
 /// Used by both ChatCompletionRequest and ResponsesRequest
 pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationError> {
@@ -331,10 +406,26 @@ pub enum ContentPart {
     InputAudio { input_audio: InputAudio },
     #[serde(rename = "video_url")]
     VideoUrl { video_url: VideoUrl },
+    /// An assistant turn's refusal, as the public API returns one and a client
+    /// replays it in the history; the renderers read it as the turn's text.
+    #[serde(rename = "refusal")]
+    Refusal { refusal: String },
     /// Pass through unknown content objects to HTTP backends.
     /// Also matches malformed known types; gRPC backends reject this variant.
     #[serde(untagged)]
     Unknown(Map<String, Value>),
+}
+
+impl ContentPart {
+    /// The text a renderer reads from the part: a text part's text, a
+    /// refusal's text (the engines' own servers render a refusal part as the
+    /// turn's text); none for a media or an unknown part.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            ContentPart::Text { text } | ContentPart::Refusal { refusal: text } => Some(text),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
@@ -839,22 +930,49 @@ pub enum ToolChoiceValue {
     None,
 }
 
-/// Tool choice for both Chat Completion and Responses APIs
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(untagged)]
+/// A Chat Completions `tool_choice`: one of the three words, a named
+/// function, or an allowed-tools choice (the Responses API has its own
+/// `ResponsesToolChoice`). On the wire the allowed-tools choice is the
+/// contract's nested object, `{"type": "allowed_tools", "allowed_tools":
+/// {"mode": ..., "tools": [{"type": "function", "function": {"name": ...}}]}}`,
+/// read and written in that shape; the flat spelling this route read before
+/// it read the contract's is still accepted (the `wire` module).
+#[derive(Debug, Clone)]
 pub enum ToolChoice {
     Value(ToolChoiceValue),
     Function {
-        #[serde(rename = "type")]
-        tool_type: String, // "function"
+        /// `"function"`.
+        tool_type: String,
         function: FunctionChoice,
     },
     AllowedTools {
-        #[serde(rename = "type")]
-        tool_type: String, // "allowed_tools"
-        mode: String, // "auto" | "required" TODO: need validation
+        /// `"allowed_tools"`.
+        tool_type: String,
+        /// `"auto"` or `"required"`; the chat validator refuses another word.
+        mode: String,
         tools: Vec<ToolReference>,
     },
+}
+
+impl<'de> Deserialize<'de> for ToolChoice {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        wire::ToolChoice::deserialize(deserializer).map(Self::from)
+    }
+}
+
+impl Serialize for ToolChoice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        wire::ToolChoiceView::from(self).serialize(serializer)
+    }
+}
+
+impl schemars::JsonSchema for ToolChoice {
+    fn schema_name() -> Cow<'static, str> {
+        "ToolChoice".into()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        wire::ToolChoice::json_schema(generator)
+    }
 }
 
 impl Default for ToolChoice {
@@ -911,6 +1029,191 @@ impl ToolChoice {
                     .collect(),
             ),
             ToolChoice::Value(_) => None,
+        }
+    }
+}
+
+/// The wire spellings of a chat [`ToolChoice`](super::ToolChoice). The read
+/// enum is named as the public type so serde's refusal of an unknown shape
+/// names the field's type, not a helper.
+mod wire {
+    use serde::{Deserialize, Serialize};
+
+    use super::{FunctionChoice, ToolChoiceValue};
+
+    /// The shapes read: the three words; the named function; the contract's
+    /// allowed-tools object; the flat allowed-tools object this route read
+    /// before it read the contract's.
+    #[derive(Deserialize, schemars::JsonSchema)]
+    #[serde(untagged)]
+    pub(super) enum ToolChoice {
+        Value(ToolChoiceValue),
+        Function {
+            #[serde(rename = "type")]
+            tool_type: String,
+            function: FunctionChoice,
+        },
+        AllowedTools {
+            #[serde(rename = "type")]
+            tool_type: String,
+            allowed_tools: AllowedToolsObject,
+        },
+        FlatAllowedTools {
+            #[serde(rename = "type")]
+            tool_type: String,
+            mode: String,
+            tools: Vec<AllowedToolReference>,
+        },
+    }
+
+    /// The contract's `allowed_tools` object: the mode and the tools.
+    #[derive(Deserialize, schemars::JsonSchema)]
+    pub(super) struct AllowedToolsObject {
+        pub(super) mode: String,
+        pub(super) tools: Vec<AllowedToolReference>,
+    }
+
+    /// An item of the allowed-tools list: the contract's nested function,
+    /// `{"type": "function", "function": {"name": ...}}`, or a flat reference
+    /// (`{"type": "function", "name": ...}` and the other kinds).
+    #[derive(Deserialize, schemars::JsonSchema)]
+    #[serde(untagged)]
+    pub(super) enum AllowedToolReference {
+        Nested {
+            #[serde(rename = "type")]
+            tool_type: FunctionTag,
+            function: FunctionChoice,
+        },
+        Flat(super::ToolReference),
+    }
+
+    /// The one `type` word of a nested function reference.
+    #[derive(Deserialize, schemars::JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub(super) enum FunctionTag {
+        Function,
+    }
+
+    impl From<AllowedToolReference> for super::ToolReference {
+        fn from(reference: AllowedToolReference) -> Self {
+            match reference {
+                AllowedToolReference::Nested {
+                    tool_type: FunctionTag::Function,
+                    function,
+                } => Self::Function {
+                    name: function.name,
+                },
+                AllowedToolReference::Flat(reference) => reference,
+            }
+        }
+    }
+
+    impl From<ToolChoice> for super::ToolChoice {
+        fn from(choice: ToolChoice) -> Self {
+            match choice {
+                ToolChoice::Value(value) => Self::Value(value),
+                ToolChoice::Function {
+                    tool_type,
+                    function,
+                } => Self::Function {
+                    tool_type,
+                    function,
+                },
+                ToolChoice::AllowedTools {
+                    tool_type,
+                    allowed_tools: AllowedToolsObject { mode, tools },
+                }
+                | ToolChoice::FlatAllowedTools {
+                    tool_type,
+                    mode,
+                    tools,
+                } => Self::AllowedTools {
+                    tool_type,
+                    mode,
+                    tools: tools.into_iter().map(Into::into).collect(),
+                },
+            }
+        }
+    }
+
+    /// A chat choice as the contract writes it, borrowed from the typed value.
+    #[derive(Serialize)]
+    #[serde(untagged)]
+    pub(super) enum ToolChoiceView<'a> {
+        Value(&'a ToolChoiceValue),
+        Function {
+            #[serde(rename = "type")]
+            tool_type: &'a str,
+            function: &'a FunctionChoice,
+        },
+        AllowedTools {
+            #[serde(rename = "type")]
+            tool_type: &'a str,
+            allowed_tools: AllowedToolsView<'a>,
+        },
+    }
+
+    #[derive(Serialize)]
+    pub(super) struct AllowedToolsView<'a> {
+        mode: &'a str,
+        #[serde(serialize_with = "nested_functions")]
+        tools: &'a [super::ToolReference],
+    }
+
+    impl<'a> From<&'a super::ToolChoice> for ToolChoiceView<'a> {
+        fn from(choice: &'a super::ToolChoice) -> Self {
+            match choice {
+                super::ToolChoice::Value(value) => Self::Value(value),
+                super::ToolChoice::Function {
+                    tool_type,
+                    function,
+                } => Self::Function {
+                    tool_type,
+                    function,
+                },
+                super::ToolChoice::AllowedTools {
+                    tool_type,
+                    mode,
+                    tools,
+                } => Self::AllowedTools {
+                    tool_type,
+                    allowed_tools: AllowedToolsView { mode, tools },
+                },
+            }
+        }
+    }
+
+    /// The allowed-tools list with each function reference in the contract's
+    /// nested spelling; a reference of another kind keeps its own shape.
+    fn nested_functions<S: serde::Serializer>(
+        tools: &[super::ToolReference],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(tools.iter().map(ToolReferenceView))
+    }
+
+    struct ToolReferenceView<'a>(&'a super::ToolReference);
+
+    impl Serialize for ToolReferenceView<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            #[derive(Serialize)]
+            struct NestedFunction<'a> {
+                #[serde(rename = "type")]
+                tool_type: &'a str,
+                function: FunctionName<'a>,
+            }
+            #[derive(Serialize)]
+            struct FunctionName<'a> {
+                name: &'a str,
+            }
+            match self.0 {
+                super::ToolReference::Function { name } => NestedFunction {
+                    tool_type: "function",
+                    function: FunctionName { name },
+                }
+                .serialize(serializer),
+                other => other.serialize(serializer),
+            }
         }
     }
 }
@@ -1444,6 +1747,21 @@ impl<'de> Deserialize<'de> for InputIds {
 
         deserializer.deserialize_seq(InputIdsVisitor)
     }
+}
+
+/// Token ids as their decimal rendering joined by spaces: the routing text of
+/// a prompt given as ids, on `/generate` and `/v1/completions` alike.
+pub(crate) fn join_ids<T: std::fmt::Display>(ids: impl IntoIterator<Item = T>) -> String {
+    use std::fmt::Write as _;
+    let ids = ids.into_iter();
+    let mut text = String::with_capacity(ids.size_hint().0 * 6);
+    for (i, id) in ids.enumerate() {
+        if i > 0 {
+            text.push(' ');
+        }
+        let _ = write!(text, "{id}");
+    }
+    text
 }
 
 /// LoRA adapter path - can be single path or batch of paths (an engine extension)
@@ -2081,6 +2399,96 @@ mod tests {
         ] {
             assert!(!choice(free.clone()).forces_call(), "{free}");
         }
+    }
+
+    /// The allowed-tools choice reads in the contract's nested shape and in
+    /// the flat shape this route read before, to the same choice, and is
+    /// written back in the contract's shape; the words and the named function
+    /// round-trip as they are.
+    #[test]
+    fn an_allowed_tools_choice_reads_both_shapes_and_writes_the_contracts() {
+        let contract = json!({"type": "allowed_tools", "allowed_tools": {"mode": "required",
+            "tools": [{"type": "function", "function": {"name": "get_weather"}},
+                      {"type": "function", "function": {"name": "get_time"}}]}});
+        let flat = json!({"type": "allowed_tools", "mode": "required",
+            "tools": [{"type": "function", "name": "get_weather"},
+                      {"type": "function", "function": {"name": "get_time"}}]});
+        for body in [&contract, &flat] {
+            let choice: ToolChoice = serde_json::from_value(body.clone()).expect("a tool choice");
+            let ToolChoice::AllowedTools {
+                tool_type,
+                mode,
+                tools,
+            } = &choice
+            else {
+                panic!("{body} read as {choice:?}")
+            };
+            assert_eq!(
+                (tool_type.as_str(), mode.as_str()),
+                ("allowed_tools", "required")
+            );
+            assert_eq!(
+                tools
+                    .iter()
+                    .map(ToolReference::function_name)
+                    .collect::<Vec<_>>(),
+                [Some("get_weather"), Some("get_time")],
+                "{body}"
+            );
+            assert!(choice.forces_call(), "{body}");
+            assert_eq!(
+                serde_json::to_value(&choice).expect("json"),
+                contract,
+                "{body}"
+            );
+        }
+        for body in [
+            json!("auto"),
+            json!("required"),
+            json!({"type": "function", "function": {"name": "get_weather"}}),
+        ] {
+            let choice: ToolChoice = serde_json::from_value(body.clone()).expect("a tool choice");
+            assert_eq!(serde_json::to_value(&choice).expect("json"), body);
+        }
+        for refused in [
+            json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto"}}),
+            json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto",
+                "tools": [{"type": "custom", "function": {"name": "x"}}]}}),
+            json!({"type": "allowed_tools"}),
+        ] {
+            let err = serde_json::from_value::<ToolChoice>(refused.clone())
+                .expect_err(&refused.to_string())
+                .to_string();
+            assert_eq!(
+                err, "data did not match any variant of untagged enum ToolChoice",
+                "{refused}"
+            );
+        }
+    }
+
+    /// An assistant `refusal` part reads as a typed part, writes back as the
+    /// public API spells it, and is the turn's text to the renderers; a text
+    /// part keeps being text and a media part has none.
+    #[test]
+    fn a_refusal_part_is_typed_and_read_as_text() {
+        let body = json!({"type": "refusal", "refusal": "I cannot help with that."});
+        let part: ContentPart = serde_json::from_value(body.clone()).expect("a content part");
+        assert_eq!(
+            part,
+            ContentPart::Refusal {
+                refusal: "I cannot help with that.".to_string()
+            }
+        );
+        assert_eq!(part.text(), Some("I cannot help with that."));
+        assert_eq!(serde_json::to_value(&part).expect("json"), body);
+        let text: ContentPart =
+            serde_json::from_value(json!({"type": "text", "text": "hi"})).expect("a content part");
+        assert_eq!(text.text(), Some("hi"));
+        let image: ContentPart = serde_json::from_value(
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}),
+        )
+        .expect("a content part");
+        assert_eq!(image.text(), None);
     }
 
     /// `response_format` on the wire: `{"type": ...}` with the schema object

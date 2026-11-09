@@ -28,12 +28,11 @@ rustup toolchain install nightly
 rustup component add rustfmt --toolchain nightly
 rustup component add clippy rustfmt
 
-# 3. Install pre-commit hooks (enforces rustfmt, clippy, DCO, no-AI-attribution, branch naming)
+# 3. Install the pre-commit, commit-msg and pre-push hooks (rustfmt, clippy, DCO, no-AI-attribution, branch naming)
 pip install pre-commit
 pre-commit install
-pre-commit install --hook-type commit-msg
 
-# 4. Create a branch (must match <type>/<desc> or <username>/<desc>)
+# 4. Create a branch (lowercase <type>/<desc> or <username>/<desc>; the rule is scripts/branch-name-check.sh)
 git checkout -b feat/my-change
 
 # 5. Build and test

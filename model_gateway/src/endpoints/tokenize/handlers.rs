@@ -16,11 +16,12 @@ use openai_protocol::tokenize::{
     ListTokenizersResponse, RemoveTokenizerResponse, TextResult, TokenizeRequest, TokenizeResponse,
     TokenizerInfo, TokensResult,
 };
+use smg_auth::AuditResource;
 use tracing::{debug, error, warn};
 
 use crate::{
     app_context::AppContext,
-    routers::grpc::utils::encode_blocking,
+    routers::grpc::utils::{encode_blocking_in_batch, InPlaceBudget},
     worker::UNKNOWN_MODEL_ID,
     workflow::{note_tokenizer_removed, Job, TokenizerConfigRequest},
 };
@@ -97,19 +98,21 @@ pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeReques
     let mut all_counts: Vec<i32> = Vec::with_capacity(texts.len());
     let mut all_char_counts: Vec<i32> = Vec::with_capacity(texts.len());
 
+    let mut budget = InPlaceBudget::default();
     for text in texts {
         // Don't add special tokens for tokenize API (matches Python behavior)
-        let encoding = match encode_blocking(tokenizer.clone(), text.to_string(), false).await {
-            Ok(enc) => enc,
-            Err(e) => {
-                error!("Tokenization failed: {}", e);
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("Tokenization failed: {e}"),
-                    "tokenization_error",
-                );
-            }
-        };
+        let encoding =
+            match encode_blocking_in_batch(tokenizer.clone(), text, false, &mut budget).await {
+                Ok(enc) => enc,
+                Err(e) => {
+                    error!("Tokenization failed: {}", e);
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("Tokenization failed: {e}"),
+                        "tokenization_error",
+                    );
+                }
+            };
 
         let token_ids: Vec<u32> = encoding.into_token_ids();
         let count = token_ids.len() as i32;
@@ -246,19 +249,22 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
 
     // Submit the job
     match job_queue.submit(job).await {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(AddTokenizerResponse {
-                id: tokenizer_id,
-                status: "pending".to_string(),
-                message: format!(
-                    "Tokenizer '{}' registration job submitted. Loading from: {}",
-                    request.name, request.source
-                ),
-                vocab_size: None,
-            }),
-        )
-            .into_response(),
+        Ok(()) => AuditResource::name(
+            (
+                StatusCode::ACCEPTED,
+                Json(AddTokenizerResponse {
+                    id: tokenizer_id.clone(),
+                    status: "pending".to_string(),
+                    message: format!(
+                        "Tokenizer '{}' registration job submitted. Loading from: {}",
+                        request.name, request.source
+                    ),
+                    vocab_size: None,
+                }),
+            )
+                .into_response(),
+            tokenizer_id,
+        ),
         Err(e) => {
             error!("Failed to submit tokenizer job: {}", e);
             (
@@ -309,14 +315,17 @@ pub async fn remove_tokenizer(context: &Arc<AppContext>, tokenizer_id: &str) -> 
             &entry.name,
         );
         debug!("Removed tokenizer '{}' (id: {})", entry.name, entry.id);
-        (
-            StatusCode::OK,
-            Json(RemoveTokenizerResponse {
-                success: true,
-                message: format!("Tokenizer '{}' removed successfully", entry.name),
-            }),
+        AuditResource::name(
+            (
+                StatusCode::OK,
+                Json(RemoveTokenizerResponse {
+                    success: true,
+                    message: format!("Tokenizer '{}' removed successfully", entry.name),
+                }),
+            )
+                .into_response(),
+            entry.id,
         )
-            .into_response()
     } else {
         warn!("Tokenizer '{}' not found", tokenizer_id);
         (
