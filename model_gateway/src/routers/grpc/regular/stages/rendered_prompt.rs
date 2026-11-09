@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use llm_multimodal::Modality;
 use llm_tokenizer::traits::{PromptEncoding, Tokenizer};
 use tracing::{debug, error};
 
@@ -109,6 +110,11 @@ pub(crate) async fn prepare_rendered_prompt(
             // plan (see `resolve_mm_processing` and `PipelinePin`).
             ctx.state.media_refs_pipeline =
                 multimodal::media_refs_pipeline_pin(&media_plan, &placeholders);
+            if media_plan.modalities() == [Modality::Image] {
+                ctx.state.image_anchor = placeholders
+                    .get(Modality::Image)
+                    .and_then(|anchor| tokenizer.token_to_id(anchor));
+            }
             multimodal_refs = Some(media_plan);
         } else {
             // The dtype every worker the selection can pick reads image

@@ -58,6 +58,15 @@ their per-DP EC endpoints through GetServerInfo; PULL EC connectors return
 their transfer handles from E instead. Multimodal EPD requests currently
 require `n=1`; failed transfers are not replayed onto another P replica.
 
+Image-only reference requests can use multiple E workers within one request.
+Register multiple `--encode` workers; `--encode-policy round_robin` distributes
+successive images across them (the default policy is consistent hashing).
+SMG selects E per image, batches images assigned to the same E, and merges
+their metadata and EC handles in the original image order before running P.
+Fetching and preprocessing stay on E. Audio/video, mixed-modality requests,
+and models whose prompt updates extend beyond their image anchors retain
+single-E encoding.
+
 Without `--kv-events-config`, the servicer turns vLLM's ZMQ KV-event publisher
 on by itself, under either implementation, before the engine is built, at a
 port found free on the host rather than vLLM's fixed default (one per

@@ -390,6 +390,7 @@ pub(crate) async fn execute_plan(
                     workers,
                     model,
                     encode_dispatch,
+                    ctx.image_anchor,
                     prefill_guard,
                     ledger,
                 )
@@ -704,18 +705,23 @@ async fn execute_fanout_pd(
 /// (`PdProtocol::encode_handoff`): under a push handoff the encoder
 /// completes before the prefill/decode pair is sent; under a rendezvous
 /// handoff the encode jobs launch beside the pair.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "EPD adds image anchors to the shared PD dispatch inputs"
+)]
 async fn execute_epd_dispatch(
     mut proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     model: &str,
     encode_dispatch: Option<EncodeDispatchPlan>,
+    image_anchor: Option<u32>,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     let push = workers.encode_handoff() == Some(EncodeHandoff::Push);
     let mut cleanup = if push && workers.encode_assignments().is_some() {
-        Some(super::vllm_encode::encode(&mut proto_request, workers).await?)
+        Some(super::vllm_encode::encode(&mut proto_request, workers, image_anchor).await?)
     } else {
         None
     };
@@ -737,8 +743,10 @@ async fn execute_epd_dispatch(
     )
     .await;
     if result.is_ok() {
-        if let Some(cleanup) = cleanup.as_mut() {
-            cleanup.disarm();
+        if let Some(cleanups) = cleanup.as_mut() {
+            for cleanup in cleanups {
+                cleanup.disarm();
+            }
         }
     }
     result
