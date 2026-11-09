@@ -26,6 +26,7 @@ mod word_cache;
 pub mod chat_template;
 pub mod huggingface;
 mod kimi_k2_tokenizer;
+mod tekken;
 pub mod tiktoken;
 
 #[cfg(test)]
