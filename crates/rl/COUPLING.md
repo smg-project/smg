@@ -42,7 +42,9 @@ version and the shape the gRPC `/generate` path reports.
 
 Wire types are not a gateway coupling: they live in `crates/protocols/src/rl.rs`
 (`openai_protocol::rl`) next to the `/workers` types, and
-`clients/openapi-gen/src/main.rs` registers the `/v1/rl/*` paths.
+`clients/openapi-gen/src/lib.rs` lists the `/v1/rl/*` paths as
+`RL_CONTROL_PLANE_ROUTES`; the gateway's route-list test reads that list
+against `router` here.
 
 ## Why the proxy is separate
 

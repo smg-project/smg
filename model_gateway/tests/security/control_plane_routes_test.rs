@@ -2,12 +2,14 @@
 //! the production route table: every listed route sits behind the
 //! control-plane authentication and answers its method, and every route the
 //! table registers is listed. A route added to one side without the other
-//! fails here.
+//! fails here. The RL list is read against the RL crate's router the same
+//! way: the gateway nests that router under `/v1/rl` only with the RL flag,
+//! so the route table above never carries it.
 
 use std::collections::BTreeSet;
 
 use axum::http::StatusCode;
-use openapi_gen::CONTROL_PLANE_ROUTES;
+use openapi_gen::{CONTROL_PLANE_ROUTES, RL_CONTROL_PLANE_ROUTES};
 use smg::server::GATED_ROUTES;
 
 use super::control_plane_roles_test::{control_plane_auth, status, ADMIN_KEY};
@@ -56,16 +58,30 @@ async fn every_listed_route_sits_behind_the_control_plane_authentication_and_ans
 /// The server source the route groups are read from.
 const SERVER_SOURCE: &str = include_str!("../../src/server.rs");
 
+/// The RL crate's source: the gateway nests its router under `/v1/rl`,
+/// behind the control-plane authentication and outside the groups above.
+const RL_SOURCE: &str = include_str!("../../../crates/rl/src/lib.rs");
+
+/// The region of a source from one marker to the next, the first one
+/// included. A missing marker is a test bug; the panic names it.
+#[expect(
+    clippy::panic,
+    reason = "test helper: a missing marker in a source is a test bug, named in the panic"
+)]
+fn between(source: &'static str, start_marker: &str, end_marker: &str) -> &'static str {
+    let start = source
+        .find(start_marker)
+        .unwrap_or_else(|| panic!("the source has no {start_marker:?}"));
+    let end = source[start..]
+        .find(end_marker)
+        .unwrap_or_else(|| panic!("the source has no {end_marker:?} after {start_marker:?}"));
+    &source[start..start + end]
+}
+
 /// The region of the server source from one marker to the next, the first
 /// one included.
-#[expect(
-    clippy::expect_used,
-    reason = "test helper: a missing marker in the server source is a test bug"
-)]
 fn source_between(start_marker: &str, end_marker: &str) -> &'static str {
-    let start = SERVER_SOURCE.find(start_marker).expect(start_marker);
-    let end = SERVER_SOURCE[start..].find(end_marker).expect(end_marker);
-    &SERVER_SOURCE[start..start + end]
+    between(SERVER_SOURCE, start_marker, end_marker)
 }
 
 /// The (method, path) pairs a region of the server source registers: every
@@ -106,6 +122,33 @@ fn registered_routes() -> BTreeSet<(String, String)> {
 /// function's body, up to its closing brace.
 fn gated_group_routes() -> BTreeSet<(String, String)> {
     routes_in(source_between("fn gated_control_plane_routes()", "\n}\n"))
+}
+
+/// The (method, path) pairs `smg_rl::router` registers, as the gateway mounts
+/// them: under `/v1/rl`, with the parameter names the API document uses.
+fn rl_router_routes() -> BTreeSet<(String, String)> {
+    routes_in(between(RL_SOURCE, "pub fn router<", "\n}\n"))
+        .into_iter()
+        .map(|(method, path)| {
+            let path = path
+                .replace("{id}", "{worker_id}")
+                .replace("{*path}", "{path}");
+            (method, format!("/v1/rl{path}"))
+        })
+        .collect()
+}
+
+#[test]
+fn every_route_the_rl_router_registers_is_listed() {
+    let listed: BTreeSet<(String, String)> = RL_CONTROL_PLANE_ROUTES
+        .iter()
+        .map(|(method, path)| (method.to_string(), path.to_string()))
+        .collect();
+    assert_eq!(
+        rl_router_routes(),
+        listed,
+        "the RL router's routes and RL_CONTROL_PLANE_ROUTES differ"
+    );
 }
 
 #[test]
