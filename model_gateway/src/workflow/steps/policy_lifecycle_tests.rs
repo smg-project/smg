@@ -251,6 +251,115 @@ async fn a_replacement_that_lists_a_model_fewer_takes_its_policy() {
 }
 
 #[tokio::test]
+async fn a_model_an_endpoint_stopped_listing_leaves_with_its_last_worker() {
+    // A refresh of the endpoint's model list on a routing miss dropped
+    // llama, and left the model index as the registration wrote it: llama's
+    // own worker is its last.
+    let app_context = app_context();
+    let llama = worker("http://w1:8000", "llama");
+    register(&app_context, Arc::clone(&llama), "cache_aware").await;
+    let both = endpoint("http://w2:8000", &["qwen", "llama"]);
+    register(&app_context, Arc::clone(&both), "random").await;
+    both.set_models(vec![ModelCard::new("qwen")]);
+
+    remove(&app_context, llama).await;
+    assert_eq!(policy_of(&app_context, "llama"), None);
+    assert_eq!(policy_of(&app_context, "qwen"), Some("random"));
+}
+
+#[tokio::test]
+async fn a_removal_asks_after_every_model_its_worker_was_registered_with() {
+    // The endpoint outlived llama's own worker, then a refresh dropped
+    // llama from its list: its removal still asks after llama.
+    let app_context = app_context();
+    let llama = worker("http://w1:8000", "llama");
+    register(&app_context, Arc::clone(&llama), "cache_aware").await;
+    let both = endpoint("http://w2:8000", &["qwen", "llama"]);
+    register(&app_context, Arc::clone(&both), "random").await;
+    remove(&app_context, llama).await;
+    assert_eq!(policy_of(&app_context, "llama"), Some("cache_aware"));
+
+    both.set_models(vec![ModelCard::new("qwen")]);
+    remove(&app_context, both).await;
+    assert_eq!(policy_of(&app_context, "llama"), None);
+}
+
+#[tokio::test]
+async fn a_removal_purges_its_worker_from_the_trees_of_the_models_it_was_registered_with() {
+    // As above, with llama's policy kept by llama's own worker: the URL
+    // leaves llama's tree, though the refreshed list no longer names llama.
+    let app_context = app_context();
+    register(
+        &app_context,
+        worker("http://w1:8000", "llama"),
+        "cache_aware",
+    )
+    .await;
+    let both = endpoint("http://w2:8000", &["qwen", "llama"]);
+    register(&app_context, Arc::clone(&both), "random").await;
+    let policy = app_context.policy_registry.get_policy("llama").unwrap();
+    let tree = policy
+        .as_any()
+        .downcast_ref::<CacheAwarePolicy>()
+        .and_then(|policy| policy.string_tree("llama"))
+        .expect("llama's cache-aware tree");
+    tree.insert_text("a prompt the endpoint served", "http://w2:8000");
+
+    both.set_models(vec![ModelCard::new("qwen")]);
+    remove(&app_context, both).await;
+    assert_eq!(policy_of(&app_context, "llama"), Some("cache_aware"));
+    assert!(!tree.get_tenant_char_count().contains_key("http://w2:8000"));
+}
+
+#[tokio::test]
+async fn a_replacement_asks_after_a_model_its_worker_stopped_listing() {
+    // The endpoint outlived llama's own worker, a refresh dropped llama from
+    // its list, then the endpoint registered again listing qwen alone.
+    let app_context = app_context();
+    let llama = worker("http://w1:8000", "llama");
+    register(&app_context, Arc::clone(&llama), "cache_aware").await;
+    let both = endpoint("http://w2:8000", &["qwen", "llama"]);
+    register(&app_context, Arc::clone(&both), "random").await;
+    remove(&app_context, llama).await;
+    assert_eq!(policy_of(&app_context, "llama"), Some("cache_aware"));
+
+    both.set_models(vec![ModelCard::new("qwen")]);
+    register(
+        &app_context,
+        endpoint("http://w2:8000", &["qwen"]),
+        "random",
+    )
+    .await;
+    assert_eq!(policy_of(&app_context, "llama"), None);
+    assert_eq!(policy_of(&app_context, "qwen"), Some("random"));
+}
+
+#[tokio::test]
+async fn a_replacement_that_renames_the_model_takes_the_old_ids_policy() {
+    // The replacement serves the model under a new id and keeps the old one
+    // as an alias. The routers resolve an alias before any policy lookup, so
+    // no request reaches the old id's policy any more.
+    let app_context = app_context();
+    register(
+        &app_context,
+        worker("http://w1:8000", "llama-3"),
+        "cache_aware",
+    )
+    .await;
+    let renamed: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://w1:8000")
+            .model(ModelCard::new("meta-llama/Llama-3").with_alias("llama-3"))
+            .build(),
+    );
+    register(&app_context, renamed, "random").await;
+    assert_eq!(policy_of(&app_context, "llama-3"), None);
+    assert_eq!(
+        policy_of(&app_context, "meta-llama/Llama-3"),
+        Some("random")
+    );
+}
+
+#[tokio::test]
 async fn a_removal_takes_the_policy_of_the_worker_a_replacement_put_in_its_place() {
     // The removal found llama's worker, then a registration replaced it at
     // its URL during the drain: the registry step removes the replacement,

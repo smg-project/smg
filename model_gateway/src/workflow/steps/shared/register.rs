@@ -120,8 +120,9 @@ fn pool_groups_touched(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -
 }
 
 /// The models a registration of `workers` may move workers off: every model
-/// each worker it replaces at the same URL served. Whether a worker of this
-/// node, the replacement included, still serves each one is asked once the
+/// whose policy a worker it replaces at the same URL keeps
+/// ([`WorkerRegistry::policy_model_ids`]). Whether a worker of this node, the
+/// replacement included, still serves each one is asked once the
 /// registration is written.
 fn models_left(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -> HashSet<String> {
     workers

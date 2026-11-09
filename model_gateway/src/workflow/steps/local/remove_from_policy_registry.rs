@@ -86,15 +86,16 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
                 .remove_worker_from_policies(worker.url());
         }
 
-        // The removed workers' URLs leave their models' trees too: a same-URL
-        // replacement during the drain is the one removed, and its models
-        // can differ from the found worker's.
+        // The removed workers' URLs leave their models' trees too, those of
+        // the models they were registered with as well as the ones they list
+        // now: a same-URL replacement during the drain is the one removed,
+        // and its models can differ from the found worker's.
         let mut cache_removals: HashMap<String, HashSet<String>> = HashMap::new();
         for worker in workers_to_remove
             .iter()
             .chain(&context.data.removed_workers)
         {
-            for model_id in WorkerRegistry::worker_model_ids(worker) {
+            for model_id in WorkerRegistry::policy_model_ids(worker) {
                 cache_removals
                     .entry(model_id)
                     .or_default()
@@ -105,10 +106,10 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
 
         // The workers have left the worker registry: a model none of this
         // node's workers serves any more loses its policy. Asked of the
-        // registry rather than counted, so a worker added again on a
-        // replacement or an update, or a mesh import removed here, cannot
-        // keep a policy alive or end it early. Every model a worker served
-        // is asked after, not its primary alone: a worker listing several
+        // registry rather than counted, so a worker registered again, or a
+        // mesh import removed here, cannot keep a policy alive or end it
+        // early. Every model a worker was registered with or lists now is
+        // asked after, not its primary alone: a worker listing several
         // models can be the last to serve one whose own workers left first.
         // The workers the registry step removed count as well as the ones
         // found, since a same-URL replacement during the drain is the one
