@@ -18,10 +18,10 @@ use tracing::{debug, info, warn};
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    as_cache_aware, get_healthy_worker_indices,
+    as_bucket, as_cache_aware, get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
-    normalize_model_key, BucketPolicy, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig,
-    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
+    normalize_model_key, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
+    PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
@@ -1127,15 +1127,13 @@ impl PolicyRegistry {
     pub fn init_pd_bucket_policies(&self, prefill_workers: &[Arc<dyn Worker>]) {
         // Initialize prefill policy if it's bucket (lock-free via OnceLock::get)
         if let Some(prefill_policy) = self.prefill_policy.get() {
-            if prefill_policy.name() == "bucket" {
-                if let Some(bucket) = prefill_policy.as_any().downcast_ref::<BucketPolicy>() {
-                    if !prefill_workers.is_empty() {
-                        debug!(
-                            "Initializing prefill bucket policy with {} workers",
-                            prefill_workers.len()
-                        );
-                        bucket.init_prefill_worker_urls(prefill_workers);
-                    }
+            if let Some(bucket) = as_bucket(prefill_policy.as_ref()) {
+                if !prefill_workers.is_empty() {
+                    debug!(
+                        "Initializing prefill bucket policy with {} workers",
+                        prefill_workers.len()
+                    );
+                    bucket.init_prefill_worker_urls(prefill_workers);
                 }
             }
         }
@@ -1165,7 +1163,7 @@ mod tests {
     use super::*;
     use crate::{
         policies::{
-            test_support::headers_with_routing_key, BucketConfig, CacheAwareConfig,
+            test_support::headers_with_routing_key, BucketConfig, BucketPolicy, CacheAwareConfig,
             CacheAwarePolicy, LeastLoadPolicy, SelectWorkerInfo,
         },
         worker::{
@@ -2810,6 +2808,46 @@ mod tests {
             per_model.removed.lock().unwrap().as_slice(),
             ["http://w2:8000"]
         );
+    }
+
+    /// The PD bucket init reaches a bucket prefill policy by its type: the
+    /// partition exists after it, so the largest size is placed in the last
+    /// range and not by the no-partition fallback.
+    #[traced_test]
+    #[test]
+    fn init_pd_bucket_policies_reaches_the_bucket_policy() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry.set_prefill_policy(Arc::new(BucketPolicy::with_config(BucketConfig {
+            balance_abs_threshold: usize::MAX,
+            bucket_adjust_interval_secs: 3600,
+            ..Default::default()
+        })));
+        let prefill = vec![
+            worker_of("http://prefill-1:8000", WorkerType::Prefill),
+            worker_of("http://prefill-2:8000", WorkerType::Prefill),
+            worker_of("http://prefill-3:8000", WorkerType::Prefill),
+        ];
+
+        registry.init_pd_bucket_policies(&prefill);
+
+        assert!(logs_contain(
+            "Initializing prefill bucket policy with 3 workers"
+        ));
+        let text = "a".repeat(10_000);
+        let info = SelectWorkerInfo {
+            request_text: Some(&text),
+            ..Default::default()
+        };
+        let selected = registry
+            .get_prefill_policy()
+            .select_worker(&prefill, &info)
+            .unwrap_or_else(|| panic!("a request of 10000 chars selects no prefill worker"));
+        assert_eq!(
+            prefill[selected].url(),
+            "http://prefill-3:8000",
+            "the largest size falls in the last range of the even split"
+        );
+        assert!(!logs_contain("No bucket found for model"));
     }
 
     /// A prefill worker's removal reaches the bucket policy, which keeps the
