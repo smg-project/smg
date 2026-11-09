@@ -869,6 +869,7 @@ impl LeastLoadPolicy {
                 Objective::ExpectedWait,
                 credit,
                 &mut scratch.borrow_mut(),
+                false,
             )
         })
     }
@@ -894,13 +895,15 @@ impl LeastLoadPolicy {
                 Objective::ResidentWork { request_tokens },
                 None,
                 &mut scratch.borrow_mut(),
+                false,
             )
         })
     }
 
     /// The argmin of `objective` over `candidates`, crediting the winner (see
     /// [`Self::select_min_expected_wait_credited`]), with `resolved` this
-    /// thread's scratch for the candidates it reads.
+    /// thread's scratch for the candidates it reads and `hold_guard` asking
+    /// for one write guard across the decision whatever its size.
     #[expect(clippy::too_many_arguments)]
     fn decide(
         &self,
@@ -911,6 +914,7 @@ impl LeastLoadPolicy {
         objective: Objective,
         credit: Option<&dyn Fn(usize) -> u64>,
         resolved: &mut Vec<Candidate>,
+        hold_guard: bool,
     ) -> Option<usize> {
         let snapshot = self.snapshot();
         let snapshot = snapshot.as_deref();
@@ -924,7 +928,7 @@ impl LeastLoadPolicy {
         // report's sample, every pass below scores from this with the guard
         // released, and the write guard covers the release and the credit
         // alone.
-        let mut held = (candidates.len() <= HELD_GUARD_CANDIDATES).then(|| {
+        let mut held = (hold_guard || candidates.len() <= HELD_GUARD_CANDIDATES).then(|| {
             self.tally
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -953,23 +957,6 @@ impl LeastLoadPolicy {
                 );
             }
         }
-        // With no report among the candidates the score reads only the picks,
-        // and decisions in flight at once would all read the same ones. Such a
-        // decision reads them again under the write guard and keeps it, as a
-        // small one does: its scores are integer reads.
-        if held.is_none() && resolved.iter().all(|candidate| candidate.report.is_none()) {
-            let tally = self
-                .tally
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for candidate in resolved.iter_mut() {
-                candidate.picked = tally
-                    .get(workers[candidate.idx].url())
-                    .map_or(0, |dispatch| dispatch.picked);
-            }
-            held = Some(tally);
-        }
-
         let (first, rest) = resolved.split_first()?;
 
         let inputs = self.score_inputs(workers, resolved);
@@ -1054,6 +1041,7 @@ impl LeastLoadPolicy {
                 }
             }
         }
+        let best_picked = best.picked;
         let best = best.idx;
 
         // In-flight correction: credit the chosen worker with this request's
@@ -1065,6 +1053,8 @@ impl LeastLoadPolicy {
         // under it. The key is allocated the first time a worker is
         // dispatched to, never after.
         let req_tokens = credit.map_or_else(|| self.request_tokens(info), |credit| credit(best));
+        let dark_split =
+            held.is_none() && resolved.iter().all(|candidate| candidate.report.is_none());
         let mut tally = match held.take() {
             Some(guard) => guard,
             None => self
@@ -1072,6 +1062,23 @@ impl LeastLoadPolicy {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         };
+        // With no report among the candidates the score reads only the picks,
+        // and decisions in flight at once can read the same ones. One that read
+        // them apart from this guard goes ahead only if no decision has taken
+        // its worker since, and otherwise decides again with one guard held. A
+        // count that rose elsewhere leaves this worker the least picked, so
+        // this one lookup is enough.
+        if dark_split
+            && tally
+                .get(workers[best].url())
+                .map_or(0, |dispatch| dispatch.picked)
+                > best_picked
+        {
+            drop(tally);
+            return self.decide(
+                workers, candidates, info, policy, objective, credit, resolved, true,
+            );
+        }
         // Read under the guard: the deque's order is the clock's order only when
         // no decision records an earlier instant after a later one landed.
         let dispatched_at = Instant::now();
@@ -1542,37 +1549,34 @@ mod tests {
         assert_eq!(policy.resolve_for_test(&workers, &[0])[0].picked, 2);
     }
 
-    /// Eight decisions in flight at once over a dark fleet above
-    /// [`HELD_GUARD_CANDIDATES`]: each reads the picks the others have
-    /// landed, so no two share a worker while idle ones remain.
+    /// Above [`HELD_GUARD_CANDIDATES`] a dark decision scores with no guard held,
+    /// and decides again under one guard if another decision takes its worker.
     #[test]
-    fn dark_decisions_in_flight_at_once_pick_distinct_workers() {
-        let workers: Vec<Arc<dyn Worker>> = (0..HELD_GUARD_CANDIDATES + 5)
+    fn a_dark_decision_whose_worker_is_taken_meanwhile_decides_again_under_one_guard() {
+        let policy = LeastLoadPolicy::new();
+        let workers: Vec<Arc<dyn Worker>> = (0..=HELD_GUARD_CANDIDATES)
             .map(|i| make_worker(&format!("http://w{i}:8000")))
             .collect();
-        for round in 0..200 {
-            let policy = LeastLoadPolicy::new();
-            let barrier = std::sync::Barrier::new(8);
-            let mut picks: Vec<usize> = std::thread::scope(|scope| {
-                let threads: Vec<_> = (0..8)
-                    .map(|_| {
-                        scope.spawn(|| {
-                            barrier.wait();
-                            policy
-                                .select_worker(&workers, &SelectWorkerInfo::default())
-                                .expect("a healthy pool picks")
-                        })
-                    })
-                    .collect();
-                threads
-                    .into_iter()
-                    .map(|thread| thread.join().expect("a decision thread panicked"))
-                    .collect()
-            });
-            picks.sort_unstable();
-            picks.dedup();
-            assert_eq!(picks.len(), 8, "round {round}");
-        }
+        let candidates: Vec<usize> = (0..workers.len()).collect();
+        let first = std::cell::Cell::new(None);
+        let credit = |best: usize| {
+            if first.get().is_none() {
+                first.set(Some(best));
+                assert!(policy.tally.try_write().is_ok(), "no guard while scoring");
+                policy.reconcile_in_flight(workers[best].url(), 1);
+            } else {
+                assert!(policy.tally.try_read().is_err(), "one guard, second pass");
+            }
+            1
+        };
+        let picked = policy.select_min_expected_wait_credited(
+            &workers,
+            &candidates,
+            &SelectWorkerInfo::default(),
+            "test",
+            Some(&credit),
+        );
+        assert_ne!(picked, first.get());
     }
 
     #[test]
