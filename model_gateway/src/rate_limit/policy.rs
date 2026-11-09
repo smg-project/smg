@@ -53,6 +53,16 @@ impl CompiledTenantPolicy {
             .map(|r| &r.rule)
     }
 
+    /// The rule with `rule_id`, if the policy still has it: a bucket is
+    /// keyed by its rule's id, and a replacement of the policy looks the
+    /// bucket's rule up by that id to learn its new limits.
+    pub(crate) fn rule_by_id(&self, rule_id: &str) -> Option<&CompiledModelRule> {
+        self.exact_model_rules
+            .values()
+            .chain(self.prefix_model_rules.iter().map(|r| &r.rule))
+            .find(|rule| &*rule.rule_id == rule_id)
+    }
+
     fn compile(spec: &TenantPolicySpec) -> Self {
         let mut exact_model_rules = HashMap::new();
         let mut prefix_model_rules = Vec::new();

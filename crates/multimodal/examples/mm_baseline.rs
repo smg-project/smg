@@ -791,7 +791,7 @@ fn meta(options: &Options) -> Value {
     let vector_kernels = if cfg!(target_arch = "aarch64") {
         "aarch64: the crate's vector paths (pixel conversion, resample, orientation, RGB runs, JPEG colour conversion)"
     } else if avx2_rows() {
-        "x86-64: the crate's AVX2 rows of the uint8 antialiased resample; the other stages run scalar"
+        "x86-64: the crate's AVX2 rows of the uint8 antialiased resample and the AVX2 wire formula of the pixel conversion; orientation, RGB runs and the JPEG colour conversion run scalar"
     } else {
         "scalar: the crate has no vector path for this architecture"
     };

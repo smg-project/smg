@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 use smg::{
     config::{
-        secrets::{entries_of, SecretFile},
+        secrets::{
+            entries_of, SecretFile, API_KEY_FILE, CONTROL_PLANE_API_KEYS_FILE, TENANT_API_KEYS_FILE,
+        },
         ConfigError, ConfigResult,
     },
     server::posture::SecretSource,
@@ -32,11 +34,7 @@ pub(crate) struct SecretSetting {
 }
 
 pub(crate) const API_KEY_SETTING: SecretSetting = SecretSetting {
-    file: SecretFile {
-        what: "the shared API key",
-        field: "api-key-file",
-        entry: "",
-    },
+    file: API_KEY_FILE,
     flag: "--api-key",
     env: "SMG_API_KEY",
     file_flag: "--api-key-file",
@@ -44,11 +42,7 @@ pub(crate) const API_KEY_SETTING: SecretSetting = SecretSetting {
 };
 
 pub(crate) const TENANT_API_KEYS_SETTING: SecretSetting = SecretSetting {
-    file: SecretFile {
-        what: "the tenant API keys",
-        field: "tenant-api-keys-file",
-        entry: "tenant_id:key",
-    },
+    file: TENANT_API_KEYS_FILE,
     flag: "--tenant-api-key",
     env: "SMG_TENANT_API_KEYS",
     file_flag: "--tenant-api-keys-file",
@@ -56,11 +50,7 @@ pub(crate) const TENANT_API_KEYS_SETTING: SecretSetting = SecretSetting {
 };
 
 pub(crate) const CONTROL_PLANE_API_KEYS_SETTING: SecretSetting = SecretSetting {
-    file: SecretFile {
-        what: "the control-plane API keys",
-        field: "control-plane-api-keys-file",
-        entry: "id:name:role:key",
-    },
+    file: CONTROL_PLANE_API_KEYS_FILE,
     flag: "--control-plane-api-keys",
     env: "CONTROL_PLANE_API_KEYS",
     file_flag: "--control-plane-api-keys-file",
@@ -121,7 +111,11 @@ pub(crate) fn env_value(
 
 impl SecretSetting {
     /// The file the flag or, failing that, the environment names.
-    fn file(&self, flag_value: Option<&Path>, env: EnvLookup<'_>) -> ConfigResult<Option<PathBuf>> {
+    pub(crate) fn file(
+        &self,
+        flag_value: Option<&Path>,
+        env: EnvLookup<'_>,
+    ) -> ConfigResult<Option<PathBuf>> {
         Ok(match flag_value {
             Some(path) => Some(path.to_path_buf()),
             None => env(self.file_env)?.map(PathBuf::from),

@@ -246,8 +246,8 @@ fn process_messages_prompt(
     };
 
     let rendered = tokenizer
-        .apply_chat_template_with_encoding(
-            &transformed_messages,
+        .apply_chat_template_with_encoding_owned(
+            transformed_messages,
             params,
             assistant_prefix.as_deref(),
         )

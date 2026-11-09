@@ -27,7 +27,7 @@ use llm_tokenizer::{
 };
 use openai_protocol::common::StringOrArray;
 use serde_json::{json, Value};
-use tokio::sync::oneshot;
+use tokio::{sync::oneshot, task::JoinHandle};
 
 use super::{
     super::*,
@@ -70,6 +70,70 @@ fn text_of(frames: &[Bytes]) -> String {
         })
         .filter_map(|event| event["choices"][0]["text"].as_str().map(str::to_owned))
         .collect()
+}
+
+/// The later prompt of a batched completion: nothing until its gate opens,
+/// then its first token with a burst (two more tokens and its finish) ready
+/// behind it. Returns the gate's sender, the stream and the server task.
+async fn later_prompt_stream() -> (oneshot::Sender<()>, ProtoStream, JoinHandle<()>) {
+    let (later_tx, later) = oneshot::channel();
+    let (later_stream, later_server) = staged_stream(
+        vec![(
+            Some(later),
+            vec![
+                chunk(0, "x"),
+                chunk(0, "y"),
+                chunk(0, "z"),
+                complete(0, "stop"),
+            ],
+        )],
+        "0",
+    )
+    .await;
+    (later_tx, later_stream, later_server)
+}
+
+/// The reading of a batched completion's two prompts, run together as the
+/// fan-out of a batched request runs its units: the first prompt under
+/// `first_spec` with `prompt_text` as its prompt, the later prompt under the
+/// plain spec, the two sharing the body's first frame.
+async fn two_prompt_reading(
+    first_stream: ProtoStream,
+    first_spec: CompletionResponseSpec,
+    prompt_text: String,
+    later_stream: ProtoStream,
+    tokenizer: Arc<dyn Tokenizer>,
+    tx: SseSender,
+) {
+    let processor = processor(false);
+    let spec = completion_spec();
+    let body_first_frame = AtomicBool::new(false);
+    let outcomes = try_join_all([
+        processor.process_completion_streaming_chunks(
+            first_stream,
+            dispatch(),
+            Arc::clone(&tokenizer),
+            (None, None, false, false, false),
+            &first_spec,
+            &prompt_text,
+            0,
+            &tx,
+            Some(&body_first_frame),
+        ),
+        processor.process_completion_streaming_chunks(
+            later_stream,
+            dispatch(),
+            tokenizer,
+            (None, None, false, false, false),
+            &spec,
+            "",
+            1,
+            &tx,
+            Some(&body_first_frame),
+        ),
+    ])
+    .await;
+    assert!(outcomes.is_ok(), "{:?}", outcomes.err());
 }
 
 /// The first token's frame reaches the connection before the reading runs on
@@ -403,57 +467,16 @@ async fn a_later_prompts_first_token_is_pending_to_the_connection_before_its_bur
         "0",
     )
     .await;
-    // The later prompt: nothing until its gate opens, then its first token
-    // with a burst ready behind it.
-    let (later_tx, later) = oneshot::channel();
-    let (later_stream, later_server) = staged_stream(
-        vec![(
-            Some(later),
-            vec![
-                chunk(0, "x"),
-                chunk(0, "y"),
-                chunk(0, "z"),
-                complete(0, "stop"),
-            ],
-        )],
-        "0",
-    )
-    .await;
+    let (later_tx, later_stream, later_server) = later_prompt_stream().await;
     let (tx, rx) = driven_channel();
-    let processor = processor(false);
-    let spec = completion_spec();
-    let reading = async move {
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
-        // The units of one request share the body's first frame, as the
-        // fan-out of a batched request gives it to them.
-        let body_first_frame = AtomicBool::new(false);
-        let outcomes = try_join_all([
-            processor.process_completion_streaming_chunks(
-                first_stream,
-                dispatch(),
-                Arc::clone(&tokenizer),
-                (None, None, false, false, false),
-                &spec,
-                "",
-                0,
-                &tx,
-                Some(&body_first_frame),
-            ),
-            processor.process_completion_streaming_chunks(
-                later_stream,
-                dispatch(),
-                Arc::clone(&tokenizer),
-                (None, None, false, false, false),
-                &spec,
-                "",
-                1,
-                &tx,
-                Some(&body_first_frame),
-            ),
-        ])
-        .await;
-        assert!(outcomes.is_ok(), "{:?}", outcomes.err());
-    };
+    let reading = two_prompt_reading(
+        first_stream,
+        completion_spec(),
+        String::new(),
+        later_stream,
+        Arc::new(CharacterTokenizer::default()),
+        tx,
+    );
     let mut body = DrivenBody::new(Box::pin(reading), rx);
     let first = body
         .next()
@@ -523,55 +546,16 @@ async fn an_earlier_prompts_token_less_finish_is_the_bodys_first_frame_and_a_lat
 ) {
     // The first prompt: a Complete with no Chunk ahead of it.
     let (first_stream, first_server) = scripted_stream(vec![complete(0, "stop")], "0").await;
-    // The later prompt: nothing until its gate opens, then its first token
-    // with a burst ready behind it.
-    let (later_tx, later) = oneshot::channel();
-    let (later_stream, later_server) = staged_stream(
-        vec![(
-            Some(later),
-            vec![
-                chunk(0, "x"),
-                chunk(0, "y"),
-                chunk(0, "z"),
-                complete(0, "stop"),
-            ],
-        )],
-        "0",
-    )
-    .await;
+    let (later_tx, later_stream, later_server) = later_prompt_stream().await;
     let (tx, rx) = driven_channel();
-    let processor = processor(false);
-    let spec = completion_spec();
-    let reading = async move {
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
-        let body_first_frame = AtomicBool::new(false);
-        let outcomes = try_join_all([
-            processor.process_completion_streaming_chunks(
-                first_stream,
-                dispatch(),
-                Arc::clone(&tokenizer),
-                (None, None, false, false, false),
-                &spec,
-                "",
-                0,
-                &tx,
-                Some(&body_first_frame),
-            ),
-            processor.process_completion_streaming_chunks(
-                later_stream,
-                dispatch(),
-                Arc::clone(&tokenizer),
-                (None, None, false, false, false),
-                &spec,
-                "",
-                1,
-                &tx,
-                Some(&body_first_frame),
-            ),
-        ])
-        .await;
-        assert!(outcomes.is_ok(), "{:?}", outcomes.err());
-    };
+    let reading = two_prompt_reading(
+        first_stream,
+        completion_spec(),
+        String::new(),
+        later_stream,
+        Arc::new(CharacterTokenizer::default()),
+        tx,
+    );
     let mut body = DrivenBody::new(Box::pin(reading), rx);
     let first = body
         .next()
@@ -725,58 +709,20 @@ async fn an_earlier_prompts_echo_past_the_flush_size_is_the_bodys_first_frame_an
         "0",
     )
     .await;
-    let (later_tx, later) = oneshot::channel();
-    let (later_stream, later_server) = staged_stream(
-        vec![(
-            Some(later),
-            vec![
-                chunk(0, "x"),
-                chunk(0, "y"),
-                chunk(0, "z"),
-                complete(0, "stop"),
-            ],
-        )],
-        "0",
-    )
-    .await;
+    let (later_tx, later_stream, later_server) = later_prompt_stream().await;
     let (tx, rx) = driven_channel();
-    let processor = processor(false);
-    let spec_with_echo = completion_spec_with_echo();
-    let spec = completion_spec();
     // The tokenizer counts the tokens decoded: how far the reading got when
     // the body handed a frame out.
     let tokenizer = Arc::new(CountsDecodedTokens::default());
     let decoding = Arc::clone(&tokenizer);
-    let reading = async move {
-        let tokenizer: Arc<dyn Tokenizer> = decoding;
-        let body_first_frame = AtomicBool::new(false);
-        let outcomes = try_join_all([
-            processor.process_completion_streaming_chunks(
-                first_stream,
-                dispatch(),
-                Arc::clone(&tokenizer),
-                (None, None, false, false, false),
-                &spec_with_echo,
-                &prompt_text,
-                0,
-                &tx,
-                Some(&body_first_frame),
-            ),
-            processor.process_completion_streaming_chunks(
-                later_stream,
-                dispatch(),
-                Arc::clone(&tokenizer),
-                (None, None, false, false, false),
-                &spec,
-                "",
-                1,
-                &tx,
-                Some(&body_first_frame),
-            ),
-        ])
-        .await;
-        assert!(outcomes.is_ok(), "{:?}", outcomes.err());
-    };
+    let reading = two_prompt_reading(
+        first_stream,
+        completion_spec_with_echo(),
+        prompt_text,
+        later_stream,
+        decoding,
+        tx,
+    );
     let mut body = DrivenBody::new(Box::pin(reading), rx);
     let first = body
         .next()

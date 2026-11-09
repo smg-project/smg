@@ -939,7 +939,7 @@ mod tests {
     use crate::{
         config::test_support::{pd_routing_mode, regular_routing_mode},
         service_discovery::testing::{create_test_app_context, live_app_context},
-        test_support::RefusedAddress,
+        worker::test_support::RefusedAddress,
     };
 
     const PASSING_2_0_4: &str = include_str!("testdata/consul/health-passing-2.0.4.json");

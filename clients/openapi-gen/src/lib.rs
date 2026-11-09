@@ -388,6 +388,7 @@ fn get_endpoint(op_id: &str, summary: &str, resp_name: &str) -> PathItem {
 pub const CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
     ("GET", "/inflight"),
     ("GET", "/config"),
+    ("POST", "/secrets/reload"),
     ("POST", "/flush_cache"),
     ("POST", "/start_profile"),
     ("POST", "/stop_profile"),
@@ -412,7 +413,8 @@ pub const CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
 ];
 
 /// The RL control-plane routes, behind the same authentication, mounted only
-/// with `--enable-rl`.
+/// with `--enable-rl`. The gateway's route-list test reads this list against
+/// the RL crate's router; the test below reads it against the document.
 pub const RL_CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/rl/workers"),
     ("GET", "/v1/rl/workers/{worker_id}"),
@@ -908,6 +910,61 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
         },
     );
 
+    paths.insert(
+        "/secrets/reload".to_string(),
+        PathItem {
+            post: Some(operation(
+                "reloadSecrets",
+                "Read the key files the start read again and put their keys in force: the admin role alone, mounted only with control-plane authentication",
+                None,
+                None,
+                {
+                    let mut responses = inline_response(
+                        "The files read with their entry counts, and whether the serving and the control-plane key sets changed",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "files": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "setting": {"type": "string"},
+                                            "path": {"type": "string"},
+                                            "entries": {"type": "integer"}
+                                        },
+                                        "required": ["setting", "path", "entries"]
+                                    }
+                                },
+                                "serving_changed": {"type": "boolean"},
+                                "control_plane_changed": {"type": "boolean"}
+                            },
+                            "required": ["files", "serving_changed", "control_plane_changed"]
+                        }),
+                    );
+                    responses.insert(
+                        "409".to_string(),
+                        Response {
+                            description: "No key was read from a file at start; nothing to reload"
+                                .to_string(),
+                            content: None,
+                        },
+                    );
+                    responses.insert(
+                        "422".to_string(),
+                        Response {
+                            description: "A file could not be used (unreadable, unparsable, or a key set the start's rules refuse); every key in force stands. The body names the field and the path, never the content"
+                                .to_string(),
+                            content: None,
+                        },
+                    );
+                    responses
+                },
+            )),
+            ..PathItem::default()
+        },
+    );
+
     // ---- WASM modules (control plane) ----
     // The module types live in the WASM runtime crate, which this generator
     // does not build; their shape is written here as the gateway answers it.
@@ -935,6 +992,22 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
             "required": ["modules"]
         })
     };
+    let mut wasm_added = inline_response(
+        "Every module loaded; each carries its uuid in `add_result`",
+        wasm_modules("The modules with their results"),
+    );
+    wasm_added.insert(
+        "400".to_string(),
+        Response {
+            description: "A module failed to load; each carries its result in `add_result`. A refused body answers the error envelope instead.".to_string(),
+            content: Some(inline_content(serde_json::json!({
+                "oneOf": [
+                    wasm_modules("The modules with their results"),
+                    schema_ref(&worker_error_name)
+                ]
+            }))),
+        },
+    );
     paths.insert(
         "/wasm".to_string(),
         PathItem {
@@ -946,10 +1019,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                     required: true,
                     content: inline_content(wasm_modules("The modules to load")),
                 }),
-                inline_response(
-                    "Every module loaded; each carries its uuid in `add_result`",
-                    wasm_modules("The modules with their results"),
-                ),
+                refused_with(wasm_added, &worker_error_name),
             )),
             get: Some(operation(
                 "listWasmModules",
@@ -999,13 +1069,16 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                 "Unload a WASM module by uuid",
                 Some(vec![path_param("module_uuid")]),
                 None,
-                BTreeMap::from([(
-                    "200".to_string(),
-                    Response {
-                        description: "The module was removed".to_string(),
-                        content: None,
-                    },
-                )]),
+                refused_with(
+                    BTreeMap::from([(
+                        "200".to_string(),
+                        Response {
+                            description: "The module was removed".to_string(),
+                            content: None,
+                        },
+                    )]),
+                    &worker_error_name,
+                ),
             )),
             ..PathItem::default()
         },
@@ -1193,8 +1266,8 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
     );
     tokenizer_added.extend(status_response(
         "409",
-        &tokenizer_added_name,
-        "A tokenizer of that name exists; `id` names it",
+        &worker_error_name,
+        "A tokenizer of that name exists; the error names its id",
     ));
     paths.insert(
         "/v1/tokenizers".to_string(),
@@ -1204,7 +1277,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                 "Load a tokenizer from a path or a hub id",
                 None,
                 Some(json_body(&add_tokenizer_name)),
-                refused_with(tokenizer_added, &error_name),
+                refused_with(tokenizer_added, &worker_error_name),
             )),
             get: Some(operation(
                 "listTokenizers",
@@ -1227,7 +1300,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                 None,
                 refused_with(
                     json_response(&tokenizer_info_name, "The tokenizer"),
-                    &error_name,
+                    &worker_error_name,
                 ),
             )),
             delete: Some(operation(
@@ -1237,7 +1310,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                 None,
                 refused_with(
                     json_response(&tokenizer_removed_name, "The tokenizer was removed"),
-                    &tokenizer_removed_name,
+                    &worker_error_name,
                 ),
             )),
             ..PathItem::default()
@@ -1253,7 +1326,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                 None,
                 refused_with(
                     json_response(&tokenizer_added_name, "The load's status"),
-                    &error_name,
+                    &worker_error_name,
                 ),
             )),
             ..PathItem::default()
@@ -1373,6 +1446,47 @@ mod tests {
         assert_eq!(
             doc["paths"]["/workers"]["get"]["parameters"][0]["name"],
             json!("model")
+        );
+    }
+
+    #[test]
+    fn the_module_and_tokenizer_routes_refuse_in_the_worker_envelope() {
+        let doc = document_value();
+        let envelope = json!("#/components/schemas/WorkerErrorResponse");
+        for (path, method, status) in [
+            ("/v1/tokenizers", "post", "409"),
+            ("/v1/tokenizers", "post", "4XX"),
+            ("/v1/tokenizers/{tokenizer_id}", "get", "4XX"),
+            ("/v1/tokenizers/{tokenizer_id}", "delete", "4XX"),
+            ("/v1/tokenizers/{tokenizer_id}/status", "get", "4XX"),
+            ("/wasm", "post", "4XX"),
+            ("/wasm/{module_uuid}", "delete", "4XX"),
+        ] {
+            assert_eq!(
+                doc["paths"][path][method]["responses"][status]["content"]["application/json"]
+                    ["schema"]["$ref"],
+                envelope,
+                "{method} {path} {status}"
+            );
+        }
+    }
+
+    /// The WASM load's explicit 400 carries two bodies, the per-module results
+    /// and, for a refused body, the envelope; the explicit status hides the
+    /// 4XX range, so the document declares both under it.
+    #[test]
+    fn the_wasm_load_400_declares_the_per_module_shape_and_the_envelope() {
+        let doc = document_value();
+        let schema = &doc["paths"]["/wasm"]["post"]["responses"]["400"]["content"]
+            ["application/json"]["schema"];
+        let shapes = schema["oneOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the 400 carries no oneOf: {schema}"));
+        assert_eq!(shapes.len(), 2, "{schema}");
+        assert_eq!(shapes[0]["required"], json!(["modules"]));
+        assert_eq!(
+            shapes[1]["$ref"],
+            json!("#/components/schemas/WorkerErrorResponse")
         );
     }
 }

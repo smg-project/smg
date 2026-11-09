@@ -48,6 +48,7 @@ impl SglangScheduler for MockScheduler {
                 logprobs: req
                     .return_logprob
                     .then(|| usize::try_from(req.top_logprobs_num).unwrap_or(0)),
+                score_ids: req.token_ids_logprob.clone(),
                 pin: req.data_parallel_rank,
             })
             .await?;
@@ -263,7 +264,9 @@ fn response(request_id: &str, frame: Frame) -> sg::GenerateResponse {
     }
 }
 
-/// The frame's logprobs in this wire's shape, one top entry per position.
+/// The frame's logprobs in this wire's shape: one top entry per position, and
+/// the scores of the token ids the request asked for as one row, the shape a
+/// prefill-only scoring request reads off the completion.
 fn logprobs(logprobs: LogProbs) -> sg::OutputLogProbs {
     sg::OutputLogProbs {
         token_logprobs: logprobs.token_logprobs,
@@ -276,7 +279,12 @@ fn logprobs(logprobs: LogProbs) -> sg::OutputLogProbs {
                 token_ids: position.ids,
             })
             .collect(),
-        token_ids_logprobs: Vec::new(),
+        token_ids_logprobs: if logprobs.scores.is_empty() {
+            Vec::new()
+        } else {
+            let (token_ids, values) = logprobs.scores.into_iter().unzip();
+            vec![sg::TopLogProbs { values, token_ids }]
+        },
     }
 }
 
@@ -400,6 +408,82 @@ mod tests {
             })
             .collect();
         assert_eq!(completions, vec![(0, vec![11]), (1, vec![12, 13])]);
+    }
+
+    /// A prefill-only scoring request (no new tokens, `token_ids_logprob` set)
+    /// reads a scripted answer's token-id logprobs as the one scores row of
+    /// its completion, in the request's order; an answer that scores another
+    /// count of ids is refused, so is one for a request that asks for no
+    /// logprobs, and so is one that scores with no number.
+    #[tokio::test]
+    async fn a_scoring_answer_carries_the_requested_ids_logprobs() {
+        let (service, _stop) = MockScheduler::for_tests(Config::default(), 65_304);
+        script::enqueue(
+            &service.name,
+            vec![
+                Answer::parse(&json!({"output_text": "", "token_id_logprobs": [-0.1, -2.3]}))
+                    .expect("an answer"),
+                Answer::parse(&json!({"output_text": "", "token_id_logprobs": [-0.1, -2.3, -4.0]}))
+                    .expect("an answer"),
+                Answer::parse(&json!({"output_text": "", "token_id_logprobs": [-0.1, -2.3]}))
+                    .expect("an answer"),
+            ],
+        )
+        .expect("a registered worker");
+        let score = |id: &str| {
+            let mut req = request(id, &[1, 2, 3, 4], false);
+            req.sampling_params = Some(sg::SamplingParams {
+                max_new_tokens: Some(0),
+                ..Default::default()
+            });
+            req.return_logprob = true;
+            req.token_ids_logprob = vec![42, 5];
+            req
+        };
+        let frames = read_frames(&service, score("sw-score")).await;
+        let [frame] = frames.as_slice() else {
+            panic!("one completion, got {frames:?}");
+        };
+        match frame.response.as_ref() {
+            Some(GenResp::Complete(complete)) => {
+                assert!(complete.output_ids.is_empty());
+                assert_eq!((complete.prompt_tokens, complete.completion_tokens), (4, 0));
+                assert_eq!(complete.finish_reason, "stop");
+                let logprobs = complete.output_logprobs.as_ref().expect("logprobs");
+                assert_eq!(
+                    logprobs.token_ids_logprobs,
+                    vec![sg::TopLogProbs {
+                        values: vec![-0.1, -2.3],
+                        token_ids: vec![42, 5],
+                    }]
+                );
+                assert!(logprobs.token_logprobs.is_empty() && logprobs.top_logprobs.is_empty());
+            }
+            other => panic!("not a completion: {other:?}"),
+        }
+        let mut stream = service
+            .generate(Request::new(score("sw-score-three")))
+            .await
+            .expect("accepted")
+            .into_inner();
+        let status = stream.next().await.expect("an item").expect_err("refused");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert!(status
+            .message()
+            .contains("scores 3 token ids, the request asks for 2"));
+        let mut silent = score("sw-score-silent");
+        silent.return_logprob = false;
+        let mut stream = service
+            .generate(Request::new(silent))
+            .await
+            .expect("accepted")
+            .into_inner();
+        let status = stream.next().await.expect("an item").expect_err("refused");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert!(status
+            .message()
+            .contains("scores 2 token ids, the request asks for no logprobs"));
+        assert!(Answer::parse(&json!({"output_text": "", "token_id_logprobs": ["x"]})).is_err());
     }
 
     /// A pinned request runs on its rank's engine, a pin past the ranks is

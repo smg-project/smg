@@ -95,7 +95,10 @@ async fn whole(frames: Vec<proto::GenerateResponse>, router_stops: &[String]) ->
     let (stream, server) = scripted_stream(frames, "0").await;
     let (result, _) = HarmonyResponseProcessor::new()
         .process_responses_iteration(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
             Arc::new(request()),
             dispatch(),
             router_stops,
@@ -228,7 +231,13 @@ async fn a_router_stop_ends_the_streamed_turn_and_the_engine_request() {
 
     let streamed = timeout(
         Duration::from_secs(5),
-        streamed(context::ExecutionResult::Single { stream }, &stops()),
+        streamed(
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
+            &stops(),
+        ),
     )
     .await
     .expect("the stream ends at the stop, without the engine's Complete");
@@ -280,7 +289,13 @@ async fn a_router_stop_inside_the_analysis_channel_streams_no_message() {
     let (stream, server) = scripted_stream(frames, "0").await;
     let streamed = timeout(
         Duration::from_secs(5),
-        streamed(context::ExecutionResult::Single { stream }, &stops()),
+        streamed(
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
+            &stops(),
+        ),
     )
     .await
     .expect("the stream ends with the engine's Complete");
@@ -334,7 +349,13 @@ async fn the_engine_s_complete_right_after_the_stop_chunk_adds_only_the_counts_t
     let (stream, server) = scripted_stream(frames, "0").await;
     let streamed = timeout(
         Duration::from_secs(5),
-        streamed(context::ExecutionResult::Single { stream }, &stops()),
+        streamed(
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
+            &stops(),
+        ),
     )
     .await
     .expect("the stream ends with the engine's Complete");
@@ -373,7 +394,14 @@ async fn the_text_a_scanner_held_back_is_released_when_no_stop_comes() {
     // "S" could still grow into the stop: held back until the turn ends.
     let ids = harmony_tokens(None, "Hello S");
     let (stream, server) = scripted_stream(frames(&ids, "stop"), "0").await;
-    let streamed = streamed(context::ExecutionResult::Single { stream }, &stops()).await;
+    let streamed = streamed(
+        context::ExecutionResult::Single {
+            stream,
+            dispatch_start: std::time::Instant::now(),
+        },
+        &stops(),
+    )
+    .await;
     server.abort();
 
     assert_eq!(streamed.text(), "Hello S", "{:?}", streamed.events);
@@ -399,7 +427,10 @@ async fn the_whole_chat_turn_keeps_its_cut_at_the_router_s_stop() {
             .expect("chat request");
     let (response, _) = HarmonyResponseProcessor::new()
         .process_non_streaming_chat_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
             Arc::new(request),
             dispatch(),
             &stops(),

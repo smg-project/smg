@@ -373,7 +373,7 @@ impl ResponseProcessor {
         request_logprobs: bool,
     ) -> Result<(ChatCompletionResponse, response_formatting::TokenCounts), axum::response::Response>
     {
-        let started = generation_start(&execution_result, Instant::now());
+        let started = generation_start(&execution_result);
         let model = &dispatch.model;
         let reasoning_parser_name = self
             .parser_resolver
@@ -676,7 +676,7 @@ impl ResponseProcessor {
         start_time: Instant,
         metrics_endpoint: &'static str,
     ) -> Result<Vec<GenerateResponse>, axum::response::Response> {
-        let started = generation_start(&execution_result, start_time);
+        let started = generation_start(&execution_result);
         // Collect all responses from the execution result
         let all_responses =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
@@ -774,7 +774,7 @@ impl ResponseProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<(Message, response_formatting::TokenCounts), axum::response::Response> {
-        let started = Instant::now();
+        let started = generation_start(&execution_result);
         let model = &dispatch.model;
         let reasoning_parser_name = self
             .parser_resolver
@@ -1117,7 +1117,7 @@ impl ResponseProcessor {
         tokenizer: &Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<CompletionResponse, axum::response::Response> {
-        let started = Instant::now();
+        let started = generation_start(&execution_result);
         let request_logprobs = completion_req.logprobs.is_some();
         let per_prompt_results = match execution_result {
             ExecutionResult::Batch { results } => results,
@@ -1264,12 +1264,21 @@ impl ResponseProcessor {
 
 /// Where a collected answer's generation clock starts, as its streamed
 /// twin's does: at the prefill dispatch of a disaggregated pair (whose
-/// prefill may already have run when the answer is collected), else at
-/// `start`, the processor's entry or the stage's.
-fn generation_start(execution_result: &ExecutionResult, start: Instant) -> Instant {
+/// prefill may already have run when the answer is collected), or at the
+/// single RPC's dispatch. A batch uses its earliest member. The shapes
+/// that carry no dispatch instant (an embedding answer, an empty batch)
+/// read the clock here, so a generated answer reads it once, at the
+/// dispatch.
+pub(crate) fn generation_start(execution_result: &ExecutionResult) -> Instant {
     match execution_result {
+        ExecutionResult::Single { dispatch_start, .. } => *dispatch_start,
         ExecutionResult::PrefillDecode { pd_timing, .. } => pd_timing.prefill_start,
-        _ => start,
+        ExecutionResult::Batch { results } => results
+            .iter()
+            .map(generation_start)
+            .min()
+            .unwrap_or_else(Instant::now),
+        ExecutionResult::Embedding { .. } => Instant::now(),
     }
 }
 

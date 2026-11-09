@@ -313,6 +313,8 @@ class RouterArgs:
     # The admin listener (bind host and port) for the control-plane routes; None = the
     # control plane stays on the data listener
     admin_host: str | None = None
+    # Most client connections the admin listener holds open at once (0 = no bound)
+    admin_max_connections: int = 0
     admin_port: int | None = None
     api_key: str | None = None
     # Routing-key assignment; defaults: random (manual policy), delegate (override)
@@ -2213,6 +2215,20 @@ class RouterArgs:
             ),
         )
         request_group.add_argument(
+            f"--{prefix}admin-max-connections",
+            type=_non_negative_int,
+            default=RouterArgs.admin_max_connections,
+            help=(
+                "Most client connections the admin listener (--admin-port) holds open at"
+                " once, the bound --max-connections puts on the data listener: a connection"
+                " beyond it is closed at accept, unanswered, and counted in"
+                " smg_http_connections_rejected_total. 0 = no bound. The bound is the admin"
+                " listener's own, so the control plane stays reachable while the data plane"
+                " is saturated, and a client that reaches the admin listener cannot hold it"
+                " open without limit"
+            ),
+        )
+        request_group.add_argument(
             f"--{prefix}trust-tenant-header",
             action="store_true",
             default=False,
@@ -3240,19 +3256,16 @@ class RouterArgs:
         args_dict["decode_urls"] = cls._parse_decode_urls(
             cli_args_dict.get(f"{prefix}decode", None)
         )
-        args_dict["selector"] = cls._parse_selector(cli_args_dict.get(f"{prefix}selector", None))
-        args_dict["encode_selector"] = cls._parse_selector(
-            cli_args_dict.get(f"{prefix}encode_selector", None)
-        )
-        args_dict["prefill_selector"] = cls._parse_selector(
-            cli_args_dict.get(f"{prefix}prefill_selector", None)
-        )
-        args_dict["decode_selector"] = cls._parse_selector(
-            cli_args_dict.get(f"{prefix}decode_selector", None)
-        )
-        args_dict["router_selector"] = cls._parse_selector(
-            cli_args_dict.get(f"{prefix}router_selector", None)
-        )
+        for selector_field in (
+            "selector",
+            "encode_selector",
+            "prefill_selector",
+            "decode_selector",
+            "router_selector",
+        ):
+            args_dict[selector_field] = cls._parse_selector(
+                cli_args_dict.get(f"{prefix}{selector_field}", None), selector_field
+            )
         args_dict["storage_context_headers"] = cls._parse_storage_context_headers(
             cli_args_dict.get(f"{prefix}storage_context_headers", None)
         )
@@ -3383,11 +3396,12 @@ class RouterArgs:
                 )
 
     @staticmethod
-    def _parse_selector(selector_list):
-        """The label selectors' ``key=value`` entries as ``{key: value}``. A
-        token without ``=`` is skipped, as the Rust CLI skips it; one argv
-        item may carry several space-separated pairs, the launcher's own
-        allowance."""
+    def _parse_selector(selector_list, field="selector"):
+        """The label selectors' ``key=value`` entries as ``{key: value}``. An
+        entry without ``=`` or without a key is refused with the Rust CLI's
+        message (it used to be skipped, and the selector that remained matched
+        more pods than the line said); one argv item may carry several
+        space-separated pairs, the launcher's own allowance."""
         if not selector_list:
             return {}
 
@@ -3395,10 +3409,17 @@ class RouterArgs:
         # An item may hold several space-separated pairs (OME passes
         # `key1=value1 key2=value2` as a single argv entry).
         for item in selector_list:
+            if not item.split():  # a blank item, e.g. an unset shell variable
+                raise ValueError(
+                    f"Invalid value for field '{field}': {item} - expected 'key=value'"
+                )
             for token in item.split():
-                if "=" in token:
-                    key, value = token.split("=", 1)
-                    selector[key] = value
+                key, sep, value = token.partition("=")
+                if not sep or not key:
+                    raise ValueError(
+                        f"Invalid value for field '{field}': {token} - expected 'key=value'"
+                    )
+                selector[key] = value
         return selector
 
     @staticmethod

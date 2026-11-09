@@ -187,48 +187,7 @@ fn decoding_a_step_of_plain_outputs_allocates_one_block_per_output() {
 #[test]
 fn decoding_a_slim_step_of_plain_outputs_allocates_no_string_per_id() {
     let outputs = 32;
-    let rids = (0..outputs).map(|index| request_id(index).into()).collect();
-    let output_ids = (0..outputs).map(|index| vec![100 + index as u32]).collect();
-    let empty_strings: Vec<String> = (0..outputs).map(|_| String::new()).collect();
-    let zeros: Vec<u32> = vec![0; outputs];
-    let no_logprobs: Vec<Vec<f64>> = vec![Vec::new(); outputs];
-    let no_logprob_ids: Vec<Vec<u32>> = vec![Vec::new(); outputs];
-    let sglang = BatchTokenIDSlimOutput {
-        rids,
-        output_ids,
-        finished_reasons: empty_strings.clone(),
-        finished_messages: vec![None; outputs],
-        finished_matched: vec![None; outputs],
-        prompt_tokens: zeros.clone(),
-        completion_tokens: zeros.clone(),
-        cached_tokens: zeros.clone(),
-        output_token_logprobs_val: no_logprobs.clone(),
-        output_token_logprobs_idx: no_logprob_ids.clone(),
-        ..Default::default()
-    };
-    let frames = vec![Bytes::from(encode_msgpack(&sglang).expect("encode"))];
-    let (decoded, sglang_allocations) =
-        decode_allocations::<SglangProtocol>(&frames, &SglangLayout::default());
-    assert_eq!(decoded, outputs);
-
-    let rids = (0..outputs).map(|index| request_id(index).into()).collect();
-    let output_ids = (0..outputs).map(|index| vec![100 + index as u32]).collect();
-    let tokenspeed = BatchTokenIDOutSlim {
-        rids,
-        output_ids,
-        finished_reasons: empty_strings,
-        prompt_tokens: zeros.clone(),
-        completion_tokens: zeros.clone(),
-        cached_tokens: zeros,
-        output_token_logprobs_val: no_logprobs,
-        output_token_logprobs_idx: no_logprob_ids,
-        ..Default::default()
-    };
-    let frames = vec![Bytes::from(encode_msgpack(&tokenspeed).expect("encode"))];
-    let (decoded, tokenspeed_allocations) =
-        decode_allocations::<TokenSpeedProtocol>(&frames, &Default::default());
-    assert_eq!(decoded, outputs);
-
+    let (sglang_allocations, tokenspeed_allocations) = slim_decode_allocations(outputs, "");
     eprintln!(
         "allocation calls per decode of {outputs} plain outputs, slim batches: sglang {sglang_allocations}, tokenspeed {tokenspeed_allocations}"
     );
@@ -242,6 +201,78 @@ fn decoding_a_slim_step_of_plain_outputs_allocates_no_string_per_id() {
     );
 }
 
+/// A slim step whose thirty-two outputs all finish costs each wire the finish
+/// reasons' strings on top of the plain step, and nothing for the finished
+/// list: its ids are the outputs' own, shared. Before, every finish copied
+/// its id once more (thirty-two more per step).
+#[test]
+fn decoding_a_slim_step_of_finished_outputs_copies_no_id() {
+    let outputs = 32;
+    let (sglang_allocations, tokenspeed_allocations) = slim_decode_allocations(outputs, "stop");
+    eprintln!(
+        "allocation calls per decode of {outputs} finished outputs, slim batches: sglang {sglang_allocations}, tokenspeed {tokenspeed_allocations}"
+    );
+    assert_eq!(
+        sglang_allocations, SGLANG_SLIM_FINISHED_STEP_ALLOCATIONS,
+        "sglang finished slim step of {outputs}"
+    );
+    assert_eq!(
+        tokenspeed_allocations, TOKENSPEED_SLIM_FINISHED_STEP_ALLOCATIONS,
+        "tokenspeed finished slim step of {outputs}"
+    );
+}
+
+/// The two slim wires' step of `outputs` outputs (one new token each, no
+/// logprobs), every output finished with `reason` when it is not empty: the
+/// first wire's batch, then the second's, each as its one frame.
+fn slim_steps(outputs: usize, reason: &str) -> (Vec<Bytes>, Vec<Bytes>) {
+    let reasons: Vec<String> = (0..outputs).map(|_| reason.to_string()).collect();
+    let zeros: Vec<u32> = vec![0; outputs];
+    let no_logprobs: Vec<Vec<f64>> = vec![Vec::new(); outputs];
+    let no_logprob_ids: Vec<Vec<u32>> = vec![Vec::new(); outputs];
+    let sglang = BatchTokenIDSlimOutput {
+        rids: (0..outputs).map(|index| request_id(index).into()).collect(),
+        output_ids: (0..outputs).map(|index| vec![100 + index as u32]).collect(),
+        finished_reasons: reasons.clone(),
+        finished_messages: vec![None; outputs],
+        finished_matched: vec![None; outputs],
+        prompt_tokens: zeros.clone(),
+        completion_tokens: zeros.clone(),
+        cached_tokens: zeros.clone(),
+        output_token_logprobs_val: no_logprobs.clone(),
+        output_token_logprobs_idx: no_logprob_ids.clone(),
+        ..Default::default()
+    };
+    let tokenspeed = BatchTokenIDOutSlim {
+        rids: (0..outputs).map(|index| request_id(index).into()).collect(),
+        output_ids: (0..outputs).map(|index| vec![100 + index as u32]).collect(),
+        finished_reasons: reasons,
+        prompt_tokens: zeros.clone(),
+        completion_tokens: zeros.clone(),
+        cached_tokens: zeros,
+        output_token_logprobs_val: no_logprobs,
+        output_token_logprobs_idx: no_logprob_ids,
+        ..Default::default()
+    };
+    (
+        vec![Bytes::from(encode_msgpack(&sglang).expect("encode"))],
+        vec![Bytes::from(encode_msgpack(&tokenspeed).expect("encode"))],
+    )
+}
+
+/// The allocation calls of one slim step's decode on each wire, the output
+/// count checked on both.
+fn slim_decode_allocations(outputs: usize, reason: &str) -> (usize, usize) {
+    let (sglang, tokenspeed) = slim_steps(outputs, reason);
+    let (decoded, sglang_allocations) =
+        decode_allocations::<SglangProtocol>(&sglang, &SglangLayout::default());
+    assert_eq!(decoded, outputs);
+    let (decoded, tokenspeed_allocations) =
+        decode_allocations::<TokenSpeedProtocol>(&tokenspeed, &Default::default());
+    assert_eq!(decoded, outputs);
+    (sglang_allocations, tokenspeed_allocations)
+}
+
 /// What a slim step of thirty-two plain outputs costs on each wire with the
 /// ids as frame views: a token vector per output, one vector per filled
 /// column (ten on the first wire, eight on the second) and three blocks of
@@ -249,6 +280,14 @@ fn decoding_a_slim_step_of_plain_outputs_allocates_no_string_per_id() {
 /// seventy-five).
 const SGLANG_SLIM_STEP_ALLOCATIONS: usize = 45;
 const TOKENSPEED_SLIM_STEP_ALLOCATIONS: usize = 43;
+
+/// The same step with every output finished: the plain step plus one string
+/// per finish reason and the finished list's one vector (45 + 32 + 1 and
+/// 43 + 32 + 1). Before the shared ids, every finish copied its id into the
+/// finished list once more and the list grew by doubling to thirty-two
+/// (thirty-two and three calls more on each wire).
+const SGLANG_SLIM_FINISHED_STEP_ALLOCATIONS: usize = 78;
+const TOKENSPEED_SLIM_FINISHED_STEP_ALLOCATIONS: usize = 76;
 
 /// The prompt of the encode pins: 8,192 token ids, a long prompt, spread over
 /// the id range so the ids take their usual three bytes each.

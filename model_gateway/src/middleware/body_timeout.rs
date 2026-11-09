@@ -321,10 +321,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{super::request_start::RequestStarted, *};
-    use crate::{
-        middleware::test_support::{echo_request, echo_route, ECHO_PATH},
-        test_support::json_of,
-    };
+    use crate::middleware::test_support::{echo_request, echo_route, json_of, ECHO_PATH};
 
     fn app(timeouts: RequestBodyTimeouts) -> Router {
         Router::new()

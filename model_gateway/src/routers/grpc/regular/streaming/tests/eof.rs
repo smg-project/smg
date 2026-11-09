@@ -304,7 +304,10 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
         .unwrap();
         let response = Arc::new(processor(false))
             .process_completion_streaming_response(
-                context::ExecutionResult::Single { stream },
+                context::ExecutionResult::Single {
+                    stream,
+                    dispatch_start: Instant::now(),
+                },
                 CompletionResponseSpec::new(&request, Vec::new()),
                 dispatch(),
                 tokenizer.clone(),
@@ -369,7 +372,10 @@ async fn completion_events(
         serde_json::from_value(request).unwrap();
     let response = Arc::new(processor(false))
         .process_completion_streaming_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             CompletionResponseSpec::new(&request, Vec::new()),
             dispatch(),
             tokenizer,
@@ -494,7 +500,10 @@ async fn byte_fallback_generate_mid_run_stop_reports_gateway_stop() {
     let processor = unary_processor(utils::ParserResolver::disabled());
     let responses = processor
         .process_non_streaming_generate_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             dispatch(),
             &mut decoder,
             false,
@@ -531,7 +540,10 @@ async fn byte_fallback_generate_stop_token_keeps_the_engine_matched_stop() {
     let processor = unary_processor(utils::ParserResolver::disabled());
     let responses = processor
         .process_non_streaming_generate_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             dispatch(),
             &mut decoder,
             false,
@@ -566,7 +578,10 @@ async fn byte_fallback_generate_eof_reports_gateway_stop() {
     let processor = unary_processor(utils::ParserResolver::disabled());
     let responses = processor
         .process_non_streaming_generate_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             dispatch(),
             &mut decoder,
             false,
@@ -660,7 +675,10 @@ async fn messages_answer(
         let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
         let (response, _) = unary_processor(resolver)
             .process_non_streaming_messages_response(
-                context::ExecutionResult::Single { stream },
+                context::ExecutionResult::Single {
+                    stream,
+                    dispatch_start: Instant::now(),
+                },
                 spec,
                 metadata,
                 tokenizer,
@@ -1289,7 +1307,10 @@ async fn byte_fallback_unary_valid_reasoning_counts_original_tokens() {
         let (stream, server) = scripted_stream(vec![frame], "0").await;
         let (message, _) = processor
             .process_non_streaming_messages_response(
-                context::ExecutionResult::Single { stream },
+                context::ExecutionResult::Single {
+                    stream,
+                    dispatch_start: Instant::now(),
+                },
                 messages_spec(true),
                 dispatch(),
                 tokenizer.clone(),
@@ -1792,7 +1813,10 @@ async fn kimi_k3_cut_inside_the_closing_structure_keeps_the_markers_out_of_conte
         let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
         let (response, _) = unary_processor(resolver())
             .process_non_streaming_chat_response(
-                context::ExecutionResult::Single { stream },
+                context::ExecutionResult::Single {
+                    stream,
+                    dispatch_start: Instant::now(),
+                },
                 chat_spec(false),
                 dispatch(),
                 tokenizer,
@@ -1993,7 +2017,10 @@ async fn chat_unary_logprobs_cover_every_generated_token() {
         utils::create_stop_decoder(&tokenizer, stop.as_ref(), None, false, false, false);
     let (response, _) = response_processor()
         .process_non_streaming_chat_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             chat_spec(false),
             dispatch(),
             tokenizer,
@@ -2050,7 +2077,10 @@ async fn chat_unary_logprobs_of_a_tool_call_answer_cover_every_generated_token()
         Some("qwen3".to_string()),
     ))
     .process_non_streaming_chat_response(
-        context::ExecutionResult::Single { stream },
+        context::ExecutionResult::Single {
+            stream,
+            dispatch_start: Instant::now(),
+        },
         chat_spec(true),
         dispatch(),
         tokenizer,
@@ -2390,6 +2420,7 @@ async fn qwen_xml_messages(text: &str, finish: &str, stream: bool) -> (Vec<Strin
             .process_non_streaming_messages_response(
                 context::ExecutionResult::Single {
                     stream: grpc_stream,
+                    dispatch_start: Instant::now(),
                 },
                 spec,
                 dispatch(),
@@ -3018,7 +3049,10 @@ async fn gemma4_rendered_prompt_state_controls_chat_responses() {
                         utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
                     let (response, _) = unary_processor(resolver)
                         .process_non_streaming_chat_response(
-                            context::ExecutionResult::Single { stream },
+                            context::ExecutionResult::Single {
+                                stream,
+                                dispatch_start: Instant::now(),
+                            },
                             spec,
                             metadata,
                             tokenizer,
@@ -3225,7 +3259,10 @@ plan<|tool_call>call:lookup{q:<|"|>Paris<|"|>}<tool_call|>"#;
         let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
         let result = processor
             .process_non_streaming_messages_response(
-                context::ExecutionResult::Single { stream },
+                context::ExecutionResult::Single {
+                    stream,
+                    dispatch_start: Instant::now(),
+                },
                 MessagesResponseSpec::from(&request),
                 dispatch(),
                 tokenizer,
@@ -3562,7 +3599,10 @@ async fn frames_of_a_chat_stream_cut_with(status: tonic::Status) -> (Vec<String>
         utils::StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
     let response = Arc::new(processor(false))
         .process_streaming_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             chat_spec(false),
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
@@ -3653,7 +3693,10 @@ async fn the_load_guards_of_a_chat_stream_go_with_its_body() {
             utils::StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
         let response = Arc::new(processor(false))
             .process_streaming_response(
-                context::ExecutionResult::Single { stream },
+                context::ExecutionResult::Single {
+                    stream,
+                    dispatch_start: Instant::now(),
+                },
                 chat_spec(false),
                 dispatch(),
                 Arc::new(CharacterTokenizer::default()),
@@ -3968,7 +4011,10 @@ async fn the_response_reads_the_parser_names_the_spec_carries() {
                     utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
                 let (response, _) = unary_processor(resolver())
                     .process_non_streaming_chat_response(
-                        context::ExecutionResult::Single { stream },
+                        context::ExecutionResult::Single {
+                            stream,
+                            dispatch_start: Instant::now(),
+                        },
                         spec,
                         dispatch(),
                         Arc::clone(&tokenizer),

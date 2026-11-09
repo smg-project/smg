@@ -64,14 +64,15 @@ jobs:
         with:
           key: symphony-fuzz
           workspaces: crates/symphony/fuzz
-      # The crate is a workspace of its own, outside the repository's fmt and clippy jobs. Its
-      # seed tests read the tree; without the variable they would skip.
-      - name: Format, lint and test the fuzz crate
+      # The crate is a workspace of its own, outside the repository's fmt, clippy and rustdoc
+      # jobs. Its seed tests read the tree; without the variable they would skip.
+      - name: Format, lint, document and test the fuzz crate
         env:
           BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures
         run: |
           cargo fmt --manifest-path crates/symphony/fuzz/Cargo.toml --all -- --check
           cargo clippy --manifest-path crates/symphony/fuzz/Cargo.toml --all-targets -- -D warnings
+          RUSTDOCFLAGS='-D warnings' cargo doc --manifest-path crates/symphony/fuzz/Cargo.toml --no-deps
           cargo test --manifest-path crates/symphony/fuzz/Cargo.toml
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked

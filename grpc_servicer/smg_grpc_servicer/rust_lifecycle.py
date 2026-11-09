@@ -287,6 +287,7 @@ def metrics_bind_address(
     port_env: str,
     host_env: str,
     environ: Mapping[str, str] | None = None,
+    flag: str = METRICS_PORT_FLAG,
 ) -> str | None:
     """Where the Rust servicer serves ``GET /metrics``, as ``host:port`` (an
     IPv6 host bracketed), or ``None`` for no endpoint: the port from
@@ -303,7 +304,7 @@ def metrics_bind_address(
     grpc_port = int(getattr(args, "port", 0) or 0)
     if port and port == grpc_port:
         raise ServicerConfigError(
-            f"{METRICS_PORT_FLAG}={port} is the gRPC port: the metrics listener needs a port "
+            f"{flag}={port} is the gRPC port: the metrics listener needs a port "
             f"of its own (or 0 for an ephemeral one)"
         )
     host = getattr(args, "metrics_host", None) if args is not None else None
@@ -315,7 +316,12 @@ def metrics_bind_address(
 
 
 def check_metrics_port_needs_rust(
-    impl: str, args: Any, env_name: str, *, environ: Mapping[str, str] | None = None
+    impl: str,
+    args: Any,
+    env_name: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+    flag: str = METRICS_PORT_FLAG,
 ) -> None:
     """A metrics port given (the flag or its variable) with the Python
     servicer selected is a :class:`ServicerConfigError`: the Python servicer
@@ -324,7 +330,7 @@ def check_metrics_port_needs_rust(
     if impl == "rust" or metrics_port(args, env_name, environ=environ) is None:
         return
     raise ServicerConfigError(
-        f"{METRICS_PORT_FLAG} (or {env_name}) needs {SERVICER_IMPL_FLAG} rust: the Python "
+        f"{flag} (or {env_name}) needs {SERVICER_IMPL_FLAG} rust: the Python "
         "servicer exposes no metrics endpoint"
     )
 
@@ -1483,6 +1489,7 @@ class RustLauncher:
     # The metrics endpoint's variables (the fallbacks of --metrics-port and
     # --metrics-host; see :func:`metrics_bind_address`).
     metrics_port_env: str
+    metrics_port_flag: str = METRICS_PORT_FLAG
     metrics_host_env: str
     # What the servicer loses without a local tokenizer directory, for the warning.
     without_tokenizer: str
@@ -1555,6 +1562,7 @@ class RustLauncher:
             port_env=self.metrics_port_env,
             host_env=self.metrics_host_env,
             environ=environ,
+            flag=self.metrics_port_flag,
         )
 
     def server_extras(self, args: Any, tokenizer_dir: str | None) -> dict[str, Any]:

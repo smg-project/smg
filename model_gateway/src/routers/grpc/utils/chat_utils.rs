@@ -1198,8 +1198,8 @@ pub(crate) fn process_chat_messages_with_placeholders(
         // The prefill goes into the same call so the text and its encoding are
         // produced together and cannot drift apart.
         tokenizer
-            .apply_chat_template_with_encoding(
-                &transformed_messages,
+            .apply_chat_template_with_encoding_owned(
+                transformed_messages,
                 params,
                 assistant_prefix.as_deref(),
             )

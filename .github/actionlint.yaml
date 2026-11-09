@@ -3,6 +3,7 @@
 self-hosted-runner:
   labels:
     - k8s-runner-cpu
+    - ai-review-cpu
     - k8s-runner-gpu
     - 1-gpu-h100
     - 4-gpu-h100

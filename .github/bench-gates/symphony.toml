@@ -62,6 +62,14 @@ repeats = 3
 filter = "^((parse|prose)/|setup/(table|engine)/|setup/declared$)"
 bench_args = ["--warm-up-time", "0.5", "--measurement-time", "2"]
 
+# The files that feed this binary beyond the measured crate. The base side is built with them as the
+# pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
+# gated rows through the binary's inlining: on 2026-11-08 a bench-file-only change read the six
+# prose/whole rows +32 % on the hosted runner (+47 % on a build host, the prose iteration closures
+# compiled to other sizes under the one-unit thin-LTO link) with the parser byte-identical. A new
+# row goes to a bench target of its own, as benches/grammar.rs is.
+sources = ["crates/symphony/benches/throughput.rs", "crates/symphony/tests/common/slices.rs"]
+
 [[gate]]
 pattern = "^parse/(whole|pieces8)/"
 threshold = 0.10

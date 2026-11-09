@@ -554,10 +554,9 @@ mod tests {
     use super::*;
     use crate::{
         routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE,
-        test_support::RefusedAddress,
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
-            test_support::no_health_check,
+            test_support::{no_health_check, RefusedAddress},
             BasicWorkerBuilder, ConnectionMode,
         },
     };

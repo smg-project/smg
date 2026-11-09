@@ -537,3 +537,137 @@ fn a_choices_stop_decoder_copies_the_requests_rules_instead_of_building_them() {
          from the parameters pays ({from_config}); the copy adds nothing"
     );
 }
+
+/// An "openai"-format template (every text part followed by a space): the
+/// Jinja render gives it each string content as a one-item part list.
+const PARTS_TEMPLATE: &str = r"{%- for message in messages -%}
+{{- '<|' + message['role'] + '|>' -}}
+{%- if message['content'] is string -%}
+{{- message['content'] | trim -}}
+{%- elif message['content'] is sequence -%}
+{%- for item in message['content'] -%}
+{{- item['text'] | trim + ' ' -}}
+{%- endfor -%}
+{%- endif -%}
+{{- '<|end|>\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<|assistant|>' -}}{%- endif -%}";
+
+/// The byte-level vocabulary with `PARTS_TEMPLATE` as its chat template, read
+/// from files the way a checkpoint is.
+fn parts_template_tokenizer() -> (tempfile::TempDir, HuggingFaceTokenizer) {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let json = dir.path().join("tokenizer.json");
+    common::byte_level_bpe(&common::FEW_MERGES, &[])
+        .save(&json, false)
+        .expect("the vocabulary file");
+    let template = dir.path().join("chat_template.jinja");
+    std::fs::write(&template, PARTS_TEMPLATE).expect("the template file");
+    let tokenizer = HuggingFaceTokenizer::from_file_with_chat_template(
+        json.to_str().expect("a utf-8 path"),
+        Some(template.to_str().expect("a utf-8 path")),
+    )
+    .expect("the tokenizer loads");
+    (dir, tokenizer)
+}
+
+/// Two turns of a tool conversation: a system prompt, a question about
+/// `city`, a call, its result, a second question, a second call and its
+/// result. Cities of one length keep two conversations one size apart.
+fn tool_conversation(city: &str) -> Vec<serde_json::Value> {
+    let call = |id: &str, city: &str| {
+        serde_json::json!({"role": "assistant", "content": null, "tool_calls": [{"id": id, "type": "function",
+            "function": {"name": "weather", "arguments": format!("{{\"city\": \"{city}\"}}")}}]})
+    };
+    let result = |id: &str, text: &str| serde_json::json!({"role": "tool", "tool_call_id": id, "content": text});
+    vec![
+        serde_json::json!({"role": "system", "content": "You answer with the tools you have."}),
+        serde_json::json!({"role": "user", "content": format!("What is the weather in {city}?")}),
+        call("call-1", city),
+        result("call-1", "{\"sky\": \"clear\", \"celsius\": 18}"),
+        serde_json::json!({"role": "user", "content": "And in Bern?"}),
+        call("call-2", "Bern"),
+        result("call-2", "{\"sky\": \"rain\", \"celsius\": 7}"),
+    ]
+}
+
+/// A warm-up render, then the borrowed and the owned render of `tokenizer`
+/// on a cold conversation each, one size apart: the allocation calls of the
+/// two, the prompts checked equal once the city is set aside.
+fn renders_of(tokenizer: &dyn Tokenizer) -> (usize, usize) {
+    let params = || ChatTemplateParams {
+        add_generation_prompt: true,
+        ..ChatTemplateParams::default()
+    };
+    tokenizer
+        .apply_chat_template_with_encoding(&tool_conversation("Rome"), params(), None)
+        .expect("the warm-up render");
+    let borrowed_messages = tool_conversation("Oslo");
+    let (borrowed, borrowed_calls) = allocations_during(|| {
+        tokenizer
+            .apply_chat_template_with_encoding(&borrowed_messages, params(), None)
+            .expect("the borrowed render")
+    });
+    let owned_messages = tool_conversation("Lima");
+    let (owned, owned_calls) = allocations_during(|| {
+        tokenizer
+            .apply_chat_template_with_encoding_owned(owned_messages, params(), None)
+            .expect("the owned render")
+    });
+    assert_eq!(
+        owned.text.replace("Lima", "Oslo"),
+        borrowed.text,
+        "the same prompt either way"
+    );
+    assert!(
+        borrowed.text.contains("<|tool|>{\"sky\": \"clear\""),
+        "the tool results stay strings: {}",
+        borrowed.text
+    );
+    (borrowed_calls, owned_calls)
+}
+
+/// The render of an OpenAI-format template wraps every string content as a
+/// one-item part list first. On a borrowed slice that is a copy of every
+/// message; on a vector the caller hands over it happens in place, the
+/// prompt the same. Today: 211 calls against 136 for the seven messages of
+/// a two-turn tool conversation, after a warm-up render; a copy added to
+/// either path moves its count.
+#[test]
+fn an_owned_render_of_an_openai_format_template_wraps_in_place_and_copies_no_message() {
+    let (_dir, tokenizer) = parts_template_tokenizer();
+    assert_eq!(
+        tokenizer.chat_template_content_format(),
+        llm_tokenizer::chat_template::ChatTemplateContentFormat::OpenAI,
+        "the template is detected as the parts format"
+    );
+    let (borrowed_calls, owned_calls) = renders_of(&tokenizer);
+    assert_eq!(
+        (borrowed_calls, owned_calls),
+        (211, 136),
+        "allocation calls of the borrowed and the owned render of seven messages"
+    );
+}
+
+/// The gateway renders through the cached wrapper, whose owned entry must
+/// reach the renderer's for the in-place wrap to hold on the serving path.
+/// Today: 211 calls against 136 through the wrapper, as through the renderer.
+#[test]
+fn the_cached_wrappers_owned_render_wraps_in_place_as_the_renderers_does() {
+    let (_dir, tokenizer) = parts_template_tokenizer();
+    let inner: Arc<dyn Tokenizer> = Arc::new(tokenizer);
+    let cached = CachedTokenizer::new(
+        inner,
+        CacheConfig {
+            enable_l0: true,
+            enable_l1: false,
+            ..CacheConfig::default()
+        },
+    );
+    let (borrowed_calls, owned_calls) = renders_of(&cached);
+    assert_eq!(
+        (borrowed_calls, owned_calls),
+        (211, 136),
+        "allocation calls of the borrowed and the owned render through the cached wrapper"
+    );
+}

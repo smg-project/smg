@@ -36,7 +36,7 @@
 //!   leaves sharing one) and child tables return to free lists when they die; a run id carries a
 //!   generation so a stale child entry or forwarding record to a reused id is recognised.
 //!   Children are an open-addressing table (linear probing, tombstones, rebuilt at 3/4 load), so
-//!   a node with many children, the root above all, inserts in constant time.
+//!   a node with many children, the root above all, inserts and unlinks one in constant time.
 //!
 //! Engine hashes: the index trusts the engine's parent pointers and block identities. Nothing is
 //! shared between workers through the maps, so one engine
@@ -70,6 +70,16 @@
 //! removals. The arena takes its memory from the process allocator a whole chunk (8 MiB) at a
 //! time and keeps every chunk once taken: what the arena holds moves in steps of one chunk
 //! (`arena_chunk_bytes`), while the words handed out (`arena_bytes`) move with the blocks.
+//!
+//! Limits: an allocation never crosses an arena chunk, so a run's child table and its hash
+//! arrays each fit one chunk. The largest table is 2^18 slots (the next doubling asks two words
+//! more than a chunk); it cannot grow, so it takes live children up to the three-quarters load
+//! every table is rebuilt at and is rebuilt at its size once an eighth of it is tombstones: a
+//! run holds at most 196,608 children, and a probe for an absent one still ends at an empty
+//! slot. A run holds at most 815,559 blocks (a 917,504-word array). A store that would pass
+//! either cap is declined from the block that would pass it, with `ApplyError::ArenaCapReached`
+//! carrying the leading blocks placed before it (held as any store's), and counted
+//! (`cap_refusals`): the engine keeps the rest, the index does not route by them.
 
 use std::{
     collections::BTreeSet,
@@ -195,6 +205,10 @@ pub struct ChainIndexStats {
     /// (an engine fleet that does not agree on hashes); such a block is matched by content and
     /// keyed by the worker's own hash in its lane map.
     pub engine_conflicts: usize,
+    /// Stores declined because a run's child table or hash array would outgrow the arena's
+    /// chunk (the fan-out and run-length caps in the module doc): the engine keeps the blocks,
+    /// the index does not route by them.
+    pub cap_refusals: usize,
     /// Stores whose blocks carried the engine hashes the index holds for other content: what
     /// the relay's hash check refuses at the engine, seen from the index. Such a store is
     /// placed by its content, so the index stays exact; the count names a broken engine.
@@ -257,6 +271,8 @@ pub struct ChainIndex {
     distinct_blocks: Box<[CachePadded<AtomicIsize>]>,
     /// Stored blocks whose engine hash was not the one the index carries.
     engine_conflicts: AtomicUsize,
+    /// Stores declined at the arena's fan-out or run-length cap.
+    cap_refusals: AtomicUsize,
     /// Stores whose blocks carried the engine hashes the index holds for other content.
     landing_mismatches: AtomicUsize,
     /// Blocks a store moved to another place for their worker (the old membership released).
@@ -295,7 +311,14 @@ enum Walk {
     Restart,
     /// The parent block is not held after all (its run died since the map was written).
     NoParent,
+    /// A run's child table or hash array would outgrow an arena chunk: the store is declined
+    /// from that block on. The count is the leading blocks placed before it, filled in by
+    /// `store_walk` from the placements it writes (the locked walk returns it as 0).
+    AtCap(usize),
 }
+
+/// A run's child table or hash array would outgrow an arena chunk.
+struct AtCap;
 
 /// What the lock-free look at a run during a store walk decided.
 enum Plan {
@@ -370,6 +393,12 @@ impl ChainIndex {
         Self::with_max_workers(256)
     }
 
+    /// Lowers the arena's cap so a test reaches the fan-out and run-length caps in a few stores.
+    #[cfg(test)]
+    pub(crate) fn lower_arena_cap(&mut self, words: usize) {
+        self.arena.cap_words = words;
+    }
+
     /// An index for up to `max_workers` interned workers (at most 1024); coverage costs one bit
     /// per worker per run, rounded up to 64.
     pub fn with_max_workers(max_workers: usize) -> Self {
@@ -405,6 +434,7 @@ impl ChainIndex {
                 .map(|_| CachePadded::new(AtomicIsize::new(0)))
                 .collect(),
             engine_conflicts: AtomicUsize::new(0),
+            cap_refusals: AtomicUsize::new(0),
             landing_mismatches: AtomicUsize::new(0),
             live_words: AtomicUsize::new(0),
             moved_hashes: AtomicUsize::new(0),
@@ -683,25 +713,60 @@ impl ChainIndex {
 
     /// Add `child` to the run's table (the run is locked): claims a slot like a lock-free
     /// inserter, growing the table under a version step that first drains inserters in flight.
-    /// `Some` when another writer linked a child with this head meanwhile: the caller descends
-    /// into that one instead.
-    fn link_child(&self, run: &Run, offset: usize, head: u64, child: u32) -> Option<(u32, u32)> {
+    /// `Ok(Some)` when another writer linked a child with this head meanwhile: the caller
+    /// descends into that one instead. `Err` when the grown table would not fit a chunk: the
+    /// table stays as it is and the store is declined.
+    fn link_child(
+        &self,
+        run: &Run,
+        offset: usize,
+        head: u64,
+        child: u32,
+    ) -> Result<Option<(u32, u32)>, AtCap> {
         let generation = self.slab.run(child).generation();
         let key = Self::child_key(offset, head);
         loop {
             let table = run.children.load(Ordering::Acquire);
             match self.arena.table_claim(table, key, child, generation) {
-                Claim::Inserted => return None,
-                Claim::Exists(other, other_generation) => return Some((other, other_generation)),
+                Claim::Inserted => return Ok(None),
+                Claim::Exists(other, other_generation) => {
+                    return Ok(Some((other, other_generation)));
+                }
                 Claim::Full | Claim::Changed => {}
+            }
+            // A table at the fan-out cap declines without the version step (every reader of
+            // the run, the first probe of every lookup when the run is the root, would retry
+            // on it): only the rebuild that drops an eighth of tombstones takes the lock, and
+            // the locked branch below decides the same way for a claim that raced this read.
+            if table != NONE
+                && !self.arena.table_can_grow(table)
+                && self.arena.table_dead(table) * 8 < self.arena.table_slots(table)
+            {
+                return Err(AtCap);
             }
             run.begin_update();
             run.wait_inflight();
             let table = run.children.load(Ordering::Relaxed);
             let grown = if table == NONE {
-                self.arena.alloc_table(MIN_TABLE_SLOTS)
+                Some(self.arena.alloc_table(MIN_TABLE_SLOTS))
             } else {
                 self.arena.table_grown(table)
+            };
+            let Some(grown) = grown else {
+                // The run is at its fan-out cap: the store is declined. The largest table is
+                // rebuilt at its size once an eighth of it is tombstones (the growth that would
+                // have taken them never comes), so a probe for an absent child keeps ending at
+                // an empty slot, at one rebuild per eighth of the table in stores, not one per
+                // store.
+                if self.arena.table_dead(table) * 8 >= self.arena.table_slots(table) {
+                    let compacted = self.arena.table_compacted(table);
+                    run.children.store(compacted, Ordering::Relaxed);
+                    run.end_update();
+                    self.arena.free_table(table);
+                } else {
+                    run.end_update();
+                }
+                return Err(AtCap);
             };
             run.children.store(grown, Ordering::Relaxed);
             run.end_update();
@@ -709,14 +774,20 @@ impl ChainIndex {
         }
     }
 
-    /// Take `child` out of the run's table (the run is locked); an emptied table goes away once
-    /// no insert is in flight on it.
+    /// Take `child` out of the run's table (both runs are locked, the child's window still
+    /// standing): its slot is probed by the key it was linked under, its offset under the run
+    /// and its first content hash; an emptied table goes away once no insert is in flight on it.
     fn unlink_child(&self, run: &Run, child: u32) {
         let table = run.children.load(Ordering::Relaxed);
         if table == NONE {
             return;
         }
-        let live = self.arena.table_take(table, child);
+        let child_run = self.slab.run(child);
+        let key = Self::child_key(
+            child_run.start().saturating_sub(run.start()),
+            self.hash_at(child_run, 0),
+        );
+        let live = self.arena.table_take(table, key, child);
         if live == 0 {
             run.begin_update();
             run.wait_inflight();
@@ -1179,6 +1250,10 @@ impl ChainIndex {
                 Walk::Done => return Ok(()),
                 Walk::Restart => {}
                 Walk::NoParent => return Err(ApplyError::ParentBlockNotFound),
+                Walk::AtCap(placed) => {
+                    self.cap_refusals.fetch_add(1, Ordering::Relaxed);
+                    return Err(ApplyError::ArenaCapReached { placed });
+                }
             }
         }
     }
@@ -1195,8 +1270,18 @@ impl ChainIndex {
     ) -> Walk {
         let mut pending: Vec<Placed> = Vec::new();
         let outcome = self.store_walk_locked(worker, blocks, origin, map, &mut pending);
+        // A store declined at a cap keeps what the walk placed before the block that would
+        // pass it: the leading blocks, in order, so the count is where the last placement ends.
+        let placed = pending
+            .iter()
+            .map(|placed| placed.start + placed.count)
+            .max()
+            .unwrap_or(0);
         self.write_placements(worker, blocks, pending, map);
-        outcome
+        match outcome {
+            Walk::AtCap(_) => Walk::AtCap(placed),
+            other => other,
+        }
     }
 
     /// The lane map writes of one store, after the run locks are released. A block the engine
@@ -1320,6 +1405,9 @@ impl ChainIndex {
             }
             match plan {
                 Plan::InsertAt(at) => {
+                    if !self.arena.array_fits(capacity_for(remaining.len())) {
+                        return Walk::AtCap(0);
+                    }
                     let head = remaining[0].content_hash.0;
                     let contents: Vec<u64> = remaining
                         .iter()
@@ -1441,16 +1529,17 @@ impl ChainIndex {
                                 pending,
                             )
                         }
-                        InRun::MoveTo(child, generation) => Some((child, generation)),
+                        InRun::MoveTo(child, generation) => Ok(Some((child, generation))),
                     };
                     drop(meta);
                     match next {
-                        Some((child, generation)) => {
+                        Ok(Some((child, generation))) => {
                             run_id = child;
                             expected = generation;
                             offset = 0;
                         }
-                        None => return Walk::Done,
+                        Ok(None) => return Walk::Done,
+                        Err(AtCap) => return Walk::AtCap(0),
                     }
                 }
             }
@@ -1627,8 +1716,9 @@ impl ChainIndex {
 
     /// Place `remaining` after `offset` blocks of the run (locked by the caller): in the child
     /// that already continues the run there, in place when the run is this worker's own leaf and
-    /// `offset` is its end, or in a new child linked at `offset`. `Some` names a child that
-    /// already existed, for the caller to carry on in.
+    /// `offset` is its end, or in a new child linked at `offset`. `Ok(Some)` names a child that
+    /// already existed, for the caller to carry on in; `Err` declines a store that would outgrow
+    /// an arena chunk, with nothing changed.
     #[expect(clippy::too_many_arguments)]
     fn store_at(
         &self,
@@ -1639,7 +1729,7 @@ impl ChainIndex {
         remaining: &[StoredBlock],
         block_start: usize,
         pending: &mut Vec<Placed>,
-    ) -> Option<(u32, u32)> {
+    ) -> Result<Option<(u32, u32)>, AtCap> {
         let run = self.slab.run(run_id);
         let coverage = self.slab.coverage(run_id);
         let head = remaining[0].content_hash.0;
@@ -1648,7 +1738,7 @@ impl ChainIndex {
             .arena
             .table_find(children, Self::child_key(offset, head))
         {
-            return Some(found);
+            return Ok(Some(found));
         }
         let len = run.len();
         debug_assert!(
@@ -1666,9 +1756,12 @@ impl ChainIndex {
             && run.forwards.load(Ordering::Relaxed) == NONE
             && covered_only_by(coverage, worker);
         let (target, first) = if own_leaf {
-            self.append(run, &contents, &engines);
+            self.append(run, &contents, &engines)?;
             (run_id, len)
         } else {
+            if !self.arena.array_fits(capacity_for(contents.len())) {
+                return Err(AtCap);
+            }
             let block = self
                 .arena
                 .alloc_array(&contents, capacity_for(contents.len()));
@@ -1689,11 +1782,20 @@ impl ChainIndex {
                 },
             );
             set(self.slab.coverage(new_id), worker);
-            if let Some(existing) = self.link_child(run, offset, head, new_id) {
-                let mut freed = Vec::new();
-                self.discard_run(new_id, worker, &mut freed);
-                self.recycle(&mut freed);
-                return Some(existing);
+            match self.link_child(run, offset, head, new_id) {
+                Ok(None) => {}
+                Ok(Some(existing)) => {
+                    let mut freed = Vec::new();
+                    self.discard_run(new_id, worker, &mut freed);
+                    self.recycle(&mut freed);
+                    return Ok(Some(existing));
+                }
+                Err(AtCap) => {
+                    let mut freed = Vec::new();
+                    self.discard_run(new_id, worker, &mut freed);
+                    self.recycle(&mut freed);
+                    return Err(AtCap);
+                }
             }
             (new_id, 0)
         };
@@ -1706,12 +1808,13 @@ impl ChainIndex {
         });
         self.credit(worker, contents.len());
         self.distinct_add(worker, contents.len());
-        None
+        Ok(None)
     }
 
     /// Extend a leaf in place when its window ends the hash array and the array has room;
-    /// otherwise move it to a larger array.
-    fn append(&self, run: &Run, contents: &[u64], engines: &[u64]) {
+    /// otherwise move it to a larger array. `Err` when the larger array would not fit an arena
+    /// chunk: the run is at the length cap and keeps what it has.
+    fn append(&self, run: &Run, contents: &[u64], engines: &[u64]) -> Result<(), AtCap> {
         let block = run.block.load(Ordering::Relaxed);
         let engine = run.engine.load(Ordering::Relaxed);
         let base = run.base.load(Ordering::Relaxed) as usize;
@@ -1740,7 +1843,10 @@ impl ChainIndex {
             }
             run.len
                 .store((len + contents.len()) as u32, Ordering::Release);
-            return;
+            return Ok(());
+        }
+        if !self.arena.array_fits(capacity_for(len + contents.len())) {
+            return Err(AtCap);
         }
         let mut grown: Vec<u64> = self
             .arena
@@ -1770,6 +1876,7 @@ impl ChainIndex {
         run.end_update();
         self.arena.array_release(block);
         self.arena.array_release(engine);
+        Ok(())
     }
 
     /// Forget the named blocks of `worker`; unknown hashes are ignored.
@@ -2052,6 +2159,7 @@ impl ChainIndex {
             header_bytes: allocated * (size_of::<Run>() + self.words * size_of::<AtomicU64>()),
             slab_bytes: self.slab.chunk_bytes(),
             engine_conflicts: self.engine_conflicts.load(Ordering::Relaxed),
+            cap_refusals: self.cap_refusals.load(Ordering::Relaxed),
             landing_mismatches: self.landing_mismatches.load(Ordering::Relaxed),
             moved_hashes: self.moved_hashes.load(Ordering::Relaxed),
             splits_by_branch: self.splits_branch.load(Ordering::Relaxed),

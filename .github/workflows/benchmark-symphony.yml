@@ -60,14 +60,17 @@ jobs:
       # The parse, prose and setup rows need no fixtures; the slice and adapter rows
       # read a bellwether tree and are not run here. A push to main keeps the single
       # summary run.
+      # The base's binary is built with the pull request's bench sources (the gate
+      # file's `sources`), so the two differ in the measured code alone.
       - name: Build the pull request's benchmark
         if: github.event_name == 'pull_request'
         timeout-minutes: 40
         run: |
           source "$HOME/.cargo/env"
           mkdir -p "$RUNNER_TEMP/bench-gate"
-          cp scripts/bench_gate.py "$RUNNER_TEMP/bench-gate/"
-          python3 scripts/bench_gate.py build --out "$RUNNER_TEMP/bench-gate/pr" -- \
+          cp scripts/bench_gate.py .github/bench-gates/symphony.toml "$RUNNER_TEMP/bench-gate/"
+          python3 scripts/bench_gate.py build --gates .github/bench-gates/symphony.toml \
+            --out "$RUNNER_TEMP/bench-gate/pr" -- \
             cargo bench -p smg-symphony --bench throughput --no-run
 
       - name: Build the base branch's benchmark
@@ -77,7 +80,8 @@ jobs:
           source "$HOME/.cargo/env"
           head=$(git rev-parse HEAD)
           git -c advice.detachedHead=false checkout --quiet "$(git rev-parse HEAD^1)"
-          python3 "$RUNNER_TEMP/bench-gate/bench_gate.py" build --out "$RUNNER_TEMP/bench-gate/base" -- \
+          python3 "$RUNNER_TEMP/bench-gate/bench_gate.py" build --gates "$RUNNER_TEMP/bench-gate/symphony.toml" \
+            --sources-from "$head" --out "$RUNNER_TEMP/bench-gate/base" -- \
             cargo bench -p smg-symphony --bench throughput --no-run
           git checkout --quiet "$head"
 

@@ -371,6 +371,19 @@ fn chat_tools(request: &ChatCompletionRequest) -> Option<Vec<Tool>> {
         .then(|| request.effective_tools().cloned().collect())
 }
 
+/// A chat request's instructions and the messages after them. As on vLLM's
+/// chat path, a leading system or developer message holds the instructions,
+/// which Harmony carries in the developer message; an empty one holds none.
+fn split_instructions(messages: &[ChatMessage]) -> (Option<String>, &[ChatMessage]) {
+    match messages.split_first() {
+        Some((
+            ChatMessage::System { content, .. } | ChatMessage::Developer { content, .. },
+            rest,
+        )) => (content.has_text().then(|| content.to_simple_string()), rest),
+        _ => (None, messages),
+    }
+}
+
 /// Harmony request builder
 ///
 /// Converts OpenAI-format requests into Harmony-encoded format with input_ids,
@@ -427,10 +440,17 @@ impl HarmonyBuilder {
         let sys_msg = self.build_system_message_from_chat(request);
         all_messages.push(sys_msg);
 
-        let dev_msg = self.build_developer_message_from_chat(chat_tools(request).as_ref());
-        all_messages.push(dev_msg);
+        // As on the Responses path, a developer message only when there are
+        // instructions or tools to carry.
+        let (instructions, messages) = split_instructions(&request.messages);
+        let tools = chat_tools(request).filter(|tools| !tools.is_empty());
+        if instructions.is_some() || tools.is_some() {
+            let dev_msg =
+                self.build_developer_message_from_chat(instructions.as_deref(), tools.as_ref());
+            all_messages.push(dev_msg);
+        }
 
-        let mut user_messages = self.convert_chat_messages(&request.messages);
+        let mut user_messages = self.convert_chat_messages(messages);
         all_messages.append(&mut user_messages);
 
         let selection_text = self.extract_selection_text(&all_messages);
@@ -578,7 +598,8 @@ impl HarmonyBuilder {
     ///
     /// # Arguments
     /// * `tools` - Optional list of tools
-    /// * `instructions` - Optional instructions (Responses API only)
+    /// * `instructions` - Optional instructions (a Responses request's
+    ///   `instructions`, or a chat request's leading system or developer message)
     #[expect(
         clippy::unused_self,
         reason = "method on HarmonyBuilder for logical grouping"
@@ -590,7 +611,7 @@ impl HarmonyBuilder {
     ) -> HarmonyMessage {
         let mut dev_content = DeveloperContent::new();
 
-        // Add instructions if provided (Responses API only)
+        // Add instructions if provided
         if let Some(instructions) = instructions {
             dev_content = dev_content.with_instructions(instructions.to_string());
         }
@@ -633,8 +654,12 @@ impl HarmonyBuilder {
         HarmonyMessage::from_role_and_content(Role::Developer, dev_content)
     }
 
-    fn build_developer_message_from_chat(&self, tools: Option<&Vec<Tool>>) -> HarmonyMessage {
-        self.build_developer_message(tools, None)
+    fn build_developer_message_from_chat(
+        &self,
+        instructions: Option<&str>,
+        tools: Option<&Vec<Tool>>,
+    ) -> HarmonyMessage {
+        self.build_developer_message(tools, instructions)
     }
 
     /// Build developer message from Responses request
@@ -1802,7 +1827,7 @@ mod tests {
             });
             assert_eq!(commentary, !expected.is_empty(), "{case}");
             // The developer message describes the same tools.
-            let developer = builder.build_developer_message_from_chat(tools.as_ref());
+            let developer = builder.build_developer_message_from_chat(None, tools.as_ref());
             assert_eq!(developer.content.len(), 1, "{case}");
             let described: Vec<String> = developer
                 .content
@@ -1916,5 +1941,205 @@ mod tests {
             candidates,
             vec![vec![text(1), text(3)], vec![text(2), text(4)]]
         );
+    }
+
+    // The prompts vLLM's Harmony renderer tests expect for the same chat
+    // requests (`rust/src/chat/src/renderer/harmony/fixtures/` in
+    // vllm-project/vllm at 7b77ed58).
+    const SIMPLE_USER: &str = concat!(
+        "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n",
+        "Knowledge cutoff: 2024-06\n",
+        "Current date: 2025-06-28\n",
+        "\n",
+        "Reasoning: medium\n",
+        "\n",
+        "# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|>",
+        "<|start|>user<|message|>Hello, who are you?<|end|>",
+        "<|start|>assistant",
+    );
+    const LEADING_SYSTEM: &str = concat!(
+        "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n",
+        "Knowledge cutoff: 2024-06\n",
+        "Current date: 2025-06-28\n",
+        "\n",
+        "Reasoning: high\n",
+        "\n",
+        "# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|>",
+        "<|start|>developer<|message|># Instructions\n",
+        "\n",
+        "Answer tersely.<|end|>",
+        "<|start|>user<|message|>What is 2 + 2?<|end|>",
+        "<|start|>assistant",
+    );
+    const DEVELOPER_TOOLS: &str = concat!(
+        "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n",
+        "Knowledge cutoff: 2024-06\n",
+        "Current date: 2025-06-28\n",
+        "\n",
+        "Reasoning: medium\n",
+        "\n",
+        "# Valid channels: analysis, commentary, final. Channel must be included for every message.\n",
+        "Calls to these tools must go to the commentary channel: 'functions'.<|end|>",
+        "<|start|>developer<|message|># Instructions\n",
+        "\n",
+        "Use tools when needed.\n",
+        "\n",
+        "# Tools\n",
+        "\n",
+        "## functions\n",
+        "\n",
+        "namespace functions {\n",
+        "\n",
+        "// Lookup a record.\n",
+        "type lookup = (_: {\n",
+        "id: string,\n",
+        "}) => any;\n",
+        "\n",
+        "} // namespace functions<|end|>",
+        "<|start|>user<|message|>Find record abc.<|end|>",
+        "<|start|>assistant",
+    );
+    const REQUEST_TOOLS: &str = concat!(
+        "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n",
+        "Knowledge cutoff: 2024-06\n",
+        "Current date: 2025-06-28\n",
+        "\n",
+        "Reasoning: medium\n",
+        "\n",
+        "# Valid channels: analysis, commentary, final. Channel must be included for every message.\n",
+        "Calls to these tools must go to the commentary channel: 'functions'.<|end|>",
+        "<|start|>developer<|message|># Tools\n",
+        "\n",
+        "## functions\n",
+        "\n",
+        "namespace functions {\n",
+        "\n",
+        "// Get weather for a city.\n",
+        "type get_weather = (_: {\n",
+        "city: string,\n",
+        "}) => any;\n",
+        "\n",
+        "} // namespace functions<|end|>",
+        "<|start|>user<|message|>Check Hangzhou weather.<|end|>",
+        "<|start|>assistant",
+    );
+
+    /// The prompt `request` renders to, dated like vLLM's fixtures.
+    fn rendered_chat_prompt(request: serde_json::Value) -> String {
+        let request: ChatCompletionRequest =
+            serde_json::from_value(request).expect("request deserializes");
+        let output = HarmonyBuilder::new()
+            .build_from_chat(&request)
+            .expect("harmony build must succeed");
+        let mut prompt = try_harmony_encoding()
+            .expect("harmony encoding must load")
+            .tokenizer()
+            .decode_utf8(&output.input_ids)
+            .expect("decode harmony tokens back to UTF-8");
+        // The builder dates the conversation today.
+        let date =
+            prompt.find("Current date: ").expect("a conversation date") + "Current date: ".len();
+        prompt.replace_range(date..date + "2025-06-28".len(), "2025-06-28");
+        prompt
+    }
+
+    /// `prompt` without `commentary` in its valid channels: `build_system_message`
+    /// still drops it for a request without tools, where vLLM keeps it.
+    fn without_commentary(prompt: &str) -> String {
+        prompt.replace("analysis, commentary, final", "analysis, final")
+    }
+
+    /// A chat request with neither instructions nor tools gets no developer
+    /// message, as on the Responses path and vLLM's chat path.
+    #[test]
+    fn a_chat_request_without_instructions_or_tools_has_no_developer_message() {
+        let user = json!({"role": "user", "content": "Hello, who are you?"});
+        let cases = [
+            (
+                "no system message",
+                json!({"model": "gpt-oss-120b", "messages": [user]}),
+                without_commentary(SIMPLE_USER),
+            ),
+            (
+                "an empty system message",
+                json!({"model": "gpt-oss-120b", "messages": [{"role": "system", "content": ""}, user]}),
+                without_commentary(SIMPLE_USER),
+            ),
+            (
+                "a system message of empty text parts",
+                json!({"model": "gpt-oss-120b", "messages": [
+                    {"role": "system", "content": [
+                        {"type": "text", "text": ""},
+                        {"type": "text", "text": ""}
+                    ]},
+                    user
+                ]}),
+                without_commentary(SIMPLE_USER),
+            ),
+            // A tool list, even an empty one, keeps the commentary channel.
+            (
+                "an empty tool list",
+                json!({"model": "gpt-oss-120b", "messages": [user], "tools": []}),
+                SIMPLE_USER.to_string(),
+            ),
+        ];
+        for (case, request, expected) in cases {
+            assert_eq!(rendered_chat_prompt(request), expected, "{case}");
+        }
+    }
+
+    /// A leading system or developer message becomes the developer message's
+    /// instructions, as on vLLM's chat path, instead of a second system message
+    /// after the builder's own.
+    #[test]
+    fn a_leading_system_or_developer_message_becomes_the_developer_instructions() {
+        for role in ["system", "developer"] {
+            let prompt = rendered_chat_prompt(json!({
+                "model": "gpt-oss-120b",
+                "reasoning_effort": "high",
+                "messages": [
+                    {"role": role, "content": "Answer tersely."},
+                    {"role": "user", "content": "What is 2 + 2?"}
+                ]
+            }));
+            assert_eq!(prompt, without_commentary(LEADING_SYSTEM), "{role}");
+        }
+    }
+
+    /// Instructions and tools share the one developer message, instructions
+    /// first. vLLM's fixture declares the tool on the developer message; a
+    /// gpt-oss request declares it at the request level.
+    #[test]
+    fn leading_instructions_come_before_the_tools_in_one_developer_message() {
+        let prompt = rendered_chat_prompt(json!({
+            "model": "gpt-oss-120b",
+            "tools": [{"type": "function", "function": {
+                "name": "lookup",
+                "description": "Lookup a record.",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}
+            }}],
+            "messages": [
+                {"role": "developer", "content": "Use tools when needed."},
+                {"role": "user", "content": "Find record abc."}
+            ]
+        }));
+        assert_eq!(prompt, DEVELOPER_TOOLS);
+    }
+
+    /// A request with tools and no instructions keeps its tools-only developer
+    /// message.
+    #[test]
+    fn a_chat_request_with_tools_keeps_its_developer_message() {
+        let prompt = rendered_chat_prompt(json!({
+            "model": "gpt-oss-120b",
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather",
+                "description": "Get weather for a city.",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+                "strict": true
+            }}],
+            "messages": [{"role": "user", "content": "Check Hangzhou weather."}]
+        }));
+        assert_eq!(prompt, REQUEST_TOOLS);
     }
 }

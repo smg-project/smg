@@ -52,6 +52,12 @@
 repeats = 3
 filter = "^(encode_throughput|latency|decode_performance|stop_sequences)/"
 
+# The files that feed this binary beyond the measured crate: the base side is built with them as the
+# pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
+# gated rows through the binary's inlining (symphony.toml records the case). A new row goes to a
+# bench target of its own.
+sources = ["model_gateway/benches/tokenizer_benchmark.rs"]
+
 [[gate]]
 pattern = "^(encode_throughput|latency)/"
 threshold = 0.10

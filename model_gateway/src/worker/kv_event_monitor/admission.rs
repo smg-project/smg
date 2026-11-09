@@ -281,8 +281,8 @@ impl KvEventMonitor {
                 }
                 _ => {}
             }
-            Self::apply_event(event, worker_id, indexer, &mut state.index);
         }
+        Self::apply_events(&batch.events, worker_id, indexer, &mut state.index);
         Metrics::record_kv_event_apply(worker_url, started.elapsed().as_secs_f64());
         Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
         if stored_blocks > 0 {
@@ -377,8 +377,8 @@ impl KvEventMonitor {
                 if let Some(kv_cache_event::Data::Stored(stored)) = &event.data {
                     snapshot_blocks += stored.blocks.len();
                 }
-                Self::apply_event(event, worker_id, indexer, &mut state.index);
             }
+            Self::apply_events(&batch.events, worker_id, indexer, &mut state.index);
             Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
             if snapshot_blocks > 0 {
                 Metrics::record_kv_event_blocks(worker_url, "snapshot", snapshot_blocks);
@@ -433,8 +433,9 @@ impl KvEventMonitor {
         dropped
     }
 
-    /// Publish the stores a batch placed without their parent and the
-    /// sub-block stores it left out of the index, if any.
+    /// Publish the stores a batch placed without their parent, the sub-block
+    /// stores it left out of the index and the stores the index declined at an
+    /// arena cap, if any.
     fn record_not_indexed(
         worker_url: &str,
         after: &WorkerIndexCounters,
@@ -447,6 +448,10 @@ impl KvEventMonitor {
         let (stores, blocks) = after.sub_block_since(before);
         if stores > 0 {
             Metrics::record_kv_event_sub_block(worker_url, stores, blocks);
+        }
+        let (stores, blocks) = after.cap_refused_since(before);
+        if stores > 0 {
+            Metrics::record_kv_event_cap_refused(worker_url, stores, blocks);
         }
     }
 
@@ -1959,6 +1964,83 @@ mod tests {
                 Some(1.0)
             );
             sim.assert_matches_reference();
+        });
+    }
+
+    /// A store the index declines at an arena cap is counted per worker from
+    /// the block declined, on either attempt. A run's child table at its cap
+    /// (2^18 slots hold 196,608 live children) is filled by two-block chains
+    /// sharing their first block, the churn bench's fan-out shape; the next
+    /// chain's first block is placed and its second declined (one store, one
+    /// block), and a chain under a parent never seen takes the same refusal on
+    /// the parent-less retry. The reference has no cap, so this feeds the real
+    /// path alone.
+    #[test]
+    fn cap_refusals_are_counted_per_worker_on_either_attempt() {
+        use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+        fn counter(handle: &PrometheusHandle, name: &str) -> Option<f64> {
+            handle
+                .render()
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}{{worker=\"grpc://w1:9000\"}}")))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+        }
+
+        // The first chain's second block is the run's own; every later chain is a
+        // child of the run.
+        const CHAINS: i64 = 196_609;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut sim = Sim::new();
+            let fill: Vec<KvCacheEvent> = (0..CHAINS)
+                .map(|chain| stored(None, &[1, 1_000 + chain]))
+                .collect();
+            sim.feed(&batch(1, None, fill));
+            assert_eq!(
+                counter(&handle, "smg_kv_event_cap_refused_stores_total"),
+                None,
+                "the table takes the children up to the cap"
+            );
+            assert_eq!(
+                sim.indexer.worker_block_count(sim.worker),
+                CHAINS as usize + 1
+            );
+            // The first block is placed, the second declined: one block refused.
+            sim.feed(&batch(2, None, vec![stored(None, &[1, 2_000_000])]));
+            assert_eq!(
+                counter(&handle, "smg_kv_event_cap_refused_stores_total"),
+                Some(1.0)
+            );
+            assert_eq!(
+                counter(&handle, "smg_kv_event_cap_refused_blocks_total"),
+                Some(1.0)
+            );
+            assert_eq!(sim.state.index.counters.cap_refused_stores, 1);
+            assert_eq!(sim.state.index.counters.cap_refused_blocks, 1);
+            // Under a parent never seen, the parent-less retry is declined the same
+            // way and counted on both counters.
+            sim.feed(&batch(3, None, vec![stored(Some(99), &[1, 2_000_001])]));
+            assert_eq!(
+                counter(&handle, "smg_kv_event_cap_refused_stores_total"),
+                Some(2.0)
+            );
+            assert_eq!(
+                counter(&handle, "smg_kv_event_cap_refused_blocks_total"),
+                Some(2.0)
+            );
+            assert_eq!(
+                counter(&handle, "smg_kv_event_parentless_stores_total"),
+                Some(1.0)
+            );
+            // The declined blocks are held by nothing; the placed first block was
+            // held already.
+            assert_eq!(
+                sim.indexer.worker_block_count(sim.worker),
+                CHAINS as usize + 1
+            );
         });
     }
 

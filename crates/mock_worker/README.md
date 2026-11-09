@@ -6,9 +6,9 @@ stand-ins for vLLM/SGLang engines.
 
 Two modes:
 
-- **canned** (default) — every response is fixed (no model); a single optional
-  `--gen-ms` delay. Cheap enough to run thousands of idle workers for measuring
-  the gateway's own CPU/registration/routing cost.
+- **canned** (default) — every response is fixed (no model), in the shape of
+  its route; a single optional `--gen-ms` delay. Cheap enough to run thousands
+  of idle workers for measuring the gateway's own CPU/registration/routing cost.
 - **realistic** (`--engine realistic`) — each worker runs a continuous-batching
   **engine simulator** that behaves like a real LLM engine on CPU, so the whole
   gateway (including load- and cache-aware routing) can be exercised without
@@ -171,7 +171,7 @@ experiments against it transfer to engines:
 | `--admin-port` | off | process-wide admin API (below) |
 | `--drain-timeout-secs` | 5 | on SIGTERM or SIGINT: stop accepting, let the requests in flight finish for this long, then exit 0 either way |
 | `--kv-events-zmq-base-port` | off | ZMQ KV-event publishers on vLLM's or SGLang's wire (below) |
-| `--kv-cache-groups` | `full_attention` | the KV cache groups a realistic engine publishes, `kind[:window],...`, one to eight of `full_attention`, `mla_attention`, `sink_full_attention`, `sliding_window:<tokens>`, `sliding_window_mla:<tokens>` and `mamba` (the first one of the three main-attention kinds, a window kind with its window, the others without): every group's events carry its index, kind and window, a window group stores only the window tail ending at the prompt's aligned replay boundary and a Mamba group the one state block there (vLLM 0.31.0's default retention), a sparse store's `token_ids` on the vLLM wire spanning the whole step as the engine writes it, and an eviction is published once per group, every group's in one batch from the mock's one pool where the engine's per-group pools may stagger them; one group only on the SGLang wire. The gRPC stream carries every group's events unfiltered (a servicer's relay forwards the main group alone, and the gateway admits main-attention kinds only), and the mock's own prefix hit still comes from the full-attention pool, not the engine's fixed point over its groups |
+| `--kv-cache-groups` | `full_attention` | the KV cache groups a realistic engine publishes, `kind[:window],...`, one to eight of `full_attention`, `mla_attention`, `sink_full_attention`, `sliding_window:<tokens>`, `sliding_window_mla:<tokens>` and `mamba` (at most one of them one of the three main-attention kinds, at any index, and a model without one starts with a window kind; a window kind with its window, the others without): every group's events carry its index, kind and window, a window group stores only the window tail ending at the prompt's aligned replay boundary and a Mamba group the one state block there (vLLM 0.31.0's default retention), a sparse store's `token_ids` on the vLLM wire spanning the whole step as the engine writes it, and an eviction is published once per group, every group's in one batch from the mock's one pool where the engine's per-group pools may stagger them; one group only on the SGLang wire. The gRPC stream carries every group's events unfiltered (a servicer's relay forwards every group, a sparse group's store as its hashes; the gateway indexes the main group and keeps the other groups' blocks in a per-worker view that bounds its overlap the way the engine does), and the mock's own prefix hit and `cached_tokens` are the engine's fixed point over its groups (a window group's tail ending at the hit or its leading run, a Mamba group's rightmost state block, iterated until nothing moves) |
 
 ```bash
 cargo run --release -p mock-worker -- \
@@ -405,7 +405,11 @@ gRPC, ZMQ), ahead of either engine mode. Two sources feed one store:
   optional: `finish_reason` defaults to `stop`; `matched_stop` is a token id
   or a string; `prompt_tokens` defaults to the request's own count;
   `logprobs` holds the sampled token's logprob per output token and is sent
-  when the request asks for logprobs; `delay_ms` is the pause before every
+  when the request asks for logprobs; `token_id_logprobs` holds the logprob
+  of each token id a scoring request asks for (`token_ids_logprob` on the
+  SGLang wire), in the request's order, on an answer of no tokens
+  (`"output_text": ""`), for a request that asks for logprobs, as the engine
+  computes the row only then; `delay_ms` is the pause before every
   frame but the first; `chunk_tokens` the tokens per frame (1 by default).
 - `POST /admin/script/{worker}` on the admin API, with one such answer or an
   array of them: the answers the worker's next requests get, in order

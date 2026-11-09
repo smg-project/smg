@@ -508,6 +508,10 @@ impl EngineOutput for TokenSpeedOutput {
         self.request_id = id;
     }
 
+    fn request_id_shared(&self) -> FrameStr {
+        self.request_id.clone()
+    }
+
     fn finished(&self) -> bool {
         self.finish_reason.is_some()
     }

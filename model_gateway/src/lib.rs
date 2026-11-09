@@ -31,11 +31,10 @@ pub mod observability;
 pub mod policies;
 pub mod rate_limit;
 pub mod routers;
+pub mod secrets;
 pub mod server;
 pub mod service_discovery;
 pub mod tenant;
-#[cfg(any(test, feature = "test-util"))]
-pub mod test_support;
 pub mod version;
 pub mod wasm;
 pub mod worker;

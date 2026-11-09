@@ -20,8 +20,7 @@ use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
     tenant::TenantKey,
-    test_support::RefusedAddress,
-    worker::{RuntimeType, Worker, WorkerType},
+    worker::{test_support::RefusedAddress, RuntimeType, Worker, WorkerType},
 };
 use smg_grpc_client::vllm_proto as proto;
 use tokio::sync::mpsc;

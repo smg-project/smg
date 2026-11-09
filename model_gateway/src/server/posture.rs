@@ -93,6 +93,32 @@ pub(crate) fn log_secret_sources(sources: &SecretSources) {
     );
 }
 
+/// The headline of the gated-routes record.
+pub(crate) const GATED_HEADLINE: &str =
+    "GATED CONTROL-PLANE ROUTES: mounted only behind control-plane authentication";
+
+/// Logs the gated-routes record, one INFO: whether the routes that exist
+/// only behind control-plane authentication are mounted on this start,
+/// and which they are, so an operator reading a 404 for one of them
+/// finds the reason in the start-up log.
+pub(crate) fn log_gated_routes(control_plane_auth: bool, routes: &[(&str, &str)]) {
+    let routes = routes
+        .iter()
+        .map(|(method, path)| format!("{method} {path}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if control_plane_auth {
+        info!(mounted = true, routes, "{GATED_HEADLINE}");
+    } else {
+        info!(
+            mounted = false,
+            routes,
+            "{GATED_HEADLINE}; this start has none, so they answer 404; configure \
+             --control-plane-api-keys, --control-plane-api-keys-file or --jwt-issuer/--jwt-audience to mount them"
+        );
+    }
+}
+
 /// The planes a start leaves open, judged the way `build_app` guards them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OpenSurfaces {
@@ -490,6 +516,23 @@ mod tests {
         assert!(logs_contain("control_plane_api_keys=\"file (2 entries)\""));
         assert!(logs_contain("postgres_db_url=\"flag\""));
         assert!(!logs_contain("redis_url="));
+    }
+
+    /// The gated-routes record says whether the routes are mounted and
+    /// names them in both states, with the flags that mount them when
+    /// they are off.
+    #[traced_test]
+    #[test]
+    fn the_gated_routes_record_names_the_routes_in_both_states() {
+        log_gated_routes(false, &[("GET", "/config")]);
+        assert!(logs_contain("GATED CONTROL-PLANE ROUTES"));
+        assert!(logs_contain("mounted=false"));
+        assert!(logs_contain("routes=\"GET /config\""));
+        assert!(logs_contain("--control-plane-api-keys"));
+
+        log_gated_routes(true, &[("GET", "/config"), ("PUT", "/rate-limits")]);
+        assert!(logs_contain("mounted=true"));
+        assert!(logs_contain("routes=\"GET /config, PUT /rate-limits\""));
     }
 
     #[traced_test]

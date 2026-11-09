@@ -71,6 +71,7 @@ use crate::{
     tenant::TenantKey,
     worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        test_support::select_worker,
         BasicWorkerBuilder, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType,
     },
 };
@@ -2944,7 +2945,7 @@ async fn cancelled_pd_stream_with_admitted_prefill_reports_and_frees_the_slot() 
     // The one slot is free again: a new admission does not queue.
     let admitted = tokio::time::timeout(
         Duration::from_millis(500),
-        admission.admit(None, |capacity| capacity.select(Arc::clone(&prefill), ())),
+        admission.admit(None, select_worker(&prefill)),
     )
     .await
     .expect("the freed slot must admit at once")

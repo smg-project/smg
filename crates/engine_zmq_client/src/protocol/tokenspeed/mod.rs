@@ -37,6 +37,7 @@ use crate::{
     error::Result,
     protocol::{
         control::{CONTROL_REPLY_SLIM_TAG, CONTROL_REPLY_WIRE_FIELDS},
+        finished_request_ids,
         handshake::EngineCoreReadyResponse,
         positional::check_prefix,
         tokenspeed::{
@@ -213,12 +214,8 @@ impl EngineProtocol for TokenSpeedProtocol {
         // TokenSpeed has no out-of-band finish channel: every finish is carried
         // by its own output. Reporting them here anyway keeps the batch shape
         // self-describing for consumers that only read the finished list.
-        // The one owned copy of an id, made at the finish alone.
-        let finished_request_ids = outputs
-            .iter()
-            .filter(|output| output.finish_reason.is_some())
-            .map(|output| String::from(&output.request_id))
-            .collect();
+        // Each finish's id shared with its output, the list sized once.
+        let finished_request_ids = finished_request_ids(&outputs);
         Ok(EngineBatch {
             engine_index,
             outputs,

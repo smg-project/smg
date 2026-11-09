@@ -134,7 +134,10 @@ async fn streamed_chat_events(
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
     let response = Arc::new(HarmonyStreamingProcessor::new())
         .process_streaming_chat_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
             Arc::new(chat_request(choices, true)),
             dispatch,
             Vec::new(),
@@ -211,7 +214,10 @@ async fn non_streamed_chat(
     let (stream, server) = scripted_stream(frames, "0").await;
     let (response, counts) = HarmonyResponseProcessor::new()
         .process_non_streaming_chat_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
             Arc::new(chat_request(choices, false)),
             dispatch(),
             &[],
@@ -324,7 +330,10 @@ async fn streamed_responses_iteration(
     let drain = async { while rx.recv().await.is_some() {} };
     let iteration = async {
         let result = HarmonyStreamingProcessor::process_responses_iteration_stream(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
             &mut emitter,
             &tx,
             None,
@@ -351,7 +360,10 @@ async fn whole_responses_iteration(
             .expect("responses request");
     let whole = HarmonyResponseProcessor::new()
         .process_responses_iteration(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
             Arc::new(request),
             dispatch(),
             &[],
