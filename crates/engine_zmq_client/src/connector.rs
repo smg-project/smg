@@ -137,8 +137,10 @@ struct RequestRegistry<O> {
 /// its first output, the prompt the engine still has to prefill for it.
 struct InFlight<O> {
     sender: OutputSender<O>,
-    /// The request's own id, one block per request, handed to each of its
-    /// outputs at dispatch in place of the step frame's view.
+    /// The request's own id, copied once at registration and shared by
+    /// every output it is handed at dispatch in place of the step frame's
+    /// view (the first hand-over adds the shared header; a terminal output
+    /// takes the id itself).
     id: FrameStr,
     prompt_tokens: u64,
     handed: bool,
@@ -210,7 +212,9 @@ impl<O: EngineOutput> RequestRegistry<O> {
             self.in_flight_since = Some(now);
             self.busy_started.notify_one();
         }
-        let id = FrameStr::owned(&request_id);
+        // The request's own copy of its id, outside any frame: every output
+        // it is handed shares it in place of the step frame's view.
+        let id = FrameStr::from(request_id.as_str());
         self.requests.insert(
             request_id,
             InFlight {
@@ -338,7 +342,8 @@ impl<O: EngineOutput> RequestRegistry<O> {
             // its request id is still borrowable.
             match self.retire(output.request_id()) {
                 Some(entry) => {
-                    output.own_request_id(entry.id.clone());
+                    // The entry is owned here: its id moves, nothing is cloned.
+                    output.own_request_id(entry.id);
                     let _ = entry.sender.send(Ok(output));
                 }
                 None => trace!(

@@ -17,12 +17,6 @@ use super::tensor::frame_view_bytes;
 pub struct FrameStr(Bytes);
 
 impl FrameStr {
-    /// A copy of `text` of its own, outside any frame: the id a request keeps
-    /// for every output it is handed.
-    pub(crate) fn owned(text: &str) -> Self {
-        FrameStr(Bytes::copy_from_slice(text.as_bytes()))
-    }
-
     /// The string.
     pub fn as_str(&self) -> &str {
         // UTF-8 by construction: every constructor takes a `str`. The check
