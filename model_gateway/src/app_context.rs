@@ -979,12 +979,15 @@ fn mcp_bootstrap_config(file: Option<&smg_mcp::McpConfig>) -> smg_mcp::McpConfig
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::WorkerStatus;
 
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        worker::{BasicWorkerBuilder, PrefillAdmissionAttempt, Worker, WorkerType},
+        worker::{
+            test_support::worker_of, BasicWorkerBuilder, PrefillAdmissionAttempt, Worker,
+            WorkerType,
+        },
     };
 
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
@@ -1353,25 +1356,13 @@ policy:
         );
     }
 
-    fn prefill_worker(url: &str) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Prefill)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .build(),
-        )
-    }
-
     #[tokio::test]
     async fn worker_status_change_wakes_prefill_admission() {
         let registry = Arc::new(WorkerRegistry::new());
         let admission = Arc::new(PrefillAdmission::new(1, 1, Duration::from_secs(1)));
         start_prefill_admission_notifier(&registry, &admission).unwrap();
 
-        let first = prefill_worker("http://prefill-1:8000");
+        let first = worker_of("http://prefill-1:8000", WorkerType::Prefill);
         registry.register(Arc::clone(&first)).unwrap();
         let occupied = admission
             .admit(None, {
