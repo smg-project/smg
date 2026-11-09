@@ -144,12 +144,14 @@ def policy_from_str(policy_str: str | None) -> PolicyType:
     return policy_map[policy_str]
 
 
-def backend_from_str(backend_str: str | None) -> BackendType:
-    """Convert backend string to BackendType enum."""
+def backend_from_str(backend_str: str | None) -> BackendType | None:
+    """The ``--backend`` name as the binding's enum. ``None`` stays ``None``: no
+    backend is pinned and the gateway's detection step decides the wire, as it
+    does for the Rust CLI without ``--backend``."""
     if isinstance(backend_str, BackendType):
         return backend_str
     if backend_str is None:
-        return BackendType.Sglang
+        return None
     backend_map = {
         "sglang": BackendType.Sglang,
         "openai": BackendType.Openai,
