@@ -2591,3 +2591,69 @@ fn the_match_counts_the_input_on_every_way_a_walk_stops() {
         );
     }
 }
+
+#[test]
+fn the_walks_advance_to_the_character_boundary_the_scan_found() {
+    // Entries that end on two-, three- and four-byte characters after a lead
+    // of up to a word of ASCII, so the advance past an entry lands on a
+    // boundary at and across the eight-byte edges; a second entry splits
+    // after the wide run and a third inside it. The insert descent, the
+    // routing match and the per-tenant match advance by the byte offset the
+    // scan found: the matched counts, the tenants and the entries' texts read
+    // back as the character-wise advance gave them, and a re-insert of the
+    // first entry under a new tenant descends through full matches only.
+    for (wide, near) in [('é', 'è'), ('中', '丮'), ('😀', '😁')] {
+        for lead in 0..=8 {
+            for count in 1..=10 {
+                let tree = Tree::new();
+                let head: String = std::iter::repeat_n('a', lead)
+                    .chain(std::iter::repeat_n(wide, count))
+                    .collect();
+                let first = format!("{head}-first");
+                let second = format!("{head}-second");
+                let mut inside: Vec<char> = head.chars().collect();
+                *inside.last_mut().unwrap() = near;
+                let inside: String = inside.into_iter().collect();
+                tree.insert_text(&first, "t1");
+                tree.insert_text(&second, "t2");
+                tree.insert_text(&inside, "t3");
+                let head_chars = lead + count;
+                let case = format!("{wide:?} lead {lead} count {count}");
+
+                let result = tree.match_prefix_with_counts(&first);
+                assert_eq!(result.matched_char_count, head_chars + 6, "{case}");
+                assert_eq!(result.input_char_count, head_chars + 6, "{case}");
+                assert_eq!(result.tenant.as_ref(), "t1", "{case}");
+                let result = tree.match_prefix_with_counts(&format!("{head}-sec"));
+                assert_eq!(result.matched_char_count, head_chars + 4, "{case}");
+                assert_eq!(result.input_char_count, head_chars + 4, "{case}");
+                let result = tree.match_prefix_with_counts(&inside);
+                assert_eq!(result.matched_char_count, head_chars, "{case}");
+                assert_eq!(result.tenant.as_ref(), "t3", "{case}");
+                let result = tree.match_prefix_with_counts(&head);
+                assert_eq!(result.matched_char_count, head_chars, "{case}");
+                assert_eq!(result.input_char_count, head_chars, "{case}");
+
+                assert_eq!(tree.prefix_match_tenant(&second, "t2"), second, "{case}");
+                assert_eq!(tree.prefix_match_tenant(&first, "t1"), first, "{case}");
+                assert_eq!(tree.prefix_match_tenant(&inside, "t3"), inside, "{case}");
+
+                // A re-insert descends through full matches only: the common
+                // prefix (when the head has more than one character), the last
+                // wide character with the dash, and the leaf.
+                tree.insert_text(&first, "t4");
+                assert_eq!(tree.prefix_match_tenant(&first, "t4"), first, "{case}");
+
+                let mut paths: Vec<String> = tree.iter_entries().map(|(path, _)| path).collect();
+                paths.sort();
+                let common: String = head.chars().take(head_chars - 1).collect();
+                let shared = format!("{head}-");
+                let mut expected: Vec<String> =
+                    vec![String::new(), common, shared, first, second, inside];
+                expected.sort();
+                expected.dedup();
+                assert_eq!(paths, expected, "{case}");
+            }
+        }
+    }
+}
