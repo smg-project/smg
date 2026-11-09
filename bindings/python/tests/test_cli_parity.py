@@ -391,3 +391,13 @@ def test_the_eviction_interval_default_is_one_value_on_every_surface(rust, launc
         "chart": int(chart.group(1)),
     }
     assert set(surfaces.values()) == {120}, surfaces
+
+
+def test_a_selector_entry_is_refused_with_the_cli_text(rust):
+    """A discovery selector entry without ``key=value`` is refused on both sides
+    with the one reason the CLI prints, so one slip reads the same everywhere."""
+    reason = "expected 'key=value'"
+    assert reason in cli_source(), "the CLI's selector refusal changed: update the launcher's"
+    refusal = f"Invalid value for field 'decode_selector': tier - {reason}"
+    with pytest.raises(ValueError, match=re.escape(refusal)):
+        RouterArgs._parse_selector(["app=engine tier"], "decode_selector")

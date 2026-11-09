@@ -2205,6 +2205,14 @@ mod tests {
                 vec!["--storage-context-headers", "noeq"],
                 "storage_context_headers",
             ),
+            (vec!["--selector", "app=engine", "tier"], "selector"),
+            (vec!["--selector", "=engine"], "selector"),
+            (vec!["--selector", "app=engine tier"], "selector"),
+            (vec!["--selector", " "], "selector"),
+            (vec!["--encode-selector", "noeq"], "encode_selector"),
+            (vec!["--prefill-selector", "noeq"], "prefill_selector"),
+            (vec!["--decode-selector", "noeq"], "decode_selector"),
+            (vec!["--router-selector", "noeq"], "router_selector"),
             (
                 vec!["--request-id-headers", "bad header"],
                 "request_id_headers",
@@ -2237,6 +2245,13 @@ mod tests {
             "1",
             "--storage-context-headers",
             "x-tenant=tenant",
+            "--selector",
+            "app=engine",
+            "tier=prod",
+            "--prefill-selector",
+            "app=engine role=prefill",
+            "--router-selector",
+            "role=router",
             "--request-id-headers",
             "x-request-id",
             "--api-key",
@@ -3238,6 +3253,46 @@ mod tests {
         let server = cli.to_server_config(router).unwrap();
         assert!(server.service_discovery_config.is_some());
         assert!(server.mesh_discovery_config.is_none());
+    }
+
+    /// One selector argument may carry several `key=value` pairs separated
+    /// by whitespace, the form a quoted chart value passes; the CLI reads
+    /// them as the launcher does, into one map.
+    #[test]
+    fn service_discovery_selector_reads_several_pairs_in_one_argument() {
+        let cli = cli_args_from(&[
+            "--service-discovery",
+            "--selector",
+            "app=engine role=prefill",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let server = cli.to_server_config(router).unwrap();
+        let RuntimeDiscoveryConfig::Kubernetes(discovery) = server
+            .service_discovery_config
+            .expect("service discovery config")
+        else {
+            panic!("the selector configures Kubernetes discovery");
+        };
+        assert_eq!(
+            discovery.selector.get("app").map(String::as_str),
+            Some("engine")
+        );
+        assert_eq!(
+            discovery.selector.get("role").map(String::as_str),
+            Some("prefill")
+        );
+    }
+
+    /// The refusal names the offending token, the text the launcher prints
+    /// for the same line.
+    #[test]
+    fn a_bad_selector_token_is_named_in_the_refusal() {
+        let error = cli_args_from(&["--selector", "app=engine tier"])
+            .to_router_config(vec![], vec![])
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("tier - expected 'key=value'"), "{text}");
+        assert!(!text.contains("app=engine tier -"), "{text}");
     }
 
     /// The router selector reaches the new independent mesh task unchanged.

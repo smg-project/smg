@@ -147,10 +147,15 @@ class TestRouterArgs:
         assert result == {}
 
     def test_parse_selector_invalid(self):
-        """Test parsing invalid selector arguments."""
-        # Test malformed selector (no equals sign)
-        result = RouterArgs._parse_selector(["app"])
-        assert result == {}
+        """An entry without '=' or without a key is refused by the field's name;
+        the first '=' splits a value that holds another."""
+        refusal = "Invalid value for field 'selector': app - expected 'key=value'"
+        with pytest.raises(ValueError, match=re.escape(refusal)):
+            RouterArgs._parse_selector(["app"])
+
+        refusal = "Invalid value for field 'prefill_selector': =prefill - expected 'key=value'"
+        with pytest.raises(ValueError, match=re.escape(refusal)):
+            RouterArgs._parse_selector(["=prefill"], "prefill_selector")
 
         # Test multiple equals signs (should use first one)
         result = RouterArgs._parse_selector(["app=worker=extra"])
@@ -2108,12 +2113,52 @@ class TestStorageContextHeadersEntries:
         )
         assert router_args.storage_context_headers == {"x-tenant": "tenant_id", "x-user": "user=v2"}
 
-    def test_label_selectors_keep_skipping_a_bare_token(self):
-        # The Rust CLI skips a selector token without '=' too; only the header
-        # mapping is refused by it.
-        assert parse_router_args(["--selector", "app", "tier=engine"]).selector == {
-            "tier": "engine"
-        }
+
+class TestDiscoverySelectorEntries:
+    """A discovery selector entry without '=' is refused with the Rust CLI's
+    message, where it used to be skipped and the selector that remained matched
+    more pods than the line said."""
+
+    SELECTOR_FLAGS = [
+        "--selector",
+        "--encode-selector",
+        "--prefill-selector",
+        "--decode-selector",
+        "--router-selector",
+    ]
+
+    @pytest.mark.parametrize("flag", SELECTOR_FLAGS)
+    def test_entry_without_equals_is_refused(self, flag):
+        field = flag.lstrip("-").replace("-", "_")
+        refusal = f"Invalid value for field '{field}': tier - expected 'key=value'"
+        with pytest.raises(ValueError, match=re.escape(refusal)):
+            parse_router_args([flag, "app=engine", "tier"])
+
+    def test_entry_without_a_key_is_refused(self):
+        refusal = "Invalid value for field 'selector': =engine - expected 'key=value'"
+        with pytest.raises(ValueError, match=re.escape(refusal)):
+            parse_router_args(["--selector", "=engine"])
+
+    def test_router_prefixed_spelling_is_refused_too(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(["--router-prefill-selector", "app=engine tier"])
+        refusal = "Invalid value for field 'prefill_selector': tier - expected 'key=value'"
+        with pytest.raises(ValueError, match=re.escape(refusal)):
+            RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+
+    def test_well_formed_entries_keep_the_space_split_allowance(self):
+        router_args = parse_router_args(["--selector", "app=engine tier=prod", "zone=a=b"])
+        assert router_args.selector == {"app": "engine", "tier": "prod", "zone": "a=b"}
+
+    @pytest.mark.parametrize("blank", ["", " "])
+    def test_blank_entry_is_refused(self, blank):
+        """A blank item, an unset shell variable in ``--selector "$SELECTOR"``,
+        is refused like the CLI refuses it instead of reading as no selector."""
+        with pytest.raises(
+            ValueError, match=re.escape("Invalid value for field 'router_selector':")
+        ):
+            RouterArgs._parse_selector([blank], "router_selector")
 
 
 class TestRustCliSecondSpellings:
