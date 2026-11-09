@@ -1,0 +1,176 @@
+name: Codex Code Review
+
+# Codex (OpenAI) reviews pull requests beside the Claude review: a full review when a PR
+# opens, an incremental one on every push, a full one on `@codex review` in a PR comment,
+# a reply when a developer answers in one of its threads, and a verdict on each finding the
+# Claude reviewer posts. The key reaches only the action's local proxy; Codex runs in a
+# read-only sandbox in a job with read permissions; a second job with pull-requests: write
+# and no key posts the result through scripts/codex_review_post.py. Prompts and output
+# schemas live in .github/codex/.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - '*.md'
+      - '*.lock'
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+# One review at a time per PR, the newest push winning; one verification pass per PR, the
+# last of Claude's burst of comments winning after the settle wait; thread replies never
+# cancel each other.
+concurrency:
+  group: >-
+    codex-${{
+      github.event_name == 'pull_request_review_comment' && format('reply-{0}', github.event.comment.id)
+      || github.event_name == 'pull_request_review' && format('verify-{0}', github.event.pull_request.number)
+      || format('review-{0}', github.event.pull_request.number || github.event.issue.number)
+    }}
+  cancel-in-progress: ${{ github.event_name != 'pull_request_review_comment' }}
+
+env:
+  CODEX_MODEL: gpt-6-astra
+  CODEX_EFFORT: xhigh
+  CODEX_VERSION: '0.167.0'
+  CODEX_OTHER_BOT: claude[bot]
+
+jobs:
+  codex:
+    name: Codex review
+    if: >-
+      github.repository == 'smg-project/smg'
+      && github.actor != 'dependabot[bot]'
+      && (
+        (github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork)
+        || (github.event_name == 'issue_comment'
+            && github.event.issue.pull_request
+            && contains(github.event.comment.body, '@codex review'))
+        || (github.event_name == 'pull_request_review_comment'
+            && github.event.comment.user.type != 'Bot')
+        || (github.event_name == 'pull_request_review'
+            && github.event.review.user.login == 'claude[bot]')
+      )
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      skip: ${{ steps.context.outputs.skip }}
+      mode: ${{ steps.context.outputs.mode }}
+    steps:
+      - name: Let Claude's burst of comments settle
+        if: github.event_name == 'pull_request_review'
+        run: sleep 120
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Resolve what this run does
+        id: context
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/codex_review_post.py context --out-dir .codex-review
+
+      - name: Check out the pull request head and write the diffs
+        if: steps.context.outputs.skip != 'true'
+        run: |
+          ctx=.codex-review/context.json
+          field() { python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or '')" "$ctx" "$1"; }
+          pr=$(field pr); head=$(field head_sha); base=$(field base_sha); before=$(field before_sha)
+          git fetch --no-tags --quiet origin "refs/pull/${pr}/head:refs/remotes/pr/${pr}" \
+            "refs/heads/$(field base_ref):refs/remotes/origin/$(field base_ref)"
+          git checkout --quiet --detach "${head}"
+          git diff --no-color "${base}...${head}" > .codex-review/pr.diff
+          if [ -n "${before}" ] && git cat-file -e "${before}^{commit}" 2>/dev/null; then
+            git diff --no-color "${before}..${head}" > .codex-review/push.diff
+          fi
+          wc -l .codex-review/*.diff
+
+      - name: Export API key from pod env
+        if: steps.context.outputs.skip != 'true'
+        uses: ./.github/actions/export-pod-api-key
+        with:
+          variable: OPENAI_API_KEY
+
+      - name: Assemble the review skills
+        if: steps.context.outputs.skip != 'true'
+        run: |
+          git clone --quiet --depth 1 https://github.com/smg-project/smg-dev-guide.git \
+            "$RUNNER_TEMP/smg-dev-guide"
+          git clone --quiet --depth 1 --filter=blob:none --sparse \
+            https://github.com/anthropics/claude-plugins-official.git "$RUNNER_TEMP/claude-plugins-official"
+          git -C "$RUNNER_TEMP/claude-plugins-official" sparse-checkout set --quiet plugins/pr-review-toolkit
+          python scripts/codex_review_skills.py \
+            --target "$HOME/.agents/skills" \
+            --guide "$RUNNER_TEMP/smg-dev-guide" \
+            --agents "$RUNNER_TEMP/claude-plugins-official/plugins/pr-review-toolkit/agents"
+          # The guide's skills call their scripts through this variable.
+          echo "CLAUDE_PLUGIN_ROOT=$RUNNER_TEMP/smg-dev-guide" >> "$GITHUB_ENV"
+
+      - name: Run Codex
+        if: steps.context.outputs.skip != 'true'
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ env.OPENAI_API_KEY }}
+          prompt-file: .github/codex/${{ steps.context.outputs.mode }}-prompt.md
+          output-schema-file: .github/codex/${{ steps.context.outputs.mode }}-schema.json
+          output-file: .codex-review/output.json
+          model: ${{ env.CODEX_MODEL }}
+          effort: ${{ env.CODEX_EFFORT }}
+          codex-version: ${{ env.CODEX_VERSION }}
+          permission-profile: ':read-only'
+          allow-bot-users: claude[bot]
+
+      - name: Keep the run's inputs and output
+        if: always() && steps.context.outputs.skip != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-review-${{ github.run_id }}
+          path: .codex-review/
+          retention-days: 7
+
+  post:
+    name: Post Codex review
+    needs: codex
+    if: needs.codex.result == 'success' && needs.codex.outputs.skip != 'true'
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # The posting script comes from the default branch, never from the pull request.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: codex-review-${{ github.run_id }}
+          path: .codex-review
+
+      - name: Post to the pull request
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/codex_review_post.py post --dir .codex-review

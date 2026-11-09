@@ -25,6 +25,19 @@ Example:
 
 After posting all inline comments, write a brief summary with a count per severity level.
 
+## Bots
+
+Two reviewers run on every non-draft pull request from a branch of this repository (forks get
+neither): Claude (`.github/workflows/claude-code-review.yml`) and Codex
+(`.github/workflows/codex-code-review.yml`, prompts in `.github/codex/`). Both post inline
+comments with the markers above, and each approves when it finds nothing 🔴 Important.
+
+- `@claude review` or `@codex review` in a PR comment runs a full review on demand.
+- A human reply in a thread Codex opened, or a comment that mentions `@codex`, gets an answer
+  from Codex in that thread.
+- Each bot grades the other's root findings in-thread with 🤝 Agree, ⚠️ Disagree or ❓ Unsure,
+  once per finding, so a disputed comment shows both views.
+
 ## Focus on
 
 - Logic errors and bugs that would break production
