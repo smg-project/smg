@@ -1080,10 +1080,10 @@ every turn the grammar of the model's response template table where that table
 spells whole turns; otherwise it constrains the calls a tool request allows under
 `auto`.
 
-#### Metrics (`--metrics-port`)
+#### Metrics (`--servicer-metrics-port`)
 
-On the Rust servicer (the default), `--metrics-port <port>` (and `--metrics-host`,
-defaulting to the gRPC `--host`) serves its Prometheus metrics
+On the Rust servicer (the default), `--servicer-metrics-port <port>` (and
+`--servicer-metrics-host`, defaulting to the gRPC `--host`) serves its Prometheus metrics
 on a listener of its own; `SMG_TOKENSPEED_SERVICER_METRICS_PORT` /
 `SMG_TOKENSPEED_SERVICER_METRICS_HOST` are the environment forms the flags
 override, and without either there is no endpoint. The families and labels are
@@ -1094,8 +1094,14 @@ equal to `--port` is refused before the engine starts, and the flag is refused
 under the Python servicer, which exposes no endpoint.
 
 ```bash
-python -m smg_grpc_servicer.tokenspeed --model <model> --port 50051 --metrics-port 29100
+python -m smg_grpc_servicer.tokenspeed --model <model> --port 50051 --servicer-metrics-port 29100
 ```
+
+TokenSpeed's `--metrics-port` and `--metrics-host` configure the engine's own
+endpoint and are forwarded unchanged under either servicer implementation.
+Use `--servicer-metrics-port` and `--servicer-metrics-host` for the servicer
+endpoint previously selected by those flags. The environment variable names
+remain unchanged.
 
 #### Multi-node engines: the worker pod's liveness
 

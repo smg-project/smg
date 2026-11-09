@@ -17,8 +17,9 @@ __all__ = [
 
 # The flag that selects the Rust request path; see `smg_grpc_servicer.tokenspeed.rust`.
 SERVICER_IMPL_ENV = "SMG_TOKENSPEED_SERVICER_IMPL"
-# The Rust servicer's Prometheus endpoint: the fallbacks of --metrics-port and
-# --metrics-host (see `smg_grpc_servicer.rust_lifecycle.metrics_bind_address`).
+# The Rust servicer's Prometheus endpoint, separate from the engine's metrics.
+METRICS_PORT_FLAG = "--servicer-metrics-port"
+METRICS_HOST_FLAG = "--servicer-metrics-host"
 METRICS_PORT_ENV = "SMG_TOKENSPEED_SERVICER_METRICS_PORT"
 METRICS_HOST_ENV = "SMG_TOKENSPEED_SERVICER_METRICS_HOST"
 
