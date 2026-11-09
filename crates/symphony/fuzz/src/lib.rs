@@ -83,7 +83,7 @@ fn allowances() -> &'static [String] {
 
 /// Whether the breach named `name` is allowed for this run: `SYMPHONY_FUZZ_ALLOW` lists, comma
 /// separated, the names the breach messages carry, so that a class already reported does not stop
-/// the fuzzer from finding the next one. Every check honors it, through [`breach`].
+/// the fuzzer from finding the next one. Every check honors it, through `breach`.
 pub fn allowed(name: &str) -> bool {
     allowances().iter().any(|allowed| allowed == name)
 }
