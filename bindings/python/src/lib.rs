@@ -2253,6 +2253,9 @@ impl Router {
                 // record is the CLI's.
                 secret_sources: Default::default(),
                 secret_files: Default::default(),
+                // No file path reaches the binding yet, so there is nothing
+                // to watch; the flag follows with the paths.
+                secrets_auto_reload: false,
             }))
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))

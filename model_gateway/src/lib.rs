@@ -24,6 +24,7 @@
 pub mod app_context;
 pub mod config;
 pub mod endpoints;
+pub(crate) mod fs_watch;
 pub mod health;
 pub mod mesh;
 pub mod middleware;

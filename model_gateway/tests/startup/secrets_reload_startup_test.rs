@@ -16,7 +16,8 @@
 use std::{fs, net::SocketAddr};
 
 use gateway_launch::{
-    base_args, free_ports, log_with_line, request, serial, Gateway, EXIT_TIMEOUT, IP,
+    base_args, free_ports, log_with_line, request, serial, serving_accepts, Gateway, EXIT_TIMEOUT,
+    IP,
 };
 
 use crate::gateway_launch;
@@ -29,13 +30,6 @@ const ROTATED_ADMIN_KEY: &str = "admin-key-two-0b5c";
 /// The status `method path` gets on `addr` with `key` as the bearer.
 fn status(addr: SocketAddr, method: &str, path: &str, key: Option<&str>) -> Option<u16> {
     request(addr, method, path, key, None).map(|(status, _)| status)
-}
-
-/// Whether the serving layer accepts `key` on a keyed serving route: the
-/// layer alone answers 401, and the route behind it answers for itself (a
-/// body error, since the probe sends none).
-fn serving_accepts(addr: SocketAddr, key: Option<&str>) -> bool {
-    status(addr, "POST", "/v1/tokenize", key).expect("the gateway answers") != 401
 }
 
 /// The status and body of a reload under `key`.

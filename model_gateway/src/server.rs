@@ -907,22 +907,14 @@ async fn reload_secrets(State(state): State<Arc<AppState>>) -> Response {
         )
             .into_response();
     };
-    // The files are read off the runtime's threads: small, but a mount can
-    // stall.
-    match tokio::task::spawn_blocking(move || reloader.reload()).await {
-        Ok(Ok(report)) => smg_auth::AuditResource::name(Json(report).into_response(), "secrets"),
-        Ok(Err(crate::secrets::BadFile(error))) => {
-            warn!(%error, "the secrets were not reloaded; the keys in force stand");
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({ "error": error.to_string() })),
-            )
-                .into_response()
-        }
-        Err(error) => {
-            error!(%error, "the secrets reload did not complete");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+    match crate::secrets::reload_logged(reloader, "route").await {
+        Some(Ok(report)) => smg_auth::AuditResource::name(Json(report).into_response(), "secrets"),
+        Some(Err(crate::secrets::BadFile(error))) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+        None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -1111,6 +1103,10 @@ pub struct ServerConfig {
     /// targets of `POST /secrets/reload`; a caller that did not track them
     /// leaves the default, and the route answers 409.
     pub secret_files: crate::secrets::SecretFiles,
+    /// `--secrets-auto-reload`: the key files watched, a change reloading
+    /// them as the route does. Nothing to watch without a file source; the
+    /// start says so.
+    pub secrets_auto_reload: bool,
 }
 
 /// `Router::layer` for an application-wide layer a configuration may leave
@@ -2481,6 +2477,20 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .map(|state| state.keys.clone()),
     )
     .map(Arc::new);
+    // `--secrets-auto-reload`: the key files watched, a change reloading
+    // them as the route does; a directory that cannot be watched refuses the
+    // start. The sources record says which it is.
+    let secrets_auto_reload = match (config.secrets_auto_reload, &secrets) {
+        (false, _) => "off".to_string(),
+        (true, Some(reloader)) => {
+            crate::secrets::start_auto_reload(Arc::clone(reloader))?;
+            format!("on ({} files)", reloader.files().count())
+        }
+        (true, None) => {
+            warn!("--secrets-auto-reload is set and no key came from a file: nothing to watch");
+            "on (no file to watch)".to_string()
+        }
+    };
 
     let app_state = Arc::new(AppState {
         router,
@@ -2570,7 +2580,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         admin_addr,
     );
     // And where a keyed start's secrets came from, sources alone.
-    posture::log_secret_sources(&config.secret_sources);
+    posture::log_secret_sources(&config.secret_sources, &secrets_auto_reload);
     // And whether the gated routes are mounted: they need control-plane
     // authentication, so a start without it says they are off.
     posture::log_gated_routes(control_plane_auth_state.is_some(), GATED_ROUTES);
@@ -3986,6 +3996,7 @@ mod tests {
             webrtc_stun_server: None,
             secret_sources: Default::default(),
             secret_files: Default::default(),
+            secrets_auto_reload: false,
         }
     }
 

@@ -250,6 +250,16 @@ impl Drop for Gateway {
     }
 }
 
+/// Whether the serving layer accepts `key` on a keyed serving route: the
+/// layer alone answers 401, and the route behind it answers for itself (a
+/// body error, since the probe sends none).
+pub fn serving_accepts(addr: SocketAddr, key: Option<&str>) -> bool {
+    request(addr, "POST", "/v1/tokenize", key, None)
+        .expect("the gateway answers")
+        .0
+        != 401
+}
+
 /// One `method path` request to `addr` over a connection closed with the
 /// response, with `key` as the bearer and `body` as a JSON body when given:
 /// the status and the response body, or `None` when nothing answered.
