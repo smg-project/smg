@@ -15,7 +15,7 @@ use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
     helpers::{maybe_inject_pd_metadata, maybe_inject_pd_rendezvous},
-    pd_protocol::{EncodeHandoff, PdDispatch, PdProtocol},
+    pd_protocol::{PdDispatch, PdProtocol},
 };
 use crate::{
     observability::{
@@ -38,8 +38,8 @@ use crate::{
             backend_client::BackendClient,
             common::stages::encode::EncodeDispatchPlan,
             context::{
-                stage_output, ClientSelection, DispatchContext, ExecutionPlan, ExecutionPlanKind,
-                ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
+                stage_output, ClientSelection, DispatchContext, EncodeOutputs, ExecutionPlan,
+                ExecutionPlanKind, ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
             },
             multimodal::worker_language_model_only,
             proto_wrapper::{
@@ -297,10 +297,10 @@ pub(crate) async fn execute_plan(
     };
 
     // `None` for non-EPD, text-only EPD, or an EPD retry (the first dispatch
-    // consumed it). Taking it transfers the encode jobs' SHM Drop guards
-    // here: dispatch consumes them, while an early error before dispatch
-    // drops them and reclaims the SHM.
-    let encode_dispatch = ctx.encode_outputs.take().map(|o| o.dispatch);
+    // consumed it). Taking it transfers a rendezvous plan's encode jobs and
+    // their SHM Drop guards here: dispatch consumes them, while an early
+    // error before dispatch drops them and reclaims the SHM.
+    let encode = ctx.encode_outputs.take();
 
     let clients = stage_output(ctx.clients.as_mut(), "execute_plan")?;
 
@@ -378,19 +378,17 @@ pub(crate) async fn execute_plan(
                 execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger).await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
-                let push_encode = workers.encode_handoff() == Some(EncodeHandoff::Push)
-                    && workers.encode_assignments().is_some();
-                // Bootstrap info was injected into the prefill request during
-                // request building; dispatch the encode jobs with the
-                // prefill+decode side.
+                let push_encode = matches!(encode, Some(EncodeOutputs::Push(_)));
+                // A rendezvous plan's bootstrap info went into the prefill
+                // request at request building and its encode jobs go with the
+                // prefill/decode pair; a push plan runs its encode call first.
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
                 execute_epd_dispatch(
                     request,
                     clients,
                     workers,
                     model,
-                    encode_dispatch,
-                    ctx.image_anchor,
+                    encode,
                     prefill_guard,
                     ledger,
                 )
@@ -701,37 +699,33 @@ async fn execute_fanout_pd(
     })
 }
 
-/// Dispatch an EPD request by its runtime's encode handoff
-/// (`PdProtocol::encode_handoff`): under a push handoff the encoder
-/// completes before the prefill/decode pair is sent; under a rendezvous
-/// handoff the encode jobs launch beside the pair.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "EPD adds image anchors to the shared PD dispatch inputs"
-)]
+/// Dispatch an EPD request by the encode stage's plan: a push plan's encoder
+/// completes before the prefill/decode pair is sent; a rendezvous plan's
+/// encode jobs launch beside the pair.
 async fn execute_epd_dispatch(
     mut proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     model: &str,
-    encode_dispatch: Option<EncodeDispatchPlan>,
-    image_anchor: Option<u32>,
+    encode: Option<EncodeOutputs>,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
-    let push = workers.encode_handoff() == Some(EncodeHandoff::Push);
-    let mut cleanup = if push && workers.encode_assignments().is_some() {
-        Some(super::vllm_encode::encode(&mut proto_request, workers, image_anchor).await?)
-    } else {
-        None
-    };
-    if let Some(encode_dispatch) = encode_dispatch {
-        spawn_encode_dispatch(encode_dispatch);
-    }
-    // A push handoff's identity has replaced the pixels already; every other
-    // prefill side drops them, its embeddings come from the encode workers.
-    if !push {
-        proto_request.clear_mm_pixel_values();
+    let mut cleanup = None;
+    match encode {
+        // The built prompt goes to the encoder first; its completion has
+        // replaced the pixels by the time the prefill side sees it.
+        Some(EncodeOutputs::Push(plan)) => {
+            cleanup = Some(plan.encode(&mut proto_request).await?);
+        }
+        // The encode jobs go beside the prefill/decode pair; the prefill side
+        // drops its pixels, its embeddings come from the encode workers.
+        Some(EncodeOutputs::Rendezvous { dispatch, .. }) => {
+            spawn_encode_dispatch(dispatch);
+            proto_request.clear_mm_pixel_values();
+        }
+        // Text-only, or a retry whose first dispatch took the plan.
+        None => proto_request.clear_mm_pixel_values(),
     }
     let result = execute_pd_dispatch(
         proto_request,

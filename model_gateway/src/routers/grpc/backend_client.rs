@@ -449,6 +449,9 @@ pub(crate) async fn send_tokenspeed_encode_frame(
         .map_err(|status| format!("encode request to {url} failed: {}", status.message()))
 }
 
+/// Hand an encode request to a gRPC encode worker over its cached encoder
+/// channel. The worker acknowledges after shipping the embedding to the
+/// prefill side; a request it did not accept is an error.
 pub(crate) async fn send_tokenspeed_encode_rpc(
     endpoint: String,
     request: tokenspeed_encoder::EncodeRequest,
