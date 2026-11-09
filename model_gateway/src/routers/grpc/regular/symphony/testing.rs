@@ -240,8 +240,11 @@ pub(super) fn message_request(extra: Value) -> CreateMessageRequest {
     serde_json::from_value(request).expect("messages request")
 }
 
-/// The rendered scrape after `record` ran under a recorder of its own.
+/// The rendered scrape after `record` ran under a recorder, and series, of its own: what it
+/// counted, with its lines from buckets no other test drains
+/// ([`own_series`](super::telemetry::own_series)).
 pub(super) fn rendered(record: impl FnOnce()) -> String {
+    let _own = telemetry::own_series();
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     metrics::with_local_recorder(&recorder, record);
@@ -476,11 +479,13 @@ pub(super) fn request_span() -> tracing::Span {
 
 /// The JSON log lines `work` writes under a subscriber of the gateway's own line format
 /// (`observability::log_format::{JsonLine, SpanFields}`), each parsed: what a reader of the
-/// access log sees, the span's recorded fields included.
+/// access log sees, the span's recorded fields included. The sampled lines come from series of
+/// `work`'s own, as under [`rendered`].
 pub(super) fn json_lines(work: impl FnOnce()) -> Vec<Value> {
     use tracing_subscriber::layer::SubscriberExt as _;
 
     use crate::observability::log_format::{JsonLine, SpanFields};
+    let _own = telemetry::own_series();
     let capture = Capture::default();
     let layer = tracing_subscriber::fmt::layer()
         .with_writer(capture.clone())
