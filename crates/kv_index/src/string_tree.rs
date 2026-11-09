@@ -391,12 +391,7 @@ fn shared_prefix_count(a: &str, b: &str) -> usize {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
 
-    // Find common byte prefix length using iterator (potentially SIMD-optimized)
-    let common_byte_len = a_bytes
-        .iter()
-        .zip(b_bytes)
-        .position(|(&a_byte, &b_byte)| a_byte != b_byte)
-        .unwrap_or_else(|| a_bytes.len().min(b_bytes.len()));
+    let common_byte_len = common_byte_prefix(a_bytes, b_bytes);
 
     // If the common byte prefix is all ASCII, byte count == char count
     // Otherwise, fall back to char-by-char comparison for UTF-8 safety
@@ -413,11 +408,7 @@ fn shared_prefix_count(a: &str, b: &str) -> usize {
 fn shared_prefix_len(a: &str, b: &str) -> (usize, usize) {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
-    let common_byte_len = a_bytes
-        .iter()
-        .zip(b_bytes)
-        .position(|(&a_byte, &b_byte)| a_byte != b_byte)
-        .unwrap_or_else(|| a_bytes.len().min(b_bytes.len()));
+    let common_byte_len = common_byte_prefix(a_bytes, b_bytes);
     if a_bytes[..common_byte_len].is_ascii() {
         return (common_byte_len, common_byte_len);
     }
@@ -441,6 +432,37 @@ fn shared_prefix_count_chars(a: &str, b: &str) -> usize {
         .zip(b.chars())
         .take_while(|(a_char, b_char)| a_char == b_char)
         .count()
+}
+
+/// The bytes `a` and `b` share from the start. The span of the shorter run is
+/// compared as one slice first: on the tree's walks the input usually runs
+/// through a node's whole text, so one compare settles it. On a difference,
+/// the first unequal word of eight bytes names the byte by the lowest set bit
+/// of its xor (the lowest-addressed byte, read little-endian), and the bytes
+/// under one word at the end go one at a time: the count the byte-wise scan
+/// gave, for every pair.
+#[inline]
+fn common_byte_prefix(a: &[u8], b: &[u8]) -> usize {
+    const WORD: usize = 8;
+    let len = a.len().min(b.len());
+    let (a, b) = (&a[..len], &b[..len]);
+    if a == b {
+        return len;
+    }
+    let (a_words, a_tail) = a.as_chunks::<WORD>();
+    let (b_words, b_tail) = b.as_chunks::<WORD>();
+    for (i, (x, y)) in a_words.iter().zip(b_words).enumerate() {
+        let differing = u64::from_le_bytes(*x) ^ u64::from_le_bytes(*y);
+        if differing != 0 {
+            return i * WORD + differing.trailing_zeros() as usize / 8;
+        }
+    }
+    a_words.len() * WORD
+        + a_tail
+            .iter()
+            .zip(b_tail)
+            .position(|(x, y)| x != y)
+            .unwrap_or(a_tail.len())
 }
 
 impl Default for Tree {
