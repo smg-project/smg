@@ -352,9 +352,12 @@ impl KvEventMonitor {
     /// has a main group. The first on a worker whose main signal was a
     /// window group restarts it: the index lets the signal's blocks go
     /// (counted; the main group's stores rebuild it, in this very batch for
-    /// an engine whose group lane merely ran ahead of its main lane) and
-    /// the signal's groups move to the view, whose events they publish from
-    /// here on. `true` when the worker needs its view.
+    /// an engine whose group lane merely ran ahead of its main lane), a
+    /// view the worker has already is cleared with it (a hashes-only store
+    /// of the group gave it one, created late and incomplete: it names the
+    /// main group's blocks from here, complete), and the signal's groups
+    /// move to the view, whose events they publish from here on. `true`
+    /// when the worker needs its view.
     fn main_group_shown(
         worker_id: u32,
         indexer: &KvIndex,
@@ -371,6 +374,11 @@ impl KvEventMonitor {
         indexer.apply_cleared(worker_id, &mut worker_blocks.blocks);
         worker_blocks.copies.clear();
         worker_blocks.counters.main_signal_dropped += dropped as u64;
+        // A view the worker has already: its names go with the blocks, and
+        // it is complete from here.
+        if let Some(view) = &worker_blocks.groups {
+            view.clear();
+        }
         for group in std::mem::take(&mut worker_blocks.main_signal_groups) {
             worker_blocks.show_group(group);
         }
@@ -2240,6 +2248,46 @@ mod tests {
         KvEventMonitor::apply_events(&[removal_in(1, 1)], w1, &indexer, &mut wb);
         assert!(!routable(&indexer, w1, &one), "the main group let it go");
         assert_eq!(indexer.current_size(), 1);
+    }
+
+    /// A hashes-only store of the window group before any main group gives
+    /// the worker a view late, over the signal's blocks, incomplete; the main
+    /// group's store restarts the worker and the view names its blocks from
+    /// an empty index: complete, the block routable.
+    #[test]
+    fn a_view_created_late_is_complete_after_the_restart() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let one = compute_request_content_hashes(&TOKENS, 4);
+        KvEventMonitor::apply_events(
+            &[window_only_store(0, 1, None, &TOKENS)],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        KvEventMonitor::apply_events(
+            &[group_store(0, Some("sliding_window"), Some(64), &[1])],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        let view = wb
+            .groups
+            .clone()
+            .expect("the hashes-only store gives a view");
+        assert!(!view.is_complete(), "created over the signal's block");
+        assert_eq!(wb.counters.group_view_late, 1);
+
+        let mut main = stored_event(1, &TOKENS);
+        main.group_idx = Some(1);
+        main.kv_cache_spec_kind = Some("full_attention".to_string());
+        KvEventMonitor::apply_events(&[store_event(main)], w1, &indexer, &mut wb);
+        assert!(view.is_complete(), "the restart cleared the view");
+        assert_eq!(wb.counters.main_signal_dropped, 1);
+        assert!(routable(&indexer, w1, &one));
+        assert_eq!(indexer.current_size(), 1);
+        assert_eq!(view.named_blocks(), 1, "the main group's block is named");
     }
 
     /// A window-only worker's second copy of a block (an engine's resend)
