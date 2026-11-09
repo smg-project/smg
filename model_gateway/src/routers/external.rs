@@ -352,6 +352,13 @@ impl RouterTrait for ExternalRouterAdapter {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
+        // `rid` is this gateway's extension, forwarded to an engine for log
+        // correlation; a provider refuses an unknown top-level field. The
+        // OpenAI-compatible providers drop the gateway-only fields from
+        // their JSON payload (`strip_sglang_fields`); a Messages provider
+        // posts the typed request, so the field is cleared here.
+        let mut body = body;
+        body.rid = None;
         self.route_reserved(tenant_meta, body, "/v1/messages", model_id, |body| {
             self.inner
                 .route_messages(headers, tenant_meta, body, model_id)
@@ -411,5 +418,83 @@ impl RouterTrait for ExternalRouterAdapter {
 
     async fn route_realtime_webrtc(&self, req: Request<Body>, model_id: &str) -> Response {
         self.inner.route_realtime_webrtc(req, model_id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use axum::{http::StatusCode, response::IntoResponse};
+    use serde_json::{json, Value};
+    use smg_external_router::spec_for_provider;
+
+    use super::*;
+    use crate::middleware::{RouteRequestMeta, TenantKey};
+
+    /// A provider router of the kind the adapter mounts, keeping the
+    /// Messages request it was handed as the JSON it would post: the trait's
+    /// two required methods, every other route its default.
+    #[derive(Debug, Default)]
+    struct RecordingProvider {
+        posted: Mutex<Option<Value>>,
+    }
+
+    #[async_trait]
+    impl ExternalRouter for RecordingProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn router_type(&self) -> &'static str {
+            "stub"
+        }
+
+        async fn route_messages(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            body: CreateMessageRequest,
+            _model_id: &str,
+        ) -> Response {
+            let posted = serde_json::to_value(&body).expect("a request serializes");
+            *self.posted.lock().expect("the recorder") = Some(posted);
+            StatusCode::OK.into_response()
+        }
+    }
+
+    /// A Messages request reaches its provider without the gateway's `rid`:
+    /// a thread turn carries the id the gateway minted, a plain request the
+    /// client's own, and a provider refuses the unknown field.
+    #[tokio::test]
+    async fn a_provider_gets_no_rid() {
+        let provider = Arc::new(RecordingProvider::default());
+        let adapter = ExternalRouterAdapter {
+            spec: spec_for_provider(None).expect("the OpenAI-compatible spec"),
+            inner: provider.clone(),
+            rate_limit_manager: None,
+            worker_registry: Arc::new(WorkerRegistry::new()),
+        };
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 1,
+            "rid": "msg_minted",
+            "messages": [{"role": "user", "content": "q"}],
+        }))
+        .expect("a request");
+        let tenant_meta = RouteRequestMeta::new(TenantKey::from("test-tenant"));
+        let response = adapter
+            .route_messages(None, &tenant_meta, request, "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let posted = provider
+            .posted
+            .lock()
+            .expect("the recorder")
+            .take()
+            .expect("a posted request");
+        assert!(posted.get("rid").is_none(), "{posted}");
+        assert_eq!(posted["model"], "m");
+        assert_eq!(posted["messages"][0]["content"], "q");
     }
 }

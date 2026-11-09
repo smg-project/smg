@@ -32,6 +32,7 @@ pub mod factory;
 pub mod gateway;
 pub mod grpc;
 pub mod http;
+pub(crate) mod message_threads;
 pub(crate) mod provider_support;
 
 pub use common::body_policy::BodyPolicy;

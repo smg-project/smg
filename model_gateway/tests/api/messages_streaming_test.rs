@@ -222,10 +222,7 @@ fn test_simple_events() {
     assert_eq!(ping["type"], "ping");
 
     let err: Value = serde_json::to_value(&MessageStreamEvent::Error {
-        error: ErrorResponse {
-            error_type: "api_error".to_string(),
-            message: "fail".to_string(),
-        },
+        error: ErrorResponse::new("api_error", "fail"),
     })
     .unwrap();
     assert_eq!(err["type"], "error");

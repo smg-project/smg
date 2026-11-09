@@ -916,9 +916,11 @@ async fn realtime_rest_handler(
 
 async fn messages_handler(
     State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    version: Version,
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
+    record_request(config.port, version, &payload);
 
     if should_fail(&config) {
         return (

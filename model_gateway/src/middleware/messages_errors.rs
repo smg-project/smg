@@ -1,8 +1,10 @@
 //! The Messages API's error envelope.
 //!
 //! Every error answered on `/v1/messages` and `/v1/messages/count_tokens`
-//! leaves as `{"type":"error","error":{"type","message"},"request_id"}`,
-//! the shape the Anthropic SDKs decode, whatever produced it inside: the
+//! leaves as `{"type":"error","error":{"type","message"},"request_id"}`
+//! (with `error.details` when the error carries a code, as a message
+//! thread's refusals do), the shape the Anthropic SDKs decode, whatever
+//! produced it inside: the
 //! gateway's OpenAI-shaped envelope, a plain-text refusal, an empty body. The
 //! status is kept and `error.type` follows from it.
 
@@ -143,15 +145,15 @@ pub async fn into_messages_envelope(response: Response, request_id: String) -> R
     let error = match serde_json::from_slice::<Value>(&bytes) {
         Ok(json) => match messages_error_of(&json) {
             Some(error) => error,
-            None => ErrorResponse {
-                error_type: messages_error_type(status).to_string(),
-                message: message_of(&json).unwrap_or_else(|| reason(status)),
-            },
+            None => ErrorResponse::new(
+                messages_error_type(status),
+                message_of(&json).unwrap_or_else(|| reason(status)),
+            ),
         },
-        Err(_) => ErrorResponse {
-            error_type: messages_error_type(status).to_string(),
-            message: text_of(&bytes).unwrap_or_else(|| reason(status)),
-        },
+        Err(_) => ErrorResponse::new(
+            messages_error_type(status),
+            text_of(&bytes).unwrap_or_else(|| reason(status)),
+        ),
     };
     let envelope = ErrorEnvelope::new(error, request_id);
     let json = serde_json::to_vec(&envelope).unwrap_or_default();
@@ -168,7 +170,8 @@ pub async fn into_messages_envelope(response: Response, request_id: String) -> R
     Response::from_parts(parts, Body::from(json))
 }
 
-/// The `error` of a body that already is a Messages envelope.
+/// The `error` of a body that already is a Messages envelope, with the
+/// `details` it carries (the error code a thread refusal names).
 fn messages_error_of(json: &Value) -> Option<ErrorResponse> {
     if json.get("type").and_then(Value::as_str) != Some("error") {
         return None;
@@ -177,6 +180,9 @@ fn messages_error_of(json: &Value) -> Option<ErrorResponse> {
     Some(ErrorResponse {
         error_type: error.get("type")?.as_str()?.to_string(),
         message: error.get("message")?.as_str()?.to_string(),
+        details: error
+            .get("details")
+            .and_then(|details| serde_json::from_value(details.clone()).ok()),
     })
 }
 

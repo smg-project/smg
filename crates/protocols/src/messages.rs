@@ -88,6 +88,13 @@ pub struct CreateMessageRequest {
     /// MCP servers to be utilized in this request (beta).
     pub mcp_servers: Option<Vec<McpServerConfig>>,
 
+    /// The message thread this request opens or continues (beta): a
+    /// `create` request is a whole conversation whose answer the gateway
+    /// keeps under the answer's `id`; a `continue` request names that id as
+    /// `previous_message_id` and carries the messages since the answer,
+    /// without `system` or `tools` (the thread keeps the create request's).
+    pub thread: Option<MessageThread>,
+
     /// Request ID forwarded to the backend for log correlation (an engine extension)
     pub rid: Option<String>,
 
@@ -111,6 +118,15 @@ pub struct CreateMessageRequest {
 
 impl Normalizable for CreateMessageRequest {
     // Use default no-op implementation
+}
+
+/// The `thread` of a Messages request: the first turn of a thread, or the
+/// next turn of the one whose last answer is `previous_message_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MessageThread {
+    Create,
+    Continue { previous_message_id: String },
 }
 
 /// `output_config`: `effort` is read as a Chat `reasoning_effort` is (a
@@ -165,6 +181,16 @@ impl CreateMessageRequest {
     /// Check if the request is for streaming
     pub fn is_stream(&self) -> bool {
         self.stream.unwrap_or(false)
+    }
+
+    /// The public API's request rules this request breaks, as the extractor
+    /// states them, or `None`: the field rules and the crate's own
+    /// (`messages_validation`), applied again to a conversation the gateway
+    /// rebuilt from a message thread's stored turns.
+    pub fn contract_violation(&self) -> Option<String> {
+        Validate::validate(self)
+            .err()
+            .map(|errors| errors.to_string())
     }
 
     /// Get the model name
@@ -369,6 +395,13 @@ fn validate_message_request(req: &CreateMessageRequest) -> Result<(), validator:
     let Some(tool_choice) = &req.tool_choice else {
         return Ok(());
     };
+
+    // A continue request of a message thread sends no tools: the thread
+    // keeps the create request's, and the choice is judged against them on
+    // the conversation the gateway rebuilds.
+    if matches!(req.thread, Some(MessageThread::Continue { .. })) {
+        return Ok(());
+    }
 
     let has_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
     let requires_tools = !matches!(tool_choice, ToolChoice::None);
@@ -1682,6 +1715,34 @@ pub struct ErrorResponse {
     pub error_type: String,
 
     pub message: String,
+
+    /// The code a client switches on before it retries, with what the
+    /// refusal names; the message-thread errors carry one, the others none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<ErrorDetails>,
+}
+
+impl ErrorResponse {
+    /// An error of `error_type` with `message` and no `details`.
+    pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            error_type: error_type.into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+}
+
+/// The `error.details` of a Messages error: `error_code`, which a client
+/// reads before it retries (a continue refused as `thread_not_found` is
+/// replayed as a new create request, a `thread_fingerprint_mismatch` is
+/// not), and under `unsupported` the request features a refusal names.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(rename = "MessagesErrorDetails")]
+pub struct ErrorDetails {
+    pub error_code: String,
+    pub unsupported: Option<Vec<String>>,
 }
 
 /// The body of an error on the Messages API:
@@ -1735,6 +1796,7 @@ pub enum ApiError {
 /// Request to count tokens in a message
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, Validate, schemars::JsonSchema)]
+#[validate(schema(function = "validate_count_message_tokens_request"))]
 pub struct CountMessageTokensRequest {
     /// The model to use for token counting
     #[validate(length(min = 1, message = "model field is required and cannot be empty"))]
@@ -1760,6 +1822,10 @@ pub struct CountMessageTokensRequest {
     /// (boxed as [`CreateMessageRequest::output_config`] is).
     pub output_config: Option<Box<OutputConfig>>,
 
+    /// The thread of a Messages request, which a count takes none of: the
+    /// count reads the whole conversation, with its `system` and `tools`.
+    pub thread: Option<Value>,
+
     /// Additional backend-specific token counting options.
     #[serde(flatten)]
     pub other: Map<String, Value>,
@@ -1767,6 +1833,20 @@ pub struct CountMessageTokensRequest {
 
 impl Normalizable for CountMessageTokensRequest {
     // Use default no-op implementation
+}
+
+/// A count reads the whole conversation: `thread` is refused, as the public
+/// API refuses it, and the client counts what a create request would send.
+fn validate_count_message_tokens_request(
+    req: &CountMessageTokensRequest,
+) -> Result<(), validator::ValidationError> {
+    if req.thread.is_some() {
+        return Err(invalid(
+            "thread_not_counted",
+            "thread: count_tokens takes no thread; count the whole conversation, with its system and tools",
+        ));
+    }
+    Ok(())
 }
 
 impl CountMessageTokensRequest {
@@ -3309,6 +3389,7 @@ mod tests {
             top_p: None,
             container: None,
             mcp_servers: None,
+            thread: None,
             rid: None,
             other: Map::new(),
         }

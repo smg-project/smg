@@ -750,6 +750,35 @@ impl MemoryResponseStorage {
         self.store.write().evict(&self.bounds, now)
     }
 
+    /// Puts `response` under its id when nothing is stored under it; a
+    /// taken id hands the record back. The eviction runs before the check,
+    /// so absent means absent or expired, and after the write for the count
+    /// bound; the check and the write are under the one lock, so two writers
+    /// of one id store one record.
+    pub fn store_response_if_absent(
+        &self,
+        response: StoredResponse,
+    ) -> Result<(), Box<StoredResponse>> {
+        self.store_response_if_absent_at(response, Utc::now())
+    }
+
+    /// [`Self::store_response_if_absent`] at `now`, the time the bounds are
+    /// judged at.
+    fn store_response_if_absent_at(
+        &self,
+        response: StoredResponse,
+        now: DateTime<Utc>,
+    ) -> Result<(), Box<StoredResponse>> {
+        let mut store = self.store.write();
+        store.evict(&self.bounds, now);
+        if store.responses.contains_key(&response.id) {
+            return Err(Box::new(response));
+        }
+        store.insert(response, now);
+        store.evict(&self.bounds, now);
+        Ok(())
+    }
+
     /// Get statistics about the store
     #[cfg(test)]
     pub(super) fn stats(&self) -> MemoryStoreStats {
@@ -1349,6 +1378,83 @@ mod tests {
             .unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().raw_response["output"], json!("Output"));
+    }
+
+    /// A write under a taken id is refused, the record handed back, and the
+    /// first record stays.
+    #[tokio::test]
+    async fn a_write_under_a_taken_id_leaves_the_first_record() {
+        let store = MemoryResponseStorage::new();
+        let mut first = StoredResponse::new(None);
+        first.id = ResponseId::from("resp_taken");
+        first.raw_response = json!({"output": "first"});
+        assert!(store.store_response_if_absent(first).is_ok());
+        let mut second = StoredResponse::new(None);
+        second.id = ResponseId::from("resp_taken");
+        second.raw_response = json!({"output": "second"});
+        let refused = store
+            .store_response_if_absent(second)
+            .expect_err("the id is taken");
+        assert_eq!(refused.raw_response["output"], json!("second"));
+        let kept = store
+            .get_response(&ResponseId::from("resp_taken"))
+            .await
+            .unwrap()
+            .expect("the first record");
+        assert_eq!(kept.raw_response["output"], json!("first"));
+        assert_eq!(store.stats().response_count, 1);
+    }
+
+    /// A write through the conditional store drops what is over the count
+    /// bound, like any write.
+    #[tokio::test]
+    async fn a_store_if_absent_write_keeps_the_count_bound() {
+        let store = MemoryResponseStorage::with_config(&MemoryConfig {
+            max_responses: 2,
+            ..MemoryConfig::default()
+        });
+        for i in 1..=3 {
+            let mut response = StoredResponse::new(None);
+            response.id = ResponseId::from(format!("resp_{i}"));
+            assert!(store.store_response_if_absent(response).is_ok());
+        }
+        assert_eq!(store.stats().response_count, 2);
+        assert!(
+            store
+                .get_response(&ResponseId::from("resp_1"))
+                .await
+                .unwrap()
+                .is_none(),
+            "the first record went"
+        );
+    }
+
+    /// A record past the retention does not block a write under its id:
+    /// the eviction runs before the presence check.
+    #[tokio::test]
+    async fn an_expired_record_does_not_block_a_write_under_its_id() {
+        let store = MemoryResponseStorage::with_config(&MemoryConfig {
+            retention_secs: Some(60),
+            ..MemoryConfig::default()
+        });
+        let written = Utc::now();
+        let mut aged = StoredResponse::new(None);
+        aged.id = ResponseId::from("resp_aged");
+        aged.raw_response = json!({"output": "old"});
+        assert!(store.store_response_if_absent_at(aged, written).is_ok());
+        let mut fresh = StoredResponse::new(None);
+        fresh.id = ResponseId::from("resp_aged");
+        fresh.raw_response = json!({"output": "new"});
+        assert!(store
+            .store_response_if_absent_at(fresh, written + TimeDelta::seconds(61))
+            .is_ok());
+        let kept = store
+            .get_response(&ResponseId::from("resp_aged"))
+            .await
+            .unwrap()
+            .expect("the new record");
+        assert_eq!(kept.raw_response["output"], json!("new"));
+        assert_eq!(store.stats().response_count, 1);
     }
 
     #[tokio::test]
