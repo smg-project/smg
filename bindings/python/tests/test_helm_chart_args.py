@@ -889,6 +889,30 @@ def test_the_schema_says_what_the_concurrency_sentinels_do():
 
 
 @needs_helm
+def test_the_default_render_requires_the_native_jpeg_decoder():
+    """The default deployment passes ``--mm-turbojpeg require``: a gateway whose
+    image lacks libjpeg-turbo refuses to start, where the launcher's own default
+    decodes JPEGs with the pure-Rust fallback and only says so in a log line."""
+    _, documents = render()
+    assert launcher_args(router_container(documents)["args"]).mm_turbojpeg == "require"
+
+
+@needs_helm
+def test_the_turbojpeg_policy_reaches_the_launcher_as_given():
+    """``router.mmTurbojpeg: prefer`` is the fallback-tolerant setting a custom
+    image without the library needs."""
+    _, documents = render("router.mmTurbojpeg=prefer")
+    assert launcher_args(router_container(documents)["args"]).mm_turbojpeg == "prefer"
+
+
+@needs_helm
+def test_a_turbojpeg_policy_outside_the_two_names_is_refused_by_the_schema():
+    assert "router.mmTurbojpeg must be one of the following" in render_error(
+        "router.mmTurbojpeg=never"
+    )
+
+
+@needs_helm
 @pytest.mark.parametrize("settle", [None, 0, 5, 30])
 def test_shutdown_settle_window(settle):
     """Omit the optional window by default and preserve explicit values, including zero."""

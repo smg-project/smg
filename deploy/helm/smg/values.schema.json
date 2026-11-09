@@ -20,6 +20,11 @@
           ]
         },
         "parser": { "type": "string", "enum": ["", "legacy", "symphony"] },
+        "mmTurbojpeg": {
+          "type": "string",
+          "enum": ["prefer", "require"],
+          "description": "What the gateway does when libjpeg-turbo cannot be loaded (--mm-turbojpeg). require refuses to start; prefer decodes JPEGs with the pure-Rust fallback, whose pixels differ from the engine's, and sets smg_mm_turbojpeg_available to 0."
+        },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "maxConcurrentRequests": {
           "type": "integer",
