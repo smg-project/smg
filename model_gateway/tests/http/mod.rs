@@ -3,6 +3,7 @@
 mod decisions_http_test;
 mod inflight_tracker_test;
 mod load_guard_raii_test;
+mod mock_engines_contract_test;
 mod relay_dump_test;
 mod rl_control_plane_test;
 mod rl_tokenspeed_control_endpoint_test;

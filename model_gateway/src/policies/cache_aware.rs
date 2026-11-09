@@ -624,6 +624,20 @@ impl CacheAwarePolicy {
         self.load_rx.read().is_some()
     }
 
+    /// Test-only: the worker URLs the string tree of `model_id` routes to,
+    /// sorted, so registry tests can assert the paths that fill and empty a
+    /// tree.
+    #[cfg(test)]
+    pub(crate) fn tree_tenants_for_test(&self, model_id: &str) -> Vec<String> {
+        let mut tenants: Vec<String> = self
+            .string_trees
+            .get(normalize_model_key(model_id))
+            .map(|tree| tree.get_tenant_char_count().into_keys().collect())
+            .unwrap_or_default();
+        tenants.sort();
+        tenants
+    }
+
     /// True when backend KV pressure demands abandoning cache affinity.
     ///
     /// Two triggers, OR'd together, both requiring a backend `token_usage`

@@ -3,6 +3,7 @@
 //! `SMG_MM_PIXEL_CACHE_MB` unset or 0).
 
 use std::{
+    io::{self, BufWriter, Write},
     mem::size_of,
     sync::{Arc, OnceLock},
 };
@@ -10,6 +11,7 @@ use std::{
 use llm_multimodal::{ModelSpecificValue, PreprocessedEncoderInputs};
 use lru::LruCache;
 use parking_lot::Mutex;
+use serde_json::Value;
 
 use crate::observability::metrics::Metrics;
 
@@ -163,15 +165,68 @@ pub(crate) fn pixel_cache_with_budget(mb: usize) -> Option<Arc<PixelCache>> {
         .clone()
 }
 
-pub(crate) fn config_fingerprint(tokenizer_id: &str, config: &serde_json::Value) -> u64 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(tokenizer_id.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(config.to_string().as_bytes());
-    let digest = hasher.finalize();
+/// A process-local cache identity without cloning the model or building its JSON string.
+/// Object order is ignored; types, array order and numeric spelling are retained.
+/// The model is borrowed separately from the request's remaining config fields.
+pub(crate) fn config_fingerprint(
+    tokenizer_id: &str,
+    config: &Value,
+    model_config: &Value,
+) -> io::Result<u64> {
+    let mut writer = BufWriter::with_capacity(4096, blake3::Hasher::new());
+    writer.write_all(b"smg-pixel-config-v1")?;
+    write_fingerprint_bytes(&mut writer, tokenizer_id.as_bytes())?;
+    write_fingerprint_value(&mut writer, config)?;
+    write_fingerprint_value(&mut writer, model_config)?;
+    writer.flush()?;
+    let digest = writer.get_ref().finalize();
     let mut head = [0u8; 8];
     head.copy_from_slice(&digest.as_bytes()[..8]);
-    u64::from_le_bytes(head)
+    Ok(u64::from_le_bytes(head))
+}
+
+/// Frame arbitrary bytes so embedded separators cannot alias adjacent fields.
+fn write_fingerprint_bytes(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    writer.write_all(&(bytes.len() as u64).to_le_bytes())?;
+    writer.write_all(bytes)
+}
+
+/// Encode typed, framed values, sorting borrowed object entries only.
+/// Number spelling keeps integer/float and signed-zero identities distinct.
+fn write_fingerprint_value(writer: &mut impl Write, value: &Value) -> io::Result<()> {
+    match value {
+        Value::Null => writer.write_all(&[0]),
+        Value::Bool(value) => writer.write_all(&[1, u8::from(*value)]),
+        Value::Number(value) => {
+            writer.write_all(&[2])?;
+            write!(writer, "{value}")?;
+            // 0xff cannot occur in the UTF-8 spelling, including arbitrary-precision numbers.
+            writer.write_all(&[0xff])
+        }
+        Value::String(value) => {
+            writer.write_all(&[3])?;
+            write_fingerprint_bytes(writer, value.as_bytes())
+        }
+        Value::Array(values) => {
+            writer.write_all(&[4])?;
+            writer.write_all(&(values.len() as u64).to_le_bytes())?;
+            for value in values {
+                write_fingerprint_value(writer, value)?;
+            }
+            Ok(())
+        }
+        Value::Object(values) => {
+            writer.write_all(&[5])?;
+            writer.write_all(&(values.len() as u64).to_le_bytes())?;
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (key, value) in entries {
+                write_fingerprint_bytes(writer, key.as_bytes())?;
+                write_fingerprint_value(writer, value)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -179,8 +234,117 @@ mod tests {
     use std::collections::HashMap;
 
     use ndarray::{ArrayD, IxDyn};
+    use serde_json::json;
 
     use super::*;
+
+    /// Canonicalization ignores nested object order without mutating either input.
+    #[test]
+    fn fingerprint_is_canonical_and_borrowed() {
+        let model = json!({"z": [{"b": 1, "a": 2}], "a": [3, 4]});
+        let config = json!({"z": 1, "a": {"y": true, "x": null}});
+        let before = (model.to_string(), config.to_string());
+        let mut sorted_model = model.clone();
+        let mut sorted_config = config.clone();
+        sorted_model.sort_all_objects();
+        sorted_config.sort_all_objects();
+        assert_eq!(
+            config_fingerprint("tokenizer", &config, &model).unwrap(),
+            config_fingerprint("tokenizer", &sorted_config, &sorted_model).unwrap()
+        );
+        assert_eq!(before, (model.to_string(), config.to_string()));
+    }
+
+    /// Typed framing preserves distinctions that JSON serialization previously made.
+    #[test]
+    fn fingerprint_distinguishes_types_and_boundaries() {
+        let values = [
+            json!(null),
+            json!(false),
+            json!(true),
+            json!(0),
+            json!(0.0),
+            json!(-0.0),
+            json!(1),
+            json!(1.0),
+            json!(f64::from_bits(1)),
+            json!(-1),
+            json!(u64::MAX),
+            json!(""),
+            json!("0"),
+            json!([]),
+            json!({}),
+            json!(["a", "bc"]),
+            json!(["ab", "c"]),
+            json!({"a": "bc"}),
+            json!({"ab": "c"}),
+            json!([1, 2]),
+            json!([2, 1]),
+            json!([1, 23]),
+            json!([12, 3]),
+            json!("\n"),
+            json!("\\n"),
+            json!("α\0β"),
+        ];
+        let mut encodings = std::collections::HashSet::new();
+        for value in values {
+            let mut encoded = Vec::new();
+            write_fingerprint_value(&mut encoded, &value).unwrap();
+            assert!(encodings.insert(encoded), "aliased value: {value}");
+        }
+        assert_ne!(
+            config_fingerprint("a\0b", &json!("c"), &Value::Null).unwrap(),
+            config_fingerprint("a", &json!("b\0c"), &Value::Null).unwrap()
+        );
+    }
+
+    /// Each supplied metadata value, tokenizer, and borrowed model participates in cache identity.
+    #[test]
+    fn fingerprint_keeps_all_cache_identity_fields() {
+        let config = json!({
+            "model_id": "model", "model_type": "minimax_m3_vl",
+            "preprocessor_config": {"patch_size": 14},
+            "image_wire_dtype": "bfloat16", "transparency": "keep_alpha",
+        });
+        let mut model = json!({"vision_config": {"hidden_size": 1024}});
+        let original = config_fingerprint("tokenizer", &config, &model).unwrap();
+        let cache = PixelCache::new(1024 * 1024);
+        let mut key = pixel_cache_key("same-image");
+        key.config_fingerprint = original;
+        cache.insert(key.clone(), pixel_cache_item(1, 8));
+        assert!(cache.get(&key).is_some());
+        for field in config.as_object().unwrap().keys() {
+            let mut changed = config.clone();
+            changed[field] = json!("different");
+            key.config_fingerprint = config_fingerprint("tokenizer", &changed, &model).unwrap();
+            assert!(cache.get(&key).is_none(), "omitted field: {field}");
+        }
+        assert_ne!(
+            original,
+            config_fingerprint("other", &config, &model).unwrap()
+        );
+        model["vision_config"]["hidden_size"] = json!(2048);
+        assert_ne!(
+            original,
+            config_fingerprint("tokenizer", &config, &model).unwrap()
+        );
+    }
+
+    /// The last buffered bytes participate even around buffer boundaries and large writes.
+    #[test]
+    fn fingerprint_includes_long_string_tails() {
+        for length in [4095, 4096, 4097, 512 * 1024] {
+            let mut text = "\nα\0".repeat(length / 4);
+            text.extend(std::iter::repeat_n('x', length - text.len()));
+            let before = config_fingerprint("t", &json!({}), &json!({"text": text})).unwrap();
+            text.pop().unwrap();
+            text.push('y');
+            assert_ne!(
+                before,
+                config_fingerprint("t", &json!({}), &json!({"text": text})).unwrap()
+            );
+        }
+    }
 
     fn pixel_cache_item(token_count: usize, payload: usize) -> Arc<CachedPreprocessedItem> {
         Arc::new(CachedPreprocessedItem {

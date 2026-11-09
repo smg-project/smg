@@ -2253,8 +2253,8 @@ mod fanout_tests {
     use crate::{
         routers::grpc::common::response_collection::drain_prefill,
         worker::{
-            BasicWorkerBuilder, PrefillAdmission, PrefillLoadGuard, Worker, WorkerLoadGuard,
-            WorkerType,
+            test_support::select_worker, BasicWorkerBuilder, PrefillAdmission, PrefillLoadGuard,
+            Worker, WorkerLoadGuard, WorkerType,
         },
     };
 
@@ -2379,10 +2379,7 @@ mod fanout_tests {
                 );
                 let admission = PrefillAdmission::new(1, 0, std::time::Duration::from_secs(1));
                 let guard = if bounded {
-                    let admitted = admission
-                        .admit(None, |capacity| capacity.select(Arc::clone(&worker), ()))
-                        .await
-                        .unwrap();
+                    let admitted = admission.admit(None, select_worker(&worker)).await.unwrap();
                     PrefillLoadGuard::Admission {
                         _reservation: Arc::new(admitted.reservation),
                     }

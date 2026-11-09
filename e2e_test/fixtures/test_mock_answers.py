@@ -178,6 +178,23 @@ def test_a_scoring_answer_states_its_token_id_logprobs_on_no_tokens(monkeypatch)
     assert MockAnswers().enqueue_scores([-0.2]) is None
 
 
+def test_a_scoring_answer_on_a_harmony_model_rides_on_no_channel(monkeypatch):
+    # An answer of no tokens has no channel: the posted text stays empty where
+    # a text answer of this class would ride on the final channel.
+    posted = []
+
+    def post(url, json, timeout):
+        posted.append(json)
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(httpx, "get", _nothing_served)
+    answers = MockAnswers(workers=[_harmony_worker()])
+    assert answers.harmony
+    answers.enqueue_scores([-0.2, -1.6])
+    assert posted == [{"output_text": "", "token_id_logprobs": [-0.2, -1.6]}]
+
+
 def _nothing_served(url, timeout):
     """A worker that served nothing yet (the reconcile before a filing reads the hits)."""
     return httpx.Response(200, json={"hits": 0}, request=httpx.Request("GET", url))

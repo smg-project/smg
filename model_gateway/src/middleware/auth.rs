@@ -262,7 +262,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        middleware::test_support::text_of, routers::common::header_utils::extract_auth_header,
+        middleware::test_support::{json_of, text_of},
+        routers::common::header_utils::extract_auth_header,
     };
 
     async fn handler(request: Request<Body>) -> impl IntoResponse {
@@ -670,7 +671,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(challenge(&response), "Bearer realm=\"data-plane\"");
-        let body: serde_json::Value = serde_json::from_str(&text_of(response).await).unwrap();
+        let body = json_of(response).await;
         assert_eq!(body["error"]["code"], "invalid_api_key");
         assert!(
             body["error"]["message"]

@@ -1027,7 +1027,10 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
             utils::ParserResolver::disabled(),
         )
         .process_non_streaming_messages_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             spec(),
             dispatch(),
             tokenizer,
@@ -1270,7 +1273,10 @@ async fn a_messages_call_whose_arguments_are_not_json_carries_the_prefixes_value
             utils::ParserResolver::disabled(),
         )
         .process_non_streaming_messages_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             spec(),
             dispatch(),
             tokenizer,
@@ -1365,6 +1371,61 @@ async fn a_messages_call_whose_arguments_are_not_json_carries_the_prefixes_value
         arguments.starts_with(&partial),
         "{arguments:?} vs {partial:?}"
     );
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn scraped_takes_its_lines_from_series_of_its_own() {
+    // Forty malformed outputs read under one scrape drain the table's bucket; the output read
+    // under the next scrape still writes its line, and counts none of the flow's suppressed
+    // lines: the series are the scrape's own. The flow's written count is read after it, so the
+    // pin does not lean on the bucket's burst size.
+    let flow = 40;
+    let written = |lines: &[&str]| {
+        lines
+            .iter()
+            .filter(|line| line.contains("did not read the whole output"))
+            .count()
+    };
+    scraped(async {
+        for _ in 0..flow {
+            fold("Hello <tool_call>\nnot a call\n</tool_call>").await;
+        }
+    })
+    .await;
+    let after_the_flow = std::cell::Cell::new(0);
+    logs_assert(|lines: &[&str]| {
+        let count = written(lines);
+        after_the_flow.set(count);
+        if count < flow {
+            Ok(())
+        } else {
+            Err(format!(
+                "no line of the flow was suppressed: {count} written"
+            ))
+        }
+    });
+    scraped(fold("Hello <tool_call>\nnot a call\n</tool_call>")).await;
+    logs_assert(|lines: &[&str]| {
+        let count = written(lines);
+        let last = lines
+            .iter()
+            .rev()
+            .find(|line| line.contains("did not read the whole output"));
+        match last {
+            Some(line)
+                if count == after_the_flow.get() + 1 && line.contains("suppressed_lines=0") =>
+            {
+                Ok(())
+            }
+            Some(line) => Err(format!(
+                "the line after the flow is missing or counts the flow's suppressed lines \
+                 ({count} written after {}): {line}",
+                after_the_flow.get()
+            )),
+            None => Err("no line at all".to_string()),
+        }
+    });
 }
 
 #[tracing_test::traced_test]
@@ -1927,7 +1988,10 @@ async fn a_decoders_end_that_fails_counts_the_output_as_failed_on_the_messages_p
             utils::ParserResolver::disabled(),
         )
         .process_non_streaming_messages_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             spec(),
             dispatch(),
             tokenizer,
@@ -2317,7 +2381,10 @@ async fn a_kimi_k3_thought_closed_by_the_answers_closer_reaches_the_client_once_
         utils::ParserResolver::disabled(),
     )
     .process_non_streaming_messages_response(
-        context::ExecutionResult::Single { stream },
+        context::ExecutionResult::Single {
+            stream,
+            dispatch_start: Instant::now(),
+        },
         spec(),
         dispatch(),
         tokenizer,

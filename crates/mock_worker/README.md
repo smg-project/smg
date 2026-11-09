@@ -6,9 +6,9 @@ stand-ins for vLLM/SGLang engines.
 
 Two modes:
 
-- **canned** (default) — every response is fixed (no model); a single optional
-  `--gen-ms` delay. Cheap enough to run thousands of idle workers for measuring
-  the gateway's own CPU/registration/routing cost.
+- **canned** (default) — every response is fixed (no model), in the shape of
+  its route; a single optional `--gen-ms` delay. Cheap enough to run thousands
+  of idle workers for measuring the gateway's own CPU/registration/routing cost.
 - **realistic** (`--engine realistic`) — each worker runs a continuous-batching
   **engine simulator** that behaves like a real LLM engine on CPU, so the whole
   gateway (including load- and cache-aware routing) can be exercised without

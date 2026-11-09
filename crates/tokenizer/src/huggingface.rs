@@ -2450,6 +2450,30 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             generation_prompt: generation_prompt_unless_continued && !continued_final_message,
         })
     }
+
+    fn apply_chat_template_with_encoding_owned(
+        &self,
+        mut messages: Vec<serde_json::Value>,
+        params: ChatTemplateParams,
+        assistant_prefix: Option<&str>,
+    ) -> Result<ChatTemplateOutput> {
+        // The shaping the Jinja render does for an OpenAI-format template
+        // (`ChatTemplateState::render_with_continuation`: every string content
+        // as a one-item text part list), done in place on the caller's
+        // vector first; the render then finds no string content to wrap and
+        // copies no message.
+        if matches!(self.renderer, Renderer::Jinja)
+            && !self.chat_template.marked()
+            && self
+                .chat_template
+                .content_format_for_tools(params.tools.is_some())
+                == ChatTemplateContentFormat::OpenAI
+        {
+            crate::chat_template::wrap_string_content_in_place(&mut messages);
+        }
+        self.apply_chat_template_with_encoding(&messages, params, assistant_prefix)
+    }
+
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
         self.template_answers().content_format()
     }

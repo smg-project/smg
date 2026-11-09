@@ -139,7 +139,10 @@ fn a_collected_generate_answer_counts_its_prompt_and_cache_hit_once_per_request(
                 utils::ParserResolver::with_flags(Arc::new(WorkerRegistry::new()), None, None),
             )
             .process_non_streaming_generate_response(
-                context::ExecutionResult::Single { stream },
+                context::ExecutionResult::Single {
+                    stream,
+                    dispatch_start: Instant::now(),
+                },
                 dispatch,
                 &mut decoder,
                 false,
