@@ -1,4 +1,4 @@
-"""The Codex review workflow runs from main, admits writers only, and keeps the keys out of reach."""
+"""The Codex review workflow admits writers only, keeps the keys out of reach, and posts what it ran."""
 
 import json
 from pathlib import Path
@@ -20,21 +20,24 @@ def step(job, prefix):
     return next(s for s in job["steps"] if str(s.get("uses", "")).startswith(prefix))
 
 
-def test_every_trigger_runs_the_workflow_from_the_default_branch(workflow):
+def test_the_triggers_are_the_pull_request_events_and_the_comment_events(workflow):
     triggers = workflow[True]  # PyYAML reads the `on` key as a boolean
     assert set(triggers) == {
-        "pull_request_target",
+        "pull_request",
         "issue_comment",
         "pull_request_review_comment",
         "pull_request_review",
     }
-    assert "pull_request" not in triggers
-    assert triggers["pull_request_target"]["types"] == [
-        "opened",
-        "synchronize",
-        "reopened",
-        "ready_for_review",
-    ]
+    # pull_request, not pull_request_target: Claude's App-token exchange rejects the latter's OIDC token
+    assert "pull_request_target" not in triggers
+    assert triggers["pull_request"]["types"] == ["opened", "synchronize", "reopened"]
+
+
+def test_the_artifact_upload_includes_the_dot_prefixed_review_directory(workflow):
+    codex = workflow["jobs"]["codex"]
+    upload = step(codex, "actions/upload-artifact@")
+    assert upload["with"]["path"] == "pr/.codex-review/"
+    assert upload["with"]["include-hidden-files"] is True
 
 
 def test_forks_and_bots_are_refused_before_any_job_starts(workflow):
