@@ -15,7 +15,10 @@ name: Codex Code Review
 # token of a `pull_request_target` run, and the comment events run from `main` anyway.
 # Codex runs in a read-only sandbox in a job with read permissions; a second job posts its
 # result as the SMG Codex Review GitHub App, with a one-hour installation token the sidecar
-# mints from the App key it holds, so no job token here can write.
+# mints from the App key it holds, so no job token here can write. The review-comment events
+# (`pull_request_review`, `pull_request_review_comment`) run the pull request's own copy of
+# this file, so a branch older than a change here keeps the old behaviour for its thread
+# replies and verdicts until it takes `main`.
 
 on:
   pull_request:
