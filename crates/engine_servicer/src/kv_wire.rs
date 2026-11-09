@@ -1054,6 +1054,46 @@ impl Normalizer {
         })
     }
 
+    /// The forwarded store once a lane has shaped its blocks: the event's
+    /// tail and the namespace the lane settled on go through as they are,
+    /// and the store counts as forwarded.
+    fn forward_stored(
+        &mut self,
+        blocks: Vec<common::KvBlock>,
+        parent: Option<BlockHash>,
+        tier: KvCacheTier,
+        locality: KvCacheLocality,
+        tail: EventTail,
+        namespace: Namespace,
+    ) -> kv_cache_event::Data {
+        self.counts.forwarded_stored += 1;
+        let EventTail {
+            medium,
+            group_idx,
+            kv_cache_spec_kind,
+            kv_cache_spec_sliding_window,
+            ownership,
+            session_id,
+            group_mask,
+            ..
+        } = tail;
+        kv_cache_event::Data::Stored(common::KvBlocksStored {
+            blocks,
+            parent_block_hash: parent.map(|hash| hash.0),
+            tier: Some(tier as i32),
+            medium,
+            group_idx,
+            kv_cache_spec_kind,
+            kv_cache_spec_sliding_window,
+            locality: Some(locality as i32),
+            ownership,
+            session_id,
+            lora_name: namespace.lora_name,
+            cache_salt: namespace.cache_salt,
+            group_mask,
+        })
+    }
+
     /// A non-main group's store on a rank with a main group: its hashes,
     /// parent and group fields go through, its tokens do not. The engine
     /// writes such a store with the step's whole token span and only the
@@ -1094,32 +1134,18 @@ impl Normalizer {
             })
             .collect();
         self.counts.group_stores += 1;
-        self.counts.forwarded_stored += 1;
-        let EventTail {
-            medium,
-            group_idx,
-            kv_cache_spec_kind,
-            kv_cache_spec_sliding_window,
-            ownership,
-            session_id,
-            group_mask,
-            ..
-        } = stored.tail;
-        Ok(kv_cache_event::Data::Stored(common::KvBlocksStored {
-            blocks,
-            parent_block_hash: stored.parent_block_hash.map(|hash| hash.0),
-            tier: Some(tier as i32),
-            medium,
-            group_idx,
-            kv_cache_spec_kind,
-            kv_cache_spec_sliding_window,
-            locality: Some(locality as i32),
-            ownership,
-            session_id,
+        let namespace = Namespace {
             lora_name: stored.lora_name.filter(|name| !name.is_empty()),
             cache_salt: stored.cache_salt.filter(|salt| !salt.is_empty()),
-            group_mask,
-        }))
+        };
+        Ok(self.forward_stored(
+            blocks,
+            stored.parent_block_hash,
+            tier,
+            locality,
+            stored.tail,
+            namespace,
+        ))
     }
 
     fn normalize_stored(
@@ -1301,32 +1327,14 @@ impl Normalizer {
                     .unwrap_or_default(),
             })
             .collect();
-        self.counts.forwarded_stored += 1;
-        let EventTail {
-            medium,
-            group_idx,
-            kv_cache_spec_kind,
-            kv_cache_spec_sliding_window,
-            ownership,
-            session_id,
-            group_mask,
-            ..
-        } = stored.tail;
-        Ok(kv_cache_event::Data::Stored(common::KvBlocksStored {
+        Ok(self.forward_stored(
             blocks,
-            parent_block_hash: stored.parent_block_hash.map(|hash| hash.0),
-            tier: Some(tier as i32),
-            medium,
-            group_idx,
-            kv_cache_spec_kind,
-            kv_cache_spec_sliding_window,
-            locality: Some(locality as i32),
-            ownership,
-            session_id,
-            lora_name: namespace.lora_name,
-            cache_salt: namespace.cache_salt,
-            group_mask,
-        }))
+            stored.parent_block_hash,
+            tier,
+            locality,
+            stored.tail,
+            namespace,
+        ))
     }
 
     fn normalize_removed(
