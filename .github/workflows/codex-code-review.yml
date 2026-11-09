@@ -62,6 +62,45 @@ env:
   ANTHROPIC_PLACEHOLDER_KEY: sk-ant-placeholder-the-sidecar-holds-the-key
 
 jobs:
+  # The status note, posted the moment a review run is admitted so the pull request shows what is
+  # happening while Codex works; the post job turns it into the outcome, and finish-status into
+  # a failure notice. Thread replies and verdict passes get none.
+  announce:
+    name: Codex review status
+    if: >-
+      github.repository == 'smg-project/smg'
+      && github.actor != 'dependabot[bot]'
+      && (
+        (github.event_name == 'pull_request'
+            && github.event.pull_request.head.repo.full_name == github.repository)
+        || (github.event_name == 'issue_comment'
+            && github.event.issue.pull_request
+            && github.event.comment.user.type != 'Bot'
+            && contains(github.event.comment.body, '@codex review'))
+      )
+    runs-on: ${{ vars.SMG_RUNNER_REVIEW || 'k8s-runner-cpu' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - uses: ./.github/actions/codex-posting-token
+        id: app-token
+
+      - name: Say that the review is under way
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: python scripts/codex_review_post.py announce --state reviewing
+
   codex:
     name: Codex review
     # A first filter from the event alone; the context step applies the full gate (fork,
@@ -208,32 +247,42 @@ jobs:
           name: codex-review-${{ github.run_id }}
           path: .codex-review
 
-      # The posting token is the Codex App's: the runner pod's sidecar mints it from the App
-      # key it holds (scripts/k8s-runner-resources/README.md) for a caller that presents this
-      # job's GitHub OIDC token, which a fork's run or another workflow cannot obtain. The
-      # token lives an hour and is masked.
-      - name: Mint the posting token from the sidecar
+      # The posting token is the Codex App's, minted by the runner pod's sidecar for this job's
+      # GitHub OIDC token (.github/actions/codex-posting-token). It lives an hour and is masked.
+      - uses: ./.github/actions/codex-posting-token
         id: app-token
-        run: |
-          oidc=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=ai-key-proxy" | jq -r '.value // empty')
-          if [ -z "$oidc" ]; then
-            echo "::error::this job got no GitHub OIDC token to prove itself with"
-            exit 1
-          fi
-          reply=$(curl -sS -X POST -H "Authorization: Bearer $oidc" "${{ env.AI_KEY_PROXY }}/github/app-token" || true)
-          token=$(jq -r '.token // empty' <<<"$reply" 2>/dev/null || true)
-          if [ -z "$token" ]; then
-            echo "::error::the key-proxy sidecar minted no posting token: ${reply:0:300}"
-            exit 1
-          fi
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
 
       - name: Post to the pull request
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
         run: python scripts/codex_review_post.py post --dir .codex-review
+
+  finish-status:
+    name: Codex review status (failed)
+    needs: codex
+    if: always() && needs.codex.result == 'failure' && needs.codex.outputs.mode == 'review'
+    runs-on: ${{ vars.SMG_RUNNER_REVIEW || 'k8s-runner-cpu' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - uses: ./.github/actions/codex-posting-token
+        id: app-token
+
+      - name: Say that the review failed
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: python scripts/codex_review_post.py announce --state failed
 
   # Claude grades Codex's findings here, right after the posting, rather than on the
   # pull_request_review event the App-posted review raises: one pass per review, no extra run.

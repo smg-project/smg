@@ -65,3 +65,16 @@ def test_no_secret_and_no_pod_key_anywhere():
     assert "sudo" not in text
     workflow = yaml.safe_load(text)
     assert workflow["env"]["AI_KEY_PROXY"] == SIDECAR
+
+
+def test_claude_tracks_progress_in_a_comment_and_requests_changes_on_important_findings(workflow):
+    review = workflow["jobs"]["review"]
+    action = next(
+        s
+        for s in review["steps"]
+        if str(s.get("uses", "")).startswith("anthropics/claude-code-action@")
+    )
+    assert action["with"]["track_progress"] is True
+    prompt = action["with"]["prompt"]
+    assert "event=REQUEST_CHANGES" in prompt and "event=APPROVE" in prompt
+    assert "dismissals" in prompt  # a later push that settles the findings lifts the request

@@ -96,8 +96,8 @@ def test_no_important_finding_and_no_live_approval_approves():
     assert post.review_event([finding(severity="nit")], live_approval=False) == "APPROVE"
 
 
-def test_an_important_finding_comments():
-    assert post.review_event([finding()], live_approval=True) == "COMMENT"
+def test_an_important_finding_requests_changes():
+    assert post.review_event([finding()], live_approval=True) == "REQUEST_CHANGES"
 
 
 def test_a_clean_rerun_on_an_approved_pr_posts_nothing():
@@ -130,7 +130,7 @@ def test_posting_an_important_finding_dismisses_the_earlier_approval():
     methods = [(m, p) for m, p, _ in api.calls if m != "GET"]
     assert ("PUT", "repos/o/r/pulls/7/reviews/5/dismissals") in methods
     created = next(b for m, p, b in api.calls if m == "POST" and p == "repos/o/r/pulls/7/reviews")
-    assert created["event"] == "COMMENT"
+    assert created["event"] == "REQUEST_CHANGES"
 
 
 def test_posting_a_clean_review_approves_once():
@@ -382,7 +382,7 @@ def test_prior_findings_carry_their_comment_id_and_severity():
 
 
 def test_an_earlier_important_finding_still_open_blocks_approval():
-    assert post.review_event([], live_approval=False, open_prior=1) == "COMMENT"
+    assert post.review_event([], live_approval=False, open_prior=1) == "REQUEST_CHANGES"
     assert post.review_event([], live_approval=False, open_prior=0) == "APPROVE"
 
 
@@ -397,7 +397,7 @@ def test_posting_with_an_open_prior_important_dismisses_the_live_approval_and_sa
     document = {"summary": "s", "findings": [], "prior_findings_still_open": [11]}
     post.post_review(api, "o/r", 7, "abc", document, DIFF, prior_important={11, 12})
     created = next(b for m, p, b in api.calls if m == "POST" and p == "repos/o/r/pulls/7/reviews")
-    assert created["event"] == "COMMENT"
+    assert created["event"] == "REQUEST_CHANGES"
     assert "1 earlier 🔴 Important finding still open" in created["body"]
     assert ("PUT", "repos/o/r/pulls/7/reviews/5/dismissals") in [(m, p) for m, p, _ in api.calls]
 
@@ -482,3 +482,104 @@ def test_a_severity_label_the_model_repeats_in_the_body_is_rendered_once():
     outside = [{"path": "p", "line": 1, "severity": "nit", "body": "🟡 **Nit**: Name."}]
     summary = post.render_summary([], "Looked at it.", outside)
     assert "🟡 Nit: Name." in summary and "🟡 Nit: 🟡" not in summary
+
+
+def test_an_important_finding_requests_changes_until_a_later_run_clears_it():
+    assert post.review_event([finding()], live_approval=False) == "REQUEST_CHANGES"
+    assert post.review_event([finding()], live_approval=True) == "REQUEST_CHANGES"
+    assert post.review_event([], live_approval=False, open_prior=1) == "REQUEST_CHANGES"
+    # the approval of a later clean run is what lifts the request
+    assert post.review_event([], live_approval=False) == "APPROVE"
+
+
+def test_the_status_note_says_what_codex_is_doing_and_then_what_it_found():
+    info = {
+        "head_sha": "abc1234def",
+        "run_url": "https://x/run/1",
+        "model": "gpt-6-astra",
+        "effort": "xhigh",
+        "files": ["a.py", "b.rs"],
+        "incremental": False,
+    }
+    reviewing = post.render_status("reviewing", info)
+    assert reviewing.startswith(post.STATUS_MARKER)
+    assert "Codex is reviewing" in reviewing and "`abc1234`" in reviewing
+    assert "gpt-6-astra" in reviewing and "xhigh" in reviewing and "https://x/run/1" in reviewing
+    assert "a.py" in reviewing and "b.rs" in reviewing
+    done = post.render_status(
+        "done",
+        {
+            "head_sha": "abc1234def",
+            "run_url": "https://x/run/1",
+            "counts": {"important": 2, "nit": 1, "pre_existing": 0},
+            "verdict": "REQUEST_CHANGES",
+        },
+    )
+    assert "Codex reviewed" in done and "2 🔴 Important" in done and "1 🟡 Nit" in done
+    assert "changes requested" in done
+    approved = post.render_status(
+        "done",
+        {
+            "head_sha": "abc1234def",
+            "run_url": "https://x/run/1",
+            "counts": {"important": 0, "nit": 0, "pre_existing": 0},
+            "verdict": "APPROVE",
+        },
+    )
+    assert "approved" in approved
+    failed = post.render_status("failed", {"head_sha": "abc1234def", "run_url": "https://x/run/1"})
+    assert "could not" in failed and "https://x/run/1" in failed
+
+
+def test_the_status_note_is_one_comment_per_pull_request_updated_in_place():
+    api = FakeApi()
+    post.upsert_status(api, "o/r", 7, f"{post.STATUS_MARKER}\nfirst")
+    assert [(m, p) for m, p, _ in api.calls if m != "GET"] == [
+        ("POST", "repos/o/r/issues/7/comments")
+    ]
+    existing = {
+        "id": 31,
+        "user": {"login": post.BOT},
+        "body": f"{post.STATUS_MARKER}\nfirst `abc1234`",
+    }
+    others = {"id": 32, "user": {"login": "simo"}, "body": "hi"}
+    api = FakeApi(gets={"repos/o/r/issues/7/comments?per_page=100": [existing, others]})
+    post.upsert_status(api, "o/r", 7, f"{post.STATUS_MARKER}\nsecond")
+    assert [(m, p) for m, p, _ in api.calls if m != "GET"] == [
+        ("PATCH", "repos/o/r/issues/comments/31")
+    ]
+    # a late announcement never overwrites a note that already covers this head
+    api = FakeApi(gets={"repos/o/r/issues/7/comments?per_page=100": [existing]})
+    post.upsert_status(
+        api,
+        "o/r",
+        7,
+        f"{post.STATUS_MARKER}\nlate",
+        head_sha="abc1234def",
+        only_if_absent_for_head=True,
+    )
+    assert all(m == "GET" for m, _, _ in api.calls)
+
+
+def test_posting_a_review_updates_the_status_note_with_the_outcome():
+    api = FakeApi()
+    context = {"mode": "review", "pr": 7, "head_sha": "abc1234def", "run_url": "https://x/run/1"}
+    post.run_post(api, "o/r", context, {"summary": "s", "findings": [finding()]}, DIFF)
+    created = next(b for m, p, b in api.calls if m == "POST" and p == "repos/o/r/pulls/7/reviews")
+    assert created["event"] == "REQUEST_CHANGES"
+    note = next(b for m, p, b in api.calls if m == "POST" and p == "repos/o/r/issues/7/comments")
+    assert "Codex reviewed" in note["body"] and "1 🔴 Important" in note["body"]
+    assert "changes requested" in note["body"]
+
+
+def test_announce_posts_the_reviewing_note_for_a_review_run_only():
+    api = FakeApi(gets={"repos/o/r/pulls/7/files?per_page=100": [{"filename": "a.py"}]})
+    context = {"skip": False, "mode": "review", "pr": 7, "head_sha": "abc1234def"}
+    info = {"run_url": "https://x/run/1", "model": "gpt-6-astra", "effort": "xhigh"}
+    post.run_announce(api, "o/r", context, "reviewing", info)
+    note = next(b for m, p, b in api.calls if m == "POST" and p == "repos/o/r/issues/7/comments")
+    assert "Codex is reviewing" in note["body"] and "a.py" in note["body"]
+    api = FakeApi()
+    reply = {"skip": False, "mode": "reply", "pr": 7, "head_sha": "x"}
+    assert post.run_announce(api, "o/r", reply, "reviewing", info) is None
+    assert api.calls == []
