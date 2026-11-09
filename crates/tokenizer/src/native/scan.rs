@@ -70,7 +70,9 @@ const EACH_BYTE: u64 = 0x0101_0101_0101_0101;
 pub(super) struct WordScan;
 
 impl WordScan {
-    /// No word scan: the byte loop.
+    /// No word scan: the mark of a role whose members are no scan's set,
+    /// which runs byte by byte under any name a caller passes. Not a scan a
+    /// caller may name ([`Roles::run_end_as`] refuses it at compile time).
     pub(super) const NONE: u8 = 0;
     /// `A-Z` and `a-z` (tested as `a-z` with the case bit set).
     pub(super) const LETTERS: u8 = 1;
@@ -99,9 +101,16 @@ impl WordScan {
     }
 
     /// Bit 7 of each byte of `word` that is outside the set of `SCAN`, or
-    /// beyond ASCII.
+    /// beyond ASCII. `SCAN` is one of the four scans, checked when the
+    /// function is instantiated.
     #[inline(always)]
     fn outside<const SCAN: u8>(word: u64) -> u64 {
+        const {
+            assert!(
+                SCAN >= Self::LETTERS && SCAN <= Self::SPACES,
+                "one of the four word scans"
+            );
+        };
         let low = word & !HIGH_BITS;
         let inside = if SCAN == Self::LETTERS {
             between(low | (EACH_BYTE * 0x20), b'a', b'z')
@@ -110,6 +119,7 @@ impl WordScan {
         } else if SCAN == Self::UPPER {
             between(low, b'A', b'Z')
         } else {
+            // `SPACES`, the one scan left.
             between(low, b'\t', b'\r') | between(low, b' ', b' ')
         };
         (inside & !word & HIGH_BITS) ^ HIGH_BITS
@@ -254,12 +264,13 @@ impl Roles {
     }
 
     /// [`Self::run_end`] for a role whose run the caller expects to be the
-    /// word scan `SCAN` ([`WordScan`]): eight bytes at a time when the
-    /// role's ASCII members are that set, else byte by byte. The first byte
-    /// is read as the byte loop reads it (a run that ends at once costs what
-    /// it did, and so does a run of characters beyond ASCII); after an ASCII
-    /// member, whole words of members pass at once up to the first byte
-    /// outside the set, which ends the run when it is ASCII and is read by
+    /// word scan `SCAN` (one of the four of [`WordScan`], never `NONE`: a
+    /// compile-time error): eight bytes at a time when the role's ASCII
+    /// members are that set, else byte by byte. The first byte is read as
+    /// the byte loop reads it (a run that ends at once costs what it did,
+    /// and so does a run of characters beyond ASCII); after an ASCII member,
+    /// whole words of members pass at once up to the first byte outside the
+    /// set, which ends the run when it is ASCII and is read by
     /// [`Self::beyond`] when it is not, or the tail under eight bytes.
     #[inline(always)]
     pub(super) fn run_end_as<const SCAN: u8>(
@@ -268,6 +279,12 @@ impl Roles {
         mut pos: usize,
         bit: Bits,
     ) -> usize {
+        const {
+            assert!(
+                SCAN >= WordScan::LETTERS && SCAN <= WordScan::SPACES,
+                "one of the four word scans; a role with no scan runs through run_end"
+            );
+        };
         debug_assert_eq!(bit.count_ones(), 1, "one role's bit");
         if self.scans[bit.trailing_zeros() as usize % Bits::BITS as usize] != SCAN {
             return self.run_end(text, pos, bit);
@@ -473,15 +490,38 @@ mod tests {
     /// A run ends at the same place through a word scan as byte by byte,
     /// whatever the mix of ASCII members, members beyond ASCII, non-members
     /// of both kinds and the offset of the run in the text; and a scan named
-    /// for a role whose members are another set is the byte loop.
+    /// for a role whose members are another set is the byte loop. The pieces
+    /// longer than a word reach the chunk loop's branches, each hundreds of
+    /// times (counted from the byte loop's answer): a whole word of members
+    /// passing at once, a second word after it, the tail under eight bytes
+    /// after a word, a member beyond ASCII after a word.
     #[test]
     fn runs_end_the_same_through_the_word_scans_and_byte_by_byte() {
         let pattern = Pattern::parse(r"\p{L}|\s|\p{Ll}|[\r\n]").expect("parses");
         let classes: Vec<&Class> = pattern.classes().iter().collect();
         let roles = Roles::build(&classes);
         let pieces = [
-            "a", "Z", " ", "\n", "\r", "1", ".", "é", "日", "×", "😀", "٣",
+            "a",
+            "Z",
+            " ",
+            "\n",
+            "\r",
+            "1",
+            ".",
+            "é",
+            "日",
+            "×",
+            "😀",
+            "٣",
+            "abcdefgh",
+            "ABCDEFGHIJK",
+            "lowercase",
+            "        ",
+            "\t\t\t\t\t",
+            "abcdefghijé",
         ];
+        let ascii = |bytes: &[u8]| bytes.iter().all(|byte| *byte < 0x80);
+        let mut reached = [0usize; 4];
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
         let mut text = String::new();
         for _ in 0..3_000 {
@@ -497,6 +537,19 @@ mod tests {
             }
             for pos in text.char_indices().map(|(pos, _)| pos).chain([text.len()]) {
                 let by_bytes = |bit: Bits| roles.run_end(&text, pos, bit);
+                for bit in [1, 2, 4] {
+                    let run = &text.as_bytes()[pos..by_bytes(bit)];
+                    if run.len() >= 9 && ascii(&run[..9]) {
+                        reached[0] += 1;
+                        reached[1] += usize::from(run.len() >= 17 && ascii(&run[..17]));
+                        reached[2] += usize::from(
+                            pos + run.len() == text.len()
+                                && ascii(run)
+                                && !(run.len() - 1).is_multiple_of(8),
+                        );
+                        reached[3] += usize::from(!ascii(&run[9..]));
+                    }
+                }
                 assert_eq!(
                     roles.run_end_as::<{ WordScan::LETTERS }>(&text, pos, 1),
                     by_bytes(1),
@@ -520,5 +573,9 @@ mod tests {
                 );
             }
         }
+        assert!(
+            reached.iter().all(|&times| times >= 100),
+            "a word, two words, a tail after a word, beyond ASCII after a word: {reached:?}"
+        );
     }
 }
