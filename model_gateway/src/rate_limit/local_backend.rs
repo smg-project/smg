@@ -872,7 +872,7 @@ mod tests {
                 scope.spawn(|| {
                     for _ in 0..ROUNDS {
                         phases.wait();
-                        let req = request(TENANT, 1);
+                        let req = reserve_request(TENANT, 1);
                         let charge_id = req.request_charge_id;
                         // reserve/close never await, so one poll finishes them.
                         if backend.reserve(req).now_or_never() != Some(ReserveOutcome::Admitted) {
@@ -884,7 +884,7 @@ mod tests {
                             let matches =
                                 match (backend.active.get(&charge_id), backend.buckets.get(&key)) {
                                     (Some(held), Some(served)) => {
-                                        Arc::ptr_eq(&held.buckets[0], served.value())
+                                        Arc::ptr_eq(&held.global, served.value())
                                     }
                                     _ => false,
                                 };
