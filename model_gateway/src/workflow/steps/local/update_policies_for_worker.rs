@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use tracing::debug;
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::workflow::data::WorkerUpdateWorkflowData;
+use crate::{policies::as_cache_aware, workflow::data::WorkerUpdateWorkflowData};
 
 /// Step to update policies for updated workers.
 ///
@@ -45,7 +45,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdatePoliciesForWorkerStep {
             let workers = app_context.worker_registry.get_by_model(model_id);
 
             if let Some(policy) = app_context.policy_registry.get_policy(model_id) {
-                if policy.name() == "cache_aware" && !workers.is_empty() {
+                if as_cache_aware(policy.as_ref()).is_some() && !workers.is_empty() {
                     // Re-initialize cache-aware policy with updated workers
                     app_context
                         .policy_registry
