@@ -924,3 +924,54 @@ def test_shutdown_settle_window(settle):
         assert flag not in args
     else:
         assert args[args.index(flag) + 1] == str(settle)
+
+
+def worker_container(documents: list[dict], name: str) -> dict:
+    """The engine container of the chart worker ``name``."""
+    (deployment,) = [
+        document
+        for document in documents
+        if document["kind"] == "Deployment" and document["metadata"]["name"] == f"smg-worker-{name}"
+    ]
+    return deployment["spec"]["template"]["spec"]["containers"][0]
+
+
+GRPC_WORKER_FORMS = {
+    # (engine, the port value given, the serving port the probe must name)
+    "vllm-default-port": ("vllm", None, 8000),
+    "sglang-default-port": ("sglang", None, 30000),
+    "vllm-explicit-port": ("vllm", 9100, 9100),
+    "sglang-explicit-port": ("sglang", 9200, 9200),
+}
+
+
+@needs_helm
+@pytest.mark.parametrize("form", sorted(GRPC_WORKER_FORMS))
+def test_a_grpc_worker_startup_probe_names_its_serving_port_as_an_integer(form):
+    """The gRPC probe takes a port number, never a name or a string: an edit that
+    quotes it or names it passes ``helm lint`` and fails only on the cluster."""
+    engine, port, serving = GRPC_WORKER_FORMS[form]
+    settings = [
+        "workers[0].name=engine",
+        f"workers[0].engine={engine}",
+        "workers[0].model=org/model",
+        "workers[0].image.tag=tag",
+        "workers[0].connectionMode=grpc",
+    ]
+    if port is not None:
+        settings.append(f"workers[0].port={port}")
+    container = worker_container(render(*settings)[1], "engine")
+    probe = container["startupProbe"]
+    assert "httpGet" not in probe
+    assert probe["grpc"]["port"] is not True and isinstance(probe["grpc"]["port"], int)
+    assert probe["grpc"]["port"] == serving
+    (serve,) = [p for p in container["ports"] if p["name"] == "serve"]
+    assert serve["containerPort"] == serving
+
+
+@needs_helm
+def test_an_http_worker_renders_no_grpc_probe():
+    container = worker_container(render(*WORKER)[1], "llama")
+    probe = container["startupProbe"]
+    assert "grpc" not in probe
+    assert probe["httpGet"] == {"path": "/health", "port": "serve"}
