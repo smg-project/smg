@@ -298,7 +298,7 @@ mod tests {
         );
     }
 
-    /// Every request field and a changed model must miss a previously cached image.
+    /// Each supplied metadata value, tokenizer, and borrowed model participates in cache identity.
     #[test]
     fn fingerprint_keeps_all_cache_identity_fields() {
         let config = json!({
@@ -337,7 +337,8 @@ mod tests {
             let mut text = "\nα\0".repeat(length / 4);
             text.extend(std::iter::repeat_n('x', length - text.len()));
             let before = config_fingerprint("t", &json!({}), &json!({"text": text})).unwrap();
-            text.push('x');
+            text.pop().unwrap();
+            text.push('y');
             assert_ne!(
                 before,
                 config_fingerprint("t", &json!({}), &json!({"text": text})).unwrap()
