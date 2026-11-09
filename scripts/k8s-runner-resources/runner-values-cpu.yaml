@@ -1,106 +1,105 @@
 ## GitHub config URL for the runner scale set
-githubConfigUrl: "https://github.com/smg-project/smg"
-
-## Name of the Kubernetes secret containing GitHub credentials
-## The secret should contain either a PAT (github_token) or GitHub App credentials
-githubConfigSecret: github-arc-secret
-
-## The shared ARC controller runs in a separate namespace.
+## This file is the deployed release's values with no credential and no privileged runner:
+## every workflow's jobs run in these pods, so nothing secret may live in their environment
+## (the review workflows take their keys from the `ai-review` GitHub environment), and only
+## the `dind` sidecar may be privileged. The cap matches the live set. Re-apply with the
+## `helm upgrade` in README.md; a live set that differs from this file has drifted.
 controllerServiceAccount:
   name: arc-gha-rs-controller
   namespace: org-actions-runner
-
-## Runner scaling configuration
-minRunners: 4
-maxRunners: 16
-
-## name of the runner scale set to create.  Defaults to the helm release name
-runnerScaleSetName: "k8s-runner-cpu"
-
-resourceMeta: {}
+githubConfigSecret: github-arc-secret
+githubConfigUrl: https://github.com/smg-project/smg
 keyVault: {}
-
-## Runner pod template
+maxRunners: 48
+minRunners: 4
+resourceMeta: {}
+runnerScaleSetName: k8s-runner-cpu
 template:
   spec:
-    # Allow CPU runners to schedule onto GPU nodes' stranded CPU (those nodes
-    # taint themselves nvidia.com/gpu:NoSchedule but routinely have 80%+ of
-    # their cores idle while only the GPUs are consumed). `Exists` tolerates
-    # both `nvidia.com/gpu=true:NoSchedule` and `nvidia.com/gpu=:NoSchedule`.
-    # No nodeSelector, so runners still schedule on plain CPU nodes too. Other
-    # taints (robobrain, robobrain-vla, ci-runner) are intentionally NOT
-    # tolerated so those reservations stay honored.
-    tolerations:
-      - key: "nvidia.com/gpu"
-        operator: "Exists"
-        effect: "NoSchedule"
-    volumes:
-      - name: work
-        emptyDir: {}
-      - name: dind-sock
-        emptyDir: {}
-      - name: dind-externals
-        emptyDir: {}
-
     containers:
-      - name: runner
-        image: fra.ocir.io/idqj093njucb/action-runner:2.337.0
-        command:
-          - /home/runner/run.sh
-        env:
-          - name: DOCKER_HOST
-            value: unix:///var/run/docker.sock
-          - name: RUNNER_WAIT_FOR_DOCKER_IN_SECONDS
-            value: '120'
-        resources:
-          requests:
-            cpu: "8"
-            memory: "16Gi"
-          limits:
-            cpu: "8"
-            memory: "16Gi"
-        volumeMounts:
-          - name: work
-            mountPath: /home/runner/_work
-          - name: dind-sock
-            mountPath: /var/run
-
+    - command:
+      - /home/runner/run.sh
+      env:
+      - name: DOCKER_HOST
+        value: unix:///var/run/docker.sock
+      - name: RUNNER_WAIT_FOR_DOCKER_IN_SECONDS
+        value: '120'
+      image: fra.ocir.io/idqj093njucb/action-runner:2.337.0
+      name: runner
+      resources:
+        limits:
+          cpu: '8'
+          memory: 16Gi
+        requests:
+          cpu: '8'
+          memory: 16Gi
+      volumeMounts:
+      - mountPath: /home/runner/_work
+        name: work
+      - mountPath: /var/run
+        name: dind-sock
+    dnsConfig:
+      options:
+      - name: ndots
+        value: '1'
     initContainers:
-      - name: init-dind-externals
-        args:
-          - '-r'
-          - /home/runner/externals/.
-          - /home/runner/tmpDir/
-        command:
-          - cp
-        image: fra.ocir.io/idqj093njucb/action-runner:2.337.0
-        volumeMounts:
-          - mountPath: /home/runner/tmpDir
-            name: dind-externals
-      - name: dind
-        args:
-          - dockerd
-          - '--host=unix:///var/run/docker.sock'
-          - '--group=$(DOCKER_GROUP_GID)'
-        env:
-          - name: DOCKER_GROUP_GID
-            value: '123'
-        image: fra.ocir.io/idqj093njucb/docker:dind
-        restartPolicy: Always
-        securityContext:
-          privileged: true
-        startupProbe:
-          exec:
-            command:
-              - docker
-              - info
-          failureThreshold: 24
-          initialDelaySeconds: 0
-          periodSeconds: 5
-        volumeMounts:
-          - mountPath: /home/runner/_work
-            name: work
-          - mountPath: /var/run
-            name: dind-sock
-          - mountPath: /home/runner/externals
-            name: dind-externals
+    - args:
+      - -r
+      - /home/runner/externals/.
+      - /home/runner/tmpDir/
+      command:
+      - cp
+      image: fra.ocir.io/idqj093njucb/action-runner:2.337.0
+      name: init-dind-externals
+      volumeMounts:
+      - mountPath: /home/runner/tmpDir
+        name: dind-externals
+    - args:
+      - dockerd
+      - --host=unix:///var/run/docker.sock
+      - --group=$(DOCKER_GROUP_GID)
+      env:
+      - name: DOCKER_GROUP_GID
+        value: '123'
+      - name: DOCKER_TLS_CERTDIR
+        value: ''
+      image: fra.ocir.io/idqj093njucb/docker:dind
+      name: dind
+      resources:
+        limits:
+          cpu: '2'
+          memory: 4Gi
+        requests:
+          cpu: '1'
+          memory: 2Gi
+      restartPolicy: Always
+      securityContext:
+        privileged: true
+      startupProbe:
+        exec:
+          command:
+          - docker
+          - info
+        failureThreshold: 24
+        initialDelaySeconds: 0
+        periodSeconds: 5
+      volumeMounts:
+      - mountPath: /home/runner/_work
+        name: work
+      - mountPath: /var/run
+        name: dind-sock
+      - mountPath: /home/runner/externals
+        name: dind-externals
+    restartPolicy: Never
+    terminationGracePeriodSeconds: 600
+    tolerations:
+    - effect: NoSchedule
+      key: nvidia.com/gpu
+      operator: Exists
+    volumes:
+    - emptyDir: {}
+      name: work
+    - emptyDir: {}
+      name: dind-sock
+    - emptyDir: {}
+      name: dind-externals

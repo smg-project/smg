@@ -62,4 +62,4 @@ def test_the_key_appears_nowhere_but_the_proxy_steps():
 
 def test_every_job_runs_on_the_review_runner_set(workflow):
     for name, job in workflow["jobs"].items():
-        assert "ai-review-cpu" in job["runs-on"], name
+        assert "k8s-runner-cpu" in job["runs-on"], name
