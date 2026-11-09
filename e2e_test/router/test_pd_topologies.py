@@ -917,16 +917,7 @@ class TestPDTopology:
         for _ in range(4):
             mock_answers.enqueue("red, yellow and blue.", prompt_contains="primary colors")
         if _moriio_lane():
-            # One MoRI-IO handoff moves one request's KV, so SMG refuses n>1
-            # rather than letting the samples share a prefill.
-            resp = httpx.post(
-                f"{gateway.base_url}/v1/completions",
-                json={"model": model, "prompt": "The three primary colors are", "n": 4},
-                timeout=60.0,
-            )
-            assert resp.status_code == 400, f"{resp.status_code} {resp.text[:300]}"
-            assert _error_code(resp) == "moriio_fanout_unsupported", resp.text[:300]
-            return
+            pytest.skip("MoRI-IO n>1 handoff is unsupported; refusal is tested separately")
         if mode == "pd_http" and is_sglang():
             # The shape the gRPC fan-out fixed: the HTTP PD router mints one
             # room for a single-prompt request whatever ``n`` is, the engine
@@ -963,6 +954,19 @@ class TestPDTopology:
             # sample, the shape above); the mock's decode side has the
             # prompt and serves the four choices itself.
             _wait_for_fanout(resp.json()["id"], 4)
+
+    def test_moriio_fanout_is_explicitly_refused(self, setup_backend):
+        """Unsupported fanout must fail explicitly, without claiming choice delivery."""
+        if not _moriio_lane():
+            pytest.skip("MoRI-IO capability contract only")
+        _, model, _, gateway = setup_backend
+        resp = httpx.post(
+            f"{gateway.base_url}/v1/completions",
+            json={"model": model, "prompt": "The three primary colors are", "n": 4},
+            timeout=60.0,
+        )
+        assert resp.status_code == 400, f"{resp.status_code} {resp.text[:300]}"
+        assert _error_code(resp) == "moriio_fanout_unsupported", resp.text[:300]
 
     # -- failure -----------------------------------------------------------
 
