@@ -1855,12 +1855,12 @@ fn test_remove_workers_from_model_does_not_mutate_other_models() {
 
 #[test]
 fn test_apply_known_remote_insert_round_trip() {
-    // Seed both kinds via `apply_repair_page` (the v2 cold-start
-    // path that populates hash_index), then verify
+    // Seed both kinds via `apply_repair_page` (the cold-start path,
+    // which inserts every path with its hash), then verify
     // `apply_known_remote_insert` resolves the hash and returns
     // true. Unknown hashes return false. Wrong-kind lookups
     // against the same hash return false (model + kind scope
-    // the index).
+    // the lookup: each tree owns its own).
     let config = CacheAwareConfig {
         eviction_interval_secs: 0,
         ..Default::default()
@@ -1868,7 +1868,9 @@ fn test_apply_known_remote_insert_round_trip() {
     let policy = CacheAwarePolicy::with_config(config);
 
     let text = "remote_text";
-    let tokens = vec![1u32, 2, 3, 4];
+    // One page of tokens: a shorter sequence is never inserted, so no node
+    // could carry its hash.
+    let tokens: Vec<u32> = (1..=16).collect();
     let string_page = TreeRepairPage {
         session_id: uuid::Uuid::now_v7(),
         model_id: "model1".to_string(),
@@ -1923,7 +1925,10 @@ fn test_apply_known_remote_insert_round_trip() {
 }
 
 #[test]
-fn test_apply_repair_page_seeds_hash_index() {
+fn a_repaired_path_resolves_until_the_tree_evicts_it() {
+    // A repair page inserts its paths with their hashes; the hash lives with
+    // the node, so once the tree's budget evicts the node a delta that names
+    // the path reads as unknown again (and the peer is asked for the text).
     let config = CacheAwareConfig {
         eviction_interval_secs: 0,
         ..Default::default()
@@ -1971,201 +1976,113 @@ fn test_apply_repair_page_seeds_hash_index() {
         kv_index::hash_token_path(&tokens),
         "http://w2",
     ));
-    {
-        let index = policy.hash_index.get("model1").unwrap();
-        assert_eq!(index.string_tree.size(), text.len());
-        assert_eq!(index.token_tree.size(), tokens.len());
-    }
+
+    // Both workers hold each path now, so a budget under one copy of the
+    // tokens evicts both from the token tree and one from the string tree.
+    let string_tree = Arc::clone(policy.string_trees.get("model1").unwrap().value());
+    let token_tree = Arc::clone(policy.token_trees.get("model1").unwrap().value());
+    assert_eq!(
+        (string_tree.hashed_paths(), token_tree.hashed_paths()),
+        (1, 1)
+    );
     policy.evict_cache(tokens.len() - 1);
-    assert_eq!(policy.hash_index.get("model1").unwrap().token_tree.len(), 0);
-    assert_eq!(
-        policy.hash_index.get("model1").unwrap().string_tree.len(),
-        1
-    );
+    assert_eq!(token_tree.hashed_paths(), 0);
+    assert!(!policy.apply_known_remote_insert(
+        "model1",
+        TreeKind::Token,
+        kv_index::hash_token_path(&tokens),
+        "http://w3",
+    ));
+    assert_eq!(string_tree.hashed_paths(), 1);
     policy.evict_cache(text.len() - 1);
-    assert_eq!(
-        policy.hash_index.get("model1").unwrap().string_tree.len(),
-        0
-    );
+    assert_eq!(string_tree.hashed_paths(), 0);
+    assert!(!policy.apply_known_remote_insert(
+        "model1",
+        TreeKind::String,
+        kv_index::hash_node_path(text),
+        "http://w3",
+    ));
 }
 
 #[test]
 fn test_apply_known_remote_insert_from_request_hot_path() {
     // Companion to `test_apply_known_remote_insert_round_trip`.
-    // That test seeds via `apply_repair_page`, which stores
-    // full text/tokens. The local request hot path
-    // (`select_worker_with_text` / `_with_tokens` plus the
-    // imbalanced fallback) stores the *matched prefix* shape
-    // instead. A regression on the matched-prefix apply path
-    // would still pass the full-path test, so seed via
-    // `select_worker` here and assert apply succeeds.
+    // That test seeds via `apply_repair_page`. The local request hot
+    // path (`select_worker_with_text` / `_with_tokens`) inserts the
+    // routed path with its hash while the mesh is attached, so seed via
+    // `select_worker` here and assert the apply succeeds.
     //
-    // Opt into request-hot-path hash_index population — without
-    // this the populate sites are no-ops and the apply call
-    // below would have nothing to resolve. In production this
-    // flag is flipped by the mesh wiring code; here we set it
-    // directly because the test mimics the mesh consumer.
+    // Raise the mesh flag without an adapter: in production the mesh
+    // wiring flips it; here the test mimics the mesh consumer.
     let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
         eviction_interval_secs: 0,
         ..Default::default()
     });
-    policy.set_populate_hash_index(true);
+    policy.set_mesh_attached_for_test(true);
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     policy.init_workers(&workers);
 
-    // Drive a string request through select_worker — populates
-    // the string-side hash_index with a matched-prefix value.
+    // Drive a string request through select_worker.
     let text = "the quick brown fox jumps over the lazy dog";
     route_text(&policy, &workers, text).unwrap();
     let text_hash = kv_index::hash_node_path(text);
 
-    // Drive a token request — populates the token-side
-    // hash_index. select_worker uses the model_id from the
+    // Drive a token request. select_worker uses the model_id from the
     // first worker's `model_id()`, which the builder leaves
     // empty → UNKNOWN_MODEL_ID after normalization.
     let tokens: Vec<u32> = (0..32).collect();
     route_tokens(&policy, &workers, &tokens);
     let token_hash = kv_index::hash_token_path(&tokens);
 
-    // Both populate sites use UNKNOWN_MODEL_ID for these
-    // workers (no model_id set on the builder), and the
-    // resolver normalizes empty → UNKNOWN_MODEL_ID, so an
-    // empty model_id resolves the same entries the populate
-    // sites wrote.
+    // Both insert sites use UNKNOWN_MODEL_ID for these workers (no
+    // model_id set on the builder), and the resolver normalizes
+    // empty → UNKNOWN_MODEL_ID, so an empty model_id resolves the
+    // same trees the insert sites wrote.
     assert!(policy.apply_known_remote_insert("", TreeKind::String, text_hash, "http://remote",));
     assert!(policy.apply_known_remote_insert("", TreeKind::Token, token_hash, "http://remote",));
 }
 
 #[test]
-fn hash_index_counts_what_it_stores() {
-    let mut index = PerModelHashIndex::default();
-    index.string_tree.insert(1, "abcd".to_string());
-    index.string_tree.insert(1, "ab".to_string());
-    index.string_tree.insert(2, "xyz".to_string());
-    assert_eq!(index.string_tree.size(), 5);
-    index.token_tree.insert(7, vec![1, 2, 3]);
-    index.token_tree.insert(7, vec![1, 2, 3, 4]);
-    assert_eq!(index.token_tree.size(), 4);
-
-    index.evict("model1", 5);
-    assert_eq!(index.string_tree.previous.len(), 2);
-    assert_eq!(index.string_tree.previous_size, 5);
-    assert_eq!(index.token_tree.previous_size, 4);
-    index.string_tree.insert(2, "xyzw".to_string());
-    assert_eq!(index.string_tree.current_size, 4);
-    assert_eq!(index.string_tree.previous_size, 2);
-    assert_eq!(index.string_tree.get(2).map(String::as_str), Some("xyzw"));
-    assert_eq!((index.string_tree.len(), index.string_tree.size()), (2, 6));
-}
-
-#[test]
-fn hash_index_eviction_keeps_the_newer_generation() {
-    let mut index = Generations::<String>::default();
-    index.insert(1, "a".repeat(30));
-    index.insert(2, "b".repeat(30));
-    assert!(index.evict(100));
-    assert_eq!(index.get(1).map(String::len), Some(30));
-    index.insert(3, "c".repeat(30));
-    assert!(!index.evict(100));
-    index.insert(4, "d".repeat(30));
-    assert!(index.evict(100));
-    assert!(index.get(1).is_none() && index.get(2).is_none());
-    assert!(index.get(3).is_some() && index.get(4).is_some());
-    assert_eq!((index.len(), index.size()), (2, 60));
-    index.insert(5, "e".repeat(50));
-    assert!(!index.evict(100));
-    assert!(index.get(5).is_some());
-    assert_eq!((index.len(), index.size()), (2, 80));
-    // A burst over the budget, as a tree repair writes, keeps what fits.
-    for hash in 5..15 {
-        index.insert(hash, "f".repeat(30));
-    }
-    assert!(index.evict(100));
-    assert_eq!((index.len(), index.size()), (3, 90));
-    index.insert(30, "g".repeat(120));
-    assert!(!index.evict(100));
-    assert!(index.get(30).is_none());
-    assert_eq!(index.size(), 90);
-}
-
-#[test]
-fn hash_index_keeps_entries_that_fit_and_rejects_oversized_values() {
-    let mut index = Generations::<String>::default();
-    index.insert(1, "a".repeat(10));
-    index.insert(2, "b".repeat(60));
-    index.evict(100);
-    index.insert(2, "b".repeat(60));
-    index.evict(100);
-    assert_eq!((index.len(), index.size()), (2, 70));
-    assert!(index.get(1).is_some());
-    index.insert(3, "c".repeat(101));
-    index.evict(100);
-    assert_eq!((index.len(), index.size()), (2, 70));
-    assert!(index.get(3).is_none());
-    index.evict(0);
-    assert_eq!((index.len(), index.size()), (0, 0));
-    for hash in 0..5 {
-        index.insert(hash, String::new());
-    }
-    index.evict(3);
-    assert_eq!((index.len(), index.size()), (3, 0));
-    index.insert(99, "é".to_string());
-    assert_eq!(index.size(), 2); // UTF-8 bytes, not characters.
-    index.evict(1);
-    assert!(index.get(99).is_none());
-    assert!(index.len() <= 1);
-}
-
-#[test]
-fn hash_index_generations_hold_their_invariants() {
-    // Random overwrites/evictions must preserve exact accounting, disjoint
-    // generations, the size bound, and recent values when they fit.
-    use rand::{rngs::StdRng, RngExt, SeedableRng};
-    let mut rng = StdRng::seed_from_u64(4751);
-    let max = 500;
-    let mut index = Generations::<Vec<u32>>::default();
-    let mut since_eviction: HashMap<u64, usize> = HashMap::new();
-    for _ in 0..20_000 {
-        if rng.random_range(0..10) == 0 {
-            let fits = index.current.len() <= max && index.current_size <= max;
-            index.evict(max);
-            assert!(index.len() <= max && index.size() <= max);
-            if fits {
-                for (hash, len) in &since_eviction {
-                    assert_eq!(index.get(*hash).map(Vec::len), Some(*len));
-                }
-            } else {
-                // Entries are under 120 long, so a full trim leaves less room.
-                assert!(index.size() > max - 120);
-            }
-            since_eviction.clear();
-        } else {
-            let hash = rng.random_range(0..200);
-            let len = rng.random_range(0..120);
-            index.insert(hash, vec![0; len]);
-            since_eviction.insert(hash, len);
-        }
-        let counted: usize = index
-            .current
-            .values()
-            .chain(index.previous.values())
-            .map(Vec::len)
-            .sum();
-        assert_eq!(index.size(), counted);
-        assert!(index
-            .current
-            .keys()
-            .all(|h| !index.previous.contains_key(h)));
-    }
-}
-
-#[test]
-fn a_peer_delta_for_a_recent_request_resolves_after_eviction() {
+fn a_peer_delta_attaches_the_worker_along_the_whole_request() {
+    // The hash index of old stored the matched prefix and attached the
+    // peer's worker there; the tree-owned lookup attaches it along the full
+    // request text, which is what that worker's cache holds after serving it.
     let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
         eviction_interval_secs: 0,
         ..Default::default()
     });
-    policy.set_populate_hash_index(true);
+    policy.set_mesh_attached_for_test(true);
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    let model = normalize_model_key(workers[0].model_id());
+    let first = format!("turn 0: {}", "x".repeat(1_000));
+    let second = format!("{first} turn 1: {}", "y".repeat(1_000));
+    route_text(&policy, &workers, &first).unwrap();
+    route_text(&policy, &workers, &second).unwrap();
+
+    assert!(policy.apply_known_remote_insert(
+        model,
+        TreeKind::String,
+        kv_index::hash_node_path(&second),
+        "http://remote",
+    ));
+    let tree = Arc::clone(policy.string_trees.get(model).unwrap().value());
+    assert_eq!(
+        tree.tenant_char_size(&Arc::<str>::from("http://remote")),
+        second.chars().count()
+    );
+}
+
+#[test]
+fn a_peer_delta_for_a_recent_request_resolves_after_eviction() {
+    // The tree's budget decides what a hash can still name: an eviction
+    // that takes the older conversation's nodes forgets its hash and keeps
+    // the newer one's.
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        eviction_interval_secs: 0,
+        ..Default::default()
+    });
+    policy.set_mesh_attached_for_test(true);
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     policy.init_workers(&workers);
     let model = normalize_model_key(workers[0].model_id());
@@ -2179,53 +2096,264 @@ fn a_peer_delta_for_a_recent_request_resolves_after_eviction() {
     };
 
     let older = converse("first");
-    let budget = policy.hash_index.get(model).unwrap().string_tree.size() * 3 / 2;
-    policy.evict_cache(budget);
+    let tree = Arc::clone(policy.string_trees.get(model).unwrap().value());
+    let one_conversation = tree.total_char_size();
     let newer = converse("second");
-    policy.evict_cache(budget);
+    policy.evict_cache(one_conversation * 3 / 2);
 
     assert!(policy.apply_known_remote_insert(model, TreeKind::String, newer, "http://remote"));
     assert!(!policy.apply_known_remote_insert(model, TreeKind::String, older, "http://remote"));
 }
 
 #[test]
-fn hash_index_counts_and_bounds_both_multi_turn_request_paths() {
+fn every_turn_of_a_conversation_resolves_while_the_tree_keeps_it() {
+    // One hashed node per turn on both trees and no second copy of the text;
+    // with one worker each tree holds one chain, whose LRU leaf is the newest
+    // turn's node: an eviction takes it first and the earlier turns keep
+    // resolving.
     let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
         eviction_interval_secs: 0,
         ..Default::default()
     });
-    policy.set_populate_hash_index(true);
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.set_mesh_attached_for_test(true);
+    let workers = make_workers(&["http://w1:8000"]);
     policy.init_workers(&workers);
     let model = normalize_model_key(workers[0].model_id());
     let (mut text, mut tokens) = (String::new(), Vec::new());
-    let (mut text_size, mut token_size) = (0, 0);
+    let mut turns: Vec<(u64, u64)> = Vec::new();
     for turn in 0..5 {
-        text_size += text.len();
-        token_size += tokens.len();
         text.push_str(&format!("turn {turn}: {} ", "x".repeat(1_000)));
         tokens.extend((0..64).map(|i| turn * 1_000 + i));
         route_text(&policy, &workers, &text).unwrap();
         route_tokens(&policy, &workers, &tokens);
+        turns.push((
+            kv_index::hash_node_path(&text),
+            kv_index::hash_token_path(&tokens),
+        ));
     }
-    {
-        let index = policy.hash_index.get(model).unwrap();
+    let string_tree = Arc::clone(policy.string_trees.get(model).unwrap().value());
+    let token_tree = Arc::clone(policy.token_trees.get(model).unwrap().value());
+    assert_eq!(
+        (string_tree.hashed_paths(), token_tree.hashed_paths()),
+        (5, 5)
+    );
+
+    string_tree.evict_tenant_by_size(string_tree.total_char_size() - 1);
+    token_tree.evict_tenant_by_size(token_tree.total_token_size() - 1);
+    assert_eq!(
+        (string_tree.hashed_paths(), token_tree.hashed_paths()),
+        (4, 4)
+    );
+    for (turn, (text_hash, token_hash)) in turns.iter().enumerate() {
+        let kept = turn < 4;
         assert_eq!(
-            (index.string_tree.len(), index.string_tree.size()),
-            (5, text_size)
+            policy.apply_known_remote_insert(model, TreeKind::String, *text_hash, "http://remote"),
+            kept,
+            "string turn {turn}"
         );
         assert_eq!(
-            (index.token_tree.len(), index.token_tree.size()),
-            (5, token_size)
+            policy.apply_known_remote_insert(model, TreeKind::Token, *token_hash, "http://remote"),
+            kept,
+            "token turn {turn}"
         );
     }
-    policy.evict_cache(text_size);
-    assert_eq!(policy.hash_index.get(model).unwrap().string_tree.len(), 5);
-    policy.evict_cache(text_size - 1);
-    assert_eq!(policy.hash_index.get(model).unwrap().string_tree.len(), 4);
-    assert_eq!(policy.hash_index.get(model).unwrap().token_tree.len(), 5);
-    policy.evict_cache(token_size - 1);
-    assert_eq!(policy.hash_index.get(model).unwrap().token_tree.len(), 4);
+}
+
+#[test]
+fn nothing_is_hashed_without_the_mesh() {
+    // Detached, the request path computes no hash and the trees record none:
+    // the no-mesh path pays nothing for the lookup.
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        eviction_interval_secs: 0,
+        ..Default::default()
+    });
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    let model = normalize_model_key(workers[0].model_id());
+    let text = "the quick brown fox jumps over the lazy dog";
+    let tokens: Vec<u32> = (0..32).collect();
+    route_text(&policy, &workers, text).unwrap();
+    route_tokens(&policy, &workers, &tokens);
+    assert_eq!(policy.string_trees.get(model).unwrap().hashed_paths(), 0);
+    assert_eq!(policy.token_trees.get(model).unwrap().hashed_paths(), 0);
+    assert!(!policy.apply_known_remote_insert(
+        model,
+        TreeKind::String,
+        kv_index::hash_node_path(text),
+        "http://remote",
+    ));
+    assert!(!policy.apply_known_remote_insert(
+        model,
+        TreeKind::Token,
+        kv_index::hash_token_path(&tokens),
+        "http://remote",
+    ));
+}
+
+#[test]
+fn a_token_prompt_under_one_page_is_not_hashed() {
+    // The token tree inserts nothing under one page (the block size), so
+    // there is no node a peer could be pointed at and no delta is published.
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        eviction_interval_secs: 0,
+        block_size: 16,
+        ..Default::default()
+    });
+    policy.set_mesh_attached_for_test(true);
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    let model = normalize_model_key(workers[0].model_id());
+    let short: Vec<u32> = (0..15).collect();
+    route_tokens(&policy, &workers, &short);
+    assert_eq!(policy.token_trees.get(model).unwrap().hashed_paths(), 0);
+    let page: Vec<u32> = (0..16).collect();
+    route_tokens(&policy, &workers, &page);
+    assert_eq!(policy.token_trees.get(model).unwrap().hashed_paths(), 1);
+}
+
+#[test]
+fn a_routed_tailed_prompt_and_a_repair_page_name_the_node_by_its_aligned_hash() {
+    // The request path hashes the page-aligned prefix the tree stores (here
+    // the one page of a one-page-and-a-tail prompt), as a repair page does
+    // for its paths, so the two name the node by one hash and a repair can
+    // displace nothing; the hash of the unaligned sequence is one no peer
+    // publishes; a repaired path this gateway never routed answers to its
+    // own hash.
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        eviction_interval_secs: 0,
+        block_size: 16,
+        ..Default::default()
+    });
+    policy.set_mesh_attached_for_test(true);
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    let model = normalize_model_key(workers[0].model_id());
+    let tailed: Vec<u32> = (0..17).collect();
+    route_tokens(&policy, &workers, &tailed);
+    assert_eq!(policy.token_trees.get(model).unwrap().hashed_paths(), 1);
+
+    let aligned: Vec<u32> = (0..16).collect();
+    let never_routed: Vec<u32> = (100..116).collect();
+    let page = TreeRepairPage {
+        session_id: uuid::Uuid::now_v7(),
+        model_id: model.to_string(),
+        tree_kind: TreeKind::Token,
+        page_index: 0,
+        entries: vec![
+            RepairEntry::Token {
+                tokens: aligned.clone(),
+                tenants: vec![(Arc::from("http://peer-w"), 1)],
+            },
+            RepairEntry::Token {
+                tokens: never_routed.clone(),
+                tenants: vec![(Arc::from("http://peer-w"), 1)],
+            },
+        ],
+        next_cursor: None,
+        is_last: true,
+    };
+    assert_eq!(policy.apply_repair_page(&page), 2);
+
+    let resolves = |tokens: &[u32]| {
+        policy.apply_known_remote_insert(
+            model,
+            TreeKind::Token,
+            kv_index::hash_token_path(tokens),
+            "http://peer-x",
+        )
+    };
+    assert!(
+        !resolves(&tailed),
+        "no peer publishes the hash of an unaligned sequence"
+    );
+    assert!(
+        resolves(&aligned),
+        "the routed prompt and the repair name the node by its aligned hash"
+    );
+    assert!(
+        resolves(&never_routed),
+        "a repaired path the gateway never routed answers to its hash"
+    );
+    assert_eq!(policy.token_trees.get(model).unwrap().hashed_paths(), 2);
+}
+
+#[test]
+fn peers_resolve_every_tail_of_a_shared_prefix() {
+    // The shared-prefix shape: prompts that share their pages and differ
+    // only inside their last page end at one node, and every one of them
+    // names that node by the hash of the shared prefix. A peer that routed
+    // one of them resolves all of them (counted), and the repair stream
+    // names the prefix by the same hash, so a repair page displaces nothing.
+    let new_policy = || {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            block_size: 16,
+            ..Default::default()
+        });
+        policy.set_mesh_attached_for_test(true);
+        policy
+    };
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let (a, b) = (new_policy(), new_policy());
+    a.init_workers(&workers);
+    b.init_workers(&workers);
+    let model = normalize_model_key(workers[0].model_id());
+    let prefix: Vec<u32> = (0..48).collect();
+    let prompts: Vec<Vec<u32>> = (0..6u32)
+        .map(|turn| {
+            let mut prompt = prefix.clone();
+            prompt.extend((0..=turn).map(|i| 1_000 + turn * 10 + i));
+            prompt
+        })
+        .collect();
+    // What the request path publishes for a prompt: the hash of its
+    // page-aligned prefix.
+    let published = |prompt: &[u32]| kv_index::hash_token_path(&prompt[..prompt.len() / 16 * 16]);
+
+    for prompt in &prompts {
+        route_tokens(&a, &workers, prompt);
+    }
+    assert_eq!(a.token_trees.get(model).unwrap().hashed_paths(), 1);
+    route_tokens(&b, &workers, &prompts[0]);
+    let resolved = prompts
+        .iter()
+        .filter(|prompt| {
+            b.apply_known_remote_insert(model, TreeKind::Token, published(prompt), "http://w1:8000")
+        })
+        .count();
+    assert_eq!(
+        resolved,
+        prompts.len(),
+        "every tail's delta resolves on the peer"
+    );
+
+    let entries: Vec<RepairEntry> = a
+        .open_repair_stream(model, TreeKind::Token)
+        .expect("a has a token tree")
+        .collect();
+    let page = TreeRepairPage {
+        session_id: uuid::Uuid::now_v7(),
+        model_id: model.to_string(),
+        tree_kind: TreeKind::Token,
+        page_index: 0,
+        entries,
+        next_cursor: None,
+        is_last: true,
+    };
+    // The page carries two entries: the root's tenants (a tenant that
+    // inserted anything exists at the root) and the shared node. The root
+    // entry inserts and names nothing; the node's entry finds the node
+    // named by the request already.
+    assert_eq!(page.entries.len(), 2);
+    assert_eq!(b.apply_repair_page(&page), 2);
+    let resolved_after = prompts
+        .iter()
+        .filter(|prompt| {
+            b.apply_known_remote_insert(model, TreeKind::Token, published(prompt), "http://w2:8000")
+        })
+        .count();
+    assert_eq!(resolved_after, prompts.len());
+    assert_eq!(b.token_trees.get(model).unwrap().hashed_paths(), 1);
 }
 
 #[test]
