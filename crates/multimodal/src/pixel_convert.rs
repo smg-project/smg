@@ -2,10 +2,10 @@
 //! wire value, `PixelNorm::table_f32` (the reference processors' per-element
 //! arithmetic) rounded to the wire's float width. The tables are the single
 //! source of the values. This module moves them: a scalar table lookup per
-//! channel block on every target, and on AArch64 a vector formula that is
-//! used for a write only after it has reproduced that write's tables for all
-//! 256 bytes of all three channels, so the bytes written are the tables'
-//! whichever path runs.
+//! channel block on every target, and on AArch64 and x86-64 a vector formula
+//! that is used for a write only after it has reproduced that write's tables
+//! for all 256 bytes of all three channels, so the bytes written are the
+//! tables' whichever path runs.
 //!
 //! Why not a vector table lookup: a 256-entry table is 512 bytes per output
 //! byte plane, and the vector unit's byte permutes index 64 bytes at a time,
@@ -15,9 +15,18 @@
 //! The AArch64 path is the crate's only use of `core::arch` vector loads and
 //! stores, hence the local override of the workspace-wide
 //! `unsafe_code = "deny"`; every pointer it forms comes from an exact-size
-//! chunk of a slice.
+//! chunk of a slice. The x86-64 path carries no `unsafe`: `multiversion`
+//! selects its AVX2 clone at the first call, and every vector word enters and
+//! leaves it through a `bytemuck` cast of an exact-size byte array.
 #![cfg_attr(target_arch = "aarch64", allow(unsafe_code))]
 
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use formula::{Bf16Formula, F32Formula};
+
+#[cfg(target_arch = "x86_64")]
+use self::avx2 as vector;
+#[cfg(target_arch = "aarch64")]
+use self::neon as vector;
 use crate::encoder_inputs::{EncoderDtype, PixelNorm};
 
 /// Writes `tables[channel][byte]` as a little-endian `u16` for every byte of
@@ -53,8 +62,8 @@ pub(crate) fn write_bf16(
     norm: &PixelNorm,
     tables: &[[u16; 256]; 3],
 ) {
-    #[cfg(target_arch = "aarch64")]
-    if let Some(formula) = neon::Bf16Formula::reproducing(norm, tables) {
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    if let Some(formula) = Bf16Formula::reproducing(norm, tables) {
         debug_assert_eq!(dst.len(), src.len() * 2);
         for ((dst, src), channel) in channel_blocks(dst, src, block, 2).zip((0..3).cycle()) {
             formula.write(dst, src, channel);
@@ -74,8 +83,8 @@ pub(crate) fn write_f32(
     norm: &PixelNorm,
     tables: &[[u32; 256]; 3],
 ) {
-    #[cfg(target_arch = "aarch64")]
-    if let Some(formula) = neon::F32Formula::reproducing(norm, tables) {
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    if let Some(formula) = F32Formula::reproducing(norm, tables) {
         debug_assert_eq!(dst.len(), src.len() * 4);
         for ((dst, src), channel) in channel_blocks(dst, src, block, 4).zip((0..3).cycle()) {
             formula.write(dst, src, channel);
@@ -93,13 +102,13 @@ pub(crate) fn write_f32(
 pub(crate) enum WireWriter {
     Half {
         tables: Box<[[u16; 256]; 3]>,
-        #[cfg(target_arch = "aarch64")]
-        formula: Option<neon::Bf16Formula>,
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        formula: Option<Bf16Formula>,
     },
     Single {
         tables: Box<[[u32; 256]; 3]>,
-        #[cfg(target_arch = "aarch64")]
-        formula: Option<neon::F32Formula>,
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        formula: Option<F32Formula>,
     },
 }
 
@@ -110,8 +119,8 @@ impl WireWriter {
             EncoderDtype::Float32 => {
                 let tables = Box::new(norm.table_f32().map(|channel| channel.map(f32::to_bits)));
                 Some(Self::Single {
-                    #[cfg(target_arch = "aarch64")]
-                    formula: neon::F32Formula::reproducing(norm, &tables),
+                    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+                    formula: F32Formula::reproducing(norm, &tables),
                     tables,
                 })
             }
@@ -121,8 +130,8 @@ impl WireWriter {
                         .map(|channel| channel.map(crate::encoder_inputs::f32_to_bf16_bits)),
                 );
                 Some(Self::Half {
-                    #[cfg(target_arch = "aarch64")]
-                    formula: neon::Bf16Formula::reproducing(norm, &tables),
+                    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+                    formula: Bf16Formula::reproducing(norm, &tables),
                     tables,
                 })
             }
@@ -133,7 +142,7 @@ impl WireWriter {
                 ),
                 // The half-up rounding of the vector formula is the
                 // bfloat16's; float16 takes the tables.
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
                 formula: None,
             }),
         }
@@ -153,7 +162,7 @@ impl WireWriter {
         debug_assert_eq!(dst.len(), src.len() * self.element_size());
         match self {
             Self::Half { tables, .. } => {
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
                 if let Self::Half {
                     formula: Some(formula),
                     ..
@@ -168,7 +177,7 @@ impl WireWriter {
                 }
             }
             Self::Single { tables, .. } => {
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
                 if let Self::Single {
                     formula: Some(formula),
                     ..
@@ -198,15 +207,12 @@ fn channel_blocks<'a>(
     dst.chunks_mut(block * width).zip(src.chunks(block))
 }
 
-#[cfg(target_arch = "aarch64")]
-mod neon {
-    use core::arch::aarch64::{
-        float32x4_t, uint32x4_t, uint8x16_t, vcvtq_f32_u32, vdivq_f32, vdupq_n_f32, vget_low_u16,
-        vget_low_u8, vld1q_u8, vmovl_high_u16, vmovl_high_u8, vmovl_u16, vmovl_u8, vmulq_f32,
-        vreinterpretq_u32_f32, vrshrn_high_n_u32, vrshrn_n_u32, vst1q_f32, vst1q_u16, vsubq_f32,
-    };
-
-    use super::PixelNorm;
+/// The vector formula of a normalization: the constants per channel and the
+/// check against the tables, shared by the two architectures' paths; the
+/// `vector` module runs the arithmetic.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+mod formula {
+    use super::{vector, PixelNorm};
 
     /// The bytes 0..=255 in order: the input that produces a whole table.
     fn every_byte() -> [u8; 256] {
@@ -227,7 +233,7 @@ mod neon {
         /// The formula for `norm`, if it reproduces `tables` for every byte of
         /// every channel (768 values, checked with the same code that writes).
         pub(crate) fn reproducing(norm: &PixelNorm, tables: &[[u16; 256]; 3]) -> Option<Self> {
-            if !std::arch::is_aarch64_feature_detected!("neon") {
+            if !vector::detected() {
                 return None;
             }
             let formula = Self {
@@ -252,9 +258,10 @@ mod neon {
 
         /// Writes `channel`'s words for `src` into `dst` (two bytes each).
         pub(crate) fn write(&self, dst: &mut [u8], src: &[u8], channel: usize) {
+            #[cfg(target_arch = "aarch64")]
             // SAFETY: NEON was detected in `reproducing`, the only constructor.
             unsafe {
-                write_bf16(
+                vector::write_bf16(
                     dst,
                     src,
                     self.scale,
@@ -262,6 +269,14 @@ mod neon {
                     self.reciprocal[channel],
                 );
             }
+            #[cfg(target_arch = "x86_64")]
+            vector::write_bf16(
+                dst,
+                src,
+                self.scale,
+                self.offset[channel],
+                self.reciprocal[channel],
+            );
         }
     }
 
@@ -276,7 +291,7 @@ mod neon {
         /// The formula for `norm`, if it reproduces `tables` for every byte of
         /// every channel.
         pub(crate) fn reproducing(norm: &PixelNorm, tables: &[[u32; 256]; 3]) -> Option<Self> {
-            if !std::arch::is_aarch64_feature_detected!("neon") {
+            if !vector::detected() {
                 return None;
             }
             let formula = Self {
@@ -301,9 +316,10 @@ mod neon {
 
         /// Writes `channel`'s words for `src` into `dst` (four bytes each).
         pub(crate) fn write(&self, dst: &mut [u8], src: &[u8], channel: usize) {
+            #[cfg(target_arch = "aarch64")]
             // SAFETY: NEON was detected in `reproducing`, the only constructor.
             unsafe {
-                write_f32(
+                vector::write_f32(
                     dst,
                     src,
                     self.scale,
@@ -311,7 +327,30 @@ mod neon {
                     self.divisor[channel],
                 );
             }
+            #[cfg(target_arch = "x86_64")]
+            vector::write_f32(
+                dst,
+                src,
+                self.scale,
+                self.offset[channel],
+                self.divisor[channel],
+            );
         }
+    }
+}
+
+/// The AArch64 path: the formula on four `f32` lanes with NEON.
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use core::arch::aarch64::{
+        float32x4_t, uint32x4_t, uint8x16_t, vcvtq_f32_u32, vdivq_f32, vdupq_n_f32, vget_low_u16,
+        vget_low_u8, vld1q_u8, vmovl_high_u16, vmovl_high_u8, vmovl_u16, vmovl_u8, vmulq_f32,
+        vreinterpretq_u32_f32, vrshrn_high_n_u32, vrshrn_n_u32, vst1q_f32, vst1q_u16, vsubq_f32,
+    };
+
+    /// Whether this core has the vector unit the formula runs on.
+    pub(super) fn detected() -> bool {
+        std::arch::is_aarch64_feature_detected!("neon")
     }
 
     /// 16 bytes as four vectors of four `f32`s.
@@ -339,8 +378,10 @@ mod neon {
         }
     }
 
+    /// `channel`'s `bfloat16` words (two bytes each) for the pixel bytes of
+    /// `src` into `dst`.
     #[target_feature(enable = "neon")]
-    fn write_bf16(dst: &mut [u8], src: &[u8], scale: f32, offset: f32, reciprocal: f32) {
+    pub(super) fn write_bf16(dst: &mut [u8], src: &[u8], scale: f32, offset: f32, reciprocal: f32) {
         let (chunks, rest) = src.as_chunks::<16>();
         let (out, out_rest) = dst.as_chunks_mut::<32>();
         let scale = (scale != 1.0).then(|| vdupq_n_f32(scale));
@@ -393,8 +434,10 @@ mod neon {
         unsafe { vst1q_u16(out.as_mut_ptr().cast::<u16>(), first) };
     }
 
+    /// `channel`'s `f32` words (four bytes each) for the pixel bytes of `src`
+    /// into `dst`.
     #[target_feature(enable = "neon")]
-    fn write_f32(dst: &mut [u8], src: &[u8], scale: f32, offset: f32, divisor: f32) {
+    pub(super) fn write_f32(dst: &mut [u8], src: &[u8], scale: f32, offset: f32, divisor: f32) {
         let (chunks, rest) = src.as_chunks::<16>();
         let (out, out_rest) = dst.as_chunks_mut::<64>();
         let scale = (scale != 1.0).then(|| vdupq_n_f32(scale));
@@ -418,6 +461,176 @@ mod neon {
             // SAFETY: `word` holds four `f32`s.
             unsafe { vst1q_f32(word.as_mut_ptr(), quotient) };
             *out = word[0].to_le_bytes();
+        }
+    }
+}
+
+/// The x86-64 path: the formula on eight `f32` lanes with AVX2. `multiversion`
+/// compiles each entry twice, with AVX2 and without, and selects the clone at
+/// the first call; the clone without AVX2 is the same arithmetic one value at
+/// a time, reached only through a formula built without the detection, which
+/// none is. No `unsafe`: the words move through `bytemuck` casts of
+/// exact-size arrays.
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use core::arch::x86_64::{
+        __m128i, __m256, __m256i, _mm256_add_epi32, _mm256_castps_si256, _mm256_cvtepi32_ps,
+        _mm256_cvtepu8_epi32, _mm256_div_ps, _mm256_mul_ps, _mm256_packus_epi32,
+        _mm256_permute4x64_epi64, _mm256_set1_epi32, _mm256_set1_ps, _mm256_srli_epi32,
+        _mm256_sub_ps, _mm_srli_si128,
+    };
+
+    use multiversion::{multiversion, target::match_target};
+
+    /// Whether this core has the vector unit the formula runs on.
+    pub(super) fn detected() -> bool {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+
+    /// `channel`'s `bfloat16` words (two bytes each) for the pixel bytes of
+    /// `src` into `dst`.
+    #[multiversion(targets("x86_64+avx2"))]
+    pub(super) fn write_bf16(dst: &mut [u8], src: &[u8], scale: f32, offset: f32, reciprocal: f32) {
+        match_target! {
+            "x86_64+avx2" => write_bf16_avx2(dst, src, scale, offset, reciprocal),
+            _ => write_bf16_scalar(dst, src, scale, offset, reciprocal),
+        }
+    }
+
+    /// `channel`'s `f32` words (four bytes each) for the pixel bytes of `src`
+    /// into `dst`.
+    #[multiversion(targets("x86_64+avx2"))]
+    pub(super) fn write_f32(dst: &mut [u8], src: &[u8], scale: f32, offset: f32, divisor: f32) {
+        match_target! {
+            "x86_64+avx2" => write_f32_avx2(dst, src, scale, offset, divisor),
+            _ => write_f32_scalar(dst, src, scale, offset, divisor),
+        }
+    }
+
+    /// 16 bytes as two vectors of eight `f32`s.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn widen(bytes: [u8; 16]) -> [__m256; 2] {
+        let bytes: __m128i = bytemuck::must_cast(bytes);
+        [
+            _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes)),
+            _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(bytes))),
+        ]
+    }
+
+    /// `value * scale - offset`.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn scaled(value: __m256, scale: __m256, offset: __m256) -> __m256 {
+        _mm256_sub_ps(_mm256_mul_ps(value, scale), offset)
+    }
+
+    /// Eight `f32`s to their `bfloat16` bits, half-up on the bit pattern: the
+    /// bias of `0x8000` wraps the way a rounding narrowing shift's wider sum
+    /// does, since only the low sixteen bits of the shifted sum are kept.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn halve(value: __m256, bias: __m256i) -> __m256i {
+        _mm256_srli_epi32::<16>(_mm256_add_epi32(_mm256_castps_si256(value), bias))
+    }
+
+    /// The thirty-two bytes of sixteen `bfloat16` words for sixteen pixel
+    /// bytes.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn bf16_words(
+        chunk: [u8; 16],
+        scale: __m256,
+        offset: __m256,
+        reciprocal: __m256,
+        bias: __m256i,
+    ) -> [u8; 32] {
+        let [low, high] = widen(chunk);
+        let low = halve(_mm256_mul_ps(scaled(low, scale, offset), reciprocal), bias);
+        let high = halve(_mm256_mul_ps(scaled(high, scale, offset), reciprocal), bias);
+        // The pack interleaves the two 128-bit halves (words 0-3, 8-11, 4-7,
+        // 12-15); the permute puts them in order.
+        bytemuck::must_cast(_mm256_permute4x64_epi64::<0b1101_1000>(
+            _mm256_packus_epi32(low, high),
+        ))
+    }
+
+    /// The sixty-four bytes of sixteen `f32` words for sixteen pixel bytes.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn f32_words(chunk: [u8; 16], scale: __m256, offset: __m256, divisor: __m256) -> [u8; 64] {
+        let [low, high] = widen(chunk);
+        bytemuck::must_cast([
+            _mm256_div_ps(scaled(low, scale, offset), divisor),
+            _mm256_div_ps(scaled(high, scale, offset), divisor),
+        ])
+    }
+
+    #[target_feature(enable = "avx2")]
+    fn write_bf16_avx2(dst: &mut [u8], src: &[u8], scale: f32, offset: f32, reciprocal: f32) {
+        let (chunks, rest) = src.as_chunks::<16>();
+        let (out, out_rest) = dst.as_chunks_mut::<32>();
+        let scale = _mm256_set1_ps(scale);
+        let offset = _mm256_set1_ps(offset);
+        let reciprocal = _mm256_set1_ps(reciprocal);
+        let bias = _mm256_set1_epi32(0x8000);
+        for (chunk, out) in chunks.iter().zip(out.iter_mut()) {
+            *out = bf16_words(*chunk, scale, offset, reciprocal, bias);
+        }
+        // The tail: the same vector pass over a zero-padded chunk, so a tail
+        // byte takes the value a chunked byte takes.
+        if !rest.is_empty() {
+            let mut chunk = [0u8; 16];
+            chunk[..rest.len()].copy_from_slice(rest);
+            let words = bf16_words(chunk, scale, offset, reciprocal, bias);
+            for (out, word) in out_rest
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(words.as_chunks::<2>().0)
+            {
+                *out = *word;
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    fn write_f32_avx2(dst: &mut [u8], src: &[u8], scale: f32, offset: f32, divisor: f32) {
+        let (chunks, rest) = src.as_chunks::<16>();
+        let (out, out_rest) = dst.as_chunks_mut::<64>();
+        let scale = _mm256_set1_ps(scale);
+        let offset = _mm256_set1_ps(offset);
+        let divisor = _mm256_set1_ps(divisor);
+        for (chunk, out) in chunks.iter().zip(out.iter_mut()) {
+            *out = f32_words(*chunk, scale, offset, divisor);
+        }
+        if !rest.is_empty() {
+            let mut chunk = [0u8; 16];
+            chunk[..rest.len()].copy_from_slice(rest);
+            let words = f32_words(chunk, scale, offset, divisor);
+            for (out, word) in out_rest
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(words.as_chunks::<4>().0)
+            {
+                *out = *word;
+            }
+        }
+    }
+
+    /// The formula one value at a time, in the same `f32` operations and the
+    /// same rounding: the clone for a core without AVX2.
+    fn write_bf16_scalar(dst: &mut [u8], src: &[u8], scale: f32, offset: f32, reciprocal: f32) {
+        for (out, &value) in dst.as_chunks_mut::<2>().0.iter_mut().zip(src) {
+            let bits = ((f32::from(value) * scale - offset) * reciprocal).to_bits();
+            *out = ((bits.wrapping_add(0x8000) >> 16) as u16).to_le_bytes();
+        }
+    }
+
+    fn write_f32_scalar(dst: &mut [u8], src: &[u8], scale: f32, offset: f32, divisor: f32) {
+        for (out, &value) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+            *out = ((f32::from(value) * scale - offset) / divisor).to_le_bytes();
         }
     }
 }
@@ -506,10 +719,14 @@ mod tests {
     /// rounding regression in the formula would not change the bytes (the
     /// table lookup is the fallback) but would lose the speed without a
     /// failing test, so this one fails instead.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn the_vector_formula_reproduces_the_tables_of_the_pipelines_normalizations() {
         use crate::encoder_inputs::f32_to_bf16_bits;
+
+        if !vector::detected() {
+            return;
+        }
 
         let into_bytes = (1.0_f64 / (1.0 / 255.0)) as f32;
         let norms = [
@@ -539,14 +756,62 @@ mod tests {
                 .table_f32()
                 .map(|channel| channel.map(f32_to_bf16_bits));
             assert!(
-                neon::Bf16Formula::reproducing(&norm, &bf16).is_some(),
+                Bf16Formula::reproducing(&norm, &bf16).is_some(),
                 "bf16 formula declined {norm:?}"
             );
             let f32s = norm.table_f32().map(|channel| channel.map(f32::to_bits));
             assert!(
-                neon::F32Formula::reproducing(&norm, &f32s).is_some(),
+                F32Formula::reproducing(&norm, &f32s).is_some(),
                 "f32 formula declined {norm:?}"
             );
+        }
+    }
+
+    /// On the target that has the vector path, runs of every length from 0 to
+    /// 40 bytes (whole vectors and every tail) through a normalization the
+    /// formula reproduces write the tables' words, in both wire widths, with
+    /// channel blocks shorter and longer than a vector.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn every_run_length_takes_the_tables_values_on_the_vector_path() {
+        use crate::encoder_inputs::f32_to_bf16_bits;
+
+        if !vector::detected() {
+            return;
+        }
+        let into_bytes = (1.0_f64 / (1.0 / 255.0)) as f32;
+        let norm = PixelNorm {
+            scale: 1.0,
+            offset: [0.5_f64 as f32 * into_bytes; 3],
+            divisor: [0.5_f64 as f32 * into_bytes; 3],
+            channel_block: 7,
+        };
+        let bf16 = norm
+            .table_f32()
+            .map(|channel| channel.map(f32_to_bf16_bits));
+        let f32s = norm.table_f32().map(|channel| channel.map(f32::to_bits));
+        assert!(Bf16Formula::reproducing(&norm, &bf16).is_some());
+        assert!(F32Formula::reproducing(&norm, &f32s).is_some());
+        for block in [7usize, 40] {
+            for n in 0..=40 {
+                let src: Vec<u8> = (0..n).map(|i| (i * 131 % 256) as u8).collect();
+                let mut dst = vec![0u8; n * 2];
+                write_bf16(&mut dst, &src, block, &norm, &bf16);
+                let expected: Vec<u8> = src
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, &v)| bf16[(i / block) % 3][v as usize].to_le_bytes())
+                    .collect();
+                assert_eq!(dst, expected, "bf16, block {block}, {n} bytes");
+                let mut dst = vec![0u8; n * 4];
+                write_f32(&mut dst, &src, block, &norm, &f32s);
+                let expected: Vec<u8> = src
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, &v)| f32s[(i / block) % 3][v as usize].to_le_bytes())
+                    .collect();
+                assert_eq!(dst, expected, "f32, block {block}, {n} bytes");
+            }
         }
     }
 }

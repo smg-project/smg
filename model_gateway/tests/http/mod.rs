@@ -11,4 +11,5 @@ mod systemone_http_test;
 mod tenant_rate_limiting_external_test;
 mod tenant_rate_limiting_http_test;
 mod tenant_rate_limiting_pd_test;
+mod tokenizer_management_test;
 mod wasm_test;

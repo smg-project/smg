@@ -14,6 +14,7 @@ use axum::{
     http::{header::CONTENT_TYPE, StatusCode},
 };
 use llm_tokenizer::TokenizerRegistry;
+use openai_protocol::worker::WorkerErrorResponse;
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
@@ -196,6 +197,7 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
         mesh_handler: None,
         mesh_adapters: None,
         secret_sources: Default::default(),
+        secrets: None,
     });
 
     let request_id_headers = vec!["x-request-id".to_string(), "x-correlation-id".to_string()];
@@ -316,11 +318,8 @@ async fn test_wasm_api_add_module_invalid_file() {
         .await
         .unwrap();
 
-    // Should return error status
-    assert!(
-        response.status() == StatusCode::BAD_REQUEST
-            || response.status() == StatusCode::INTERNAL_SERVER_ERROR
-    );
+    // A module that failed to load: 400 with the per-module result.
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let response_json: WasmModuleAddResponse = serde_json::from_slice(&body).unwrap();
@@ -371,11 +370,8 @@ async fn test_wasm_api_add_module_invalid_wasm() {
         .await
         .unwrap();
 
-    // Should return error status
-    assert!(
-        response.status() == StatusCode::BAD_REQUEST
-            || response.status() == StatusCode::INTERNAL_SERVER_ERROR
-    );
+    // A module that failed to load: 400 with the per-module result.
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let response_json: WasmModuleAddResponse = serde_json::from_slice(&body).unwrap();
@@ -560,11 +556,66 @@ async fn test_wasm_api_remove_module_not_found() {
         .await
         .unwrap();
 
-    // Should return error status
+    assert_eq!(remove_response.status(), StatusCode::NOT_FOUND);
+    let refusal = envelope(remove_response).await;
+    assert_eq!(refusal.code, "WASM_MODULE_NOT_FOUND");
     assert!(
-        remove_response.status() == StatusCode::BAD_REQUEST
-            || remove_response.status() == StatusCode::NOT_FOUND
+        refusal.error.contains(&fake_uuid.to_string()),
+        "{}",
+        refusal.error
     );
+}
+
+/// The control plane's envelope of a refusal.
+#[expect(clippy::expect_used)]
+async fn envelope(response: axum::response::Response) -> WorkerErrorResponse {
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    serde_json::from_slice(&body).expect("the control plane's envelope")
+}
+
+#[tokio::test]
+async fn test_wasm_api_remove_module_malformed_uuid_is_a_400_in_the_envelope() {
+    let (app, _app_context, _temp_dir) = create_test_app_with_wasm().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/wasm/not-a-uuid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let refusal = envelope(response).await;
+    assert_eq!(refusal.code, "BAD_REQUEST");
+    assert!(refusal.error.contains("not-a-uuid"), "{}", refusal.error);
+}
+
+#[tokio::test]
+async fn test_wasm_api_add_module_body_the_type_does_not_take_is_a_400_in_the_envelope() {
+    let (app, _app_context, _temp_dir) = create_test_app_with_wasm().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/wasm")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"modules":[{"name":"m"}]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let refusal = envelope(response).await;
+    assert_eq!(refusal.code, "BAD_REQUEST");
+    assert!(refusal.error.contains("file_path"), "{}", refusal.error);
 }
 
 // ============================================================================
@@ -630,10 +681,7 @@ async fn test_wasm_module_duplicate_sha256() {
         .unwrap();
 
     // Should return error status for duplicate
-    assert!(
-        response2.status() == StatusCode::BAD_REQUEST
-            || response2.status() == StatusCode::INTERNAL_SERVER_ERROR
-    );
+    assert_eq!(response2.status(), StatusCode::BAD_REQUEST);
 
     let body = to_bytes(response2.into_body(), usize::MAX).await.unwrap();
     let response_json: WasmModuleAddResponse = serde_json::from_slice(&body).unwrap();

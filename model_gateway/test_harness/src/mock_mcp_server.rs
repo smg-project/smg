@@ -188,7 +188,7 @@ impl MockSearchServer {
             .get("query")
             .and_then(|v| v.as_str())
             .unwrap_or("test");
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Mock search results for: {query}"
         ))]))
     }
@@ -199,7 +199,7 @@ impl MockSearchServer {
         Parameters(_params): Parameters<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             "Mock local search results",
         )]))
     }
@@ -259,7 +259,7 @@ impl MockSearchResponseServer {
                     }
                 });
 
-                Ok(CallToolResult::success(vec![Content::text(
+                Ok(CallToolResult::success(vec![ContentBlock::text(
                     embedded_payload.to_string(),
                 )]))
             }
@@ -269,10 +269,10 @@ impl MockSearchResponseServer {
 
 #[tool_handler]
 impl ServerHandler for MockSearchServer {
-    fn get_info(&self) -> ServerInfo {
-        // `ServerInfo`/`InitializeResult` is `#[non_exhaustive]` in rmcp 1.7;
+    fn get_info(&self) -> ServerConfig {
+        // `ServerConfig` (`InitializeResult`) is `#[non_exhaustive]` (since rmcp 1.7);
         // build via the constructor instead of a struct literal.
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions("Mock server for testing")
     }
@@ -351,8 +351,8 @@ impl MockFailingSearchServer {
 
 #[tool_handler]
 impl ServerHandler for MockFailingSearchServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions("Mock failing server for testing")
     }
@@ -368,8 +368,8 @@ impl ServerHandler for MockFailingSearchServer {
 
 #[tool_handler]
 impl ServerHandler for MockSearchResponseServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions("Mock search response server for testing")
     }

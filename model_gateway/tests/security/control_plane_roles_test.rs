@@ -153,10 +153,18 @@ async fn control_plane_role_matrix() {
             StatusCode::FORBIDDEN,
             "{method} {path} with the user key"
         );
-        assert_eq!(
-            status(&app, method, path, Some(ADMIN_KEY)).await,
-            StatusCode::OK,
-            "{method} {path} with the admin key"
+        // The gate passed, the route answers for itself (a reload with no
+        // file configured is a 409 here; its own test has the 200).
+        let admin = status(&app, method, path, Some(ADMIN_KEY)).await;
+        assert!(
+            !matches!(
+                admin,
+                StatusCode::UNAUTHORIZED
+                    | StatusCode::FORBIDDEN
+                    | StatusCode::NOT_FOUND
+                    | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "{method} {path} with the admin key passes the gate: {admin}"
         );
     }
 

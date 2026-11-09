@@ -4,6 +4,9 @@
 //! - POST /wasm - Add modules
 //! - DELETE /wasm/:uuid - Remove a module
 //! - GET /wasm - List all modules with metrics
+//!
+//! A refusal answers in the control plane's envelope (`{"error", "code"}`),
+//! the shape the worker routes use; a load's per-module results keep theirs.
 
 use std::{sync::Arc, time::Duration};
 
@@ -21,6 +24,7 @@ use crate::{
         WasmMetrics, WasmModuleAddRequest, WasmModuleAddResponse, WasmModuleAddResult,
         WasmModuleListResponse,
     },
+    worker::admin_json::{refusal, AdminJson},
     workflow::{
         job_queue::{Job, JobQueue},
         WasmModuleConfigRequest,
@@ -75,16 +79,34 @@ async fn wait_for_job_completion(
     }
 }
 
-pub async fn add_wasm_module(
+/// 503 in the envelope: the gateway runs without the WASM module manager.
+fn no_wasm_manager() -> Response {
+    refusal(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "SERVICE_UNAVAILABLE",
+        "The WASM module manager is not enabled on this gateway".to_string(),
+    )
+}
+
+/// 503 in the envelope: the job queue the module jobs run on is not up.
+fn no_job_queue() -> Response {
+    refusal(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "SERVICE_UNAVAILABLE",
+        "The job queue is not initialized".to_string(),
+    )
+}
+
+pub(crate) async fn add_wasm_module(
     State(state): State<Arc<AppState>>,
-    Json(config): Json<WasmModuleAddRequest>,
+    AdminJson(config): AdminJson<WasmModuleAddRequest>,
 ) -> Response {
     let Some(_) = state.context.wasm_manager.as_ref() else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return no_wasm_manager();
     };
 
     let Some(job_queue) = state.context.worker_job_queue.get() else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return no_job_queue();
     };
 
     let mut status = StatusCode::OK;
@@ -174,16 +196,38 @@ pub async fn remove_wasm_module(
     Path(module_uuid_str): Path<String>,
 ) -> Response {
     let Ok(module_uuid) = Uuid::parse_str(&module_uuid_str) else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return refusal(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            format!("'{module_uuid_str}' is not a module uuid"),
+        );
     };
 
-    let Some(_) = state.context.wasm_manager.as_ref() else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    let Some(wasm_manager) = state.context.wasm_manager.as_ref() else {
+        return no_wasm_manager();
     };
 
     let Some(job_queue) = state.context.worker_job_queue.get() else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return no_job_queue();
     };
+
+    match wasm_manager.get_module(module_uuid) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return refusal(
+                StatusCode::NOT_FOUND,
+                "WASM_MODULE_NOT_FOUND",
+                format!("No WASM module with uuid {module_uuid}"),
+            )
+        }
+        Err(e) => {
+            return refusal(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_SERVER_ERROR",
+                format!("Failed to read the module table: {e}"),
+            )
+        }
+    }
 
     use crate::workflow::WasmModuleRemovalRequest;
 
@@ -205,40 +249,49 @@ pub async fn remove_wasm_module(
                     (StatusCode::OK, "Module removed successfully").into_response(),
                     module_uuid.to_string(),
                 ),
-                Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+                Err(e) => refusal(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL_SERVER_ERROR",
+                    e,
+                ),
             }
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+        Err(e) => refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SERVICE_UNAVAILABLE",
             format!("Failed to submit job: {e}"),
-        )
-            .into_response(),
+        ),
     }
 }
 
 pub async fn list_wasm_modules(State(state): State<Arc<AppState>>) -> Response {
     let Some(wasm_manager) = state.context.wasm_manager.as_ref() else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return no_wasm_manager();
     };
-    let modules = wasm_manager.get_modules();
-    if let Ok(modules) = modules {
-        let (total, success, failed, total_time_ms, max_time_ms) = wasm_manager.get_metrics();
-        let average_execution_time_ms = if total > 0 {
-            Some(total_time_ms as f64 / total as f64)
-        } else {
-            None
-        };
-        let metrics = WasmMetrics {
-            total_executions: total,
-            successful_executions: success,
-            failed_executions: failed,
-            total_execution_time_ms: total_time_ms,
-            max_execution_time_ms: max_time_ms,
-            average_execution_time_ms,
-        };
-        let response = WasmModuleListResponse { modules, metrics };
-        (StatusCode::OK, Json(response)).into_response()
+    let modules = match wasm_manager.get_modules() {
+        Ok(modules) => modules,
+        Err(e) => {
+            return refusal(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_SERVER_ERROR",
+                format!("Failed to read the module table: {e}"),
+            )
+        }
+    };
+    let (total, success, failed, total_time_ms, max_time_ms) = wasm_manager.get_metrics();
+    let average_execution_time_ms = if total > 0 {
+        Some(total_time_ms as f64 / total as f64)
     } else {
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    }
+        None
+    };
+    let metrics = WasmMetrics {
+        total_executions: total,
+        successful_executions: success,
+        failed_executions: failed,
+        total_execution_time_ms: total_time_ms,
+        max_execution_time_ms: max_time_ms,
+        average_execution_time_ms,
+    };
+    let response = WasmModuleListResponse { modules, metrics };
+    (StatusCode::OK, Json(response)).into_response()
 }
