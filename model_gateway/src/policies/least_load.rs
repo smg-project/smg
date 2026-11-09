@@ -247,10 +247,42 @@ struct Candidate {
     /// Token-work and requests dispatched since the report's sample.
     since_poll_tokens: u64,
     since_poll_requests: u64,
-    /// The report's sample instant, and whether the tally holds dispatches
-    /// made at or before it: the decision's write phase releases those.
+    /// The report's sample instant, and whether the tally still holds
+    /// dispatches made at or before it for the decision's write phase to
+    /// release (a read under the held guard released them as it read).
     sampled_at: Option<Instant>,
     release: bool,
+}
+
+/// The credit of `url` as a read under the tally's read guard answers it:
+/// the dispatches the report reflects leave the credit and stay in the
+/// tally for the decision's write phase to release
+/// ([`SincePollDispatch::credit_after`]).
+fn credit_read(
+    tally: &HashMap<String, SincePollDispatch>,
+    url: &str,
+    sampled_at: Option<Instant>,
+) -> (u64, u64, bool) {
+    tally
+        .get(url)
+        .map_or((0, 0, false), |dispatch| dispatch.credit_after(sampled_at))
+}
+
+/// The credit of `url` as the guard held across a small decision answers
+/// it: the dispatches the report reflects are released as the credit is
+/// read ([`SincePollDispatch::release_through`]), one lookup per candidate,
+/// and nothing is left for the write phase.
+fn credit_released(
+    tally: &mut HashMap<String, SincePollDispatch>,
+    url: &str,
+    sampled_at: Option<Instant>,
+) -> (u64, u64, bool) {
+    tally.get_mut(url).map_or((0, 0, false), |dispatch| {
+        if let Some(sampled_at) = sampled_at {
+            dispatch.release_through(sampled_at);
+        }
+        (dispatch.tokens, dispatch.requests, false)
+    })
 }
 
 /// What the expected-wait score reads of one report.
@@ -378,24 +410,22 @@ impl LeastLoadPolicy {
     }
 
     /// One candidate as the decision reads it: one read of the snapshot and
-    /// one of the tally. The credit is read as it stands after the report's
-    /// sample: the dispatches made at or before it are the engine's by now
-    /// and leave the credit, the later ones stay
-    /// ([`SincePollDispatch::credit_after`]); the tally itself is released
-    /// by the decision's write phase.
+    /// one of the tally through `credit`, which answers `(tokens, requests,
+    /// release)` for the worker's url and its report's sample instant: the
+    /// dispatches made at or before the sample are the engine's by now and
+    /// leave the credit, the later ones stay. The two guard shapes answer it
+    /// differently ([`credit_read`], [`credit_released`]).
     fn resolve(
         &self,
         idx: usize,
         worker: &Arc<dyn Worker>,
         snapshot: Option<&LoadSnapshot>,
-        tally: &HashMap<String, SincePollDispatch>,
+        credit: &mut impl FnMut(&str, Option<Instant>) -> (u64, u64, bool),
     ) -> Candidate {
         let url = worker.url();
         let report = snapshot.and_then(|snapshot| snapshot.report(url));
         let sampled_at = report.map(|(_, sampled_at)| sampled_at);
-        let (since_poll_tokens, since_poll_requests, release) = tally
-            .get(url)
-            .map_or((0, 0, false), |dispatch| dispatch.credit_after(sampled_at));
+        let (since_poll_tokens, since_poll_requests, release) = credit(url, sampled_at);
         Candidate {
             idx,
             report: report.map(|(load, _)| self.report_facts(worker, load)),
@@ -429,9 +459,10 @@ impl LeastLoadPolicy {
             .tally
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut credit = |url: &str, sampled_at| credit_read(&tally, url, sampled_at);
         indices
             .iter()
-            .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &tally))
+            .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &mut credit))
             .collect()
     }
 
@@ -447,9 +478,8 @@ impl LeastLoadPolicy {
             .tally
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (tokens, requests, _) = tally.get(url).map_or((0, 0, false), |dispatch| {
-            dispatch.credit_after(report.map(|(_, sampled_at)| sampled_at))
-        });
+        let (tokens, requests, _) =
+            credit_read(&tally, url, report.map(|(_, sampled_at)| sampled_at));
         (report.is_some(), tokens, requests)
     }
 
@@ -721,33 +751,39 @@ impl LeastLoadPolicy {
         let snapshot = snapshot.as_deref();
 
         // Up to `HELD_GUARD_CANDIDATES` candidates one write guard is held
-        // across the decision: each candidate is read under it, the scoring
-        // is short, and a second guard handoff costs more than it frees.
-        // Above it each candidate is read once under the read guard, its
-        // report and its credit after the report's sample, every pass below
-        // scores from this with the guard released, and the write guard
-        // covers the release and the credit alone.
+        // across the decision: each candidate is read under it with the
+        // dispatches its report reflects released as they are read (one
+        // lookup per candidate), the scoring is short, and a second guard
+        // handoff costs more than it frees. Above it each candidate is read
+        // once under the read guard, its report and its credit after the
+        // report's sample, every pass below scores from this with the guard
+        // released, and the write guard covers the release and the credit
+        // alone.
         let mut held = (candidates.len() <= HELD_GUARD_CANDIDATES).then(|| {
             self.tally
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         });
         resolved.clear();
-        match held.as_deref() {
-            Some(tally) => resolved.extend(
-                candidates
-                    .iter()
-                    .map(|&idx| self.resolve(idx, &workers[idx], snapshot, tally)),
-            ),
+        match held.as_deref_mut() {
+            Some(tally) => {
+                let mut credit = |url: &str, sampled_at| credit_released(tally, url, sampled_at);
+                resolved.extend(
+                    candidates
+                        .iter()
+                        .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &mut credit)),
+                );
+            }
             None => {
                 let tally = self
                     .tally
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut credit = |url: &str, sampled_at| credit_read(&tally, url, sampled_at);
                 resolved.extend(
                     candidates
                         .iter()
-                        .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &tally)),
+                        .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &mut credit)),
                 );
             }
         }
@@ -813,9 +849,9 @@ impl LeastLoadPolicy {
         // token-work until its next poll refreshes the snapshot. Above
         // `HELD_GUARD_CANDIDATES` the write guard taken here covers the
         // release of the dispatches the reports read above reflect, and the
-        // credit; the guard held across a smaller decision covered the
-        // scores too. The key is allocated the first time a worker is
-        // dispatched to, never after.
+        // credit; the guard held across a smaller decision released as it
+        // read, so only the credit is left under it. The key is allocated
+        // the first time a worker is dispatched to, never after.
         let req_tokens = credit.map_or_else(|| self.request_tokens(info), |credit| credit(best));
         let mut tally = match held.take() {
             Some(guard) => guard,

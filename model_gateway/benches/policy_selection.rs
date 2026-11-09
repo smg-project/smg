@@ -190,11 +190,12 @@ fn fed_pool(policy: &dyn LoadBalancingPolicy, workers: usize) -> (TestFeed, Vec<
 
 /// One least-load decision over a fed pool: the eligibility walk, the expected-wait score of
 /// every candidate from its report and its since-report credit, the argmin with its tie draw,
-/// and the winner's credit. The request carries 1,024 token ids.
+/// and the winner's credit. The request carries 1,024 token ids. Four workers take the decision's
+/// held-guard shape, the larger pools its split shape.
 fn bench_least_load_decision(c: &mut Criterion) {
     let mut group = c.benchmark_group("least_load/decision");
     let tokens: Vec<u32> = (0..1_024).collect();
-    for workers in [8, 32, 128] {
+    for workers in [4, 8, 32, 128] {
         let policy = LeastLoadPolicy::new();
         let (_feed, pool) = fed_pool(&policy, workers);
         let info = SelectWorkerInfo {
