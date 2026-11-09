@@ -4,8 +4,9 @@
 //! virtual nodes. The registry reconciles one ring per model when workers are
 //! added or removed via [`HashRing::updated`], which rehashes only the URLs
 //! that changed — individual lookups only pay an `O(log n)` binary search plus
-//! a visited mark per worker, on the stack, to skip virtual-node duplicates.
-//! See [`HashRing::find_healthy_url`] for details.
+//! a visited mark per worker (on the stack up to 512 workers, one vector of
+//! words beyond) to skip virtual-node duplicates. See
+//! [`HashRing::find_healthy_url`] for details.
 //!
 //! The type intentionally has no dependency on the `Worker` trait — it is
 //! constructed from URLs — so policies and tests can build rings without
@@ -221,10 +222,11 @@ impl HashRing {
     /// (clockwise). Skips virtual nodes for workers already checked.
     ///
     /// Cost per call: `O(log n)` binary search to find the start position
-    /// plus a visited mark per worker, kept on the stack for a fleet of up
-    /// to `64 * INLINE_VISITED_WORDS` workers, to ask `is_healthy` once per
-    /// worker while walking clockwise over its virtual nodes. A keyed lookup
-    /// allocates nothing.
+    /// plus a visited mark per worker, to ask `is_healthy` once per worker
+    /// while walking clockwise over its virtual nodes. The marks sit on the
+    /// stack for a fleet of up to `64 * INLINE_VISITED_WORDS` workers, so
+    /// such a lookup allocates nothing; a larger fleet allocates one vector
+    /// of words per lookup.
     ///
     /// - `key`: The routing key to hash
     /// - `is_healthy`: Function to check if a worker URL is healthy
