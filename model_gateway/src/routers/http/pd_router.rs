@@ -96,6 +96,11 @@ use crate::{
 /// [`PDRouter::handle_server_selection_error`].
 type PdPair = (Arc<dyn Worker>, Arc<dyn Worker>);
 
+// A partially executed choice set must not be replayed by the outer retry
+// executor: a failed child terminates this original sampling request.
+#[derive(Clone, Copy)]
+struct MoriIoChoiceTerminal;
+
 /// The load one admitted PD request holds. The Prefill guard is released
 /// when the Prefill phase ends; the Decode guard rides on the response body.
 struct PdLoadGuards {
@@ -465,6 +470,10 @@ impl PDRouter {
     /// retrying it would only queue the request behind the same limit again.
     fn should_retry_pd_response(response: &Response) -> bool {
         is_retryable_response(response)
+            && response
+                .extensions()
+                .get::<MoriIoChoiceTerminal>()
+                .is_none()
             && !matches!(
                 error::extract_error_code_from_response(response),
                 PD_PREFILL_QUEUE_FULL | PD_PREFILL_QUEUE_TIMEOUT
@@ -703,7 +712,7 @@ impl PDRouter {
             // Retries disabled: one dispatch; the lease frees the parsed
             // request as soon as its serialized sides exist.
             let res = self
-                .execute_dual_dispatch_attempt(0, headers, &lease, context)
+                .execute_dual_dispatch_attempt(0, headers, &lease, context, false)
                 .await;
             // Mirror the retry executor's exhaustion accounting for a
             // retryable response that gets no retry.
@@ -722,8 +731,10 @@ impl PDRouter {
                     move |attempt: u32| {
                         let context = context.clone();
                         async move {
-                            self.execute_dual_dispatch_attempt(attempt, headers, lease, context)
-                                .await
+                            self.execute_dual_dispatch_attempt(
+                                attempt, headers, lease, context, false,
+                            )
+                            .await
                         }
                     }
                 },
@@ -790,6 +801,313 @@ impl PDRouter {
         response
     }
 
+    /// A single-prompt, buffered MoRI request uses one independently owned
+    /// n=1 PD dispatch per choice. Serial execution bounds active handoffs to
+    /// one and dropping this future cancels the current dispatch, not siblings
+    /// that have already returned or have not yet been submitted.
+    async fn execute_moriio_choices(
+        &self,
+        attempt: u32,
+        headers: Option<&HeaderMap>,
+        mut body: Value,
+        routing: RoutingDerivatives,
+        mut context: PDRequestContext<'_>,
+    ) -> Response {
+        // Chat's PdRoute uses batch_size for its sampling fanout n, not a
+        // batch of prompts. Each independent chat child is one conversation.
+        // Completions' actual prompt batch size remains unchanged/refused.
+        if context.route == "/v1/chat/completions" {
+            context.batch_size = None;
+        }
+        let n = body.get("n").and_then(Value::as_u64).unwrap_or(1);
+        if !(2..=128).contains(&n) {
+            // Match both public request types' existing validated n range.
+            return error::bad_request("moriio_fanout_unsupported", "n must be between 1 and 128");
+        }
+        let encoded = match serde_json::to_vec(&body) {
+            Ok(bytes) => bytes,
+            Err(error) => return Self::handle_serialization_error(error),
+        };
+        let mut checked = match RawBody::parse(&encoded) {
+            Ok(body) => body,
+            Err(error) => return Self::handle_serialization_error(error),
+        };
+        let one = match to_raw_value(&1) {
+            Ok(value) => value,
+            Err(error) => return Self::handle_serialization_error(error),
+        };
+        checked.insert("n", one);
+        if let Some(refusal) = Self::moriio_refusal(&context, headers, &checked) {
+            return *refusal;
+        }
+        // A seed identifies one engine's sampling sequence, and best_of ranks
+        // samples together. Independent engines cannot preserve either contract.
+        if context.is_stream
+            || body.get("return_audio").and_then(Value::as_bool) == Some(true)
+            || body.get("audio").is_some_and(|value| !value.is_null())
+            || body
+                .get("modalities")
+                .and_then(Value::as_array)
+                .is_some_and(|values| values.iter().any(|value| value == "audio"))
+            || ["seed", "best_of"]
+                .iter()
+                .any(|key| body.get(*key).is_some_and(|value| !value.is_null()))
+        {
+            return error::bad_request(
+                "moriio_fanout_unsupported",
+                "MoRI-IO independent choices require nonstream text/tool sampling without seed or best_of",
+            );
+        }
+        body["n"] = Value::from(1);
+        let mut answer: Option<Value> = None;
+        let mut response_parts = None;
+        for index in 0..n {
+            let child_id = format!("choice-{}", uuid::Uuid::now_v7().simple());
+            let mut child_headers = headers.cloned().unwrap_or_default();
+            let child_header = match HeaderValue::from_str(&child_id) {
+                Ok(value) => value,
+                Err(_) => return Self::invalid_moriio_choice(),
+            };
+            child_headers.insert("x-request-id", child_header);
+            let mut child = body.clone();
+            child["request_id"] = Value::String(child_id);
+            let child_lease = RequestLease::new(
+                child,
+                RoutingDerivatives {
+                    tokens: routing.tokens.clone(),
+                    text: routing.text.clone(),
+                    rid_key: routing.rid_key.clone(),
+                    cache_namespace: routing.cache_namespace,
+                },
+                ReleasePoint::AfterDispatch,
+            );
+            let mut child_context = context.clone();
+            child_context.headers = Some(child_headers.clone());
+            let response = self
+                .execute_dual_dispatch_attempt(
+                    attempt,
+                    Some(&child_headers),
+                    &child_lease,
+                    child_context,
+                    true,
+                )
+                .await;
+            if response.status() != StatusCode::OK {
+                return response;
+            }
+            let (parts, response_body) = response.into_parts();
+            let bytes = match axum::body::to_bytes(response_body, usize::MAX).await {
+                Ok(bytes) => bytes,
+                Err(_) => return Self::invalid_moriio_choice(),
+            };
+            let child: Value = match serde_json::from_slice(&bytes) {
+                Ok(value) => value,
+                Err(_) => return Self::invalid_moriio_choice(),
+            };
+            let expected_model = if context.model_id == UNKNOWN_MODEL_ID {
+                body.get("model").and_then(Value::as_str)
+            } else {
+                Some(context.model_id)
+            };
+            if child.get("model").and_then(Value::as_str) != expected_model
+                || Self::append_moriio_choice(&mut answer, child, context.route, index).is_err()
+            {
+                return Self::invalid_moriio_choice();
+            }
+            response_parts.get_or_insert(parts);
+        }
+        let (Some(answer), Some(mut parts)) = (answer, response_parts) else {
+            return Self::invalid_moriio_choice();
+        };
+        // The first child's wire length/encoding is not the aggregate's.
+        for name in ["content-length", "content-encoding", "transfer-encoding"] {
+            parts.headers.remove(name);
+        }
+        parts
+            .headers
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        match serde_json::to_vec(&answer) {
+            Ok(bytes) => Response::from_parts(parts, Body::from(bytes)),
+            Err(error) => Self::handle_serialization_error(error),
+        }
+    }
+
+    fn invalid_moriio_choice() -> Response {
+        error::bad_gateway(
+            "moriio_choice_invalid",
+            "MoRI-IO child returned an invalid or incompatible completion",
+        )
+    }
+
+    /// Sum only completion-side counters; prompt-side counters describe the
+    /// original prompt once. Reject inconsistent/unknown shapes instead of
+    /// silently undercounting, overflowing or inventing token usage.
+    fn sum_choice_counters(total: &mut Value, next: &Value) -> Result<(), ()> {
+        match (total, next) {
+            (Value::Null, Value::Null) => Ok(()),
+            (Value::Number(left), Value::Number(right)) => {
+                let sum = left
+                    .as_u64()
+                    .and_then(|a| right.as_u64().and_then(|b| a.checked_add(b)))
+                    .ok_or(())?;
+                if sum > u64::from(u32::MAX) {
+                    return Err(());
+                }
+                *left = sum.into();
+                Ok(())
+            }
+            (Value::Object(left), Value::Object(right)) if left.len() == right.len() => {
+                for (key, value) in left {
+                    Self::sum_choice_counters(value, right.get(key).ok_or(())?)?;
+                }
+                Ok(())
+            }
+            _ => Err(()),
+        }
+    }
+
+    fn append_moriio_choice(
+        aggregate: &mut Option<Value>,
+        mut child: Value,
+        route: &str,
+        index: u64,
+    ) -> Result<(), ()> {
+        let valid_schema = if route == "/v1/completions" {
+            serde_json::from_value::<openai_protocol::completion::CompletionResponse>(child.clone())
+                .is_ok()
+        } else {
+            serde_json::from_value::<openai_protocol::chat::ChatCompletionResponse>(child.clone())
+                .is_ok()
+        };
+        if !valid_schema {
+            return Err(());
+        }
+        let object = child.as_object_mut().ok_or(())?;
+        let expected_object = if route == "/v1/completions" {
+            "text_completion"
+        } else {
+            "chat.completion"
+        };
+        if object.get("object").and_then(Value::as_str) != Some(expected_object)
+            || object
+                .get("id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || object
+                .get("model")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || object.get("created").and_then(Value::as_u64).is_none()
+            || object.get("error").is_some_and(|value| !value.is_null())
+        {
+            return Err(());
+        }
+        let choices = object
+            .get_mut("choices")
+            .and_then(Value::as_array_mut)
+            .ok_or(())?;
+        if choices.len() != 1 {
+            return Err(());
+        }
+        let choice = choices[0].as_object_mut().ok_or(())?;
+        if choice.get("index").and_then(Value::as_u64) != Some(0)
+            || !matches!(
+                choice.get("finish_reason").and_then(Value::as_str),
+                Some("stop" | "length" | "tool_calls" | "function_call" | "content_filter")
+            )
+        {
+            return Err(());
+        }
+        if route == "/v1/completions" {
+            if choice.get("text").and_then(Value::as_str).is_none() {
+                return Err(());
+            }
+        } else {
+            let message = choice.get("message").and_then(Value::as_object).ok_or(())?;
+            if message.get("role").and_then(Value::as_str) != Some("assistant")
+                || !(message
+                    .get("content")
+                    .is_some_and(|v| v.is_string() || v.is_null()))
+                || (message.get("content").is_none_or(Value::is_null)
+                    && !message.get("tool_calls").is_some_and(Value::is_array)
+                    && !message.get("function_call").is_some_and(Value::is_object)
+                    && !message
+                        .get("reasoning_content")
+                        .is_some_and(Value::is_string)
+                    && !message.get("refusal").is_some_and(Value::is_string)
+                    && choice.get("finish_reason").and_then(Value::as_str)
+                        != Some("content_filter"))
+            {
+                return Err(());
+            }
+        }
+        choice.insert("index".into(), index.into());
+        if let Some(usage) = object.get("usage").filter(|value| !value.is_null()) {
+            let prompt = usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .ok_or(())?;
+            let completion = usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .ok_or(())?;
+            if prompt.checked_add(completion) != usage.get("total_tokens").and_then(Value::as_u64) {
+                return Err(());
+            }
+        }
+        if let Some(total) = aggregate {
+            if ["model", "object", "system_fingerprint", "service_tier"]
+                .iter()
+                .any(|key| total.get(*key) != child.get(*key))
+            {
+                return Err(());
+            }
+            match (total.get_mut("usage"), child.get("usage")) {
+                (Some(Value::Object(left)), Some(Value::Object(right)))
+                    if left.len() == right.len() =>
+                {
+                    for (key, value) in left.iter_mut() {
+                        let next = right.get(key).ok_or(())?;
+                        match key.as_str() {
+                            "completion_tokens" | "completion_tokens_details" => {
+                                Self::sum_choice_counters(value, next)?
+                            }
+                            // Prompt accounting follows the first child's
+                            // prefill once, as one n-choice request does. Later
+                            // recomputation/cache hits are not extra prompts.
+                            "total_tokens" | "prompt_tokens_details" => {}
+                            _ if value == next => {}
+                            _ => return Err(()),
+                        }
+                    }
+                    let prompt = left
+                        .get("prompt_tokens")
+                        .and_then(Value::as_u64)
+                        .ok_or(())?;
+                    let completion = left
+                        .get("completion_tokens")
+                        .and_then(Value::as_u64)
+                        .ok_or(())?;
+                    let tokens = prompt
+                        .checked_add(completion)
+                        .filter(|sum| *sum <= u64::from(u32::MAX))
+                        .ok_or(())?;
+                    left.insert("total_tokens".into(), tokens.into());
+                }
+                (None, None) | (Some(Value::Null), Some(Value::Null)) => {}
+                _ => return Err(()),
+            }
+            total
+                .get_mut("choices")
+                .and_then(Value::as_array_mut)
+                .ok_or(())?
+                .push(child["choices"][0].clone());
+        } else {
+            *aggregate = Some(child);
+        }
+        Ok(())
+    }
+
     /// One PD dispatch attempt: select the pair, lease-serialize the
     /// per-side bodies, dispatch, and record per-attempt worker outcomes.
     async fn execute_dual_dispatch_attempt<T: Serialize>(
@@ -798,7 +1116,9 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
         lease: &RequestLease<T>,
         context: PDRequestContext<'_>,
+        moriio_child: bool,
     ) -> Response {
+        let attempt_started = tokio::time::Instant::now();
         // Admission may queue the request, so the selection inputs are copied
         // out of the lease's synchronous view first.
         let (text, tokens, rid_key, cache_namespace) = lease.with_view(|view| {
@@ -840,6 +1160,13 @@ impl PDRouter {
             decode.redacted_url()
         );
 
+        if moriio_child && !is_moriio_worker(decode.as_ref()) {
+            return error::service_unavailable(
+                "moriio_choice_pair_changed",
+                "an independent MoRI-IO choice requires a MoRI-IO pair",
+            );
+        }
+
         // Dispatch-time re-check of both sides, the same one the regular HTTP
         // and gRPC paths take just before their load guards.
         let shedding = self.worker_registry.overload_shed_enabled();
@@ -867,6 +1194,64 @@ impl PDRouter {
             } else {
                 connector_mode_for_worker(prefill.as_ref())
             };
+            if mode == KvConnectorMode::MoriIo {
+                let fanout = lease.with_view(|view| {
+                    serde_json::to_value(view.request).map(|body| {
+                        let routing = RoutingDerivatives {
+                            tokens: view.tokens.map(Vec::from),
+                            text: view.text.map(str::to_string),
+                            rid_key: view.rid_key.map(str::to_string),
+                            cache_namespace: view.cache_namespace,
+                        };
+                        (body, routing)
+                    })
+                });
+                let (body, routing) = match fanout {
+                    Ok(value) => value,
+                    Err(error) => return Self::handle_serialization_error(error),
+                };
+                if body.get("n").and_then(Value::as_u64).unwrap_or(1) > 1 {
+                    // Each child selects/adopts its own guards and mints its own
+                    // handoff. Never retain the provisional parent's admission
+                    // while trying to acquire a child (a one-slot queue deadlock).
+                    // Registration resolves this metadata for ALL workers
+                    // from the same HTTP pool/router timeout as their clients
+                    // (create_worker), despite the historical ZMQ field name.
+                    // One deadline covers selection and ALL serial children;
+                    // each child must not get a fresh parent-sized allowance.
+                    let timeout = prefill
+                        .metadata()
+                        .zmq_request_timeout
+                        .into_iter()
+                        .chain(decode.metadata().zmq_request_timeout)
+                        .min();
+                    drop(guards);
+                    lease.release_dispatch();
+                    let fanout = Box::pin(
+                        self.execute_moriio_choices(attempt, headers, body, routing, context),
+                    );
+                    let mut response = if let Some(timeout) = timeout {
+                        match attempt_started.checked_add(timeout) {
+                            Some(deadline) => match tokio::time::timeout_at(deadline, fanout).await
+                            {
+                                Ok(response) => response,
+                                Err(_) => request_timeout_response(
+                                    "MoRI-IO choices exceeded the request deadline",
+                                ),
+                            },
+                            None => {
+                                request_timeout_response("MoRI-IO request deadline is out of range")
+                            }
+                        }
+                    } else {
+                        // An explicitly unbounded registration retains that
+                        // policy; client cancellation still drops this future.
+                        fanout.await
+                    };
+                    response.extensions_mut().insert(MoriIoChoiceTerminal);
+                    return response;
+                }
+            }
             let moriio_endpoints = match mode {
                 KvConnectorMode::MoriIo => {
                     match Self::moriio_pair(prefill.as_ref(), decode.as_ref()) {
@@ -4746,6 +5131,433 @@ mod tests {
         (spawn_stub(app).await, seen)
     }
 
+    fn choice_reply(body: &Value, route: &str) -> Value {
+        let mut choice = if route == "/v1/completions" {
+            json!({"index": 0, "text": "a valid choice", "finish_reason": "stop", "logprobs": null})
+        } else {
+            json!({"index": 0, "message": {"role": "assistant", "content": "a valid choice"}, "finish_reason": "stop", "logprobs": null})
+        };
+        if body
+            .get("logprobs")
+            .is_some_and(|value| !value.is_null() && value != &Value::Bool(false))
+        {
+            choice["logprobs"] = if route == "/v1/completions" {
+                json!({"tokens": ["a"], "token_logprobs": [-0.1], "top_logprobs": [null], "text_offset": [0]})
+            } else {
+                json!({"content": [{"token": "a", "logprob": -0.1, "bytes": [97], "top_logprobs": []}], "refusal": null})
+            };
+        }
+        json!({
+            "id": body["request_id"], "created": 1, "model": "m",
+            "object": if route == "/v1/completions" { "text_completion" } else { "chat.completion" },
+            "choices": [choice],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 0},
+                "completion_tokens_details": {"reasoning_tokens": 1}},
+        })
+    }
+
+    async fn spawn_choice_decode_stub(fault: Option<&'static str>) -> (String, Seen) {
+        let seen: Seen = Arc::default();
+        let log = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(axum::routing::any(move |req: Request| {
+            let log = Arc::clone(&log);
+            async move {
+                let route = req.uri().path().to_string();
+                let id = req
+                    .headers()
+                    .get("x-request-id")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let mut body: Value = serde_json::from_slice(&bytes).unwrap();
+                body["test_header_id"] = json!(id);
+                let index = {
+                    let mut log = log.lock().unwrap();
+                    log.push((route.clone(), body.clone()));
+                    log.len()
+                };
+                let mut reply = choice_reply(&body, &route);
+                if index == 2 {
+                    match fault {
+                        Some("raw") => return (StatusCode::OK, "not JSON").into_response(),
+                        Some("http") => {
+                            return (StatusCode::BAD_GATEWAY, "child failed").into_response()
+                        }
+                        Some("index") => reply["choices"][0]["index"] = json!(1),
+                        Some("finish") => reply["choices"][0]["finish_reason"] = Value::Null,
+                        Some("model") => reply["model"] = json!("other-model"),
+                        Some("schema") => {
+                            reply["choices"][0]["message"] = json!({"role": "user", "content": 42})
+                        }
+                        Some("count") => reply["choices"] = json!([]),
+                        Some("total") => reply["usage"]["total_tokens"] = json!(8),
+                        Some("details") => {
+                            reply["usage"]["completion_tokens_details"] =
+                                json!({"reasoning_tokens": "bad"})
+                        }
+                        Some("missing_usage") => {
+                            reply.as_object_mut().unwrap().remove("usage");
+                        }
+                        _ => {}
+                    }
+                }
+                axum::Json(reply).into_response()
+            }
+        }));
+        (spawn_stub(app).await, seen)
+    }
+
+    fn assert_moriio_guards_released(router: &PDRouter) {
+        for worker in router
+            .worker_registry
+            .get_prefill_workers()
+            .iter()
+            .chain(router.worker_registry.get_decode_workers().iter())
+        {
+            assert_eq!(worker.load(), 0, "request load guard leaked");
+        }
+    }
+
+    #[tokio::test]
+    async fn moriio_independent_choices_keep_handoffs_and_aggregate_usage() {
+        for (mode, concurrent) in [("read", false), ("write", false), ("write", true)] {
+            for (route, n) in [("/v1/completions", 4), ("/v1/chat/completions", 3)] {
+                let (prefill_url, prefill_seen) =
+                    spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+                let (decode_url, decode_seen) = spawn_choice_decode_stub(None).await;
+                let router = create_test_pd_router();
+                let labels = if concurrent {
+                    vec![CONCURRENT_WRITE]
+                } else if mode == "write" {
+                    vec![("moriio_write_dispatch", "sequential")]
+                } else {
+                    vec![]
+                };
+                register_moriio_pair_with(
+                    &router,
+                    (prefill_url, Some(mode)),
+                    (decode_url, mode),
+                    &labels,
+                );
+                let response =
+                    moriio_call(&router, route, None, &json!({"n": n, "temperature": 0.8, "logprobs": if route == "/v1/completions" { json!(1) } else { json!(true) }})).await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{mode}/{concurrent}/{route}"
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let answer: Value = serde_json::from_slice(&bytes).unwrap();
+                let choices = answer["choices"].as_array().unwrap();
+                assert_eq!(choices.len(), n);
+                for (index, choice) in choices.iter().enumerate() {
+                    assert_eq!(choice["index"], json!(index));
+                    assert_eq!(choice["finish_reason"], "stop");
+                    assert!(
+                        !choice["logprobs"].is_null(),
+                        "preserve actual child logprobs"
+                    );
+                }
+                assert_eq!(answer["usage"]["prompt_tokens"], 5);
+                assert_eq!(answer["usage"]["completion_tokens"], json!(2 * n));
+                assert_eq!(answer["usage"]["total_tokens"], json!(5 + 2 * n));
+                assert_eq!(
+                    answer["usage"]["completion_tokens_details"]["reasoning_tokens"],
+                    json!(n)
+                );
+                let prefill = prefill_seen.lock().unwrap();
+                let decode = decode_seen.lock().unwrap();
+                assert_eq!(prefill.len(), n);
+                assert_eq!(decode.len(), n);
+                let mut identities = std::collections::HashSet::new();
+                let mut transfers = std::collections::HashSet::new();
+                for ((_, p), (_, d)) in prefill.iter().zip(decode.iter()) {
+                    assert_eq!(p["n"], 1);
+                    assert_eq!(d["n"], 1);
+                    assert_eq!(p["request_id"], d["request_id"]);
+                    assert_eq!(d["test_header_id"], d["request_id"]);
+                    assert!(identities.insert(d["request_id"].as_str().unwrap()));
+                    assert_eq!(
+                        p["kv_transfer_params"]["transfer_id"],
+                        d["kv_transfer_params"]["transfer_id"]
+                    );
+                    assert!(
+                        transfers.insert(d["kv_transfer_params"]["transfer_id"].as_str().unwrap())
+                    );
+                    assert!((d["temperature"].as_f64().unwrap() - 0.8).abs() < 1e-6);
+                    assert_ne!(d["kv_transfer_params"]["remote_host"], "client-chosen");
+                }
+                assert_moriio_guards_released(&router);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn moriio_independent_choices_never_return_partial_success() {
+        for fault in [
+            "raw",
+            "http",
+            "index",
+            "finish",
+            "model",
+            "schema",
+            "count",
+            "total",
+            "details",
+            "missing_usage",
+        ] {
+            let (prefill_url, prefill_seen) = spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+            let (decode_url, decode_seen) = spawn_choice_decode_stub(Some(fault)).await;
+            let mut router = create_test_pd_router();
+            router.retry_config.max_retries = 3;
+            register_moriio_pair(&router, (prefill_url, Some("read")), (decode_url, "read"));
+            let response =
+                moriio_call(&router, "/v1/chat/completions", None, &json!({"n": 4})).await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{fault}");
+            assert_eq!(
+                decode_seen.lock().unwrap().len(),
+                2,
+                "no child after failure/{fault}"
+            );
+            assert_eq!(prefill_seen.lock().unwrap().len(), 2);
+            assert_moriio_guards_released(&router);
+        }
+    }
+
+    #[tokio::test]
+    async fn moriio_independent_choices_preserve_unsupported_combinations() {
+        for extra in [
+            json!({"n": 4, "seed": 7}),
+            json!({"n": 4, "best_of": 8}),
+            json!({"n": 4, "stream": true}),
+            json!({"n": 129}),
+        ] {
+            let (prefill_url, prefill_seen) = spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+            let (decode_url, decode_seen) = spawn_choice_decode_stub(None).await;
+            let router = create_test_pd_router();
+            register_moriio_pair(&router, (prefill_url, Some("write")), (decode_url, "write"));
+            let response = moriio_call(&router, "/v1/completions", None, &extra).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(prefill_seen.lock().unwrap().is_empty());
+            assert!(decode_seen.lock().unwrap().is_empty());
+            assert_moriio_guards_released(&router);
+        }
+        // The new restrictions are not applied to the existing n=1 path.
+        let (prefill_url, _) = spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+        let (decode_url, seen) = spawn_choice_decode_stub(None).await;
+        let router = create_test_pd_router();
+        register_moriio_pair(&router, (prefill_url, Some("read")), (decode_url, "read"));
+        // Stub records headers, so supply the same normal request-id that an
+        // ordinary caller can provide; no new id semantics on this n=1 path.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("existing-n1"));
+        assert_eq!(
+            moriio_call(
+                &router,
+                "/v1/completions",
+                Some(&headers),
+                &json!({"n": 1, "seed": 7})
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn moriio_choice_usage_and_schema_are_checked_before_aggregation() {
+        let first = choice_reply(&json!({"request_id": "one"}), "/v1/completions");
+        let mut second = first.clone();
+        second["usage"]["prompt_tokens_details"]["cached_tokens"] = json!(5);
+        let mut aggregate = None;
+        PDRouter::append_moriio_choice(&mut aggregate, first.clone(), "/v1/completions", 0)
+            .unwrap();
+        PDRouter::append_moriio_choice(&mut aggregate, second, "/v1/completions", 1).unwrap();
+        let aggregate = aggregate.unwrap();
+        assert_eq!(
+            aggregate["usage"]["prompt_tokens_details"]["cached_tokens"], 0,
+            "account original prompt once, using first prefill"
+        );
+        assert_eq!(aggregate["usage"]["total_tokens"], 9);
+        for mutation in [
+            json!({"prompt_tokens": 6, "completion_tokens": 2, "total_tokens": 8}),
+            json!({"prompt_tokens": 5, "completion_tokens": 4294967290_u32, "total_tokens": 4294967295_u32}),
+        ] {
+            let mut aggregate = None;
+            PDRouter::append_moriio_choice(&mut aggregate, first.clone(), "/v1/completions", 0)
+                .unwrap();
+            let mut invalid = first.clone();
+            invalid["usage"]
+                .as_object_mut()
+                .unwrap()
+                .extend(mutation.as_object().unwrap().clone());
+            assert!(
+                PDRouter::append_moriio_choice(&mut aggregate, invalid, "/v1/completions", 1)
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn moriio_independent_choices_cancel_or_timeout_closes_current_child() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        for cancel in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+            let server = tokio::spawn(async move {
+                for index in 0..2 {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut stream = BufReader::new(socket);
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        stream.read_line(&mut line).await.unwrap();
+                        assert!(!line.is_empty());
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((key, value)) = line.split_once(':') {
+                            if key.eq_ignore_ascii_case("content-length") {
+                                length = value.trim().parse().unwrap();
+                            }
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    stream.read_exact(&mut body).await.unwrap();
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    entered_tx.send(index).unwrap();
+                    if index == 0 {
+                        let reply =
+                            serde_json::to_vec(&choice_reply(&body, "/v1/completions")).unwrap();
+                        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.len()).as_bytes()).await.unwrap();
+                        stream.write_all(&reply).await.unwrap();
+                        stream.shutdown().await.unwrap();
+                    } else {
+                        // The second engine request holds its response open.
+                        // A dropped/expired parent must close the real socket.
+                        let mut byte = [0];
+                        assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+                    }
+                }
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err(),
+                    "future third child must not be dispatched"
+                );
+            });
+            let (prefill_url, prefill_seen) = spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+            let router = Arc::new(create_test_pd_router());
+            register_moriio_pair_with_bound(
+                &router,
+                (prefill_url, Some("read")),
+                (url, "read"),
+                &[],
+                Some(std::time::Duration::from_secs(2)),
+            );
+            let task_router = Arc::clone(&router);
+            let task = tokio::spawn(async move {
+                moriio_call(&task_router, "/v1/completions", None, &json!({"n": 4})).await
+            });
+            tokio::time::timeout(ROUND_TRIP_GUARD, async {
+                assert_eq!(entered_rx.recv().await, Some(0));
+                assert_eq!(entered_rx.recv().await, Some(1));
+                if cancel {
+                    task.abort();
+                    assert!(task.await.unwrap_err().is_cancelled());
+                } else {
+                    assert_eq!(task.await.unwrap().status(), StatusCode::GATEWAY_TIMEOUT);
+                }
+                server.await.unwrap();
+            })
+            .await
+            .unwrap();
+            assert_eq!(prefill_seen.lock().unwrap().len(), 2);
+            assert_moriio_guards_released(&router);
+        }
+    }
+
+    #[test]
+    fn moriio_independent_choices_allow_reasoning_only_typed_responses() {
+        let mut child = choice_reply(&json!({"request_id": "reasoning"}), "/v1/chat/completions");
+        child["choices"][0]["message"]["content"] = Value::Null;
+        child["choices"][0]["message"]["reasoning_content"] =
+            json!("reasoning token budget exhausted");
+        child["choices"][0]["finish_reason"] = json!("length");
+        let mut total = None;
+        PDRouter::append_moriio_choice(&mut total, child, "/v1/chat/completions", 0).unwrap();
+        assert_eq!(
+            total.unwrap()["choices"][0]["message"]["content"],
+            Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn moriio_independent_choices_stop_on_missing_or_foreign_handoff() {
+        for fault in [StubHandoff::Missing, StubHandoff::Foreign] {
+            let (prefill_url, seen) = spawn_moriio_prefill_stub(fault).await;
+            let (decode_url, decode_seen) = spawn_choice_decode_stub(None).await;
+            let router = create_test_pd_router();
+            register_moriio_pair(&router, (prefill_url, Some("read")), (decode_url, "read"));
+            assert_eq!(
+                moriio_call(&router, "/v1/completions", None, &json!({"n": 4}))
+                    .await
+                    .status(),
+                StatusCode::BAD_GATEWAY
+            );
+            assert_eq!(seen.lock().unwrap().len(), 1);
+            assert!(decode_seen.lock().unwrap().is_empty());
+            assert_moriio_guards_released(&router);
+        }
+    }
+
+    #[tokio::test]
+    async fn moriio_independent_choices_validate_canonical_model_for_alias() {
+        let (prefill_url, _) = spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+        let (decode_url, seen) = spawn_choice_decode_stub(None).await;
+        let router = create_test_pd_router();
+        register_moriio_pair(&router, (prefill_url, Some("read")), (decode_url, "read"));
+        let workers: Vec<_> = router
+            .worker_registry
+            .get_prefill_workers()
+            .iter()
+            .chain(router.worker_registry.get_decode_workers().iter())
+            .cloned()
+            .collect();
+        for worker in workers {
+            let updated = BasicWorkerBuilder::from_spec((*worker.metadata().spec).clone())
+                .model(ModelCard::new("m").with_alias("client-alias"))
+                .runtime_type(RuntimeType::Vllm)
+                .build();
+            updated.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router
+                .worker_registry
+                .register_or_replace(Arc::new(updated));
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "client-alias", "n": 3, "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap();
+        let response = router
+            .route_chat(None, &tenant, request, "client-alias")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        for (_, body) in seen.lock().unwrap().iter() {
+            assert_eq!(body["model"], "m");
+        }
+        assert_moriio_guards_released(&router);
+    }
+
     /// Register a MoRI-IO pair; a `None` prefill mode registers a prefill
     /// worker without any KV connector.
     fn register_moriio_pair(
@@ -4761,9 +5573,19 @@ mod tests {
     /// As [`register_moriio_pair`], with extra labels on the decode worker.
     fn register_moriio_pair_with(
         router: &PDRouter,
+        prefill: (String, Option<&str>),
+        decode: (String, &str),
+        decode_labels: &[(&str, &str)],
+    ) {
+        register_moriio_pair_with_bound(router, prefill, decode, decode_labels, None);
+    }
+
+    fn register_moriio_pair_with_bound(
+        router: &PDRouter,
         (prefill_url, prefill_mode): (String, Option<&str>),
         (decode_url, decode_mode): (String, &str),
         decode_labels: &[(&str, &str)],
+        timeout: Option<std::time::Duration>,
     ) {
         let mut prefill = BasicWorkerBuilder::new(prefill_url)
             .worker_type(WorkerType::Prefill)
@@ -4784,6 +5606,10 @@ mod tests {
             .label("tp_size", "4");
         for (key, value) in decode_labels {
             decode = decode.label(*key, *value);
+        }
+        if let Some(timeout) = timeout {
+            prefill = prefill.zmq_request_timeout(timeout);
+            decode = decode.zmq_request_timeout(timeout);
         }
         for worker in [prefill.build(), decode.build()] {
             worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
@@ -5284,12 +6110,12 @@ mod tests {
                 "moriio_request_id_reserved",
             ),
             (
-                "n>1",
+                "streaming n>1",
                 Some("write"),
                 "write",
                 chat,
                 None,
-                json!({"n": 2}),
+                json!({"n": 2, "stream": true}),
                 StatusCode::BAD_REQUEST,
                 "moriio_fanout_unsupported",
             ),

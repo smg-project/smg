@@ -916,8 +916,6 @@ class TestPDTopology:
         # the gateway's dispatch log is read below.
         for _ in range(4):
             mock_answers.enqueue("red, yellow and blue.", prompt_contains="primary colors")
-        if _moriio_lane():
-            pytest.skip("MoRI-IO n>1 handoff is unsupported; refusal is tested separately")
         if mode == "pd_http" and is_sglang():
             # The shape the gRPC fan-out fixed: the HTTP PD router mints one
             # room for a single-prompt request whatever ``n`` is, the engine
@@ -946,6 +944,7 @@ class TestPDTopology:
         assert resp.status_code == 200, f"{resp.status_code} {resp.text[:300]}"
         choices = resp.json().get("choices", [])
         assert len(choices) == 4, f"expected 4 choices, got {len(choices)}"
+        assert sorted(c.get("index") for c in choices) == list(range(4)), choices
         assert all(c.get("text", "").strip() for c in choices), f"empty choice in {choices}"
         if get_runtime() == "mock" and mode != "pd_http":
             # The fan-out itself: one single-sample child per choice under
@@ -955,14 +954,14 @@ class TestPDTopology:
             # prompt and serves the four choices itself.
             _wait_for_fanout(resp.json()["id"], 4)
 
-    def test_moriio_fanout_is_explicitly_refused(self, setup_backend):
-        """Unsupported fanout must fail explicitly, without claiming choice delivery."""
+    def test_moriio_streaming_fanout_is_explicitly_refused(self, setup_backend):
+        """Streaming fanout remains unsupported; buffered choices are tested above."""
         if not _moriio_lane():
             pytest.skip("MoRI-IO capability contract only")
         _, model, _, gateway = setup_backend
         resp = httpx.post(
             f"{gateway.base_url}/v1/completions",
-            json={"model": model, "prompt": "The three primary colors are", "n": 4},
+            json={"model": model, "prompt": "The three primary colors are", "n": 4, "stream": True},
             timeout=60.0,
         )
         assert resp.status_code == 400, f"{resp.status_code} {resp.text[:300]}"
