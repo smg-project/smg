@@ -114,4 +114,4 @@ def test_every_mode_has_a_prompt_and_a_closed_schema():
 
 def test_every_job_runs_on_the_review_runner_set(workflow):
     for name, job in workflow["jobs"].items():
-        assert "ai-review-cpu" in job["runs-on"], name
+        assert "k8s-runner-cpu" in job["runs-on"], name

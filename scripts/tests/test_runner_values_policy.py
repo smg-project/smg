@@ -1,4 +1,4 @@
-"""The committed runner values carry no credentials, and the review set carries no Docker."""
+"""The committed runner values carry no API key, and only the dind sidecar is privileged."""
 
 from pathlib import Path
 
@@ -7,7 +7,7 @@ import yaml
 
 RESOURCES = Path(__file__).resolve().parents[2] / "scripts/k8s-runner-resources"
 VALUES = sorted(RESOURCES.glob("runner-values-*.yaml"))
-REVIEW = RESOURCES / "runner-values-ai-review-cpu.yaml"
+CPU = RESOURCES / "runner-values-cpu.yaml"
 
 
 def containers(values):
@@ -25,7 +25,7 @@ def test_no_runner_values_file_puts_an_api_key_in_the_environment(path):
     for container in containers(yaml.safe_load(path.read_text())):
         for env in container.get("env") or []:
             name = env["name"]
-            if name in ALLOWED_CREDENTIALS and path != REVIEW:
+            if name in ALLOWED_CREDENTIALS and path != CPU:
                 continue
             assert not any(word in name for word in ("KEY", "TOKEN", "SECRET", "PASSWORD")), (
                 f"{path.name}: {container['name']} carries {name}"
@@ -39,15 +39,13 @@ def test_only_a_dind_sidecar_may_be_privileged(path):
         assert not privileged or container["name"] == "dind", f"{path.name}: {container['name']}"
 
 
-def test_the_review_set_has_no_docker_and_no_privilege():
-    values = yaml.safe_load(REVIEW.read_text())
-    assert values["runnerScaleSetName"] == "ai-review-cpu"
-    assert values["githubConfigUrl"] == "https://github.com/smg-project/smg"
-    spec = values["template"]["spec"]
-    assert "initContainers" not in spec
-    assert [c["name"] for c in spec["containers"]] == ["runner"]
-    runner = spec["containers"][0]
-    assert runner["env"] == []
-    assert runner["securityContext"]["privileged"] is False
-    assert runner["securityContext"]["runAsNonRoot"] is True
-    assert all("dind" not in v["name"] for v in spec["volumes"])
+def test_the_cpu_set_the_reviews_run_on_carries_no_credential_at_all():
+    values = yaml.safe_load(CPU.read_text())
+    assert values["runnerScaleSetName"] == "k8s-runner-cpu"
+    runner = next(c for c in values["template"]["spec"]["containers"] if c["name"] == "runner")
+    assert [e["name"] for e in runner["env"]] == [
+        "DOCKER_HOST",
+        "RUNNER_WAIT_FOR_DOCKER_IN_SECONDS",
+    ]
+    assert not (runner.get("securityContext") or {}).get("privileged")
+    assert values["maxRunners"] == 48

@@ -26,7 +26,7 @@ COMPONENTS = (
     (".github/workflows/claude-code-review.yml", "scripts/tests/test_claude_review_workflow.py"),
     ("scripts/ci_anthropic_proxy.py", "scripts/tests/test_ci_anthropic_proxy.py"),
     (
-        "scripts/k8s-runner-resources/runner-values-ai-review-cpu.yaml",
+        "scripts/k8s-runner-resources/runner-values-cpu.yaml",
         "scripts/tests/test_runner_values_policy.py",
     ),
 )
