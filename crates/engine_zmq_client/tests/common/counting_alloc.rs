@@ -26,6 +26,8 @@ thread_local! {
     /// pin counts its own path whatever runs beside it; a constant without a
     /// destructor, so the allocator reaches it without one.
     static CALLS: Cell<usize> = const { Cell::new(0) };
+    /// Bytes this thread requested, counted the same way.
+    static BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Allocation and reallocation calls the calling thread has made so far.
@@ -33,15 +35,22 @@ pub fn calls() -> usize {
     CALLS.with(Cell::get)
 }
 
-fn count_call() {
+/// Bytes the calling thread has requested so far (the growth of a
+/// reallocation counts once).
+pub fn bytes() -> usize {
+    BYTES.with(Cell::get)
+}
+
+fn count_call(bytes: usize) {
     CALLS.with(|calls| calls.set(calls.get() + 1));
+    BYTES.with(|total| total.set(total.get() + bytes));
 }
 
 pub struct Counting;
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count_call();
+        count_call(layout.size());
         ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
         LIVE.fetch_add(layout.size(), Ordering::Relaxed);
         // SAFETY: the same layout contract as the caller's, forwarded to the system allocator.
@@ -55,8 +64,9 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        count_call();
-        ALLOCATED.fetch_add(new_size.saturating_sub(layout.size()), Ordering::Relaxed);
+        let growth = new_size.saturating_sub(layout.size());
+        count_call(growth);
+        ALLOCATED.fetch_add(growth, Ordering::Relaxed);
         if new_size >= layout.size() {
             LIVE.fetch_add(new_size - layout.size(), Ordering::Relaxed);
         } else {
