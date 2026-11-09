@@ -648,8 +648,8 @@ impl PolicyRegistry {
     /// The policy for `model_id`'s requests: built for the model's first
     /// worker (from `policy_hint`, its `policy` label) and returned as it is
     /// for every later one, until no worker of this node serves the model
-    /// ([`Self::on_model_unserved`]). Registering, replacing or updating a
-    /// worker of the model calls this as often as it likes.
+    /// ([`Self::on_model_unserved`]). Registering or replacing a worker of
+    /// the model calls this as often as it likes.
     pub fn on_worker_added(
         &self,
         model_id: &str,
@@ -2166,8 +2166,8 @@ mod tests {
     fn test_policy_registry_cleanup() {
         let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
-        // A model's policy outlives any number of adds: a replacement or an
-        // update of a worker adds again.
+        // A model's policy outlives any number of adds: a registration or a
+        // replacement of a worker adds again.
         registry.on_worker_added("llama-3", Some("cache_aware"));
         registry.on_worker_added("llama-3", None);
         registry.on_worker_added("llama-3", None);

@@ -137,6 +137,22 @@ async fn the_policy_leaves_with_the_last_worker_however_often_it_was_updated() {
 }
 
 #[tokio::test]
+async fn an_update_that_lands_after_the_last_removal_builds_no_policy() {
+    // A PATCH found llama's only worker, then a DELETE removed it and the
+    // policy before the update's policies step ran. That step leaves llama
+    // without a policy, so the next registration builds its own label's.
+    let app_context = app_context();
+    let llama = worker("http://w1:8000", "llama");
+    register(&app_context, Arc::clone(&llama), "cache_aware").await;
+    remove(&app_context, Arc::clone(&llama)).await;
+
+    update(&app_context, llama).await;
+    assert_eq!(policy_of(&app_context, "llama"), None);
+    register(&app_context, worker("http://w2:8000", "llama"), "random").await;
+    assert_eq!(policy_of(&app_context, "llama"), Some("random"));
+}
+
+#[tokio::test]
 async fn a_registration_of_a_known_url_is_the_same_worker() {
     let app_context = app_context();
     register(
