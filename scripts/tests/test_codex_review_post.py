@@ -408,3 +408,12 @@ def test_an_unknown_id_in_still_open_is_ignored():
     post.post_review(api, "o/r", 7, "abc", document, DIFF, prior_important={11})
     created = next(b for m, p, b in api.calls if m == "POST" and p == "repos/o/r/pulls/7/reviews")
     assert created["event"] == "APPROVE"
+
+
+def test_a_draft_pull_request_is_reviewed_like_any_other():
+    pr = pr_payload()
+    pr["draft"] = True
+    context = post.resolve_context(
+        "pull_request", {"action": "opened", "pull_request": pr}, GateApi(), "o/r"
+    )
+    assert context["skip"] is False and context["mode"] == "review"
