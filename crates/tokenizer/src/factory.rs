@@ -311,6 +311,36 @@ pub fn discover_processor_chat_template_in_dir(dir: &Path) -> Option<String> {
         .flatten()
 }
 
+/// The processor's legacy template file beside the tokenizer files, for the
+/// requests without tools the engine's server renders through it (see
+/// `ChatTemplateState::from_checkpoint`): read when the template in use is
+/// the checkpoint's own (the configuration's, or the sibling
+/// `chat_template.jinja` the discovery prefers); a template file given from
+/// elsewhere is the operator's and stands alone, as the request's own
+/// template outranks the processor's in the engine's server. A file that
+/// does not parse is no processor template: the engine's processor does not
+/// load then, and its server falls back to the tokenizer's template. One
+/// read for both backends.
+pub(crate) fn processor_chat_template(
+    dir: Option<&Path>,
+    chat_template_path: Option<&str>,
+) -> Option<String> {
+    let checkpoints_own_template = chat_template_path.is_none_or(|path| {
+        dir.is_some_and(|dir| Path::new(path) == dir.join("chat_template.jinja"))
+    });
+    dir.filter(|_| checkpoints_own_template)
+        .and_then(discover_processor_chat_template_in_dir)
+        .and_then(
+            |path| match crate::chat_template::load_chat_template_from_file(&path) {
+                Ok(template) => template,
+                Err(e) => {
+                    debug!("the processor's chat template at {path} does not load: {e}");
+                    None
+                }
+            },
+        )
+}
+
 /// Whether `tokenizer_config.json` in `dir` carries a `chat_template` the
 /// loaders read: a string, or a list of named templates (see
 /// `ConfigChatTemplates`). The file fallbacks serve a config without one.
@@ -706,6 +736,63 @@ mod tests {
             create_tokenizer_from_downloaded_dir(path, "org/model", other.to_str()).unwrap(),
         ] {
             assert_eq!(render(loaded), "hello!");
+        }
+    }
+
+    /// A checkpoint that ships both files and a processor template
+    /// (`chat_template.json` beside a configuration template) renders a
+    /// request without tools through the processor's template, as the
+    /// conversion beside it does, and a request with tools through the
+    /// configuration's.
+    #[test]
+    fn a_checkpoint_that_ships_both_files_reads_the_processor_template_like_the_conversion() {
+        use crate::{
+            chat_template::ChatTemplateParams, huggingface::HuggingFaceTokenizer, tekken::testing,
+            traits::Tokenizer,
+        };
+        let dir = testing::dir_with(&testing::minimal());
+        let path = dir.path();
+        std::fs::write(
+            path.join("tokenizer_config.json"),
+            r#"{"chat_template": "config"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            path.join("chat_template.json"),
+            r#"{"chat_template": "processor"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            path.join("tokenizer.json"),
+            r#"{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+                "normalizer": null, "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null,
+                "decoder": null, "model": {"type": "WordLevel", "vocab": {"hello": 0, "<unk>": 1},
+                "unk_token": "<unk>"}}"#,
+        )
+        .unwrap();
+        let messages = [json!({"role": "user", "content": "hello"})];
+        let tools = [json!({"type": "function", "function": {"name": "f", "parameters": {}}})];
+        let loader = create_tokenizer(path.to_str().unwrap()).unwrap();
+        let conversion = HuggingFaceTokenizer::from_file_with_chat_template(
+            path.join("tokenizer.json").to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let arms: [(&str, &dyn Tokenizer); 2] =
+            [("loader", loader.as_ref()), ("conversion", &conversion)];
+        for (arm, tokenizer) in arms {
+            let without_tools = tokenizer
+                .apply_chat_template(&messages, ChatTemplateParams::default())
+                .unwrap();
+            assert_eq!(without_tools, "processor", "{arm}");
+            let with_tools = ChatTemplateParams {
+                tools: Some(tools.as_slice()),
+                ..ChatTemplateParams::default()
+            };
+            let with_tools = tokenizer
+                .apply_chat_template(&messages, with_tools)
+                .unwrap();
+            assert_eq!(with_tools, "config", "{arm}");
         }
     }
 

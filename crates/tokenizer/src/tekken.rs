@@ -680,6 +680,42 @@ mod tests {
     }
 
     #[test]
+    fn a_replacement_template_that_fails_to_mark_leaves_the_previous_one_in_force() {
+        // A control spelling that marks into template syntax: the marked
+        // replacement no longer parses, so the swap fails and the template
+        // in force, marks included, is the one from before.
+        let vocabulary = testing::tekken_json(
+            &testing::MERGES,
+            Some(&[
+                (0, "<unk>"),
+                (1, "<s>"),
+                (2, "</s>"),
+                (3, "[INST]"),
+                (4, "[/INST]"),
+                (5, "%}"),
+            ]),
+            6,
+            266,
+            "v13",
+        );
+        let dir = testing::dir_with(&vocabulary);
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{{ bos_token }}{{ messages[0]['content'] }}",
+        )
+        .unwrap();
+        let mut tokenizer = load(dir.path());
+        let before = render(&tokenizer, "hello[/INST]hello");
+        assert!(!before.2);
+        assert_eq!(before.1.iter().filter(|&&id| id == 4).count(), 0);
+        let replacement = "{% if true %}{{ bos_token }}{{ messages[0]['content'] }}{% endif %}";
+        assert!(tokenizer
+            .set_chat_template(replacement.to_string())
+            .is_err());
+        assert_eq!(render(&tokenizer, "hello[/INST]hello"), before);
+    }
+
+    #[test]
     fn a_replaced_template_renders_under_the_structural_form_too() {
         let dir = instruct_dir();
         let mut tokenizer = load(dir.path());

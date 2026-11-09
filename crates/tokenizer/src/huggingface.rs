@@ -831,29 +831,9 @@ impl HuggingFaceTokenizer {
         }
 
         // The processor's legacy template file beside the tokenizer, for the
-        // requests without tools the engine's server renders through it (see
-        // `ChatTemplateState::from_checkpoint`): read when the template in
-        // use is the checkpoint's own (the configuration's, or the sibling
-        // `chat_template.jinja` the discovery prefers); a template file given
-        // from elsewhere is the operator's and stands alone, as the request's
-        // own template outranks the processor's in the engine's server. A
-        // file that does not parse is no processor template: the engine's
-        // processor does not load then, and its server falls back to the
-        // tokenizer's template.
-        let tokenizer_dir = tokenizer_path.parent();
-        let checkpoints_own_template = chat_template_path.is_none_or(|path| {
-            tokenizer_dir.is_some_and(|dir| Path::new(path) == dir.join("chat_template.jinja"))
-        });
-        let processor_template = tokenizer_dir
-            .filter(|_| checkpoints_own_template)
-            .and_then(crate::factory::discover_processor_chat_template_in_dir)
-            .and_then(|path| match load_chat_template_from_file(&path) {
-                Ok(template) => template,
-                Err(e) => {
-                    debug!("the processor's chat template at {path} does not load: {e}");
-                    None
-                }
-            });
+        // requests without tools (the rule is on `processor_chat_template`).
+        let processor_template =
+            crate::factory::processor_chat_template(tokenizer_path.parent(), chat_template_path);
 
         // The configuration's special tokens on request (the rule is on
         // `from_file`): an explicit `add_bos_token` / `add_eos_token` of
@@ -2528,12 +2508,11 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             .glm
             .as_ref()
             .and_then(|checkpoint| checkpoint.renderer(Some(&template)));
-        self.chat_template.set(template)?;
-        if self.structural_controls {
-            if let Some(controls) = self.core.added() {
-                self.chat_template.mark_controls(controls)?;
-            }
-        }
+        let controls = self
+            .structural_controls
+            .then(|| self.core.added())
+            .flatten();
+        self.chat_template.replace_marked(template, controls)?;
         if self.glm.is_some() {
             self.renderer = glm_renderer.map_or(Renderer::Jinja, Renderer::Glm53);
             self.profile = self.renderer.profile();

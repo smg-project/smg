@@ -560,7 +560,13 @@ impl TiktokenTokenizer {
         // tokens structurally are compiled marked over the special spellings
         // (see `controls`); a special block the matcher declines keeps the
         // flat reading, as the conversion of such a checkpoint does.
-        let mut chat_template = ChatTemplateState::from_config(chat_template)?;
+        // The processor's legacy template beside the files, for the requests
+        // without tools, read as the conversion of the checkpoint reads it
+        // (`factory::processor_chat_template`, one read for both backends).
+        let processor_template =
+            crate::factory::processor_chat_template(Some(dir), chat_template_path);
+        let mut chat_template =
+            ChatTemplateState::from_checkpoint(chat_template, processor_template)?;
         let controls = structural_controls
             .then(|| {
                 let spellings: Vec<(String, TokenIdType)> = specials
@@ -1463,11 +1469,10 @@ impl TokenizerTrait for TiktokenTokenizer {
     }
 
     fn set_chat_template(&mut self, template: String) -> Result<()> {
-        self.chat_template.set(template)?;
-        if let Some(controls) = &self.controls {
-            self.chat_template.mark_controls(controls)?;
-        }
-        Ok(())
+        // Replaced and marked as one step: a template that fails to mark
+        // leaves the previous one in force (see `replace_marked`).
+        self.chat_template
+            .replace_marked(template, self.controls.as_ref())
     }
 }
 

@@ -2683,6 +2683,12 @@ impl Object for RenderContext {
 #[derive(Debug, Default)]
 pub(crate) struct RenderedLength(AtomicUsize);
 
+impl Clone for RenderedLength {
+    fn clone(&self) -> Self {
+        Self(AtomicUsize::new(self.0.load(Ordering::Relaxed)))
+    }
+}
+
 /// The most a render pre-allocates from the hint, whatever the last length.
 const RENDERED_LENGTH_CAP: usize = 64 * 1024;
 
@@ -2914,6 +2920,7 @@ impl ConfigChatTemplates {
 ///
 /// `Environment<'static>` is both `Send` and `Sync`, so embedding this in
 /// tokenizer structs shared across threads is safe.
+#[derive(Clone)]
 pub struct ChatTemplateState {
     /// Cached, fully-configured environment. `None` when no template is set.
     env: Option<Environment<'static>>,
@@ -3325,6 +3332,26 @@ impl ChatTemplateState {
     /// Whether the templates are compiled marked (see [`Self::mark_controls`]).
     pub(crate) fn marked(&self) -> bool {
         self.marked
+    }
+
+    /// [`Self::set`] and [`Self::mark_controls`] as one step: the template
+    /// is replaced only when it both builds and marks, so a template that
+    /// fails to mark leaves the previous one in force, marks included (set
+    /// first and marked after, a failed mark left the new template installed
+    /// unmarked, and every later render read a typed control spelling as
+    /// its token).
+    pub(crate) fn replace_marked(
+        &mut self,
+        template: String,
+        controls: Option<&AddedTokens>,
+    ) -> Result<()> {
+        let mut fresh = self.clone();
+        fresh.set(template)?;
+        if let Some(controls) = controls {
+            fresh.mark_controls(controls)?;
+        }
+        *self = fresh;
+        Ok(())
     }
 
     pub fn set(&mut self, template: String) -> Result<()> {
