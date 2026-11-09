@@ -33,7 +33,7 @@ use crate::{
         regular::{
             processor::ResponseProcessor,
             symphony::{
-                assign,
+                assign, telemetry,
                 template::Templates,
                 testing::{tools, Refusing},
                 Asks, Assignment,
@@ -1094,8 +1094,10 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
 }
 
 /// The scrape of a recorder of this test's own after `read` ran on this thread (the test
-/// runtime is single-threaded, so the local recorder sees every record of the future).
+/// runtime is single-threaded, so the local recorder sees every record of the future), the
+/// Symphony series it read being this test's own too (`telemetry::own_series`).
 pub(super) async fn scraped<F: Future>(read: F) -> (F::Output, String) {
+    let _own = telemetry::own_series();
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     let guard = metrics::set_default_local_recorder(&recorder);
