@@ -890,6 +890,18 @@ async fn admin_config(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+/// The control-plane routes that exist only behind control-plane
+/// authentication, mounted by `build_apps` when it is configured: the
+/// routes that expose addresses or change the configuration. A route
+/// that joins this group is listed in [`GATED_ROUTES`] too, which the
+/// start-up record prints and the role matrix test reads.
+fn gated_control_plane_routes() -> Router<Arc<AppState>> {
+    Router::new().route("/config", get(admin_config))
+}
+
+/// The gated routes by name, in the order of `gated_control_plane_routes`.
+pub const GATED_ROUTES: &[(&str, &str)] = &[("GET", "/config")];
+
 async fn list_workers_rest(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListWorkersQuery>,
@@ -1151,6 +1163,10 @@ pub fn build_apps(
     cors_allowed_origins: Vec<String>,
     admin_listener: bool,
 ) -> Result<GatewayApps, InvalidHeaderName> {
+    // The admin-only reads join the state once, for every attachment of
+    // the control-plane layer below: the shared groups and the gated group.
+    let control_plane_auth_state =
+        control_plane_auth_state.map(|state| state.with_admin_only_reads(ADMIN_ONLY_READS));
     // Pending (upgrade not completed): 30s TTL
     // Disconnected: 60 min TTL
     app_state.context.realtime_registry.start_reaper(
@@ -1402,15 +1418,6 @@ pub fn build_apps(
                 .delete(delete_worker),
         );
 
-    // The configuration view names every worker and store address, so it
-    // exists only where control-plane authentication guards it; without
-    // that, the path is unknown and answers 404 like any other.
-    let admin_routes = if control_plane_auth_state.is_some() {
-        admin_routes.route("/config", get(admin_config))
-    } else {
-        admin_routes
-    };
-
     // Fallback (no control-plane auth) normally uses `admin_auth_config`.
     // If only tenant keys are configured (no shared `--api-key`), there's no
     // credential that should reach these routes — deny outright instead of
@@ -1420,7 +1427,7 @@ pub fn build_apps(
     let apply_control_plane_auth = |routes: Router<Arc<AppState>>| {
         if let Some(ref cp_state) = control_plane_auth_state {
             routes.route_layer(axum::middleware::from_fn_with_state(
-                cp_state.clone().with_admin_only_reads(ADMIN_ONLY_READS),
+                cp_state.clone(),
                 smg_auth::control_plane_auth_middleware,
             ))
         } else if !admin_auth_config.is_enabled() && serving_auth_config.is_enabled() {
@@ -1434,6 +1441,18 @@ pub fn build_apps(
     };
     let admin_routes = apply_control_plane_auth(admin_routes);
     let worker_routes = apply_control_plane_auth(worker_routes);
+
+    // The gated routes exist only behind control-plane authentication:
+    // their layer is the control-plane check alone, never the shared-key
+    // fallback or the open pass-through above, and a start without
+    // control-plane authentication does not mount them, so the path is
+    // unknown and answers 404 on both listeners.
+    let gated_routes = control_plane_auth_state.as_ref().map(|cp_state| {
+        gated_control_plane_routes().route_layer(axum::middleware::from_fn_with_state(
+            cp_state.clone(),
+            smg_auth::control_plane_auth_middleware,
+        ))
+    });
 
     // RL control plane: mounted only when the flag built an `RlState`, so
     // with `--enable-rl` off nothing under /v1/rl exists and the sink 404s.
@@ -1453,6 +1472,9 @@ pub fn build_apps(
         .merge(multipart_upload_routes)
         .merge(public_routes);
     let mut control_plane = Router::new().merge(admin_routes).merge(worker_routes);
+    if let Some(gated_routes) = gated_routes {
+        control_plane = control_plane.merge(gated_routes);
+    }
     if let Some(rl_routes) = rl_routes {
         control_plane = control_plane.merge(rl_routes);
     }
@@ -2477,6 +2499,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     );
     // And where a keyed start's secrets came from, sources alone.
     posture::log_secret_sources(&config.secret_sources);
+    // And whether the gated routes are mounted: they need control-plane
+    // authentication, so a start without it says they are off.
+    posture::log_gated_routes(control_plane_auth_state.is_some(), GATED_ROUTES);
 
     let apps = build_apps(
         app_state,

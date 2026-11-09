@@ -407,6 +407,20 @@ impl AppTestContext {
         )
     }
 
+    /// The production routers with initialized control-plane auth.
+    pub fn create_apps_with_auth(
+        &self,
+        control_plane_auth: Option<smg_auth::ControlPlaneAuthState>,
+        admin_listener: bool,
+    ) -> smg::server::GatewayApps {
+        test_app::create_test_apps_with_context_and_auth(
+            Arc::clone(&self.router),
+            Arc::clone(&self.app_context),
+            control_plane_auth,
+            admin_listener,
+        )
+    }
+
     pub async fn shutdown(mut self) {
         for worker in &mut self.workers {
             worker.stop().await;
