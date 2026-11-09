@@ -966,6 +966,10 @@ mod tests {
                 gauge(&handle, "smg_kv_index_engine_conflicts", "chain"),
                 Some(0.0)
             );
+            assert_eq!(
+                gauge(&handle, "smg_kv_index_cap_refusals", "chain"),
+                Some(0.0)
+            );
             assert!(gauge(&handle, "smg_kv_index_arena_bytes", "chain").is_some_and(|b| b > 0.0));
             // The arena holds whole chunks: what it holds is at least what it handed out.
             let handed_out = gauge(&handle, "smg_kv_index_arena_bytes", "chain").expect("arena");
@@ -1042,6 +1046,14 @@ mod tests {
                     ),
                     ("smg_kv_event_sub_block_stores_total", vec![("worker", url)]),
                     ("smg_kv_event_sub_block_blocks_total", vec![("worker", url)]),
+                    (
+                        "smg_kv_event_cap_refused_stores_total",
+                        vec![("worker", url)],
+                    ),
+                    (
+                        "smg_kv_event_cap_refused_blocks_total",
+                        vec![("worker", url)],
+                    ),
                     ("smg_kv_event_degraded_ranks", vec![("worker", url)]),
                     (
                         "smg_kv_index_moved_hashes",
@@ -1049,6 +1061,10 @@ mod tests {
                     ),
                     (
                         "smg_kv_index_engine_conflicts",
+                        vec![("model", UNKNOWN_MODEL_ID)],
+                    ),
+                    (
+                        "smg_kv_index_cap_refusals",
                         vec![("model", UNKNOWN_MODEL_ID)],
                     ),
                     (
