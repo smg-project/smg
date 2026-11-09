@@ -112,6 +112,28 @@ const _: () = assert!(matches!(
     b"circuit_open"
 ));
 
+/// The published-state code of the `available` series (its index plus one):
+/// the one code that says no routing veto held at the last publish. The
+/// routing reads ([`Worker::routing_state`], [`Worker::is_available`]) answer
+/// from it without the breaker's guard, and read the facts on any other code.
+pub(super) const AVAILABLE_CODE: u8 = 1;
+const _: () = assert!(matches!(
+    ROUTING_STATE_SERIES[AVAILABLE_CODE as usize - 1]
+        .0
+        .as_bytes(),
+    b"available"
+));
+
+/// The bit an instance the registry retired sets on the published code when
+/// a fact it still writes moves (a trip of the breaker it may share with its
+/// replacement, a stall or an overload on the shared runtime). It can assert
+/// no pair: the replacement may keep a breaker of its own, or share this
+/// one. A stale code answers no routing read from the fast path, and the
+/// first read by an instance the registry holds publishes again from the
+/// facts, which clears the bit.
+pub(super) const STALE_BIT: u8 = 0x80;
+const _: () = assert!(STALE_BIT as usize > ROUTING_STATE_SERIES.len());
+
 /// The index in [`ROUTING_STATE_SERIES`] of a worker with these facts: the
 /// first that excludes it, else available.
 pub(super) fn routing_state_series(
@@ -151,6 +173,11 @@ pub struct WorkerRuntime {
     /// the over-window burst the gate exists to prevent. Lives here so a
     /// same-URL replacement inherits the rooms the engine still holds.
     pd_admitted: AtomicUsize,
+    /// Rooms the places in `pd_queue` are waiting for, kept beside the
+    /// claimed rooms so a selection can read what the window has left for a
+    /// newcomer with two atomic loads and no queue lock. Updated only under
+    /// the queue's lock, with the place that takes or gives it back.
+    pd_waiting_rooms: AtomicUsize,
     /// The dispatches waiting at the PD admission gate for this worker's
     /// rooms, oldest first, so a room that frees goes to the one that has
     /// waited longest for it (see [`Self::pd_enqueue`]), each with the
@@ -624,6 +651,7 @@ impl WorkerRuntime {
             total_pending_probes: AtomicUsize::new(0),
             load_counter: AtomicUsize::new(0),
             pd_admitted: AtomicUsize::new(0),
+            pd_waiting_rooms: AtomicUsize::new(0),
             pd_queue: Mutex::new(PdQueue::default()),
             processed_counter: AtomicUsize::new(0),
             worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
@@ -714,9 +742,16 @@ impl WorkerRuntime {
     }
 
     /// The code of the `smg_worker_state` series published last (0 when
-    /// none was).
+    /// none was), with the stale bit (`STALE_BIT`) set when a retired
+    /// instance marked it.
     pub fn published_state(&self) -> u8 {
         self.published_state.load(Ordering::Acquire)
+    }
+
+    /// Mark the published code stale (the `STALE_BIT`). Called under
+    /// [`Self::publish_lock`], so it lands before or after a whole publish.
+    pub fn mark_published_stale(&self) {
+        self.published_state.fetch_or(STALE_BIT, Ordering::AcqRel);
     }
 
     /// Remember `code` as the published `smg_worker_state` series; the code
@@ -1056,6 +1091,11 @@ impl WorkerRuntime {
         self.pd_admitted.load(Ordering::Relaxed)
     }
 
+    /// Rooms the places waiting in the admission queue need, in all.
+    pub fn pd_waiting_rooms(&self) -> usize {
+        self.pd_waiting_rooms.load(Ordering::Relaxed)
+    }
+
     /// Claim `count` rooms, but only while the claimed total stays within
     /// `window`. All-or-nothing: a refusal claims nothing.
     pub fn try_admit_pd(&self, count: usize, window: usize) -> bool {
@@ -1098,6 +1138,7 @@ impl WorkerRuntime {
             rooms,
             wake: Arc::new(Notify::new()),
         });
+        self.pd_waiting_rooms.fetch_add(rooms, Ordering::Relaxed);
         place
     }
 
@@ -1124,7 +1165,12 @@ impl WorkerRuntime {
                 return;
             };
             let could_claim = queue.may_claim(place);
-            queue.waiting.remove(at);
+            let rooms = queue.waiting.remove(at).map_or(0, |gone| gone.rooms);
+            let _ = self.pd_waiting_rooms.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |waiting| Some(waiting.saturating_sub(rooms)),
+            );
             if could_claim {
                 queue.claimable_wakes()
             } else {

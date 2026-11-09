@@ -337,6 +337,16 @@ impl<B> MakeSpan<B> for RequestSpan {
             response_bytes = Empty,
             response_bytes_sent = Empty,
             worker = Empty,
+            // What the Symphony reader leaves of an output it did not read
+            // clean (`regular::symphony::telemetry::Mark`), recorded when
+            // the output ends, never for a clean one.
+            symphony.table = Empty,
+            symphony.outcome = Empty,
+            symphony.choice = Empty,
+            symphony.reason = Empty,
+            symphony.bytes = Empty,
+            symphony.malformed_bytes = Empty,
+            symphony.finish = Empty,
             module = "smg"
         );
 
@@ -799,7 +809,11 @@ pub(crate) struct SpanDuty {
 impl SpanDuty {
     /// The body ended (its last frame, or the declared length out) with
     /// `bytes_sent` bytes out: a streamed body's end gets its line, with the
-    /// bytes, when the record carries them.
+    /// bytes, when the record carries them. The line carries the span's
+    /// fields as they stand at the body's end, so what the request learned
+    /// while it streamed (the Symphony reader's `symphony.*` mark, recorded
+    /// when the output ended) is read here, where the finish line went out
+    /// before it existed.
     pub(crate) fn ended(&mut self, bytes_sent: u64) {
         self.close_log.done();
         if std::mem::replace(&mut self.end_line, false) {

@@ -1,11 +1,16 @@
 //! The secrets the command line, the environment or a file can give (the
-//! serving key, the tenant keys, the store URLs): the names of their sources
-//! and the one resolution rule, with the environment lookup as a parameter.
+//! serving key, the tenant keys, the control-plane keys, the store URLs):
+//! the names of their sources and the one resolution rule, with the
+//! environment lookup as a parameter. A file is read by the library's rules
+//! (`smg::config::secrets`), the ones a reload of the keys reads it by.
 
 use std::path::{Path, PathBuf};
 
 use smg::{
-    config::{ConfigError, ConfigResult},
+    config::{
+        secrets::{entries_of, SecretFile},
+        ConfigError, ConfigResult,
+    },
     server::posture::SecretSource,
 };
 
@@ -13,10 +18,9 @@ use smg::{
 /// names of its sources, for the resolution and for the refusals. A
 /// refusal names sources and paths; none carries a value.
 pub(crate) struct SecretSetting {
-    /// What the secret is, for the refusals.
-    what: &'static str,
-    /// The `ConfigError` field a bad file is reported under.
-    file_field: &'static str,
+    /// The file's names: what the secret is, the field a bad file is
+    /// reported under, the shape of an entry.
+    file: SecretFile,
     /// The flag taking the value.
     flag: &'static str,
     /// The environment variable taking the value.
@@ -28,8 +32,11 @@ pub(crate) struct SecretSetting {
 }
 
 pub(crate) const API_KEY_SETTING: SecretSetting = SecretSetting {
-    what: "the shared API key",
-    file_field: "api-key-file",
+    file: SecretFile {
+        what: "the shared API key",
+        field: "api-key-file",
+        entry: "",
+    },
     flag: "--api-key",
     env: "SMG_API_KEY",
     file_flag: "--api-key-file",
@@ -37,17 +44,35 @@ pub(crate) const API_KEY_SETTING: SecretSetting = SecretSetting {
 };
 
 pub(crate) const TENANT_API_KEYS_SETTING: SecretSetting = SecretSetting {
-    what: "the tenant API keys",
-    file_field: "tenant-api-keys-file",
+    file: SecretFile {
+        what: "the tenant API keys",
+        field: "tenant-api-keys-file",
+        entry: "tenant_id:key",
+    },
     flag: "--tenant-api-key",
     env: "SMG_TENANT_API_KEYS",
     file_flag: "--tenant-api-keys-file",
     file_env: "SMG_TENANT_API_KEYS_FILE",
 };
 
+pub(crate) const CONTROL_PLANE_API_KEYS_SETTING: SecretSetting = SecretSetting {
+    file: SecretFile {
+        what: "the control-plane API keys",
+        field: "control-plane-api-keys-file",
+        entry: "id:name:role:key",
+    },
+    flag: "--control-plane-api-keys",
+    env: "CONTROL_PLANE_API_KEYS",
+    file_flag: "--control-plane-api-keys-file",
+    file_env: "CONTROL_PLANE_API_KEYS_FILE",
+};
+
 pub(crate) const POSTGRES_DB_URL_SETTING: SecretSetting = SecretSetting {
-    what: "the PostgreSQL connection URL",
-    file_field: "postgres-db-url-file",
+    file: SecretFile {
+        what: "the PostgreSQL connection URL",
+        field: "postgres-db-url-file",
+        entry: "",
+    },
     flag: "--postgres-db-url",
     env: "SMG_POSTGRES_DB_URL",
     file_flag: "--postgres-db-url-file",
@@ -55,8 +80,11 @@ pub(crate) const POSTGRES_DB_URL_SETTING: SecretSetting = SecretSetting {
 };
 
 pub(crate) const REDIS_URL_SETTING: SecretSetting = SecretSetting {
-    what: "the Redis connection URL",
-    file_field: "redis-url-file",
+    file: SecretFile {
+        what: "the Redis connection URL",
+        field: "redis-url-file",
+        entry: "",
+    },
     flag: "--redis-url",
     env: "SMG_REDIS_URL",
     file_flag: "--redis-url-file",
@@ -106,36 +134,18 @@ impl SecretSetting {
         ConfigError::IncompatibleConfig {
             reason: format!(
                 "{} is given twice, by {} (or {}) and by {} (or {}); give one source",
-                self.what, self.flag, self.env, self.file_flag, self.file_env
+                self.file.what, self.flag, self.env, self.file_flag, self.file_env
             ),
         }
     }
 
-    /// The refusal for a file that cannot be used, naming the path, never
-    /// the content.
-    fn bad_file(&self, path: &Path, reason: &str) -> ConfigError {
-        ConfigError::InvalidValue {
-            field: self.file_field.to_string(),
-            value: path.display().to_string(),
-            reason: reason.to_string(),
-        }
-    }
-
-    fn read_file(&self, path: &Path) -> ConfigResult<String> {
-        std::fs::read_to_string(path)
-            .map_err(|e| self.bad_file(path, &format!("the file cannot be read: {e}")))
-    }
-
     /// The value of a single-valued secret and its source: the flag's,
     /// else the environment's, else the content of the file the flag or the
-    /// environment names; the environment's value and the file's content
-    /// have their surrounding whitespace (a trailing newline) dropped, since
-    /// a Secret made from a file usually carries the editor's newline into
-    /// both. A value and a file together are refused, as is a file that is
-    /// empty or holds more than one line (a tenant key file or a
-    /// concatenated pair in the place of one value is a mistake, not a
-    /// value). An empty value from the flag or the environment passes here
-    /// and is refused where the value is validated.
+    /// environment names ([`SecretFile::value`]: one line, trimmed, an
+    /// empty or longer file refused); the environment's value has its
+    /// surrounding whitespace dropped like the file's. A value and a file
+    /// together are refused. An empty value from the flag or the
+    /// environment passes here and is refused where the value is validated.
     pub(crate) fn resolve_value(
         &self,
         flag_value: Option<&str>,
@@ -152,43 +162,24 @@ impl SecretSetting {
             (Some(_), Some(_)) => Err(self.given_twice()),
             (Some(value), None) => Ok(Some(value)),
             (None, None) => Ok(None),
-            (None, Some(path)) => {
-                let content = self.read_file(&path)?;
-                let value = content.trim();
-                if value.is_empty() {
-                    return Err(self.bad_file(&path, "the file is empty"));
-                }
-                if value.lines().count() > 1 {
-                    return Err(self.bad_file(
-                        &path,
-                        "the file holds more than one line; it must hold the value alone",
-                    ));
-                }
-                Ok(Some((value.to_string(), SecretSource::File)))
-            }
+            (None, Some(path)) => Ok(Some((self.file.value(&path)?, SecretSource::File))),
         }
     }
 
     /// The entries of a list-valued secret and their source: the flag's
     /// occurrences, else the environment's value split at ',' and at line
-    /// ends, else the lines of the file the flag or the environment names,
-    /// blank lines and `#` comment lines skipped; the whitespace around an
-    /// entry is dropped. Entries and a file together are refused, and so is
-    /// a source that is set but holds no entry: the source was meant to
-    /// close the serving routes, and an empty one would leave them open.
+    /// ends, else the lines of the file the flag or the environment names
+    /// ([`SecretFile::entries`]); blank entries and `#` comment lines are
+    /// skipped and the whitespace around an entry dropped. Entries and a
+    /// file together are refused, and so is a source that is set but holds
+    /// no entry: the source was meant to close the routes its keys guard,
+    /// and an empty one would leave them open.
     pub(crate) fn resolve_entries(
         &self,
         flag_values: &[String],
         file_flag_value: Option<&Path>,
         env: EnvLookup<'_>,
     ) -> ConfigResult<Option<(Vec<String>, SecretSource)>> {
-        let entries_of = |text: &str, separators: &[char]| -> Vec<String> {
-            text.split(separators)
-                .map(str::trim)
-                .filter(|entry| !entry.is_empty() && !entry.starts_with('#'))
-                .map(str::to_string)
-                .collect()
-        };
         let value = if flag_values.is_empty() {
             match env(self.env)? {
                 Some(text) => {
@@ -198,8 +189,8 @@ impl SecretSetting {
                             field: self.env.to_string(),
                             value: "<empty>".to_string(),
                             reason: format!(
-                                "set but holds no entry; {} are tenant_id:key entries separated by ',' or a newline",
-                                self.what
+                                "set but holds no entry; {} are {} entries separated by ',' or a newline",
+                                self.file.what, self.file.entry
                             ),
                         });
                     }
@@ -214,17 +205,7 @@ impl SecretSetting {
             (Some(_), Some(_)) => Err(self.given_twice()),
             (Some(value), None) => Ok(Some(value)),
             (None, None) => Ok(None),
-            (None, Some(path)) => {
-                let content = self.read_file(&path)?;
-                let entries = entries_of(&content, &['\n']);
-                if entries.is_empty() {
-                    return Err(self.bad_file(
-                        &path,
-                        "the file holds no entry; one tenant_id:key per line, blank and # lines skipped",
-                    ));
-                }
-                Ok(Some((entries, SecretSource::File)))
-            }
+            (None, Some(path)) => Ok(Some((self.file.entries(&path)?, SecretSource::File))),
         }
     }
 }

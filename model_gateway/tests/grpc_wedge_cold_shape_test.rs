@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::grpc_harness::{grpc_router_config, grpc_test_context, grpc_worker};
+use common::grpc_harness::{free_port, grpc_router_config, grpc_test_context, grpc_worker};
 use openai_protocol::{completion::CompletionRequest, model_card::ModelCard, worker::WorkerStatus};
 use smg::{
     app_context::AppContext,
@@ -108,7 +108,7 @@ impl MockEngine {
                 let _ = admin_stopped.await;
             },
         ));
-        let client = smg::clients::http_client_builder()
+        let client = smg::server::http_client_builder()
             .no_proxy()
             .build()
             .expect("test client");
@@ -159,19 +159,6 @@ impl MockEngine {
             let _ = admin.await;
         }
     }
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test helper: a port the OS cannot hand out fails the fixture"
-)]
-async fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("ephemeral port address")
-        .port()
 }
 
 /// A completion of `prompt_tokens` tokens of the mock tokenizer's vocabulary.

@@ -1974,6 +1974,113 @@ fn per_tree_page_size_is_independent() {
     assert_eq!(fine.match_prefix_with_counts(&seq).matched_token_count, 592);
 }
 
+/// The page-wise prefix count is the token-wise count rounded down to the
+/// page, for every shape: equal runs, one run a prefix of the other, a
+/// difference at every position around a page boundary, and at the default
+/// as well as at odd page sizes.
+#[test]
+fn page_prefix_count_equals_the_rounded_token_wise_count() {
+    fn token_wise(a: &[TokenId], b: &[TokenId], page: usize) -> usize {
+        let common = a.iter().zip(b).take_while(|(a, b)| a == b).count();
+        align_to_page(common, page)
+    }
+    for page in [1usize, 3, 16, 512] {
+        let lens = [
+            0,
+            1,
+            page - 1,
+            page,
+            page + 1,
+            2 * page,
+            2 * page + 3,
+            5 * page,
+        ];
+        for &la in &lens {
+            for &lb in &lens {
+                let a: Vec<TokenId> = (0..la as u32).collect();
+                let b: Vec<TokenId> = (0..lb as u32).collect();
+                assert_eq!(
+                    common_page_prefix(&a, &b, page),
+                    token_wise(&a, &b, page),
+                    "equal runs of {la} and {lb} tokens, page {page}"
+                );
+                let shorter = la.min(lb);
+                let edges = [
+                    0,
+                    1,
+                    page - 1,
+                    page,
+                    page + 1,
+                    2 * page - 1,
+                    2 * page,
+                    2 * page + 1,
+                ];
+                for d in edges.into_iter().chain([shorter.saturating_sub(1)]) {
+                    if d >= shorter {
+                        continue;
+                    }
+                    let mut b = b.clone();
+                    b[d] = u32::MAX;
+                    assert_eq!(
+                        common_page_prefix(&a, &b, page),
+                        token_wise(&a, &b, page),
+                        "runs of {la} and {lb} tokens differing at {d}, page {page}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A run with a partial-page tail: the tail is never cached, a request that
+/// diverges inside a page matches the whole pages before it, and a split at
+/// the page boundary leaves both sides their pages; the fused path reads the
+/// same counts as the match.
+#[test]
+fn partial_page_tails_match_the_whole_pages_before_them() {
+    let tree = TokenTree::new();
+    let seq: Vec<TokenId> = (0..(2 * PAGE_SIZE + 5) as u32).collect();
+    tree.insert_tokens(&seq, "w1");
+    assert_eq!(
+        tree.match_prefix_with_counts(&seq).matched_token_count,
+        2 * PAGE_SIZE
+    );
+
+    // Diverges five tokens into the second page.
+    let mut fork = seq.clone();
+    fork[PAGE_SIZE + 5] = 9_999;
+    assert_eq!(
+        tree.match_prefix_with_counts(&fork).matched_token_count,
+        PAGE_SIZE
+    );
+
+    // Longer than the cached run: the run's whole pages.
+    let mut longer = seq.clone();
+    longer.extend(1_000..1_040);
+    assert_eq!(
+        tree.match_prefix_with_counts(&longer).matched_token_count,
+        2 * PAGE_SIZE
+    );
+
+    // Inserting the fork splits at the page boundary.
+    tree.insert_tokens(&fork, "w2");
+    let forked = tree.match_prefix_with_counts(&fork);
+    assert_eq!(forked.matched_token_count, 2 * PAGE_SIZE);
+    assert_eq!(forked.tenant.as_ref(), "w2");
+    let original = tree.match_prefix_with_counts(&seq);
+    assert_eq!(original.matched_token_count, 2 * PAGE_SIZE);
+    assert_eq!(original.tenant.as_ref(), "w1");
+
+    assert_eq!(
+        tree.match_and_insert(&fork, "w2").matched_token_count,
+        2 * PAGE_SIZE
+    );
+    assert_eq!(
+        tree.match_and_insert(&longer, "w1").matched_token_count,
+        2 * PAGE_SIZE
+    );
+}
+
 /// The nodes a page-aligned sequence descends through, root excluded.
 fn path_nodes(tree: &TokenTree, tokens: &[TokenId]) -> Vec<NodeRef> {
     let mut nodes = Vec::new();

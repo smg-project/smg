@@ -43,6 +43,14 @@ jobs:
     name: Tokenizer
     if: github.repository == 'smg-project/smg' || vars.SMG_RUN_BENCHMARKS == 'true'
     runs-on: ubuntu-latest
+    env:
+      # Every bench binary of this job, the gate's pair and the summary run's,
+      # places every function on a 64-byte boundary, so a pull request's code
+      # size does not move the unchanged hot functions into another placement
+      # class (the two speed states of identical code described in
+      # .github/bench-gates/tokenizer.toml). RUSTFLAGS replaces the list in
+      # .cargo/config.toml, so the outliner flag is repeated here.
+      RUSTFLAGS: -C llvm-args=-enable-machine-outliner=never -C llvm-args=-align-all-functions=6
     steps:
       - uses: actions/checkout@v7
         with:
@@ -86,9 +94,10 @@ jobs:
         timeout-minutes: 45
         run: |
           set -o pipefail
+          lscpu | grep -m1 'Model name' | tee benchmark_output.txt || true
           python3 scripts/bench_gate.py run --gates .github/bench-gates/tokenizer.toml \
             --base "$RUNNER_TEMP/bench-gate/base" --pr "$RUNNER_TEMP/bench-gate/pr" \
-            --cwd model_gateway --out bench-gate 2>&1 | tee benchmark_output.txt
+            --cwd model_gateway --out bench-gate 2>&1 | tee -a benchmark_output.txt
 
       - name: Run benchmark
         if: github.event_name != 'pull_request'
@@ -96,7 +105,8 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           set -o pipefail
-          cargo bench -p smg --features tokenizers-v1 --bench tokenizer_benchmark 2>&1 | tee benchmark_output.txt
+          lscpu | grep -m1 'Model name' | tee benchmark_output.txt || true
+          cargo bench -p smg --features tokenizers-v1 --bench tokenizer_benchmark 2>&1 | tee -a benchmark_output.txt
 
       - name: Upload benchmark results
         if: always()

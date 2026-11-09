@@ -514,10 +514,11 @@ pub trait ModelProcessorSpec: Send + Sync {
         None
     }
 
-    /// [`Self::default_video_sample_fps`] given the video preprocessor config
-    /// the checkpoint ships, for a family whose reference reads the rate from
-    /// it; the default ignores the config.
-    fn default_video_sample_fps_with(&self, _config: Option<&PreProcessorConfig>) -> Option<f64> {
+    /// [`Self::default_video_sample_fps`] given the config the video processor
+    /// is built from (the checkpoint's video processor config, else its shared
+    /// one), for a family whose reference reads the rate from it; the default
+    /// ignores the config.
+    fn default_video_sample_fps_with(&self, _config: &PreProcessorConfig) -> Option<f64> {
         self.default_video_sample_fps()
     }
 
@@ -527,10 +528,13 @@ pub trait ModelProcessorSpec: Send + Sync {
         FrameSampling::Even
     }
 
-    /// [`Self::video_frame_sampling`] given the video preprocessor config the
-    /// checkpoint ships, for a family whose reference reads its frame budget
-    /// or grouping from it; the default ignores the config.
-    fn video_frame_sampling_with(&self, _config: Option<&PreProcessorConfig>) -> FrameSampling {
+    /// [`Self::video_frame_sampling`] given the config the video processor is
+    /// built from, for a family whose reference reads its frame budget or
+    /// grouping from it; the default ignores the config. A family sampled by
+    /// its engine's own video loader keeps that loader's constants here: the
+    /// loader reads no processor config, so a group or budget the config
+    /// states reaches the processor alone.
+    fn video_frame_sampling_with(&self, _config: &PreProcessorConfig) -> FrameSampling {
         self.video_frame_sampling()
     }
 }

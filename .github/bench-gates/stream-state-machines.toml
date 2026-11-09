@@ -19,6 +19,18 @@
 # The rule on that trimmed spread gives 20 % (twice 7.6 % is 15.2 %), which is also more than five times
 # the quiet spread. The null case through this gate passed all three times.
 
+#
+# Placement. The workflow's benchmark job builds its binaries, the gate's pair and the summary
+# run's, with every function on a 64-byte boundary (RUSTFLAGS:
+# `-C llvm-args=-align-all-functions=6`, beside the outliner flag of .cargo/config.toml).
+# symphony.toml records why: identical code sits in one of two speed states chosen by where its
+# unchanged hot functions land modulo 64, and a pull request's code size alone moved them. Under the
+# flags this gate's null read (the same bytes twice, three interleaved runs a side on one core, 5
+# ids) read 0 failed, 0 suspect with a largest change of medians of +3.7 %, so the thresholds stand.
+# An inserted regression on the path the rows run (200 dependent multiply-adds on every poll of the
+# engine stream) is caught: 5 of 5 failed, +21 to +36 % (generate +21 %, the other four +32 to +36
+# %), about 310 polls per iteration on every row.
+
 repeats = 3
 filter = "^stream_state_machines/"
 

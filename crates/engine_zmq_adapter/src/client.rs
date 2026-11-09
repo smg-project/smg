@@ -11,7 +11,7 @@ use std::{
 
 use engine_zmq_client::{
     check_engine_layouts,
-    codec::{tensor::encode_with_aux_frames, OpaqueValue},
+    codec::{add_request_capacity, tensor::encode_with_aux_frames, OpaqueValue},
     connect_handshake,
     connector::{Client, EngineCoreClient, SglangClient, TokenSpeedClient, TrtllmClient},
     protocol::{
@@ -1048,7 +1048,8 @@ impl ZmqEngineClient {
         }
         let request =
             translate_encode_request(req, rendezvous).map_err(tonic::Status::invalid_argument)?;
-        let (payload, aux_frames) = encode_with_aux_frames(&request).map_err(zmq_status)?;
+        let (payload, aux_frames) =
+            encode_with_aux_frames(&request, add_request_capacity(0)).map_err(zmq_status)?;
         let residue = request.bootstrap_room.rem_euclid(encoders.len() as i64) as usize;
         client
             .send_typed(
@@ -1613,6 +1614,18 @@ impl ZmqEngineClient {
             ZmqBackend::TokenSpeed(client) => client.note_reports_steps(),
             ZmqBackend::Sglang(client) => client.note_reports_steps(),
             ZmqBackend::Trtllm(client) => client.note_reports_steps(),
+        }
+    }
+
+    /// A sign of the engine's progress from outside its output wire, a live
+    /// KV-event batch it published: the engine's silence ends now, as on an
+    /// output of any kind (the ZMQ client's `note_progress`).
+    pub fn note_progress(&self) {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.note_progress(),
+            ZmqBackend::TokenSpeed(client) => client.note_progress(),
+            ZmqBackend::Sglang(client) => client.note_progress(),
+            ZmqBackend::Trtllm(client) => client.note_progress(),
         }
     }
 

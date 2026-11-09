@@ -55,6 +55,7 @@ mod assemble;
 mod capability;
 mod config;
 mod detect;
+pub(crate) mod ec_push;
 mod encoder_budget;
 mod inflight;
 mod item_limits;
@@ -445,12 +446,11 @@ mod tests {
         processing_failed_message, processing_failed_response, record_decoder_availability,
         report_jpeg_decoder, Response,
     };
-    use crate::routers::common::retry::NonRetryable;
+    use crate::{routers::common::retry::NonRetryable, test_support::json_of};
 
     async fn status_and_error(response: Response) -> (u16, serde_json::Value) {
         let status = response.status().as_u16();
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        (status, serde_json::from_slice(&body).unwrap())
+        (status, json_of(response).await)
     }
 
     /// A configuration file the model's hub failed to serve is a 502 under its

@@ -188,16 +188,11 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
 
     /// The family's video loader is the Qwen2-VL line's: a clip is sampled
     /// before its processor sees it, `total / fps x 2` frames in whole
-    /// temporal groups, at most 768 ([`FrameSampling::SteppedGroups`]), so a
-    /// 5-frame clip at 1 fps is four frames, two temporal groups.
+    /// temporal groups of two, at most 768 ([`FrameSampling::SteppedGroups`]),
+    /// so a 5-frame clip at 1 fps is four frames, two temporal groups,
+    /// whatever the processor config states.
     fn video_frame_sampling(&self) -> FrameSampling {
-        loader_frame_sampling(None)
-    }
-
-    /// The temporal group is the processor config's `temporal_patch_size`
-    /// where the checkpoint states one.
-    fn video_frame_sampling_with(&self, config: Option<&PreProcessorConfig>) -> FrameSampling {
-        loader_frame_sampling(config)
+        loader_frame_sampling()
     }
 
     fn prompt_replacements(
@@ -428,8 +423,9 @@ mod tests {
     /// A clip is sampled the way the family's own video loader samples it:
     /// a 5-frame clip at 1 fps is its first four frames (two temporal groups),
     /// not ten frames at the nominal 2 fps with every frame doubled; the
-    /// temporal group follows the processor config; a one-frame clip, shorter
-    /// than one temporal group, gets no frame, as on the engine's own server.
+    /// temporal group is the loader's own, not the processor config's; a
+    /// one-frame clip, shorter than one temporal group, gets no frame, as on
+    /// the engine's own server.
     #[test]
     fn omni_video_frames_follow_the_qwen2_vl_loader_rule() {
         use crate::media::{sampled_frame_indices, VideoFetchConfig};
@@ -447,9 +443,9 @@ mod tests {
             ..PreProcessorConfig::default()
         };
         assert_eq!(
-            spec.video_frame_sampling_with(Some(&config)),
+            spec.video_frame_sampling_with(&config),
             FrameSampling::SteppedGroups {
-                temporal_patch_size: 4,
+                temporal_patch_size: 2,
                 max_frames: 768,
             }
         );

@@ -1537,12 +1537,13 @@ impl ChatDecode {
 
         self.completion_tokens.record_chunk(chunk);
 
-        // Convert logprobs if present and requested
+        // Convert logprobs if present and requested, with the candidates the
+        // request's `top_logprobs` asked for.
         let chunk_logprobs = if original_request.logprobs {
             let encoding = try_harmony_encoding()?;
             chunk
                 .output_logprobs()
-                .map(|lp| convert_harmony_logprobs(encoding, lp))
+                .map(|lp| convert_harmony_logprobs(encoding, lp, original_request.top_logprobs))
         } else {
             None
         };

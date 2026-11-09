@@ -51,7 +51,7 @@ async fn every_smg_family_has_help_text() {
     // A worker of its own: the lag histogram test counts the samples on the workers it names.
     Metrics::record_kv_event_lag("grpc://worker-help:50051", 0.004);
 
-    let body = smg::clients::http_client()
+    let body = smg::server::http_client()
         .get(format!("http://{addr}/metrics"))
         .send()
         .await

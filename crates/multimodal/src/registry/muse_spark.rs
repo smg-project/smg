@@ -545,10 +545,10 @@ impl ModelProcessorSpec for MuseSparkSpec {
         Some(DEFAULT_VIDEO_FPS)
     }
 
-    fn default_video_sample_fps_with(&self, config: Option<&PreProcessorConfig>) -> Option<f64> {
+    fn default_video_sample_fps_with(&self, config: &PreProcessorConfig) -> Option<f64> {
         Some(
             config
-                .and_then(|config| config.get_extra::<f64>("fps"))
+                .get_extra::<f64>("fps")
                 .filter(|fps| fps.is_finite() && *fps > 0.0)
                 .unwrap_or(DEFAULT_VIDEO_FPS),
         )
@@ -564,14 +564,14 @@ impl ModelProcessorSpec for MuseSparkSpec {
         }
     }
 
-    fn video_frame_sampling_with(&self, config: Option<&PreProcessorConfig>) -> FrameSampling {
+    fn video_frame_sampling_with(&self, config: &PreProcessorConfig) -> FrameSampling {
         FrameSampling::TemporalGroups {
             frame_factor: config
-                .and_then(|config| config.temporal_patch_size)
+                .temporal_patch_size
                 .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE)
                 .max(1),
             max_frames: config
-                .and_then(|config| config.get_extra::<usize>("num_frames"))
+                .get_extra::<usize>("num_frames")
                 .filter(|frames| *frames > 0)
                 .unwrap_or(DEFAULT_VIDEO_FRAMES),
         }
@@ -732,14 +732,21 @@ mod tests {
         );
         let config = video_config();
         assert_eq!(
-            spec.video_frame_sampling_with(Some(&config)),
+            spec.video_frame_sampling_with(&config),
             FrameSampling::TemporalGroups {
                 frame_factor: 2,
                 max_frames: 600
             }
         );
-        assert_eq!(spec.default_video_sample_fps_with(Some(&config)), Some(2.0));
-        assert_eq!(spec.default_video_sample_fps_with(None), Some(2.0));
+        assert_eq!(spec.default_video_sample_fps_with(&config), Some(2.0));
+        assert_eq!(
+            spec.default_video_sample_fps_with(&PreProcessorConfig::default()),
+            Some(2.0)
+        );
+        // A config rate reaches the sampler as the double the reference reads,
+        // never narrowed to binary32 on the way.
+        let non_dyadic = PreProcessorConfig::from_json(r#"{"fps":0.3}"#).unwrap();
+        assert_eq!(spec.default_video_sample_fps_with(&non_dyadic), Some(0.3));
         let image = spec.encoder_field_layouts_for(Modality::Image);
         assert_eq!(image.encoder_input, FieldLayout::flat("patches_per_image"));
         assert_eq!(

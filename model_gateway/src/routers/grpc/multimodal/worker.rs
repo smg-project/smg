@@ -635,7 +635,7 @@ impl WorkerMediaPipeline {
             "media fetch policy for worker-side processing"
         );
         let connector = build_with(
-            || crate::clients::http_client_builder().timeout(Duration::from_secs(30)),
+            || crate::server::http_client_builder().timeout(Duration::from_secs(30)),
             false,
             "media HTTP client",
             |client| MediaConnector::new(client, connector_config.clone()),
@@ -1049,10 +1049,45 @@ fn classify_fetch(error: &MediaConnectorError, message: String) -> WorkerMediaEr
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use llm_tokenizer::MockTokenizer;
 
     use super::*;
-    use crate::test_support::video_tools_available;
+
+    /// Set to a non-empty value where the video tools must be installed (CI sets
+    /// it on the shards that install ffmpeg): the tests that decode a clip then
+    /// fail, instead of skipping, when ffmpeg or ffprobe is missing. The
+    /// multimodal crate's tests read the same variable.
+    const REQUIRE_VIDEO_TOOLS: &str = "SMG_REQUIRE_VIDEO_TOOLS";
+
+    /// Whether ffmpeg and ffprobe run on this host. Where they do not, a failure
+    /// under [`REQUIRE_VIDEO_TOOLS`], else a skip said on stderr; the multimodal
+    /// crate's test support carries the same rule.
+    #[expect(
+        clippy::print_stderr,
+        reason = "a skip says so; the harness shows it under --nocapture"
+    )]
+    fn video_tools_available() -> bool {
+        let runs = |tool: &str| {
+            Command::new(tool)
+                .arg("-version")
+                .output()
+                .is_ok_and(|out| out.status.success())
+        };
+        if runs("ffmpeg") && runs("ffprobe") {
+            return true;
+        }
+        let required = std::env::var_os(REQUIRE_VIDEO_TOOLS).is_some_and(|value| !value.is_empty());
+        assert!(
+            !required,
+            "ffmpeg or ffprobe is not installed, and {REQUIRE_VIDEO_TOOLS} is set"
+        );
+        eprintln!(
+            "ffmpeg or ffprobe is not installed: skipping; the tests that need no clip still run"
+        );
+        false
+    }
 
     fn limits(pairs: &[(Modality, usize)]) -> HashMap<Modality, usize> {
         pairs.iter().copied().collect()

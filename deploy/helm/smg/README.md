@@ -321,7 +321,7 @@ The budget is not a startup probe on the router's `/readiness`: a startup probe 
 Model loading takes from a minute to tens of minutes, depending on the checkpoint and where it is streamed from. Workers have startup probes with these defaults (`initialDelaySeconds` plus `failureThreshold` times `periodSeconds`: 360 s of budget):
 
 - HTTP mode: `httpGet /health` with `initialDelaySeconds: 60`, `failureThreshold: 30`
-- gRPC mode: `tcpSocket` probe (not all engines implement gRPC health checking yet)
+- gRPC mode: `grpc` probe on the serving port, the same budget. The probe asks the servicer's `grpc.health.v1` service, which every servicer serves (the Rust servicer for every engine, the Python servicers alike) and which answers `SERVING` once the engine serves. The pod therefore counts as started when the engine does, not when the servicer binds its port. The built-in gRPC probe needs Kubernetes 1.24 or later; the chart requires 1.26.
 
 Override per worker:
 

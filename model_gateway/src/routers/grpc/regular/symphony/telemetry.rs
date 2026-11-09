@@ -1,6 +1,17 @@
-//! What the reader records about an output: the counters per table, and one sampled line per
-//! output with a malformed run, written under the request span (the log line carries the span's
-//! request id; the trace exporter's own filter does not take this target).
+//! What the reader records about an output: the counters per table; one sampled line per
+//! output with a malformed run, written inside the request span once the output ended (the line
+//! carries the span's request id and the fields below; the trace exporter's own filter does not
+//! take this target); and, for every outcome that is not clean, the `symphony.*` fields of the
+//! request's span ([`Mark`]): the table, the outcome, the choice, the first run's reason, the
+//! bytes read and the malformed ones, and the engine's finish. The fields reach the request's
+//! trace, the sampled line, and every line written under the span after the mark: a whole
+//! response's access-log line among them, while a streamed response's access-log line goes out
+//! before its reading and carries them only where the stream's end line is written
+//! (`access_log_fields` naming `response_bytes`). One reading per request stands on the span,
+//! the first that was not clean ([`Tally::mark`]). The lines on malformed outputs are bounded
+//! per table and reason (a burst, then a steady rate, [`Sampler`]), so a flood of one shape
+//! hides no other; the lines on empty outputs and on calls to undeclared functions are bounded
+//! per table, each on a bucket of its own.
 //!
 //! The classes, from the crate's events (`symphony::Event`):
 //!
@@ -81,8 +92,11 @@
 //!
 //! Cost: a clean output records one counter increment through a key built once per table (the
 //! `metrics` macros build a key, with a `Vec` of labels, on every call), no allocation. A
-//! malformed one adds a histogram observation, the per-reason counters, and, when the table's
-//! token bucket allows it, one `warn` line: the only allocations. One counted `unknown_tool` adds
+//! malformed one adds a histogram observation, the per-reason counters, and, when the bucket of
+//! the table and the first run's reason allows it, one `warn` line: the only allocations. An
+//! output that is not clean records up to seven fields on the request's span ([`Mark`]), each
+//! one `record` call the log layers append to the span's stored fields; a clean one records
+//! none. One counted `unknown_tool` adds
 //! the per-reason counters, the first undeclared name cut to [`NAME_SHOWN`] bytes (one small
 //! allocation, made when the call starts) and, from a bucket of its own, one `warn` line; no
 //! histogram observation, the table having read it whole. A marker kept as text in an output run
@@ -100,7 +114,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         OnceLock,
     },
     time::Instant,
@@ -110,7 +124,7 @@ use metrics::{Counter, Key, Label, Level, Metadata};
 use parking_lot::Mutex;
 use smg_external_router::metrics::handles::keep_handles;
 use symphony::{formats::Table, DropReason, Event, FinishReason, MalformedReason};
-use tracing::{debug, warn};
+use tracing::{debug, warn, Span};
 
 use super::names::Fallback;
 
@@ -665,6 +679,51 @@ impl Tally {
         );
     }
 
+    /// The outcome the output is counted under: `malformed` when a run the table refused or kept
+    /// as content is among its runs, else `unknown_tool` when a call named a function the request
+    /// did not declare, else `empty` when it showed nothing, else `clean`.
+    fn outcome(&self) -> usize {
+        let malformed = self.malformed();
+        let undeclared = self.undeclared_calls();
+        if malformed > undeclared {
+            MALFORMED_OUTCOME
+        } else if undeclared > 0 {
+            UNKNOWN_TOOL
+        } else if self.is_empty() {
+            EMPTY
+        } else {
+            CLEAN
+        }
+    }
+
+    /// Leaves the output's reading on `span`, the request's, when it was not clean ([`Mark`]):
+    /// the table, the outcome, the choice, the first run's reason (`unknown_tool` for an output
+    /// counted so), the bytes read and the malformed ones, and the engine's finish. A clean
+    /// output leaves nothing, so the common case records no field. `marked` is the request's
+    /// ([`super::Assignment::marked`]): the first reading of the request that is not clean sets
+    /// it and stands on the span, its choice beside it, and a later choice's reading or a later
+    /// failure leaves the mark, so the span never shows the fields of two readings.
+    pub(crate) fn mark(&self, span: &Span, marked: &AtomicBool, table: &'static str, choice: u32) {
+        let outcome = self.outcome();
+        if outcome == CLEAN || marked.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let reason = match outcome {
+            UNKNOWN_TOOL => REASONS[UNKNOWN_TOOL_REASON],
+            _ => self.first.as_ref().map_or("", |first| first.reason),
+        };
+        Mark {
+            table,
+            outcome: OUTCOMES[outcome],
+            choice: Some(choice),
+            reason,
+            bytes: Some(self.at as u64),
+            malformed_bytes: self.malformed_bytes,
+            finish: self.finish,
+        }
+        .on(span);
+    }
+
     /// Records the output under `table`, read to its end: the counters, and the line when the
     /// output has a malformed run, a call to a function the request did not declare, or showed
     /// nothing ([`Self::is_empty`]), and the table's bucket for that kind of line allows one (the
@@ -677,15 +736,7 @@ impl Tally {
         let malformed = self.malformed();
         let undeclared = self.undeclared_calls();
         let empty = self.is_empty();
-        let outcome = if malformed > undeclared {
-            MALFORMED_OUTCOME
-        } else if undeclared > 0 {
-            UNKNOWN_TOOL
-        } else if empty {
-            EMPTY
-        } else {
-            CLEAN
-        };
+        let outcome = self.outcome();
         increment(&series.outputs[outcome], 1);
         // A forbidden call is counted whatever the outcome: an output of forbidden calls alone
         // is an empty one for the client, and this counter says why.
@@ -749,14 +800,14 @@ impl Tally {
             self.write_unknown_tool(series, table, who, undeclared);
             return;
         }
-        let Some(suppressed_lines) = series.sampler.allow() else {
-            return;
-        };
-        let outcome = OUTCOMES[outcome];
         let (reason, why, at, bytes) = match &self.first {
             Some(first) => (first.reason, first.why, first.at, first.bytes),
             None => ("", "", 0, 0),
         };
+        let Some(suppressed_lines) = series.malformed_lines[reason_slot(reason)].allow() else {
+            return;
+        };
+        let outcome = OUTCOMES[outcome];
         warn!(
             target: "smg::symphony",
             request_id = who.request_id,
@@ -787,6 +838,99 @@ impl Tally {
 /// `failed`).
 pub(crate) fn record_failed(table: &'static str) {
     increment(&series(table).outputs[FAILED], 1);
+}
+
+/// Leaves a failed output on `span`, the request's: the table, the outcome and the `bytes` read
+/// when it failed. No run names a reason and the engine's finish is not known yet. `marked` is
+/// the request's, as for [`Tally::mark`]: a failure after a reading's mark leaves the mark (the
+/// failure has its ERROR line and its counter).
+pub(crate) fn mark_failed(span: &Span, marked: &AtomicBool, table: &'static str, bytes: usize) {
+    if marked.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    Mark {
+        table,
+        outcome: OUTCOMES[FAILED],
+        choice: None,
+        reason: "",
+        bytes: Some(bytes as u64),
+        malformed_bytes: 0,
+        finish: "",
+    }
+    .on(span);
+}
+
+/// Leaves an output whose reading panicked on `span`, the request's: the table that read it, or
+/// `none` where no table did, and the outcome. The bytes read went with the reader, and so did
+/// the request's mark: the boundary that catches the panic records after any reading's mark,
+/// its table and outcome overwrite, and a reading's choice, reason, bytes and finish stay as the
+/// last state before the panic.
+pub(crate) fn mark_panicked(span: &Span, table: Option<&'static str>) {
+    Mark {
+        table: table.unwrap_or(NO_TABLE),
+        outcome: OUTCOMES[PANICKED],
+        choice: None,
+        reason: "",
+        bytes: None,
+        malformed_bytes: 0,
+        finish: "",
+    }
+    .on(span);
+}
+
+/// What a reading that was not clean leaves on the request's span, as its `symphony.*` fields:
+/// every line written under the span after that carries them (the output's sampled line, a
+/// whole response's access-log line, a stream's end line where one is written), so a request is
+/// found by its outcome, table or reason where the output's own line was bounded away. The
+/// fields are declared on the request span
+/// (`middleware::logging::RequestSpan`); a span without them, or no span, takes nothing.
+pub(crate) struct Mark {
+    pub table: &'static str,
+    pub outcome: &'static str,
+    /// The choice, where the reading had one; a failure caught at the request's boundary has
+    /// none.
+    pub choice: Option<u32>,
+    /// The first run's reason label; empty where the outcome has none (`empty`, `failed`,
+    /// `panicked`).
+    pub reason: &'static str,
+    /// The output's bytes read; none where the count went with the reader (`panicked`).
+    pub bytes: Option<u64>,
+    pub malformed_bytes: u64,
+    /// The engine's finish label; empty where the output had none yet.
+    pub finish: &'static str,
+}
+
+impl Mark {
+    /// Records the fields on `span`; an empty reason or finish, an absent choice or byte count
+    /// and no malformed bytes record nothing under their names.
+    pub(crate) fn on(&self, span: &Span) {
+        span.record("symphony.table", self.table);
+        span.record("symphony.outcome", self.outcome);
+        if let Some(choice) = self.choice {
+            span.record("symphony.choice", choice);
+        }
+        if !self.reason.is_empty() {
+            span.record("symphony.reason", self.reason);
+        }
+        if let Some(bytes) = self.bytes {
+            span.record("symphony.bytes", bytes);
+        }
+        if self.malformed_bytes > 0 {
+            span.record("symphony.malformed_bytes", self.malformed_bytes);
+        }
+        if !self.finish.is_empty() {
+            span.record("symphony.finish", self.finish);
+        }
+    }
+}
+
+/// The place of the reason labelled `label` in [`REASONS`]: the bucket its lines take from. A
+/// first run no label names takes from the first.
+fn reason_slot(label: &str) -> usize {
+    REASONS
+        .iter()
+        .position(|reason| *reason == label)
+        .unwrap_or(0)
 }
 
 /// Records a whole Messages response refused after its output was read under `table`: its
@@ -909,8 +1053,11 @@ struct Series {
     fallback: [Key; 5],
     /// [`REFUSED`] under its one reason.
     refused: Key,
-    /// The bucket of the lines on malformed outputs.
-    sampler: Sampler,
+    /// The buckets of the lines on malformed outputs, one per reason of the output's first run,
+    /// in the order of [`REASONS`]: a flow of one shape (a model that leaves every call
+    /// unterminated) suppresses no line of another shape, so the first lines of every reason
+    /// are written and each reason keeps its own rate after that.
+    malformed_lines: [Sampler; REASONS.len()],
     /// The bucket of the lines on empty outputs: their own, so a steady flow of empty outputs (a
     /// probe with `max_tokens: 1`, a keepalive that finishes with no token) suppresses no
     /// malformed line and counts on none.
@@ -940,7 +1087,7 @@ impl Series {
             calls_forbidden: key(CALLS_FORBIDDEN, &[]),
             fallback: FALLBACK_REASONS.map(|reason| key(FALLBACK, &[("reason", reason)])),
             refused: key(REFUSED, &[("reason", REFUSED_TOOL_USE_INPUT)]),
-            sampler: Sampler::new(),
+            malformed_lines: std::array::from_fn(|_| Sampler::new()),
             empty_lines: Sampler::new(),
             unknown_tool_lines: Sampler::new(),
         }
@@ -1029,11 +1176,14 @@ impl Sampler {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
     use smg_external_router::metrics::handles::force_on_this_thread;
     use symphony::{DropReason, FinishReason, Text};
 
     use super::*;
-    use crate::routers::grpc::regular::symphony::testing::{line_with, rendered};
+    use crate::routers::grpc::regular::symphony::testing::{
+        json_lines, line_with, rendered, request_span,
+    };
 
     fn malformed(text: &str, why: MalformedReason) -> Event<'static> {
         Event::Malformed {
@@ -1553,6 +1703,261 @@ mod tests {
         assert_eq!(dropping.tool_calls, 1);
         assert_eq!(keeping.tool_calls, 3);
         assert_eq!(dropping.at, 33);
+    }
+
+    /// The span object of the last line `work` wrote: the access log's last line of the request,
+    /// written under the request span after the output ended, as the JSON layer renders it.
+    fn last_span_of(work: impl FnOnce(&Span)) -> Value {
+        let mut lines = json_lines(|| {
+            let span = request_span();
+            let _entered = span.enter();
+            work(&span);
+            tracing::info!(target: "smg::response", "finished processing request");
+        });
+        let mut last = lines.pop().expect("the access log line");
+        last["span"].take()
+    }
+
+    #[test]
+    fn a_malformed_output_leaves_its_reading_on_the_request_span() {
+        let span = last_span_of(|span| {
+            let mut tally = Tally::default();
+            tally.see(&Event::Content(Text::uncounted("Hi ")), false);
+            tally.see(
+                &malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
+                false,
+            );
+            tally.see(&finished(FinishReason::Length), false);
+            tally.mark(span, &AtomicBool::new(false), "qwen3", 1);
+        });
+        assert_eq!(span["name"], "http_request");
+        assert_eq!(span["symphony.table"], "qwen3");
+        assert_eq!(span["symphony.outcome"], "malformed");
+        assert_eq!(span["symphony.choice"], 1);
+        assert_eq!(span["symphony.reason"], "unterminated_region");
+        assert_eq!(span["symphony.bytes"], 15);
+        assert_eq!(span["symphony.malformed_bytes"], 12);
+        assert_eq!(span["symphony.finish"], "length");
+    }
+
+    #[test]
+    fn a_clean_output_leaves_nothing_on_the_request_span() {
+        let span = last_span_of(|span| {
+            let mut tally = Tally::default();
+            tally.see(&Event::Content(Text::uncounted("Hi")), false);
+            tally.see(&finished(FinishReason::Stop), false);
+            tally.mark(span, &AtomicBool::new(false), "qwen3", 0);
+        });
+        assert_eq!(span["name"], "http_request");
+        assert!(span.get("symphony.outcome").is_none(), "{span}");
+        assert!(span.get("symphony.table").is_none(), "{span}");
+        assert!(span.get("symphony.bytes").is_none(), "{span}");
+    }
+
+    #[test]
+    fn an_empty_and_an_unknown_tool_output_leave_their_outcome_and_what_names_it() {
+        let empty = last_span_of(|span| {
+            let mut tally = Tally::default();
+            tally.see(&dropped("\n", 1, DropReason::Whitespace), false);
+            tally.see(&finished(FinishReason::Stop), false);
+            tally.mark(span, &AtomicBool::new(false), "olmo3", 0);
+        });
+        assert_eq!(empty["symphony.outcome"], "empty");
+        assert_eq!(empty["symphony.table"], "olmo3");
+        assert_eq!(empty["symphony.bytes"], 1);
+        assert_eq!(empty["symphony.finish"], "stop");
+        assert!(empty.get("symphony.reason").is_none(), "{empty}");
+        assert!(empty.get("symphony.malformed_bytes").is_none(), "{empty}");
+        let unknown = last_span_of(|span| {
+            let mut tally = Tally::default();
+            tally.see(&malformed("", MalformedReason::UnknownTool), false);
+            tally.see(&call_named(0, "lookup_v2", "<tool_call>"), false);
+            tally.see(&finished(FinishReason::ToolCalls), false);
+            tally.mark(span, &AtomicBool::new(false), "qwen3", 0);
+        });
+        assert_eq!(unknown["symphony.outcome"], "unknown_tool");
+        assert_eq!(unknown["symphony.reason"], "unknown_tool");
+        assert_eq!(unknown["symphony.finish"], "tool_calls");
+        assert!(
+            unknown.get("symphony.malformed_bytes").is_none(),
+            "{unknown}"
+        );
+    }
+
+    #[test]
+    fn a_failed_and_a_panicked_reading_leave_the_outcome_and_the_table() {
+        let failed = last_span_of(|span| mark_failed(span, &AtomicBool::new(false), "hy4", 7));
+        assert_eq!(failed["symphony.outcome"], "failed");
+        assert_eq!(failed["symphony.table"], "hy4");
+        assert_eq!(failed["symphony.bytes"], 7);
+        assert!(failed.get("symphony.finish").is_none(), "{failed}");
+        assert!(failed.get("symphony.choice").is_none(), "{failed}");
+        assert!(failed.get("symphony.reason").is_none(), "{failed}");
+        let panicked = last_span_of(|span| mark_panicked(span, None));
+        assert_eq!(panicked["symphony.outcome"], "panicked");
+        assert_eq!(panicked["symphony.table"], "none");
+        assert!(panicked.get("symphony.bytes").is_none(), "{panicked}");
+        let read = last_span_of(|span| mark_panicked(span, Some("glm4")));
+        assert_eq!(read["symphony.table"], "glm4");
+    }
+
+    #[test]
+    fn one_reading_per_request_stands_on_the_span_the_first_that_was_not_clean() {
+        // Three choices and a failure after them: the clean reading marks nothing, the malformed
+        // one marks, and the empty reading and the failure leave the mark, so the span shows one
+        // reading's fields and never a mix.
+        let span = last_span_of(|span| {
+            let marked = AtomicBool::new(false);
+            let mut clean = Tally::default();
+            clean.see(&Event::Content(Text::uncounted("Hi")), false);
+            clean.see(&finished(FinishReason::Stop), false);
+            clean.mark(span, &marked, "qwen3", 0);
+            assert!(
+                !marked.load(Ordering::Acquire),
+                "a clean reading marks nothing"
+            );
+            let mut refused = Tally::default();
+            refused.see(&Event::Content(Text::uncounted("Hi ")), false);
+            refused.see(
+                &malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
+                false,
+            );
+            refused.see(&finished(FinishReason::Length), false);
+            refused.mark(span, &marked, "qwen3", 1);
+            let mut empty = Tally::default();
+            empty.see(&dropped("\n", 1, DropReason::Whitespace), false);
+            empty.see(&finished(FinishReason::Stop), false);
+            empty.mark(span, &marked, "qwen3", 2);
+            mark_failed(span, &marked, "qwen3", 3);
+        });
+        assert_eq!(span["symphony.outcome"], "malformed");
+        assert_eq!(span["symphony.choice"], 1);
+        assert_eq!(span["symphony.reason"], "unterminated_region");
+        assert_eq!(span["symphony.bytes"], 15);
+        assert_eq!(span["symphony.malformed_bytes"], 12);
+        assert_eq!(span["symphony.finish"], "length");
+    }
+
+    #[test]
+    fn a_streamed_reading_marks_the_trace_and_its_line_after_the_access_line_went_out() {
+        // A streamed response's access-log line is written when the head goes out, before the
+        // body drives the reading, so it carries no field of the reading; the reading then marks
+        // the span and writes its sampled line inside it, as the reader does, so that line carries
+        // the request's span and the fields just marked.
+        let lines = json_lines(|| {
+            let span = request_span();
+            span.in_scope(
+                || tracing::info!(target: "smg::response", "finished processing request"),
+            );
+            let marked = AtomicBool::new(false);
+            let mut tally = Tally::default();
+            tally.see(&Event::Content(Text::uncounted("Hi ")), false);
+            tally.see(
+                &malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
+                false,
+            );
+            tally.see(&finished(FinishReason::Length), false);
+            tally.mark(&span, &marked, "glm", 0);
+            span.in_scope(|| {
+                tally.report(
+                    "glm",
+                    Who {
+                        request_id: "req-streamed",
+                        model: "glm-5",
+                        choice: 0,
+                    },
+                );
+            });
+        });
+        let access = &lines[0]["span"];
+        assert_eq!(access["name"], "http_request");
+        assert!(access.get("symphony.outcome").is_none(), "{access}");
+        let line = lines
+            .iter()
+            .find(|line| line["span"].get("symphony.outcome").is_some())
+            .expect("the output's line, written inside the span");
+        assert_eq!(line["span"]["name"], "http_request");
+        assert_eq!(line["span"]["symphony.outcome"], "malformed");
+        assert_eq!(line["span"]["symphony.reason"], "unterminated_region");
+        assert_eq!(line["span"]["symphony.malformed_bytes"], 12);
+    }
+
+    #[test]
+    fn a_span_without_the_fields_and_no_span_take_nothing() {
+        // Another span's fields are its own: a mark on it records nothing and nothing panics;
+        // the span of no subscriber takes nothing either.
+        let lines = json_lines(|| {
+            let other = tracing::info_span!("grpc_execute", request_type = "chat");
+            let _entered = other.enter();
+            mark_failed(&other, &AtomicBool::new(false), "qwen3", 1);
+            tracing::info!("under another span");
+        });
+        let span = &lines[0]["span"];
+        assert_eq!(span["name"], "grpc_execute");
+        assert!(span.get("symphony.outcome").is_none(), "{span}");
+        mark_failed(&Span::none(), &AtomicBool::new(false), "qwen3", 1);
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn malformed_lines_take_from_a_bucket_per_reason() {
+        // Forty outputs whose first run is an unterminated region drain that reason's bucket on
+        // the table; an output whose first run is of another reason still writes its line, and
+        // counts none of the forty's suppressed lines as its own.
+        let unterminated: u32 = 40;
+        rendered(|| {
+            for choice in 0..unterminated {
+                let mut tally = Tally::default();
+                tally.see(
+                    &malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
+                    false,
+                );
+                tally.see(&finished(FinishReason::Stop), false);
+                tally.report(
+                    "ling",
+                    Who {
+                        request_id: "req-unterminated-flow",
+                        model: "m",
+                        choice,
+                    },
+                );
+            }
+            let mut tally = Tally::default();
+            tally.see(
+                &malformed("{\"q\": }", MalformedReason::InvalidArguments),
+                false,
+            );
+            tally.see(&finished(FinishReason::Stop), false);
+            tally.report(
+                "ling",
+                Who {
+                    request_id: "req-invalid-after-the-flow",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        logs_assert(|lines: &[&str]| {
+            let flow = lines
+                .iter()
+                .filter(|line| line.contains("req-unterminated-flow"))
+                .count();
+            if flow >= unterminated as usize {
+                return Err(format!(
+                    "no line of the flow was suppressed: {flow} written"
+                ));
+            }
+            match lines
+                .iter()
+                .find(|line| line.contains("req-invalid-after-the-flow"))
+            {
+                Some(line) if line.contains("suppressed_lines=0") => Ok(()),
+                Some(line) => Err(format!(
+                    "the line counts the other reason's suppressed lines: {line}"
+                )),
+                None => Err("the flow of one reason suppressed the line of another".to_string()),
+            }
+        });
     }
 
     #[test]

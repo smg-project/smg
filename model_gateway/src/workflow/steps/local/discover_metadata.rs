@@ -771,6 +771,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::workflow::steps::local::test_support::labels_of;
 
     /// A ZMQ worker's labels say its grammars start at the first generated
     /// token (the gateway's own link holds them there), with or without the
@@ -801,17 +802,14 @@ mod tests {
     /// canonical labels, and an existing canonical label is never overwritten.
     #[test]
     fn normalize_grpc_keys_canonicalises_every_parallelism_spelling() {
-        let mut labels: HashMap<String, String> = [
+        let mut labels = labels_of(&[
             ("attn_tp_size", "2"),
             ("pipeline_parallel_size", "1"),
             ("data_parallel_size", "4"),
             ("context_parallel_size", "1"),
             ("block_size", "16"),
             ("uptime_seconds", "12.5"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+        ]);
         normalize_grpc_keys(&mut labels);
         assert_eq!(labels.get("tp_size").map(String::as_str), Some("2"));
         assert_eq!(labels.get("pp_size").map(String::as_str), Some("1"));
@@ -823,18 +821,12 @@ mod tests {
         assert!(!labels.contains_key("uptime_seconds"));
 
         // An engine that reports both keeps its own `tp_size`.
-        let mut attn: HashMap<String, String> = [("tp_size", "8"), ("attn_tp_size", "2")]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        let mut attn = labels_of(&[("tp_size", "8"), ("attn_tp_size", "2")]);
         normalize_grpc_keys(&mut attn);
         assert_eq!(attn.get("tp_size").map(String::as_str), Some("8"));
         assert!(!attn.contains_key("attn_tp_size"));
 
-        let mut both: HashMap<String, String> = [("tp_size", "8"), ("tensor_parallel_size", "2")]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        let mut both = labels_of(&[("tp_size", "8"), ("tensor_parallel_size", "2")]);
         normalize_grpc_keys(&mut both);
         assert_eq!(both.get("tp_size").map(String::as_str), Some("8"));
     }
@@ -850,7 +842,7 @@ mod tests {
     async fn the_sglang_http_read_combines_the_three_endpoints_with_the_engines_own_labels_first() {
         use http::StatusCode;
 
-        use crate::test_support::serve_json_routes;
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         let base = serve_json_routes(vec![
             (
@@ -879,7 +871,7 @@ mod tests {
         ])
         .await;
 
-        let labels = fetch_sglang_http_metadata(&crate::clients::http_client(), &base, None).await;
+        let labels = fetch_sglang_http_metadata(&crate::server::http_client(), &base, None).await;
         assert_eq!(
             label(&labels, "model_path"),
             Some("org/model-a"),
@@ -908,7 +900,7 @@ mod tests {
     async fn the_sglang_http_read_takes_the_older_spelling_and_tolerates_an_endpoint_not_offered() {
         use http::StatusCode;
 
-        use crate::test_support::serve_json_routes;
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         let base = serve_json_routes(vec![
             (
@@ -923,7 +915,7 @@ mod tests {
             ),
         ])
         .await;
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
 
         let tolerant = fetch_sglang_http_metadata(&client, &base, None).await;
         assert_eq!(label(&tolerant, "model_path"), Some("org/model-b"));
@@ -948,7 +940,7 @@ mod tests {
     {
         use http::StatusCode;
 
-        use crate::test_support::serve_json_routes;
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         let base = serve_json_routes(vec![
             (
@@ -968,7 +960,7 @@ mod tests {
             ),
         ])
         .await;
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
 
         let tolerant = fetch_sglang_http_metadata(&client, &base, None).await;
         assert_eq!(label(&tolerant, "model_path"), Some("org/model-c"));
@@ -990,12 +982,12 @@ mod tests {
     async fn the_vllm_http_read_takes_the_model_list_and_the_version() {
         use http::StatusCode;
 
-        use crate::test_support::serve_json_routes;
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         let models = serde_json::json!({"data": [
             {"id": "served-d", "root": "org/model-d", "max_model_len": 8192}
         ]});
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
 
         let base = serve_json_routes(vec![
             ("/v1/models", StatusCode::OK, models.clone()),
@@ -1029,7 +1021,7 @@ mod tests {
 
         let refused = RefusedAddress::reserve();
         let base = refused.http_url();
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
 
         assert!(fetch_vllm_http_metadata(&client, &base, None)
             .await
@@ -1321,7 +1313,7 @@ mod tests {
         use http::StatusCode;
         use serde_json::json;
 
-        use crate::test_support::serve_json_routes;
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         let base = serve_json_routes(vec![(
             "/v1/models",
@@ -1339,7 +1331,7 @@ mod tests {
         )])
         .await;
 
-        let labels = fetch_sglang_http_metadata(&crate::clients::http_client(), &base, None).await;
+        let labels = fetch_sglang_http_metadata(&crate::server::http_client(), &base, None).await;
 
         assert_eq!(
             labels.get("served_model_name").map(String::as_str),
@@ -1380,7 +1372,7 @@ mod tests {
         });
 
         let err = get_server_info(
-            &crate::clients::http_client(),
+            &crate::server::http_client(),
             &format!("http://user:secret@127.0.0.1:{port}"),
             None,
         )

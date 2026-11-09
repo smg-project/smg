@@ -145,10 +145,8 @@ fn load_yaml(path: Option<&str>) -> Result<RateLimitYaml, String> {
 
 #[cfg(test)]
 mod tests {
-    use uuid::Uuid;
-
     use super::*;
-    use crate::{rate_limit::config::TenantPolicySpec, tenant::TenantKey};
+    use crate::rate_limit::{config::TenantPolicySpec, test_support::reserve_request};
 
     fn manager_with_limits(tpm: u32, rpm: u32) -> RateLimitManager {
         let yaml = RateLimitYaml {
@@ -166,19 +164,10 @@ mod tests {
         }
     }
 
-    fn request(tenant: &str, tokens: u32) -> ReserveRequest<'static> {
-        ReserveRequest {
-            request_charge_id: Uuid::now_v7(),
-            tenant_key: TenantKey::new(tenant),
-            model_id: None,
-            estimated_input_tokens: tokens,
-        }
-    }
-
     #[tokio::test]
     async fn admitted_reservation_carries_a_handle() {
         let manager = manager_with_limits(100, 5);
-        match manager.reserve(request("auth:team-red", 50)).await {
+        match manager.reserve(reserve_request("auth:team-red", 50)).await {
             Reservation::Admitted(handle) => {
                 // The handle is independently usable -- settle through it,
                 // not through the backend directly.
@@ -192,7 +181,7 @@ mod tests {
     async fn denied_reservation_carries_no_handle() {
         let manager = manager_with_limits(100, 5);
         assert!(matches!(
-            manager.reserve(request("auth:team-red", 200)).await,
+            manager.reserve(reserve_request("auth:team-red", 200)).await,
             Reservation::Denied { .. }
         ));
     }

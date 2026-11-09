@@ -734,6 +734,7 @@ mod tests {
     use super::*;
     use crate::{
         config::PdReadinessConfig,
+        test_support::json_of,
         worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker},
     };
 
@@ -1248,12 +1249,6 @@ mod tests {
             }
             Arc::new(builder.build())
         }
-        async fn body_of(response: Response) -> serde_json::Value {
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            serde_json::from_slice(&bytes).unwrap()
-        }
 
         let state = probe_state();
         let registry = WorkerRegistry::new();
@@ -1277,7 +1272,7 @@ mod tests {
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.extensions().get::<ProbeResponse>().is_some());
-        let body = body_of(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["status"], "ready");
         assert_eq!(body["healthy_workers"], 1);
         assert_eq!(body["models_without_media_processing"], json!(["qwen-vl"]));
@@ -1286,7 +1281,7 @@ mod tests {
         for placement in [MmProcessingMode::Auto, MmProcessingMode::Router] {
             state.recompute_with(&registry, &router_config, |_| true, placement);
             assert!(state.readiness().models_without_media_processing.is_empty());
-            let body = body_of(state.readiness_response()).await;
+            let body = json_of(state.readiness_response()).await;
             assert_eq!(body["status"], "ready");
             assert!(body.get("models_without_media_processing").is_none());
         }
@@ -1307,7 +1302,7 @@ mod tests {
         assert!(state.readiness().models_without_media_processing.is_empty());
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = body_of(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["healthy_workers"], 2);
         assert!(body.get("models_without_media_processing").is_none());
 
@@ -1316,7 +1311,7 @@ mod tests {
         state.recompute_with(&empty, &router_config, |_| true, MmProcessingMode::Worker);
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = body_of(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["reason"], "insufficient healthy workers");
         assert!(body.get("models_without_media_processing").is_none());
     }
@@ -1327,12 +1322,6 @@ mod tests {
     /// whose last worker left is no longer listed.
     #[tokio::test]
     async fn readiness_names_each_served_model_with_a_reason() {
-        async fn body_of(response: Response) -> serde_json::Value {
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            serde_json::from_slice(&bytes).unwrap()
-        }
         let state = probe_state();
         let registry = WorkerRegistry::new();
         let router_config = regular_config();
@@ -1365,7 +1354,7 @@ mod tests {
         );
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = body_of(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["status"], "ready");
         assert_eq!(
             body["models"],
@@ -1388,7 +1377,7 @@ mod tests {
         );
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = body_of(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["reason"], "tokenizer not yet registered");
         assert_eq!(body["models"][0]["ready"], true);
         assert_eq!(
@@ -1399,7 +1388,7 @@ mod tests {
 
         // The tokenizer lands: every model ready, no reason anywhere.
         state.recompute_with(&registry, &router_config, |_| true, MmProcessingMode::Auto);
-        let body = body_of(state.readiness_response()).await;
+        let body = json_of(state.readiness_response()).await;
         assert_eq!(body["status"], "ready");
         let models = body["models"].as_array().unwrap();
         assert_eq!(models.len(), 2);
@@ -1412,7 +1401,7 @@ mod tests {
         state.recompute_with(&registry, &router_config, |_| true, MmProcessingMode::Auto);
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = body_of(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["models"][1]["reason"], "draining");
         assert_eq!(body["models"][1]["healthy_workers"], 0);
 
@@ -1420,7 +1409,7 @@ mod tests {
         // longer listed.
         registry.remove(&m2);
         state.recompute_with(&registry, &router_config, |_| true, MmProcessingMode::Auto);
-        let body = body_of(state.readiness_response()).await;
+        let body = json_of(state.readiness_response()).await;
         assert_eq!(
             body["models"],
             json!([{"model": "m1", "ready": true, "healthy_workers": 1, "total_workers": 1}])
@@ -1431,7 +1420,7 @@ mod tests {
         state.recompute_with(&registry, &router_config, |_| true, MmProcessingMode::Auto);
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = body_of(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["reason"], "insufficient healthy workers");
         assert_eq!(body["models"], json!([]));
     }
@@ -1441,12 +1430,6 @@ mod tests {
     /// own answer reads the fleet-level thresholds.
     #[tokio::test]
     async fn pd_readiness_names_the_role_a_model_lacks() {
-        async fn body_of(response: Response) -> serde_json::Value {
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            serde_json::from_slice(&bytes).unwrap()
-        }
         let state = probe_state();
         let registry = WorkerRegistry::new();
         let router_config = config(RoutingMode::PrefillDecode {
@@ -1473,7 +1456,7 @@ mod tests {
         recompute(&state, &registry, &router_config);
         let response = state.readiness_response();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = body_of(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["roles"]["decode"]["healthy"], 1);
         assert_eq!(
             body["models"],
@@ -1491,12 +1474,6 @@ mod tests {
     /// it. The entry's roles follow the workers the model has, not the mode.
     #[tokio::test]
     async fn epd_readiness_asks_encode_of_a_model_with_an_encode_worker() {
-        async fn body_of(response: Response) -> serde_json::Value {
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            serde_json::from_slice(&bytes).unwrap()
-        }
         let state = probe_state();
         let registry = WorkerRegistry::new();
         let router_config = config(RoutingMode::EncodePrefillDecode {
@@ -1550,7 +1527,7 @@ mod tests {
                 .unwrap();
         }
         recompute(&state, &registry, &router_config);
-        let body = body_of(state.readiness_response()).await;
+        let body = json_of(state.readiness_response()).await;
         assert_eq!(
             body["models"],
             json!([
@@ -1699,7 +1676,7 @@ mod tests {
         let addr = start_probe_listener("127.0.0.1", 0, state.clone()).unwrap();
         let base = format!("http://{addr}");
 
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
         let resp = client.get(format!("{base}/liveness")).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), "OK");

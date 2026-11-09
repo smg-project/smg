@@ -338,6 +338,9 @@ impl Scanner {
 
     /// The end of the piece that starts at `pos`, if one does: the first of
     /// the seven alternatives that matches there, as the engine picks it.
+    /// Compiled into its callers' loops: out of line it was a call per
+    /// piece, and every value the loop keeps across a call is a spill.
+    #[inline(always)]
     pub(super) fn match_at(&self, classes: &[Class], text: &str, pos: usize) -> Option<usize> {
         let (c, len) = self.roles.at(text, pos)?;
         let after = pos + len;

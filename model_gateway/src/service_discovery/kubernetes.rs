@@ -705,7 +705,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        test_support::make_labeled_pod,
+        service_discovery::testing::make_labeled_pod,
         worker::{endpoint::Endpoint, registry::WorkerId, EndpointKey},
     };
 

@@ -45,10 +45,11 @@ pub struct ServicerConfig {
     /// [`DEFAULT_ENGINE_STARTUP_CEILING`].
     pub engine_startup_ceiling: Option<Duration>,
     /// Bound on the connected engine's silence: how long it may hold requests
-    /// in flight, in total since its last output, with nothing pending
-    /// prefill, before the servicer treats it as dead and fails them. The
-    /// prompt tokens pending prefill extend it at `engine_prefill_tokens_per_sec`.
-    /// See [`DEFAULT_ENGINE_SILENCE_TIMEOUT`].
+    /// in flight, in total since its last output or other sign of progress
+    /// (a KV-event batch its publisher sent, read live by the relay), with
+    /// nothing pending prefill, before the servicer treats it as dead and
+    /// fails them. The prompt tokens pending prefill extend it at
+    /// `engine_prefill_tokens_per_sec`. See [`DEFAULT_ENGINE_SILENCE_TIMEOUT`].
     pub engine_silence_timeout: Duration,
     /// The prefill rate the silence bound allows the engine: the prompt tokens
     /// of the in-flight requests without a first output yet extend the bound

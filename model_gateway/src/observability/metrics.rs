@@ -86,6 +86,7 @@ mod handles {
     };
 
     use metrics::{Counter, Gauge, Histogram};
+    use rustc_hash::FxHashMap;
     #[cfg(test)]
     pub(super) use smg_external_router::metrics::handles::force_on_this_thread;
     pub(super) use smg_external_router::metrics::handles::{
@@ -94,12 +95,17 @@ mod handles {
 
     use super::{intern_model_label, intern_string};
 
-    /// Handles by the matched path (the only label a request computes).
-    pub(super) type ByPath<H> = HashMap<String, H>;
+    /// Handles by the matched path (the only label a request computes: the
+    /// route template, the gateway's own, so these maps hash with FxHash).
+    pub(super) type ByPath<H> = FxHashMap<String, H>;
     /// Handles by method, then matched path.
-    pub(super) type ByMethodAndPath<H> = HashMap<&'static str, ByPath<H>>;
+    pub(super) type ByMethodAndPath<H> = FxHashMap<&'static str, ByPath<H>>;
     /// Response counters by matched path, then status code, then error code.
-    pub(super) type ByPathStatusAndError = HashMap<String, HashMap<u16, ByPath<Counter>>>;
+    /// The error-code level keeps the standard hasher: a worker's own error
+    /// code can reach it through the response middleware, so that key is not
+    /// one the gateway controls.
+    pub(super) type ByPathStatusAndError =
+        FxHashMap<String, FxHashMap<u16, HashMap<String, Counter>>>;
 
     /// The static labels of the stream-timing set.
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -286,7 +292,7 @@ mod handles {
     /// own allocation, as the request counters' is, and a label the interner
     /// refused (its sentinel) keeps nothing (`None`).
     pub(super) fn engine_rank<'m>(
-        by_model: &'m mut HashMap<Arc<str>, HashMap<i32, EngineRankHandles>>,
+        by_model: &'m mut HashMap<Arc<str>, FxHashMap<i32, EngineRankHandles>>,
         model_id: &str,
         dp_rank: i32,
     ) -> Option<&'m mut EngineRankHandles> {
@@ -295,7 +301,7 @@ mod handles {
             if !kept(by_model.len(), &label) {
                 return None;
             }
-            by_model.insert(label, HashMap::new());
+            by_model.insert(label, FxHashMap::default());
         }
         let ranks = by_model.get_mut(model_id)?;
         Some(ranks.entry(dp_rank).or_default())
@@ -320,14 +326,14 @@ mod handles {
     /// every family is here: the map is cleared when the generation moves.
     pub(super) struct ByWorker<V> {
         generation: u64,
-        by_worker: HashMap<String, V>,
+        by_worker: FxHashMap<String, V>,
     }
 
     impl<V> Default for ByWorker<V> {
         fn default() -> Self {
             Self {
                 generation: 0,
-                by_worker: HashMap::new(),
+                by_worker: FxHashMap::default(),
             }
         }
     }
@@ -335,7 +341,7 @@ mod handles {
     impl<V> ByWorker<V> {
         /// The handles by worker, after dropping every kept handle if the
         /// worker set changed since they were kept.
-        pub(super) fn current(&mut self) -> &mut HashMap<String, V> {
+        pub(super) fn current(&mut self) -> &mut FxHashMap<String, V> {
             let generation = WORKER_SET_GENERATION.load(Ordering::Acquire);
             if self.generation != generation {
                 self.by_worker.clear();
@@ -357,7 +363,7 @@ mod handles {
     pub(super) type WorkerRequests = ByWorker<HashMap<Arc<str>, Counter>>;
 
     /// `smg_worker_cb_outcomes_total`: by worker URL, then the outcome.
-    pub(super) type WorkerOutcomes = ByWorker<HashMap<&'static str, Counter>>;
+    pub(super) type WorkerOutcomes = ByWorker<FxHashMap<&'static str, Counter>>;
 
     /// A per-worker gauge set on every request (the active-request count,
     /// the circuit breaker's consecutive outcomes): set through its kept
@@ -366,7 +372,7 @@ mod handles {
 
     /// The `smg_engine_*` set: by worker URL, then the model label as the
     /// interner gave it, then the DP rank.
-    pub(super) type EngineLoads = ByWorker<HashMap<Arc<str>, HashMap<i32, EngineRankHandles>>>;
+    pub(super) type EngineLoads = ByWorker<HashMap<Arc<str>, FxHashMap<i32, EngineRankHandles>>>;
 
     /// Uses the one handle of a series with no dynamic label: this thread's
     /// kept handle, built on first use, or a key built per call when handles
@@ -386,9 +392,10 @@ mod handles {
     /// Uses the handle under a static label (or a tuple of them): this
     /// thread's kept handle, built on the label's first sight, or a key
     /// built per call when handles are not kept. A static label set is
-    /// finite, so the map needs no cap.
+    /// finite, so the map needs no cap; its labels are the gateway's own
+    /// constants, so the map hashes with FxHash.
     pub(super) fn with_static<K: Copy + Eq + Hash, H>(
-        kept: &'static LocalKey<RefCell<HashMap<K, H>>>,
+        kept: &'static LocalKey<RefCell<FxHashMap<K, H>>>,
         label: K,
         build: impl FnOnce() -> H,
         use_handle: impl FnOnce(&H),
@@ -402,17 +409,17 @@ mod handles {
 
     thread_local! {
         /// `smg_http_requests_total`.
-        pub(super) static HTTP_REQUESTS: RefCell<ByMethodAndPath<Counter>> = RefCell::new(HashMap::new());
+        pub(super) static HTTP_REQUESTS: RefCell<ByMethodAndPath<Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_http_request_duration_seconds`.
-        pub(super) static HTTP_DURATIONS: RefCell<ByMethodAndPath<Histogram>> = RefCell::new(HashMap::new());
+        pub(super) static HTTP_DURATIONS: RefCell<ByMethodAndPath<Histogram>> = RefCell::new(FxHashMap::default());
         /// `smg_http_responses_total`.
-        pub(super) static HTTP_RESPONSES: RefCell<ByPathStatusAndError> = RefCell::new(HashMap::new());
+        pub(super) static HTTP_RESPONSES: RefCell<ByPathStatusAndError> = RefCell::new(FxHashMap::default());
         /// `smg_http_rate_limit_total` by result.
-        pub(super) static HTTP_RATE_LIMITS: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        pub(super) static HTTP_RATE_LIMITS: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_http_connections_active`: one series, a handle to it per worker.
         pub(super) static HTTP_CONNECTIONS_ACTIVE: RefCell<Option<Gauge>> = const { RefCell::new(None) };
         /// The stream-timing set by its static labels, then the model.
-        pub(super) static STREAMS: RefCell<ByLabels<StreamLabels, StreamHandles>> = RefCell::new(HashMap::new());
+        pub(super) static STREAMS: RefCell<ByLabels<StreamLabels, StreamHandles>> = RefCell::new(FxHashMap::default());
         /// `smg_worker_requests_total`.
         pub(super) static WORKER_REQUESTS: RefCell<WorkerRequests> = RefCell::new(WorkerRequests::default());
         /// `smg_worker_requests_active`.
@@ -426,25 +433,25 @@ mod handles {
         /// The `smg_engine_*` set.
         pub(super) static ENGINE_LOADS: RefCell<EngineLoads> = RefCell::new(EngineLoads::default());
         /// `smg_worker_selection_total` by its static labels, then the model.
-        pub(super) static WORKER_SELECTIONS: RefCell<ByLabels<SelectionLabels, Counter>> = RefCell::new(HashMap::new());
+        pub(super) static WORKER_SELECTIONS: RefCell<ByLabels<SelectionLabels, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_cache_aware_policy_branch_total` by branch.
-        pub(super) static CACHE_AWARE_BRANCHES: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        pub(super) static CACHE_AWARE_BRANCHES: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_manual_policy_branch_total` by branch.
-        pub(super) static MANUAL_BRANCHES: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        pub(super) static MANUAL_BRANCHES: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_consistent_hashing_policy_branch_total` by branch.
-        pub(super) static CONSISTENT_HASHING_BRANCHES: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        pub(super) static CONSISTENT_HASHING_BRANCHES: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_prefix_hash_policy_branch_total` by branch.
-        pub(super) static PREFIX_HASH_BRANCHES: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        pub(super) static PREFIX_HASH_BRANCHES: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_cache_aware_match_ratio`: one series.
         pub(super) static CACHE_AWARE_MATCH_RATIO: RefCell<Option<Histogram>> = const { RefCell::new(None) };
         /// `smg_routing_key_source_total` by source.
-        pub(super) static ROUTING_KEY_SOURCES: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        pub(super) static ROUTING_KEY_SOURCES: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_admission_queue_depth`: one series.
         pub(super) static ADMISSION_QUEUE_DEPTH: RefCell<Option<Gauge>> = const { RefCell::new(None) };
         /// `smg_admission_inflight`: one series.
         pub(super) static ADMISSION_INFLIGHT: RefCell<Option<Gauge>> = const { RefCell::new(None) };
         /// `smg_router_request_body_path_total` by path, then reason.
-        pub(super) static REQUEST_BODY_PATHS: RefCell<HashMap<(&'static str, &'static str), Counter>> = RefCell::new(HashMap::new());
+        pub(super) static REQUEST_BODY_PATHS: RefCell<FxHashMap<(&'static str, &'static str), Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_router_request_buffers_released_early_bytes_total`: one series.
         pub(super) static REQUEST_BUFFERS_RELEASED_EARLY: RefCell<Option<Counter>> = const { RefCell::new(None) };
     }
@@ -1178,6 +1185,11 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_kv_index_arena_free_bytes",
         "Bytes of the chain index's word arena sitting in free lists, by model"
+    );
+    describe_gauge!(
+        "smg_kv_index_arena_chunk_bytes",
+        "Bytes the chain index's word arena holds from the allocator: whole 8 MiB chunks, \
+         each kept once taken, by model"
     );
     describe_gauge!(
         "smg_kv_index_slab_bytes",
@@ -3344,6 +3356,8 @@ impl Metrics {
         gauge!("smg_kv_index_arena_bytes", "model" => model.clone()).set(stats.arena_bytes as f64);
         gauge!("smg_kv_index_arena_free_bytes", "model" => model.clone())
             .set(stats.arena_free_bytes as f64);
+        gauge!("smg_kv_index_arena_chunk_bytes", "model" => model.clone())
+            .set(stats.arena_chunk_bytes as f64);
         gauge!("smg_kv_index_slab_bytes", "model" => model.clone()).set(stats.slab_bytes as f64);
         gauge!("smg_kv_index_moved_hashes", "model" => model.clone())
             .set(stats.moved_hashes as f64);

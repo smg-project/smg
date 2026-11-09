@@ -152,17 +152,17 @@ mod own_thread_tests {
 /// Convert an output's logprobs, read in place on the engine message, to the
 /// OpenAI ChatLogProbs format using Harmony's tokenizer.
 ///
-/// Delegates to the shared `convert_proto_logprobs` with Harmony's built-in tokenizer
-/// for token ID decoding.
+/// `top_logprobs` is the request's; [`utils::requested_alternatives`] turns it
+/// into the candidates the answer carries per token, the rule the regular chat
+/// path reads, and only those are decoded.
 pub(crate) fn convert_harmony_logprobs(
     encoding: &HarmonyEncoding,
     proto_logprobs: ProtoOutputLogProbs<'_>,
+    top_logprobs: Option<u32>,
 ) -> ChatLogProbs {
     let tokenizer = encoding.tokenizer();
-    // Every candidate the engine sent: this path does not cut them to the request's
-    // `top_logprobs` yet, where the regular path does; the cut changes what a client
-    // gets, so it is a change of its own.
-    utils::convert_proto_logprobs(proto_logprobs, None, |token_id| {
+    let requested = Some(utils::requested_alternatives(top_logprobs));
+    utils::convert_proto_logprobs(proto_logprobs, requested, |token_id| {
         tokenizer
             .decode_utf8([token_id])
             .unwrap_or_else(|_| format!("<token_{token_id}>"))
@@ -1337,9 +1337,10 @@ mod tests {
     //!      gpt-oss is trained to emit calls against.
 
     use openai_protocol::{
-        common::{AudioUrl, InputAudio},
+        common::{AudioUrl, ChatLogProbsContent, InputAudio},
         responses::{ImageGenerationTool, ResponseInput, ResponseTool, ResponsesRequest},
     };
+    use smg_grpc_client::vllm_proto as vllm;
 
     use super::*;
     use crate::routers::grpc::common::responses::utils::namespace_test_request;
@@ -1820,5 +1821,100 @@ mod tests {
                 .collect();
             assert_eq!(described, expected, "{case}");
         }
+    }
+
+    /// An engine's answer for two generated tokens, three candidates each:
+    /// the sampled token ranked beside two runners-up, whether or not
+    /// alternatives were asked for.
+    fn three_candidates_per_position() -> vllm::OutputLogProbs {
+        vllm::OutputLogProbs {
+            token_logprobs: vec![-0.1, -0.2],
+            token_ids: vec![1, 2],
+            top_logprobs: vec![
+                vllm::TopLogProbs {
+                    values: vec![-0.1, -1.5, -2.5],
+                    token_ids: vec![1, 3, 5],
+                },
+                vllm::TopLogProbs {
+                    values: vec![-0.2, -1.6, -2.6],
+                    token_ids: vec![2, 4, 6],
+                },
+            ],
+        }
+    }
+
+    /// The per-token entries of a converted answer.
+    fn entries(logprobs: ChatLogProbs) -> Vec<ChatLogProbsContent> {
+        match logprobs {
+            ChatLogProbs::Detailed { content, .. } => content.unwrap_or_default(),
+            ChatLogProbs::Raw(_) => Vec::new(),
+        }
+    }
+
+    /// A chat request on the Harmony path gets the `top_logprobs` candidates
+    /// it asked for per token, none when it asked for none, as it does on
+    /// the regular path: the engine's surplus candidates stay behind.
+    #[test]
+    fn harmony_logprobs_carry_only_the_requested_candidates() {
+        let encoding = try_harmony_encoding().expect("harmony encoding must load");
+        let proto = three_candidates_per_position();
+        for (top_logprobs, expected) in [
+            (None, 0),
+            (Some(0), 0),
+            (Some(1), 1),
+            (Some(2), 2),
+            (Some(3), 3),
+            (Some(5), 3),
+        ] {
+            let answered = entries(convert_harmony_logprobs(
+                encoding,
+                ProtoOutputLogProbs::Vllm(&proto),
+                top_logprobs,
+            ));
+            let per_token: Vec<usize> = answered
+                .iter()
+                .map(|entry| entry.top_logprobs.len())
+                .collect();
+            assert_eq!(
+                per_token,
+                vec![expected; 2],
+                "top_logprobs {top_logprobs:?}"
+            );
+        }
+    }
+
+    /// The candidates kept are the engine's first ones in its order, each
+    /// decoded by Harmony's tokenizer as the sampled token is.
+    #[test]
+    fn harmony_logprobs_keep_the_engines_first_candidates() {
+        let encoding = try_harmony_encoding().expect("harmony encoding must load");
+        let text = |token_id: u32| {
+            encoding
+                .tokenizer()
+                .decode_utf8([token_id])
+                .expect("a token of the vocabulary")
+        };
+        let proto = three_candidates_per_position();
+        let answered = entries(convert_harmony_logprobs(
+            encoding,
+            ProtoOutputLogProbs::Vllm(&proto),
+            Some(2),
+        ));
+        let tokens: Vec<String> = answered.iter().map(|entry| entry.token.clone()).collect();
+        assert_eq!(tokens, vec![text(1), text(2)]);
+        let candidates: Vec<Vec<String>> = answered
+            .iter()
+            .map(|entry| {
+                entry
+                    .top_logprobs
+                    .iter()
+                    .map(|candidate| candidate.token.clone())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            candidates,
+            vec![vec![text(1), text(3)], vec![text(2), text(4)]]
+        );
     }
 }

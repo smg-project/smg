@@ -52,7 +52,7 @@ use super::{
             gossip_client::GossipClient, gossip_message, NodeState, NodeStatus, NodeUpdate, Ping,
             PingReq, StateSync, StreamMessage,
         },
-        status_of, ClusterState,
+        member_transition_line, status_of, ClusterState,
     },
 };
 use crate::{
@@ -84,6 +84,10 @@ fn join_peer_name(index: usize) -> String {
 fn is_join_peer(name: &str) -> bool {
     name == INIT_PEER_NAME || name.starts_with(&format!("{INIT_PEER_NAME}_"))
 }
+
+/// The period of the node's tick: one round is one probe of one random
+/// member and one collection of the stream round.
+pub(crate) const ROUND_PERIOD: Duration = Duration::from_secs(1);
 
 /// The per-node event loop driver. Holds the cluster-state reference,
 /// self-identity, init-peer address, mTLS config, the live set of
@@ -169,7 +173,7 @@ impl GossipController {
                     break;
                 }
 
-                () = tokio::time::sleep(Duration::from_secs(1)) => {
+                () = tokio::time::sleep(ROUND_PERIOD) => {
                     let Some(peer) = peer else {
                         log::debug!("No peer address available to connect");
                         continue;
@@ -394,13 +398,16 @@ impl GossipController {
         let entry = entry.clone();
         if held != Some(status_of(&entry)) {
             log::info!(
-                "Member {} is {:?} at version {} (its own word; was {})",
-                entry.name,
-                status_of(&entry),
-                entry.version,
-                held.map_or_else(
-                    || "not in the table".to_string(),
-                    |status| format!("{status:?}")
+                "{}",
+                member_transition_line(
+                    &entry,
+                    format_args!(
+                        "its own word; was {}",
+                        held.map_or_else(
+                            || "not in the table".to_string(),
+                            |status| format!("{status:?}")
+                        )
+                    )
                 )
             );
         }

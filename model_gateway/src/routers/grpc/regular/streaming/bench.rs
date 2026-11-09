@@ -36,7 +36,7 @@ use tonic::{
 };
 use tool_parser::ParserFactory as ToolParserFactory;
 
-use super::{GenerateStreamContext, StreamingProcessor};
+use super::{character_tokenizer::CharacterTokenizer, GenerateStreamContext, StreamingProcessor};
 use crate::{
     routers::{
         common::sse::{sse_channel, SseReceiver},
@@ -48,7 +48,6 @@ use crate::{
             utils::ParserResolver,
         },
     },
-    test_support::CharacterTokenizer,
     worker::WorkerRegistry,
 };
 
@@ -175,6 +174,8 @@ impl StreamBench {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            span: tracing::Span::none(),
+            marked: Arc::default(),
         });
         let completion_request: CompletionRequest = serde_json::from_value(json!({
             "model": MODEL, "prompt": COMPLETION_PROMPT, "stream": true

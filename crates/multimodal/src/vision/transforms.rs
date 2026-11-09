@@ -1367,12 +1367,20 @@ impl ChunkTaps {
 /// Output rows `[y0, y0 + band.len() / row_len)` of the height pass, the
 /// portable arm of [`HeightPass`]: each output row sums its taps over whole
 /// source rows, one tap's row at a time, so the inner loop runs along the
-/// row.
-fn pil_v_band(src: &[u8], kernel: &FixedKernel, row_len: usize, y0: usize, band: &mut [u8]) {
+/// row. `src` holds the source rows from `first_row` on.
+fn pil_v_band(
+    src: &[u8],
+    first_row: usize,
+    kernel: &FixedKernel,
+    row_len: usize,
+    y0: usize,
+    band: &mut [u8],
+) {
     let half = kernel.half();
     let mut sums = vec![0_i32; row_len];
     for (i, out_row) in band.chunks_exact_mut(row_len).enumerate() {
         let (start, n) = kernel.bounds[y0 + i];
+        let start = start - first_row;
         sums.fill(half);
         for (k, &tap) in kernel.taps[y0 + i].iter().take(n).enumerate() {
             let row = &src[(start + k) * row_len..(start + k + 1) * row_len];
@@ -1417,10 +1425,11 @@ impl HeightPass {
         Self::Portable
     }
 
-    /// Output rows `[y0, y0 + band.len() / row_len)` of the height pass; a
-    /// vector arm builds the band's tap layout, detects its features and
-    /// calls in one place, as the crate's NEON kernels and the FMA pass keep
-    /// them.
+    /// Output rows `[y0, y0 + band.len() / row_len)` of the height pass over
+    /// `src`, which holds the source rows from `first_row` on (every row the
+    /// band's windows cover); a vector arm builds the band's tap layout,
+    /// detects its features and calls in one place, as the crate's NEON
+    /// kernels and the FMA pass keep them.
     #[cfg_attr(
         target_arch = "x86_64",
         expect(
@@ -1428,30 +1437,38 @@ impl HeightPass {
             reason = "the target-feature function runs only after this function detected its features"
         )
     )]
-    fn rows(self, src: &[u8], kernel: &FixedKernel, row_len: usize, y0: usize, band: &mut [u8]) {
+    fn rows(
+        self,
+        src: &[u8],
+        first_row: usize,
+        kernel: &FixedKernel,
+        row_len: usize,
+        y0: usize,
+        band: &mut [u8],
+    ) {
         match self {
-            Self::Portable => pil_v_band(src, kernel, row_len, y0, band),
+            Self::Portable => pil_v_band(src, first_row, kernel, row_len, y0, band),
             #[cfg(target_arch = "x86_64")]
             Self::Avx2 => {
                 if !std::arch::is_x86_feature_detected!("avx2") {
-                    return pil_v_band(src, kernel, row_len, y0, band);
+                    return pil_v_band(src, first_row, kernel, row_len, y0, band);
                 }
                 let split = SplitTaps::new(kernel, y0, band.len() / row_len, 2);
                 // SAFETY: `is_x86_feature_detected!("avx2")` answered true just
                 // above, the only requirement of a `target_feature(enable =
                 // "avx2")` function.
-                unsafe { avx2::v_band(src, kernel, &split, row_len, y0, band) }
+                unsafe { avx2::v_band(src, first_row, kernel, &split, row_len, y0, band) }
             }
             #[cfg(target_arch = "x86_64")]
             Self::Avx512 => {
                 if !avx512::detected() {
-                    return pil_v_band(src, kernel, row_len, y0, band);
+                    return pil_v_band(src, first_row, kernel, row_len, y0, band);
                 }
                 let chunks = ChunkTaps::new(kernel, y0, band.len() / row_len);
                 // SAFETY: `avx512::detected()` answered true just above: the
                 // processor reports every feature the `target_feature`
                 // function enables, its only requirement.
-                unsafe { avx512::v_band(src, kernel, &chunks, row_len, y0, band) }
+                unsafe { avx512::v_band(src, first_row, kernel, &chunks, row_len, y0, band) }
             }
         }
     }
@@ -1693,10 +1710,12 @@ mod avx2 {
     /// the multiply-adds against the taps' pair `(t0, t1)` sum them, the high
     /// and the low halves of the taps into accumulators of their own; an odd
     /// last tap pairs with a zero tap over its own row. The row's last
-    /// columns run in scalar.
+    /// columns run in scalar. `src` holds the source rows from `first_row`
+    /// on.
     #[target_feature(enable = "avx2")]
     pub(super) fn v_band(
         src: &[u8],
+        first_row: usize,
         kernel: &FixedKernel,
         split: &SplitTaps,
         row_len: usize,
@@ -1708,6 +1727,7 @@ mod avx2 {
         let zero = _mm256_setzero_si256();
         for (i, out_row) in band.chunks_exact_mut(row_len).enumerate() {
             let (start, n) = kernel.bounds[y0 + i];
+            let start = start - first_row;
             let pairs = n.div_ceil(2);
             let hi = &split.hi[i * split.pairs..i * split.pairs + pairs];
             let lo = &split.lo[i * split.pairs..i * split.pairs + pairs];
@@ -1974,10 +1994,12 @@ mod avx512 {
 
     /// Output rows `[y0, y0 + band.len() / row_len)` of the height pass,
     /// sixty-four columns at a time across the taps ([`v_tile`]); the row's
-    /// last columns run under a mask.
+    /// last columns run under a mask. `src` holds the source rows from
+    /// `first_row` on.
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
     pub(super) fn v_band(
         src: &[u8],
+        first_row: usize,
         kernel: &FixedKernel,
         chunks: &ChunkTaps,
         row_len: usize,
@@ -1986,6 +2008,7 @@ mod avx512 {
     ) {
         for (i, out_row) in band.chunks_exact_mut(row_len).enumerate() {
             let (start, n) = kernel.bounds[y0 + i];
+            let start = start - first_row;
             let window = (start, start + n - 1);
             let words = &chunks.words[i * chunks.steps * 3..][..n.div_ceil(4) * 3];
             let (full, rest) = out_row.as_chunks_mut::<64>();
@@ -2196,7 +2219,7 @@ fn pil_resample_vertical<const C: usize>(
     let pass = HeightPass::new();
     let tasks = par_threads(out.len(), out_h);
     if tasks <= 1 {
-        pass.rows(src, kernel, row_len, 0, &mut out);
+        pass.rows(src, 0, kernel, row_len, 0, &mut out);
         return out;
     }
     let band_rows = out_h.div_ceil(tasks);
@@ -2208,7 +2231,141 @@ fn pil_resample_vertical<const C: usize>(
             let (band, tail) = rest.split_at_mut(n * row_len);
             rest = tail;
             let start = y0;
-            scope.spawn(move |_| pass.rows(src, kernel, row_len, start, band));
+            scope.spawn(move |_| pass.rows(src, 0, kernel, row_len, start, band));
+            y0 += n;
+        }
+    });
+    out
+}
+
+/// Bytes of width-pass rows a band of the height pass reads at a time when
+/// both axes change ([`pil_resample_both`]): a band's rows stay in a core's
+/// second-level cache between the pass that writes them and the pass that
+/// reads them, in place of an intermediate image of every source row (88 MB
+/// for an 8192x8192 image resized to 3584x3584), which was paged in fresh per
+/// image, written once and read back from memory.
+const PIL_BAND_BYTES: usize = 512 * 1024;
+
+/// Source rows the width pass's vector arms take per block; a band's new
+/// rows end on a block so that no band ends in an arm's one-row tail.
+const PIL_WIDTH_ROWS: usize = 4;
+
+/// The two passes of a resample that changes both axes, run in bands of
+/// output rows: a band's height pass reads the width-pass rows its windows
+/// cover, which the width pass wrote just before into a buffer of about
+/// [`PIL_BAND_BYTES`] (one output row's windows at least); the rows the next
+/// band shares with it are carried over, not resampled again. Every output
+/// byte is the same two sums as over a whole intermediate image, so the bytes
+/// are those of the per-sample reference.
+struct BandedPasses<'a, const C: usize> {
+    src: &'a [u8],
+    in_w: usize,
+    in_h: usize,
+    out_w: usize,
+    width: &'a FixedKernel,
+    height: &'a FixedKernel,
+    width_pass: WidthPass,
+    height_pass: HeightPass,
+    band_bytes: usize,
+}
+
+impl<const C: usize> BandedPasses<'_, C> {
+    /// Output rows `[y0, y0 + out.len() / (out_w * C))`, a band at a time.
+    fn rows(&self, y0: usize, mut out: &mut [u8]) {
+        let row_len = self.out_w * C;
+        // The width-pass rows `mid` holds: source rows `[mid_start, mid_end)`.
+        let mut mid = Vec::new();
+        let (mut mid_start, mut mid_end) = (0, 0);
+        let mut y = y0;
+        let end = y0 + out.len() / row_len;
+        while y < end {
+            // The band `[y, y1)`: as many output rows as keep their windows'
+            // source rows within the budget, the first row whatever its
+            // window takes.
+            let (start, n) = self.height.bounds[y];
+            let mut stop = start + n;
+            let mut y1 = y + 1;
+            while y1 < end {
+                let (next_start, next_n) = self.height.bounds[y1];
+                let next_stop = stop.max(next_start + next_n);
+                if (next_stop - start) * row_len > self.band_bytes {
+                    break;
+                }
+                stop = next_stop;
+                y1 += 1;
+            }
+            // The band's rows end on a block; those already in `mid` move to
+            // its front (windows start in order, so the band starts at or
+            // after the buffer's rows) and the width pass fills in the rest.
+            let stop = stop.next_multiple_of(PIL_WIDTH_ROWS).min(self.in_h);
+            let kept = mid_end.clamp(start, stop);
+            if kept > start {
+                mid.copy_within(
+                    (start - mid_start) * row_len..(kept - mid_start) * row_len,
+                    0,
+                );
+            }
+            mid.resize((stop - start) * row_len, 0);
+            if kept < stop {
+                self.width_pass.rows::<C>(
+                    self.src,
+                    self.width,
+                    self.in_w,
+                    self.out_w,
+                    kept,
+                    &mut mid[(kept - start) * row_len..],
+                );
+            }
+            (mid_start, mid_end) = (start, stop);
+            let (band, rest) = out.split_at_mut((y1 - y) * row_len);
+            self.height_pass
+                .rows(&mid, mid_start, self.height, row_len, y, band);
+            out = rest;
+            y = y1;
+        }
+    }
+}
+
+/// `src` (`in_w` x `in_h` interleaved pixels of `C` channels) resampled on
+/// both axes to `out_w` x `out_h` by [`BandedPasses`] in bands of about
+/// `band_bytes`; the output rows are banded across the pool, each task with a
+/// buffer of its own.
+fn pil_resample_both<const C: usize>(
+    src: &[u8],
+    (in_w, in_h): (usize, usize),
+    (out_w, out_h): (usize, usize),
+    width: &FixedKernel,
+    height: &FixedKernel,
+    band_bytes: usize,
+) -> Vec<u8> {
+    let row_len = out_w * C;
+    let mut out = plain_buffer(out_h * row_len);
+    let passes = &BandedPasses::<C> {
+        src,
+        in_w,
+        in_h,
+        out_w,
+        width,
+        height,
+        width_pass: WidthPass::new::<C>(width),
+        height_pass: HeightPass::new(),
+        band_bytes,
+    };
+    let tasks = par_threads(out.len(), out_h);
+    if tasks <= 1 {
+        passes.rows(0, &mut out);
+        return out;
+    }
+    let band_rows = out_h.div_ceil(tasks);
+    parallel_scope(|scope| {
+        let mut rest = out.as_mut_slice();
+        let mut y0 = 0;
+        while y0 < out_h {
+            let n = band_rows.min(out_h - y0);
+            let (band, tail) = rest.split_at_mut(n * row_len);
+            rest = tail;
+            let start = y0;
+            scope.spawn(move |_| passes.rows(start, band));
             y0 += n;
         }
     });
@@ -2256,6 +2413,11 @@ pub fn resize_bicubic_pil_rgb(
         return Err(TransformError::ShapeError(format!(
             "PIL bicubic RGB source has {} bytes, expected {expected} for {width}x{height}",
             data.len()
+        )));
+    }
+    if width == 0 || height == 0 {
+        return Err(TransformError::ShapeError(format!(
+            "PIL bicubic RGB source {width}x{height} must be non-empty"
         )));
     }
     if out_w == 0 || out_h == 0 {
@@ -2316,6 +2478,69 @@ pub fn resize_bilinear_pil_rgb(
             "failed to build PIL bilinear RGB image for {out_w}x{out_h}"
         ))
     })
+}
+
+/// Pillow's `Image.resize(.., BICUBIC)` of an `RGBA` image: the colours are
+/// premultiplied by their alpha (Pillow's `RGBa` mode, its `MULDIV255` per
+/// byte), the four channels go through the same 22-bit kernel as RGB, and the
+/// colours are divided back (`255 * v / a`, truncated and clamped; an alpha of
+/// 0 or 255 leaves them as they are). An image that keeps its size is copied,
+/// as Pillow copies it before any conversion.
+pub(crate) fn resize_bicubic_pil_rgba(
+    image: &DynamicImage,
+    out_w: u32,
+    out_h: u32,
+) -> image::RgbaImage {
+    let owned;
+    let rgba = match image {
+        DynamicImage::ImageRgba8(rgba) => rgba,
+        _ => {
+            owned = image.to_rgba8();
+            &owned
+        }
+    };
+    let (in_w, in_h) = rgba.dimensions();
+    if (in_w, in_h) == (out_w, out_h) {
+        return rgba.clone();
+    }
+    let mut premultiplied = Vec::with_capacity(rgba.as_raw().len());
+    for &[r, g, b, a] in rgba.as_raw().as_chunks::<4>().0 {
+        premultiplied.extend_from_slice(&[
+            mul_div_255(r, a),
+            mul_div_255(g, a),
+            mul_div_255(b, a),
+            a,
+        ]);
+    }
+    let mut output = resize_pil_bytes::<4>(
+        &premultiplied,
+        in_w,
+        in_h,
+        out_w,
+        out_h,
+        PilResizeFilter::Bicubic,
+        KernelQuantization::Pillow,
+    );
+    for pixel in output.as_chunks_mut::<4>().0 {
+        let alpha = u32::from(pixel[3]);
+        if alpha != 0 && alpha != 255 {
+            for value in &mut pixel[..3] {
+                *value = (255 * u32::from(*value) / alpha).min(255) as u8;
+            }
+        }
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "output is exactly out_w*out_h*4 bytes by construction"
+    )]
+    image::RgbaImage::from_raw(out_w, out_h, output).expect("pil rgba resize buffer size")
+}
+
+/// Pillow's `MULDIV255`: `value * alpha / 255` rounded to the nearest byte.
+#[inline]
+fn mul_div_255(value: u8, alpha: u8) -> u8 {
+    let product = u32::from(value) * u32::from(alpha) + 128;
+    (((product >> 8) + product) >> 8) as u8
 }
 
 /// Pillow-exact LANCZOS resize (RGB8), matching
@@ -2401,15 +2626,20 @@ fn resize_pil_bytes<const C: usize>(
     } else if in_w == out_w {
         let kernel = FixedKernel::new(in_h, out_h, filter, quantization);
         pil_resample_vertical::<C>(data, out_h, in_w, &kernel)
-    } else {
+    } else if in_h == out_h {
         let kernel = FixedKernel::new(in_w, out_w, filter, quantization);
-        let horizontal = pil_resample_horizontal::<C>(data, in_h, in_w, out_w, &kernel);
-        if in_h == out_h {
-            horizontal
-        } else {
-            let kernel = FixedKernel::new(in_h, out_h, filter, quantization);
-            pil_resample_vertical::<C>(&horizontal, out_h, out_w, &kernel)
-        }
+        pil_resample_horizontal::<C>(data, in_h, in_w, out_w, &kernel)
+    } else {
+        let width = FixedKernel::new(in_w, out_w, filter, quantization);
+        let height = FixedKernel::new(in_h, out_h, filter, quantization);
+        pil_resample_both::<C>(
+            data,
+            (in_w, in_h),
+            (out_w, out_h),
+            &width,
+            &height,
+            PIL_BAND_BYTES,
+        )
     }
 }
 
@@ -4011,7 +4241,7 @@ mod tests {
             }
             let kernel = FixedKernel::new(in_h, out_h, filter, KernelQuantization::Pillow);
             let mut portable_rows = vec![0_u8; out_h * out_w * C];
-            HeightPass::Portable.rows(&portable, &kernel, out_w * C, 0, &mut portable_rows);
+            HeightPass::Portable.rows(&portable, 0, &kernel, out_w * C, 0, &mut portable_rows);
             #[cfg_attr(
                 not(target_arch = "x86_64"),
                 expect(unused_mut, reason = "only the x86-64 arms are pushed")
@@ -4028,7 +4258,7 @@ mod tests {
             }
             for (name, arm) in &arms {
                 let mut detected_rows = vec![0_u8; out_h * out_w * C];
-                arm.rows(&portable, &kernel, out_w * C, 0, &mut detected_rows);
+                arm.rows(&portable, 0, &kernel, out_w * C, 0, &mut detected_rows);
                 assert_same_bytes(
                     &detected_rows,
                     &portable_rows,
@@ -4046,6 +4276,75 @@ mod tests {
         {
             for (seed, &case) in PIL_PASS_CASES.iter().enumerate() {
                 let (in_w, in_h, out_w, out_h) = case;
+                let what = format!("filter {f}: {in_w}x{in_h} -> {out_w}x{out_h}");
+                check::<3>(&gradient_rgb(in_w, in_h, seed), case, filter, &what);
+                check::<4>(&gradient_rgba(in_w, in_h, seed), case, filter, &what);
+            }
+        }
+    }
+
+    /// The banded passes write the per-sample reference's bytes whatever the
+    /// band budget: one output row per band (every band carries most of its
+    /// rows from the one before), a few rows, the shipped budget and one
+    /// band for the whole image; the cases cover downscales, upscales, one
+    /// axis each way and a row whose windows alone exceed the budget.
+    #[test]
+    fn pil_banded_passes_carry_rows_between_bands() {
+        fn check<const C: usize>(
+            data: &[u8],
+            (in_w, in_h, out_w, out_h): (usize, usize, usize, usize),
+            filter: PilResizeFilter,
+            what: &str,
+        ) {
+            let width = FixedKernel::new(in_w, out_w, filter, KernelQuantization::Pillow);
+            let height = FixedKernel::new(in_h, out_h, filter, KernelQuantization::Pillow);
+            let expected = per_sample_reference_channels::<C>(
+                data,
+                in_w,
+                in_h,
+                out_w,
+                out_h,
+                filter,
+                KernelQuantization::Pillow,
+            );
+            let row_len = out_w * C;
+            for band_bytes in [
+                0,
+                row_len,
+                3 * row_len,
+                17 * row_len,
+                PIL_BAND_BYTES,
+                usize::MAX,
+            ] {
+                let actual = pil_resample_both::<C>(
+                    data,
+                    (in_w, in_h),
+                    (out_w, out_h),
+                    &width,
+                    &height,
+                    band_bytes,
+                );
+                assert_same_bytes(
+                    &actual,
+                    &expected,
+                    &format!("{C} channels, {what}, bands of {band_bytes} bytes"),
+                );
+            }
+        }
+        for (f, filter) in [
+            PilResizeFilter::Bicubic,
+            PilResizeFilter::Lanczos,
+            PilResizeFilter::Bilinear,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (seed, &case) in PIL_PASS_CASES.iter().enumerate() {
+                let (in_w, in_h, out_w, out_h) = case;
+                if in_w == out_w || in_h == out_h {
+                    continue;
+                }
+                let seed = seed * 17 + f * 103;
                 let what = format!("filter {f}: {in_w}x{in_h} -> {out_w}x{out_h}");
                 check::<3>(&gradient_rgb(in_w, in_h, seed), case, filter, &what);
                 check::<4>(&gradient_rgba(in_w, in_h, seed), case, filter, &what);
@@ -4335,6 +4634,19 @@ mod tests {
         for (out_w, out_h) in [(0, 480), (480, 0)] {
             assert!(matches!(
                 resize_bicubic_pil_rgb(&data, 2, 2, out_w, out_h),
+                Err(TransformError::ShapeError(_))
+            ));
+        }
+    }
+
+    /// A source with no pixels is refused before the passes run (its byte
+    /// count matches an empty buffer, so the length check lets it through);
+    /// the banded passes would otherwise take their row count from it.
+    #[test]
+    fn resize_bicubic_pil_rgb_rejects_an_empty_source() {
+        for (width, height) in [(0, 4), (4, 0), (0, 0)] {
+            assert!(matches!(
+                resize_bicubic_pil_rgb(&[], width, height, 2, 2),
                 Err(TransformError::ShapeError(_))
             ));
         }
@@ -5258,5 +5570,117 @@ mod tests {
                 );
             }
         }
+    }
+    /// `RGBA` bytes from a 32-bit linear congruential generator (the top byte
+    /// of the state per byte), a third of the pixels fully transparent, a
+    /// third opaque, the rest at the generator's alpha.
+    fn generated_rgba(width: u32, height: u32, seed: u32) -> image::RgbaImage {
+        let mut state = seed;
+        let mut bytes: Vec<u8> = (0..width * height * 4)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        for (index, pixel) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            match index % 3 {
+                0 => pixel[3] = 0,
+                1 => pixel[3] = 255,
+                _ => {}
+            }
+        }
+        image::RgbaImage::from_raw(width, height, bytes).unwrap()
+    }
+
+    /// Pillow 12.3.0's `Image.resize(BICUBIC)` of two generated `RGBA` images,
+    /// a downscale and an upscale: the SHA-256 of the output bytes, with the
+    /// first eight bytes in the clear. Resampling the four channels without
+    /// the premultiplication differs on 72 of the 96 and on 208 of the 288
+    /// bytes.
+    #[test]
+    fn resize_bicubic_pil_rgba_carries_pillows_bytes() {
+        use sha2::{Digest, Sha256};
+
+        for (width, height, out_w, out_h, seed, digest, first_eight) in [
+            (
+                11,
+                7,
+                6,
+                4,
+                3,
+                "1c242764fe95e780c2d12292983746425d9ca5c0d6470d688034ed0f0cee921d",
+                [136, 153, 112, 118, 23, 188, 106, 153],
+            ),
+            (
+                5,
+                3,
+                9,
+                8,
+                5,
+                "8d440c419d8017bee119cb4eda912e9b5cbded0311a8783746e9b072780dc7d7",
+                [0, 0, 0, 0, 176, 88, 119, 75],
+            ),
+        ] {
+            let image = DynamicImage::ImageRgba8(generated_rgba(width, height, seed));
+            let out = resize_bicubic_pil_rgba(&image, out_w, out_h);
+            assert_eq!(
+                out.as_raw()[..8],
+                first_eight,
+                "{width}x{height} -> {out_w}x{out_h}: the first eight bytes"
+            );
+            let hex: String = Sha256::digest(out.as_raw())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(
+                hex, digest,
+                "{width}x{height} -> {out_w}x{out_h}: the digest"
+            );
+        }
+    }
+
+    /// An opaque `RGBA` image resizes to the RGB kernel's bytes with its alpha
+    /// kept at 255, and an image that keeps its size comes back as it is: no
+    /// premultiplication round trip, which a half-transparent pixel would not
+    /// survive.
+    #[test]
+    fn resize_bicubic_pil_rgba_agrees_with_the_rgb_kernel_when_opaque_and_copies_an_unchanged_size()
+    {
+        let (width, height) = (9, 6);
+        let mut opaque = generated_rgba(width, height, 17);
+        for pixel in opaque.pixels_mut() {
+            pixel[3] = 255;
+        }
+        let rgb: Vec<u8> = opaque
+            .as_raw()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b, _]| [r, g, b])
+            .collect();
+        let expected = resize_bicubic_pil_rgb(&rgb, width, height, 5, 4).unwrap();
+        let out = resize_bicubic_pil_rgba(&DynamicImage::ImageRgba8(opaque), 5, 4);
+        for (got, want) in out
+            .as_raw()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(expected.as_raw().as_chunks::<3>().0)
+        {
+            assert_eq!(got[..3], want[..], "the colour bytes of an opaque pixel");
+            assert_eq!(got[3], 255, "the alpha of an opaque pixel");
+        }
+
+        let translucent = generated_rgba(width, height, 23);
+        let same = resize_bicubic_pil_rgba(
+            &DynamicImage::ImageRgba8(translucent.clone()),
+            width,
+            height,
+        );
+        assert_eq!(
+            same.as_raw(),
+            translucent.as_raw(),
+            "an unchanged size is a copy of the input"
+        );
     }
 }

@@ -358,6 +358,11 @@ fn setup(worker_count: usize, blocks_per_worker: usize, variant: &Variant) -> Se
             ) as Arc<dyn Worker>
         })
         .collect();
+    // A registered worker carries a published state, which the routing reads
+    // answer from; the fleet reads like one.
+    for worker in &workers {
+        worker.republish_state();
+    }
     // Every session lives on one to four workers; each worker is filled to
     // its budget from the sessions assigned to it, the engine stream first.
     let mut assigned: Vec<Vec<usize>> = vec![Vec::new(); worker_count];

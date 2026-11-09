@@ -172,14 +172,14 @@ impl HarmonyResponseProcessor {
                     )
                 })?;
 
-            // Convert output logprobs if present: the engine's, one entry per
-            // generated token, as the engine's own server returns them.
+            // Convert output logprobs if present: one entry per generated
+            // token, with the candidates the request's `top_logprobs` asked for.
             let logprobs: Option<ChatLogProbs> = if request_logprobs {
                 let encoding = try_harmony_encoding()
                     .map_err(|e| error::internal_error("harmony_encoding_unavailable", e))?;
                 complete
                     .output_logprobs()
-                    .map(|lp| convert_harmony_logprobs(encoding, lp))
+                    .map(|lp| convert_harmony_logprobs(encoding, lp, chat_request.top_logprobs))
             } else {
                 None
             };

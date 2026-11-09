@@ -40,8 +40,8 @@ use std::{
 };
 
 use notify::{event::ModifyKind, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use openai_protocol::worker::WorkerType;
-use serde::Deserialize;
+use openai_protocol::worker::{WorkerInfo, WorkerType};
+use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, task, time};
 use tracing::{info, warn};
 
@@ -94,28 +94,105 @@ struct ManifestVersion {
     version: u64,
 }
 
-#[derive(Deserialize)]
+/// The manifest as the file holds it, and as `GET /workers?format=manifest`
+/// writes it (see [`export_manifest`]).
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Manifest {
+pub(crate) struct Manifest {
     /// Checked by [`ManifestVersion`]; named here only so it is a known field.
     #[serde(rename = "version")]
     _version: u64,
     workers: Vec<ManifestWorker>,
+    /// What an export could not carry (a worker's key, an address's
+    /// credentials), one line per worker. Ignored on read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestWorker {
     /// Defaults to the endpoint. Giving one lets a producer signal a new
     /// instance at an address it reuses.
+    #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     worker_type: Option<WorkerType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     bootstrap_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     kv_connector: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     kv_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     kv_engine_id: Option<String>,
+}
+
+/// The registered fleet in the manifest's shape, for
+/// `GET /workers?format=manifest`: what a second gateway reads with
+/// `--discovery-provider file`. A data-parallel group is one record at the
+/// address it was registered with. No `id` is written: the reader derives
+/// one from the address, and an id that changed with every restart of the
+/// exporting gateway would re-register the fleet on every reader. A
+/// worker's key is no manifest field and an address's credentials never
+/// leave: both are dropped, and each such address is named in `warnings`.
+pub(crate) fn export_manifest(workers: &[WorkerInfo]) -> Manifest {
+    // One record per data-parallel group: the lowest rank speaks for it.
+    let mut lowest_rank: HashMap<&str, usize> = HashMap::new();
+    for info in workers {
+        if let (Some(base), Some(rank)) = (info.spec.dp_base_url.as_deref(), info.spec.dp_rank) {
+            let lowest = lowest_rank.entry(base).or_insert(rank);
+            *lowest = (*lowest).min(rank);
+        }
+    }
+
+    let mut warnings = Vec::new();
+    let mut records = Vec::with_capacity(workers.len());
+    for info in workers {
+        let spec = &info.spec;
+        if let (Some(base), Some(rank)) = (spec.dp_base_url.as_deref(), spec.dp_rank) {
+            if lowest_rank.get(base) != Some(&rank) {
+                continue;
+            }
+        }
+        let address = spec.dp_base_url.as_deref().unwrap_or(&spec.url);
+        // No registered address fails to parse; one that did is not written
+        // raw, as it may carry a credential.
+        let Ok(endpoint) = Endpoint::parse(address) else {
+            warnings.push(format!(
+                "{}: not exported, the address does not parse",
+                Endpoint::redacted_str(address)
+            ));
+            continue;
+        };
+        let url = endpoint.without_credentials().render();
+        if endpoint.has_credentials() {
+            warnings.push(format!("{url}: url credentials not exported"));
+        }
+        if spec.api_key.is_some() {
+            warnings.push(format!("{url}: api_key not exported"));
+        }
+        records.push(ManifestWorker {
+            id: None,
+            url,
+            worker_type: Some(spec.worker_type),
+            bootstrap_port: spec
+                .bootstrap_port
+                .filter(|_| takes_bootstrap_port(spec.worker_type)),
+            model_id: info.model_id.clone(),
+            kv_connector: spec.kv_connector.clone(),
+            kv_role: spec.kv_role.clone(),
+            kv_engine_id: spec.kv_engine_id.clone(),
+        });
+    }
+    Manifest {
+        _version: MANIFEST_VERSION,
+        workers: records,
+        warnings,
+    }
 }
 
 impl ManifestWorker {
@@ -142,9 +219,7 @@ impl ManifestWorker {
         if self.bootstrap_port == Some(0) {
             return Err("bootstrap_port must be between 1 and 65535".to_string());
         }
-        if self.bootstrap_port.is_some()
-            && !matches!(worker_type, WorkerType::Encode | WorkerType::Prefill)
-        {
+        if self.bootstrap_port.is_some() && !takes_bootstrap_port(worker_type) {
             return Err(format!(
                 "bootstrap_port applies only to encode and prefill workers, not {worker_type}"
             ));
@@ -170,6 +245,12 @@ impl ManifestWorker {
             compat_labels: BTreeMap::new(),
         })
     }
+}
+
+/// Whether a worker of this type opens a bootstrap port: the reader refuses
+/// one on any other type, and the writer leaves it out.
+fn takes_bootstrap_port(worker_type: WorkerType) -> bool {
+    matches!(worker_type, WorkerType::Encode | WorkerType::Prefill)
 }
 
 /// Parse a whole manifest, or reject it whole: no partial list is applied.
@@ -1135,5 +1216,140 @@ mod tests {
             );
             assert!(!discovery.warned, "the watch starting is logged in turn");
         }
+    }
+
+    /// The export of a fleet, fed back through the parser, yields the same
+    /// endpoints, types and settings; a key and an address's credentials
+    /// stay behind and are named in the warnings.
+    #[test]
+    fn an_exported_fleet_parses_back_without_its_credentials() {
+        use openai_protocol::model_card::ModelCard;
+
+        use crate::worker::{basic::worker_to_info, BasicWorkerBuilder, Worker};
+
+        fn info(worker: BasicWorkerBuilder) -> WorkerInfo {
+            let worker: Arc<dyn Worker> = Arc::new(worker.build());
+            worker_to_info(&worker)
+        }
+        let fleet = [
+            info(
+                BasicWorkerBuilder::new("http://10.0.0.22:8000")
+                    .worker_type(WorkerType::Prefill)
+                    .bootstrap_port(Some(8998))
+                    .kv_connector("MooncakeConnector")
+                    .kv_role("kv_producer")
+                    .kv_engine_id("engine-a")
+                    .model(ModelCard::new("llama")),
+            ),
+            info(
+                BasicWorkerBuilder::new("grpc://decode.internal:9000")
+                    .worker_type(WorkerType::Decode)
+                    .model(ModelCard::new("llama")),
+            ),
+            info(
+                BasicWorkerBuilder::new("http://admin:hunter2@10.0.0.23:8001")
+                    .worker_type(WorkerType::Decode)
+                    .api_key("s3cr3t"),
+            ),
+        ];
+
+        let exported = export_manifest(&fleet);
+        let text = serde_json::to_string(&exported).unwrap();
+
+        for secret in ["hunter2", "s3cr3t", r#""api_key""#, "admin", r#""id""#] {
+            assert!(
+                !text.contains(secret),
+                "{secret} reached the export: {text}"
+            );
+        }
+        assert_eq!(
+            exported.warnings,
+            [
+                "http://10.0.0.23:8001: url credentials not exported",
+                "http://10.0.0.23:8001: api_key not exported"
+            ]
+        );
+
+        let parsed = parse(&text, Roles::PrefillDecode).unwrap();
+        let summary: Vec<_> = parsed
+            .iter()
+            .map(|w| {
+                (
+                    w.endpoint.render(),
+                    w.worker_type,
+                    w.bootstrap_port,
+                    w.model_id_override.as_deref(),
+                    w.kv_connector.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (
+                    "http://10.0.0.22:8000".to_string(),
+                    WorkerType::Prefill,
+                    Some(8998),
+                    Some("llama"),
+                    Some("MooncakeConnector"),
+                ),
+                (
+                    "grpc://decode.internal:9000".to_string(),
+                    WorkerType::Decode,
+                    None,
+                    Some("llama"),
+                    None,
+                ),
+                (
+                    "http://10.0.0.23:8001".to_string(),
+                    WorkerType::Decode,
+                    None,
+                    None,
+                    None,
+                ),
+            ]
+        );
+        assert_eq!(parsed[0].kv_role.as_deref(), Some("kv_producer"));
+        assert_eq!(parsed[0].kv_engine_id.as_deref(), Some("engine-a"));
+    }
+
+    /// A data-parallel group was registered at one address; its export is
+    /// that one record, not one per rank.
+    #[test]
+    fn a_data_parallel_group_exports_as_one_record_at_its_base_address() {
+        use crate::worker::{basic::worker_to_info, BasicWorkerBuilder, Worker};
+
+        let fleet: Vec<WorkerInfo> = (0..2)
+            .map(|rank| {
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new("http://10.0.0.30:8000")
+                        .worker_type(WorkerType::Regular)
+                        .dp_config(rank, 2)
+                        .build(),
+                );
+                worker_to_info(&worker)
+            })
+            .collect();
+
+        let exported = export_manifest(&fleet);
+        let text = serde_json::to_string(&exported).unwrap();
+
+        assert_eq!(exported.workers.len(), 1, "{text}");
+        assert_eq!(exported.workers[0].url, "http://10.0.0.30:8000");
+        assert!(exported.workers[0].id.is_none(), "{text}");
+        assert!(exported.warnings.is_empty(), "{text}");
+        assert_eq!(parse(&text, Roles::Regular).unwrap().len(), 1);
+    }
+
+    /// An export with warnings is still a manifest: the field is known and
+    /// ignored on read, so the fleet registers minus what was not carried.
+    #[test]
+    fn warnings_in_a_manifest_are_read_past() {
+        let workers = parse(
+            r#"{"version": 1, "workers": [{"url": "10.0.0.5:8000"}], "warnings": ["worker a: api_key not exported"]}"#,
+            Roles::Regular,
+        )
+        .unwrap();
+        assert_eq!(workers.len(), 1);
     }
 }

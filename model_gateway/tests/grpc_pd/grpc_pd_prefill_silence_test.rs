@@ -58,7 +58,6 @@
 //! decode worker and nothing on the prefill.
 
 use std::{
-    future::Future,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -67,6 +66,7 @@ use std::{
 };
 
 use common::{
+    decode_stream::produce_after,
     engine_answers::{
         TokenSpeedAnswers, TokenSpeedGenerateStream, VllmAnswers, VllmGenerateStream,
     },
@@ -74,11 +74,10 @@ use common::{
         build_grpc_router, grpc_router_config, grpc_worker, serve_canned_worker, serve_engine,
         Canned,
     },
+    metrics_capture::render_after,
 };
 use futures::future::join_all;
-use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::model_card::ModelCard;
-use proto::generate_response::Response as GenResp;
 use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
@@ -129,8 +128,6 @@ const HANDOFF: Duration = Duration::from_millis(2_500);
 /// How long after a burst the prefill answers its first call, in the
 /// handoff cases: past the bound, an engine step after the handoff.
 const LATE_ANSWER: Duration = Duration::from_secs(4);
-
-type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
 
 /// What a sequential-dispatch mock engine does with a generate call.
 #[derive(Clone, Copy)]
@@ -194,49 +191,6 @@ impl Engine {
     }
 }
 
-fn chunk(id: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Chunk(proto::GenerateStreamChunk {
-            token_ids: vec![id],
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-fn complete() -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Complete(proto::GenerateComplete {
-            output_ids: (1..=OUTPUT_TOKENS).collect(),
-            finish_reason: "stop".to_string(),
-            prompt_tokens: 1,
-            completion_tokens: OUTPUT_TOKENS,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-/// Feed one generate stream: the tokens after `delay`, then the completion.
-/// With `delay` at [`FOREVER`] the sender is held and nothing is written.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "test mock; the producer task ends with its stream"
-)]
-fn produce_after(tx: GenerateTx, delay: Duration) {
-    tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        for id in 1..=OUTPUT_TOKENS {
-            if tx.send(Ok(chunk(id))).await.is_err() {
-                return;
-            }
-        }
-        let _ = tx.send(Ok(complete())).await;
-    });
-}
-
 #[tonic::async_trait]
 impl VllmAnswers for Engine {
     async fn generate(
@@ -249,11 +203,11 @@ impl VllmAnswers for Engine {
             Behaviour::HoldHeaders => {
                 tokio::time::sleep(FOREVER).await;
             }
-            Behaviour::EmptyStream => produce_after(tx, FOREVER),
-            Behaviour::Answer(delay) => produce_after(tx, delay),
+            Behaviour::EmptyStream => produce_after(tx, FOREVER, OUTPUT_TOKENS),
+            Behaviour::Answer(delay) => produce_after(tx, delay, OUTPUT_TOKENS),
             Behaviour::Queued => {
                 self.gate.turn().await;
-                produce_after(tx, Duration::ZERO);
+                produce_after(tx, Duration::ZERO, OUTPUT_TOKENS);
             }
             Behaviour::HoldHeadersThenFail(delay) => {
                 tokio::time::sleep(delay).await;
@@ -437,47 +391,6 @@ impl TokenSpeedAnswers for QueuedEngine {
         }
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
-
-    async fn health_check(
-        &self,
-        _request: Request<ts::HealthCheckRequest>,
-    ) -> Result<Response<ts::HealthCheckResponse>, Status> {
-        Ok(Response::new(ts::HealthCheckResponse {
-            healthy: true,
-            message: "ok".to_string(),
-        }))
-    }
-
-    async fn abort(
-        &self,
-        _request: Request<ts::AbortRequest>,
-    ) -> Result<Response<ts::AbortResponse>, Status> {
-        Ok(Response::new(ts::AbortResponse {
-            success: true,
-            message: String::new(),
-        }))
-    }
-
-    async fn get_model_info(
-        &self,
-        _request: Request<ts::GetModelInfoRequest>,
-    ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
-        Ok(Response::new(ts::GetModelInfoResponse::default()))
-    }
-
-    async fn get_server_info(
-        &self,
-        _request: Request<ts::GetServerInfoRequest>,
-    ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
-        Ok(Response::new(ts::GetServerInfoResponse::default()))
-    }
-
-    async fn get_loads(
-        &self,
-        _request: Request<ts::GetLoadsRequest>,
-    ) -> Result<Response<ts::GetLoadsResponse>, Status> {
-        Ok(Response::new(ts::GetLoadsResponse::default()))
-    }
 }
 
 /// Serve a queued parallel-dispatch mock engine in-process; returns its port
@@ -571,47 +484,6 @@ impl TokenSpeedAnswers for CutEngine {
                 .await;
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
-    }
-
-    async fn health_check(
-        &self,
-        _request: Request<ts::HealthCheckRequest>,
-    ) -> Result<Response<ts::HealthCheckResponse>, Status> {
-        Ok(Response::new(ts::HealthCheckResponse {
-            healthy: true,
-            message: "ok".to_string(),
-        }))
-    }
-
-    async fn abort(
-        &self,
-        _request: Request<ts::AbortRequest>,
-    ) -> Result<Response<ts::AbortResponse>, Status> {
-        Ok(Response::new(ts::AbortResponse {
-            success: true,
-            message: String::new(),
-        }))
-    }
-
-    async fn get_model_info(
-        &self,
-        _request: Request<ts::GetModelInfoRequest>,
-    ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
-        Ok(Response::new(ts::GetModelInfoResponse::default()))
-    }
-
-    async fn get_server_info(
-        &self,
-        _request: Request<ts::GetServerInfoRequest>,
-    ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
-        Ok(Response::new(ts::GetServerInfoResponse::default()))
-    }
-
-    async fn get_loads(
-        &self,
-        _request: Request<ts::GetLoadsRequest>,
-    ) -> Result<Response<ts::GetLoadsResponse>, Status> {
-        Ok(Response::new(ts::GetLoadsResponse::default()))
     }
 }
 
@@ -787,29 +659,6 @@ fn assert_all_answered_past_the_bound(answers: &[(http::StatusCode, String, Dura
     );
 }
 
-/// Run `case` on a current-thread runtime under a thread-local recorder and
-/// return the rendered `/metrics` text.
-#[expect(
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
-fn render_after<F, Fut>(case: F) -> String
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let handle = recorder.handle();
-    metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("current-thread runtime");
-        rt.block_on(case());
-    });
-    handle.render()
-}
-
 /// The value of the `smg_worker_errors_total` sample for `worker_type` and
 /// `error_type` (any connection), zero when it was not emitted.
 fn worker_errors(rendered: &str, worker_type: &str, error_type: &str) -> f64 {
@@ -952,6 +801,12 @@ fn a_non_streaming_request_is_not_bound_by_the_decode_sides_first_token() {
         .await;
         let (status, body, elapsed) = one_chat(router.as_ref(), false).await;
         assert_eq!(status, http::StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON answer");
+        assert_eq!(
+            json["usage"]["completion_tokens"].as_u64(),
+            Some(u64::from(OUTPUT_TOKENS)),
+            "the usage carries the decode's completion count: {body}"
+        );
         assert!(
             elapsed >= BOUND + Duration::from_secs(1) && elapsed < CASE_CAP,
             "answered when the decode answered, past the bound: {elapsed:?}"

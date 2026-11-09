@@ -55,6 +55,7 @@ pub fn is_tokenizer_file(filename: &str) -> bool {
         || filename.ends_with("merges.txt")
         || filename.ends_with(".model")  // SentencePiece models
         || filename.ends_with(".tiktoken")
+        || filename.ends_with("tekken.json") // the tekken vocabulary file
         || is_chat_template_file(filename) // Include chat template files
 }
 
@@ -370,6 +371,7 @@ mod tests {
         assert!(is_tokenizer_file("special_tokens_map.json"));
         assert!(is_tokenizer_file("vocab.json"));
         assert!(is_tokenizer_file("merges.txt"));
+        assert!(is_tokenizer_file("tekken.json"));
         assert!(is_tokenizer_file("spiece.model"));
         assert!(is_tokenizer_file("chat_template.jinja"));
         assert!(is_tokenizer_file("template.jinja"));

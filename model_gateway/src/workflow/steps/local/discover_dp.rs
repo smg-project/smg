@@ -207,13 +207,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
+    use crate::workflow::steps::local::test_support::labels_of;
 
     #[test]
     fn dp_info_from_labels_reads_dp_size_and_model() {
@@ -223,7 +217,7 @@ mod tests {
             vec![("attn_dp_size", "4")],
             vec![("dp_size", "2"), ("attn_dp_size", "2")],
         ] {
-            let mut metadata = labels(&widths);
+            let mut metadata = labels_of(&widths);
             metadata.insert("served_model_name".to_string(), "m".to_string());
             let info = dp_info_from_labels(&metadata).unwrap();
             assert_eq!(info.dp_size, 4);
@@ -233,17 +227,18 @@ mod tests {
 
     #[test]
     fn dp_info_from_labels_model_path_fallback() {
-        let info =
-            dp_info_from_labels(&labels(&[("dp_size", "2"), ("model_path", "org/repo")])).unwrap();
+        let info = dp_info_from_labels(&labels_of(&[("dp_size", "2"), ("model_path", "org/repo")]))
+            .unwrap();
         assert_eq!(info.model_id, "repo");
         let info =
-            dp_info_from_labels(&labels(&[("dp_size", "2"), ("model_path", "org/repo/")])).unwrap();
+            dp_info_from_labels(&labels_of(&[("dp_size", "2"), ("model_path", "org/repo/")]))
+                .unwrap();
         assert_eq!(info.model_id, "repo");
     }
 
     #[test]
     fn dp_info_from_labels_unknown_model_when_absent() {
-        let info = dp_info_from_labels(&labels(&[("dp_size", "2")])).unwrap();
+        let info = dp_info_from_labels(&labels_of(&[("dp_size", "2")])).unwrap();
         assert_eq!(info.model_id, UNKNOWN_MODEL_ID);
     }
 
@@ -253,7 +248,7 @@ mod tests {
         // grouped one reports its spec size, so create_worker gets a dp_info
         // to validate under --dp-aware instead of an internal error.
         let mut spec = WorkerSpec::new("ipc:///tmp/smg-zmq/engine.ipc");
-        let info = zmq_dp_info(&spec, &labels(&[("model_id", "m")]));
+        let info = zmq_dp_info(&spec, &labels_of(&[("model_id", "m")]));
         assert_eq!(info.dp_size, 1);
         assert_eq!(info.model_id, "m");
 
@@ -266,14 +261,16 @@ mod tests {
 
     #[test]
     fn dp_info_from_labels_rejects_missing_or_zero_dp_size() {
-        assert!(dp_info_from_labels(&labels(&[])).is_err());
-        assert!(dp_info_from_labels(&labels(&[("dp_size", "0")])).is_err());
-        assert!(dp_info_from_labels(&labels(&[("dp_size", "abc")])).is_err());
-        assert!(dp_info_from_labels(&labels(&[("dp_size", "1"), ("attn_dp_size", "0")])).is_err());
+        assert!(dp_info_from_labels(&labels_of(&[])).is_err());
+        assert!(dp_info_from_labels(&labels_of(&[("dp_size", "0")])).is_err());
+        assert!(dp_info_from_labels(&labels_of(&[("dp_size", "abc")])).is_err());
         assert!(
-            dp_info_from_labels(&labels(&[("dp_size", "1"), ("attn_dp_size", "abc")])).is_err()
+            dp_info_from_labels(&labels_of(&[("dp_size", "1"), ("attn_dp_size", "0")])).is_err()
         );
-        let overflow = labels(&[("dp_size", &usize::MAX.to_string()), ("attn_dp_size", "2")]);
+        assert!(
+            dp_info_from_labels(&labels_of(&[("dp_size", "1"), ("attn_dp_size", "abc")])).is_err()
+        );
+        let overflow = labels_of(&[("dp_size", &usize::MAX.to_string()), ("attn_dp_size", "2")]);
         assert!(dp_info_from_labels(&overflow).is_err());
     }
 }

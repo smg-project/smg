@@ -173,7 +173,45 @@ def model_info_from_config(
         # lists): the servicer withholds a PD decode side's KV-transfer rejection
         # notice there, whatever connector the projection above reports.
         "runs_mooncake": runs_mooncake(vllm_config),
+        # Encoder-cache disaggregation, off `ec_transfer_config` as the Python
+        # servicer reads it; the Rust servicer refuses a leg that names a
+        # connector when none runs.
+        **ec_transfer_facts(vllm_config),
         "log_stats": log_stats,
+    }
+
+
+def ec_transfer_facts(vllm_config: Any) -> dict[str, Any]:
+    """The encoder-cache disaggregation identity the Rust servicer advertises,
+    read off ``ec_transfer_config`` as the Python servicer reads it: whether a
+    connector runs at all, which, this engine's role, and for a Mooncake
+    consumer one ZMQ address per data-parallel rank (``ec_port + rank *
+    tensor_parallel_size`` on ``ec_ip``). The Rust servicer manages every rank
+    it starts, so no rank's slot is left empty."""
+    ec_config = getattr(vllm_config, "ec_transfer_config", None)
+    if ec_config is None:
+        return {
+            "supports_ec_transfer": False,
+            "ec_connector": "",
+            "ec_role": "",
+            "ec_zmq_addrs": [],
+        }
+    connector = str(getattr(ec_config, "ec_connector", None) or "")
+    addrs: list[str] = []
+    if connector == "ECMooncakeConnector" and bool(getattr(ec_config, "is_ec_consumer", False)):
+        parallel = vllm_config.parallel_config
+        tensor_parallel = int(getattr(parallel, "tensor_parallel_size", 1) or 1)
+        ranks = int(getattr(parallel, "data_parallel_size", 1) or 1)
+        host = str(getattr(ec_config, "ec_ip", None) or "127.0.0.1")
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        port = int(getattr(ec_config, "ec_port", 0) or 0)
+        addrs = [f"tcp://{host}:{port + rank * tensor_parallel}" for rank in range(ranks)]
+    return {
+        "supports_ec_transfer": True,
+        "ec_connector": connector,
+        "ec_role": str(getattr(ec_config, "ec_role", None) or ""),
+        "ec_zmq_addrs": addrs,
     }
 
 

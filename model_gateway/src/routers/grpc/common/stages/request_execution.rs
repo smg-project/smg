@@ -15,7 +15,7 @@ use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
     helpers::{maybe_inject_pd_metadata, maybe_inject_pd_rendezvous},
-    pd_protocol::{PdDispatch, PdProtocol},
+    pd_protocol::{EncodeHandoff, PdDispatch, PdProtocol},
 };
 use crate::{
     observability::{
@@ -378,7 +378,8 @@ pub(crate) async fn execute_plan(
                 execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger).await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
-                let vllm_encode = request.is_vllm() && workers.encode_assignments().is_some();
+                let push_encode = workers.encode_handoff() == Some(EncodeHandoff::Push)
+                    && workers.encode_assignments().is_some();
                 // Bootstrap info was injected into the prefill request during
                 // request building; dispatch the encode jobs with the
                 // prefill+decode side.
@@ -395,8 +396,9 @@ pub(crate) async fn execute_plan(
                 )
                 .await
                 .map_err(|mut response| {
-                    // A PUSH may already have reserved buffers on this P replica.
-                    if vllm_encode {
+                    // A push may already have reserved buffers on this
+                    // prefill replica.
+                    if push_encode {
                         mark_non_retryable(&mut response);
                     }
                     response
@@ -699,7 +701,10 @@ async fn execute_fanout_pd(
     })
 }
 
-/// Complete vLLM encoding before P/D, or launch TokenSpeed rendezvous alongside P/D.
+/// Dispatch an EPD request by its runtime's encode handoff
+/// (`PdProtocol::encode_handoff`): under a push handoff the encoder
+/// completes before the prefill/decode pair is sent; under a rendezvous
+/// handoff the encode jobs launch beside the pair.
 #[expect(
     clippy::too_many_arguments,
     reason = "EPD adds image anchors to the shared PD dispatch inputs"
@@ -714,7 +719,8 @@ async fn execute_epd_dispatch(
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
-    let mut cleanup = if proto_request.is_vllm() && workers.encode_assignments().is_some() {
+    let push = workers.encode_handoff() == Some(EncodeHandoff::Push);
+    let mut cleanup = if push && workers.encode_assignments().is_some() {
         Some(super::vllm_encode::encode(&mut proto_request, workers, image_anchor).await?)
     } else {
         None
@@ -722,7 +728,9 @@ async fn execute_epd_dispatch(
     if let Some(encode_dispatch) = encode_dispatch {
         spawn_encode_dispatch(encode_dispatch);
     }
-    if !proto_request.is_vllm() {
+    // A push handoff's identity has replaced the pixels already; every other
+    // prefill side drops them, its embeddings come from the encode workers.
+    if !push {
         proto_request.clear_mm_pixel_values();
     }
     let result = execute_pd_dispatch(
@@ -3038,6 +3046,7 @@ mod tests {
     use super::*;
     use crate::{
         routers::common::{attempt_ledger::FailedSide, retry::is_retryable_response},
+        test_support::text_of,
         worker::{
             BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, RuntimeType, Worker,
             WorkerType,
@@ -5174,10 +5183,7 @@ mod tests {
     async fn sequential_pd_decode_form_rejects_incompatible_pairings() {
         async fn refusal(response: Response) -> String {
             assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("body");
-            let text = String::from_utf8(body.to_vec()).expect("utf-8 body");
+            let text = text_of(response).await;
             assert!(
                 text.contains("no decode worker with a vision encoder is paired"),
                 "{text}"

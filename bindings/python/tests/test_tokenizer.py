@@ -1313,6 +1313,9 @@ def test_the_pool_takes_its_size_from_the_environment(
         for name, value in os.environ.items()
         if name not in ("SMG_TOKENIZER_THREADS", "TOKENIZERS_PARALLELISM", "RAYON_NUM_THREADS")
     }
+    # The child reads the variables when its tokenizer builds the pool. The
+    # pool is handed out once every worker has started and named its thread,
+    # so the count below does not race the workers' first run.
     child = subprocess.run(
         [sys.executable, "-c", POOL_THREADS, str(checkpoint)],
         env={**clean, **environment},

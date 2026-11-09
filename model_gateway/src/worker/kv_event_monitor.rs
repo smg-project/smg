@@ -967,6 +967,10 @@ mod tests {
                 Some(0.0)
             );
             assert!(gauge(&handle, "smg_kv_index_arena_bytes", "chain").is_some_and(|b| b > 0.0));
+            // The arena holds whole chunks: what it holds is at least what it handed out.
+            let handed_out = gauge(&handle, "smg_kv_index_arena_bytes", "chain").expect("arena");
+            assert!(gauge(&handle, "smg_kv_index_arena_chunk_bytes", "chain")
+                .is_some_and(|held| held >= handed_out));
             assert!(gauge(&handle, "smg_kv_index_slab_bytes", "chain").is_some_and(|b| b > 0.0));
         });
     }
@@ -1135,6 +1139,7 @@ mod tests {
                     "smg_kv_index_blocks_live",
                     "smg_kv_index_runs_live",
                     "smg_kv_index_arena_bytes",
+                    "smg_kv_index_arena_chunk_bytes",
                     "smg_kv_index_slab_bytes",
                     "smg_kv_block_size_tokens",
                 ] {

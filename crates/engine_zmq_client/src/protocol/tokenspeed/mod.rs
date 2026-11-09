@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 
 use crate::{
-    codec::{encode_msgpack, tensor::encode_with_aux_frames, OpaqueValue},
+    codec::{add_request_capacity, encode_msgpack, tensor::encode_with_aux_frames, OpaqueValue},
     error::Result,
     protocol::{
         control::{CONTROL_REPLY_SLIM_TAG, CONTROL_REPLY_WIRE_FIELDS},
@@ -122,12 +122,13 @@ impl EngineProtocol for TokenSpeedProtocol {
     /// frames ([`encode_with_aux_frames`]): the engine's `MsgpackDecoder`
     /// resolves a tensor's frame index against the message's frames, the
     /// payload being frame 0, as it resolves its own encoder's. A text
-    /// request, or one whose tensors are all small, keeps its one frame.
+    /// request, or one whose tensors are all small, keeps its one frame, in a
+    /// buffer sized from the prompt before the write.
     fn encode_add(
         request: &Self::Request,
         _layout: &SlimOutputLayout,
     ) -> Result<(Vec<u8>, Vec<Bytes>)> {
-        encode_with_aux_frames(request)
+        encode_with_aux_frames(request, add_request_capacity(request.input_ids.len()))
     }
 
     fn encode_abort(request_id: &str) -> Result<Vec<u8>> {

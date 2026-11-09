@@ -169,15 +169,22 @@ impl LocalRateLimitBackend {
     /// bucket and none can take it before it is gone. A reserve that comes
     /// after finds the slot vacant and starts a fresh bucket.
     fn sweep_idle_buckets(&self, idle_ttl: Duration) -> usize {
+        let candidates = self.idle_bucket_candidates(idle_ttl);
+        self.evict_idle_candidates(&candidates, idle_ttl)
+    }
+
+    fn idle_bucket_candidates(&self, idle_ttl: Duration) -> Vec<ScopeKey> {
         let now = Instant::now();
-        let candidates: Vec<ScopeKey> = self
-            .buckets
+        self.buckets
             .iter()
             .filter(|entry| {
                 Arc::strong_count(entry.value()) == 1 && entry.value().idle_at(now) >= idle_ttl
             })
             .map(|entry| entry.key().clone())
-            .collect();
+            .collect()
+    }
+
+    fn evict_idle_candidates(&self, candidates: &[ScopeKey], idle_ttl: Duration) -> usize {
         candidates
             .iter()
             .filter(|key| {
@@ -319,8 +326,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::rate_limit::config::{
-        ModelMatcherSpec, ModelRuleSpec, RateLimitYaml, TenantPolicySpec,
+    use crate::rate_limit::{
+        config::{ModelMatcherSpec, ModelRuleSpec, RateLimitYaml, TenantPolicySpec},
+        test_support::reserve_request,
     };
 
     fn policy_set(tpm: u32, rpm: u32) -> CompiledPolicySet {
@@ -336,22 +344,13 @@ mod tests {
         CompiledPolicySet::compile(&yaml).unwrap()
     }
 
-    fn request(tenant: &str, tokens: u32) -> ReserveRequest<'static> {
-        ReserveRequest {
-            request_charge_id: Uuid::now_v7(),
-            tenant_key: TenantKey::new(tenant),
-            model_id: None,
-            estimated_input_tokens: tokens,
-        }
-    }
-
     #[tokio::test]
     async fn reserve_admits_within_budget_and_denies_over() {
         let backend = LocalRateLimitBackend::new(policy_set(100, 5));
-        let first = backend.reserve(request("auth:team-red", 60)).await;
+        let first = backend.reserve(reserve_request("auth:team-red", 60)).await;
         assert_eq!(first, ReserveOutcome::Admitted);
 
-        let second = backend.reserve(request("auth:team-red", 60)).await;
+        let second = backend.reserve(reserve_request("auth:team-red", 60)).await;
         assert!(matches!(second, ReserveOutcome::Denied { .. }));
     }
 
@@ -359,11 +358,11 @@ mod tests {
     async fn different_tenants_have_independent_budgets() {
         let backend = LocalRateLimitBackend::new(policy_set(100, 5));
         assert_eq!(
-            backend.reserve(request("auth:team-red", 90)).await,
+            backend.reserve(reserve_request("auth:team-red", 90)).await,
             ReserveOutcome::Admitted
         );
         assert_eq!(
-            backend.reserve(request("auth:team-blue", 90)).await,
+            backend.reserve(reserve_request("auth:team-blue", 90)).await,
             ReserveOutcome::Admitted
         );
     }
@@ -371,7 +370,7 @@ mod tests {
     #[tokio::test]
     async fn repeated_reserve_with_same_charge_id_does_not_double_charge() {
         let backend = LocalRateLimitBackend::new(policy_set(100, 5));
-        let req = request("auth:team-red", 60);
+        let req = reserve_request("auth:team-red", 60);
         let charge_id = req.request_charge_id;
 
         // First attempt debits 60 of 100; the retry (same charge_id)
@@ -382,7 +381,7 @@ mod tests {
         // Remaining 40 still fits -- would be denied if the retry had
         // double-debited.
         assert_eq!(
-            backend.reserve(request("auth:team-red", 40)).await,
+            backend.reserve(reserve_request("auth:team-red", 40)).await,
             ReserveOutcome::Admitted
         );
 
@@ -400,7 +399,7 @@ mod tests {
             .await;
         // 100 - 60 (settled exactly) - 40 (still open) = 0 remaining.
         assert!(matches!(
-            backend.reserve(request("auth:team-red", 1)).await,
+            backend.reserve(reserve_request("auth:team-red", 1)).await,
             ReserveOutcome::Denied { .. }
         ));
     }
@@ -408,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn settle_with_more_usage_than_reserved_creates_debt() {
         let backend = LocalRateLimitBackend::new(policy_set(100, 5));
-        let req = request("auth:team-red", 50);
+        let req = reserve_request("auth:team-red", 50);
         let charge_id = req.request_charge_id;
         assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
 
@@ -424,7 +423,7 @@ mod tests {
             .await;
 
         // 100 capacity - 50 reserved - 60 extra from settlement = -10 (debt).
-        let next = backend.reserve(request("auth:team-red", 1)).await;
+        let next = backend.reserve(reserve_request("auth:team-red", 1)).await;
         assert!(matches!(next, ReserveOutcome::Denied { .. }));
     }
 
@@ -433,7 +432,7 @@ mod tests {
     #[tokio::test]
     async fn settle_charges_the_counts_and_not_their_split() {
         let backend = LocalRateLimitBackend::new(policy_set(100, 5));
-        let req = request("auth:team-red", 50);
+        let req = reserve_request("auth:team-red", 50);
         let charge_id = req.request_charge_id;
         assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
 
@@ -451,11 +450,11 @@ mod tests {
 
         // 100 - 60 = 40 remain: the split neither charges twice nor refunds.
         assert_eq!(
-            backend.reserve(request("auth:team-red", 40)).await,
+            backend.reserve(reserve_request("auth:team-red", 40)).await,
             ReserveOutcome::Admitted
         );
         assert!(matches!(
-            backend.reserve(request("auth:team-red", 1)).await,
+            backend.reserve(reserve_request("auth:team-red", 1)).await,
             ReserveOutcome::Denied { .. }
         ));
     }
@@ -466,7 +465,7 @@ mod tests {
         // settle time. Without refilling before the charge, that
         // overshoot gets replayed later, clawing back part of the charge.
         let backend = LocalRateLimitBackend::new(policy_set(6000, 1000));
-        let req = request("auth:team-red", 2);
+        let req = reserve_request("auth:team-red", 2);
         let charge_id = req.request_charge_id;
         assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
 
@@ -486,7 +485,9 @@ mod tests {
         // Assert well above 5500 (not the exact boundary) so a few extra
         // tokens of scheduling-jitter refill can't flip the outcome.
         assert!(matches!(
-            backend.reserve(request("auth:team-red", 5530)).await,
+            backend
+                .reserve(reserve_request("auth:team-red", 5530))
+                .await,
             ReserveOutcome::Denied { .. }
         ));
     }
@@ -494,26 +495,26 @@ mod tests {
     #[tokio::test]
     async fn close_reserved_only_keeps_the_debit() {
         let backend = LocalRateLimitBackend::new(policy_set(100, 5));
-        let req = request("auth:team-red", 100);
+        let req = reserve_request("auth:team-red", 100);
         let charge_id = req.request_charge_id;
         assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
 
         backend.close_reserved_only(charge_id).await;
 
-        let next = backend.reserve(request("auth:team-red", 1)).await;
+        let next = backend.reserve(reserve_request("auth:team-red", 1)).await;
         assert!(matches!(next, ReserveOutcome::Denied { .. }));
     }
 
     #[tokio::test]
     async fn abandon_keeps_the_debit() {
         let backend = LocalRateLimitBackend::new(policy_set(100, 5));
-        let req = request("auth:team-red", 100);
+        let req = reserve_request("auth:team-red", 100);
         let charge_id = req.request_charge_id;
         assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
 
         backend.abandon(charge_id).await;
 
-        let next = backend.reserve(request("auth:team-red", 1)).await;
+        let next = backend.reserve(reserve_request("auth:team-red", 1)).await;
         assert!(matches!(next, ReserveOutcome::Denied { .. }));
     }
 
@@ -579,7 +580,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_drops_an_idle_full_bucket_and_keeps_a_recent_one() {
         let backend = LocalRateLimitBackend::new(fast_refill_policy());
-        let req = request("ip:203.0.113.7", 1);
+        let req = reserve_request("ip:203.0.113.7", 1);
         let charge_id = req.request_charge_id;
         assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
         backend.close_reserved_only(charge_id).await;
@@ -614,7 +615,7 @@ mod tests {
         let backend = LocalRateLimitBackend::new(CompiledPolicySet::compile(&yaml).unwrap());
         let gpt4 = |tokens| ReserveRequest {
             model_id: Some("gpt-4"),
-            ..request("ip:203.0.113.7", tokens)
+            ..reserve_request("ip:203.0.113.7", tokens)
         };
         let req = gpt4(1);
         let charge_id = req.request_charge_id;
@@ -643,7 +644,7 @@ mod tests {
             ReserveOutcome::Denied { .. }
         ));
         assert!(matches!(
-            backend.reserve(request("ip:203.0.113.7", 1)).await,
+            backend.reserve(reserve_request("ip:203.0.113.7", 1)).await,
             ReserveOutcome::Denied { .. }
         ));
     }
@@ -651,7 +652,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_keeps_a_bucket_in_settlement_debt() {
         let backend = LocalRateLimitBackend::new(fast_refill_policy());
-        let req = request("ip:203.0.113.7", 1);
+        let req = reserve_request("ip:203.0.113.7", 1);
         let charge_id = req.request_charge_id;
         assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
         // A full refill window of debt beyond capacity: dropping the bucket
@@ -671,7 +672,7 @@ mod tests {
         assert_eq!(backend.sweep_idle_buckets(Duration::ZERO), 0);
         assert_eq!(backend.buckets.len(), 1);
         assert!(matches!(
-            backend.reserve(request("ip:203.0.113.7", 1)).await,
+            backend.reserve(reserve_request("ip:203.0.113.7", 1)).await,
             ReserveOutcome::Denied { .. }
         ));
     }
@@ -681,7 +682,7 @@ mod tests {
         // 100 tokens/s: refills a one-token draw in ~10ms, but not a
         // hundred tokens in the few milliseconds the rest of the test takes.
         let backend = LocalRateLimitBackend::new(policy_set(6000, 60_000));
-        let req = request("ip:203.0.113.7", 1);
+        let req = reserve_request("ip:203.0.113.7", 1);
         let charge_id = req.request_charge_id;
         assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
         backend.close_reserved_only(charge_id).await;
@@ -691,12 +692,16 @@ mod tests {
         assert!(backend.buckets.is_empty());
 
         assert_eq!(
-            backend.reserve(request("ip:203.0.113.7", 6000)).await,
+            backend
+                .reserve(reserve_request("ip:203.0.113.7", 6000))
+                .await,
             ReserveOutcome::Admitted
         );
         assert_eq!(backend.buckets.len(), 1);
         assert!(matches!(
-            backend.reserve(request("ip:203.0.113.7", 100)).await,
+            backend
+                .reserve(reserve_request("ip:203.0.113.7", 100))
+                .await,
             ReserveOutcome::Denied { .. }
         ));
     }
@@ -766,7 +771,7 @@ mod tests {
                     while !stop.load(Ordering::Relaxed) {
                         let round = rounds.load(Ordering::Acquire);
                         for _ in 0..RESERVES_PER_ROUND {
-                            let req = request(TENANT, 1);
+                            let req = reserve_request(TENANT, 1);
                             let charge_id = req.request_charge_id;
                             // reserve/close never await, so one poll finishes them.
                             let outcome = backend.reserve(req).now_or_never().unwrap();
@@ -805,6 +810,116 @@ mod tests {
         );
     }
 
+    /// Force a reserve after the sweep collects an idle candidate, before
+    /// its final Arc-count recheck. Held reservations must keep that bucket
+    /// served; after all closes the next sweep must evict it.
+    #[test]
+    fn a_reserve_between_sweep_passes_never_debits_a_removed_bucket() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Barrier,
+        };
+
+        use futures::FutureExt;
+
+        const TENANT: &str = "ip:203.0.113.7";
+        const ROUNDS: usize = 128;
+        // Refills a one-token draw in nanoseconds, so the bucket is full,
+        // and sweepable, almost whenever no reserve holds it.
+        let backend = LocalRateLimitBackend::new(policy_set(u32::MAX, u32::MAX));
+        let key = ScopeKey::TenantGlobal(TenantKey::new(TENANT));
+        let phases = Barrier::new(4);
+        let bad_reserves = AtomicUsize::new(0);
+        let bad_candidates = AtomicUsize::new(0);
+        let wrong_bucket = AtomicUsize::new(0);
+        let bad_sweeps = AtomicUsize::new(0);
+        let seed = || {
+            drop(backend.bucket_for(
+                key.clone(),
+                ScopeLimits {
+                    tokens_per_minute: u32::MAX,
+                    requests_per_minute: u32::MAX,
+                },
+            ));
+        };
+        seed();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..ROUNDS {
+                    // Pause the actual two-pass sweep after its count-of-one
+                    // observation, then let all three reserves clone that Arc.
+                    let candidates = backend.idle_bucket_candidates(Duration::ZERO);
+                    if candidates.as_slice() != std::slice::from_ref(&key) {
+                        bad_candidates.fetch_add(1, Ordering::Relaxed);
+                    }
+                    phases.wait(); // first pass finished; let reserves run
+                    phases.wait(); // all reservations now hold their bucket
+                    if backend.evict_idle_candidates(&candidates, Duration::ZERO) != 0 {
+                        bad_sweeps.fetch_add(1, Ordering::Relaxed);
+                    }
+                    phases.wait(); // re-check finished; let readers check identity
+                    phases.wait(); // all identity checks finished; let reserves close
+                    phases.wait(); // all reservation-held Arcs have been dropped
+                    if backend.sweep_idle_buckets(Duration::ZERO) != 1 {
+                        bad_sweeps.fetch_add(1, Ordering::Relaxed);
+                    }
+                    seed();
+                    phases.wait(); // prepare the next race before releasing readers
+                }
+            });
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    for _ in 0..ROUNDS {
+                        phases.wait();
+                        let req = reserve_request(TENANT, 1);
+                        let charge_id = req.request_charge_id;
+                        // reserve/close never await, so one poll finishes them.
+                        if backend.reserve(req).now_or_never() != Some(ReserveOutcome::Admitted) {
+                            bad_reserves.fetch_add(1, Ordering::Relaxed);
+                        }
+                        phases.wait();
+                        phases.wait();
+                        {
+                            let matches =
+                                match (backend.active.get(&charge_id), backend.buckets.get(&key)) {
+                                    (Some(held), Some(served)) => held
+                                        .buckets()
+                                        .next()
+                                        .is_some_and(|first| Arc::ptr_eq(first, served.value())),
+                                    _ => false,
+                                };
+                            if !matches {
+                                wrong_bucket.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        phases.wait();
+                        if backend
+                            .close_reserved_only(charge_id)
+                            .now_or_never()
+                            .is_none()
+                        {
+                            bad_reserves.fetch_add(1, Ordering::Relaxed);
+                        }
+                        phases.wait();
+                        phases.wait();
+                    }
+                });
+            }
+        });
+
+        // Assert after joining, so an invariant failure cannot strand another
+        // participant at a barrier. Each round checks both held and idle states.
+        assert_eq!(bad_reserves.load(Ordering::Relaxed), 0);
+        assert_eq!(bad_candidates.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            wrong_bucket.load(Ordering::Relaxed),
+            0,
+            "an admitted reservation holds a bucket the map no longer serves"
+        );
+        assert_eq!(bad_sweeps.load(Ordering::Relaxed), 0);
+    }
+
     #[tokio::test]
     async fn started_backend_sweeps_on_its_own_and_does_not_outlive_its_owner() {
         let backend = LocalRateLimitBackend::start_with_sweep(
@@ -813,7 +928,7 @@ mod tests {
             Duration::from_millis(10),
         )
         .unwrap();
-        let req = request("ip:203.0.113.7", 1);
+        let req = reserve_request("ip:203.0.113.7", 1);
         let charge_id = req.request_charge_id;
         assert_eq!(backend.reserve(req).await, ReserveOutcome::Admitted);
         backend.close_reserved_only(charge_id).await;

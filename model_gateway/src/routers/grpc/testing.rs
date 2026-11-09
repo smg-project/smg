@@ -18,6 +18,7 @@ use llm_tokenizer::{
 };
 use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
+use serde_json::{json, Value};
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
 };
@@ -95,7 +96,7 @@ pub(crate) fn grpc_ctx_from(
     Arc::new(
         AppContext::builder()
             .router_config(config.clone())
-            .client(crate::clients::http_client())
+            .client(crate::server::http_client())
             .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
             .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
             .tool_parser_factory(Some(ToolParserFactory::new()))
@@ -146,6 +147,15 @@ pub(crate) fn forced_call_on_a_thinking_prompt(
         Some(ToolConstraint::StructuralTag(tag)) => ("structural_tag".to_string(), tag),
         other => panic!("expected a structural tag, got {other:?}"),
     }
+}
+
+/// A chat tool declaration named `name`, with an empty object schema: what
+/// the tool-reading tests put in a request's or a message's `tools`.
+pub(crate) fn tool(name: &str) -> Value {
+    json!({
+        "type": "function",
+        "function": {"name": name, "parameters": {"type": "object", "properties": {}}}
+    })
 }
 
 /// The threads a [`ThreadRecordingTokenizer`]'s encodes and decodes ran on,

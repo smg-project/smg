@@ -1,4 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+};
 
 use axum::Router;
 use llm_tokenizer::registry::TokenizerRegistry;
@@ -256,7 +259,7 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
 pub async fn create_test_app_context_with_config(router_config: &RouterConfig) -> Arc<AppContext> {
     // A test's upstreams are its own loopback servers; the environment's
     // proxy would otherwise sit in the path of every request.
-    let client = smg::clients::http_client_builder()
+    let client = smg::server::http_client_builder()
         .no_proxy()
         .build()
         .expect("test client");
@@ -362,4 +365,26 @@ pub fn register_external_worker_with_card(ctx: &Arc<AppContext>, url: &str, mode
     );
 
     ctx.worker_registry.register(worker);
+}
+
+/// The text of the metrics endpoint at `addr`.
+#[expect(clippy::expect_used, reason = "test helper")]
+pub async fn scrape(addr: SocketAddr) -> String {
+    smg::server::http_client()
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await
+        .expect("metrics endpoint reachable")
+        .text()
+        .await
+        .expect("metrics body")
+}
+
+/// The body of `response` as text, up to one mebibyte.
+#[expect(clippy::expect_used, reason = "test helper")]
+pub async fn read_body(response: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("response body");
+    String::from_utf8(bytes.to_vec()).expect("utf-8 body")
 }

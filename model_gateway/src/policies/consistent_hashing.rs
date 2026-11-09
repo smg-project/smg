@@ -1,7 +1,12 @@
 //! Consistent hashing routing policy with header-based routing support
 //!
 //! Supports two routing mechanisms via HTTP headers:
-//! - `X-SMG-Target-Worker`: Direct routing by worker index (0-based), returns None if unavailable
+//! - `X-SMG-Target-Worker`: Direct routing by worker index (0-based) into the
+//!   workers the caller hands the policy. Placement hands it the workers
+//!   available when the request arrives, so the index counts those and an
+//!   index past them is a miss, not another worker. The one exception is a
+//!   pool with every worker vetoed, which placement's all-vetoed fallback
+//!   serves without reading the header.
 //! - `X-SMG-Routing-Key`: Consistent hash routing for session affinity
 //!
 //! ## Consistent Hashing
@@ -246,13 +251,10 @@ mod tests {
     use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::{policies::test_support::make_workers, worker::HashRing};
-
-    fn headers_with_routing_key(key: &str) -> http::HeaderMap {
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-smg-routing-key", key.parse().unwrap());
-        headers
-    }
+    use crate::{
+        policies::test_support::{headers_with_routing_key, make_workers},
+        worker::HashRing,
+    };
 
     fn headers_with_target_worker(idx: usize) -> http::HeaderMap {
         let mut headers = http::HeaderMap::new();

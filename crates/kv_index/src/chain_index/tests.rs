@@ -38,6 +38,65 @@ fn array_classes_round_up_and_back() {
     assert_eq!(table_class(1024), 9);
 }
 
+/// The arena takes memory from the process allocator a whole chunk at a time and keeps it: at a
+/// chunk boundary one more small array moves the bytes held by a chunk while the bytes handed
+/// out move by the array. An index whose arena sits near a boundary therefore holds one of two
+/// amounts a chunk apart for the same blocks, which `arena_chunk_bytes` names beside
+/// `arena_bytes`: nothing before the first array (the reserved word 0 is handed out, no chunk is
+/// held), then the handed-out words rounded up to whole chunks.
+#[test]
+fn the_arena_holds_whole_chunks_and_keeps_them() {
+    const CHUNK_BYTES: usize = WORD_CHUNK * size_of::<AtomicU64>();
+    // Two header words and a 16-word class array: the 18 words a short chain's hashes take.
+    const ARRAY_WORDS: usize = 16 + 2;
+    let contents = [7u64; 16];
+    let arena = WordArena::new();
+    let held_is_rounded_up = |arena: &WordArena| {
+        assert_eq!(
+            arena.chunk_bytes(),
+            (arena.used() as usize).div_ceil(WORD_CHUNK) * CHUNK_BYTES,
+            "held bytes are the handed-out words rounded up to whole chunks"
+        );
+    };
+    assert_eq!(
+        arena.chunk_bytes(),
+        0,
+        "nothing held before the first array"
+    );
+    arena.alloc_array(&contents, contents.len());
+    assert_eq!(
+        arena.chunk_bytes(),
+        CHUNK_BYTES,
+        "the first array takes a whole chunk"
+    );
+    held_is_rounded_up(&arena);
+    while arena.used() as usize + ARRAY_WORDS <= WORD_CHUNK {
+        arena.alloc_array(&contents, contents.len());
+    }
+    let before = arena.used();
+    assert_eq!(
+        arena.chunk_bytes(),
+        CHUNK_BYTES,
+        "one chunk holds every array that fits"
+    );
+    arena.alloc_array(&contents, contents.len());
+    assert_eq!(
+        arena.chunk_bytes(),
+        2 * CHUNK_BYTES,
+        "the first array past the boundary takes the next whole chunk"
+    );
+    assert!(
+        (arena.used() - before) as usize <= 2 * ARRAY_WORDS,
+        "the words handed out moved by one array and the chunk's tail, not by a chunk"
+    );
+    held_is_rounded_up(&arena);
+    // A freed array goes to a free list, never back to the allocator: the chunks stay.
+    let last = arena.used() as u32 - ARRAY_WORDS as u32 + 2;
+    arena.array_release(last);
+    assert_eq!(arena.chunk_bytes(), 2 * CHUNK_BYTES);
+    assert!(arena.free_words() >= ARRAY_WORDS);
+}
+
 #[test]
 fn store_lookup_and_divergence() {
     let index = ChainIndex::with_max_workers(8);

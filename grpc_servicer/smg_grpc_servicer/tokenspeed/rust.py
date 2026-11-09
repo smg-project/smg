@@ -370,32 +370,52 @@ def cache_layer_labels(model_config: Any) -> tuple[str, ...]:
     return ()
 
 
+def kv_events_name_their_group() -> bool:
+    """Whether the installed engine's scheduler publishes its KV events per
+    cache group: its ``KVEvent.BlockStored`` carries ``group_idx``.
+
+    Such an engine publishes a hybrid model's History chain, its State
+    checkpoints and its sliding windows each under its own group, the layout
+    the relay reads from the reference engine, so the publisher serves a
+    hybrid model. An engine whose events carry no group publishes one event
+    per boundary, and only while every group holds it: on a hybrid model
+    that is the checkpoint boundaries alone, no chain a router can follow."""
+    try:
+        from tokenspeed_scheduler import tokenspeed_scheduler_ext as scheduler_ext
+    except ImportError:
+        return False
+    stored = getattr(getattr(scheduler_ext, "KVEvent", None), "BlockStored", None)
+    return hasattr(stored, "group_idx")
+
+
 def kv_events_unpublishable(server_args: Any, model_config: Any = None) -> str | None:
     """Why TokenSpeed's KV event publisher cannot serve the model this process
     loads, or ``None`` when it can.
 
     TokenSpeed keeps a hybrid model's recurrent state (its Gated DeltaNet,
     Mamba or KDA layers) in State groups of its cache: blocks that hold one
-    checkpoint each and span no tokens. Its KV-event drain walks every cache
-    group of a published boundary for a token-span quantity, and a State
-    group has none: the scheduler's assertion (``a State group has no token
-    span``) ends the engine process at the first drain of a request's tail,
-    under the fused scheduler as under the prefill and decode roles. Which
-    layer labels get a State group is the engine's own vocabulary (the
-    recipes' ``STATE_LAYER_TYPES``, over :func:`cache_layer_labels`), so the
-    answer follows the engine installed: one without that vocabulary has no
-    State groups, and a model whose labels are all history (full, sliding or
-    sparse attention) is served. ``model_config`` is TokenSpeed's
-    ``ModelConfig`` for the served model, built here when not given
-    (:func:`_model_config`), after the vocabulary was found."""
+    checkpoint each and span no tokens. An engine whose KV events name their
+    cache group (:func:`kv_events_name_their_group`) publishes such a model's
+    History chain beside its checkpoints, and is served without reading the
+    model. On an engine whose events carry no group, a boundary is published
+    only while every group holds it, so a hybrid model's history chain never
+    reaches the router: the publisher stays off for such a model. Which layer
+    labels get a State group is the engine's own vocabulary (the recipes'
+    ``STATE_LAYER_TYPES``, over :func:`cache_layer_labels`), so the answer
+    follows the engine installed: one without that vocabulary has no State
+    groups, and a model whose labels are all history (full, sliding or sparse
+    attention) is served. ``model_config`` is TokenSpeed's ``ModelConfig``
+    for the served model, built here when not given (:func:`_model_config`),
+    after the vocabulary was found."""
+    if kv_events_name_their_group():
+        return None
     try:
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import STATE_LAYER_TYPES
     except ImportError as error:
         # An engine that does not spell its State-group vocabulary there (an
         # older one, with no State groups, or one that moved the module), or
         # no engine at all (the launcher's unit tests): the default is not
-        # guarded, and the log says so, since a hybrid model on an engine
-        # that moved the module would abort in the drain again.
+        # guarded, and the log says so.
         logger.info(
             "TokenSpeed's State-group vocabulary could not be read (%s): the KV-events default "
             "is not guarded against State groups on this engine",
@@ -411,8 +431,9 @@ def kv_events_unpublishable(server_args: Any, model_config: Any = None) -> str |
     return (
         f"{EngineConfigView(server_args).server_args.model} keeps recurrent state in "
         f"{len(state)} of its {len(labels)} layers ({', '.join(sorted(set(state)))}): State "
-        "groups of TokenSpeed's cache, which span no tokens, and TokenSpeed's KV-event drain "
-        "aborts the engine on a group with no token span"
+        "groups of TokenSpeed's cache, and this engine's KV-event feed publishes a boundary "
+        "only while every group holds it, so the model's history chain would never reach the "
+        "router (an engine whose KV events name their cache group publishes it)"
     )
 
 

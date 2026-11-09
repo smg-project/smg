@@ -9,10 +9,10 @@ use std::fmt::Write as _;
 
 use serde_json::Value;
 
-// `DsEncodingError` lives in `deepseek_common` (shared with V4.1) and is
-// re-exported here unchanged: it is part of this module's public API
-// (returned from `encode_messages`), and `pub(super)` items are only
-// reachable within `encoders` on their own.
+// `DsEncodingError` lives in `deepseek_common` (one type for the three
+// renderers) and is re-exported here unchanged: it is part of this module's
+// public API (returned from `encode_messages`), and `pub(super)` items are
+// only reachable within `encoders` on their own.
 pub use super::deepseek_common::DsEncodingError;
 // Reuse the public ThinkingMode enum from the V3.2 module to keep the
 // "thinking" / "chat" mode invariant identical across DeepSeek versions.
@@ -152,13 +152,7 @@ fn render_message(
     drop_thinking: bool,
     reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<String, DsEncodingError> {
-    let Some(msg) = messages.get(index) else {
-        return Err(DsEncodingError::IndexOutOfRange {
-            index,
-            len: messages.len(),
-        });
-    };
-    let turn = Turn::read(index, msg);
+    let turn = Turn::read(index, messages)?;
     let last_user_idx = find_last_user_index(messages);
     let mut prompt = String::new();
 
@@ -174,15 +168,7 @@ fn render_message(
 
     match turn.role {
         "system" => render_system(&mut prompt, &turn),
-        "developer" => {
-            if turn.content.is_empty() {
-                return Err(DsEncodingError::InvalidMessage {
-                    role: turn.role.to_string(),
-                    msg: turn.msg.to_string(),
-                });
-            }
-            render_developer(&mut prompt, &turn);
-        }
+        "developer" => render_developer(&mut prompt, &turn)?,
         "user" => render_user(&mut prompt, turn.msg, turn.content),
         "latest_reminder" => {
             prompt.push_str(LATEST_REMINDER);
@@ -236,12 +222,12 @@ fn render_system(prompt: &mut String, turn: &Turn<'_>) {
 }
 
 /// A developer message: the user token, its content, then the tools and
-/// the response format it carries (the content is never empty: the caller
-/// refused an empty one).
-fn render_developer(prompt: &mut String, turn: &Turn<'_>) {
+/// the response format it carries; an empty one is refused.
+fn render_developer(prompt: &mut String, turn: &Turn<'_>) -> Result<(), DsEncodingError> {
+    let content = turn.developer_content()?;
     let mut content_developer = String::new();
     content_developer.push_str(USER);
-    content_developer.push_str(turn.content);
+    content_developer.push_str(content);
     push_tools_and_response_format(
         &mut content_developer,
         turn.tools.as_deref(),
@@ -249,6 +235,7 @@ fn render_developer(prompt: &mut String, turn: &Turn<'_>) {
         render_tools,
     );
     prompt.push_str(&content_developer);
+    Ok(())
 }
 
 /// A user message: the user token, then its content blocks (tool results

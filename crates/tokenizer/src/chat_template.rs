@@ -30,6 +30,8 @@ use minijinja::{
 use serde::Serialize;
 use serde_json::{self, ser::Formatter, Value as JsonValue};
 
+use crate::{encoders::marks, native::AddedTokens};
+
 /// Chat template content format
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChatTemplateContentFormat {
@@ -2954,6 +2956,9 @@ pub struct ChatTemplateState {
     /// template, which the processor's agrees with on the thinking answers;
     /// [`Self::content_format_for_tools`] answers for the one selected.
     processor: Option<Box<ChatTemplateState>>,
+    /// The templates are compiled with their control spellings marked (see
+    /// [`Self::mark_controls`]).
+    marked: bool,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -2996,6 +3001,7 @@ impl ChatTemplateState {
             tool_use: None,
             output_len: RenderedLength::default(),
             processor: None,
+            marked: false,
         };
         state.raw_tool_call_arguments = state.writes_tool_call_arguments_as_text();
         Ok(state)
@@ -3131,6 +3137,7 @@ impl ChatTemplateState {
             tool_use: None,
             output_len: RenderedLength::default(),
             processor: None,
+            marked: false,
         }
     }
 
@@ -3289,6 +3296,37 @@ impl ChatTemplateState {
         render_chat_template(env, messages, params, &self.output_len)
     }
 
+    /// Compiles the templates (this one, the `tool_use` one, the processor's)
+    /// with every control spelling `controls` knows between the marks of
+    /// `encoders::marks`, so a render tells the control tokens the template
+    /// wrote from the same spellings in request text, which the renderer
+    /// strips of marks first. For a checkpoint whose reference library writes
+    /// its control tokens structurally and encodes every request string as
+    /// plain text. A template that names a spelling in a comparison rather
+    /// than in its output would compare against the marked spelling; the
+    /// templates of such a family write their spellings only.
+    pub(crate) fn mark_controls(&mut self, controls: &AddedTokens) -> Result<()> {
+        if let Some(env) = &self.env {
+            let source = env.get_template("chat")?.source().to_owned();
+            if let Cow::Owned(marked) = marks::mark_controls(&source, controls) {
+                self.env = Some(build_environment(marked)?);
+            }
+        }
+        self.marked = true;
+        for nested in [&mut self.tool_use, &mut self.processor]
+            .into_iter()
+            .flatten()
+        {
+            nested.mark_controls(controls)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the templates are compiled marked (see [`Self::mark_controls`]).
+    pub(crate) fn marked(&self) -> bool {
+        self.marked
+    }
+
     pub fn set(&mut self, template: String) -> Result<()> {
         let (
             content_format,
@@ -3311,6 +3349,7 @@ impl ChatTemplateState {
         // A replacement template stands alone, as a template file does.
         self.tool_use = None;
         self.processor = None;
+        self.marked = false;
         self.raw_tool_call_arguments = self.writes_tool_call_arguments_as_text();
         Ok(())
     }

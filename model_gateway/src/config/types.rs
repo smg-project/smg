@@ -739,7 +739,11 @@ pub enum AccessLogField {
     /// end; a body that ended early (a client that left, a stream that
     /// failed) has the bytes out so far on that line as
     /// `response_bytes_sent`, a key of its own, so the length is never
-    /// recorded twice.
+    /// recorded twice. A streamed body's end line is written after the
+    /// output was read, so it also carries what the request learned while
+    /// it streamed: the `symphony.*` fields of an output the Symphony reader
+    /// did not read clean, which the finish line of a stream goes out too
+    /// early to carry.
     ResponseBytes,
     /// The worker the request was routed to.
     Worker,
@@ -1460,7 +1464,11 @@ pub enum PolicyConfig {
     },
 
     /// Consistent hashing policy using hash ring for session affinity:
-    /// - X-SMG-Target-Worker: Direct routing to a specific worker by URL
+    /// - X-SMG-Target-Worker: Direct routing to a specific worker by its index
+    ///   (0-based) among the workers available when the request arrives; an
+    ///   index past them is answered as no available worker, except in a pool
+    ///   with every worker vetoed, which the all-vetoed fallback serves without
+    ///   reading the header
     /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
     /// - Provides O(log n) lookup with minimal redistribution (~1/N keys) on topology change
     #[serde(rename = "consistent_hashing")]

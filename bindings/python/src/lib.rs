@@ -1020,8 +1020,8 @@ impl Router {
             })
         };
 
-        // IGW does not override backend or disaggregated modes; IGW-only keeps
-        // the Python binding's existing empty startup-worker behavior.
+        // IGW selects routers per request; it does not change which configured
+        // workers are registered at startup, or override backend/disaggregated modes.
         let mode = if let Some(provider) = self.backend.provider_mode(&self.worker_urls) {
             provider
         } else if self.epd_disaggregation {
@@ -1062,11 +1062,7 @@ impl Router {
             }
         } else {
             RoutingMode::Regular {
-                worker_urls: if self.enable_igw {
-                    vec![]
-                } else {
-                    self.worker_urls.clone()
-                },
+                worker_urls: self.worker_urls.clone(),
             }
         };
 
@@ -2306,7 +2302,7 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The process-level TLS crypto provider, installed once when the module
     // is imported: every HTTP client a binding builds takes it, whether or
     // not a router is started in this process.
-    clients::install_crypto_provider();
+    server::install_crypto_provider();
 
     m.add_class::<PolicyType>()?;
     m.add_class::<BackendType>()?;
