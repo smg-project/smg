@@ -161,6 +161,15 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
+      # Until the script has merged, the default branch lacks it: take this run's own copy
+      # then (the pull request that introduces it). Once main has the script, this is a no-op.
+      - name: Bootstrap the posting script on its own pull request
+        run: |
+          if [ ! -f scripts/codex_review_post.py ]; then
+            git fetch --no-tags --quiet --depth 1 origin "${GITHUB_SHA}"
+            git checkout --quiet "${GITHUB_SHA}" -- scripts/codex_review_post.py
+          fi
+
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
