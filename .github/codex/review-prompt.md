@@ -6,8 +6,8 @@ describes and nothing else: no prose before or after it, no code fence.
 
 - `.codex-review/context.json`: `pr`, `title`, `author`, `head_sha`, `base_sha`, `base_ref`,
   `incremental` (true when this run reviews a new push to an open PR), `before_sha` (the head
-  before that push, when known) and `prior_findings` (what Codex already said on this PR, as
-  `path`, `line`, `body`).
+  before that push, when known) and `prior_findings` (what Codex already said on this PR:
+  `comment_id`, `path`, `line`, `severity`, `body`).
 - `.codex-review/pr.diff`: the whole pull request, `base_sha...head_sha`.
 - `.codex-review/push.diff`: only when `incremental` is true and the previous head is known,
   the diff of this push alone.
@@ -28,8 +28,11 @@ describes and nothing else: no prose before or after it, no code fence.
 4. For every candidate finding, open the file and read enough surrounding code to be sure.
    A finding you cannot support with the code in front of you is not a finding.
 5. Deduplicate against `prior_findings`: do not repeat a finding on the same path within three
-   lines of an earlier one, even in different words. If an earlier finding was fixed, say
-   nothing about it.
+   lines of an earlier one, even in different words. Instead, judge each earlier finding
+   against this head: list the `comment_id` of every one that still applies in
+   `prior_findings_still_open`, and leave out the ones that were fixed or no longer hold. An
+   earlier `important` finding you list there blocks approval; one you leave out releases it,
+   so look at the code before deciding either way.
 
 ## Findings
 

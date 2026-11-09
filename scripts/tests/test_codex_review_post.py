@@ -219,3 +219,192 @@ def test_findings_file_is_validated_before_posting(tmp_path):
     bad.write_text(json.dumps({"summary": "s", "findings": [{"path": "p"}]}))
     with pytest.raises(post.FindingsError):
         post.load_findings(bad)
+
+
+# --- who may trigger a review -------------------------------------------------------------------
+
+
+def pr_payload(author="simo", head_repo="o/r"):
+    return {
+        "number": 7,
+        "title": "t",
+        "draft": False,
+        "user": {"login": author},
+        "head": {"sha": "h" * 40, "repo": {"full_name": head_repo}},
+        "base": {"sha": "b" * 40, "ref": "main", "repo": {"full_name": "o/r"}},
+    }
+
+
+class GateApi(FakeApi):
+    """Permission lookups: simo writes, rando reads; every list is empty."""
+
+    def __call__(self, method, path, body=None):
+        self.calls.append((method, path, body))
+        if path.startswith("repos/o/r/collaborators/"):
+            login = path.split("/")[4]
+            return {"permission": "write" if login in ("simo", "alex") else "read"}
+        if method == "GET":
+            return self.gets.get(path, [])
+        return {"id": 99}
+
+
+def test_write_access_is_admin_or_write_only():
+    api = GateApi()
+    assert post.has_write(api, "o/r", "simo") is True
+    assert post.has_write(api, "o/r", "rando") is False
+
+
+def test_a_fork_pull_request_is_never_reviewed():
+    event = {"action": "opened", "pull_request": pr_payload(head_repo="rando/r")}
+    context = post.resolve_context("pull_request_target", event, GateApi(), "o/r")
+    assert context["skip"] is True and "fork" in context["skip_reason"]
+
+
+def test_a_pull_request_by_a_user_without_write_access_is_not_reviewed():
+    event = {"action": "opened", "pull_request": pr_payload(author="rando")}
+    context = post.resolve_context("pull_request_target", event, GateApi(), "o/r")
+    assert context["skip"] is True and "write access" in context["skip_reason"]
+
+
+def test_a_pull_request_by_a_writer_from_this_repository_is_reviewed():
+    event = {"action": "opened", "pull_request": pr_payload()}
+    context = post.resolve_context("pull_request_target", event, GateApi(), "o/r")
+    assert context["skip"] is False and context["mode"] == "review"
+
+
+def test_a_command_from_a_user_without_write_access_is_ignored():
+    event = {
+        "issue": {"number": 7, "pull_request": {"url": "u"}},
+        "comment": {"body": "@codex review", "user": {"login": "rando", "type": "User"}},
+    }
+    api = GateApi(gets={"repos/o/r/pulls/7": pr_payload()})
+    context = post.resolve_context("issue_comment", event, api, "o/r")
+    assert context["skip"] is True and "write access" in context["skip_reason"]
+
+
+def test_a_command_on_a_fork_pull_request_is_ignored_even_from_a_writer():
+    event = {
+        "issue": {"number": 7, "pull_request": {"url": "u"}},
+        "comment": {"body": "@codex review", "user": {"login": "simo", "type": "User"}},
+    }
+    api = GateApi(gets={"repos/o/r/pulls/7": pr_payload(head_repo="rando/r")})
+    context = post.resolve_context("issue_comment", event, api, "o/r")
+    assert context["skip"] is True and "fork" in context["skip_reason"]
+
+
+def test_a_thread_reply_from_a_user_without_write_access_is_ignored():
+    root = {
+        "id": 1,
+        "in_reply_to_id": None,
+        "user": {"login": post.BOT},
+        "body": f"{post.MARKER} x",
+    }
+    reply = {
+        "id": 2,
+        "in_reply_to_id": 1,
+        "user": {"login": "rando", "type": "User"},
+        "body": "why?",
+    }
+    event = {"pull_request": pr_payload(), "comment": reply}
+    api = GateApi(gets={"repos/o/r/pulls/7/comments?per_page=100": [root, reply]})
+    context = post.resolve_context("pull_request_review_comment", event, api, "o/r")
+    assert context["skip"] is True and "write access" in context["skip_reason"]
+
+
+def test_the_other_bots_review_on_a_fork_pull_request_is_not_verified():
+    event = {
+        "review": {"user": {"login": "claude[bot]"}},
+        "pull_request": pr_payload(head_repo="x/r"),
+    }
+    context = post.resolve_context("pull_request_review", event, GateApi(), "o/r")
+    assert context["skip"] is True and "fork" in context["skip_reason"]
+
+
+def test_the_gate_admits_a_writer_on_a_pull_request_of_this_repository():
+    event = {"action": "opened", "pull_request": pr_payload()}
+    verdict = post.gate("pull_request_target", event, GateApi(), "o/r")
+    assert verdict == {"allowed": True, "reason": "", "user": "simo", "pr": 7, "head_sha": "h" * 40}
+
+
+def test_the_gate_refuses_a_commenter_without_write_access():
+    event = {
+        "issue": {"number": 7, "pull_request": {"url": "u"}},
+        "comment": {"body": "@claude review", "user": {"login": "rando", "type": "User"}},
+    }
+    api = GateApi(gets={"repos/o/r/pulls/7": pr_payload()})
+    verdict = post.gate("issue_comment", event, api, "o/r")
+    assert verdict["allowed"] is False and "write access" in verdict["reason"]
+    assert verdict["user"] == "rando" and verdict["pr"] == 7
+
+
+def test_the_gate_refuses_a_fork_whoever_asks():
+    event = {
+        "pull_request": pr_payload(head_repo="rando/r"),
+        "comment": {"body": "@claude", "user": {"login": "simo", "type": "User"}, "id": 3},
+    }
+    verdict = post.gate("pull_request_review_comment", event, GateApi(), "o/r")
+    assert verdict["allowed"] is False and "fork" in verdict["reason"]
+
+
+# --- an earlier Important finding that is still open blocks approval ----------------------------
+
+
+def test_prior_findings_carry_their_comment_id_and_severity():
+    comments = [
+        {
+            "id": 11,
+            "in_reply_to_id": None,
+            "user": {"login": post.BOT},
+            "path": "p",
+            "line": 3,
+            "body": f"{post.MARKER}\n🔴 **Important**: Off by one.",
+        },
+        {
+            "id": 12,
+            "in_reply_to_id": None,
+            "user": {"login": post.BOT},
+            "path": "p",
+            "line": 9,
+            "body": f"{post.MARKER}\n🟡 **Nit**: Name.",
+        },
+        {"id": 13, "in_reply_to_id": 11, "user": {"login": "simo"}, "body": "fixed"},
+    ]
+    assert post.prior_findings(comments) == [
+        {
+            "comment_id": 11,
+            "path": "p",
+            "line": 3,
+            "severity": "important",
+            "body": "🔴 **Important**: Off by one.",
+        },
+        {"comment_id": 12, "path": "p", "line": 9, "severity": "nit", "body": "🟡 **Nit**: Name."},
+    ]
+
+
+def test_an_earlier_important_finding_still_open_blocks_approval():
+    assert post.review_event([], live_approval=False, open_prior=1) == "COMMENT"
+    assert post.review_event([], live_approval=False, open_prior=0) == "APPROVE"
+
+
+def test_posting_with_an_open_prior_important_dismisses_the_live_approval_and_says_so():
+    api = FakeApi(
+        gets={
+            "repos/o/r/pulls/7/reviews?per_page=100": [
+                {"id": 5, "state": "APPROVED", "user": {"login": post.BOT}, "body": post.MARKER}
+            ]
+        }
+    )
+    document = {"summary": "s", "findings": [], "prior_findings_still_open": [11]}
+    post.post_review(api, "o/r", 7, "abc", document, DIFF, prior_important={11, 12})
+    created = next(b for m, p, b in api.calls if m == "POST" and p == "repos/o/r/pulls/7/reviews")
+    assert created["event"] == "COMMENT"
+    assert "1 earlier 🔴 Important finding still open" in created["body"]
+    assert ("PUT", "repos/o/r/pulls/7/reviews/5/dismissals") in [(m, p) for m, p, _ in api.calls]
+
+
+def test_an_unknown_id_in_still_open_is_ignored():
+    api = FakeApi()
+    document = {"summary": "s", "findings": [], "prior_findings_still_open": [999]}
+    post.post_review(api, "o/r", 7, "abc", document, DIFF, prior_important={11})
+    created = next(b for m, p, b in api.calls if m == "POST" and p == "repos/o/r/pulls/7/reviews")
+    assert created["event"] == "APPROVE"

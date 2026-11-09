@@ -23,6 +23,8 @@ COMPONENTS = (
     ("scripts/codex_review_post.py", "scripts/tests/test_codex_review_post.py"),
     ("scripts/codex_review_skills.py", "scripts/tests/test_codex_review_skills.py"),
     (".github/workflows/codex-code-review.yml", "scripts/tests/test_codex_review_workflow.py"),
+    (".github/workflows/claude-code-review.yml", "scripts/tests/test_claude_review_workflow.py"),
+    ("scripts/ci_anthropic_proxy.py", "scripts/tests/test_ci_anthropic_proxy.py"),
 )
 # Regression suites of scripts that predate them. A pair is named in the change
 # that brings the suite, and both paths must exist: a suite the tree lacks is an

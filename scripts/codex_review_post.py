@@ -13,6 +13,15 @@ Run by .github/workflows/codex-code-review.yml:
         mode's JSON schema) and posts: one pull-request review with inline comments, a reply
         in a thread, or one verdict per finding of the other bot. Needs pull-requests: write.
 
+    codex_review_post.py gate
+        The same admission rules for another workflow (the Claude review): writes allowed=,
+        reason=, user=, pr= and head_sha= to GITHUB_OUTPUT and always exits 0.
+
+Admission, on every trigger: the pull request's head must live in this repository (a fork is
+never reviewed and its commands are ignored), and the human who caused the run (the pull
+request's author, or the commenter) must have write access to the repository. The other
+bot's own review activity is admitted on non-fork pull requests only.
+
 Modes:
     review  a pull request opened, reopened or pushed (incremental), or `@codex review` in a
             comment: findings become one review, APPROVE when nothing Important was found
@@ -54,6 +63,7 @@ SEVERITY_INLINE = {
 }
 SEVERITY_LABEL = {"important": "🔴 Important", "nit": "🟡 Nit", "pre_existing": "🟣 Pre-existing"}
 VERDICTS = {"agree": "🤝 Agree", "disagree": "⚠️ Disagree", "unsure": "❓ Unsure"}
+WRITE_PERMISSIONS = {"admin", "write"}
 COMMAND_RE = re.compile(r"@codex\s+review\b", re.IGNORECASE)
 MENTION_RE = re.compile(r"@codex\b", re.IGNORECASE)
 PAGE = 100
@@ -116,6 +126,22 @@ def list_all(api: Api, path: str) -> list[dict]:
 
 def is_bot(user: dict) -> bool:
     return user.get("type") == "Bot" or str(user.get("login", "")).endswith("[bot]")
+
+
+def has_write(api: Api, repo: str, login: str) -> bool:
+    """Whether `login` may push to `repo`: GitHub's collaborator permission is admin or write
+    (maintain reports as write, triage and read as read; a stranger is a 404)."""
+    try:
+        answer = api("GET", f"repos/{repo}/collaborators/{login}/permission")
+    except ApiError:
+        return False
+    return isinstance(answer, dict) and answer.get("permission") in WRITE_PERMISSIONS
+
+
+def is_fork(pr: dict, repo: str) -> bool:
+    """Whether the pull request's head lives outside `repo` (a deleted head repo counts)."""
+    head_repo = (pr.get("head") or {}).get("repo") or {}
+    return str(head_repo.get("full_name", "")).lower() != repo.lower()
 
 
 # --- diff ---------------------------------------------------------------------------------------
@@ -190,13 +216,44 @@ def validate_findings(document: Any) -> dict:
     return document
 
 
+SEVERITY_OF_ICON = {"🔴": "important", "🟡": "nit", "🟣": "pre_existing"}
+
+
+def prior_findings(comments: list[dict]) -> list[dict]:
+    """Codex's own root findings on the pull request, with the severity their marker carries."""
+    found = []
+    for c in comments:
+        body = c.get("body") or ""
+        if c.get("in_reply_to_id") is not None or c["user"]["login"] != BOT or MARKER not in body:
+            continue
+        text = body.replace(MARKER, "").strip()
+        severity = next(
+            (sev for icon, sev in SEVERITY_OF_ICON.items() if text.startswith(icon)), None
+        )
+        found.append(
+            {
+                "comment_id": c["id"],
+                "path": c.get("path"),
+                "line": c.get("line") or c.get("original_line"),
+                "severity": severity,
+                "body": text,
+            }
+        )
+    return found
+
+
 def render_finding(finding: dict) -> str:
     return f"{MARKER}\n{SEVERITY_INLINE[finding['severity']]}: {finding['body'].strip()}"
 
 
-def render_summary(findings: list[dict], summary: str, outside: list[dict]) -> str:
+def render_summary(
+    findings: list[dict], summary: str, outside: list[dict], open_prior: int = 0
+) -> str:
     counts = {sev: sum(1 for f in findings if f["severity"] == sev) for sev in SEVERITY_LABEL}
     tally = " · ".join(f"{counts[sev]} {label}" for sev, label in SEVERITY_LABEL.items())
+    if open_prior:
+        plural = "s" if open_prior > 1 else ""
+        tally += f" · {open_prior} earlier 🔴 Important finding{plural} still open"
     lines = [MARKER, "### Codex review", "", summary.strip(), "", tally]
     if outside:
         lines += ["", "Findings on lines outside this diff:", ""]
@@ -208,7 +265,11 @@ def render_summary(findings: list[dict], summary: str, outside: list[dict]) -> s
 
 
 def build_review(
-    findings: list[dict], summary: str, diff_lines: dict[str, set[int]], head_sha: str
+    findings: list[dict],
+    summary: str,
+    diff_lines: dict[str, set[int]],
+    head_sha: str,
+    open_prior: int = 0,
 ) -> dict:
     """One pull-request review: inline comments on the findings the diff can carry, the rest
     named in the body. The event is the caller's."""
@@ -228,7 +289,7 @@ def build_review(
             outside.append(finding)
     return {
         "commit_id": head_sha,
-        "body": render_summary(findings, summary, outside),
+        "body": render_summary(findings, summary, outside, open_prior),
         "comments": comments,
     }
 
@@ -237,10 +298,11 @@ def has_important(findings: list[dict]) -> bool:
     return any(f["severity"] == "important" for f in findings)
 
 
-def review_event(findings: list[dict], live_approval: bool) -> str | None:
-    """APPROVE when nothing Important was found and no Codex approval is live; COMMENT when
-    there is something to say otherwise; None when a clean rerun has nothing to add."""
-    if has_important(findings):
+def review_event(findings: list[dict], live_approval: bool, open_prior: int = 0) -> str | None:
+    """APPROVE when nothing Important was found, no earlier Important finding is still open and
+    no Codex approval is live; COMMENT when there is something to say otherwise; None when a
+    clean rerun has nothing to add."""
+    if has_important(findings) or open_prior:
         return "COMMENT"
     if not live_approval:
         return "APPROVE"
@@ -259,17 +321,31 @@ def live_approvals(reviews: list[dict]) -> list[int]:
 
 
 def post_review(
-    api: Api, repo: str, pr: int, head_sha: str, document: dict, diff_text: str
+    api: Api,
+    repo: str,
+    pr: int,
+    head_sha: str,
+    document: dict,
+    diff_text: str,
+    prior_important: set[int] = frozenset(),
 ) -> dict | None:
+    """Post the run's findings as one review. `prior_important` holds the comment ids of Codex's
+    earlier Important findings; the ones the run reports as still open block approval."""
     findings = document["findings"]
+    still_open = {
+        int(i) for i in document.get("prior_findings_still_open", []) if isinstance(i, int)
+    }
+    open_prior = len(still_open & set(prior_important))
     live = live_approvals(list_all(api, f"repos/{repo}/pulls/{pr}/reviews"))
-    event = review_event(findings, bool(live))
+    event = review_event(findings, bool(live), open_prior)
     if event is None:
         return None
-    review = build_review(findings, document["summary"], diff_lines_by_path(diff_text), head_sha)
+    review = build_review(
+        findings, document["summary"], diff_lines_by_path(diff_text), head_sha, open_prior
+    )
     review["event"] = event
     created = api("POST", f"repos/{repo}/pulls/{pr}/reviews", review)
-    if has_important(findings):
+    if has_important(findings) or open_prior:
         for review_id in live:
             api(
                 "PUT",
@@ -375,10 +451,14 @@ def resolve_context(
     event_name: str, event: dict, api: Api, repo: str, other_bot: str = OTHER_BOT
 ) -> dict:
     """What this run does, from the event that started it."""
-    if event_name == "pull_request":
+    if event_name in ("pull_request", "pull_request_target"):
         pr = event["pull_request"]
+        if is_fork(pr, repo):
+            return _skip("pull request from a fork")
         if pr.get("draft"):
             return _skip("draft pull request")
+        if not has_write(api, repo, pr["user"]["login"]):
+            return _skip(f"author {pr['user']['login']} has no write access")
         incremental = event.get("action") == "synchronize"
         context = {
             "mode": "review",
@@ -395,7 +475,11 @@ def resolve_context(
             return _skip("comment by a bot")
         if not COMMAND_RE.search(comment.get("body") or ""):
             return _skip("no @codex review command")
+        if not has_write(api, repo, comment["user"]["login"]):
+            return _skip(f"commenter {comment['user']['login']} has no write access")
         pr = api("GET", f"repos/{repo}/pulls/{issue['number']}")
+        if is_fork(pr, repo):
+            return _skip("pull request from a fork")
         context = {
             "mode": "review",
             "skip": False,
@@ -406,8 +490,12 @@ def resolve_context(
         }
     elif event_name == "pull_request_review_comment":
         pr, comment = event["pull_request"], event["comment"]
+        if is_fork(pr, repo):
+            return _skip("pull request from a fork")
         if is_bot(comment["user"]):
             return _skip("comment by a bot")
+        if not has_write(api, repo, comment["user"]["login"]):
+            return _skip(f"commenter {comment['user']['login']} has no write access")
         root_id = comment.get("in_reply_to_id") or comment["id"]
         comments = list_all(api, f"repos/{repo}/pulls/{pr['number']}/comments")
         if not thread_awaits_reply(comments, root_id, mention=comment.get("body")):
@@ -426,6 +514,8 @@ def resolve_context(
         }
     elif event_name == "pull_request_review":
         review, pr = event["review"], event["pull_request"]
+        if is_fork(pr, repo):
+            return _skip("pull request from a fork")
         if review["user"]["login"] != other_bot:
             return _skip(f"review by {review['user']['login']}, not {other_bot}")
         comments = list_all(api, f"repos/{repo}/pulls/{pr['number']}/comments")
@@ -452,14 +542,54 @@ def resolve_context(
         return _skip(f"unsupported event {event_name}")
 
     comments = list_all(api, f"repos/{repo}/pulls/{context['pr']}/comments")
-    context["prior_findings"] = [
-        {"path": c.get("path"), "line": c.get("line") or c.get("original_line"), "body": c["body"]}
-        for c in comments
-        if c.get("in_reply_to_id") is None
-        and c["user"]["login"] == BOT
-        and MARKER in (c.get("body") or "")
-    ]
+    context["prior_findings"] = prior_findings(comments)
     return context
+
+
+# --- admission for another workflow -------------------------------------------------------------
+
+
+def gate(event_name: str, event: dict, api: Api, repo: str) -> dict:
+    """Whether the human behind this event may have a review run on this pull request."""
+    verdict = {"allowed": False, "reason": "", "user": "", "pr": None, "head_sha": ""}
+    if event_name in ("pull_request", "pull_request_target"):
+        pr = event["pull_request"]
+        verdict["user"] = pr["user"]["login"]
+    elif event_name == "issue_comment":
+        issue, comment = event["issue"], event["comment"]
+        verdict["user"] = comment["user"]["login"]
+        if "pull_request" not in issue:
+            verdict["reason"] = "not a pull request"
+            return verdict
+        pr = api("GET", f"repos/{repo}/pulls/{issue['number']}")
+    elif event_name == "pull_request_review_comment":
+        pr, comment = event["pull_request"], event["comment"]
+        verdict["user"] = comment["user"]["login"]
+    elif event_name == "pull_request_review":
+        pr, review = event["pull_request"], event["review"]
+        verdict["user"] = review["user"]["login"]
+    else:
+        verdict["reason"] = f"unsupported event {event_name}"
+        return verdict
+    verdict["pr"] = pr["number"]
+    verdict["head_sha"] = pr["head"]["sha"]
+    if is_fork(pr, repo):
+        verdict["reason"] = "pull request from a fork"
+        return verdict
+    if event_name == "pull_request_review":
+        verdict["allowed"] = True  # the other bot's activity; the bot's own gate admitted it
+        return verdict
+    user = verdict["user"]
+    if event_name != "pull_request_target" and event_name != "pull_request":
+        comment_user = event["comment"]["user"] if "comment" in event else {}
+        if is_bot(comment_user):
+            verdict["reason"] = "comment by a bot"
+            return verdict
+    if not has_write(api, repo, user):
+        verdict["reason"] = f"{user} has no write access"
+        return verdict
+    verdict["allowed"] = True
+    return verdict
 
 
 # --- posting ------------------------------------------------------------------------------------
@@ -469,7 +599,20 @@ def run_post(api: Api, repo: str, context: dict, output: Any, diff_text: str) ->
     mode = context["mode"]
     pr = context["pr"]
     if mode == "review":
-        return post_review(api, repo, pr, context["head_sha"], validate_findings(output), diff_text)
+        prior_important = {
+            f["comment_id"]
+            for f in context.get("prior_findings", [])
+            if f.get("severity") == "important"
+        }
+        return post_review(
+            api,
+            repo,
+            pr,
+            context["head_sha"],
+            validate_findings(output),
+            diff_text,
+            prior_important,
+        )
     if mode == "reply":
         return post_reply(api, repo, pr, context["root_comment_id"], render_reply(output))
     if mode == "verify":
@@ -498,6 +641,7 @@ def main(argv: list[str] | None = None) -> int:
     context_cmd.add_argument("--out-dir", required=True, type=Path)
     post_cmd = commands.add_parser("post", help="post Codex's output to the pull request")
     post_cmd.add_argument("--dir", required=True, type=Path)
+    commands.add_parser("gate", help="admission verdict for another workflow, to GITHUB_OUTPUT")
     args = parser.parse_args(argv)
 
     token = os.environ.get("GITHUB_TOKEN")
@@ -506,6 +650,21 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     repo = os.environ["GITHUB_REPOSITORY"]
     api = github_api(token, os.environ.get("GITHUB_API_URL", "https://api.github.com"))
+
+    if args.command == "gate":
+        event_name = os.environ["GITHUB_EVENT_NAME"]
+        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+        verdict = gate(event_name, event, api, repo)
+        output_path = os.environ.get("GITHUB_OUTPUT")
+        if output_path:
+            with open(output_path, "a", encoding="utf-8") as handle:
+                handle.write(f"allowed={'true' if verdict['allowed'] else 'false'}\n")
+                handle.write(f"reason={verdict['reason']}\n")
+                handle.write(f"user={verdict['user']}\n")
+                handle.write(f"pr={verdict['pr'] or ''}\n")
+                handle.write(f"head_sha={verdict['head_sha']}\n")
+        print("admitted" if verdict["allowed"] else f"refused: {verdict['reason']}")
+        return 0
 
     if args.command == "context":
         event_name = os.environ["GITHUB_EVENT_NAME"]

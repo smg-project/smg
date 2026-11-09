@@ -1,7 +1,13 @@
 name: Claude Code Review
 
+# Trust boundary: every trigger runs this file from `main` (`pull_request_target` and the
+# comment events), never from the pull request. A pull request from a fork is never
+# reviewed and its commands are ignored; the author or commenter must have write access
+# (scripts/codex_review_post.py gate). The Anthropic key lives in the `ai-review`
+# environment, released only to runs from `main`, and is held by scripts/ci_anthropic_proxy.py
+# running as root; Claude's process gets a placeholder key and ANTHROPIC_BASE_URL.
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened]
     paths-ignore:
       - '*.md'
@@ -10,8 +16,6 @@ on:
     types: [created]
   pull_request_review_comment:
     types: [created]
-  pull_request_review:
-    types: [submitted]
 
 permissions:
   contents: read
@@ -22,6 +26,7 @@ permissions:
 env:
   PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
   REVIEW_EVENT: ${{ github.event_name == 'issue_comment' && 'opened' || github.event.action }}
+  PROXY_PLACEHOLDER_KEY: sk-ant-placeholder-the-proxy-holds-the-key
   BEFORE_SHA: ${{ github.event.before }}
 
 jobs:
@@ -32,44 +37,87 @@ jobs:
       github.repository == 'smg-project/smg'
       && github.actor != 'dependabot[bot]'
       && (
-        (github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork)
+        (github.event_name == 'pull_request_target'
+            && github.event.pull_request.head.repo.full_name == github.repository)
         || (github.event_name == 'issue_comment'
             && github.event.issue.pull_request
+            && github.event.comment.user.type != 'Bot'
             && contains(github.event.comment.body, '@claude review'))
       )
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 30
+    environment: ai-review
     concurrency:
       group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
       cancel-in-progress: true
     steps:
+      # The default branch: this workflow's scripts. The pull request's head is checked
+      # out below, after the gate, for Claude to read.
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Export API key from pod env
-        uses: ./.github/actions/export-pod-api-key
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Gate the run
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/codex_review_post.py gate
+
+      # The key arrives on stdin and lives only in a root-owned process; the job's user,
+      # Claude's tools included, can read neither its environment nor its memory.
+      - name: Start the Anthropic key proxy
+        if: steps.gate.outputs.allowed == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "::error::ANTHROPIC_API_KEY is not set in the ai-review environment"
+            exit 1
+          fi
+          port_file="$RUNNER_TEMP/anthropic-proxy.port"
+          printf '%s\n' "${ANTHROPIC_API_KEY}" | sudo -n env -i PATH=/usr/bin:/bin \
+            /usr/bin/python3 scripts/ci_anthropic_proxy.py --port-file "$port_file" \
+            > "$RUNNER_TEMP/anthropic-proxy.log" 2>&1 &
+          for _ in $(seq 1 50); do [ -s "$port_file" ] && break; sleep 0.2; done
+          if [ ! -s "$port_file" ]; then
+            echo "::error::the Anthropic key proxy did not start"; cat "$RUNNER_TEMP/anthropic-proxy.log"; exit 1
+          fi
+          echo "ANTHROPIC_BASE_URL=http://127.0.0.1:$(cat "$port_file")" >> "$GITHUB_ENV"
+
+      - name: Check out the pull request head
+        if: steps.gate.outputs.allowed == 'true'
+        run: |
+          git fetch --no-tags --quiet origin "refs/pull/${{ steps.gate.outputs.pr }}/head:refs/remotes/pr/${{ steps.gate.outputs.pr }}"
+          git checkout --quiet --detach "${{ steps.gate.outputs.head_sha }}"
 
       - name: Install gh CLI
+        if: steps.gate.outputs.allowed == 'true'
         uses: ./.github/actions/setup-gh
 
-      # A comment-triggered run starts on the default branch; review the PR's head.
-      - name: Check out the pull request head
-        if: github.event_name == 'issue_comment'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh pr checkout "$PR_NUMBER"
+      # Nothing after this point may become root: the proxy's memory stays out of reach.
+      - name: Drop sudo for the rest of the job
+        if: steps.gate.outputs.allowed == 'true'
+        run: |
+          sudo -n /bin/sh -c 'rm -f /etc/sudoers.d/* && sed -i "/^runner\b/d; /^%sudo\b/d; /^%admin\b/d; /^%wheel\b/d" /etc/sudoers'
+          if sudo -n true 2>/dev/null; then echo "::error::sudo is still available"; exit 1; fi
+          echo "sudo dropped"
 
       - name: Record run start time
         id: run-start
+        if: steps.gate.outputs.allowed == 'true'
         run: echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - uses: anthropics/claude-code-action@v1
         id: claude-review
+        if: steps.gate.outputs.allowed == 'true'
         continue-on-error: true
         with:
-          anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ env.PROXY_PLACEHOLDER_KEY }}
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ env.PR_NUMBER }}
@@ -212,11 +260,11 @@ jobs:
             https://github.com/smg-project/smg-dev-guide.git
 
       - name: Annotate on failure
-        if: steps.claude-review.outcome == 'failure'
+        if: steps.gate.outputs.allowed == 'true' && steps.claude-review.outcome == 'failure'
         run: echo "::warning::Claude review did not complete — may have hit turn limit or encountered an error."
 
       - name: Review summary
-        if: always()
+        if: always() && steps.gate.outputs.allowed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -311,9 +359,11 @@ jobs:
       (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment')
       && contains(github.event.comment.body, '@claude')
       && !contains(github.event.comment.body, '@claude review')
+      && github.event.comment.user.type != 'Bot'
       && github.repository == 'smg-project/smg'
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 30
+    environment: ai-review
     concurrency:
       group: claude-respond-${{ github.event.issue.number || github.event.pull_request.number }}
       cancel-in-progress: false
@@ -323,15 +373,59 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Export API key from pod env
-        uses: ./.github/actions/export-pod-api-key
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Gate the run
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/codex_review_post.py gate
+
+      # The key arrives on stdin and lives only in a root-owned process; the job's user,
+      # Claude's tools included, can read neither its environment nor its memory.
+      - name: Start the Anthropic key proxy
+        if: steps.gate.outputs.allowed == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "::error::ANTHROPIC_API_KEY is not set in the ai-review environment"
+            exit 1
+          fi
+          port_file="$RUNNER_TEMP/anthropic-proxy.port"
+          printf '%s\n' "${ANTHROPIC_API_KEY}" | sudo -n env -i PATH=/usr/bin:/bin \
+            /usr/bin/python3 scripts/ci_anthropic_proxy.py --port-file "$port_file" \
+            > "$RUNNER_TEMP/anthropic-proxy.log" 2>&1 &
+          for _ in $(seq 1 50); do [ -s "$port_file" ] && break; sleep 0.2; done
+          if [ ! -s "$port_file" ]; then
+            echo "::error::the Anthropic key proxy did not start"; cat "$RUNNER_TEMP/anthropic-proxy.log"; exit 1
+          fi
+          echo "ANTHROPIC_BASE_URL=http://127.0.0.1:$(cat "$port_file")" >> "$GITHUB_ENV"
+
+      - name: Check out the pull request head
+        if: steps.gate.outputs.allowed == 'true'
+        run: |
+          git fetch --no-tags --quiet origin "refs/pull/${{ steps.gate.outputs.pr }}/head:refs/remotes/pr/${{ steps.gate.outputs.pr }}"
+          git checkout --quiet --detach "${{ steps.gate.outputs.head_sha }}"
 
       - name: Install gh CLI
+        if: steps.gate.outputs.allowed == 'true'
         uses: ./.github/actions/setup-gh
 
+      # Nothing after this point may become root: the proxy's memory stays out of reach.
+      - name: Drop sudo for the rest of the job
+        if: steps.gate.outputs.allowed == 'true'
+        run: |
+          sudo -n /bin/sh -c 'rm -f /etc/sudoers.d/* && sed -i "/^runner\b/d; /^%sudo\b/d; /^%admin\b/d; /^%wheel\b/d" /etc/sudoers'
+          if sudo -n true 2>/dev/null; then echo "::error::sudo is still available"; exit 1; fi
+          echo "sudo dropped"
+
       - uses: anthropics/claude-code-action@v1
+        if: steps.gate.outputs.allowed == 'true'
         with:
-          anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ env.PROXY_PLACEHOLDER_KEY }}
           claude_args: |
             --model claude-opus-5-5
             --max-turns 30
@@ -342,70 +436,3 @@ jobs:
           plugin_marketplaces: |
             https://github.com/anthropics/claude-plugins-official.git
             https://github.com/smg-project/smg-dev-guide.git
-
-  # Grade Codex's findings: when the Codex reviewer submits a review, read each of its root
-  # inline comments that has no verdict yet, check it against the code, and answer in the
-  # thread with 🤝 Agree, ⚠️ Disagree or ❓ Unsure. Codex grades Claude's findings the same
-  # way (codex-code-review.yml): root comments only, one verdict each, never a reply to a reply.
-  verify-codex:
-    name: Claude verifies Codex findings
-    if: >-
-      github.event_name == 'pull_request_review'
-      && github.repository == 'smg-project/smg'
-      && github.event.review.user.login == 'github-actions[bot]'
-      && contains(github.event.review.body, '<!-- codex-review -->')
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
-    timeout-minutes: 20
-    concurrency:
-      group: claude-verify-${{ github.event.pull_request.number }}
-      cancel-in-progress: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Export API key from pod env
-        uses: ./.github/actions/export-pod-api-key
-
-      - name: Install gh CLI
-        uses: ./.github/actions/setup-gh
-
-      - name: Check out the pull request head
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh pr checkout "$PR_NUMBER"
-
-      - uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
-          prompt: |
-            REPO: ${{ github.repository }}
-            PR NUMBER: ${{ env.PR_NUMBER }}
-            The Codex reviewer (user github-actions[bot]) posted findings on this pull
-            request. Grade each one against the code and answer in its thread.
-
-            1. List the review comments:
-                 gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments --paginate \
-                   --jq '.[] | {id, in_reply_to_id, user: .user.login, path, line, body}'
-               A target is a comment by github-actions[bot] whose body contains
-               "<!-- codex-review -->" and whose in_reply_to_id is null, and for which no
-               reply (a comment whose in_reply_to_id is the target's id) contains
-               "<!-- claude-verdict -->".
-            2. For each target, read the file at HEAD around the line and decide:
-               agree (the defect is real and described correctly), disagree (the code does
-               not have the defect, or the finding misreads it), or unsure (the code alone
-               cannot settle it).
-            3. Reply once per target, in its thread:
-                 gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments/<id>/replies \
-                   -f body="$BODY"
-               where $BODY is the line "<!-- claude-verdict -->", then one of
-               "🤝 Agree: ...", "⚠️ Disagree: ..." or "❓ Unsure: ..." with at most two
-               sentences of evidence and a line reference.
-            Never reply to a reply, never grade a target twice, never post anything else.
-            When there are no targets, do nothing.
-          claude_args: |
-            --model claude-opus-5-5
-            --effort xhigh
-            --max-turns 30
-            --allowedTools "Read,Glob,Grep,Bash"

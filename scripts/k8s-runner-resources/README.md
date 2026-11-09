@@ -39,6 +39,15 @@ https://github.com/organizations/smg-project/settings/installations/<installatio
 See GitHub's [ARC authentication documentation](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/authenticate-to-the-api)
 for the authoritative permission list.
 
+## 1a. No API keys in the runner pods
+
+The runner pod templates in this directory carry no API keys, and none may be added: every job of
+every workflow runs in these pods, so a key in their environment is readable by any pull request
+that reaches a runner. The review workflows take their keys from the `ai-review` GitHub
+environment, which releases them only to runs from `main`, and hand them to a proxy process the
+reviewer cannot read. A live scale set whose pods still carry `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`
+or `XAI_API_KEY` has drifted from these values; `helm upgrade` from the files here removes them.
+
 ## 2. Create or update the Kubernetes secret
 
 Never paste credentials into `archived/arc-secret-template.yaml` or commit a private key.

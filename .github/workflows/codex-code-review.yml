@@ -1,15 +1,22 @@
 name: Codex Code Review
 
 # Codex (OpenAI) reviews pull requests beside the Claude review: a full review when a PR
-# opens, an incremental one on every push, a full one on `@codex review` in a PR comment,
-# a reply when a developer answers in one of its threads, and a verdict on each finding the
-# Claude reviewer posts. The key reaches only the action's local proxy; Codex runs in a
-# read-only sandbox in a job with read permissions; a second job with pull-requests: write
-# and no key posts the result through scripts/codex_review_post.py. Prompts and output
-# schemas live in .github/codex/.
+# opens, an incremental one on every push, a full one on `@codex review` in a PR comment, a
+# reply when a developer answers in one of its threads, and a verdict on each finding the
+# Claude reviewer posts. After Codex has posted, Claude grades Codex's findings in the same run.
+#
+# Trust boundary. Every trigger here runs this file, the prompts, the schemas and the scripts
+# from `main`, never from the pull request (`pull_request_target` and the comment events). A
+# pull request from a fork is never reviewed and its commands are ignored; the author or the
+# commenter must have write access (scripts/codex_review_post.py gates every run). The keys
+# live in the `ai-review` environment, which releases them only to runs from `main`: the
+# OpenAI key goes to openai/codex-action's local proxy on stdin, the Anthropic key to
+# scripts/ci_anthropic_proxy.py running as root, and neither reviewer's process ever holds a
+# key. Codex runs in a read-only sandbox in a job with read permissions; a second job with
+# pull-requests: write and no key posts its result.
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore:
       - '*.md'
@@ -24,14 +31,17 @@ on:
 permissions: {}
 
 # One review at a time per PR, the newest push winning; one verification pass per PR, the
-# last of Claude's burst of comments winning after the settle wait; thread replies never
-# cancel each other.
+# last of Claude's burst of comments winning after the settle wait. Events this workflow
+# ignores (a plain comment, another reviewer's review) get a group of their own, so they
+# cancel nothing; thread replies never cancel each other.
 concurrency:
   group: >-
     codex-${{
       github.event_name == 'pull_request_review_comment' && format('reply-{0}', github.event.comment.id)
-      || github.event_name == 'pull_request_review' && format('verify-{0}', github.event.pull_request.number)
-      || format('review-{0}', github.event.pull_request.number || github.event.issue.number)
+      || github.event_name == 'pull_request_review' && github.event.review.user.login == 'claude[bot]' && format('verify-{0}', github.event.pull_request.number)
+      || github.event_name == 'issue_comment' && contains(github.event.comment.body, '@codex review') && format('review-{0}', github.event.issue.number)
+      || github.event_name == 'pull_request_target' && format('review-{0}', github.event.pull_request.number)
+      || format('noop-{0}', github.run_id)
     }}
   cancel-in-progress: ${{ github.event_name != 'pull_request_review_comment' }}
 
@@ -44,32 +54,42 @@ env:
 jobs:
   codex:
     name: Codex review
+    # A first filter from the event alone; the context step applies the full gate (fork,
+    # write access, draft, command) with the API before anything of the PR is checked out.
     if: >-
       github.repository == 'smg-project/smg'
       && github.actor != 'dependabot[bot]'
       && (
-        (github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork)
+        (github.event_name == 'pull_request_target'
+            && github.event.pull_request.head.repo.full_name == github.repository)
         || (github.event_name == 'issue_comment'
             && github.event.issue.pull_request
+            && github.event.comment.user.type != 'Bot'
             && contains(github.event.comment.body, '@codex review'))
         || (github.event_name == 'pull_request_review_comment'
+            && github.event.pull_request.head.repo.full_name == github.repository
             && github.event.comment.user.type != 'Bot')
         || (github.event_name == 'pull_request_review'
+            && github.event.pull_request.head.repo.full_name == github.repository
             && github.event.review.user.login == 'claude[bot]')
       )
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 30
+    environment: ai-review
     permissions:
       contents: read
       pull-requests: read
     outputs:
       skip: ${{ steps.context.outputs.skip }}
       mode: ${{ steps.context.outputs.mode }}
+      pr: ${{ steps.context.outputs.pr }}
     steps:
       - name: Let Claude's burst of comments settle
         if: github.event_name == 'pull_request_review'
         run: sleep 120
 
+      # The default branch: this workflow's scripts, prompts and schemas. The pull request's
+      # own tree goes into ./pr below, read by Codex, executed by nothing.
       - name: Checkout
         uses: actions/checkout@v7
         with:
@@ -80,13 +100,13 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Resolve what this run does
+      - name: Gate the run and resolve what it does
         id: context
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python scripts/codex_review_post.py context --out-dir .codex-review
 
-      - name: Check out the pull request head and write the diffs
+      - name: Check out the pull request head into ./pr and write the diffs
         if: steps.context.outputs.skip != 'true'
         run: |
           ctx=.codex-review/context.json
@@ -94,18 +114,13 @@ jobs:
           pr=$(field pr); head=$(field head_sha); base=$(field base_sha); before=$(field before_sha)
           git fetch --no-tags --quiet origin "refs/pull/${pr}/head:refs/remotes/pr/${pr}" \
             "refs/heads/$(field base_ref):refs/remotes/origin/$(field base_ref)"
-          git checkout --quiet --detach "${head}"
-          git diff --no-color "${base}...${head}" > .codex-review/pr.diff
+          git worktree add --quiet --detach pr "${head}"
+          mv .codex-review pr/.codex-review
+          git diff --no-color "${base}...${head}" > pr/.codex-review/pr.diff
           if [ -n "${before}" ] && git cat-file -e "${before}^{commit}" 2>/dev/null; then
-            git diff --no-color "${before}..${head}" > .codex-review/push.diff
+            git diff --no-color "${before}..${head}" > pr/.codex-review/push.diff
           fi
-          wc -l .codex-review/*.diff
-
-      - name: Export API key from pod env
-        if: steps.context.outputs.skip != 'true'
-        uses: ./.github/actions/export-pod-api-key
-        with:
-          variable: OPENAI_API_KEY
+          wc -l pr/.codex-review/*.diff
 
       - name: Assemble the review skills
         if: steps.context.outputs.skip != 'true'
@@ -114,7 +129,7 @@ jobs:
             "$RUNNER_TEMP/smg-dev-guide"
           git clone --quiet --depth 1 --filter=blob:none --sparse \
             https://github.com/anthropics/claude-plugins-official.git "$RUNNER_TEMP/claude-plugins-official"
-          git -C "$RUNNER_TEMP/claude-plugins-official" sparse-checkout set --quiet plugins/pr-review-toolkit
+          git -C "$RUNNER_TEMP/claude-plugins-official" sparse-checkout set plugins/pr-review-toolkit
           python scripts/codex_review_skills.py \
             --target "$HOME/.agents/skills" \
             --guide "$RUNNER_TEMP/smg-dev-guide" \
@@ -122,14 +137,17 @@ jobs:
           # The guide's skills call their scripts through this variable.
           echo "CLAUDE_PLUGIN_ROOT=$RUNNER_TEMP/smg-dev-guide" >> "$GITHUB_ENV"
 
+      # The key is an input of this step alone: the action feeds it to its local proxy on
+      # stdin, and the Codex process sees only the proxy. It is never in the job environment.
       - name: Run Codex
         if: steps.context.outputs.skip != 'true'
         uses: openai/codex-action@v1
         with:
-          openai-api-key: ${{ env.OPENAI_API_KEY }}
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           prompt-file: .github/codex/${{ steps.context.outputs.mode }}-prompt.md
           output-schema-file: .github/codex/${{ steps.context.outputs.mode }}-schema.json
-          output-file: .codex-review/output.json
+          output-file: pr/.codex-review/output.json
+          working-directory: pr
           model: ${{ env.CODEX_MODEL }}
           effort: ${{ env.CODEX_EFFORT }}
           codex-version: ${{ env.CODEX_VERSION }}
@@ -141,7 +159,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: codex-review-${{ github.run_id }}
-          path: .codex-review/
+          path: pr/.codex-review/
           retention-days: 7
 
   post:
@@ -154,21 +172,10 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      # The posting script comes from the default branch, never from the pull request.
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
-
-      # Until the script has merged, the default branch lacks it: take this run's own copy
-      # then (the pull request that introduces it). Once main has the script, this is a no-op.
-      - name: Bootstrap the posting script on its own pull request
-        run: |
-          if [ ! -f scripts/codex_review_post.py ]; then
-            git fetch --no-tags --quiet --depth 1 origin "${GITHUB_SHA}"
-            git checkout --quiet "${GITHUB_SHA}" -- scripts/codex_review_post.py
-          fi
 
       - uses: actions/setup-python@v7
         with:
@@ -183,3 +190,99 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python scripts/codex_review_post.py post --dir .codex-review
+
+  # Claude grades Codex's findings. A review posted with the job token raises no event, so
+  # this runs here, after the posting, instead of on pull_request_review.
+  verify-by-claude:
+    name: Claude verifies Codex findings
+    needs: [codex, post]
+    if: needs.post.result == 'success' && needs.codex.outputs.mode == 'review'
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    timeout-minutes: 20
+    environment: ai-review
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: codex-review-${{ github.run_id }}
+          path: .codex-review
+
+      # The key arrives on stdin and lives only in a root-owned process; the job's user,
+      # Claude's tools included, can read neither its environment nor its memory.
+      - name: Start the Anthropic key proxy
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "::error::ANTHROPIC_API_KEY is not set in the ai-review environment"
+            exit 1
+          fi
+          port_file="$RUNNER_TEMP/anthropic-proxy.port"
+          printf '%s\n' "${ANTHROPIC_API_KEY}" | sudo -n env -i PATH=/usr/bin:/bin \
+            /usr/bin/python3 scripts/ci_anthropic_proxy.py --port-file "$port_file" \
+            > "$RUNNER_TEMP/anthropic-proxy.log" 2>&1 &
+          for _ in $(seq 1 50); do [ -s "$port_file" ] && break; sleep 0.2; done
+          if [ ! -s "$port_file" ]; then
+            echo "::error::the Anthropic key proxy did not start"; cat "$RUNNER_TEMP/anthropic-proxy.log"; exit 1
+          fi
+          echo "ANTHROPIC_BASE_URL=http://127.0.0.1:$(cat "$port_file")" >> "$GITHUB_ENV"
+
+      - name: Check out the pull request head
+        run: |
+          pr=${{ needs.codex.outputs.pr }}
+          head=$(python3 -c "import json; print(json.load(open('.codex-review/context.json'))['head_sha'])")
+          git fetch --no-tags --quiet origin "refs/pull/${pr}/head:refs/remotes/pr/${pr}"
+          git checkout --quiet --detach "${head}"
+
+      - name: Install gh CLI
+        uses: ./.github/actions/setup-gh
+
+      # Nothing after this point may become root: the proxy's memory stays out of reach.
+      - name: Drop sudo for the rest of the job
+        run: |
+          sudo -n /bin/sh -c 'rm -f /etc/sudoers.d/* && sed -i "/^runner\b/d; /^%sudo\b/d; /^%admin\b/d; /^%wheel\b/d" /etc/sudoers'
+          if sudo -n true 2>/dev/null; then echo "::error::sudo is still available"; exit 1; fi
+          echo "sudo dropped"
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: sk-ant-placeholder-the-proxy-holds-the-key
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ needs.codex.outputs.pr }}
+            The Codex reviewer (user github-actions[bot]) posted findings on this pull
+            request. Grade each one against the code and answer in its thread.
+
+            1. List the review comments:
+                 gh api repos/${{ github.repository }}/pulls/${{ needs.codex.outputs.pr }}/comments --paginate \
+                   --jq '.[] | {id, in_reply_to_id, user: .user.login, path, line, body}'
+               A target is a comment by github-actions[bot] whose body contains
+               "<!-- codex-review -->" and whose in_reply_to_id is null, and for which no
+               reply (a comment whose in_reply_to_id is the target's id) contains
+               "<!-- claude-verdict -->".
+            2. For each target, read the file at HEAD around the line and decide:
+               agree (the defect is real and described correctly), disagree (the code does
+               not have the defect, or the finding misreads it), or unsure (the code alone
+               cannot settle it).
+            3. Reply once per target, in its thread:
+                 gh api repos/${{ github.repository }}/pulls/${{ needs.codex.outputs.pr }}/comments/<id>/replies \
+                   -f body="$BODY"
+               where $BODY is the line "<!-- claude-verdict -->", then one of
+               "🤝 Agree: ...", "⚠️ Disagree: ..." or "❓ Unsure: ..." with at most two
+               sentences of evidence and a line reference.
+            Never reply to a reply, never grade a target twice, never post anything else.
+            When there are no targets, do nothing.
+          claude_args: |
+            --model claude-opus-5-5
+            --effort xhigh
+            --max-turns 30
+            --allowedTools "Read,Glob,Grep,Bash"
