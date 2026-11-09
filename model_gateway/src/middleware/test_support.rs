@@ -9,16 +9,19 @@ use axum::{
 };
 use bytes::Bytes;
 
-/// The `/echo` handler: the request's body, back.
+/// The path the middleware tests mount the echo route on and post to.
+pub(crate) const ECHO_PATH: &str = "/echo";
+
+/// The echo handler: the request's body, back.
 pub(crate) fn echo_route() -> MethodRouter {
     post(|body: Bytes| async move { body })
 }
 
-/// A POST of `body` to `/echo`.
+/// A POST of `body` to [`ECHO_PATH`].
 pub(crate) fn echo_request(body: Body) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri("/echo")
+        .uri(ECHO_PATH)
         .body(body)
         .unwrap()
 }

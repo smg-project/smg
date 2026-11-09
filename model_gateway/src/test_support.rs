@@ -278,7 +278,7 @@ impl CheckpointTokenizer {
         let dir = PathBuf::from(self.cache_dir);
         fs::create_dir_all(&dir)
             .unwrap_or_else(|error| panic!("cannot create {}: {error}", dir.display()));
-        let client = crate::clients::blocking_http_client();
+        let client = crate::server::blocking_http_client();
         for &(file, min_bytes) in self.files {
             let path = dir.join(file);
             if path.is_file() {

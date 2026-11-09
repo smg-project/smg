@@ -2929,7 +2929,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_recovers_on_second_connection() {
         let (addr, accepted) = flaky_upstream(1).await;
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
         let builder = client.post(format!("http://{addr}/generate")).body("{}");
 
         let res = send_with_stale_conn_retry(builder).await.unwrap();
@@ -2940,7 +2940,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_is_bounded_to_one() {
         let (addr, accepted) = flaky_upstream(usize::MAX).await;
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
         let builder = client.post(format!("http://{addr}/generate")).body("{}");
 
         let err = send_with_stale_conn_retry(builder).await.unwrap_err();
@@ -2951,7 +2951,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_skips_unclonable_bodies() {
         let (addr, accepted) = flaky_upstream(usize::MAX).await;
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
         let stream_body = reqwest::Body::wrap_stream(stream::once(async {
             Ok::<_, std::io::Error>(Bytes::from_static(b"{}"))
         }));
@@ -3521,7 +3521,7 @@ mod tests {
     /// budget for a call to a worker, what `--request-timeout-secs` sets.
     fn client_with_timeout(timeout: Duration) -> Arc<reqwest::Client> {
         Arc::new(
-            crate::clients::http_client_builder()
+            crate::server::http_client_builder()
                 .timeout(timeout)
                 .build()
                 .unwrap(),
@@ -3661,7 +3661,7 @@ mod tests {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _guard = metrics::set_default_local_recorder(&recorder);
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
         let worker = BasicWorkerBuilder::new("http://worker:8080").build();
         let outcome = RouteOutcome {
             model_label: Cow::Borrowed("m"),
@@ -3717,7 +3717,7 @@ mod tests {
         let url = spawn_cut_stub("/body", "application/json", &["abc", "def", "gh"], false).await;
 
         let body = Router::read_worker_body_capped(
-            worker_body(&crate::clients::http_client(), &url).await,
+            worker_body(&crate::server::http_client(), &url).await,
             8,
         )
         .await
@@ -3731,7 +3731,7 @@ mod tests {
         let url = spawn_cut_stub("/body", "application/json", &["abc", "def", "gh"], false).await;
 
         let response = Router::read_worker_body_capped(
-            worker_body(&crate::clients::http_client(), &url).await,
+            worker_body(&crate::server::http_client(), &url).await,
             7,
         )
         .await
@@ -3749,7 +3749,7 @@ mod tests {
         let url = spawn_cut_stub("/body", "application/json", &["abc"], true).await;
 
         let response = Router::read_worker_body_capped(
-            worker_body(&crate::clients::http_client(), &url).await,
+            worker_body(&crate::server::http_client(), &url).await,
             8,
         )
         .await
@@ -5077,7 +5077,7 @@ mod tests {
         // timeout fires.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let client = crate::clients::http_client_builder()
+        let client = crate::server::http_client_builder()
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
@@ -5131,7 +5131,7 @@ mod tests {
                 "the peer stopped answering",
             )),
         ]);
-        let err = crate::clients::http_client()
+        let err = crate::server::http_client()
             .post(format!("http://{addr}/generate"))
             .body(reqwest::Body::wrap_stream(body))
             .send()
@@ -5159,7 +5159,7 @@ mod tests {
     async fn an_upstream_failures_answer_names_the_reason_and_not_the_worker() {
         let refused = RefusedAddress::reserve();
         let addr = refused.addr();
-        let err = crate::clients::http_client_builder()
+        let err = crate::server::http_client_builder()
             .build()
             .unwrap()
             .get(format!("http://{addr}/generate"))
@@ -5186,7 +5186,7 @@ mod tests {
         // A reserved port nobody listens at: the connect is refused.
         let refused = RefusedAddress::reserve();
         let addr = refused.addr();
-        let err = crate::clients::http_client()
+        let err = crate::server::http_client()
             .get(format!("http://{addr}/generate"))
             .send()
             .await
@@ -6473,7 +6473,7 @@ mod upstream_span_tests {
             }
             socket.write_all(b"0\r\n\r\n").await.expect("last chunk");
         });
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
         let response =
             send_with_stale_conn_retry(client.get(format!("http://{addr}/v1/chat/completions")))
                 .instrument(tracing::info_span!("http_request"))

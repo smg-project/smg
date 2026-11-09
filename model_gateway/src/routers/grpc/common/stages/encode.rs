@@ -22,8 +22,7 @@ use async_trait::async_trait;
 use axum::response::Response;
 use rand::RngExt;
 use smg_grpc_client::{
-    common_proto,
-    tokenspeed_encoder::{tokenspeed_encoder_proto as tokenspeed_encoder, TokenSpeedEncoderClient},
+    common_proto, tokenspeed_encoder::tokenspeed_encoder_proto as tokenspeed_encoder,
 };
 use tracing::error;
 use uuid::Uuid;
@@ -31,7 +30,7 @@ use uuid::Uuid;
 use super::{helpers::bootstrap_rendezvous, pd_protocol::EncodeHandoff, PipelineStage};
 use crate::{
     routers::grpc::{
-        backend_client::BackendClient,
+        backend_client::{send_tokenspeed_encode_frame, send_tokenspeed_encode_rpc, BackendClient},
         client::GrpcClient,
         context::{ClientSelection, EncodeOutputs, RequestContext, WorkerSelection},
         multimodal::{
@@ -430,49 +429,6 @@ fn backend_name(client: &BackendClient) -> &'static str {
         // OpenAI-compatible HTTP backend), and Unspecified never reach here.
         RuntimeType::External | RuntimeType::Generic | RuntimeType::Unspecified => "unknown",
     }
-}
-
-/// Hand an encode request to a TokenSpeed encode server over its worker's
-/// ZMQ connection. Nothing answers it: the server ships the embedding to the
-/// prefill side over the transfer engine, as the gRPC encoder acks after its
-/// send.
-async fn send_tokenspeed_encode_frame(
-    worker: &dyn Worker,
-    rendezvous: &EncodeRendezvous,
-    request: tokenspeed_encoder::EncodeRequest,
-) -> std::result::Result<(), String> {
-    let url = worker.url();
-    let client = worker
-        .get_backend_client()
-        .await
-        .map_err(|e| format!("encode worker {url} is not connected: {e}"))?
-        .ok_or_else(|| format!("encode worker {url} has no ZMQ connection"))?;
-    let BackendClient::Zmq(client) = client.as_ref() else {
-        return Err(format!("encode worker {url} is not a direct-ZMQ worker"));
-    };
-    client
-        .encode_tokenspeed(request, rendezvous)
-        .await
-        .map_err(|status| format!("encode request to {url} failed: {}", status.message()))
-}
-
-async fn send_tokenspeed_encode_rpc(
-    endpoint: String,
-    request: tokenspeed_encoder::EncodeRequest,
-) -> std::result::Result<(), String> {
-    let client = TokenSpeedEncoderClient::connect_cached(&endpoint)
-        .await
-        .map_err(|e| format!("connect to encode worker {endpoint} failed: {e}"))?;
-    let response = client
-        .encode(request)
-        .await
-        .map_err(|e| format!("encode RPC to {endpoint} failed: {}", e.message()))?;
-    if !response.accepted {
-        return Err(format!(
-            "encode worker {endpoint} did not accept the request"
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

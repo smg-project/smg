@@ -330,7 +330,7 @@ mod tests {
     async fn refused_call() -> (std::net::SocketAddr, reqwest::Error) {
         let refused = crate::test_support::RefusedAddress::reserve();
         let addr = refused.addr();
-        let error = crate::clients::http_client_builder()
+        let error = crate::server::http_client_builder()
             .build()
             .unwrap()
             .get(format!("http://{addr}/v1/chat/completions"))

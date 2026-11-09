@@ -322,13 +322,13 @@ mod tests {
 
     use super::{super::request_start::RequestStarted, *};
     use crate::{
-        middleware::test_support::{echo_request, echo_route},
+        middleware::test_support::{echo_request, echo_route, ECHO_PATH},
         test_support::json_of,
     };
 
     fn app(timeouts: RequestBodyTimeouts) -> Router {
         Router::new()
-            .route("/echo", echo_route())
+            .route(ECHO_PATH, echo_route())
             .layer(timeouts.layer())
     }
 

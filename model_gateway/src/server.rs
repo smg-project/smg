@@ -58,6 +58,11 @@ pub mod connection_timeouts;
 pub mod posture;
 pub(crate) mod tls;
 
+// The HTTP client constructors and the process crypto provider they install
+// first live beside the private-key-file check in `tls`; callers read them as
+// `server::http_client()` and its siblings.
+pub use tls::{blocking_http_client, http_client, http_client_builder, install_crypto_provider};
+
 use crate::{
     app_context::AppContext,
     config::{ParserChoice, RouterConfig},
@@ -2039,7 +2044,7 @@ fn serve_listeners(
 
 /// Start the gateway listeners and drain them within the configured shutdown budget.
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    crate::clients::install_crypto_provider();
+    install_crypto_provider();
 
     // Defense in depth: the CLI and Python bindings both validate via
     // `RouterConfigBuilder::build()` before reaching here, but `RouterConfig`
@@ -3807,10 +3812,7 @@ mod tests {
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>());
             let checking = async {
                 let addr = handle.listening().await.expect("HTTP server did not bind");
-                let client = crate::clients::http_client_builder()
-                    .no_proxy()
-                    .build()
-                    .unwrap();
+                let client = http_client_builder().no_proxy().build().unwrap();
                 for (path, content_type, expected) in [
                     ("plain", "application/json", "{\"ok\":true}"),
                     (

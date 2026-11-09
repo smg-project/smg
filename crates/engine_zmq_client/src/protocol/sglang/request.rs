@@ -751,6 +751,14 @@ impl SglangRequest {
             Self::Embed(request) => &request.rid,
         }
     }
+
+    /// The prompt's token ids.
+    pub fn input_ids(&self) -> &[u32] {
+        match self {
+            Self::Generate(request) => &request.input_ids,
+            Self::Embed(request) => &request.input_ids,
+        }
+    }
 }
 
 impl From<TokenizedGenerateReqInput> for SglangRequest {

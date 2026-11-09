@@ -788,7 +788,7 @@ mod tests {
         )
         .unwrap();
         let mixed = vec![large.clone(), tensor(16)];
-        let (payload, frames) = encode_with_aux_frames(&mixed).unwrap();
+        let (payload, frames) = encode_with_aux_frames(&mixed, 0).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(
             frames[0].as_ptr(),

@@ -704,14 +704,14 @@ mod tests {
             bootstrap_room: 7,
             items: vec![encode_item(12)],
         };
-        let (_, frames) = encode_with_aux_frames(&small).unwrap();
+        let (_, frames) = encode_with_aux_frames(&small, 0).unwrap();
         assert!(frames.is_empty());
 
         let large = TokenSpeedEncodeRequest {
             items: vec![encode_item(TENSOR_AUX_MIN_BYTES)],
             ..small
         };
-        let (payload, frames) = encode_with_aux_frames(&large).unwrap();
+        let (payload, frames) = encode_with_aux_frames(&large, 0).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].len(), TENSOR_AUX_MIN_BYTES);
         assert!(payload.len() < TENSOR_AUX_MIN_BYTES);

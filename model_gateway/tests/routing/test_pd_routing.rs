@@ -213,7 +213,7 @@ mod pd_routing_unit_tests {
                     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
                 };
 
-                let client = smg::clients::http_client();
+                let client = smg::server::http_client();
 
                 // Initialize rate limiter
                 let rate_limiter = Some(Arc::new(TokenBucket::new(64, 64)));

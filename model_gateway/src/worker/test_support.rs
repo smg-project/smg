@@ -41,7 +41,7 @@ pub(crate) fn ready_worker(url: &str, model: &str) -> Arc<dyn Worker> {
 }
 
 /// A worker of `worker_type` at `url` with no health checker behind it: what
-/// the policy registry and the attempt-ledger tests fill their pools with.
+/// a test fills a pool with when no health checker may run.
 pub(crate) fn worker_of(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
     Arc::new(
         BasicWorkerBuilder::new(url)
