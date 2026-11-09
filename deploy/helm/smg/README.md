@@ -68,7 +68,24 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 
 ### Routing Policies
 
-`cache_aware` (default), `round_robin`, `power_of_two`, `least_load`, `passthrough`, `consistent_hashing`, `prefix_hash`, `manual`, `random`: the launcher's `--policy` choices, which `values.schema.json` lists. `bucket` is a prefill-side policy: the launcher takes it for `--prefill-policy` (`router.extraArgs`), not for `--policy`.
+`cache_aware` (default), `round_robin`, `power_of_two`, `least_load`, `passthrough`, `consistent_hashing`, `prefix_hash`, `manual`, `random`: the launcher's `--policy` choices, which `values.schema.json` lists. `bucket` is a prefill-side policy: the launcher takes it for `--prefill-policy` (`router.disaggregation.prefillPolicy`), not for `--policy`.
+
+### Disaggregated Serving
+
+`router.disaggregation.mode` selects the gateway's `--pd-disaggregation` (`pd`) or `--epd-disaggregation` (`epd`); empty, the default, is a regular fleet. The role policies `prefillPolicy`, `decodePolicy` and `encodePolicy` are the launcher's `--prefill-policy`, `--decode-policy` and `--encode-policy` choices, which the schema lists (`bucket` is a prefill-side choice). The role workers are either static URLs, `prefill`, `decode` and `encode` lists of `{url, bootstrapPort}` rendered as `--prefill URL [BOOTSTRAP_PORT]`, `--decode URL` and `--encode URL [BOOTSTRAP_PORT]`, or, under Kubernetes discovery, the pods matching `router.discovery.kubernetes.prefillSelector`, `decodeSelector` and `encodeSelector`. A role given without its mode, or the encode role outside `epd`, is refused at render rather than ignored by the gateway at start-up; a typo in a role key is refused by the schema. A prefill-decode fleet found by label:
+
+```yaml
+router:
+  disaggregation:
+    mode: pd
+    prefillPolicy: cache_aware
+    decodePolicy: power_of_two
+  discovery:
+    provider: kubernetes
+    kubernetes:
+      prefillSelector: "app=engine role=prefill"
+      decodeSelector: "app=engine role=decode"
+```
 
 ### Admission Bound
 
