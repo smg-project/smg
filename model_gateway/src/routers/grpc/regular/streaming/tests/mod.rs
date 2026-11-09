@@ -173,6 +173,104 @@ fn text_delta_frames_write_the_bytes_of_the_serialized_choice() {
     assert_eq!(text_delta(&neither), None, "no text");
 }
 
+/// A generate event written from the choice's escaped text is byte for byte
+/// the serialized event with the raw text: the chunks (quotes, a backslash,
+/// control bytes, a tab, a newline, a carriage return, characters of two,
+/// three and four bytes, a line separator, an empty chunk, a JSON-looking
+/// text) pushed one at a time, each step written as a chunk event and as a
+/// finish event, with and without logprobs, over several indices, with and
+/// without the frame's room owed.
+#[test]
+fn generate_event_frames_write_the_bytes_of_the_serialized_event() {
+    /// The event as serde serializes it from the raw text: the oracle.
+    #[derive(Serialize)]
+    struct SerializedEvent<'a> {
+        text: &'a str,
+        output_ids: &'a [u32],
+        meta_info: &'a GenerateMetaInfo<'a>,
+        index: u32,
+    }
+    let chunks = [
+        "Hello",
+        " \"quoted\"",
+        " back\\slash",
+        "\ttab\nnewline\rreturn",
+        "\u{0}\u{1f}\u{7f}",
+        "",
+        " caf\u{e9}",
+        " \u{65e5}\u{672c}\u{8a9e}",
+        " \u{1f600}",
+        " \u{2028}",
+        " {\"json\":[1,2]}",
+    ];
+    let input_logprobs = [vec![None], vec![Some(-0.25)]];
+    let output_logprobs = [vec![Some(-0.5)], vec![None, Some(-1.0)]];
+    for index in [0u32, 1, 7, u32::MAX] {
+        let mut escaped = EscapedText::default();
+        let mut raw = String::new();
+        for (step, chunk) in chunks.iter().enumerate() {
+            escaped.push_str(chunk);
+            raw.push_str(chunk);
+            let ids: Vec<u32> = chunk.chars().map(u32::from).collect();
+            for with_logprobs in [false, true] {
+                for (what, finish_reason, e2e_latency) in [
+                    ("chunk", None, None),
+                    (
+                        "finish",
+                        Some(utils::parse_finish_reason("length", 7)),
+                        Some(0.0123),
+                    ),
+                ] {
+                    let logprobs = with_logprobs.then_some(GenerateLogprobs {
+                        input_token_logprobs: Some(input_logprobs.as_slice()),
+                        output_token_logprobs: Some(output_logprobs.as_slice()),
+                    });
+                    let event = GenerateEvent {
+                        text: &escaped,
+                        output_ids: &ids,
+                        meta_info: GenerateMetaInfo {
+                            id: "gen-frames-0",
+                            finish_reason,
+                            prompt_tokens: 10,
+                            weight_version: "v7",
+                            logprobs,
+                            completion_tokens: step as u32 + 1,
+                            cached_tokens: 3,
+                            reasoning_tokens: 1,
+                            e2e_latency,
+                        },
+                        index,
+                    };
+                    let mut expected = b"data: ".to_vec();
+                    serde_json::to_writer(
+                        &mut expected,
+                        &SerializedEvent {
+                            text: &raw,
+                            output_ids: &ids,
+                            meta_info: &event.meta_info,
+                            index,
+                        },
+                    )
+                    .expect("the event serializes");
+                    expected.extend_from_slice(b"\n\n");
+                    for room_owed in [0, FRAME_ROOM] {
+                        let mut got = BytesMut::new();
+                        let mut owed = room_owed;
+                        StreamingProcessor::write_generate_event(&mut got, &mut owed, &event, what)
+                            .expect("the event writes");
+                        assert_eq!(
+                            got.as_ref(),
+                            expected.as_slice(),
+                            "index {index}, step {step} {chunk:?}, logprobs {with_logprobs}, {what}, room owed {room_owed}"
+                        );
+                        assert_eq!(owed, 0, "the write takes the room owed");
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
     use smg_grpc_client::sglang_proto as proto;
