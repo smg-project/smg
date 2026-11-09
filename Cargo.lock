@@ -7693,6 +7693,7 @@ dependencies = [
  "smg-mcp",
  "smg-mesh",
  "smg-mm-rdma",
+ "smg-policy",
  "smg-response-template",
  "smg-rl",
  "smg-symphony",
@@ -7929,6 +7930,16 @@ dependencies = [
  "nixl-sys",
  "parking_lot",
  "tracing",
+]
+
+[[package]]
+name = "smg-policy"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

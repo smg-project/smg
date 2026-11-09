@@ -1,0 +1,20 @@
+[package]
+name = "smg-policy"
+version = "0.1.0"
+edition = "2021"
+description = "Routing policy engine: a bounded view, a typed decision, a lifecycle, and a filter/score/pick framework"
+license = "Apache-2.0"
+repository = "https://github.com/smg-project/smg"
+keywords = ["routing", "policy", "load-balancing", "llm"]
+categories = ["algorithms"]
+
+[dependencies]
+parking_lot = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true
