@@ -823,7 +823,6 @@ async fn execute_single(
     // The call's future is boxed, as the disaggregated sides' are: it is the
     // large part of the dispatch, and inlined in the pipeline's future it
     // put that future over the size bound.
-    let dispatch_start = Instant::now();
     let result = dispatch_single_booked(
         Box::pin(client.generate(proto_request)),
         worker,
@@ -853,7 +852,7 @@ async fn execute_single(
     })?;
     Ok(ExecutionResult::Single {
         stream,
-        dispatch_start,
+        dispatch_start: dispatched_at,
     })
 }
 
