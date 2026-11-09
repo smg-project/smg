@@ -98,10 +98,18 @@ async fn with_control_plane_authentication_the_gated_routes_sit_on_the_admin_lis
     let data = apps.data;
 
     for (method, path) in GATED_ROUTES {
-        assert_eq!(
-            status(&admin, method, path, ADMIN_KEY).await,
-            StatusCode::OK,
-            "{method} {path} on the admin listener with the admin key"
+        // The gate passed: the route answers for itself (the reload is a
+        // 409 here, no key having come from a file).
+        let answer = status(&admin, method, path, ADMIN_KEY).await;
+        assert!(
+            !matches!(
+                answer,
+                StatusCode::UNAUTHORIZED
+                    | StatusCode::FORBIDDEN
+                    | StatusCode::NOT_FOUND
+                    | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "{method} {path} on the admin listener with the admin key: {answer}"
         );
         // The shared serving key is no control-plane credential.
         assert_eq!(
@@ -115,6 +123,15 @@ async fn with_control_plane_authentication_the_gated_routes_sit_on_the_admin_lis
             "{method} {path} on the data listener"
         );
     }
+    assert_eq!(
+        status(&admin, "GET", "/config", ADMIN_KEY).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(&admin, "POST", "/secrets/reload", ADMIN_KEY).await,
+        StatusCode::CONFLICT,
+        "no key came from a file in this start"
+    );
 
     ctx.shutdown().await;
 }

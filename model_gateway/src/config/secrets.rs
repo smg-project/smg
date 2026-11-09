@@ -23,10 +23,31 @@ pub struct SecretFile {
     pub entry: &'static str,
 }
 
+/// The shared serving key's file.
+pub const API_KEY_FILE: SecretFile = SecretFile {
+    what: "the shared API key",
+    field: "api-key-file",
+    entry: "",
+};
+
+/// The tenant keys' file.
+pub const TENANT_API_KEYS_FILE: SecretFile = SecretFile {
+    what: "the tenant API keys",
+    field: "tenant-api-keys-file",
+    entry: "tenant_id:key",
+};
+
+/// The control-plane keys' file.
+pub const CONTROL_PLANE_API_KEYS_FILE: SecretFile = SecretFile {
+    what: "the control-plane API keys",
+    field: "control-plane-api-keys-file",
+    entry: "id:name:role:key",
+};
+
 impl SecretFile {
     /// The refusal for a file that cannot be used, naming the path, never
     /// the content.
-    fn bad_file(&self, path: &Path, reason: &str) -> ConfigError {
+    pub fn bad_file(&self, path: &Path, reason: &str) -> ConfigError {
         ConfigError::InvalidValue {
             field: self.field.to_string(),
             value: path.display().to_string(),
@@ -128,8 +149,9 @@ pub fn parse_control_plane_api_key(key_str: &str) -> ConfigResult<ApiKeyEntry> {
 
 /// Parse a tenant-scoped data-plane API key entry, `tenant_id:key`. Only
 /// the ':' separator is checked here; the non-empty and duplicate checks
-/// live in `ConfigValidator::validate_tenant_api_keys` so they also cover
-/// `TenantApiKeyEntry` values from a config file or language binding. Fails
+/// live in `ConfigValidator::tenant_credentials`, which the start and a
+/// reload run over the whole set, so they also cover `TenantApiKeyEntry`
+/// values from a config file or language binding. Fails
 /// hard (an empty `AuthConfig` disables auth entirely, not just narrows it)
 /// and never echoes `key_str`, which may be the plaintext credential.
 pub fn parse_tenant_api_key(key_str: &str) -> ConfigResult<TenantApiKeyEntry> {

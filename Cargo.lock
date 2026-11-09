@@ -7734,6 +7734,7 @@ dependencies = [
 name = "smg-auth"
 version = "1.2.5"
 dependencies = [
+ "arc-swap",
  "axum",
  "base64 0.22.1",
  "chrono",
