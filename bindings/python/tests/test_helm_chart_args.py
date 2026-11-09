@@ -368,6 +368,15 @@ ROLE = {"Role", "RoleBinding"}
 CLUSTER_ROLE = {"ClusterRole", "ClusterRoleBinding"}
 CONSUL_VARIABLES = {"CONSUL_HTTP_TOKEN", "CONSUL_CACERT", "CONSUL_CLIENT_CERT", "CONSUL_CLIENT_KEY"}
 EXAMPLES = sorted((CHART / "examples").glob("*.yaml"))
+# The files the launcher reads while it parses (a Secret mounted into the pod
+# in the cluster), each with a stand-in content of the shape it holds.
+PARSE_TIME_FILES = {
+    "--api-key-file": "example-key\n",
+    "--tenant-api-keys-file": "acme:example-key\n",
+    "--control-plane-api-keys-file": "ops:Operations:admin:example-key\n",
+    "--postgres-db-url-file": "postgresql://smg:example@postgres:5432/smg\n",
+    "--redis-url-file": "redis://redis:6379\n",
+}
 
 
 def router_container(documents: list[dict]) -> dict:
@@ -379,6 +388,18 @@ def launcher_args(args: list[str]) -> RouterArgs:
     parser = argparse.ArgumentParser(allow_abbrev=False)
     RouterArgs.add_cli_args(parser)
     return RouterArgs.from_cli_args(parser.parse_args(args))
+
+
+def with_readable_files(args: list[str], directory: Path) -> list[str]:
+    """The rendered arguments with each file the launcher reads while it
+    parses replaced by a readable stand-in under ``directory``."""
+    args = list(args)
+    for index, flag in enumerate(args[:-1]):
+        if flag in PARSE_TIME_FILES:
+            path = directory / flag.strip("-")
+            path.write_text(PARSE_TIME_FILES[flag], encoding="utf-8")
+            args[index + 1] = str(path)
+    return args
 
 
 def rbac_kinds(documents: list[dict]) -> set[str]:
@@ -834,9 +855,9 @@ def test_chart_workers_without_discovery_are_passed_as_worker_urls():
 
 @needs_helm
 @pytest.mark.parametrize("example", EXAMPLES, ids=[example.name for example in EXAMPLES])
-def test_every_example_renders_arguments_the_launcher_parses(example):
+def test_every_example_renders_arguments_the_launcher_parses(example, tmp_path):
     _, documents = render(files=(example,))
-    launcher_args(router_container(documents)["args"])
+    launcher_args(with_readable_files(router_container(documents)["args"], tmp_path))
 
 
 @needs_chart
@@ -1191,3 +1212,125 @@ def test_a_role_value_outside_the_launcher_choices_is_refused_by_the_schema(sett
     """The schema carries the launcher's choices per role and the role keys, so
     a typo fails at render, where a raw extraArgs string failed at start-up."""
     assert words in render_error("router.disaggregation.mode=epd", setting)
+
+
+ADMIN_EXAMPLE = CHART / "examples" / "with-admin-plane.yaml"
+CONTROL_PLANE_KEYS = "ops:Operations:admin:hunter2\nro:Read only:user:hunter3\n"
+
+
+def services(documents: list[dict]) -> dict[str, dict]:
+    return {d["metadata"]["name"]: d for d in documents if d["kind"] == "Service"}
+
+
+@needs_helm
+def test_the_admin_listener_renders_its_port_and_service_only_when_set():
+    """Without ``router.adminPort`` nothing names the admin listener; with it
+    the pod passes the flags and carries the port, and a Service of its own
+    exposes it on a port named ``admin`` while the ingress names the data
+    Service alone."""
+    _, documents = render()
+    assert "smg-router-admin" not in services(documents)
+    args = router_pod(documents)["spec"]["containers"][0]["args"]
+    assert "--admin-port" not in args and "--admin-host" not in args
+
+    _, documents = render(
+        "router.adminPort=9001",
+        "router.adminHost=127.0.0.1",
+        "router.ingress.enabled=true",
+        "router.ingress.hosts[0].host=smg.example.com",
+        "router.ingress.hosts[0].paths[0].path=/",
+        "router.ingress.hosts[0].paths[0].pathType=Prefix",
+    )
+    pod = router_pod(documents)
+    args = pod["spec"]["containers"][0]["args"]
+    assert args[args.index("--admin-port") + 1] == "9001"
+    assert args[args.index("--admin-host") + 1] == "127.0.0.1"
+    ports = {p["name"]: p["containerPort"] for p in pod["spec"]["containers"][0]["ports"]}
+    assert ports["admin"] == 9001
+    admin = services(documents)["smg-router-admin"]
+    assert admin["spec"]["type"] == "ClusterIP"
+    assert admin["spec"]["ports"] == [
+        {"name": "admin", "port": 9001, "targetPort": "admin", "protocol": "TCP"}
+    ]
+    (ingress,) = [d for d in documents if d["kind"] == "Ingress"]
+    backends = {
+        path["backend"]["service"]["name"]
+        for rule in ingress["spec"]["rules"]
+        for path in rule["http"]["paths"]
+    }
+    assert backends == {"smg-router"}
+
+
+@needs_helm
+def test_control_plane_keys_render_into_a_chart_secret_read_as_a_file():
+    """``auth.controlPlane.apiKeys`` is in a chart-managed Secret and nowhere
+    else in the release; the pod reads it as a file and rolls on a change."""
+    rendered, documents = render(f"auth.controlPlane.apiKeys={CONTROL_PLANE_KEYS}")
+    pod = router_pod(documents)
+    args = pod["spec"]["containers"][0]["args"]
+    assert args[args.index("--control-plane-api-keys-file") + 1] == (
+        "/etc/smg/control-plane/control-plane-api-keys"
+    )
+    assert "--control-plane-api-keys" not in args
+    assert "hunter2" not in " ".join(args)
+    (secret,) = [
+        d
+        for d in documents
+        if d["kind"] == "Secret" and d["metadata"]["name"] == "smg-control-plane"
+    ]
+    assert secret["stringData"] == {"control-plane-api-keys": CONTROL_PLANE_KEYS}
+    assert rendered.count("hunter2") == 1
+    mounts = {m["name"]: m["mountPath"] for m in pod["spec"]["containers"][0]["volumeMounts"]}
+    assert mounts["control-plane"] == "/etc/smg/control-plane"
+    (volume,) = [v for v in pod["spec"]["volumes"] if v["name"] == "control-plane"]
+    assert volume["secret"]["secretName"] == "smg-control-plane"
+    checksum = pod["metadata"]["annotations"]["checksum/control-plane"]
+    assert re.fullmatch(r"[0-9a-f]{64}", checksum)
+    _, rotated = render(f"auth.controlPlane.apiKeys={CONTROL_PLANE_KEYS}rotated")
+    assert router_pod(rotated)["metadata"]["annotations"]["checksum/control-plane"] != checksum
+
+
+@needs_helm
+def test_control_plane_keys_from_an_existing_secret():
+    rendered, documents = render(
+        "auth.controlPlane.existingSecret=cp-keys",
+        "auth.controlPlane.secretKey=keys.txt",
+        # Keys left in the values are written nowhere: the existing Secret wins.
+        f"auth.controlPlane.apiKeys={CONTROL_PLANE_KEYS}",
+    )
+    assert "hunter2" not in rendered
+    assert "smg-control-plane" not in secret_names(documents)
+    pod = router_pod(documents)
+    args = pod["spec"]["containers"][0]["args"]
+    assert (
+        args[args.index("--control-plane-api-keys-file") + 1] == "/etc/smg/control-plane/keys.txt"
+    )
+    (volume,) = [v for v in pod["spec"]["volumes"] if v["name"] == "control-plane"]
+    assert volume["secret"] == {
+        "secretName": "cp-keys",
+        "items": [{"key": "keys.txt", "path": "keys.txt"}],
+    }
+    assert "checksum/control-plane" not in (pod["metadata"]["annotations"] or {})
+
+
+@needs_helm
+def test_without_control_plane_keys_nothing_names_them():
+    _, documents = render()
+    pod = router_pod(documents)
+    assert "--control-plane-api-keys-file" not in pod["spec"]["containers"][0]["args"]
+    assert "control-plane" not in {v["name"] for v in pod["spec"]["volumes"]}
+    assert "smg-control-plane" not in secret_names(documents)
+
+
+@needs_helm
+def test_the_admin_plane_example_renders_arguments_the_launcher_parses():
+    """The example installs: its flags are launcher options and parse."""
+    _, documents = render(files=(ADMIN_EXAMPLE,))
+    pod = router_pod(documents)
+    args = pod["spec"]["containers"][0]["args"]
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    RouterArgs.add_cli_args(parser)
+    parsed = parser.parse_args(args)
+    assert parsed.admin_port == 9001
+    assert parsed.control_plane_api_keys_file == "/etc/smg/control-plane/control-plane-api-keys"
+    assert "smg-router-admin" in services(documents)

@@ -44,6 +44,9 @@ spec:
         {{- if and .Values.auth.apiKey (not .Values.auth.existingSecret) }}
         checksum/auth: {{ .Values.auth.apiKey | sha256sum }}
         {{- end }}
+        {{- if and .Values.auth.controlPlane.apiKeys (not .Values.auth.controlPlane.existingSecret) }}
+        checksum/control-plane: {{ .Values.auth.controlPlane.apiKeys | sha256sum }}
+        {{- end }}
         {{- if include "smg.historySecretManaged" . }}
         checksum/history-secret: {{ include (print $.Template.BasePath "/secret-history.yaml") . | sha256sum }}
         {{- end }}
@@ -79,6 +82,11 @@ spec:
             - name: metrics
               containerPort: {{ .Values.router.metrics.port }}
               protocol: TCP
+            {{- if .Values.router.adminPort }}
+            - name: admin
+              containerPort: {{ .Values.router.adminPort }}
+              protocol: TCP
+            {{- end }}
             {{- if .Values.router.mesh.enabled }}
             - name: mesh
               containerPort: {{ .Values.router.mesh.port }}
@@ -170,6 +178,11 @@ spec:
               mountPath: /etc/smg/auth
               readOnly: true
             {{- end }}
+            {{- if include "smg.controlPlaneSecretName" . }}
+            - name: control-plane
+              mountPath: /etc/smg/control-plane
+              readOnly: true
+            {{- end }}
             {{- if and (eq (.Values.router.discovery.provider | default "") "file") .Values.router.discovery.file.configMap.name }}
             - name: discovery-manifest
               mountPath: /etc/smg/discovery
@@ -190,6 +203,14 @@ spec:
             items:
               - key: {{ include "smg.authSecretKey" . }}
                 path: {{ include "smg.authSecretKey" . }}
+        {{- end }}
+        {{- if include "smg.controlPlaneSecretName" . }}
+        - name: control-plane
+          secret:
+            secretName: {{ include "smg.controlPlaneSecretName" . }}
+            items:
+              - key: {{ include "smg.controlPlaneSecretKey" . }}
+                path: {{ include "smg.controlPlaneSecretKey" . }}
         {{- end }}
         {{- /* The whole ConfigMap, not a subPath of it: the kubelet projects an
              update by swapping a symlink in this directory, which the

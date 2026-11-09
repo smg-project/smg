@@ -221,6 +221,14 @@ Called from the router Deployment template.
 - "0.0.0.0"
 - "--port"
 - {{ .Values.router.port | quote }}
+{{- if .Values.router.adminPort }}
+- "--admin-port"
+- {{ .Values.router.adminPort | quote }}
+{{- with .Values.router.adminHost }}
+- "--admin-host"
+- {{ . | quote }}
+{{- end }}
+{{- end }}
 - "--policy"
 - {{ .Values.router.policy | quote }}
 {{- with .Values.router.disaggregation }}
@@ -626,6 +634,10 @@ Called from the router Deployment template.
 - "--api-key-file"
 - {{ printf "/etc/smg/auth/%s" (include "smg.authSecretKey" .) | quote }}
 {{- end }}
+{{- if include "smg.controlPlaneSecretName" . }}
+- "--control-plane-api-keys-file"
+- {{ printf "/etc/smg/control-plane/%s" (include "smg.controlPlaneSecretKey" .) | quote }}
+{{- end }}
 {{- range .Values.router.extraArgs }}
 - {{ . | quote }}
 {{- end }}
@@ -651,6 +663,28 @@ Auth secret key -- the key within the auth Secret that holds the API key.
 */}}
 {{- define "smg.authSecretKey" -}}
 {{- .Values.auth.apiKeySecretKey | default "api-key" -}}
+{{- end }}
+
+{{/*
+Control-plane secret -- the Secret holding the control-plane API keys file,
+mounted into the router pod and read with --control-plane-api-keys-file;
+the keys are never in the pod's arguments. `auth.controlPlane.existingSecret`
+names a Secret the operator manages; otherwise `auth.controlPlane.apiKeys`,
+when set, is written into a chart-managed Secret. Empty when neither is set.
+*/}}
+{{- define "smg.controlPlaneSecretName" -}}
+{{- if .Values.auth.controlPlane.existingSecret -}}
+{{- .Values.auth.controlPlane.existingSecret -}}
+{{- else if .Values.auth.controlPlane.apiKeys -}}
+{{- printf "%s-control-plane" (include "smg.fullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Control-plane secret key -- the key within that Secret holding the file.
+*/}}
+{{- define "smg.controlPlaneSecretKey" -}}
+{{- .Values.auth.controlPlane.secretKey | default "control-plane-api-keys" -}}
 {{- end }}
 
 {{/*
