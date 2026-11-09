@@ -4,14 +4,17 @@
 //! reads the prefill time away. Every streaming route therefore anchors its
 //! time to first token and its generation duration at the prefill dispatch,
 //! as the chat stream does, and records the PD first-token pair at the first
-//! decode token: the chat, Messages and completions streams (single and
-//! batched), and the openai-harmony pipeline's chat and Responses streams.
+//! decode token: the chat, Messages, completions (single and batched) and
+//! generate streams, and the openai-harmony pipeline's chat and Responses
+//! streams.
 //! Each case drives the route's `PrefillDecode` arm over scripted sides whose
 //! dispatch instants lie a known time before the stream, under a thread-local
 //! Prometheus recorder, and reads the rendered families.
 use std::{future::Future, time::Duration};
 
-use openai_protocol::{chat::ChatCompletionRequest, completion::CompletionRequest};
+use openai_protocol::{
+    chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+};
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
 use tokio::task::JoinHandle;
 
@@ -124,6 +127,14 @@ fn completion_spec(prompt: Value) -> CompletionResponseSpec {
         serde_json::from_value(json!({"model": MODEL, "prompt": prompt, "stream": true}))
             .expect("completion request");
     CompletionResponseSpec::new(&request, Vec::new())
+}
+
+/// A generate request over one text, streamed.
+fn generate_spec() -> GenerateResponseSpec {
+    let request: GenerateRequest =
+        serde_json::from_value(json!({"model": MODEL, "text": "test", "stream": true}))
+            .expect("generate request");
+    GenerateResponseSpec::from(&request)
 }
 
 fn source(endpoint: &'static str) -> utils::StreamSource {
@@ -367,6 +378,32 @@ fn a_batched_pd_completion_stream_anchors_at_its_earliest_prefill_dispatch() {
         2.0,
         PREFILL_OFFSET + later,
     );
+}
+
+/// The generate stream of a pair (the one that carries the prefill side's
+/// input logprobs) derives its anchor from the pair's prefill dispatch once
+/// at its start; a stream anchored at its own start would read the
+/// prefill time away.
+#[test]
+fn a_pd_generate_stream_anchors_at_the_prefill_dispatch() {
+    let rendered = render_after(|| async {
+        let (result, servers) = pd_result(text_frames(), PREFILL_OFFSET).await;
+        let response = Arc::new(processor(false))
+            .process_streaming_generate(
+                result,
+                generate_spec(),
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                None,
+                None,
+                source(metrics_labels::ENDPOINT_GENERATE),
+            )
+            .await;
+        read_to_end(response).await;
+        servers
+    });
+    assert_stream_anchor(&rendered, "generate", metrics_labels::ENDPOINT_GENERATE);
+    assert_pd_pair(&rendered, "generate", 1.0, PREFILL_OFFSET);
 }
 
 /// The openai-harmony pipeline's chat stream.
