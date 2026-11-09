@@ -113,6 +113,8 @@ impl VllmEngine for MockScheduler {
                 // The alternatives per token; -1 (all) reads as none beyond
                 // the sampled token's own.
                 logprobs: params.logprobs.map(|top| usize::try_from(top).unwrap_or(0)),
+                // This proto carries no scores row for requested token ids.
+                score_ids: Vec::new(),
                 pin: req.data_parallel_rank,
             })
             .await?;
