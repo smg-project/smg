@@ -547,6 +547,7 @@ def test_file_provider_reads_a_manifest_path_without_a_config_map():
 @needs_helm
 def test_slurm_provider_passes_the_job_names_of_each_role_and_its_settings():
     _, documents = render(
+        "router.disaggregation.mode=pd",
         "router.discovery.provider=slurm",
         "router.discovery.slurm.port=8000",
         "router.discovery.slurm.prefillJobNames={prefill-a,prefill-b}",
@@ -1103,6 +1104,61 @@ def test_a_role_without_its_mode_is_refused_at_render(setting):
 def test_the_encode_role_outside_epd_is_refused_at_render(setting):
     error = render_error("router.disaggregation.mode=pd", *setting.split(",", 1))
     assert "router.disaggregation.mode=epd" in error
+
+
+SLURM_ROLES = (
+    "router.discovery.provider=slurm",
+    "router.discovery.slurm.port=8000",
+    "router.discovery.slurm.prefillJobNames={prefill}",
+    "router.discovery.slurm.decodeJobNames={decode}",
+)
+
+
+@needs_helm
+def test_the_slurm_role_job_names_follow_the_mode_rule():
+    """The Slurm role job names are role values too: refused without the mode,
+    the regular job names refused under it, the encode names refused outside
+    epd, rendered under the mode."""
+    assert "router.disaggregation.mode" in render_error(*SLURM_ROLES)
+    error = render_error(
+        "router.disaggregation.mode=pd", *SLURM_ROLES, "router.discovery.slurm.jobNames={regular}"
+    )
+    assert "router.discovery.slurm.jobNames" in error
+    error = render_error(
+        "router.disaggregation.mode=pd",
+        *SLURM_ROLES,
+        "router.discovery.slurm.encodeJobNames={encode}",
+    )
+    assert "router.disaggregation.mode=epd" in error
+    _, documents = render("router.disaggregation.mode=pd", *SLURM_ROLES)
+    parsed = launcher_args(router_container(documents)["args"])
+    assert parsed.pd_disaggregation is True
+    assert (parsed.slurm_prefill_job_name, parsed.slurm_decode_job_name) == (
+        ["prefill"],
+        ["decode"],
+    )
+
+
+PD_STATIC_ROLES = (
+    "router.disaggregation.mode=pd",
+    "router.disaggregation.prefill[0].url=http://prefill-0:8000",
+    "router.disaggregation.decode[0].url=http://decode-0:8000",
+)
+
+
+@needs_helm
+def test_regular_workers_under_a_role_mode_are_refused_or_left_out():
+    """A disaggregated gateway reads only its role workers: explicit regular URLs
+    under a mode are refused, the chart's own workers get no ``--worker-urls``
+    when the roles address them, and chart workers given no role are refused."""
+    assert "router.workerUrls" in render_error(
+        *PD_STATIC_ROLES, "router.workerUrls={http://w:8000}"
+    )
+    _, documents = render(*WORKER, *PD_STATIC_ROLES)
+    args = router_container(documents)["args"]
+    assert "--worker-urls" not in args
+    assert "--pd-disaggregation" in args
+    assert "gives no role" in render_error(*WORKER, "router.disaggregation.mode=pd")
 
 
 @needs_helm

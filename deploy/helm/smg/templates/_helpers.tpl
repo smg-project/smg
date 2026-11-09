@@ -316,12 +316,25 @@ Called from the router Deployment template.
 {{- end }}
 {{- end }}
 {{- end }}
+{{- $disaggregationMode := .Values.router.disaggregation.mode | default "" }}
+{{- $roleWorkers := or .Values.router.disaggregation.prefill .Values.router.disaggregation.decode .Values.router.disaggregation.encode }}
+{{- $chartWorkersAreRegular := and .Values.workers (not (include "smg.discoveryProvider" .)) (not (include "smg.meshRouterDiscovery" .)) }}
+{{- /* A disaggregated gateway reads only its role workers and drops regular
+     worker URLs without a word, so the chart refuses them under a mode and
+     passes its own workers only when the roles or a discovery provider
+     address them. */}}
+{{- if and $disaggregationMode .Values.router.workerUrls -}}
+{{- fail "router.workerUrls names regular workers under router.disaggregation.mode: a disaggregated gateway reads only its role workers (router.disaggregation.prefill, decode and encode, or the discovery role selectors)" -}}
+{{- end }}
+{{- if and $disaggregationMode $chartWorkersAreRegular (not $roleWorkers) -}}
+{{- fail "workers deploys engines that router.disaggregation.mode gives no role: list their services under router.disaggregation.prefill, decode or encode, or find them by a discovery role selector" -}}
+{{- end }}
 {{- if .Values.router.workerUrls }}
 - "--worker-urls"
 {{- range .Values.router.workerUrls }}
 - {{ . | quote }}
 {{- end }}
-{{- else if and .Values.workers (not (include "smg.discoveryProvider" .)) (not (include "smg.meshRouterDiscovery" .)) }}
+{{- else if and $chartWorkersAreRegular (not $disaggregationMode) }}
 - "--worker-urls"
 {{- range $i, $worker := .Values.workers }}
 {{- $defaults := index $.Values.engineDefaults $worker.engine }}
@@ -396,6 +409,16 @@ Called from the router Deployment template.
 - {{ include "smg.discoveryFilePath" $ | quote }}
 {{- else if eq .provider "slurm" }}
 {{- with .slurm }}
+{{- $mode := $.Values.router.disaggregation.mode | default "" }}
+{{- if and (not $mode) (or .prefillJobNames .decodeJobNames .encodeJobNames) -}}
+{{- fail "router.discovery.slurm names a role job (prefillJobNames, decodeJobNames or encodeJobNames) without router.disaggregation.mode: set mode to pd or epd" -}}
+{{- end }}
+{{- if and (ne $mode "epd") .encodeJobNames -}}
+{{- fail (printf "router.discovery.slurm.encodeJobNames needs router.disaggregation.mode=epd (mode is %q)" $mode) -}}
+{{- end }}
+{{- if and $mode .jobNames -}}
+{{- fail (printf "router.discovery.slurm.jobNames names regular jobs under router.disaggregation.mode=%s: a disaggregated gateway reads only its role jobs (prefillJobNames, decodeJobNames and, under epd, encodeJobNames)" $mode) -}}
+{{- end }}
 {{- range .jobNames }}
 - "--slurm-job-name"
 - {{ . | quote }}
