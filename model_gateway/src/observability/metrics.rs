@@ -1498,7 +1498,7 @@ pub(crate) fn init_metrics() {
     // fetches.
     describe_histogram!(
         "smg_mm_processing_seconds",
-        "Seconds a multimodal request spent in a processing stage (config_lookup, media_fetch_decode, preprocess, token_expand, total), by model"
+        "Seconds a multimodal request spent in a processing stage (config_lookup, media_fetch_decode, preprocess, token_expand, total), by model; pool_queue is one observation per blocking task, the wait for a pool thread, so its count is tasks, not requests"
     );
     describe_histogram!(
         "smg_mm_media_per_request",
@@ -2254,7 +2254,9 @@ impl Metrics {
 
     /// One processing stage of a multimodal request: `seconds` spent in
     /// `stage` (`config_lookup`, `media_fetch_decode`, `preprocess`,
-    /// `token_expand`, `total`), the clock reads the timing log makes.
+    /// `token_expand`, `total`), the clock reads the timing log makes; and
+    /// `pool_queue`, one observation per blocking task, the time it waited
+    /// in the pool's queue before it ran.
     pub fn record_mm_processing_stage(model_id: &str, stage: &'static str, seconds: f64) {
         let model = intern_model_label(model_id);
         histogram!("smg_mm_processing_seconds", "model" => model, "stage" => stage).record(seconds);
@@ -3814,7 +3816,22 @@ impl Metrics {
 /// Metrics helpers for tests elsewhere in the crate.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use metrics_exporter_prometheus::PrometheusBuilder;
+    use std::sync::OnceLock;
+
+    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+    /// The lib test binary's one process-wide recorder, for records made on
+    /// threads no local recorder covers (the blocking pool). Installed once;
+    /// every other test keeps its own local recorder, which takes precedence
+    /// on its thread.
+    pub(crate) fn global_recorder() -> &'static PrometheusHandle {
+        static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+        HANDLE.get_or_init(|| {
+            PrometheusBuilder::new()
+                .install_recorder()
+                .expect("the lib test binary's one global recorder")
+        })
+    }
 
     /// Run `f` under a thread-local Prometheus recorder and return the
     /// rendered `/metrics` text — the same scrape output the :29000 endpoint
