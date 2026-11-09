@@ -1005,7 +1005,7 @@ impl StreamingProcessor {
         if stream.client_left() {
             return Ok(());
         }
-        Self::record_generate_metrics(dispatch_start, first_token_time, counts, None, &ctx);
+        Self::record_generate_metrics(dispatch_start, first_token_time, counts, &ctx);
 
         Ok(())
     }
@@ -1086,6 +1086,12 @@ impl StreamingProcessor {
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
         let start_time = Instant::now();
+        // The stream's one anchor: the prefill dispatch of a disaggregated
+        // pair, else this read. `start_time` itself stays the response's
+        // e2e clock.
+        let stream_base = pd_timing
+            .as_ref()
+            .map_or(start_time, |timing| timing.prefill_start);
         let mut first_token_time: Option<Instant> = None;
 
         // Track state per index for n>1 case
@@ -1305,13 +1311,7 @@ impl StreamingProcessor {
         if stream.client_left() {
             return Ok(());
         }
-        Self::record_generate_metrics(
-            start_time,
-            first_token_time,
-            counts,
-            pd_timing.as_ref(),
-            &ctx,
-        );
+        Self::record_generate_metrics(stream_base, first_token_time, counts, &ctx);
 
         Ok(())
     }
@@ -1323,19 +1323,15 @@ impl StreamingProcessor {
     /// The token and latency records of a generate stream at its end, from
     /// the tally's `counts`: the prompt and its cache hit once per request
     /// (the tally's, shared by every index), the completion tokens of every
-    /// index.
+    /// index. `stream_base` is the stream's one anchor, the RPC dispatch its
+    /// caller handed in (the prefill dispatch for PD): headers may arrive
+    /// with the first chunk, so TTFT and the generation duration run from it.
     fn record_generate_metrics(
-        start_time: Instant,
+        stream_base: Instant,
         first_token_time: Option<Instant>,
         counts: TokenCounts,
-        pd_timing: Option<&context::PdTiming>,
         ctx: &GenerateStreamContext,
     ) {
-        // Headers may arrive with the first chunk, so use the RPC dispatch
-        // (prefill dispatch for PD) for both TTFT and generation duration.
-        let stream_base = pd_timing
-            .map(|timing| timing.prefill_start)
-            .unwrap_or(start_time);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: ctx.backend_type,
@@ -4597,13 +4593,9 @@ impl<'a> ChatStream<'a> {
         if client_left {
             return;
         }
-        // Both clocks include the RPC's wait for response headers: Single
-        // carries its dispatch in `start_time`, PD uses prefill dispatch.
-        let stream_base = self
-            .pd_timing
-            .as_ref()
-            .map(|timing| timing.prefill_start)
-            .unwrap_or(self.start_time);
+        // Both clocks include the RPC's wait for response headers: they run
+        // from the dispatch carried in `start_time` (the prefill dispatch for PD).
+        let stream_base = self.start_time;
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.processor.backend_type,
@@ -5780,12 +5772,9 @@ impl<'a> MessagesStream<'a> {
             return;
         }
         // Both clocks include the RPC's wait for response headers, as the
-        // chat stream's do; PD keeps its prefill dispatch anchor.
-        let stream_base = self
-            .pd_timing
-            .as_ref()
-            .map(|timing| timing.prefill_start)
-            .unwrap_or(self.start_time);
+        // chat stream's do: they run from the dispatch carried in `start_time`
+        // (the prefill dispatch for PD).
+        let stream_base = self.start_time;
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.processor.backend_type,

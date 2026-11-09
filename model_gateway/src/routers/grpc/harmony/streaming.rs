@@ -1859,13 +1859,9 @@ impl ChatDecode {
             .await?;
         }
 
-        // Headers may arrive with the first chunk. Both clocks start at the RPC dispatch
-        // carried in `start_time` for Single, or at prefill dispatch for PD.
-        let stream_base = self
-            .pd_timing
-            .as_ref()
-            .map(|timing| timing.prefill_start)
-            .unwrap_or(self.start_time);
+        // Headers may arrive with the first chunk. Both clocks start at the
+        // dispatch carried in `start_time` (the prefill dispatch for PD).
+        let stream_base = self.start_time;
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: metrics_labels::BACKEND_HARMONY,
