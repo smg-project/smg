@@ -834,9 +834,9 @@ impl LeastLoadPolicy {
     /// can pick the least-loaded worker before any of their credits lands:
     /// a herd of at most one decision per runtime thread, inside one
     /// scoring window; every credit lands. A decision with no report among
-    /// its candidates keeps the write guard across the decision as well: it
-    /// scores only the picks, and a herd there is the burst they are counted
-    /// to spread.
+    /// its candidates scores only the picks, where a herd is the burst they
+    /// are counted to spread, so it goes ahead only if no decision took its
+    /// worker meanwhile, and otherwise decides again under one guard.
     pub(super) fn select_min_expected_wait(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -957,6 +957,7 @@ impl LeastLoadPolicy {
                 );
             }
         }
+
         let (first, rest) = resolved.split_first()?;
 
         let inputs = self.score_inputs(workers, resolved);
