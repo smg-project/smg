@@ -574,17 +574,15 @@ async fn cached_images(
     {
         return Ok(None);
     }
-    let mut config = serde_json::json!({
+    let config = serde_json::json!({
         "model_id": ctx.model_id,
         "model_type": ctx.model_type,
-        "model_config": ctx.model_config.config,
         "preprocessor_config": preprocessor_config_for(ctx.model_config, Modality::Image),
         // A one-pass result is only right for its own wire.
         "image_wire_dtype": ctx.image_wire_dtype.map(|dtype| dtype.to_string()),
         "transparency": ctx.transparency,
     });
-    config.sort_all_objects();
-    let fingerprint = config_fingerprint(ctx.tokenizer_id, &config);
+    let fingerprint = config_fingerprint(ctx.tokenizer_id, &config, &ctx.model_config.config)?;
     // Deduplicate within the request even if the result cannot fit
     // in the cache. Record every position before scheduling work.
     let mut unique = HashMap::new();
