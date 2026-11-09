@@ -609,16 +609,18 @@ impl WorkerSelectionStage {
             }
             WorkerSelectionMode::EncodePrefillDecode => {
                 let hashes = if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
-                    // A vLLM encoder processes the whole prompt, batching its media.
                     let refs = multimodal::assemble_media_refs(plan.clone())
                         .map_err(multimodal::MmRefsError::into_response)?;
-                    let mut hash = blake3::Hasher::new();
-                    for item in &refs.items {
-                        hash.update(&item.modality.to_le_bytes());
-                        hash.update(&(item.url.len() as u64).to_le_bytes());
-                        hash.update(item.url.as_bytes());
-                    }
-                    Ok(vec![hash.finalize().as_bytes().to_vec()])
+                    Ok(refs
+                        .items
+                        .iter()
+                        .map(|item| {
+                            let mut hash = blake3::Hasher::new();
+                            hash.update(&item.modality.to_le_bytes());
+                            hash.update(item.url.as_bytes());
+                            hash.finalize().as_bytes().to_vec()
+                        })
+                        .collect())
                 } else {
                     encode_item_hashes(inputs.intermediate)
                 };
@@ -648,6 +650,7 @@ impl WorkerSelectionStage {
                             EpdDemands {
                                 encode: media,
                                 decode_vision: inputs.demand.decode,
+                                image_fanout: ctx.state.image_anchor.is_some(),
                             },
                         ),
                     )
@@ -2058,9 +2061,9 @@ impl WorkerSelectionStage {
                 && (pair.runtime != RuntimeType::Vllm
                     || ec_pair(worker.as_ref(), pair.prefill.as_ref()))
         });
-        // vLLM encodes the whole prompt on one worker; TokenSpeed routes items.
+        // Only image-only reference requests can merge vLLM's prompt updates.
         let prompt_hash;
-        let hashes = if pair.runtime == RuntimeType::Vllm && needs_encode {
+        let hashes = if pair.runtime == RuntimeType::Vllm && needs_encode && !demand.image_fanout {
             let mut hash = blake3::Hasher::new();
             for item in encode_item_hashes {
                 hash.update(&(item.len() as u64).to_le_bytes());
@@ -2088,6 +2091,7 @@ impl WorkerSelectionStage {
 struct EpdDemands {
     encode: MediaDemands,
     decode_vision: bool,
+    image_fanout: bool,
 }
 
 /// A configured connector must explicitly support the selected E/P role.
@@ -3162,6 +3166,7 @@ mod tests {
             sticky_key: None,
             clients: None,
             encode_outputs: None,
+            image_anchor: None,
             dispatch: None,
             load_guards: None,
             multimodal_inflight: None,
@@ -3965,7 +3970,7 @@ mod tests {
                 WorkerSelectionMode::EncodePrefillDecode,
                 None,
             );
-            for _ in 0..8 {
+            for image_fanout in [false, true] {
                 let (encoders, prefill, decode, runtime) = stage
                     .select_encode_prefill_decode_workers(
                         model,
@@ -3981,12 +3986,13 @@ mod tests {
                                 pipeline: PipelinePin::Any,
                             },
                             decode_vision: true,
+                            image_fanout,
                         },
                         None,
                     )
                     .unwrap_or_else(|_| panic!("eligible EPD set must be selected"));
                 assert_eq!(runtime, RuntimeType::Vllm);
-                assert_eq!(encoders.len(), 1);
+                assert_eq!(encoders.len(), if image_fanout { 2 } else { 1 });
                 assert_eq!(prefill.url(), "grpc://127.0.0.1:8805");
                 assert_eq!(decode.url(), "grpc://127.0.0.1:8807");
             }
@@ -4010,6 +4016,7 @@ mod tests {
                             pipeline: PipelinePin::Any,
                         },
                         decode_vision: true,
+                        image_fanout: false,
                     },
                     None,
                 )
@@ -4204,6 +4211,7 @@ mod tests {
                             pipeline: PipelinePin::Any,
                         },
                         decode_vision: grids,
+                        image_fanout: false,
                     },
                     None,
                 );
@@ -4241,7 +4249,8 @@ mod tests {
                                     vision: true,
                                     pipeline: PipelinePin::Any
                                 },
-                                decode_vision: grids
+                                decode_vision: grids,
+                                image_fanout: false,
                             },
                             None
                         ),
@@ -4256,6 +4265,7 @@ mod tests {
                             pipeline: PipelinePin::Any,
                         },
                         decode_vision: false,
+                        image_fanout: false,
                     };
                     assert!(
                         stage

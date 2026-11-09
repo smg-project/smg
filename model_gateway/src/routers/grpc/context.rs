@@ -281,6 +281,9 @@ pub(crate) struct ProcessingState {
     /// `Some` together with `multimodal_intermediate`. Request building takes it.
     pub multimodal_refs: Option<MediaPlan>,
 
+    /// Resolved image anchor for vLLM's image-only encoder fan-out.
+    pub image_anchor: Option<u32>,
+
     /// Set once request building attached media references, so retry
     /// re-selection stays pinned to workers that accept them.
     pub media_refs_forwarded: bool,
@@ -438,6 +441,7 @@ pub(crate) struct DispatchContext {
     /// prefill/decode sides against the already-running encode jobs.
     pub encode_outputs: Option<EncodeOutputs>,
     pub multimodal_inflight: Option<InflightPermit>,
+    pub image_anchor: Option<u32>,
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
     /// Prefill admission slot for the next PD/EPD dispatch; a retry's
@@ -1167,6 +1171,7 @@ impl RequestContext {
             clients: state.clients,
             encode_outputs: state.encode_outputs,
             multimodal_inflight: state.multimodal_inflight,
+            image_anchor: state.image_anchor,
             dispatch: None,
             load_guards: None,
             pd_prefill_guard: state.pd_prefill_guard,
