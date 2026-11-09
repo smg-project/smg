@@ -110,7 +110,8 @@ spec:
             {{- end }}
             {{- if $metricsPort }}
             {{- /* The Rust servicer's metrics listener port (the launcher's
-                   --metrics-port flag overrides it). */}}
+                   --metrics-port flag, or --servicer-metrics-port for TokenSpeed,
+                   overrides it). */}}
             - name: SMG_{{ upper $worker.engine }}_SERVICER_METRICS_PORT
               value: {{ $metricsPort | quote }}
             {{- end }}

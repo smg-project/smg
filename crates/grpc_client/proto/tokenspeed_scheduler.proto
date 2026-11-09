@@ -424,6 +424,9 @@ message SchedulerLoad {
   // measurement; absent if unknown or stale. Numbered 16 (the next free
   // number) so the existing field numbers stay stable.
   optional double prefill_throughput = 16;
+  // Context tokens (prompt plus committed output) of every request the rank
+  // holds: the attention work its decode steps read. Absent on old workers.
+  optional int64 num_resident_tokens = 17;
 }
 
 message MemoryMetrics {

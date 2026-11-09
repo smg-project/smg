@@ -612,6 +612,14 @@ class TestBackendChoices:
         assert parse_router_args(["--backend", name]).backend == name
         assert backend_from_str(name) == getattr(BackendType, name.capitalize())
 
+    def test_no_backend_is_the_default_and_pins_no_wire(self):
+        """Without ``--backend`` the launcher names no engine, as the Rust CLI: a ZMQ
+        worker's wire is left to the gateway's detection step (it used to be pinned
+        to SGLang here and to vLLM EngineCore by the binary)."""
+        assert RouterArgs().backend is None
+        assert parse_router_args([]).backend is None
+        assert backend_from_str(None) is None
+
 
 class TestParseRouterArgs:
     """Test the parse_router_args function."""
@@ -2558,6 +2566,19 @@ class TestPdPairingMode:
 
     def test_reaches_the_rust_router(self):
         assert _rust_router_kwargs(pd_pairing_mode="strict")["pd_pairing_mode"] == "strict"
+
+
+class TestPowerOfTwoLoadMetric:
+    """--power-of-two-load-metric takes resident_tokens:<request_tokens> besides the
+    metric names, and refuses it without a non-negative cost at parse time."""
+
+    def test_resident_tokens_parses(self):
+        args = parse_router_args(["--power-of-two-load-metric", "resident_tokens:62500"])
+        assert args.power_of_two_load_metric == "resident_tokens:62500"
+
+    def test_resident_tokens_without_a_cost_is_refused(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--power-of-two-load-metric", "resident_tokens"])
 
 
 class TestRuntimeWorkerThreads:

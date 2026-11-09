@@ -58,6 +58,15 @@ their per-DP EC endpoints through GetServerInfo; PULL EC connectors return
 their transfer handles from E instead. Multimodal EPD requests currently
 require `n=1`; failed transfers are not replayed onto another P replica.
 
+Image-only reference requests can use multiple E workers within one request.
+Register multiple `--encode` workers; `--encode-policy round_robin` distributes
+successive images across them (the default policy is consistent hashing).
+SMG selects E per image, batches images assigned to the same E, and merges
+their metadata and EC handles in the original image order before running P.
+Fetching and preprocessing stay on E. Audio/video, mixed-modality requests,
+and models whose prompt updates extend beyond their image anchors retain
+single-E encoding.
+
 Without `--kv-events-config`, the servicer turns vLLM's ZMQ KV-event publisher
 on by itself, under either implementation, before the engine is built, at a
 port found free on the host rather than vLLM's fixed default (one per
@@ -1071,10 +1080,10 @@ every turn the grammar of the model's response template table where that table
 spells whole turns; otherwise it constrains the calls a tool request allows under
 `auto`.
 
-#### Metrics (`--metrics-port`)
+#### Metrics (`--servicer-metrics-port`)
 
-On the Rust servicer (the default), `--metrics-port <port>` (and `--metrics-host`,
-defaulting to the gRPC `--host`) serves its Prometheus metrics
+On the Rust servicer (the default), `--servicer-metrics-port <port>` (and
+`--servicer-metrics-host`, defaulting to the gRPC `--host`) serves its Prometheus metrics
 on a listener of its own; `SMG_TOKENSPEED_SERVICER_METRICS_PORT` /
 `SMG_TOKENSPEED_SERVICER_METRICS_HOST` are the environment forms the flags
 override, and without either there is no endpoint. The families and labels are
@@ -1085,8 +1094,14 @@ equal to `--port` is refused before the engine starts, and the flag is refused
 under the Python servicer, which exposes no endpoint.
 
 ```bash
-python -m smg_grpc_servicer.tokenspeed --model <model> --port 50051 --metrics-port 29100
+python -m smg_grpc_servicer.tokenspeed --model <model> --port 50051 --servicer-metrics-port 29100
 ```
+
+TokenSpeed's `--metrics-port` and `--metrics-host` configure the engine's own
+endpoint and are forwarded unchanged under either servicer implementation.
+Use `--servicer-metrics-port` and `--servicer-metrics-host` for the servicer
+endpoint previously selected by those flags. The environment variable names
+remain unchanged.
 
 #### Multi-node engines: the worker pod's liveness
 

@@ -5,7 +5,7 @@ use zeromq::{util::PeerIdentity, Endpoint, SocketEvent};
 
 use super::*;
 use crate::{
-    codec::{decode_msgpack, encode_msgpack},
+    codec::{decode_msgpack, encode_msgpack, tensor::lies_within},
     mock_engine::{
         connect_to_frontend, default_ready_response, hello, redial_input, EngineInbound,
         IpcNamespace, MockEngine,
@@ -144,7 +144,7 @@ fn wave_control(engine_index: u32, control: DpControlMessage) -> Vec<Bytes> {
 fn batch(engine_index: u32, output: EngineCoreOutput) -> Vec<Bytes> {
     let finished = output.finish_reason.map(|_| {
         let mut set = std::collections::BTreeSet::new();
-        set.insert(output.request_id.clone());
+        set.insert(String::from(&output.request_id));
         set
     });
     let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
@@ -977,7 +977,7 @@ async fn a_request_reported_at_intervals_counts_no_silence() {
             ..TokenizedGenerateReqInput::default()
         };
     let done = |rid: &str, prompt_tokens: u32| BatchTokenIDOutSlim {
-        rids: vec![rid.to_string()],
+        rids: vec![rid.into()],
         output_ids: vec![vec![11]],
         finished_reasons: vec!["stop".into()],
         prompt_tokens: vec![prompt_tokens],
@@ -1105,7 +1105,7 @@ async fn an_sglang_request_reported_at_intervals_counts_no_silence() {
         })
     };
     let done = |rid: &str, prompt_tokens: u32| BatchTokenIDSlimOutput {
-        rids: vec![rid.to_string()],
+        rids: vec![rid.into()],
         output_ids: vec![vec![11]],
         finished_reasons: vec!["stop".into()],
         finished_messages: vec![None],
@@ -1157,7 +1157,7 @@ async fn an_sglang_request_reported_at_intervals_counts_no_silence() {
     assert_eq!(client.prefill_pending_tokens(), 7);
     // Its result ends it, and the silence with it.
     let result = BatchEmbeddingSlimOutput {
-        rids: vec!["sg-embed".to_string()],
+        rids: vec!["sg-embed".into()],
         embeddings: vec![vec![0.5]],
         prompt_tokens: vec![2],
         cached_tokens: vec![0],
@@ -3348,7 +3348,7 @@ fn tokenspeed_request(
 fn tokenspeed_done(rid: &str, prompt_tokens: u32) -> Vec<Bytes> {
     use crate::protocol::tokenspeed::output::BatchTokenIDOutSlim;
     let done = BatchTokenIDOutSlim {
-        rids: vec![rid.to_string()],
+        rids: vec![rid.into()],
         output_ids: vec![vec![11]],
         finished_reasons: vec!["stop".into()],
         prompt_tokens: vec![prompt_tokens],
@@ -3392,7 +3392,7 @@ async fn a_pending_prompt_extends_the_bound_on_the_sglang_wire() {
         },
         |rid, prompt_tokens| {
             let done = BatchTokenIDSlimOutput {
-                rids: vec![rid.to_string()],
+                rids: vec![rid.into()],
                 output_ids: vec![vec![11]],
                 finished_reasons: vec!["stop".into()],
                 finished_messages: vec![None],
@@ -3702,6 +3702,43 @@ async fn an_add_the_engine_never_received_queues_no_allowance_on_the_wire() {
         "at the window, nothing queued for the prompts the engine never got: {elapsed:?}"
     );
     assert!(!client.is_alive());
+}
+
+/// A decoded output's id is a view of its step frame; the routed output
+/// carries its request's own id instead, so a stream that reads slowly
+/// holds its outputs' bytes and not every step frame they came in.
+#[test]
+fn a_routed_output_keeps_its_request_id_and_frees_the_step_frame() {
+    let mut registry = RequestRegistry::<<VllmProtocol as EngineProtocol>::Output>::default();
+    let mut receiver = registry
+        .register("req-1".to_string(), 1, true)
+        .expect("register");
+    let mut frames = batch(
+        0,
+        EngineCoreOutput {
+            request_id: "req-1".into(),
+            new_token_ids: vec![10],
+            ..Default::default()
+        },
+    );
+    let decoded = VllmProtocol::decode_batch(&frames, &()).expect("decode");
+    let output = decoded.outputs.into_iter().next().expect("one output");
+    assert!(
+        lies_within(&frames[0], output.request_id().as_bytes()),
+        "decoded within the frame, the id is a view of it"
+    );
+    registry.route(output);
+    let routed = receiver.try_recv().expect("routed").expect("an output");
+    assert_eq!(routed.request_id(), "req-1");
+    assert!(
+        !lies_within(&frames[0], routed.request_id().as_bytes()),
+        "the routed id is the request's own"
+    );
+    let frame = frames.pop().expect("the frame");
+    assert!(
+        frame.try_into_mut().is_ok(),
+        "nothing else holds the step frame"
+    );
 }
 
 /// The registry's side of it: a registered prompt is neither pending nor

@@ -1100,6 +1100,7 @@ jobs:
               # registration workflow, the server and the entry points every lane
               ("model_gateway/tests/**",                         NONE),
               ("model_gateway/test_harness/**",                  NONE),
+              ("model_gateway/src/routers/grpc/tokenizer_cache/**", NONE),
               ("model_gateway/benches/**",                       NONE),
               ("model_gateway/src/endpoints/responses/**",       "agentic vendor"),
               ("model_gateway/src/endpoints/conversations/**",   "agentic vendor"),
@@ -1892,7 +1893,7 @@ jobs:
             timeout: 60
             test_timeout: 50
             test_filter: -k "1p1d and not sole_leg_outage"
-            min_selected: 11
+            min_selected: 24
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -1909,7 +1910,8 @@ jobs:
       test_filter: ${{ matrix.test_filter || '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport or MismatchedProtocol"' }}
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
       # floor ≈ 93% of the slice: 15 cases on sglang/tokenspeed, 17 on vllm
-      # (its two transport classes); the 1p1d smoke selects 13, floor 11
+      # (its two transport classes); the 1p1d smoke selects 26 with its HTTP
+      # row (run 42508847810), floor 24
       min_selected: ${{ matrix.min_selected || 14 }}
       kv_backend: ${{ matrix.kv_backend || '' }}
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}

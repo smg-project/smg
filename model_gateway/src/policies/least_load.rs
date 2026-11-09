@@ -258,14 +258,47 @@ struct Candidate {
     /// Token-work and requests dispatched since the report's sample.
     since_poll_tokens: u64,
     since_poll_requests: u64,
-    /// The report's sample instant, and whether the tally holds dispatches
-    /// made at or before it: the decision's write phase releases those.
+    /// The report's sample instant, and whether the tally still holds
+    /// dispatches made at or before it for the decision's write phase to
+    /// release (a read under the held guard released them as it read).
     sampled_at: Option<Instant>,
     release: bool,
     /// This policy's picks there whose request has not ended (see
     /// `SincePollDispatch::picked`); the score reads them only without a
     /// report.
     picked: u64,
+}
+
+/// The credit of `url` as a read under the tally's read guard answers it:
+/// the dispatches the report reflects leave the credit and stay in the
+/// tally for the decision's write phase to release
+/// ([`SincePollDispatch::credit_after`]). The worker's picks come with it.
+fn credit_read(
+    tally: &HashMap<String, SincePollDispatch>,
+    url: &str,
+    sampled_at: Option<Instant>,
+) -> (u64, u64, bool, u64) {
+    tally.get(url).map_or((0, 0, false, 0), |dispatch| {
+        let (tokens, requests, release) = dispatch.credit_after(sampled_at);
+        (tokens, requests, release, dispatch.picked)
+    })
+}
+
+/// The credit of `url` as the guard held across a small decision answers
+/// it: the dispatches the report reflects are released as the credit is
+/// read ([`SincePollDispatch::release_through`]), one lookup per candidate,
+/// and nothing is left for the write phase. The worker's picks come with it.
+fn credit_released(
+    tally: &mut HashMap<String, SincePollDispatch>,
+    url: &str,
+    sampled_at: Option<Instant>,
+) -> (u64, u64, bool, u64) {
+    tally.get_mut(url).map_or((0, 0, false, 0), |dispatch| {
+        if let Some(sampled_at) = sampled_at {
+            dispatch.release_through(sampled_at);
+        }
+        (dispatch.tokens, dispatch.requests, false, dispatch.picked)
+    })
 }
 
 /// What the expected-wait score reads of one report.
@@ -280,6 +313,9 @@ struct ReportFacts {
     kv_pressure: f64,
     /// Resident token usage, for the trace record.
     token_usage: f64,
+    /// Context tokens of the requests the worker holds, when every rank
+    /// reports them (see `WorkerLoadResponse::total_resident_tokens`).
+    resident_tokens: Option<f64>,
     /// The worker's live drain rate when it has one (see
     /// `LeastLoadPolicy::live_drain_rate`): the live output rate of a decode
     /// or regular worker, the measured input capacity of a prefill worker.
@@ -293,6 +329,27 @@ struct ScoreInputs {
     fleet_has_loads: bool,
     /// The best-known reporting peer's score: what a worker without a
     /// fresh report scores before its own in-flight.
+    peer_baseline: f64,
+}
+
+/// What a decision minimizes.
+#[derive(Clone, Copy, Debug)]
+enum Objective {
+    /// The expected wait (see [`LeastLoadPolicy::score`]).
+    ExpectedWait,
+    /// The resident work, each request priced at `request_tokens` (see
+    /// [`LeastLoadPolicy::resident_score`]).
+    ResidentWork { request_tokens: u64 },
+}
+
+/// What one resident-work score reads besides the candidate and its worker.
+#[derive(Clone, Copy)]
+struct ResidentInputs {
+    request_tokens: f64,
+    /// Whether any candidate reports resident tokens.
+    fleet_has_resident: bool,
+    /// The best-known reporting peer's score: what a worker without resident
+    /// tokens scores before its own in-flight.
     peer_baseline: f64,
 }
 
@@ -393,25 +450,23 @@ impl LeastLoadPolicy {
     }
 
     /// One candidate as the decision reads it: one read of the snapshot and
-    /// one of the tally. The credit is read as it stands after the report's
-    /// sample: the dispatches made at or before it are the engine's by now
-    /// and leave the credit, the later ones stay
-    /// ([`SincePollDispatch::credit_after`]); the tally itself is released
-    /// by the decision's write phase.
+    /// one of the tally through `read_credit`, which answers `(tokens, requests,
+    /// release, picked)` for the worker's url and its report's sample instant: the
+    /// dispatches made at or before the sample are the engine's by now and
+    /// leave the credit, the later ones stay. The two guard shapes answer it
+    /// differently ([`credit_read`], [`credit_released`]).
     fn resolve(
         &self,
         idx: usize,
         worker: &Arc<dyn Worker>,
         snapshot: Option<&LoadSnapshot>,
-        tally: &HashMap<String, SincePollDispatch>,
+        read_credit: &mut impl FnMut(&str, Option<Instant>) -> (u64, u64, bool, u64),
     ) -> Candidate {
         let url = worker.url();
         let report = snapshot.and_then(|snapshot| snapshot.report(url));
         let sampled_at = report.map(|(_, sampled_at)| sampled_at);
-        let dispatch = tally.get(url);
-        let picked = dispatch.map_or(0, |dispatch| dispatch.picked);
-        let (since_poll_tokens, since_poll_requests, release) =
-            dispatch.map_or((0, 0, false), |dispatch| dispatch.credit_after(sampled_at));
+        let (since_poll_tokens, since_poll_requests, release, picked) =
+            read_credit(url, sampled_at);
         Candidate {
             idx,
             report: report.map(|(load, _)| self.report_facts(worker, load)),
@@ -432,6 +487,9 @@ impl LeastLoadPolicy {
                 .unwrap_or(0),
             kv_pressure: load.effective_kv_pressure(),
             token_usage: load.effective_token_usage(),
+            resident_tokens: load
+                .total_resident_tokens()
+                .map(|tokens| tokens.max(0) as f64),
             live_rate: Self::live_drain_rate(worker, load),
         }
     }
@@ -446,9 +504,10 @@ impl LeastLoadPolicy {
             .tally
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut read_credit = |url: &str, sampled_at| credit_read(&tally, url, sampled_at);
         indices
             .iter()
-            .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &tally))
+            .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &mut read_credit))
             .collect()
     }
 
@@ -464,9 +523,8 @@ impl LeastLoadPolicy {
             .tally
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (tokens, requests, _) = tally.get(url).map_or((0, 0, false), |dispatch| {
-            dispatch.credit_after(report.map(|(_, sampled_at)| sampled_at))
-        });
+        let (tokens, requests, _, _) =
+            credit_read(&tally, url, report.map(|(_, sampled_at)| sampled_at));
         (report.is_some(), tokens, requests)
     }
 
@@ -615,6 +673,83 @@ impl LeastLoadPolicy {
         inputs
     }
 
+    /// Resident-work score for a resolved candidate (lower is better), in
+    /// context tokens: the tokens the worker's report says it holds, the
+    /// prompts dispatched to it since that report, and `request_tokens` for
+    /// every request it holds. Requests the router holds beyond the report
+    /// and the credit ([`Self::unaccounted_requests`]) are priced at the
+    /// worker's mean context.
+    ///
+    /// A worker without resident tokens (no fresh report, or an engine that
+    /// does not count them) scores as the best-known reporting peer plus its
+    /// live in-flight, each request at the mean prefill and `request_tokens`;
+    /// with no candidate reporting them, the live in-flight count decides.
+    fn resident_score(
+        &self,
+        worker: &Arc<dyn Worker>,
+        candidate: &Candidate,
+        inputs: &ResidentInputs,
+    ) -> f64 {
+        let mean_prefill = f64::from(self.mean_prefill_tokens);
+        let reported = candidate.report.and_then(|report| {
+            report
+                .resident_tokens
+                .map(|resident| (report.reported_requests, resident))
+        });
+        match reported {
+            Some((reported_requests, resident)) => {
+                let unaccounted = Self::unaccounted_requests(
+                    worker,
+                    reported_requests,
+                    candidate.since_poll_requests,
+                );
+                let mean_context = if reported_requests > 0 {
+                    resident / reported_requests as f64
+                } else {
+                    mean_prefill
+                };
+                let requests = reported_requests + candidate.since_poll_requests + unaccounted;
+                resident
+                    + candidate.since_poll_tokens as f64
+                    + unaccounted as f64 * mean_context
+                    + inputs.request_tokens * requests as f64
+            }
+            None if inputs.fleet_has_resident => {
+                inputs.peer_baseline + worker.load() as f64 * (mean_prefill + inputs.request_tokens)
+            }
+            None => worker.load() as f64,
+        }
+    }
+
+    /// The resident-work inputs for one pass over the resolved `candidates`:
+    /// whether any reports resident tokens, and the best such score.
+    fn resident_inputs(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        candidates: &[Candidate],
+        request_tokens: u64,
+    ) -> ResidentInputs {
+        let mut inputs = ResidentInputs {
+            request_tokens: request_tokens as f64,
+            fleet_has_resident: false,
+            peer_baseline: 0.0,
+        };
+        let best_known = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .report
+                    .is_some_and(|report| report.resident_tokens.is_some())
+            })
+            .map(|candidate| self.resident_score(&workers[candidate.idx], candidate, &inputs))
+            .fold(f64::INFINITY, f64::min);
+        if best_known.is_finite() {
+            inputs.fleet_has_resident = true;
+            inputs.peer_baseline = best_known;
+        }
+        inputs
+    }
+
     /// Waiting-queue token-work for a worker.
     ///
     /// Prefers the backend's own `num_waiting_uncached_tokens`. Backends that
@@ -731,20 +866,49 @@ impl LeastLoadPolicy {
                 candidates,
                 info,
                 policy,
+                Objective::ExpectedWait,
                 credit,
                 &mut scratch.borrow_mut(),
             )
         })
     }
 
-    /// [`Self::select_min_expected_wait_credited`] over `resolved`, this
+    /// Argmin of the resident-work score ([`Self::resident_score`]) over
+    /// `candidates`, with each request priced at `request_tokens` context
+    /// tokens, crediting the winner with the request's prompt. The decision,
+    /// its tie-break and its credit are [`Self::select_min_expected_wait`]'s.
+    pub(super) fn select_min_resident_work(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        candidates: &[usize],
+        info: &SelectWorkerInfo,
+        policy: &'static str,
+        request_tokens: u64,
+    ) -> Option<usize> {
+        CANDIDATES.with(|scratch| {
+            self.decide(
+                workers,
+                candidates,
+                info,
+                policy,
+                Objective::ResidentWork { request_tokens },
+                None,
+                &mut scratch.borrow_mut(),
+            )
+        })
+    }
+
+    /// The argmin of `objective` over `candidates`, crediting the winner (see
+    /// [`Self::select_min_expected_wait_credited`]), with `resolved` this
     /// thread's scratch for the candidates it reads.
+    #[expect(clippy::too_many_arguments)]
     fn decide(
         &self,
         workers: &[Arc<dyn Worker>],
         candidates: &[usize],
         info: &SelectWorkerInfo,
         policy: &'static str,
+        objective: Objective,
         credit: Option<&dyn Fn(usize) -> u64>,
         resolved: &mut Vec<Candidate>,
     ) -> Option<usize> {
@@ -752,33 +916,40 @@ impl LeastLoadPolicy {
         let snapshot = snapshot.as_deref();
 
         // Up to `HELD_GUARD_CANDIDATES` candidates one write guard is held
-        // across the decision: each candidate is read under it, the scoring
-        // is short, and a second guard handoff costs more than it frees.
-        // Above it each candidate is read once under the read guard, its
-        // report and its credit after the report's sample, every pass below
-        // scores from this with the guard released, and the write guard
-        // covers the release and the credit alone.
+        // across the decision: each candidate is read under it with the
+        // dispatches its report reflects released as they are read (one
+        // lookup per candidate), the scoring is short, and a second guard
+        // handoff costs more than it frees. Above it each candidate is read
+        // once under the read guard, its report and its credit after the
+        // report's sample, every pass below scores from this with the guard
+        // released, and the write guard covers the release and the credit
+        // alone.
         let mut held = (candidates.len() <= HELD_GUARD_CANDIDATES).then(|| {
             self.tally
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         });
         resolved.clear();
-        match held.as_deref() {
-            Some(tally) => resolved.extend(
-                candidates
-                    .iter()
-                    .map(|&idx| self.resolve(idx, &workers[idx], snapshot, tally)),
-            ),
+        match held.as_deref_mut() {
+            Some(tally) => {
+                let mut read_credit =
+                    |url: &str, sampled_at| credit_released(tally, url, sampled_at);
+                resolved.extend(
+                    candidates
+                        .iter()
+                        .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &mut read_credit)),
+                );
+            }
             None => {
                 let tally = self
                     .tally
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut read_credit = |url: &str, sampled_at| credit_read(&tally, url, sampled_at);
                 resolved.extend(
                     candidates
                         .iter()
-                        .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &tally)),
+                        .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &mut read_credit)),
                 );
             }
         }
@@ -802,6 +973,16 @@ impl LeastLoadPolicy {
         let (first, rest) = resolved.split_first()?;
 
         let inputs = self.score_inputs(workers, resolved);
+        let resident = match objective {
+            Objective::ExpectedWait => None,
+            Objective::ResidentWork { request_tokens } => {
+                Some(self.resident_inputs(workers, resolved, request_tokens))
+            }
+        };
+        let score_of = |candidate: &Candidate| match &resident {
+            Some(resident) => self.resident_score(&workers[candidate.idx], candidate, resident),
+            None => self.score(&workers[candidate.idx], candidate, &inputs),
+        };
 
         // Argmin with reservoir tie-breaking: workers within
         // `TIE_EPSILON_SECS` of the minimum (the common idle/homogeneous case
@@ -811,6 +992,25 @@ impl LeastLoadPolicy {
             if cache_trace::enabled() {
                 let worker = &workers[candidate.idx];
                 let report = candidate.report;
+                if let Some(resident) = &resident {
+                    cache_trace::score(serde_json::json!({
+                        "source": "resident_work", "worker": worker.url(), "score": score,
+                        "score_unit": if resident.fleet_has_resident { "tokens" } else { "requests" },
+                        "resident_tokens": report.and_then(|report| report.resident_tokens),
+                        "reported_requests": report.map(|report| report.reported_requests),
+                        "since_poll_tokens": candidate.since_poll_tokens,
+                        "since_poll_requests": candidate.since_poll_requests,
+                        "unaccounted_requests": report.map(|report| {
+                            Self::unaccounted_requests(
+                                worker,
+                                report.reported_requests,
+                                candidate.since_poll_requests,
+                            )
+                        }),
+                        "fresh_load": report.is_some(),
+                    }));
+                    return;
+                }
                 cache_trace::score(serde_json::json!({
                     "source": "expected_wait", "worker": worker.url(), "score": score,
                     "score_unit": if inputs.fleet_has_loads { "seconds" } else { "requests" },
@@ -834,11 +1034,11 @@ impl LeastLoadPolicy {
             }
         };
         let mut best = first;
-        let mut best_score = self.score(&workers[best.idx], best, &inputs);
+        let mut best_score = score_of(best);
         observe_score(best, best_score);
         let mut tied = 1u32;
         for candidate in rest {
-            let s = self.score(&workers[candidate.idx], candidate, &inputs);
+            let s = score_of(candidate);
             observe_score(candidate, s);
             if s < best_score - TIE_EPSILON_SECS {
                 best = candidate;
@@ -861,8 +1061,9 @@ impl LeastLoadPolicy {
         // the pick until the request ends. Above `HELD_GUARD_CANDIDATES` the
         // write guard taken here covers the release of the dispatches the
         // reports read above reflect, and the credit; the guard held across a
-        // smaller decision covered the scores too. The key is allocated the
-        // first time a worker is dispatched to, never after.
+        // smaller decision released as it read, so only the credit is left
+        // under it. The key is allocated the first time a worker is
+        // dispatched to, never after.
         let req_tokens = credit.map_or_else(|| self.request_tokens(info), |credit| credit(best));
         let mut tally = match held.take() {
             Some(guard) => guard,
@@ -2314,10 +2515,11 @@ mod tests {
         );
     }
 
-    /// A read of the tally (a decision's resolve, the test view) subtracts
-    /// the dispatches a report reflects without releasing them; the
-    /// decision's write phase releases them for its candidates, once it
-    /// holds the guard, and credits its winner.
+    /// A read under the read guard (a split decision's resolve, the test
+    /// view) subtracts the dispatches a report reflects without releasing
+    /// them; a decision under the held guard releases them as it resolves;
+    /// a split decision releases them for its candidates in its write
+    /// phase, once it holds the guard. Either decision credits its winner.
     #[test]
     fn a_decision_releases_what_its_reports_reflect_and_a_read_does_not() {
         let policy = LeastLoadPolicy::new();

@@ -8,7 +8,6 @@ on:
       - '.github/bench-gates/stream-state-machines.toml'
       - 'scripts/bench_gate.py'
       - 'model_gateway/benches/stream_state_machines.rs'
-      - 'model_gateway/src/bench_support.rs'
       - 'model_gateway/src/routers/grpc/**'
       - 'model_gateway/src/routers/common/**'
       - 'crates/grpc_client/src/**'
@@ -20,8 +19,7 @@ on:
       - '!model_gateway/src/**/tests/**'
       - '!model_gateway/src/**/*_test.rs'
       - '!model_gateway/src/**/test_*.rs'
-      # After the test exclusions: the rows decode with this file's character tokenizer.
-      - 'model_gateway/src/test_support.rs'
+      - '!model_gateway/src/routers/grpc/tokenizer_cache/**'
   pull_request:
     branches: [ main, release/** ]
     paths:
@@ -29,7 +27,6 @@ on:
       - '.github/bench-gates/stream-state-machines.toml'
       - 'scripts/bench_gate.py'
       - 'model_gateway/benches/stream_state_machines.rs'
-      - 'model_gateway/src/bench_support.rs'
       - 'model_gateway/src/routers/grpc/**'
       - 'model_gateway/src/routers/common/**'
       - 'crates/grpc_client/src/**'
@@ -41,8 +38,7 @@ on:
       - '!model_gateway/src/**/tests/**'
       - '!model_gateway/src/**/*_test.rs'
       - '!model_gateway/src/**/test_*.rs'
-      # After the test exclusions: the rows decode with this file's character tokenizer.
-      - 'model_gateway/src/test_support.rs'
+      - '!model_gateway/src/routers/grpc/tokenizer_cache/**'
   workflow_dispatch:
   schedule:
     - cron: '0 0 * * 0'

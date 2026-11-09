@@ -23,6 +23,7 @@ pub use backend::{RateLimitBackend, ReserveOutcome, ReserveRequest, UsageSettlem
 pub use config::{
     ModelMatcherSpec, ModelRuleSpec, RateLimitConfigError, RateLimitYaml, TenantPolicySpec,
 };
+pub use local_backend::PolicyReplacement;
 pub use manager::{RateLimitManager, Reservation};
 pub use policy::{CompiledPolicySet, ScopeLimits};
 pub use rejection::{rejection_response, RATE_LIMIT_ERROR_CODE};

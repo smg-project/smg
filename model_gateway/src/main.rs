@@ -493,10 +493,7 @@ struct RoutingArgs {
 
     /// Maximum total size of each model's approximation tree for cache-aware
     /// routing (chars for HTTP, tokens for gRPC), shared across all workers;
-    /// eviction keeps every tree at or under this bound. With mesh enabled,
-    /// eviction also keeps a model's string and token prefix hash indexes
-    /// each within this bound, in entries and in stored bytes or tokens,
-    /// dropping older entries first
+    /// eviction keeps every tree at or under this bound
     #[arg(long, default_value_t = 67108864, help_heading = "Routing Policy")]
     max_tree_size: usize,
 
@@ -571,7 +568,8 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
     least_load_mean_prefill_tokens: u32,
 
-    /// What power_of_two compares: expected_wait (default), requests or least_requests
+    /// What power_of_two compares: expected_wait (default), requests, least_requests or
+    /// resident_tokens:<request_tokens> (resident context tokens plus that many per request)
     #[arg(long, default_value = "expected_wait", value_parser = parse_power_of_two_load_metric, help_heading = "Routing Policy")]
     power_of_two_load_metric: PowerOfTwoLoadMetric,
 

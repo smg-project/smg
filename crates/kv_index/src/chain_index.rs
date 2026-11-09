@@ -61,13 +61,15 @@
 //! A lane-map slot carries its key: a probe is settled in the map itself, with no read into the
 //! index per block (key-less 8-byte slots checked through the index cost 30-40% of lane CPU).
 //!
-//! Memory: 16 bytes per distinct block on a chain (its content hash and its engine hash, shared
-//! by every worker that holds it, with about 12% slack for growth) plus a 64-byte run header, the
-//! coverage words and a child table per branching run, against the 16-byte lane-map slot each
-//! lane keeps per held block for removals. The arena takes its memory from the process allocator
-//! a whole chunk (8 MiB) at a time and keeps every chunk once taken: what the arena holds moves
-//! in steps of one chunk (`arena_chunk_bytes`), while the words handed out (`arena_bytes`) move
-//! with the blocks.
+//! Memory: a chain's content hashes and engine hashes sit in two arrays of 8-byte words, shared by
+//! every worker that holds the chain, each array rounded up to a size class (4 words apart below
+//! 32, 8 apart to 128, a quarter of an octave above) behind two header words, with about 12%
+//! slack for growth: 16 bytes per distinct block when a run fills its class, about 23 bytes at
+//! a cell of runs a dozen blocks long; plus a 64-byte run header, the coverage words and a child
+//! table per branching run, against the 16-byte lane-map slot each lane keeps per held block for
+//! removals. The arena takes its memory from the process allocator a whole chunk (8 MiB) at a
+//! time and keeps every chunk once taken: what the arena holds moves in steps of one chunk
+//! (`arena_chunk_bytes`), while the words handed out (`arena_bytes`) move with the blocks.
 
 use std::{
     collections::BTreeSet,
@@ -113,8 +115,13 @@ const RUN_DIR: usize = 1 << 16;
 const WORD_CHUNK_BITS: u32 = 20;
 const WORD_CHUNK: usize = 1 << WORD_CHUNK_BITS;
 const WORD_DIR: usize = 1 << 12;
-/// Hash array capacities: multiples of 8 up to 128, then powers of two.
-const SMALL_ARRAY_CLASSES: usize = 16;
+/// Hash array capacities: `8, 12, .., 32` in steps of 4, `40, .., 128` in steps of 8, then four
+/// classes per octave (`array_class`). Short chains are the common case and an 8-word step below
+/// 32 cost a 12-block chain's two arrays 4 words each; the 8-word floor and every class of the
+/// coarser ladder stay, so no chain is reallocated more often than before unless it grows across
+/// one of the new classes.
+const FINE_ARRAY_CLASSES: usize = 7;
+const SMALL_ARRAY_CLASSES: usize = FINE_ARRAY_CLASSES + 12;
 const ARRAY_CLASSES: usize = SMALL_ARRAY_CLASSES + 4 * 13;
 /// Classes above the wanted one an allocation may take a freed array from (one octave).
 const ARRAY_FIT_SPAN: usize = 4;

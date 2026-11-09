@@ -24,7 +24,8 @@ use crate::{
 /// scored, and nothing is allocated. A pool too thin for the draw (fewer
 /// than two eligible workers, or most of them vetoed) is walked once instead,
 /// which lists the eligible workers. The `LeastRequests` metric reads every
-/// eligible worker's in-flight count by definition, so it walks every pick.
+/// eligible worker's in-flight count by definition, so it walks every pick;
+/// `ResidentTokens` scores every eligible worker, so it walks every pick too.
 #[derive(Debug)]
 pub struct PowerOfTwoPolicy {
     /// Expected-wait scorer shared with least-load: the load feed, the
@@ -71,6 +72,20 @@ fn fewest_in_flight(workers: &[Arc<dyn Worker>], candidates: &[usize]) -> Vec<us
 
 impl LoadBalancingPolicy for PowerOfTwoPolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+        if let PowerOfTwoLoadMetric::ResidentTokens { request_tokens } = self.load_metric {
+            let healthy = get_healthy_worker_indices(workers, info);
+            return match healthy.as_slice() {
+                [] => None,
+                [only] => Some(*only),
+                _ => self.scorer.select_min_resident_work(
+                    workers,
+                    &healthy,
+                    info,
+                    self.name(),
+                    request_tokens,
+                ),
+            };
+        }
         if self.load_metric == PowerOfTwoLoadMetric::LeastRequests {
             let healthy = get_healthy_worker_indices(workers, info);
             return match healthy.as_slice() {
@@ -156,6 +171,8 @@ impl Default for PowerOfTwoPolicy {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 
     use super::*;
     use crate::{
@@ -432,6 +449,67 @@ mod tests {
         TestFeed::attached_to(&requests).publish(&loads);
         for _ in 0..20 {
             assert_eq!(requests.select_worker(&workers, &info), Some(1));
+        }
+    }
+
+    /// One DP rank holding `running` requests over `resident` context tokens.
+    fn resident(running: i32, resident: i64) -> WorkerLoadResponse {
+        WorkerLoadResponse {
+            dp_rank_count: 1,
+            loads: vec![SchedulerLoadSnapshot {
+                dp_rank: 0,
+                num_running_reqs: running,
+                num_resident_tokens: Some(resident),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn resident_tokens(request_tokens: u64) -> PowerOfTwoPolicy {
+        PowerOfTwoPolicy::with_load_metric(PowerOfTwoLoadMetric::ResidentTokens { request_tokens })
+    }
+
+    #[test]
+    fn resident_tokens_takes_the_least_resident_work_over_every_worker() {
+        // w1 holds the fewest tokens but the most requests: it wins on tokens
+        // alone, and loses once each request is priced at 100K tokens
+        // (w1 1.3M vs w3 1.15M).
+        let workers = holding(&[0, 0, 0, 0]);
+        let mut loads = HashMap::new();
+        for (i, (running, tokens)) in [(4, 900_000), (12, 100_000), (5, 800_000), (2, 950_000)]
+            .into_iter()
+            .enumerate()
+        {
+            loads.insert(format!("http://w{i}:8000"), resident(running, tokens));
+        }
+        let info = SelectWorkerInfo::default();
+
+        let tokens_only = resident_tokens(0);
+        TestFeed::attached_to(&tokens_only).publish(&loads);
+        assert_eq!(tokens_only.select_worker(&workers, &info), Some(1));
+
+        let with_requests = resident_tokens(100_000);
+        TestFeed::attached_to(&with_requests).publish(&loads);
+        assert_eq!(with_requests.select_worker(&workers, &info), Some(3));
+    }
+
+    #[test]
+    fn resident_tokens_scores_a_worker_without_the_count_from_its_peers() {
+        // w1's report predates resident tokens: it scores as the best peer
+        // plus its live requests, never as idle.
+        let policy = resident_tokens(0);
+        let feed = TestFeed::attached_to(&policy);
+        let workers = holding(&[2, 2]);
+        let mut loads = HashMap::new();
+        loads.insert("http://w0:8000".to_string(), resident(2, 500_000));
+        loads.insert("http://w1:8000".to_string(), one_rank_load(0, 0.1, 100.0));
+        feed.publish(&loads);
+        for _ in 0..5 {
+            assert_eq!(
+                policy.select_worker(&workers, &SelectWorkerInfo::default()),
+                Some(0)
+            );
         }
     }
 

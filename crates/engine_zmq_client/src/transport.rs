@@ -683,7 +683,7 @@ mod tests {
         let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
             outputs: vec![EngineCoreOutput {
-                request_id: "req-1".to_string(),
+                request_id: "req-1".into(),
                 new_token_ids: vec![100, 101],
                 finish_reason: Some(EngineCoreFinishReason::Stop),
                 ..EngineCoreOutput::default()

@@ -547,6 +547,7 @@ def test_file_provider_reads_a_manifest_path_without_a_config_map():
 @needs_helm
 def test_slurm_provider_passes_the_job_names_of_each_role_and_its_settings():
     _, documents = render(
+        "router.disaggregation.mode=pd",
         "router.discovery.provider=slurm",
         "router.discovery.slurm.port=8000",
         "router.discovery.slurm.prefillJobNames={prefill-a,prefill-b}",
@@ -889,6 +890,30 @@ def test_the_schema_says_what_the_concurrency_sentinels_do():
 
 
 @needs_helm
+def test_the_default_render_requires_the_native_jpeg_decoder():
+    """The default deployment passes ``--mm-turbojpeg require``: a gateway whose
+    image lacks libjpeg-turbo refuses to start, where the launcher's own default
+    decodes JPEGs with the pure-Rust fallback and only says so in a log line."""
+    _, documents = render()
+    assert launcher_args(router_container(documents)["args"]).mm_turbojpeg == "require"
+
+
+@needs_helm
+def test_the_turbojpeg_policy_reaches_the_launcher_as_given():
+    """``router.mmTurbojpeg: prefer`` is the fallback-tolerant setting a custom
+    image without the library needs."""
+    _, documents = render("router.mmTurbojpeg=prefer")
+    assert launcher_args(router_container(documents)["args"]).mm_turbojpeg == "prefer"
+
+
+@needs_helm
+def test_a_turbojpeg_policy_outside_the_two_names_is_refused_by_the_schema():
+    assert "router.mmTurbojpeg must be one of the following" in render_error(
+        "router.mmTurbojpeg=never"
+    )
+
+
+@needs_helm
 @pytest.mark.parametrize("settle", [None, 0, 5, 30])
 def test_shutdown_settle_window(settle):
     """Omit the optional window by default and preserve explicit values, including zero."""
@@ -900,3 +925,269 @@ def test_shutdown_settle_window(settle):
         assert flag not in args
     else:
         assert args[args.index(flag) + 1] == str(settle)
+
+
+def worker_container(documents: list[dict], name: str) -> dict:
+    """The engine container of the chart worker ``name``."""
+    (deployment,) = [
+        document
+        for document in documents
+        if document["kind"] == "Deployment" and document["metadata"]["name"] == f"smg-worker-{name}"
+    ]
+    return deployment["spec"]["template"]["spec"]["containers"][0]
+
+
+GRPC_WORKER_FORMS = {
+    # (engine, the port value given, the serving port the probe must name)
+    "vllm-default-port": ("vllm", None, 8000),
+    "sglang-default-port": ("sglang", None, 30000),
+    "vllm-explicit-port": ("vllm", 9100, 9100),
+    "sglang-explicit-port": ("sglang", 9200, 9200),
+}
+
+
+@needs_helm
+@pytest.mark.parametrize("form", sorted(GRPC_WORKER_FORMS))
+def test_a_grpc_worker_startup_probe_names_its_serving_port_as_an_integer(form):
+    """The gRPC probe takes a port number, never a name or a string: an edit that
+    quotes it or names it passes ``helm lint`` and fails only on the cluster."""
+    engine, port, serving = GRPC_WORKER_FORMS[form]
+    settings = [
+        "workers[0].name=engine",
+        f"workers[0].engine={engine}",
+        "workers[0].model=org/model",
+        "workers[0].image.tag=tag",
+        "workers[0].connectionMode=grpc",
+    ]
+    if port is not None:
+        settings.append(f"workers[0].port={port}")
+    container = worker_container(render(*settings)[1], "engine")
+    probe = container["startupProbe"]
+    assert "httpGet" not in probe
+    assert probe["grpc"]["port"] is not True and isinstance(probe["grpc"]["port"], int)
+    assert probe["grpc"]["port"] == serving
+    (serve,) = [p for p in container["ports"] if p["name"] == "serve"]
+    assert serve["containerPort"] == serving
+
+
+@needs_helm
+def test_an_http_worker_renders_no_grpc_probe():
+    container = worker_container(render(*WORKER)[1], "llama")
+    probe = container["startupProbe"]
+    assert "grpc" not in probe
+    assert probe["httpGet"] == {"path": "/health", "port": "serve"}
+
+
+ROLE_FLAGS = {
+    "--pd-disaggregation",
+    "--epd-disaggregation",
+    "--prefill-policy",
+    "--decode-policy",
+    "--encode-policy",
+    "--prefill",
+    "--decode",
+    "--encode",
+    "--prefill-selector",
+    "--decode-selector",
+    "--encode-selector",
+}
+
+
+@needs_chart
+def test_the_chart_renders_every_role_flag_the_launcher_takes():
+    """The eleven role flags of disaggregated serving are typed values, not
+    raw ``extraArgs`` strings."""
+    assert ROLE_FLAGS <= router_args_flags()
+
+
+@needs_helm
+def test_a_regular_fleet_renders_no_role_flag():
+    args = router_container(render()[1])["args"]
+    assert not ROLE_FLAGS & set(args), sorted(ROLE_FLAGS & set(args))
+
+
+@needs_helm
+def test_the_prefill_role_renders_its_mode_policy_and_workers():
+    _, documents = render(
+        "router.disaggregation.mode=pd",
+        "router.disaggregation.prefillPolicy=bucket",
+        "router.disaggregation.prefill[0].url=http://prefill-0:8000",
+        "router.disaggregation.prefill[0].bootstrapPort=8998",
+        "router.disaggregation.prefill[1].url=http://prefill-1:8000",
+    )
+    parsed = launcher_args(router_container(documents)["args"])
+    assert parsed.pd_disaggregation is True and parsed.epd_disaggregation is False
+    assert parsed.prefill_policy == "bucket"
+    assert parsed.prefill_urls == [("http://prefill-0:8000", 8998), ("http://prefill-1:8000", None)]
+
+
+@needs_helm
+def test_the_decode_role_renders_its_policy_and_workers():
+    _, documents = render(
+        "router.disaggregation.mode=pd",
+        "router.disaggregation.decodePolicy=power_of_two",
+        "router.disaggregation.decode[0].url=http://decode-0:8000",
+        "router.disaggregation.decode[1].url=http://decode-1:8000",
+    )
+    parsed = launcher_args(router_container(documents)["args"])
+    assert parsed.decode_policy == "power_of_two"
+    assert parsed.decode_urls == ["http://decode-0:8000", "http://decode-1:8000"]
+
+
+@needs_helm
+def test_the_encode_role_renders_under_epd():
+    _, documents = render(
+        "router.disaggregation.mode=epd",
+        "router.disaggregation.encodePolicy=consistent_hashing",
+        "router.disaggregation.encode[0].url=http://encode-0:8000",
+        "router.disaggregation.encode[0].bootstrapPort=8998",
+    )
+    parsed = launcher_args(router_container(documents)["args"])
+    assert parsed.epd_disaggregation is True and parsed.pd_disaggregation is False
+    assert parsed.encode_policy == "consistent_hashing"
+    assert parsed.encode_urls == [("http://encode-0:8000", 8998)]
+
+
+@needs_helm
+def test_the_role_selectors_reach_the_kubernetes_provider():
+    """The README's prefill-decode fleet found by label, from the values alone."""
+    _, documents = render(
+        *PROVIDERS["kubernetes"],
+        "router.disaggregation.mode=pd",
+        "router.disaggregation.prefillPolicy=cache_aware",
+        "router.disaggregation.decodePolicy=power_of_two",
+        "router.discovery.kubernetes.prefillSelector=app=engine role=prefill",
+        "router.discovery.kubernetes.decodeSelector=app=engine role=decode",
+    )
+    parsed = launcher_args(router_container(documents)["args"])
+    assert parsed.pd_disaggregation is True
+    assert parsed.prefill_policy == "cache_aware" and parsed.decode_policy == "power_of_two"
+    assert parsed.prefill_selector == {"app": "engine", "role": "prefill"}
+    assert parsed.decode_selector == {"app": "engine", "role": "decode"}
+    assert parsed.selected_discovery_provider() == "kubernetes"
+
+
+@needs_helm
+def test_the_encode_selector_reaches_the_kubernetes_provider_under_epd():
+    _, documents = render(
+        *PROVIDERS["kubernetes"],
+        "router.disaggregation.mode=epd",
+        "router.discovery.kubernetes.encodeSelector=role=encode",
+    )
+    assert launcher_args(router_container(documents)["args"]).encode_selector == {"role": "encode"}
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "router.disaggregation.prefillPolicy=cache_aware",
+        "router.disaggregation.decode[0].url=http://decode-0:8000",
+        "router.discovery.provider=kubernetes,router.discovery.kubernetes.prefillSelector=role=prefill",
+    ],
+)
+def test_a_role_without_its_mode_is_refused_at_render(setting):
+    """The gateway would ignore the role with a warning at start-up; the chart
+    refuses it where the values are written."""
+    assert "router.disaggregation.mode" in render_error(*setting.split(",", 1))
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "router.disaggregation.encodePolicy=random",
+        "router.disaggregation.encode[0].url=http://encode-0:8000",
+        "router.discovery.provider=kubernetes,router.discovery.kubernetes.encodeSelector=role=encode",
+    ],
+)
+def test_the_encode_role_outside_epd_is_refused_at_render(setting):
+    error = render_error("router.disaggregation.mode=pd", *setting.split(",", 1))
+    assert "router.disaggregation.mode=epd" in error
+
+
+SLURM_ROLES = (
+    "router.discovery.provider=slurm",
+    "router.discovery.slurm.port=8000",
+    "router.discovery.slurm.prefillJobNames={prefill}",
+    "router.discovery.slurm.decodeJobNames={decode}",
+)
+
+
+@needs_helm
+def test_the_slurm_role_job_names_follow_the_mode_rule():
+    """The Slurm role job names are role values too: refused without the mode,
+    the regular job names refused under it, the encode names refused outside
+    epd, rendered under the mode."""
+    assert "router.disaggregation.mode" in render_error(*SLURM_ROLES)
+    error = render_error(
+        "router.disaggregation.mode=pd", *SLURM_ROLES, "router.discovery.slurm.jobNames={regular}"
+    )
+    assert "router.discovery.slurm.jobNames" in error
+    error = render_error(
+        "router.disaggregation.mode=pd",
+        *SLURM_ROLES,
+        "router.discovery.slurm.encodeJobNames={encode}",
+    )
+    assert "router.disaggregation.mode=epd" in error
+    _, documents = render("router.disaggregation.mode=pd", *SLURM_ROLES)
+    parsed = launcher_args(router_container(documents)["args"])
+    assert parsed.pd_disaggregation is True
+    assert (parsed.slurm_prefill_job_name, parsed.slurm_decode_job_name) == (
+        ["prefill"],
+        ["decode"],
+    )
+
+
+PD_STATIC_ROLES = (
+    "router.disaggregation.mode=pd",
+    "router.disaggregation.prefill[0].url=http://prefill-0:8000",
+    "router.disaggregation.decode[0].url=http://decode-0:8000",
+)
+
+
+@needs_helm
+def test_regular_workers_under_a_role_mode_are_refused_or_left_out():
+    """A disaggregated gateway reads only its role workers: explicit regular URLs
+    under a mode are refused, the chart's own workers get no ``--worker-urls``
+    when the roles address them, and chart workers given no role are refused."""
+    assert "router.workerUrls" in render_error(
+        *PD_STATIC_ROLES, "router.workerUrls={http://w:8000}"
+    )
+    _, documents = render(*WORKER, *PD_STATIC_ROLES)
+    args = router_container(documents)["args"]
+    assert "--worker-urls" not in args
+    assert "--pd-disaggregation" in args
+    assert "gives no role" in render_error(*WORKER, "router.disaggregation.mode=pd")
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    ("setting", "words"),
+    [
+        (
+            "router.disaggregation.mode=xpd",
+            "router.disaggregation.mode must be one of the following",
+        ),
+        (
+            "router.disaggregation.prefillPolicy=fastest",
+            "router.disaggregation.prefillPolicy must be one of the following",
+        ),
+        (
+            "router.disaggregation.decodePolicy=bucket",
+            "router.disaggregation.decodePolicy must be one of",
+        ),
+        (
+            "router.disaggregation.encodePolicy=cache_aware",
+            "router.disaggregation.encodePolicy must be one of",
+        ),
+        (
+            "router.disaggregation.prefill[0].bootstrapport=8998",
+            "Additional property bootstrapport",
+        ),
+    ],
+)
+def test_a_role_value_outside_the_launcher_choices_is_refused_by_the_schema(setting, words):
+    """The schema carries the launcher's choices per role and the role keys, so
+    a typo fails at render, where a raw extraArgs string failed at start-up."""
+    assert words in render_error("router.disaggregation.mode=epd", setting)

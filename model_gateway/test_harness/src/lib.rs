@@ -5,10 +5,10 @@ pub mod decode_stream;
 pub mod engine_answers;
 pub mod grpc_harness;
 pub mod held_worker;
-/// The gateway's copy of the hub fetcher (compiled by path from this crate's
-/// `src/hub_fetch.rs`), re-exported so a test binary that links both crates has
-/// one module and one download lock.
-pub use smg::test_support::hub_fetch;
+/// The gateway's hub fetcher (beside the checkpoint tokenizer fixtures of the
+/// gRPC router's tests), re-exported so a test binary that links both crates
+/// has one module and one download lock.
+pub use smg::routers::grpc::tokenizer_cache::hub_fetch;
 pub mod metrics_capture;
 pub mod mock_mcp_server;
 #[cfg(feature = "provider-openai")]
@@ -403,6 +403,20 @@ impl AppTestContext {
         test_app::create_test_apps_with_context(
             Arc::clone(&self.router),
             Arc::clone(&self.app_context),
+            admin_listener,
+        )
+    }
+
+    /// The production routers with initialized control-plane auth.
+    pub fn create_apps_with_auth(
+        &self,
+        control_plane_auth: Option<smg_auth::ControlPlaneAuthState>,
+        admin_listener: bool,
+    ) -> smg::server::GatewayApps {
+        test_app::create_test_apps_with_context_and_auth(
+            Arc::clone(&self.router),
+            Arc::clone(&self.app_context),
+            control_plane_auth,
             admin_listener,
         )
     }

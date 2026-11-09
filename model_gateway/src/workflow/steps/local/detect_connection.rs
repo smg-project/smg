@@ -225,8 +225,7 @@ mod tests {
     use crate::{
         config::RouterConfig,
         policies::PolicyRegistry,
-        test_support::RefusedAddress,
-        worker::WorkerRegistry,
+        worker::{test_support::RefusedAddress, WorkerRegistry},
         workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
     };
 

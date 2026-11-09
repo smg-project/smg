@@ -22,8 +22,6 @@
 //! - [`workflow`]: the workflow engine and its steps: worker registration and lifecycle, tokenizer, MCP and WASM registration.
 
 pub mod app_context;
-#[cfg(any(test, feature = "test-util"))]
-pub mod bench_support;
 pub mod config;
 pub mod endpoints;
 pub mod health;
@@ -36,8 +34,6 @@ pub mod routers;
 pub mod server;
 pub mod service_discovery;
 pub mod tenant;
-#[cfg(any(test, feature = "test-util"))]
-pub mod test_support;
 pub mod version;
 pub mod wasm;
 pub mod worker;

@@ -15,7 +15,7 @@ use serde::{
 // place in this module's API.
 pub use crate::protocol::control::{ControlReplySlim, CONTROL_REPLY_SLIM_TAG};
 use crate::{
-    codec::decode_msgpack,
+    codec::{decode_msgpack, tensor::decode_within_frame, FrameStr},
     error::{Error, Result},
     protocol::{
         control::read_control_reply_after_tag,
@@ -46,7 +46,8 @@ pub enum MatchedStop {
 /// request that did not ask for logprobs.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BatchTokenIDSlimOutput {
-    pub rids: Vec<String>,
+    /// The request ids, views of the frame they were decoded within.
+    pub rids: Vec<FrameStr>,
     /// Newly generated token ids per request this step.
     pub output_ids: Vec<Vec<u32>>,
     /// `""` while generating, else `stop` | `length` | `abort`.
@@ -253,7 +254,8 @@ fn read_token_batch_after_tag<'de, A: SeqAccess<'de>>(
 /// One request's slice of a [`BatchTokenIDSlimOutput`].
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SglangOutput {
-    pub request_id: String,
+    /// The request's id, a view of the frame it was decoded within.
+    pub request_id: FrameStr,
     pub output_ids: Vec<u32>,
     /// `None` while the request is still generating.
     pub finish_reason: Option<String>,
@@ -298,7 +300,11 @@ pub struct SglangOutput {
 
 impl EngineOutput for SglangOutput {
     fn request_id(&self) -> &str {
-        &self.request_id
+        self.request_id.as_str()
+    }
+
+    fn own_request_id(&mut self, id: FrameStr) {
+        self.request_id = id;
     }
 
     fn finished(&self) -> bool {
@@ -548,7 +554,7 @@ impl BatchEmbeddingSlimOutput {
             .map(|(request_id, reason)| {
                 let embedding = embeddings.next().unwrap_or_default();
                 SglangOutput {
-                    request_id,
+                    request_id: request_id.into(),
                     // An embedding output is terminal by construction.
                     finish_reason: Some(if reason.is_empty() {
                         "stop".to_string()
@@ -624,8 +630,11 @@ pub(crate) fn decode_slim_batch(frames: &[Bytes]) -> Result<EngineBatch<SglangOu
             "ignoring aux frames on a slim output (the slim records have no tensor fields)"
         );
     }
-    let payload = frames.first().map(AsRef::as_ref).unwrap_or_default();
-    let (engine_index, load, outputs) = match decode_msgpack::<SglangWireOutput>(payload)? {
+    let empty = Bytes::new();
+    let frame = frames.first().unwrap_or(&empty);
+    // Within the frame's scope, so every request id is a view of it, not a copy.
+    let wire = decode_within_frame(frame, || decode_msgpack::<SglangWireOutput>(frame))?;
+    let (engine_index, load, outputs) = match wire {
         SglangWireOutput::Tokens(batch) => (
             batch.engine_index,
             load_of(
@@ -657,10 +666,11 @@ pub(crate) fn decode_slim_batch(frames: &[Bytes]) -> Result<EngineBatch<SglangOu
             });
         }
     };
+    // The one owned copy of an id, made at the finish alone.
     let finished_request_ids = outputs
         .iter()
         .filter(|output| output.finish_reason.is_some())
-        .map(|output| output.request_id.clone())
+        .map(|output| String::from(&output.request_id))
         .collect();
     Ok(EngineBatch {
         engine_index,

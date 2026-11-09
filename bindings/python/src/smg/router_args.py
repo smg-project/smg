@@ -71,6 +71,22 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _power_of_two_load_metric(value: str) -> str:
+    """argparse type for --power-of-two-load-metric: a metric name, or
+    resident_tokens:<request_tokens> with a non-negative integer cost, refused
+    here rather than by the binding's conversion after parsing."""
+    metric = value.strip().lower()
+    cost = metric.removeprefix("resident_tokens:")
+    if metric in ("expected_wait", "requests", "least_requests") or (
+        cost != metric and cost.isdigit()
+    ):
+        return value
+    raise argparse.ArgumentTypeError(
+        "expected expected_wait, requests, least_requests or "
+        f"resident_tokens:<request_tokens>, got {value!r}"
+    )
+
+
 def _ip_address(value: str) -> str | None:
     """argparse type for a listener address the router validates as an IP address:
     a plain IPv4 or IPv6 literal, surrounding whitespace aside (blank is unset, as
@@ -301,7 +317,8 @@ class RouterArgs:
     api_key: str | None = None
     # Routing-key assignment; defaults: random (manual policy), delegate (override)
     assignment_mode: str | None = None
-    backend: str = "sglang"
+    # None pins no wire: the gateway detects it, as it does for the CLI without --backend
+    backend: str | None = None
     balance_abs_threshold: int = 64
     # The spill gate's price of a held prefix, in tokens per request (0: unpriced)
     balance_prefix_margin_tokens: int = 0
@@ -390,7 +407,7 @@ class RouterArgs:
     # policy (--engine-metrics)
     engine_metrics: bool = False
     epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
-    eviction_interval_secs: int = 60
+    eviction_interval_secs: int = 120
     # Seconds a request to a gRPC worker may take from its dispatch to its last
     # message; 0 (the default) arms no deadline
     grpc_request_timeout_secs: int = 0
@@ -1023,10 +1040,13 @@ class RouterArgs:
         )
         routing_group.add_argument(
             f"--{prefix}power-of-two-load-metric",
-            type=str,
-            choices=["expected_wait", "requests", "least_requests"],
+            type=_power_of_two_load_metric,
             default=RouterArgs.power_of_two_load_metric,
-            help="What power_of_two compares: expected_wait, requests or least_requests",
+            help=(
+                "What power_of_two compares: expected_wait, requests, least_requests or"
+                " resident_tokens:<request_tokens> (resident context tokens plus that many"
+                " per request)"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}pd-pairing-mode",
@@ -1352,9 +1372,7 @@ class RouterArgs:
             help="Maximum total size of each model's approximation tree for "
             "cache-aware routing (chars for HTTP, tokens for gRPC), shared "
             "across all workers; eviction keeps every tree at or under this "
-            "bound. With mesh enabled, eviction also keeps a model's string and "
-            "token prefix hash indexes each within this bound, in entries and in "
-            "stored bytes or tokens, dropping older entries first",
+            "bound",
         )
         routing_group.add_argument(
             f"--{prefix}block-size",
@@ -2645,10 +2663,11 @@ class RouterArgs:
             default=RouterArgs.backend,
             choices=["sglang", "vllm", "trtllm", "tokenspeed", "openai", "anthropic", "gemini"],
             help=(
-                "Backend runtime to use (default: sglang). Over ZMQ the backend names the "
-                "workers' engine and pins the wire protocol (it cannot be auto-detected): "
-                "pass vllm or tokenspeed for those engines; the default serves SGLang schedulers. "
-                "openai, anthropic and gemini select that provider's route"
+                "Backend runtime (default: none, the gateway detects it, as the Rust CLI does). "
+                "Over ZMQ the backend names the workers' engine and pins the wire protocol, "
+                "which the handshake cannot tell apart: pass sglang, vllm or tokenspeed for "
+                "that engine; an unpinned ZMQ worker gets the vLLM EngineCore wire and a "
+                "warning at start. openai, anthropic and gemini select that provider's route"
             ),
         )
         backend_group.add_argument(

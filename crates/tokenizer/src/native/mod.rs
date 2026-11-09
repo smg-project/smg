@@ -501,7 +501,14 @@ pub(crate) struct AddedTokens {
 /// [`Self::MAX_COUNT`] of them (a token shorter than the length stands
 /// whole), so a hit is as close to a token as the set allows. A set whose
 /// prefixes would be shorter than [`Self::MIN_LEN`] bytes keeps the
-/// automaton's own search.
+/// automaton's own search. When the library declines the prefixes that fit
+/// (its SIMD searcher takes a one-byte pattern among at most sixteen, and a
+/// set with newline or tab runs among its tokens has such prefixes), the
+/// tokens' distinct first bytes stand in when there are at most
+/// [`Self::MAX_FIRST_BYTES`]: a hit then is a byte that starts some token,
+/// and the automaton anchored there decides, where the unanchored automaton
+/// walked every byte of the text (measured at about thirty instructions per
+/// byte on a 6,415-token set).
 struct Prefixes {
     searcher: packed::Searcher,
 }
@@ -510,6 +517,7 @@ impl Prefixes {
     const MAX_LEN: usize = 16;
     const MIN_LEN: usize = 3;
     const MAX_COUNT: usize = 64;
+    const MAX_FIRST_BYTES: usize = 16;
 
     /// Whether the automaton's start-byte scan declines `tokens`: a first
     /// byte beyond ASCII, or more than three distinct first bytes.
@@ -549,12 +557,23 @@ impl Prefixes {
         if prefixes.len() > Self::MAX_COUNT || (cut_short && len < Self::MIN_LEN) {
             return None;
         }
-        let searcher = packed::Config::new()
+        let searcher = Self::searcher(&prefixes).or_else(|| {
+            let firsts = distinct(1);
+            (firsts.len() <= Self::MAX_FIRST_BYTES)
+                .then(|| Self::searcher(&firsts))
+                .flatten()
+        })?;
+        Some(Self { searcher })
+    }
+
+    /// The library's packed searcher over `patterns`, none when it declines
+    /// them.
+    fn searcher(patterns: &[&[u8]]) -> Option<packed::Searcher> {
+        packed::Config::new()
             .match_kind(packed::MatchKind::LeftmostFirst)
             .builder()
-            .extend(&prefixes)
-            .build()?;
-        Some(Self { searcher })
+            .extend(patterns)
+            .build()
     }
 
     /// The first position at or after `from` where a prefix stands.
@@ -1217,7 +1236,7 @@ impl NativeEncoder {
     /// The table [`Self::seed_vocabulary`] reads, and whether every id of
     /// `0..vocab_size` was an entry (so the table holds every short entry).
     /// On the sentencepiece path (`chars`) an entry's spelling is its own
-    /// text: its key is its bytes.
+    /// text: its key is its raw form (`CharSymbols::entry_key`).
     fn vocabulary_seed(
         model: &ModelWrapper,
         alphabet: &[char; 256],
@@ -1252,7 +1271,7 @@ impl NativeEncoder {
                         Some(ids)
                     };
                     if chars {
-                        let key = ShortPieceKey::of(entry.as_bytes())?;
+                        let key = CharSymbols::entry_key(&entry)?;
                         return Some(Seeded::Short(key, ids_of(entry.as_str())?));
                     }
                     let mut piece = [0u8; SHORT_PIECE_MAX_BYTES];
@@ -1756,7 +1775,7 @@ impl NativeEncoder {
         // vocabulary token joins, read on the raw text.
         if let Some(chars) = &self.chars {
             let bytes = text.as_bytes();
-            return (from.max(1)..text.len()).find(|&p| chars.raw_cut_ok(bytes, p));
+            return (from.max(1)..text.len()).find(|&p| chars.cuts_at(bytes, p));
         }
         if self.stages.is_empty() {
             return None;
@@ -1850,18 +1869,13 @@ impl NativeEncoder {
             Segment::Text(text) => text,
         };
         if let Some(chars) = &self.chars {
-            // The sentencepiece path cuts the text itself and hands each piece
-            // to the same probe as the shapes below. An empty text gets no
-            // marker: `tokenizers` drops an empty split before the
-            // pre-tokenizer runs.
+            // The sentencepiece path cuts the raw text itself, out of line.
+            // An empty text gets no marker: `tokenizers` drops an empty
+            // split before the pre-tokenizer runs.
             if !text.is_empty() {
-                chars.pieces(&CharSymbols::marked(text, marker), &mut |piece: &str| {
-                    if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
-                        fallback = Some(declined);
-                    }
-                });
+                self.encode_sentencepiece(chars, text, marker, mapped, ids, cache);
             }
-            return fallback.map_or(Ok(()), Err);
+            return Ok(());
         }
         // One pass over the unit (word at a time in the standard library) on
         // the byte-level path, the one that reads it: the cold pieces of an
@@ -1928,9 +1942,10 @@ impl NativeEncoder {
 
     /// Appends the ids of one piece: from the thread's cache, else from the
     /// encoder's seed, else merged over the model's merges (the whole piece
-    /// looked up first under `ignore_merges`; from character symbols on the
-    /// sentencepiece path), else, for a model the merge table declined, from
-    /// the model itself over the piece's byte-level alphabet form;
+    /// looked up first under `ignore_merges`), else, for a model the merge
+    /// table declined, from the model itself over the piece's byte-level
+    /// alphabet form (a raw piece of the sentencepiece path never comes here:
+    /// it has [`Self::tokenize_raw_piece_slow`]);
     /// remembered in the thread's cache whichever answered;
     /// [`Fallback::PieceDeclined`] when the model declines the piece (or
     /// there is none to ask: a vocabulary read from ranks has a complete
@@ -2086,11 +2101,14 @@ impl NativeEncoder {
         let start = ids.len();
         // A piece this thread has not met: the encoder's seed has it when it
         // is a vocabulary word, else it is merged, by the table or by the
-        // model for a table that declined.
+        // model for a table that declined. A raw piece of the sentencepiece
+        // path never comes here: it has its own slow path.
+        debug_assert!(
+            self.chars.is_none(),
+            "a sentencepiece piece takes tokenize_raw_piece_slow"
+        );
         if !key.is_some_and(|key| self.seed.ids_into(key, ids)) {
-            if let Some(chars) = &self.chars {
-                chars.merge(piece, &mut cache.symbols, ids);
-            } else if let Some(table) = &self.merges {
+            if let Some(table) = &self.merges {
                 // Under `ignore_merges` a piece that is an entry is that entry:
                 // the model's map is asked when the piece can be one (the
                 // lookup is the piece mapped to the alphabet as a string, its
@@ -2120,6 +2138,26 @@ impl NativeEncoder {
                 }
             }
         }
+        self.remember_piece(bytes, key, start, ids, cache);
+        Ok(())
+    }
+
+    /// Remembers `ids[start..]` as the encoding of `piece` in the thread's
+    /// cache: the packed table for a piece with a key, the map for one of up
+    /// to `CACHED_PIECE_MAX_BYTES`, the long tier, by bytes, for one of up
+    /// to `LONG_PIECE_MAX_BYTES`; each within the thread's share. Inlined
+    /// into both slow paths: out of line it is a call frame per cache miss
+    /// on every vocabulary (four to eight instructions per token on a cold
+    /// byte-level text, counted).
+    #[inline(always)]
+    fn remember_piece(
+        &self,
+        piece: &[u8],
+        key: Option<ShortPieceKey>,
+        start: usize,
+        ids: &[u32],
+        cache: &mut PieceCache,
+    ) {
         if let Some(key) = key {
             let share = self.piece_cache_share();
             if cache.short_entries() >= share {
@@ -2129,14 +2167,14 @@ impl NativeEncoder {
                 .packed
                 .get_or_insert_with(ShortPieceTable::new)
                 .insert(key, &ids[start..], share);
-        } else if bytes.len() <= CACHED_PIECE_MAX_BYTES {
+        } else if piece.len() <= CACHED_PIECE_MAX_BYTES {
             let share = self.piece_cache_share();
             if cache.short_entries() >= share {
                 cache.clear_short(share);
             }
-            cache.short.insert(bytes.into(), ids[start..].into());
-        } else if cacheable {
-            let entry = LONG_PIECE_ENTRY_BYTES + bytes.len() + size_of_val(&ids[start..]);
+            cache.short.insert(piece.into(), ids[start..].into());
+        } else if piece.len() <= LONG_PIECE_MAX_BYTES {
+            let entry = LONG_PIECE_ENTRY_BYTES + piece.len() + size_of_val(&ids[start..]);
             let share = self.long_piece_bytes_share();
             if entry <= share {
                 if cache.long_bytes + entry > share {
@@ -2144,10 +2182,128 @@ impl NativeEncoder {
                     cache.long_bytes = 0;
                 }
                 cache.long_bytes += entry;
-                cache.long.insert(bytes.into(), ids[start..].into());
+                cache.long.insert(piece.into(), ids[start..].into());
             }
         }
-        Ok(())
+    }
+
+    /// A unit of the sentencepiece path (see [`sentencepiece`]): the raw
+    /// text cut into pieces by the character tables, each piece probed in
+    /// the thread's cache by its raw bytes (the key read from the text
+    /// around it, as [`Self::tokenize_piece_at`] reads one), its spelling in
+    /// the vocabulary's form made for a merge alone. The word marker before
+    /// the text (`marker`) joins the first piece as a space, or stands alone
+    /// when no token bridges it to the first byte. Out of line, as
+    /// [`Self::encode_single_stage`]. Nothing on this path declines a piece.
+    #[inline(never)]
+    fn encode_sentencepiece(
+        &self,
+        chars: &CharSymbols,
+        text: &str,
+        marker: bool,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) {
+        let bytes = text.as_bytes();
+        // A text that starts with a space or a marker has its marker already.
+        let mut leading = marker && !(text.starts_with(' ') || text.starts_with(WORD_MARKER));
+        if leading && chars.cuts_at(&[b' ', bytes[0]], 1) {
+            self.tokenize_leading_piece(chars, "", mapped, ids, cache);
+            leading = false;
+        }
+        chars.pieces(
+            bytes,
+            #[inline(always)]
+            |start, end| {
+                if leading {
+                    leading = false;
+                    self.tokenize_leading_piece(chars, &text[start..end], mapped, ids, cache);
+                } else {
+                    self.tokenize_raw_piece(chars, text, start..end, mapped, ids, cache);
+                }
+            },
+        );
+    }
+
+    /// The piece `text[piece]` of a sentencepiece unit: the key read from
+    /// the text around it and the packed table's probe; the rest out of line.
+    #[inline(always)]
+    fn tokenize_raw_piece(
+        &self,
+        chars: &CharSymbols,
+        text: &str,
+        piece: Range<usize>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) {
+        let key = ShortPieceKey::at(text.as_bytes(), piece.start, piece.end);
+        if let Some(key) = key {
+            if let Some(packed) = &cache.packed {
+                if packed.ids_into(key, ids) {
+                    return;
+                }
+            }
+        }
+        self.tokenize_raw_piece_slow(chars, &text[piece], key, mapped, ids, cache);
+    }
+
+    /// The first piece of a unit the word marker goes before: the marker,
+    /// a space in the raw form, followed by the piece. Once per unit.
+    #[inline(never)]
+    fn tokenize_leading_piece(
+        &self,
+        chars: &CharSymbols,
+        piece: &str,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) {
+        let mut spaced = String::with_capacity(piece.len() + 1);
+        spaced.push(' ');
+        spaced.push_str(piece);
+        let key = ShortPieceKey::of(spaced.as_bytes());
+        if let Some(key) = key {
+            if let Some(packed) = &cache.packed {
+                if packed.ids_into(key, ids) {
+                    return;
+                }
+            }
+        }
+        self.tokenize_raw_piece_slow(chars, &spaced, key, mapped, ids, cache);
+    }
+
+    /// The rest of [`Self::tokenize_raw_piece`], out of line: the longer
+    /// pieces' cache (by the raw bytes), the seed, the merge from the
+    /// piece's character symbols in the vocabulary's form, and the cache
+    /// insert.
+    #[inline(never)]
+    fn tokenize_raw_piece_slow(
+        &self,
+        chars: &CharSymbols,
+        raw: &str,
+        key: Option<ShortPieceKey>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) {
+        let bytes = raw.as_bytes();
+        if key.is_none() && bytes.len() <= LONG_PIECE_MAX_BYTES {
+            if let Some(found) = cache.get(bytes) {
+                ids.extend_from_slice(found);
+                return;
+            }
+        }
+        let start = ids.len();
+        if !key.is_some_and(|key| self.seed.ids_into(key, ids)) {
+            chars.merge(
+                CharSymbols::normalized(raw, mapped),
+                &mut cache.symbols,
+                ids,
+            );
+        }
+        self.remember_piece(bytes, key, start, ids, cache);
     }
 
     /// The calling thread's piece cache for this encoder, made at the

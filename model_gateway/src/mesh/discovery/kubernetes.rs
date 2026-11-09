@@ -386,7 +386,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::test_support::make_labeled_pod;
+    use crate::service_discovery::testing::make_labeled_pod;
 
     fn router_config_and_pod() -> (MeshDiscoveryConfig, Pod) {
         let mut router_selector = HashMap::new();

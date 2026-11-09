@@ -786,7 +786,7 @@ mod tests {
     use smg_data_connector::{MemoryConversationItemStorage, MemoryConversationStorage};
 
     use super::*;
-    use crate::test_support::json_of;
+    use crate::middleware::test_support::json_of;
 
     /// A client-supplied item id longer than the stores' id columns is refused
     /// at the handler, before any store is asked, so every backend answers the

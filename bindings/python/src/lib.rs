@@ -50,6 +50,25 @@ pub enum PolicyType {
     PrefixHash,
 }
 
+impl PolicyType {
+    /// The name the CLI's policy flags take for this policy, for a message
+    /// that reads the same from the binary and from here.
+    fn cli_name(&self) -> &'static str {
+        match self {
+            Self::Random => "random",
+            Self::RoundRobin => "round_robin",
+            Self::Passthrough => "passthrough",
+            Self::CacheAware => "cache_aware",
+            Self::PowerOfTwo => "power_of_two",
+            Self::LeastLoad => "least_load",
+            Self::Bucket => "bucket",
+            Self::Manual => "manual",
+            Self::ConsistentHashing => "consistent_hashing",
+            Self::PrefixHash => "prefix_hash",
+        }
+    }
+}
+
 #[pyclass(eq, from_py_object)]
 #[derive(Clone, PartialEq, Debug)]
 pub enum BackendType {
@@ -91,6 +110,20 @@ impl BackendType {
             Self::Sglang | Self::Vllm | Self::Tokenspeed | Self::Trtllm => return None,
         };
         Some(mode)
+    }
+
+    /// The wire a startup worker over ZMQ speaks when this backend names its
+    /// engine. The shared EngineCore handshake carries no engine identity, so
+    /// the wire cannot be probed; a provider or TensorRT-LLM pins none, and
+    /// without a backend the detection step decides, as it does for the CLI
+    /// without `--backend`.
+    fn startup_worker_runtime(&self) -> Option<worker::RuntimeType> {
+        match self {
+            Self::Vllm => Some(worker::RuntimeType::Vllm),
+            Self::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
+            Self::Sglang => Some(worker::RuntimeType::Sglang),
+            Self::Openai | Self::Anthropic | Self::Trtllm | Self::Gemini => None,
+        }
     }
 }
 
@@ -492,7 +525,7 @@ struct Router {
     admin_port: Option<u16>,
     api_key: Option<String>,
     assignment_mode: Option<String>,
-    backend: BackendType,
+    backend: Option<BackendType>,
     balance_abs_threshold: usize,
     balance_prefix_margin_tokens: u32,
     balance_rel_threshold: f32,
@@ -963,7 +996,9 @@ impl Router {
         .ok_or_else(|| config::ConfigError::InvalidValue {
             field: "power_of_two_load_metric".to_string(),
             value: self.power_of_two_load_metric.clone(),
-            reason: "expected expected_wait, requests or least_requests".to_string(),
+            reason: "expected expected_wait, requests, least_requests or \
+                     resident_tokens:<request_tokens>"
+                .to_string(),
         })?;
 
         let convert_policy = |policy: &PolicyType| -> config::ConfigResult<ConfigPolicyConfig> {
@@ -1020,9 +1055,29 @@ impl Router {
             })
         };
 
+        // The encode side takes the three policies the CLI's `--encode-policy`
+        // takes. The CLI refuses the others at the flag and the launcher at
+        // parse time; the binding refuses them here, before anything binds.
+        if let Some(policy) = &self.encode_policy {
+            if !matches!(
+                policy,
+                PolicyType::Random | PolicyType::RoundRobin | PolicyType::ConsistentHashing
+            ) {
+                return Err(config::ConfigError::InvalidValue {
+                    field: "encode_policy".to_string(),
+                    value: policy.cli_name().to_string(),
+                    reason: "expected random, round_robin or consistent_hashing".to_string(),
+                });
+            }
+        }
+
         // IGW selects routers per request; it does not change which configured
         // workers are registered at startup, or override backend/disaggregated modes.
-        let mode = if let Some(provider) = self.backend.provider_mode(&self.worker_urls) {
+        let provider = self
+            .backend
+            .as_ref()
+            .and_then(|backend| backend.provider_mode(&self.worker_urls));
+        let mode = if let Some(provider) = provider {
             provider
         } else if self.epd_disaggregation {
             RoutingMode::EncodePrefillDecode {
@@ -1166,19 +1221,15 @@ impl Router {
             None
         };
 
-        // `backend` normally only steers the routing mode. Over ZMQ it
-        // additionally pins the startup workers' runtime: the shared EngineCore
-        // handshake carries no engine identity, so the wire protocol cannot be
-        // probed. HTTP/gRPC keep auto-detection (None). Mirrors
+        // `backend` normally only steers the routing mode. Over ZMQ an engine
+        // backend additionally pins the startup workers' runtime. HTTP/gRPC,
+        // and ZMQ without a backend, keep auto-detection (None). Mirrors
         // `to_router_config` in model_gateway/src/cli/configure.rs.
         let startup_worker_runtime_type =
             if matches!(self.connection_mode, worker::ConnectionMode::Zmq) {
-                match self.backend {
-                    BackendType::Vllm => Some(worker::RuntimeType::Vllm),
-                    BackendType::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
-                    BackendType::Sglang => Some(worker::RuntimeType::Sglang),
-                    _ => None,
-                }
+                self.backend
+                    .as_ref()
+                    .and_then(BackendType::startup_worker_runtime)
             } else {
                 None
             };
@@ -1378,9 +1429,9 @@ impl Router {
     #[new]
     #[pyo3(signature = (
         worker_urls,
-        policy = PolicyType::RoundRobin,
+        policy = PolicyType::CacheAware,
         host = String::from("0.0.0.0"),
-        port = 3001,
+        port = 30000,
         // Every other parameter is keyword-only, in alphabetical order (the struct's
         // note says where a new one goes).
         *,
@@ -1389,7 +1440,7 @@ impl Router {
         admin_port = None,
         api_key = None,
         assignment_mode = None,
-        backend = BackendType::Sglang,
+        backend = None,
         balance_abs_threshold = 64,
         balance_prefix_margin_tokens = 0,
         balance_rel_threshold = 1.5,
@@ -1587,7 +1638,7 @@ impl Router {
         worker_stall_secs = 2,
         worker_startup_check_interval = 30,
         worker_startup_delay = 0,
-        worker_startup_timeout_secs = 600,
+        worker_startup_timeout_secs = 1800,
         worker_warmup_blocks = 1024,
         worker_warmup_divert_every = 8,
         worker_warmup_secs = 60,
@@ -1610,7 +1661,7 @@ impl Router {
         admin_port: Option<u16>,
         api_key: Option<String>,
         assignment_mode: Option<String>,
-        backend: BackendType,
+        backend: Option<BackendType>,
         balance_abs_threshold: usize,
         balance_prefix_margin_tokens: u32,
         balance_rel_threshold: f32,
@@ -2366,6 +2417,34 @@ mod tests {
                 engine.provider_mode(&urls).is_none(),
                 "{engine:?} is an engine backend: the disaggregation flags select its mode"
             );
+        }
+    }
+
+    /// An engine backend pins the wire its startup workers speak over ZMQ; no
+    /// backend, a provider and TensorRT-LLM leave the choice to the detection
+    /// step, as the CLI does without `--backend`.
+    #[test]
+    fn an_engine_backend_pins_its_wire_and_no_backend_pins_none() {
+        use worker::RuntimeType;
+        let pin = |backend: Option<BackendType>| {
+            backend
+                .as_ref()
+                .and_then(BackendType::startup_worker_runtime)
+        };
+        assert_eq!(pin(None), None);
+        assert_eq!(pin(Some(BackendType::Vllm)), Some(RuntimeType::Vllm));
+        assert_eq!(
+            pin(Some(BackendType::Tokenspeed)),
+            Some(RuntimeType::TokenSpeed)
+        );
+        assert_eq!(pin(Some(BackendType::Sglang)), Some(RuntimeType::Sglang));
+        for unpinned in [
+            BackendType::Openai,
+            BackendType::Anthropic,
+            BackendType::Trtllm,
+            BackendType::Gemini,
+        ] {
+            assert_eq!(unpinned.startup_worker_runtime(), None, "{unpinned:?}");
         }
     }
 
