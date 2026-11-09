@@ -273,9 +273,10 @@ class Router:
               one with the lower expected wait (least-load scoring over the pair)
             - PolicyType.LeastLoad: Route to the worker with the lowest load score
               (in-flight requests plus KV-cache pressure)
+            Default: PolicyType.CacheAware
         host: Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::,
             ::1), or 0.0.0.0 for all interfaces. Default: '0.0.0.0'
-        port: Port number to bind the router server. Default: 3001
+        port: Port number to bind the router server. Default: 30000
         worker_startup_timeout_secs: Timeout in seconds for worker startup and
             registration. Large models can take significant time to load into GPU
             memory. Default: 1800 (30 minutes)
@@ -292,7 +293,7 @@ class Router:
             Default: 200
         cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to
             cached worker if the match rate exceeds threshold, otherwise routes to the
-            worker with the smallest tree. Default: 0.5
+            worker with the smallest tree. Default: 0.3
         cache_boundaries: Token positions at which serving engines retain reusable
             prefix state; cache-affinity policies hash request heads at the deepest
             applicable boundary. Default: []
@@ -348,7 +349,7 @@ class Router:
         selection_temperature: Cache-aware softmax temperature over min-max
             normalized scores for event-driven selection. 0.0 is exact argmax;
             larger values spread picks across candidates. Default: 0.0
-        max_payload_size: Maximum payload size in bytes. Default: 256MB
+        max_payload_size: Maximum payload size in bytes. Default: 512 MiB
         max_tree_size: Maximum total size of each model's approximation tree for
             cache-aware routing (chars for HTTP, tokens for gRPC), shared across
             all workers; eviction keeps every tree at or under this bound.
