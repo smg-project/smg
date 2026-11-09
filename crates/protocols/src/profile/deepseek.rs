@@ -10,6 +10,26 @@
 //! self-hosted engine serves that call (the gateway shapes the call's grammar
 //! for where the engine starts it, after the thought or around it), and the
 //! vendor's own API refuses it by itself where it still does.
+//!
+//! The sampling and length fields are the client's: this profile fills none
+//! of them. The family's reference library (the vendor's own request
+//! conversion, deepseek-recipe 0.2.0) resolves them for the vendor's serving:
+//! `temperature` 1.0 in thinking mode; `top_p` at least 0.95 under V4.1
+//! thinking, 0.95 under V4 thinking with tools, 1.0 under V4 thinking without
+//! them and under V4.1 outside thinking; an absent `max_tokens` 8192 outside
+//! thinking, 65536 in it and 131072 at `max` effort, within the context left
+//! after the prompt; a `max_tokens` above 393216 and an `n` other than 1
+//! refused; `thinking.type: adaptive` read as `enabled`. A self-hosted engine
+//! fills an absent value with its own default (the checkpoint's generation
+//! config through the worker's sampling defaults, the engine's length
+//! default), bounds the budget by its own window, serves `n` choices and
+//! honours a value the client wrote; the gateway's window check reads the
+//! input alone, and `thinking.type` keeps the pair the vendor's API
+//! documents. The thinking toggle resolves as the library resolves it. The
+//! effort spellings do too, except that V4.1 keeps `medium` and `xhigh` for
+//! the checkpoint's own table where the library reads `medium` as `high`,
+//! and V4 reads `xhigh` as `high` where the library keeps the level (see
+//! `normalize_chat` and `alias_effort_for_upstream`).
 
 use serde_json::Value;
 
