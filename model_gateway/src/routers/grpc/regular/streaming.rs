@@ -5676,11 +5676,16 @@ impl<'a> MessagesStream<'a> {
     }
 
     /// Phase 4: the `message_delta` with the stop reason and the usage. A
-    /// truncation stays max_tokens after a tool call started, as Chat keeps
+    /// truncation stays a truncation after a tool call started, as Chat keeps
     /// `length`: the call may be cut short.
     async fn send_message_delta(&mut self) -> Result<(), utils::StreamFailure> {
+        // The engines report the request's budget and the model's window
+        // alike as `length`; the spec tells them apart from the counts.
+        let truncation = self
+            .spec
+            .length_stop_reason(self.prompt_tokens, self.completion_tokens.total());
         let stop_reason = if self.finish_reason_str == "length" {
-            Some(messages::StopReason::MaxTokens)
+            Some(truncation.clone())
         } else if self.has_tool_calls || self.finish_reason_str == "tool_calls" {
             Some(messages::StopReason::ToolUse)
         } else if self.matched_stop.as_ref().is_some_and(Value::is_string) {
@@ -5692,13 +5697,15 @@ impl<'a> MessagesStream<'a> {
             Some(messages::StopReason::EndTurn)
         };
         // Symphony's stop reason is the `Finish` event's; a stop sequence the decoder or the
-        // engine matched is reported as such, as the message says.
+        // engine matched is reported as such, as the message says, and its `max_tokens` is the
+        // engine's `length`, read against the budget as above.
         let stop_reason = match self.symphony_stop.take() {
             Some(messages::StopReason::EndTurn)
                 if self.matched_stop.as_ref().is_some_and(Value::is_string) =>
             {
                 Some(messages::StopReason::StopSequence)
             }
+            Some(messages::StopReason::MaxTokens) => Some(truncation),
             Some(stop) => Some(stop),
             None => stop_reason,
         };

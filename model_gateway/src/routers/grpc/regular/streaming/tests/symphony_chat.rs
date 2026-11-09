@@ -681,6 +681,8 @@ pub(super) fn assigned_message(
 ) -> MessagesResponseSpec {
     MessagesResponseSpec {
         prompt_tokens: 0,
+        max_tokens: 4096,
+        context_window: None,
         first_tool_call_only: false,
         thinking_requested: thinking,
         thinking_text_returned: true,
@@ -879,13 +881,22 @@ async fn two_symphony_messages_never_share_a_tool_use_id() {
 
 #[tokio::test]
 async fn symphony_message_stop_reasons_follow_the_finish_and_the_matched_stop() {
-    // The token limit.
-    let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    // The token limit: the five tokens are the whole budget.
+    let mut spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    spec.max_tokens = 5;
     let (result, events) =
         message_events(vec![chunk(0, "Hello"), complete(0, "length")], spec, None).await;
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(message_blocks(&events)[0].2, "Hello");
     assert_eq!(message_stop_reason(&events), "max_tokens");
+    // The same cut short of the budget: the window was filled.
+    let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    let (_, events) =
+        message_events(vec![chunk(0, "Hello"), complete(0, "length")], spec, None).await;
+    assert_eq!(
+        message_stop_reason(&events),
+        "model_context_window_exceeded"
+    );
     // The turn's end.
     let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
     let (_, events) =
