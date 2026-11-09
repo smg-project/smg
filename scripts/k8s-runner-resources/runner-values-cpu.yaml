@@ -195,8 +195,9 @@ template:
                 headers: { Authorization: 'Bearer ' + jwt, Accept: 'application/vnd.github+json', 'User-Agent': 'smg-ai-key-proxy' },
                 body: JSON.stringify({ permissions: { pull_requests: 'write', issues: 'write', metadata: 'read' } }),
               });
+              const text = await reply.text();  // njs: no await inside a call's arguments
               r.headersOut['Content-Type'] = 'application/json';
-              r.return(reply.status, await reply.text());
+              r.return(reply.status, text);
             } catch (e) {
               r.return(500, JSON.stringify({ error: String(e) }) + '\n');
             }
