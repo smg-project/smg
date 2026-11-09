@@ -294,7 +294,8 @@ impl Attempt {
     }
 
     /// Admit `principal`, whichever credential proved it: the role check (a
-    /// 403 for a method the role may not use), the admission line, the
+    /// 403 for a method the role may not use, or for a read kept to the
+    /// `admin` role), the admission line, the
     /// extension the handlers read, the request itself and, for a request
     /// that is not a read, the outcome line with the status the handler
     /// answered and the resource it named.
@@ -344,12 +345,14 @@ impl Attempt {
 /// 2. Attempts JWT validation first (if configured)
 /// 3. Falls back to API key validation (if configured)
 /// 4. Checks the principal's role against the request: `admin` for every
-///    method, `user` for the read-only ones (GET, HEAD)
+///    method, `user` for the read-only ones (GET, HEAD) that are not kept
+///    to the `admin` role ([`ControlPlaneAuthState::with_admin_only_reads`])
 /// 5. Writes the admission audit line and, after the handler of a request
 ///    that is not a read, the outcome line with its status and resource
 ///
 /// Returns 401 Unauthorized if authentication fails.
-/// Returns 403 Forbidden if the principal's role does not allow the method.
+/// Returns 403 Forbidden if the principal's role does not allow the method,
+/// or the read is one kept to the `admin` role.
 pub async fn control_plane_auth_middleware(
     State(auth_state): State<ControlPlaneAuthState>,
     request: Request<Body>,
