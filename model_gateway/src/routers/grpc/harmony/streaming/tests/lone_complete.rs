@@ -64,7 +64,10 @@ async fn streamed_events(frames: Vec<proto::GenerateResponse>, choices: u32) -> 
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
     let response = Arc::new(HarmonyStreamingProcessor::new())
         .process_streaming_chat_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
             Arc::new(request),
             dispatch,
             Vec::new(),

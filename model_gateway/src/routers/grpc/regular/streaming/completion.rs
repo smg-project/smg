@@ -43,7 +43,10 @@ use crate::{
 /// One backend stream of a `/v1/completions` request. Batched requests fan
 /// out into several, each remapped by a prompt-major choice-index offset.
 pub(super) enum CompletionStreamUnit {
-    Single(ProtoStream),
+    Single {
+        stream: ProtoStream,
+        dispatch_start: Instant,
+    },
     PrefillDecode {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
@@ -55,12 +58,11 @@ pub(super) enum CompletionStreamUnit {
 }
 
 impl CompletionStreamUnit {
-    /// The prefill dispatch instant of a disaggregated unit: the base its
-    /// TTFT and generation duration are measured from.
-    pub(super) fn prefill_start(&self) -> Option<Instant> {
+    /// The dispatch instant both TTFT and generation duration start from.
+    pub(super) fn generation_start(&self) -> Instant {
         match self {
-            Self::Single(_) => None,
-            Self::PrefillDecode { pd_timing, .. } => Some(pd_timing.prefill_start),
+            Self::Single { dispatch_start, .. } => *dispatch_start,
+            Self::PrefillDecode { pd_timing, .. } => pd_timing.prefill_start,
         }
     }
 }

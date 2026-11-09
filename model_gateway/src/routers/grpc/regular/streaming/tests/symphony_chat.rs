@@ -1027,7 +1027,10 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
             utils::ParserResolver::disabled(),
         )
         .process_non_streaming_messages_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             spec(),
             dispatch(),
             tokenizer,
@@ -1270,7 +1273,10 @@ async fn a_messages_call_whose_arguments_are_not_json_carries_the_prefixes_value
             utils::ParserResolver::disabled(),
         )
         .process_non_streaming_messages_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             spec(),
             dispatch(),
             tokenizer,
@@ -1927,7 +1933,10 @@ async fn a_decoders_end_that_fails_counts_the_output_as_failed_on_the_messages_p
             utils::ParserResolver::disabled(),
         )
         .process_non_streaming_messages_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             spec(),
             dispatch(),
             tokenizer,
@@ -2317,7 +2326,10 @@ async fn a_kimi_k3_thought_closed_by_the_answers_closer_reaches_the_client_once_
         utils::ParserResolver::disabled(),
     )
     .process_non_streaming_messages_response(
-        context::ExecutionResult::Single { stream },
+        context::ExecutionResult::Single {
+            stream,
+            dispatch_start: Instant::now(),
+        },
         spec(),
         dispatch(),
         tokenizer,
