@@ -45,6 +45,7 @@ use tracing::{
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::{
+    auth::fingerprint_of,
     edge_body::BodyDuties,
     metrics::{matched_path_label, BodyProgress, CLIENT_CLOSED_REQUEST_STATUS},
     request_id::RequestId,
@@ -139,12 +140,8 @@ impl AccessLogRecord {
     /// log.
     pub fn key_id(&self, key_hash: &[u8; 32]) {
         if self.fields.contains(AccessLogField::KeyId) {
-            let mut id = String::with_capacity(16);
-            for byte in &key_hash[..8] {
-                // Writing into a String cannot fail.
-                let _ = write!(id, "{byte:02x}");
-            }
-            self.span.record("key_id", id.as_str());
+            self.span
+                .record("key_id", fingerprint_of(key_hash).as_str());
         }
     }
 }

@@ -1,5 +1,6 @@
 //! Security integration tests
 
+pub mod admin_config_test;
 pub mod admin_listener_test;
 pub mod audit_resource_test;
 pub mod auth_integration_test;

@@ -387,6 +387,7 @@ fn get_endpoint(op_id: &str, summary: &str, resp_name: &str) -> PathItem {
 /// below reads it against the document, so the two cannot drift apart unseen.
 pub const CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
     ("GET", "/inflight"),
+    ("GET", "/config"),
     ("POST", "/flush_cache"),
     ("POST", "/start_profile"),
     ("POST", "/stop_profile"),
@@ -875,6 +876,31 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
                             "request_ids": {"type": "array", "items": {"type": "integer", "minimum": 0}}
                         },
                         "required": ["instance_id", "request_ids"]
+                    }),
+                ),
+            )),
+            ..PathItem::default()
+        },
+    );
+
+    paths.insert(
+        "/config".to_string(),
+        PathItem {
+            get: Some(operation(
+                "getEffectiveConfig",
+                "The effective configuration with every secret redacted: the admin role alone, mounted only with control-plane authentication",
+                None,
+                None,
+                inline_response(
+                    "The redacted configuration view: the build identity, the secret sources and the configuration",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "build": {"type": "object"},
+                            "secret_sources": {"type": "object"},
+                            "config": {"type": "object"}
+                        },
+                        "required": ["build", "secret_sources", "config"]
                     }),
                 ),
             )),

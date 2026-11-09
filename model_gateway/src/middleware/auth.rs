@@ -21,7 +21,7 @@
 //! probe) sit outside it: they forward the caller's header as they did and
 //! add no credential of their own, since there "no header" means anonymous.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fmt::Write as _, sync::Arc};
 
 use axum::{
     body::Body,
@@ -100,6 +100,22 @@ impl AuthConfig {
 
 fn hash_key(key: &str) -> [u8; 32] {
     Sha256::digest(key.as_bytes()).into()
+}
+
+/// The first 16 hex digits of the key's SHA-256: how the access log and the
+/// configuration view name a key without writing it.
+pub fn key_fingerprint(key: &str) -> String {
+    fingerprint_of(&hash_key(key))
+}
+
+/// [`key_fingerprint`] of a key already hashed.
+pub(crate) fn fingerprint_of(key_hash: &[u8; 32]) -> String {
+    let mut id = String::with_capacity(16);
+    for byte in &key_hash[..8] {
+        // Writing into a String cannot fail.
+        let _ = write!(id, "{byte:02x}");
+    }
+    id
 }
 
 /// The header names a provider reads its own key from, which an SDK may fill
