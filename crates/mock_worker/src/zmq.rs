@@ -162,6 +162,8 @@ struct LockstepGroup {
 struct SyncState {
     /// The ranks the group was made for.
     size: usize,
+    /// The ranks that have joined so far; the group is full at `size`.
+    joined: usize,
     /// The ranks still in the group; a rank that ends leaves.
     members: usize,
     arrived: usize,
@@ -185,6 +187,7 @@ impl LockstepGroup {
         Arc::new(Self {
             state: Mutex::new(SyncState {
                 size,
+                joined: 0,
                 members: size,
                 arrived: 0,
                 with_work: 0,
@@ -222,12 +225,18 @@ impl LockstepGroup {
             .outcome
     }
 
-    /// Whether a rank has left. A group that is ending takes no new rank: a
-    /// rank set started at the same address while the last one ends gets a
-    /// group of its own instead of a seat among the leavers.
-    fn ending(&self) -> bool {
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.members < state.size
+    /// Join one more rank, unless the group is full (the ranks it was made
+    /// for have joined) or ending (a rank has left). Either way a rank set
+    /// started at the same address gets a group of its own: never a place
+    /// among the leavers, never a share of a set that is complete.
+    fn join(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.joined < state.size && state.members == state.size {
+            state.joined += 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// A rank ended: the group's syncs no longer wait for it. Returns whether
@@ -279,18 +288,21 @@ fn lockstep_groups() -> &'static Mutex<HashMap<String, Arc<LockstepGroup>>> {
 }
 
 /// The lockstep group of the `size` ranks of this process that dial
-/// `handshake_address`: the one under that address while none of its ranks
-/// has left, else a new one in its place.
+/// `handshake_address`: the one under that address while it is not full
+/// and none of its ranks has left, else a new one in its place. The rank
+/// joins under the registry's lock, so two ranks arriving together cannot
+/// both start a group.
 fn lockstep_group(handshake_address: &str, size: usize) -> Arc<LockstepGroup> {
     let mut groups = lockstep_groups()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     if let Some(group) = groups.get(handshake_address) {
-        if !group.ending() {
+        if group.join() {
             return group.clone();
         }
     }
     let group = LockstepGroup::new(size);
+    group.join();
     groups.insert(handshake_address.to_string(), group.clone());
     group
 }
@@ -1918,6 +1930,39 @@ mod tests {
         assert!(
             current.is_some_and(|current| Arc::ptr_eq(&current, &new)),
             "the ending group's last leave took the new group out of the registry"
+        );
+    }
+
+    /// A full group takes no new rank either: a set whose joins straddle the
+    /// last set's first leave shares one group of its own, instead of one
+    /// rank placed among the old set and the other waiting alone in a new
+    /// group.
+    #[tokio::test]
+    async fn a_set_whose_joins_straddle_the_last_sets_first_leave_shares_one_group() {
+        let address = "lockstep-registry-straddling-waves";
+        let old = lockstep_group(address, 2);
+        assert!(
+            Arc::ptr_eq(&old, &lockstep_group(address, 2)),
+            "one group per set"
+        );
+        let membership = |group: &Arc<LockstepGroup>| Membership {
+            group: group.clone(),
+            handshake_address: address.to_string(),
+        };
+        let (first_rank, second_rank) = (membership(&old), membership(&old));
+        let new_first = lockstep_group(address, 2);
+        assert!(!Arc::ptr_eq(&old, &new_first), "a rank joined a full group");
+        drop(first_rank);
+        let new_second = lockstep_group(address, 2);
+        assert!(
+            Arc::ptr_eq(&new_first, &new_second),
+            "the new set was split across two groups"
+        );
+        drop(second_rank);
+        let current = lockstep_groups().lock().unwrap().get(address).cloned();
+        assert!(
+            current.is_some_and(|current| Arc::ptr_eq(&current, &new_first)),
+            "the old set's last leave took the new group out of the registry"
         );
     }
 }
