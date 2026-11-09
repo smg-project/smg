@@ -1768,7 +1768,10 @@ mod tests {
     use smg_grpc_client::VllmEngineClient;
 
     use super::*;
-    use crate::routers::grpc::{client::GrpcClient, test_engine::mock_engine};
+    use crate::{
+        routers::grpc::{client::GrpcClient, test_engine::mock_engine},
+        worker::test_support::select_worker,
+    };
 
     /// Only multimodal vLLM EPD owns EC state absent from its retained plan.
     /// The plan's kind, its media and the handoff kind each decide it
@@ -2039,10 +2042,7 @@ mod tests {
 
         let admission = PrefillAdmission::new(1, 0, std::time::Duration::from_secs(1));
         let admitted = match admission
-            .admit(Some(routing_key), {
-                let prefill = Arc::clone(&prefill);
-                move |capacity| capacity.select(Arc::clone(&prefill), ())
-            })
+            .admit(Some(routing_key), select_worker(&prefill))
             .await
         {
             Ok(admitted) => admitted,

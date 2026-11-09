@@ -985,8 +985,8 @@ mod tests {
     use crate::{
         config::types::PolicyConfig,
         worker::{
-            test_support::worker_of, BasicWorkerBuilder, PrefillAdmissionAttempt, Worker,
-            WorkerType,
+            test_support::{select_worker, worker_of},
+            BasicWorkerBuilder, PrefillAdmissionAttempt, Worker, WorkerType,
         },
     };
 
@@ -1364,13 +1364,7 @@ policy:
 
         let first = worker_of("http://prefill-1:8000", WorkerType::Prefill);
         registry.register(Arc::clone(&first)).unwrap();
-        let occupied = admission
-            .admit(None, {
-                let first = Arc::clone(&first);
-                move |capacity| capacity.select(Arc::clone(&first), ())
-            })
-            .await
-            .unwrap();
+        let occupied = admission.admit(None, select_worker(&first)).await.unwrap();
 
         let attempts = Arc::new(AtomicUsize::new(0));
         #[expect(
