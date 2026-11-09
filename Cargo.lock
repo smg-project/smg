@@ -3952,6 +3952,7 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "blake3",
+ "bytemuck",
  "bytes",
  "cc",
  "criterion",
@@ -3961,6 +3962,7 @@ dependencies = [
  "http",
  "image",
  "libloading",
+ "multiversion",
  "ndarray",
  "npyz",
  "once_cell",
@@ -4473,6 +4475,27 @@ name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
+
+[[package]]
+name = "multiversion"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18f07d0ab403c0c662001890da44da2500990d86e15788489cf9a94895f19e4e"
+dependencies = [
+ "multiversion-macros",
+]
+
+[[package]]
+name = "multiversion-macros"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e521b4032cf166c0d10a5d8598abd9858696612b9e2a4576ef97c7af4626bd6"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "rustversion",
+ "syn 3.0.3",
+]
 
 [[package]]
 name = "native-tls"
