@@ -347,7 +347,10 @@ the client reads the decode side's output.
   `bootstrap_room` (a 400, as the engines' disaggregated servers answer one),
   and a prefill worker one whose `bootstrap_port` is not the port it bound:
   its decode partner would rendezvous elsewhere for the handoff this mock
-  stands in for.
+  stands in for. A missing or null `bootstrap_port` reads as the engines'
+  default, 8998 (what the gateway sends for a prefill worker registered
+  without a port): the worker on that port takes it, one on another
+  refuses it.
 
 No KV moves between the two: the decode side has the prompt. ZMQ workers
 take no role, and one process gives the role to one wire's workers (worker
