@@ -964,10 +964,9 @@ def test_a_grpc_worker_startup_probe_names_its_serving_port_as_an_integer(form):
     container = worker_container(render(*settings)[1], "engine")
     probe = container["startupProbe"]
     assert "httpGet" not in probe
-    assert probe["grpc"]["port"] is not True and isinstance(probe["grpc"]["port"], int)
+    assert type(probe["grpc"]["port"]) is int
     assert probe["grpc"]["port"] == serving
-    (serve,) = [p for p in container["ports"] if p["name"] == "serve"]
-    assert serve["containerPort"] == serving
+    assert named(container["ports"], "serve")["containerPort"] == serving
 
 
 @needs_helm
