@@ -79,6 +79,7 @@ use unicode_normalization_alignments::UnicodeNormalization;
 
 mod cased;
 mod chain;
+mod long_entries;
 mod merge;
 mod nfc;
 mod pattern;
@@ -87,6 +88,7 @@ mod sentencepiece;
 mod short_pieces;
 mod unicode;
 
+use long_entries::LongEntryFilter;
 use merge::{ByteTokens, MergeTable};
 use nfc::NfcQuick;
 use pattern::Pattern;
@@ -229,6 +231,14 @@ impl SeededIds {
     fn as_slice(&self) -> &[u32] {
         &self.ids[..usize::from(self.count)]
     }
+}
+
+/// One vocabulary entry as the pass over the vocabulary reads it: a short
+/// piece with its ids, for the seed, or the bytes of a long one, for the
+/// filter the whole-piece lookup consults (see `long_entries`).
+enum Seeded {
+    Short(ShortPieceKey, SeededIds),
+    Long(Box<[u8]>),
 }
 
 /// One thread's cache of the pieces it met with one encoder, each with the
@@ -734,6 +744,14 @@ pub(crate) struct NativeEncoder {
     /// (see [`Self::tokenize_piece`]). A vocabulary with gaps in its ids has
     /// entries past that range the seed did not read, and keeps the lookup.
     seed_covers_short_entries: bool,
+    /// The vocabulary's entries longer than the seed's keys as a filter,
+    /// read with the seed when the pass read every entry (`None` on the
+    /// paths without the pass, on the sentencepiece path, whose pass reads
+    /// no long entry, and for a vocabulary with gaps, whose entries past the
+    /// range went unread): the whole-piece lookup `ignore_merges` asks for
+    /// on a long piece is spared when the filter refuses it (see
+    /// `long_entries` and [`Self::tokenize_piece`]).
+    long_entries: Option<LongEntryFilter>,
     /// The model's merges as a table a piece neither the thread's cache nor
     /// the seed holds is merged over; `None` for a model the table cannot
     /// stand in for, whose such pieces the model itself tokenizes.
@@ -845,6 +863,7 @@ impl NativeEncoder {
             alphabet: bytes_char(),
             seed: ShortPieceTable::for_entries(0),
             seed_covers_short_entries: false,
+            long_entries: None,
             merges,
             chars: None,
             piece_cache: ThreadLocal::new(),
@@ -900,6 +919,7 @@ impl NativeEncoder {
             alphabet: bytes_char(),
             seed: ShortPieceTable::for_entries(0),
             seed_covers_short_entries: false,
+            long_entries: None,
             merges: None,
             chars: Some(Box::new(chars)),
             piece_cache: ThreadLocal::new(),
@@ -1190,7 +1210,7 @@ impl NativeEncoder {
     /// of the pool, and the crate never clears a thread's cache of a dropped
     /// model.
     pub(crate) fn seed_vocabulary(&mut self, model: &ModelWrapper) {
-        (self.seed, self.seed_covers_short_entries) =
+        (self.seed, self.seed_covers_short_entries, self.long_entries) =
             Self::vocabulary_seed(model, &self.alphabet, self.chars.is_some());
     }
 
@@ -1202,12 +1222,12 @@ impl NativeEncoder {
         model: &ModelWrapper,
         alphabet: &[char; 256],
         chars: bool,
-    ) -> (ShortPieceTable, bool) {
+    ) -> (ShortPieceTable, bool, Option<LongEntryFilter>) {
         let ModelWrapper::BPE(bpe) = model else {
-            return (ShortPieceTable::for_entries(0), false);
+            return (ShortPieceTable::for_entries(0), false, None);
         };
         if bpe.dropout.is_some_and(|dropout| dropout > 0.0) {
-            return (ShortPieceTable::for_entries(0), false);
+            return (ShortPieceTable::for_entries(0), false, None);
         }
         let started = Instant::now();
         // The byte each alphabet character stands for, by character.
@@ -1215,48 +1235,80 @@ impl NativeEncoder {
         for (byte, &c) in alphabet.iter().enumerate() {
             byte_of[c as usize] = Some(byte as u8);
         }
-        // One slot per id that is an entry: the seeded piece, or `None` for an
-        // entry that is no short byte-level piece.
-        let entries: Vec<Option<(ShortPieceKey, SeededIds)>> = (0..bpe.get_vocab_size() as u32)
+        // One slot per id that is an entry: the seeded piece, the bytes of a
+        // long byte-level piece, or `None` for an entry that is no
+        // byte-level piece.
+        let entries: Vec<Option<Seeded>> = (0..bpe.get_vocab_size() as u32)
             .into_par_iter()
             .with_min_len(2048)
             .filter_map(|id| {
                 let entry = bpe.id_to_token(id)?;
                 let seeded = (|| {
-                    let key = if chars {
-                        ShortPieceKey::of(entry.as_bytes())?
-                    } else {
-                        let mut piece = [0u8; SHORT_PIECE_MAX_BYTES];
-                        let mut len = 0;
-                        for c in entry.chars() {
-                            *piece.get_mut(len)? = byte_of.get(c as usize).copied().flatten()?;
-                            len += 1;
+                    let ids_of = |entry: &str| {
+                        let mut ids = SeededIds::default();
+                        for token in &model.tokenize(entry).ok()? {
+                            ids.push(token.id)?;
                         }
-                        ShortPieceKey::of(&piece[..len])?
+                        Some(ids)
                     };
-                    let mut ids = SeededIds::default();
-                    for token in &model.tokenize(&entry).ok()? {
-                        ids.push(token.id)?;
+                    if chars {
+                        let key = ShortPieceKey::of(entry.as_bytes())?;
+                        return Some(Seeded::Short(key, ids_of(entry.as_str())?));
                     }
-                    Some((key, ids))
+                    let mut piece = [0u8; SHORT_PIECE_MAX_BYTES];
+                    let mut len = 0;
+                    // The bytes of an entry past the key's length, with the
+                    // key's bytes in front: a long entry for the filter.
+                    let mut long = Vec::new();
+                    for c in entry.chars() {
+                        let byte = byte_of.get(c as usize).copied().flatten()?;
+                        if len < SHORT_PIECE_MAX_BYTES {
+                            piece[len] = byte;
+                            len += 1;
+                        } else {
+                            if long.is_empty() {
+                                long.extend_from_slice(&piece);
+                            }
+                            long.push(byte);
+                        }
+                    }
+                    if !long.is_empty() {
+                        return Some(Seeded::Long(long.into_boxed_slice()));
+                    }
+                    let key = ShortPieceKey::of(&piece[..len])?;
+                    Some(Seeded::Short(key, ids_of(entry.as_str())?))
                 })();
                 Some(seeded)
             })
             .collect();
         let covers = entries.len() == bpe.get_vocab_size();
-        let seeded = entries.iter().flatten().count();
-        let mut table = ShortPieceTable::for_entries(seeded);
-        for (key, ids) in entries.iter().flatten() {
-            table.insert(*key, ids.as_slice(), seeded);
+        let short = entries
+            .iter()
+            .flatten()
+            .filter(|seeded| matches!(seeded, Seeded::Short(..)))
+            .count();
+        let long = entries.iter().flatten().count() - short;
+        let mut table = ShortPieceTable::for_entries(short);
+        let mut filter = LongEntryFilter::for_entries(long);
+        for seeded in entries.iter().flatten() {
+            match seeded {
+                Seeded::Short(key, ids) => {
+                    table.insert(*key, ids.as_slice(), short);
+                }
+                Seeded::Long(bytes) => filter.insert(bytes),
+            }
         }
+        let filter = (covers && !chars).then_some(filter);
         tracing::debug!(
             entries = table.len(),
             slots = table.slots(),
+            long_entries = long,
+            long_entry_bytes = filter.as_ref().map_or(0, LongEntryFilter::bytes),
             covers_short_entries = covers,
             ms = started.elapsed().as_millis() as u64,
             "the native encoder's vocabulary pieces"
         );
-        (table, covers)
+        (table, covers, filter)
     }
 
     /// This path's encoder for a tiktoken vocabulary, `ranks` as the file
@@ -1325,6 +1377,7 @@ impl NativeEncoder {
             alphabet: bytes_char(),
             seed: Self::ranks_seed(ranks),
             seed_covers_short_entries: false,
+            long_entries: None,
             merges: Some(merges),
             chars: None,
             piece_cache: ThreadLocal::new(),
@@ -2039,17 +2092,15 @@ impl NativeEncoder {
                 chars.merge(piece, &mut cache.symbols, ids);
             } else if let Some(table) = &self.merges {
                 // Under `ignore_merges` a piece that is an entry is that entry:
-                // the model's map is asked, except for a short piece the seed,
-                // holding every short entry, has just missed, which is none
-                // (the lookup is the piece mapped to the alphabet as a string,
-                // its hash, a probe of the map and a compare: a memory latency
-                // and more on a cold piece, measured).
-                let whole =
-                    if table.ignore_merges && !(self.seed_covers_short_entries && key.is_some()) {
-                        model.and_then(|model| model.token_to_id(self.mapped(bytes, mapped)))
-                    } else {
-                        None
-                    };
+                // the model's map is asked when the piece can be one (the
+                // lookup is the piece mapped to the alphabet as a string, its
+                // hash, a probe of the map and a compare: a memory latency and
+                // more on a cold piece, measured).
+                let whole = if table.ignore_merges && self.may_be_entry(key, bytes) {
+                    model.and_then(|model| model.token_to_id(self.mapped(bytes, mapped)))
+                } else {
+                    None
+                };
                 match whole {
                     Some(id) => ids.push(id),
                     // A cold piece of a unit with a non-ASCII byte merges
@@ -2137,6 +2188,21 @@ impl NativeEncoder {
             cache.clear_short(share);
         }
         cache
+    }
+
+    /// Whether a piece the thread's cache and the seed missed can still be
+    /// an entry of the vocabulary: a short piece (`key`) only when the seed
+    /// does not hold every short entry; a long piece only when the filter
+    /// over the long entries, when the seed's pass read them all, may hold
+    /// it (see `long_entries`).
+    fn may_be_entry(&self, key: Option<ShortPieceKey>, bytes: &[u8]) -> bool {
+        match key {
+            Some(_) => !self.seed_covers_short_entries,
+            None => self
+                .long_entries
+                .as_ref()
+                .is_none_or(|filter| filter.may_hold(bytes)),
+        }
     }
 
     /// The piece in the byte-level alphabet, the form the model's vocabulary
