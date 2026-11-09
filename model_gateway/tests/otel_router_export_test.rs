@@ -53,7 +53,6 @@ async fn a_router_request_under_tracing_reaches_the_collector_as_two_spans() {
     });
 
     let worker_url = mock_worker.start().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
     println!("Mock worker started on: {worker_url}");
 
     // 3. create router config and enable tracing
@@ -99,9 +98,8 @@ async fn a_router_request_under_tracing_reaches_the_collector_as_two_spans() {
     );
     println!("Logging initialized with OTEL layer");
 
-    // 5. Create a span and sleep for a while
+    // 5. The test's own span; its duration is nobody's assertion.
     let _span = info_span!(target: "smg::otel-trace", "test_router_with_tracing");
-    tokio::time::sleep(Duration::from_secs(1)).await;
     drop(_span);
 
     // 6. create app context and router
@@ -122,8 +120,9 @@ async fn a_router_request_under_tracing_reaches_the_collector_as_two_spans() {
         .await
         .expect("Failed to submit worker init job");
 
-    // 8. wait for worker initialization (detection + registration can take several seconds)
-    tokio::time::sleep(Duration::from_millis(3000)).await;
+    // 8. The worker's registration: the init job submits one AddWorker job per
+    // configured worker, whose workflow detects, registers and activates it.
+    common::wait_for_worker_registration(&app_context, &worker_url, Duration::from_secs(10)).await;
     println!("Workers initialized");
 
     // 9. create router

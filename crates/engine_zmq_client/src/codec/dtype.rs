@@ -63,6 +63,26 @@ pub enum Endianness {
     Native,
 }
 
+/// The dtype spellings this crate reads or writes, each as one static string:
+/// the numpy `dtype.str` forms the engine's ndarrays carry (the logprobs
+/// columns first, the common case) and the torch names its tensors and the
+/// multimodal payloads carry. A decoded array borrows its dtype from here, so
+/// a known spelling costs it no string.
+const KNOWN_SPELLINGS: &[&str] = &[
+    "<i8", "<f4", "<i4", "<f8", "<f2", "<u4", "<u8", "<i2", "<u2", "|u1", "|i1", "|b1", "float32",
+    "float16", "bfloat16", "float64", "int64", "int32", "int16", "int8", "uint64", "uint32",
+    "uint16", "uint8", "bool", ">i8", ">f4", ">i4", ">f8", ">f2", "=i8", "=f4", "=i4", "=f8",
+    "=f2",
+];
+
+/// `spelling` as the static string of the known table, when it is one.
+pub fn known_spelling(spelling: &str) -> Option<&'static str> {
+    KNOWN_SPELLINGS
+        .iter()
+        .copied()
+        .find(|known| *known == spelling)
+}
+
 /// Parse a numpy dtype string (e.g. `"<i4"`, `"float32"`) into a scalar type
 /// and byte order.
 pub fn parse_dtype(dtype: &str, field: &str) -> Result<(ScalarType, Endianness)> {
@@ -89,50 +109,6 @@ pub fn parse_dtype(dtype: &str, field: &str) -> Result<(ScalarType, Endianness)>
         }
     };
     Ok((scalar, endianness))
-}
-
-/// Decode a little/big/native-endian buffer into a `Vec<i32>`.
-pub fn decode_i32_vec(bytes: &[u8], endianness: Endianness, field: &str) -> Result<Vec<i32>> {
-    if !bytes.len().is_multiple_of(4) {
-        return Err(decode_error(
-            field,
-            &format!("byte length {} is not divisible by 4", bytes.len()),
-        ));
-    }
-    let mut cursor = Cursor::new(bytes);
-    let mut values = Vec::with_capacity(bytes.len() / 4);
-    while (cursor.position() as usize) < bytes.len() {
-        let value = match endianness {
-            Endianness::Little => cursor.read_i32::<LittleEndian>(),
-            Endianness::Big => cursor.read_i32::<BigEndian>(),
-            Endianness::Native => cursor.read_i32::<NativeEndian>(),
-        }
-        .map_err(|error| decode_error(field, &format!("failed to read i32 payload: {error}")))?;
-        values.push(value);
-    }
-    Ok(values)
-}
-
-/// Decode a little/big/native-endian buffer into a `Vec<i64>`.
-pub fn decode_i64_vec(bytes: &[u8], endianness: Endianness, field: &str) -> Result<Vec<i64>> {
-    if !bytes.len().is_multiple_of(8) {
-        return Err(decode_error(
-            field,
-            &format!("byte length {} is not divisible by 8", bytes.len()),
-        ));
-    }
-    let mut cursor = Cursor::new(bytes);
-    let mut values = Vec::with_capacity(bytes.len() / 8);
-    while (cursor.position() as usize) < bytes.len() {
-        let value = match endianness {
-            Endianness::Little => cursor.read_i64::<LittleEndian>(),
-            Endianness::Big => cursor.read_i64::<BigEndian>(),
-            Endianness::Native => cursor.read_i64::<NativeEndian>(),
-        }
-        .map_err(|error| decode_error(field, &format!("failed to read i64 payload: {error}")))?;
-        values.push(value);
-    }
-    Ok(values)
 }
 
 /// Decode a little/big/native-endian buffer into a `Vec<f32>`.
@@ -317,22 +293,17 @@ mod tests {
 
     #[test]
     fn decoders_respect_endianness() {
-        let le = 1_i32.to_le_bytes();
+        let le = 2.5_f32.to_le_bytes();
         assert_eq!(
-            decode_i32_vec(&le, Endianness::Little, "f").unwrap(),
-            vec![1]
-        );
-        let be = 1_i32.to_be_bytes();
-        assert_eq!(decode_i32_vec(&be, Endianness::Big, "f").unwrap(), vec![1]);
-        assert!(decode_i32_vec(&[0, 1, 2], Endianness::Little, "f").is_err());
-
-        let f = 2.5_f32.to_le_bytes();
-        assert_eq!(
-            decode_f32_vec(&f, Endianness::Little, "f").unwrap(),
+            decode_f32_vec(&le, Endianness::Little, "f").unwrap(),
             vec![2.5]
         );
-        let big = 7_i64.to_be_bytes();
-        assert_eq!(decode_i64_vec(&big, Endianness::Big, "f").unwrap(), vec![7]);
+        let be = 2.5_f32.to_be_bytes();
+        assert_eq!(
+            decode_f32_vec(&be, Endianness::Big, "f").unwrap(),
+            vec![2.5]
+        );
+        assert!(decode_f32_vec(&[0, 1, 2], Endianness::Little, "f").is_err());
     }
 
     #[test]

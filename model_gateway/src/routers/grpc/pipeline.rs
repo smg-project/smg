@@ -37,7 +37,7 @@ use super::{
     common::{
         response_formatting::TokenCounts,
         responses::{ResponsesContext, StreamStartupSender},
-        stages::*,
+        stages::{pd_protocol::PdProtocol, *},
     },
     context::*,
     harmony,
@@ -594,7 +594,10 @@ impl RequestPipeline {
             // re-stamped (engine ids, sampling defaults, the forced tool
             // call's shape, PD rooms) for the new workers. Buffered decode
             // state from the failed attempt is reset.
-            self.stages.worker_selection.reselect(dctx).await?;
+            self.stages
+                .worker_selection
+                .reselect(dctx, plan.as_ref().ok_or_else(consumed)?)
+                .await?;
             let workers = stage_output(dctx.workers.as_ref(), "run_attempt")?;
             dctx.clients = Some(
                 acquire_clients(
@@ -631,6 +634,7 @@ impl RequestPipeline {
             &attempt_plan,
             &dctx.dispatch_model,
             dctx.workers.as_ref(),
+            dctx.created,
         ));
 
         execute_plan(dctx, attempt_plan, last_attempt, self.request_timeout).await?;
@@ -721,6 +725,12 @@ impl RequestPipeline {
             };
             Metrics::record_request_buffers_released_early(plan.wire_len());
 
+            // Keep the original failure and metrics, without sleeping for a
+            // retry that cannot safely replay an encoder's replica-bound
+            // handoff (the selected runtime's encode handoff decides).
+            let encode_handoff = PdProtocol::encode_handoff(dctx.wire.runtime);
+            let retry_config =
+                retry_config.filter(|_| !plan.replays_replica_bound_handoff(encode_handoff));
             let max_attempts = retry_config.map_or(1, |config| config.max_retries.max(1));
             let mut plan = Some(plan);
             let mut spec = Some(spec);

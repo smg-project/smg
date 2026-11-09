@@ -10,7 +10,8 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
     trace_service_server::{TraceService, TraceServiceServer},
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
-use tokio::sync::oneshot;
+use tokio::{net::TcpListener, sync::oneshot};
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{transport::Server, Request as TonicRequest, Response, Status};
 
 #[derive(Clone)]
@@ -61,20 +62,19 @@ pub async fn start_collector(
     port: u16,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<TestOtelCollector, Box<dyn std::error::Error>> {
-    let addr = format!("0.0.0.0:{port}").parse()?;
+    // Bound before this returns: an exporter may connect at once.
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     let collector = TestOtelCollector::new();
     let collector_clone = collector.clone();
 
     tokio::spawn(async move {
         let _ = Server::builder()
             .add_service(TraceServiceServer::new(collector_clone))
-            .serve_with_shutdown(addr, async {
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
                 shutdown_rx.await.ok();
             })
             .await;
     });
-
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     Ok(collector)
 }

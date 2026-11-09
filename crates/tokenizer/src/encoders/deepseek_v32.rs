@@ -8,13 +8,12 @@
 use std::fmt::Write as _;
 
 use serde_json::Value;
-use thiserror::Error;
 
-// The message read, the index predicates, the JSON spelling, the OpenAI-shape
-// readers and the tools-and-response-format section are the V4 family's too
-// and come from `deepseek_common`. V3.2's tool-message handling, drop-thinking
-// role set, DSML argument rendering and tools template are different
-// algorithms and texts and stay here.
+// The error type, the message read, the index predicates, the JSON spelling,
+// the OpenAI-shape readers and the tools-and-response-format section are the
+// V4 family's too and come from `deepseek_common`. V3.2's tool-message
+// handling, drop-thinking role set, DSML argument rendering and tools template
+// are different algorithms and texts and stay here.
 use super::{
     deepseek_common::{
         after_last_user, at_or_after_last_user, find_last_user_index,
@@ -63,41 +62,15 @@ impl Default for EncodeParams {
     }
 }
 
-/// Errors raised when a message list is malformed.
-///
-/// Mirrors the Python `DS32EncodingError`.
-#[derive(Debug, Error)]
-pub enum DsEncodingError {
-    #[error("Index {index} out of range for messages list of length {len}")]
-    IndexOutOfRange { index: usize, len: usize },
-
-    #[error("Invalid message for role `{role}`: {msg}")]
-    InvalidMessage { role: String, msg: String },
-
-    #[error("Invalid messages at {index}: {context}")]
-    InvalidToolMessages { index: usize, context: String },
-
-    #[error("No tool calls but found tool output")]
-    NoToolCalls,
-
-    #[error("Unknown role: {0}")]
-    UnknownRole(String),
-
-    #[error("thinking mode: invalid message without reasoning_content/tool_calls after last user message: {0}")]
-    MissingReasoningOrToolCalls(String),
-
-    #[error("Failed to parse tool-call arguments as JSON: {0}")]
-    InvalidToolArgumentsJson(#[source] serde_json::Error),
-}
-
 // ---------------------------------------------------------------------------
-// Special-token constants: the family's shared ones come from `deepseek_common`
-// (re-exported under this renderer's path). Copied verbatim from the Python
-// source.
+// The family's public items, re-exported under this renderer's path: the
+// error type (one for the three renderers, returned from `encode_messages`;
+// the Python `DS32EncodingError` sentences are among its variants) and the
+// shared special-token constants, copied verbatim from the Python source.
 // ---------------------------------------------------------------------------
 
 pub use super::deepseek_common::{
-    BOS_TOKEN, DSML_TOKEN, EOS_TOKEN, THINKING_END_TOKEN, THINKING_START_TOKEN,
+    DsEncodingError, BOS_TOKEN, DSML_TOKEN, EOS_TOKEN, THINKING_END_TOKEN, THINKING_START_TOKEN,
 };
 
 /// What this renderer answers around a render (see [`RendererProfile`]).
@@ -228,13 +201,7 @@ fn render_message(
     messages: &[Value],
     thinking_mode: ThinkingMode,
 ) -> Result<String, DsEncodingError> {
-    let Some(msg) = messages.get(index) else {
-        return Err(DsEncodingError::IndexOutOfRange {
-            index,
-            len: messages.len(),
-        });
-    };
-    let turn = Turn::read(index, msg);
+    let turn = Turn::read(index, messages)?;
     let last_user_idx = find_last_user_index(messages);
     let mut prompt = String::new();
 
@@ -244,15 +211,7 @@ fn render_message(
 
     match turn.role {
         "system" => render_system(&mut prompt, &turn),
-        "developer" => {
-            if turn.content.is_empty() {
-                return Err(DsEncodingError::InvalidMessage {
-                    role: turn.role.to_string(),
-                    msg: turn.msg.to_string(),
-                });
-            }
-            render_developer(&mut prompt, &turn, opens_thinking);
-        }
+        "developer" => render_developer(&mut prompt, &turn, opens_thinking)?,
         "user" => render_user(&mut prompt, turn.content, opens_thinking),
         "tool" => {
             let position = tool_result_position(index, messages)?;
@@ -299,8 +258,13 @@ fn render_system(prompt: &mut String, turn: &Turn<'_>) {
 
 /// A developer message: a user message made of the tools and the response
 /// format it carries and its content under a heading, then the thinking
-/// token (the content is never empty: the caller refused an empty one).
-fn render_developer(prompt: &mut String, turn: &Turn<'_>, opens_thinking: bool) {
+/// token; an empty one is refused.
+fn render_developer(
+    prompt: &mut String,
+    turn: &Turn<'_>,
+    opens_thinking: bool,
+) -> Result<(), DsEncodingError> {
+    let content = turn.developer_content()?;
     let mut content_developer = String::new();
     push_tools_and_response_format(
         &mut content_developer,
@@ -308,11 +272,11 @@ fn render_developer(prompt: &mut String, turn: &Turn<'_>, opens_thinking: bool) 
         turn.response_format,
         render_tools,
     );
-    let content = turn.content;
     let _ = write!(content_developer, "\n\n# The user's message is: {content}");
 
     prompt.push_str(&user_msg(&content_developer));
     prompt.push_str(thinking_token(opens_thinking));
+    Ok(())
 }
 
 /// A user message: its content between the user and assistant tokens, then

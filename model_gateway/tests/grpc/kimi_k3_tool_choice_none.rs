@@ -11,11 +11,13 @@
 //! prompt is the chat prompt of the same request without its effort.
 //!
 //! The rendering tests run on a byte-level stand-in vocabulary with the K3
-//! control tokens, so they need no download. The count test is opt-in:
-//! `SMG_KIMI_K3_TOKENIZER_DIR` names a directory with the checkpoint's
-//! `tiktoken.model`, `tokenizer_config.json` and `config.json`; the prompt
-//! tokens the gateway bills (the renderer's own ids, less the response-channel
-//! stub it does not bill) must then fall in the verifier's accepted range,
+//! control tokens, so they need no download. The count test renders through
+//! the checkpoint's own tokenizer: `SMG_KIMI_K3_TOKENIZER_DIR` names a
+//! directory with its `tiktoken.model`, `tokenizer_config.json` and
+//! `config.json`, else the files are fetched once from the public checkpoint
+//! and the test skips only when the hub is unreachable; the prompt tokens the
+//! gateway bills (the renderer's own ids, less the response-channel stub it
+//! does not bill) must fall in the verifier's accepted range,
 //! `expected..=expected + 3`.
 #![expect(
     clippy::expect_used,
@@ -36,6 +38,7 @@ use openai_protocol::{
 };
 use serde_json::{json, Value};
 use smg::routers::grpc::{
+    tokenizer_cache::{ensure_kimi_k3_cached, KIMI_K3_TOKENIZER_DIR_ENV},
     utils::{
         process_chat_messages_with_encoding, process_messages_with_encoding, request_as_rendered,
         template_tools,
@@ -44,7 +47,6 @@ use smg::routers::grpc::{
 };
 use validator::Validate;
 
-const TOKENIZER_DIR_ENV: &str = "SMG_KIMI_K3_TOKENIZER_DIR";
 /// The verifier accepts `expected..=expected + MAX_PROMPT_TOKEN_OVERCOUNT`.
 const MAX_PROMPT_TOKEN_OVERCOUNT: u32 = 3;
 
@@ -252,11 +254,12 @@ fn k3_tool_choice_none_declares_the_tool_and_forbids_the_call() {
 
 #[test]
 fn the_kit_cases_count_the_vendors_prompt_tokens() {
-    let Ok(dir) = std::env::var(TOKENIZER_DIR_ENV) else {
-        println!("{TOKENIZER_DIR_ENV} is not set: skipping the prompt-token count against the vendor ground truth");
+    let Some(dir) = ensure_kimi_k3_cached() else {
+        println!("skipping the prompt-token count against the vendor ground truth: the hub is unreachable and {KIMI_K3_TOKENIZER_DIR_ENV} is not set");
         return;
     };
-    let tok = create_tokenizer(&dir).expect("the checkpoint's tokenizer");
+    let tok = create_tokenizer(dir.to_str().expect("utf-8 tokenizer path"))
+        .expect("the checkpoint's tokenizer");
     for id in ["k3_tool_none", "k3_tool_choice_none"] {
         let case = kit_case(id);
         let rendered = render(tok.as_ref(), &case.request);

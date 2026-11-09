@@ -18,6 +18,16 @@ jobs:
       contents: read
       pull-requests: write
     steps:
+      # The rule is the repository's script, the one the pre-push hook runs. A
+      # pull_request run takes this workflow from the pull request's own tree,
+      # so the script is read from that tree too: a ref to another branch would
+      # judge a pull request that adds or changes the script by a copy without
+      # it. No credentials stay in the checkout.
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/branch-name-check.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - name: Validate branch name
         env:
           BRANCH: ${{ github.head_ref }}
@@ -25,11 +35,18 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
-          REGEX='^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?(/[a-zA-Z0-9._-]+)+$'
-
-          if [[ "$BRANCH" =~ $REGEX ]]; then
+          # The script exits 0 for an accepted name and 1 for a refused one. Any
+          # other status means the check did not run: the job fails and the
+          # pull request stays open.
+          rc=0
+          bash scripts/branch-name-check.sh "$BRANCH" || rc=$?
+          if [ "$rc" -eq 0 ]; then
             echo "✅ Branch name is valid: '$BRANCH'"
             exit 0
+          fi
+          if [ "$rc" -ne 1 ]; then
+            echo "::error::The branch-name check did not run (exit $rc); the pull request stays open."
+            exit "$rc"
           fi
 
           # Post comment and close the PR
@@ -42,6 +59,8 @@ jobs:
           - \`<username>/<description>\` — e.g. \`changsu/fix-routing\`
 
           Allowed types: \`feat\`, \`fix\`, \`chore\`, \`docs\`, \`refactor\`, \`test\`, \`ci\`, \`perf\`
+
+          Names are lowercase (a dependency bot's branch keeps its own case); the rule is \`scripts/branch-name-check.sh\`, the one the pre-push hook runs.
 
           To fix, rename your branch locally, push the new branch, and open a new PR:
           \`\`\`bash

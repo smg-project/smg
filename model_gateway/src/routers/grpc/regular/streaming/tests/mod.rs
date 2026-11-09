@@ -1,13 +1,16 @@
+mod completion_failure;
 mod delta_slicing;
 pub(crate) mod eof;
 mod failure;
 mod generate_bytes;
 mod generate_decode;
 mod generate_finish;
+mod generate_frames;
 mod generate_tokens;
 mod isolation;
 mod local_stop;
 mod messages_bytes;
+mod messages_failure;
 mod pd_anchor;
 mod pd_usage;
 mod sse_bytes;
@@ -170,6 +173,104 @@ fn text_delta_frames_write_the_bytes_of_the_serialized_choice() {
     assert_eq!(text_delta(&neither), None, "no text");
 }
 
+/// A generate event written from the choice's escaped text is byte for byte
+/// the serialized event with the raw text: the chunks (quotes, a backslash,
+/// control bytes, a tab, a newline, a carriage return, characters of two,
+/// three and four bytes, a line separator, an empty chunk, a JSON-looking
+/// text) pushed one at a time, each step written as a chunk event and as a
+/// finish event, with and without logprobs, over several indices, with and
+/// without the frame's room owed.
+#[test]
+fn generate_event_frames_write_the_bytes_of_the_serialized_event() {
+    /// The event as serde serializes it from the raw text: the oracle.
+    #[derive(Serialize)]
+    struct SerializedEvent<'a> {
+        text: &'a str,
+        output_ids: &'a [u32],
+        meta_info: &'a GenerateMetaInfo<'a>,
+        index: u32,
+    }
+    let chunks = [
+        "Hello",
+        " \"quoted\"",
+        " back\\slash",
+        "\ttab\nnewline\rreturn",
+        "\u{0}\u{1f}\u{7f}",
+        "",
+        " caf\u{e9}",
+        " \u{65e5}\u{672c}\u{8a9e}",
+        " \u{1f600}",
+        " \u{2028}",
+        " {\"json\":[1,2]}",
+    ];
+    let input_logprobs = [vec![None], vec![Some(-0.25)]];
+    let output_logprobs = [vec![Some(-0.5)], vec![None, Some(-1.0)]];
+    for index in [0u32, 1, 7, u32::MAX] {
+        let mut escaped = EscapedText::default();
+        let mut raw = String::new();
+        for (step, chunk) in chunks.iter().enumerate() {
+            escaped.push_str(chunk);
+            raw.push_str(chunk);
+            let ids: Vec<u32> = chunk.chars().map(u32::from).collect();
+            for with_logprobs in [false, true] {
+                for (what, finish_reason, e2e_latency) in [
+                    ("chunk", None, None),
+                    (
+                        "finish",
+                        Some(utils::parse_finish_reason("length", 7)),
+                        Some(0.0123),
+                    ),
+                ] {
+                    let logprobs = with_logprobs.then_some(GenerateLogprobs {
+                        input_token_logprobs: Some(input_logprobs.as_slice()),
+                        output_token_logprobs: Some(output_logprobs.as_slice()),
+                    });
+                    let event = GenerateEvent {
+                        text: &escaped,
+                        output_ids: &ids,
+                        meta_info: GenerateMetaInfo {
+                            id: "gen-frames-0",
+                            finish_reason,
+                            prompt_tokens: 10,
+                            weight_version: "v7",
+                            logprobs,
+                            completion_tokens: step as u32 + 1,
+                            cached_tokens: 3,
+                            reasoning_tokens: 1,
+                            e2e_latency,
+                        },
+                        index,
+                    };
+                    let mut expected = b"data: ".to_vec();
+                    serde_json::to_writer(
+                        &mut expected,
+                        &SerializedEvent {
+                            text: &raw,
+                            output_ids: &ids,
+                            meta_info: &event.meta_info,
+                            index,
+                        },
+                    )
+                    .expect("the event serializes");
+                    expected.extend_from_slice(b"\n\n");
+                    for room_owed in [0, FRAME_ROOM] {
+                        let mut got = BytesMut::new();
+                        let mut owed = room_owed;
+                        StreamingProcessor::write_generate_event(&mut got, &mut owed, &event, what)
+                            .expect("the event writes");
+                        assert_eq!(
+                            got.as_ref(),
+                            expected.as_slice(),
+                            "index {index}, step {step} {chunk:?}, logprobs {with_logprobs}, {what}, room owed {room_owed}"
+                        );
+                        assert_eq!(owed, 0, "the write takes the room owed");
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
     use smg_grpc_client::sglang_proto as proto;
@@ -241,7 +342,7 @@ fn continuous_chat_usage_accumulates_delta_ids_without_double_counting_complete(
 /// in both the message_start skeleton and the final message_delta usage.
 #[test]
 fn messages_usage_cache_counters_serialize_as_integer_zeros() {
-    let start = serde_json::to_value(StreamingProcessor::initial_messages_usage()).unwrap();
+    let start = serde_json::to_value(StreamingProcessor::initial_messages_usage(0)).unwrap();
     assert_eq!(start["input_tokens"], 0);
     assert_eq!(start["output_tokens"], 0);
     assert_eq!(start["cache_creation_input_tokens"], 0);
@@ -283,7 +384,11 @@ fn message_delta_cache_read_input_tokens_is_the_engines_hit() {
 /// turn that ran with thinking and no such key otherwise.
 #[test]
 fn messages_usage_always_present_keys_and_thinking_tokens() {
-    let start = serde_json::to_value(StreamingProcessor::initial_messages_usage()).unwrap();
+    let start = serde_json::to_value(StreamingProcessor::initial_messages_usage(25)).unwrap();
+    // The skeleton reports the prompt's count, as the public API's reference
+    // stream does, and no output yet.
+    assert_eq!(start["input_tokens"], 25);
+    assert_eq!(start["output_tokens"], 0);
     assert_eq!(
         start["cache_creation"],
         serde_json::json!({"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0})
@@ -415,6 +520,19 @@ fn finish_preserves_pending_decode_errors() {
     assert!(error.to_string().contains("pending token decode failed"));
 }
 
+/// The SSE frame of a Messages event written the plain way: the event's type line, then the
+/// whole event through serde.
+fn serialized_messages_event(event: &MessageStreamEvent) -> Vec<u8> {
+    let mut bytes = format!(
+        "event: {}\ndata: ",
+        StreamingProcessor::message_event_type_name(event)
+    )
+    .into_bytes();
+    serde_json::to_writer(&mut bytes, event).expect("the event serializes");
+    bytes.extend_from_slice(b"\n\n");
+    bytes
+}
+
 /// The one-pass `content_block_delta` frames write exactly the bytes of the
 /// serialized event, so the literal head can never drift from serde's walk of
 /// the two tagged enums: every string delta variant, several block indices and
@@ -422,16 +540,6 @@ fn finish_preserves_pending_decode_errors() {
 /// and the other events keep the serialized whole.
 #[test]
 fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
-    fn serialized(event: &MessageStreamEvent) -> Vec<u8> {
-        let mut bytes = format!(
-            "event: {}\ndata: ",
-            StreamingProcessor::message_event_type_name(event)
-        )
-        .into_bytes();
-        serde_json::to_writer(&mut bytes, event).expect("the event serializes");
-        bytes.extend_from_slice(b"\n\n");
-        bytes
-    }
     fn formatted(event: &MessageStreamEvent) -> Vec<u8> {
         let mut buffer = BytesMut::with_capacity(64);
         StreamingProcessor::format_messages_sse_into(&mut buffer, event)
@@ -468,7 +576,7 @@ fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
                 let event = MessageStreamEvent::ContentBlockDelta { index, delta };
                 assert_eq!(
                     formatted(&event),
-                    serialized(&event),
+                    serialized_messages_event(&event),
                     "index {index}, text {text:?}"
                 );
             }
@@ -487,9 +595,9 @@ fn messages_delta_frames_write_the_bytes_of_the_serialized_event() {
             }),
         },
     };
-    assert_eq!(formatted(&citation), serialized(&citation));
+    assert_eq!(formatted(&citation), serialized_messages_event(&citation));
     let stop = MessageStreamEvent::ContentBlockStop { index: 3 };
-    assert_eq!(formatted(&stop), serialized(&stop));
+    assert_eq!(formatted(&stop), serialized_messages_event(&stop));
     assert_eq!(
         formatted(&stop),
         b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\n"

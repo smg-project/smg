@@ -32,6 +32,7 @@ use crate::{
         registry::WorkerId,
         BasicWorker, ConnectionMode, RuntimeType,
     },
+    workflow::steps::local::test_support::labels_of,
 };
 
 fn make_app_context(workers: &[Arc<dyn Worker>]) -> Arc<AppContext> {
@@ -161,13 +162,6 @@ fn make_refresh_context(
         snapshot: Some(snapshot),
     };
     WorkflowContext::new(WorkflowInstanceId::new(), data)
-}
-
-fn labels_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-        .collect()
 }
 
 /// A gRPC decode worker over `labels`, with `discovered` on record as the
@@ -1190,7 +1184,7 @@ async fn zmq_update_preserves_transport_state_and_the_live_client() {
 /// entry the old worker was keeping alive.
 #[tokio::test]
 async fn http_update_adopts_the_materialized_shared_client() {
-    let client = Arc::new(crate::clients::http_client());
+    let client = Arc::new(crate::server::http_client());
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://w:8080")
             .http_client(Arc::clone(&client))
@@ -1216,7 +1210,7 @@ async fn http_update_adopts_the_materialized_shared_client() {
 async fn http_update_preserves_http2() {
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://w:8080")
-            .http_client(Arc::new(crate::clients::http_client()))
+            .http_client(Arc::new(crate::server::http_client()))
             .http2(true)
             .status(WorkerStatus::Ready)
             .build(),
@@ -1329,13 +1323,6 @@ async fn a_refused_rank_leaves_no_partial_update_behind() {
     );
 }
 
-fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect()
-}
-
 /// A worker as registration builds it: its card derived from the spec and
 /// the labels, the labels on the worker.
 fn registered(spec: WorkerSpec, labels: HashMap<String, String>) -> Arc<dyn Worker> {
@@ -1376,7 +1363,7 @@ fn registered_worker(
 async fn a_label_refresh_re_derives_the_model_card_from_the_engines_labels() {
     let worker = discovered(
         WorkerSpec::new("http://w:8000"),
-        labels(&[("served_model_name", "m"), ("max_model_len", "4096")]),
+        labels_of(&[("served_model_name", "m"), ("max_model_len", "4096")]),
     );
     assert_eq!(
         worker.context_length("m"),
@@ -1386,7 +1373,7 @@ async fn a_label_refresh_re_derives_the_model_card_from_the_engines_labels() {
     assert!(!worker.models().remove(0).model_type.supports_vision());
     let app_ctx = make_app_context(std::slice::from_ref(&worker));
 
-    let fresh = labels(&[
+    let fresh = labels_of(&[
         ("served_model_name", "m"),
         ("max_model_len", "32768"),
         ("supports_vision", "true"),
@@ -1429,7 +1416,7 @@ async fn a_label_refresh_re_derives_the_model_card_from_the_engines_labels() {
 async fn the_model_card_follows_a_label_update() {
     let worker = registered(
         WorkerSpec::new("http://w:8000"),
-        labels(&[
+        labels_of(&[
             ("served_model_name", "m"),
             ("max_model_len", "4096"),
             ("model_type", "llama"),
@@ -1441,7 +1428,7 @@ async fn the_model_card_follows_a_label_update() {
     let mut ctx = make_context(
         Arc::clone(&app_ctx),
         Arc::clone(&worker),
-        labels(&[
+        labels_of(&[
             ("served_model_name", "other"),
             ("max_model_len", "8192"),
             ("model_type", "qwen3"),
@@ -1481,13 +1468,13 @@ async fn the_model_card_follows_a_label_update() {
 async fn a_card_value_set_by_hand_stands_over_a_label_update() {
     let mut spec = WorkerSpec::new("http://w:8000");
     spec.models = WorkerModels::Single(Box::new(ModelCard::new("m").with_context_length(2048)));
-    let worker = registered(spec, labels(&[("max_model_len", "4096")]));
+    let worker = registered(spec, labels_of(&[("max_model_len", "4096")]));
     assert_eq!(worker.context_length("m"), Some(2048), "as registered");
     let app_ctx = make_app_context(std::slice::from_ref(&worker));
     let mut ctx = make_context(
         Arc::clone(&app_ctx),
         Arc::clone(&worker),
-        labels(&[("max_model_len", "8192")]),
+        labels_of(&[("max_model_len", "8192")]),
     );
     assert_eq!(
         UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap(),
@@ -1509,7 +1496,7 @@ async fn a_card_value_set_by_hand_stands_over_a_label_update() {
 async fn a_parser_override_from_a_label_update_must_be_known() {
     let worker = registered(
         WorkerSpec::new("http://w:8000"),
-        labels(&[("served_model_name", "m")]),
+        labels_of(&[("served_model_name", "m")]),
     );
     let app_ctx = make_app_context_with(
         std::slice::from_ref(&worker),
@@ -1518,7 +1505,7 @@ async fn a_parser_override_from_a_label_update_must_be_known() {
     let mut unknown = make_context(
         Arc::clone(&app_ctx),
         Arc::clone(&worker),
-        labels(&[("tool_parser", "definitely-not-a-parser")]),
+        labels_of(&[("tool_parser", "definitely-not-a-parser")]),
     );
     let err = UpdateWorkerPropertiesStep
         .execute(&mut unknown)
@@ -1534,7 +1521,7 @@ async fn a_parser_override_from_a_label_update_must_be_known() {
     let mut known = make_context(
         Arc::clone(&app_ctx),
         Arc::clone(&worker),
-        labels(&[("tool_parser", "json")]),
+        labels_of(&[("tool_parser", "json")]),
     );
     assert_eq!(
         UpdateWorkerPropertiesStep
@@ -1573,7 +1560,7 @@ async fn an_external_workers_cards_are_left_as_they_are() {
         let mut ctx = make_context(
             Arc::clone(&app_ctx),
             Arc::clone(&worker),
-            labels(&[
+            labels_of(&[
                 ("is_embedding", "true"),
                 ("model_type", "chat"),
                 ("max_model_len", "8192"),
@@ -1607,11 +1594,11 @@ async fn an_external_workers_cards_are_left_as_they_are() {
 async fn a_conflicting_parser_override_from_a_label_update_is_warned_about() {
     let peer = registered(
         WorkerSpec::new("http://peer:8000"),
-        labels(&[("served_model_name", "m"), ("tool_parser", "json")]),
+        labels_of(&[("served_model_name", "m"), ("tool_parser", "json")]),
     );
     let worker = registered(
         WorkerSpec::new("http://w:8000"),
-        labels(&[("served_model_name", "m"), ("tool_parser", "json")]),
+        labels_of(&[("served_model_name", "m"), ("tool_parser", "json")]),
     );
     let app_ctx = make_app_context_with(
         &[Arc::clone(&peer), Arc::clone(&worker)],
@@ -1620,7 +1607,7 @@ async fn a_conflicting_parser_override_from_a_label_update_is_warned_about() {
     let mut ctx = make_context(
         Arc::clone(&app_ctx),
         Arc::clone(&worker),
-        labels(&[("tool_parser", "pythonic")]),
+        labels_of(&[("tool_parser", "pythonic")]),
     );
     assert_eq!(
         UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap(),

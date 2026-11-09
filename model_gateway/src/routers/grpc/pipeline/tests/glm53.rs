@@ -134,6 +134,7 @@ async fn glm53_media_returns_normal_completion_and_stream_without_media_processi
 async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
     use crate::routers::grpc::{
         backend_client::BackendClient, client::GrpcClient, proto_wrapper::ProtoGenerateRequest,
+        spec::ResponseSpec,
     };
     // A transport listener is enough: construction never calls an engine RPC.
     let port = spawn_stub(GatedScheduler::default()).await;
@@ -268,6 +269,13 @@ async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
             .await
             .unwrap();
         assert!(matches!(built.plan, ExecutionPlan::PrefillDecode(_)));
+        if let ResponseSpec::Messages(spec) = &built.spec {
+            assert_eq!(
+                spec.prompt_tokens as usize,
+                token_ids.len(),
+                "the Messages spec carries the rendered prompt's count"
+            );
+        }
         for request in built.plan.generate_requests_mut() {
             let ProtoGenerateRequest::Sglang(request) = request else {
                 panic!("SGLang proto")
@@ -345,4 +353,43 @@ fn glm53_media_is_recorded_before_the_template_renders_it_as_text() {
         Some(1.0),
         "{body}"
     );
+}
+
+/// Chat preparation renders a `medium` effort on a GLM-5.3 model as
+/// `High`, the level z.ai maps it to (issue #5181).
+#[tokio::test]
+async fn glm53_medium_effort_is_rendered_as_high() {
+    use openai_protocol::validated::Normalizable;
+
+    let port = spawn_stub(GatedScheduler::default()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    register_worker_with_labels(&registry, port, WorkerType::Regular, LANGUAGE_MODEL_ONLY);
+    let deps = PipelineDeps::pair(
+        registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    );
+    let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).unwrap();
+    let components = glm53_components(registry).await;
+    let mut request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "zai-org/GLM-5.3",
+        "max_tokens": 8,
+        "reasoning_effort": "medium",
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .unwrap();
+    request.normalize();
+    assert_eq!(request.reasoning_effort.as_deref(), Some("high"));
+    let mut ctx = RequestContext::for_chat(Arc::new(request), None, MODEL.into(), components);
+    pipeline.stages.preparation.execute(&mut ctx).await.unwrap();
+    let Some(PreparationOutput::Chat {
+        processed_messages, ..
+    }) = ctx.state.preparation.as_ref()
+    else {
+        panic!("chat preparation")
+    };
+    let prompt = &processed_messages.text;
+    assert!(prompt.contains("Reasoning Effort: High"), "{prompt}");
 }

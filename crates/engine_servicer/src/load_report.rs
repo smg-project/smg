@@ -92,6 +92,17 @@ impl Aggregate {
     }
 }
 
+/// The mean of one per-rank figure over the entries a wire built, 0 with no
+/// entry: the aggregate's average throughput and utilization, which the
+/// entries carry from the servicer's own estimates and the wire's fill.
+pub(crate) fn mean(values: impl ExactSizeIterator<Item = f64>) -> f64 {
+    let count = values.len();
+    if count == 0 {
+        return 0.0;
+    }
+    values.sum::<f64>() / count as f64
+}
+
 /// The per-rank entries of a `GetLoads` answer, as every wire lists them:
 /// the snapshot's ranks (the one the request names, when it names one), each
 /// built by `reported` from its snapshot and its figures, then a zero-filled
@@ -133,6 +144,29 @@ pub(crate) fn rank_entries<L>(
         entries.into_iter().map(|(_, entry)| entry).collect(),
         Aggregate::of(shares),
     )
+}
+
+/// One rank's entry of [`rank_entries`], read alone: the rank `dp_rank`
+/// names (`None`: rank 0) as `load` reports it now, built by `reported`
+/// from its snapshot and its figures; a connected rank (below `ranks`)
+/// without a report as `unreported` builds it, zero-filled; a rank past the
+/// connected ones gets none. The relay's per-rank record reads this, so it
+/// stays the rank's entry of the full answer by construction.
+pub(crate) fn rank_entry<L>(
+    load: impl FnOnce(u32) -> Option<SchedulerLoadSnapshot>,
+    kv_capacity_tokens: i32,
+    ranks: usize,
+    dp_rank: Option<i32>,
+    reported: impl FnOnce(&SchedulerLoadSnapshot, &RankFigures) -> L,
+    unreported: impl FnOnce(i32) -> L,
+) -> Option<L> {
+    let rank = dp_rank.unwrap_or(0);
+    let index = u32::try_from(rank).ok()?;
+    match load(index) {
+        Some(load) => Some(reported(&load, &RankFigures::of(&load, kv_capacity_tokens))),
+        None if usize::try_from(index).is_ok_and(|index| index < ranks) => Some(unreported(rank)),
+        None => None,
+    }
 }
 
 #[cfg(test)]
@@ -236,6 +270,13 @@ mod tests {
         assert_eq!(silent, vec![-1]);
     }
 
+    /// The mean of a per-rank figure over the entries built; zero with none.
+    #[test]
+    fn the_mean_of_a_figure_over_the_entries_is_zero_with_none() {
+        assert_eq!(mean(std::iter::empty()), 0.0);
+        assert_eq!(mean([1.0, 2.0, 6.0].into_iter()), 3.0);
+    }
+
     /// The aggregate sums the ranks (saturating) and averages their usage;
     /// with no rank every figure is zero.
     #[test]
@@ -276,5 +317,39 @@ mod tests {
         );
         assert_eq!((empty.running, empty.waiting, empty.total), (0, 0, 0));
         assert_eq!(empty.avg_usage, 0.0);
+    }
+
+    /// One rank read alone is that rank's entry of the full answer: a
+    /// reported rank from its snapshot, a connected rank without a report
+    /// zero-filled, a rank past the connected ones absent, `None` naming
+    /// rank 0.
+    #[test]
+    fn a_rank_read_alone_is_its_entry_of_the_full_answer() {
+        let snapshot = vec![load(0, 1, 2, 0.5), load(2, 3, 4, 0.25)];
+        let reported = |load: &SchedulerLoadSnapshot, figures: &RankFigures| {
+            (
+                figures.dp_rank,
+                Some((load.num_running_reqs, figures.waiting)),
+            )
+        };
+        let unreported = |rank: i32| (rank, None);
+        for dp_rank in [None, Some(0), Some(1), Some(2), Some(3)] {
+            let alone = rank_entry(
+                |index| {
+                    snapshot
+                        .iter()
+                        .find(|load| u32::try_from(load.dp_rank) == Ok(index))
+                        .cloned()
+                },
+                1_000,
+                3,
+                dp_rank,
+                reported,
+                unreported,
+            );
+            let (entries, _) =
+                rank_entries(snapshot.clone(), 1_000, 3, dp_rank, reported, unreported);
+            assert_eq!(alone, entries.first().copied(), "rank {dp_rank:?}");
+        }
     }
 }

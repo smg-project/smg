@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 import pytest
-from infra.constants import ConnectionMode, Runtime
+from infra.constants import ConnectionMode, Runtime, zmq_backend
 
 # setup_backend pulls in the cloud SDKs; skip if the env lacks them.
 setup_backend = pytest.importorskip("fixtures.setup_backend")
 
 
 @pytest.mark.parametrize(
-    "engine", [Runtime.VLLM.value, Runtime.TOKENSPEED.value, Runtime.SGLANG.value]
+    "engine",
+    [Runtime.VLLM.value, Runtime.TOKENSPEED.value, Runtime.SGLANG.value, Runtime.MOCK.value],
 )
 def test_zmq_allowed_for_capable_engines(engine):
     # Does not raise.
     setup_backend._validate_connection_mode(ConnectionMode.ZMQ, engine)
+
+
+def test_zmq_backend_pins_the_mock_to_the_vllm_wire():
+    # The mock's ZMQ ranks speak the vLLM wire; an engine is its own backend.
+    assert zmq_backend(Runtime.MOCK.value) == Runtime.VLLM.value
+    for engine in (Runtime.VLLM.value, Runtime.TOKENSPEED.value, Runtime.SGLANG.value):
+        assert zmq_backend(engine) == engine
 
 
 @pytest.mark.parametrize("engine", [Runtime.TRTLLM.value, Runtime.MLX.value])

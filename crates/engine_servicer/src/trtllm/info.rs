@@ -2,11 +2,15 @@
 //! comes from the launcher's facts (what the engine's Python servicer reads
 //! off the LLM API's arguments and tokenizer) and from the handshake.
 
+use openai_protocol::worker::SchedulerLoadSnapshot;
 use smg_grpc_client::trtllm_proto as trt;
 use tonic::Status;
 
 use super::{State, HEALTHY};
-use crate::load_report::rank_entries;
+use crate::{
+    load_report::{rank_entries, rank_entry, RankFigures},
+    load_tracker::LoadEstimate,
+};
 
 /// `HealthCheck`: `OK` only with the engine link up and no drain announced,
 /// else the shared message (the Python servicer's status is its message too).
@@ -122,47 +126,23 @@ fn world_of(tensor: i32, pipeline: i32, context: i32) -> i32 {
 }
 
 /// `GetLoads`: the per-rank load from the shims' load tails (the figures the
-/// pushed record carries) in the gRPC response shape: every connected rank,
-/// zero-filled before its first tail, with the window and the KV capacity
-/// the servicer knows; the rank the request names alone when it names one.
-/// No queued token-work, rate or capacity yet: the shim's wire carries no
-/// timings for them.
+/// pushed record carries) in the gRPC response shape, with the servicer's
+/// own bookkeeping ([`crate::load_tracker`]) for the queued token-work, the
+/// prefill and generation throughput and the hit rate the tail does not
+/// carry, each rank's own: every connected rank, zero-filled before its
+/// first tail, with the window and the KV capacity the servicer knows; the
+/// rank the request names alone when it names one.
 pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<trt::GetLoadsResponse, Status> {
     let client = state.shared.engine()?;
-    let max_running_requests = state
-        .shared
-        .running_window(state.model.max_running_requests);
-    let max_total_num_tokens = state.shared.kv_capacity_tokens();
+    let capacity = Capacity::of(state);
     let ranks = state.shared.rank_count(state.model.data_parallel_size);
-    let entry = |dp_rank: i32, running: i32, waiting: i32, used_tokens: i32, usage: f64| {
-        trt::SchedulerLoad {
-            dp_rank,
-            num_running_reqs: running,
-            num_waiting_reqs: waiting,
-            num_total_reqs: running.saturating_add(waiting),
-            num_used_tokens: used_tokens,
-            max_total_num_tokens,
-            token_usage: usage,
-            utilization: usage,
-            max_running_requests,
-            ..Default::default()
-        }
-    };
     let (loads, _) = rank_entries(
         client.get_loads().loads,
-        max_total_num_tokens,
+        capacity.max_total_num_tokens,
         ranks,
         dp_rank,
-        |_, figures| {
-            entry(
-                figures.dp_rank,
-                figures.running,
-                figures.waiting,
-                figures.used_tokens,
-                figures.usage,
-            )
-        },
-        |dp_rank| entry(dp_rank, 0, 0, 0, 0.0),
+        |load, figures| reported_entry(state, load, figures, &capacity),
+        |dp_rank| unreported_entry(state, dp_rank, &capacity),
     );
     Ok(trt::GetLoadsResponse {
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -172,4 +152,97 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<trt::GetLoads
         dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
         loads,
     })
+}
+
+/// One rank's entry of [`loads`], built as that answer builds it and read
+/// alone: no timestamp, no version, no vector of the other ranks and this
+/// rank's estimate only, for the record the relay attaches to every batch
+/// and tick. `None` names the answer's first entry, rank 0 (a connected
+/// shim makes it a rank); a rank past the connected ones has no entry.
+pub(super) fn rank_load(state: &State, dp_rank: Option<i32>) -> Option<trt::SchedulerLoad> {
+    let client = state.shared.engine().ok()?;
+    let capacity = Capacity::of(state);
+    rank_entry(
+        |index| client.rank_load(index),
+        capacity.max_total_num_tokens,
+        state.shared.rank_count(state.model.data_parallel_size),
+        dp_rank,
+        |load, figures| reported_entry(state, load, figures, &capacity),
+        |rank| unreported_entry(state, rank, &capacity),
+    )
+}
+
+/// The capacity figures every rank's entry carries: the running window and
+/// the KV capacity the servicer knows.
+struct Capacity {
+    max_running_requests: i32,
+    max_total_num_tokens: i32,
+}
+
+impl Capacity {
+    fn of(state: &State) -> Self {
+        Self {
+            max_running_requests: state
+                .shared
+                .running_window(state.model.max_running_requests),
+            max_total_num_tokens: state.shared.kv_capacity_tokens(),
+        }
+    }
+}
+
+/// One rank's entry from its figures and the servicer's own estimate for it.
+fn entry(figures: &RankFigures, capacity: &Capacity, estimate: LoadEstimate) -> trt::SchedulerLoad {
+    trt::SchedulerLoad {
+        dp_rank: figures.dp_rank,
+        num_running_reqs: figures.running,
+        num_waiting_reqs: figures.waiting,
+        num_total_reqs: figures.total,
+        num_used_tokens: figures.used_tokens,
+        max_total_num_tokens: capacity.max_total_num_tokens,
+        token_usage: figures.usage,
+        utilization: figures.usage,
+        max_running_requests: capacity.max_running_requests,
+        num_waiting_uncached_tokens: estimate.queued_token_work,
+        gen_throughput: estimate.gen_throughput,
+        prefill_throughput: estimate.prefill_throughput,
+        cache_hit_rate: estimate.cache_hit_rate,
+    }
+}
+
+/// A reported rank's entry: the tail's figures with, from this servicer's
+/// own bookkeeping ([`crate::load_tracker`]), the queued token-work,
+/// prefill/generation throughput and hit rate the tail does not carry, the
+/// rank's own.
+fn reported_entry(
+    state: &State,
+    load: &SchedulerLoadSnapshot,
+    figures: &RankFigures,
+    capacity: &Capacity,
+) -> trt::SchedulerLoad {
+    entry(
+        figures,
+        capacity,
+        state
+            .shared
+            .loads
+            .estimate(load.dp_rank, load.num_waiting_reqs),
+    )
+}
+
+/// A connected rank no load tail has reported yet: a zero-filled entry with
+/// the servicer's own figures for the rank (see [`rank_entries`]).
+fn unreported_entry(state: &State, dp_rank: i32, capacity: &Capacity) -> trt::SchedulerLoad {
+    let zero = RankFigures {
+        dp_rank,
+        running: 0,
+        waiting: 0,
+        total: 0,
+        used_tokens: 0,
+        usage: 0.0,
+    };
+    entry(
+        &zero,
+        capacity,
+        state.shared.loads.estimate(dp_rank, i32::MAX),
+    )
 }

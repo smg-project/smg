@@ -11,7 +11,7 @@ use std::{
 
 use engine_zmq_client::{
     check_engine_layouts,
-    codec::{tensor::encode_with_aux_frames, OpaqueValue},
+    codec::{add_request_capacity, tensor::encode_with_aux_frames, OpaqueValue},
     connect_handshake,
     connector::{Client, EngineCoreClient, SglangClient, TokenSpeedClient, TrtllmClient},
     protocol::{
@@ -31,6 +31,7 @@ use futures::StreamExt;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerType};
 use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto as vllm};
+use tokio::time::Instant;
 
 #[cfg(unix)]
 use crate::sockets::unlink_stale_socket;
@@ -1047,7 +1048,8 @@ impl ZmqEngineClient {
         }
         let request =
             translate_encode_request(req, rendezvous).map_err(tonic::Status::invalid_argument)?;
-        let (payload, aux_frames) = encode_with_aux_frames(&request).map_err(zmq_status)?;
+        let (payload, aux_frames) =
+            encode_with_aux_frames(&request, add_request_capacity(0)).map_err(zmq_status)?;
         let residue = request.bootstrap_room.rem_euclid(encoders.len() as i64) as usize;
         client
             .send_typed(
@@ -1578,6 +1580,18 @@ impl ZmqEngineClient {
         }
     }
 
+    /// When the engine last sent an output batch of any kind, `None` before
+    /// the first (the ZMQ client's `last_output_at`): read whether or not
+    /// anything is in flight, and never moved by a dispatch.
+    pub fn last_output_at(&self) -> Option<Instant> {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.last_output_at(),
+            ZmqBackend::TokenSpeed(client) => client.last_output_at(),
+            ZmqBackend::Sglang(client) => client.last_output_at(),
+            ZmqBackend::Trtllm(client) => client.last_output_at(),
+        }
+    }
+
     /// Whether the engine's wire has shown a scheduler step without any
     /// token, so its silence is the scheduler's own (the ZMQ client's
     /// `reports_steps`).
@@ -1600,6 +1614,18 @@ impl ZmqEngineClient {
             ZmqBackend::TokenSpeed(client) => client.note_reports_steps(),
             ZmqBackend::Sglang(client) => client.note_reports_steps(),
             ZmqBackend::Trtllm(client) => client.note_reports_steps(),
+        }
+    }
+
+    /// A sign of the engine's progress from outside its output wire, a live
+    /// KV-event batch it published: the engine's silence ends now, as on an
+    /// output of any kind (the ZMQ client's `note_progress`).
+    pub fn note_progress(&self) {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.note_progress(),
+            ZmqBackend::TokenSpeed(client) => client.note_progress(),
+            ZmqBackend::Sglang(client) => client.note_progress(),
+            ZmqBackend::Trtllm(client) => client.note_progress(),
         }
     }
 
@@ -1645,17 +1671,7 @@ impl ZmqEngineClient {
         let loads: Vec<SchedulerLoadSnapshot> = self
             .engines()
             .iter()
-            .filter_map(|engine| {
-                let dp_rank = engine.engine_id.engine_index()?;
-                let load = self.engine_load(dp_rank)?;
-                Some(SchedulerLoadSnapshot {
-                    dp_rank: i32::try_from(dp_rank).unwrap_or(i32::MAX),
-                    num_running_reqs: i32::try_from(load.num_running).unwrap_or(i32::MAX),
-                    num_waiting_reqs: i32::try_from(load.num_waiting).unwrap_or(i32::MAX),
-                    token_usage: load.kv_cache_usage,
-                    ..Default::default()
-                })
-            })
+            .filter_map(|engine| self.rank_load(engine.engine_id.engine_index()?))
             .collect();
         WorkerLoadResponse {
             timestamp: String::new(),
@@ -1663,6 +1679,25 @@ impl ZmqEngineClient {
             loads,
             ..Default::default()
         }
+    }
+
+    /// One connected rank's entry of [`get_loads`](Self::get_loads), read
+    /// alone: what a per-rank reader (the relay's load record) wants, without
+    /// the vector of the other ranks. `None` for a rank not connected or not
+    /// reported yet.
+    pub fn rank_load(&self, dp_rank: u32) -> Option<SchedulerLoadSnapshot> {
+        self.engines()
+            .iter()
+            .any(|engine| engine.engine_id.engine_index() == Some(dp_rank))
+            .then(|| self.engine_load(dp_rank))
+            .flatten()
+            .map(|load| SchedulerLoadSnapshot {
+                dp_rank: i32::try_from(dp_rank).unwrap_or(i32::MAX),
+                num_running_reqs: i32::try_from(load.num_running).unwrap_or(i32::MAX),
+                num_waiting_reqs: i32::try_from(load.num_waiting).unwrap_or(i32::MAX),
+                token_usage: load.kv_cache_usage,
+                ..Default::default()
+            })
     }
 
     /// Keep the KV-transfer samples the engines report from now on, for
@@ -1834,6 +1869,7 @@ fn zmq_status_of(error: &engine_zmq_client::Error) -> tonic::Status {
         engine_zmq_client::Error::EngineCoreDead
         | engine_zmq_client::Error::EngineInputBlocked { .. }
         | engine_zmq_client::Error::EngineInputFull { .. }
+        | engine_zmq_client::Error::EngineInputBytesFull { .. }
         | engine_zmq_client::Error::ClientClosed { .. } => {
             tonic::Status::unavailable(error.to_string())
         }
@@ -2016,6 +2052,20 @@ mod tests {
             request_id: "req-1".to_string(),
         });
         assert_eq!(engine_failure.code(), Code::Internal, "{engine_failure:?}");
+    }
+
+    /// Byte-budget rejection remains retryable, including shared errors.
+    #[test]
+    fn retained_input_exhaustion_answers_unavailable() {
+        let status = zmq_status(engine_zmq_client::Error::Shared(Arc::new(
+            engine_zmq_client::Error::EngineInputBytesFull {
+                retained_bytes: 10,
+                request_bytes: 1,
+                limit_bytes: 10,
+            },
+        )));
+        assert_eq!(status.code(), Code::Unavailable);
+        assert!(status.message().contains("10 bytes"));
     }
 
     /// The failure the connector fans out to the requests in flight when its

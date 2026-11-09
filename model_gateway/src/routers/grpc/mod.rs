@@ -21,7 +21,13 @@ pub(crate) mod spec;
 pub(crate) mod test_engine;
 #[cfg(test)]
 pub(crate) mod testing;
+#[cfg(any(test, feature = "test-util"))]
+pub mod tokenizer_cache;
 pub mod utils; // Used by routers/http and bindings/golang
+/// The stream state machines' benchmark seams: what `benches/stream_state_machines.rs`
+/// drives, compiled for the crate's test targets only.
+#[cfg(any(test, feature = "test-util"))]
+pub use regular::streaming::bench::{EngineScript, StreamBench};
 pub mod zmq_client; // ZMQ backend adapter behind the vLLM client surface
 
 // Re-export for convenience

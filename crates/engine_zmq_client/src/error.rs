@@ -80,6 +80,15 @@ pub enum Error {
         limit_frames: usize,
         limit_bytes: usize,
     },
+    /// Queued and actively sending payloads would exceed the client's byte budget.
+    #[error(
+        "engine input retains {retained_bytes} bytes; request of {request_bytes} bytes exceeds the {limit_bytes} byte budget"
+    )]
+    EngineInputBytesFull {
+        retained_bytes: usize,
+        request_bytes: usize,
+        limit_bytes: usize,
+    },
     #[error("engine utility call failed: {message}")]
     UtilityCallFailed { message: String },
     #[error("utility call `{method}` got no reply within {timeout:?}")]

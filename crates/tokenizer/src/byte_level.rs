@@ -14,8 +14,10 @@
 //! the window's already-emitted prefix always consists of complete
 //! sequences, so the lossy decode of the pending bytes alone is the text the
 //! reference would emit: the same pieces at the same tokens, and over a
-//! whole stream exactly `decode(all_ids)`. The pending buffer holds at most
-//! the bytes since the last emission, normally one partial character.
+//! whole stream exactly `decode(all_ids)`, except at the end: the pending
+//! buffer holds at most the bytes since the last emission, normally one
+//! partial character, and the stream's end releases it as `decode` renders
+//! the same bytes minus a character the end cut short (see `cut_start`).
 
 use std::{
     borrow::Cow,
@@ -190,6 +192,27 @@ impl ByteLevelTableBuilder {
     }
 }
 
+/// The decoder kind of a `tokenizers` vocabulary as the load's log names it:
+/// the variant, with a `Sequence`'s members listed, `none` without a decoder.
+pub(crate) fn decoder_kind(decoder: Option<&DecoderWrapper>) -> String {
+    fn variant(decoder: &DecoderWrapper) -> String {
+        let debug = format!("{decoder:?}");
+        debug
+            .split(['(', ' ', '{'])
+            .next()
+            .unwrap_or(debug.as_str())
+            .to_owned()
+    }
+    match decoder {
+        None => "none".to_owned(),
+        Some(DecoderWrapper::Sequence(sequence)) => {
+            let members: Vec<String> = sequence.get_decoders().iter().map(variant).collect();
+            format!("Sequence({})", members.join(", "))
+        }
+        Some(decoder) => variant(decoder),
+    }
+}
+
 impl ByteLevelTable {
     /// `None` unless the tokenizer decodes with a plain `ByteLevel` decoder.
     pub(crate) fn build(tokenizer: &HfTokenizer) -> Option<Arc<Self>> {
@@ -217,7 +240,6 @@ impl ByteLevelTable {
     /// Decode a complete HF sequence using the same bytes as incremental decode.
     /// Unknown IDs are dropped, as in tokenizers; lossy UTF-8 conversion happens
     /// only after concatenation so characters may span token boundaries.
-    #[cfg(any(feature = "tokenizers-v1", test))]
     pub(crate) fn decode(&self, ids: &[TokenIdType], skip_special_tokens: bool) -> String {
         let mut bytes = Vec::with_capacity(ids.len().saturating_mul(4));
         for &id in ids {
@@ -227,10 +249,28 @@ impl ByteLevelTable {
                 }
             }
         }
-        match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+        text_of(bytes).0
+    }
+
+    /// [`Self::decode`] for a vocabulary that does not drop unknown ids:
+    /// `None` at the first id without an entry, before anything is rendered,
+    /// so the caller decodes the whole sequence its own way (the tiktoken
+    /// backend's crate decode, with its unknown-id error and its lossy
+    /// fallback); otherwise the same bytes, concatenated and converted once,
+    /// with whether the conversion was lossy, for the caller's log.
+    pub(crate) fn decode_known(
+        &self,
+        ids: &[TokenIdType],
+        skip_special_tokens: bool,
+    ) -> Option<(String, bool)> {
+        let mut bytes = Vec::with_capacity(ids.len().saturating_mul(4));
+        for &id in ids {
+            let (token_bytes, special) = self.token_bytes(id)?;
+            if !skip_special_tokens || !special {
+                bytes.extend_from_slice(token_bytes);
+            }
         }
+        Some(text_of(bytes))
     }
 
     /// Where `id` lives: its kind and its span in the store the kind names;
@@ -252,7 +292,6 @@ impl ByteLevelTable {
     /// and one slice of the store the kind picks; the step's piece, with the
     /// text slice's boundary checks, is not built for a decode that only
     /// concatenates bytes.
-    #[cfg(any(feature = "tokenizers-v1", test))]
     #[inline]
     fn token_bytes(&self, id: TokenIdType) -> Option<(&[u8], bool)> {
         let (kind, span) = self.locate(id)?;
@@ -279,10 +318,20 @@ impl ByteLevelTable {
     }
 }
 
+/// The text of concatenated token bytes: one UTF-8 conversion, lossy only
+/// when the sequence is not valid UTF-8 (a character cut by the sequence's
+/// end, or bytes that never formed one); the flag says it was lossy.
+fn text_of(bytes: Vec<u8>) -> (String, bool) {
+    match String::from_utf8(bytes) {
+        Ok(text) => (text, false),
+        Err(error) => (String::from_utf8_lossy(error.as_bytes()).into_owned(), true),
+    }
+}
+
 /// The bytes a token string stands for: its chars mapped through the
 /// byte-level alphabet when every one of them is in it, otherwise the string's
 /// own UTF-8 (how `ByteLevel::decode_chain` treats added tokens).
-fn push_token_bytes(token: &str, out: &mut Vec<u8>) {
+pub(crate) fn push_token_bytes(token: &str, out: &mut Vec<u8>) {
     let start = out.len();
     for ch in token.chars() {
         let mapped = usize::try_from(u32::from(ch))
@@ -360,6 +409,29 @@ fn settled(text: &str) -> bool {
     !text.is_empty() && !text.ends_with(char::REPLACEMENT_CHARACTER)
 }
 
+/// Where a character the input's end cut short begins in `bytes`: the index
+/// of a trailing sequence that is the valid start of a character and nothing
+/// more (`Utf8Error::error_len` is `None` there), or `bytes.len()` when the
+/// input ends on a complete character or on an invalid sequence. The bytes
+/// before it render as `String::from_utf8_lossy` renders them, a complete
+/// character as it is and an invalid sequence (a stray byte the model wrote)
+/// as the replacement character; the bytes from it on are the start of a
+/// character the model never finished, and a stream's end releases nothing
+/// for them.
+pub(crate) fn cut_start(bytes: &[u8]) -> usize {
+    let mut index = 0;
+    while index < bytes.len() {
+        match std::str::from_utf8(&bytes[index..]) {
+            Ok(_) => break,
+            Err(error) => match error.error_len() {
+                Some(invalid) => index += error.valid_up_to() + invalid,
+                None => return index + error.valid_up_to(),
+            },
+        }
+    }
+    bytes.len()
+}
+
 impl ByteLevelIncremental {
     /// The text `token_id` makes final: a whole token of valid text borrowed
     /// from the table (the common case), or a pending run's decode in the
@@ -421,6 +493,23 @@ impl IncrementalDecoder for ByteLevelIncremental {
         })
     }
 
+    fn finish_into(&mut self, out: &mut String) -> Result<bool> {
+        if self.pending.is_empty() {
+            return Ok(false);
+        }
+        // The emitted text ends at a character boundary, so the pending
+        // bytes alone are the tail `decode` renders for the whole stream:
+        // the complete characters among them as they are, an invalid
+        // sequence as the replacement character. A sequence the end cut
+        // short is left out: it is the start of a character the model never
+        // finished, and a replacement character for it would be ours.
+        let kept = &self.pending[..cut_start(&self.pending)];
+        let released = !kept.is_empty();
+        out.push_str(&String::from_utf8_lossy(kept));
+        self.pending.clear();
+        Ok(released)
+    }
+
     fn reset(&mut self) {
         self.pending.clear();
         self.text.clear();
@@ -430,7 +519,7 @@ impl IncrementalDecoder for ByteLevelIncremental {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
 
     use tokenizers::{
@@ -442,7 +531,7 @@ mod tests {
 
     use super::*;
 
-    const SPECIAL: &str = "<|im_end|>";
+    pub(crate) const SPECIAL: &str = "<|im_end|>";
     const ADDED: &str = "<tool>";
 
     fn alphabet() -> Vec<char> {
@@ -462,7 +551,7 @@ mod tests {
     /// bytes of a 4-byte emoji, "Ġà" (a space plus the lead byte of a 3-byte
     /// character) and "ï¿½" (the three bytes of a literal U+FFFD), so
     /// characters get split across tokens in every way the fixtures show.
-    fn byte_level_tokenizer() -> HfTokenizer {
+    pub(crate) fn byte_level_tokenizer() -> HfTokenizer {
         let mut vocab = Vocab::default();
         for (id, ch) in alphabet().into_iter().enumerate() {
             vocab.insert(ch.to_string(), id as u32);
@@ -512,6 +601,31 @@ mod tests {
         (steps, dec.pending().to_vec())
     }
 
+    /// The one-character byte-level token that stands for `byte`.
+    pub(crate) fn byte_token(byte: u8) -> String {
+        alphabet()
+            .into_iter()
+            .find(|&c| CHAR_BYTES[c as usize] == Some(byte))
+            .expect("every byte has a char")
+            .to_string()
+    }
+
+    /// The bytes `ids` stand for, in order, a skipped special token left out:
+    /// what the full decode renders and what a stream's bytes add up to.
+    pub(crate) fn bytes_of(tokenizer: &HfTokenizer, ids: &[u32], skip: bool) -> Vec<u8> {
+        let added = tokenizer.get_added_tokens_decoder();
+        ids.iter()
+            .filter(|id| !(skip && added.get(id).is_some_and(|token| token.special)))
+            .flat_map(|&id| {
+                let token = tokenizer.id_to_token(id).expect("a vocabulary id");
+                token
+                    .chars()
+                    .map(|c| CHAR_BYTES[c as usize].expect("a byte-level char"))
+                    .collect::<Vec<u8>>()
+            })
+            .collect()
+    }
+
     /// The reference: tokenizers' own incremental algorithm, step by step.
     fn hf_steps(tokenizer: &HfTokenizer, ids: &[u32], skip: bool) -> Vec<String> {
         let mut window = Vec::new();
@@ -531,6 +645,42 @@ mod tests {
                 .unwrap_or_default()
             })
             .collect()
+    }
+
+    #[test]
+    fn cut_start_finds_the_character_the_end_cut() {
+        // Complete text, an invalid sequence (a stray continuation byte, a
+        // surrogate's bytes, a four-byte start a letter interrupts) and a
+        // literal U+FFFD are kept whole: the full decode's rendering stands.
+        let kept: [&[u8]; 8] = [
+            b"",
+            b"abc",
+            "\u{E9}".as_bytes(),
+            &[0xA9],
+            &[0xA9, 0xA9],
+            &[0xED, 0xA0],
+            "\u{FFFD}".as_bytes(),
+            &[0xF0, 0x9F, 0x41],
+        ];
+        for bytes in kept {
+            assert_eq!(cut_start(bytes), bytes.len(), "{bytes:02X?}");
+        }
+        // The start of a character and nothing more is the cut, whatever
+        // precedes it: text, a stray byte, a complete character, a literal
+        // U+FFFD.
+        let cut: [(&[u8], usize); 8] = [
+            (&[0xC3], 0),
+            (&[0x41, 0xC3], 1),
+            (&[0xF0, 0x9F], 0),
+            (&[0xF0, 0x9F, 0x98], 0),
+            (&[0x20, 0xE0], 1),
+            (&[0xA9, 0xF0, 0x9F], 1),
+            (&[0xE0, 0xB5, 0x8D, 0xE0, 0xB4], 3),
+            (&[0xEF, 0xBF, 0xBD, 0xE2, 0x80], 3),
+        ];
+        for (bytes, start) in cut {
+            assert_eq!(cut_start(bytes), start, "{bytes:02X?}");
+        }
     }
 
     #[test]

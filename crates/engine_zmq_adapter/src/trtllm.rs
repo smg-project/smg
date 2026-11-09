@@ -54,6 +54,11 @@ impl TrtllmGenerateStream {
         }
     }
 
+    /// The choice index this stream stamps on its responses.
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+
     /// The engine-side id of this choice's request.
     pub fn request_id(&self) -> &str {
         self.inner.request_id()

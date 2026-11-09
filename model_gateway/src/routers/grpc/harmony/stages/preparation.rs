@@ -361,7 +361,7 @@ impl HarmonyPreparationStage {
         // Build tags for each tool - need two patterns per tool for reasoning on/off
         for tool in tools_to_use {
             let tool_name = &tool.function.name;
-            let params_schema = &tool.function.parameters;
+            let params_schema = tool.function.parameters_schema();
 
             // Pattern 1: For reasoning-enabled mode (with analysis channel before commentary)
             tags.push(json!({

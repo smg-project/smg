@@ -1,25 +1,118 @@
-//! Read-only RPCs: `HealthCheck`, `GetModelInfo`, `GetServerInfo`, `GetLoads`.
+//! The informational RPCs: `HealthCheck` (the Python servicer's one-token
+//! probe of the scheduler), `GetModelInfo`, `GetServerInfo`, `GetLoads`.
 //! Metadata comes from the launcher's config (what the Python servicer reads
 //! off TokenSpeed's `ModelConfig` and `ServerArgs`) and from the handshake.
 
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
 use engine_zmq_adapter::ZmqEngineClient;
+use futures::StreamExt;
+use openai_protocol::worker::SchedulerLoadSnapshot;
 use prost_types::Timestamp;
 use smg_grpc_client::tokenspeed_proto as ts;
 use tonic::Status;
 
-use super::{State, HEALTHY};
+use super::{generate, State};
 use crate::{
-    load_report::rank_entries,
+    health_probe::{self, Verdict},
+    load_report::{mean, rank_entries, rank_entry, RankFigures},
     proto_json::{insert_capacity, struct_from_json},
-    servicer::proto_token_ids,
+    servicer::{proto_token_ids, RequestOrigin},
 };
 
-/// `HealthCheck`: SERVING only with the engine link up and no drain announced.
-pub(super) fn health_check(state: &State) -> ts::HealthCheckResponse {
-    ts::HealthCheckResponse {
-        healthy: state.shared.is_serving(),
-        message: state.shared.health_message(HEALTHY).to_string(),
+/// What `HealthCheck` says of a scheduler that answered the probe, or
+/// pushed anything while it was out (the Python servicer's words).
+const PASSED: &str = "Health check passed";
+
+/// `HealthCheck`: unhealthy with the engine link down or the drain
+/// announced, as every wire; else the Python servicer's deep probe, a
+/// one-token request through [`generate::generate`], healthy once the
+/// scheduler pushed anything since the probe started or answered it,
+/// unhealthy the moment the probe fails, unhealthy at the servicer's bound
+/// with neither ([`health_probe::run`]). A disaggregated role (prefill,
+/// decode, encode) answers shallow, as the Python servicer does: its
+/// requests pair with a peer, so a lone probe would not reach the scheduler.
+pub(super) async fn health_check(state: &Arc<State>) -> ts::HealthCheckResponse {
+    health_check_with(state, state.health_probe_timeout).await
+}
+
+/// [`health_check`] with the probe's bound given.
+pub(super) async fn health_check_with(
+    state: &Arc<State>,
+    timeout: Duration,
+) -> ts::HealthCheckResponse {
+    if !state.shared.is_serving() {
+        return ts::HealthCheckResponse {
+            healthy: false,
+            message: state.shared.health_message(PASSED).to_string(),
+        };
     }
+    if health_probe::disaggregated_role(&state.model.server_args_json) {
+        return ts::HealthCheckResponse {
+            healthy: true,
+            message: health_probe::SHALLOW_MESSAGE.to_string(),
+        };
+    }
+    let client = match state.shared.engine() {
+        Ok(client) => client,
+        Err(status) => {
+            return ts::HealthCheckResponse {
+                healthy: false,
+                message: status.message().to_string(),
+            }
+        }
+    };
+    let verdict = health_probe::run(timeout, || client.last_output_at(), probe(state)).await;
+    ts::HealthCheckResponse {
+        healthy: verdict.healthy(),
+        message: match verdict {
+            Verdict::Passed => PASSED.to_string(),
+            Verdict::Failed => "Scheduler returned no output".to_string(),
+            Verdict::TimedOut => format!("Health check timeout after {}s", timeout.as_secs()),
+        },
+    }
+}
+
+/// The probe, as the Python servicer sends it: one token from the prompt
+/// `[0]` at temperature zero under a `HEALTH_CHECK_` id, resolved at its
+/// first output. It is the servicer's own, counted neither as a client's
+/// request nor as load ([`RequestOrigin::HealthProbe`]). Dropping it before
+/// the output aborts the request on the scheduler, as a client's stream
+/// does.
+async fn probe(state: &Arc<State>) -> Result<(), Status> {
+    let request = ts::GenerateRequest {
+        request_id: format!("HEALTH_CHECK_{}", probe_nanos()),
+        tokenized: Some(ts::TokenizedInput {
+            input_ids: vec![0],
+            original_text: String::new(),
+        }),
+        sampling_params: Some(ts::SamplingParams {
+            max_new_tokens: Some(1),
+            temperature: Some(0.0),
+            ..Default::default()
+        }),
+        stream: false,
+        ..Default::default()
+    };
+    let mut stream = generate::generate(state, request, RequestOrigin::HealthProbe).await?;
+    match stream.next().await {
+        Some(Ok(_)) => Ok(()),
+        Some(Err(status)) => Err(status),
+        None => Err(Status::internal(
+            "the probe's stream ended without an output",
+        )),
+    }
+}
+
+/// The probe id's suffix: nanoseconds since the epoch (the Python servicer
+/// stamps its clock the same way).
+fn probe_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos())
 }
 
 /// `GetModelInfo`: the launcher's config, with the handshake's context length
@@ -116,65 +209,135 @@ pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
 /// wire's load tail does not carry, each rank's own.
 pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsResponse, Status> {
     let client = state.shared.engine()?;
-    let max_total_num_tokens = state.shared.kv_capacity_tokens();
-    let max_running_requests = state
-        .shared
-        .running_window(state.model.max_running_requests);
+    if state.encode_role.is_some() {
+        // An encode worker has no scheduler: its engine runs the vision
+        // tower alone, with no running batch, no waiting queue and no KV
+        // cache, and its encode path feeds no load figure. The answer is
+        // the Python servicer's: no rank, an empty aggregate; the load
+        // record the relay and the records-only stream read from here is
+        // then none, so nothing is pushed for the role either.
+        return Ok(ts::GetLoadsResponse {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            version: "tokenspeed".to_string(),
+            dp_rank_count: 0,
+            loads: Vec::new(),
+            aggregate: Some(ts::AggregateMetrics::default()),
+        });
+    }
+    let capacity = Capacity::of(state);
     let ranks = state.shared.rank_count(state.model.data_parallel_size);
     let (loads, aggregate) = rank_entries(
         client.get_loads().loads,
-        max_total_num_tokens,
+        capacity.max_total_num_tokens,
         ranks,
         dp_rank,
-        |load, figures| {
-            let estimate = state
-                .shared
-                .loads
-                .estimate(load.dp_rank, load.num_waiting_reqs);
-            ts::SchedulerLoad {
-                dp_rank: figures.dp_rank,
-                num_running_reqs: figures.running,
-                num_waiting_reqs: figures.waiting,
-                num_total_reqs: figures.total,
-                num_used_tokens: figures.used_tokens,
-                max_total_num_tokens,
-                max_running_requests,
-                token_usage: figures.usage,
-                // The direct TokenSpeed wire reports active pages, excluding
-                // retained cache (unlike the Python legacy GetLoad projection).
-                active_token_usage: Some(figures.usage),
-                num_waiting_uncached_tokens: estimate.queued_token_work,
-                gen_throughput: estimate.gen_throughput,
-                prefill_throughput: estimate.prefill_throughput,
-                cache_hit_rate: estimate.cache_hit_rate,
-                ..Default::default()
-            }
-        },
-        |dp_rank| {
-            let estimate = state.shared.loads.estimate(dp_rank, i32::MAX);
-            ts::SchedulerLoad {
-                dp_rank,
-                max_running_requests,
-                max_total_num_tokens,
-                num_waiting_uncached_tokens: estimate.queued_token_work,
-                gen_throughput: estimate.gen_throughput,
-                prefill_throughput: estimate.prefill_throughput,
-                cache_hit_rate: estimate.cache_hit_rate,
-                ..Default::default()
-            }
-        },
+        |load, figures| reported_entry(state, load, figures, &capacity),
+        |dp_rank| unreported_entry(state, dp_rank, &capacity),
     );
+    let aggregate = ts::AggregateMetrics {
+        total_running_reqs: aggregate.running,
+        total_waiting_reqs: aggregate.waiting,
+        total_reqs: aggregate.total,
+        avg_token_usage: aggregate.avg_usage,
+        avg_throughput: mean(loads.iter().map(|load| load.gen_throughput)),
+        avg_utilization: mean(loads.iter().map(|load| load.utilization)),
+    };
     Ok(ts::GetLoadsResponse {
         timestamp: chrono::Utc::now().to_rfc3339(),
         version: "tokenspeed".to_string(),
         dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
         loads,
-        aggregate: Some(ts::AggregateMetrics {
-            total_running_reqs: aggregate.running,
-            total_waiting_reqs: aggregate.waiting,
-            total_reqs: aggregate.total,
-            avg_token_usage: aggregate.avg_usage,
-            ..Default::default()
-        }),
+        aggregate: Some(aggregate),
     })
+}
+
+/// One rank's entry of [`loads`], built as that answer builds it and read
+/// alone: no timestamp, no version, no vector of the other ranks and this
+/// rank's estimate only, for the record the relay attaches to every batch
+/// and tick. `None` names the answer's first entry, rank 0 (a connected
+/// engine makes it a rank); a rank past the connected ones has no entry, and
+/// an encode worker has none at all (it answers `GetLoads` with no rank).
+pub(super) fn rank_load(state: &State, dp_rank: Option<i32>) -> Option<ts::SchedulerLoad> {
+    let client = state.shared.engine().ok()?;
+    if state.encode_role.is_some() {
+        return None;
+    }
+    let capacity = Capacity::of(state);
+    rank_entry(
+        |index| client.rank_load(index),
+        capacity.max_total_num_tokens,
+        state.shared.rank_count(state.model.data_parallel_size),
+        dp_rank,
+        |load, figures| reported_entry(state, load, figures, &capacity),
+        |rank| unreported_entry(state, rank, &capacity),
+    )
+}
+
+/// The capacity figures every rank's entry carries: the running window and
+/// the KV capacity the servicer knows.
+struct Capacity {
+    max_running_requests: i32,
+    max_total_num_tokens: i32,
+}
+
+impl Capacity {
+    fn of(state: &State) -> Self {
+        Self {
+            max_running_requests: state
+                .shared
+                .running_window(state.model.max_running_requests),
+            max_total_num_tokens: state.shared.kv_capacity_tokens(),
+        }
+    }
+}
+
+/// A reported rank's entry: the snapshot's figures with, from this
+/// servicer's own bookkeeping ([`crate::load_tracker`]), the queued
+/// token-work, prefill/generation throughput and hit rate this wire's load
+/// tail does not carry, the rank's own.
+fn reported_entry(
+    state: &State,
+    load: &SchedulerLoadSnapshot,
+    figures: &RankFigures,
+    capacity: &Capacity,
+) -> ts::SchedulerLoad {
+    let estimate = state
+        .shared
+        .loads
+        .estimate(load.dp_rank, load.num_waiting_reqs);
+    ts::SchedulerLoad {
+        dp_rank: figures.dp_rank,
+        num_running_reqs: figures.running,
+        num_waiting_reqs: figures.waiting,
+        num_total_reqs: figures.total,
+        num_used_tokens: figures.used_tokens,
+        max_total_num_tokens: capacity.max_total_num_tokens,
+        max_running_requests: capacity.max_running_requests,
+        token_usage: figures.usage,
+        utilization: figures.usage,
+        // The direct TokenSpeed wire reports active pages, excluding
+        // retained cache (unlike the Python legacy GetLoad projection).
+        active_token_usage: Some(figures.usage),
+        num_waiting_uncached_tokens: estimate.queued_token_work,
+        gen_throughput: estimate.gen_throughput,
+        prefill_throughput: estimate.prefill_throughput,
+        cache_hit_rate: estimate.cache_hit_rate,
+        ..Default::default()
+    }
+}
+
+/// A connected rank no load tail has reported yet: a zero-filled entry with
+/// the servicer's own figures for the rank (see [`rank_entries`]).
+fn unreported_entry(state: &State, dp_rank: i32, capacity: &Capacity) -> ts::SchedulerLoad {
+    let estimate = state.shared.loads.estimate(dp_rank, i32::MAX);
+    ts::SchedulerLoad {
+        dp_rank,
+        max_running_requests: capacity.max_running_requests,
+        max_total_num_tokens: capacity.max_total_num_tokens,
+        num_waiting_uncached_tokens: estimate.queued_token_work,
+        gen_throughput: estimate.gen_throughput,
+        prefill_throughput: estimate.prefill_throughput,
+        cache_hit_rate: estimate.cache_hit_rate,
+        ..Default::default()
+    }
 }

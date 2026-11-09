@@ -1805,7 +1805,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict,
                 extra: Default::default(),
             },
@@ -2522,7 +2522,7 @@ mod tests {
         let one_call = value!({"type": "or", "elements": tools
             .iter()
             .filter(|tool| !tool.function.name.is_empty())
-            .map(|tool| call(&tool.function.name, tool.function.parameters.clone()))
+            .map(|tool| call(&tool.function.name, tool.function.parameters_schema().clone()))
             .collect::<Vec<_>>()});
         assert_eq!(
             payload,

@@ -18,10 +18,14 @@
 //!    loaded
 //! 5. Return least loaded worker that passes load check, or initial if all overloaded
 //!
-//! ## Complexity
+//! ## Complexity, per request
 //!
-//! - Hash computation: O(prefix_length)
-//! - Ring lookup: O(log n) binary search
+//! - Eligibility and load: one read per worker of the pool, into one list
+//!   (the load sum and the least-loaded fallback read it)
+//! - Hash computation: O(prefix_length) per boundary level, its ring key
+//!   spelled into a stack buffer
+//! - Ring lookup: O(log n) binary search, each probed node found in the list
+//!   by a scan of its URLs
 //! - Load balance fallback: O(n) scan for least loaded
 //!
 //! ## Comparison with cache_aware
@@ -35,7 +39,7 @@
 //!
 //! prefix_hash trades optimal cache utilization for predictable O(log n) performance.
 
-use std::sync::Arc;
+use std::{cell::Cell, sync::Arc};
 
 use tracing::debug;
 
@@ -209,6 +213,20 @@ impl PrefixHashPolicy {
             .map(|(idx, _)| idx)
     }
 
+    /// The ring key of a prefix hash: its sixteen lowercase hex digits, the
+    /// spelling the ring has always hashed, written into `buf`.
+    #[expect(
+        clippy::expect_used,
+        reason = "sixteen hex digits are ASCII, so the buffer is always a str"
+    )]
+    fn ring_key(prefix_hash: u64, buf: &mut [u8; 16]) -> &str {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        for (i, byte) in buf.iter_mut().enumerate() {
+            *byte = DIGITS[((prefix_hash >> (60 - 4 * i)) & 0xf) as usize];
+        }
+        std::str::from_utf8(buf).expect("hex digits are ASCII")
+    }
+
     /// Check if a worker's load is acceptable
     ///
     /// Overload requires clearing both the relative and the absolute margin,
@@ -257,27 +275,36 @@ impl PrefixHashPolicy {
 
         // Use pre-computed ring if available
         if let Some(ref ring) = info.hash_ring {
-            // Build URL to (index, worker) map for healthy workers
-            let healthy_url_map: std::collections::HashMap<&str, (usize, &Arc<dyn Worker>)> =
+            // The ring answers with a URL; its entry in the list is found by
+            // a scan (the last eligible worker at that URL, as the map this
+            // replaced answered).
+            let healthy_at = |url: &str| {
                 healthy_workers
                     .iter()
-                    .map(|(idx, w)| (w.url(), (*idx, *w)))
-                    .collect();
+                    .rfind(|(_, worker)| worker.url() == url)
+            };
 
             // Deepest ring target, kept as the all-overloaded fallback.
             let mut initial: Option<(usize, usize)> = None;
+            let mut key_buf = [0u8; 16];
             for &(level, key_bytes) in candidates {
                 let prefix_hash = xxhash_rust::xxh3::xxh3_64(key_bytes);
-                // Convert prefix hash to a ring key string for lookup
-                let key = format!("{prefix_hash:016x}");
+                let key = Self::ring_key(prefix_hash, &mut key_buf);
 
-                // Find this level's worker from the ring
-                let Some(initial_url) =
-                    ring.find_healthy_url(&key, |url| healthy_url_map.contains_key(url))
-                else {
+                // Find this level's worker from the ring; the probe that
+                // accepts the ring's answer keeps the entry it found, one
+                // scan per probed node.
+                let found = Cell::new(None);
+                if ring
+                    .find_healthy_url(key, |url| {
+                        found.set(healthy_at(url));
+                        found.get().is_some()
+                    })
+                    .is_none()
+                {
                     continue;
-                };
-                let Some(&(idx, worker)) = healthy_url_map.get(initial_url) else {
+                }
+                let Some(&(idx, worker)) = found.get() else {
                     continue;
                 };
 
@@ -1008,5 +1035,71 @@ mod tests {
         let key = format!("{hash:016x}");
         let expected_url = ring.find_healthy_url(&key, |_| true).unwrap();
         assert_eq!(workers[result.unwrap()].url(), expected_url);
+    }
+
+    /// Sixteen workers on a ring with boundaries at 64 and 256 tokens and
+    /// thirty-two prompts of 70 to 400 tokens: every prompt lands where it
+    /// did when a per-request URL map translated the ring's answer and the
+    /// ring key was a formatted string, with every worker eligible and with
+    /// three of them not ready. The placement is the ring's; neither the
+    /// translation nor the key's spelling may move it.
+    #[test]
+    fn the_recorded_prompt_set_lands_where_the_ring_placed_it() {
+        const RECORDED_ALL_ELIGIBLE: [usize; 32] = [
+            15, 6, 10, 15, 14, 8, 3, 4, 4, 9, 9, 7, 11, 7, 7, 10, 5, 11, 10, 6, 0, 6, 1, 6, 3, 1,
+            15, 11, 3, 11, 7, 3,
+        ];
+        const RECORDED_THREE_NOT_READY: [usize; 32] = [
+            15, 6, 10, 15, 14, 8, 8, 4, 4, 9, 9, 9, 12, 1, 1, 10, 5, 5, 10, 6, 0, 6, 1, 6, 15, 1,
+            15, 15, 9, 4, 0, 9,
+        ];
+        let policy = PrefixHashPolicy::new(PrefixHashConfig {
+            cache_boundaries: vec![64, 256],
+            ..Default::default()
+        });
+        let urls: Vec<String> = (0..16).map(|i| format!("http://w{i:02}:8000")).collect();
+        let workers = make_workers(&urls.iter().map(String::as_str).collect::<Vec<_>>());
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+        let prompts: Vec<Vec<u32>> = (0..32u32)
+            .map(|p| {
+                let len = 70 + (p * 37) % 331;
+                (0..len)
+                    .map(|i| (p / 4) * 1_000 + i * (1 + p % 3))
+                    .collect()
+            })
+            .collect();
+        let placements = |workers: &[Arc<dyn Worker>]| -> Vec<usize> {
+            prompts
+                .iter()
+                .map(|tokens| {
+                    let info = SelectWorkerInfo {
+                        tokens: Some(tokens),
+                        hash_ring: Some(ring.clone()),
+                        ..Default::default()
+                    };
+                    let (result, branch, _) = policy.select_worker_impl(workers, &info);
+                    assert_eq!(branch, Branch::RingHit, "prompt of {} tokens", tokens.len());
+                    result.expect("an eligible owner exists")
+                })
+                .collect()
+        };
+        assert_eq!(
+            placements(&workers),
+            RECORDED_ALL_ELIGIBLE,
+            "with every worker eligible the prompts placed {:?}",
+            placements(&workers)
+        );
+        for not_ready in [3, 7, 11] {
+            workers[not_ready].set_status(WorkerStatus::NotReady);
+        }
+        let moved = placements(&workers);
+        assert!(
+            !moved.contains(&3) && !moved.contains(&7) && !moved.contains(&11),
+            "a not-ready worker owns a prompt: {moved:?}"
+        );
+        assert_eq!(
+            moved, RECORDED_THREE_NOT_READY,
+            "with three workers not ready the prompts placed {moved:?}"
+        );
     }
 }

@@ -1,24 +1,129 @@
-//! Read-only RPCs: `HealthCheck`, `GetModelInfo`, `GetServerInfo`, `GetLoads`.
+//! The informational RPCs: `HealthCheck` (the Python servicer's one-token
+//! probe of the scheduler), `GetModelInfo`, `GetServerInfo`, `GetLoads`.
 //! Metadata comes from the launcher's config (what the Python servicer reads
 //! off SGLang's `ModelConfig` and `ServerArgs`) and from the handshake.
 
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use futures::StreamExt;
+use openai_protocol::worker::SchedulerLoadSnapshot;
 use prost_types::Timestamp;
 use smg_grpc_client::sglang_proto as sg;
 use tonic::Status;
 
-use super::{State, HEALTHY};
+use super::{embed, generate, State};
 use crate::{
-    load_report::rank_entries,
+    health_probe::{self, Verdict},
+    load_report::{mean, rank_entries, rank_entry, RankFigures},
     proto_json::{insert_capacity, struct_from_json},
-    servicer::proto_token_ids,
+    servicer::{proto_token_ids, RequestOrigin},
 };
 
-/// `HealthCheck`: SERVING only with the engine link up and no drain announced.
-pub(super) fn health_check(state: &State) -> sg::HealthCheckResponse {
-    sg::HealthCheckResponse {
-        healthy: state.shared.is_serving(),
-        message: state.shared.health_message(HEALTHY).to_string(),
+/// What `HealthCheck` says of a scheduler that answered the probe, or
+/// pushed anything while it was out (the Python servicer's words).
+const PASSED: &str = "Health check passed";
+
+/// `HealthCheck`: unhealthy with the engine link down or the drain
+/// announced, as every wire; else the Python servicer's deep probe, a
+/// one-token request through [`generate::generate`] (an embedding request
+/// on a model without generation), healthy once the scheduler pushed
+/// anything since the probe started or answered it, unhealthy the moment the
+/// probe fails, unhealthy at the servicer's bound with neither
+/// ([`health_probe::run`]). A disaggregated role answers shallow: its
+/// requests pair with a peer, so a lone probe would not reach the scheduler.
+pub(super) async fn health_check(state: &Arc<State>) -> sg::HealthCheckResponse {
+    health_check_with(state, state.health_probe_timeout).await
+}
+
+/// [`health_check`] with the probe's bound given.
+pub(super) async fn health_check_with(
+    state: &Arc<State>,
+    timeout: Duration,
+) -> sg::HealthCheckResponse {
+    if !state.shared.is_serving() {
+        return sg::HealthCheckResponse {
+            healthy: false,
+            message: state.shared.health_message(PASSED).to_string(),
+        };
     }
+    if health_probe::disaggregated_role(&state.model.server_args_json) {
+        return sg::HealthCheckResponse {
+            healthy: true,
+            message: health_probe::SHALLOW_MESSAGE.to_string(),
+        };
+    }
+    let client = match state.shared.engine() {
+        Ok(client) => client,
+        Err(status) => {
+            return sg::HealthCheckResponse {
+                healthy: false,
+                message: status.message().to_string(),
+            }
+        }
+    };
+    let verdict = health_probe::run(timeout, || client.last_output_at(), probe(state)).await;
+    sg::HealthCheckResponse {
+        healthy: verdict.healthy(),
+        message: match verdict {
+            Verdict::Passed => PASSED.to_string(),
+            Verdict::Failed => "Health check probe failed".to_string(),
+            Verdict::TimedOut => format!("Health check timeout after {}s", timeout.as_secs()),
+        },
+    }
+}
+
+/// The probe, as the Python servicer sends it: one token from the prompt
+/// `[0]` at temperature zero under a `HEALTH_CHECK_` id, resolved at its
+/// first output; on a model without generation, the same prompt as an
+/// embedding request. It is the servicer's own, counted neither as a
+/// client's request nor as load ([`RequestOrigin::HealthProbe`]). Dropping
+/// it before the output aborts the request on the scheduler, as a client's
+/// stream does.
+async fn probe(state: &Arc<State>) -> Result<(), Status> {
+    let request_id = format!("HEALTH_CHECK_{}", probe_nanos());
+    let tokenized = Some(sg::TokenizedInput {
+        input_ids: vec![0],
+        original_text: String::new(),
+    });
+    if !state.model.is_generation {
+        let request = sg::EmbedRequest {
+            request_id,
+            tokenized,
+            ..Default::default()
+        };
+        return embed::embed(state, request).await.map(|_| ());
+    }
+    let request = sg::GenerateRequest {
+        request_id,
+        tokenized,
+        sampling_params: Some(sg::SamplingParams {
+            max_new_tokens: Some(1),
+            temperature: 0.0,
+            ..Default::default()
+        }),
+        logprob_start_len: -1,
+        stream: false,
+        ..Default::default()
+    };
+    let mut stream = generate::generate(state, request, None, RequestOrigin::HealthProbe).await?;
+    match stream.next().await {
+        Some(Ok(_)) => Ok(()),
+        Some(Err(status)) => Err(status),
+        None => Err(Status::internal(
+            "the probe's stream ended without an output",
+        )),
+    }
+}
+
+/// The probe id's suffix: nanoseconds since the epoch (the Python servicer
+/// stamps its clock the same way).
+fn probe_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos())
 }
 
 /// `GetModelInfo`: the launcher's config, with the handshake's context length
@@ -117,51 +222,24 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
 /// `include` sections have no source on this wire.
 pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<sg::GetLoadsResponse, Status> {
     let client = state.shared.engine()?;
-    let max_total_num_tokens = state.shared.kv_capacity_tokens();
-    let max_running_requests = state
-        .shared
-        .running_window(state.model.max_running_requests);
+    let capacity = Capacity::of(state);
     let ranks = state.shared.rank_count(state.model.data_parallel_size);
     let (loads, aggregate) = rank_entries(
         client.get_loads().loads,
-        max_total_num_tokens,
+        capacity.max_total_num_tokens,
         ranks,
         dp_rank,
-        |load, figures| {
-            let estimate = state
-                .shared
-                .loads
-                .estimate(load.dp_rank, load.num_waiting_reqs);
-            sg::SchedulerLoad {
-                dp_rank: figures.dp_rank,
-                num_running_reqs: figures.running,
-                num_waiting_reqs: figures.waiting,
-                num_total_reqs: figures.total,
-                num_used_tokens: figures.used_tokens,
-                max_total_num_tokens,
-                max_running_requests,
-                token_usage: figures.usage,
-                num_waiting_uncached_tokens: estimate.queued_token_work,
-                gen_throughput: estimate.gen_throughput,
-                prefill_throughput: estimate.prefill_throughput,
-                cache_hit_rate: estimate.cache_hit_rate,
-                ..Default::default()
-            }
-        },
-        |dp_rank| {
-            let estimate = state.shared.loads.estimate(dp_rank, i32::MAX);
-            sg::SchedulerLoad {
-                dp_rank,
-                max_running_requests,
-                max_total_num_tokens,
-                num_waiting_uncached_tokens: estimate.queued_token_work,
-                gen_throughput: estimate.gen_throughput,
-                prefill_throughput: estimate.prefill_throughput,
-                cache_hit_rate: estimate.cache_hit_rate,
-                ..Default::default()
-            }
-        },
+        |load, figures| reported_entry(state, load, figures, &capacity),
+        |dp_rank| unreported_entry(state, dp_rank, &capacity),
     );
+    let aggregate = sg::AggregateMetrics {
+        total_running_reqs: aggregate.running,
+        total_waiting_reqs: aggregate.waiting,
+        total_reqs: aggregate.total,
+        avg_token_usage: aggregate.avg_usage,
+        avg_throughput: mean(loads.iter().map(|load| load.gen_throughput)),
+        avg_utilization: mean(loads.iter().map(|load| load.utilization)),
+    };
     Ok(sg::GetLoadsResponse {
         timestamp: chrono::Utc::now().to_rfc3339(),
         version: state
@@ -169,12 +247,90 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<sg::GetLoadsR
             .engine_version(&state.model.sglang_version, "sglang-"),
         dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
         loads,
-        aggregate: Some(sg::AggregateMetrics {
-            total_running_reqs: aggregate.running,
-            total_waiting_reqs: aggregate.waiting,
-            total_reqs: aggregate.total,
-            avg_token_usage: aggregate.avg_usage,
-            ..Default::default()
-        }),
+        aggregate: Some(aggregate),
     })
+}
+
+/// One rank's entry of [`loads`], built as that answer builds it and read
+/// alone: no timestamp, no version, no vector of the other ranks and this
+/// rank's estimate only, for the record the relay attaches to every batch
+/// and tick. `None` names the answer's first entry, rank 0 (a connected
+/// engine makes it a rank); a rank past the connected ones has no entry.
+pub(super) fn rank_load(state: &State, dp_rank: Option<i32>) -> Option<sg::SchedulerLoad> {
+    let client = state.shared.engine().ok()?;
+    let capacity = Capacity::of(state);
+    rank_entry(
+        |index| client.rank_load(index),
+        capacity.max_total_num_tokens,
+        state.shared.rank_count(state.model.data_parallel_size),
+        dp_rank,
+        |load, figures| reported_entry(state, load, figures, &capacity),
+        |rank| unreported_entry(state, rank, &capacity),
+    )
+}
+
+/// The capacity figures every rank's entry carries: the running window and
+/// the KV capacity the servicer knows.
+struct Capacity {
+    max_running_requests: i32,
+    max_total_num_tokens: i32,
+}
+
+impl Capacity {
+    fn of(state: &State) -> Self {
+        Self {
+            max_running_requests: state
+                .shared
+                .running_window(state.model.max_running_requests),
+            max_total_num_tokens: state.shared.kv_capacity_tokens(),
+        }
+    }
+}
+
+/// A reported rank's entry: the snapshot's figures with, from this
+/// servicer's own bookkeeping ([`crate::load_tracker`]), the queued
+/// token-work, prefill/generation throughput and hit rate this wire's load
+/// tail does not carry, the rank's own.
+fn reported_entry(
+    state: &State,
+    load: &SchedulerLoadSnapshot,
+    figures: &RankFigures,
+    capacity: &Capacity,
+) -> sg::SchedulerLoad {
+    let estimate = state
+        .shared
+        .loads
+        .estimate(load.dp_rank, load.num_waiting_reqs);
+    sg::SchedulerLoad {
+        dp_rank: figures.dp_rank,
+        num_running_reqs: figures.running,
+        num_waiting_reqs: figures.waiting,
+        num_total_reqs: figures.total,
+        num_used_tokens: figures.used_tokens,
+        max_total_num_tokens: capacity.max_total_num_tokens,
+        max_running_requests: capacity.max_running_requests,
+        token_usage: figures.usage,
+        utilization: figures.usage,
+        num_waiting_uncached_tokens: estimate.queued_token_work,
+        gen_throughput: estimate.gen_throughput,
+        prefill_throughput: estimate.prefill_throughput,
+        cache_hit_rate: estimate.cache_hit_rate,
+        ..Default::default()
+    }
+}
+
+/// A connected rank no load tail has reported yet: a zero-filled entry with
+/// the servicer's own figures for the rank (see [`rank_entries`]).
+fn unreported_entry(state: &State, dp_rank: i32, capacity: &Capacity) -> sg::SchedulerLoad {
+    let estimate = state.shared.loads.estimate(dp_rank, i32::MAX);
+    sg::SchedulerLoad {
+        dp_rank,
+        max_running_requests: capacity.max_running_requests,
+        max_total_num_tokens: capacity.max_total_num_tokens,
+        num_waiting_uncached_tokens: estimate.queued_token_work,
+        gen_throughput: estimate.gen_throughput,
+        prefill_throughput: estimate.prefill_throughput,
+        cache_hit_rate: estimate.cache_hit_rate,
+        ..Default::default()
+    }
 }

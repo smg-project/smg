@@ -1,6 +1,5 @@
 //! `vllm.grpc.engine.VllmEngine` over the shared state: each RPC delegates to
-//! its handler module; RPCs the Rust path does not serve yet answer
-//! UNIMPLEMENTED so the Python servicer stays the place for them.
+//! its handler module.
 
 use std::sync::Arc;
 
@@ -104,9 +103,9 @@ impl VllmEngine for VllmEngineService {
 
     async fn get_loads(
         &self,
-        _request: Request<vllm::GetLoadsRequest>,
+        request: Request<vllm::GetLoadsRequest>,
     ) -> Result<Response<vllm::GetLoadsResponse>, Status> {
-        info::loads(&self.state).map(Response::new)
+        info::loads(&self.state, request.into_inner().dp_rank).map(Response::new)
     }
 
     async fn get_tokenizer(

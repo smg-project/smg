@@ -32,7 +32,8 @@ pub(super) fn request(extra: Value) -> ChatCompletionRequest {
     serde_json::from_value(request).expect("chat request")
 }
 
-pub(super) fn tools() -> Vec<Tool> {
+/// The `lookup` tool the tests' requests declare and their outputs call.
+pub(crate) fn tools() -> Vec<Tool> {
     serde_json::from_value(json!([{
         "type": "function", "function": {
             "name": "lookup", "parameters": {"type": "object", "properties": {}}
@@ -273,6 +274,8 @@ pub(super) fn read_with(format: Format) -> Vec<Event<'static>> {
         prompt: "<|im_start|>assistant\n".to_string(),
         forbids_calls: false,
         past_the_end: false,
+        span: tracing::Span::none(),
+        marked: Arc::default(),
     };
     let mut events = Events::new();
     let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
@@ -458,5 +461,64 @@ impl Tokenizer for Refusing {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+/// The request span as the access-log layer makes it (`middleware::logging::RequestSpan`), with
+/// every field the reader may leave on it declared; the span of no subscriber where none is set.
+pub(super) fn request_span() -> tracing::Span {
+    use tower_http::trace::MakeSpan as _;
+
+    use crate::middleware::logging::RequestSpan;
+    let mut make = RequestSpan;
+    make.make_span(&http::Request::new(()))
+}
+
+/// The JSON log lines `work` writes under a subscriber of the gateway's own line format
+/// (`observability::log_format::{JsonLine, SpanFields}`), each parsed: what a reader of the
+/// access log sees, the span's recorded fields included.
+pub(super) fn json_lines(work: impl FnOnce()) -> Vec<Value> {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    use crate::observability::log_format::{JsonLine, SpanFields};
+    let capture = Capture::default();
+    let layer = tracing_subscriber::fmt::layer()
+        .with_writer(capture.clone())
+        .fmt_fields(SpanFields)
+        .event_format(JsonLine::new());
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), work);
+    capture
+        .text()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .collect()
+}
+
+/// The bytes a test's log layer wrote.
+#[derive(Clone, Default)]
+pub(super) struct Capture(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+impl Capture {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().clone()).expect("utf-8 lines")
+    }
+}
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+    type Writer = Capture;
+
+    fn make_writer(&'a self) -> Capture {
+        self.clone()
     }
 }

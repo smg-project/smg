@@ -53,9 +53,9 @@ impl ModelProcessorSpec for Phi3VisionSpec {
         modality: Modality,
     ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
         match modality {
-            Modality::Image => Ok(Box::new(
-                Phi3VisionProcessor::new().with_normalization_of(preprocessor_config),
-            )),
+            Modality::Image => Ok(Box::new(Phi3VisionProcessor::from_preprocessor_config(
+                preprocessor_config,
+            ))),
             _ => Err(ModelRegistryError::UnsupportedModality {
                 spec: self.name(),
                 modality,
@@ -81,11 +81,14 @@ impl ModelProcessorSpec for Phi3VisionSpec {
 
 #[cfg(test)]
 mod tests {
+    use image::Rgb;
     use serde_json::json;
 
     use crate::{
         registry::{test_helpers::*, ModelMetadata, ModelRegistry},
-        types::ImageSize,
+        test_support::create_test_image,
+        types::{ImageSize, Modality},
+        vision::PreProcessorConfig,
     };
 
     #[test]
@@ -127,5 +130,74 @@ mod tests {
         let registry = ModelRegistry::new();
         let spec = registry.lookup(&metadata).expect("phi3 alias");
         assert_eq!(spec.name(), "phi3_v");
+    }
+
+    /// The spec builds its processor from the checkpoint's preprocessor
+    /// config: a `num_crops` of 4 yields five tiles (the global view and the
+    /// four crops) and the token count of the 672x672 HD image, where the
+    /// sixteen-crop default yields seventeen tiles and the 1344x1344 count.
+    #[test]
+    fn the_crop_count_is_the_preprocessor_configs_num_crops() {
+        let tokenizer = TestTokenizer::new(&[("<|image|>", 555)]);
+        let config = json!({"model_type": "phi3_v"});
+        let metadata = ModelMetadata {
+            model_id: "Phi-3.5-vision-instruct",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let registry = ModelRegistry::new();
+        let spec = registry.lookup(&metadata).expect("phi3 spec");
+        let preprocessor_config = PreProcessorConfig::from_json(r#"{"num_crops": 4}"#).unwrap();
+        let processor = spec
+            .vision_processor(&config, &preprocessor_config, Modality::Image)
+            .expect("image processor");
+
+        let output = processor
+            .preprocess(&[&create_test_image(256, 256, Rgb([128, 128, 128]))])
+            .unwrap();
+        assert_eq!(
+            output.encoder_input.shape()[1],
+            5,
+            "the global view and num_crops tiles"
+        );
+        assert_eq!(
+            output.item_sizes,
+            vec![(672, 672)],
+            "the HD size of a 2x2 grid"
+        );
+        assert_eq!(
+            output.feature_token_counts,
+            vec![757],
+            "(2 * 2 + 1) * 144 + 1 + (2 + 1) * 12"
+        );
+        assert_eq!(processor.calculate_num_tokens(256, 256).unwrap(), 757);
+    }
+
+    /// A checkpoint whose config names no crop count keeps the family's
+    /// sixteen-crop default.
+    #[test]
+    fn a_config_without_num_crops_keeps_the_sixteen_crop_default() {
+        let tokenizer = TestTokenizer::new(&[("<|image|>", 555)]);
+        let config = json!({"model_type": "phi3_v"});
+        let metadata = ModelMetadata {
+            model_id: "Phi-3-vision",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let registry = ModelRegistry::new();
+        let spec = registry.lookup(&metadata).expect("phi3 spec");
+        let processor = spec
+            .vision_processor(&config, &PreProcessorConfig::default(), Modality::Image)
+            .expect("image processor");
+
+        let output = processor
+            .preprocess(&[&create_test_image(256, 256, Rgb([128, 128, 128]))])
+            .unwrap();
+        assert_eq!(
+            output.encoder_input.shape()[1],
+            17,
+            "the global view and sixteen tiles"
+        );
+        assert_eq!(output.feature_token_counts, vec![2509], "a 4x4 grid");
     }
 }

@@ -338,6 +338,18 @@ impl fmt::Display for StreamFailure {
     }
 }
 
+/// The per-choice state at the engine's `index` (the unit's own index on the
+/// completion stream), or the decoding failure an index past the choices the
+/// request expects is: the chat and completion streams report it alike.
+pub(crate) fn choice_mut<T>(choices: &mut [T], index: u32) -> Result<&mut T, StreamFailure> {
+    let expected = choices.len();
+    choices.get_mut(index as usize).ok_or_else(|| {
+        StreamFailure::from(format!(
+            "engine sent choice index {index}; the request expects {expected} choice(s)"
+        ))
+    })
+}
+
 /// Where a streaming response is read from, kept by the task that writes it
 /// for the accounting of a failure after the response began.
 #[derive(Clone)]
@@ -542,10 +554,9 @@ mod tests {
     use super::*;
     use crate::{
         routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE,
-        test_support::RefusedAddress,
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
-            test_support::no_health_check,
+            test_support::{no_health_check, RefusedAddress},
             BasicWorkerBuilder, ConnectionMode,
         },
     };

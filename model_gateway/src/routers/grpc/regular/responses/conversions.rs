@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use openai_protocol::{
     chat::{
-        ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent,
+        AssistantReasoning, ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
+        MessageContent,
     },
     common::{
         ContentPart, FunctionCallResponse, ImageUrl, JsonSchemaFormat, ResponseFormat, Tool,
@@ -185,7 +186,9 @@ fn push_item(
                     content: None,
                     name: None,
                     tool_calls: None,
-                    reasoning_content: Some(reasoning_text),
+                    reasoning: AssistantReasoning {
+                        text: Some(reasoning_text),
+                    },
                     ext: Default::default(),
                 };
                 push_chat_message(messages, assistant);
@@ -522,7 +525,7 @@ fn assistant_tool_call(
                 arguments: Some(arguments),
             },
         }]),
-        reasoning_content: None,
+        reasoning: Default::default(),
         ext: Default::default(),
     }
 }
@@ -538,18 +541,18 @@ fn push_chat_message(messages: &mut Vec<ChatMessage>, message: ChatMessage) {
             Some(ChatMessage::Assistant {
                 content,
                 tool_calls,
-                reasoning_content,
+                reasoning,
                 ..
             }),
             ChatMessage::Assistant {
                 content: new_content,
                 tool_calls: new_tool_calls,
-                reasoning_content: new_reasoning,
+                reasoning: new_reasoning,
                 ..
             },
         ) => {
-            if let Some(new_reasoning) = new_reasoning {
-                let merged = reasoning_content.get_or_insert_with(String::new);
+            if let Some(new_reasoning) = new_reasoning.text {
+                let merged = reasoning.text.get_or_insert_with(String::new);
                 if !merged.is_empty() {
                     merged.push('\n');
                 }
@@ -602,7 +605,7 @@ fn role_to_chat_message(role: &str, content: MessageContent) -> ChatMessage {
             content: Some(content),
             name: None,
             tool_calls: None,
-            reasoning_content: None,
+            reasoning: Default::default(),
             ext: Default::default(),
         },
         "system" => ChatMessage::System {
@@ -1643,6 +1646,31 @@ mod tests {
             assert_eq!(item["call_id"], call_id);
             assert_eq!(item["arguments"], "{}");
         }
+    }
+
+    /// A call the parser did not read whole, delivered under `tool_calls` with arguments that
+    /// are no JSON value (a tagged syntax that refused bytes inside the call writes no close for
+    /// it): the item is `incomplete`, and so is the response, with no stated reason, as a call
+    /// cut by an abort leaves it.
+    #[test]
+    fn a_generated_call_the_parser_did_not_read_whole_leaves_the_response_incomplete() {
+        let request = ResponsesRequest::default();
+        let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+            "choices":[{"index":0,"message":{"role":"assistant","tool_calls":[
+                {"id":"call_add","type":"function","function":{"name":"add_integers","arguments":""}}
+            ]},"finish_reason":"tool_calls"}]
+        })).unwrap();
+        let wire = serde_json::to_value(chat_to_responses(&chat, &request, None).unwrap()).unwrap();
+        assert_eq!(wire["status"], "incomplete", "{wire}");
+        assert_eq!(
+            wire["incomplete_details"],
+            serde_json::Value::Null,
+            "{wire}"
+        );
+        assert_eq!(wire["output"][0]["type"], "function_call", "{wire}");
+        assert_eq!(wire["output"][0]["status"], "incomplete", "{wire}");
+        assert_eq!(wire["output"][0]["arguments"], "", "{wire}");
     }
 
     #[test]

@@ -35,7 +35,7 @@ use std::{
 
 use dashmap::DashMap;
 
-use super::activity::L0;
+use super::{activity::L0, sampler::Sampler};
 use crate::traits::{Encoding, TokenIdType};
 
 /// Entries sampled per eviction; the oldest of them is removed.
@@ -113,8 +113,8 @@ pub struct L0Cache {
     hits: AtomicU64,
     misses: AtomicU64,
     access_counter: AtomicU64,
-    /// State of the sampler's generator.
-    sample_state: AtomicU64,
+    /// The eviction sampler's generator.
+    sampler: Sampler,
 }
 
 impl L0Cache {
@@ -138,7 +138,7 @@ impl L0Cache {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             access_counter: AtomicU64::new(0),
-            sample_state: AtomicU64::new(0x9E37_79B9_7F4A_7C15),
+            sampler: Sampler::new(),
         }
     }
 
@@ -190,45 +190,19 @@ impl L0Cache {
         }
     }
 
-    /// The next pseudo-random number of the sampler (xorshift; the quality a
-    /// uniform sample needs, no more).
-    fn random(&self) -> u64 {
-        let mut x = self.sample_state.load(Ordering::Relaxed);
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.sample_state.store(x, Ordering::Relaxed);
-        x
-    }
-
     /// Removes the least recently used of [`EVICTION_SAMPLE_SIZE`] entries
     /// drawn uniformly from the index (every entry when the cache holds no
-    /// more than that). The caller holds the index lock.
+    /// more than that; the rule is the sampler's, [`Sampler::oldest`]). The
+    /// caller holds the index lock.
     fn evict_one(&self, index: &mut Vec<u64>) {
-        if index.is_empty() {
-            return;
-        }
-        let mut oldest: Option<(usize, u64)> = None;
-        let mut consider = |cache: &Self, position: usize| {
-            let timestamp = cache
-                .map
-                .get(&index[position])
-                .map_or(0, |found| found.last_accessed.load(Ordering::Relaxed));
-            if oldest.is_none_or(|(_, ts)| timestamp < ts) {
-                oldest = Some((position, timestamp));
-            }
-        };
-        if index.len() <= EVICTION_SAMPLE_SIZE {
-            for position in 0..index.len() {
-                consider(self, position);
-            }
-        } else {
-            for _ in 0..EVICTION_SAMPLE_SIZE {
-                let position = (self.random() % index.len() as u64) as usize;
-                consider(self, position);
-            }
-        }
-        let Some((position, _)) = oldest else {
+        let Some(position) = self
+            .sampler
+            .oldest(index.len(), EVICTION_SAMPLE_SIZE, |position| {
+                self.map
+                    .get(&index[position])
+                    .map_or(0, |found| found.last_accessed.load(Ordering::Relaxed))
+            })
+        else {
             return;
         };
         let victim = index.swap_remove(position);

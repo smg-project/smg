@@ -9,11 +9,13 @@ use std::collections::HashMap;
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        bind_socket_addr, validate_mesh_server_name, CacheIndexKind, CircuitBreakerConfig,
-        ConfigError, ConfigResult, ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig,
-        HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode,
-        MemoryConfig, MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig,
-        PolicyConfig, PostgresConfig, ReadinessRoleConfig, RedisConfig, RetryConfig, RouterConfig,
+        bind_socket_addr,
+        secrets::{parse_control_plane_api_key, parse_tenant_api_key},
+        validate_mesh_server_name, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
+        ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig, HealthCheckConfig,
+        HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode, MemoryConfig,
+        MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
+        PostgresConfig, ReadinessRoleConfig, RedisConfig, RetryConfig, RouterConfig,
         RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, SlurmDiscoveryConfig,
         TokenizerCacheConfig, TraceConfig, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
     },
@@ -30,10 +32,10 @@ use smg_mesh::{MTLSConfig, MeshServerConfig};
 
 use super::{
     secrets::{
-        EnvLookup, API_KEY_SETTING, POSTGRES_DB_URL_SETTING, REDIS_URL_SETTING,
-        TENANT_API_KEYS_SETTING,
+        EnvLookup, API_KEY_SETTING, CONTROL_PLANE_API_KEYS_SETTING, POSTGRES_DB_URL_SETTING,
+        REDIS_URL_SETTING, TENANT_API_KEYS_SETTING,
     },
-    value::{parse_control_plane_api_key, parse_role_mapping, parse_tenant_api_key},
+    value::parse_role_mapping,
 };
 use crate::{Backend, CliArgs, DiscoveryProvider};
 
@@ -68,6 +70,14 @@ impl CliArgs {
         )? {
             sources.tenant_api_keys = Some((source, entries.len()));
             self.integrations.tenant_api_keys = entries;
+        }
+        if let Some((entries, source)) = CONTROL_PLANE_API_KEYS_SETTING.resolve_entries(
+            &self.integrations.control_plane_api_keys,
+            self.integrations.control_plane_api_keys_file.as_deref(),
+            env,
+        )? {
+            sources.control_plane_api_keys = Some((source, entries.len()));
+            self.integrations.control_plane_api_keys = entries;
         }
         if self.model.history_backend == "postgres" {
             if let Some((value, source)) = POSTGRES_DB_URL_SETTING.resolve_value(
@@ -258,10 +268,10 @@ impl CliArgs {
             format!("Mesh_{random_string}")
         };
 
-        let peer = self
+        let init_peers = self
             .integrations
             .mesh_peer_urls
-            .first()
+            .iter()
             .map(|url| {
                 url.parse::<std::net::SocketAddr>()
                     .map_err(|e| ConfigError::InvalidValue {
@@ -270,7 +280,7 @@ impl CliArgs {
                         reason: format!("invalid socket address: {e}"),
                     })
             })
-            .transpose()?;
+            .collect::<ConfigResult<Vec<_>>>()?;
 
         // Port 0 parses fine as a socket address, but it is meaningless as an
         // advertised one: peers gossip this port and cannot dial an ephemeral
@@ -319,7 +329,7 @@ impl CliArgs {
             self_name,
             bind_addr,
             advertise_addr,
-            init_peer: peer,
+            init_peers,
             mtls_config: self.mesh_mtls_config()?,
         }))
     }

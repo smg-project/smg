@@ -1,4 +1,5 @@
-default_stages: [pre-commit, pre-push, manual]
+default_stages: [pre-commit, manual]
+default_install_hook_types: [pre-commit, commit-msg, pre-push]
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -6,11 +7,14 @@ repos:
     hooks:
       - id: check-symlinks
       - id: destroyed-symlinks
+        stages: [pre-commit, manual]
       - id: trailing-whitespace
+        stages: [pre-commit, manual]
         # Patch files keep their whitespace: a blank context line is a single space.
         # Chat-template fixtures are kept as published; their whitespace is part of the template.
         exclude: \.patch$|tests/fixtures/.*\.jinja$
       - id: end-of-file-fixer
+        stages: [pre-commit, manual]
         # Recorded SSE streams end with the protocol's blank line, and the
         # streaming tests compare them byte for byte.
         exclude: \.sse$
@@ -19,8 +23,10 @@ repos:
         exclude: ^deploy/helm/.*/templates/|^deploy/helm/.*/tests/
       - id: check-toml
       - id: check-added-large-files
+        stages: [pre-commit, manual]
       - id: check-merge-conflict
       - id: check-shebang-scripts-are-executable
+        stages: [pre-commit, manual]
         exclude: \.rs$
       - id: detect-private-key
         exclude: .*tests/.*_test\.rs$
@@ -35,7 +41,7 @@ repos:
     hooks:
       - id: codespell
         additional_dependencies: ['tomli']
-        args: ['-L', 'cann,thi,makro,wil,rouge,PRIS,hel,te,ans,ser,wit,WIT,implementors,caf,nin,Nin,doubleclick,allocatedp,notin,NotIn,ure']
+        args: ['-L', 'cann,thi,makro,wil,rouge,PRIS,hel,te,ans,ser,wit,WIT,implementors,caf,nin,Nin,doubleclick,allocatedp,notin,NotIn,ure,preformed']
         exclude: |
           (?x)^(
             Cargo\.lock|
@@ -76,15 +82,8 @@ repos:
 
       - id: branch-name-check
         name: Branch naming convention
-        description: Ensure branch name follows <type>/<desc> or <username>/<desc> format
-        entry: |
-          bash -c '
-            branch=$(git rev-parse --abbrev-ref HEAD)
-            if [[ "$branch" != "main" && ! "$branch" =~ ^[a-z0-9]([a-z0-9._-]*[a-z0-9])?/[a-z0-9._-]+$ ]]; then
-              echo "Branch \"$branch\" does not follow naming convention: <type>/<description> or <username>/<description>"
-              exit 1
-            fi
-          '
+        description: Ensure the branch name follows the rule in scripts/branch-name-check.sh, the one the pull-request workflow reads too
+        entry: scripts/branch-name-check.sh
         language: system
         stages: [pre-push]
         always_run: true

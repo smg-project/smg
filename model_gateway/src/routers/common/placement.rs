@@ -32,7 +32,7 @@ use crate::{
         SelectWorkerInfo, WorkerRole,
     },
     routers::{
-        common::{header_utils, overload, retry::mark_non_retryable},
+        common::{header_utils, overload, pd_admission, retry::mark_non_retryable},
         error,
     },
     worker::{
@@ -84,17 +84,17 @@ impl WireConstraint {
     }
 }
 
-/// Whether Prefill admission may drop full workers from the candidate set
-/// before the policy runs. An explicit target under consistent hashing is
+/// Whether an admission pre-filter may drop full workers from a role's
+/// candidate set before `policy` runs over it (Prefill admission's capacity,
+/// the decode pick's rooms). An explicit target under consistent hashing is
 /// exempt: it indexes the unfiltered set and stays strict, so the request
-/// waits for that worker (checked after selection) instead of moving to
-/// another one.
+/// waits for that worker (checked after selection, or at the gate) instead
+/// of moving to another one.
 pub(crate) fn admission_prefilters(
-    prefill_policy: &dyn LoadBalancingPolicy,
+    policy: &dyn LoadBalancingPolicy,
     headers: Option<&HeaderMap>,
 ) -> bool {
-    prefill_policy.name() != "consistent_hashing"
-        || header_utils::extract_target_worker(headers).is_none()
+    policy.name() != "consistent_hashing" || header_utils::extract_target_worker(headers).is_none()
 }
 
 /// A per-request candidate predicate: a worker it rejects is never selected.
@@ -236,6 +236,37 @@ pub(crate) fn select_single(
     select_from(registry, policies, model_id, candidates.as_slice(), inputs)
 }
 
+/// Probe retry candidates without advancing the routing policy or recording a selection.
+pub(crate) fn has_selectable_single(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    pool: RoutingPool,
+    wire: Option<WireConstraint>,
+    inputs: PlacementInputs<'_>,
+) -> bool {
+    let policy = policies.get_policy_or_default(model_id);
+    // Filtering changes the index used by an explicit consistent-hash target.
+    if policy.name() == "consistent_hashing"
+        && header_utils::extract_target_worker(inputs.headers).is_some()
+    {
+        return false;
+    }
+    let candidates = candidates(registry, model_id, pool, wire);
+    let accepted: Vec<_> = candidates
+        .as_slice()
+        .iter()
+        .filter(|worker| {
+            inputs
+                .candidate_filter
+                .is_none_or(|accepts| accepts(worker.as_ref()))
+        })
+        .cloned()
+        .collect();
+    accepted.iter().any(|worker| worker.is_available())
+        || overload::has_fallback_if_all_vetoed(&accepted, registry.overload_shed_enabled())
+}
+
 /// [`select_single`] over an explicit candidate slice: the entry for a caller
 /// with a candidate rule the pools cannot express, such as dropping DP-aware
 /// workers from a path that cannot pin a rank.
@@ -267,7 +298,7 @@ pub(crate) fn select_from(
         request_text: inputs.text,
         tokens: inputs.tokens,
         headers: inputs.headers,
-        routing_key: policies.resolve_routing_key(inputs.headers),
+        routing_key: policies.sticky_header_key(inputs.headers),
         rid_key: inputs.rid_key,
         cache_namespace: inputs.cache_namespace,
         // Cached hash ring for consistent hashing (O(log n) lookup).
@@ -1125,7 +1156,7 @@ pub(crate) fn select_pair(
         request_text: inputs.text,
         tokens: inputs.tokens,
         headers: inputs.headers,
-        routing_key: policies.resolve_routing_key(inputs.headers),
+        routing_key: policies.sticky_header_key(inputs.headers),
         rid_key: inputs.rid_key,
         cache_namespace: inputs.cache_namespace,
         hash_ring,
@@ -1171,7 +1202,7 @@ pub(crate) fn select_pair(
     }
     // The pick's open partners: non-empty by construction, short of an
     // availability flip between the two reads.
-    let decode: Vec<Arc<dyn Worker>> = pairs.partners[open[prefill_idx]]
+    let mut decode: Vec<Arc<dyn Worker>> = pairs.partners[open[prefill_idx]]
         .iter()
         .filter(|d| partner_open(d, pair_runtime))
         .cloned()
@@ -1183,6 +1214,7 @@ pub(crate) fn select_pair(
         );
         return Err(fail(WorkerRole::Decode, PlacementFailure::Unavailable));
     }
+    retain_decodes_with_a_room(decode_policy.as_ref(), inputs.headers, &mut decode);
     // A decode pool all over the thresholds pairs by load, as the default
     // paired it: the least-loaded of the pick's partners, counted as a veto
     // fallback and not as a selection of the decode policy. Any other keeps
@@ -1239,9 +1271,52 @@ pub(crate) fn select_pair(
     })
 }
 
+/// Narrow a decode pick's candidates to the workers whose admission gate
+/// would seat one more room now ([`pd_admission::has_free_room`]), when some
+/// have one and some do not; with every candidate full, or none reporting a
+/// window, the list is left as it is and the policy chooses as before, the
+/// dispatch waiting on its pick. An explicit target under consistent hashing
+/// indexes the unfiltered list and is never narrowed ([`admission_prefilters`]),
+/// so it waits at its own gate as before.
+///
+/// The pick reads the rooms the gate claims against because the policies
+/// cannot: a load report never carries the places parked at the gateway, and
+/// the router's in-flight count rises only on admission, so a load-scoring
+/// policy kept picking the full side whose queue it was growing while its
+/// siblings had rooms. Each candidate's gate is read once (a room taken
+/// between two reads of the same worker could otherwise narrow the list to
+/// nothing), the kept candidates stay in their order, and nothing is
+/// allocated.
+pub(crate) fn retain_decodes_with_a_room(
+    decode_policy: &dyn LoadBalancingPolicy,
+    headers: Option<&HeaderMap>,
+    decode: &mut Vec<Arc<dyn Worker>>,
+) {
+    if !admission_prefilters(decode_policy, headers) {
+        return;
+    }
+    // The candidates with a room move to the front, in their order; the
+    // ones without end up behind them and are cut off only when there is
+    // someone to keep and someone to cut.
+    let mut kept = 0;
+    for at in 0..decode.len() {
+        if pd_admission::has_free_room(decode[at].as_ref()) {
+            decode.swap(kept, at);
+            kept += 1;
+        }
+    }
+    if kept > 0 && kept < decode.len() {
+        decode.truncate(kept);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Mutex, time::Duration};
+    use std::{
+        collections::{BTreeMap, HashMap},
+        sync::Mutex,
+        time::Duration,
+    };
 
     use axum::http::StatusCode;
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
@@ -1249,10 +1324,19 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::types::{PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
+        config::types::{
+            ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig,
+        },
         observability::logging::test_support::test_subscriber,
-        policies::{CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, RoundRobinPolicy},
-        worker::{runtime::StallReason, BasicWorkerBuilder, ModelCard, PdWire, WorkerType},
+        policies::{
+            CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, LeastLoadPolicy,
+            PowerOfTwoPolicy, RoundRobinPolicy,
+        },
+        worker::{
+            load_state::{one_rank_load, TestFeed},
+            runtime::StallReason,
+            BasicWorkerBuilder, ModelCard, PdWire, WorkerType,
+        },
     };
 
     const MODEL: &str = "m";
@@ -1336,6 +1420,207 @@ mod tests {
             *hits.entry(pair.decode.url().to_string()).or_insert(0) += 1;
         }
         hits
+    }
+
+    /// One prefill and two decode workers, each decode with a running window
+    /// of `window` rooms, so the admission gate's rooms count in the pick.
+    fn gated_pd_registry(window: u16) -> WorkerRegistry {
+        let registry = WorkerRegistry::new();
+        for (url, worker_type) in [
+            ("grpc://p:1", WorkerType::Prefill),
+            ("grpc://d:1", WorkerType::Decode),
+            ("grpc://d:2", WorkerType::Decode),
+        ] {
+            let mut labels = HashMap::new();
+            if matches!(worker_type, WorkerType::Decode) {
+                labels.insert("max_running_requests".to_string(), window.to_string());
+            }
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(MODEL))
+                        .worker_type(worker_type)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::Vllm)
+                        .kv_connector("NixlConnector")
+                        .labels(labels)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                ))
+                .expect("worker registers");
+        }
+        registry
+    }
+
+    /// A decode partner whose window is full, or whose free room a place
+    /// waiting at its gate is in line for, is left out of the pick while its
+    /// sibling has a room; with both full the policy chooses as before.
+    #[test]
+    fn a_full_decode_window_sends_the_pick_to_the_partner_with_a_room() {
+        let registry = gated_pd_registry(2);
+        let policies = cohort_policies();
+        let full = registry.get_by_url("grpc://d:1").expect("registered");
+        assert!(full.try_admit_pd(2, 2), "both rooms claimed");
+        let picks = hits(&registry, &policies, 10);
+        assert_eq!(
+            picks.get("grpc://d:1").copied().unwrap_or(0),
+            0,
+            "{picks:?}"
+        );
+        assert_eq!(picks["grpc://d:2"], 10, "{picks:?}");
+
+        // One room freed, but a place already waits for it.
+        full.release_pd(1);
+        let place = full.pd_enqueue(1);
+        let picks = hits(&registry, &policies, 10);
+        assert_eq!(
+            picks.get("grpc://d:1").copied().unwrap_or(0),
+            0,
+            "{picks:?}"
+        );
+        full.pd_dequeue(place);
+        let picks = hits(&registry, &policies, 10);
+        assert_eq!(picks["grpc://d:1"], 5, "{picks:?}");
+        assert_eq!(picks["grpc://d:2"], 5, "{picks:?}");
+
+        // Every partner full: the policy's own rotation, and the dispatch
+        // waits on its pick as before.
+        let other = registry.get_by_url("grpc://d:2").expect("registered");
+        assert!(full.try_admit_pd(1, 2) && other.try_admit_pd(2, 2));
+        let picks = hits(&registry, &policies, 10);
+        assert_eq!(picks["grpc://d:1"], 5, "{picks:?}");
+        assert_eq!(picks["grpc://d:2"], 5, "{picks:?}");
+    }
+
+    /// The narrowing keeps the candidates with a room in their order (a
+    /// policy that rotates over its list, or indexes it, sees the same
+    /// sequence minus the full ones) and leaves a list alone when every
+    /// candidate is full or every one has a room.
+    #[test]
+    fn the_narrowing_keeps_the_candidates_with_a_room_in_their_order() {
+        let decode = |url: &str| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new(MODEL))
+                    .worker_type(WorkerType::Decode)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .labels(HashMap::from([(
+                        "max_running_requests".to_string(),
+                        "1".to_string(),
+                    )]))
+                    .build(),
+            )
+        };
+        let policy = RoundRobinPolicy::new();
+        let mut candidates: Vec<Arc<dyn Worker>> =
+            ["grpc://d:1", "grpc://d:2", "grpc://d:3", "grpc://d:4"]
+                .map(decode)
+                .into();
+        assert!(candidates[0].try_admit_pd(1, 1) && candidates[2].try_admit_pd(1, 1));
+        retain_decodes_with_a_room(&policy, None, &mut candidates);
+        let urls: Vec<&str> = candidates.iter().map(|d| d.url()).collect();
+        assert_eq!(urls, ["grpc://d:2", "grpc://d:4"]);
+
+        // Every candidate full, then every one with a room: the list as it was.
+        assert!(candidates[0].try_admit_pd(1, 1) && candidates[1].try_admit_pd(1, 1));
+        retain_decodes_with_a_room(&policy, None, &mut candidates);
+        assert_eq!(candidates.len(), 2, "nothing to keep: the policy's list");
+        candidates[0].release_pd(1);
+        candidates[1].release_pd(1);
+        retain_decodes_with_a_room(&policy, None, &mut candidates);
+        let urls: Vec<&str> = candidates.iter().map(|d| d.url()).collect();
+        assert_eq!(urls, ["grpc://d:2", "grpc://d:4"], "nothing to cut");
+    }
+
+    /// An explicit target under consistent hashing indexes the partners the
+    /// policy is given, so a full partner is never dropped from under it: the
+    /// targeted full worker is picked and waits at its gate as before, and a
+    /// target past the full one keeps its index.
+    #[test]
+    fn an_explicit_target_under_consistent_hashing_keeps_its_full_decode_partner() {
+        let registry = gated_pd_registry(2);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        policies.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
+        policies.set_decode_policy(Arc::new(ConsistentHashingPolicy::new()));
+        let full = registry.get_by_url("grpc://d:1").expect("registered");
+        assert!(full.try_admit_pd(2, 2), "both rooms claimed");
+        let pairs = pairs_of(&registry, &policies);
+        for (index, expected) in [(0, "grpc://d:1"), (1, "grpc://d:2")] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", index.to_string().parse().unwrap());
+            let pair = select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                true,
+                None,
+                PlacementInputs {
+                    headers: Some(&headers),
+                    ..Default::default()
+                },
+            )
+            .expect("the targeted pair is open");
+            assert_eq!(pair.decode.url(), expected, "target {index}");
+        }
+    }
+
+    /// The load-scoring decode policies price a side by its report and
+    /// their own dispatch credit, neither of which holds a request parked at
+    /// the gate, and a fuller batch reports the higher aggregate rate, so a
+    /// full decode side read as the cheaper pick while its queue grew. With
+    /// the gate's rooms in the selection the full side is not offered.
+    #[test]
+    fn the_load_scoring_policies_are_not_offered_a_full_decode_window() {
+        let scorers: [Arc<dyn LoadBalancingPolicy>; 2] = [
+            Arc::new(LeastLoadPolicy::new()),
+            Arc::new(PowerOfTwoPolicy::new()),
+        ];
+        for decode_policy in scorers {
+            let name = decode_policy.name();
+            let registry = gated_pd_registry(8);
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            policies.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
+            let feed = TestFeed::attached_to(decode_policy.as_ref());
+            policies.set_decode_policy(decode_policy);
+            // d:1 runs its whole window of eight at 160 tokens/s and holds
+            // every room; d:2 runs one request at 20 tokens/s.
+            let mut full_report = one_rank_load(0, 0.0, 160.0);
+            full_report.loads[0].num_running_reqs = 8;
+            feed.publish(&HashMap::from([
+                ("grpc://d:1".to_string(), full_report),
+                ("grpc://d:2".to_string(), one_rank_load(0, 0.0, 20.0)),
+            ]));
+            let full = registry.get_by_url("grpc://d:1").expect("registered");
+            assert!(full.try_admit_pd(8, 8));
+            let tokens: Vec<u32> = (0..512).collect();
+            let pairs = pairs_of(&registry, &policies);
+            for _ in 0..20 {
+                let pair = select_pair(
+                    &registry,
+                    &policies,
+                    MODEL,
+                    &pairs,
+                    None,
+                    true,
+                    None,
+                    PlacementInputs {
+                        tokens: Some(&tokens),
+                        ..Default::default()
+                    },
+                )
+                .expect("a pair is open");
+                assert_eq!(
+                    pair.decode.url(),
+                    "grpc://d:2",
+                    "{name} picked the full side"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2030,6 +2315,42 @@ mod tests {
         .expect("a worker is selectable")
     }
 
+    #[test]
+    fn context_preflight_does_not_advance_round_robin() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let first = pick(&registry, &policies, PlacementInputs::default());
+        assert!(has_selectable_single(
+            &registry,
+            &policies,
+            MODEL,
+            RoutingPool::HttpRegular,
+            None,
+            PlacementInputs::default()
+        ));
+        let second = pick(&registry, &policies, PlacementInputs::default());
+        assert_ne!(first.url(), second.url());
+    }
+
+    #[test]
+    fn context_preflight_declines_explicit_consistent_hash_target() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-target-worker", "0".parse().unwrap());
+        assert!(!has_selectable_single(
+            &registry,
+            &policies,
+            MODEL,
+            RoutingPool::HttpRegular,
+            None,
+            PlacementInputs {
+                headers: Some(&headers),
+                ..Default::default()
+            }
+        ));
+    }
+
     /// A routing key pins consistent hashing to one worker; once that worker
     /// was tried, the retry falls through to the next node on the ring, and
     /// a pool with nothing untried left is used whole.
@@ -2176,6 +2497,80 @@ mod tests {
                 "target {index}: the retry stays on the targeted worker"
             );
         }
+    }
+
+    /// An explicit target counts the workers available when the request
+    /// arrives. With the worker at index 1 out (not ready, overloaded, or
+    /// its breaker open), index 1 names the worker that was at index 2 and
+    /// index 2 names nobody. Back in, the indexes read as before.
+    #[test]
+    fn an_explicit_target_indexes_the_available_workers() {
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let target = |index: usize| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", index.to_string().parse().unwrap());
+            select_single(
+                &registry,
+                &policies,
+                MODEL,
+                RoutingPool::HttpRegular,
+                None,
+                PlacementInputs {
+                    headers: Some(&headers),
+                    ..Default::default()
+                },
+            )
+        };
+        let by_index: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|index| target(index).expect("a healthy pool answers every index"))
+            .collect();
+        assert_ne!(by_index[0].url(), by_index[1].url());
+        assert_ne!(by_index[1].url(), by_index[2].url());
+        assert_ne!(by_index[0].url(), by_index[2].url());
+
+        let out = &by_index[1];
+        let shifted = |veto: &str| {
+            assert_eq!(
+                target(1).map(|worker| worker.url().to_string()),
+                Some(by_index[2].url().to_string()),
+                "{veto}: index 1 names the next available worker"
+            );
+            assert!(
+                target(2).is_none(),
+                "{veto}: index 2 is past the available workers"
+            );
+            assert_eq!(target(0).unwrap().url(), by_index[0].url(), "{veto}");
+        };
+        out.set_status(WorkerStatus::NotReady);
+        shifted("not ready");
+        out.set_status(WorkerStatus::Ready);
+        assert!(registry.set_worker_overloaded(out, true));
+        shifted("overloaded");
+        assert!(registry.set_worker_overloaded(out, false));
+        for _ in 0..16 {
+            out.record_circuit_breaker_outcome(false);
+        }
+        assert!(!out.circuit_breaker_can_execute());
+        shifted("breaker open");
+        out.reset_circuit_breaker();
+        assert!(out.circuit_breaker_can_execute());
+        assert_eq!(target(1).unwrap().url(), by_index[1].url());
+        assert_eq!(target(2).unwrap().url(), by_index[2].url());
+
+        // The documented exception: a pool with every worker vetoed is served
+        // by the all-vetoed fallback, which does not read the header.
+        for worker in &by_index {
+            assert!(registry.set_worker_overloaded(worker, true));
+        }
+        assert!(
+            target(5).is_some(),
+            "an all-vetoed pool serves an index past the pool through the fallback"
+        );
+        for worker in &by_index {
+            assert!(registry.set_worker_overloaded(worker, false));
+        }
+        assert_eq!(target(1).unwrap().url(), by_index[1].url());
     }
 
     /// Round robin never re-selects a tried worker while another is left,
@@ -2967,6 +3362,63 @@ mod tests {
             registry.set_overload_shed(true);
             assert_ne!(pick(&registry, &policies, inputs).url(), owner.url());
         }
+    }
+
+    /// A header key with turn and retry suffixes under the routing-key
+    /// override: placement derives the key once, lineage-stripped, so the
+    /// policies that place by the key themselves (consistent hashing, the
+    /// sticky map) see the key the load guard counts, and every turn of
+    /// `conv` lands on the owner of `conv`. Without the override the key is
+    /// raw: a new turn is a new key.
+    #[test]
+    fn a_header_keys_turns_share_one_owner_under_the_override() {
+        let keyed = |key: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-routing-key", key.parse().unwrap());
+            headers
+        };
+        let manual = || PolicyConfig::Manual {
+            eviction_interval_secs: 0,
+            max_idle_secs: 0,
+            assignment_mode: ManualAssignmentMode::MinLoad,
+        };
+        let turns = ["conv_t1", "conv_t2", "conv_t3_r1", "conv_r2"];
+        for config in [PolicyConfig::ConsistentHashing, manual()] {
+            let policies = PolicyRegistry::with_override(
+                config,
+                RoutingKeyOverrideConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+            let name = policies.get_default_policy().name();
+            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+            let base = keyed("conv");
+            let owner = pick(&registry, &policies, with_headers(&base));
+            // A vacant sticky key would go to a lighter worker.
+            owner.increment_load();
+            for turn in turns {
+                let headers = keyed(turn);
+                assert_eq!(
+                    pick(&registry, &policies, with_headers(&headers)).url(),
+                    owner.url(),
+                    "{name}: {turn} left the owner of conv"
+                );
+            }
+        }
+
+        // Override off: the sticky map pins each raw key on its own.
+        let policies = PolicyRegistry::new(manual());
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let first = keyed("conv_t1");
+        let owner = pick(&registry, &policies, with_headers(&first));
+        owner.increment_load();
+        let second = keyed("conv_t2");
+        assert_ne!(
+            pick(&registry, &policies, with_headers(&second)).url(),
+            owner.url(),
+            "without the override a new turn is a new key"
+        );
     }
 
     /// Every worker over the thresholds, the owner the busier: the session

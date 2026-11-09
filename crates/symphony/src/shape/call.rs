@@ -1163,7 +1163,7 @@ mod tests {
             function: openai_protocol::common::Function {
                 name: "f".to_string(),
                 description: None,
-                parameters: serde_json::json!({"type": "object", "properties": {}}),
+                parameters: Some(serde_json::json!({"type": "object", "properties": {}})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -1715,10 +1715,10 @@ mod tests {
             function: openai_protocol::common::Function {
                 name: "f".to_string(),
                 description: None,
-                parameters: serde_json::json!({"type": "object", "properties": {
+                parameters: Some(serde_json::json!({"type": "object", "properties": {
                     "s": {"type": "string"},
                     "n": {"type": "integer"},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -2036,10 +2036,10 @@ mod tests {
             function: openai_protocol::common::Function {
                 name: "f".to_string(),
                 description: None,
-                parameters: serde_json::json!({"type": "object", "properties": {
+                parameters: Some(serde_json::json!({"type": "object", "properties": {
                     "n": {"type": "integer"},
                     "s": {"type": "string"},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },

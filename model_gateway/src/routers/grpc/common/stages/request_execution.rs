@@ -15,7 +15,7 @@ use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
     helpers::{maybe_inject_pd_metadata, maybe_inject_pd_rendezvous},
-    pd_protocol::{PdDispatch, PdProtocol},
+    pd_protocol::{EncodeHandoff, PdDispatch, PdProtocol},
 };
 use crate::{
     observability::{
@@ -357,12 +357,18 @@ pub(crate) async fn execute_plan(
     );
 
     // The deadline runs from here: the admission wait above is the gateway's
-    // own queueing, bounded by its own setting, not time the worker had.
-    let deadline = request_timeout.map(RequestDeadline::after);
+    // own queueing, bounded by its own setting, not time the worker had. The
+    // instant is read once: the single dispatch's booking and its stream's
+    // generation duration run from the same one.
+    let dispatched_at = tokio::time::Instant::now();
+    let deadline =
+        request_timeout.map(|timeout| RequestDeadline::after_from(dispatched_at, timeout));
     let dispatch = async {
         match execution_plan {
             ExecutionPlan::Single(request) => match request {
-                ProtoRequest::Generate(req) => execute_single(req, clients, workers, ledger).await,
+                ProtoRequest::Generate(req) => {
+                    execute_single(req, clients, workers, ledger, dispatched_at.into_std()).await
+                }
                 ProtoRequest::Embed(req) => {
                     execute_single_embed(req, clients, workers, ledger).await
                 }
@@ -372,6 +378,8 @@ pub(crate) async fn execute_plan(
                 execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger).await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
+                let push_encode = workers.encode_handoff() == Some(EncodeHandoff::Push)
+                    && workers.encode_assignments().is_some();
                 // Bootstrap info was injected into the prefill request during
                 // request building; dispatch the encode jobs with the
                 // prefill+decode side.
@@ -382,10 +390,19 @@ pub(crate) async fn execute_plan(
                     workers,
                     model,
                     encode_dispatch,
+                    ctx.image_anchor,
                     prefill_guard,
                     ledger,
                 )
                 .await
+                .map_err(|mut response| {
+                    // A push may already have reserved buffers on this
+                    // prefill replica.
+                    if push_encode {
+                        mark_non_retryable(&mut response);
+                    }
+                    response
+                })
             }
             ExecutionPlan::Batch { kind, requests, .. } => {
                 execute_batch_dispatch(
@@ -396,6 +413,7 @@ pub(crate) async fn execute_plan(
                     model,
                     prefill_guard,
                     ledger,
+                    dispatched_at.into_std(),
                 )
                 .await
             }
@@ -683,20 +701,39 @@ async fn execute_fanout_pd(
     })
 }
 
+/// Dispatch an EPD request by its runtime's encode handoff
+/// (`PdProtocol::encode_handoff`): under a push handoff the encoder
+/// completes before the prefill/decode pair is sent; under a rendezvous
+/// handoff the encode jobs launch beside the pair.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "EPD adds image anchors to the shared PD dispatch inputs"
+)]
 async fn execute_epd_dispatch(
     mut proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     model: &str,
     encode_dispatch: Option<EncodeDispatchPlan>,
+    image_anchor: Option<u32>,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
+    let push = workers.encode_handoff() == Some(EncodeHandoff::Push);
+    let mut cleanup = if push && workers.encode_assignments().is_some() {
+        Some(super::vllm_encode::encode(&mut proto_request, workers, image_anchor).await?)
+    } else {
+        None
+    };
     if let Some(encode_dispatch) = encode_dispatch {
         spawn_encode_dispatch(encode_dispatch);
     }
-    proto_request.clear_mm_pixel_values();
-    execute_pd_dispatch(
+    // A push handoff's identity has replaced the pixels already; every other
+    // prefill side drops them, its embeddings come from the encode workers.
+    if !push {
+        proto_request.clear_mm_pixel_values();
+    }
+    let result = execute_pd_dispatch(
         proto_request,
         clients,
         workers,
@@ -704,7 +741,15 @@ async fn execute_epd_dispatch(
         prefill_guard,
         ledger,
     )
-    .await
+    .await;
+    if result.is_ok() {
+        if let Some(cleanups) = cleanup.as_mut() {
+            for cleanup in cleanups {
+                cleanup.disarm();
+            }
+        }
+    }
+    result
 }
 
 #[expect(
@@ -754,6 +799,7 @@ fn spawn_encode_dispatch(encode_dispatch: EncodeDispatchPlan) {
 /// Dispatch one backend request per batched prompt concurrently, preserving
 /// prompt order. Fail-fast: the first failed dispatch fails the batch and
 /// drops the remaining streams (abort-on-drop reclaims them backend-side).
+#[expect(clippy::too_many_arguments)]
 async fn execute_batch_dispatch(
     kind: ExecutionPlanKind,
     requests: Vec<ProtoGenerateRequest>,
@@ -762,6 +808,7 @@ async fn execute_batch_dispatch(
     model: &str,
     prefill_guard: Option<PrefillLoadGuard>,
     ledger: &AttemptLedger,
+    dispatched_at: Instant,
 ) -> Result<ExecutionResult, Response> {
     // One Prefill handle per PD sub-request, all on the one admission slot.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
@@ -782,7 +829,7 @@ async fn execute_batch_dispatch(
             async move {
                 match kind {
                     ExecutionPlanKind::Single => {
-                        execute_single(request, &mut clients, workers, ledger).await
+                        execute_single(request, &mut clients, workers, ledger, dispatched_at).await
                     }
                     // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
                     ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
@@ -810,6 +857,7 @@ async fn execute_single(
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
+    dispatched_at: Instant,
 ) -> Result<ExecutionResult, Response> {
     let client = clients.single_or_mismatch("execute_single")?;
 
@@ -831,6 +879,7 @@ async fn execute_single(
         worker,
         prompt_tokens,
         streaming,
+        dispatched_at,
     )
     .await;
     if let Some(status) = result.breaker_status() {
@@ -874,11 +923,12 @@ async fn dispatch_single_booked(
     worker: Option<&Arc<dyn Worker>>,
     prompt_tokens: u64,
     streaming: bool,
+    dispatched_at: Instant,
 ) -> StreamResult {
     let Some(worker) = worker else {
         return call.await;
     };
-    let booking = DispatchBooking::book(worker, prompt_tokens, streaming);
+    let booking = DispatchBooking::book_at(worker, prompt_tokens, streaming, dispatched_at);
     let stream = call.await?;
     Ok(stream.tracked_booked(Arc::clone(worker), booking))
 }
@@ -2507,11 +2557,14 @@ impl SequentialPlan {
         // must run the vision encoder, so that side keeps the full multimodal
         // payload (SHM-backed tensors cannot serve both sides and fail loudly
         // on the decode read).
-        let decode_request = match self.decode_form {
+        let mut decode_request = match self.decode_form {
             SequentialPdDecodeForm::Full => proto_request.clone(),
             SequentialPdDecodeForm::TextPlusHashes => proto_request.clone_without_mm(),
             SequentialPdDecodeForm::IdentityOnly => proto_request.clone_without_mm_pixels(),
         };
+        if let ProtoGenerateRequest::Vllm(request) = &mut decode_request {
+            request.ec_transfer_params_json = None;
+        }
         // Sanitize prefill sampling (max_tokens=1, n=1), stream=false.
         let mut prefill_request = proto_request;
         prefill_request.sanitize_sampling_for_prefill(1);
@@ -2992,6 +3045,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        middleware::test_support::text_of,
         routers::common::{attempt_ledger::FailedSide, retry::is_retryable_response},
         worker::{
             BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, RuntimeType, Worker,
@@ -5129,10 +5183,7 @@ mod tests {
     async fn sequential_pd_decode_form_rejects_incompatible_pairings() {
         async fn refusal(response: Response) -> String {
             assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("body");
-            let text = String::from_utf8(body.to_vec()).expect("utf-8 body");
+            let text = text_of(response).await;
             assert!(
                 text.contains("no decode worker with a vision encoder is paired"),
                 "{text}"
@@ -5295,9 +5346,10 @@ mod tests {
                     )))
                 }
             };
-            let stream = dispatch_single_booked(call, Some(&worker), 4_096, streaming)
-                .await
-                .expect("the call answered");
+            let stream =
+                dispatch_single_booked(call, Some(&worker), 4_096, streaming, Instant::now())
+                    .await
+                    .expect("the call answered");
             assert_eq!(
                 seen.lock().unwrap().take(),
                 Some((pending, pile)),
@@ -5316,6 +5368,7 @@ mod tests {
             Some(&worker),
             4_096,
             true,
+            Instant::now(),
         )
         .await;
         assert!(failed.is_err(), "the call's failure is the dispatch's");

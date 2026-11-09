@@ -64,7 +64,7 @@ fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
                             max_long_side_pixel: video_url.max_long_side_pixel,
                         });
                     }
-                    ContentPart::Text { .. } => {}
+                    ContentPart::Text { .. } | ContentPart::Refusal { .. } => {}
                     // Chat preparation rejects unknown parts before building the media plan.
                     ContentPart::Unknown(_) => {}
                 }

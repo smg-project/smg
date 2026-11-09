@@ -151,6 +151,17 @@ impl PieceTable {
         out
     }
 
+    /// `text`, a piece's, as the window's first piece renders it: without its
+    /// one leading space when the chain strips it (`Strip(" ", 1, 0)` over the
+    /// whole text), as it is otherwise. [`Self::render`] of that piece alone.
+    pub(crate) fn at_window_start<'t>(&self, text: &'t str) -> &'t str {
+        if self.strips_leading_space {
+            text.strip_prefix(' ').unwrap_or(text)
+        } else {
+            text
+        }
+    }
+
     /// The text `id` adds to a window that has nothing pending, when that is
     /// all a step needs to know: a plain piece (or a kept special token) with
     /// text that does not end in a replacement character, which the step

@@ -750,7 +750,9 @@ mod tests {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                parameters: Some(
+                    json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                ),
                 strict: None,
                 extra: Default::default(),
             },

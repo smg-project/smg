@@ -13,6 +13,17 @@
 //! params pass through to the engine and back, and `GetServerInfo` carries
 //! the connector, role, engine id and pairing facts the Router matches on.
 //!
+//! Encoder-cache disaggregation (the encoder of an encode-prefill-decode
+//! fleet, and the prefill side that consumes its handles) rides the engine's
+//! own connector: the launcher reads `ec_transfer_config` into the four
+//! `GetServerInfo` fields (`supports_ec_transfer`, `ec_connector`, `ec_role`,
+//! `ec_zmq_addrs`), a request's `ec_transfer_params_json` goes to the engine
+//! as the connector's extra argument, the connector's answer comes back on
+//! the `Complete` with the request's media identity, and an engine without a
+//! connector refuses such a request up front (`generate.rs`). A consumer's
+//! handles and a producer's completion pass the Python servicer's
+//! per-connector checks (`encoder_cache.rs`).
+//!
 //! `Embed`, `FlushCache` (a ZMQ utility call), `GetTokenizer` (the tokenizer
 //! directory zipped as the Python servicer zips it) and `SubscribeKvEvents`
 //! (vLLM's ZMQ KV-event publisher relayed) are served too. Worker-side media
@@ -23,6 +34,7 @@
 
 mod admin;
 mod embed;
+mod encoder_cache;
 mod engine;
 mod generate;
 mod info;
@@ -95,6 +107,17 @@ pub struct VllmModelInfo {
     /// projects): a PD decode side's KV-transfer rejection notice is
     /// withheld there (see `generate.rs`).
     pub runs_mooncake: bool,
+    /// Encoder-cache disaggregation identity off `ec_transfer_config`, as the
+    /// launcher reads it: whether an encoder-cache connector runs at all, which
+    /// (`ECCPUConnector`, `ECMooncakeConnector`, ...), this engine's role
+    /// (`ec_producer`, `ec_consumer`, `ec_both`) and, for a Mooncake consumer,
+    /// the ZMQ address per data-parallel rank; all empty when the engine runs
+    /// without one, and a request carrying `ec_transfer_params_json` is then
+    /// refused up front (see `generate.rs`).
+    pub supports_ec_transfer: bool,
+    pub ec_connector: String,
+    pub ec_role: String,
+    pub ec_zmq_addrs: Vec<String>,
     /// PD pairing facts the Router matches before a handoff: requested KV
     /// cache dtype and attention backend (empty when auto), and the model
     /// dtype / block size the handshake confirms (these two are fallbacks
@@ -205,22 +228,13 @@ impl std::fmt::Debug for VllmServicerConfig {
 /// attaches to every batch it streams.
 impl crate::kv_events::RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
-        let response = info::loads(self).ok()?;
-        let load = match dp_rank {
-            // A connected rank reads its own entry (zero-filled until its
-            // first scheduler step, whichever rank reported first), never
-            // another rank's figures; a rank past the connected ones gets
-            // no record.
-            Some(rank) => response.loads.iter().find(|load| load.dp_rank == rank)?,
-            None => response
-                .loads
-                .iter()
-                .find(|load| load.dp_rank == 0)
-                .or_else(|| response.loads.first())?,
-        };
+        // A connected rank reads its own entry (zero-filled until its first
+        // scheduler step, whichever rank reported first), never another
+        // rank's figures; a rank past the connected ones gets no record.
+        let load = info::rank_load(self, dp_rank)?;
         // The queued token-work is this servicer's own estimate for the
-        // rank (see `info::loads`), so every rank's record reports it.
-        let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
+        // rank (see `info::rank_load`), so every rank's record reports it.
+        let mut record = smg_grpc_client::common_proto::EngineLoad::from(&load);
         record.waiting_uncached_tokens =
             Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
         Some(record)

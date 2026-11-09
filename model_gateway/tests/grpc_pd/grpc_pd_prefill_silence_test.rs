@@ -58,7 +58,6 @@
 //! decode worker and nothing on the prefill.
 
 use std::{
-    future::Future,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -66,13 +65,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::grpc_harness::{
-    build_grpc_router, grpc_router_config, grpc_worker, serve_canned_worker, serve_engine, Canned,
+use common::{
+    decode_stream::produce_after,
+    engine_answers::{
+        TokenSpeedAnswers, TokenSpeedGenerateStream, VllmAnswers, VllmGenerateStream,
+    },
+    grpc_harness::{
+        build_grpc_router, grpc_router_config, grpc_worker, serve_canned_worker, serve_engine,
+        Canned,
+    },
+    metrics_capture::render_after,
 };
 use futures::future::join_all;
-use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::model_card::ModelCard;
-use proto::generate_response::Response as GenResp;
 use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
@@ -82,13 +87,10 @@ use smg::{
         RuntimeType, Worker, WorkerType,
     },
 };
-use smg_grpc_client::{
-    common_proto as grpc_common, tokenspeed_scheduler::tokenspeed_proto as ts, vllm_proto as proto,
-};
+use smg_grpc_client::{tokenspeed_scheduler::tokenspeed_proto as ts, vllm_proto as proto};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
 
 use crate::common;
 
@@ -126,8 +128,6 @@ const HANDOFF: Duration = Duration::from_millis(2_500);
 /// How long after a burst the prefill answers its first call, in the
 /// handoff cases: past the bound, an engine step after the handoff.
 const LATE_ANSWER: Duration = Duration::from_secs(4);
-
-type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
 
 /// What a sequential-dispatch mock engine does with a generate call.
 #[derive(Clone, Copy)]
@@ -191,163 +191,30 @@ impl Engine {
     }
 }
 
-fn chunk(id: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Chunk(proto::GenerateStreamChunk {
-            token_ids: vec![id],
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-fn complete() -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Complete(proto::GenerateComplete {
-            output_ids: (1..=OUTPUT_TOKENS).collect(),
-            finish_reason: "stop".to_string(),
-            prompt_tokens: 1,
-            completion_tokens: OUTPUT_TOKENS,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-/// Feed one generate stream: the tokens after `delay`, then the completion.
-/// With `delay` at [`FOREVER`] the sender is held and nothing is written.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "test mock; the producer task ends with its stream"
-)]
-fn produce_after(tx: GenerateTx, delay: Duration) {
-    tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        for id in 1..=OUTPUT_TOKENS {
-            if tx.send(Ok(chunk(id))).await.is_err() {
-                return;
-            }
-        }
-        let _ = tx.send(Ok(complete())).await;
-    });
-}
-
 #[tonic::async_trait]
-impl proto::vllm_engine_server::VllmEngine for Engine {
-    async fn start_profile(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::StartProfileRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn stop_profile(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::StopProfileRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    type GenerateStream = ReceiverStream<Result<proto::GenerateResponse, Status>>;
-
+impl VllmAnswers for Engine {
     async fn generate(
         &self,
         _request: Request<proto::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<VllmGenerateStream>, Status> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel(8);
         match self.behaviour {
             Behaviour::HoldHeaders => {
                 tokio::time::sleep(FOREVER).await;
             }
-            Behaviour::EmptyStream => produce_after(tx, FOREVER),
-            Behaviour::Answer(delay) => produce_after(tx, delay),
+            Behaviour::EmptyStream => produce_after(tx, FOREVER, OUTPUT_TOKENS),
+            Behaviour::Answer(delay) => produce_after(tx, delay, OUTPUT_TOKENS),
             Behaviour::Queued => {
                 self.gate.turn().await;
-                produce_after(tx, Duration::ZERO);
+                produce_after(tx, Duration::ZERO, OUTPUT_TOKENS);
             }
             Behaviour::HoldHeadersThenFail(delay) => {
                 tokio::time::sleep(delay).await;
                 return Err(Status::internal("the engine gave up on the request"));
             }
         }
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    async fn abort(
-        &self,
-        _request: Request<proto::AbortRequest>,
-    ) -> Result<Response<proto::AbortResponse>, Status> {
-        Ok(Response::new(proto::AbortResponse::default()))
-    }
-
-    async fn flush_cache(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::FlushCacheRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::FlushCacheResponse>, Status> {
-        Ok(Response::new(
-            smg_grpc_client::common_proto::FlushCacheResponse::default(),
-        ))
-    }
-
-    async fn embed(
-        &self,
-        _request: Request<proto::EmbedRequest>,
-    ) -> Result<Response<proto::EmbedResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn health_check(
-        &self,
-        _request: Request<proto::HealthCheckRequest>,
-    ) -> Result<Response<proto::HealthCheckResponse>, Status> {
-        Ok(Response::new(proto::HealthCheckResponse {
-            healthy: true,
-            ..Default::default()
-        }))
-    }
-
-    async fn get_model_info(
-        &self,
-        _request: Request<proto::GetModelInfoRequest>,
-    ) -> Result<Response<proto::GetModelInfoResponse>, Status> {
-        Ok(Response::new(proto::GetModelInfoResponse::default()))
-    }
-
-    async fn get_server_info(
-        &self,
-        _request: Request<proto::GetServerInfoRequest>,
-    ) -> Result<Response<proto::GetServerInfoResponse>, Status> {
-        Ok(Response::new(proto::GetServerInfoResponse::default()))
-    }
-
-    async fn get_loads(
-        &self,
-        _request: Request<proto::GetLoadsRequest>,
-    ) -> Result<Response<proto::GetLoadsResponse>, Status> {
-        Ok(Response::new(proto::GetLoadsResponse::default()))
-    }
-
-    type GetTokenizerStream =
-        ReceiverStream<Result<smg_grpc_client::common_proto::GetTokenizerChunk, Status>>;
-
-    async fn get_tokenizer(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    type SubscribeKvEventsStream =
-        ReceiverStream<Result<smg_grpc_client::common_proto::KvEventBatch, Status>>;
-
-    async fn subscribe_kv_events(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
 
@@ -477,15 +344,11 @@ impl QueuedEngine {
 }
 
 #[tonic::async_trait]
-impl TokenSpeedScheduler for QueuedEngine {
-    type GenerateStream = ReceiverStream<Result<ts::GenerateResponse, Status>>;
-    type GetTokenizerStream = ReceiverStream<Result<grpc_common::GetTokenizerChunk, Status>>;
-    type SubscribeKvEventsStream = ReceiverStream<Result<grpc_common::KvEventBatch, Status>>;
-
+impl TokenSpeedAnswers for QueuedEngine {
     async fn generate(
         &self,
         request: Request<ts::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<TokenSpeedGenerateStream>, Status> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, rx) = mpsc::channel(8);
         let request_id = request.into_inner().request_id;
@@ -526,83 +389,7 @@ impl TokenSpeedScheduler for QueuedEngine {
                 }
             }
         }
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    async fn health_check(
-        &self,
-        _request: Request<ts::HealthCheckRequest>,
-    ) -> Result<Response<ts::HealthCheckResponse>, Status> {
-        Ok(Response::new(ts::HealthCheckResponse {
-            healthy: true,
-            message: "ok".to_string(),
-        }))
-    }
-
-    async fn abort(
-        &self,
-        _request: Request<ts::AbortRequest>,
-    ) -> Result<Response<ts::AbortResponse>, Status> {
-        Ok(Response::new(ts::AbortResponse {
-            success: true,
-            message: String::new(),
-        }))
-    }
-
-    async fn get_model_info(
-        &self,
-        _request: Request<ts::GetModelInfoRequest>,
-    ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
-        Ok(Response::new(ts::GetModelInfoResponse::default()))
-    }
-
-    async fn get_server_info(
-        &self,
-        _request: Request<ts::GetServerInfoRequest>,
-    ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
-        Ok(Response::new(ts::GetServerInfoResponse::default()))
-    }
-
-    async fn get_loads(
-        &self,
-        _request: Request<ts::GetLoadsRequest>,
-    ) -> Result<Response<ts::GetLoadsResponse>, Status> {
-        Ok(Response::new(ts::GetLoadsResponse::default()))
-    }
-
-    async fn flush_cache(
-        &self,
-        _request: Request<grpc_common::FlushCacheRequest>,
-    ) -> Result<Response<grpc_common::FlushCacheResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn start_profile(
-        &self,
-        _request: Request<grpc_common::StartProfileRequest>,
-    ) -> Result<Response<grpc_common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn stop_profile(
-        &self,
-        _request: Request<grpc_common::StopProfileRequest>,
-    ) -> Result<Response<grpc_common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn get_tokenizer(
-        &self,
-        _request: Request<grpc_common::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn subscribe_kv_events(
-        &self,
-        _request: Request<grpc_common::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
 
@@ -614,7 +401,7 @@ async fn start_queued_grpc_worker(shape: ParallelShape) -> (u16, QueuedEngine) {
         shape,
         calls: Arc::new(AtomicUsize::new(0)),
     };
-    let port = serve_engine(TokenSpeedSchedulerServer::new(engine.clone())).await;
+    let port = serve_engine(engine.clone().into_server()).await;
     (port, engine)
 }
 
@@ -629,7 +416,7 @@ async fn start_cold_queued_grpc_worker(cold: Duration) -> (u16, QueuedEngine) {
         shape: ParallelShape::Queued,
         calls: Arc::new(AtomicUsize::new(0)),
     };
-    let port = serve_engine(TokenSpeedSchedulerServer::new(engine.clone())).await;
+    let port = serve_engine(engine.clone().into_server()).await;
     (port, engine)
 }
 
@@ -652,13 +439,13 @@ async fn start_late_grpc_worker(
         },
         calls: Arc::new(AtomicUsize::new(0)),
     };
-    let port = serve_engine(TokenSpeedSchedulerServer::new(engine.clone())).await;
+    let port = serve_engine(engine.clone().into_server()).await;
     (port, engine)
 }
 
 /// Serve a sequential-dispatch mock engine in-process; returns its port.
 async fn start_mock_engine(engine: Engine) -> u16 {
-    serve_engine(proto::vllm_engine_server::VllmEngineServer::new(engine)).await
+    serve_engine(engine.into_server()).await
 }
 
 /// Serve the mock-worker crate's canned worker in-process (a parallel-dispatch
@@ -681,11 +468,7 @@ async fn start_mock_grpc_worker(delay: Duration) -> u16 {
 struct CutEngine;
 
 #[tonic::async_trait]
-impl TokenSpeedScheduler for CutEngine {
-    type GenerateStream = ReceiverStream<Result<ts::GenerateResponse, Status>>;
-    type GetTokenizerStream = ReceiverStream<Result<grpc_common::GetTokenizerChunk, Status>>;
-    type SubscribeKvEventsStream = ReceiverStream<Result<grpc_common::KvEventBatch, Status>>;
-
+impl TokenSpeedAnswers for CutEngine {
     #[expect(
         clippy::disallowed_methods,
         reason = "test mock; the producer task ends with its one item"
@@ -693,96 +476,20 @@ impl TokenSpeedScheduler for CutEngine {
     async fn generate(
         &self,
         _request: Request<ts::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<TokenSpeedGenerateStream>, Status> {
         let (tx, rx) = mpsc::channel(1);
         tokio::spawn(async move {
             let _ = tx
                 .send(Err(Status::unavailable("the engine dropped the request")))
                 .await;
         });
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    async fn health_check(
-        &self,
-        _request: Request<ts::HealthCheckRequest>,
-    ) -> Result<Response<ts::HealthCheckResponse>, Status> {
-        Ok(Response::new(ts::HealthCheckResponse {
-            healthy: true,
-            message: "ok".to_string(),
-        }))
-    }
-
-    async fn abort(
-        &self,
-        _request: Request<ts::AbortRequest>,
-    ) -> Result<Response<ts::AbortResponse>, Status> {
-        Ok(Response::new(ts::AbortResponse {
-            success: true,
-            message: String::new(),
-        }))
-    }
-
-    async fn get_model_info(
-        &self,
-        _request: Request<ts::GetModelInfoRequest>,
-    ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
-        Ok(Response::new(ts::GetModelInfoResponse::default()))
-    }
-
-    async fn get_server_info(
-        &self,
-        _request: Request<ts::GetServerInfoRequest>,
-    ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
-        Ok(Response::new(ts::GetServerInfoResponse::default()))
-    }
-
-    async fn get_loads(
-        &self,
-        _request: Request<ts::GetLoadsRequest>,
-    ) -> Result<Response<ts::GetLoadsResponse>, Status> {
-        Ok(Response::new(ts::GetLoadsResponse::default()))
-    }
-
-    async fn flush_cache(
-        &self,
-        _request: Request<grpc_common::FlushCacheRequest>,
-    ) -> Result<Response<grpc_common::FlushCacheResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn start_profile(
-        &self,
-        _request: Request<grpc_common::StartProfileRequest>,
-    ) -> Result<Response<grpc_common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn stop_profile(
-        &self,
-        _request: Request<grpc_common::StopProfileRequest>,
-    ) -> Result<Response<grpc_common::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn get_tokenizer(
-        &self,
-        _request: Request<grpc_common::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn subscribe_kv_events(
-        &self,
-        _request: Request<grpc_common::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
 
 /// Serve a [`CutEngine`] in-process; returns its port.
 async fn start_cut_grpc_worker() -> u16 {
-    serve_engine(TokenSpeedSchedulerServer::new(CutEngine)).await
+    serve_engine(CutEngine.into_server()).await
 }
 
 /// A PD gRPC router over the given workers, registered as `runtime` (which picks
@@ -952,29 +659,6 @@ fn assert_all_answered_past_the_bound(answers: &[(http::StatusCode, String, Dura
     );
 }
 
-/// Run `case` on a current-thread runtime under a thread-local recorder and
-/// return the rendered `/metrics` text.
-#[expect(
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
-fn render_after<F, Fut>(case: F) -> String
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let handle = recorder.handle();
-    metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("current-thread runtime");
-        rt.block_on(case());
-    });
-    handle.render()
-}
-
 /// The value of the `smg_worker_errors_total` sample for `worker_type` and
 /// `error_type` (any connection), zero when it was not emitted.
 fn worker_errors(rendered: &str, worker_type: &str, error_type: &str) -> f64 {
@@ -1117,6 +801,12 @@ fn a_non_streaming_request_is_not_bound_by_the_decode_sides_first_token() {
         .await;
         let (status, body, elapsed) = one_chat(router.as_ref(), false).await;
         assert_eq!(status, http::StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON answer");
+        assert_eq!(
+            json["usage"]["completion_tokens"].as_u64(),
+            Some(u64::from(OUTPUT_TOKENS)),
+            "the usage carries the decode's completion count: {body}"
+        );
         assert!(
             elapsed >= BOUND + Duration::from_secs(1) && elapsed < CASE_CAP,
             "answered when the decode answered, past the bound: {elapsed:?}"

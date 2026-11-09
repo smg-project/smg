@@ -21,8 +21,8 @@ use futures_util::StreamExt;
 use memchr::memmem;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{GenerationRequest, InputIds, StringOrArray},
-    completion::CompletionRequest,
+    common::{GenerationRequest, InputIds},
+    completion::{CompletionPrompt, CompletionRequest},
     generate::GenerateRequest,
     messages::{CountMessageTokensRequest, CreateMessageRequest},
     rerank::RerankRequest,
@@ -300,7 +300,11 @@ impl PdRoute for CompletionRequest {
 
     fn batch_size(&self) -> Option<usize> {
         match &self.prompt {
-            StringOrArray::Array(arr) if !arr.is_empty() => Some(arr.len()),
+            CompletionPrompt::Texts(_) | CompletionPrompt::TokenIdBatches(_)
+                if !self.prompt.is_empty() =>
+            {
+                Some(self.prompt.len())
+            }
             _ => None,
         }
     }
@@ -310,11 +314,14 @@ impl PdRoute for CompletionRequest {
     }
 
     fn routing_inputs(&self) -> (Option<String>, Option<Vec<u32>>) {
-        let text = match &self.prompt {
-            StringOrArray::String(s) => Some(s.clone()),
-            StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
-        };
-        (text, None)
+        match &self.prompt {
+            CompletionPrompt::Text(s) => (Some(s.clone()), None),
+            CompletionPrompt::Texts(v) => (v.first().map(|s| s.to_string()), None),
+            // A prompt of ids routes on them, as `/generate`'s does; a batch
+            // is dispatched to one worker, so its first prompt is the signal.
+            CompletionPrompt::TokenIds(ids) => (None, Some(ids.clone())),
+            CompletionPrompt::TokenIdBatches(batches) => (None, batches.first().cloned()),
+        }
     }
 }
 
@@ -753,7 +760,11 @@ impl PDRouter {
         )
         .await;
 
-        // Record Layer 2 metrics
+        // Record Layer 2 metrics: the duration on a success, else the error
+        // class and reason of the answer. The answer is the request's whether
+        // it was definitive at once or the last retryable one before the
+        // retries ran out, so it counts once either way; the exhaustion
+        // counters above record the spent retries beside it.
         let duration = start_time.elapsed();
         if response.status().is_success() {
             Metrics::record_router_duration(
@@ -764,7 +775,7 @@ impl PDRouter {
                 endpoint,
                 duration,
             );
-        } else if !is_retryable_response(&response) {
+        } else {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_PD,
@@ -2922,18 +2933,20 @@ mod tests {
     use super::*;
     use crate::{
         config::{types::PdPairingMode, PolicyConfig},
-        middleware::ReportedRefusal,
-        observability::logging::test_support::test_subscriber,
+        middleware::{test_support::json_of, ReportedRefusal},
+        observability::logging::test_support::{test_subscriber, RefusalLineCounter},
         routers::common::sse::SSE_CHANNEL_BUFFER,
         tenant::TenantKey,
-        test_support::RefusedAddress,
-        worker::{circuit_breaker::CircuitState, BasicWorkerBuilder, WorkerType},
+        worker::{
+            circuit_breaker::CircuitState, test_support::RefusedAddress, BasicWorkerBuilder,
+            WorkerType,
+        },
     };
 
     /// A call that never reached its worker, with the worker's URL on the
     /// error as reqwest attaches it.
     async fn call_refused_by(addr: std::net::SocketAddr) -> reqwest::Error {
-        crate::clients::http_client_builder()
+        crate::server::http_client_builder()
             .build()
             .unwrap()
             .get(format!("http://{addr}/generate"))
@@ -2944,10 +2957,7 @@ mod tests {
 
     /// The message of the error envelope `response` carries.
     async fn error_message(response: Response) -> String {
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
+        let body = json_of(response).await;
         body["error"]["message"].as_str().unwrap().to_string()
     }
 
@@ -2993,7 +3003,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let worker = BasicWorkerBuilder::new(format!("http://{addr}")).build();
-        let error = crate::clients::http_client_builder()
+        let error = crate::server::http_client_builder()
             .timeout(std::time::Duration::from_millis(100))
             .build()
             .unwrap()
@@ -3088,6 +3098,12 @@ mod tests {
         assert_eq!(prompt.batch_size(), None);
         assert!(!prompt.returns_logprob());
         assert_eq!(prompt.routing_inputs(), (Some("only".to_string()), None));
+        let ids: CompletionRequest = req(json!({"model": "m", "prompt": [11, 12, 13]}));
+        assert_eq!(ids.batch_size(), None);
+        assert_eq!(ids.routing_inputs(), (None, Some(vec![11, 12, 13])));
+        let batches: CompletionRequest = req(json!({"model": "m", "prompt": [[11, 12], [13]]}));
+        assert_eq!(batches.batch_size(), Some(2));
+        assert_eq!(batches.routing_inputs(), (None, Some(vec![11, 12])));
 
         let rerank: RerankRequest = req(json!({"model": "m", "query": "q", "documents": ["d"]}));
         assert_eq!(RerankRequest::ROUTE, "/v1/rerank");
@@ -3551,7 +3567,7 @@ mod tests {
                 ..Default::default()
             };
             let client = Arc::new(
-                crate::clients::http_client_builder()
+                crate::server::http_client_builder()
                     .timeout(std::time::Duration::from_secs(1))
                     .build()
                     .unwrap(),
@@ -3655,7 +3671,7 @@ mod tests {
             ..Default::default()
         };
         let client = Arc::new(
-            crate::clients::http_client_builder()
+            crate::server::http_client_builder()
                 .timeout(std::time::Duration::from_secs(1))
                 .build()
                 .unwrap(),
@@ -3953,7 +3969,7 @@ mod tests {
         for head_sent in [false, true] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = Arc::new(
-                crate::clients::http_client_builder()
+                crate::server::http_client_builder()
                     .timeout(std::time::Duration::from_millis(100))
                     .build()
                     .unwrap(),
@@ -4459,6 +4475,70 @@ mod tests {
         // A prefill 5xx stays a status the retry layer and the client can act
         // on, not a 200 carrying an in-band stream error.
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The pair's last retryable answer, once the request's retries are
+    /// spent, is the request's failure: counted once in the router error
+    /// family beside the exhaustion counters, as the regular router counts
+    /// its own. One attempt here (retries off), ended by the prefill side's
+    /// 503.
+    #[test]
+    fn an_exhausted_requests_last_retryable_answer_counts_as_its_error() {
+        use crate::observability::metrics::test_support::render_with_recorder;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let rendered = render_with_recorder(|| {
+            runtime.block_on(async {
+                let prefill = axum::Router::new().route(
+                    "/v1/chat/completions",
+                    axum::routing::post(|| async {
+                        (StatusCode::SERVICE_UNAVAILABLE, r#"{"error":"busy"}"#)
+                    }),
+                );
+                let decode = axum::Router::new().route(
+                    "/v1/chat/completions",
+                    axum::routing::post(|| async {
+                        ([(CONTENT_TYPE, "text/event-stream")], DECODE_SSE)
+                    }),
+                );
+                let mut router = create_test_pd_router();
+                router.retry_config.max_retries = 1;
+                register_pd_pair(&router, spawn_stub(prefill).await, spawn_stub(decode).await);
+                let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+                let response = router
+                    .route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID)
+                    .await;
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            });
+        });
+        let errors: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_router_request_errors_total{"))
+            .collect();
+        assert!(
+            errors.iter().any(|line| {
+                line.contains("router_type=\"http\"")
+                    && line.contains("backend_type=\"pd\"")
+                    && line.contains("endpoint=\"chat\"")
+                    && line.contains("error_type=\"backend_error\"")
+                    && line.ends_with(" 1")
+            }),
+            "the request's last answer counts once as its error:\n{rendered}"
+        );
+        assert_eq!(errors.len(), 1, "one sample, one label set:\n{rendered}");
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_worker_retries_exhausted_total{")
+                    && line.contains("worker_type=\"prefill\"")
+                    && line.contains("endpoint=\"chat\"")
+                    && line.ends_with(" 1")
+            }),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]
@@ -6939,28 +7019,6 @@ mod tests {
         );
         assert!(decode.circuit_breaker_can_execute());
         assert!(prefill.circuit_breaker_can_execute());
-    }
-
-    /// Counts, on this thread's subscriber, the ERROR events and the refusal
-    /// lines (the events carrying a `suppressed` field).
-    struct RefusalLineCounter {
-        errors: Arc<AtomicUsize>,
-        refusal_lines: Arc<AtomicUsize>,
-    }
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefusalLineCounter {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if *event.metadata().level() == tracing::Level::ERROR {
-                self.errors.fetch_add(1, Ordering::Relaxed);
-            }
-            if event.metadata().fields().field("suppressed").is_some() {
-                self.refusal_lines.fetch_add(1, Ordering::Relaxed);
-            }
-        }
     }
 
     /// The sequential shape's pair: a prefill engine of the handoff kind (its

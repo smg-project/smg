@@ -34,6 +34,8 @@
 //! 4. Process each crop + original resized image
 //! 5. Stack all processed patches
 
+use std::borrow::Cow;
+
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
 use ndarray::{self, Array3};
 use serde_json::Value;
@@ -42,8 +44,8 @@ use crate::vision::{
     preprocessor_config::PreProcessorConfig,
     processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
     transforms::{
-        center_crop, expand_to_square, mean_to_rgb, normalize, pil_to_filter, resize, stack_batch,
-        to_tensor, TransformError,
+        center_crop, crop_rgb, expand_to_square, mean_to_rgb, normalize, paste_rgb, pil_to_filter,
+        resize, stack_batch, to_tensor, TransformError,
     },
 };
 
@@ -255,10 +257,10 @@ impl LlavaProcessor {
                 // Pad mode: expand to square with mean color padding, then resize
                 let (w, h) = image.dimensions();
                 let squared = if w == h {
-                    std::borrow::Cow::Borrowed(image)
+                    Cow::Borrowed(image)
                 } else {
                     let mean_color = mean_to_rgb(&mean);
-                    std::borrow::Cow::Owned(expand_to_square(image, mean_color))
+                    Cow::Owned(expand_to_square(image, mean_color))
                 };
 
                 // Resize to target size (maintaining square)
@@ -537,11 +539,15 @@ impl LlavaNextProcessor {
             .map(|(h, _w)| h)
             .unwrap_or(self.base.image_size);
 
-        // Resize patch to target size
-        let resized = if transforms.do_resize {
-            resize(image, target_size, target_size, filter)
+        // Resize patch to target size. An RGB sample that already has it (the
+        // crops of the padded image, and the base image resized to it) is
+        // taken as it is: the resizer's same-size pass is a copy of the bytes.
+        let same_size = image.dimensions() == (target_size, target_size)
+            && matches!(image, DynamicImage::ImageRgb8(_));
+        let resized = if transforms.do_resize && !same_size {
+            Cow::Owned(resize(image, target_size, target_size, filter))
         } else {
-            image.clone()
+            Cow::Borrowed(image)
         };
 
         // Center crop if configured (skip if image already fits)
@@ -551,7 +557,7 @@ impl LlavaNextProcessor {
                 if crop_w >= rw && crop_h >= rh {
                     resized
                 } else {
-                    center_crop(&resized, crop_w, crop_h)
+                    Cow::Owned(center_crop(&resized, crop_w, crop_h))
                 }
             } else {
                 resized
@@ -625,7 +631,6 @@ impl VisionPreProcessor for LlavaNextProcessor {
 
         // Build 5D encoder_input [num_images, max_patches, C, H, W] matching the
         // HF LlavaNextImageProcessor output the engine expects with Batched layout.
-        let max_patches = patches_per_image.iter().map(|p| p.len()).max().unwrap_or(0);
         let (c, h, w) = if let Some(first) = patches_per_image.iter().find_map(|p| p.first()) {
             let s = first.shape();
             (s[0], s[1], s[2])
@@ -634,14 +639,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
         };
 
         let num_images = images.len();
-        let mut encoder_input = ndarray::Array5::<f32>::zeros((num_images, max_patches, c, h, w));
-        for (i, patches) in patches_per_image.iter().enumerate() {
-            for (j, patch) in patches.iter().enumerate() {
-                encoder_input
-                    .slice_mut(ndarray::s![i, j, .., .., ..])
-                    .assign(patch);
-            }
-        }
+        let encoder_input = stack_patches(&patches_per_image, (c, h, w))?;
 
         // Build model-specific image_sizes tensor as [num_images, 2] in (height, width) order
         // to match the HF LlavaNextImageProcessor output format the engine expects.
@@ -815,13 +813,33 @@ fn resize_and_pad_image(image: &DynamicImage, target: (u32, u32)) -> DynamicImag
     };
 
     let resized = resize(image, new_width, new_height, FilterType::CatmullRom);
+    let paste_x = (target_width - new_width) / 2;
+    let paste_y = (target_height - new_height) / 2;
 
-    let mut new_image = DynamicImage::new_rgb8(target_width, target_height);
-    let paste_x = (target_width - new_width) as i64 / 2;
-    let paste_y = (target_height - new_height) as i64 / 2;
-
-    image::imageops::overlay(&mut new_image, &resized, paste_x, paste_y);
-    new_image
+    match resized {
+        // The paste of an opaque image onto a black canvas is a copy: the
+        // canvas is built from rows.
+        DynamicImage::ImageRgb8(rgb) => DynamicImage::ImageRgb8(paste_rgb(
+            &rgb,
+            target_width,
+            target_height,
+            paste_x,
+            paste_y,
+            [0, 0, 0],
+        )),
+        // Any other layout is pasted pixel by pixel, as the generic paste
+        // blends it (an alpha channel over the black canvas).
+        other => {
+            let mut new_image = DynamicImage::new_rgb8(target_width, target_height);
+            image::imageops::overlay(
+                &mut new_image,
+                &other,
+                i64::from(paste_x),
+                i64::from(paste_y),
+            );
+            new_image
+        }
+    }
 }
 
 /// Divide image into crops of specified size.
@@ -831,16 +849,61 @@ fn divide_to_samples(image: &DynamicImage, crop_size: (u32, u32)) -> Vec<Dynamic
 
     for y in (0..height).step_by(crop_size.1 as usize) {
         for x in (0..width).step_by(crop_size.0 as usize) {
-            let patch = image.crop_imm(x, y, crop_size.0, crop_size.1);
+            let patch = match image {
+                // Row copies out of the image's own bytes; the generic crop
+                // fills a zeroed image pixel by pixel.
+                DynamicImage::ImageRgb8(rgb) => {
+                    DynamicImage::ImageRgb8(crop_rgb(rgb, x, y, crop_size.0, crop_size.1))
+                }
+                other => other.crop_imm(x, y, crop_size.0, crop_size.1),
+            };
             samples.push(patch);
         }
     }
     samples
 }
 
+/// The batch tensor `[num_images, max_patches, c, h, w]`, `max_patches` the
+/// widest image's patch count: every image's patches in order, then zero
+/// patches up to that width, every element written once (a zeroed tensor
+/// assigned patch by patch paid the allocator's page faults for a zero fill
+/// the copies then overwrote). A patch of another shape is refused rather
+/// than broadcast into its slot.
+fn stack_patches(
+    patches_per_image: &[Vec<Array3<f32>>],
+    (c, h, w): (usize, usize, usize),
+) -> Result<ndarray::Array5<f32>, TransformError> {
+    let num_images = patches_per_image.len();
+    let max_patches = patches_per_image.iter().map(Vec::len).max().unwrap_or(0);
+    let patch_len = c * h * w;
+    let mut data = Vec::with_capacity(num_images * max_patches * patch_len);
+    for patches in patches_per_image {
+        for patch in patches {
+            if patch.shape() != [c, h, w] {
+                return Err(TransformError::InvalidShape {
+                    expected: format!("[{c}, {h}, {w}]"),
+                    actual: patch.shape().to_vec(),
+                });
+            }
+            match patch.as_slice() {
+                Some(values) => data.extend_from_slice(values),
+                None => data.extend(patch.iter()),
+            }
+        }
+        data.resize(data.len() + (max_patches - patches.len()) * patch_len, 0.0);
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "data holds num_images * max_patches * c * h * w elements by construction"
+    )]
+    let tensor = ndarray::Array5::from_shape_vec((num_images, max_patches, c, h, w), data)
+        .expect("patch tensor matches its shape");
+    Ok(tensor)
+}
+
 #[cfg(test)]
 mod tests {
-    use image::Rgb;
+    use image::{Rgb, RgbImage};
 
     use super::*;
     use crate::test_support::create_test_image;
@@ -1004,5 +1067,121 @@ mod tests {
             assert_eq!(sample.width(), 336);
             assert_eq!(sample.height(), 336);
         }
+    }
+
+    /// An image whose bytes vary with the position: a misplaced byte shows.
+    fn gradient(width: u32, height: u32, seed: usize) -> RgbImage {
+        RgbImage::from_raw(
+            width,
+            height,
+            crate::test_support::gradient_rgb(width as usize, height as usize, seed),
+        )
+        .expect("gradient size")
+    }
+
+    #[test]
+    fn the_padded_image_is_the_generic_paste_on_black() {
+        // A wide image (padded above and below) and a tall one (padded on
+        // the sides), each resized the way the processor resizes it and
+        // pasted with the generic paste onto a zeroed canvas.
+        for (width, height, target) in [(100u32, 40u32, (672u32, 336u32)), (40, 100, (336, 672))] {
+            let image = DynamicImage::ImageRgb8(gradient(width, height, 3));
+            let padded = resize_and_pad_image(&image, target);
+            let (scale_w, scale_h) = (
+                target.0 as f32 / width as f32,
+                target.1 as f32 / height as f32,
+            );
+            let (new_w, new_h) = if scale_w < scale_h {
+                (
+                    target.0,
+                    ((height as f32 * scale_w).ceil() as u32).min(target.1),
+                )
+            } else {
+                (
+                    ((width as f32 * scale_h).ceil() as u32).min(target.0),
+                    target.1,
+                )
+            };
+            let resized = resize(&image, new_w, new_h, FilterType::CatmullRom);
+            let mut expected = DynamicImage::new_rgb8(target.0, target.1);
+            image::imageops::overlay(
+                &mut expected,
+                &resized,
+                i64::from((target.0 - new_w) / 2),
+                i64::from((target.1 - new_h) / 2),
+            );
+            assert_eq!(padded.dimensions(), (target.0, target.1));
+            assert_eq!(padded.as_bytes(), expected.as_bytes(), "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn the_crops_are_the_generic_crops() {
+        // A grid of whole crops, a grid the image's edges clip, a column.
+        for (width, height) in [(672, 672), (700, 500), (336, 1008)] {
+            let image = DynamicImage::ImageRgb8(gradient(width, height, 5));
+            let samples = divide_to_samples(&image, (336, 336));
+            let mut expected = Vec::new();
+            for y in (0..height).step_by(336) {
+                for x in (0..width).step_by(336) {
+                    expected.push(image.crop_imm(x, y, 336, 336));
+                }
+            }
+            assert_eq!(samples.len(), expected.len(), "{width}x{height}");
+            for (sample, expected) in samples.iter().zip(&expected) {
+                assert_eq!(
+                    sample.dimensions(),
+                    expected.dimensions(),
+                    "{width}x{height}"
+                );
+                assert_eq!(sample.as_bytes(), expected.as_bytes(), "{width}x{height}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_patch_of_another_shape_is_refused_not_broadcast() {
+        // A degenerate `[3, 336, 1]` patch: a zeroed tensor's assign would
+        // have broadcast it across its slot; the copy refuses it.
+        let patches = vec![vec![Array3::<f32>::zeros((3, 336, 1))]];
+        assert!(matches!(
+            stack_patches(&patches, (3, 336, 336)),
+            Err(TransformError::InvalidShape { .. })
+        ));
+    }
+
+    #[test]
+    fn the_batch_tensor_holds_every_patch_and_zero_padding() {
+        let config = PreProcessorConfig {
+            do_resize: Some(true),
+            do_center_crop: Some(false),
+            do_normalize: Some(true),
+            ..Default::default()
+        };
+        let processor = LlavaNextProcessor::new().with_preprocessor_config(&config);
+        // A square image takes the square grid (four crops and the base
+        // image); a small wide one a two-crop grid, padded to the square's
+        // patch count in the batch.
+        let square = DynamicImage::ImageRgb8(gradient(500, 500, 7));
+        let wide = DynamicImage::ImageRgb8(gradient(100, 50, 11));
+        let result = processor.preprocess(&[&square, &wide]).unwrap();
+        let tensor = result.encoder_input.as_f32();
+        assert_eq!(tensor.shape(), &[2, 5, 3, 336, 336]);
+
+        // The zeroed form: a zero tensor with every patch assigned.
+        let filter = processor.base.transforms.filter;
+        let mut expected = ndarray::Array5::<f32>::zeros((2, 5, 3, 336, 336));
+        for (i, image) in [&square, &wide].into_iter().enumerate() {
+            let best_resolution = processor.select_best_resolution(image.dimensions());
+            let padded = processor.resize_and_pad_image(image, best_resolution);
+            let mut samples = vec![resize(image, 336, 336, filter)];
+            samples.extend(processor.divide_to_samples(&padded, (336, 336)));
+            for (j, sample) in samples.iter().enumerate() {
+                expected
+                    .slice_mut(ndarray::s![i, j, .., .., ..])
+                    .assign(&processor.process_patch(sample));
+            }
+        }
+        assert_eq!(tensor.as_slice().unwrap(), expected.as_slice().unwrap());
     }
 }

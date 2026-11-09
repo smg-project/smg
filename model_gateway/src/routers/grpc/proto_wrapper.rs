@@ -42,6 +42,7 @@ mod multimodal;
 mod request;
 mod shm;
 
+use self::shm::vllm_mm_hash_identity;
 pub use self::{
     embed::{ProtoEmbedComplete, ProtoEmbedRequest},
     logprobs::{ProtoInputLogProbs, ProtoOutputLogProbs, ProtoTopLogProbs},
@@ -57,7 +58,6 @@ pub use self::{
         collect_vllm_generate_request_shm_handles, mm_shm_dev_writable, write_tokenspeed_shm_with,
     },
 };
-use self::{logprobs::convert_trtllm_output_logprobs, shm::vllm_mm_hash_identity};
 pub(crate) use self::{
     multimodal::{stage_tokenspeed_tensor_rdma, EncodeItemBootstrapInfo},
     request::VLLM_MROPE_GRID_KEYS,
@@ -66,27 +66,6 @@ pub(crate) use self::{
         vllm_mm_identity,
     },
 };
-
-/// Helper macro to convert output logprobs from proto types to unified type.
-/// Both SGLang and vLLM have identical OutputLogProbs structure.
-/// Note: Cloning is necessary as we convert from borrowed proto types to owned unified types.
-/// OOM risk is mitigated by capping top_logprobs at 20 in sampling params.
-macro_rules! convert_output_logprobs {
-    ($lp:expr) => {
-        ProtoOutputLogProbs {
-            token_logprobs: $lp.token_logprobs.clone(),
-            token_ids: $lp.token_ids.clone(),
-            top_logprobs: $lp
-                .top_logprobs
-                .iter()
-                .map(|t| ProtoTopLogProbs {
-                    values: t.values.clone(),
-                    token_ids: t.token_ids.clone(),
-                })
-                .collect(),
-        }
-    };
-}
 
 /// Helper macro to convert input logprobs from proto types to unified type.
 macro_rules! convert_input_logprobs {
@@ -547,26 +526,20 @@ impl ProtoGenerateStreamChunk {
         }
     }
 
-    /// Get output logprobs.
-    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs> {
+    /// The output's logprobs, read in place on the message; `None` when the
+    /// engine sent none (the TRT-LLM wire sends an empty list for none).
+    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs<'_>> {
         match self {
-            Self::Sglang(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Vllm(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Trtllm(c) => convert_trtllm_output_logprobs(&c.logprobs),
-            Self::Mlx(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+            Self::Sglang(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Sglang),
+            Self::Vllm(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Vllm),
+            Self::Trtllm(c) => {
+                (!c.logprobs.is_empty()).then(|| ProtoOutputLogProbs::Trtllm(&c.logprobs))
+            }
+            Self::Mlx(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Mlx),
             Self::TokenSpeed(c) => c
                 .output_logprobs
                 .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+                .map(ProtoOutputLogProbs::TokenSpeed),
         }
     }
 
@@ -796,26 +769,20 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get output logprobs.
-    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs> {
+    /// The output's logprobs, read in place on the message; `None` when the
+    /// engine sent none (the TRT-LLM wire sends an empty list for none).
+    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs<'_>> {
         match self {
-            Self::Sglang(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Vllm(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Trtllm(c) => convert_trtllm_output_logprobs(&c.logprobs),
-            Self::Mlx(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+            Self::Sglang(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Sglang),
+            Self::Vllm(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Vllm),
+            Self::Trtllm(c) => {
+                (!c.logprobs.is_empty()).then(|| ProtoOutputLogProbs::Trtllm(&c.logprobs))
+            }
+            Self::Mlx(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Mlx),
             Self::TokenSpeed(c) => c
                 .output_logprobs
                 .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+                .map(ProtoOutputLogProbs::TokenSpeed),
         }
     }
 
@@ -1104,8 +1071,19 @@ impl PrefillTicket {
         prompt_tokens: u64,
         timed: bool,
     ) -> Option<Self> {
+        Self::book_as_at(worker, prompt_tokens, timed, liveness::now_ms())
+    }
+
+    /// [`Self::book_as`] at `now_ms` on the gateway clock (`liveness::now_ms`):
+    /// the dispatch's one stamp, shared with its deadline.
+    pub(crate) fn book_as_at(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        timed: bool,
+        now_ms: u64,
+    ) -> Option<Self> {
         (prompt_tokens > 0).then(|| {
-            worker.note_prefill_started(prompt_tokens, timed);
+            worker.note_prefill_started_at(prompt_tokens, timed, now_ms);
             Self {
                 worker: Arc::clone(worker),
                 tokens: prompt_tokens,
@@ -1115,13 +1093,14 @@ impl PrefillTicket {
         })
     }
 
-    /// The first response came back, reporting `cached` prompt tokens served
-    /// from the engine's prefix cache.
-    fn first_response(&mut self, cached: u64) {
+    /// The first response came back at `now_ms` on the gateway clock (the
+    /// stamp its reader took for the message), reporting `cached` prompt
+    /// tokens served from the engine's prefix cache.
+    fn first_response_at(&mut self, cached: u64, now_ms: u64) {
         if !self.released {
             self.released = true;
             self.worker
-                .note_prefill_ended(self.tokens, self.timed, Some(cached));
+                .note_prefill_ended_at(self.tokens, self.timed, Some(cached), now_ms);
         }
     }
 }
@@ -1148,6 +1127,18 @@ pub(crate) struct DispatchBooking {
 
 impl DispatchBooking {
     pub(crate) fn book(worker: &Arc<dyn Worker>, prompt_tokens: u64, streaming: bool) -> Self {
+        Self::book_at(worker, prompt_tokens, streaming, Instant::now())
+    }
+
+    /// [`Self::book`] for a request dispatched at `dispatched_at`: the one
+    /// instant the dispatch read, which its deadline runs from too, stamps
+    /// the prefill booking.
+    pub(crate) fn book_at(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        streaming: bool,
+        dispatched_at: Instant,
+    ) -> Self {
         let progress = streaming.then(|| {
             worker.note_tracked_started();
             ProgressTicket {
@@ -1155,7 +1146,12 @@ impl DispatchBooking {
             }
         });
         Self {
-            prefill: PrefillTicket::book_as(worker, prompt_tokens, streaming),
+            prefill: PrefillTicket::book_as_at(
+                worker,
+                prompt_tokens,
+                streaming,
+                liveness::ms_at(dispatched_at),
+            ),
             progress,
         }
     }
@@ -1874,7 +1870,10 @@ impl ProtoStream {
         };
         match &item {
             Some(Ok(response)) => {
-                liveness::on_token_progress(&tracked.worker);
+                // One stamp for the message: the worker's progress note and,
+                // on the first response, the end of the prompt's prefill.
+                let now_ms = liveness::now_ms();
+                liveness::on_token_progress_at(&tracked.worker, now_ms);
                 if std::mem::take(&mut tracked.samples_success) {
                     tracked.worker.record_outcome(200);
                 }
@@ -1882,7 +1881,7 @@ impl ProtoStream {
                     tracked.output = Some(OutputTicket::open(&tracked.worker));
                 }
                 if let Some(ticket) = tracked.prefill.as_mut() {
-                    ticket.first_response(u64::from(response.cached_tokens()));
+                    ticket.first_response_at(u64::from(response.cached_tokens()), now_ms);
                 }
                 tracked.prefill = None;
             }

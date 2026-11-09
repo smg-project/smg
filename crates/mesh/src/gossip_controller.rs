@@ -41,35 +41,53 @@ use anyhow::Result;
 use parking_lot::RwLock;
 use rand::seq::{IndexedRandom, SliceRandom};
 use tokio::sync::{mpsc, watch, Mutex};
-use tonic::transport::Endpoint;
 use tracing as log;
 use tracing::{instrument, Instrument};
 
 use super::{
     dialer::Dialer,
-    mtls::tls_server_name,
     service::{
         broadcast_node_states,
         gossip::{
-            gossip_client::GossipClient, gossip_message, NodeState, NodeStatus, Ping, PingReq,
-            StateSync, StreamMessage,
+            gossip_client::GossipClient, gossip_message, NodeState, NodeStatus, NodeUpdate, Ping,
+            PingReq, StateSync, StreamMessage,
         },
-        ClusterState,
+        member_transition_line, status_of, ClusterState,
     },
 };
 use crate::{
     crdt_kv::CrdtWatermark,
     metrics,
     transport::{
-        limits::MAX_MESSAGE_SIZE,
+        limits::{MAX_MESSAGE_SIZE, STREAM_HEARTBEAT_INTERVAL},
         peer_stream::{handle_frame, next_frame, send_round, Frame, RoundOutcome, SenderState},
         sync_stream::build_heartbeat,
     },
 };
 
-/// The name the configured join peer (`--mesh-peer-urls`) goes by until
-/// its answer names it: in the dial's log lines and in the retry table.
+/// The name the first configured join peer (`--mesh-peer-urls`) goes by
+/// until its answer names it: in the dial's log lines and in the retry
+/// table. The entries after it carry their position: `init_peer_1`,
+/// `init_peer_2`, so each has a retry state of its own.
 const INIT_PEER_NAME: &str = "init_peer";
+
+/// The placeholder name of the join peer at `index` of the configured list.
+fn join_peer_name(index: usize) -> String {
+    if index == 0 {
+        INIT_PEER_NAME.to_string()
+    } else {
+        format!("{INIT_PEER_NAME}_{index}")
+    }
+}
+
+/// Whether `name` is a join peer's placeholder, not a member's name.
+fn is_join_peer(name: &str) -> bool {
+    name == INIT_PEER_NAME || name.starts_with(&format!("{INIT_PEER_NAME}_"))
+}
+
+/// The period of the node's tick: one round is one probe of one random
+/// member and one collection of the stream round.
+pub(crate) const ROUND_PERIOD: Duration = Duration::from_secs(1);
 
 /// The per-node event loop driver. Holds the cluster-state reference,
 /// self-identity, init-peer address, mTLS config, the live set of
@@ -81,7 +99,9 @@ pub struct GossipController {
     state: ClusterState,
     self_name: String,
     self_addr: SocketAddr,
-    init_peer: Option<SocketAddr>,
+    /// The configured join peers, dialed in turn while the table holds
+    /// nobody else.
+    init_peers: Vec<SocketAddr>,
     /// The node's dials: the probes, the relayed probes and the status
     /// broadcasts go through it, one channel per peer address.
     dialer: Arc<Dialer>,
@@ -102,14 +122,14 @@ impl GossipController {
         state: ClusterState,
         self_addr: SocketAddr,
         self_name: &str,
-        init_peer: Option<SocketAddr>,
+        init_peers: Vec<SocketAddr>,
         dialer: Arc<Dialer>,
     ) -> Self {
         Self {
             state,
             self_name: self_name.to_string(),
             self_addr,
-            init_peer,
+            init_peers,
             dialer,
             sync_connections: Arc::new(Mutex::new(HashMap::new())),
             current_stream_batch: Arc::new(RwLock::new(Arc::new(crate::kv::RoundBatch::default()))),
@@ -139,10 +159,10 @@ impl GossipController {
         let mut retry_managers: HashMap<String, RetryManager> = HashMap::new();
 
         loop {
-            log::info!("Round {} Status:{:?}", round, self.state.read());
+            log::trace!("Round {} Status:{:?}", round, self.state.read());
             self.reap_finished_streams().await;
             let targets = self.probe_targets();
-            let peer = self.peer_to_dial(&targets);
+            let peer = self.peer_to_dial(&targets, round);
             round += 1;
             self.periodic_gc(round, &targets, &mut retry_managers);
             self.collect_stream_batch();
@@ -153,9 +173,9 @@ impl GossipController {
                     break;
                 }
 
-                () = tokio::time::sleep(Duration::from_secs(1)) => {
+                () = tokio::time::sleep(ROUND_PERIOD) => {
                     let Some(peer) = peer else {
-                        log::info!("No peer address available to connect");
+                        log::debug!("No peer address available to connect");
                         continue;
                     };
                     let outcome = Self::dial_with_backoff(
@@ -167,7 +187,7 @@ impl GossipController {
                     .await;
                     match outcome {
                         DialOutcome::Connected => {
-                            log::info!("Successfully connected to peer {}", peer.name);
+                            log::debug!("Successfully connected to peer {}", peer.name);
                         }
                         DialOutcome::JoinPeerAlone { next_delay } => {
                             log::debug!(
@@ -230,14 +250,18 @@ impl GossipController {
     }
 
     /// The peer this round dials: a random probe target, or, while the table
-    /// holds nobody else, the configured join peer as a Suspected placeholder
-    /// named `init_peer`: at the start, and again should every other member
-    /// be gone, under its backoff like any peer. Members a service discovery
-    /// wrote into the table take precedence.
-    fn peer_to_dial(&self, targets: &BTreeMap<String, NodeState>) -> Option<NodeState> {
+    /// holds nobody else, one of the configured join peers as a Suspected
+    /// placeholder named by its position (`init_peer`, `init_peer_1`, ...),
+    /// the entries taken in turn round by round: at the start, and again
+    /// should every other member be gone, each under its own backoff like
+    /// any peer. Members a service discovery wrote into the table take
+    /// precedence.
+    fn peer_to_dial(&self, targets: &BTreeMap<String, NodeState>, round: u64) -> Option<NodeState> {
         if targets.is_empty() {
-            return self.init_peer.map(|init_peer| NodeState {
-                name: INIT_PEER_NAME.to_string(),
+            let count = u64::try_from(self.init_peers.len()).ok()?;
+            let index = usize::try_from(round.checked_rem(count)?).ok()?;
+            return self.init_peers.get(index).map(|init_peer| NodeState {
+                name: join_peer_name(index),
                 address: init_peer.to_string(),
                 status: NodeStatus::Suspected as i32,
                 version: 1,
@@ -253,10 +277,11 @@ impl GossipController {
     /// the receiver has held for a full assembly timeout are assumed lost,
     /// and the sender re-publishes on its own retry cycle with a fresh
     /// generation. Every sixtieth round (~60 s) the retry managers of peers
-    /// no longer in the table go; the join peer's entry stays, as it is never
-    /// in the table under its placeholder name and its backoff must not
-    /// restart every minute. The dialer's channels to addresses the table no
-    /// longer names go with them (the join peer's address stays too).
+    /// no longer in the table go; the join peers' entries stay, as they are
+    /// never in the table under their placeholder names and their backoff
+    /// must not restart every minute. The dialer's channels to addresses the
+    /// table no longer names go with them (the join peers' addresses stay
+    /// too).
     fn periodic_gc(
         &self,
         round: u64,
@@ -269,15 +294,14 @@ impl GossipController {
             }
         }
         if round.is_multiple_of(60) {
-            retry_managers.retain(|peer_name, _| {
-                targets.contains_key(peer_name) || peer_name == INIT_PEER_NAME
-            });
+            retry_managers
+                .retain(|peer_name, _| targets.contains_key(peer_name) || is_join_peer(peer_name));
             let members: Vec<SocketAddr> = self
                 .state
                 .read()
                 .values()
                 .filter_map(|node| node.address.parse().ok())
-                .chain(self.init_peer)
+                .chain(self.init_peers.iter().copied())
                 .collect();
             self.dialer.retain(|addr| members.contains(addr));
         }
@@ -298,7 +322,7 @@ impl GossipController {
     /// One dial of `peer` under its retry manager's backoff: nothing is
     /// dialled while the manager still backs off from an earlier failure;
     /// otherwise `connect` runs. Its success resets the manager, unless the
-    /// peer is the join peer and `has_another_member` finds the table still
+    /// peer is a join peer and `has_another_member` finds the table still
     /// without a member to probe (the join peer is this node itself, or it
     /// is leaving): that counts as an attempt, so the next dial waits out
     /// the backoff instead of coming every round. A failure records the
@@ -321,7 +345,7 @@ impl GossipController {
             };
         }
         match connect(peer.clone()).await {
-            Ok(()) if peer.name == INIT_PEER_NAME && !has_another_member() => {
+            Ok(()) if is_join_peer(&peer.name) && !has_another_member() => {
                 retry_manager.record_attempt();
                 DialOutcome::JoinPeerAlone {
                     next_delay: retry_manager.next_delay(),
@@ -342,8 +366,113 @@ impl GossipController {
         }
     }
 
+    /// A peer's answer to a probe, direct or relayed, written into the
+    /// table: an `Alive` or `Leaving` status and the address it advertises
+    /// go in and the entry comes back, with one info line when the status
+    /// held for the member changed (the member's own word); any other
+    /// status is left to the verdict path and `None` comes back.
+    pub(crate) fn record_in_table(
+        state: &ClusterState,
+        node_update: &NodeUpdate,
+    ) -> Option<NodeState> {
+        if node_update.status != NodeStatus::Alive as i32
+            && node_update.status != NodeStatus::Leaving as i32
+        {
+            return None;
+        }
+        let mut s = state.write();
+        let held = s.get(&node_update.name).map(status_of);
+        let entry = s
+            .entry(node_update.name.clone())
+            .and_modify(|e| {
+                e.status = node_update.status;
+                e.address.clone_from(&node_update.address);
+            })
+            .or_insert_with(|| NodeState {
+                name: node_update.name.clone(),
+                address: node_update.address.clone(),
+                status: node_update.status,
+                version: 1,
+                metadata: HashMap::new(),
+            });
+        let entry = entry.clone();
+        if held != Some(status_of(&entry)) {
+            log::info!(
+                "{}",
+                member_transition_line(
+                    &entry,
+                    format_args!(
+                        "its own word; was {}",
+                        held.map_or_else(
+                            || "not in the table".to_string(),
+                            |status| format!("{status:?}")
+                        )
+                    )
+                )
+            );
+        }
+        Some(entry)
+    }
+
+    /// The answer a relay brought back: recorded (`true`) when it is the
+    /// probed peer's own, refused (`false`) when it is not. A relay answers
+    /// for the node it reached, so an answer named for another member (a
+    /// stale address another node holds now) must not mark the peer
+    /// reachable or move its entry; the join peer's placeholder is the one
+    /// name the answer may supply. The peer's own answer goes into the table
+    /// as a direct answer's does, so a member held `Suspected` after an
+    /// earlier break is `Alive` again on the first relay that reaches it, as
+    /// long as it still holds itself `Alive` (a verdict that reached it
+    /// through a peer is what it answers with). No sync stream is started
+    /// here: the direct probe has just failed on this node's link to the
+    /// peer, and the stream would dial that same link.
+    pub(crate) fn record_relayed_answer(
+        state: &ClusterState,
+        peer_name: &str,
+        relay_address: &str,
+        node_update: &NodeUpdate,
+    ) -> bool {
+        if !is_join_peer(peer_name) && node_update.name != peer_name {
+            log::warn!(
+                "The relay through {} answered for {}, not {}: a stale address, next relay",
+                relay_address,
+                node_update.name,
+                peer_name
+            );
+            return false;
+        }
+        log::debug!("Received NodeUpdate through the relay: {:?}", node_update);
+        Self::record_in_table(state, node_update);
+        true
+    }
+
+    /// Record a peer's answer to a direct probe: its status and address
+    /// (`record_in_table`), and for an `Alive` member the sync stream,
+    /// started at the freshest address over the link that has just answered.
+    async fn record_answer(&self, node_update: NodeUpdate) {
+        log::debug!("Received NodeUpdate from peer: {:?}", node_update);
+        let Some(updated_peer) = Self::record_in_table(&self.state, &node_update) else {
+            return;
+        };
+
+        // If node is Alive, establish sync_stream connection with freshest address.
+        if node_update.status == NodeStatus::Alive as i32 {
+            if let Err(e) = self
+                .start_sync_stream_connection(updated_peer.clone())
+                .await
+            {
+                log::warn!(
+                    "Failed to start sync_stream to {}: {}",
+                    updated_peer.name,
+                    e
+                );
+                // Connection failure doesn't affect ping flow, will retry in next cycle
+            }
+        }
+    }
+
     async fn connect_to_peer(&self, peer: NodeState) -> Result<()> {
-        log::info!("Connecting to peer {} at {}", peer.name, peer.address);
+        log::debug!("Connecting to peer {} at {}", peer.name, peer.address);
 
         let read_state = self.state.clone();
 
@@ -363,48 +492,14 @@ impl GossipController {
             )
             .await
         {
-            Ok(node_update) => {
-                log::info!("Received NodeUpdate from peer: {:?}", node_update);
-                // Update state for Alive or Leaving status
-                if node_update.status == NodeStatus::Alive as i32
-                    || node_update.status == NodeStatus::Leaving as i32
-                {
-                    let updated_peer = {
-                        let mut s = read_state.write();
-                        let entry = s
-                            .entry(node_update.name.clone())
-                            .and_modify(|e| {
-                                e.status = node_update.status;
-                                e.address.clone_from(&node_update.address);
-                            })
-                            .or_insert_with(|| NodeState {
-                                name: node_update.name.clone(),
-                                address: node_update.address.clone(),
-                                status: node_update.status,
-                                version: 1,
-                                metadata: HashMap::new(),
-                            });
-                        entry.clone()
-                    }; // Lock is released here
-
-                    // If node is Alive, establish sync_stream connection with freshest address.
-                    if node_update.status == NodeStatus::Alive as i32 {
-                        if let Err(e) = self
-                            .start_sync_stream_connection(updated_peer.clone())
-                            .await
-                        {
-                            log::warn!(
-                                "Failed to start sync_stream to {}: {}",
-                                updated_peer.name,
-                                e
-                            );
-                            // Connection failure doesn't affect ping flow, will retry in next cycle
-                        }
-                    }
-                }
-            }
+            Ok(node_update) => self.record_answer(node_update).await,
             Err(e) => {
-                log::info!("Failed to connect to peer: {}, now try ping-req", e);
+                log::warn!(
+                    "Failed to connect to peer {} at {}: {}, now try ping-req",
+                    peer_name,
+                    peer.address,
+                    e
+                );
                 let mut map = read_state.read().clone();
                 map.retain(|k, v| {
                     k.ne(&self.self_name)
@@ -414,12 +509,12 @@ impl GossipController {
                 let random_nodes = get_random_values_refs(&map, 3);
                 let mut reachable = false;
                 for node in random_nodes {
-                    log::info!(
+                    log::debug!(
                         "Trying to ping-req node {}, req target: {}",
                         node.address,
                         peer_addr
                     );
-                    if self
+                    let relayed = self
                         .dialer
                         .ping(
                             node,
@@ -427,9 +522,16 @@ impl GossipController {
                                 node: Some(peer.clone()),
                             })),
                         )
-                        .await
-                        .is_ok()
-                    {
+                        .await;
+                    if let Ok(node_update) = relayed {
+                        if !Self::record_relayed_answer(
+                            &self.state,
+                            &peer_name,
+                            &node.address,
+                            &node_update,
+                        ) {
+                            continue;
+                        }
                         reachable = true;
                         break;
                     }
@@ -484,7 +586,7 @@ impl GossipController {
             }
         }
 
-        log::info!("Successfully connected to peer {}", peer_addr);
+        log::debug!("Successfully connected to peer {}", peer_addr);
 
         Ok(())
     }
@@ -566,6 +668,9 @@ impl GossipController {
                 // The periodic sender: the shared round every second, with
                 // this end's round metrics around it. The peer is known from
                 // the start, so every round can carry its targeted entries.
+                // It also sends a heartbeat every
+                // `STREAM_HEARTBEAT_INTERVAL`, which the acceptor answers, so
+                // an idle stream is not closed by either end's idle timeout.
                 let incremental_sender_handle = {
                     let tx_incremental = tx.clone();
                     let self_name_incremental = self_name.clone();
@@ -578,9 +683,21 @@ impl GossipController {
                     tokio::spawn(async move {
                         let mut interval = tokio::time::interval(Duration::from_secs(1));
                         let mut sender = SenderState::default();
+                        let mut last_heartbeat = tokio::time::Instant::now();
 
                         loop {
                             interval.tick().await;
+
+                            if last_heartbeat.elapsed() >= STREAM_HEARTBEAT_INTERVAL {
+                                last_heartbeat = tokio::time::Instant::now();
+                                let heartbeat = build_heartbeat(
+                                    shared_sequence.fetch_add(1, Ordering::Relaxed),
+                                    &self_name_incremental,
+                                );
+                                if tx_incremental.send(heartbeat).await.is_err() {
+                                    return;
+                                }
+                            }
 
                             let round_start = Instant::now();
                             let stream_batch = stream_batch_handle.read().clone();
@@ -607,7 +724,7 @@ impl GossipController {
                                 round_elapsed,
                             );
                             if round_elapsed.as_millis() > 10 {
-                                log::info!(
+                                log::debug!(
                                     peer = %peer_name_incremental,
                                     round_ms = round_elapsed.as_millis(),
                                     "mesh sync round"
@@ -631,14 +748,13 @@ impl GossipController {
                     )
                     .await;
                     match frame {
-                        Frame::Continue => {}
+                        Frame::Continue | Frame::Heartbeat => {}
                         Frame::Ack { sequence, .. } => {
                             log::trace!("Received ACK from {} (seq: {})", peer_name, sequence);
                         }
                         Frame::Nack { sequence } => {
                             log::warn!("Received NACK from {} (seq: {})", peer_name, sequence);
                         }
-                        Frame::Closed => break,
                     }
                 }
 
@@ -682,33 +798,14 @@ impl GossipController {
             peer_addr
         );
 
-        // Connect to peer's gRPC service via Endpoint so TLS can be configured.
-        // The stream keeps a connection of its own (see `dialer`).
-        let connect_url = if self.dialer.mtls_manager().is_some() {
-            format!("https://{peer_addr}")
-        } else {
-            format!("http://{peer_addr}")
-        };
-        log::info!("Connecting to URL: {}", connect_url);
-
-        let mut endpoint = Endpoint::from_shared(connect_url.clone())
-            .map_err(|e| anyhow::anyhow!("Invalid peer endpoint {connect_url}: {e}"))?;
-
-        if let Some(mtls_manager) = self.dialer.mtls_manager() {
-            let tls_domain = endpoint.uri().host().map_or_else(
-                || peer_name.clone(),
-                |host| tls_server_name(host).to_owned(),
-            );
-            let tls = mtls_manager
-                .client_tls_config(&tls_domain)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to load the mTLS identity: {e}"))?;
-            endpoint = endpoint
-                .tls_config(tls)
-                .map_err(|e| anyhow::anyhow!("Failed to configure TLS endpoint: {e}"))?;
-        }
-
-        let channel = endpoint.connect().await.map_err(|e| {
+        // The stream runs on the channel the probes keep for the peer's
+        // address, with the node's TLS identity when the mesh has one: one
+        // connection per direction of a pair, reconnected by the channel
+        // itself after a loss (see `dialer`).
+        let addr = peer_addr.parse::<SocketAddr>().map_err(|e| {
+            anyhow::anyhow!("Invalid peer address {peer_addr} for the sync stream: {e}")
+        })?;
+        let channel = self.dialer.channel(&peer_name, addr).await.map_err(|e| {
             log::warn!(
                 "Failed to connect to peer {} for sync_stream: {}",
                 peer_name,
@@ -923,7 +1020,8 @@ mod retry_manager_tests {
 #[cfg(test)]
 mod dial_tests {
     use std::{
-        collections::HashMap,
+        collections::{BTreeMap, HashMap},
+        net::SocketAddr,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -931,8 +1029,11 @@ mod dial_tests {
         time::{Duration, Instant},
     };
 
+    use parking_lot::RwLock;
+
     use super::{
-        DialOutcome, GossipController, NodeState, NodeStatus, RetryManager, INIT_PEER_NAME,
+        is_join_peer, join_peer_name, DialOutcome, Dialer, GossipController, NodeState, NodeStatus,
+        RetryManager, INIT_PEER_NAME,
     };
 
     fn node(name: &str) -> NodeState {
@@ -1072,6 +1173,95 @@ mod dial_tests {
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
+    /// Every configured join peer is a join peer: the second entry's
+    /// placeholder answering alone records an attempt as the first's does,
+    /// under a retry state of its own.
+    #[tokio::test]
+    async fn every_join_peer_is_dialed_under_its_own_retry_state() {
+        assert_eq!(join_peer_name(0), INIT_PEER_NAME);
+        assert_eq!(join_peer_name(2), "init_peer_2");
+        assert!(is_join_peer(INIT_PEER_NAME) && is_join_peer("init_peer_1"));
+        assert!(!is_join_peer("init_peerless") && !is_join_peer("peer-a"));
+
+        let mut retry_managers: HashMap<String, RetryManager> = HashMap::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let second = node(&join_peer_name(1));
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &second,
+            connect(&calls, true),
+            || false,
+        )
+        .await;
+        assert!(
+            matches!(outcome, DialOutcome::JoinPeerAlone { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(retry_managers["init_peer_1"].attempt_count(), 1);
+        assert!(
+            !retry_managers.contains_key(INIT_PEER_NAME),
+            "the first join peer's retry state is untouched"
+        );
+    }
+
+    /// While the table holds nobody to probe, the rounds dial the configured
+    /// join peers in turn, each under its placeholder; a member in the table
+    /// takes precedence over all of them.
+    #[test]
+    fn the_rounds_dial_the_join_peers_in_turn_while_the_table_is_empty() {
+        let seeds: Vec<SocketAddr> = vec![
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+            "127.0.0.1:3".parse().unwrap(),
+        ];
+        let state = Arc::new(RwLock::new(BTreeMap::new()));
+        let controller = GossipController::new(
+            state,
+            "127.0.0.1:9".parse().unwrap(),
+            "self",
+            seeds.clone(),
+            Dialer::new(None),
+        );
+        let nobody = BTreeMap::new();
+
+        let dialed: Vec<(String, String)> = (0..6)
+            .map(|round| {
+                let peer = controller
+                    .peer_to_dial(&nobody, round)
+                    .expect("a join peer to dial");
+                (peer.name, peer.address)
+            })
+            .collect();
+        assert_eq!(
+            dialed,
+            vec![
+                ("init_peer".to_string(), seeds[0].to_string()),
+                ("init_peer_1".to_string(), seeds[1].to_string()),
+                ("init_peer_2".to_string(), seeds[2].to_string()),
+                ("init_peer".to_string(), seeds[0].to_string()),
+                ("init_peer_1".to_string(), seeds[1].to_string()),
+                ("init_peer_2".to_string(), seeds[2].to_string()),
+            ],
+            "the entries are dialed in turn, round by round"
+        );
+
+        let members = BTreeMap::from([("peer-a".to_string(), node("peer-a"))]);
+        let peer = controller.peer_to_dial(&members, 0).expect("a member");
+        assert_eq!(peer.name, "peer-a", "a member in the table comes first");
+
+        let alone = GossipController::new(
+            Arc::new(RwLock::new(BTreeMap::new())),
+            "127.0.0.1:9".parse().unwrap(),
+            "self",
+            Vec::new(),
+            Dialer::new(None),
+        );
+        assert!(
+            alone.peer_to_dial(&nobody, 0).is_none(),
+            "no join peer configured, nobody to dial"
+        );
+    }
+
     /// Two failures in a row double the wait, and each peer keeps its own
     /// retry state.
     #[tokio::test]
@@ -1114,3 +1304,7 @@ mod dial_tests {
         assert_eq!(retry_managers["peer-a"].attempt_count(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/heartbeat_integration.rs"]
+mod heartbeat_tests;

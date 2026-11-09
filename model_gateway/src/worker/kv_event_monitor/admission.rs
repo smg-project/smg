@@ -502,7 +502,10 @@ mod tests {
     };
 
     use super::{super::apply::convert_kv_block, *};
-    use crate::worker::kv_event_recovery::{Cursor, GAP_CLEAR_THRESHOLD, RESTART_WINDOW};
+    use crate::worker::{
+        kv_event_recovery::{Cursor, GAP_CLEAR_THRESHOLD, RESTART_WINDOW},
+        test_support::kv_cache_cleared,
+    };
 
     /// Token ids for engine block `id`: distinct content per id.
     fn tokens_for(id: i64) -> Vec<u32> {
@@ -536,13 +539,6 @@ mod tests {
                 block_hashes: ids.to_vec(),
                 ..Default::default()
             })),
-        }
-    }
-
-    fn cleared() -> KvCacheEvent {
-        KvCacheEvent {
-            event_id: 0,
-            data: Some(kv_cache_event::Data::Cleared(KvCacheCleared::default())),
         }
     }
 
@@ -616,7 +612,7 @@ mod tests {
             assert_eq!(index_blocks(&handle), Some(4.0), "two more stored");
 
             assert_eq!(
-                sim.feed(&batch(4, None, vec![cleared()])),
+                sim.feed(&batch(4, None, vec![kv_cache_cleared()])),
                 BatchOutcome::Applied
             );
             assert_eq!(sim.indexer.worker_block_count(sim.worker), 0);
@@ -868,7 +864,11 @@ mod tests {
         // "no cursor" once a batch carried it.
         let mut sim = Sim::new();
         assert_eq!(
-            sim.deliver(&batch(0, None, vec![cleared(), stored(None, &[1, 2])])),
+            sim.deliver(&batch(
+                0,
+                None,
+                vec![kv_cache_cleared(), stored(None, &[1, 2])]
+            )),
             BatchOutcome::Applied
         );
         assert_eq!(
@@ -1391,7 +1391,7 @@ mod tests {
         sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
         // SGLang's first batch after a restart carries AllBlocksCleared and
         // its counter starts over, with the servicer's stream still up.
-        let first = batch(0, None, vec![cleared(), stored(None, &[9])]);
+        let first = batch(0, None, vec![kv_cache_cleared(), stored(None, &[9])]);
         sim.reference_clear();
         sim.reference_apply(&first);
         assert_eq!(sim.feed(&first), BatchOutcome::Applied);
@@ -1414,7 +1414,7 @@ mod tests {
     fn recovery_cleared_event_matches_reference() {
         let mut sim = Sim::new();
         sim.deliver(&batch(1, None, vec![stored(None, &[1, 2, 3])]));
-        sim.deliver(&batch(2, None, vec![cleared()]));
+        sim.deliver(&batch(2, None, vec![kv_cache_cleared()]));
         sim.deliver(&batch(3, None, vec![stored(None, &[4])]));
         sim.assert_matches_reference();
         assert_eq!(sim.reference.worker_block_count(sim.worker), 1);
@@ -1501,7 +1501,7 @@ mod tests {
             .map(|(index, stores)| {
                 let mut events = Vec::new();
                 if index == 0 {
-                    events.push(cleared());
+                    events.push(kv_cache_cleared());
                 }
                 events.extend(stores.iter().cloned());
                 KvEventBatch {

@@ -201,7 +201,7 @@ async fn test_cohere_streaming_basic() {
         function: openai_protocol::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
-            parameters: json!({}),
+            parameters: Some(json!({})),
             strict: None,
             extra: Default::default(),
         },

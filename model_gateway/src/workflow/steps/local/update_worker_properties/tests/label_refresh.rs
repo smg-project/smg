@@ -5,30 +5,24 @@
 use std::collections::HashMap;
 
 use super::refreshed_labels;
-
-fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-        .collect()
-}
+use crate::workflow::steps::local::test_support::labels_of;
 
 #[test]
 fn engine_sourced_labels_follow_the_engine() {
-    let discovered = map(&[("max_num_seqs", "256"), ("page_size", "128")]);
-    let current = map(&[
+    let discovered = labels_of(&[("max_num_seqs", "256"), ("page_size", "128")]);
+    let current = labels_of(&[
         ("max_num_seqs", "256"),
         ("page_size", "128"),
         ("tier", "gold"),
     ]);
-    let fresh = map(&[
+    let fresh = labels_of(&[
         ("max_num_seqs", "8"),
         ("page_size", "1152"),
         ("supports_vision", "true"),
     ]);
     assert_eq!(
         refreshed_labels(&current, &discovered, &fresh),
-        map(&[
+        labels_of(&[
             ("max_num_seqs", "8"),
             ("page_size", "1152"),
             ("supports_vision", "true"),
@@ -40,28 +34,28 @@ fn engine_sourced_labels_follow_the_engine() {
 
 #[test]
 fn an_operator_override_keeps_its_value() {
-    let discovered = map(&[("served_model_name", "/models/x"), ("max_num_seqs", "256")]);
-    let current = map(&[("served_model_name", "m1"), ("max_num_seqs", "256")]);
-    let fresh = map(&[("served_model_name", "/models/y"), ("max_num_seqs", "8")]);
+    let discovered = labels_of(&[("served_model_name", "/models/x"), ("max_num_seqs", "256")]);
+    let current = labels_of(&[("served_model_name", "m1"), ("max_num_seqs", "256")]);
+    let fresh = labels_of(&[("served_model_name", "/models/y"), ("max_num_seqs", "8")]);
     assert_eq!(
         refreshed_labels(&current, &discovered, &fresh),
-        map(&[("served_model_name", "m1"), ("max_num_seqs", "8")]),
+        labels_of(&[("served_model_name", "m1"), ("max_num_seqs", "8")]),
         "a value the operator set over discovery's is kept; the untouched one follows"
     );
 }
 
 #[test]
 fn a_label_the_engine_no_longer_reports_is_dropped_unless_the_operator_set_it() {
-    let discovered = map(&[("mm_processor", "inprocess"), ("supports_vision", "true")]);
-    let current = map(&[
+    let discovered = labels_of(&[("mm_processor", "inprocess"), ("supports_vision", "true")]);
+    let current = labels_of(&[
         ("mm_processor", "inprocess"),
         ("supports_vision", "true"),
         ("extra", "1"),
     ]);
-    let fresh = map(&[("supports_vision", "false")]);
+    let fresh = labels_of(&[("supports_vision", "false")]);
     assert_eq!(
         refreshed_labels(&current, &discovered, &fresh),
-        map(&[("supports_vision", "false"), ("extra", "1")]),
+        labels_of(&[("supports_vision", "false"), ("extra", "1")]),
         "a vanished engine key goes, a flipped one follows, an operator key stays"
     );
 }
@@ -69,11 +63,11 @@ fn a_label_the_engine_no_longer_reports_is_dropped_unless_the_operator_set_it() 
 #[test]
 fn a_new_engine_key_does_not_override_an_operator_label() {
     let discovered = HashMap::new();
-    let current = map(&[("weight_version", "pinned")]);
-    let fresh = map(&[("weight_version", "v7"), ("vocab_size", "32000")]);
+    let current = labels_of(&[("weight_version", "pinned")]);
+    let fresh = labels_of(&[("weight_version", "v7"), ("vocab_size", "32000")]);
     assert_eq!(
         refreshed_labels(&current, &discovered, &fresh),
-        map(&[("weight_version", "pinned"), ("vocab_size", "32000")]),
+        labels_of(&[("weight_version", "pinned"), ("vocab_size", "32000")]),
     );
 }
 
@@ -83,30 +77,30 @@ fn a_window_the_operator_set_stays_the_only_window_when_the_engine_names_the_oth
     // window) and the operator set the window under the name the reader
     // prefers less; the engine's first report names it under the other.
     let discovered = HashMap::new();
-    let current = map(&[("max_running_requests", "64")]);
-    let fresh = map(&[("max_num_seqs", "256"), ("page_size", "128")]);
+    let current = labels_of(&[("max_running_requests", "64")]);
+    let fresh = labels_of(&[("max_num_seqs", "256"), ("page_size", "128")]);
     assert_eq!(
         refreshed_labels(&current, &discovered, &fresh),
-        map(&[("max_running_requests", "64"), ("page_size", "128")]),
+        labels_of(&[("max_running_requests", "64"), ("page_size", "128")]),
         "the engine's window under the other name is not added beside the operator's"
     );
     // The same window name the operator overrode: the operator's value, as
     // registration and a label update keep it.
-    let discovered = map(&[("max_num_seqs", "256")]);
-    let current = map(&[("max_num_seqs", "64")]);
-    let fresh = map(&[("max_num_seqs", "512"), ("max_running_requests", "512")]);
+    let discovered = labels_of(&[("max_num_seqs", "256")]);
+    let current = labels_of(&[("max_num_seqs", "64")]);
+    let fresh = labels_of(&[("max_num_seqs", "512"), ("max_running_requests", "512")]);
     assert_eq!(
         refreshed_labels(&current, &discovered, &fresh),
-        map(&[("max_num_seqs", "64")]),
+        labels_of(&[("max_num_seqs", "64")]),
         "a hand-set window drops the engine's figure under either name"
     );
     // A window discovery recorded and the operator left alone follows the
     // engine under the same name, as before.
-    let discovered = map(&[("max_num_seqs", "256")]);
-    let current = map(&[("max_num_seqs", "256")]);
-    let fresh = map(&[("max_num_seqs", "8")]);
+    let discovered = labels_of(&[("max_num_seqs", "256")]);
+    let current = labels_of(&[("max_num_seqs", "256")]);
+    let fresh = labels_of(&[("max_num_seqs", "8")]);
     assert_eq!(
         refreshed_labels(&current, &discovered, &fresh),
-        map(&[("max_num_seqs", "8")]),
+        labels_of(&[("max_num_seqs", "8")]),
     );
 }

@@ -1,7 +1,8 @@
 //! A test binary's downloads from the model hub: one at a time per process, a
 //! rate-limited answer waited out and sent again, a GET that broke below HTTP
 //! sent again after a short wait, a cached file written whole or not at all.
-//! The tokenizer crate's and the gateway's test harnesses carry the same file.
+//! The tokenizer crate's tests and the gateway's `routers::grpc::tokenizer_cache`
+//! carry the same file.
 
 use std::{
     fs,

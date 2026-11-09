@@ -323,7 +323,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        codec::{decode_msgpack, decode_value, encode_msgpack},
+        codec::{decode_msgpack, decode_value, encode_msgpack, hex},
         protocol::tokenspeed::sampling::TOP_K_DISABLED,
     };
 
@@ -337,17 +337,6 @@ mod tests {
          000000000000cb0000000000000000cb0000000000000000cb3ff000000000000000c0c0c0\
          c0c2c3c3c2c0c0c0c02ac0019000c3c3ff00c0c3c0c0c0c2cb0000000000000000c0c0c0c0\
          c0c0c0c0";
-
-    fn python_request_bytes() -> Vec<u8> {
-        let hex: String = PYTHON_REQUEST_VECTOR
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-            .collect()
-    }
 
     /// The logical request behind [`PYTHON_REQUEST_VECTOR`], built through the
     /// same normalization path SMG uses.
@@ -392,7 +381,8 @@ mod tests {
     /// trailing-field skip must recover every field SMG cares about.
     #[test]
     fn python_request_vector_decodes() {
-        let decoded: TokenizedGenerateReqInput = decode_msgpack(&python_request_bytes()).unwrap();
+        let decoded: TokenizedGenerateReqInput =
+            decode_msgpack(&hex(PYTHON_REQUEST_VECTOR)).unwrap();
         assert_eq!(decoded.rid, "vec-1");
         assert_eq!(decoded.http_worker_ipc, None);
         assert_eq!(decoded.input_text, None);
@@ -445,7 +435,7 @@ mod tests {
         let roundtripped: TokenizedGenerateReqInput = decode_msgpack(&encoded).unwrap();
         assert_eq!(roundtripped, request);
         let from_vector: TokenizedGenerateReqInput =
-            decode_msgpack(&python_request_bytes()).unwrap();
+            decode_msgpack(&hex(PYTHON_REQUEST_VECTOR)).unwrap();
         assert_eq!(roundtripped, from_vector);
     }
 
@@ -510,12 +500,7 @@ mod tests {
              00000000000000c0c0c0c0c0950a141e283297919a01cedeadbeefce09811a469192010393a\
              862666c6f61743136920302c70c03000102030405060708090a0bc081a87669745f67726964\
              93a675696e743332920103c70c03010000000200000003000000c0c0c009c0c0c0c0c0";
-        let hex: String = encoded.iter().map(|b| format!("{b:02x}")).collect();
-        let pinned: String = TS_MM_VECTOR
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        assert_eq!(hex, pinned);
+        assert_eq!(encoded, hex(TS_MM_VECTOR));
 
         let Value::Array(array) = decode_value(&encoded).unwrap() else {
             panic!("expected positional array");
@@ -612,7 +597,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_wrong_tag() {
-        let mut request_bytes = python_request_bytes();
+        let mut request_bytes = hex(PYTHON_REQUEST_VECTOR);
         // Corrupt one tag byte: "TokenizedGenerateReqInput" -> "TOkenized...".
         request_bytes[5] = b'O';
         let error = decode_msgpack::<TokenizedGenerateReqInput>(&request_bytes).unwrap_err();
@@ -719,14 +704,14 @@ mod tests {
             bootstrap_room: 7,
             items: vec![encode_item(12)],
         };
-        let (_, frames) = encode_with_aux_frames(&small).unwrap();
+        let (_, frames) = encode_with_aux_frames(&small, 0).unwrap();
         assert!(frames.is_empty());
 
         let large = TokenSpeedEncodeRequest {
             items: vec![encode_item(TENSOR_AUX_MIN_BYTES)],
             ..small
         };
-        let (payload, frames) = encode_with_aux_frames(&large).unwrap();
+        let (payload, frames) = encode_with_aux_frames(&large, 0).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].len(), TENSOR_AUX_MIN_BYTES);
         assert!(payload.len() < TENSOR_AUX_MIN_BYTES);

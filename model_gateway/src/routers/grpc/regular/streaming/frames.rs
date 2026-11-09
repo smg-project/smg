@@ -48,6 +48,21 @@ impl io::Write for FrameSink<'_> {
 /// while the engine keeps more ready, so one frame stays a bounded burst.
 pub(super) const CHUNK_FLUSH_BYTES: usize = 16 * 1024;
 
+/// The least room the generate loops' frame buffer takes at its first write
+/// after a full frame left it: two frames, so the frame after it is written
+/// without growing the buffer step by step; a frame that left larger than
+/// this room (one event, the text so far) makes the room owed its own length
+/// plus one bound (the next event is about as large and still fits in one
+/// allocation), and a frame up to the room keeps the room: a frame leaves at
+/// the flush bound, so its length plus a bound is never under it. Taken at
+/// that write and not at the flush:
+/// a paced engine's connection has dropped the sent frame by then and the
+/// buffer takes the allocation they shared back in place, while a burst's next
+/// write comes with the frame still in flight and allocates a fresh room (a
+/// buffer grown against a frame in flight grows by exact-size allocations,
+/// not by doubling).
+pub(super) const FRAME_ROOM: usize = 2 * CHUNK_FLUSH_BYTES;
+
 /// The SSE frame of the per-token chat chunks of one stream.
 ///
 /// Every chunk of a stream repeats the same `id`, `object`, `created`,
@@ -208,6 +223,40 @@ pub(super) fn text_delta<'a>(choice: &'a ChatStreamChoiceRef<'_>) -> Option<(Tex
 /// Serializing a string or an integer into memory cannot fail.
 fn push_json<W: io::Write, T: Serialize + ?Sized>(writer: W, value: &T) {
     let _ = serde_json::to_writer(writer, value);
+}
+
+/// A generate choice's text so far as the contents of its JSON string: the
+/// bytes serde writes between the quotes, escaped once as each chunk arrives.
+/// Every event of a generate stream carries the choice's whole text, and the
+/// stream only appends to it (each chunk is decoded on its own and pushed),
+/// so the escaped form is extended in step and never rewritten, and an event
+/// copies the text into its frame instead of escaping it again (serde's
+/// escape walked every byte of the answer on every event, a cost growing
+/// with the square of the answer's length). The bytes are serde's own:
+/// `tests::generate_event_frames_write_the_bytes_of_the_serialized_event`
+/// pins an event written from this text against the serialized event with
+/// the raw text.
+#[derive(Default)]
+pub(super) struct EscapedText(Vec<u8>);
+
+impl EscapedText {
+    /// Append `text` escaped by serde_json's own rule: it is written onto the
+    /// end as a JSON string literal and the two quotes it was written between
+    /// are removed (the closing one popped, the opening one by a move of the
+    /// chunk's few bytes).
+    pub(super) fn push_str(&mut self, text: &str) {
+        let start = self.0.len();
+        push_json(&mut self.0, text);
+        self.0.pop();
+        self.0.remove(start);
+    }
+
+    /// Append the JSON string literal of the text so far to `buffer`.
+    pub(super) fn write_literal(&self, buffer: &mut BytesMut) {
+        buffer.extend_from_slice(b"\"");
+        buffer.extend_from_slice(&self.0);
+        buffer.extend_from_slice(b"\"");
+    }
 }
 
 /// The SSE frame of the per-token chunks of one completion stream.
