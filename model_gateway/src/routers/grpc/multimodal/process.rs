@@ -644,7 +644,13 @@ async fn cached_images(
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .context("Missing image output position")?;
-        PreprocessedEncoderInputs::concat(parts, &layouts)
+        PreprocessedEncoderInputs::concat_refs(
+            &parts
+                .iter()
+                .map(|part| &part.preprocessed)
+                .collect::<Vec<_>>(),
+            &layouts,
+        )
     })
     .await
     .context("Image batch assembly task panicked")?
@@ -818,14 +824,14 @@ async fn preprocess_image_cached(
     model_id: String,
     fingerprint: u64,
     image_wire_dtype: Option<EncoderDtype>,
-) -> Result<PreprocessedEncoderInputs> {
+) -> Result<Arc<CachedPreprocessedItem>> {
     let key = PixelCacheKey {
         image_hash: image.hash.clone(),
         config_fingerprint: fingerprint,
     };
     if let Some(cached) = cache.get(&key) {
         Metrics::record_mm_pixel_cache_lookup(&model_id, true);
-        return Ok(cached.preprocessed.clone());
+        return Ok(cached);
     }
     Metrics::record_mm_pixel_cache_lookup(&model_id, false);
 
@@ -839,13 +845,9 @@ async fn preprocess_image_cached(
     // dtype was resolved (twice the neutral bytes at the half widths, four
     // times at float32, against the same budget), so a hit skips the write
     // pass; the neutral patches otherwise.
-    cache.insert(
-        key,
-        Arc::new(CachedPreprocessedItem {
-            preprocessed: preprocessed.clone(),
-        }),
-    );
-    Ok(preprocessed)
+    let cached = Arc::new(CachedPreprocessedItem { preprocessed });
+    cache.insert(key, cached.clone());
+    Ok(cached)
 }
 
 async fn preprocess_image_batch(
