@@ -1527,6 +1527,16 @@ mod tests {
         }
     }
 
+    /// A read under the read guard answers the picks too: a fleet with a report
+    /// above [`HELD_GUARD_CANDIDATES`] scores its dark workers from it.
+    #[test]
+    fn a_read_under_the_read_guard_answers_the_picks() {
+        let policy = LeastLoadPolicy::new();
+        let workers = make_workers(&["http://a:8000"]);
+        policy.reconcile_in_flight(workers[0].url(), 2);
+        assert_eq!(policy.resolve_for_test(&workers, &[0])[0].picked, 2);
+    }
+
     /// Eight decisions in flight at once over a dark fleet above
     /// [`HELD_GUARD_CANDIDATES`]: each reads the picks the others have
     /// landed, so no two share a worker while idle ones remain.
