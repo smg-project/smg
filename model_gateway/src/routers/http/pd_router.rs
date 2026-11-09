@@ -1031,9 +1031,9 @@ impl PDRouter {
                 || (message.get("content").is_none_or(Value::is_null)
                     && !message.get("tool_calls").is_some_and(Value::is_array)
                     && !message.get("function_call").is_some_and(Value::is_object)
-                    && !message
-                        .get("reasoning_content")
-                        .is_some_and(Value::is_string)
+                    && !["reasoning_content", "reasoning"]
+                        .iter()
+                        .any(|field| message.get(*field).is_some_and(Value::is_string))
                     && !message.get("refusal").is_some_and(Value::is_string)
                     && choice.get("finish_reason").and_then(Value::as_str)
                         != Some("content_filter"))
@@ -1070,7 +1070,7 @@ impl PDRouter {
                         let next = right.get(key).ok_or(())?;
                         match key.as_str() {
                             "completion_tokens" | "completion_tokens_details" => {
-                                Self::sum_choice_counters(value, next)?
+                                Self::sum_choice_counters(value, next)?;
                             }
                             // Prompt accounting follows the first child's
                             // prefill once, as one n-choice request does. Later
@@ -1194,27 +1194,36 @@ impl PDRouter {
             } else {
                 connector_mode_for_worker(prefill.as_ref())
             };
+            let mut serialized_moriio_body = None;
             if mode == KvConnectorMode::MoriIo {
-                let fanout = lease.with_view(|view| {
+                let prepared = lease.with_view(|view| {
                     // Match the existing wire serializer: to_value widens
                     // typed f32 parameters (0.8 -> 0.800000011920929).
-                    serialize_json_sized(view.request, raw_body_len)
-                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes))
-                        .map(|body| {
-                            let routing = RoutingDerivatives {
-                                tokens: view.tokens.map(Vec::from),
-                                text: view.text.map(str::to_string),
-                                rid_key: view.rid_key.map(str::to_string),
-                                cache_namespace: view.cache_namespace,
-                            };
-                            (body, routing)
-                        })
+                    let bytes = serialize_json_sized(view.request, raw_body_len)?;
+                    // The common n=1 path needs only a raw lookup, not a DOM
+                    // of the whole prompt or copies of routing derivatives.
+                    let fanout = if Self::sampling_n(&RawBody::parse(&bytes)?) > 1 {
+                        let body = serde_json::from_slice::<Value>(&bytes)?;
+                        let routing = RoutingDerivatives {
+                            tokens: view.tokens.map(Vec::from),
+                            text: view.text.map(str::to_string),
+                            rid_key: view.rid_key.map(str::to_string),
+                            cache_namespace: view.cache_namespace,
+                        };
+                        Some((body, routing))
+                    } else {
+                        None
+                    };
+                    Ok::<_, serde_json::Error>((bytes, fanout))
                 });
-                let (body, routing) = match fanout {
+                let (bytes, fanout) = match prepared {
                     Ok(value) => value,
                     Err(error) => return Self::handle_serialization_error(error),
                 };
-                if body.get("n").and_then(Value::as_u64).unwrap_or(1) > 1 {
+                if let Some((body, routing)) = fanout {
+                    // The fanout owns its parsed body. Release the temporary
+                    // wire buffer before awaiting its independent children.
+                    drop(bytes);
                     // Each child selects/adopts its own guards and mints its own
                     // handoff. Never retain the provisional parent's admission
                     // while trying to acquire a child (a one-slot queue deadlock).
@@ -1255,6 +1264,7 @@ impl PDRouter {
                     response.extensions_mut().insert(MoriIoChoiceTerminal);
                     return response;
                 }
+                serialized_moriio_body = Some(bytes);
             }
             let moriio_endpoints = match mode {
                 KvConnectorMode::MoriIo => {
@@ -1286,8 +1296,11 @@ impl PDRouter {
                 lease.serialize_sides_with(|view| -> Result<(Vec<u8>, Vec<u8>), Box<Response>> {
                     let serialization_error =
                         |e: serde_json::Error| Box::new(Self::handle_serialization_error(e));
-                    let bytes = serialize_json_sized(view.request, raw_body_len)
-                        .map_err(serialization_error)?;
+                    let bytes = match serialized_moriio_body.take() {
+                        Some(bytes) => bytes,
+                        None => serialize_json_sized(view.request, raw_body_len)
+                            .map_err(serialization_error)?,
+                    };
                     let mut body = RawBody::parse(&bytes).map_err(serialization_error)?;
                     body.set_model(to_raw_value(context.model_id).map_err(serialization_error)?);
 
@@ -5496,17 +5509,42 @@ mod tests {
 
     #[test]
     fn moriio_independent_choices_allow_reasoning_only_typed_responses() {
-        let mut child = choice_reply(&json!({"request_id": "reasoning"}), "/v1/chat/completions");
-        child["choices"][0]["message"]["content"] = Value::Null;
-        child["choices"][0]["message"]["reasoning_content"] =
-            json!("reasoning token budget exhausted");
-        child["choices"][0]["finish_reason"] = json!("length");
-        let mut total = None;
-        PDRouter::append_moriio_choice(&mut total, child, "/v1/chat/completions", 0).unwrap();
-        assert_eq!(
-            total.unwrap()["choices"][0]["message"]["content"],
-            Value::Null
-        );
+        for field in ["reasoning_content", "reasoning"] {
+            let mut child =
+                choice_reply(&json!({"request_id": "reasoning"}), "/v1/chat/completions");
+            child["choices"][0]["message"]["content"] = Value::Null;
+            child["choices"][0]["message"][field] = json!("reasoning token budget exhausted");
+            child["choices"][0]["finish_reason"] = json!("length");
+            let mut total = None;
+            PDRouter::append_moriio_choice(&mut total, child, "/v1/chat/completions", 0).unwrap();
+            let total = total.unwrap();
+            assert_eq!(total["choices"][0]["message"]["content"], Value::Null);
+            assert_eq!(
+                total["choices"][0]["message"][field],
+                json!("reasoning token budget exhausted")
+            );
+        }
+    }
+
+    #[test]
+    fn moriio_independent_choices_reject_malformed_reasoning_only_responses() {
+        for fields in [
+            json!({"reasoning": 7}),
+            json!({"reasoning_content": false}),
+            json!({"reasoning": null, "reasoning_content": null}),
+        ] {
+            let mut child =
+                choice_reply(&json!({"request_id": "reasoning"}), "/v1/chat/completions");
+            let message = child["choices"][0]["message"].as_object_mut().unwrap();
+            message.insert("content".into(), Value::Null);
+            message.extend(fields.as_object().unwrap().clone());
+            child["choices"][0]["finish_reason"] = json!("length");
+            let mut total = None;
+            assert!(
+                PDRouter::append_moriio_choice(&mut total, child, "/v1/chat/completions", 0,)
+                    .is_err()
+            );
+        }
     }
 
     #[tokio::test]
