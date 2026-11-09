@@ -2728,10 +2728,6 @@ fn fnv_hash_str(s: &str) -> u64 {
     h
 }
 
-/// Chunk `ids` into `block_size`-token blocks, returning each full block's
-/// cumulative-prefix content key, the rolling hash after all tokens, and the
-/// trailing partial block. The partial (< block_size) tail is never a block —
-/// matching real engines, which only cache full pages.
 /// The mask of a cached block without a recorded one: group 0 alone when
 /// the first group is the main-attention group, which stores every block;
 /// nothing when the engine has no main group, since a window or state group
@@ -2810,6 +2806,10 @@ fn hit_over_groups(
     }
 }
 
+/// Chunk `ids` into `block_size`-token blocks, returning each full block's
+/// cumulative-prefix content key, the rolling hash after all tokens, and the
+/// trailing partial block. The partial (< block_size) tail is never a block —
+/// matching real engines, which only cache full pages.
 fn prompt_blocks(ids: &[u32], block_size: usize) -> (Vec<u64>, u64, Vec<u32>) {
     let mut h = FNV_OFFSET;
     let mut keys = Vec::new();
