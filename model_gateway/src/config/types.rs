@@ -739,7 +739,11 @@ pub enum AccessLogField {
     /// end; a body that ended early (a client that left, a stream that
     /// failed) has the bytes out so far on that line as
     /// `response_bytes_sent`, a key of its own, so the length is never
-    /// recorded twice.
+    /// recorded twice. A streamed body's end line is written after the
+    /// output was read, so it also carries what the request learned while
+    /// it streamed: the `symphony.*` fields of an output the Symphony reader
+    /// did not read clean, which the finish line of a stream goes out too
+    /// early to carry.
     ResponseBytes,
     /// The worker the request was routed to.
     Worker,
