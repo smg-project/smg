@@ -2237,8 +2237,8 @@ mod tests {
         },
         tenant::TenantKey,
         worker::{
-            test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard,
-            PrefillReservation, WorkerLoadGuard,
+            test_support::{no_health_check, select_worker},
+            BasicWorkerBuilder, ConnectionMode, ModelCard, PrefillReservation, WorkerLoadGuard,
         },
     };
 
@@ -2316,11 +2316,8 @@ mod tests {
 
     /// Occupy one of `worker`'s admission slots.
     async fn occupy(admission: &PrefillAdmission, worker: &Arc<dyn Worker>) -> PrefillReservation {
-        let worker = Arc::clone(worker);
         admission
-            .admit(None, move |capacity| {
-                capacity.select(Arc::clone(&worker), ())
-            })
+            .admit(None, select_worker(worker))
             .await
             .map(|admitted| admitted.reservation)
             .unwrap_or_else(|_| panic!("admission of an idle worker should succeed"))
