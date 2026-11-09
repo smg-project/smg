@@ -341,6 +341,192 @@ fn a_short_chain_grown_block_by_block_sits_in_a_twelve_word_class() {
 }
 
 #[test]
+fn the_arena_caps_a_table_and_an_array_at_one_chunk() {
+    let arena = WordArena::new();
+    assert_eq!(
+        arena.largest_table_slots(),
+        1 << 18,
+        "2^18 slots are 524,290 words; 2^19 ask for two words more than a chunk"
+    );
+    assert_eq!(
+        slots_for(196_608),
+        1 << 18,
+        "three-quarters of the largest table"
+    );
+    assert_eq!(slots_for(196_609), 1 << 19);
+    assert!(
+        arena.array_fits(917_504),
+        "the largest class two words short of a chunk"
+    );
+    assert!(
+        !arena.array_fits(917_505),
+        "the next class is a whole chunk, with no room for the header"
+    );
+    assert!(arena.array_fits(capacity_for(815_559)));
+    assert!(!arena.array_fits(capacity_for(815_560)));
+}
+
+/// With the arena's cap lowered to 64 words a run's child table stops at 16 slots and takes
+/// twelve live children, three-quarters of it: a chain of two blocks and twelve more sharing
+/// its first block fit under it (the first chain's second block is the run's own, the others
+/// its children), the next such store is declined and counted, the thirteen still score, and
+/// another run takes children as before. Two children gone, two more fit; the refusal after
+/// them finds an eighth of the table tombstoned and rebuilds it at its size.
+#[test]
+fn a_store_past_the_fan_out_cap_is_declined_and_counted() {
+    let mut index = ChainIndex::with_max_workers(8);
+    index.lower_arena_cap(64);
+    let w = index.intern_worker("w").expect("id");
+    let mut mw = ChainBlockMap::default();
+    let parent = content(5, 0);
+    let chains: Vec<[ContentHash; 2]> = (0..13).map(|i| [parent, content(6, i)]).collect();
+    for chain in &chains {
+        index
+            .apply_stored(w, &blocks_of(chain), None, &mut mw)
+            .expect("a child within the cap");
+    }
+    assert_eq!(
+        index.stats().child_entries,
+        12,
+        "three-quarters of 16 slots"
+    );
+    let past = [parent, content(6, 13)];
+    assert!(matches!(
+        index.apply_stored(w, &blocks_of(&past), None, &mut mw),
+        Err(ApplyError::ArenaCapReached { .. })
+    ));
+    assert_eq!(index.stats().cap_refusals, 1);
+    for chain in &chains {
+        assert_eq!(scores(&index, chain), vec![(w, 2)], "still held");
+    }
+    assert_eq!(scores(&index, &past), vec![(w, 1)], "the shared block only");
+    let elsewhere = [content(7, 0), content(7, 1)];
+    index
+        .apply_stored(w, &blocks_of(&elsewhere), None, &mut mw)
+        .expect("another run is not at its cap");
+    assert_eq!(scores(&index, &elsewhere), vec![(w, 2)]);
+
+    let gone: Vec<SequenceHash> = chains[3..5]
+        .iter()
+        .map(|chain| blocks_of(chain)[1].seq_hash)
+        .collect();
+    index.apply_removed(w, &gone, &mut mw);
+    let stats = index.stats();
+    assert_eq!(
+        (stats.child_entries, stats.child_tombstones),
+        (10, 2),
+        "two children gone, their slots tombstoned"
+    );
+    for i in 13..15 {
+        index
+            .apply_stored(w, &blocks_of(&[parent, content(6, i)]), None, &mut mw)
+            .expect("room again below the cap");
+    }
+    assert!(matches!(
+        index.apply_stored(w, &blocks_of(&[parent, content(6, 15)]), None, &mut mw),
+        Err(ApplyError::ArenaCapReached { .. })
+    ));
+    let stats = index.stats();
+    assert_eq!(
+        (
+            stats.child_entries,
+            stats.child_tombstones,
+            stats.cap_refusals
+        ),
+        (12, 0, 2),
+        "declined, and the table rebuilt at its size without its tombstones"
+    );
+}
+
+/// A store declined at a run's cap keeps what the walk placed before the block that would pass
+/// it: a second worker storing a chain under a run at the cap is a holder of the block it
+/// matched there, in the index and in its lane map (so its later removal works), and the error
+/// says how many leading blocks were placed.
+#[test]
+fn a_store_declined_at_the_cap_keeps_its_placed_prefix() {
+    let mut index = ChainIndex::with_max_workers(8);
+    index.lower_arena_cap(64);
+    let a = index.intern_worker("a").expect("id");
+    let b = index.intern_worker("b").expect("id");
+    let (mut ma, mut mb) = (ChainBlockMap::default(), ChainBlockMap::default());
+    let parent = content(5, 0);
+    for i in 0..13 {
+        index
+            .apply_stored(a, &blocks_of(&[parent, content(6, i)]), None, &mut ma)
+            .expect("a child within the cap");
+    }
+    let late = blocks_of(&[parent, content(6, 13)]);
+    assert!(matches!(
+        index.apply_stored(b, &late, None, &mut mb),
+        Err(ApplyError::ArenaCapReached { placed: 1 })
+    ));
+    assert_eq!(index.stats().cap_refusals, 1);
+    let sorted = |mut scores: Vec<(u32, u32)>| {
+        scores.sort_unstable();
+        scores
+    };
+    assert_eq!(
+        sorted(scores(&index, &[parent])),
+        vec![(a, 1), (b, 1)],
+        "b holds the shared block"
+    );
+    assert_eq!(
+        sorted(scores(&index, &[parent, content(6, 13)])),
+        vec![(a, 1), (b, 1)],
+        "the declined block is held by neither"
+    );
+    assert!(
+        index.is_held(&mb, late[0].seq_hash),
+        "b's map has the placed block"
+    );
+    assert!(!index.is_held(&mb, late[1].seq_hash));
+    index.apply_removed(b, &[late[0].seq_hash], &mut mb);
+    assert_eq!(
+        scores(&index, &[parent]),
+        vec![(a, 1)],
+        "b's removal of it works"
+    );
+}
+
+/// With the cap at 64 words the longest hash array is 56 words: a chain of 57 blocks is
+/// declined whole, a chain of 50 is stored and grows in place to 56, and the block that would
+/// move it to a 64-word array is declined, the chain keeping its 56.
+#[test]
+fn a_store_past_the_run_length_cap_is_declined_and_counted() {
+    let mut index = ChainIndex::with_max_workers(8);
+    index.lower_arena_cap(64);
+    let w = index.intern_worker("w").expect("id");
+    let mut mw = ChainBlockMap::default();
+    let long: Vec<ContentHash> = (0..57).map(|p| content(8, p)).collect();
+    let blocks = blocks_of(&long);
+    assert!(matches!(
+        index.apply_stored(w, &blocks, None, &mut mw),
+        Err(ApplyError::ArenaCapReached { .. })
+    ));
+    assert_eq!(
+        scores(&index, &long),
+        Vec::new(),
+        "nothing of a declined chain"
+    );
+    index
+        .apply_stored(w, &blocks[..50], None, &mut mw)
+        .expect("fifty blocks fit a 56-word array");
+    index
+        .apply_stored(w, &blocks[50..56], Some(blocks[49].seq_hash), &mut mw)
+        .expect("six more fill the array in place");
+    assert!(matches!(
+        index.apply_stored(w, &blocks[56..], Some(blocks[55].seq_hash), &mut mw),
+        Err(ApplyError::ArenaCapReached { .. })
+    ));
+    assert_eq!(
+        scores(&index, &long),
+        vec![(w, 56)],
+        "the chain keeps its fifty-six"
+    );
+    assert_eq!(index.stats().cap_refusals, 2);
+}
+
+#[test]
 fn appends_reuse_the_array_until_another_worker_joins() {
     let index = ChainIndex::with_max_workers(8);
     let w = index.intern_worker("w").expect("id");

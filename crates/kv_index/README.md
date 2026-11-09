@@ -217,11 +217,14 @@ Metrics added: `smg_kv_index_lookup_seconds{index}`, `smg_kv_event_apply_seconds
 `smg_kv_event_blocks_total{worker,op}`, `smg_kv_event_parentless_stores_total{worker}`,
 `smg_kv_event_sub_block_stores_total{worker}` (stores narrower than the worker's block of record,
 a hybrid engine's prefix entries at its hash granularity, left out of the index),
+`smg_kv_event_cap_refused_stores_total{worker}` and `smg_kv_event_cap_refused_blocks_total{worker}`
+(stores the index declined at an arena cap and the blocks they left out),
 `smg_kv_index_blocks{worker}`, `smg_kv_index_memberships` and `smg_kv_index_entries` per model,
 `smg_kv_index_runs_live`, `smg_kv_index_blocks_live`, `smg_kv_index_arena_bytes`,
 `smg_kv_index_arena_free_bytes`, `smg_kv_index_arena_chunk_bytes` (what the arena holds from the
 allocator: whole 8 MiB chunks, kept once taken), `smg_kv_index_slab_bytes`, `smg_kv_index_moved_hashes`,
-`smg_kv_index_engine_conflicts`;
+`smg_kv_index_engine_conflicts`, `smg_kv_index_cap_refusals` (stores declined because a run's
+child table or hash array would outgrow an arena chunk);
 `smg_kv_event_batches_total{disposition}`, `smg_kv_event_gaps_total{outcome}`,
 `smg_kv_event_resyncs_total{reason}`, `smg_kv_event_lag_seconds`, `smg_kv_event_degraded_ranks`,
 `smg_kv_event_subscriptions_total`; `smg_worker_stalled{reason}`,
