@@ -64,11 +64,11 @@ use crate::{
                 symphony::template::Templates,
             },
             test_engine::serve_on_loopback,
+            tokenizer_cache,
             utils::tonic_ext::TonicStatusExt,
         },
     },
     tenant::TenantKey,
-    test_support,
     worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         BasicWorkerBuilder, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType,
@@ -2980,7 +2980,7 @@ const V41_CORN_TOKENS: usize = 189;
 /// The checkpoint's tokenizer directory, fetched on a blocking thread: the
 /// download blocks, and must not run on the runtime.
 async fn deepseek_v41_model_dir() -> Option<PathBuf> {
-    tokio::task::spawn_blocking(test_support::ensure_deepseek_v41_cached)
+    tokio::task::spawn_blocking(tokenizer_cache::ensure_deepseek_v41_cached)
         .await
         .expect("the download thread")
 }
@@ -2992,7 +2992,7 @@ async fn deepseek_v41_model_dir() -> Option<PathBuf> {
 fn skip_no_tokenizer() {
     eprintln!(
         "skipping: no DeepSeek-V4.1 tokenizer (the hub is unreachable; set {})",
-        test_support::DEEPSEEK_V41_MODEL_DIR_ENV
+        tokenizer_cache::DEEPSEEK_V41_MODEL_DIR_ENV
     );
 }
 

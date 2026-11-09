@@ -19,8 +19,8 @@ use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
 use tonic::codec::Codec;
 use tool_parser::types::ToolCallItem;
 
+pub(super) use super::super::character_tokenizer::CharacterTokenizer;
 use super::super::*;
-pub(super) use crate::test_support::CharacterTokenizer;
 use crate::{
     routers::{
         common::sse::SseReceiver,

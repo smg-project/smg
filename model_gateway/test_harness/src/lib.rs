@@ -5,10 +5,10 @@ pub mod decode_stream;
 pub mod engine_answers;
 pub mod grpc_harness;
 pub mod held_worker;
-/// The gateway's copy of the hub fetcher (compiled by path from this crate's
-/// `src/hub_fetch.rs`), re-exported so a test binary that links both crates has
-/// one module and one download lock.
-pub use smg::test_support::hub_fetch;
+/// The gateway's hub fetcher (beside the checkpoint tokenizer fixtures of the
+/// gRPC router's tests), re-exported so a test binary that links both crates
+/// has one module and one download lock.
+pub use smg::routers::grpc::tokenizer_cache::hub_fetch;
 pub mod metrics_capture;
 pub mod mock_mcp_server;
 #[cfg(feature = "provider-openai")]

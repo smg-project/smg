@@ -842,7 +842,7 @@ mod tests {
     async fn the_sglang_http_read_combines_the_three_endpoints_with_the_engines_own_labels_first() {
         use http::StatusCode;
 
-        use crate::test_support::serve_json_routes;
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         let base = serve_json_routes(vec![
             (
@@ -900,7 +900,7 @@ mod tests {
     async fn the_sglang_http_read_takes_the_older_spelling_and_tolerates_an_endpoint_not_offered() {
         use http::StatusCode;
 
-        use crate::test_support::serve_json_routes;
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         let base = serve_json_routes(vec![
             (
@@ -940,7 +940,7 @@ mod tests {
     {
         use http::StatusCode;
 
-        use crate::test_support::serve_json_routes;
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         let base = serve_json_routes(vec![
             (
@@ -982,7 +982,7 @@ mod tests {
     async fn the_vllm_http_read_takes_the_model_list_and_the_version() {
         use http::StatusCode;
 
-        use crate::test_support::serve_json_routes;
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         let models = serde_json::json!({"data": [
             {"id": "served-d", "root": "org/model-d", "max_model_len": 8192}
@@ -1313,7 +1313,7 @@ mod tests {
         use http::StatusCode;
         use serde_json::json;
 
-        use crate::test_support::serve_json_routes;
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         let base = serve_json_routes(vec![(
             "/v1/models",

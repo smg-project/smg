@@ -36,7 +36,7 @@ use tonic::{
 };
 use tool_parser::ParserFactory as ToolParserFactory;
 
-use super::{GenerateStreamContext, StreamingProcessor};
+use super::{character_tokenizer::CharacterTokenizer, GenerateStreamContext, StreamingProcessor};
 use crate::{
     routers::{
         common::sse::{sse_channel, SseReceiver},
@@ -48,7 +48,6 @@ use crate::{
             utils::ParserResolver,
         },
     },
-    test_support::CharacterTokenizer,
     worker::WorkerRegistry,
 };
 
