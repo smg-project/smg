@@ -1,8 +1,8 @@
-// SGLang per-step batched output on SMG's wire — `BatchTokenIDSlimOutput`,
-// declared by the SMG plugin that runs inside the scheduler
-// (`smg_grpc_servicer.sglang.zmq_msgpack`): a tagged positional msgpack array
-// of parallel per-request columns. **Field order is the wire contract** — do
-// not reorder; the plugin appends only.
+//! SGLang per-step batched output on SMG's wire — `BatchTokenIDSlimOutput`,
+//! declared by the SMG plugin that runs inside the scheduler
+//! (`smg_grpc_servicer.sglang.zmq_msgpack`): a tagged positional msgpack array
+//! of parallel per-request columns. **Field order is the wire contract** — do
+//! not reorder; the plugin appends only.
 
 use bytes::Bytes;
 use serde::{
@@ -15,7 +15,7 @@ use serde::{
 // place in this module's API.
 pub use crate::protocol::control::{ControlReplySlim, CONTROL_REPLY_SLIM_TAG};
 use crate::{
-    codec::decode_msgpack,
+    codec::{decode_msgpack, tensor::decode_within_frame, FrameStr},
     error::{Error, Result},
     protocol::{
         control::read_control_reply_after_tag,
@@ -46,7 +46,8 @@ pub enum MatchedStop {
 /// request that did not ask for logprobs.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BatchTokenIDSlimOutput {
-    pub rids: Vec<String>,
+    /// The request ids, views of the frame they were decoded within.
+    pub rids: Vec<FrameStr>,
     /// Newly generated token ids per request this step.
     pub output_ids: Vec<Vec<u32>>,
     /// `""` while generating, else `stop` | `length` | `abort`.
@@ -253,7 +254,8 @@ fn read_token_batch_after_tag<'de, A: SeqAccess<'de>>(
 /// One request's slice of a [`BatchTokenIDSlimOutput`].
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SglangOutput {
-    pub request_id: String,
+    /// The request's id, a view of the frame it was decoded within.
+    pub request_id: FrameStr,
     pub output_ids: Vec<u32>,
     /// `None` while the request is still generating.
     pub finish_reason: Option<String>,
@@ -298,7 +300,11 @@ pub struct SglangOutput {
 
 impl EngineOutput for SglangOutput {
     fn request_id(&self) -> &str {
-        &self.request_id
+        self.request_id.as_str()
+    }
+
+    fn own_request_id(&mut self, id: FrameStr) {
+        self.request_id = id;
     }
 
     fn finished(&self) -> bool {
@@ -548,7 +554,7 @@ impl BatchEmbeddingSlimOutput {
             .map(|(request_id, reason)| {
                 let embedding = embeddings.next().unwrap_or_default();
                 SglangOutput {
-                    request_id,
+                    request_id: request_id.into(),
                     // An embedding output is terminal by construction.
                     finish_reason: Some(if reason.is_empty() {
                         "stop".to_string()
@@ -624,8 +630,11 @@ pub(crate) fn decode_slim_batch(frames: &[Bytes]) -> Result<EngineBatch<SglangOu
             "ignoring aux frames on a slim output (the slim records have no tensor fields)"
         );
     }
-    let payload = frames.first().map(AsRef::as_ref).unwrap_or_default();
-    let (engine_index, load, outputs) = match decode_msgpack::<SglangWireOutput>(payload)? {
+    let empty = Bytes::new();
+    let frame = frames.first().unwrap_or(&empty);
+    // Within the frame's scope, so every request id is a view of it, not a copy.
+    let wire = decode_within_frame(frame, || decode_msgpack::<SglangWireOutput>(frame))?;
+    let (engine_index, load, outputs) = match wire {
         SglangWireOutput::Tokens(batch) => (
             batch.engine_index,
             load_of(
@@ -657,10 +666,11 @@ pub(crate) fn decode_slim_batch(frames: &[Bytes]) -> Result<EngineBatch<SglangOu
             });
         }
     };
+    // The one owned copy of an id, made at the finish alone.
     let finished_request_ids = outputs
         .iter()
         .filter(|output| output.finish_reason.is_some())
-        .map(|output| output.request_id.clone())
+        .map(|output| String::from(&output.request_id))
         .collect();
     Ok(EngineBatch {
         engine_index,
@@ -692,7 +702,7 @@ fn load_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{decode_msgpack, encode_msgpack};
+    use crate::codec::{decode_msgpack, encode_msgpack, hex};
 
     /// `msgspec.msgpack.encode` of the plugin's slim batch for rids a/b with
     /// b finished on token 42 with logprobs and two ranked candidates on its
@@ -722,13 +732,6 @@ mod tests {
     const PYTHON_SLIM28: &str = "dc001cb64261746368546f6b656e4944536c696d4f757470757492a161a16292910a911492a0a473746f7092c0c092c02a92030392010192000092909092909001020028cd019092c0c092909092909092000092909092909092909092909092909092909092c0c092c09492cb3fe0000000000000cbbfe000000000000092cb3fd0000000000000cb3fe800000000000092cb3ff0000000000000cb000000000000000092cbbff0000000000000cb4000000000000000";
     /// The plugin's terminal abort for rid `x`: its `n=2` rejection, status 400.
     const PYTHON_ABORT: &str = "dc0013b64261746368546f6b656e4944536c696d4f757470757491a178919091a561626f727491d9396e3d32206973206e6f7420736572766564206f6e207468697320776972653b20534d472066616e73206f7574206e203e203120697473656c6691c091009100910091909190000000000091cd019091909190";
-
-    fn hex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
 
     /// The 19-element pin predates the appended prompt-logprob and reasoning
     /// columns: it decodes with them empty, and re-encoding (24 elements)

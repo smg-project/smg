@@ -8,10 +8,6 @@
 //! so installing the global Prometheus recorder here does not collide with
 //! other suites.
 
-#![expect(clippy::expect_used, reason = "test failures should panic")]
-
-use std::net::SocketAddr;
-
 use smg::{
     observability::{
         metrics::{init_startup_series, start_prometheus, PrometheusConfig},
@@ -19,17 +15,7 @@ use smg::{
     },
     worker::{CircuitBreaker, CircuitBreakerConfig},
 };
-
-async fn scrape(addr: SocketAddr) -> String {
-    smg::clients::http_client()
-        .get(format!("http://{addr}/metrics"))
-        .send()
-        .await
-        .expect("metrics endpoint reachable")
-        .text()
-        .await
-        .expect("metrics body")
-}
+use smg_test_harness::test_app::scrape;
 
 /// The rendered sample of `family` whose label set contains every pair in
 /// `labels`, as `(line, value)`.

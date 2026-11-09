@@ -35,6 +35,10 @@ pub struct PathSpec {
     pub client: &'static [&'static str],
     pub answer: String,
     pub finish: &'static str,
+    /// The pause between the frames of a streamed answer, in milliseconds: 0
+    /// hands a whole answer over at once (an engine's burst), a pause spaces
+    /// the frames as an engine decoding one token per step does.
+    pub frame_pause_ms: u64,
     pub label: &'static str,
 }
 
@@ -46,6 +50,7 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             client: &["--mode", "chat", "--max-tokens", "8", "--seed", "101"],
             answer: words(8),
             finish: "stop",
+            frame_pause_ms: 0,
             label: "chat, non-stream, 64-word prompt, 8 output tokens",
         },
         PathSpec {
@@ -62,6 +67,7 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             ],
             answer: words(128),
             finish: "length",
+            frame_pause_ms: 0,
             label: "chat stream, 128 deltas of one token",
         },
         PathSpec {
@@ -81,6 +87,7 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             ],
             answer: TOOL_CALL_ANSWER.to_string(),
             finish: "stop",
+            frame_pause_ms: 0,
             label: "tool call: 4 schemas, 2 earlier rounds, the answer parsed into tool_calls",
         },
         PathSpec {
@@ -97,6 +104,7 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             ],
             answer: JSON_ANSWER.to_string(),
             finish: "stop",
+            frame_pause_ms: 0,
             label: "json_schema answer",
         },
         PathSpec {
@@ -105,7 +113,220 @@ pub static PATHS: LazyLock<Vec<PathSpec>> = LazyLock::new(|| {
             client: &["--mode", "messages", "--max-tokens", "8", "--seed", "105"],
             answer: words(8),
             finish: "stop",
+            frame_pause_ms: 0,
             label: "Messages API, non-stream, 8 output tokens",
+        },
+        // The streamed answers below are not in `DEFAULT_PATHS`: each prices
+        // one stream shape (`PERF_PATHS` names them), at rates that keep the
+        // frames per second near the `stream` path's.
+        PathSpec {
+            name: "messages_stream",
+            rate: 100.0,
+            client: &[
+                "--mode",
+                "messages",
+                "--stream",
+                "--max-tokens",
+                "300",
+                "--seed",
+                "106",
+            ],
+            answer: words(300),
+            finish: "length",
+            frame_pause_ms: 0,
+            label: "Messages stream, 300 deltas of one token",
+        },
+        PathSpec {
+            name: "generate_stream",
+            rate: 100.0,
+            client: &[
+                "--mode",
+                "generate",
+                "--stream",
+                "--max-tokens",
+                "300",
+                "--seed",
+                "107",
+            ],
+            answer: words(300),
+            finish: "length",
+            frame_pause_ms: 0,
+            label: "generate stream, 300 frames of one token, the whole text in every frame",
+        },
+        PathSpec {
+            name: "completion_stream",
+            rate: 100.0,
+            client: &[
+                "--mode",
+                "completion",
+                "--stream",
+                "--max-tokens",
+                "300",
+                "--seed",
+                "109",
+            ],
+            answer: words(300),
+            finish: "length",
+            frame_pause_ms: 0,
+            label: "completion stream, 300 deltas of one token",
+        },
+        PathSpec {
+            name: "generate_stream_long",
+            rate: 16.0,
+            client: &[
+                "--mode",
+                "generate",
+                "--stream",
+                "--max-tokens",
+                "2000",
+                "--seed",
+                "108",
+            ],
+            answer: words(2000),
+            finish: "length",
+            frame_pause_ms: 0,
+            label: "generate stream, 2,000 frames of one token, the whole text in every frame",
+        },
+        // The generate wire at an engine's pace: the same 300 frames with a
+        // 20 ms pause between them (50 tokens a second per stream), at the rate
+        // that keeps the frames per second at `generate_stream`'s, so about
+        // 600 streams are open at once. The paths above hand a whole answer
+        // over at once (an engine's burst); this one reads the stream loops
+        // as a decoding engine drives them, one frame at a time.
+        PathSpec {
+            name: "generate_stream_spaced",
+            rate: 100.0,
+            client: &[
+                "--mode",
+                "generate",
+                "--stream",
+                "--max-tokens",
+                "300",
+                "--seed",
+                "110",
+            ],
+            answer: words(300),
+            finish: "length",
+            frame_pause_ms: 20,
+            label: "generate stream, 300 frames of one token 20 ms apart, the whole text in every frame",
+        },
+        // The paced twins of the other streamed shapes: the same answers, 20 ms
+        // between frames, the rates of the burst paths (so the frames per second
+        // hold and the open streams multiply the same way).
+        PathSpec {
+            name: "stream_spaced",
+            rate: 250.0,
+            client: &[
+                "--mode",
+                "chat",
+                "--stream",
+                "--max-tokens",
+                "128",
+                "--seed",
+                "111",
+            ],
+            answer: words(128),
+            finish: "length",
+            frame_pause_ms: 20,
+            label: "chat stream, 128 deltas of one token 20 ms apart",
+        },
+        PathSpec {
+            name: "completion_stream_spaced",
+            rate: 100.0,
+            client: &[
+                "--mode",
+                "completion",
+                "--stream",
+                "--max-tokens",
+                "300",
+                "--seed",
+                "112",
+            ],
+            answer: words(300),
+            finish: "length",
+            frame_pause_ms: 20,
+            label: "completion stream, 300 deltas of one token 20 ms apart",
+        },
+        PathSpec {
+            name: "messages_stream_spaced",
+            rate: 100.0,
+            client: &[
+                "--mode",
+                "messages",
+                "--stream",
+                "--max-tokens",
+                "300",
+                "--seed",
+                "113",
+            ],
+            answer: words(300),
+            finish: "length",
+            frame_pause_ms: 20,
+            label: "Messages stream, 300 deltas of one token 20 ms apart",
+        },
+        // The generate wire at an engine's pace on a long answer: 5,000 frames
+        // of one token 20 ms apart, the whole text in every frame, so the text
+        // passes the gateway's 16 KiB frame bound about two thirds of the way
+        // through and each of the last 1,700 or so events fills a frame of its
+        // own, 20 ms after the one before (the shape of a long reasoning
+        // answer). `generate_stream_long` fills its frames from a burst (its
+        // events stay under 10 KiB; two or three make a frame) and the
+        // 300-frame spaced path never reaches the bound; this one reads what a
+        // stream loop's frame buffer does between full frames at an engine's
+        // pace. The rate keeps the frames per second at
+        // `generate_stream`'s: an answer takes about 100 s, so about 600
+        // streams are open at once, and a cell of 10,000 requests runs about
+        // half an hour (a recipe names a smaller `--requests`). The answer's
+        // pauses (about 105 s with the timer's granularity) fit the load
+        // client's 120 s drain with about 15 s to spare, and a `live` ramp on
+        // it names its own `--rates` (the default steps start at 200/s, the
+        // burst paths' pace) and `--slo-e2e-p99-ms` above about 110,000
+        // (above the answer, under the drain); a longer or slower paced path
+        // needs the drain made a knob first.
+        PathSpec {
+            name: "generate_stream_spaced_long",
+            rate: 6.0,
+            client: &[
+                "--mode",
+                "generate",
+                "--stream",
+                "--max-tokens",
+                "5000",
+                "--seed",
+                "114",
+            ],
+            answer: words(5000),
+            finish: "length",
+            frame_pause_ms: 20,
+            label: "generate stream, 5,000 frames of one token 20 ms apart, the whole text in every frame",
+        },
+        // The stream with the sampled logprob and five candidates per token,
+        // the gateway reading, converting and decoding six token ids per
+        // delta. Its rate is the gateway's load, not the frame rate: such an
+        // answer costs about 3.5 times the instructions and 13 times the
+        // allocation calls of the plain stream's, so at 100/s the cell runs
+        // about 1.4 times the `stream` cell's gateway instructions per second
+        // and about five times its allocation calls (3.5 and 13 times them at
+        // the `stream` rate).
+        PathSpec {
+            name: "stream_logprobs",
+            rate: 100.0,
+            client: &[
+                "--mode",
+                "chat",
+                "--stream",
+                "--max-tokens",
+                "128",
+                "--logprobs",
+                "5",
+                "--seed",
+                "109",
+            ],
+            answer: words(128),
+            finish: "length",
+            frame_pause_ms: 0,
+            label:
+                "chat stream, 128 deltas of one token, the sampled logprob and 5 candidates each",
         },
     ]
 });
@@ -145,18 +366,21 @@ pub fn parse_paths(text: &str) -> Result<Vec<PathSpec>> {
 
 /// The scripted answers of one cell: `count` copies, served in order to the next
 /// requests of every worker (the mock worker's shared queue), the text encoded by the
-/// worker with the bed's tokenizer; one token per streamed frame, no pause.
+/// worker with the bed's tokenizer; one token per streamed frame, the path's pause
+/// between frames (none on the burst paths). A path whose requests ask for logprobs
+/// gets the worker's made-up sampled logprobs, one per token, and the candidates the
+/// worker draws from the answer's own tokens.
 pub fn answers(spec: &PathSpec, count: usize) -> Vec<Value> {
-    (0..count)
-        .map(|_| {
-            json!({
-                "output_text": spec.answer,
-                "finish_reason": spec.finish,
-                "chunk_tokens": 1,
-                "delay_ms": 0,
-            })
-        })
-        .collect()
+    let mut answer = json!({
+        "output_text": spec.answer,
+        "finish_reason": spec.finish,
+        "chunk_tokens": 1,
+        "delay_ms": spec.frame_pause_ms,
+    });
+    if spec.client.contains(&"--logprobs") {
+        answer["logprobs"] = json!("sampled");
+    }
+    (0..count).map(|_| answer.clone()).collect()
 }
 
 /// Repeat i alternates which side goes first (as scripts/bench_gate.py does).
@@ -202,6 +426,26 @@ mod tests {
         let stream = path_named("stream").unwrap();
         assert_eq!(stream.finish, "length");
         assert!(stream.client.contains(&"--stream"));
+        for (name, tokens) in [
+            ("messages_stream", 300),
+            ("generate_stream", 300),
+            ("completion_stream", 300),
+            ("generate_stream_long", 2000),
+            ("generate_stream_spaced", 300),
+            ("stream_spaced", 128),
+            ("completion_stream_spaced", 300),
+            ("messages_stream_spaced", 300),
+            ("generate_stream_spaced_long", 5000),
+        ] {
+            let spec = path_named(name).unwrap();
+            assert_eq!(spec.finish, "length", "{name}");
+            assert!(spec.client.contains(&"--stream"), "{name}");
+            assert_eq!(spec.answer.split_whitespace().count(), tokens, "{name}");
+            assert!(
+                !DEFAULT_PATHS.split(',').any(|p| p == name),
+                "{name} is opt-in"
+            );
+        }
         let tools: Value = serde_json::from_str(&path_named("tools").unwrap().answer).unwrap();
         assert!(tools["name"].as_str().unwrap().starts_with("lookup_"));
         let json: Value = serde_json::from_str(&path_named("json").unwrap().answer).unwrap();
@@ -231,6 +475,71 @@ mod tests {
                 .split_whitespace()
                 .count(),
             8
+        );
+    }
+
+    #[test]
+    fn the_spaced_streams_pace_their_frames_and_the_burst_paths_do_not() {
+        for name in [
+            "generate_stream_spaced",
+            "stream_spaced",
+            "completion_stream_spaced",
+            "messages_stream_spaced",
+            "generate_stream_spaced_long",
+        ] {
+            let spaced = path_named(name).unwrap();
+            assert_eq!(spaced.frame_pause_ms, 20, "{name}");
+            assert_eq!(answers(spaced, 1)[0]["delay_ms"], json!(20), "{name}");
+        }
+        for spec in PATHS.iter().filter(|p| !p.name.contains("_spaced")) {
+            assert_eq!(spec.frame_pause_ms, 0, "{}", spec.name);
+            assert_eq!(answers(spec, 1)[0]["delay_ms"], json!(0), "{}", spec.name);
+        }
+    }
+
+    #[test]
+    fn the_long_spaced_generate_stream_passes_the_frame_bound_on_its_last_thousand_frames() {
+        // The gateway flushes a streamed frame at 16 KiB, and the generate wire
+        // carries the whole text so far in every event: once the text passes
+        // the bound, every event is a full frame of its own.
+        const FRAME_BOUND: usize = 16 * 1024;
+        let spec = path_named("generate_stream_spaced_long").unwrap();
+        let tokens = spec.answer.split_whitespace().count();
+        assert_eq!(tokens, 5000);
+        assert!(
+            words(tokens - 1000).len() > FRAME_BOUND,
+            "the last thousand frames each carry more than the bound"
+        );
+        assert!(
+            words(tokens / 2).len() < FRAME_BOUND,
+            "the first half stays under it, as the 300-frame paths do"
+        );
+        let generate = path_named("generate_stream").unwrap();
+        assert_eq!(
+            spec.rate * tokens as f64,
+            generate.rate * 300.0,
+            "the frames per second are generate_stream's"
+        );
+    }
+
+    #[test]
+    fn the_logprobs_stream_is_opt_in_and_its_answers_carry_sampled_logprobs() {
+        let spec = path_named("stream_logprobs").unwrap();
+        assert_eq!(spec.finish, "length");
+        assert!(spec.client.contains(&"--stream"));
+        assert!(spec.client.contains(&"--logprobs"));
+        assert_eq!(spec.answer, path_named("stream").unwrap().answer);
+        assert!(
+            !DEFAULT_PATHS.split(',').any(|p| p == "stream_logprobs"),
+            "opt-in"
+        );
+        let scripted = answers(spec, 2);
+        assert_eq!(scripted.len(), 2);
+        assert_eq!(scripted[0]["logprobs"], json!("sampled"));
+        assert_eq!(
+            answers(path_named("stream").unwrap(), 1)[0].get("logprobs"),
+            None,
+            "the plain stream scripts none"
         );
     }
 

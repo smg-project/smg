@@ -275,19 +275,39 @@ impl<'a> Asks<'a> {
         }
     }
 
-    /// The JSON schema the request's answer must fit; a Messages request asks none (an
-    /// `output_format` is refused before this).
+    /// The JSON schema the request's answer must fit: a chat request's `response_format`'s, a
+    /// Messages request's `output_config.format`'s.
     pub(super) fn answer_schema(self) -> Option<Value> {
         match self {
             Self::Chat(request) => answer_schema(request.response_format.as_ref()),
-            Self::Messages { .. } => None,
+            Self::Messages { request, .. } => request.output_schema().cloned(),
+        }
+    }
+
+    /// [`Self::answer_schema`] for the engine's own JSON-schema constraint where nothing else
+    /// constrains the answer (no table reads the response, or the table gives the selected
+    /// worker no tag for the schema, which a registry table leaves to the engine): a Messages
+    /// request's, unless its choice forces a call to one of `tools` ([`Self::forced_call`]): a
+    /// turn forced into a call has no text answer to format, whether or not the call has a
+    /// constraint of its own (a legacy parser may give a forced call none and let the model
+    /// write its native call). A chat request's reaches the engine through its request builder
+    /// (`response_format_schema`), so none is named here.
+    pub(crate) fn untabled_answer_schema(self, tools: &[Tool]) -> Option<Value> {
+        match self {
+            Self::Chat(_) => None,
+            Self::Messages { .. } if self.forced_call(tools).is_some() => None,
+            Self::Messages { request, .. } => request.output_schema().cloned(),
         }
     }
 
     /// Whether the request's choice forces a call to one of `tools`, and then whether one call at
-    /// most: a chat `tool_choice` that forces a call ([`ToolChoice::forces_call`]), one call for a
-    /// named function or `parallel_tool_calls: false`; a Messages `tool_choice` of `any` or a
-    /// named tool, one call for the named tool or `disable_parallel_tool_use`.
+    /// most: a chat `tool_choice` that forces a call ([`ToolChoice::forces_call`]; validation holds
+    /// a named function to the declared ones), one call for a named function or
+    /// `parallel_tool_calls: false`; a Messages `tool_choice` of `any`, or one naming a tool among
+    /// `tools` (validation lets it name a tool of another kind, which the custom tools the model
+    /// sees never hold: the list narrowed by the choice at preparation and the declared one at the
+    /// decision then agree that nothing is forced), one call for the named tool or
+    /// `disable_parallel_tool_use`.
     fn forced_call(self, tools: &[Tool]) -> Option<bool> {
         if tools.is_empty() {
             return None;
@@ -301,7 +321,10 @@ impl<'a> Asks<'a> {
                 })
             }
             Self::Messages { request, .. } => match &request.tool_choice {
-                Some(MessagesToolChoice::Tool { .. }) => Some(true),
+                Some(MessagesToolChoice::Tool { name, .. }) => tools
+                    .iter()
+                    .any(|tool| tool.function.name == *name)
+                    .then_some(true),
                 Some(choice @ MessagesToolChoice::Any { .. }) => {
                     Some(choice.disables_parallel_tool_use())
                 }
@@ -999,9 +1022,9 @@ pub(crate) fn turn_constraint(
     }
 }
 
-/// [`turn_constraint`] over `format`: the request's tools and choice, its parallel use, and a chat
-/// request's `response_format`, `regex` or `ebnf` as the answer's (the protocol refuses more than
-/// one; a Messages request carries no answer format).
+/// [`turn_constraint`] over `format`: the request's tools and choice, its parallel use, and the
+/// answer's format, a chat request's `response_format`, `regex` or `ebnf` (the protocol refuses
+/// more than one) or a Messages request's `output_config.format`.
 pub(super) fn turn_of(
     format: &Format,
     asks: Asks<'_>,
@@ -1056,6 +1079,118 @@ mod tests {
 
     use super::*;
     use crate::routers::grpc::regular::symphony::testing::{assign, constraint, *};
+
+    /// A Messages request's untabled schema is its format's, except under a choice that forces a
+    /// call to a declared tool: the turn has no text answer to format, whether or not the call has a
+    /// constraint; with no callable tool, or a choice naming a tool outside the callable ones (a
+    /// tool of another kind, which the model never sees), the choice forces nothing and the answer
+    /// is formatted.
+    #[test]
+    fn a_forced_call_leaves_the_untabled_schema_out() {
+        let schema =
+            json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]});
+        let request = |choice: Option<Value>| -> CreateMessageRequest {
+            let mut body = json!({
+                "model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}],
+                "output_config": {"format": {"type": "json_schema", "schema": schema}},
+            });
+            if let Some(choice) = choice {
+                body["tool_choice"] = choice;
+            }
+            serde_json::from_value(body).expect("a Messages request")
+        };
+        let tools: Vec<Tool> = serde_json::from_value(json!([
+            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object", "properties": {}}}}
+        ]))
+        .expect("a tool");
+        let asks = |request: &CreateMessageRequest| {
+            Asks::Messages {
+                request,
+                continues: false,
+            }
+            .untabled_answer_schema(&tools)
+        };
+        assert_eq!(asks(&request(None)), Some(schema.clone()));
+        assert_eq!(
+            asks(&request(Some(json!({"type": "auto"})))),
+            Some(schema.clone())
+        );
+        assert_eq!(asks(&request(Some(json!({"type": "any"})))), None);
+        assert_eq!(
+            asks(&request(Some(json!({"type": "tool", "name": "lookup"})))),
+            None
+        );
+        assert_eq!(
+            asks(&request(Some(
+                json!({"type": "tool", "name": "web_search"})
+            ))),
+            Some(schema.clone()),
+            "a choice naming a tool outside the callable ones forces no call to them"
+        );
+        let forced = request(Some(json!({"type": "any"})));
+        assert_eq!(
+            Asks::Messages {
+                request: &forced,
+                continues: false
+            }
+            .untabled_answer_schema(&[]),
+            Some(schema.clone()),
+            "no callable tool: the choice forces nothing"
+        );
+    }
+
+    /// A Messages request's `output_config.format` is the answer's schema as a chat request's
+    /// `response_format` is: the table derives the same tag for both, and hands a worker the
+    /// schema itself where it has no tag for it.
+    #[test]
+    fn a_messages_output_format_is_the_answers_schema_as_a_chat_response_format_is() {
+        let deepseek = names(Some("deepseek_v4"), Some("deepseek_v4"));
+        let schema = json!({"type": "object", "properties": {"city": {"type": "string"}}});
+        let chat = request(json!({"response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "city", "schema": schema},
+        }}));
+        let messages: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen3-8B", "max_tokens": 16, "messages": [],
+            "output_config": {"format": {"type": "json_schema", "schema": schema}},
+        }))
+        .expect("a Messages request");
+        let answer_of = |asks| {
+            let prepared = super::constraint(
+                ParserChoice::Symphony,
+                &deepseek,
+                asks,
+                &[],
+                true,
+                false,
+                symphony::GrammarStart::Either,
+                TagVocabulary::Current,
+                &templates(),
+            );
+            let Ok(Prepared::Answer(answer)) = prepared else {
+                panic!("the answer's tag, not {prepared:?}");
+            };
+            answer
+        };
+        let for_chat = answer_of(Asks::Chat(&chat));
+        let for_messages = answer_of(Asks::Messages {
+            request: &messages,
+            continues: false,
+        });
+        assert_eq!(for_messages.schema(), Some(&schema));
+        for start in [
+            symphony::GrammarStart::FirstToken,
+            symphony::GrammarStart::Unknown,
+        ] {
+            let tag = |answer: &Arc<AnswerTag>| {
+                answer
+                    .for_start(start, TagVocabulary::Current)
+                    .expect("no hf")
+                    .map(|constraint| constraint.to_tuple())
+            };
+            assert_eq!(tag(&for_messages), tag(&for_chat), "{start:?}");
+        }
+    }
 
     /// Where a worker's engine starts the grammar shapes what precedes a table's answer or its
     /// calls when the prompt leaves the thought open: nothing after the reasoning parser's gate

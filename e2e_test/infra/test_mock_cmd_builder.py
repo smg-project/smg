@@ -8,11 +8,14 @@ from unittest.mock import patch
 import pytest
 from infra.constants import (
     DEFAULT_HOST,
+    ENV_MOCK_WIRE,
     LOCAL_RUNTIMES,
+    MOCK_WIRES,
     RUNTIME_LABELS,
     ConnectionMode,
     Runtime,
     WorkerType,
+    get_mock_wire,
 )
 from infra.worker import Worker
 
@@ -95,19 +98,89 @@ def test_the_prefill_and_decode_roles_reach_the_grpc_command_with_the_bootstrap_
     assert "--worker-type" not in _worker(ConnectionMode.GRPC)._build_cmd(), "a regular worker"
 
 
-def test_a_role_on_another_wire_or_an_encode_role_is_refused():
-    with pytest.raises(ValueError, match="gRPC workers"):
-        _worker(ConnectionMode.HTTP, worker_type=WorkerType.DECODE)._build_cmd()
-    with pytest.raises(ValueError, match="no encode role"):
-        _worker(ConnectionMode.GRPC, worker_type=WorkerType.ENCODE)._build_cmd()
+def _last_flag(cmd: list[str], flag: str) -> str:
+    return cmd[max(i for i, arg in enumerate(cmd) if arg == flag) + 1]
+
+
+def test_an_encode_worker_takes_the_vllm_wire_and_a_bootstrap_port():
+    encode = _worker(ConnectionMode.GRPC, worker_type=WorkerType.ENCODE, bootstrap_port=31901)
+    cmd = encode._build_cmd()
+    assert _flag(cmd, "--worker-type") == "encode"
+    assert _last_flag(cmd, "--grpc-wire") == "vllm", "the encode role is the vLLM wire's"
+    assert _flag(cmd, "--bootstrap-base-port") == "31901", "the port the gateway is told of"
+    # A class's own wire comes after the role's, as for every pool: the mock
+    # takes the last, and refuses the encode role on a wire without one.
+    stated = _worker(
+        ConnectionMode.GRPC,
+        worker_type=WorkerType.ENCODE,
+        extra_engine_args=["--grpc-wire", "sglang"],
+    )._build_cmd()
+    assert _last_flag(stated, "--grpc-wire") == "sglang"
+
+
+def test_the_prefill_and_decode_roles_reach_the_http_command_with_the_bootstrap_port():
+    prefill = _worker(ConnectionMode.HTTP, worker_type=WorkerType.PREFILL, bootstrap_port=31900)
+    cmd = prefill._build_cmd()
+    assert _flag(cmd, "--http-base-port") == "31001", "an HTTP worker on its own port"
+    assert _flag(cmd, "--worker-type") == "prefill"
+    assert _flag(cmd, "--bootstrap-base-port") == "31900", "the port the gateway is told of"
+    assert "--grpc-wire" not in cmd, "an HTTP worker speaks no scheduler wire"
+    decode = _worker(ConnectionMode.HTTP, worker_type=WorkerType.DECODE)
+    cmd = decode._build_cmd()
+    assert _flag(cmd, "--worker-type") == "decode"
+    assert "--bootstrap-base-port" not in cmd, "a decode worker binds no bootstrap port"
+
+
+def test_a_role_on_another_wire_is_refused():
+    # The ZMQ workers take no role; the encode role is the gRPC vLLM wire's.
+    with pytest.raises(ValueError, match="HTTP or gRPC workers"):
+        _worker(ConnectionMode.ZMQ, worker_type=WorkerType.DECODE)._build_cmd()
+    with pytest.raises(ValueError, match="gRPC worker"):
+        _worker(ConnectionMode.HTTP, worker_type=WorkerType.ENCODE)._build_cmd()
 
 
 def test_the_mock_is_paired_on_its_wires_one_transport():
-    # The mock moves no KV; the gateway pairs it as a worker of the scheduler
-    # wire it speaks, whose one transport is Mooncake, whatever the lane's
-    # setting for the engines that have a choice.
+    # The mock moves no KV and names Mooncake as its transport on every
+    # scheduler wire it can speak; the gateway pairs it on that, whatever the
+    # lane's setting for the engines that have a choice.
     with patch.dict(os.environ, {"E2E_VLLM_KV_BACKEND": "nixl"}):
         assert (
             _worker(ConnectionMode.GRPC, worker_type=WorkerType.PREFILL).effective_kv_backend()
             == "mooncake"
         )
+
+
+def test_the_lane_leaves_the_mocks_wire_alone_unless_it_names_one(monkeypatch):
+    # Unset or blank: the mock's own default, no flag on the command line.
+    monkeypatch.delenv(ENV_MOCK_WIRE, raising=False)
+    assert get_mock_wire() is None
+    assert "--grpc-wire" not in _worker(ConnectionMode.GRPC)._build_cmd()
+    monkeypatch.setenv(ENV_MOCK_WIRE, "  ")
+    assert get_mock_wire() is None
+    assert "--grpc-wire" not in _worker(ConnectionMode.GRPC)._build_cmd()
+
+
+@pytest.mark.parametrize("wire", MOCK_WIRES)
+def test_the_lanes_wire_reaches_the_grpc_command_whatever_its_case(monkeypatch, wire):
+    monkeypatch.setenv(ENV_MOCK_WIRE, f" {wire.upper()} ")
+    assert get_mock_wire() == wire
+    cmd = _worker(ConnectionMode.GRPC)._build_cmd()
+    assert _flag(cmd, "--grpc-wire") == wire
+    # The HTTP worker speaks no scheduler proto, so the lane's wire is not its business.
+    assert "--grpc-wire" not in _worker(ConnectionMode.HTTP)._build_cmd()
+
+
+def test_a_class_s_own_wire_comes_after_the_lanes_so_the_mock_takes_it(monkeypatch):
+    monkeypatch.setenv(ENV_MOCK_WIRE, "vllm")
+    worker = _worker(ConnectionMode.GRPC, extra_engine_args=["--grpc-wire", "sglang"])
+    cmd = worker._build_cmd()
+    flags = [cmd[i + 1] for i, flag in enumerate(cmd) if flag == "--grpc-wire"]
+    assert flags == ["vllm", "sglang"], "the lane's first, the class's last"
+
+
+def test_an_unknown_wire_raises(monkeypatch):
+    monkeypatch.setenv(ENV_MOCK_WIRE, "trtllm")
+    with pytest.raises(ValueError, match="E2E_MOCK_WIRE='trtllm'"):
+        get_mock_wire()
+    with pytest.raises(ValueError, match="E2E_MOCK_WIRE='trtllm'"):
+        _worker(ConnectionMode.GRPC)._build_cmd()

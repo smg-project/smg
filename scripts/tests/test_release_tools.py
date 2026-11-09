@@ -9,6 +9,7 @@ real repository or the network.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import shutil
@@ -44,6 +45,7 @@ MAKE_TARGETS = {
     "release-bump-main": "bump-main",
     "release-publish-plan": "publish-plan",
     "release-check": "check",
+    "release-ship": "ship",
 }
 
 GH_STUB = r"""#!/usr/bin/env bash
@@ -56,29 +58,100 @@ api_error() { # <message> <status>: an API error as gh reports it: the body on s
 case "$1 $2" in
   "pr create")
     for ((i = 1; i <= $#; i++)); do
-      if [ "${!i}" = "--body-file" ]; then j=$((i + 1)); cp "${!j}" "$GH_STUB_LOG.body"; fi
+      case "${!i}" in
+        --body-file) j=$((i + 1)); cp "${!j}" "$GH_STUB_LOG.body" ;;
+        --head) j=$((i + 1)); head=${!j} ;;
+        --base) j=$((i + 1)); base=${!j} ;;
+      esac
     done
+    printf '%s %s\n' "${head-}" "${base-}" > "$GH_STUB_LOG.pr"
     echo "https://example.invalid/pull/1" ;;
   "pr list")
     [ -z "${GH_STUB_LIST_ERROR-}" ] || { echo "gh: $GH_STUB_LIST_ERROR" >&2; exit 1; }
     case " $* " in
-      *" --head "*) # the cut's precondition: the open pull requests on a head (--json number --jq .[].number)
+      *" --head "*) # the open pull requests on a head (--json number --jq .[].number): the cut's and the ship's reads
         for ((i = 1; i <= $#; i++)); do
           if [ "${!i}" = "--head" ]; then j=$((i + 1)); head=${!j}; fi
+          if [ "${!i}" = "--base" ]; then j=$((i + 1)); base=${!j}; fi
         done
+        [ -z "${base-}" ] || printf '%s %s\n' "$head" "$base" > "$GH_STUB_LOG.pr"
         case " ${GH_STUB_OPEN_HEADS-} " in *" $head "*) echo 8 ;; esac ;;
       *) echo "#7  fix(router): y  pick/1.14-0000000" ;;
     esac ;;
+  "pr view") # the bump pull request the ship waits for; GH_STUB_MERGE=1 merges it (origin's base moves to its head)
+    if [ "${GH_STUB_MERGE-}" = 1 ] && [ -s "$GH_STUB_LOG.pr" ]; then
+      read -r head base < "$GH_STUB_LOG.pr"
+      git -C "$GH_STUB_ORIGIN" update-ref "refs/heads/$base" "refs/heads/$head"
+      echo MERGED
+    else
+      echo "${GH_STUB_PR_STATE:-OPEN}"
+    fi ;;
+  "api user") [ -z "${GH_STUB_AUTH_ERROR-}" ] || { echo "gh: HTTP 401: Bad credentials" >&2; exit 1; }; echo 1 ;;
+  "api repos/example/repo/branches/"*) echo "${GH_STUB_PROTECTED:-false}" ;;
+  "api repos/example/repo/rules/branches/"*) [ -z "${GH_STUB_RULES-}" ] || printf '%b\n' "$GH_STUB_RULES" ;;
+  "api repos/example/repo/rulesets/"*) [ -z "${GH_STUB_BYPASS-}" ] || printf '%b\n' "$GH_STUB_BYPASS" ;;
+  "release view")
+    case " ${GH_STUB_RELEASES-} " in
+      *" $3 "*) echo "https://example.invalid/releases/$3 (prerelease: ${GH_STUB_RELEASE_PRE:-false})" ;;
+      *) echo "release not found" >&2; exit 1 ;;
+    esac ;;
+  "release create") echo "https://example.invalid/releases/$3" ;;
+  "workflow run") ;;
+  "run list") # the runs on a tag: GH_STUB_TAG_RUNS holds "file;id;title;status;conclusion" lines, --workflow narrows
+    [ -z "${GH_STUB_RUN_LIST_ERROR-}" ] || { echo "gh: $GH_STUB_RUN_LIST_ERROR" >&2; exit 1; }
+    workflow=""
+    for ((i = 1; i <= $#; i++)); do
+      if [ "${!i}" = "--workflow" ]; then j=$((i + 1)); workflow=${!j}; fi
+    done
+    while IFS=';' read -r file id title status conclusion; do
+      [ -n "$file" ] || continue
+      [ -z "$workflow" ] || [ "$file" = "$workflow" ] || continue
+      if [ -n "$workflow" ]; then printf '%s\t%s\t%s\t%s\n' "$id" "$title" "$status" "$conclusion"
+      else printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$file" "$status" "$conclusion" "$title"; fi
+    done <<< "${GH_STUB_TAG_RUNS-}" ;;
   "repo view") echo "example/repo" ;;
+  "api graphql") # the notes' batch read of pull request bodies: GH_STUB_PULLS/<number>.md is a body, no file a null
+    [ -z "${GH_STUB_GRAPHQL_ERROR-}" ] || { echo "gh: $GH_STUB_GRAPHQL_ERROR" >&2; exit 1; }
+    if [ -n "${GH_STUB_GRAPHQL_NULL_REPO-}" ]; then # a repository the token cannot see: null, an error, exit 1
+      echo '{"data":{"repository":null},"errors":[{"type":"NOT_FOUND","message":"Could not resolve to a Repository"}]}'
+      echo "gh: Could not resolve to a Repository with the name 'example/repo'. (NOT_FOUND)" >&2
+      exit 1
+    fi
+    python3 - "${GH_STUB_PULLS:-/nonexistent}" "$*" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+pulls, query = Path(sys.argv[1]), sys.argv[2]
+data = {}
+for alias, number in re.findall(r"(p\d+): pullRequest\(number: (\d+)\)", query):
+    body = pulls / f"{number}.md"
+    data[alias] = (
+        {"number": int(number), "title": "", "body": body.read_text(), "author": {"login": "someone"}}
+        if body.is_file()
+        else None
+    )
+print(json.dumps({"data": {"repository": data}}))
+PY
+    ;;
   "api --paginate")
     [ -z "${GH_STUB_API_ERROR-}" ] || api_error "$GH_STUB_API_ERROR" "${GH_STUB_API_STATUS:-422}"
-    printf '%b\n' "${GH_STUB_CHECKS:-success a\nsuccess b}" ;;
+    # one commit's own check runs when a test sets GH_STUB_CHECKS_<sha> (a bump's parent); else GH_STUB_CHECKS
+    sha=${3#*commits/}; sha=${sha%%/*}; of_sha="GH_STUB_CHECKS_$sha"; checks=${!of_sha-${GH_STUB_CHECKS-}}
+    printf '%b\n' "${checks:-success a\nsuccess b}" ;;
   "api repos/example/repo/actions/workflows/pr-test-rust.yml/runs?head_sha="*)
     [ -z "${GH_STUB_RUNS_ERROR-}" ] || api_error "$GH_STUB_RUNS_ERROR" 401
-    case "${GH_STUB_RUNS-}" in
+    # one commit's own runs when a test sets GH_STUB_RUNS_<sha> (a version-only head's parent); else GH_STUB_RUNS;
+    # a line is "<conclusion> <url>", with the run's event as a third word when a test gives one: a pull_request
+    # line is dropped when the read selects on the event, as the API would
+    sha=${2#*head_sha=}; sha=${sha%%&*}; of_sha="GH_STUB_RUNS_$sha"; runs=${!of_sha-${GH_STUB_RUNS-}}
+    case "$runs" in
       none) ;;
       "") echo "success https://example.invalid/runs/1" ;;
-      *) printf '%b\n' "$GH_STUB_RUNS" ;;
+      *) printf '%b\n' "$runs" | while read -r conclusion url event; do
+           [[ "$event" == pull_request && "$4" == *'.event != "pull_request"'* ]] || echo "$conclusion $url"
+         done ;;
     esac ;;
 esac
 """
@@ -167,6 +240,16 @@ def versioned(name: str, version: str) -> str:
     return f'[package]\nname = "{name}"\nversion = "{version}"\n'
 
 
+def interpreter_library_path() -> dict[str, str]:
+    """The LD_LIBRARY_PATH of this process, when it has one. The sandboxes below put this
+    interpreter's directory on PATH so the tools under test run the same python; on a
+    runner whose python is a relocatable tool-cache build, that interpreter finds its
+    shared library through LD_LIBRARY_PATH, which an environment built from scratch
+    would drop."""
+    library_path = os.environ.get("LD_LIBRARY_PATH")
+    return {"LD_LIBRARY_PATH": library_path} if library_path else {}
+
+
 class Sandbox:
     """An origin, a clone with the tooling, the stubs, and the helpers the tests share."""
 
@@ -208,11 +291,13 @@ class Sandbox:
             "GIT_COMMITTER_EMAIL": "owner@example.invalid",
             "GIT_EDITOR": "true",
             "GH_STUB_LOG": str(self.gh_log),
+            "GH_STUB_ORIGIN": str(self.origin),
             "CARGO_STUB_LOG": str(self.cargo_log),
             "CURL_STUB_LOG": str(self.curl_log),
             "PYTHONDONTWRITEBYTECODE": "1",
             "TMPDIR": str(self.base),
         }
+        env.update(interpreter_library_path())
         env.update(extra)
         return env
 
@@ -308,8 +393,9 @@ class Sandbox:
         self.put(".github/workflows/release-engine-docker.yml", ENGINE_WORKFLOW)
         shutil.copy(ROOT / "Makefile", self.work / "Makefile")
         (self.work / "scripts" / "release").mkdir(parents=True)
-        shutil.copy(ROOT / "scripts" / "check_release_versions.py", self.work / "scripts")
-        for name in ("release.sh", "sync_versions.py"):
+        for name in ("check_release_versions.py", "ci_version_only.py"):
+            shutil.copy(ROOT / "scripts" / name, self.work / "scripts")
+        for name in ("release.sh", "sync_versions.py", "notes.py", "NOTES-TEMPLATE.md"):
             shutil.copy(ROOT / "scripts" / "release" / name, self.work / "scripts" / "release")
         self.put("scripts/release_docker_notes.sh", DOCKER_NOTES_STUB)
         (self.work / "scripts" / "release_docker_notes.sh").chmod(0o755)
@@ -1355,9 +1441,10 @@ def test_a_squash_landed_pick_is_read_as_picked_by_status_and_the_next_notes(rep
     repo.tool("tag", "1.14.0", PUSH="1")
     # The release's own notes name the two fixes, under Fixes, not the squash commit's subject under Maintenance.
     notes = repo.tool("notes", "1.14.0").stdout
-    assert "- fix(router): three (#123)\n" in notes and "- fix(router): four (#126)\n" in notes
+    changed = notes[notes.index("## What's Changed") :]
+    assert "- fix(router): three (#123)\n" in changed and "- fix(router): four (#126)\n" in changed
     assert "chore(release): pick 2 commits" not in notes
-    assert notes.index("### Fixes") < notes.index("- fix(router): three (#123)")
+    assert changed.index("### Fixes") < changed.index("- fix(router): three (#123)")
     assert "6 commits since v1.13.0" in notes, "the two originals count, the squash commit does not"
     repo.tool("bump-main", "1.14.0")
     repo.git("push", "--quiet", "origin", "HEAD:refs/heads/main")  # the pull request merges
@@ -1424,18 +1511,627 @@ def test_notes_group_the_merged_subjects_and_name_the_release_command(repo: Sand
     finished_release(repo)
     done = repo.tool("notes", "1.14.0")
     out = done.stdout
-    assert out.startswith("## SMG v1.14.0\n")
+    assert out.startswith("# Shepherd Model Gateway v1.14.0\n")
     assert "commits since v1.13.0 on `release/1.14`" in out
     assert "### Features\n\n- feat(tool_parser): more\n" in out
     assert "### Fixes\n\n- fix(router): three (#123)\n- fix(router): two\n" in out
     assert "chore(release): bump versions" not in out
     assert "### Docker images\n\n- stub images for v1.14.0" in out
-    assert "gh release create v1.14.0 --verify-tag --title 'SMG v1.14.0'" in done.stderr
+    assert "gh release create v1.14.0 --verify-tag --title 'v1.14.0'" in done.stderr, (
+        "the tag alone is the title"
+    )
+    assert "### Storage" not in out, (
+        "no pull request declares a storage change: no Storage subsection"
+    )
     assert "--prerelease" not in done.stderr
     candidate = repo.tool("notes", "1.14.0-rc.1")
-    assert "gh release create v1.14.0-rc.1 --verify-tag --prerelease" in candidate.stderr
+    assert (
+        "gh release create v1.14.0-rc.1 --verify-tag --prerelease --title 'v1.14.0-rc.1'"
+        in candidate.stderr
+    )
     since = repo.tool("notes", "1.14.0", "v1.14.0-rc.1").stdout
     assert "fix(router): two" not in since and "fix(router): three (#123)" in since
+
+
+# A dozen-and-three merged pull requests, one per bucket of the notes: the squash subjects and the bodies GH_STUB_PULLS
+# serves (None: a number the repository has no pull request for).
+NOTED_PULLS: tuple[tuple[str, str | None], ...] = (
+    (
+        "feat(health): the readiness body names each served model (#201)",
+        "## Description\n\nx\n\n## Release note\n\nThe readiness body names each served model with a reason.\n\n"
+        "## Numbers\n\n| a | b |\n",
+    ),
+    (
+        "perf(tokenizer): native encode for byte-level vocabularies (#202)",
+        "## Release note\n\nEncoding a 32k-token prompt takes a sixth of the CPU it took.\n",
+    ),
+    (
+        "feat(symphony): Llama 3.1 reads with the json table (#203)",
+        "## Release notes\n\n- Symphony reads the Llama 3.1 tool syntax.\n- Under its own id.\n",
+    ),
+    (
+        "fix(servicer): the start deadline follows the engine's liveness (#204)",
+        "**Release note:** an engine that takes an hour to load no longer restarts from zero.\n\nMore text.\n",
+    ),
+    (
+        "fix(multimodal): an image to a text-only worker is refused up front (#205)",
+        "## Release note\n\nAn image sent to a model without a vision encoder is refused with 400.\n",
+    ),
+    (
+        "fix(metrics): the KV event lag is a histogram (#206)",
+        "## Release note\n\n`smg_kv_event_lag_seconds` is a histogram;"
+        " the `smg_kv_event_tail_depth` metric is removed.\n",
+    ),
+    (
+        "feat(python): Router takes parser (#207)",
+        "## Release note\n\n`Router(...)` takes `parser=`.\n",
+    ),
+    (
+        "feat(helm)!: the router runs as UID 65532 (#208)",
+        "## Release note\n\nThe chart runs the router as UID 65532.\n\n## Upgrade\n\n"
+        "BREAKING CHANGE: a custom image must run as that user.\n",
+    ),
+    (
+        "fix(config): a malformed control-plane key list is a start-up error (#209)",
+        "## Release note\n\nA malformed `--control-plane-api-keys` entry refuses to start instead of being dropped.\n",
+    ),
+    (
+        "feat(gateway): admission is bounded by default (#210)",
+        "## Release note\n\nAn unset `--max-concurrent-requests` now defaults to 1,024 in-flight requests per core.\n",
+    ),
+    ("docs(readme): the upgrade page (#211)", "## Release note\n\nnone\n"),
+    (
+        "fix(router): the retry charge is one per request (#212)",
+        "## Description\n\nno release-note section here\n",
+    ),
+    ("chore(ci): pin the runner image (#213)", None),
+    (
+        "fix(storage): the memory backend is bounded (#214)",
+        "## Release note\n\nThe memory history backend is bounded at 10,000 responses.\n\n"
+        "## Compatibility\n\nBREAKING CHANGE: an evicted id answers 404.\n",
+    ),
+    ("feat(gateway): a test-only change (#215)", "## Release note\n\nNone: a test-only change.\n"),
+    (
+        "fix(gateway): a fix whose note was left blank (#216)",
+        "## Description\n\nx\n\n## Release note\n\n<!-- one or two sentences on what a user gets -->\n\n"
+        "## Test Plan\n\ny\n",
+    ),
+)
+SKELETON = (
+    "# Shepherd Model Gateway v1.14.0",
+    "## Before you upgrade",
+    "## Highlights",
+    "### How this release was validated",
+    "## Notable fixes",
+    "## Upgrade notes",
+    "### Storage",
+    "### Configuration that now refuses to start",
+    "### Changed defaults",
+    "### API behavior",
+    "### Metrics",
+    "### Engine side",
+    "### Bindings and Rust crates",
+    "## Packages",
+    "## Known limits",
+    "## What's Changed",
+)
+
+
+def noted_release(
+    repo: Sandbox, pulls: Path, extra: tuple[tuple[str, str | None], ...] = ()
+) -> None:
+    """The sixteen pull requests merged on main (and extra ones after them), their bodies where GH_STUB_PULLS
+    serves them, v1.14.0 tagged."""
+    pulls.mkdir()
+    for index, (subject, body) in enumerate(NOTED_PULLS + extra):
+        repo.commit_main(subject, f"model_gateway/src/change_{index}.rs", f"// {index}\n")
+        if body is not None:
+            (pulls / f"{subject.rsplit('#', 1)[1].rstrip(')')}.md").write_text(body)
+    repo.cut()
+    repo.tool("bump", "1.14.0")
+    repo.land_on_release()
+    repo.tool("tag", "1.14.0", PUSH="1")
+
+
+def section(text: str, heading: str, until: str) -> str:
+    return text[text.index(heading) : text.index(until)]
+
+
+def subsection(text: str, heading: str) -> str:
+    """A ### subsection: from its heading to the next heading of any level, or to the unsorted candidates."""
+    start = text.index(heading) + len(heading)
+    rest = text[start:]
+    next_heading = re.search(
+        r"^#{2,3} |^<!-- AUTHOR: candidates with no obvious subsection", rest, re.M
+    )
+    return rest[: next_heading.start()] if next_heading else rest
+
+
+def load_notes_module():
+    spec = importlib.util.spec_from_file_location(
+        "release_notes", ROOT / "scripts" / "release" / "notes.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["release_notes"] = (
+        module  # the dataclass resolves its string annotations through sys.modules
+    )
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_notes_render_the_template_seeded_by_the_pull_requests_release_notes(
+    repo: Sandbox, tmp_path: Path
+) -> None:
+    pulls = tmp_path / "pulls"
+    noted_release(repo, pulls)
+    done = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls))
+    out = done.stdout
+    headings = [line for line in out.splitlines() if line.startswith("#")]
+    assert tuple(line for line in headings if line in SKELETON) == SKELETON, (
+        "every section, in the published order"
+    )
+    assert "{{" not in out
+    assert "chore(release): bump versions" not in out
+    highlights = section(out, "## Highlights", "### How this release was validated")
+    assert "**Gateway**\n\n" in highlights
+    assert "- The readiness body names each served model with a reason. (#201)\n" in highlights
+    assert (
+        "- An unset `--max-concurrent-requests` now defaults to 1,024 in-flight requests per core. (#210)"
+        in highlights
+    )
+    assert (
+        "**Tokenizer**\n\n- Encoding a 32k-token prompt takes a sixth of the CPU it took. (#202)"
+        in highlights
+    )
+    assert "- Symphony reads the Llama 3.1 tool syntax. Under its own id. (#203)" in highlights, (
+        "the list joined"
+    )
+    assert "**Bindings and crates**\n\n- `Router(...)` takes `parser=`. (#207)" in highlights
+    assert "**Helm and deploy**\n\n- The chart runs the router as UID 65532. (#208)" in highlights
+    assert (
+        "- feat(tool_parser): more <!-- AUTHOR: no pull request number in the subject: write the sentence or drop"
+        in highlights
+    )
+    assert "#215" not in highlights, "a note that says none seeds nothing"
+    assert "#211" not in highlights, "documentation seeds nothing"
+    assert "#204" not in highlights and "#212" not in highlights, "fixes are not highlights"
+    fixes = section(out, "## Notable fixes", "## Upgrade notes")
+    assert "These bugs shipped in v1.13.0." in fixes
+    assert (
+        "- fix(router): the retry charge is one per request (#212) <!-- AUTHOR: no release note in the pull request:"
+        " write the sentence or drop the line -->" in fixes
+    )
+    assert (
+        "**Servicers and engines**\n\n- an engine that takes an hour to load no longer restarts from zero. (#204)"
+        in fixes
+    )
+    assert (
+        "**Multimodal**\n\n- An image sent to a model without a vision encoder is refused with 400. (#205)"
+        in fixes
+    )
+    assert "**Metrics and observability**\n\n- `smg_kv_event_lag_seconds` is a histogram;" in fixes
+    assert "- fix(router): two <!-- AUTHOR: no pull request number in the subject" in fixes
+    assert (
+        "- fix(gateway): a fix whose note was left blank (#216) <!-- AUTHOR: the release-note section is empty:"
+        " write the sentence or drop the line -->" in fixes
+    ), "an empty section is a marked subject, never a silent drop"
+    assert "#201" not in fixes
+    changed = out[out.index("## What's Changed") :]
+    assert "commits since v1.13.0 on `release/1.14` (the merged pull requests, by type):" in changed
+    assert (
+        "### Features\n\n" in changed and "- feat(gateway): a test-only change (#215)\n" in changed
+    )
+    assert "### Documentation\n\n- docs(readme): the upgrade page (#211)\n" in changed
+    assert "### Maintenance\n\n- chore(ci): pin the runner image (#213)\n" in changed
+    assert (
+        "18 pull requests: 11 carry a release note, 2 declare none, 1 leave the section empty, 1 have no"
+        " release-note section, 1 could not be read, 2 subjects name no pull request" in done.stderr
+    )
+    assert "release.sh notes --check <file>" in done.stderr
+    assert (
+        "gh release create v1.14.0 --verify-tag --title 'v1.14.0' --notes-file <file>"
+        in done.stderr
+    )
+
+
+def test_notes_seed_upgrade_notes_from_what_the_pull_requests_declare(
+    repo: Sandbox, tmp_path: Path
+) -> None:
+    pulls = tmp_path / "pulls"
+    noted_release(repo, pulls)
+    out = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls)).stdout
+    upgrade = section(out, "## Upgrade notes", "## Packages")
+    declared = "<!-- AUTHOR: declared: {}; keep it here, move it or drop it -->"
+    assert "- The memory history backend is bounded at 10,000 responses. (#214) " + declared.format(
+        "a breaking change"
+    ) in subsection(upgrade, "### Storage")
+    assert "(#209) " + declared.format("a configuration that now refuses to start") in subsection(
+        upgrade, "### Configuration that now refuses to start"
+    )
+    assert "(#210) " + declared.format("a changed default") in subsection(
+        upgrade, "### Changed defaults"
+    )
+    assert "(#206) " + declared.format("a removed or renamed flag or setting") in subsection(
+        upgrade, "### Metrics"
+    )
+    empty = "<!-- AUTHOR: nothing declared by the pull requests under this heading: write it or delete the heading. -->"
+    for heading in ("### API behavior", "### Engine side", "### Bindings and Rust crates"):
+        assert subsection(upgrade, heading).strip() == empty, heading
+    unsorted = upgrade[upgrade.index("<!-- AUTHOR: candidates with no obvious subsection") :]
+    assert (
+        "- The chart runs the router as UID 65532. (#208) " + declared.format("a breaking change")
+        in unsorted
+    )
+    assert "#201" not in upgrade and "#205" not in upgrade, "nothing declared, nothing seeded"
+
+
+def test_notes_name_the_packages_and_engines_at_the_tag(repo: Sandbox, tmp_path: Path) -> None:
+    pulls = tmp_path / "pulls"
+    noted_release(repo, pulls)
+    out = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls)).stdout
+    packages = section(out, "## Packages", "## Known limits")
+    assert (
+        "- `smg` 1.14.0 on PyPI and crates.io, with container images and Helm chart 1.14.0. Release images build on"
+        " vLLM (vllm/vllm-openai:v0.31.0 and vllm/vllm-openai:v0.27.1), SGLang (lmsysorg/sglang:v0.5.21) and"
+        " TokenSpeed (the latest nightly carrier).\n" in packages
+    )
+    assert (
+        "- `smg-grpc-servicer` 0.14.0. <!-- AUTHOR: the upgrade order between gateways and engine pods"
+        in packages
+    )
+    assert (
+        "- The library crates moved to new versions: `tool-parser` 0.6.0 (from 0.5.0). <!-- AUTHOR: name"
+        in packages
+    )
+    assert "Building from source" not in packages, "no rust-version in this tree: no line"
+    assert "### Docker images\n\n- stub images for v1.14.0" in packages
+    assert "[Full changelog](https://github.com/example/repo/compare/v1.13.0...v1.14.0)" in out
+
+
+def test_notes_keep_what_a_sentence_that_reads_as_none_declares(
+    repo: Sandbox, tmp_path: Path
+) -> None:
+    """A conditional sentence ("as long as") is a release note with its declaration; one that reads as none and
+    goes on ("No behavior change, but the default moves") seeds no candidate line, and what it declares reaches
+    Upgrade notes in its own words."""
+    pulls = tmp_path / "pulls"
+    conditional = "No user-visible change as long as `--foo` is unset; with it set, the gateway now refuses to start."
+    none_but = "No behavior change, but the default of `--x` moves to 5."
+    noted_release(
+        repo,
+        pulls,
+        (
+            (
+                "fix(gateway): a set `--foo` needs its peer (#217)",
+                f"## Release note\n\n{conditional}\n",
+            ),
+            ("feat(gateway): the `--x` default moves (#218)", f"## Release note\n\n{none_but}\n"),
+            ("feat(gateway)!: remove the `--legacy-foo` flag (#219)", "## Release note\n\nnone\n"),
+        ),
+    )
+    out = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls)).stdout
+    declared = "<!-- AUTHOR: declared: {}; keep it here, move it or drop it -->"
+    assert f"- {conditional} (#217)" in section(out, "## Notable fixes", "## Upgrade notes")
+    assert "(#218)" not in section(out, "## Highlights", "## Upgrade notes"), "it reads as none"
+    upgrade = section(out, "## Upgrade notes", "## Packages")
+    assert f"- {conditional} (#217) " + declared.format(
+        "a configuration that now refuses to start"
+    ) in subsection(upgrade, "### Configuration that now refuses to start")
+    assert "- feat(gateway): the `--x` default moves (#218) " + declared.format(
+        f'a changed default; the release note says "{none_but}"'
+    ) in subsection(upgrade, "### Changed defaults"), (
+        "the subject leads, the sentence rides in the comment"
+    )
+    assert "- feat(gateway)!: remove the `--legacy-foo` flag (#219) " + declared.format(
+        'a breaking change, a removed or renamed flag or setting; the release note says "none"'
+    ) in subsection(upgrade, "### API behavior"), "a bare none: the subject says what broke"
+    assert "(#219)" not in section(out, "## Highlights", "## Upgrade notes")
+
+
+def test_notes_read_each_pull_request_body_once(repo: Sandbox, tmp_path: Path) -> None:
+    pulls = tmp_path / "pulls"
+    noted_release(repo, pulls)
+    first = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls)).stdout
+    reads = [call for call in repo.gh_calls() if call.startswith("gh api graphql")]
+    assert (
+        len(reads) == 1 and "p201: pullRequest(number: 201)" in reads[0] and "p215:" in reads[0]
+    ), "one batch"
+    second = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls)).stdout
+    assert second == first
+    assert len([call for call in repo.gh_calls() if call.startswith("gh api graphql")]) == 1, (
+        "the cache answered"
+    )
+
+
+def test_notes_render_without_the_bodies_when_gh_cannot_read_them(
+    repo: Sandbox, tmp_path: Path
+) -> None:
+    pulls = tmp_path / "pulls"
+    noted_release(repo, pulls)
+    offline = repo.tool(
+        "notes",
+        "1.14.0",
+        GH_STUB_PULLS=str(pulls),
+        GH_STUB_GRAPHQL_ERROR="boom",
+        NOTES_CACHE=str(tmp_path / "c1"),
+    )
+    assert "the read of 16 pull request bodies failed (gh: boom)" in offline.stderr
+    assert "0 carry a release note" in offline.stderr
+    assert "16 of them fall back to their subjects" in offline.stderr
+    assert (
+        "- feat(health): the readiness body names each served model (#201) <!-- AUTHOR: no release note in the pull"
+        " request: write the sentence or drop the line -->" in offline.stdout
+    )
+    assert (
+        "[Full changelog](https://github.com/example/repo/compare/v1.13.0...v1.14.0)"
+        in offline.stdout
+    )
+    without_gh = repo.tool(
+        "notes", "1.14.0", GH="/nonexistent/gh", NOTES_CACHE=str(tmp_path / "c2")
+    )
+    assert "the repository is unknown" in without_gh.stderr
+    assert (
+        "<!-- AUTHOR: the compare link of the previous final and this tag -->" in without_gh.stdout
+    )
+    assert "## What's Changed" in without_gh.stdout
+
+
+def test_notes_check_refuses_a_placeholder_and_passes_a_filled_draft(
+    repo: Sandbox, tmp_path: Path
+) -> None:
+    pulls = tmp_path / "pulls"
+    noted_release(repo, pulls)
+    out = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls)).stdout
+    draft = tmp_path / "notes.md"
+    draft.write_text(out)
+    refused = repo.tool("notes", "--check", str(draft), check=False)
+    assert refused.returncode == 1
+    assert (
+        "still carries" in refused.stderr
+        and "author comment(s), 0 template token(s)" in refused.stderr
+    )
+    assert "  line 3: <!-- AUTHOR: the opening paragraph" in refused.stderr
+    filled = re.sub(r"<!--\s*AUTHOR:.*?-->", "written", out, flags=re.S)
+    draft.write_text(filled)
+    assert "carries no placeholder" in repo.tool("notes", "--check", str(draft)).stderr
+    draft.write_text(filled + "\n{{highlights}}\n")
+    token = repo.tool("notes", "--check", str(draft), check=False)
+    assert token.returncode == 1 and "0 author comment(s), 1 template token(s)" in token.stderr
+    draft.write_text("")
+    assert "is empty" in repo.tool("notes", "--check", str(draft), check=False).stderr
+    missing = repo.tool("notes", "--check", str(tmp_path / "nope.md"), check=False)
+    assert missing.returncode == 1 and "no such file" in missing.stderr
+    usage = repo.tool("notes", "--check", check=False)
+    assert usage.returncode == 1 and "usage: release.sh notes --check <file>" in usage.stderr
+    draft.write_text(
+        filled + "\n- none because tests only (#5)\n"
+    )  # a candidate line that says none
+    none_line = repo.tool("notes", "--check", str(draft), check=False)
+    assert none_line.returncode == 1 and "1 line(s) that say none" in none_line.stderr
+
+
+def test_notes_refuse_a_template_token_the_render_does_not_fill(repo: Sandbox) -> None:
+    finished_release(repo)
+    repo.put("scripts/release/NOTES-TEMPLATE.md", "# v{{version}}\n\n{{nope}}\n")
+    refused = repo.tool("notes", "1.14.0", check=False)
+    assert refused.returncode == 1
+    assert "the template names {{nope}}, which the render does not fill" in refused.stderr
+    assert "the draft was not rendered" in refused.stderr and refused.stdout == ""
+
+
+def test_the_release_note_of_a_pull_request_body() -> None:
+    notes = load_notes_module()
+    assert (
+        notes.release_note("## Release note\n\nOne sentence.\n\n## Numbers\n\nx") == "One sentence."
+    )
+    assert notes.release_note("### Release notes\n\n- a\n- b\n") == "a b"
+    assert notes.release_note("**Release note:** inline.\nstill.\n\nnot this\n") == "inline. still."
+    assert (
+        notes.release_note("## Release note: on the heading\n\nand below\n")
+        == "on the heading and below"
+    )
+    assert notes.release_note("## Release note\n\n<!-- a comment -->\nkept\n") == "kept"
+    for none in (
+        "none",
+        "N/A",
+        "No user-visible change.",
+        "None: a test-only change.",
+        "(none)",
+        "nothing",
+    ):
+        assert notes.release_note(f"## Release note\n\n{none}\n") == "", none
+    assert (
+        notes.release_note(
+            "## Release note\n\nNone of the flags change, but the metric is renamed.\n"
+        )
+        != ""
+    )
+    assert notes.release_note("## Description\n\nno section\n") is None
+    assert notes.release_note("") is None
+    # an empty section (nothing, or a placeholder comment alone) is no note: the subject is seeded and marked
+    assert notes.release_note("## Release note\n\n\n\n## Test Plan\n\nx") is None
+    assert notes.release_note("## Release note\n\n## Test Plan\n") is None
+    assert (
+        notes.release_note("## Release note\n\n<!-- a comment alone -->\n\n## Test Plan\n") is None
+    )
+    assert notes.note_section("## Release note\n\n<!-- alone -->\n") == (True, None)
+    assert notes.note_section("## Description\n\nx") == (False, None)
+    assert notes.note_section("## Release note\n\nnone\n") == (True, "")
+    # the four bodies of the pull request template's section: untouched (its comment alone) -> missing, seeded and
+    # marked; a sentence -> as written; "none" with a reason -> declared none; the section deleted -> missing
+    template_comment = (
+        '<!-- One sentence on what a user gets, written to be pasted into the release notes as it stands, or "none"'
+        " with the reason. The release notes are written from these sentences. -->"
+    )
+    untouched = (
+        f"## Description\n\nx\n\n## Release note\n\n{template_comment}\n\n## Test Plan\n\ny\n"
+    )
+    assert notes.release_note(untouched) is None
+    assert (
+        notes.release_note(untouched.replace(template_comment, "A sentence, as written."))
+        == "A sentence, as written."
+    )
+    assert (
+        notes.release_note(untouched.replace(template_comment, "none: a test-only change.")) == ""
+    )
+    assert notes.release_note("## Description\n\nx\n\n## Test Plan\n\ny\n") is None
+    # "none" with a reason, in the spellings the template invites: a dash of any width or a word opens the reason
+    for declared in (
+        "none because it is a test-only change",
+        "None \u2014 tests only",
+        "none \u2013 CI only",
+        "none, a refactor",
+        "N/A \u2014 refactor",
+        "No user-facing change.",
+    ):
+        assert notes.release_note(f"## Release note\n\n{declared}\n") == "", declared
+    # a sentence that goes on in its own words is a release note: "as" and "since" open no reason ("as long as",
+    # "as of", "since 1.13" are conditions and times)
+    for sentence in (
+        "None of the defaults change in this release.",
+        "Nothing breaks when the flag is unset.",
+        "No user-visible change as long as `--foo` is unset; with it set, the gateway now refuses to start.",
+        "No behaviour change as long as the default of `--max-batch` is kept; it now defaults to 64.",
+        "No visible change since 1.13 for callers; the flag now defaults to on.",
+        "Nothing as of this release; the flag is removed in the next.",
+    ):
+        assert notes.release_note(f"## Release note\n\n{sentence}\n") == sentence, sentence
+    # what a sentence that reads as none goes on to declare still reaches Upgrade notes, in its own words,
+    # while it seeds no candidate line
+    pull = notes.Pull.of("feat(gateway): the `--x` default moves (#7)")
+    pull.read = True
+    pull.take("## Release note\n\nNo behavior change, but the default of `--x` moves to 5.\n")
+    pull.declare()
+    assert pull.note == "" and not pull.seeds and pull.kinds == ["a changed default"]
+    assert pull.upgrade_line == (
+        "- feat(gateway): the `--x` default moves (#7) <!-- AUTHOR: declared: a changed default; the release"
+        ' note says "No behavior change, but the default of `--x` moves to 5."; keep it here, move it or drop'
+        " it -->"
+    ), "the subject leads when the section reads as none; the sentence rides in the comment"
+    # a bare none, or one with a reason: the subject says what the declaration refers to
+    pull = notes.Pull.of("refactor(config): remove the unused `--foo` flag (#10)")
+    pull.read = True
+    pull.take("## Release note\n\nnone: internal refactor\n")
+    pull.declare()
+    assert pull.kinds == ["a removed or renamed flag or setting"]
+    assert pull.upgrade_line == (
+        "- refactor(config): remove the unused `--foo` flag (#10) <!-- AUTHOR: declared: a removed or renamed"
+        ' flag or setting; the release note says "none: internal refactor"; keep it here, move it or drop'
+        " it -->"
+    )
+    pull = notes.Pull.of("fix(gateway): a set `--foo` needs its peer (#8)")
+    pull.read = True
+    pull.take(
+        "## Release note\n\nNo user-visible change as long as `--foo` is unset; with it set, the gateway"
+        " now refuses to start.\n"
+    )
+    pull.declare()
+    assert pull.seeds and pull.kinds == ["a configuration that now refuses to start"]
+    assert notes.placeholders("- none because tests only (#5)\n- A real sentence. (#6)\n") == [
+        (1, "- none because tests only (#5)")
+    ]
+    assert (
+        notes.release_note("## Release note\n\nA --> closer first, then a <!-- opener.\n")
+        == "A --&gt; closer first, then a &lt;!-- opener."
+    )
+    absorbed = "<!-- (an opener without a closer: it hides everything up to the next closer)"
+    assert notes.placeholders("a <!-- x\n<!-- AUTHOR: y -->") == [
+        (1, absorbed),
+        (2, "<!-- AUTHOR: y -->"),
+    ], "the opener without a closer, and the author comment that absorbed it"
+    assert notes.placeholders("a <!-- x\nprose the draft loses\n<!-- plain -->\nmore") == [
+        (1, absorbed)
+    ], "a plain comment that absorbs an unclosed opener does not pass it"
+    assert notes.placeholders("text <!-- open\nmore") == [
+        (1, "<!-- (an opener without a closer: it hides everything after it)")
+    ]
+    assert notes.placeholders("a `<!--` in code\n<!-- plain -->\n") == [], "code spans open nothing"
+    assert notes.placeholders("<!-- see AUTHOR: later -->\n<!-- not one -->") == [
+        (1, "<!-- see AUTHOR: later -->")
+    ]
+    pull = notes.Pull.of("feat(gateway, python)!: x (#7)")
+    assert (pull.number, pull.type, pull.scope, pull.bang, pull.area) == (
+        7,
+        "feat",
+        "gateway, python",
+        True,
+        "Gateway",
+    )
+    assert notes.Pull.of("docs(gateway): x (#8)").area is None
+    assert notes.Pull.of("fix(e2e): x (#9)").area is None
+    assert notes.Pull.of("fix(whatever): x (#9)").area == "Other areas"
+    unparsed = notes.Pull.of("Add a thing")
+    assert (unparsed.number, unparsed.type, unparsed.area) == (None, "", "Other areas")
+    assert notes.placeholders("a\n<!-- AUTHOR: x -->\n{{t}}\n<!-- not one -->") == [
+        (2, "<!-- AUTHOR: x -->"),
+        (3, "{{t}}"),
+    ]
+    quoted = "## Release note\n\nThe template writes `<!-- x -->` as text, and `-->` alone.\n"
+    assert (
+        notes.release_note(quoted) == "The template writes `<!-- x -->` as text, and `-->` alone."
+    )
+    mixed = "## Release note\n\n<!-- hidden --> kept, with `<!-- shown -->` and <!-- see `x` --> gone.\n"
+    assert notes.release_note(mixed) == "kept, with `<!-- shown -->` and gone."
+    assert notes.placeholders("an opener in code: `<!--` hides nothing\n") == []
+    assert notes.placeholders("`<!-- AUTHOR: quoted -->` is not a placeholder") == []
+
+
+def test_notes_render_without_the_bodies_when_the_repository_is_not_visible(
+    repo: Sandbox, tmp_path: Path
+) -> None:
+    """A token that cannot see the repository gets "repository": null and no data: the fallback, not a crash."""
+    pulls = tmp_path / "pulls"
+    noted_release(repo, pulls)
+    done = repo.tool("notes", "1.14.0", GH_STUB_PULLS=str(pulls), GH_STUB_GRAPHQL_NULL_REPO="1")
+    assert (
+        "the read of 16 pull request bodies failed (gh: Could not resolve to a Repository"
+        in done.stderr
+    )
+    assert "0 carry a release note" in done.stderr and "## What's Changed" in done.stdout
+    assert "(#201) <!-- AUTHOR: no release note in the pull request" in done.stdout
+
+
+def test_notes_refresh_reads_every_body_again_and_a_cut_cache_file_is_read_again(
+    repo: Sandbox, tmp_path: Path
+) -> None:
+    pulls = tmp_path / "pulls"
+    noted_release(repo, pulls)
+    cache = tmp_path / "cache"
+    env = {"GH_STUB_PULLS": str(pulls), "NOTES_CACHE": str(cache)}
+    first = repo.tool("notes", "1.14.0", **env).stdout
+    assert "(#212) <!-- AUTHOR: no release note in the pull request" in first
+    (pulls / "212.md").write_text("## Release note\n\nThe retry charge is one per request.\n")
+    cached = repo.tool("notes", "1.14.0", **env).stdout
+    assert "(#212) <!-- AUTHOR: no release note" in cached, "the cache answers until a refresh"
+    refreshed = repo.tool("notes", "1.14.0", NOTES_REFRESH="1", **env).stdout
+    assert "- The retry charge is one per request. (#212)" in refreshed
+    reads = [call for call in repo.gh_calls() if call.startswith("gh api graphql")]
+    assert len(reads) == 2 and "p201:" in reads[1], "the refresh asked for every number again"
+    (cache / "example-repo" / "201.json").write_text("{")  # a write cut short
+    again = repo.tool("notes", "1.14.0", **env).stdout
+    assert "- The readiness body names each served model with a reason. (#201)" in again
+    reads = [call for call in repo.gh_calls() if call.startswith("gh api graphql")]
+    assert len(reads) == 3 and "p201:" in reads[2] and "p202:" not in reads[2], (
+        "only the cut file is read again"
+    )
+    (cache / "example-repo" / "205.json").unlink()  # one body with no earlier read left
+    failed = repo.tool("notes", "1.14.0", NOTES_REFRESH="1", GH_STUB_GRAPHQL_ERROR="boom", **env)
+    assert "the read of 16 pull request bodies failed (gh: boom)" in failed.stderr
+    assert (
+        "15 of them render from the earlier read; the refresh did not reach them" in failed.stderr
+    )
+    assert (
+        "1 of them fall back to their subjects" in failed.stderr
+        and "2 could not be read" in failed.stderr
+    )
+    assert "- The retry charge is one per request. (#212)" in failed.stdout, (
+        "the earlier read stands, and says so"
+    )
+    assert "(#205) <!-- AUTHOR: no release note in the pull request" in failed.stdout
+    assert "- chore(ci): pin the runner image (#213)" in failed.stdout, (
+        "#213 is no pull request: unread as always"
+    )
 
 
 # --- publish-plan ----------------------------------------------------------------------------
@@ -1575,7 +2271,14 @@ def test_check_fails_on_a_version_mismatch_or_red_ci(repo: Sandbox) -> None:
     assert red.returncode == 1
     assert "       red: unit tests" in red.stdout
     assert "[FAIL] CI: 1 green, 1 red, 0 pending" in red.stdout
-    pending = repo.tool("check", "1.14.0-rc.1", check=False, GH_STUB_CHECKS="in_progress build")
+    # the parent's run is pending too: the bump has no card tier to inherit
+    pending = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        check=False,
+        GH_STUB_CHECKS="in_progress build",
+        GH_STUB_RUNS="in_progress https://example.invalid/runs/2",
+    )
     assert pending.returncode == 1 and "1 pending" in pending.stdout
 
 
@@ -1595,6 +2298,135 @@ def test_check_requires_a_run_of_the_test_matrix_on_the_head(repo: Sandbox) -> N
     )
     assert pending.returncode == 1
     assert "[FAIL] PR Test (SMG): no successful run on" in pending.stdout
+
+
+def test_check_takes_the_parents_run_for_a_head_that_changes_nothing_but_version_strings(
+    repo: Sandbox,
+) -> None:
+    """The cut's bump commit changes nothing but version strings on main's tip: the workflow lets it inherit the
+    card tier from that commit when its run passed, and the gate reads that run while the head's own host rows are
+    pending or not started. A red on the head, a parent whose run did not pass or whose only passed run is a
+    pull request's, or code beside the bump: nothing is inherited."""
+    repo.cut()
+    head = repo.origin_ref("refs/heads/release/1.14")
+    assert head is not None
+    parent = repo.git("rev-parse", f"{head}^")
+    # the parent: green on every check of its own (the head's checks come from every workflow), its run passed
+    passed = {
+        f"GH_STUB_RUNS_{parent}": "success https://example.invalid/runs/2",
+        f"GH_STUB_CHECKS_{parent}": "success build\\nsuccess pr-test-mlx\\nskipped e2e (mock)",
+    }
+    out = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        GH_STUB_CHECKS="in_progress build\\nsuccess lint",
+        GH_STUB_RUNS="queued https://example.invalid/runs/3",
+        **passed,
+    ).stdout
+    assert (
+        f"[ok]   CI: 1 green, 1 pending on {head[:7]}: the head changes nothing but version strings on"
+        f" {parent[:7]}, green on every check, whose PR Test (SMG) run passed (https://example.invalid/runs/2)"
+        in out
+    )
+    assert (
+        f"[ok]   PR Test (SMG): the card tier of {head[:7]} is {parent[:7]}'s successful run"
+        " (https://example.invalid/runs/2)" in out
+    )
+    assert "the head's own run (queued https://example.invalid/runs/3) is expected to end" in out
+    assert out.rstrip().endswith("the verifier lines are the release owner's.")
+    none = repo.tool(
+        "check", "1.14.0-rc.1", GH_STUB_CHECKS="queued build", GH_STUB_RUNS="none", **passed
+    )
+    assert "the head's own run (not started yet) is expected to end" in none.stdout
+    assert "[FAIL]" not in none.stdout
+    # a parent whose PR Test (SMG) run passed but whose other workflow is red, or still pending, covers nothing:
+    # the same red is queued on the head
+    for parent_checks in (
+        "success build\\nfailure pr-test-mlx",
+        "success build\\nin_progress pr-test-mlx",
+    ):
+        other = repo.tool(
+            "check",
+            "1.14.0-rc.1",
+            check=False,
+            GH_STUB_CHECKS="in_progress build\\nsuccess lint",
+            GH_STUB_RUNS="queued https://example.invalid/runs/3",
+            **{**passed, f"GH_STUB_CHECKS_{parent}": parent_checks},
+        )
+        assert other.returncode == 1, parent_checks
+        assert "[FAIL] CI: 1 green, 0 red, 1 pending" in other.stdout, parent_checks
+        assert "[FAIL] PR Test (SMG): no successful run on" in other.stdout, parent_checks
+    red = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        check=False,
+        GH_STUB_CHECKS="failure build",
+        GH_STUB_RUNS="failure https://example.invalid/runs/3",
+        **passed,
+    )
+    assert red.returncode == 1
+    assert "[FAIL] CI: 0 green, 1 red, 0 pending" in red.stdout
+    assert "[FAIL] PR Test (SMG): no successful run on" in red.stdout
+    cancelled = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        check=False,
+        GH_STUB_CHECKS="in_progress build",
+        GH_STUB_RUNS="queued https://example.invalid/runs/3",
+        **{**passed, f"GH_STUB_RUNS_{parent}": "cancelled https://example.invalid/runs/2"},
+    )
+    assert cancelled.returncode == 1
+    assert "[FAIL] CI: 0 green, 0 red, 1 pending" in cancelled.stdout
+    assert "[FAIL] PR Test (SMG): no successful run on" in cancelled.stdout
+    # a pull request's run can pass with the card lanes skipped (the docs-only shortcut): the parent's push run
+    # is the one read, whatever the order the API lists them in, and a pull request's run alone covers nothing
+    push = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        GH_STUB_CHECKS="in_progress build",
+        GH_STUB_RUNS="queued https://example.invalid/runs/3",
+        **{
+            **passed,
+            f"GH_STUB_RUNS_{parent}": "success https://example.invalid/runs/9 pull_request"
+            "\\nsuccess https://example.invalid/runs/2 push",
+        },
+    ).stdout
+    assert (
+        f"[ok]   PR Test (SMG): the card tier of {head[:7]} is {parent[:7]}'s successful run"
+        " (https://example.invalid/runs/2)" in push
+    )
+    pull_request = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        check=False,
+        GH_STUB_CHECKS="in_progress build",
+        GH_STUB_RUNS="queued https://example.invalid/runs/3",
+        **{
+            **passed,
+            f"GH_STUB_RUNS_{parent}": "success https://example.invalid/runs/9 pull_request",
+        },
+    )
+    assert pull_request.returncode == 1
+    assert "[FAIL] CI: 0 green, 0 red, 1 pending" in pull_request.stdout
+    assert "[FAIL] PR Test (SMG): no successful run on" in pull_request.stdout
+    # code lands on the branch after the bump: that head inherits nothing, whatever the bump's run
+    repo.git("switch", "--quiet", "--detach", "origin/release/1.14")
+    repo.put("model_gateway/src/main.rs", 'fn main() {\n    println!("three");\n}\n')
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "fix(router): three on the branch (#10)")
+    repo.git("push", "--quiet", "origin", "HEAD:refs/heads/release/1.14")
+    repo.git("switch", "--quiet", "main")
+    code = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        check=False,
+        GH_STUB_CHECKS="in_progress build",
+        GH_STUB_RUNS="queued https://example.invalid/runs/4",
+        **{f"GH_STUB_RUNS_{head}": "success https://example.invalid/runs/3"},
+    )
+    assert code.returncode == 1
+    assert "[FAIL] CI: 0 green, 0 red, 1 pending" in code.stdout
+    assert "[FAIL] PR Test (SMG): no successful run on" in code.stdout
 
 
 def test_check_reads_an_api_error_as_an_error_not_as_a_pending_check(repo: Sandbox) -> None:
@@ -1812,6 +2644,553 @@ def test_check_without_gh_names_the_branch_page(repo: Sandbox) -> None:
     assert "[....] CI: not readable here" in out
 
 
+# --- ship -------------------------------------------------------------------------------------
+
+
+def ship_lines(out: str) -> list[str]:
+    return [line[len("ship: ") :] for line in out.splitlines() if line.startswith("ship: ")]
+
+
+ENGINE_RUN = "SMG+{engine} | base={base} | engine=latest | smg=release tag |  by @owner"
+# a candidate's plan: the Python package, the crates and the gRPC packages wait for the final
+CANDIDATE_DISPATCHES = [
+    "gh workflow run release-docker.yml --ref v1.14.0-rc.2",
+    "gh workflow run release-helm.yml --ref v1.14.0-rc.2",
+    "gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=vllm",
+    "gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=vllm"
+    " -f base_image_ref=vllm/vllm-openai:v0.27.1",
+    "gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=sglang",
+    "gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=tokenspeed",
+    "gh workflow run release-go.yml --ref v1.14.0-rc.2 -f version=1.14.0-rc.2",
+]
+TITLE = "# Shepherd Model Gateway v1.14.0-rc.2"  # the template's first line for the candidate
+
+
+def written_notes(repo: Sandbox) -> Path:
+    """Notes the author wrote for v1.14.0-rc.2: the template's title and a sentence, no placeholder."""
+    path = repo.base / "notes.md"
+    path.write_text(f"{TITLE}\n\nWhat changed, in the author's words.\n")
+    return path
+
+
+def written(notes: Path) -> None:
+    """The author's pass over a rendered draft: every placeholder comment becomes a sentence."""
+    notes.write_text(re.sub(r"<!--.*?-->", "Written.", notes.read_text(), flags=re.S))
+
+
+def test_ship_dry_run_lists_every_step_and_writes_nothing(repo: Sandbox) -> None:
+    """A dry run reads the branch, the rules and the plan, prints each step with what it would do, and
+    changes nothing; a candidate's release is a prerelease, a final's is latest."""
+    repo.cut()
+    head = repo.origin_ref("refs/heads/release/1.14")
+    calls = len(repo.gh_calls())
+    done = repo.tool("ship", "1.14.0-rc.2", "--dry-run")
+    lines = ship_lines(done.stdout)
+    assert lines[0].startswith("v1.14.0-rc.2, a candidate on release/1.14 at ")
+    assert lines[1] == (
+        "dry run: each step prints what it would do with what it reads now; nothing is written"
+    )
+    assert "[ok]   CI: 2 check(s) green" in done.stdout and "[ok]   PR Test (SMG)" in done.stdout
+    assert "DeepSeek provider verifier: <record link>" in done.stdout
+    steps = [
+        "preflight: the CI of release/1.14's head",
+        "would commit 'chore(release): bump versions for v1.14.0-rc.2' on chore/release-1.14.0-rc.2",
+        "would tag v1.14.0-rc.2 at release/1.14's head once it reads 1.14.0-rc.2",
+        "would render the notes (release.sh notes 1.14.0-rc.2) into ",
+        "would create the GitHub release: gh release create v1.14.0-rc.2 --verify-tag --prerelease"
+        " --title 'v1.14.0-rc.2' --notes-file ",
+        "publish: the plan is read at ",
+        "would dispatch: gh workflow run release-docker.yml --ref v1.14.0-rc.2",
+        "dry run of v1.14.0-rc.2 done: nothing was committed, pushed, tagged, created or dispatched",
+    ]
+    found = [next(i for i, line in enumerate(lines) if line.startswith(step)) for step in steps]
+    assert found == sorted(found), "the steps print in their order"
+    bump = lines[found[1]]
+    assert bump.endswith(
+        "and move release/1.14 to it directly: no rule the caller cannot bypass requires"
+        " a pull request on release/1.14"
+    )
+    assert [
+        line[len("would dispatch: ") :] for line in lines if line.startswith("would dispatch: ")
+    ] == (CANDIDATE_DISPATCHES)
+    assert repo.origin_ref("refs/heads/release/1.14") == head
+    assert repo.origin_ref("refs/tags/v1.14.0-rc.2") is None
+    assert repo.git("branch", "--list", "chore/release-1.14.0-rc.2") == ""
+    assert repo.git("branch", "--show-current") == "main"
+    writes = [
+        call
+        for call in repo.gh_calls()[calls:]
+        if call.split()[1:3] in (["pr", "create"], ["release", "create"], ["workflow", "run"])
+    ]
+    assert writes == [], "a dry run reads"
+    final = ship_lines(repo.tool("ship", "1.14.0", "--dry-run").stdout)
+    assert final[0].startswith("v1.14.0, the final on release/1.14 at ")
+    release = [line for line in final if line.startswith("would create the GitHub release: ")]
+    assert len(release) == 1 and " --latest " in release[0] and "--prerelease" not in release[0]
+    assert "would dispatch: gh workflow run release-go.yml --ref v1.14.0 -f version=1.14.0" in final
+    assert "would dispatch: gh workflow run release-pypi.yml --ref v1.14.0" in final, (
+        "the final's plan carries the registry dispatches a candidate's leaves out"
+    )
+
+
+def test_ship_plans_the_bump_by_a_pull_request_when_a_rule_the_caller_cannot_bypass_applies(
+    repo: Sandbox,
+) -> None:
+    repo.cut()
+
+    def plan(**env: str) -> str:
+        return repo.tool("ship", "1.14.0-rc.2", "--dry-run", **env).stdout
+
+    assert (
+        "by a pull request: the rule 'pull_request' of ruleset 11 applies to release/1.14 and the"
+        " caller is not on its bypass list" in plan(GH_STUB_RULES="pull_request 11")
+    )
+    assert "directly: no rule the caller cannot bypass" in plan(
+        GH_STUB_RULES="pull_request 11", GH_STUB_BYPASS="7\\n1"
+    ), "the caller (user 1) is on the ruleset's always-bypass list"
+    assert "by a pull request: release/1.14 carries branch protection (the classic kind)" in plan(
+        GH_STUB_PROTECTED="true"
+    )
+    assert "directly (BUMP_PUSH=1)" in plan(GH_STUB_RULES="pull_request 11", BUMP_PUSH="1")
+    assert "by a pull request (BUMP_PUSH=0)" in plan(BUMP_PUSH="0")
+
+
+def test_ship_takes_a_candidate_from_the_bump_to_the_dispatches_and_a_rerun_changes_nothing(
+    repo: Sandbox,
+) -> None:
+    repo.cut()
+    parent = repo.origin_ref("refs/heads/release/1.14")
+    cut_calls = len(repo.gh_calls())
+    first = repo.tool("ship", "1.14.0-rc.2", check=False)
+    out = first.stdout
+    head = repo.origin_ref("refs/heads/release/1.14")
+    assert head != parent and repo.git("rev-parse", f"{head}^") == parent, (
+        "the bump commit was pushed onto the branch"
+    )
+    for path in VERSION_FILES:
+        assert repo.version_of(path, head) == "1.14.0-rc.2", path
+    assert repo.git("log", "-1", "--format=%s", head) == (
+        "chore(release): bump versions for v1.14.0-rc.2"
+    )
+    assert "bump: pushing chore/release-1.14.0-rc.2 to release/1.14 directly" in out
+    assert "[ok]   versions: the branch reads 1.14.0-rc.2" in out and "[ok]   registry:" in out
+    assert repo.origin_ref("refs/tags/v1.14.0-rc.2^{commit}") == head
+    assert repo.git("branch", "--show-current") == "main"
+    assert repo.git("branch", "--list", "chore/release-1.14.0-rc.2") == "", (
+        "the topic is on the branch now"
+    )
+    notes = repo.work / ".git" / "release" / "notes-v1.14.0-rc.2.md"
+    assert notes.read_text().startswith(f"{TITLE}\n")
+    # the fresh render carries the template's author placeholders: the ship stops at the notes with the
+    # check's lines for the author, and nothing is published
+    assert first.returncode == 1 and f"notes: rendered into {notes}" in out
+    assert "not ready for publication: still carries " in first.stderr
+    assert " author comment(s), 0 template token(s), 0 line(s) that say none (listed above)" in (
+        first.stderr
+    )
+    assert "(fill them, then rerun the ship: --from notes)" in first.stderr
+    assert "  line " in first.stderr and "<!-- AUTHOR:" in first.stderr
+    calls = repo.gh_calls()[cut_calls:]
+    assert not [call for call in calls if call.startswith("gh pr create")], (
+        "no pull request: the push was allowed (the cut's own, moving main, came before)"
+    )
+    assert not [
+        call for call in calls if call.split()[1:3] in (["release", "create"], ["workflow", "run"])
+    ], "nothing is published on unwritten notes"
+    written(notes)
+    out = repo.tool("ship", "1.14.0-rc.2").stdout
+    assert f"notes: {notes}, rendered by an earlier run" in out
+    calls = repo.gh_calls()[cut_calls:]
+    assert (
+        "gh release create v1.14.0-rc.2 --verify-tag --prerelease --title v1.14.0-rc.2"
+        f" --notes-file {notes}" in calls
+    )
+    assert [call for call in calls if call.startswith("gh workflow run ")] == CANDIDATE_DISPATCHES
+    assert "publish: 7 dispatched, 0 there already, 0 failed" in out
+    assert "the runs on v1.14.0-rc.2 (gh run list --branch v1.14.0-rc.2):" in out
+    assert out.rstrip().endswith(
+        "7 new dispatch(es) (0 were there already); a run that fails is dispatched again by"
+        " 'release.sh ship 1.14.0-rc.2 --from publish'"
+    )
+    # the rerun: the branch, the tag, the release and the runs are there; a failed or cancelled run is
+    # dispatched again, nothing else is
+    runs = "\n".join(
+        [
+            "release-docker.yml;3;Release Docker Image;completed;failure",
+            "release-helm.yml;4;Release Helm Chart;completed;success",
+            "release-engine-docker.yml;5;"
+            + ENGINE_RUN.format(engine="vllm", base="engine default")
+            + ";queued;",
+            "release-engine-docker.yml;6;"
+            + ENGINE_RUN.format(engine="vllm", base="vllm/vllm-openai:v0.27.1")
+            + ";queued;",
+            "release-engine-docker.yml;7;"
+            + ENGINE_RUN.format(engine="sglang", base="engine default")
+            + ";completed;cancelled",
+            "release-engine-docker.yml;8;"
+            + ENGINE_RUN.format(engine="tokenspeed", base="engine default")
+            + ";queued;",
+            "release-go.yml;10;Release gRPC goLang packages;completed;success",
+        ]
+    )
+    before = len(repo.gh_calls())
+    again = repo.tool(
+        "ship",
+        "1.14.0-rc.2",
+        GH_STUB_RELEASES="v1.14.0-rc.2",
+        GH_STUB_RELEASE_PRE="true",
+        GH_STUB_TAG_RUNS=runs,
+    ).stdout
+    assert "preflight: release/1.14 reads 1.14.0-rc.2 already; the CI of the bump's parent" in again
+    assert "bump: done, release/1.14 reads 1.14.0-rc.2 at" in again
+    assert "tag: done, v1.14.0-rc.2 is on origin at" in again
+    assert "notes: the GitHub release v1.14.0-rc.2 exists (" in again and (
+        "its notes are out, nothing is read or rendered" in again
+    ), "the release is out: the kept render is not read again"
+    assert (
+        "release: done, https://example.invalid/releases/v1.14.0-rc.2 (prerelease: true)" in again
+    )
+    assert (
+        "publish: done, gh workflow run release-helm.yml --ref v1.14.0-rc.2: run 4 (success)"
+        in again
+    )
+    assert (
+        "publish: done, gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=vllm:"
+        " run 5 (queued)" in again
+    )
+    assert (
+        "publish: done, gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=vllm"
+        " -f base_image_ref=vllm/vllm-openai:v0.27.1: run 6 (queued)" in again
+    )
+    new_calls = repo.gh_calls()[before:]
+    assert [call for call in new_calls if call.startswith("gh workflow run ")] == [
+        "gh workflow run release-docker.yml --ref v1.14.0-rc.2",
+        "gh workflow run release-engine-docker.yml --ref v1.14.0-rc.2 -f engine=sglang",
+    ]
+    assert not [
+        call for call in new_calls if call.split()[1:3] in (["release", "create"], ["pr", "create"])
+    ]
+    assert "publish: 2 dispatched, 5 there already, 0 failed" in again
+    assert repo.origin_ref("refs/heads/release/1.14") == head
+    assert "  4            release-helm.yml                     completed success" in again
+
+
+def test_ship_opens_the_bump_pull_request_when_the_remote_refuses_the_push_and_waits_for_its_merge(
+    repo: Sandbox,
+) -> None:
+    """The rules read as pushable and the remote says otherwise (a hook here, a rule there): the bump goes
+    by its pull request, the ship waits for the merge, then tags the merged head."""
+    repo.cut()
+    hook = repo.origin / "hooks" / "pre-receive"
+    hook.write_text(
+        "#!/usr/bin/env bash\n"
+        "while read -r old new ref; do\n"
+        '  case "$ref" in refs/heads/release/*) echo "a pull request is required" >&2; exit 1 ;; esac\n'
+        "done\n"
+        "exit 0\n"
+    )
+    hook.chmod(0o755)
+    out = repo.tool(
+        "ship", "1.14.0-rc.2", GH_STUB_MERGE="1", MERGE_POLL="0", NOTES=str(written_notes(repo))
+    ).stdout
+    assert (
+        "bump: origin refused the push (" in out and "opening the bump pull request instead" in out
+    )
+    assert (
+        "bump: pull request #1 opened (https://example.invalid/pull/1): waiting for its merge"
+        " (120 min at most, read every 0 s)" in out
+    )
+    calls = repo.gh_calls()
+    assert any(
+        call.startswith(
+            "gh pr create --base release/1.14 --head chore/release-1.14.0-rc.2"
+            " --title chore(release): bump versions for v1.14.0-rc.2 --body-file "
+        )
+        for call in calls
+    )
+    assert "gh pr view 1 --json state --jq .state" in calls
+    assert "## Release gate" in repo.pr_body()
+    head = repo.origin_ref("refs/heads/release/1.14")
+    assert repo.version_of("model_gateway/Cargo.toml", head) == "1.14.0-rc.2"
+    assert "bump: release/1.14 reads 1.14.0-rc.2 at" in out
+    assert repo.origin_ref("refs/tags/v1.14.0-rc.2^{commit}") == head
+    assert [call for call in calls if call.startswith("gh workflow run ")] == CANDIDATE_DISPATCHES
+
+
+def test_ship_stops_when_the_bump_pull_request_is_not_merged_in_time_and_resumes_on_it(
+    repo: Sandbox,
+) -> None:
+    repo.cut()
+    done = repo.tool("ship", "1.14.0-rc.2", BUMP_PUSH="0", MERGE_WAIT="0", check=False)
+    assert done.returncode == 1
+    assert (
+        "the bump pull request #1 is not merged after 0 min: merge it, then rerun the ship"
+        in done.stderr
+    )
+    assert (
+        "bump: opening the pull request of chore/release-1.14.0-rc.2 against release/1.14"
+        " (by a pull request (BUMP_PUSH=0))" in done.stdout
+    )
+    assert repo.origin_ref("refs/heads/chore/release-1.14.0-rc.2") is not None, (
+        "the topic is pushed and its pull request open"
+    )
+    assert repo.origin_ref("refs/tags/v1.14.0-rc.2") is None
+    assert not [call for call in repo.gh_calls() if call.startswith("gh release create")]
+    again = repo.tool(
+        "ship",
+        "1.14.0-rc.2",
+        GH_STUB_OPEN_HEADS="chore/release-1.14.0-rc.2",
+        GH_STUB_MERGE="1",
+        MERGE_POLL="0",
+        NOTES=str(written_notes(repo)),
+    ).stdout
+    assert (
+        "bump: the pull request #8 of chore/release-1.14.0-rc.2 is open (an earlier run):"
+        " waiting for its merge" in again
+    )
+    head = repo.origin_ref("refs/heads/release/1.14")
+    assert repo.version_of("model_gateway/Cargo.toml", head) == "1.14.0-rc.2"
+    assert repo.origin_ref("refs/tags/v1.14.0-rc.2^{commit}") == head
+    assert repo.git("branch", "--list", "chore/release-1.14.0-rc.2") == ""
+    closed = repo.tool("ship", "1.14.0", BUMP_PUSH="0", GH_STUB_PR_STATE="CLOSED", check=False)
+    assert closed.returncode == 1 and "was closed without a merge" in closed.stderr
+
+
+def test_ship_stops_on_a_red_ci_row_and_goes_on_past_a_pending_one(repo: Sandbox) -> None:
+    repo.cut()
+    red = repo.tool(
+        "ship",
+        "1.14.0-rc.2",
+        "--dry-run",
+        check=False,
+        GH_STUB_CHECKS="failure unit tests\\nsuccess lint",
+    )
+    assert red.returncode == 1 and "a CI row of " in red.stderr and " is red (above)" in red.stderr
+    assert "       red: unit tests" in red.stdout and "would commit" not in red.stdout
+    pending = repo.tool(
+        "ship",
+        "1.14.0-rc.2",
+        "--dry-run",
+        GH_STUB_CHECKS="in_progress e2e (card)\\nsuccess lint",
+        GH_STUB_RUNS="in_progress https://example.invalid/runs/2",
+    ).stdout
+    assert "       pending: e2e (card) (in_progress)" in pending
+    assert "preflight: the pending rows above do not hold the ship" in pending
+    assert any(line.startswith("would commit") for line in ship_lines(pending))
+    ended = repo.tool(
+        "ship",
+        "1.14.0-rc.2",
+        "--dry-run",
+        check=False,
+        GH_STUB_RUNS="cancelled https://example.invalid/runs/3",
+    )
+    assert ended.returncode == 1, "a matrix that ended without a success is red, not pending"
+    absent = repo.tool("ship", "1.14.0-rc.2", "--dry-run", check=False, GH_STUB_RUNS="none")
+    assert absent.returncode == 1 and "[FAIL] PR Test (SMG): no run on" in absent.stdout, (
+        "a matrix that never ran is red, not pending: nothing arrives by waiting"
+    )
+    logged_out = repo.tool("ship", "1.14.0-rc.2", "--dry-run", check=False, GH_STUB_AUTH_ERROR="1")
+    assert logged_out.returncode == 1 and "is not logged in" in logged_out.stderr
+    assert "preflight" not in logged_out.stdout, "nothing is read before gh is known to answer"
+
+
+def test_ship_refuses_a_tag_elsewhere_and_a_topic_of_a_bump_that_did_not_land(
+    repo: Sandbox,
+) -> None:
+    repo.cut()
+    repo.git("tag", "v1.14.0-rc.2", "origin/main")
+    repo.git("push", "--quiet", "origin", "refs/tags/v1.14.0-rc.2")
+    done = repo.tool("ship", "1.14.0-rc.2", "--dry-run", "--from", "tag", check=False)
+    assert done.returncode == 1 and "tags never move; the ship stops" in done.stderr
+    repo.git("push", "--quiet", "origin", ":refs/tags/v1.14.0-rc.2")
+    repo.git("tag", "-d", "v1.14.0-rc.2")
+    repo.git("branch", "chore/release-1.14.0-rc.2", "origin/release/1.14")
+    stale = repo.tool("ship", "1.14.0-rc.2", check=False)
+    assert stale.returncode == 1
+    assert "the branch chore/release-1.14.0-rc.2 exists (a bump that did not land)" in stale.stderr
+    assert repo.origin_ref("refs/heads/release/1.14") == repo.git(
+        "rev-parse", "origin/release/1.14"
+    )
+
+
+def test_ship_from_resumes_at_a_step_and_publishes_the_authored_notes(repo: Sandbox) -> None:
+    repo.cut()
+    repo.tool("bump", "1.14.0-rc.2", PUSH="0")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    repo.tool("tag", "1.14.0-rc.2", PUSH="1")
+    authored = written_notes(repo)
+    lines = ship_lines(
+        repo.tool("ship", "1.14.0-rc.2", "--from", "notes", NOTES=str(authored)).stdout
+    )
+    assert lines[1:4] == [
+        "preflight: skipped (--from notes)",
+        "bump: skipped (--from notes)",
+        "tag: skipped (--from notes)",
+    ]
+    assert f"notes: {authored} (NOTES)" in lines
+    assert (
+        "gh release create v1.14.0-rc.2 --verify-tag --prerelease --title v1.14.0-rc.2"
+        f" --notes-file {authored}" in repo.gh_calls()
+    )
+    assert "publish: 7 dispatched, 0 there already, 0 failed" in lines
+    wrong = repo.base / "wrong.md"
+    wrong.write_text("# notes\n")
+    stopped = repo.tool("ship", "1.14.0-rc.2", "--from", "notes", NOTES=str(wrong), check=False)
+    assert stopped.returncode == 1
+    assert f"not ready for publication: the first line is not '{TITLE}'" in stopped.stderr
+    half = repo.base / "half.md"
+    half.write_text(f"{TITLE}\n\n<!-- AUTHOR: the opening paragraph -->\n\nA sentence.\n")
+    creates = len([call for call in repo.gh_calls() if call.startswith("gh release create")])
+    stopped = repo.tool("ship", "1.14.0-rc.2", "--from", "notes", NOTES=str(half), check=False)
+    assert stopped.returncode == 1
+    assert (
+        "not ready for publication: still carries 1 placeholder(s): 1 author comment(s),"
+        " 0 template token(s), 0 line(s) that say none (listed above) (fill them, then rerun the"
+        " ship: --from notes)" in stopped.stderr
+    )
+    assert "  line 3: <!-- AUTHOR: the opening paragraph -->" in stopped.stderr
+    assert len([call for call in repo.gh_calls() if call.startswith("gh release create")]) == (
+        creates
+    ), "the template's check holds the release"
+    # from the release step the notes of the earlier run are read, not rendered again
+    later = repo.tool("ship", "1.14.0-rc.2", "--from", "release", NOTES=str(authored)).stdout
+    assert f"notes: {authored} (NOTES)" in later and "release: created" in later
+    assert (
+        "unknown step 'frobnicate'"
+        in repo.tool("ship", "1.14.0-rc.2", "--from", "frobnicate", check=False).stderr
+    )
+    assert (
+        "no release/1.15 on origin: cut it first"
+        in repo.tool("ship", "1.15.0-rc.1", "--dry-run", check=False).stderr
+    )
+
+
+def test_ship_rerun_stands_down_at_the_notes_once_the_release_exists(repo: Sandbox) -> None:
+    """A rerun after an interruption in publish, with no kept render (the first run used NOTES, or the render was
+    deleted) or with a NOTES file that is not ready: the release is out with its notes, so the notes step reads
+    and renders nothing and the ship goes on to the dispatches instead of asking for notes that are published."""
+    repo.cut()
+    repo.tool("bump", "1.14.0-rc.2", PUSH="0")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    repo.tool("tag", "1.14.0-rc.2", PUSH="1")
+    notes = repo.work / ".git" / "release" / "notes-v1.14.0-rc.2.md"
+    out = repo.tool(
+        "ship", "1.14.0-rc.2", GH_STUB_RELEASES="v1.14.0-rc.2", GH_STUB_RELEASE_PRE="true"
+    ).stdout
+    assert (
+        "notes: the GitHub release v1.14.0-rc.2 exists (https://example.invalid/releases/v1.14.0-rc.2"
+        " (prerelease: true)): its notes are out, nothing is read or rendered"
+    ) in ship_lines(out)
+    assert not notes.exists(), "nothing is rendered"
+    assert "release: done, https://example.invalid/releases/v1.14.0-rc.2 (prerelease: true)" in out
+    assert "publish: 7 dispatched, 0 there already, 0 failed" in out
+    assert not [call for call in repo.gh_calls() if call.startswith("gh release create")]
+    half = repo.base / "half.md"
+    half.write_text(f"{TITLE}\n\n<!-- AUTHOR: the opening paragraph -->\n")
+    again = repo.tool(
+        "ship",
+        "1.14.0-rc.2",
+        "--from",
+        "notes",
+        NOTES=str(half),
+        GH_STUB_RELEASES="v1.14.0-rc.2",
+        GH_STUB_RELEASE_PRE="true",
+    ).stdout
+    assert "its notes are out, nothing is read or rendered" in again and "release: done" in again, (
+        "a NOTES file that is not ready does not matter once the release is out"
+    )
+
+
+def test_ship_dispatches_nothing_when_the_plan_or_a_run_list_cannot_be_read(repo: Sandbox) -> None:
+    """The plan is read whole, with its status, before the first dispatch, and a failed read of a workflow's runs is
+    not an empty list: either failure stops the ship with nothing dispatched (a rerun would double a run otherwise).
+    The plan half runs against a final: its plan prints the registry dispatch lines, then reads the component list."""
+    repo.cut()
+    repo.tool("bump", "1.14.0-rc.2", PUSH="0")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    repo.tool("tag", "1.14.0-rc.2", PUSH="1")
+    before = len(repo.gh_calls())
+    unread = repo.tool(
+        "ship", "1.14.0-rc.2", "--from", "publish", check=False, GH_STUB_RUN_LIST_ERROR="no answer"
+    )
+    assert unread.returncode == 1
+    assert "the runs of release-docker.yml on v1.14.0-rc.2 could not be read" in unread.stderr
+    assert "gh: no answer" in unread.stderr, "gh's own message is shown"
+    assert not [call for call in repo.gh_calls()[before:] if call.startswith("gh workflow run ")]
+    # the plan of a final reads the component list after it has printed the first dispatch lines: a list that cannot
+    # be read stops the plan there (a candidate's plan never reads it, so this half runs against the final)
+    repo.tool("bump", "1.14.0", PUSH="0")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    repo.tool("tag", "1.14.0", PUSH="1")
+    before = len(repo.gh_calls())
+    broken = repo.tool("ship", "1.14.0", "--from", "publish", check=False, PYTHON="false")
+    assert broken.returncode == 1
+    assert "the crates and packages at v1.14.0 are unknown" in broken.stderr, (
+        "the final's plan died in its component list, not in the engine table"
+    )
+    assert "the publish plan of v1.14.0 could not be read" in broken.stderr
+    assert not [call for call in repo.gh_calls()[before:] if call.startswith("gh workflow run ")]
+
+
+def test_ship_dispatches_nothing_when_the_engine_table_cannot_be_read(repo: Sandbox) -> None:
+    """The engine table is read inside the plan, whose failures `set -e` does not see under `if`: a table the
+    Python cannot parse stops the plan by name, so the ship dispatches nothing (not the registry workflows
+    alone, with the engine images missing)."""
+    repo.commit_main(
+        "ci: a trailing comma in the engine table",
+        ".github/workflows/release-engine-docker.yml",
+        ENGINE_WORKFLOW.replace(
+            '"tokenspeed": {"release_bases": [""]}', '"tokenspeed": {"release_bases": [""]},'
+        ),
+    )
+    repo.cut()
+    repo.tool("bump", "1.14.0-rc.2", PUSH="0")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    repo.tool("tag", "1.14.0-rc.2", PUSH="1")
+    before = len(repo.gh_calls())
+    done = repo.tool("ship", "1.14.0-rc.2", "--from", "publish", check=False)
+    assert done.returncode == 1
+    assert (
+        "the engine table of .github/workflows/release-engine-docker.yml at v1.14.0-rc.2 could not be read"
+        in done.stderr
+    )
+    assert "the publish plan of v1.14.0-rc.2 could not be read" in done.stderr
+    assert not [call for call in repo.gh_calls()[before:] if call.startswith("gh workflow run ")]
+    plan = repo.tool("publish-plan", "1.14.0-rc.2", check=False)
+    assert plan.returncode == 1 and "no engine dispatch listed" in plan.stderr
+
+
+def test_ship_leaves_no_notes_file_behind_when_the_render_fails(repo: Sandbox) -> None:
+    """The notes are rendered beside their place and moved there once whole: a render that stops halfway
+    leaves no file a rerun would keep as "rendered by an earlier run"."""
+    repo.cut()
+    repo.tool("bump", "1.14.0-rc.2", PUSH="0")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    repo.tool("tag", "1.14.0-rc.2", PUSH="1")
+    first_final = repo.git("rev-parse", "v1.13.0^{commit}")
+    repo.git("push", "--quiet", "origin", ":refs/tags/v1.13.0")
+    repo.git("tag", "-d", "v1.13.0")
+    failed = repo.tool("ship", "1.14.0-rc.2", "--from", "notes", check=False)
+    assert failed.returncode == 1 and "no final release tag below v1.14.0-rc.2" in failed.stderr
+    notes = repo.work / ".git" / "release" / "notes-v1.14.0-rc.2.md"
+    assert not notes.exists()
+    repo.git("tag", "v1.13.0", first_final)
+    repo.git("push", "--quiet", "origin", "refs/tags/v1.13.0")
+    again = repo.tool("ship", "1.14.0-rc.2", "--from", "notes", check=False)
+    assert f"notes: rendered into {notes}" in again.stdout
+    assert again.returncode == 1 and "not ready for publication: still carries " in again.stderr, (
+        "the fresh render carries the author's placeholders: the ship stops at the notes"
+    )
+    assert notes.read_text().startswith(f"{TITLE}\n")
+    assert not notes.with_name(notes.name + ".partial").exists()
+
+
 # --- a rehearsal: the cut before its push ------------------------------------------------------------
 
 
@@ -1835,7 +3214,7 @@ def test_the_read_only_commands_read_a_local_cut_before_its_push(repo: Sandbox) 
         and "gh workflow run release-docker.yml --ref v1.14.0-rc.1" in plan.stdout
     )
     notes = repo.tool("notes", "1.14.0-rc.1")
-    assert said in notes.stderr and "## SMG v1.14.0-rc.1" in notes.stdout
+    assert said in notes.stderr and "# Shepherd Model Gateway v1.14.0-rc.1" in notes.stdout
     assert repo.origin_ref("refs/heads/release/1.14") is None, "a read pushes nothing"
     on_main = repo.git("rev-parse", "origin/main")
     for command in (("bump", "1.14.0-rc.2"), ("pick", "1.14", on_main), ("tag", "1.14.0-rc.1")):
@@ -2087,6 +3466,7 @@ def grpc_detect(
             "PATH": os.pathsep.join(
                 [str(bin_dir), str(Path(sys.executable).parent), "/usr/bin", "/bin"]
             ),
+            **interpreter_library_path(),
             "GITHUB_OUTPUT": str(output),
             "GITHUB_REF_TYPE": ref_type,
             "GITHUB_REF_NAME": "v1.14.0" if ref_type == "tag" else "release/1.14",

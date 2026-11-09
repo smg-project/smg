@@ -39,11 +39,30 @@
 //! (an owner this node cannot tell is gone, a peer that is behind) without
 //! the registry or service discovery knowing anything about the mesh.
 //!
-//! Remaining gap: a crash-restart that registers locally before its old
-//! state gossips back orphans up to one store key per worker per restart
-//! (the owner is alive, so the key is not dead). Tombstone metadata also
-//! accrues per removed worker (time-based collection would resurrect
-//! deleted keys; it is only sound at causal stability).
+//! Restarts: a node that comes back under its name after a crash registers
+//! its endpoints under fresh ids, and the keys of its earlier life gossip
+//! back to it from the peers (the owner is alive, so no peer treats them as
+//! dead). A key that names this node as its owner whose endpoint a `Local`
+//! worker of this process holds under another id is such a leftover: the
+//! node tombstones it, being its owner. A key whose endpoint this process
+//! does not hold yet imports as any other (gossip serves before the start-up
+//! jobs register the configured workers), and the start-up upsert claims it
+//! under its id. A peer whose import a tombstone removes re-imports the
+//! endpoint from the live key that names it in the same step, so the peer
+//! rebinds to the new id without waiting for a pass, and the owner's later
+//! tombstone of that id reaches the import.
+//!
+//! Remaining gaps: a key of this node's name whose endpoint the new life
+//! never registers again (it left the configuration across the crash) is
+//! imported as a `Mesh` worker on this node and on every peer and tombstoned
+//! by nobody (it is in no outbound `published` set and it is no leftover by
+//! the rule above), so it stays in each registry for as long as its owner is
+//! live: routable while its probes pass, demoted to `Failed` once they fail
+//! (a `Mesh` worker is never removed for failed probes), and imported again
+//! from the store after a restart; a pass that tombstones a `Mesh` import
+//! whose key names this node, once the start-up jobs are done, is its rule.
+//! Tombstone metadata accrues per removed worker (time-based collection would
+//! resurrect deleted keys; it is only sound at causal stability).
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -240,7 +259,9 @@ impl WorkerSyncAdapter {
                 // echo dequeued after the key was tombstoned would resurrect
                 // a removed worker; a stale state would regress health).
                 // Re-reading the namespace makes delivery order irrelevant.
-                this.sync_key_from_store(&key, worker_id);
+                if let Some(url) = this.sync_key_from_store(&key, worker_id) {
+                    this.reimport_endpoint(&url);
+                }
             }
             debug!("WorkerSyncAdapter subscription closed");
         });
@@ -303,14 +324,26 @@ impl WorkerSyncAdapter {
         // to test membership, and feeds the backfill below so the
         // namespace is scanned once per pass.
         let live: HashSet<String> = self.workers.keys("").into_iter().collect();
-        for (id, _) in self.worker_registry.get_all_with_ids() {
+        for (id, worker) in self.worker_registry.get_all_with_ids() {
             let key = format!("{PREFIX}{}", id.as_str());
-            if !live.contains(&key) {
-                // Missing backing key: same handling as a live tombstone
-                // event — imports are removed, locally-owned state is
-                // re-asserted.
-                self.sync_key_from_store(&key, id.as_str());
+            if live.contains(&key) {
+                continue;
             }
+            // A local worker this node never publishes (`is_publishable`
+            // keeps a host-local ZMQ worker off the mesh) has no key by
+            // design: nothing is missing for it, where a published worker's
+            // missing key is a foreign tombstone to re-assert and an
+            // import's a tombstone to apply.
+            let never_published = self.worker_registry.origin_of(&id) == Some(WorkerOrigin::Local)
+                && !self.is_publishable(&id, &worker);
+            if never_published {
+                continue;
+            }
+            // Missing backing key: same handling as a live tombstone
+            // event — imports are removed, locally-owned state is
+            // re-asserted. What a tombstone vacates, the backfill below
+            // refills from the live keys.
+            self.sync_key_from_store(&key, id.as_str());
         }
         self.backfill_keys(live);
     }
@@ -319,10 +352,15 @@ impl WorkerSyncAdapter {
     /// key: a live value routes through `on_remote_worker_state`; a missing
     /// (tombstoned) one removes a mesh import, re-asserts a locally-owned
     /// worker's state, and ignores unknown ids. Tombstones resolve via the
-    /// publisher's id, which the import adopted.
-    fn sync_key_from_store(&self, key: &str, worker_id: &str) {
+    /// publisher's id, which the import adopted. Returns the endpoint a
+    /// removed import held, for the caller to refill from another live key
+    /// when no backfill of its own follows.
+    fn sync_key_from_store(&self, key: &str, worker_id: &str) -> Option<String> {
         match self.workers.get(key) {
-            Some(bytes) => self.apply_incoming(worker_id, &bytes),
+            Some(bytes) => {
+                self.apply_incoming(worker_id, &bytes);
+                None
+            }
             None => {
                 let id = WorkerId::from_string(worker_id.to_string());
                 // A missing key for a locally-owned worker is anomalous
@@ -340,15 +378,133 @@ impl WorkerSyncAdapter {
                             worker_id,
                             &worker_state_of(&id, &worker, &self.node_name),
                         );
-                        return;
+                        return None;
                     }
                 }
                 match self.worker_registry.remove_remote(&id) {
-                    Some(_) => info!(worker_id, "removed worker on remote tombstone"),
-                    None => debug!(worker_id, "ignored tombstone (unknown id)"),
+                    Some(worker) => {
+                        info!(worker_id, "removed worker on remote tombstone");
+                        Some(worker.url().to_owned())
+                    }
+                    None => {
+                        debug!(worker_id, "ignored tombstone (unknown id)");
+                        None
+                    }
                 }
             }
         }
+    }
+
+    /// The endpoint a tombstone just vacated, imported again from another
+    /// live key that names it, as the reconcile pass does within one pass
+    /// (missing keys first, live keys after). On the event path the live key
+    /// was applied before the tombstone and only refreshed the import's
+    /// health, so without this step the peer has no worker at the endpoint
+    /// until its next pass: a reconcile interval at most, on every owner
+    /// restart (the owner's new key for the endpoint arrives before its
+    /// tombstone of the old one) and whenever one of several publishers of
+    /// an endpoint removes it. Each key's value is decoded once, and the
+    /// walk ends at the first key whose import lands.
+    fn reimport_endpoint(&self, url: &str) {
+        for key in self.workers.keys("") {
+            let Some(worker_id) = key.strip_prefix(PREFIX).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let Some(state) = self
+                .workers
+                .get(&key)
+                .and_then(|bytes| decode_worker_state(&bytes).ok())
+                .filter(|state| state.url == url)
+            else {
+                continue;
+            };
+            self.apply_state(worker_id, &state);
+            if self.worker_registry.get_by_url(url).is_some() {
+                return;
+            }
+        }
+    }
+
+    /// Whether a key is the leftover of this node's earlier life under the
+    /// same name: it names this node as its owner, no worker of this process
+    /// holds its id, and a `Local` worker of this process holds its URL under
+    /// another id (the restart registered the endpoint again before the key
+    /// gossiped back). The earlier life could not tombstone what it had
+    /// published (a crash); only the owner tombstones its keys, and this
+    /// process is that owner now. A key of this node's name whose endpoint
+    /// this process does not hold yet is no leftover: gossip serves before
+    /// the start-up jobs register the configured workers, so the key imports
+    /// as before and the start-up upsert claims it under the same id, and the
+    /// peers see no change. This node's own live keys echo back through the
+    /// same path and are held, so they are never taken for leftovers. Two
+    /// nodes under one name would tombstone each other's keys: names are
+    /// unique by contract, the membership table is keyed by them. One id
+    /// under two names is possible (a discovery registers an endpoint another
+    /// member published, and the registration claims the import with its
+    /// id): the two write the key in turns under their own names, and a
+    /// member back from a crash whose name the key last carried tombstones it
+    /// although the other holds the id. The other re-publishes it on the
+    /// tombstone (the foreign-tombstone branch of `sync_key_from_store`), so
+    /// the imports of that id are gone until its re-put arrives, and no
+    /// longer. A key of this name that the new life never claims again (its
+    /// endpoint left the configuration) stays, as before this rule.
+    fn is_own_orphan(&self, worker_id: &str, state: &WorkerState) -> bool {
+        state.owner == self.node_name
+            && self
+                .worker_registry
+                .get(&WorkerId::from_string(worker_id.to_string()))
+                .is_none()
+            && self
+                .worker_registry
+                .get_id_by_url(&state.url)
+                .is_some_and(|held| {
+                    held.as_str() != worker_id
+                        && self.worker_registry.origin_of(&held) == Some(WorkerOrigin::Local)
+                })
+    }
+
+    /// A key of this node's name whose id a `Local` worker of this process
+    /// holds (the start-up claim of an earlier life's key), carrying a
+    /// specification this node did not publish at or above the worker's
+    /// revision: the earlier life's later publication, seen by a peer first
+    /// and gossiped here after the claim. The claim raised the revision past
+    /// the version this node had seen, not past this one, so the peers that
+    /// hold it keep the earlier life's specification. The revision is raised
+    /// past it and the worker published again at once. Only what a revision
+    /// covers counts (`specification_matches`): health is not versioned, so
+    /// this node's own state with another health at the same version (a
+    /// status change the outbound loop has not put yet) is left to that loop,
+    /// an echo of this node's own publication is left alone, and a lower
+    /// version is outranked already.
+    fn republish_above_own_key(&self, worker_id: &str, state: &WorkerState) -> bool {
+        if state.owner != self.node_name {
+            return false;
+        }
+        let id = WorkerId::from_string(worker_id.to_string());
+        let Some(worker) = self.worker_registry.get(&id) else {
+            return false;
+        };
+        if !self.is_publishable(&id, &worker) {
+            return false;
+        }
+        let current = worker_state_of(&id, &worker, &self.node_name);
+        let stored_outranks = state.version > current.version
+            || (state.version == current.version && !specification_matches(state, &current));
+        if !stored_outranks {
+            return false;
+        }
+        worker.raise_revision_to(state.version + 1);
+        let raised = worker_state_of(&id, &worker, &self.node_name);
+        info!(
+            worker_id,
+            url = %Endpoint::redacted_str(&state.url),
+            stored = state.version,
+            published = raised.version,
+            "publishing a claimed worker above a later state of its key: a peer saw the earlier \
+             life's last publication first"
+        );
+        self.on_worker_changed(worker_id, &raised);
+        true
     }
 
     /// Whether this node should export the worker to the cluster. Only
@@ -453,15 +609,33 @@ impl WorkerSyncAdapter {
     }
 
     fn apply_incoming(&self, worker_id: &str, bytes: &[u8]) {
-        let state = match decode_worker_state(bytes) {
-            Ok(state) => state,
-            Err(err) => {
-                warn!(worker_id, %err, "failed to decode WorkerState");
-                return;
-            }
-        };
+        match decode_worker_state(bytes) {
+            Ok(state) => self.apply_state(worker_id, &state),
+            Err(err) => warn!(worker_id, %err, "failed to decode WorkerState"),
+        }
+    }
+
+    /// A live key's state into the registry: a leftover of this node's
+    /// earlier life is tombstoned, a later state of a key this node claimed
+    /// is published over, a dead owner's import dropped, a gone owner's left
+    /// alone inside the grace, a live owner's imported or refreshed unless
+    /// this node retired the endpoint.
+    fn apply_state(&self, worker_id: &str, state: &WorkerState) {
+        if self.is_own_orphan(worker_id, state) {
+            info!(
+                worker_id,
+                url = %Endpoint::redacted_str(&state.url),
+                "tombstoning a key of this node's name whose endpoint this process holds under \
+                 another id: left by an earlier life of the node"
+            );
+            self.on_worker_removed(worker_id);
+            return;
+        }
+        if self.republish_above_own_key(worker_id, state) {
+            return;
+        }
         match self.owner_liveness(&state.owner) {
-            OwnerLiveness::Dead => self.drop_dead_owner_import(&state),
+            OwnerLiveness::Dead => self.drop_dead_owner_import(state),
             // Inside the grace a gone owner's key creates no import and
             // refreshes none: a router that starts after an owner died never
             // imports its keys, while an owner that blips keeps its imports
@@ -472,10 +646,10 @@ impl WorkerSyncAdapter {
                 "leaving worker state alone: its owner node is gone, inside the grace"
             ),
             OwnerLiveness::Live => {
-                if self.holds_back(&state) {
-                    self.drop_held_back_import(&state);
+                if self.holds_back(state) {
+                    self.drop_held_back_import(state);
                 } else {
-                    self.worker_registry.on_remote_worker_state(&state);
+                    self.worker_registry.on_remote_worker_state(state);
                 }
             }
         }
@@ -657,10 +831,7 @@ impl WorkerSyncAdapter {
     }
 
     /// True when the store already holds an equivalent state for the
-    /// worker. `load` is not compared (volatile and unread by importers);
-    /// specs compare semantically as JSON values — `WorkerSpec` holds maps,
-    /// so two encodings of identical specs can differ byte-wise. Cheap
-    /// scalar fields and a byte-equality fast path gate the JSON parses.
+    /// worker (`states_match`).
     fn store_matches(&self, id: &WorkerId, state: &WorkerState) -> bool {
         let Some(bytes) = self.workers.get(&format!("{PREFIX}{}", id.as_str())) else {
             return false;
@@ -668,29 +839,7 @@ impl WorkerSyncAdapter {
         let Ok(stored) = bincode::deserialize::<WorkerState>(&bytes) else {
             return false;
         };
-        if stored.worker_id != state.worker_id
-            || stored.model_id != state.model_id
-            || stored.url != state.url
-            || stored.health != state.health
-            || stored.version != state.version
-            || stored.owner != state.owner
-        {
-            return false;
-        }
-        // Byte equality is sufficient (not necessary): re-serialising the
-        // same spec instance is byte-stable in-process, so this skips the
-        // JSON parses in the steady state; key-order drift (e.g. across
-        // restarts) falls through to the semantic comparison.
-        if stored.spec == state.spec {
-            return true;
-        }
-        match (
-            serde_json::from_slice::<serde_json::Value>(&stored.spec),
-            serde_json::from_slice::<serde_json::Value>(&state.spec),
-        ) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
-        }
+        states_match(&stored, state)
     }
 
     /// Publish a worker update to the cluster. Callers pass the
@@ -737,6 +886,44 @@ fn worker_state_of(worker_id: &WorkerId, worker: &Arc<dyn Worker>, owner: &str) 
 
 fn is_gone(status: i32) -> bool {
     status == NodeStatus::Down as i32 || status == NodeStatus::Leaving as i32
+}
+
+/// Whether two states of one key are equivalent: the same specification at
+/// the same version and health. `load` is not compared (volatile and unread
+/// by importers).
+fn states_match(stored: &WorkerState, state: &WorkerState) -> bool {
+    stored.health == state.health
+        && stored.version == state.version
+        && specification_matches(stored, state)
+}
+
+/// Whether two states of one key carry the same specification: the fields a
+/// revision covers (id, model, url, owner and the spec), not health or load.
+/// Specs compare semantically as JSON values — `WorkerSpec` holds maps, so
+/// two encodings of identical specs can differ byte-wise. Cheap scalar fields
+/// and a byte-equality fast path gate the JSON parses.
+fn specification_matches(stored: &WorkerState, state: &WorkerState) -> bool {
+    if stored.worker_id != state.worker_id
+        || stored.model_id != state.model_id
+        || stored.url != state.url
+        || stored.owner != state.owner
+    {
+        return false;
+    }
+    // Byte equality is sufficient (not necessary): re-serialising the
+    // same spec instance is byte-stable in-process, so this skips the
+    // JSON parses in the steady state; key-order drift (e.g. across
+    // restarts) falls through to the semantic comparison.
+    if stored.spec == state.spec {
+        return true;
+    }
+    match (
+        serde_json::from_slice::<serde_json::Value>(&stored.spec),
+        serde_json::from_slice::<serde_json::Value>(&state.spec),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// What the outbound loop remembers about a worker it published.
@@ -809,6 +996,7 @@ mod tests {
     use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
     use smg_mesh::{gossip::NodeState, MergeStrategy, MeshKV};
     use tokio::{sync::mpsc::error::TryRecvError, time::sleep};
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::worker::BasicWorkerBuilder;
@@ -900,6 +1088,14 @@ mod tests {
                 .model(ModelCard::new("llama-3"))
                 .build(),
         )
+    }
+
+    /// The `version` the store holds for `key`, when the key is live and
+    /// decodes.
+    fn version_of(ns: &CrdtNamespace, key: &str) -> Option<u64> {
+        ns.get(key)
+            .and_then(|bytes| decode_worker_state(&bytes).ok())
+            .map(|state| state.version)
     }
 
     /// Poll until `cond` is true or ~1s elapses.
@@ -1223,6 +1419,47 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
+    async fn the_reconcile_pass_leaves_a_local_zmq_worker_alone_which_it_never_published() {
+        // A host-local ZMQ worker has no key by design (it is never
+        // published); its absent key is not a missed remote tombstone, so a
+        // pass neither asks the registry to remove it nor warns of a refused
+        // tombstone no peer sent.
+        let (ns, registry, adapter) = setup();
+        let zmq: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("ipc:///tmp/smg-local.sock")
+                .model(ModelCard::new("llama-3"))
+                .connection_mode(ConnectionMode::Zmq)
+                .build(),
+        );
+        let zmq_id = registry.register(zmq).unwrap();
+        let http_id = registry
+            .register(local_worker("http://local:8080"))
+            .unwrap();
+
+        adapter.reconcile_once();
+        adapter.reconcile_once();
+
+        assert!(
+            registry.get(&zmq_id).is_some() && registry.get(&http_id).is_some(),
+            "both local workers stay registered"
+        );
+        assert!(
+            ns.get(&format!("worker:{}", zmq_id.as_str())).is_none(),
+            "the pass does not publish the ZMQ worker either"
+        );
+        assert!(
+            ns.get(&format!("worker:{}", http_id.as_str())).is_some(),
+            "the pass re-asserts the published worker whose key is missing"
+        );
+        assert!(
+            !logs_contain("Refusing remote tombstone"),
+            "a pass must not take the absent key of a worker this node never publishes \
+             for a remote tombstone"
+        );
+    }
+
+    #[tokio::test]
     async fn rapid_put_then_delete_converges_to_absent() {
         // Both queued events resolve against the store (which holds the
         // tombstone by the time they drain), so a stale put echo can never
@@ -1256,8 +1493,11 @@ mod tests {
         let publisher = adapter(ns.clone(), pub_registry.clone());
         publisher.start();
 
+        // The importer is another member: under the publisher's own name it
+        // would take the key for a leftover of an earlier life and tombstone it.
         let sub_registry = Arc::new(WorkerRegistry::new());
-        let subscriber = adapter(ns, sub_registry.clone());
+        let subscriber =
+            WorkerSyncAdapter::new(ns, sub_registry.clone(), "node-b".into(), empty_cluster());
         subscriber.start();
 
         let worker: Arc<dyn Worker> = Arc::new(
@@ -1283,6 +1523,66 @@ mod tests {
             *imported.worker_type(),
             crate::worker::WorkerType::Decode,
             "worker type must survive the spec round trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_owners_replacement_in_place_reaches_its_peers_import() {
+        // One node publishes a worker and another imports it; the owner
+        // then replaces the worker in place (`register_or_replace`: the
+        // discovery reconciler's upsert, the start-up workflow, a `PUT`)
+        // with a new model and role under the same address. The `Replaced`
+        // event publishes the new state under the same key, and the
+        // import must follow it instead of keeping the first specification
+        // for as long as it lives.
+        let mesh = MeshKV::new("node-a".into());
+        let ns = worker_namespace(&mesh);
+
+        let pub_registry = Arc::new(WorkerRegistry::new());
+        let publisher = adapter(ns.clone(), pub_registry.clone());
+        publisher.start();
+
+        let sub_registry = Arc::new(WorkerRegistry::new());
+        let subscriber =
+            WorkerSyncAdapter::new(ns, sub_registry.clone(), "node-b".into(), empty_cluster());
+        subscriber.start();
+
+        let url = "http://remote:9000";
+        pub_registry.register(local_worker(url)).unwrap();
+        assert!(
+            wait_for(|| sub_registry.get_by_url(url).is_some()).await,
+            "import did not land"
+        );
+        let imported_as = sub_registry.get_id_by_url(url).unwrap();
+
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("llama-4"))
+                .worker_type(crate::worker::WorkerType::Decode)
+                .build(),
+        );
+        pub_registry.register_or_replace(replacement);
+
+        assert!(
+            wait_for(|| sub_registry
+                .get_by_url(url)
+                .is_some_and(|worker| worker.model_id() == "llama-4"))
+            .await,
+            "the import did not follow the owner's replacement; it serves {:?}",
+            sub_registry
+                .get_by_url(url)
+                .map(|w| w.model_id().to_string())
+        );
+        let followed = sub_registry.get_by_url(url).unwrap();
+        assert_eq!(
+            *followed.worker_type(),
+            crate::worker::WorkerType::Decode,
+            "the role follows too"
+        );
+        assert_eq!(
+            sub_registry.get_id_by_url(url),
+            Some(imported_as),
+            "under the id the import adopted"
         );
     }
 
@@ -1730,6 +2030,496 @@ mod tests {
             "a returning owner's key imports before the next pass"
         );
     }
+    #[tokio::test]
+    async fn an_owner_that_comes_back_tombstones_the_keys_of_its_earlier_life_and_its_peer_rebinds_its_import(
+    ) {
+        // One store stands in for the gossip between the owner and its peer.
+        let mesh = MeshKV::new("node-p".into());
+        let ns = worker_namespace(&mesh);
+        let url = "http://engine:8080";
+
+        // The owner's first life publishes its worker (no tasks: a crashed
+        // process runs nothing afterwards); the peer imports it under the
+        // id that life gave it.
+        let first_registry = Arc::new(WorkerRegistry::new());
+        let first_life = WorkerSyncAdapter::new(
+            ns.clone(),
+            first_registry.clone(),
+            "node-p".into(),
+            empty_cluster(),
+        );
+        let first_id = first_registry.register(local_worker(url)).unwrap();
+        first_life.resync_local(&mut HashMap::new());
+        let first_key = format!("worker:{}", first_id.as_str());
+        assert!(
+            ns.get(&first_key).is_some(),
+            "the first life published its worker"
+        );
+        drop(first_life);
+        drop(first_registry);
+
+        let peer_registry = Arc::new(WorkerRegistry::new());
+        let peer = WorkerSyncAdapter::new(
+            ns.clone(),
+            peer_registry.clone(),
+            "node-s".into(),
+            empty_cluster(),
+        );
+        peer.start();
+        assert!(
+            wait_for(|| peer_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
+            "the peer imported the worker under the owner's first id"
+        );
+
+        // The owner comes back under its name: a fresh registry that holds
+        // the same endpoint under a fresh id by the time the key of its
+        // earlier life reaches it (the backfill at start).
+        let second_registry = Arc::new(WorkerRegistry::new());
+        let second_id = second_registry.register(local_worker(url)).unwrap();
+        assert_ne!(second_id, first_id, "a fresh registry mints a fresh id");
+        let second_life = WorkerSyncAdapter::new(
+            ns.clone(),
+            second_registry.clone(),
+            "node-p".into(),
+            empty_cluster(),
+        );
+        second_life.start();
+
+        assert!(
+            wait_for(|| ns.get(&first_key).is_none()).await,
+            "the owner tombstones the key of its earlier life"
+        );
+        assert!(
+            wait_for(|| peer_registry.get_id_by_url(url).as_ref() == Some(&second_id)).await,
+            "the peer's import follows the owner's new id, not the next pass: {:?}",
+            peer_registry.get_id_by_url(url)
+        );
+
+        // The owner's later removal is a tombstone of a key the peer's
+        // import now answers to.
+        second_registry.remove(&second_id);
+        assert!(
+            wait_for(|| peer_registry.get_by_url(url).is_none()).await,
+            "the owner's removal reaches the peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_back_before_the_new_life_registers_its_endpoint_is_claimed_under_its_id() {
+        // Gossip serves before the start-up jobs register the configured
+        // workers: the key of the earlier life can reach the new life while
+        // its registry is still empty. Such a key is no leftover: it imports
+        // as before, the start-up upsert claims it under the same id and the
+        // peer's import never changes, where a tombstone would have left the
+        // peer without the endpoint until the new registration published.
+        // The test runs on a current-thread runtime, so the new life's
+        // outbound loop runs only while the test awaits: each step that it
+        // must see is awaited before the next.
+        let mesh = MeshKV::new("node-p".into());
+        let ns = worker_namespace(&mesh);
+        let url = "http://engine:8080";
+        let first_registry = Arc::new(WorkerRegistry::new());
+        let first_life = WorkerSyncAdapter::new(
+            ns.clone(),
+            first_registry.clone(),
+            "node-p".into(),
+            empty_cluster(),
+        );
+        let first_id = first_registry.register(local_worker(url)).unwrap();
+        first_life.resync_local(&mut HashMap::new());
+        let first_key = format!("worker:{}", first_id.as_str());
+        let first_version = version_of(&ns, &first_key).expect("the first life's key");
+        drop(first_life);
+        drop(first_registry);
+
+        let peer_registry = Arc::new(WorkerRegistry::new());
+        let peer = WorkerSyncAdapter::new(
+            ns.clone(),
+            peer_registry.clone(),
+            "node-s".into(),
+            empty_cluster(),
+        );
+        peer.start();
+        assert!(
+            wait_for(|| peer_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
+            "the peer imported the worker under the owner's first id"
+        );
+
+        // The owner comes back under its name with an empty registry: the
+        // key of its earlier life reaches it before anything registers.
+        let second_registry = Arc::new(WorkerRegistry::new());
+        let second_life = WorkerSyncAdapter::new(
+            ns.clone(),
+            second_registry.clone(),
+            "node-p".into(),
+            empty_cluster(),
+        );
+        second_life.start();
+        assert!(
+            wait_for(|| second_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
+            "the new life imports the key of its earlier life instead of tombstoning it"
+        );
+        assert!(ns.get(&first_key).is_some(), "the key stands");
+
+        // The start-up upsert claims the endpoint under the same id. The
+        // replacement bumps the worker's revision, so the claim's publish
+        // raises the key's version: from there the new life's outbound loop
+        // tracks the key, and a pass sees this life's own live key.
+        assert_eq!(
+            second_registry.register_or_replace(local_worker(url)),
+            first_id,
+            "the claim keeps the id"
+        );
+        assert_eq!(
+            second_registry.origin_of(&first_id),
+            Some(WorkerOrigin::Local)
+        );
+        assert!(
+            wait_for(|| version_of(&ns, &first_key).is_some_and(|v| v > first_version)).await,
+            "the new life publishes the claimed worker under the same key"
+        );
+        second_life.reconcile_once();
+        assert!(
+            ns.get(&first_key).is_some(),
+            "the claimed key is this life's own now"
+        );
+        assert_eq!(
+            peer_registry.get_id_by_url(url).as_ref(),
+            Some(&first_id),
+            "the peer's import never moved"
+        );
+
+        // The owner's later removal still reaches the peer.
+        second_registry.remove(&first_id);
+        assert!(
+            wait_for(|| peer_registry.get_by_url(url).is_none()).await,
+            "the owner's removal reaches the peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_local_workers_own_key_is_never_taken_for_a_leftover() {
+        // The echo of this node's own publish and every pass see a key of
+        // this node's name; the worker it names is held here, so it stays.
+        let (ns, registry, adapter) = setup();
+        adapter.start();
+
+        let id = registry
+            .register(local_worker("http://local:8080"))
+            .unwrap();
+        let key = format!("worker:{}", id.as_str());
+        assert!(wait_for(|| ns.get(&key).is_some()).await, "publish landed");
+
+        adapter.reconcile_once();
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            ns.get(&key).is_some(),
+            "the key of a worker this node holds is not tombstoned"
+        );
+        assert!(
+            registry.get(&id).is_some(),
+            "and the worker stays registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tombstone_that_removes_an_import_refills_its_endpoint_from_another_live_key_at_once()
+    {
+        // Two live publishers name one endpoint; the import came from the
+        // first, the second's key refreshed its health only.
+        let (ns, registry, adapter) = setup();
+        adapter.start();
+        let url = "http://shared:8080";
+        ns.put(
+            "worker:b-w1",
+            bincode::serialize(&owned_state("b-w1", url, "node-b")).unwrap(),
+        );
+        assert!(
+            wait_for(|| registry
+                .get_id_by_url(url)
+                .is_some_and(|id| id.as_str() == "b-w1"))
+            .await,
+            "imported from the first publisher's key"
+        );
+        ns.put(
+            "worker:c-w1",
+            bincode::serialize(&owned_state("c-w1", url, "node-c")).unwrap(),
+        );
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            registry
+                .get_id_by_url(url)
+                .is_some_and(|id| id.as_str() == "b-w1"),
+            "a second key for a held endpoint refreshes health only"
+        );
+
+        // The first publisher removes its worker: the event path refills the
+        // endpoint from the other key, as the pass would at its next run.
+        ns.delete("worker:b-w1");
+        assert!(
+            wait_for(|| registry
+                .get_id_by_url(url)
+                .is_some_and(|id| id.as_str() == "c-w1"))
+            .await,
+            "the endpoint is refilled from the other live key in the same step: {:?}",
+            registry.get_id_by_url(url)
+        );
+    }
+
+    /// A worker of `url` serving `model`, as the start-up jobs register it.
+    fn local_worker_of(url: &str, model: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(model))
+                .build(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_claim_after_a_restart_publishes_above_the_earlier_lifes_version() {
+        // The published version is the owner's worker revision, which
+        // restarts at zero with the process; the key outlives it. A life
+        // that replaced its worker once published version 1 or more, and a
+        // peer recorded that version with its import. The new life claims
+        // the key its earlier life left (the start-up upsert over the
+        // import), which bumps a fresh revision to 1: without the raise,
+        // the claim publishes at or below what the peer holds, and the
+        // peer keeps the earlier life's specification for good.
+        let mesh = MeshKV::new("node-p".into());
+        let ns = worker_namespace(&mesh);
+        let url = "http://engine:8080";
+        let first_registry = Arc::new(WorkerRegistry::new());
+        let first_life = WorkerSyncAdapter::new(
+            ns.clone(),
+            first_registry.clone(),
+            "node-p".into(),
+            empty_cluster(),
+        );
+        let first_id = first_registry
+            .register(local_worker_of(url, "model-a"))
+            .unwrap();
+        // A replacement in the first life (a `PUT`, a discovery refresh):
+        // the key's version is 1 or more from here on.
+        assert_eq!(
+            first_registry.register_or_replace(local_worker_of(url, "model-a")),
+            first_id
+        );
+        first_life.resync_local(&mut HashMap::new());
+        let first_key = format!("worker:{}", first_id.as_str());
+        let first_version = version_of(&ns, &first_key).expect("the first life's key");
+        assert!(
+            first_version >= 1,
+            "the first life published at {first_version}"
+        );
+        drop(first_life);
+        drop(first_registry);
+
+        let peer_registry = Arc::new(WorkerRegistry::new());
+        let peer = WorkerSyncAdapter::new(
+            ns.clone(),
+            peer_registry.clone(),
+            "node-s".into(),
+            empty_cluster(),
+        );
+        peer.start();
+        assert!(
+            wait_for(|| peer_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
+            "the peer imported the worker under the owner's first id"
+        );
+        assert_eq!(
+            peer_registry
+                .get_by_url(url)
+                .map(|worker| worker.model_id().to_string()),
+            Some("model-a".to_string())
+        );
+
+        // The owner comes back under its name, imports its earlier life's
+        // key, and the start-up upsert claims it with the new configuration.
+        let second_registry = Arc::new(WorkerRegistry::new());
+        let second_life = WorkerSyncAdapter::new(
+            ns.clone(),
+            second_registry.clone(),
+            "node-p".into(),
+            empty_cluster(),
+        );
+        second_life.start();
+        assert!(
+            wait_for(|| second_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
+            "the new life imports the key of its earlier life"
+        );
+        assert_eq!(
+            second_registry.register_or_replace(local_worker_of(url, "model-b")),
+            first_id,
+            "the claim keeps the id"
+        );
+        assert!(
+            wait_for(|| version_of(&ns, &first_key).is_some_and(|v| v > first_version)).await,
+            "the claim publishes above the earlier life's version {first_version}: {:?}",
+            version_of(&ns, &first_key)
+        );
+        assert!(
+            wait_for(|| {
+                peer_registry
+                    .get_by_url(url)
+                    .is_some_and(|worker| worker.model_id() == "model-b")
+            })
+            .await,
+            "the peer's import follows the claim's specification: {:?}",
+            peer_registry
+                .get_by_url(url)
+                .map(|worker| worker.model_id().to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_publication_of_the_earlier_life_is_outranked_after_the_claim() {
+        // The claim raises the revision past the version this node saw for
+        // the key. A peer may have seen a later publication of the earlier
+        // life first (a replacement just before its death, gossiped there
+        // and not here yet). When it arrives after the claim, the owner
+        // raises the revision past it and publishes again, so that peer's
+        // import follows the claim too.
+        let mesh = MeshKV::new("node-p".into());
+        let ns = worker_namespace(&mesh);
+        let url = "http://engine:8080";
+        let first_registry = Arc::new(WorkerRegistry::new());
+        let first_life = WorkerSyncAdapter::new(
+            ns.clone(),
+            first_registry.clone(),
+            "node-p".into(),
+            empty_cluster(),
+        );
+        let first_id = first_registry
+            .register(local_worker_of(url, "model-a"))
+            .unwrap();
+        assert_eq!(
+            first_registry.register_or_replace(local_worker_of(url, "model-a")),
+            first_id
+        );
+        first_life.resync_local(&mut HashMap::new());
+        let first_key = format!("worker:{}", first_id.as_str());
+        let earlier = ns
+            .get(&first_key)
+            .and_then(|bytes| decode_worker_state(&bytes).ok())
+            .expect("the first life's key");
+        drop(first_life);
+        drop(first_registry);
+
+        let peer_registry = Arc::new(WorkerRegistry::new());
+        let peer = WorkerSyncAdapter::new(
+            ns.clone(),
+            peer_registry.clone(),
+            "node-s".into(),
+            empty_cluster(),
+        );
+        peer.start();
+        assert!(
+            wait_for(|| peer_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
+            "the peer imported the worker under the owner's first id"
+        );
+
+        let second_registry = Arc::new(WorkerRegistry::new());
+        let second_life = WorkerSyncAdapter::new(
+            ns.clone(),
+            second_registry.clone(),
+            "node-p".into(),
+            empty_cluster(),
+        );
+        second_life.start();
+        assert!(
+            wait_for(|| second_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
+            "the new life imports the key of its earlier life"
+        );
+        assert_eq!(
+            second_registry.register_or_replace(local_worker_of(url, "model-b")),
+            first_id
+        );
+        assert!(
+            wait_for(|| version_of(&ns, &first_key).is_some_and(|v| v > earlier.version)).await,
+            "the claim publishes above the version this node saw"
+        );
+        let claimed = version_of(&ns, &first_key).expect("the claim's key");
+
+        // The earlier life's last publication, seen by a peer first, arrives
+        // after the claim: the earlier specification at a higher version.
+        let late_version = claimed + 1;
+        let late = WorkerState {
+            version: late_version,
+            ..earlier
+        };
+        ns.put(&first_key, bincode::serialize(&late).unwrap());
+
+        let stored = || {
+            ns.get(&first_key)
+                .and_then(|bytes| decode_worker_state(&bytes).ok())
+                .map(|state| (state.version, state.model_id))
+        };
+        assert!(
+            wait_for(|| stored()
+                .is_some_and(|(version, model)| version > late_version && model == "model-b"))
+            .await,
+            "the owner publishes the claimed worker above the late state: {:?}",
+            stored()
+        );
+        assert!(
+            wait_for(|| {
+                peer_registry
+                    .get_by_url(url)
+                    .is_some_and(|worker| worker.model_id() == "model-b")
+            })
+            .await,
+            "the peer's import follows the claim: {:?}",
+            peer_registry
+                .get_by_url(url)
+                .map(|worker| worker.model_id().to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_health_only_difference_at_the_same_version_leaves_the_revision_alone() {
+        // Health is not versioned: a probe's demotion changes the worker's
+        // state without a revision bump, and the outbound loop puts it a
+        // moment later. A pass or an event that reads the key in that gap
+        // sees this node's own earlier state, not a later state of its key.
+        // The revision is a replacement token elsewhere, so it must not
+        // move for that. Another specification at the same version is the
+        // earlier life's later publication and does raise it.
+        let (ns, registry, adapter) = setup();
+        let worker = local_worker("http://local:8080");
+        let id = registry.register(worker.clone()).unwrap();
+        worker.set_status(WorkerStatus::Ready);
+        adapter.resync_local(&mut HashMap::new());
+        let key = format!("worker:{}", id.as_str());
+        let published = worker_state_of(&id, &worker, "node-a");
+        let revision = worker.revision();
+        assert!(
+            published.health,
+            "the key is published with the worker healthy"
+        );
+        assert_eq!(version_of(&ns, &key), Some(revision));
+
+        worker.set_status(WorkerStatus::NotReady);
+        adapter.apply_state(id.as_str(), &published);
+        assert_eq!(
+            worker.revision(),
+            revision,
+            "the stale health at the same version is this node's own state"
+        );
+        assert_eq!(version_of(&ns, &key), Some(revision));
+
+        let foreign = WorkerState {
+            model_id: "other-model".to_string(),
+            ..published
+        };
+        adapter.apply_state(id.as_str(), &foreign);
+        assert_eq!(
+            worker.revision(),
+            revision + 1,
+            "another specification at the same version is outranked"
+        );
+        assert_eq!(version_of(&ns, &key), Some(revision + 1));
+    }
+
     /// A locally registered worker as discovery registers it: the provider's
     /// instance id in its labels.
     fn discovered_worker(url: &str, instance: &str) -> Arc<dyn Worker> {

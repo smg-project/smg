@@ -66,7 +66,7 @@ impl MeshAdapters {
     /// delta arriving before the tree adapter subscribes would be dropped.
     ///
     /// After construction the tree adapter is attached to `policy_registry`,
-    /// which propagates it (and flips `populate_hash_index` on) to every
+    /// which propagates it (and raises the mesh flag) to every
     /// existing and future [`CacheAwarePolicy`] instance.
     ///
     /// # Panics
@@ -394,8 +394,8 @@ mod tests {
             .downcast_ref::<CacheAwarePolicy>()
             .expect("cache_aware default policy");
         assert!(
-            cache_aware.should_populate_hash_index_for_test(),
-            "wiring must flip populate_hash_index when the adapter is attached",
+            cache_aware.mesh_attached_for_test(),
+            "wiring must raise the mesh flag when the adapter is attached",
         );
     }
 
@@ -476,8 +476,8 @@ mod tests {
             .downcast_ref::<CacheAwarePolicy>()
             .expect("cache_aware model policy");
         assert!(
-            !cache_aware.should_populate_hash_index_for_test(),
-            "populate flag defaults off before wiring",
+            !cache_aware.mesh_attached_for_test(),
+            "the mesh flag defaults off before wiring",
         );
 
         let mesh = MeshKV::new("node-a".into());
@@ -490,7 +490,7 @@ mod tests {
         );
 
         assert!(
-            cache_aware.should_populate_hash_index_for_test(),
+            cache_aware.mesh_attached_for_test(),
             "wiring must propagate the adapter to already-existing model policies",
         );
     }
@@ -514,12 +514,12 @@ mod tests {
             .as_any()
             .downcast_ref::<CacheAwarePolicy>()
             .expect("cache_aware default policy");
-        assert!(cache_aware.should_populate_hash_index_for_test());
+        assert!(cache_aware.mesh_attached_for_test());
 
         policy_registry.set_mesh_tree_sync(None);
         assert!(
-            !cache_aware.should_populate_hash_index_for_test(),
-            "detach must clear the populate flag",
+            !cache_aware.mesh_attached_for_test(),
+            "detach must lower the mesh flag",
         );
     }
 
@@ -657,27 +657,33 @@ mod tests {
     async fn bridge_dispatches_through_default_policy() {
         use kv_index::hash_node_path;
 
-        use crate::mesh::adapters::tree_sync::TreeRepairPage;
+        use crate::mesh::adapters::tree_sync::{RepairEntry, TreeRepairPage};
 
         let policy_registry = Arc::new(PolicyRegistry::new(cache_aware_policy_config()));
         // Do NOT touch `get_policy_or_default("m")` — we want the
-        // default policy path, not a per-model entry. Manually seed
-        // the default policy's hash_index so `apply_known_remote_insert`
-        // has something to resolve.
+        // default policy path, not a per-model entry. Seed the default
+        // policy's string tree through a repair page (the path with its
+        // hash) so `apply_known_remote_insert` has something to resolve.
         let default_policy = policy_registry.get_default_policy();
         let cache_aware = default_policy
             .as_any()
             .downcast_ref::<CacheAwarePolicy>()
             .expect("default policy is cache-aware");
-        cache_aware.set_populate_hash_index_for_test_true();
         let text = "hello world";
         let path_hash = hash_node_path(text);
-        cache_aware.seed_hash_index_for_test(
-            crate::worker::UNKNOWN_MODEL_ID,
-            TreeKind::String,
-            path_hash,
-            text,
-        );
+        let seed = TreeRepairPage {
+            session_id: uuid::Uuid::nil(),
+            model_id: crate::worker::UNKNOWN_MODEL_ID.into(),
+            tree_kind: TreeKind::String,
+            page_index: 0,
+            entries: vec![RepairEntry::String {
+                path: text.to_string(),
+                tenants: vec![(Arc::from("http://w0:8000"), 1)],
+            }],
+            next_cursor: None,
+            is_last: true,
+        };
+        assert_eq!(cache_aware.apply_repair_page(&seed), 1);
 
         let handle = PolicyRegistryTreeHandle::new(policy_registry);
         assert!(

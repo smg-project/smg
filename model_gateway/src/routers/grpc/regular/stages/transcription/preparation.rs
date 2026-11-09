@@ -146,7 +146,7 @@ fn build_chat_request(
             content: Some(MessageContent::Text(prefill)),
             name: None,
             tool_calls: None,
-            reasoning_content: None,
+            reasoning: Default::default(),
             ext: Default::default(),
         });
     }

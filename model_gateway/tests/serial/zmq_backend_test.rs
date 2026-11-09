@@ -520,7 +520,7 @@ async fn grammar_over_zmq(parser: &str, led: bool) {
         EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
             outputs: vec![EngineCoreOutput {
-                request_id: request_id.to_string(),
+                request_id: request_id.into(),
                 new_token_ids: vec![1],
                 finish_reason: Some(EngineCoreFinishReason::Stop),
                 ..Default::default()

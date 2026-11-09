@@ -1,23 +1,27 @@
-"""The Rust request path of the TokenSpeed gRPC servicer, behind one flag.
+"""The Rust request path of the TokenSpeed gRPC servicer, the launcher's default.
 
-``python -m smg_grpc_servicer.tokenspeed`` (what ``ts serve`` spawns) serves
+``python -m smg_grpc_servicer.tokenspeed`` (what ``ts serve`` spawns) served
 ``tokenspeed.grpc.scheduler.TokenSpeedScheduler`` from Python over TokenSpeed's
-in-process ``AsyncLLM``. With ``--servicer-impl rust`` (this package's flag on
-that launcher, see :func:`add_servicer_impl_argument`;
-``SMG_TOKENSPEED_SERVICER_IMPL=rust`` is the fallback the flag overrides) the
-same entrypoint hands the process to :func:`serve_rust` before an ``AsyncLLM``
-or a Python gRPC server exists: the contract is served by the Rust
+in-process ``AsyncLLM``. Unless ``--servicer-impl python`` (this package's flag
+on that launcher, see :func:`add_servicer_impl_argument`;
+``SMG_TOKENSPEED_SERVICER_IMPL`` is the fallback the flag overrides) selects
+that path, the same entrypoint hands the process to :func:`serve_rust` before
+an ``AsyncLLM`` or a Python gRPC server exists: the contract is served by the Rust
 :class:`smg.servicer.TokenSpeedGrpcServer` on a Rust-owned thread, and the
 scheduler rank processes are started from this same process (the way
 TokenSpeed's own ``launch_scheduler_headless``, what ``ts serve --headless``
 runs, starts them), dialing the servicer's same-host msgpack ZMQ handshake.
 Python keeps the lifecycle only. The Router cannot tell the two
-implementations apart.
+implementations apart. This path is the default; the Python servicer is
+selected with ``--servicer-impl python`` / ``SMG_TOKENSPEED_SERVICER_IMPL=python``
+and is deprecated (the launcher logs its deprecation when it is chosen).
 
 What the msgpack wire does not carry, the Rust path reports rather than
 emulates: ``FlushCache`` and profiling ride the wire's control call on a
 scheduler whose handshake declares its control reply, and answer UNIMPLEMENTED
-on one that does not; ranked ``top_logprobs`` and prompt logprobs are refused.
+on one that does not; ranked ``top_logprobs`` and prompt logprobs each ride to
+schedulers whose handshakes all declare that one's output columns, and are
+refused otherwise.
 Prefill/decode disaggregation is served: the request's bootstrap fields ride
 the wire as the Python servicer forwards them, and a prefill launch starts the
 engine's KV bootstrap server here, ahead of the ranks, on an engine whose PD
@@ -130,9 +134,9 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
     return _add_servicer_impl_argument(
         parser,
         help=(
-            "Which implementation serves the gRPC contract: the Python servicer (default) "
-            "or the Rust one (smg.servicer.TokenSpeedGrpcServer, with the scheduler(s) "
-            f"headless). Unset falls back to ${SERVICER_IMPL_ENV}."
+            "Which implementation serves the gRPC contract: the Rust servicer (default; "
+            "smg.servicer.TokenSpeedGrpcServer, with the scheduler(s) headless) or the "
+            f"deprecated Python one. Unset falls back to ${SERVICER_IMPL_ENV}, then rust."
         ),
     )
 
@@ -152,7 +156,7 @@ def add_metrics_arguments(parser: argparse.ArgumentParser) -> bool:
 def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = None) -> str:
     """Which implementation serves this process: ``args.servicer_impl`` when
     the launcher carried the flag, else ``$SMG_TOKENSPEED_SERVICER_IMPL``, else
-    python."""
+    rust."""
     return servicer_impl_source(args, environ)[0]
 
 
@@ -366,32 +370,52 @@ def cache_layer_labels(model_config: Any) -> tuple[str, ...]:
     return ()
 
 
+def kv_events_name_their_group() -> bool:
+    """Whether the installed engine's scheduler publishes its KV events per
+    cache group: its ``KVEvent.BlockStored`` carries ``group_idx``.
+
+    Such an engine publishes a hybrid model's History chain, its State
+    checkpoints and its sliding windows each under its own group, the layout
+    the relay reads from the reference engine, so the publisher serves a
+    hybrid model. An engine whose events carry no group publishes one event
+    per boundary, and only while every group holds it: on a hybrid model
+    that is the checkpoint boundaries alone, no chain a router can follow."""
+    try:
+        from tokenspeed_scheduler import tokenspeed_scheduler_ext as scheduler_ext
+    except ImportError:
+        return False
+    stored = getattr(getattr(scheduler_ext, "KVEvent", None), "BlockStored", None)
+    return hasattr(stored, "group_idx")
+
+
 def kv_events_unpublishable(server_args: Any, model_config: Any = None) -> str | None:
     """Why TokenSpeed's KV event publisher cannot serve the model this process
     loads, or ``None`` when it can.
 
     TokenSpeed keeps a hybrid model's recurrent state (its Gated DeltaNet,
     Mamba or KDA layers) in State groups of its cache: blocks that hold one
-    checkpoint each and span no tokens. Its KV-event drain walks every cache
-    group of a published boundary for a token-span quantity, and a State
-    group has none: the scheduler's assertion (``a State group has no token
-    span``) ends the engine process at the first drain of a request's tail,
-    under the fused scheduler as under the prefill and decode roles. Which
-    layer labels get a State group is the engine's own vocabulary (the
-    recipes' ``STATE_LAYER_TYPES``, over :func:`cache_layer_labels`), so the
-    answer follows the engine installed: one without that vocabulary has no
-    State groups, and a model whose labels are all history (full, sliding or
-    sparse attention) is served. ``model_config`` is TokenSpeed's
-    ``ModelConfig`` for the served model, built here when not given
-    (:func:`_model_config`), after the vocabulary was found."""
+    checkpoint each and span no tokens. An engine whose KV events name their
+    cache group (:func:`kv_events_name_their_group`) publishes such a model's
+    History chain beside its checkpoints, and is served without reading the
+    model. On an engine whose events carry no group, a boundary is published
+    only while every group holds it, so a hybrid model's history chain never
+    reaches the router: the publisher stays off for such a model. Which layer
+    labels get a State group is the engine's own vocabulary (the recipes'
+    ``STATE_LAYER_TYPES``, over :func:`cache_layer_labels`), so the answer
+    follows the engine installed: one without that vocabulary has no State
+    groups, and a model whose labels are all history (full, sliding or sparse
+    attention) is served. ``model_config`` is TokenSpeed's ``ModelConfig``
+    for the served model, built here when not given (:func:`_model_config`),
+    after the vocabulary was found."""
+    if kv_events_name_their_group():
+        return None
     try:
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import STATE_LAYER_TYPES
     except ImportError as error:
         # An engine that does not spell its State-group vocabulary there (an
         # older one, with no State groups, or one that moved the module), or
         # no engine at all (the launcher's unit tests): the default is not
-        # guarded, and the log says so, since a hybrid model on an engine
-        # that moved the module would abort in the drain again.
+        # guarded, and the log says so.
         logger.info(
             "TokenSpeed's State-group vocabulary could not be read (%s): the KV-events default "
             "is not guarded against State groups on this engine",
@@ -407,8 +431,9 @@ def kv_events_unpublishable(server_args: Any, model_config: Any = None) -> str |
     return (
         f"{EngineConfigView(server_args).server_args.model} keeps recurrent state in "
         f"{len(state)} of its {len(labels)} layers ({', '.join(sorted(set(state)))}): State "
-        "groups of TokenSpeed's cache, which span no tokens, and TokenSpeed's KV-event drain "
-        "aborts the engine on a group with no token span"
+        "groups of TokenSpeed's cache, and this engine's KV-event feed publishes a boundary "
+        "only while every group holds it, so the model's history chain would never reach the "
+        "router (an engine whose KV events name their cache group publishes it)"
     )
 
 
@@ -689,19 +714,19 @@ def refuse_encode_role_without_wire(server_args: Any) -> None:
         if getattr(error, "name", None) == "tokenspeed":
             return  # no engine installed (the launcher's unit tests)
         raise ServicerConfigError(
-            f"{SERVICER_IMPL_ENV}=rust cannot read the EPD encode capability off this engine "
-            f"build ({error}): its wire module does not import; run this worker on the Python "
-            f"servicer (unset {SERVICER_IMPL_ENV} or pass --servicer-impl python)"
+            f"The Rust servicer cannot read the EPD encode capability off this engine "
+            f"build ({error}): its wire module does not import; run this worker on the "
+            f"deprecated Python servicer (--servicer-impl python / {SERVICER_IMPL_ENV}=python)"
         ) from None
     registers_encode_role = getattr(zmq_wire, "encode_ready_response", None) is not None
     if not registers_encode_role and getattr(zmq_wire, "REQ_TYPE_ENCODE", None) is None:
         raise ServicerConfigError(
-            f"{SERVICER_IMPL_ENV}=rust does not serve the EPD encode role on this engine build "
+            "The Rust servicer does not serve the EPD encode role on this engine build "
             "(disaggregation_mode='encode'): its direct msgpack wire carries no encode request, "
             "so the encode rank would never dial the servicer's handshake and the worker would "
             "wait in silence, serving nothing; run an engine whose wire carries the encode "
-            f"request, or this worker on the Python servicer (unset {SERVICER_IMPL_ENV} or pass "
-            "--servicer-impl python)"
+            "request, or this worker on the deprecated Python servicer (--servicer-impl python / "
+            f"{SERVICER_IMPL_ENV}=python)"
         )
 
 

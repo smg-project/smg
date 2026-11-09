@@ -407,6 +407,7 @@ impl BasicWorkerBuilder {
             backend_client,
             zmq_connect_started: Arc::new(AtomicBool::new(false)),
             zmq_connect_abort: Arc::new(ArcSwapOption::empty()),
+            superseded: AtomicBool::new(false),
             connect_signal_tx: self.connect_signal_tx,
             models_override: Arc::new(ArcSwap::from_pointee(WorkerModels::Wildcard)),
             http_client,
@@ -547,7 +548,7 @@ mod tests {
     #[test]
     fn provided_http_client_is_used_as_is() {
         let worker = BasicWorkerBuilder::new("http://localhost:8080")
-            .http_client(Arc::new(crate::clients::http_client()))
+            .http_client(Arc::new(crate::server::http_client()))
             .build();
         assert!(!worker.http_client.cell_is_empty());
     }

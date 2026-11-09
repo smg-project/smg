@@ -1,6 +1,10 @@
 //! Qwen3 audio preprocessing using a Whisper-compatible log-mel frontend.
 
-use std::sync::Arc;
+use std::{
+    borrow::Cow,
+    fmt,
+    sync::{Arc, OnceLock},
+};
 
 use ndarray::{Array2, Array3};
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
@@ -8,7 +12,7 @@ use serde_json::Value;
 
 use crate::{
     audio::{
-        transforms::{bandlimited_resample, hann_window, mel_basis},
+        transforms::{bandlimited_resample, hann_window, mel_bands, mel_basis},
         AudioPreProcessor, DecodedAudio,
     },
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
@@ -122,6 +126,9 @@ fn find_model_usize(config: &Value, paths: &[&[&str]]) -> Option<usize> {
 #[derive(Debug, Clone)]
 pub struct Qwen3AudioProcessor {
     params: Qwen3AudioParams,
+    /// The window, the filter bank and the FFT plan of these parameters, built on the first clip
+    /// (after the parameters are validated) and kept for every clip after it.
+    frontend: OnceLock<Arc<MelFrontend>>,
 }
 
 impl Default for Qwen3AudioProcessor {
@@ -132,13 +139,14 @@ impl Default for Qwen3AudioProcessor {
 
 impl Qwen3AudioProcessor {
     pub fn new() -> Self {
-        Self {
-            params: Qwen3AudioParams::default(),
-        }
+        Self::with_params(Qwen3AudioParams::default())
     }
 
     pub fn with_params(params: Qwen3AudioParams) -> Self {
-        Self { params }
+        Self {
+            params,
+            frontend: OnceLock::new(),
+        }
     }
 
     pub fn from_configs(model_config: &Value, preprocessor_config: &PreProcessorConfig) -> Self {
@@ -152,17 +160,20 @@ impl Qwen3AudioProcessor {
         &self.params
     }
 
+    /// The log-mel features of a batch of decoded clips. The clips are borrowed: a clip at the
+    /// frontend's sample rate is copied once, into the batch's padded buffer, and only a clip at
+    /// another rate is resampled into a buffer of its own first.
     pub fn preprocess_decoded_clips(
         &self,
-        clips: Vec<DecodedAudio>,
+        clips: &[&DecodedAudio],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         self.validate_params()?;
         if clips.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
 
-        let mut waveforms = Vec::with_capacity(clips.len());
-        for (clip_index, clip) in clips.into_iter().enumerate() {
+        let mut waveforms: Vec<Cow<'_, [f32]>> = Vec::with_capacity(clips.len());
+        for (clip_index, clip) in clips.iter().enumerate() {
             if clip.sample_rate == 0 {
                 return Err(TransformError::ShapeError(
                     "decoded audio sample rate must be positive".to_string(),
@@ -178,14 +189,25 @@ impl Qwen3AudioProcessor {
                     "decoded audio contains a non-finite sample".to_string(),
                 ));
             }
-            let samples = if clip.sample_rate == self.params.sample_rate {
-                clip.samples
+            let mut samples: Cow<'_, [f32]> = if clip.sample_rate == self.params.sample_rate {
+                Cow::Borrowed(clip.samples.as_slice())
             } else {
-                bandlimited_resample(&clip.samples, clip.sample_rate, self.params.sample_rate)?
+                Cow::Owned(bandlimited_resample(
+                    &clip.samples,
+                    clip.sample_rate,
+                    self.params.sample_rate,
+                )?)
             };
-            let mut samples = samples;
             if let Some(max_samples) = self.params.max_samples {
-                samples.truncate(max_samples);
+                if samples.len() > max_samples {
+                    samples = match samples {
+                        Cow::Borrowed(borrowed) => Cow::Borrowed(&borrowed[..max_samples]),
+                        Cow::Owned(mut owned) => {
+                            owned.truncate(max_samples);
+                            Cow::Owned(owned)
+                        }
+                    };
+                }
             }
             if samples.is_empty() {
                 return Err(TransformError::ShapeError(
@@ -202,7 +224,11 @@ impl Qwen3AudioProcessor {
             waveforms.push(samples);
         }
 
-        let max_samples = waveforms.iter().map(Vec::len).max().unwrap_or(0);
+        let max_samples = waveforms
+            .iter()
+            .map(|samples| samples.len())
+            .max()
+            .unwrap_or(0);
         // Whisper's centered STFT yields floor(samples / hop) + 1 frames and
         // then drops the final frame. This matches padding=True with the batch
         // padded to its longest waveform.
@@ -215,27 +241,32 @@ impl Qwen3AudioProcessor {
         }
 
         let batch_size = waveforms.len();
-        let feature_values = batch_size
-            .checked_mul(self.params.n_mels)
-            .and_then(|value| value.checked_mul(max_frames))
-            .ok_or_else(|| {
-                TransformError::ShapeError("Qwen3 audio feature size overflow".to_string())
-            })?;
-        let mut all_features = Vec::with_capacity(feature_values);
+        let clip_values = self.params.n_mels.checked_mul(max_frames).ok_or_else(|| {
+            TransformError::ShapeError("Qwen3 audio feature size overflow".to_string())
+        })?;
+        let feature_values = batch_size.checked_mul(clip_values).ok_or_else(|| {
+            TransformError::ShapeError("Qwen3 audio feature size overflow".to_string())
+        })?;
+        let frontend = self
+            .frontend
+            .get_or_init(|| Arc::new(MelFrontend::build(&self.params)));
+        let mut scratch = MelScratch::new(frontend, &self.params, max_samples);
+        let mut all_features = vec![0.0_f32; feature_values];
         let mut attention_mask = Vec::with_capacity(batch_size * max_frames);
         let mut feature_lengths = Vec::with_capacity(batch_size);
         let mut token_counts = Vec::with_capacity(batch_size);
         let mut item_sizes = Vec::with_capacity(batch_size);
-        let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(self.params.n_fft);
 
-        for waveform in waveforms {
-            let original_samples = waveform.len();
-            let feature_length = (original_samples / self.params.hop_length).min(max_frames);
-            let mut padded = waveform;
-            padded.resize(max_samples, self.params.padding_value);
-            let features = whisper_log_mel(&padded, max_frames, &self.params, fft.as_ref())?;
-            all_features.extend(features.into_raw_vec_and_offset().0);
+        for (features, waveform) in all_features.chunks_exact_mut(clip_values).zip(&waveforms) {
+            let feature_length = (waveform.len() / self.params.hop_length).min(max_frames);
+            frontend.log_mel(
+                waveform,
+                max_samples,
+                max_frames,
+                &self.params,
+                &mut scratch,
+                features,
+            )?;
 
             attention_mask.extend((0..max_frames).map(|frame| i64::from(frame < feature_length)));
             feature_lengths.push(feature_length as i64);
@@ -269,7 +300,7 @@ impl Qwen3AudioProcessor {
     }
 
     pub fn preprocess_decoded(&self, decoded: DecodedAudio) -> Result<Array2<f32>, TransformError> {
-        let output = self.preprocess_decoded_clips(vec![decoded])?;
+        let output = self.preprocess_decoded_clips(&[&decoded])?;
         output
             .encoder_input
             .into_f32()
@@ -317,7 +348,8 @@ impl AudioPreProcessor for Qwen3AudioProcessor {
         &self,
         clips: &[Arc<AudioClip>],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        self.preprocess_decoded_clips(clips.iter().map(|clip| clip.decoded().clone()).collect())
+        let decoded: Vec<&DecodedAudio> = clips.iter().map(|clip| clip.decoded()).collect();
+        self.preprocess_decoded_clips(&decoded)
     }
 }
 
@@ -338,74 +370,181 @@ fn qwen3_audio_output_length(input_length: usize, n_window: usize) -> usize {
         + qwen_audio_cnn_output_length(remainder)
 }
 
-fn whisper_log_mel(
-    samples: &[f32],
-    frame_count: usize,
-    params: &Qwen3AudioParams,
-    fft: &dyn Fft<f32>,
-) -> Result<Array2<f32>, TransformError> {
-    let center_pad = params.n_fft / 2;
-    let padded = reflect_pad(samples, center_pad);
-    let fft_bins = params.n_fft / 2 + 1;
-    let window = hann_window(params.n_fft);
-    let mel_filters = mel_basis(params.sample_rate, params.n_fft, params.n_mels);
-    let mut buffer = vec![Complex32::new(0.0, 0.0); params.n_fft];
-    let mut output = vec![0.0_f32; params.n_mels * frame_count];
+/// The frames of a clip run through the FFT so many at a time: the chunk's complex frames stay
+/// in cache (32 frames of 400 bins are 100 KiB) and one FFT call covers them all.
+const FRAMES_PER_CHUNK: usize = 32;
 
-    for frame in 0..frame_count {
-        let start = frame * params.hop_length;
-        let end = start + params.n_fft;
-        let frame_samples = padded.get(start..end).ok_or_else(|| {
-            TransformError::ShapeError(format!(
-                "Qwen3 audio STFT frame {frame} lies outside padded waveform"
-            ))
-        })?;
-        for index in 0..params.n_fft {
-            buffer[index] = Complex32::new(frame_samples[index] * window[index], 0.0);
-        }
-        fft.process(&mut buffer);
-
-        for mel in 0..params.n_mels {
-            let filter = &mel_filters[mel * fft_bins..(mel + 1) * fft_bins];
-            let mut value = 0.0_f32;
-            for bin in 0..fft_bins {
-                let fft_value = buffer[bin];
-                let power = fft_value
-                    .re
-                    .mul_add(fft_value.re, fft_value.im * fft_value.im);
-                value = filter[bin].mul_add(power, value);
-            }
-            output[mel * frame_count + frame] = value.max(1e-10).log10();
-        }
-    }
-
-    let peak = output.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let floor = peak - 8.0;
-    for value in &mut output {
-        *value = (value.max(floor) + 4.0) / 4.0;
-    }
-
-    Array2::from_shape_vec((params.n_mels, frame_count), output).map_err(|error| {
-        TransformError::ShapeError(format!(
-            "failed to create Qwen log-mel input [{}, {frame_count}]: {error}",
-            params.n_mels
-        ))
-    })
+/// What the log-mel frontend needs beside the samples, built once per configuration: the window,
+/// the filter bank with the bin band each filter's weight lies in, and the FFT plan.
+struct MelFrontend {
+    window: Vec<f32>,
+    /// `n_mels` rows of `n_fft / 2 + 1` weights.
+    filters: Vec<f32>,
+    /// Per filter, the half-open bin range `[first, last)` outside which its weight is zero.
+    bands: Vec<(usize, usize)>,
+    fft: Arc<dyn Fft<f32>>,
 }
 
-fn reflect_pad(samples: &[f32], padding: usize) -> Vec<f32> {
-    if padding == 0 {
-        return samples.to_vec();
+impl fmt::Debug for MelFrontend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MelFrontend")
+            .field("window", &self.window.len())
+            .field("filters", &self.bands.len())
+            .field("fft", &self.fft.len())
+            .finish()
     }
-    if samples.len() == 1 {
-        return vec![samples[0]; samples.len() + 2 * padding];
+}
+
+/// The buffers one batch reuses for every clip: the padded waveform, a chunk of complex frames,
+/// the FFT's own scratch and the chunk's power spectra.
+struct MelScratch {
+    padded: Vec<f32>,
+    frames: Vec<Complex32>,
+    fft_scratch: Vec<Complex32>,
+    power: Vec<f32>,
+}
+
+impl MelScratch {
+    fn new(frontend: &MelFrontend, params: &Qwen3AudioParams, max_samples: usize) -> Self {
+        let fft_bins = params.n_fft / 2 + 1;
+        Self {
+            padded: Vec::with_capacity(max_samples + 2 * (params.n_fft / 2)),
+            frames: vec![Complex32::new(0.0, 0.0); FRAMES_PER_CHUNK * params.n_fft],
+            fft_scratch: vec![Complex32::new(0.0, 0.0); frontend.fft.get_inplace_scratch_len()],
+            power: vec![0.0_f32; FRAMES_PER_CHUNK * fft_bins],
+        }
+    }
+}
+
+impl MelFrontend {
+    fn build(params: &Qwen3AudioParams) -> Self {
+        let fft_bins = params.n_fft / 2 + 1;
+        let filters = mel_basis(params.sample_rate, params.n_fft, params.n_mels);
+        // 394 of the 25,728 weights are non-zero at the default geometry.
+        let bands = mel_bands(&filters, params.n_mels, fft_bins);
+        Self {
+            window: hann_window(params.n_fft),
+            filters,
+            bands,
+            fft: FftPlanner::<f32>::new().plan_fft_forward(params.n_fft),
+        }
     }
 
-    let mut padded = Vec::with_capacity(samples.len() + 2 * padding);
-    for position in -(padding as isize)..(samples.len() + padding) as isize {
-        padded.push(samples[reflect_index(position, samples.len())]);
+    /// The normalised log-mel rows of one clip into `out` (`n_mels` rows of `frame_count`
+    /// values), as the frame-by-frame computation produced them: the same window, the same FFT
+    /// of every frame, the same power term, the same product in the same bin order, so the
+    /// bits do not move. The clip is extended to `padded_len` (the batch's longest) with the
+    /// padding value before the centre reflection, as the reference pads a batch.
+    fn log_mel(
+        &self,
+        samples: &[f32],
+        padded_len: usize,
+        frame_count: usize,
+        params: &Qwen3AudioParams,
+        scratch: &mut MelScratch,
+        out: &mut [f32],
+    ) -> Result<(), TransformError> {
+        let n_fft = params.n_fft;
+        let fft_bins = n_fft / 2 + 1;
+        reflect_pad_into(
+            &mut scratch.padded,
+            samples,
+            padded_len,
+            params.padding_value,
+            n_fft / 2,
+        );
+
+        let mut frame = 0;
+        while frame < frame_count {
+            let count = FRAMES_PER_CHUNK.min(frame_count - frame);
+            for k in 0..count {
+                let start = (frame + k) * params.hop_length;
+                let frame_samples = scratch.padded.get(start..start + n_fft).ok_or_else(|| {
+                    TransformError::ShapeError(format!(
+                        "Qwen3 audio STFT frame {} lies outside padded waveform",
+                        frame + k
+                    ))
+                })?;
+                let buffer = &mut scratch.frames[k * n_fft..(k + 1) * n_fft];
+                for (slot, (&sample, &weight)) in buffer
+                    .iter_mut()
+                    .zip(frame_samples.iter().zip(&self.window))
+                {
+                    *slot = Complex32::new(sample * weight, 0.0);
+                }
+            }
+            self.fft.process_with_scratch(
+                &mut scratch.frames[..count * n_fft],
+                &mut scratch.fft_scratch,
+            );
+
+            // The power term of each bin once per frame; `mul_add`, as the product reads it,
+            // not `re * re + im * im`, which rounds twice and differs on real spectra (the
+            // sibling frontends hoist the unfused form; this one must not copy it).
+            for k in 0..count {
+                let spectrum = &scratch.frames[k * n_fft..k * n_fft + fft_bins];
+                let power = &mut scratch.power[k * fft_bins..(k + 1) * fft_bins];
+                for (value, bin) in power.iter_mut().zip(spectrum) {
+                    *value = bin.re.mul_add(bin.re, bin.im * bin.im);
+                }
+            }
+
+            // The mel product over each filter's band: a zero weight adds nothing to a finite
+            // power, so the band's sum is the full row's sum, bit for bit. Where a power
+            // overflowed, a zero weight times infinity is NaN and the full row keeps it.
+            for k in 0..count {
+                let power = &scratch.power[k * fft_bins..(k + 1) * fft_bins];
+                let finite = power.iter().all(|value| value.is_finite());
+                for mel in 0..params.n_mels {
+                    let (first, last) = if finite {
+                        self.bands[mel]
+                    } else {
+                        (0, fft_bins)
+                    };
+                    let weights = &self.filters[mel * fft_bins + first..mel * fft_bins + last];
+                    let mut value = 0.0_f32;
+                    for (weight, power) in weights.iter().zip(&power[first..last]) {
+                        value = weight.mul_add(*power, value);
+                    }
+                    out[mel * frame_count + frame + k] = value.max(1e-10).log10();
+                }
+            }
+            frame += count;
+        }
+
+        let peak = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let floor = peak - 8.0;
+        for value in out.iter_mut() {
+            *value = (value.max(floor) + 4.0) / 4.0;
+        }
+        Ok(())
     }
-    padded
+}
+
+/// `out` becomes `samples` extended to `len` with `padding_value`, then reflected `padding`
+/// samples at both ends (numpy's `reflect` mode, which the reference's centred STFT uses). The
+/// buffer's capacity is kept across clips.
+fn reflect_pad_into(
+    out: &mut Vec<f32>,
+    samples: &[f32],
+    len: usize,
+    padding_value: f32,
+    padding: usize,
+) {
+    out.clear();
+    let value_at = |index: usize| samples.get(index).copied().unwrap_or(padding_value);
+    if padding == 0 {
+        out.extend((0..len).map(value_at));
+        return;
+    }
+    if len == 1 {
+        out.resize(1 + 2 * padding, value_at(0));
+        return;
+    }
+    out.extend(
+        (-(padding as isize)..(len + padding) as isize)
+            .map(|position| value_at(reflect_index(position, len))),
+    );
 }
 
 fn reflect_index(mut index: isize, len: usize) -> usize {
@@ -498,7 +637,7 @@ mod tests {
     #[test]
     fn batches_variable_lengths_with_feature_mask() {
         let output = Qwen3AudioProcessor::new()
-            .preprocess_decoded_clips(vec![decoded(1000), decoded(801)])
+            .preprocess_decoded_clips(&[&decoded(1000), &decoded(801)])
             .unwrap();
 
         assert_eq!(output.encoder_input.shape(), &[2, 128, 6]);
@@ -520,7 +659,7 @@ mod tests {
     #[test]
     fn rejects_sub_hop_clip_in_mixed_batch() {
         let error = Qwen3AudioProcessor::new()
-            .preprocess_decoded_clips(vec![decoded(320), decoded(159)])
+            .preprocess_decoded_clips(&[&decoded(320), &decoded(159)])
             .unwrap_err();
 
         match error {
@@ -548,7 +687,7 @@ mod tests {
         assert_eq!(expected_token_counts, vec![1, 1]);
 
         let output = processor
-            .preprocess_decoded_clips(vec![decoded(320), decoded(160)])
+            .preprocess_decoded_clips(&[&decoded(320), &decoded(160)])
             .unwrap();
 
         assert_eq!(output.encoder_input.shape(), &[2, 128, 2]);
@@ -598,7 +737,7 @@ mod tests {
         let preprocessor = PreProcessorConfig::from_json(r#"{"n_samples": 320}"#).unwrap();
         let processor = Qwen3AudioProcessor::from_configs(&serde_json::json!({}), &preprocessor);
         let output = processor
-            .preprocess_decoded_clips(vec![decoded(800)])
+            .preprocess_decoded_clips(&[&decoded(800)])
             .unwrap();
 
         assert_eq!(output.encoder_input.shape(), &[1, 128, 5]);
@@ -612,7 +751,7 @@ mod tests {
             ..Default::default()
         });
         let output = processor
-            .preprocess_decoded_clips(vec![decoded(800)])
+            .preprocess_decoded_clips(&[&decoded(800)])
             .unwrap();
 
         assert_eq!(output.encoder_input.shape(), &[1, 128, 2]);
@@ -635,10 +774,318 @@ mod tests {
 
     #[test]
     fn reflect_padding_matches_numpy_convention() {
-        assert_eq!(
-            reflect_pad(&[1.0, 2.0, 3.0], 2),
-            vec![3.0, 2.0, 1.0, 2.0, 3.0, 2.0, 1.0]
+        let mut out = Vec::new();
+        reflect_pad_into(&mut out, &[1.0, 2.0, 3.0], 3, 0.0, 2);
+        assert_eq!(out, vec![3.0, 2.0, 1.0, 2.0, 3.0, 2.0, 1.0]);
+        reflect_pad_into(&mut out, &[2.0], 1, 0.0, 2);
+        assert_eq!(out, vec![2.0; 5]);
+        // A clip shorter than the batch's longest is extended with the padding value first, so
+        // the reflection at its end mirrors the padding.
+        reflect_pad_into(&mut out, &[1.0, 2.0], 4, 0.0, 2);
+        assert_eq!(out, vec![0.0, 2.0, 1.0, 2.0, 0.0, 0.0, 0.0, 2.0]);
+        reflect_pad_into(&mut out, &[1.0, 2.0], 3, 0.0, 0);
+        assert_eq!(out, vec![1.0, 2.0, 0.0]);
+    }
+
+    /// The frontend as it computed before the frames were batched: the padded waveform copied,
+    /// one FFT call per frame with its own scratch, the power term inside the product, and the
+    /// product over every bin. The batched frontend must equal it bit for bit on every input.
+    fn frame_by_frame_reference(
+        samples: &[f32],
+        padded_len: usize,
+        frame_count: usize,
+        params: &Qwen3AudioParams,
+    ) -> Vec<f32> {
+        fn reflect_pad(samples: &[f32], padding: usize) -> Vec<f32> {
+            if padding == 0 {
+                return samples.to_vec();
+            }
+            if samples.len() == 1 {
+                return vec![samples[0]; samples.len() + 2 * padding];
+            }
+            let mut padded = Vec::with_capacity(samples.len() + 2 * padding);
+            for position in -(padding as isize)..(samples.len() + padding) as isize {
+                padded.push(samples[reflect_index(position, samples.len())]);
+            }
+            padded
+        }
+        let mut waveform = samples.to_vec();
+        waveform.resize(padded_len, params.padding_value);
+        let padded = reflect_pad(&waveform, params.n_fft / 2);
+        let fft_bins = params.n_fft / 2 + 1;
+        let window = hann_window(params.n_fft);
+        let mel_filters = mel_basis(params.sample_rate, params.n_fft, params.n_mels);
+        let fft = FftPlanner::<f32>::new().plan_fft_forward(params.n_fft);
+        let mut buffer = vec![Complex32::new(0.0, 0.0); params.n_fft];
+        let mut output = vec![0.0_f32; params.n_mels * frame_count];
+        for frame in 0..frame_count {
+            let start = frame * params.hop_length;
+            for index in 0..params.n_fft {
+                buffer[index] = Complex32::new(padded[start + index] * window[index], 0.0);
+            }
+            fft.process(&mut buffer);
+            for mel in 0..params.n_mels {
+                let filter = &mel_filters[mel * fft_bins..(mel + 1) * fft_bins];
+                let mut value = 0.0_f32;
+                for bin in 0..fft_bins {
+                    let fft_value = buffer[bin];
+                    let power = fft_value
+                        .re
+                        .mul_add(fft_value.re, fft_value.im * fft_value.im);
+                    value = filter[bin].mul_add(power, value);
+                }
+                output[mel * frame_count + frame] = value.max(1e-10).log10();
+            }
+        }
+        let peak = output.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let floor = peak - 8.0;
+        for value in &mut output {
+            *value = (value.max(floor) + 4.0) / 4.0;
+        }
+        output
+    }
+
+    /// Deterministic waveforms over the paths a numerical change would move: a tone, noise,
+    /// silence, an impulse, a loud square wave, a very quiet tone, and lengths on both sides of
+    /// a chunk boundary (31, 32, 33 frames), a single frame and a part frame.
+    fn waveform_corpus() -> Vec<(String, Vec<f32>)> {
+        let mut state = 0x243f_6a88_u32;
+        let mut noise = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let mut corpus: Vec<(String, Vec<f32>)> = vec![
+            (
+                "tone".into(),
+                (0..16_000)
+                    .map(|i| (i as f32 * 0.001).sin() * 0.5)
+                    .collect(),
+            ),
+            ("noise".into(), (0..16_000).map(|_| noise()).collect()),
+            ("silence".into(), vec![0.0; 8_000]),
+            ("impulse".into(), {
+                let mut v = vec![0.0_f32; 8_000];
+                v[7] = 1.0;
+                v
+            }),
+            (
+                "loud".into(),
+                (0..8_000)
+                    .map(|i| {
+                        if (i / 37) % 2 == 0 {
+                            30_000.0
+                        } else {
+                            -30_000.0
+                        }
+                    })
+                    .collect(),
+            ),
+            (
+                "quiet".into(),
+                (0..8_000)
+                    .map(|i| (i as f32 * 0.01).sin() * 1e-30)
+                    .collect(),
+            ),
+        ];
+        for frames in [1, 31, 32, 33, 65] {
+            let count = frames * 160 + 7;
+            corpus.push((
+                format!("{frames}_frames"),
+                (0..count)
+                    .map(|i| (i as f32 * 0.003).sin() * 0.3 + noise() * 0.05)
+                    .collect(),
+            ));
+        }
+        corpus
+    }
+
+    fn log_mel_of(processor: &Qwen3AudioProcessor, samples: &[f32]) -> Vec<f32> {
+        processor
+            .preprocess_decoded(DecodedAudio {
+                samples: samples.to_vec(),
+                sample_rate: 16_000,
+            })
+            .expect("log-mel")
+            .into_raw_vec_and_offset()
+            .0
+    }
+
+    fn assert_same_bits(name: &str, actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len(), "{name}: value count");
+        for (index, (a, e)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                a.to_bits() == e.to_bits(),
+                "{name}: value {index} is {a:?}, the frame-by-frame computation gives {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_batched_frontend_equals_the_frame_by_frame_computation_bit_for_bit() {
+        let processor = Qwen3AudioProcessor::new();
+        let params = processor.params().clone();
+        for (name, samples) in waveform_corpus() {
+            let frames = samples.len() / params.hop_length;
+            assert_same_bits(
+                &name,
+                &log_mel_of(&processor, &samples),
+                &frame_by_frame_reference(&samples, samples.len(), frames, &params),
+            );
+        }
+    }
+
+    #[test]
+    fn a_batch_of_unequal_clips_equals_each_clip_padded_to_the_longest() {
+        let processor = Qwen3AudioProcessor::new();
+        let params = processor.params().clone();
+        let corpus = waveform_corpus();
+        let clips: Vec<DecodedAudio> = corpus
+            .iter()
+            .map(|(_, samples)| DecodedAudio {
+                samples: samples.clone(),
+                sample_rate: 16_000,
+            })
+            .collect();
+        let refs: Vec<&DecodedAudio> = clips.iter().collect();
+        let output = processor.preprocess_decoded_clips(&refs).expect("batch");
+        let longest = corpus.iter().map(|(_, s)| s.len()).max().unwrap_or(0);
+        let frames = longest / params.hop_length;
+        assert_eq!(output.encoder_input.shape(), &[corpus.len(), 128, frames]);
+        let values = output.encoder_input.as_f32();
+        let values = values.as_slice_memory_order().expect("contiguous");
+        for (index, (name, samples)) in corpus.iter().enumerate() {
+            assert_same_bits(
+                name,
+                &values[index * 128 * frames..(index + 1) * 128 * frames],
+                &frame_by_frame_reference(samples, longest, frames, &params),
+            );
+        }
+    }
+
+    #[test]
+    fn a_spectrum_that_overflows_takes_the_full_product_and_keeps_its_bits() {
+        // f32 squares overflow above about 1.8e19; the windowed FFT of 1e30-scale samples is
+        // far past it, so every power term is infinite and the band product would differ from
+        // the full one (a zero weight times infinity is NaN there).
+        let processor = Qwen3AudioProcessor::new();
+        let params = processor.params().clone();
+        let overflowing: Vec<f32> = (0..4_000)
+            .map(|i| if i % 2 == 0 { 1e30 } else { -1e30 })
+            .collect();
+        assert!(
+            a_power_term_overflows(&overflowing, &params),
+            "the overflow fixture no longer overflows; the full-product path is untested"
         );
-        assert_eq!(reflect_pad(&[2.0], 2), vec![2.0; 5]);
+        let frames = overflowing.len() / params.hop_length;
+        let expected = frame_by_frame_reference(&overflowing, overflowing.len(), frames, &params);
+        // The full product turns every row into NaN (a zero weight times infinity), which
+        // `max` then drops for the floor, so the clip reads as silence; the band product alone
+        // would read as infinity. Both frontends must agree on the former.
+        assert!(
+            expected.iter().all(|value| *value == -1.5),
+            "the reference is the floor"
+        );
+        assert_same_bits("overflow", &log_mel_of(&processor, &overflowing), &expected);
+
+        // And an ordinary clip takes the band product throughout.
+        let (_, ordinary) = waveform_corpus().swap_remove(1);
+        assert!(
+            !a_power_term_overflows(&ordinary, &params),
+            "an ordinary clip should take the band product"
+        );
+    }
+
+    /// One band per filter describes the filter only while its weight is contiguous. It is,
+    /// because the filters are triangular and adjacent, and the band product would silently
+    /// drop weight if that ever stopped being true, so it is asserted rather than trusted;
+    /// the bank's density is the reason the band product pays.
+    #[test]
+    fn mel_filter_bands_are_contiguous_and_sparse() {
+        let params = Qwen3AudioParams::default();
+        let fft_bins = params.n_fft / 2 + 1;
+        let frontend = MelFrontend::build(&params);
+        let mut non_zero = 0;
+        for (mel, &(first, last)) in frontend.bands.iter().enumerate() {
+            let row = &frontend.filters[mel * fft_bins..(mel + 1) * fft_bins];
+            assert!(
+                row[..first].iter().chain(&row[last..]).all(|w| *w == 0.0),
+                "mel row {mel} carries weight outside [{first}, {last}); the band product \
+                 would drop it"
+            );
+            non_zero += row.iter().filter(|w| **w != 0.0).count();
+        }
+        // 394 of 25,728 at the default geometry.
+        assert!(
+            non_zero * 50 < params.n_mels * fft_bins,
+            "the filter bank is {non_zero}/{} non-zero, denser than the band product assumes",
+            params.n_mels * fft_bins
+        );
+    }
+
+    /// `mul_add` and the unfused product round differently on real spectra, so the comment
+    /// warning against the sibling frontends' formulation is load bearing. If this ever stops
+    /// differing the warning can go.
+    #[test]
+    fn the_fused_and_unfused_power_terms_really_do_differ() {
+        let params = Qwen3AudioParams::default();
+        let (_, samples) = waveform_corpus().swap_remove(1);
+        let window = hann_window(params.n_fft);
+        let fft = FftPlanner::<f32>::new().plan_fft_forward(params.n_fft);
+        let mut buffer = vec![Complex32::new(0.0, 0.0); params.n_fft];
+        let (mut differing, mut total) = (0_usize, 0_usize);
+        for frame in 0..40 {
+            let start = frame * params.hop_length;
+            for index in 0..params.n_fft {
+                buffer[index] = Complex32::new(samples[start + index] * window[index], 0.0);
+            }
+            fft.process(&mut buffer);
+            for bin in &buffer[..params.n_fft / 2 + 1] {
+                let fused = bin.re.mul_add(bin.re, bin.im * bin.im);
+                let unfused = bin.re * bin.re + bin.im * bin.im;
+                total += 1;
+                differing += usize::from(fused.to_bits() != unfused.to_bits());
+            }
+        }
+        assert!(
+            differing > 0,
+            "the two power formulations agreed on all {total} bins"
+        );
+    }
+
+    /// Whether some frame's power spectrum of `samples` is not finite, so the frontend takes the
+    /// full product on it.
+    fn a_power_term_overflows(samples: &[f32], params: &Qwen3AudioParams) -> bool {
+        let window = hann_window(params.n_fft);
+        let fft = FftPlanner::<f32>::new().plan_fft_forward(params.n_fft);
+        let mut buffer = vec![Complex32::new(0.0, 0.0); params.n_fft];
+        (0..samples.len() / params.hop_length).any(|frame| {
+            let start = frame * params.hop_length;
+            for index in 0..params.n_fft {
+                let sample = samples.get(start + index).copied().unwrap_or(0.0);
+                buffer[index] = Complex32::new(sample * window[index], 0.0);
+            }
+            fft.process(&mut buffer);
+            buffer[..params.n_fft / 2 + 1]
+                .iter()
+                .any(|bin| !bin.re.mul_add(bin.re, bin.im * bin.im).is_finite())
+        })
+    }
+
+    #[test]
+    fn a_processor_clone_shares_the_built_frontend_and_computes_the_same_bits() {
+        let processor = Qwen3AudioProcessor::new();
+        let (_, samples) = waveform_corpus().swap_remove(1);
+        let before = log_mel_of(&processor, &samples);
+        let clone = processor.clone();
+        assert_same_bits("clone", &log_mel_of(&clone, &samples), &before);
+        assert!(
+            Arc::ptr_eq(
+                processor.frontend.get().expect("built"),
+                clone.frontend.get().expect("built")
+            ),
+            "a clone after the first clip carries the same tables"
+        );
     }
 }

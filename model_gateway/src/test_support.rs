@@ -3,15 +3,9 @@
 //! only (`cfg(test)`, or the `test-util` feature the self dev-dependency
 //! turns on for them), never into a production build.
 
-use std::{
-    collections::BTreeMap,
-    net::{Ipv4Addr, SocketAddr},
-};
+use std::net::{Ipv4Addr, SocketAddr};
 
-use k8s_openapi::{
-    api::core::v1::{Pod, PodCondition, PodSpec, PodStatus},
-    apimachinery::pkg::apis::meta::v1::ObjectMeta,
-};
+use axum::response::Response;
 use tokio::net::TcpSocket;
 
 /// A loopback address nothing answers at, refused for as long as this value
@@ -67,36 +61,28 @@ impl RefusedAddress {
     }
 }
 
-/// A running, ready pod named `name` at `ip`, carrying `labels`: the shape
-/// the Kubernetes watchers' tests feed to their label selectors.
-pub fn make_labeled_pod(name: &str, ip: &str, labels: &[(&str, &str)]) -> Pod {
-    let mut label_map = BTreeMap::new();
-    for &(k, v) in labels {
-        label_map.insert(k.to_string(), v.to_string());
-    }
-    Pod {
-        metadata: ObjectMeta {
-            name: Some(name.to_string()),
-            uid: Some(format!("uid-{name}")),
-            labels: Some(label_map),
-            ..Default::default()
-        },
-        spec: Some(PodSpec::default()),
-        status: Some(PodStatus {
-            pod_ip: Some(ip.to_string()),
-            phase: Some("Running".to_string()),
-            conditions: Some(vec![PodCondition {
-                type_: "Ready".to_string(),
-                status: "True".to_string(),
-                last_probe_time: None,
-                last_transition_time: None,
-                message: None,
-                reason: None,
-                observed_generation: None,
-            }]),
-            ..Default::default()
-        }),
-    }
+/// The whole body of `response`, read as JSON.
+#[expect(
+    clippy::expect_used,
+    reason = "a test reader: a body that is not the JSON the test expects is a test failure"
+)]
+pub async fn json_of(response: Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    serde_json::from_slice(&bytes).expect("a JSON body")
+}
+
+/// The whole body of `response`, read as text.
+#[expect(
+    clippy::expect_used,
+    reason = "a test reader: a body that is not the text the test expects is a test failure"
+)]
+pub async fn text_of(response: Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    String::from_utf8(bytes.to_vec()).expect("a UTF-8 body")
 }
 
 #[cfg(test)]

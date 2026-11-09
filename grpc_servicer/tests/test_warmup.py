@@ -35,6 +35,7 @@ from smg_grpc_servicer.vllm import warmup as vllm_warmup
 from smg_grpc_servicer.warmup import (
     DEFAULT_BUDGET_SECS,
     WarmupInputs,
+    draw_nonce,
     hybrid_buckets,
     odd_variants,
     parse_setting,
@@ -232,13 +233,28 @@ def test_every_request_of_a_plan_has_its_own_tokens():
 
 
 def test_every_request_id_has_the_form_the_servicer_admits_while_readiness_is_held():
-    # The Rust servicers admit only `smg-warmup-<ordinal>` while readiness is
-    # held for the warm-up (WARMUP_REQUEST_ID_PREFIX / is_warmup_request_id in
-    # the engine servicer crate's request registry): a rename on either side
-    # would have every warm-up request refused and the pass count only errors.
+    # The Rust servicers admit only `smg-warmup-<nonce>-<ordinal>` while
+    # readiness is held for the warm-up, the nonce the server was constructed
+    # with (WARMUP_REQUEST_ID_PREFIX / is_warmup_request_id in the engine
+    # servicer crate's request registry), and the bare `smg-warmup-<ordinal>`
+    # when it was constructed with none: a rename on either side would have
+    # every warm-up request refused and the pass count only errors.
+    plan = plan_warmup(ISSUE, "full", nonce="c0ffee42")
+    ids = [request.request_id for step in plan.steps for request in step.requests]
+    assert ids and all(
+        re.fullmatch(r"smg-warmup-c0ffee42-[0-9]+", request_id) for request_id in ids
+    )
     plan = plan_warmup(ISSUE, "full")
     ids = [request.request_id for step in plan.steps for request in step.requests]
     assert ids and all(re.fullmatch(r"smg-warmup-[0-9]+", request_id) for request_id in ids)
+
+
+def test_a_drawn_nonce_is_letters_and_digits_and_differs_per_draw():
+    # The form the servicer's configuration admits (ASCII letters and digits,
+    # never a `-`, which separates it from the ordinal), fresh per process.
+    nonces = {draw_nonce() for _ in range(8)}
+    assert len(nonces) == 8
+    assert all(re.fullmatch(r"[0-9a-z]+", nonce) for nonce in nonces)
 
 
 def test_a_prompt_never_exceeds_the_step_nor_the_context_less_its_output():
@@ -2256,15 +2272,21 @@ def test_the_python_servicer_skips_the_pass_when_the_knob_is_off_or_bad(fake_vll
     assert any("No event loop runs here" in m for m in messages)
 
 
-def _health_servicer_module():
-    """The vLLM health servicer, loaded with a stand-in for vLLM's logger."""
+def _health_servicer_module(monkeypatch):
+    """The vLLM health servicer, loaded with a stand-in for vLLM's logger.
+
+    The stand-in lives for the test alone: a bare ``vllm`` left in
+    ``sys.modules`` satisfies another file's ``importorskip("vllm")`` in the
+    same process, and that file's real imports then fail under it.
+    """
     if "vllm.logger" not in sys.modules:
         vllm = types.ModuleType("vllm")
         vllm_logger = types.ModuleType("vllm.logger")
         vllm_logger.init_logger = logging.getLogger
         vllm.logger = vllm_logger
-        sys.modules.setdefault("vllm", vllm)
-        sys.modules["vllm.logger"] = vllm_logger
+        if "vllm" not in sys.modules:
+            monkeypatch.setitem(sys.modules, "vllm", vllm)
+        monkeypatch.setitem(sys.modules, "vllm.logger", vllm_logger)
     path = Path(__file__).parents[1] / "smg_grpc_servicer" / "vllm" / "health_servicer.py"
     spec = importlib.util.spec_from_file_location("warmup_health_servicer", path)
     module = importlib.util.module_from_spec(spec)
@@ -2273,7 +2295,7 @@ def _health_servicer_module():
 
 
 def test_the_health_service_answers_not_serving_while_the_pass_runs(monkeypatch):
-    module = _health_servicer_module()
+    module = _health_servicer_module(monkeypatch)
 
     class Engine:
         async def check_health(self):

@@ -61,6 +61,9 @@ What this table says beyond the Qwen ones:
   result renders as a user turn, and the model's turn after it opens with `<｜Assistant｜>` and
   the thought opened or closed (thinking mode, chat mode), so the output always starts in a stay
   of its own.
+- **An invoke written outside a block is the call** (`content + invoke_open = invoke`), as under
+  V4's table (its section): the serving engines' parsers for this spelling read it so as well, and
+  the gateway's older `deepseek_v41` parser did already.
 - **The block's opener is the blank line and the tag.** The template writes two newlines between
   a message's content and its calls block, and the family's reference parser (the checkpoint's
   `encoding` module) looks for the block as `\n\n<｜DSML｜ calls`, reading the content up to
@@ -101,7 +104,31 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   opens a block written without the blank line, as it did; what precedes it is content (the
   legacy parser trims those newlines too). The prompt ends with `<think>` in thinking mode and
   with `</think>` right after `<｜Assistant｜>` in chat mode, so the replay starts the output inside
-  the thought or in the content; bellwether has not recorded the group's set yet.
+  the thought or in the content. bellwether records the group's hand-written sets through the
+  engine's copy of the encoder (V4-Pro shares the group and replays its sets under its own row):
+  28 parse cases, sixteen common and twelve turns, which the corpus harness
+  (`tests/bellwether_parse_fixtures.rs`) replayed from bellwether's record tree every one bitwise
+  but the listed reasoning probe (bellwether #16). The fixture pin holds that record (V4-Flash's 28
+  cases and V4.1-Flash's 28, where it held sixteen earlier common cases of V4.1-Flash and no set
+  of V4-Flash), and the pinned harness replays it.
+- **An invoke written outside a block is the call** (`content + invoke_open = invoke`), as the
+  serving engines' own parsers for the family read it: their state machines start a call at the
+  invoke's opener from the content as from the block, and their detectors accept a bare invoke
+  where no block opened. The family's reference encoder refuses such a completion outright (its
+  parser reads the content up to the block's opener and then asserts that no DSML token stands in
+  the content), so it reads neither a call nor content there. Before this row the table kept the
+  invoke as content, its two tags counted as markers out of place: the one reading no reference
+  gives, and the call was lost. Seen live once in several hundred answers to one prompt, an invoke
+  written after `:tool` in place of the block's opener, which streamed as 37 content deltas of
+  markup before the model wrote the call again inside a block; with the row, that output is the
+  model's text (`\n\n:tool\n`) and two calls, which is what the engines' own servers deliver for
+  it. The invoke's close leads into the block's wrapping state, as a block's invoke does: a second
+  bare invoke is the next call, a block opener met there is wrapping (`calls + calls_open = calls`,
+  the blank-line spelling too), as it is to the engines' machines, whitespace after the call is the
+  template's, prose after it is text between calls (`Malformed { TextBetweenCalls }`, shown as
+  content by the chat adapter where the engines drop it), and the model's end of output there
+  closes nothing. The structural tag is unchanged: the grammar takes the block from a row into the
+  invoke from the wrapping state alone, so a forced call is still written as the block.
 - **A turn the prompt leaves unopened starts inside the thought.** The template writes
   `<｜Assistant｜>` and the thought's opener after a user message, and after a system message that
   ends the conversation or that an assistant turn follows (a coding agent's environment notes and
@@ -128,7 +155,8 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
 
 DSML as V4 spells it, with `function_calls` for the block's name: the table is V4's with the block's
 two terminals changed and the same `Tags::DSML_V4` for the invoke and parameter tags, so what the
-V4 section says of the format holds here (a calls block ends the thought; the blank line before
+V4 section says of the format holds here (a calls block ends the thought; an invoke written outside
+a block is the call; the blank line before
 the block is the opener's, `\n\n<｜DSML｜function_calls>` beside the bare tag, as the encoder's
 parser reads it; the prompt ends with `<think>` or `</think>` right after `<｜Assistant｜>`), with two
 exceptions at the turn's start. The table has no unopened row, and must not take V4's: the encoder
@@ -151,8 +179,12 @@ Beyond that:
   assistant turn and opens the thought again (`</function_results>`, two newlines, `<think>`; or
   `</think>` in chat mode), the tails the table anchors the turn at, so the output starts inside
   the thought, or in the content, as the tail says.
-- **Each DSML checkpoint reads with its own table.** The V4 block name and the V4.1 spaced tags are
-  content under this table and this block is content under theirs; the registry reads V3.2,
+- **Each DSML checkpoint reads with its own table.** The V4.1 spaced tags are content under this
+  table and this block is content under V4.1's. The V4 spelling shares this table's invoke and
+  parameter tags and differs in the block's name alone, so a block in that spelling here, or this
+  block under V4's table, is the foreign opener as content, its invokes as calls (invokes met
+  outside a block the table knows) and the foreign close as text between calls, as the serving
+  engines' own parsers for either spelling read it. The registry reads V3.2,
   V3.2-Speciale and V3.2-Exp here (the Exp checkpoint's own template writes the earlier V3.1
   spelling, but the engine renders its architecture through the V3.2 encoder, and bellwether
   records it so), the V4 checkpoints with theirs, and the `deepseek32` alias takes a deployment
@@ -170,10 +202,16 @@ every cut, and once each a thought and an answer, a calls block inside the thoug
 inside a string value, and the turn after a tool result in thinking and in chat mode. The other
 shapes of a tool-calling conversation (two calls in one block, a call after content, a call with
 no parameters, every kind of value, non-ASCII text) are hand-written cases of bellwether's sets,
-which its recorder renders through the encoder once the group has a manifest there; the corpus
-harness replays them from the fixture pin, and until then nothing in this repository checks what
-they parse to; the README row says awaiting fixtures until the pin holds it. What the table
-leaves open: the recorded set, and the live reading against the engine's own server.
+which its recorder renders through the engine's copy of the encoder (V3.2 and V3.2-Speciale as one
+group, V3.2-Exp as its own): 19 parse cases a group, eleven common and eight turns, which the
+corpus harness (`tests/bellwether_parse_fixtures.rs`) replayed from bellwether's record tree every
+one bitwise. The fixture pin holds that record (19 cases each for V3.2 and V3.2-Exp, where it held
+three earlier cases of V3.2-Exp and no set of V3.2), and the pinned harness replays it. The nine
+cases whose message carries a thought are not
+recorded: the encoder's chat-mode
+default renders none for a request that leaves the thinking switch alone, and the recorder
+refuses a reference the rendered turn does not carry. What the table leaves open: the live
+reading against the engine's own server.
 
 ## DeepSeek V3.1 (`deepseek_v3.1`)
 
@@ -360,6 +398,15 @@ What this table says beyond the DeepSeek one:
   (`reasoning + response_open = content`, `reasoning + tools_open = tools`) and for a tools
   block opened inside the answer (`content + tools_open = tools`): the region ended, however
   the model left it, since the tags are tokens the model cannot write as text.
+- **The answer's closer ends a thought too.** On about 1 % of very long turns the model writes
+  its reply straight into the prefilled thought and closes it with `<|close|>response<|sep|>`,
+  never with the thought's closer or the answer's opener (`reasoning + response_close =
+  message`, a row for the parser alone: the grammars derived from the table keep the
+  thought's own close): the closer ends the thought as the end-of-turn tag would and is
+  dropped as wrapping, so no marker reaches the client. The reply stays the thought's text, streamed and
+  whole alike, since every byte is classified once, where it arrives; the engine's own parser
+  reads the whole output as the answer and, streaming, sends the reply a second time as the
+  answer after the thought. Before the row the closer was the thought's text.
 - **The prompt opens the thought.** The template ends the generation prompt with
   `<|open|>message role="assistant"<|sep|><|open|>think<|sep|>`, so an empty thought writes
   `<|close|>think<|sep|>` at once, and the engine's prompt replay puts the output inside the

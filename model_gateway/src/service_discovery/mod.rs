@@ -38,6 +38,7 @@ mod snapshot;
 pub(crate) mod testing;
 
 pub use consul::ConsulProviderConfig;
+pub(crate) use file::export_manifest;
 pub use file::FileProviderConfig;
 #[cfg(feature = "test-util")]
 pub use kubernetes::start_service_discovery_with_client;

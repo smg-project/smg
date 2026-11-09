@@ -4,8 +4,6 @@
 //! - Usage calculation from gRPC responses
 //! - ChatCompletionResponse construction
 
-use std::collections::HashMap;
-
 use openai_protocol::{common::Usage, generate::GenerateResponse};
 
 use crate::{
@@ -169,18 +167,41 @@ pub(crate) fn effective_weight_version<'a>(
 /// - cumulative streams send the count in the Complete message, and the
 ///   running count in every chunk before it
 pub(crate) struct CompletionTokenTracker {
-    tokens: HashMap<u32, u32>,
-    /// The running count a cumulative stream reported in its latest chunk:
-    /// how far it had come, for a stream that ends before its Complete.
-    reported: HashMap<u32, u32>,
+    /// One entry per choice index, grown as the indices come (the engines
+    /// send them dense from zero): the count known for the choice, and the
+    /// running count a cumulative stream reported in its latest chunk (how
+    /// far it had come, for a stream that ends before its Complete).
+    choices: Vec<TrackedChoice>,
 }
+
+#[derive(Clone, Copy, Default)]
+struct TrackedChoice {
+    tokens: u32,
+    reported: u32,
+}
+
+/// Choice indices past this many are a malformed engine message, not a
+/// vector to grow: their counts are dropped.
+const MAX_TRACKED_CHOICES: usize = 4096;
 
 impl CompletionTokenTracker {
     pub fn new() -> Self {
         Self {
-            tokens: HashMap::new(),
-            reported: HashMap::new(),
+            choices: Vec::new(),
         }
+    }
+
+    /// The entry of choice `index`, made when first seen; `None` for an
+    /// index past [`MAX_TRACKED_CHOICES`].
+    fn choice(&mut self, index: u32) -> Option<&mut TrackedChoice> {
+        let index = index as usize;
+        if index >= MAX_TRACKED_CHOICES {
+            return None;
+        }
+        if self.choices.len() <= index {
+            self.choices.resize(index + 1, TrackedChoice::default());
+        }
+        self.choices.get_mut(index)
     }
 
     /// Record tokens from a streaming chunk.
@@ -188,11 +209,13 @@ impl CompletionTokenTracker {
     /// report it in Complete instead, so a chunk of theirs only notes the
     /// running count it carries.
     pub fn record_chunk(&mut self, chunk: &ProtoGenerateStreamChunk) {
+        let Some(choice) = self.choice(chunk.index()) else {
+            return;
+        };
         if chunk.chunk_semantics().is_delta() {
-            *self.tokens.entry(chunk.index()).or_insert(0) += chunk.token_ids().len() as u32;
+            choice.tokens += chunk.token_ids().len() as u32;
         } else {
-            self.reported
-                .insert(chunk.index(), chunk.completion_tokens());
+            choice.reported = chunk.completion_tokens();
         }
     }
 
@@ -200,12 +223,11 @@ impl CompletionTokenTracker {
     /// Delta streams keep the count accumulated from their chunks; cumulative
     /// streams take the value from Complete.
     pub fn record_complete(&mut self, complete: &ProtoGenerateComplete) {
-        let index = complete.index();
-        if complete.chunk_semantics().is_delta() {
-            // Keep accumulated count; ensure entry exists
-            self.tokens.entry(index).or_insert(0);
-        } else {
-            self.tokens.insert(index, complete.completion_tokens());
+        let Some(choice) = self.choice(complete.index()) else {
+            return;
+        };
+        if !complete.chunk_semantics().is_delta() {
+            choice.tokens = complete.completion_tokens();
         }
     }
 
@@ -219,14 +241,14 @@ impl CompletionTokenTracker {
     /// generated past the stop carries the tail's count, and the stream does
     /// not pass it on.
     pub fn record_local_stop(&mut self, index: u32) {
-        let reported = self.reported.get(&index).copied().unwrap_or(0);
-        let known = self.tokens.entry(index).or_insert(0);
-        *known = (*known).max(reported);
+        if let Some(choice) = self.choice(index) {
+            choice.tokens = choice.tokens.max(choice.reported);
+        }
     }
 
     /// Get total completion tokens across all indices
     pub fn total(&self) -> u32 {
-        self.tokens.values().sum()
+        self.choices.iter().map(|choice| choice.tokens).sum()
     }
 
     /// Completion tokens delivered so far across all indices: the count
@@ -234,12 +256,10 @@ impl CompletionTokenTracker {
     /// stream last reported. How far a stream that ends before its Complete
     /// had come.
     pub fn delivered(&self) -> u32 {
-        let mut per_index = self.reported.clone();
-        for (index, tokens) in &self.tokens {
-            let known = per_index.entry(*index).or_insert(0);
-            *known = (*known).max(*tokens);
-        }
-        per_index.values().sum()
+        self.choices
+            .iter()
+            .map(|choice| choice.tokens.max(choice.reported))
+            .sum()
     }
 }
 

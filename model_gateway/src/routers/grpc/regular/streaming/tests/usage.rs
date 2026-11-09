@@ -30,16 +30,13 @@ use tokio::{sync::oneshot, task::JoinHandle};
 use super::{
     super::*,
     eof::{
-        chunk, collect_events, data_frame, decoded_stream, gated_stream, mock_worker_endpoint,
-        processor, scripted_stream, trailers_frame, CharacterTokenizer,
+        chunk, collect_events, data_frame, decoded_stream, gated_stream, messages_spec,
+        mock_worker_endpoint, processor, response_processor, runtime, scripted_stream,
+        trailers_frame, CharacterTokenizer,
     },
     symphony_chat::assigned_message,
 };
-use crate::{
-    rate_limit::test_support::RecordingBackend,
-    routers::grpc::{pipeline::RequestPipeline, regular::processor::ResponseProcessor},
-    worker::WorkerRegistry,
-};
+use crate::{rate_limit::test_support::RecordingBackend, routers::grpc::pipeline::RequestPipeline};
 
 /// A scripted worker stream and the mock server that owns its connection.
 type Scripted = (ProtoStream, JoinHandle<()>);
@@ -179,19 +176,6 @@ fn dispatch() -> context::DispatchMetadata {
     }
 }
 
-/// The non-streamed processor with the parsers of [`processor`].
-fn response_processor() -> ResponseProcessor {
-    ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::with_flags(
-            Arc::new(WorkerRegistry::new()),
-            None,
-            Some("qwen3".to_string()),
-        ),
-    )
-}
-
 fn tokenizer() -> Arc<dyn Tokenizer> {
     Arc::new(CharacterTokenizer::default())
 }
@@ -267,7 +251,7 @@ async fn streamed_completion_usage(
     let response = Arc::new(processor(false))
         .process_completion_streaming_response(
             context::ExecutionResult::Single { stream },
-            CompletionResponseSpec::from(request),
+            CompletionResponseSpec::new(request, Vec::new()),
             dispatch,
             tokenizer(),
             reservation,
@@ -298,8 +282,9 @@ async fn non_streamed_completion(
     let response = response_processor()
         .process_non_streaming_completion_response(
             context::ExecutionResult::Single { stream },
-            CompletionResponseSpec::from(request),
+            CompletionResponseSpec::new(request, Vec::new()),
             dispatch(),
+            &tokenizer,
             &mut decoder,
         )
         .await
@@ -371,23 +356,6 @@ async fn non_streamed_generate(
         .unwrap_or_else(|response| panic!("{}", response.status()));
     server.abort();
     responses
-}
-
-/// A Messages request with thinking on or off, no tools.
-fn messages_spec(thinking: bool) -> MessagesResponseSpec {
-    MessagesResponseSpec {
-        thinking_requested: thinking,
-        thinking_text_returned: true,
-        reasoning_in_prefill: false,
-        tool_choice: None,
-        has_tools: false,
-        history_tool_calls_count: 0,
-        chat_tools: Vec::new().into(),
-        stop_sequences: None,
-        symphony: None,
-        first_tool_call_only: false,
-        parser_names: None,
-    }
 }
 
 /// Drive the Messages streaming path over `stream` with a reservation to
@@ -888,9 +856,13 @@ async fn generate_settlement_carries_the_engines_counts_streamed_and_not() {
 }
 
 /// The settlement of a Messages request carries the engine's counts, streamed
-/// and not, though the Messages usage reports no cache hits and the greater
-/// of the engine's and the parser's thinking count: the engine's cache hit
-/// and its own thinking count, zero where its frames carry none.
+/// and not: the engine's cache hit and its own thinking count, zero where its
+/// frames carry none. The Messages usage reports the same cache hit as
+/// `cache_read_input_tokens` beside `input_tokens` = the prompt outside the
+/// cache, on the final `message_delta` and on the collected message (integers
+/// either way; the `message_start` skeleton, which precedes the engine's
+/// frames, reports the whole rendered prompt and a zero cache hit), and
+/// the greater of the engine's and the parser's thinking count.
 #[tokio::test]
 async fn messages_settlement_carries_the_engines_counts_streamed_and_not() {
     let texts = ["<think>", "ab", "</think>", "de"];
@@ -904,20 +876,53 @@ async fn messages_settlement_carries_the_engines_counts_streamed_and_not() {
                 None => engine_stream(frames(&texts, 1, counters)).await,
             }
         };
+        let spec = || {
+            let mut spec = messages_spec(true);
+            spec.prompt_tokens = counters.prompt;
+            spec
+        };
         let (handle, backend) = RecordingBackend::reservation();
-        let events = streamed_messages(scripted().await, messages_spec(true), Some(handle)).await;
+        let events = streamed_messages(scripted().await, spec(), Some(handle)).await;
         assert_eq!(backend.settlements(), vec![expected], "{name}: streamed");
         let delta = events
             .iter()
             .rfind(|event| event["type"] == "message_delta")
             .expect("a message_delta event");
         assert_eq!(
-            delta["usage"]["cache_read_input_tokens"], 0,
-            "{name}: the Messages usage reports no cache hits"
+            delta["usage"]["cache_read_input_tokens"], expected.cached_input_tokens,
+            "{name}: the message_delta usage reports the engine's cache hit"
         );
-        let (message, counts) = non_streamed_messages(scripted().await, messages_spec(true)).await;
+        assert_eq!(delta["usage"]["cache_creation_input_tokens"], 0, "{name}");
+        assert_eq!(
+            delta["usage"]["input_tokens"],
+            expected.actual_input_tokens - expected.cached_input_tokens,
+            "{name}: the message_delta input_tokens is the prompt outside the cache"
+        );
+        let start = events
+            .iter()
+            .find(|event| event["type"] == "message_start")
+            .expect("a message_start event");
+        assert_eq!(
+            start["message"]["usage"]["input_tokens"], expected.actual_input_tokens,
+            "{name}: the skeleton reports the whole rendered prompt"
+        );
+        assert_eq!(
+            start["message"]["usage"]["cache_read_input_tokens"], 0,
+            "{name}: the skeleton precedes the engine's frames"
+        );
+        let (message, counts) = non_streamed_messages(scripted().await, spec()).await;
         assert_eq!(counts.settlement(), expected, "{name}: non-streamed");
-        assert_eq!(message.usage.cache_read_input_tokens, Some(0), "{name}");
+        assert_eq!(
+            message.usage.cache_read_input_tokens,
+            Some(expected.cached_input_tokens),
+            "{name}: the collected message reports the engine's cache hit"
+        );
+        assert_eq!(message.usage.cache_creation_input_tokens, Some(0), "{name}");
+        assert_eq!(
+            message.usage.input_tokens,
+            expected.actual_input_tokens - expected.cached_input_tokens,
+            "{name}: the collected message's input_tokens is the prompt outside the cache"
+        );
     }
 }
 
@@ -925,9 +930,9 @@ async fn messages_settlement_carries_the_engines_counts_streamed_and_not() {
 /// a streamed answer's are: the chat, completion, generate and messages
 /// shapes each render their counts and one generation observation under
 /// their own endpoint, a transcription (decoded through the generate
-/// processor) under its own; no TTFT or TPOT, which a collected answer has
-/// no first token for; and no prompt figures for generate, whose streamed
-/// answer counts none either.
+/// processor) under its own, the prompt and its cache hit included, as the
+/// streamed generate answer counts them; and no TTFT or TPOT, which a
+/// collected answer has no first token for.
 #[test]
 fn a_collected_answer_records_its_token_and_generation_families() {
     use crate::observability::metrics::test_support::render_with_recorder;
@@ -944,14 +949,9 @@ fn a_collected_answer_records_its_token_and_generation_families() {
     let completion_request: CompletionRequest =
         serde_json::from_value(json!({"model": "eof-test", "prompt": "hi", "n": 1}))
             .expect("completion request");
-    // The recorder is thread-local: a current-thread runtime keeps every
-    // record on this thread.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a runtime");
+    let rt = runtime();
     let rendered = render_with_recorder(|| {
-        runtime.block_on(async {
+        rt.block_on(async {
             non_streamed_chat(
                 engine_stream(frames(&["ab", "c"], 1, counters)).await,
                 &chat_request,
@@ -990,8 +990,12 @@ fn a_collected_answer_records_its_token_and_generation_families() {
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"completions\",token_type=\"cached\"} 4",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"completions\",token_type=\"output\"} 2",
         "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"completions\"} 1",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"generate\",token_type=\"input\"} 12",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"generate\",token_type=\"cached\"} 4",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"generate\",token_type=\"output\"} 4",
         "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"generate\"} 1",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"audio_transcriptions\",token_type=\"input\"} 12",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"audio_transcriptions\",token_type=\"cached\"} 4",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"audio_transcriptions\",token_type=\"output\"} 5",
         "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"audio_transcriptions\"} 1",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"messages\",token_type=\"input\"} 12",
@@ -1009,8 +1013,6 @@ fn a_collected_answer_records_its_token_and_generation_families() {
         "smg_router_tpot_seconds",
         "smg_router_time_to_first_token_seconds",
         "smg_router_request_time_per_output_token_seconds",
-        "endpoint=\"generate\",token_type=\"input\"",
-        "endpoint=\"generate\",token_type=\"cached\"",
     ] {
         assert!(
             !rendered.contains(absent),
@@ -1034,14 +1036,9 @@ fn a_collected_symphony_message_records_its_token_and_generation_families() {
         spec_accepted: 0,
         spec_drafted: 0,
     };
-    // The recorder is thread-local: a current-thread runtime keeps every
-    // record on this thread.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a runtime");
+    let rt = runtime();
     let rendered = render_with_recorder(|| {
-        runtime.block_on(async {
+        rt.block_on(async {
             let (_, counts) = non_streamed_messages(
                 engine_stream(frames(&["hi"], 1, counters)).await,
                 assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false),
@@ -1348,7 +1345,7 @@ async fn a_watched_completion_stream_whose_client_leaves_with_held_text_ends_at_
     let stream = stream.until_client_gone(&tx, "cmpl-eof");
     let processor = processor(false);
     let stop = Some(StringOrArray::Array(vec!["hiya".to_string()]));
-    let spec = CompletionResponseSpec::from(&request);
+    let spec = CompletionResponseSpec::new(&request, Vec::new());
     let streamed = processor.process_completion_streaming_chunks(
         stream,
         dispatch(),
@@ -1358,6 +1355,7 @@ async fn a_watched_completion_stream_whose_client_leaves_with_held_text_ends_at_
         "p",
         0,
         &tx,
+        None,
     );
     let client = async {
         let mut text = String::new();

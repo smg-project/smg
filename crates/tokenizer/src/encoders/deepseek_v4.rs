@@ -9,10 +9,10 @@ use std::fmt::Write as _;
 
 use serde_json::Value;
 
-// `DsEncodingError` lives in `deepseek_common` (shared with V4.1) and is
-// re-exported here unchanged: it is part of this module's public API
-// (returned from `encode_messages`), and `pub(super)` items are only
-// reachable within `encoders` on their own.
+// `DsEncodingError` lives in `deepseek_common` (one type for the three
+// renderers) and is re-exported here unchanged: it is part of this module's
+// public API (returned from `encode_messages`), and `pub(super)` items are
+// only reachable within `encoders` on their own.
 pub use super::deepseek_common::DsEncodingError;
 // Reuse the public ThinkingMode enum from the V3.2 module to keep the
 // "thinking" / "chat" mode invariant identical across DeepSeek versions.
@@ -26,7 +26,7 @@ use super::{
         after_last_user, at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
         find_last_user_index, merge_tool_messages, push_tools_and_response_format,
         render_v4_tools_template, sort_tool_results_by_call_order, task_sp_token, to_json,
-        tool_schemas, DsmlTags, Turn,
+        tool_schemas, DsmlTags, IncomingBlocks, Turn,
     },
     RendererProfile,
 };
@@ -152,13 +152,7 @@ fn render_message(
     drop_thinking: bool,
     reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<String, DsEncodingError> {
-    let Some(msg) = messages.get(index) else {
-        return Err(DsEncodingError::IndexOutOfRange {
-            index,
-            len: messages.len(),
-        });
-    };
-    let turn = Turn::read(index, msg);
+    let turn = Turn::read(index, messages)?;
     let last_user_idx = find_last_user_index(messages);
     let mut prompt = String::new();
 
@@ -174,15 +168,7 @@ fn render_message(
 
     match turn.role {
         "system" => render_system(&mut prompt, &turn),
-        "developer" => {
-            if turn.content.is_empty() {
-                return Err(DsEncodingError::InvalidMessage {
-                    role: turn.role.to_string(),
-                    msg: turn.msg.to_string(),
-                });
-            }
-            render_developer(&mut prompt, &turn);
-        }
+        "developer" => render_developer(&mut prompt, &turn)?,
         "user" => render_user(&mut prompt, turn.msg, turn.content),
         "latest_reminder" => {
             prompt.push_str(LATEST_REMINDER);
@@ -236,12 +222,12 @@ fn render_system(prompt: &mut String, turn: &Turn<'_>) {
 }
 
 /// A developer message: the user token, its content, then the tools and
-/// the response format it carries (the content is never empty: the caller
-/// refused an empty one).
-fn render_developer(prompt: &mut String, turn: &Turn<'_>) {
+/// the response format it carries; an empty one is refused.
+fn render_developer(prompt: &mut String, turn: &Turn<'_>) -> Result<(), DsEncodingError> {
+    let content = turn.developer_content()?;
     let mut content_developer = String::new();
     content_developer.push_str(USER);
-    content_developer.push_str(turn.content);
+    content_developer.push_str(content);
     push_tools_and_response_format(
         &mut content_developer,
         turn.tools.as_deref(),
@@ -249,6 +235,7 @@ fn render_developer(prompt: &mut String, turn: &Turn<'_>) {
         render_tools,
     );
     prompt.push_str(&content_developer);
+    Ok(())
 }
 
 /// A user message: the user token, then its content blocks (tool results
@@ -457,7 +444,7 @@ pub(crate) fn render_messages(
     // thinking, a user turn otherwise.
     let messages = marks::without_marks(messages);
     // Preprocess: merge tool messages and sort tool results.
-    let merged = merge_tool_messages(&messages);
+    let merged = merge_tool_messages(&messages, IncomingBlocks::Rebuilt);
     let mut full_messages = sort_tool_results_by_call_order(merged);
     let mut prompt = if params.add_default_bos_token {
         BOS.to_string()
@@ -496,7 +483,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        super::deepseek_common::{ASSISTANT_SP_TOKEN, LATEST_REMINDER_SP_TOKEN, USER_SP_TOKEN},
+        super::deepseek_common::{
+            object_arguments_render_one_parameter_per_key_through, ASSISTANT_SP_TOKEN,
+            LATEST_REMINDER_SP_TOKEN, USER_SP_TOKEN,
+        },
         *,
     };
 
@@ -633,34 +623,10 @@ mod tests {
     }
     #[test]
     fn object_form_tool_call_arguments_render_params() {
-        // `model_gateway`'s `process_tool_call_arguments` converts the OpenAI
-        // arguments *string* into a dict before the chat template runs, so the
-        // encoder receives object-form arguments. It must render them, not drop
-        // them — dropping erased every historical tool call's parameters in
-        // multi-turn prompts and made the model loop (re-calling tools forever).
-        let msgs = [
-            user("call my tool"),
-            json!({
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "search",
-                            "arguments": { "query": "deepseek", "limit": 5 }
-                        }
-                    }
-                ]
-            }),
-        ];
-        let out = encode_messages(&msgs, ThinkingMode::Chat, &EncodeParams::default()).unwrap();
-        assert!(out.contains(&format!(
-            "<{DSML_TOKEN}parameter name=\"query\" string=\"true\">deepseek</{DSML_TOKEN}parameter>"
-        )));
-        assert!(out.contains(&format!(
-            "<{DSML_TOKEN}parameter name=\"limit\" string=\"false\">5</{DSML_TOKEN}parameter>"
-        )));
+        object_arguments_render_one_parameter_per_key_through(
+            |msgs| encode_messages(msgs, ThinkingMode::Chat, &EncodeParams::default()),
+            "parameter",
+        );
     }
     /// A system message after the first renders as the serving engine's copy
     /// of the encoder renders it: bare text with no role marker, and the
@@ -997,5 +963,44 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// The reference writes the response-format section under `if
+    /// response_format:`, so `null` and `{}` render no section, on a system
+    /// and on a developer message (the engine's own encoder copy renders
+    /// these bytes).
+    #[test]
+    fn a_falsy_response_format_renders_no_section() {
+        for (mode, thinking_token) in [
+            (ThinkingMode::Chat, THINKING_END_TOKEN),
+            (ThinkingMode::Thinking, THINKING_START_TOKEN),
+        ] {
+            for falsy in [json!(null), json!({})] {
+                let messages = [
+                    json!({ "role": "system", "content": "You are terse.", "response_format": falsy }),
+                    user("hello"),
+                ];
+                let out = encode_messages(&messages, mode, &EncodeParams::default()).unwrap();
+                assert_eq!(
+                    out,
+                    format!(
+                        "{BOS_TOKEN}You are terse.{USER_SP_TOKEN}hello{ASSISTANT_SP_TOKEN}{thinking_token}"
+                    ),
+                    "{falsy}"
+                );
+            }
+        }
+        let messages = [
+            json!({ "role": "developer", "content": "Answer in one line.", "response_format": null }),
+            user("hello"),
+        ];
+        let out = encode_messages(&messages, ThinkingMode::Chat, &EncodeParams::default()).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{BOS_TOKEN}{USER_SP_TOKEN}Answer in one line.{USER_SP_TOKEN}hello\
+                 {ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}"
+            )
+        );
     }
 }

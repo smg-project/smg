@@ -13,23 +13,11 @@ use serde_json::{json, Value};
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
 use tokio::{sync::oneshot, time::timeout};
 
-use super::{super::HarmonyStreamingProcessor, usage::harmony_tokens};
+use super::{super::HarmonyStreamingProcessor, chunk, usage::harmony_tokens};
 use crate::{
     observability::metrics::metrics_labels,
     routers::grpc::{context, regular::streaming::tests::eof::gated_stream, utils},
 };
-
-fn chunk(token_ids: Vec<u32>) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
-            index: 0,
-            prompt_tokens: 3,
-            completion_tokens: token_ids.len() as u32,
-            token_ids,
-            ..Default::default()
-        })),
-    }
-}
 
 fn complete(output_ids: Vec<u32>) -> proto::GenerateResponse {
     proto::GenerateResponse {

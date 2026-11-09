@@ -290,6 +290,38 @@ pub enum CallId {
     Header,
 }
 
+/// The text that opens the model's turn, with its reverse finder built once with the table:
+/// the prompt's replay starts at the opener's last occurrence, and a request searches for it two
+/// or three times (the replay, the turn, an unopened turn), so the searcher's preprocessing of
+/// the needle is paid here, not on every search.
+#[derive(Clone, Debug)]
+struct TurnOpener {
+    text: String,
+    finder: memchr::memmem::FinderRev<'static>,
+}
+
+impl TurnOpener {
+    fn new(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            finder: memchr::memmem::FinderRev::new(text).into_owned(),
+        }
+    }
+
+    /// The byte offset where the opener last occurs in `prompt`, as `str::rfind` finds it.
+    fn rfind(&self, prompt: &str) -> Option<usize> {
+        self.finder.rfind(prompt.as_bytes())
+    }
+}
+
+impl PartialEq for TurnOpener {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
+impl Eq for TurnOpener {}
+
 /// One format's table. Built with [`Format::new`] and the methods that add a row each; the
 /// first state added is the initial one.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -301,10 +333,15 @@ pub struct Format {
     scanner_markers: Arc<[String]>,
     states: Vec<State>,
     transitions: Vec<Transition>,
+    /// Parser-only boundary tolerance; grammars retain the canonical transitions.
+    leading_transitions: Vec<Transition>,
+    /// Parser-only recovery rows, followed after text as well, for a terminal the model writes
+    /// where the canonical rows have none; grammars retain the canonical transitions.
+    recovery_transitions: Vec<Transition>,
     calls: Option<CallSyntax>,
     /// Where a call's id comes from.
     call_id: CallId,
-    turn_opener: Option<String>,
+    turn_opener: Option<TurnOpener>,
     /// The turn anchors, in the order a match at one place prefers them.
     anchors: Vec<Anchor>,
     /// The state a turn starts in when it does not start with a terminal.
@@ -418,6 +455,8 @@ impl Format {
             scanner_markers: Arc::from([]),
             states: Vec::new(),
             transitions: Vec::new(),
+            leading_transitions: Vec::new(),
+            recovery_transitions: Vec::new(),
             calls: None,
             call_id: CallId::Minted,
             turn_opener: None,
@@ -512,7 +551,54 @@ impl Format {
             on: self.terminal_named(on),
             to: self.state_named(to),
         };
+        assert!(
+            !self
+                .recovery_transitions
+                .iter()
+                .any(|row| row.from == transition.from && row.on == transition.on),
+            "{}: a recovery row already reads {on} in {from}",
+            self.name
+        );
         self.transitions.push(transition);
+        self
+    }
+
+    /// Override a terminal's row only before substantive text in a stay. Once text begins,
+    /// the terminal is literal. Used for M3's boundary closers, not its generated grammar.
+    pub(crate) fn leading_transition(mut self, from: &str, on: &str, to: &str) -> Self {
+        let row = Transition {
+            from: self.state_named(from),
+            on: self.terminal_named(on),
+            to: self.state_named(to),
+        };
+        assert_eq!(self.emits(row.from), Emits::Content);
+        assert_eq!(self.emits(row.to), Emits::Content);
+        self.leading_transitions.push(row);
+        self
+    }
+
+    /// `from + on = to` for the parser alone: a terminal the model writes where the canonical
+    /// rows have none, read as the row says, after text as well (Kimi K3's answer closer inside
+    /// its thought). A grammar derived from the table keeps the canonical rows, so it never asks
+    /// the model for the shape.
+    pub(crate) fn recovery_transition(mut self, from: &str, on: &str, to: &str) -> Self {
+        let row = Transition {
+            from: self.state_named(from),
+            on: self.terminal_named(on),
+            to: self.state_named(to),
+        };
+        assert!(
+            self.next(row.from, row.on).is_none(),
+            "{}: a canonical row already reads {on} in {from}",
+            self.name
+        );
+        assert!(
+            self.emits(row.from) != Emits::Arguments && self.emits(row.to) != Emits::Arguments,
+            "{}: a recovery row may not touch an arguments state ({from} + {on} = {to}); the \
+             engine reads a call's rows from the canonical table alone",
+            self.name
+        );
+        self.recovery_transitions.push(row);
         self
     }
 
@@ -621,7 +707,7 @@ impl Format {
     /// prompt's replay starts at its last occurrence.
     #[must_use]
     pub fn opens_turn(mut self, text: &str) -> Self {
-        self.turn_opener = Some(text.to_string());
+        self.turn_opener = Some(TurnOpener::new(text));
         self
     }
 
@@ -970,7 +1056,7 @@ impl Format {
     /// The corpus replay feeds it before a generation prompt's tail, since a table may key the
     /// turn's start on it ([`Self::unopened_turn_starts_in`]).
     pub fn turn_opener(&self) -> Option<&str> {
-        self.turn_opener.as_deref()
+        self.turn_opener.as_ref().map(|opener| opener.text.as_str())
     }
 
     /// The texts that start the model's turn: the turn opener, or the turn anchors in the table's
@@ -990,9 +1076,9 @@ impl Format {
             let (at, anchor) = self.last_anchor(prompt)?;
             return Some((at, &prompt[at + anchor.text.len()..], anchor.state));
         }
-        let opener = self.turn_opener()?;
-        let at = prompt.rfind(opener)?;
-        Some((at, &prompt[at + opener.len()..], 0))
+        let opener = self.turn_opener.as_ref()?;
+        let at = opener.rfind(prompt)?;
+        Some((at, &prompt[at + opener.text.len()..], 0))
     }
 
     /// The part of `prompt` the engine replays to find the state the generation starts in: from
@@ -1005,7 +1091,11 @@ impl Format {
             let from = self.last_anchor(prompt).map_or(prompt.len(), |(at, _)| at);
             return &prompt[from..];
         }
-        match self.turn_opener().and_then(|opener| prompt.rfind(opener)) {
+        match self
+            .turn_opener
+            .as_ref()
+            .and_then(|opener| opener.rfind(prompt))
+        {
             Some(at) => &prompt[at..],
             None => prompt,
         }
@@ -1133,7 +1223,7 @@ impl Format {
             match piece {
                 Piece::Marker(index) if self.ignored(index) => {}
                 Piece::Marker(index) => {
-                    if let Some(to) = self.next(state, index) {
+                    if let Some(to) = self.next_after_text(state, index, begun) {
                         (state, begun) = (to, false);
                     }
                 }
@@ -1162,10 +1252,10 @@ impl Format {
         if prompt.is_empty() {
             return None;
         }
-        let opener = self.turn_opener()?;
-        let opened = prompt
-            .rfind(opener)
-            .is_some_and(|at| !prompt[at + opener.len()..].contains(unopened.end.as_str()));
+        let opener = self.turn_opener.as_ref()?;
+        let opened = opener
+            .rfind(prompt)
+            .is_some_and(|at| !prompt[at + opener.text.len()..].contains(unopened.end.as_str()));
         (!opened).then_some(unopened.state)
     }
 
@@ -1252,14 +1342,14 @@ impl Format {
     /// with a whole structural token and is the beginning of a terminal that, whole, would move
     /// the engine out of `state` or be dropped where it stands. The beginning of a terminal the
     /// state has no row for is text, as the whole terminal would be.
-    pub(crate) fn is_cut_tag(&self, state: usize, tail: &str) -> bool {
+    pub(crate) fn is_cut_tag(&self, state: usize, tail: &str, begun: bool) -> bool {
         self.structural_tokens
             .iter()
             .any(|token| tail.starts_with(token.as_str()))
             && self.terminals.iter().enumerate().any(|(index, terminal)| {
                 terminal.text.len() > tail.len()
                     && terminal.text.starts_with(tail)
-                    && (terminal.ignored || self.next(state, index).is_some())
+                    && (terminal.ignored || self.next_after_text(state, index, begun).is_some())
             })
     }
 
@@ -1294,6 +1384,37 @@ impl Format {
             .iter()
             .find(|transition| transition.from == from && transition.on == on)
             .map(|transition| transition.to)
+    }
+
+    /// The parser's row, including boundary tolerance; shown markers retain their original
+    /// rows so requests without reasoning separation preserve every marker.
+    pub(crate) fn next_after_text(&self, from: usize, on: usize, begun: bool) -> Option<usize> {
+        if let Some(to) = self.leading_next(from, on) {
+            return (!begun).then_some(to);
+        }
+        self.next(from, on).or_else(|| self.recovery_next(from, on))
+    }
+
+    /// A parser-only recovery row, unless the request shows the marker as text.
+    pub(crate) fn recovery_next(&self, from: usize, on: usize) -> Option<usize> {
+        if self.recovery_transitions.is_empty() || self.shown(on) {
+            return None;
+        }
+        self.recovery_transitions
+            .iter()
+            .find(|row| row.from == from && row.on == on)
+            .map(|row| row.to)
+    }
+
+    /// Find a parser-only boundary row unless the request preserves reasoning markers.
+    pub(crate) fn leading_next(&self, from: usize, on: usize) -> Option<usize> {
+        if self.leading_transitions.is_empty() || self.shown(on) {
+            return None;
+        }
+        self.leading_transitions
+            .iter()
+            .find(|row| row.from == from && row.on == on)
+            .map(|row| row.to)
     }
 
     /// Every row of the table as `(from, on, to)`, in the order the rows were added.
@@ -1390,7 +1511,7 @@ impl Format {
                 self.name, terminal.name
             ));
         }
-        if self.turn_opener.as_deref() == Some("") {
+        if self.turn_opener() == Some("") {
             return Err(format!("format {}: an empty turn opener", self.name));
         }
         if self.anchors.iter().any(|anchor| anchor.text.is_empty()) {

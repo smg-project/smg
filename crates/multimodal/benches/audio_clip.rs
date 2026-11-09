@@ -29,9 +29,13 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use llm_multimodal::{
-    audio::{decode_audio_mono_f32, AudioPreProcessor, DecodedAudio, Qwen3AudioProcessor},
+    audio::{
+        decode_audio_mono_f32, AudioPreProcessor, DecodedAudio, InklingAudioProcessor,
+        ParakeetAudioProcessor, Qwen3AudioProcessor,
+    },
     AudioClip, AudioSource, PreprocessedEncoderInputs,
 };
 
@@ -103,23 +107,26 @@ fn wav() -> Vec<u8> {
     bytes
 }
 
-/// The bytes decoded as the media connector decodes them.
-fn decode(runtime: &tokio::runtime::Runtime, bytes: &[u8]) -> DecodedAudio {
-    runtime.block_on(decode_audio_mono_f32(bytes)).unwrap()
+/// The bytes decoded as the media connector decodes them: the clip's buffer handed over by
+/// reference count, read in place.
+fn decode(runtime: &tokio::runtime::Runtime, bytes: &Bytes) -> DecodedAudio {
+    runtime
+        .block_on(decode_audio_mono_f32(bytes.clone()))
+        .unwrap()
 }
 
 /// The decoded clip as the gateway holds it for the frontend.
 fn clip(decoded: DecodedAudio) -> Arc<AudioClip> {
     Arc::new(AudioClip::new(
-        bytes::Bytes::new(),
+        Bytes::new(),
         decoded,
         AudioSource::InlineBytes,
         String::new(),
     ))
 }
 
-/// The frontend's batch entry over the clips, the one the gateway calls.
-fn mel(processor: &Qwen3AudioProcessor, clips: &[Arc<AudioClip>]) -> PreprocessedEncoderInputs {
+/// A frontend's batch entry over the clips, the one the gateway calls.
+fn mel(processor: &dyn AudioPreProcessor, clips: &[Arc<AudioClip>]) -> PreprocessedEncoderInputs {
     processor.preprocess(clips).unwrap()
 }
 
@@ -128,16 +135,16 @@ fn mel(processor: &Qwen3AudioProcessor, clips: &[Arc<AudioClip>]) -> Preprocesse
 fn concurrent(
     runtime: &tokio::runtime::Runtime,
     processor: &Arc<Qwen3AudioProcessor>,
-    bytes: &Arc<Vec<u8>>,
+    bytes: &Bytes,
     count: usize,
 ) -> Vec<PreprocessedEncoderInputs> {
     runtime.block_on(async {
         let tasks = (0..count).map(|_| {
             let processor = Arc::clone(processor);
-            let bytes = Arc::clone(bytes);
+            let bytes = bytes.clone();
             async move {
-                let decoded = decode_audio_mono_f32(&bytes).await.unwrap();
-                tokio::task::spawn_blocking(move || mel(&processor, &[clip(decoded)]))
+                let decoded = decode_audio_mono_f32(bytes).await.unwrap();
+                tokio::task::spawn_blocking(move || mel(&*processor, &[clip(decoded)]))
                     .await
                     .unwrap()
             }
@@ -162,7 +169,7 @@ fn bench_audio_clip(c: &mut Criterion) {
         SAMPLE_RATE as usize,
         "the clip is at the frontend's rate, so no resample runs"
     );
-    let bytes = Arc::new(wav());
+    let bytes = Bytes::from(wav());
     let decoded = decode(&runtime, &bytes);
     assert_eq!(decoded.samples.len(), (SAMPLE_RATE * SECONDS) as usize);
     let clips = vec![clip(decoded)];
@@ -172,7 +179,7 @@ fn bench_audio_clip(c: &mut Criterion) {
         bytes.len(),
         clips[0].decoded().samples.len(),
         allocations_during(|| decode(&runtime, &bytes)),
-        allocations_during(|| mel(&processor, &clips)),
+        allocations_during(|| mel(&*processor, &clips)),
     );
 
     let mut group = c.benchmark_group("audio_clip");
@@ -185,13 +192,13 @@ fn bench_audio_clip(c: &mut Criterion) {
         b.iter_with_large_drop(|| decode(&runtime, bytes));
     });
     group.bench_with_input(BenchmarkId::new("mel", "30s"), &clips, |b, clips| {
-        b.iter_with_large_drop(|| mel(&processor, clips));
+        b.iter_with_large_drop(|| mel(&*processor, clips));
     });
     group.bench_with_input(
         BenchmarkId::new("decode_and_mel", "30s"),
         &bytes,
         |b, bytes| {
-            b.iter_with_large_drop(|| mel(&processor, &[clip(decode(&runtime, bytes))]));
+            b.iter_with_large_drop(|| mel(&*processor, &[clip(decode(&runtime, bytes))]));
         },
     );
     group.throughput(Throughput::Elements(8));
@@ -201,6 +208,38 @@ fn bench_audio_clip(c: &mut Criterion) {
         &bytes,
         |b, bytes| {
             b.iter_with_large_drop(|| concurrent(&runtime, &processor, bytes, 8));
+        },
+    );
+    group.finish();
+
+    // The sibling frontends on the same clip: the dMel bins of the Inkling
+    // family and the log-mel frames of the Parakeet family.
+    let inkling = InklingAudioProcessor::new();
+    let parakeet = ParakeetAudioProcessor::default();
+    println!(
+        "audio_clip/30s through the sibling frontends: inkling dmel {} allocation calls; parakeet \
+         log-mel {} allocation calls",
+        allocations_during(|| mel(&inkling, &clips)),
+        allocations_during(|| mel(&parakeet, &clips)),
+    );
+    let mut group = c.benchmark_group("audio_clip_siblings");
+    group
+        .sample_size(10)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(5));
+    group.throughput(Throughput::Elements(1));
+    group.bench_with_input(
+        BenchmarkId::new("inkling_dmel", "30s"),
+        &clips,
+        |b, clips| {
+            b.iter_with_large_drop(|| mel(&inkling, clips));
+        },
+    );
+    group.bench_with_input(
+        BenchmarkId::new("parakeet_log_mel", "30s"),
+        &clips,
+        |b, clips| {
+            b.iter_with_large_drop(|| mel(&parakeet, clips));
         },
     );
     group.finish();

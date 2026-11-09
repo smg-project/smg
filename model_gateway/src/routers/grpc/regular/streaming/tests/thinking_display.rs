@@ -2,6 +2,8 @@
 //! text, `summarized`, `updates` and no display return it, under the reasoning parser and under
 //! Symphony alike, in the stream and in the message; the usage is the same under every value.
 
+use std::sync::Arc;
+
 use openai_protocol::messages::CreateMessageRequest;
 use serde_json::{json, Value};
 use smg_grpc_client::vllm_engine::proto::generate_response::Response as GenerationEvent;
@@ -9,17 +11,10 @@ use symphony::{formats::qwen3, CallSyntax};
 
 use super::{
     super::*,
-    eof::{chunk, complete, dispatch, scripted_stream, CharacterTokenizer},
+    eof::{chunk, complete, dispatch, response_processor, scripted_stream, CharacterTokenizer},
     symphony_chat::{message_blocks, message_events},
 };
-use crate::{
-    routers::grpc::{
-        context,
-        regular::{processor::ResponseProcessor, symphony::Assignment},
-        spec::MessagesResponseSpec,
-    },
-    worker::WorkerRegistry,
-};
+use crate::routers::grpc::{context, regular::symphony::Assignment, spec::MessagesResponseSpec};
 
 /// Every `display` a request can state, and none, with whether the thinking text is returned.
 const DISPLAYS: [(Option<&str>, bool); 4] = [
@@ -51,22 +46,11 @@ fn spec(display: Option<&str>, with_symphony: bool) -> MessagesResponseSpec {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
+            marked: Arc::default(),
         });
     }
     spec
-}
-
-/// The non-streaming processor with the Qwen3 reasoning parser.
-fn response_processor() -> ResponseProcessor {
-    ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::with_flags(
-            Arc::new(WorkerRegistry::new()),
-            None,
-            Some("qwen3".to_string()),
-        ),
-    )
 }
 
 /// The thinking text a display returns for `thought`: the thought, or nothing under `omitted`.

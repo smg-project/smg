@@ -7,6 +7,7 @@
 
 use std::{collections::HashMap, time::Instant};
 
+use bytes::Bytes;
 use rand::RngExt;
 use smg_grpc_client::{
     common_proto as common, sglang_proto as sglang, tokenspeed_proto as tokenspeed,
@@ -79,7 +80,7 @@ impl MultimodalData {
         match self {
             Self::Sglang(data) => data.inline_bytes(),
             Self::Vllm(data) => data.inline_bytes(),
-            Self::Trtllm(data) => data.image_data.iter().map(Vec::len).sum(),
+            Self::Trtllm(data) => data.image_data.iter().map(Bytes::len).sum(),
             Self::TokenSpeed(data) => data
                 .items
                 .iter()
@@ -165,10 +166,11 @@ pub struct VllmMultimodalData {
     pub extra_batches: Vec<VllmMultimodalData>,
 }
 
-/// TRT-LLM multimodal data: raw image bytes only.
+/// TRT-LLM multimodal data: raw image bytes only, each image's file as the
+/// frame holds it (shared, not copied).
 #[derive(Debug)]
 pub struct TrtllmMultimodalData {
-    pub image_data: Vec<Vec<u8>>,
+    pub image_data: Vec<Bytes>,
 }
 
 /// TokenSpeed multimodal data: preprocessed encoder input with patch-only placeholders.
@@ -315,7 +317,7 @@ impl SglangMultimodalData {
             audio_data: vec![],
             modalities: vec![self.modality],
             pixel_values: Some(sglang::TensorData {
-                data: self.pixel_values.into(),
+                data: llm_multimodal::buffer_pool::recycled_bytes(self.pixel_values),
                 shape: self.pixel_values_shape,
                 dtype: self.pixel_values_dtype,
             }),
@@ -642,6 +644,8 @@ fn resolve_mm_tensor_payload(
                 );
             }
             Metrics::record_mm_tensor(engine, "shm", nbytes);
+            // The segment holds the copy; the buffer goes back to the pool.
+            llm_multimodal::buffer_pool::recycle(data);
             MmTensorPayload::Shm(handle)
         }
         Err(error) => {
@@ -665,7 +669,9 @@ fn tokenspeed_tensor_payload(
     rdma: Option<MmRdmaExport<'_>>,
 ) -> tokenspeed::tensor_data::Payload {
     match resolve_mm_tensor_payload(data, shm_enabled, min_bytes, "tokenspeed", rdma) {
-        MmTensorPayload::Inline(data) => tokenspeed::tensor_data::Payload::Inline(data.into()),
+        MmTensorPayload::Inline(data) => tokenspeed::tensor_data::Payload::Inline(
+            llm_multimodal::buffer_pool::recycled_bytes(data),
+        ),
         MmTensorPayload::Shm(handle) => tokenspeed::tensor_data::Payload::Shm(handle),
         MmTensorPayload::Remote(handle) => tokenspeed::tensor_data::Payload::Remote(handle),
     }
@@ -678,7 +684,9 @@ fn vllm_tensor_payload(
     rdma: Option<MmRdmaExport<'_>>,
 ) -> vllm::tensor_data::Payload {
     match resolve_mm_tensor_payload(data, shm_enabled, min_bytes, "vllm", rdma) {
-        MmTensorPayload::Inline(data) => vllm::tensor_data::Payload::Inline(data.into()),
+        MmTensorPayload::Inline(data) => {
+            vllm::tensor_data::Payload::Inline(llm_multimodal::buffer_pool::recycled_bytes(data))
+        }
         MmTensorPayload::Shm(handle) => vllm::tensor_data::Payload::Shm(handle),
         MmTensorPayload::Remote(handle) => vllm::tensor_data::Payload::Remote(handle),
     }

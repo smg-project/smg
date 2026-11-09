@@ -1,0 +1,84 @@
+# SmgAdmissionRejections reads whichever limiter is live: the concurrency
+# limit's queue (smg_admission_queue_rejected_total by reason) or the priority
+# scheduler's per-class queues (smg_scheduler_admit_total, the rejected_*
+# outcomes). The series carry the labels the chart's job selector renders
+# (run.sh); a counter rising by 60 a minute is one rejection a second.
+rule_files:
+  - rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # The priority scheduler rejecting one bulk request a second, admitting the
+  # rest; the concurrency limit's counter has no sample (it is not live).
+  - interval: 1m
+    name: the scheduler's rejections fire the alert
+    input_series:
+      - series: 'smg_scheduler_admit_total{namespace="smg", job="smg-router", class="bulk", outcome="rejected_queue_full"}'
+        values: '0+60x20'
+      - series: 'smg_scheduler_admit_total{namespace="smg", job="smg-router", class="bulk", outcome="admitted"}'
+        values: '0+600x20'
+      - series: 'smg_scheduler_admit_total{namespace="smg", job="smg-router", class="interactive", outcome="admitted"}'
+        values: '0+600x20'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: SmgAdmissionRejections
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: smg
+              job: smg-router
+            exp_annotations:
+              summary: "The gateway is rejecting requests at admission"
+              description: "1 requests per second have been rejected at admission by smg/smg-router for 5m: the concurrency limit, or the priority scheduler's queue bound or wait, is reached."
+
+  # The concurrency limit's queue rejecting one request a second.
+  - interval: 1m
+    name: the concurrency limit's rejections fire the alert
+    input_series:
+      - series: 'smg_admission_queue_rejected_total{namespace="smg", job="smg-router", reason="full"}'
+        values: '0+60x20'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: SmgAdmissionRejections
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: smg
+              job: smg-router
+            exp_annotations:
+              summary: "The gateway is rejecting requests at admission"
+              description: "1 requests per second have been rejected at admission by smg/smg-router for 5m: the concurrency limit, or the priority scheduler's queue bound or wait, is reached."
+
+  # The scheduler admitting everything: quiet.
+  - interval: 1m
+    name: admitted outcomes alone keep the alert quiet
+    input_series:
+      - series: 'smg_scheduler_admit_total{namespace="smg", job="smg-router", class="default", outcome="admitted"}'
+        values: '0+600x20'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: SmgAdmissionRejections
+        exp_alerts: []
+
+  # Both families with samples (the multimodal bounds and the selection
+  # timeout count in the concurrency limit's family under either mode): the
+  # alert reads the sum.
+  - interval: 1m
+    name: both families count toward the one rate
+    input_series:
+      - series: 'smg_admission_queue_rejected_total{namespace="smg", job="smg-router", reason="selection_timeout"}'
+        values: '0+60x20'
+      - series: 'smg_scheduler_admit_total{namespace="smg", job="smg-router", class="bulk", outcome="rejected_queue_timeout"}'
+        values: '0+60x20'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: SmgAdmissionRejections
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: smg
+              job: smg-router
+            exp_annotations:
+              summary: "The gateway is rejecting requests at admission"
+              description: "2 requests per second have been rejected at admission by smg/smg-router for 5m: the concurrency limit, or the priority scheduler's queue bound or wait, is reached."

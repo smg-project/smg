@@ -29,24 +29,28 @@ static MODEL_LABELS: Lazy<BoundedLabels> = Lazy::new(|| BoundedLabels::new(MAX_M
 static TOOL_LABELS: Lazy<BoundedLabels> = Lazy::new(|| BoundedLabels::new(MAX_TOOL_LABELS));
 static BOUNDED_LABEL_SENTINEL_ARC: Lazy<Arc<str>> = Lazy::new(|| Arc::from(BOUNDED_LABEL_SENTINEL));
 
-/// Intern a client-controlled label with a hard cardinality cap.
-///
-/// Distinct values beyond `cap` collapse to a shared sentinel, so untrusted input
-/// (client-supplied model names, model-generated tool names) cannot grow the
-/// interner — or the metric's Prometheus series set — without bound. Unlike an LRU,
-/// admitted values are never evicted and re-admitted, which would keep minting new
-/// series in the recorder even as the map churned.
 /// A label set that admits at most `cap` distinct values; everything past
-/// the cap maps to the sentinel. Admission reserves a slot before touching
-/// the map, so a burst of distinct labels cannot overshoot the cap.
-struct BoundedLabels {
+/// the cap maps to the sentinel `other`.
+///
+/// Distinct values beyond `cap` collapse to the shared sentinel, so untrusted
+/// input (client-supplied model names, model-generated tool names, tenant
+/// keys) cannot grow the interner, or the metric's Prometheus series set,
+/// without bound. Unlike an LRU, admitted values are never evicted and
+/// re-admitted, which would keep minting new series in the recorder even as
+/// the map churned. Admission reserves a slot before touching the map, so a
+/// burst of distinct labels cannot overshoot the cap. The model and tool
+/// labels are two process-wide sets; a label another part of the gateway
+/// bounds by a setting of its own (the scheduler's tenant label) gets a set
+/// of its own.
+pub struct BoundedLabels {
     map: DashMap<String, Arc<str>>,
     admitted: AtomicUsize,
     cap: usize,
 }
 
 impl BoundedLabels {
-    fn new(cap: usize) -> Self {
+    /// A set that admits `cap` distinct values.
+    pub fn new(cap: usize) -> Self {
         Self {
             map: DashMap::new(),
             admitted: AtomicUsize::new(0),
@@ -54,7 +58,9 @@ impl BoundedLabels {
         }
     }
 
-    fn intern(&self, s: &str) -> Arc<str> {
+    /// `s` as the label value: its own interned copy while the set has room,
+    /// the sentinel `other` once it has none.
+    pub fn intern(&self, s: &str) -> Arc<str> {
         if let Some(entry) = self.map.get(s) {
             return Arc::clone(entry.value());
         }
@@ -361,6 +367,7 @@ pub mod handles {
     use std::{
         cell::{Cell, RefCell},
         collections::HashMap,
+        hash::BuildHasher,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -368,6 +375,7 @@ pub mod handles {
     };
 
     use metrics::{Counter, Histogram};
+    use rustc_hash::FxHashMap;
 
     use super::{intern_model_label, BOUNDED_LABEL_SENTINEL_ARC, MAX_MODEL_LABELS};
 
@@ -405,8 +413,11 @@ pub mod handles {
 
     /// Handles by a static label set, then by the model label as the
     /// interner gave it: the key is the interner's own allocation, shared
-    /// with every thread that kept the handle.
-    pub type ByLabels<L, H> = HashMap<L, HashMap<Arc<str>, H>>;
+    /// with every thread that kept the handle. The static level hashes
+    /// with FxHash: its keys are the gateway's own label constants, hashed
+    /// on every record; the model level keeps SipHash, its key is the
+    /// client's.
+    pub type ByLabels<L, H> = FxHashMap<L, HashMap<Arc<str>, H>>;
 
     /// The static labels of `smg_router_requests_total`.
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -431,16 +442,16 @@ pub mod handles {
         /// A test's say for this thread, over the installed flag.
         static FORCED: Cell<Option<bool>> = const { Cell::new(None) };
         /// `smg_router_requests_total`.
-        pub(super) static ROUTER_REQUESTS: RefCell<ByLabels<RequestLabels, Counter>> = RefCell::new(HashMap::new());
+        pub(super) static ROUTER_REQUESTS: RefCell<ByLabels<RequestLabels, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_router_request_duration_seconds`.
-        pub(super) static ROUTER_DURATIONS: RefCell<ByLabels<DurationLabels, Histogram>> = RefCell::new(HashMap::new());
+        pub(super) static ROUTER_DURATIONS: RefCell<ByLabels<DurationLabels, Histogram>> = RefCell::new(FxHashMap::default());
     }
 
     /// Uses the handle under `key`, building it on first sight and keeping
     /// it while the map is under [`MAX_KEPT_PER_MAP`]. The key is only
     /// allocated for a new entry.
-    pub fn with_handle<H>(
-        map: &mut HashMap<String, H>,
+    pub fn with_handle<H, S: BuildHasher>(
+        map: &mut HashMap<String, H, S>,
         key: &str,
         build: impl FnOnce() -> H,
         use_handle: impl FnOnce(&H),
@@ -500,7 +511,10 @@ pub mod handles {
         clippy::expect_used,
         reason = "the key is inserted just above when missing"
     )]
-    pub fn nested<'m, V: Default>(map: &'m mut HashMap<String, V>, key: &str) -> &'m mut V {
+    pub fn nested<'m, V: Default, S: BuildHasher>(
+        map: &'m mut HashMap<String, V, S>,
+        key: &str,
+    ) -> &'m mut V {
         if !map.contains_key(key) {
             map.insert(key.to_owned(), V::default());
         }

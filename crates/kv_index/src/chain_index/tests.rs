@@ -1,11 +1,11 @@
 use super::{arena::*, slab::*, *};
 use crate::reference::{request_prefix_hashes, ReferenceIndexer};
 
-fn content(stream: u64, position: usize) -> ContentHash {
+pub(crate) fn content(stream: u64, position: usize) -> ContentHash {
     crate::compute_content_hash(&[stream as u32, (stream >> 32) as u32, position as u32])
 }
 
-fn blocks_of(contents: &[ContentHash]) -> Vec<StoredBlock> {
+pub(crate) fn blocks_of(contents: &[ContentHash]) -> Vec<StoredBlock> {
     contents
         .iter()
         .zip(request_prefix_hashes(contents))
@@ -28,14 +28,90 @@ fn scores(index: &ChainIndex, query: &[ContentHash]) -> Vec<(u32, u32)> {
 
 #[test]
 fn array_classes_round_up_and_back() {
-    for capacity in [1usize, 8, 9, 16, 100, 128, 129, 256, 257, 1000, 4096, 5000] {
+    for capacity in [
+        1usize, 4, 8, 9, 12, 13, 16, 28, 32, 33, 40, 41, 100, 128, 129, 256, 257, 1000, 4096, 5000,
+    ] {
         let class = array_class(capacity);
         assert!(class_capacity(class) >= capacity, "capacity {capacity}");
         assert_eq!(array_class(class_capacity(class)), class);
     }
+    assert_eq!(class_capacity(array_class(1)), 8, "the 8-word floor");
+    assert_eq!(class_capacity(array_class(9)), 12, "a 4-word step to 32");
+    assert_eq!(class_capacity(array_class(13)), 16);
+    assert_eq!(class_capacity(array_class(33)), 40, "an 8-word step to 128");
+    assert_eq!(
+        class_capacity(array_class(129)),
+        160,
+        "a quarter octave above"
+    );
+    for class in 1..ARRAY_CLASSES {
+        assert!(
+            class_capacity(class) > class_capacity(class - 1),
+            "classes grow: {class}"
+        );
+    }
     assert_eq!(table_class(2), 0);
     assert_eq!(table_class(4), 1);
     assert_eq!(table_class(1024), 9);
+}
+
+/// The arena takes memory from the process allocator a whole chunk at a time and keeps it: at a
+/// chunk boundary one more small array moves the bytes held by a chunk while the bytes handed
+/// out move by the array. An index whose arena sits near a boundary therefore holds one of two
+/// amounts a chunk apart for the same blocks, which `arena_chunk_bytes` names beside
+/// `arena_bytes`: nothing before the first array (the reserved word 0 is handed out, no chunk is
+/// held), then the handed-out words rounded up to whole chunks.
+#[test]
+fn the_arena_holds_whole_chunks_and_keeps_them() {
+    const CHUNK_BYTES: usize = WORD_CHUNK * size_of::<AtomicU64>();
+    // Two header words and a 16-word class array: the 18 words a short chain's hashes take.
+    const ARRAY_WORDS: usize = 16 + 2;
+    let contents = [7u64; 16];
+    let arena = WordArena::new();
+    let held_is_rounded_up = |arena: &WordArena| {
+        assert_eq!(
+            arena.chunk_bytes(),
+            (arena.used() as usize).div_ceil(WORD_CHUNK) * CHUNK_BYTES,
+            "held bytes are the handed-out words rounded up to whole chunks"
+        );
+    };
+    assert_eq!(
+        arena.chunk_bytes(),
+        0,
+        "nothing held before the first array"
+    );
+    arena.alloc_array(&contents, contents.len());
+    assert_eq!(
+        arena.chunk_bytes(),
+        CHUNK_BYTES,
+        "the first array takes a whole chunk"
+    );
+    held_is_rounded_up(&arena);
+    while arena.used() as usize + ARRAY_WORDS <= WORD_CHUNK {
+        arena.alloc_array(&contents, contents.len());
+    }
+    let before = arena.used();
+    assert_eq!(
+        arena.chunk_bytes(),
+        CHUNK_BYTES,
+        "one chunk holds every array that fits"
+    );
+    arena.alloc_array(&contents, contents.len());
+    assert_eq!(
+        arena.chunk_bytes(),
+        2 * CHUNK_BYTES,
+        "the first array past the boundary takes the next whole chunk"
+    );
+    assert!(
+        (arena.used() - before) as usize <= 2 * ARRAY_WORDS,
+        "the words handed out moved by one array and the chunk's tail, not by a chunk"
+    );
+    held_is_rounded_up(&arena);
+    // A freed array goes to a free list, never back to the allocator: the chunks stay.
+    let last = arena.used() as u32 - ARRAY_WORDS as u32 + 2;
+    arena.array_release(last);
+    assert_eq!(arena.chunk_bytes(), 2 * CHUNK_BYTES);
+    assert!(arena.free_words() >= ARRAY_WORDS);
 }
 
 #[test]
@@ -217,6 +293,51 @@ fn dead_runs_and_arrays_are_reused() {
         "arena words were not recycled: {stats:?}"
     );
     assert_eq!(index.current_size(), 0);
+}
+
+/// A chain stored as four blocks and grown one block at a time to twelve, the shape of a short
+/// prompt with its decode, ends with its hashes in a 12-word class: the one reallocation at the
+/// ninth block asks for eleven words and gets twelve, not sixteen.
+#[test]
+fn a_short_chain_grown_block_by_block_sits_in_a_twelve_word_class() {
+    let index = ChainIndex::with_max_workers(8);
+    let w = index.intern_worker("w").expect("id");
+    let mut mw = ChainBlockMap::default();
+    let held: Vec<ContentHash> = (0..12).map(|p| content(3, p)).collect();
+    let blocks = blocks_of(&held);
+    index
+        .apply_stored(w, &blocks[..4], None, &mut mw)
+        .expect("prompt");
+    let first = mw.get(blocks[0].seq_hash).expect("held").run;
+    let prompt_array = index.slab.run(first).block.load(Ordering::Relaxed);
+    assert_eq!(
+        index.arena.array_capacity(prompt_array),
+        8,
+        "four blocks and their slack take the 8-word floor"
+    );
+    for b in 4..12 {
+        index
+            .apply_stored(w, &blocks[b..b + 1], Some(blocks[b - 1].seq_hash), &mut mw)
+            .expect("decode block");
+    }
+    assert_eq!(scores(&index, &held), vec![(w, 12)]);
+    let at = mw.get(blocks[11].seq_hash).expect("held");
+    let run = index.slab.run(at.run);
+    assert_eq!(run.len(), 12, "one run");
+    let (block, engine) = (
+        run.block.load(Ordering::Relaxed),
+        run.engine.load(Ordering::Relaxed),
+    );
+    assert_eq!(
+        index.arena.array_capacity(block),
+        12,
+        "the content array's class"
+    );
+    assert_eq!(
+        index.arena.array_capacity(engine),
+        12,
+        "the engine twin's class"
+    );
 }
 
 #[test]

@@ -14,6 +14,7 @@ pub mod qwen3_asr;
 mod qwen3_omni;
 mod qwen3_vl;
 mod qwen_vl;
+mod step3_vl;
 mod traits;
 pub mod transcription;
 
@@ -35,6 +36,7 @@ use qwen3_asr::Qwen3AsrSpec;
 use qwen3_omni::Qwen3OmniSpec;
 use qwen3_vl::Qwen3VLVisionSpec;
 use qwen_vl::QwenVLVisionSpec;
+use step3_vl::Step3VLVisionSpec;
 // Re-export public API from traits.
 pub use traits::{
     modality_limit_override, EncoderInputFormat, MediaItemInfo, MediaPartOrder, ModalityHooks,
@@ -75,6 +77,8 @@ impl ModelRegistry {
                 LazySpec::new(|| Box::new(Qwen3VLVisionSpec)),
                 LazySpec::new(|| Box::new(QwenVLVisionSpec)),
                 LazySpec::new(|| Box::new(Phi3VisionSpec)),
+                // Step3-VL matches its own model types only.
+                LazySpec::new(|| Box::new(Step3VLVisionSpec)),
             ],
         }
     }
@@ -360,8 +364,8 @@ mod tests {
         drop(config);
 
         for _ in 0..2 {
-            let small_output = small.preprocess(&[white_image()]).unwrap();
-            let large_output = large.preprocess(&[white_image()]).unwrap();
+            let small_output = small.preprocess(&[&white_image()]).unwrap();
+            let large_output = large.preprocess(&[&white_image()]).unwrap();
             assert_eq!(small_output.feature_token_counts, vec![1]);
             assert_eq!(large_output.feature_token_counts, vec![4]);
             assert!(small_output
@@ -401,7 +405,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             images
-                .preprocess(&[white_image()])
+                .preprocess(&[&white_image()])
                 .unwrap()
                 .feature_token_counts,
             vec![1]
@@ -457,7 +461,7 @@ mod tests {
         let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(28, 14, |x, _| {
             image::Rgb([if x < 14 { 255 } else { 0 }; 3])
         }));
-        let output = processor.preprocess(&[image]).unwrap();
+        let output = processor.preprocess(&[&image]).unwrap();
         assert_eq!(output.encoder_input.shape(), &[1, 3, 28, 28]);
         assert_eq!(output.feature_token_counts, vec![4]);
         assert_eq!(processor.get_processed_size(), Some((28, 28)));

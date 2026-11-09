@@ -1,5 +1,9 @@
 pub(crate) mod bounds;
 pub mod builder;
+pub(crate) mod redacted;
+pub mod secrets;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod types;
 pub(crate) mod validation;
 

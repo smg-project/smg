@@ -49,7 +49,7 @@ impl RequestCompletionSink for PolicyCompletionSink {
         };
         registry
             .policy_for_worker(worker)
-            .on_request_complete(worker.url(), true);
+            .on_request_complete(worker.url());
     }
 }
 
@@ -307,9 +307,10 @@ impl PolicyRegistry {
         }
     }
 
-    /// The header-derived sticky key: the resolved routing key,
-    /// lineage-stripped when the override is enabled (matching selection),
-    /// raw otherwise.
+    /// The one header-derived key: the resolved routing key, lineage-stripped
+    /// when the override is enabled, raw otherwise. Placement hands it to
+    /// every policy as `SelectWorkerInfo::routing_key` and the load guard
+    /// counts under it, so selection and accounting agree by construction.
     pub fn sticky_header_key<'a>(&self, headers: Option<&'a HeaderMap>) -> Option<&'a str> {
         let raw = self.resolve_routing_key(headers)?;
         Some(if self.routing_key_sticky.is_some() {
@@ -336,16 +337,18 @@ impl PolicyRegistry {
     }
 
     /// Resolve the effective sticky key: a valid configured routing-key header
-    /// wins, with the rid-derived key as fallback. Header keys get the same
-    /// lineage stripping as rid keys, so a
-    /// proxy forwarding `conv_t2` as a header pins the entry `conv`.
+    /// wins, with the rid-derived key as fallback. `info.routing_key` is the
+    /// header key as placement derived it ([`Self::sticky_header_key`]:
+    /// lineage-stripped under the override, so a proxy forwarding `conv_t2`
+    /// pins the entry `conv`); a caller that left it empty gets the same
+    /// derivation from the headers here. Nothing strips twice.
     fn effective_sticky_key<'a>(
         &self,
         info: &SelectWorkerInfo<'a>,
     ) -> Option<(&'a str, &'static str)> {
         info.routing_key
-            .or_else(|| self.resolve_routing_key(info.headers))
-            .map(|raw| (Self::strip_header_key(raw), "header"))
+            .or_else(|| self.sticky_header_key(info.headers))
+            .map(|key| (key, "header"))
             .or_else(|| info.rid_key.map(|key| (key, "rid")))
     }
 
@@ -437,13 +440,13 @@ impl PolicyRegistry {
             result
         };
 
-        let healthy = get_healthy_worker_indices(workers, info);
-        if healthy.is_empty() {
-            return finish(None, ExecutionBranch::NoHealthyWorkers);
-        }
         let delegate = sticky.assignment_mode() == ManualAssignmentMode::Delegate;
 
-        let pin = sticky.peek_pin(workers, key, &healthy);
+        // A hit reads the pin's candidates alone; the eligible list is built
+        // only where a worker has to be chosen from it.
+        let pin = sticky.peek_pin(workers, key, |idx| {
+            info.admits(workers[idx].routing_state())
+        });
         if let PinState::Pinned(idx) = pin {
             if !over_cap(idx) {
                 return finish(Some(idx), ExecutionBranch::OccupiedHit);
@@ -458,12 +461,23 @@ impl PolicyRegistry {
                     None => return finish(None, ExecutionBranch::CapRespill),
                 }
             } else {
+                // The pin was admitted by a live read above; the pool can lose
+                // every eligible worker before this second read.
+                let healthy = get_healthy_worker_indices(workers, info);
+                if healthy.is_empty() {
+                    return finish(None, ExecutionBranch::NoHealthyWorkers);
+                }
                 sticky.assign_index(workers, &healthy)
             };
             if new_idx != idx && !over_cap(new_idx) {
                 sticky.pin_front(key, workers[new_idx].url());
             }
             return finish(Some(new_idx), ExecutionBranch::CapRespill);
+        }
+
+        let healthy = get_healthy_worker_indices(workers, info);
+        if healthy.is_empty() {
+            return finish(None, ExecutionBranch::NoHealthyWorkers);
         }
 
         if delegate {
@@ -568,7 +582,7 @@ impl PolicyRegistry {
 
     /// Attach the mesh outbound bridge (thread-safe, can be called after
     /// initialization). Every existing cache-aware policy gets the adapter
-    /// wired in and its `populate_hash_index` flag flipped on (both flip
+    /// wired in and its mesh flag raised (both flip
     /// atomically inside [`CacheAwarePolicy::set_mesh_tree_sync`]); every
     /// future cache-aware policy created here inherits both. Pass `None`
     /// to detach.
@@ -593,7 +607,7 @@ impl PolicyRegistry {
     }
 
     /// Inject the mesh adapter into a policy if it's cache-aware.
-    /// The setter also flips `populate_hash_index` to match adapter
+    /// The setter also flips the policy's mesh flag to match adapter
     /// presence, so callers do not need to touch that flag directly.
     fn maybe_inject_mesh_tree_sync(
         policy: &Arc<dyn LoadBalancingPolicy>,
@@ -617,8 +631,9 @@ impl PolicyRegistry {
 
     /// The policy that places requests on `worker`: the prefill, decode or
     /// encode policy by worker type, else the model's policy. Completion
-    /// reports and in-flight reconciliation both go there.
-    fn policy_for_worker(&self, worker: &dyn Worker) -> Arc<dyn LoadBalancingPolicy> {
+    /// reports and in-flight reconciliation both go there, and the worker's
+    /// stream is chosen by what it needs (see `UpdatePoliciesStep`).
+    pub(crate) fn policy_for_worker(&self, worker: &dyn Worker) -> Arc<dyn LoadBalancingPolicy> {
         match worker.worker_type() {
             WorkerType::Prefill => self.get_prefill_policy(),
             WorkerType::Decode => self.get_decode_policy(),
@@ -1164,33 +1179,21 @@ mod tests {
 
     use super::*;
     use crate::{
-        policies::{BucketConfig, CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
+        policies::{
+            test_support::headers_with_routing_key, BucketConfig, CacheAwareConfig,
+            LeastLoadPolicy, SelectWorkerInfo,
+        },
         worker::{
-            load_state::LoadSnapshot, test_support::no_health_check, BasicWorkerBuilder, HashRing,
-            Worker, WorkerLoadGuard, WorkerType,
+            load_state::LoadSnapshot, test_support::worker_of, HashRing, Worker, WorkerLoadGuard,
+            WorkerType,
         },
     };
-
-    fn worker(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(worker_type)
-                .health_config(no_health_check())
-                .build(),
-        )
-    }
 
     fn cache_aware_policy() -> Arc<dyn LoadBalancingPolicy> {
         Arc::new(CacheAwarePolicy::with_config(CacheAwareConfig {
             eviction_interval_secs: 0,
             ..Default::default()
         }))
-    }
-
-    fn headers_with_key(key: &str) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        h.insert("x-smg-routing-key", key.parse().unwrap());
-        h
     }
 
     #[test]
@@ -1217,11 +1220,11 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-            worker("http://w3", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
+            worker_of("http://w3", WorkerType::Regular),
         ];
-        let headers = headers_with_key("session-A");
+        let headers = headers_with_routing_key("session-A");
         let info = SelectWorkerInfo {
             headers: Some(&headers),
             ..Default::default()
@@ -1245,11 +1248,11 @@ mod tests {
         let policy = reg.get_default_policy();
         let pools = [
             vec![
-                worker("http://a1", WorkerType::Regular),
-                worker("http://a2", WorkerType::Regular),
+                worker_of("http://a1", WorkerType::Regular),
+                worker_of("http://a2", WorkerType::Regular),
             ],
-            vec![worker("http://b1", WorkerType::Regular)],
-            vec![worker("http://c1", WorkerType::Regular)],
+            vec![worker_of("http://b1", WorkerType::Regular)],
+            vec![worker_of("http://c1", WorkerType::Regular)],
         ];
         let info = SelectWorkerInfo {
             rid_key: Some("session-42"),
@@ -1295,13 +1298,13 @@ mod tests {
             let name = policy.name();
             assert!(!PolicyRegistry::routing_key_override_applies(name));
             let workers = vec![
-                worker("http://w1", WorkerType::Regular),
-                worker("http://w2", WorkerType::Regular),
-                worker("http://w3", WorkerType::Regular),
-                worker("http://w4", WorkerType::Regular),
+                worker_of("http://w1", WorkerType::Regular),
+                worker_of("http://w2", WorkerType::Regular),
+                worker_of("http://w3", WorkerType::Regular),
+                worker_of("http://w4", WorkerType::Regular),
             ];
             let hash_ring = Some(Arc::new(HashRing::new(workers.iter().map(|w| w.url()))));
-            let headers = headers_with_key("conversation-42");
+            let headers = headers_with_routing_key("conversation-42");
             let pinned = reg
                 .select_worker(
                     &policy,
@@ -1347,8 +1350,8 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
         ];
         let info = SelectWorkerInfo::default(); // no key header
                                                 // RoundRobin alternates -> proves the configured policy is used, not sticky.
@@ -1378,7 +1381,7 @@ mod tests {
     fn request_text_scan_is_false_for_text_free_policies() {
         let reg = PolicyRegistry::new(PolicyConfig::RoundRobin);
         assert!(!reg.any_policy_needs_request_text(None));
-        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_key("k"))));
+        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_routing_key("k"))));
     }
 
     #[test]
@@ -1395,13 +1398,13 @@ mod tests {
     #[test]
     fn key_hint_lifts_text_requirement_only_under_enabled_override() {
         let without = PolicyRegistry::new(cache_aware_config());
-        assert!(without.any_policy_needs_request_text(Some(&headers_with_key("session-A"))));
+        assert!(without.any_policy_needs_request_text(Some(&headers_with_routing_key("session-A"))));
 
         let with = PolicyRegistry::with_override(cache_aware_config(), enabled_override());
         assert!(with.any_policy_needs_request_text(None));
-        assert!(!with.any_policy_needs_request_text(Some(&headers_with_key("session-A"))));
+        assert!(!with.any_policy_needs_request_text(Some(&headers_with_routing_key("session-A"))));
         let over_cap = "k".repeat(129);
-        assert!(with.any_policy_needs_request_text(Some(&headers_with_key(&over_cap))));
+        assert!(with.any_policy_needs_request_text(Some(&headers_with_routing_key(&over_cap))));
     }
 
     #[test]
@@ -1411,7 +1414,7 @@ mod tests {
         reg.on_worker_added("llama-3", Some("cache_aware"));
         assert!(reg.any_policy_needs_request_text(None));
         assert!(!reg.any_policy_needs_request_text(Some(&headers_with_tokens("1,2,3"))));
-        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_key("session-A"))));
+        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_routing_key("session-A"))));
     }
 
     /// The answer follows the per-model map: a text policy's model lifts the
@@ -1450,7 +1453,7 @@ mod tests {
     #[test]
     fn text_requirement_under_a_key_counts_the_exempt_policies_only() {
         let reg = PolicyRegistry::with_override(cache_aware_config(), enabled_override());
-        let keyed = headers_with_key("session-A");
+        let keyed = headers_with_routing_key("session-A");
         assert!(reg.any_policy_needs_request_text(None));
         assert!(!reg.any_policy_needs_request_text(Some(&keyed)));
         assert!(!reg.any_policy_needs_request_text_with_tokens(None));
@@ -1575,10 +1578,10 @@ mod tests {
         let reg = PolicyRegistry::new(PolicyConfig::RoundRobin); // override off
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
         ];
-        let headers = headers_with_key("session-A");
+        let headers = headers_with_routing_key("session-A");
         let info = SelectWorkerInfo {
             headers: Some(&headers),
             ..Default::default()
@@ -1614,7 +1617,7 @@ mod tests {
         both.insert("x-smg-routing-key", "legacy".parse().unwrap());
         assert_eq!(reg.resolve_routing_key(Some(&both)), Some("primary"));
 
-        let legacy_only = headers_with_key("legacy");
+        let legacy_only = headers_with_routing_key("legacy");
         assert_eq!(reg.resolve_routing_key(Some(&legacy_only)), Some("legacy"));
 
         // An invalid value under the first name falls through to the next.
@@ -1636,7 +1639,7 @@ mod tests {
             None
         );
         assert_eq!(
-            reg.resolve_routing_key(Some(&headers_with_key("legacy"))),
+            reg.resolve_routing_key(Some(&headers_with_routing_key("legacy"))),
             Some("legacy")
         );
     }
@@ -1657,23 +1660,23 @@ mod tests {
     fn header_keys_share_rid_lineage_stripping() {
         let reg = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
         assert_eq!(
-            reg.sticky_header_key(Some(&headers_with_key("conv_t2"))),
+            reg.sticky_header_key(Some(&headers_with_routing_key("conv_t2"))),
             Some("conv")
         );
         assert_eq!(
-            reg.sticky_header_key(Some(&headers_with_key("conv_t2_r1"))),
+            reg.sticky_header_key(Some(&headers_with_routing_key("conv_t2_r1"))),
             Some("conv")
         );
         // A key that is nothing but suffix keys as itself.
         assert_eq!(
-            reg.sticky_header_key(Some(&headers_with_key("_t1"))),
+            reg.sticky_header_key(Some(&headers_with_routing_key("_t1"))),
             Some("_t1")
         );
 
         // Override disabled: raw key, no stripping.
         let disabled = PolicyRegistry::new(PolicyConfig::RoundRobin);
         assert_eq!(
-            disabled.sticky_header_key(Some(&headers_with_key("conv_t2"))),
+            disabled.sticky_header_key(Some(&headers_with_routing_key("conv_t2"))),
             Some("conv_t2")
         );
     }
@@ -1683,17 +1686,17 @@ mod tests {
         let reg = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-            worker("http://w3", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
+            worker_of("http://w3", WorkerType::Regular),
         ];
-        let t1 = headers_with_key("conv_t1");
+        let t1 = headers_with_routing_key("conv_t1");
         let info_t1 = SelectWorkerInfo {
             headers: Some(&t1),
             ..Default::default()
         };
         let first = reg.select_worker(&policy, &workers, &info_t1).unwrap();
-        let t2 = headers_with_key("conv_t2");
+        let t2 = headers_with_routing_key("conv_t2");
         let info_t2 = SelectWorkerInfo {
             headers: Some(&t2),
             ..Default::default()
@@ -1711,9 +1714,9 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
-            worker("http://w3", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
+            worker_of("http://w3", WorkerType::Regular),
         ];
         let headers = headers_with("x-routing-key", "session-A");
         let info = SelectWorkerInfo {
@@ -1760,8 +1763,8 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
         ];
         (reg, policy, workers)
     }
@@ -1799,7 +1802,7 @@ mod tests {
     fn header_key_wins_over_rid_and_rid_is_fallback() {
         let (reg, policy, workers) = delegating_registry_with_two_workers();
 
-        let headers = headers_with_key("conversation-42");
+        let headers = headers_with_routing_key("conversation-42");
         let first = reg
             .select_worker(
                 &policy,
@@ -1859,8 +1862,8 @@ mod tests {
         );
         for headers in [
             HeaderMap::new(),
-            headers_with_key(""),
-            headers_with_key(&"k".repeat(ROUTING_KEY_HINT_MAX_BYTES + 1)),
+            headers_with_routing_key(""),
+            headers_with_routing_key(&"k".repeat(ROUTING_KEY_HINT_MAX_BYTES + 1)),
             invalid_utf8,
         ] {
             let info = SelectWorkerInfo {
@@ -1882,7 +1885,7 @@ mod tests {
     #[test]
     fn header_priority_accounts_inflight_requests_under_the_selected_key() {
         let (reg, policy, workers) = delegating_registry_with_two_workers();
-        let headers = headers_with_key("conversation_t1");
+        let headers = headers_with_routing_key("conversation_t1");
         let mut guards = Vec::new();
         for rid in ["request-1", "request-2", "request-3"] {
             let info = SelectWorkerInfo {
@@ -1917,8 +1920,8 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
         ];
         policy
             .as_any()
@@ -2113,8 +2116,8 @@ mod tests {
         );
         let policy = reg.get_default_policy();
         let workers = vec![
-            worker("http://w1", WorkerType::Regular),
-            worker("http://w2", WorkerType::Regular),
+            worker_of("http://w1", WorkerType::Regular),
+            worker_of("http://w2", WorkerType::Regular),
         ];
         let info = SelectWorkerInfo {
             rid_key: Some("convC"),
@@ -2181,7 +2184,7 @@ mod tests {
         let policy = reg.get_default_policy();
         // Single worker: the respill has nowhere to go, so the branch flips
         // purely on the key's in-flight count.
-        let workers = vec![worker("http://w1", WorkerType::Regular)];
+        let workers = vec![worker_of("http://w1", WorkerType::Regular)];
         let info = SelectWorkerInfo {
             rid_key: Some("convF"),
             ..Default::default()
@@ -2305,8 +2308,8 @@ mod tests {
         let later = registry.on_worker_added("m", Some("least_load"));
 
         let workers = vec![
-            worker("http://a:8000", WorkerType::Regular),
-            worker("http://b:8000", WorkerType::Regular),
+            worker_of("http://a:8000", WorkerType::Regular),
+            worker_of("http://b:8000", WorkerType::Regular),
         ];
         for policy in [registry.get_default_policy(), later] {
             for _ in 0..20 {
@@ -2433,13 +2436,12 @@ mod tests {
             kv_pressure_weight: 0.4,
             mean_prefill_tokens: 2048,
             default_throughput: 555.0,
-            max_waiting_requests: 48,
         });
 
         let policy = registry.on_worker_added("llama-3", Some("least_load"));
         assert!(!Arc::ptr_eq(&policy, &registry.get_default_policy()));
         let least_load = policy.as_any().downcast_ref::<LeastLoadPolicy>().unwrap();
-        assert_eq!(least_load.params_for_test(), (0.4, 2048, 555.0, 48));
+        assert_eq!(least_load.params_for_test(), (0.4, 2048, 555.0));
     }
 
     /// An integration setter racing policy publication must never be
@@ -2537,7 +2539,7 @@ mod tests {
                 "{role} policy missed the load feed"
             );
             assert!(
-                cache_aware.should_populate_hash_index_for_test(),
+                cache_aware.mesh_attached_for_test(),
                 "{role} policy missed the mesh tree bridge"
             );
         }
@@ -2568,12 +2570,12 @@ mod tests {
         registry.set_decode_policy(cache_aware_policy());
 
         let prefill_workers = vec![
-            worker("http://prefill-1:8000", WorkerType::Prefill),
-            worker("http://prefill-2:8000", WorkerType::Prefill),
+            worker_of("http://prefill-1:8000", WorkerType::Prefill),
+            worker_of("http://prefill-2:8000", WorkerType::Prefill),
         ];
         let decode_workers = vec![
-            worker("http://decode-1:8000", WorkerType::Decode),
-            worker("http://decode-2:8000", WorkerType::Decode),
+            worker_of("http://decode-1:8000", WorkerType::Decode),
+            worker_of("http://decode-2:8000", WorkerType::Decode),
         ];
 
         registry.init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
@@ -2615,7 +2617,7 @@ mod tests {
             (!workers.is_empty()).then_some(0)
         }
 
-        fn on_request_complete(&self, worker_url: &str, _success: bool) {
+        fn on_request_complete(&self, worker_url: &str) {
             self.completed.lock().unwrap().push(worker_url.to_string());
         }
 
@@ -2784,9 +2786,9 @@ mod tests {
             ..Default::default()
         })));
         let prefill = vec![
-            worker("http://prefill-1:8000", WorkerType::Prefill),
-            worker("http://prefill-2:8000", WorkerType::Prefill),
-            worker("http://prefill-3:8000", WorkerType::Prefill),
+            worker_of("http://prefill-1:8000", WorkerType::Prefill),
+            worker_of("http://prefill-2:8000", WorkerType::Prefill),
+            worker_of("http://prefill-3:8000", WorkerType::Prefill),
         ];
         registry.init_pd_bucket_policies(&prefill);
 
@@ -2809,5 +2811,50 @@ mod tests {
                 "size {size}"
             );
         }
+    }
+
+    /// The keyed decisions of a replay under the delegating override: eight
+    /// regular workers behind a round-robin registry, sixteen session keys
+    /// picked over three rounds, two workers vetoed for the second round and
+    /// back for the third (a pin whose worker is vetoed respills and
+    /// follows the respill). The sequence was recorded from the override
+    /// that built its eligible list before reading the pin and copied the
+    /// key per lookup; the override that reads the pin borrowed and lists
+    /// only to assign must pick the same.
+    #[test]
+    fn the_replayed_keyed_requests_pick_the_recorded_sequence() {
+        const RECORDED: [usize; 48] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 1, 3, 4, 3, 6, 7, 0, 1, 4, 3, 4,
+            6, 6, 7, 0, 1, 1, 3, 4, 3, 6, 7, 0, 1, 4, 3, 4, 6, 6, 7,
+        ];
+        let reg = PolicyRegistry::with_override(
+            PolicyConfig::RoundRobin,
+            rid_override(ManualAssignmentMode::Delegate),
+        );
+        let policy = reg.get_default_policy();
+        let workers: Vec<Arc<dyn Worker>> = (0..8)
+            .map(|i| worker_of(&format!("http://w{i}"), WorkerType::Regular))
+            .collect();
+        let keys: Vec<String> = (0..16).map(|i| format!("conv{i}_t{}", i % 3)).collect();
+        let mut picks = Vec::with_capacity(RECORDED.len());
+        for round in 0..3 {
+            for vetoed in [2, 5] {
+                workers[vetoed].set_overloaded(round == 1);
+            }
+            for key in &keys {
+                let info = SelectWorkerInfo {
+                    rid_key: Some(key),
+                    ..Default::default()
+                };
+                picks.push(
+                    reg.select_worker(&policy, &workers, &info)
+                        .expect("six workers stay eligible"),
+                );
+            }
+        }
+        assert_eq!(
+            picks, RECORDED,
+            "the replay picked {picks:?}; the recorded sequence is the decision"
+        );
     }
 }

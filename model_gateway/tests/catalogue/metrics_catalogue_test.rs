@@ -15,13 +15,11 @@
 
 #![expect(clippy::expect_used, reason = "test failures should panic")]
 
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use regex::Regex;
+
+use super::{repo_root, rust_files};
 
 const METRICS_SOURCE: &str = "model_gateway/src/observability/metrics.rs";
 /// Where a described family may be recorded: anywhere in the workspace.
@@ -29,31 +27,6 @@ const SOURCE_ROOTS: &[&str] = &["model_gateway", "crates", "clients", "bindings"
 /// Where a caller of this crate's `Metrics` may live: the crates that depend
 /// on it, not the ones it depends on.
 const CALLER_ROOTS: &[&str] = &["model_gateway", "bindings", "examples"];
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("the gateway crate lives one level under the workspace root")
-        .to_path_buf()
-}
-
-/// Every `.rs` file under `dir`, build directories skipped.
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name();
-            if name != "target" && !name.to_string_lossy().starts_with('.') {
-                rust_files(&path, out);
-            }
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
-}
 
 /// The source text with `//` line comments cut off.
 fn code_only(text: &str) -> String {

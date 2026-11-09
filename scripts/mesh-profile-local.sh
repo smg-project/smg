@@ -111,26 +111,41 @@ stop_all() {
 
 # ── Metrics collection ──────────────────────────────────────────────
 
-collect_metrics() {
-    local M=$METRICS_BASE_PORT
-    local PB PC RS RC
-    PB=$(curl -sf "http://127.0.0.1:$M/metrics" | awk '/sync_batch_bytes_sum.*policy/{s+=$2}END{print s+0}')
-    PC=$(curl -sf "http://127.0.0.1:$M/metrics" | awk '/sync_batch_bytes_count.*policy/{s+=$2}END{print s+0}')
-    RS=$(curl -sf "http://127.0.0.1:$M/metrics" | awk '/sync_round_duration_seconds_sum/{s+=$2}END{print s+0}')
-    RC=$(curl -sf "http://127.0.0.1:$M/metrics" | awk '/sync_round_duration_seconds_count/{s+=$2}END{print s+0}')
+# The mesh series (crates/mesh/src/metrics.rs) of every gateway, one line per
+# gateway and series. The sender round histogram is written by the end that
+# dials a sync stream, the peer gauge and the ack and nack counters by the end
+# that accepts it, so one gateway's page shows one side of each pair. A
+# gateway that is down or has written no mesh series yet contributes no line
+# and does not end the loop (the script runs under `set -e`).
+mesh_metrics_lines() {
+    local i
+    for i in $(seq 0 $((NUM_GATEWAYS - 1))); do
+        curl -sf "http://127.0.0.1:$((METRICS_BASE_PORT + i))/metrics" 2>/dev/null \
+            | grep -E '^router_mesh_(peer_(connections|ack_total|nack_total|reconnects_total)|sync_round_duration_seconds_(sum|count))\{' \
+            | sed "s/^/gw-$i /" || true
+    done
+}
 
-    local AB AR TK
-    AB=$(echo "$PB $PC" | awk '{if($2>0)printf "%.1f",$1/$2/1024;else print "0"}')
+# Summed over every gateway and peer: open sync streams, successful acks
+# (the ack counter carries a status label; a failed ack is not one), nacks,
+# reconnects, and the mean sender round.
+collect_metrics() {
+    local lines
+    lines=$(mesh_metrics_lines)
+    local PEERS ACKS NACKS RECONNECTS RS RC AR
+    PEERS=$(echo "$lines" | awk '$2 ~ /^router_mesh_peer_connections\{/{s+=$3}END{print s+0}')
+    ACKS=$(echo "$lines" | awk '$2 ~ /^router_mesh_peer_ack_total\{/ && $2 ~ /status="success"/{s+=$3}END{print s+0}')
+    NACKS=$(echo "$lines" | awk '$2 ~ /^router_mesh_peer_nack_total\{/{s+=$3}END{print s+0}')
+    RECONNECTS=$(echo "$lines" | awk '$2 ~ /^router_mesh_peer_reconnects_total\{/{s+=$3}END{print s+0}')
+    RS=$(echo "$lines" | awk '$2 ~ /^router_mesh_sync_round_duration_seconds_sum\{/{s+=$3}END{print s+0}')
+    RC=$(echo "$lines" | awk '$2 ~ /^router_mesh_sync_round_duration_seconds_count\{/{s+=$3}END{print s+0}')
     AR=$(echo "$RS $RC" | awk '{if($2>0)printf "%.2f",$1/$2*1000;else print "0"}')
-    TK=$(echo "$PB" | awk '{printf "%.1f",$1/1024}')
-    echo "${TK}|${PC}|${AB}|${AR}"
+    echo "${PEERS}|${ACKS}|${NACKS}|${RECONNECTS}|${AR}"
 }
 
 show_metrics() {
-    echo "=== Mesh Sync Metrics (gateway-0) ==="
-    curl -sf "http://127.0.0.1:$METRICS_BASE_PORT/metrics" 2>/dev/null \
-        | grep -E 'router_mesh_sync_(round_duration_seconds_(sum|count)|batch_bytes_(sum|count))|router_mesh_store_' \
-        | grep -v '^#' | sed 's/^/  /'
+    echo "=== Mesh peer and sync metrics (every gateway) ==="
+    mesh_metrics_lines | sed 's/^/  /'
 }
 
 # Monitor fd count, CPU, memory for gateway processes over time
@@ -194,15 +209,15 @@ run_one_scenario() {
     result=$(collect_metrics)
     local label="${workers}w / ${rps}rps / ${duration}s"
     [ "$prompt_size" -gt 0 ] && label="$label / ${prompt_size}ch"
-    IFS='|' read -r tk pc ab ar <<< "$result"
-    printf "| %-28s | %10s KB | %7s | %8s KB | %8s ms |\n" "$label" "$tk" "$pc" "$ab" "$ar"
+    IFS='|' read -r peers acks nacks reconnects ar <<< "$result"
+    printf "| %-28s | %5s | %7s | %7s | %10s | %9s ms |\n" "$label" "$peers" "$acks" "$nacks" "$reconnects" "$ar"
 }
 
 run_bench() {
     echo "# Mesh Benchmark — $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo ""
-    echo "| Scenario                     | Policy Total | Batches | Avg Batch  | Avg Round  |"
-    echo "|------------------------------|-------------|---------|------------|------------|"
+    echo "| Scenario                     | Peers | Acks    | Nacks   | Reconnects | Avg Round    |"
+    echo "|------------------------------|-------|---------|---------|------------|--------------|"
 
     # Vary workers
     run_one_scenario 10 100 30

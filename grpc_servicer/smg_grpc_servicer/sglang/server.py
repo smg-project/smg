@@ -33,6 +33,7 @@ from smg_grpc_servicer.rust_lifecycle import (
     EXIT_GRACE_SECS,
     ServicerConfigError,
     announce_kv_events_default,
+    announce_servicer_impl,
     check_metrics_port_needs_rust,
     configuration_exit,
     guarded_exit,
@@ -112,6 +113,41 @@ async def _cleanup_failed_startup(
         logger.exception("Failed to shut down request manager after startup failure")
 
 
+def handshake_model_info(server_args: ServerArgs, scheduler_info: dict, facts: Any) -> dict:
+    """The model info this servicer reports at the handshake (``GetModelInfo``),
+    from the scheduler's ready message where it carries the figure and the loaded
+    model config otherwise.
+
+    The ready message carries the engine's running figures (``status``,
+    ``max_total_num_tokens``, ``max_req_input_len``, ``startup_time``) and no
+    vocabulary, so ``vocab_size`` is the loaded model config's, whatever the model
+    serves: the gateway bounds a pretokenized prompt's ids by this label, and a
+    constant of one model family would let an id past a smaller table through.
+    """
+    # Classification labels from the HuggingFace config (if available), as
+    # serving_classify.py::_get_id2label_mapping reads them; the JSON string is
+    # the proto's transport of a dict like {0: "negative", 1: "positive"}.
+    id2label, num_labels = facts.id2label, facts.num_labels
+    id2label_json = json.dumps(id2label) if id2label else ""
+    return {
+        "model_name": server_args.model_path,
+        "max_context_length": scheduler_info.get(
+            "max_total_num_tokens", server_args.context_length or 8192
+        ),
+        "vocab_size": scheduler_info.get("vocab_size") or facts.vocab_size,
+        "supports_vision": scheduler_info.get("supports_vision", False),
+        "model_type": facts.model_type or None,
+        "architectures": facts.architectures or None,
+        "max_req_input_len": scheduler_info.get("max_req_input_len", 8192),
+        "eos_token_ids": scheduler_info.get("eos_token_ids", []),
+        "pad_token_id": scheduler_info.get("pad_token_id", 0),
+        "bos_token_id": scheduler_info.get("bos_token_id", 1),
+        # Classification model support
+        "id2label_json": id2label_json,
+        "num_labels": num_labels or 0,
+    }
+
+
 async def serve_grpc(
     server_args: ServerArgs,
     model_info: dict | None = None,
@@ -130,17 +166,25 @@ async def serve_grpc(
             callback signature is a public contract.
     """
 
-    # One flag selects the Rust request path (--servicer-impl, this package's
-    # flag on SGLang's parser, else the environment); the entrypoint and every
-    # ServerArgs flag stay the same, and the Router cannot tell them apart.
+    # The switch picks the request path (--servicer-impl, this package's flag
+    # on SGLang's parser, else the environment, else the launcher's default);
+    # the entrypoint and every ServerArgs flag stay the same, and the Router
+    # cannot tell them apart.
     try:
         impl, origin = servicer_impl_source(server_args)
-        logger.info("Servicer implementation: %s (source=%s)", impl, origin)
+        announce_servicer_impl(impl, origin, SERVICER_IMPL_ENV, logger)
         if impl == "rust":
             if on_request_manager_ready is not None:
-                logger.warning(
-                    "%s=rust: SGLang's HTTP sidecar (metrics, profiling endpoints) stays off; "
-                    "the Rust servicer has no request manager to wire it to",
+                # The state of every launch on the Rust servicer, so a note; a
+                # warning when the launch asked for the sidecar's own /metrics
+                # (--enable-metrics), which nothing serves then.
+                asked_for_metrics = bool(getattr(server_args, "enable_metrics", False))
+                (logger.warning if asked_for_metrics else logger.info)(
+                    "The Rust servicer has no request manager to wire SGLang's HTTP sidecar "
+                    "to (its /metrics, admin and profiling endpoints stay off); its own "
+                    "metrics endpoint is --metrics-port / %s; the Python servicer "
+                    "(--servicer-impl python / %s=python) keeps the sidecar",
+                    METRICS_PORT_ENV,
                     SERVICER_IMPL_ENV,
                 )
             raise SystemExit(await serve_rust(server_args))
@@ -217,32 +261,9 @@ async def serve_grpc(
 
         # Update model info from scheduler info and model config
         if model_info is None:
-            # Extract classification labels from HuggingFace config (if available)
-            # Match logic in serving_classify.py::_get_id2label_mapping
-            facts = EngineConfigView(server_args, model_config).model
-            id2label, num_labels = facts.id2label, facts.num_labels
-
-            # Convert to JSON string for proto transport
-            # id2label is a dict like {0: "negative", 1: "positive"}
-            id2label_json = json.dumps(id2label) if id2label else ""
-
-            model_info = {
-                "model_name": server_args.model_path,
-                "max_context_length": scheduler_info.get(
-                    "max_total_num_tokens", server_args.context_length or 8192
-                ),
-                "vocab_size": scheduler_info.get("vocab_size", 128256),
-                "supports_vision": scheduler_info.get("supports_vision", False),
-                "model_type": facts.model_type or None,
-                "architectures": facts.architectures or None,
-                "max_req_input_len": scheduler_info.get("max_req_input_len", 8192),
-                "eos_token_ids": scheduler_info.get("eos_token_ids", []),
-                "pad_token_id": scheduler_info.get("pad_token_id", 0),
-                "bos_token_id": scheduler_info.get("bos_token_id", 1),
-                # Classification model support
-                "id2label_json": id2label_json,
-                "num_labels": num_labels or 0,
-            }
+            model_info = handshake_model_info(
+                server_args, scheduler_info, EngineConfigView(server_args, model_config).model
+            )
 
         if on_request_manager_ready is not None:
             await on_request_manager_ready(request_manager, server_args, scheduler_info)

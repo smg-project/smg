@@ -14,24 +14,29 @@ use std::{
 use engine_zmq_adapter::{
     stops::take_tokenspeed_string_stops, to_tokenspeed_response, TokenSpeedGenerateStream,
 };
-use futures::{stream::SelectAll, Stream};
+use futures::Stream;
 use llm_tokenizer::stop::StopSequenceDecoder;
 use smg_grpc_client::{tokenspeed_proto as ts, vllm_proto as vllm};
 use tonic::Status;
 
 use super::State;
 use crate::{
+    load_tracker::{rank_of, ChoiceLoad, PendingGuard, PrefillProbe, Submission},
     metrics::{complete_finish_reason, ChoiceMetrics},
     requests::HeldTerminal,
+    servicer::RequestOrigin,
     stop_match::{stop_decoder, StopMatcher},
-    stream::{poll_engine_item, Choice, RequestStream},
+    stream::{poll_engine_item, Choice, Choices, RequestStream},
     BoxStream,
 };
 
-/// Handle one `Generate` request against the connected scheduler.
+/// Handle one `Generate` request against the connected scheduler. `origin`
+/// says whose request it is, which decides what is counted
+/// ([`RequestOrigin`]).
 pub(super) async fn generate(
     state: &Arc<State>,
     mut req: ts::GenerateRequest,
+    origin: RequestOrigin,
 ) -> Result<BoxStream<ts::GenerateResponse>, Status> {
     // The request's arrival, the instant its latencies are measured from.
     let arrival = Instant::now();
@@ -42,7 +47,12 @@ pub(super) async fn generate(
     let request_id: Arc<str> = Arc::from(req.request_id.as_str());
     // Register before the submit: an `Abort` landing in the gap must find the
     // entry, and a duplicate id is refused up front.
-    let (registration, cancel) = state.shared.registry.register(&request_id)?;
+    // The servicer's own probe is registered for cancellation and settling
+    // like a client's request, outside the active count the scrape reports.
+    let (registration, cancel) = match origin {
+        RequestOrigin::Client => state.shared.registry.register(&request_id)?,
+        RequestOrigin::HealthProbe => state.shared.registry.register_uncounted(&request_id)?,
+    };
     let streaming = req.stream;
     let (skip_special_tokens, min_tokens) = req
         .sampling_params
@@ -68,36 +78,74 @@ pub(super) async fn generate(
     let subs = client
         .generate_tokenspeed_streams_for_model(req, state.model.grid_tensors())
         .await?;
-    let metrics = state.shared.metrics.request(
-        arrival,
-        subs.first()
-            .and_then(TokenSpeedGenerateStream::engine_index),
-        prompt_tokens,
-        max_tokens,
-        n,
-    );
-    let mut choices = SelectAll::new();
+    // A client's request is in the load tracker's view (in flight on the
+    // rank its first choice went to, the choice that reports the prompt,
+    // from here until the engine's first output or the stream's end, each
+    // choice's prefill sampled on the servicer's clock from here to its
+    // first output: this wire carries no engine timing) and in the request
+    // metrics; the servicer's own health probe is in neither.
+    let (probe, loads, metrics) = match origin {
+        RequestOrigin::Client => {
+            let at = Instant::now();
+            let rank = rank_of(
+                subs.iter()
+                    .find(|sub| sub.index() == 0)
+                    .or_else(|| subs.first())
+                    .and_then(TokenSpeedGenerateStream::engine_index),
+            );
+            (
+                state.shared.loads.submit(Submission {
+                    request_id: &request_id,
+                    rank,
+                    prompt_tokens,
+                    at,
+                }),
+                Some(PendingGuard::new(Arc::clone(state), &request_id)),
+                state.shared.metrics.request(
+                    arrival,
+                    subs.first()
+                        .and_then(TokenSpeedGenerateStream::engine_index),
+                    prompt_tokens,
+                    max_tokens,
+                    n,
+                ),
+            )
+        }
+        RequestOrigin::HealthProbe => (
+            PrefillProbe::default(),
+            None,
+            state.shared.metrics.uncounted(),
+        ),
+    };
+    let mut choices = Choices::new();
     for sub in subs {
         // Each choice decodes its own text: the matcher is per sequence.
         let decoder = match &decoder {
             Some(_) => stop_decoder(tokenizer, &stops, skip_special_tokens)?,
             None => None,
         };
+        // Each choice's engine request went to its own rank (an unpinned
+        // fan-out is placed per choice): its tokens are credited there.
+        let load = match origin {
+            RequestOrigin::Client => {
+                ChoiceLoad::new(rank_of(sub.engine_index()), sub.index(), probe)
+            }
+            RequestOrigin::HealthProbe => ChoiceLoad::uncounted(),
+        };
         choices.push(ChoiceStream::new(
             Arc::clone(&request_id),
+            Arc::clone(state),
             sub,
             decoder,
             streaming,
             min_tokens,
             metrics.choice(),
+            load,
         ));
     }
-    Ok(Box::pin(RequestStream::new(
-        choices,
-        cancel,
-        registration,
-        metrics,
-    )))
+    Ok(Box::pin(
+        RequestStream::new(choices, cancel, registration, metrics).holding(loads),
+    ))
 }
 
 /// One choice of a generate request: the ZMQ-mapped stream plus the string
@@ -118,16 +166,23 @@ struct ChoiceStream {
     pending: Option<vllm::GenerateResponse>,
     /// This choice's observation of the request's metrics.
     metrics: ChoiceMetrics,
+    /// The servicer state, for the load tracker.
+    state: Arc<State>,
+    /// This choice's share of the load tracker's bookkeeping.
+    load: ChoiceLoad,
 }
 
 impl ChoiceStream {
+    #[expect(clippy::too_many_arguments)]
     fn new(
         request_id: Arc<str>,
+        state: Arc<State>,
         inner: TokenSpeedGenerateStream,
         decoder: Option<StopSequenceDecoder>,
         streaming: bool,
         min_tokens: u32,
         metrics: ChoiceMetrics,
+        load: ChoiceLoad,
     ) -> Self {
         Self {
             request_id,
@@ -136,6 +191,8 @@ impl ChoiceStream {
             streaming,
             pending: None,
             metrics,
+            state,
+            load,
         }
     }
 
@@ -223,6 +280,13 @@ impl Stream for ChoiceStream {
                 if let Some(vllm::generate_response::Response::Complete(complete)) =
                     item.response.as_ref()
                 {
+                    this.load.count_prompt(
+                        &this.state.shared.loads,
+                        &this.request_id,
+                        complete.prompt_tokens,
+                        complete.cached_tokens,
+                        Instant::now(),
+                    );
                     this.metrics.complete(
                         &complete.finish_reason,
                         complete.prompt_tokens,
@@ -236,11 +300,21 @@ impl Stream for ChoiceStream {
                 }
                 return Poll::Ready(Some(Ok(response)));
             };
-            this.metrics.chunk(
-                u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX),
+            let tokens = u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX);
+            // The metrics' clock read serves the load tracker too.
+            let at = this
+                .metrics
+                .chunk(tokens, chunk.prompt_tokens, chunk.cached_tokens)
+                .unwrap_or_else(Instant::now);
+            let loads = &this.state.shared.loads;
+            this.load.count_prompt(
+                loads,
+                &this.request_id,
                 chunk.prompt_tokens,
                 chunk.cached_tokens,
+                at,
             );
+            this.load.generated(loads, tokens, at);
             let matched = match this.stops.feed(&chunk.token_ids) {
                 Ok(matched) => matched,
                 Err(status) => {

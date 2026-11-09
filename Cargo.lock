@@ -7631,6 +7631,7 @@ dependencies = [
  "once_cell",
  "openai-harmony",
  "openai-protocol",
+ "openapi-gen",
  "openmetrics-parser",
  "openssl",
  "opentelemetry 0.32.0",
@@ -7650,6 +7651,7 @@ dependencies = [
  "reqwest 0.13.4",
  "rmp-serde",
  "rsa",
+ "rustc-hash 2.1.3",
  "rustix",
  "rustls",
  "rustls-pemfile",
@@ -7698,6 +7700,7 @@ dependencies = [
  "wat",
  "wfaas",
  "xxhash-rust",
+ "zeromq",
  "zip",
 ]
 
@@ -7766,6 +7769,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "rmcp",
+ "rustc-hash 2.1.3",
  "rustls",
  "serde",
  "serde_json",
@@ -7869,6 +7873,7 @@ dependencies = [
  "dashmap",
  "futures",
  "http",
+ "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",
  "openssl",
@@ -7876,7 +7881,6 @@ dependencies = [
  "prost",
  "rand 0.10.2",
  "rustls",
- "rustls-pemfile",
  "serde",
  "tempfile",
  "tokio",
@@ -7884,6 +7888,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -7903,16 +7908,20 @@ dependencies = [
 name = "smg-python"
 version = "1.15.0-dev"
 dependencies = [
+ "blake3",
  "bytes",
  "engine-servicer",
  "llm-multimodal",
  "llm-tokenizer",
  "once_cell",
+ "openai-protocol",
  "prost",
  "pyo3",
  "rand 0.10.2",
+ "rayon",
  "reasoning-parser",
  "serde_json",
+ "serde_path_to_error",
  "serde_yaml",
  "smg",
  "smg-auth",
@@ -7920,11 +7929,13 @@ dependencies = [
  "smg-mesh",
  "smg-rl",
  "smg-symphony",
+ "tempfile",
  "tikv-jemallocator",
  "tokio",
  "tonic",
  "tool-parser",
  "tracing",
+ "validator",
 ]
 
 [[package]]
@@ -7974,6 +7985,7 @@ name = "smg-symphony"
 version = "0.2.0"
 dependencies = [
  "criterion",
+ "memchr",
  "openai-protocol",
  "rand 0.10.2",
  "regex",
@@ -7995,6 +8007,8 @@ dependencies = [
  "http",
  "http-body-util",
  "llm-tokenizer",
+ "metrics",
+ "metrics-exporter-prometheus",
  "mock-worker",
  "openai-protocol",
  "openssl",

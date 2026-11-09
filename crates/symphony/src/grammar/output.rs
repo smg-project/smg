@@ -619,7 +619,7 @@ impl OutputSpelling {
         for tool in tools {
             let count = tool
                 .function
-                .parameters
+                .parameters_schema()
                 .get("properties")
                 .and_then(Value::as_object)
                 .map_or(0, Map::len);
@@ -652,7 +652,7 @@ impl OutputSpelling {
         for tool in tools {
             let name = &tool.function.name;
             self.check_name(name)?;
-            let parameters = &tool.function.parameters;
+            let parameters = tool.function.parameters_schema();
             let object = parameters.as_object().filter(|schema| {
                 schema
                     .get("type")
@@ -706,7 +706,7 @@ impl OutputSpelling {
         for tool in tools {
             let name = &tool.function.name;
             self.check_name(name)?;
-            if let Some(object) = tool.function.parameters.as_object() {
+            if let Some(object) = tool.function.parameters_schema().as_object() {
                 for key in object
                     .get("properties")
                     .and_then(Value::as_object)
@@ -910,7 +910,7 @@ impl OutputSpelling {
                 let header = format!("{}{name}{}", self.call_lead, self.header_close);
                 b.sequence(vec![
                     b.leaf(Grammar::ConstString(header)),
-                    self.arguments_in(b, &tool.function.parameters),
+                    self.arguments_in(b, tool.function.parameters_schema()),
                 ])
             })
             .collect();

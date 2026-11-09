@@ -50,6 +50,7 @@ pub(crate) fn validate(req: &CreateMessageRequest) -> Result<(), ValidationError
     validate_tool_pairing(&req.messages)?;
     validate_stop_sequences(req.stop_sequences.as_deref())?;
     validate_tools(req.tools.as_deref())?;
+    validate_output_format(req)?;
     validate_thinking(req)
 }
 
@@ -369,20 +370,59 @@ fn validate_tools(tools: Option<&[Tool]>) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// A thinking budget starts at 1024 tokens. (That it stays under
-/// `max_tokens` depends on the `anthropic-beta` header, so the gateway's
-/// handler checks it.)
-fn validate_thinking(req: &CreateMessageRequest) -> Result<(), ValidationError> {
-    if let Some(ThinkingConfig::Enabled { budget_tokens, .. }) = &req.thinking {
-        if *budget_tokens < 1024 {
+/// An output format's schema is a JSON object, under either field it comes
+/// in ([`CreateMessageRequest::output_schema`]); the format's `type` is the
+/// deserializer's to refuse.
+fn validate_output_format(req: &CreateMessageRequest) -> Result<(), ValidationError> {
+    let under = [
+        (
+            "output_config.format",
+            req.output_config
+                .as_ref()
+                .and_then(|config| config.format.as_ref()),
+        ),
+        ("output_format", req.output_format.as_deref()),
+    ];
+    for (field, format) in under {
+        if format.is_some_and(|format| !format.schema().is_object()) {
             return Err(invalid(
-                "thinking_budget_too_small",
-                "thinking.enabled.budget_tokens: Input should be greater than or equal to 1024"
-                    .to_owned(),
+                "output_format_schema_not_an_object",
+                format!("{field}.schema: Input should be a valid dictionary"),
             ));
         }
     }
     Ok(())
+}
+
+/// `enabled` needs a budget of at least 1024 tokens (that it stays under
+/// `max_tokens` depends on the `anthropic-beta` header, so the gateway's
+/// handler checks it); `between_tools` takes `type` alone (the public API
+/// refuses `display`, `budget_tokens` or `block_binding` sent with it).
+fn validate_thinking(req: &CreateMessageRequest) -> Result<(), ValidationError> {
+    match &req.thinking {
+        Some(ThinkingConfig::Enabled { budget_tokens, .. }) if *budget_tokens < 1024 => {
+            Err(invalid(
+                "thinking_budget_too_small",
+                "thinking.enabled.budget_tokens: Input should be greater than or equal to 1024"
+                    .to_owned(),
+            ))
+        }
+        Some(ThinkingConfig::BetweenTools { other }) if !other.is_empty() => {
+            let mut fields: Vec<&str> = other.keys().map(String::as_str).collect();
+            fields.sort_unstable();
+            let refusals: Vec<String> = fields
+                .iter()
+                .map(|field| {
+                    format!("thinking.between_tools.{field}: Extra inputs are not permitted")
+                })
+                .collect();
+            Err(invalid(
+                "thinking_between_tools_takes_no_other_field",
+                refusals.join("; "),
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -702,5 +742,47 @@ mod tests {
         .expect_err("the public API refuses an unknown field in a message")
         .to_string();
         assert!(err.contains("extra"), "{err}");
+    }
+
+    /// `between_tools` passes with `type` alone and is refused, naming each
+    /// field the way the module's other refusals do, with anything else
+    /// beside it.
+    #[test]
+    fn between_tools_takes_no_other_field() {
+        assert!(request(json!({"thinking": {"type": "between_tools"}}))
+            .validate()
+            .is_ok());
+        let refusal = rejection(json!({
+            "thinking": {"type": "between_tools", "display": "omitted", "budget_tokens": 2048}
+        }));
+        assert!(
+            refusal.contains(
+                "thinking.between_tools.budget_tokens: Extra inputs are not permitted; \
+                 thinking.between_tools.display: Extra inputs are not permitted"
+            ),
+            "{refusal}"
+        );
+    }
+
+    /// An output format's schema is a JSON object, under either field it
+    /// comes in; the field is named as the public API names it.
+    #[test]
+    fn an_output_formats_schema_is_an_object() {
+        for field in ["output_config.format", "output_format"] {
+            let body = |schema: Value| {
+                let format = json!({"type": "json_schema", "schema": schema});
+                match field {
+                    "output_format" => json!({"output_format": format}),
+                    _ => json!({"output_config": {"format": format}}),
+                }
+            };
+            accepted(body(json!({"type": "object"})));
+            assert!(
+                rejection(body(json!("an object"))).contains(&format!(
+                    "{field}.schema: Input should be a valid dictionary"
+                )),
+                "{field}"
+            );
+        }
     }
 }

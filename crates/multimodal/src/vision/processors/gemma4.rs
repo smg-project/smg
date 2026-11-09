@@ -317,24 +317,29 @@ fn encode<F: RgbSource>(
     };
 
     let patch_pixels = params.patch_pixels();
-    let mut values = vec![0.0_f32; params.max_patches() * patch_pixels];
+    // The patches in reading order, then the zero padding, each element
+    // written once into a plain allocation: a zeroed allocation of this size
+    // costs the allocator's page faults per image, and the patches overwrite
+    // all of it but the padding.
+    let mut values = Vec::with_capacity(params.max_patches() * patch_pixels);
     let row_bytes = width * CHANNELS;
     for patch_y in 0..grid_h {
         for patch_x in 0..grid_w {
             // Patch elements run `[dy][dx][channel]`, the interleaved layout
             // of the source rows (the reference's `(ph, pw, p, p, c)` view).
-            let patch = &mut values[(patch_y * grid_w + patch_x) * patch_pixels..][..patch_pixels];
             for dy in 0..params.patch {
                 let source =
                     (patch_y * params.patch + dy) * row_bytes + patch_x * params.patch * CHANNELS;
                 let row = &pixels[source..source + params.patch * CHANNELS];
-                let out = &mut patch[dy * params.patch * CHANNELS..][..params.patch * CHANNELS];
-                for (out, (value, lut)) in out.iter_mut().zip(row.iter().zip(lut.iter().cycle())) {
-                    *out = lut[*value as usize];
-                }
+                values.extend(
+                    row.iter()
+                        .zip(lut.iter().cycle())
+                        .map(|(value, lut)| lut[*value as usize]),
+                );
             }
         }
     }
+    values.resize(params.max_patches() * patch_pixels, 0.0);
     // `(x, y)` per patch in reading order, `-1` for the padding.
     let mut positions = vec![-1_i64; params.max_patches() * 2];
     for (index, position) in positions[..num_patches * 2]
@@ -510,7 +515,7 @@ impl VisionPreProcessor for Gemma4Processor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
@@ -518,10 +523,14 @@ impl VisionPreProcessor for Gemma4Processor {
         let params = self.params_for(Modality::Image)?;
         let encoded = images
             .iter()
-            .map(|image| encode(image, params, &self.pixels))
+            .map(|image| encode(*image, params, &self.pixels))
             .collect::<Result<Vec<_>, _>>()?;
         let (tensor, positions, tokens) = stack(encoded, params)?;
-        let sizes = images.iter().map(GenericImageView::dimensions).collect();
+        let sizes = images
+            .iter()
+            .copied()
+            .map(GenericImageView::dimensions)
+            .collect();
         Ok(PreprocessedEncoderInputs::new(tensor, tokens, sizes)
             .with_extra("pixel_position_ids", positions))
     }
@@ -662,7 +671,7 @@ mod tests {
         let image = solid(512, 512, [255, 0, 51]);
         let out = Gemma4Processor::from_config_for(&image_config(), Modality::Image)
             .unwrap()
-            .preprocess(std::slice::from_ref(&image))
+            .preprocess(&[&image])
             .unwrap();
         assert_eq!(out.encoder_input.shape(), &[1, 2520, 768]);
         assert_eq!(out.feature_token_counts, vec![256]);
@@ -690,11 +699,55 @@ mod tests {
     }
 
     #[test]
+    fn the_patch_tensor_equals_its_zero_filled_form() {
+        // The patches in reading order, then zero padding to the budget, as the
+        // zero-filled tensor held them; an unresized gradient, so every patch
+        // element is checked against the index form.
+        let params = params();
+        let side = params.side_mult();
+        let (width, height) = (2 * side, side);
+        let pixels = crate::test_support::gradient_rgb(width, height, 7);
+        let frame = DynamicImage::ImageRgb8(
+            RgbImage::from_raw(width as u32, height as u32, pixels.clone()).unwrap(),
+        );
+        let pipeline = Pixels {
+            do_resize: false,
+            ..Pixels::from_config(&image_config()).unwrap()
+        };
+        let encoded = encode(&frame, params, &pipeline).unwrap();
+        let (patch, patch_pixels) = (params.patch, params.patch_pixels());
+        let (grid_w, grid_h) = (width / patch, height / patch);
+        let mut expected = vec![0.0_f32; params.max_patches() * patch_pixels];
+        for patch_y in 0..grid_h {
+            for patch_x in 0..grid_w {
+                for dy in 0..patch {
+                    for dx in 0..patch {
+                        for channel in 0..CHANNELS {
+                            let source = ((patch_y * patch + dy) * width + patch_x * patch + dx)
+                                * CHANNELS
+                                + channel;
+                            let index = (patch_y * grid_w + patch_x) * patch_pixels
+                                + (dy * patch + dx) * CHANNELS
+                                + channel;
+                            expected[index] = pipeline.lut[channel][pixels[source] as usize];
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(encoded.values, expected);
+        assert_eq!(
+            encoded.tokens,
+            grid_w * grid_h / (params.pool * params.pool)
+        );
+    }
+
+    #[test]
     fn batches_stack_images_of_different_sizes() {
         let images = [solid(64, 64, [1, 2, 3]), solid(1920, 1080, [4, 5, 6])];
         let out = Gemma4Processor::from_config_for(&image_config(), Modality::Image)
             .unwrap()
-            .preprocess(&images)
+            .preprocess(&images.iter().collect::<Vec<_>>())
             .unwrap();
         assert_eq!(out.encoder_input.shape(), &[2, 2520, 768]);
         assert_eq!(out.feature_token_counts, vec![256, 264]);
@@ -785,12 +838,12 @@ mod tests {
         let no_resize: PreProcessorConfig =
             serde_json::from_value(serde_json::json!({"do_resize": false})).unwrap();
         let no_resize = Gemma4Processor::from_config_for(&no_resize, Modality::Image).unwrap();
-        assert!(no_resize.preprocess(&[solid(100, 100, [0; 3])]).is_err());
-        let aligned = no_resize.preprocess(&[solid(96, 48, [0; 3])]).unwrap();
+        assert!(no_resize.preprocess(&[&solid(100, 100, [0; 3])]).is_err());
+        let aligned = no_resize.preprocess(&[&solid(96, 48, [0; 3])]).unwrap();
         assert_eq!(aligned.feature_token_counts, vec![2]);
         // Aligned but over the budget of 2520 patches (180 x 60 = 10,800).
         assert!(no_resize
-            .preprocess(&[solid(48 * 60, 48 * 20, [0; 3])])
+            .preprocess(&[&solid(48 * 60, 48 * 20, [0; 3])])
             .is_err());
     }
 

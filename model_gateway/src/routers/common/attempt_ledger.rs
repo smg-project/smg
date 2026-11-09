@@ -165,7 +165,7 @@ mod tests {
         routers::common::retry::is_retryable_response,
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
-            test_support::no_health_check,
+            test_support::{no_health_check, worker_of},
             BasicWorkerBuilder,
         },
     };
@@ -261,15 +261,6 @@ mod tests {
         ledger.settle(&mut transport, [&w1], pool.iter());
         assert!(ledger.admits(w1.as_ref()));
         assert!(is_retryable_response(&transport));
-    }
-
-    fn worker_of(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(worker_type)
-                .health_config(no_health_check())
-                .build(),
-        )
     }
 
     #[test]

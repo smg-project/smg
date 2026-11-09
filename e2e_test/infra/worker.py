@@ -31,6 +31,7 @@ from .constants import (
     effective_startup_timeout,
     get_gpu_offset,
     get_mm_processing,
+    get_mock_wire,
     get_runtime,
     get_servicer_impl,
     get_servicer_impl_setting,
@@ -74,17 +75,6 @@ _ERROR_LEVEL_LINE = re.compile(r"\b(?:ERROR|CRITICAL|FATAL)\b|panicked at ")
 # the exception marker only: a level word inside the message (torch's NCCL error
 # ends with "run with NCCL_DEBUG=INFO for details") does not lower the line.
 _BELOW_ERROR_LEVEL_LINE = re.compile(r"\b(?:DEBUG|INFO|WARNING|WARN)\b")
-
-# The engines whose gRPC server carries no ``grpc.health.v1`` service:
-# TRT-LLM, whose upstream server registers its own service and no standard
-# health (it answers its own proto's HealthCheck, the one the gateway
-# probes). For these alone, and only while the worker is that server (the
-# Rust servicer a lane may run for TRT-LLM instead hosts the standard service
-# like every engine servicer of this repository), a ready channel that answers
-# UNIMPLEMENTED counts as the worker, until the harness asks their own
-# HealthCheck instead. The scripted mock worker hosts the standard service
-# like the engine servicers.
-ENGINES_WITHOUT_GRPC_HEALTH = frozenset({"trtllm"})
 
 
 def _excerpt(line: str) -> str:
@@ -166,6 +156,8 @@ class Worker:
     # handle, the ports) runs once per start, and once for a worker that never
     # started; a second ``stop`` finds nothing to do.
     _torn_down: bool = field(default=False, repr=False)
+    # Last native model answer during this wait, for identity failure diagnostics.
+    _last_trt_model_identity: tuple[str, str] | None = field(default=None, repr=False)
     _moriio_ports: list[int] = field(default_factory=list, repr=False)
 
     @property
@@ -452,8 +444,12 @@ class Worker:
             # exists for the engines that have a choice.
             return "mooncake"
         if self.engine == "mock":
-            # The mock engine moves no KV; the gateway pairs it on the
-            # scheduler wire it speaks, whose one transport is Mooncake.
+            # The mock engine moves no KV and names Mooncake as its transport
+            # on every scheduler wire it can speak (``--grpc-wire``): as the
+            # transfer backend in its server args on the TokenSpeed and SGLang
+            # wires, as the connector on the vLLM one. The gateway pairs it on
+            # that, whatever the lane's setting for the engines that have a
+            # choice.
             return "mooncake"
         return vllm_kv_backend()
 
@@ -690,6 +686,16 @@ class Worker:
         if self.admin_port is None:
             self.admin_port = get_open_port()
             self._admin_port_auto = True
+        # The disaggregation roles are the HTTP and the gRPC workers'; the
+        # encode role is the gRPC vLLM wire's alone (the mock answers the
+        # encoder-cache handoff there); the ZMQ workers take none.
+        if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE, WorkerType.ENCODE):
+            if self.mode == ConnectionMode.ZMQ:
+                raise ValueError(
+                    "the mock engine's prefill, decode and encode roles are HTTP or gRPC workers"
+                )
+            if self.worker_type == WorkerType.ENCODE and self.mode != ConnectionMode.GRPC:
+                raise ValueError("the mock engine's encode role is a gRPC worker")
         cmd = [
             os.environ.get("MOCK_WORKER_BIN", "mock-worker"),
             "--host",
@@ -705,6 +711,13 @@ class Worker:
         ]
         if self.mode == ConnectionMode.GRPC:
             cmd += ["--grpc-base-port", str(self.port), "--grpc-count", "1"]
+            # The scheduler proto the lane runs the mock on; the mock's own
+            # default (TokenSpeed) when the lane names none. A class's own
+            # ``--grpc-wire`` comes after, in its extra engine arguments, and
+            # the mock takes the last.
+            wire = get_mock_wire()
+            if wire is not None:
+                cmd += ["--grpc-wire", wire]
         elif self.mode == ConnectionMode.ZMQ:
             # The gateway binds the handshake it derives from the worker's
             # ipc:// URL on the IPv4 loopback whatever the lane's host is
@@ -716,17 +729,18 @@ class Worker:
             cmd += ["--zmq-handshake", handshake, "--zmq-count", "1"]
         else:
             cmd += ["--http-base-port", str(self.port), "--http-count", "1"]
-        # The disaggregation role, as the engines take theirs: a prefill
-        # worker also binds the bootstrap port the gateway is told of, where
-        # the probe finds it; both advertise the role in their server args.
-        if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
-            if self.mode != ConnectionMode.GRPC:
-                raise ValueError("the mock engine's prefill and decode roles are gRPC workers")
+        # The disaggregation role, as the engines take theirs: a prefill or
+        # an encode worker also binds the bootstrap port the gateway is told
+        # of, where the probe finds it; all advertise the role in their
+        # server args (the HTTP workers in ``/server_info``). The encode
+        # role takes the vLLM wire whatever the lane's wire; a class's own
+        # wire still comes after, and the mock takes the last.
+        if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE, WorkerType.ENCODE):
             cmd += ["--worker-type", self.worker_type.value]
-            if self.worker_type == WorkerType.PREFILL and self.bootstrap_port is not None:
+            if self.worker_type == WorkerType.ENCODE:
+                cmd += ["--grpc-wire", "vllm"]
+            if self.worker_type != WorkerType.DECODE and self.bootstrap_port is not None:
                 cmd += ["--bootstrap-base-port", str(self.bootstrap_port)]
-        elif self.worker_type == WorkerType.ENCODE:
-            raise ValueError("the mock engine has no encode role")
         return cmd
 
     def _build_mlx_cmd(self, model_path: str, spec: dict) -> list[str]:
@@ -932,13 +946,9 @@ class Worker:
         ]
 
     def _serves_no_standard_health(self) -> bool:
-        """Whether this worker's server is one without ``grpc.health.v1``
-        (``ENGINES_WITHOUT_GRPC_HEALTH``): the engine's own server, not the
-        Rust servicer the lane may run for TRT-LLM instead, which hosts the
-        service like every engine servicer of this repository."""
-        if self.engine not in ENGINES_WITHOUT_GRPC_HEALTH:
-            return False
-        return self.engine != "trtllm" or trtllm_runs_engines_own_servicer()
+        """Only TRT's own server uses native health RPCs; its Rust servicer
+        hosts ``grpc.health.v1`` like the other repository servicers."""
+        return self.engine == "trtllm" and trtllm_runs_engines_own_servicer()
 
     def _build_env(self) -> dict[str, str]:
         """Build environment variables for the worker process."""
@@ -1162,23 +1172,18 @@ class Worker:
                 self._log_file = None
             raise
 
-    def grpc_serving(self, timeout: float = 5.0) -> bool:
-        """One health answer of a gRPC worker: ``True`` on SERVING from its
-        ``grpc.health.v1`` service, ``False`` on anything else: a NOT_SERVING,
-        a refused connection, and an answer without the health service.
+    def grpc_serving(self, timeout: float = 5.0, *, _deadline: float | None = None) -> bool:
+        """Require the engine's health answer, within one probe deadline.
 
-        Every engine servicer of this repository hosts the health service, so
-        UNIMPLEMENTED is not this worker speaking. An engine binds its port
-        only once it has loaded its model, and another process's listener can
-        sit on the number until then: an HTTP/2 server's 404 reads as
-        UNIMPLEMENTED through grpc, and the ready channel behind it is the
-        stranger's, which the nightly PD sweep once certified as a decode
-        worker. One engine's server carries no such service, TRT-LLM
-        (``ENGINES_WITHOUT_GRPC_HEALTH``; it answers its own proto's
-        HealthCheck, the one the gateway probes); for it alone, while the
-        worker is that server (``_serves_no_standard_health``), a ready
-        channel that answers UNIMPLEMENTED counts.
+        TRT's own server must answer its HealthCheck and name the launched
+        model. The Rust TRT servicer and other repository servicers require
+        the standard SERVING answer.
         """
+        native_trt = self._serves_no_standard_health()
+        if native_trt:
+            deadline = time.monotonic() + timeout
+            if _deadline is not None:
+                deadline = min(deadline, _deadline)
         try:
             import grpc
             from grpc_health.v1 import health_pb2, health_pb2_grpc
@@ -1189,23 +1194,46 @@ class Worker:
 
         channel = grpc.insecure_channel(host_port(DEFAULT_HOST, self.port))
         try:
+            if native_trt:
+                try:
+                    from smg_grpc_proto import trtllm_service_pb2, trtllm_service_pb2_grpc
+                except ImportError as error:
+                    raise RuntimeError("TRT gRPC health check requires smg-grpc-proto") from error
+
+                # The launcher's positional model argument; configuration errors
+                # must propagate instead of looking like a not-yet-ready worker.
+                expected_model = get_model_spec(self.model_id)["model"]
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                stub = trtllm_service_pb2_grpc.TrtllmServiceStub(channel)
+                try:
+                    health = stub.HealthCheck(
+                        trtllm_service_pb2.HealthCheckRequest(), timeout=remaining
+                    )
+                    if health.status != "OK":
+                        return False
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    info = stub.GetModelInfo(
+                        trtllm_service_pb2.GetModelInfoRequest(), timeout=remaining
+                    )
+                    self._last_trt_model_identity = (info.model_id, expected_model)
+                    return (
+                        time.monotonic() < deadline
+                        and isinstance(expected_model, str)
+                        and bool(expected_model.strip())
+                        and info.model_id == expected_model
+                    )
+                except Exception:
+                    return False
+
             try:
                 stub = health_pb2_grpc.HealthStub(channel)
                 request = health_pb2.HealthCheckRequest(service="")
                 response = stub.Check(request, timeout=timeout)
                 return response.status == health_pb2.HealthCheckResponse.SERVING
-            except grpc.RpcError as e:
-                if (
-                    self._serves_no_standard_health()
-                    and hasattr(e, "code")
-                    and e.code() == grpc.StatusCode.UNIMPLEMENTED
-                ):
-                    try:
-                        grpc.channel_ready_future(channel).result(timeout=timeout)
-                        return True
-                    except Exception:
-                        return False
-                return False
             except Exception:
                 return False
         finally:
@@ -1213,16 +1241,41 @@ class Worker:
 
     def _wait_grpc_healthy(self, timeout: float) -> None:
         """Wait for a gRPC worker to become healthy."""
-        start = time.perf_counter()
-        while time.perf_counter() - start < timeout:
+        if self.engine == "trtllm":
+            self._last_trt_model_identity = None
+            deadline = time.monotonic() + timeout
+            while (remaining := deadline - time.monotonic()) > 0:
+                self.raise_if_exited()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if (
+                    self.grpc_serving(timeout=min(5.0, remaining), _deadline=deadline)
+                    and time.monotonic() < deadline
+                ):
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(HEALTH_CHECK_INTERVAL, remaining))
+            # A launcher can exit while the final probe consumes the deadline.
+            # Prefer its exit status and log over a generic readiness timeout.
             self.raise_if_exited()
-            if self.grpc_serving():
-                return
-            time.sleep(HEALTH_CHECK_INTERVAL)
+        else:
+            start = time.perf_counter()
+            while time.perf_counter() - start < timeout:
+                self.raise_if_exited()
+                if self.grpc_serving():
+                    return
+                time.sleep(HEALTH_CHECK_INTERVAL)
 
+        identity_detail = ""
+        if self.engine == "trtllm" and self._last_trt_model_identity is not None:
+            actual_model, expected_model = self._last_trt_model_identity
+            if actual_model != expected_model:
+                identity_detail = f"; answered as {actual_model!r}, expected {expected_model!r}"
         raise TimeoutError(
             f"gRPC worker {self.model_id} on port {self.port} "
-            f"did not become healthy within {timeout}s"
+            f"did not become healthy within {timeout}s{identity_detail}"
         )
 
 

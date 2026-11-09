@@ -4,6 +4,7 @@
 use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::profile::ProviderProfile;
+use smg_grpc_client::FormatSetAside;
 
 use crate::routers::{
     error,
@@ -70,6 +71,7 @@ impl BuildStage for TranscriptionRequestBuildingStage {
             processed_messages.continued_final_message,
             token_ids,
             None,
+            FormatSetAside::default(),
             None,
             false,
             "transcription-",

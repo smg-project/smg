@@ -120,7 +120,10 @@ def test_package_exposes_the_flag_and_the_rust_entry_points():
 
 
 def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env():
-    assert rust.resolve_servicer_impl(environ={}) == "python"
+    assert rust.resolve_servicer_impl(environ={}) == "rust"
+    assert (
+        rust.resolve_servicer_impl(environ={"SMG_TOKENSPEED_SERVICER_IMPL": "python"}) == "python"
+    )
     assert rust.resolve_servicer_impl(environ={"SMG_TOKENSPEED_SERVICER_IMPL": " Rust "}) == "rust"
     args = argparse.Namespace(servicer_impl="rust")
     assert rust.resolve_servicer_impl(args, environ={}) == "rust"
@@ -146,7 +149,7 @@ def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env():
 
 
 def test_servicer_impl_source_names_the_origin_and_writes_a_flag_back():
-    assert rust.servicer_impl_source(environ={}) == ("python", "default")
+    assert rust.servicer_impl_source(environ={}) == ("rust", "default")
     assert rust.servicer_impl_source(environ={"SMG_TOKENSPEED_SERVICER_IMPL": "rust"}) == (
         "rust",
         "env",
@@ -159,7 +162,7 @@ def test_servicer_impl_source_names_the_origin_and_writes_a_flag_back():
     assert environ == {"SMG_TOKENSPEED_SERVICER_IMPL": "python"}
     # Without a flag in hand nothing is written.
     environ = {}
-    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("python", "default")
+    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("rust", "default")
     assert environ == {}
 
 
@@ -233,7 +236,7 @@ def test_the_launcher_takes_the_flag_ahead_of_tokenspeeds_args(launcher, monkeyp
     assert os.environ[rust.SERVICER_IMPL_ENV] == "rust"
 
 
-def test_the_launcher_falls_back_to_the_environment_then_python(launcher, monkeypatch, caplog):
+def test_the_launcher_falls_back_to_the_environment_then_rust(launcher, monkeypatch, caplog):
     module, calls = launcher
     monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "rust")
     with caplog.at_level("INFO", logger=module.logger.name):
@@ -242,20 +245,26 @@ def test_the_launcher_falls_back_to_the_environment_then_python(launcher, monkey
     assert raised.value.code == 3 and calls["served"][0] == "rust"
     assert calls["argv"] == ["--model", "org/m"]
     assert "Servicer implementation: rust (source=env)" in caplog.text
-    # `--servicer-impl python` overrides the exported `rust`, environment included.
+    assert "deprecated" not in caplog.text
+    # `--servicer-impl python` overrides the exported `rust`, environment
+    # included, and is announced as deprecated.
     caplog.clear()
     with caplog.at_level("INFO", logger=module.logger.name):
         module.main(["--servicer-impl=python", "--model", "org/m"])
     assert calls["served"][0] == "python" and calls["argv"] == ["--model", "org/m"]
     assert "Servicer implementation: python (source=flag)" in caplog.text
+    assert "The Python gRPC servicer is deprecated" in caplog.text
     assert os.environ[rust.SERVICER_IMPL_ENV] == "python"
-    # Neither: the Python servicer, and the environment is left alone.
+    # Neither: the Rust servicer (the default), no deprecation line, and the
+    # environment is left alone.
     monkeypatch.delenv(rust.SERVICER_IMPL_ENV)
     caplog.clear()
     with caplog.at_level("INFO", logger=module.logger.name):
-        module.main(["--model", "org/m"])
-    assert calls["served"][0] == "python"
-    assert "Servicer implementation: python (source=default)" in caplog.text
+        with pytest.raises(SystemExit) as raised:
+            module.main(["--model", "org/m"])
+    assert raised.value.code == 3 and calls["served"][0] == "rust"
+    assert "Servicer implementation: rust (source=default)" in caplog.text
+    assert "deprecated" not in caplog.text
     assert rust.SERVICER_IMPL_ENV not in os.environ
 
 
@@ -514,6 +523,18 @@ def _install_cache_vocabulary(monkeypatch, state_labels=("linear_attention",)):
     )
 
 
+def _install_scheduler_events(monkeypatch, per_group: bool):
+    """The engine's scheduler extension, as far as the launcher reads it: the
+    ``KVEvent.BlockStored`` class, with the cache-group field when the engine
+    publishes its events per group."""
+    fields = {"group_idx": 0, "kv_cache_spec_kind": "full_attention"} if per_group else {}
+    return _install(
+        monkeypatch,
+        "tokenspeed_scheduler.tokenspeed_scheduler_ext",
+        KVEvent=SimpleNamespace(BlockStored=type("BlockStored", (), fields)),
+    )
+
+
 def _model_config_of(*labels, nested=False, attribute="layer_types"):
     """A model config whose checkpoint labels its layers ``labels`` (on the
     config itself, or on the text config nested in it), as TokenSpeed's
@@ -535,19 +556,49 @@ def _model_config_of(*labels, nested=False, attribute="layer_types"):
     )
 
 
+def test_kv_event_publishing_is_on_for_a_hybrid_model_when_the_engine_publishes_per_group(
+    monkeypatch,
+):
+    """An engine whose scheduler publishes its KV events per cache group (its
+    ``KVEvent.BlockStored`` carries ``group_idx``) publishes a hybrid model's
+    History chain and its State checkpoints each under its own group, which
+    is what the relay and the router read: the publisher is on for such a
+    model, and the model config is not read for the decision. An engine whose
+    events carry no group keeps the answer below."""
+    _install_cache_vocabulary(monkeypatch)
+    _install_scheduler_events(monkeypatch, per_group=True)
+    hybrid = _model_config_of("linear_attention", "full_attention")
+
+    def never(args):
+        raise AssertionError("the model config is not read when the engine publishes per group")
+
+    monkeypatch.setattr(rust, "_model_config", never)
+    for config in (hybrid, None):
+        args = FakeServerArgs()
+        assert rust.default_kv_events_config(args, environ={}, model_config=config) is not None
+        assert json.loads(args.kv_events_config)["enable_kv_cache_events"] is True
+    # The same engine without the group on its events: the hybrid model's
+    # publisher stays off, as on any engine before per-group events.
+    _install_scheduler_events(monkeypatch, per_group=False)
+    args = FakeServerArgs()
+    assert rust.default_kv_events_config(args, environ={}, model_config=hybrid) is None
+    assert args.kv_events_config is None
+
+
 def test_kv_event_publishing_stays_off_for_a_model_whose_cache_keeps_recurrent_state(
     monkeypatch, caplog
 ):
-    """TokenSpeed keeps a hybrid model's recurrent state in State groups,
-    which span no tokens, and its KV-event drain aborts the engine on such a
-    group: every prefill and decode worker of a Gated-DeltaNet model died at
-    its first request once the default turned the publisher on. The default
-    follows the engine's own vocabulary of which layer labels get a State
-    group, read off the model config the engine builds: the publisher stays
-    off for such a model, said once with what turns it on; a model whose
-    layers are all history is served as before, as is one on an engine
-    without that vocabulary; an explicit configuration and the opt-out are
-    not asked, and the model config is not read for them."""
+    """TokenSpeed keeps a hybrid model's recurrent state in State groups, and
+    an engine whose KV events carry no cache group publishes a boundary only
+    while every group holds it: on such a model only the checkpoint
+    boundaries, no chain a router can follow (older such engines aborted in
+    the drain). The default follows the engine's own vocabulary of which
+    layer labels get a State group, read off the model config the engine
+    builds: the publisher stays off for such a model, said once with what
+    turns it on; a model whose layers are all history is served as before,
+    as is one on an engine without that vocabulary; an explicit
+    configuration and the opt-out are not asked, and the model config is not
+    read for them."""
     _install_cache_vocabulary(monkeypatch)
     hybrid = _model_config_of(
         "linear_attention", "linear_attention", "linear_attention", "full_attention"
@@ -558,9 +609,10 @@ def test_kv_event_publishing_stays_off_for_a_model_whose_cache_keeps_recurrent_s
     assert args.kv_events_config is None
     assert (
         "KV event publishing left off: org/m keeps recurrent state in 3 of its 4 layers "
-        "(linear_attention): State groups of TokenSpeed's cache, which span no tokens, and "
-        "TokenSpeed's KV-event drain aborts the engine on a group with no token span; pass "
-        "--kv-events-config to turn the publisher on anyway"
+        "(linear_attention): State groups of TokenSpeed's cache, and this engine's KV-event "
+        "feed publishes a boundary only while every group holds it, so the model's history "
+        "chain would never reach the router (an engine whose KV events name their cache group "
+        "publishes it); pass --kv-events-config to turn the publisher on anyway"
     ) in caplog.text
     # The labels on the text config nested in a multimodal checkpoint's, and a
     # checkpoint that declares its cache labels outright, read the same.

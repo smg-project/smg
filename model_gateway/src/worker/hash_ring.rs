@@ -4,7 +4,8 @@
 //! virtual nodes. The registry reconciles one ring per model when workers are
 //! added or removed via [`HashRing::updated`], which rehashes only the URLs
 //! that changed — individual lookups only pay an `O(log n)` binary search plus
-//! a small bounded dedupe set to skip virtual-node duplicates. See
+//! a visited mark per worker (on the stack up to 512 workers, one vector of
+//! words beyond) to skip virtual-node duplicates. See
 //! [`HashRing::find_healthy_url`] for details.
 //!
 //! The type intentionally has no dependency on the `Worker` trait — it is
@@ -19,6 +20,44 @@ use std::{
 /// Number of virtual nodes per physical worker for even distribution.
 /// 150 is a common choice that provides good balance between memory and distribution.
 const VIRTUAL_NODES_PER_WORKER: usize = 150;
+
+/// The words of visited marks a lookup keeps on the stack: one bit per
+/// worker, so a fleet of up to `64 * INLINE_VISITED_WORDS` workers is walked
+/// without an allocation.
+const INLINE_VISITED_WORDS: usize = 8;
+
+/// The workers a lookup has asked about, marked by URL index: a bit per
+/// worker in a few words on the stack for the fleets the ring usually holds,
+/// a vector of words for a larger one.
+enum Visited {
+    Inline([u64; INLINE_VISITED_WORDS]),
+    Heap(Vec<u64>),
+}
+
+impl Visited {
+    /// Marks for a ring of `workers` URLs, none set.
+    fn for_workers(workers: usize) -> Self {
+        let words = workers.div_ceil(64);
+        if words <= INLINE_VISITED_WORDS {
+            Self::Inline([0; INLINE_VISITED_WORDS])
+        } else {
+            Self::Heap(vec![0; words])
+        }
+    }
+
+    /// Marks the worker at `index`; whether this is its first mark.
+    fn mark(&mut self, index: usize) -> bool {
+        let words: &mut [u64] = match self {
+            Self::Inline(words) => words,
+            Self::Heap(words) => words,
+        };
+        let bit = 1u64 << (index % 64);
+        let word = &mut words[index / 64];
+        let first = *word & bit == 0;
+        *word |= bit;
+        first
+    }
+}
 
 /// Consistent hash ring for O(log n) worker selection.
 ///
@@ -183,9 +222,11 @@ impl HashRing {
     /// (clockwise). Skips virtual nodes for workers already checked.
     ///
     /// Cost per call: `O(log n)` binary search to find the start position
-    /// plus one small `HashSet` allocation bounded by
-    /// `min(worker_count(), 16)` slots to dedupe virtual-node hits while
-    /// walking clockwise. The dedupe set is dropped before return.
+    /// plus a visited mark per worker, to ask `is_healthy` once per worker
+    /// while walking clockwise over its virtual nodes. The marks sit on the
+    /// stack for a fleet of up to `64 * INLINE_VISITED_WORDS` workers, so
+    /// such a lookup allocates nothing; a larger fleet allocates one vector
+    /// of words per lookup.
     ///
     /// - `key`: The routing key to hash
     /// - `is_healthy`: Function to check if a worker URL is healthy
@@ -201,21 +242,18 @@ impl HashRing {
 
         let start = self.entries.partition_point(|(pos, _)| *pos < key_pos);
 
-        // Walk clockwise from start, wrapping around. Track visited URLs to
-        // avoid calling `is_healthy` multiple times for the same worker when
-        // we hit its virtual nodes. Capacity is bounded by the physical worker
-        // count — typically a handful of entries — so the per-lookup
-        // allocation is negligible relative to the hashing itself.
-        let mut checked_urls = HashSet::with_capacity(self.worker_count().min(16));
+        // Walk clockwise from start, wrapping around. A worker is asked once
+        // whatever its virtual nodes: the entries index the URLs, so a bit per
+        // index marks the ones asked, without a set to allocate.
+        let mut visited = Visited::for_workers(self.worker_count());
 
         for i in 0..self.entries.len() {
             let (_, index) = self.entries[(start + i) % self.entries.len()];
-            let url_str: &str = &self.urls[index as usize];
-
-            if !checked_urls.insert(url_str) {
+            if !visited.mark(index as usize) {
                 continue;
             }
 
+            let url_str: &str = &self.urls[index as usize];
             if is_healthy(url_str) {
                 return Some(url_str);
             }
@@ -292,6 +330,39 @@ mod tests {
     fn find_healthy_url_returns_none_when_all_unhealthy() {
         let ring = HashRing::new(["http://a", "http://b"]);
         assert_eq!(ring.find_healthy_url("k", |_| false), None);
+    }
+
+    /// Every worker is asked once while a lookup walks the whole ring, on a
+    /// fleet the stack marks cover and on one past them.
+    #[test]
+    fn find_healthy_url_asks_each_worker_once_on_small_and_large_fleets() {
+        for workers in [
+            3,
+            64 * INLINE_VISITED_WORDS,
+            64 * INLINE_VISITED_WORDS + 1,
+            700,
+        ] {
+            let urls: Vec<String> = (0..workers).map(|i| format!("http://w{i}:8000")).collect();
+            let ring = HashRing::new(&urls);
+            let asked = std::cell::RefCell::new(HashMap::<String, usize>::new());
+            assert_eq!(
+                ring.find_healthy_url("routing-key", |url| {
+                    *asked.borrow_mut().entry(url.to_string()).or_insert(0) += 1;
+                    false
+                }),
+                None
+            );
+            let asked = asked.into_inner();
+            assert_eq!(
+                asked.len(),
+                workers,
+                "{workers} workers: every worker asked"
+            );
+            assert!(
+                asked.values().all(|&times| times == 1),
+                "{workers} workers: each asked once, got {asked:?}"
+            );
+        }
     }
 
     #[test]

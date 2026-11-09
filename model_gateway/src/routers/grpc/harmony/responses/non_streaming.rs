@@ -14,15 +14,15 @@ use openai_protocol::{
     },
 };
 use serde_json::{json, to_string};
-use smg_mcp::{McpServerBinding, McpToolSession};
+use smg_mcp::McpServerBinding;
 use tracing::{debug, error, warn};
 
 use super::{
     common::{
-        build_next_request_with_tools, inject_mcp_metadata,
+        build_next_request_with_tools, inject_mcp_metadata, open_mcp_session,
         strip_image_generation_from_request_tools, McpCallTracking,
     },
-    execution::{convert_mcp_tools_to_response_tools, execute_mcp_tools, ToolResult},
+    execution::{execute_mcp_tools, ToolResult},
 };
 use crate::{
     middleware::TenantRequestMeta,
@@ -33,7 +33,7 @@ use crate::{
         grpc::{
             common::responses::{
                 collect_user_function_names, ensure_mcp_connection, load_history,
-                persist_response_if_needed,
+                persist_response_if_needed, tool_call_limit,
                 utils::{
                     function_call_status, generation_failure_error, resolve_function_identity,
                     response_status,
@@ -131,26 +131,7 @@ async fn execute_with_mcp_loop(
     let mut original_tools = current_request.tools.clone();
     let user_function_names = collect_user_function_names(&current_request);
 
-    // Create session once — bundles orchestrator, request_ctx, server_keys, mcp_tools
-    let session_request_id = format!("resp_{}", uuid::Uuid::now_v7());
-
-    let session = McpToolSession::new(&ctx.mcp_orchestrator, mcp_servers, &session_request_id);
-
-    // Add filtered MCP tools (static + requested dynamic) to the request
-    let mcp_tools = session.mcp_tools();
-    if !mcp_tools.is_empty() {
-        let mcp_response_tools = convert_mcp_tools_to_response_tools(&session);
-
-        let mut all_tools = current_request.tools.take().unwrap_or_default();
-        all_tools.extend(mcp_response_tools);
-        current_request.tools = Some(all_tools);
-
-        debug!(
-            mcp_tool_count = mcp_tools.len(),
-            total_tool_count = current_request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
-            "MCP client available - added static MCP tools to Harmony Responses request"
-        );
-    }
+    let session = open_mcp_session(ctx, mcp_servers, &mut current_request);
 
     // Once the MCP loop has taken ownership of image_generation
     // dispatch, drop the hosted-tool descriptor so the harmony builder
@@ -224,10 +205,7 @@ async fn execute_with_mcp_loop(
                 );
 
                 // Check combined limit (user's max_tool_calls vs safety limit)
-                let effective_limit = match max_tool_calls {
-                    Some(user_max) => user_max.min(DEFAULT_MAX_ITERATIONS),
-                    None => DEFAULT_MAX_ITERATIONS,
-                };
+                let effective_limit = tool_call_limit(max_tool_calls);
 
                 // Check if we would exceed the limit with these new MCP tool calls
                 let total_calls_after = mcp_tracking.total_calls() + mcp_tool_calls.len();

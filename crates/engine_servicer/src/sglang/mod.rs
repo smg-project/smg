@@ -1,9 +1,10 @@
-//! The `sglang.grpc.scheduler.SglangScheduler` servicer in Rust: the contract
-//! the Python `smg_grpc_servicer.sglang` package serves, over the msgpack ZMQ
-//! wire a headless SGLang scheduler dials (what the SMG plugin inside the
-//! scheduler speaks to the Router's direct lane). The Router cannot tell the
-//! two implementations apart; Python keeps the lifecycle, launching the
-//! headless scheduler and driving this server through the binding.
+//! The `sglang.grpc.scheduler.SglangScheduler` servicer in Rust, the default
+//! for SGLang: the contract the deprecated Python servicer in
+//! `smg_grpc_servicer.sglang` serves, over the msgpack ZMQ wire a headless
+//! SGLang scheduler dials (what the SMG plugin inside the scheduler speaks to
+//! the Router's direct lane). The Router cannot tell the two implementations
+//! apart; Python keeps the lifecycle, launching the headless scheduler and
+//! driving this server through the binding.
 //!
 //! Prefill/decode disaggregation works as on the Python servicer: a request's
 //! bootstrap fields (host, port, room) ride the scheduler's own request struct
@@ -16,7 +17,8 @@
 //! prefill side of a disaggregated pair a request runs on the rank of its
 //! room's residue instead (`bootstrap_room % dp_size`: where SGLang's prefill
 //! side requires it and the decode side looks for the KV), the pin yielding
-//! to it with a warning; the decode side keeps the pin.
+//! to it (a warning on the connection's first such request, a debug line on
+//! each later one); the decode side keeps the pin.
 //!
 //! The language side of encode/prefill disaggregation (`--language-only`)
 //! works as behind the engine's own frontend: a request's image references
@@ -48,6 +50,7 @@ use tonic::service::Routes;
 
 use crate::{
     engine_link::EngineLink,
+    health_probe,
     kv_events::KvEventRelay,
     metrics::{Identity, ServicerMetrics},
     proto_json,
@@ -59,8 +62,9 @@ use crate::{
 pub const SERVICE_NAME: &str = "sglang.grpc.scheduler.SglangScheduler";
 /// The `wire` label of this servicer's metrics.
 const WIRE: &str = "sglang";
-/// What `HealthCheck`'s message says of a serving engine on this wire.
-const HEALTHY: &str = "healthy";
+/// The knob the Python servicer reads its health probe's bound from, in
+/// seconds; this servicer reads the same one.
+const HEALTH_CHECK_TIMEOUT_ENV: &str = "SGLANG_HEALTH_CHECK_TIMEOUT";
 
 /// What `GetModelInfo` and `GetServerInfo` report: the facts the Python
 /// servicer reads off SGLang's `ModelConfig` and `ServerArgs`, which the
@@ -280,16 +284,24 @@ impl std::fmt::Debug for SglangServicerConfig {
 /// attaches to every batch it streams.
 impl crate::kv_events::RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
-        let response = info::loads(self, dp_rank).ok()?;
-        // The engine reports no queued token-work on this wire yet: the
-        // record's `waiting_uncached_tokens` stays unset.
-        Some(smg_grpc_client::common_proto::EngineLoad::from(
-            response.loads.first()?,
-        ))
+        // A connected rank reads its own entry (zero-filled until its first
+        // load tail), never another rank's figures; a rank past the
+        // connected ones gets no record.
+        let load = info::rank_load(self, dp_rank)?;
+        // The queued token-work is this servicer's own estimate for the
+        // rank (see `info::rank_load`), so every rank's record reports it.
+        let mut record = smg_grpc_client::common_proto::EngineLoad::from(&load);
+        record.waiting_uncached_tokens =
+            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+        Some(record)
     }
 
     fn engine_link(&self) -> &EngineLink {
         &self.shared.engine
+    }
+
+    fn rank_count(&self) -> usize {
+        self.shared.rank_count(self.model.data_parallel_size)
     }
 }
 
@@ -306,6 +318,9 @@ pub(super) struct State {
     /// Resolved once at startup; missing or malformed roles cannot enable reuse.
     pub(super) media_disaggregation_mode: Option<String>,
     pub(super) mm_hasher: Option<engine_zmq_adapter::SglangCpuMmHasher>,
+    /// How long `HealthCheck`'s probe waits for the scheduler
+    /// ([`HEALTH_CHECK_TIMEOUT_ENV`]).
+    pub(super) health_probe_timeout: Duration,
 }
 
 impl WireState for State {
@@ -402,11 +417,17 @@ impl SglangServicerServer {
             media_identity_key,
             media_disaggregation_mode,
             model: config.model,
-            shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
+            shared: Shared::new(
+                kv_relay,
+                metrics,
+                config.servicer.tokenizer_dir.clone(),
+                config.servicer.warmup_nonce.clone(),
+            ),
             encode: config.encode_dispatcher,
             media: config.media_processor,
             mm_hasher,
             media_identity_enabled,
+            health_probe_timeout: health_probe::timeout_from_env(HEALTH_CHECK_TIMEOUT_ENV),
         });
         let routes = Routes::new(
             SglangSchedulerServer::new(service::SglangService {
@@ -469,7 +490,8 @@ impl SglangServicerServer {
 
     /// Hold (`false`) or release (`true`) readiness alone: health flips as
     /// with `set_serving`, admission stays open to the lifecycle owner's own
-    /// requests (its planned warm-up before SERVING, `smg-warmup-<n>`) and to
+    /// requests (its planned warm-up before SERVING, `smg-warmup-<nonce>-<n>`
+    /// with the configured `warmup_nonce`, else `smg-warmup-<n>`) and to
     /// nothing else, so the warm-up's steps share the engine with no client
     /// request. `set_serving(false)` is the drain switch and closes admission
     /// as well.

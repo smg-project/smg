@@ -1,7 +1,10 @@
+use std::{future::Future, sync::mpsc};
+
 use llm_tokenizer::{chat_template::ChatTemplateContentFormat, traits::RendererCapabilities};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{AudioUrl, ContentPart, ImageUrl, InputAudio, VideoUrl},
+    profile::ProviderProfile,
 };
 use serde_json::json;
 
@@ -70,6 +73,24 @@ fn process_chat_messages_rejects_unknown_content_parts() {
     assert!(error.contains("vendor_media"));
 }
 
+/// A refusal part is the assistant's: on any other role it is refused before
+/// the engine wire, as the unknown parts are, so no pipeline drops it.
+#[test]
+fn a_refusal_part_outside_an_assistant_turn_is_refused() {
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": [{"type": "refusal", "refusal": "I cannot."}]}
+    ]))
+    .unwrap();
+    let error = validate_chat_content_parts(&messages).unwrap_err();
+    assert!(error.contains("refusal"), "{error}");
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [{"type": "refusal", "refusal": "I cannot."}]}
+    ]))
+    .unwrap();
+    assert!(validate_chat_content_parts(&messages).is_ok());
+}
+
 #[test]
 fn known_chat_content_parts_are_accepted() {
     let messages: Vec<ChatMessage> = serde_json::from_value(json!([
@@ -82,10 +103,67 @@ fn known_chat_content_parts_are_accepted() {
             {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
         ]},
         {"role": "assistant", "content": null},
-        {"role": "function", "name": "lookup", "content": "result"}
+        {"role": "assistant", "content": [{"type": "refusal", "refusal": "I cannot."}]},
+        {"role": "function", "name": "lookup", "content": "result"},
+        {"role": "function", "name": "lookup", "content": null}
     ]))
     .unwrap();
     assert!(validate_chat_content_parts(&messages).is_ok());
+}
+
+/// A function result with `content: null` (the deprecated role's shape for a
+/// call that returned nothing) reaches the template as empty content in the
+/// template's own format, as a tool-call-only assistant turn does.
+#[test]
+fn a_function_result_without_content_reaches_the_template_as_empty_content() {
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "hi"},
+        {"role": "function", "name": "lookup", "content": null},
+        {"role": "function", "name": "lookup", "content": "found"}
+    ]))
+    .unwrap();
+    let as_string =
+        process_content_format(&messages, ChatTemplateContentFormat::String, None).unwrap();
+    assert_eq!(as_string[1]["content"], json!(""));
+    assert_eq!(as_string[2]["content"], json!("found"));
+    let as_parts =
+        process_content_format(&messages, ChatTemplateContentFormat::OpenAI, None).unwrap();
+    assert_eq!(as_parts[1]["content"], json!([]));
+    assert_eq!(as_parts[2]["content"], json!("found"));
+}
+
+/// A replayed assistant refusal part is the turn's text to the template, in
+/// the string format and in the parts format, as the engines' own servers
+/// hand it over; the text parts beside it keep their order.
+#[test]
+fn a_refusal_part_reaches_the_template_as_the_turns_text() {
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Sorry."},
+            {"type": "refusal", "refusal": "I cannot help with that."}
+        ]},
+        {"role": "user", "content": "ok"}
+    ]))
+    .unwrap();
+    let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
+    let as_string =
+        process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
+            .unwrap();
+    assert_eq!(
+        as_string[1]["content"],
+        json!("Sorry.\nI cannot help with that.")
+    );
+    let as_parts =
+        process_content_format(&messages, ChatTemplateContentFormat::OpenAI, Some(&tokens))
+            .unwrap();
+    assert_eq!(
+        as_parts[1]["content"],
+        json!([
+            {"type": "text", "text": "Sorry."},
+            {"type": "text", "text": "I cannot help with that."}
+        ])
+    );
 }
 
 #[test]
@@ -612,7 +690,7 @@ fn render_parts(parts: &[&str]) -> String {
         tokenizer.chat_template_content_format(),
         ChatTemplateContentFormat::OpenAI
     );
-    process_chat_messages_with_placeholders(&request, &tokenizer, None, MediaPartOrder::MediaFirst)
+    process_with_derived_profile(&request, &tokenizer, None, MediaPartOrder::MediaFirst)
         .unwrap()
         .0
         .text
@@ -747,7 +825,7 @@ fn render_through(
         llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase).unwrap();
     tokenizer.set_chat_template(template.to_string()).unwrap();
     assert_eq!(tokenizer.chat_template_content_format(), format);
-    process_chat_messages_with_placeholders(request, &tokenizer, None, MediaPartOrder::MediaFirst)
+    process_with_derived_profile(request, &tokenizer, None, MediaPartOrder::MediaFirst)
         .map(|(processed, _)| processed.text)
 }
 
@@ -1084,17 +1162,17 @@ fn thinking_effort_overrides_top_level_effort_in_kwargs() {
 #[test]
 fn thinking_disabled_projects_params_thinking_false() {
     let request = thinking_request(json!({"type": "disabled"}), Some("high"));
-    assert_eq!(resolve_template_thinking(&request), Some(false));
+    assert_eq!(resolved_template_thinking(&request), Some(false));
     // `adaptive` and an omitted `type` leave the template default in charge.
     for thinking in [json!({"type": "adaptive"}), json!({"keep": "all"})] {
         assert_eq!(
-            resolve_template_thinking(&thinking_request(thinking, None)),
+            resolved_template_thinking(&thinking_request(thinking, None)),
             None
         );
     }
-    assert_eq!(resolve_template_thinking(&effort_request(None)), None);
+    assert_eq!(resolved_template_thinking(&effort_request(None)), None);
     assert_eq!(
-        resolve_template_thinking(&effort_request(Some("none"))),
+        resolved_template_thinking(&effort_request(Some("none"))),
         Some(false)
     );
 }
@@ -1112,22 +1190,22 @@ fn minimax_effort_keeps_thinking_on() {
     };
     for effort in ["none", "minimal", "high"] {
         assert_eq!(
-            resolve_template_thinking(&minimax(None, Some(effort))),
+            resolved_template_thinking(&minimax(None, Some(effort))),
             None,
             "{effort}"
         );
         assert_eq!(
-            resolve_template_thinking(&minimax(Some(json!({"type": "disabled"})), Some(effort))),
+            resolved_template_thinking(&minimax(Some(json!({"type": "disabled"})), Some(effort))),
             Some(false),
             "{effort}: thinking.disabled wins"
         );
     }
     assert_eq!(
-        resolve_template_thinking(&minimax(Some(json!({"type": "disabled"})), None)),
+        resolved_template_thinking(&minimax(Some(json!({"type": "disabled"})), None)),
         Some(false)
     );
     assert_eq!(
-        resolve_template_thinking(&minimax(Some(json!({"type": "enabled"})), Some("none"))),
+        resolved_template_thinking(&minimax(Some(json!({"type": "enabled"})), Some("none"))),
         Some(true)
     );
 }
@@ -1135,10 +1213,10 @@ fn minimax_effort_keeps_thinking_on() {
 #[test]
 fn thinking_enabled_beats_reasoning_effort_none() {
     let request = thinking_request(json!({"type": "enabled"}), Some("none"));
-    assert_eq!(resolve_template_thinking(&request), Some(true));
+    assert_eq!(resolved_template_thinking(&request), Some(true));
     // A `none` inside `thinking.effort` is the switch too when no type is given.
     let request = thinking_request(json!({"effort": "none"}), Some("high"));
-    assert_eq!(resolve_template_thinking(&request), Some(false));
+    assert_eq!(resolved_template_thinking(&request), Some(false));
 }
 
 #[test]
@@ -1304,7 +1382,7 @@ fn prefill_request() -> ChatCompletionRequest {
     .unwrap()
 }
 
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
+fn block_on<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1315,7 +1393,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 #[test]
 fn flat_renderer_joins_the_prefill_and_reports_from_text() {
     let tokenizer = llm_tokenizer::MockTokenizer::new();
-    let (processed, encoding) = process_chat_messages_with_placeholders(
+    let (processed, encoding) = process_with_derived_profile(
         &prefill_request(),
         &tokenizer,
         None,
@@ -1353,13 +1431,9 @@ fn render_with(capabilities: RendererCapabilities, request: &ChatCompletionReque
     let tokenizer = llm_tokenizer::MockTokenizer::new()
         .with_renderer_capabilities(capabilities)
         .with_json_chat_template();
-    let (processed, _) = process_chat_messages_with_placeholders(
-        request,
-        &tokenizer,
-        None,
-        MediaPartOrder::MediaFirst,
-    )
-    .unwrap();
+    let (processed, _) =
+        process_with_derived_profile(request, &tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap();
     // The default `apply_chat_template_with_encoding` appends the
     // assistant prefix after the rendered text, so a prefill that was
     // popped shows up as a suffix on the JSON document.
@@ -1469,14 +1543,9 @@ fn jinja_template_renders_no_header_when_add_generation_prompt_is_false() {
             body["add_generation_prompt"] = Value::Null;
         }
         let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
-        process_chat_messages_with_placeholders(
-            &request,
-            &tokenizer,
-            None,
-            MediaPartOrder::MediaFirst,
-        )
-        .unwrap()
-        .0
+        process_with_derived_profile(&request, &tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap()
+            .0
     };
     let closed = render(json!(false));
     assert_eq!(closed.text, "<|turn|>user<|body|>Hello.<|end|>");
@@ -1507,14 +1576,9 @@ fn the_rendered_prompt_reports_its_generation_header() {
             .with_renderer_capabilities(capabilities)
             .with_json_chat_template();
         let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
-        process_chat_messages_with_placeholders(
-            &request,
-            &tokenizer,
-            None,
-            MediaPartOrder::MediaFirst,
-        )
-        .unwrap()
-        .0
+        process_with_derived_profile(&request, &tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap()
+            .0
     };
     let hello = json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}]});
     assert!(processed(Default::default(), hello.clone()).generation_prompt);
@@ -1557,7 +1621,7 @@ fn rendered_markers_are_anchored_before_tokenizing() {
     placeholders.insert(Modality::Video, "<SPECIAL_30>".to_string());
     placeholders.add_rendered_marker("<video>".to_string(), "<SPECIAL_30>".to_string());
     let render = |placeholders| {
-        process_chat_messages_with_placeholders(
+        process_with_derived_profile(
             &request,
             &tokenizer,
             placeholders,
@@ -1590,7 +1654,7 @@ fn jinja_template_continues_inside_the_assistant_turn() {
     tokenizer
         .set_chat_template(HEADER_TEMPLATE.to_string())
         .unwrap();
-    let (processed, _) = process_chat_messages_with_placeholders(
+    let (processed, _) = process_with_derived_profile(
         &prefill_request(),
         &tokenizer,
         None,
@@ -1623,13 +1687,9 @@ fn parts_valued_prefill_reaches_the_render_call_under_openai_content_format() {
     let tokenizer = llm_tokenizer::MockTokenizer::new()
         .with_content_format(ChatTemplateContentFormat::OpenAI)
         .with_json_chat_template();
-    let (processed, _) = process_chat_messages_with_placeholders(
-        &request,
-        &tokenizer,
-        None,
-        MediaPartOrder::MediaFirst,
-    )
-    .unwrap();
+    let (processed, _) =
+        process_with_derived_profile(&request, &tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap();
     let (rendered, prefix) = processed
         .text
         .split_at(processed.text.rfind('}').unwrap() + 1);
@@ -1894,7 +1954,7 @@ fn deferred_renderer_gets_the_prefill_and_its_job_runs_in_the_tokenize_step() {
     let tokenizer = llm_tokenizer::MockTokenizer::new()
         .with_deferred_chat_ids(vec![7, 8, 9])
         .with_unbilled_prompt_tokens(3);
-    let (processed, encoding) = process_chat_messages_with_placeholders(
+    let (processed, encoding) = process_with_derived_profile(
         &prefill_request(),
         &tokenizer,
         None,
@@ -1910,7 +1970,7 @@ fn deferred_renderer_gets_the_prefill_and_its_job_runs_in_the_tokenize_step() {
         processed.unbilled_prompt_tokens, 3,
         "the renderer's unbilled count rides along"
     );
-    let (flat, _) = process_chat_messages_with_placeholders(
+    let (flat, _) = process_with_derived_profile(
         &prefill_request(),
         &llm_tokenizer::MockTokenizer::new(),
         None,
@@ -1922,6 +1982,41 @@ fn deferred_renderer_gets_the_prefill_and_its_job_runs_in_the_tokenize_step() {
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(tokenizer);
     let ids = block_on(encode_prompt_blocking(tokenizer, &processed.text, encoding)).unwrap();
     assert_eq!(ids.token_ids(), &[7, 8, 9]);
+}
+
+#[test]
+fn a_long_decode_takes_the_offload_path_and_a_short_one_runs_inline() {
+    use std::thread;
+
+    use crate::routers::grpc::testing::thread_recording_tokenizer;
+
+    // `block_on` polls on this thread, so an offloaded decode runs somewhere else.
+    let (tokenizer, ran_on) = thread_recording_tokenizer();
+    let hello = tokenizer.token_to_id("Hello").expect("mock vocab");
+    let decode = |ids: Vec<u32>| {
+        block_on(decode_ids_blocking(tokenizer.clone(), vec![ids], false))
+            .unwrap()
+            .remove(0)
+    };
+
+    let long = vec![hello; ENCODE_OFFLOAD_MIN_BYTES / size_of::<u32>()];
+    let expected = tokenizer.decode(&long, false).unwrap();
+    ran_on.lock().unwrap().clear();
+    assert_eq!(decode(long), expected);
+    let offloaded = ran_on.lock().unwrap().pop().expect("the decode ran");
+    assert_ne!(
+        offloaded,
+        thread::current().id(),
+        "a prompt of ids the size of a long text decodes off the worker thread"
+    );
+
+    assert_eq!(decode(vec![hello]), "Hello");
+    let inline = ran_on.lock().unwrap().pop().expect("the decode ran");
+    assert_eq!(
+        inline,
+        thread::current().id(),
+        "a short prompt of ids decodes inline"
+    );
 }
 
 #[test]
@@ -1948,13 +2043,8 @@ fn deferred_encode_takes_the_offload_path_for_large_prompts() {
             "messages": [{"role": "user", "content": content}]
         }))
         .unwrap();
-        process_chat_messages_with_placeholders(
-            &request,
-            &*tokenizer,
-            None,
-            MediaPartOrder::MediaFirst,
-        )
-        .unwrap()
+        process_with_derived_profile(&request, &*tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap()
     };
     let encode = |text: &str, encoding: PromptEncoding| {
         block_on(encode_prompt_blocking(tokenizer.clone(), text, encoding)).unwrap()
@@ -1978,6 +2068,175 @@ fn deferred_encode_takes_the_offload_path_for_large_prompts() {
         inline,
         thread::current().id(),
         "a small deferred encode runs inline"
+    );
+}
+
+#[test]
+fn a_conversation_of_a_few_kilobytes_is_encoded_on_the_request_thread() {
+    use std::{
+        sync::Mutex,
+        thread::{self, ThreadId},
+    };
+    // The job records the thread it ran on; `block_on` polls on this thread.
+    let ran_on: Arc<Mutex<Option<ThreadId>>> = Arc::new(Mutex::new(None));
+    let probe = {
+        let ran_on = ran_on.clone();
+        move || *ran_on.lock().unwrap() = Some(thread::current().id())
+    };
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+        llm_tokenizer::MockTokenizer::new()
+            .with_deferred_chat_ids(vec![1, 2])
+            .with_deferred_chat_probe(probe),
+    );
+    // A system prompt and two rounds of a conversation, about five kilobytes
+    // rendered: the shape of an ordinary multi-turn request, well above the
+    // old 512-byte threshold and below the one that protects the runtime.
+    let paragraph = |seed: usize| {
+        (0..350)
+            .map(|i| format!("w{}", (seed * 7 + i * 13) % 97))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "m",
+        "messages": [
+            {"role": "system", "content": paragraph(1)},
+            {"role": "user", "content": paragraph(2)},
+            {"role": "assistant", "content": paragraph(3)},
+            {"role": "user", "content": paragraph(4)}
+        ]
+    }))
+    .unwrap();
+    let (processed, encoding) =
+        process_with_derived_profile(&request, &*tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap();
+    assert!(
+        processed.text.len() > 4 * 1024 && processed.text.len() < ENCODE_OFFLOAD_MIN_BYTES,
+        "the rendered conversation is a few kilobytes ({} bytes), under the threshold",
+        processed.text.len()
+    );
+    block_on(encode_prompt_blocking(
+        tokenizer.clone(),
+        &processed.text,
+        encoding,
+    ))
+    .unwrap();
+    let ran = ran_on.lock().unwrap().take().expect("the job ran");
+    assert_eq!(
+        ran,
+        thread::current().id(),
+        "a conversation of a few kilobytes is encoded on the thread that holds the request, \
+         not handed to the blocking pool"
+    );
+}
+
+#[test]
+fn a_batch_encodes_in_place_up_to_the_bound_and_the_rest_on_the_pool() {
+    use std::thread;
+
+    use crate::routers::grpc::testing::thread_recording_tokenizer;
+
+    // `block_on` polls on this thread, so an encode in place runs here and an
+    // offloaded one somewhere else.
+    let (tokenizer, ran_on) = thread_recording_tokenizer();
+    let here = thread::current().id();
+    let batch = |texts: Vec<String>| {
+        block_on(encode_texts_blocking(tokenizer.clone(), &texts, false)).unwrap();
+        std::mem::take(&mut *ran_on.lock().unwrap())
+    };
+
+    // Sixty-four prompts of twelve kibibytes, the shape of a completion batch:
+    // each alone is under the bound, the batch is forty times over it.
+    let long = "word ".repeat(12 * 1024 / 5);
+    assert!(long.len() < ENCODE_OFFLOAD_MIN_BYTES && 2 * long.len() > ENCODE_OFFLOAD_MIN_BYTES);
+    let threads = batch(vec![long; 64]);
+    assert_eq!(threads.len(), 64, "every prompt of the batch is encoded");
+    assert_eq!(
+        threads.iter().filter(|t| **t == here).count(),
+        1,
+        "one prompt of the batch fits the bound in place; the other sixty-three go to the pool"
+    );
+
+    // Sixty-four short prompts, under the bound in total, all stay in place.
+    let threads = batch(vec!["hello there".to_string(); 64]);
+    assert_eq!(threads.len(), 64);
+    assert!(
+        threads.iter().all(|t| *t == here),
+        "a batch under the bound in total is encoded on the thread that holds the request"
+    );
+}
+
+/// An input under the break-even size never takes the pool: once a call's
+/// share is spent it yields the worker and starts the next share, whether the
+/// call awaits its inputs one by one (a tokenize call of many short texts)
+/// or joins them, where the join runs about one share per poll pass.
+#[test]
+fn short_inputs_after_a_spent_share_stay_in_place_and_yield_instead() {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+        thread,
+    };
+
+    use crate::routers::grpc::testing::thread_recording_tokenizer;
+
+    /// The polls a future took to complete: one per yield of the call.
+    struct Polls<F>(Pin<Box<F>>, usize);
+    impl<F: Future> Future for Polls<F> {
+        type Output = (F::Output, usize);
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.1 += 1;
+            match self.0.as_mut().poll(cx) {
+                Poll::Ready(output) => Poll::Ready((output, self.1)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    let (tokenizer, ran_on) = thread_recording_tokenizer();
+    let here = thread::current().id();
+    let spends_the_share = "word ".repeat((ENCODE_OFFLOAD_MIN_BYTES - 512) / 5);
+    let short = "word ".repeat(20); // 100 bytes, under the break-even size
+    let texts = vec![short; 2_000]; // 200 KB in all: twelve shares and a bit
+
+    // One by one, as the tokenize loop awaits them.
+    let mut budget = InPlaceBudget::default();
+    block_on(async {
+        encode_blocking_in_batch(tokenizer.clone(), &spends_the_share, false, &mut budget)
+            .await
+            .unwrap();
+        for text in &texts {
+            encode_blocking_in_batch(tokenizer.clone(), text, false, &mut budget)
+                .await
+                .unwrap();
+        }
+    });
+    let threads = std::mem::take(&mut *ran_on.lock().unwrap());
+    assert_eq!(threads.len(), 2_001);
+    assert!(
+        threads.iter().all(|t| *t == here),
+        "a short input is never sent to the pool, spent share or not"
+    );
+
+    // As one call's batch, placed in one pass.
+    let ((), polls) = block_on(Polls(
+        Box::pin(async {
+            encode_texts_blocking(tokenizer.clone(), &texts, false)
+                .await
+                .unwrap();
+        }),
+        0,
+    ));
+    let threads = std::mem::take(&mut *ran_on.lock().unwrap());
+    assert_eq!(
+        threads.len(),
+        2_000,
+        "each input of the batch is encoded exactly once"
+    );
+    assert!(threads.iter().all(|t| *t == here));
+    assert!(
+        (12..=16).contains(&polls),
+        "the batch runs about one share of short inputs per pass and yields between passes: {polls} passes"
     );
 }
 
@@ -2083,4 +2342,246 @@ fn the_completion_finish_reason_is_one_table() {
             "local_stop={local_stop} engine={engine:?}"
         );
     }
+}
+
+/// `resolve_template_thinking` with the profile the request's model derives,
+/// as the preparation stage carries it.
+fn resolved_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
+    resolve_template_thinking(request, ProviderProfile::for_model(&request.model))
+}
+
+/// The render reads the profile the stage carries, not one derived again
+/// from the model: a profile that reads an effort differently from the
+/// default one decides the toggle whatever the model id says, and a typed
+/// toggle wins under either.
+#[test]
+fn the_render_reads_the_carried_profile_not_the_model() {
+    // `none` switches thinking off under the default profile and leaves the
+    // template's default under MiniMax's.
+    let request = effort_request(Some("none"));
+    assert_eq!(
+        resolve_template_thinking(&request, ProviderProfile::Generic),
+        Some(false)
+    );
+    assert_eq!(
+        resolve_template_thinking(&request, ProviderProfile::Minimax),
+        None
+    );
+
+    // A MiniMax model id with the default profile carried: the carried
+    // profile decides, not the id.
+    let mut named = effort_request(Some("none"));
+    named.model = "MiniMax-M3".to_string();
+    assert_eq!(
+        ProviderProfile::for_model(&named.model),
+        ProviderProfile::Minimax
+    );
+    assert_eq!(
+        resolve_template_thinking(&named, ProviderProfile::Generic),
+        Some(false)
+    );
+    assert_eq!(
+        resolve_template_thinking(&named, ProviderProfile::Minimax),
+        None
+    );
+
+    // A typed toggle wins over either profile's reading of the effort.
+    let toggled = thinking_request(json!({"type": "disabled"}), Some("high"));
+    assert_eq!(
+        resolve_template_thinking(&toggled, ProviderProfile::Generic),
+        Some(false)
+    );
+    assert_eq!(
+        resolve_template_thinking(&toggled, ProviderProfile::Minimax),
+        Some(false)
+    );
+}
+
+/// `process_chat_messages_with_placeholders` with the profile the request's
+/// model derives, as the preparation stage carries it.
+fn process_with_derived_profile(
+    request: &ChatCompletionRequest,
+    tokenizer: &dyn Tokenizer,
+    placeholder_tokens: Option<&PlaceholderTokens>,
+    media_order: MediaPartOrder,
+) -> Result<(ProcessedMessages, PromptEncoding), String> {
+    process_chat_messages_with_placeholders(
+        request,
+        tokenizer,
+        placeholder_tokens,
+        media_order,
+        ProviderProfile::for_model(&request.model),
+    )
+}
+
+/// A tool declared without a parameter schema reaches the template with
+/// `"parameters": null`, whether the request left the field out or wrote
+/// `null`, as the engine's own server hands its declarations to the same
+/// template; a client's own `{}` stays `{}`. The prepared tool set keeps the
+/// two shapes apart as well: the second request reads the kept value.
+#[test]
+fn a_tool_declared_without_a_schema_reaches_the_template_with_a_null_schema() {
+    let tokenizer = llm_tokenizer::MockTokenizer::new()
+        .with_chat_template("{% for tool in tools %}{{ tool | tojson }};{% endfor %}")
+        .expect("chat template");
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"type": "function", "function": {"name": "absent"}},
+            {"type": "function", "function": {"name": "nulled", "parameters": null}},
+            {"type": "function", "function": {"name": "empty", "parameters": {}}},
+        ]
+    }))
+    .expect("chat request");
+    for pass in ["first", "second"] {
+        let processed = process_chat_messages(&request, &tokenizer, None).expect(pass);
+        assert_eq!(
+            processed.text,
+            "{\"type\": \"function\", \"function\": {\"name\": \"absent\", \"parameters\": null}};\
+             {\"type\": \"function\", \"function\": {\"name\": \"nulled\", \"parameters\": null}};\
+             {\"type\": \"function\", \"function\": {\"name\": \"empty\", \"parameters\": {}}};",
+            "{pass} render"
+        );
+    }
+}
+
+/// A tokenizer that records, for every encode, the thread it ran on and the
+/// address of the text it was handed: the caller's own buffer, or a copy.
+struct RecordsEncodes {
+    inner: llm_tokenizer::MockTokenizer,
+    seen: parking_lot::Mutex<Vec<(std::thread::ThreadId, usize)>>,
+}
+
+impl RecordsEncodes {
+    fn new() -> Self {
+        Self {
+            inner: llm_tokenizer::MockTokenizer::new(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl llm_tokenizer::traits::Encoder for RecordsEncodes {
+    fn encode(&self, input: &str, add_special_tokens: bool) -> anyhow::Result<Encoding> {
+        self.seen
+            .lock()
+            .push((std::thread::current().id(), input.as_ptr() as usize));
+        self.inner.encode(input, add_special_tokens)
+    }
+
+    fn encode_batch(
+        &self,
+        inputs: &[&str],
+        add_special_tokens: bool,
+    ) -> anyhow::Result<Vec<Encoding>> {
+        self.inner.encode_batch(inputs, add_special_tokens)
+    }
+}
+
+impl llm_tokenizer::traits::Decoder for RecordsEncodes {
+    fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+        self.inner.decode(token_ids, skip_special_tokens)
+    }
+}
+
+impl Tokenizer for RecordsEncodes {
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    fn get_special_tokens(&self) -> &llm_tokenizer::traits::SpecialTokens {
+        self.inner.get_special_tokens()
+    }
+
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[test]
+fn a_prompt_below_the_offload_threshold_is_encoded_from_the_callers_own_text() {
+    let recorder = Arc::new(RecordsEncodes::new());
+    let tokenizer: Arc<dyn Tokenizer> = Arc::clone(&recorder) as Arc<dyn Tokenizer>;
+    let short = "a".repeat(ENCODE_OFFLOAD_MIN_BYTES - 1);
+    let long = "a".repeat(ENCODE_OFFLOAD_MIN_BYTES);
+    block_on(encode_prompt_blocking(
+        Arc::clone(&tokenizer),
+        &short,
+        PromptEncoding::FromText,
+    ))
+    .unwrap();
+    block_on(encode_prompt_blocking(
+        tokenizer,
+        &long,
+        PromptEncoding::FromText,
+    ))
+    .unwrap();
+    let seen = recorder.seen.lock();
+    let here = std::thread::current().id();
+    assert_eq!(
+        seen[0],
+        (here, short.as_ptr() as usize),
+        "a prompt below the threshold encodes in place, from the caller's own text, not a copy"
+    );
+    assert_ne!(
+        seen[1].0, here,
+        "a prompt at the threshold encodes on the blocking pool"
+    );
+    assert_ne!(
+        seen[1].1,
+        long.as_ptr() as usize,
+        "the blocking task reads a copy of its own, which outlives the caller's borrow"
+    );
+}
+
+/// A pool call dropped while its job runs keeps the job's permit until the
+/// blocking work ends: a pass ended by one input's error, or dropped by a
+/// client gone, still counts its running jobs against the bound. The bound is
+/// read after the drop and judged only once the job has been let go, so a
+/// regression fails the test instead of hanging the runtime's shutdown on the
+/// parked job.
+#[test]
+fn a_dropped_pool_call_holds_its_permit_until_the_blocking_work_ends() {
+    static PERMITS: Semaphore = Semaphore::const_new(1);
+    let (started, running) = mpsc::channel::<()>();
+    let (release, released) = mpsc::channel::<()>();
+    block_on(async {
+        {
+            let mut call = std::pin::pin!(pool_on(&PERMITS, move || {
+                started.send(()).ok();
+                released.recv_timeout(Duration::from_secs(10)).ok();
+                anyhow::Ok(())
+            }));
+            // One poll takes the permit and hands the job to the blocking pool.
+            assert!(futures::poll!(call.as_mut()).is_pending());
+            assert!(
+                running.recv_timeout(Duration::from_secs(10)).is_ok(),
+                "the job started"
+            );
+            assert_eq!(PERMITS.available_permits(), 0);
+        }
+        // The future is gone while the job still runs: read the bound, then let the job end.
+        let available_after_the_drop = PERMITS.available_permits();
+        release.send(()).ok();
+        for _ in 0..10_000 {
+            if PERMITS.available_permits() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(PERMITS.available_permits(), 1, "the permit never returned");
+        assert_eq!(
+            available_after_the_drop, 0,
+            "the permit returned before the work ended"
+        );
+    });
 }

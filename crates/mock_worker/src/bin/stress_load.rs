@@ -15,10 +15,12 @@
 //! function schemas), `responses` (the Responses API with `store: true`,
 //! `--chain` requests per session linked by `previous_response_id`) and
 //! `image` (`--image <file>` inline as a data URL, `--images-per-request`
-//! copies, before the text), `messages` (the Messages API, one user message)
-//! and `embeddings` (the prompt as the input). `--json-schema` asks a chat
-//! request for a JSON answer under a fixed schema. `--tenants N` spreads the
-//! requests over N tenant ids sent in `--tenant-header`.
+//! copies, before the text), `messages` (the Messages API, one user message),
+//! `embeddings` (the prompt as the input), `generate` (the engine-native
+//! `/generate` route, the prompt as its `text`) and `completion`
+//! (`/v1/completions`, the prompt as its `prompt`). `--json-schema` asks a
+//! chat request for a JSON answer under a fixed schema. `--tenants N` spreads
+//! the requests over N tenant ids sent in `--tenant-header`.
 //!
 //! Prompts are deterministic from `--seed`: `--distinct` distinct prompts of
 //! about `--prompt-tokens` words (one token each for a large-vocabulary BPE),
@@ -87,12 +89,18 @@ enum Mode {
     Messages,
     /// `POST /v1/embeddings` with the prompt as the input.
     Embeddings,
+    /// `POST /generate` (the engine-native route) with the prompt as its
+    /// `text`; a streamed answer repeats the whole text so far in every frame.
+    Generate,
+    /// `POST /v1/completions` with the prompt as its `prompt`; a streamed
+    /// answer is one `text` delta per frame.
+    Completion,
 }
 
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "stress_load",
-    about = "Open-loop load client for the gateway stress bed (chat, tools, responses, image, messages, embeddings)"
+    about = "Open-loop load client for the gateway stress bed (chat, tools, responses, image, messages, embeddings, generate, completion)"
 )]
 struct Args {
     /// Gateway base URL.
@@ -137,6 +145,10 @@ struct Args {
     /// (`response_format: json_schema`).
     #[arg(long, default_value_t = false)]
     json_schema: bool,
+    /// Chat requests ask for logprobs: the sampled token's and this many
+    /// alternatives per token (`logprobs: true, top_logprobs: N`).
+    #[arg(long)]
+    logprobs: Option<u32>,
     /// Spread the requests over this many tenant ids (0: no tenant header).
     #[arg(long, default_value_t = 0)]
     tenants: usize,
@@ -383,6 +395,9 @@ fn build_bodies(args: &Args) -> Result<Vec<Bytes>> {
     if args.json_schema && args.mode != Mode::Chat {
         anyhow::bail!("--json-schema applies to --mode chat only");
     }
+    if args.logprobs.is_some() && args.mode != Mode::Chat {
+        anyhow::bail!("--logprobs applies to --mode chat only");
+    }
     let mut bodies = Vec::with_capacity(distinct);
     for i in 0..distinct {
         let body = match args.mode {
@@ -397,6 +412,10 @@ fn build_bodies(args: &Args) -> Result<Vec<Bytes>> {
                 if args.json_schema {
                     body["response_format"] = answer_schema();
                 }
+                if let Some(top_logprobs) = args.logprobs {
+                    body["logprobs"] = json!(true);
+                    body["top_logprobs"] = json!(top_logprobs);
+                }
                 body
             }
             Mode::Messages => json!({
@@ -408,6 +427,19 @@ fn build_bodies(args: &Args) -> Result<Vec<Bytes>> {
             Mode::Embeddings => json!({
                 "model": args.model,
                 "input": prompt(args, i),
+            }),
+            Mode::Generate => json!({
+                "model": args.model,
+                "text": prompt(args, i),
+                "sampling_params": {"max_new_tokens": args.max_tokens},
+                "stream": args.stream,
+            }),
+            Mode::Completion => json!({
+                "model": args.model,
+                "prompt": prompt(args, i),
+                "max_tokens": args.max_tokens,
+                "stream": args.stream,
+                "stream_options": if args.stream { json!({"include_usage": true}) } else { Value::Null },
             }),
             Mode::Tools => json!({
                 "model": args.model,
@@ -998,6 +1030,8 @@ async fn run(args: Args) -> Result<Summary> {
         Mode::Responses => "/v1/responses",
         Mode::Messages => "/v1/messages",
         Mode::Embeddings => "/v1/embeddings",
+        Mode::Generate => "/generate",
+        Mode::Completion => "/v1/completions",
         _ => "/v1/chat/completions",
     };
     let url = format!("{}{}", args.gateway.trim_end_matches('/'), path);
@@ -1175,6 +1209,28 @@ mod tests {
         let v: Value = serde_json::from_slice(&e[1]).unwrap();
         assert!(v["input"].as_str().unwrap().contains("[session 1]"));
         assert!(v.get("messages").is_none());
+
+        let mut g = args(Mode::Generate);
+        g.stream = true;
+        let g = build_bodies(&g).unwrap();
+        let v: Value = serde_json::from_slice(&g[2]).unwrap();
+        assert!(v["text"].as_str().unwrap().contains("[session 2]"));
+        assert_eq!(v["sampling_params"]["max_new_tokens"], 8);
+        assert_eq!(v["stream"], true);
+        assert!(v.get("messages").is_none());
+
+        let mut c = args(Mode::Completion);
+        c.stream = true;
+        let c = build_bodies(&c).unwrap();
+        let v: Value = serde_json::from_slice(&c[3]).unwrap();
+        assert!(v["prompt"].as_str().unwrap().contains("[session 3]"));
+        assert_eq!(v["max_tokens"], 8);
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["stream_options"]["include_usage"], true);
+        assert!(v.get("messages").is_none());
+        let v: Value =
+            serde_json::from_slice(&build_bodies(&args(Mode::Completion)).unwrap()[0]).unwrap();
+        assert!(v["stream_options"].is_null());
 
         let mut c = args(Mode::Chat);
         c.json_schema = true;

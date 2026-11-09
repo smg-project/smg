@@ -263,6 +263,7 @@ class TestConvertBatch:
         assert next_id == 12
 
 
+@pytest.mark.usefixtures("the_python_vllm_servicer_chosen")
 class TestServicerWiring:
     def test_servicer_resolves_config_from_engine(self):
         pytest.importorskip("vllm")

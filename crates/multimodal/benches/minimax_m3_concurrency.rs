@@ -100,9 +100,7 @@ async fn run(
                     })
                     .unwrap();
                 let output = tokio::task::spawn_blocking(move || {
-                    processor
-                        .preprocess(std::slice::from_ref(frame.image().unwrap()))
-                        .unwrap()
+                    processor.preprocess(&[frame.image().unwrap()]).unwrap()
                 })
                 .await
                 .unwrap();

@@ -3,15 +3,17 @@
 The router launched from Python (``smg launch``, ``python -m smg``) runs the
 Rust gateway inside ``smg.smg_rs``, whose jemalloc must take the same
 ``malloc_conf`` as the ``smg`` executable: a background purging thread, dirty
-pages returned after ten seconds, muzzy pages at once, 16 arenas. Otherwise a
-traffic burst's freed pages stay resident for the life of the process and a
-many-core host spreads a small live heap over one arena's slabs per thread.
-Asked to
+pages returned after ten seconds, muzzy pages at once, 16 arenas, and
+allocations below 32 MiB served from the arenas' dirty cache. Otherwise a
+traffic burst's freed pages stay resident for the life of the process, a
+many-core host spreads a small live heap over one arena's slabs per thread,
+and every image request's encoded tensor is faulted in page by page. Asked to
 through ``_RJEM_MALLOC_CONF``, jemalloc prints its statistics when the process
 exits, and the options in effect are their ``opt`` section.
 """
 
 import os
+import re
 import subprocess
 import sys
 
@@ -44,11 +46,21 @@ def jemalloc_options(malloc_conf: str) -> str:
     return stats[start : stats.index("}", start)]
 
 
+def option_number(options: str, name: str) -> int:
+    """A numeric option's value in the ``opt`` section, whole: a substring
+    check would also accept a longer number with the same leading digits."""
+    match = re.search(rf'"{name}":(\d+)', options)
+    assert match, f"{name} not in the options: {options}"
+    return int(match.group(1))
+
+
 @pytest.mark.unit
 def test_extension_applies_the_server_malloc_conf():
     options = jemalloc_options("stats_print:true,stats_print_opts:J")
     for expected in SERVER_MALLOC_CONF:
         assert expected in options, f"{expected} not in effect: {options}"
+    threshold = option_number(options, "oversize_threshold")
+    assert threshold == 32 << 20, f"oversize_threshold not in effect: {options}"
 
 
 @pytest.mark.unit

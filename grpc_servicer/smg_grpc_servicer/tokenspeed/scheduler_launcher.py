@@ -33,7 +33,8 @@ def launch_engine(
     except ImportError as error:
         raise RuntimeError(
             "This TokenSpeed ships no in-process Python frontend (AsyncLLM), so the Python "
-            f"servicer path cannot serve it; start with --servicer-impl rust ({error})"
+            "servicer path cannot serve it; drop --servicer-impl python / "
+            f"SMG_TOKENSPEED_SERVICER_IMPL=python and run the default, the Rust servicer ({error})"
         ) from error
 
     async_llm, _template_manager, scheduler_info = _launch_subprocesses(

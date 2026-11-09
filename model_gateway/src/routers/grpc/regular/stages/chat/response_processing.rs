@@ -1,6 +1,7 @@
 //! Chat response processing stage: Handles both streaming and non-streaming responses
 //!
-//! - For streaming: Spawns background task and returns SSE response (early exit)
+//! - For streaming: Builds the reading of the engine's answer and returns the SSE response
+//!   whose body drives it (early exit)
 //! - For non-streaming: Collects all responses and builds final ChatCompletionResponse
 
 use std::sync::Arc;
@@ -113,7 +114,7 @@ impl ChatResponseProcessingStage {
                 .and_then(RateLimitCell::take_for_streaming_handoff);
 
             // Streaming: Use StreamingProcessor and return SSE response. The
-            // stream task consumes the spec, never the parsed request.
+            // reading consumes the spec, never the parsed request.
             let source = StreamSource::new(
                 ctx.workers.as_ref(),
                 &dispatch,

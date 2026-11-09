@@ -14,17 +14,23 @@
 //!
 //! The pre-tokenizer of the GPT-4 family (Qwen 2 and 3, Llama 3, GLM 4.6
 //! and their kin ship one template, the digit rule's bound apart) is matched
-//! by a [`Scanner`] instead of the program: each of its seven alternatives
-//! is decided at a position by a few class tests and class runs, which is
-//! what the backtracking engine arrives at for that shape, so the pieces are
-//! the same and no character is interpreted op by op. The classes are the
-//! parser's, so the two matchers cannot read a category differently.
+//! by a [`Scanner`] instead of the program, and the cased-letter template
+//! (gpt-oss, Llama 4, MiniMax and their kin) by [`cased::Scanner`]: each
+//! alternative is decided at a position by a few class tests and class runs,
+//! which is what the backtracking engine arrives at for that shape, so the
+//! pieces are the same and no character is interpreted op by op. A scanner
+//! reads a character's classes as role bits ([`scan::Roles`]). The classes
+//! are the parser's, so the matchers cannot read a category differently.
 //!
 //! Character categories come from [`super::unicode`], generated from that
 //! same engine, so `\p{L}` or `\s` cannot mean one thing here and another
 //! there.
 
-use super::{chain, unicode};
+use super::{
+    cased, chain,
+    scan::{Bits, Roles},
+    unicode,
+};
 
 /// A set of characters: Unicode categories, code point ranges, negation.
 #[derive(Debug, Clone, Default)]
@@ -32,8 +38,14 @@ pub(super) struct Class {
     negated: bool,
     categories: u16,
     ranges: Vec<(u32, u32)>,
+    /// Categories taken out of the class before any negation: the engine's
+    /// intersection with a negated property class, `[...&&[^\p{Han}]]`.
+    without: u16,
     /// Membership of U+0000..=U+007F, resolved once.
     ascii: AsciiSet,
+    /// Membership of U+0000..=U+FFFF, resolved once (empty until
+    /// [`Class::finish`]).
+    plane: PlaneSet,
 }
 
 /// A set of ASCII characters as a membership table, one entry per code
@@ -79,6 +91,67 @@ impl AsciiSet {
     }
 }
 
+/// Words of a [`PlaneSet`]: one bit per code point of the Basic
+/// Multilingual Plane.
+const PLANE_WORDS: usize = 0x1_0000 / 64;
+
+/// A set of characters of the Basic Multilingual Plane as a bitmap, 8 KiB.
+/// A class test on a character beyond ASCII was a binary search over the
+/// range table of each of the class's categories, once per character per
+/// class test (measured: half of a warm encode of prose with a sixth of its
+/// bytes outside ASCII); a bit test is one load. The planes above keep the
+/// tables: rare in prompts, and a bit per code point of them would be 136
+/// KiB per class.
+#[derive(Clone)]
+struct PlaneSet(Box<[u64; PLANE_WORDS]>);
+
+impl Default for PlaneSet {
+    fn default() -> Self {
+        Self(Box::new([0; PLANE_WORDS]))
+    }
+}
+
+impl std::fmt::Debug for PlaneSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let members: u32 = self.0.iter().map(|word| word.count_ones()).sum();
+        f.debug_tuple("PlaneSet").field(&members).finish()
+    }
+}
+
+impl PlaneSet {
+    /// Membership of `code`, which the caller has checked is below U+10000.
+    #[inline]
+    fn contains(&self, code: u32) -> bool {
+        debug_assert!(code < 0x1_0000);
+        (self.0[(code >> 6) as usize & (PLANE_WORDS - 1)] >> (code & 63)) & 1 != 0
+    }
+
+    /// Inserts every code point of `ranges` that is in the plane.
+    fn insert_ranges(&mut self, ranges: &[(u32, u32)]) {
+        for &(start, end) in ranges {
+            for code in start..=end.min(0xFFFF) {
+                self.0[(code >> 6) as usize] |= 1 << (code & 63);
+            }
+        }
+    }
+
+    /// Removes every code point of `ranges` that is in the plane.
+    fn remove_ranges(&mut self, ranges: &[(u32, u32)]) {
+        for &(start, end) in ranges {
+            for code in start..=end.min(0xFFFF) {
+                self.0[(code >> 6) as usize] &= !(1 << (code & 63));
+            }
+        }
+    }
+
+    /// The complement within the plane.
+    fn negate(&mut self) {
+        for word in self.0.iter_mut() {
+            *word = !*word;
+        }
+    }
+}
+
 const CAT_LETTER: u16 = 1 << 0;
 const CAT_MARK: u16 = 1 << 1;
 const CAT_NUMBER: u16 = 1 << 2;
@@ -90,6 +163,10 @@ const CAT_TITLECASE: u16 = 1 << 7;
 const CAT_MODIFIER_LETTER: u16 = 1 << 8;
 const CAT_OTHER_LETTER: u16 = 1 << 9;
 const CAT_SPACE: u16 = 1 << 10;
+/// The `Han` script: the one script property the patterns use (a template
+/// cuts ideograph runs out before its letter classes and takes them out of
+/// those classes).
+const CAT_HAN: u16 = 1 << 11;
 
 /// Pairs of ASCII letters that are the full case folding of one character
 /// (ß ẞ: ss; ﬀ: ff; ﬁ: fi; ﬂ: fl; ﬃ ﬄ: ffi, ffl; ﬅ ﬆ: st), which the engine
@@ -97,7 +174,7 @@ const CAT_SPACE: u16 = 1 << 10;
 const MULTI_CHARACTER_FOLDS: [[char; 2]; 5] =
     [['s', 's'], ['s', 't'], ['f', 'f'], ['f', 'i'], ['f', 'l']];
 
-const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 11] = [
+const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 12] = [
     (CAT_LETTER, unicode::LETTER),
     (CAT_MARK, unicode::MARK),
     (CAT_NUMBER, unicode::NUMBER),
@@ -109,12 +186,20 @@ const CATEGORY_TABLES: [(u16, &[(u32, u32)]); 11] = [
     (CAT_MODIFIER_LETTER, unicode::MODIFIER_LETTER),
     (CAT_OTHER_LETTER, unicode::OTHER_LETTER),
     (CAT_SPACE, unicode::SPACE),
+    (CAT_HAN, unicode::HAN),
 ];
 
 #[inline]
 fn in_ranges(ranges: &[(u32, u32)], code: u32) -> bool {
     let index = ranges.partition_point(|&(_, end)| end < code);
     ranges.get(index).is_some_and(|&(start, _)| start <= code)
+}
+
+/// Whether `code` is in the table of any category of `categories`.
+fn in_categories(categories: u16, code: u32) -> bool {
+    CATEGORY_TABLES
+        .iter()
+        .any(|&(bit, table)| categories & bit != 0 && in_ranges(table, code))
 }
 
 impl Class {
@@ -126,15 +211,39 @@ impl Class {
             }
         }
         self.ascii = ascii;
+        self.plane = self.plane_set();
         self
+    }
+
+    /// The members of the class in the Basic Multilingual Plane: the class's
+    /// own ranges and the tables of its categories, the complement for a
+    /// negated class (the `hit != negated` of [`Class::contains_slow`]).
+    fn plane_set(&self) -> PlaneSet {
+        let mut plane = PlaneSet::default();
+        plane.insert_ranges(&self.ranges);
+        for &(bit, table) in &CATEGORY_TABLES {
+            if self.categories & bit != 0 {
+                plane.insert_ranges(table);
+            }
+        }
+        for &(bit, table) in &CATEGORY_TABLES {
+            if self.without & bit != 0 {
+                plane.remove_ranges(table);
+            }
+        }
+        if self.negated {
+            plane.negate();
+        }
+        plane
     }
 
     fn contains_slow(&self, code: u32) -> bool {
         let mut hit = in_ranges(&self.ranges, code);
         if !hit && self.categories != 0 {
-            hit = CATEGORY_TABLES
-                .iter()
-                .any(|&(bit, table)| self.categories & bit != 0 && in_ranges(table, code));
+            hit = in_categories(self.categories, code);
+        }
+        if hit && self.without != 0 {
+            hit = !in_categories(self.without, code);
         }
         hit != self.negated
     }
@@ -144,9 +253,16 @@ impl Class {
         let code = u32::from(c);
         if code < 128 {
             self.ascii.contains(code)
+        } else if code < 0x1_0000 {
+            self.plane.contains(code)
         } else {
             self.contains_slow(code)
         }
+    }
+
+    /// Whether the class may hold a character beyond ASCII.
+    pub(super) fn may_hold_beyond_ascii(&self) -> bool {
+        self.first().non_ascii
     }
 
     /// The characters the class may hold, exact below U+0080 and one bit for
@@ -247,11 +363,24 @@ pub(crate) struct Pattern {
     program: Vec<Op>,
     /// The first-character sets the `Split` ops index.
     firsts: Vec<First>,
-    /// The matcher of the GPT-4 family's template, when the pattern is one.
-    scanner: Option<Scanner>,
+    /// How the pattern is matched: by the scanner of its template's shape,
+    /// else by the program.
+    matcher: Matcher,
     /// What the pattern is as a stage of a three-stage chain, when it is
     /// one (see [`chain`]).
     part: Option<chain::Part>,
+}
+
+/// The matcher of a pattern: a hand-written scanner for the two template
+/// shapes in use, the program for every other pattern.
+#[derive(Debug, Clone)]
+enum Matcher {
+    /// The compiled program, interpreted (see [`Pattern::match_at`]).
+    Program,
+    /// The GPT-4 family's template.
+    Template(Scanner),
+    /// The cased-letter template.
+    Cased(cased::Scanner),
 }
 
 /// One instruction of a compiled pattern. The tree is flattened into a
@@ -322,7 +451,13 @@ impl Pattern {
         if choices(&root) > MAX_CHOICES {
             return None;
         }
-        let scanner = Scanner::recognize(&root, &parser.classes);
+        let matcher = match Scanner::recognize(&root, &parser.classes) {
+            Some(scanner) => Matcher::Template(scanner),
+            None => match cased::Scanner::recognize(&root, &parser.classes) {
+                Some(scanner) => Matcher::Cased(scanner),
+                None => Matcher::Program,
+            },
+        };
         let part = chain::Part::recognize(&root);
         let mut program = Vec::new();
         let mut firsts = Vec::new();
@@ -332,7 +467,7 @@ impl Pattern {
             classes: parser.classes,
             program,
             firsts,
-            scanner,
+            matcher,
             part,
         })
     }
@@ -350,11 +485,17 @@ impl Pattern {
     /// This pattern matched by its program alone, the scanner set aside: the
     /// tests hold the two against each other.
     #[cfg(test)]
-    fn program_only(&self) -> Self {
+    pub(super) fn program_only(&self) -> Self {
         Self {
-            scanner: None,
+            matcher: Matcher::Program,
             ..self.clone()
         }
+    }
+
+    /// Whether a scanner matches this pattern (else the program does).
+    #[cfg(test)]
+    pub(super) fn has_scanner(&self) -> bool {
+        !matches!(self.matcher, Matcher::Program)
     }
 
     /// The matches in `text`, leftmost first, each continuing after the last.
@@ -364,6 +505,25 @@ impl Pattern {
             text,
             pos: 0,
             choices: [Choice::default(); MAX_CHOICES],
+        }
+    }
+
+    /// Calls `f` with each match of `text`, leftmost first, each continuing
+    /// after the last (what [`Self::find_iter`] yields), the matcher
+    /// dispatched once per text: a scanner runs its own loop with `f`
+    /// compiled into it, where the iterator costs a call, a frame and an
+    /// `Option` written to the stack per piece (measured: a tenth of the
+    /// instructions of a warm long encode); the program keeps the iterator.
+    #[inline(always)]
+    pub(crate) fn for_each_match<F: FnMut(usize, usize)>(&self, text: &str, mut f: F) {
+        match &self.matcher {
+            Matcher::Template(scanner) => scanner.for_each_match(&self.classes, text, &mut f),
+            Matcher::Cased(scanner) => scanner.for_each_match(&self.classes, text, &mut f),
+            Matcher::Program => {
+                for (start, end) in self.find_iter(text) {
+                    f(start, end);
+                }
+            }
         }
     }
 
@@ -484,14 +644,11 @@ impl Pattern {
     }
 }
 
-/// A part of the GPT-4 family's template that one class fills: the bit of
-/// [`Scanner::ascii`] and the slot of [`Scanner::classes`] that hold it.
+/// A part of the GPT-4 family's template that one class fills: its bit in
+/// a character's role bits.
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 enum Role {
-    /// The first character of a clitic alternative (a bit only: beyond
-    /// ASCII the alternatives are tried).
-    CliticStart,
     /// The optional lead-in of a letter run (`[^\r\n\p{L}\p{N}]?`).
     WordPrefix,
     /// A letter run (`\p{L}+`).
@@ -517,11 +674,8 @@ enum Role {
     Space,
 }
 
-/// The roles, so many slots of [`Scanner::classes`].
-const ROLES: usize = 12;
-
-/// The roles that one class fills, every role but the clitic start.
-const CLASSED_ROLES: [Role; ROLES - 1] = [
+/// The roles, in the order of their bits.
+const ROLES: [Role; 11] = [
     Role::WordPrefix,
     Role::Word,
     Role::Digit,
@@ -537,8 +691,8 @@ const CLASSED_ROLES: [Role; ROLES - 1] = [
 
 impl Role {
     #[inline(always)]
-    fn bit(self) -> u16 {
-        1 << (self as u16)
+    const fn bit(self) -> Bits {
+        1 << (self as u32)
     }
 }
 
@@ -571,22 +725,20 @@ impl Role {
 /// first alternative to reach the end of the pattern wins.
 #[derive(Debug, Clone)]
 struct Scanner {
-    /// Per ASCII code point, a bit per [`Role`] whose class holds it.
-    ascii: [u16; 128],
-    /// The class of each role, read for characters beyond ASCII (the clitic
-    /// start's slot is unused).
-    classes: [usize; ROLES],
-    /// Whether a clitic alternative may begin beyond ASCII.
-    clitic_beyond_ascii: bool,
+    roles: Roles,
     /// The clitic alternatives, each the classes of its characters in order.
     clitics: Vec<Vec<usize>>,
+    /// Per ASCII code point, whether a clitic alternative may begin with it.
+    clitic_start: [bool; 128],
+    /// Whether a clitic alternative may begin beyond ASCII.
+    clitic_beyond_ascii: bool,
     /// The most digits the digit alternative takes at once.
     digit_cap: u32,
 }
 
 impl Scanner {
     /// The scanner of `root`, when it is the template; `None` for every other
-    /// shape, which the program matches.
+    /// shape.
     fn recognize(root: &Node, classes: &[Class]) -> Option<Self> {
         let Node::Alt { alternatives, .. } = root else {
             return None;
@@ -632,109 +784,81 @@ impl Scanner {
         let Node::NotAhead(not_trail) = not_trail else {
             return None;
         };
-        let mut roles = [0usize; ROLES];
-        roles[Role::WordPrefix as usize] = repeat(word_prefix, 0, 1)?;
-        roles[Role::Word as usize] = repeat(word_run, 1, u32::MAX)?;
-        roles[Role::Digit as usize] = digit;
-        roles[Role::PunctPrefix as usize] = repeat(punct_prefix, 0, 1)?;
-        roles[Role::Punct as usize] = repeat(punct_run, 1, u32::MAX)?;
-        roles[Role::PunctBreak as usize] = repeat(punct_break, 0, u32::MAX)?;
-        roles[Role::BreakSpace as usize] = repeat(break_space, 0, u32::MAX)?;
-        roles[Role::Break as usize] = repeat(break_run, 1, u32::MAX)?;
-        roles[Role::TrailSpace as usize] = repeat(trail_space, 1, u32::MAX)?;
-        roles[Role::NotTrail as usize] = *not_trail;
-        roles[Role::Space as usize] = repeat(space, 1, u32::MAX)?;
-        let mut ascii = [0u16; 128];
-        for (code, bits) in ascii.iter_mut().enumerate() {
-            let c = char::from(code as u8);
-            for role in CLASSED_ROLES {
-                if classes[roles[role as usize]].contains(c) {
-                    *bits |= role.bit();
-                }
-            }
-            if clitics
-                .iter()
-                .any(|alternative| classes[alternative[0]].contains(c))
-            {
-                *bits |= Role::CliticStart.bit();
-            }
-        }
-        let clitic_beyond_ascii = clitics
+        let of = |role: Role| -> Option<usize> {
+            Some(match role {
+                Role::WordPrefix => repeat(word_prefix, 0, 1)?,
+                Role::Word => repeat(word_run, 1, u32::MAX)?,
+                Role::Digit => digit,
+                Role::PunctPrefix => repeat(punct_prefix, 0, 1)?,
+                Role::Punct => repeat(punct_run, 1, u32::MAX)?,
+                Role::PunctBreak => repeat(punct_break, 0, u32::MAX)?,
+                Role::BreakSpace => repeat(break_space, 0, u32::MAX)?,
+                Role::Break => repeat(break_run, 1, u32::MAX)?,
+                Role::TrailSpace => repeat(trail_space, 1, u32::MAX)?,
+                Role::NotTrail => *not_trail,
+                Role::Space => repeat(space, 1, u32::MAX)?,
+            })
+        };
+        let role_classes = ROLES
             .iter()
-            .any(|alternative| classes[alternative[0]].first().non_ascii);
+            .map(|&role| of(role).map(|class| &classes[class]))
+            .collect::<Option<Vec<&Class>>>()?;
+        let mut clitic_start = [false; 128];
+        let mut clitic_beyond_ascii = false;
+        for alternative in &clitics {
+            let class = &classes[alternative[0]];
+            for (code, start) in clitic_start.iter_mut().enumerate() {
+                *start |= class.contains(char::from(code as u8));
+            }
+            clitic_beyond_ascii |= class.may_hold_beyond_ascii();
+        }
         Some(Self {
-            ascii,
-            classes: roles,
-            clitic_beyond_ascii,
+            roles: Roles::build(&role_classes),
             clitics,
+            clitic_start,
+            clitic_beyond_ascii,
             digit_cap,
         })
     }
 
-    /// Whether `c` is in the class of `role`.
-    #[inline(always)]
-    fn has(&self, classes: &[Class], role: Role, c: char) -> bool {
-        let code = u32::from(c);
-        if code < 128 {
-            self.ascii[code as usize] & role.bit() != 0
-        } else {
-            classes[self.classes[role as usize]].contains(c)
-        }
-    }
-
-    /// The end of the run of `role`'s class that starts at `pos`.
-    #[inline(always)]
-    fn run_end(&self, classes: &[Class], text: &str, mut pos: usize, role: Role) -> usize {
-        while let Some((c, len)) = next_char(text, pos) {
-            if !self.has(classes, role, c) {
-                break;
-            }
-            pos += len;
-        }
-        pos
-    }
-
     /// The end of the piece that starts at `pos`, if one does: the first of
     /// the seven alternatives that matches there, as the engine picks it.
+    /// Compiled into its callers' loops: out of line it was a call per
+    /// piece, and every value the loop keeps across a call is a spill.
+    #[inline(always)]
     fn match_at(&self, classes: &[Class], text: &str, pos: usize) -> Option<usize> {
-        let (c, len) = next_char(text, pos)?;
+        let (c, len) = self.roles.at(text, pos)?;
         let after = pos + len;
         // 1. A clitic: the first alternative whose characters follow in order.
-        let may_start_clitic = if u32::from(c) < 128 {
-            self.ascii[u32::from(c) as usize] & Role::CliticStart.bit() != 0
+        let first = text.as_bytes()[pos];
+        let may_start_clitic = if first < 0x80 {
+            self.clitic_start[usize::from(first)]
         } else {
             self.clitic_beyond_ascii
         };
         if may_start_clitic {
-            'alternatives: for alternative in &self.clitics {
-                let mut p = pos;
-                for &class in alternative {
-                    match next_char(text, p) {
-                        Some((d, n)) if classes[class].contains(d) => p += n,
-                        _ => continue 'alternatives,
-                    }
-                }
-                return Some(p);
+            if let Some(end) = clitic_match(classes, text, pos, &self.clitics) {
+                return Some(end);
             }
         }
         // 2. A letter run, with the lead-in when a letter follows it.
-        if self.has(classes, Role::WordPrefix, c) {
-            if let Some((d, n)) = next_char(text, after) {
-                if self.has(classes, Role::Word, d) {
-                    return Some(self.run_end(classes, text, after + n, Role::Word));
+        if c & Role::WordPrefix.bit() != 0 {
+            if let Some((d, n)) = self.roles.at(text, after) {
+                if d & Role::Word.bit() != 0 {
+                    return Some(self.roles.run_end(text, after + n, Role::Word.bit()));
                 }
             }
         }
-        if self.has(classes, Role::Word, c) {
-            return Some(self.run_end(classes, text, after, Role::Word));
+        if c & Role::Word.bit() != 0 {
+            return Some(self.roles.run_end(text, after, Role::Word.bit()));
         }
         // 3. Up to the bound of digits.
-        if self.has(classes, Role::Digit, c) {
+        if c & Role::Digit.bit() != 0 {
             let mut end = after;
             let mut count = 1;
             while count < self.digit_cap {
-                match next_char(text, end) {
-                    Some((d, n)) if self.has(classes, Role::Digit, d) => {
+                match self.roles.at(text, end) {
+                    Some((d, n)) if d & Role::Digit.bit() != 0 => {
                         end += n;
                         count += 1;
                     }
@@ -745,39 +869,48 @@ impl Scanner {
         }
         // 4. A punctuation run, with the space when punctuation follows it,
         //    and the line breaks after the run.
-        if self.has(classes, Role::PunctPrefix, c) {
-            if let Some((d, n)) = next_char(text, after) {
-                if self.has(classes, Role::Punct, d) {
-                    let end = self.run_end(classes, text, after + n, Role::Punct);
-                    return Some(self.run_end(classes, text, end, Role::PunctBreak));
+        if c & Role::PunctPrefix.bit() != 0 {
+            if let Some((d, n)) = self.roles.at(text, after) {
+                if d & Role::Punct.bit() != 0 {
+                    let end = self.roles.run_end(text, after + n, Role::Punct.bit());
+                    return Some(self.roles.run_end(text, end, Role::PunctBreak.bit()));
                 }
             }
         }
-        if self.has(classes, Role::Punct, c) {
-            let end = self.run_end(classes, text, after, Role::Punct);
-            return Some(self.run_end(classes, text, end, Role::PunctBreak));
+        if c & Role::Punct.bit() != 0 {
+            let end = self.roles.run_end(text, after, Role::Punct.bit());
+            return Some(self.roles.run_end(text, end, Role::PunctBreak.bit()));
         }
         // 5. Whitespace ending in line breaks: the greedy whitespace run
-        //    gives back characters until a line break follows it.
-        let mut end = self.run_end(classes, text, pos, Role::BreakSpace);
+        //    gives back to the last position where a line break stands,
+        //    inside the run or right after it.
+        let mut end = pos;
+        let mut last_break = None;
         loop {
-            if let Some((d, n)) = next_char(text, end) {
-                if self.has(classes, Role::Break, d) {
-                    return Some(self.run_end(classes, text, end + n, Role::Break));
+            match self.roles.at(text, end) {
+                Some((d, n)) if d & Role::BreakSpace.bit() != 0 => {
+                    if d & Role::Break.bit() != 0 {
+                        last_break = Some(end);
+                    }
+                    end += n;
                 }
+                Some((d, _)) if d & Role::Break.bit() != 0 => {
+                    last_break = Some(end);
+                    break;
+                }
+                _ => break,
             }
-            if end == pos {
-                break;
-            }
-            end = previous_boundary(text, end);
+        }
+        if let Some(start) = last_break {
+            return Some(self.roles.run_end(text, start, Role::Break.bit()));
         }
         // 6. Whitespace before a non-space: the greedy run gives back its last
         //    character while a non-space follows it, down to one.
-        if self.has(classes, Role::TrailSpace, c) {
-            let mut end = self.run_end(classes, text, after, Role::TrailSpace);
+        if c & Role::TrailSpace.bit() != 0 {
+            let mut end = self.roles.run_end(text, after, Role::TrailSpace.bit());
             loop {
-                match next_char(text, end) {
-                    Some((d, _)) if self.has(classes, Role::NotTrail, d) => {}
+                match self.roles.at(text, end) {
+                    Some((d, _)) if d & Role::NotTrail.bit() != 0 => {}
                     _ => return Some(end),
                 }
                 let shorter = previous_boundary(text, end);
@@ -788,11 +921,41 @@ impl Scanner {
             }
         }
         // 7. The whitespace run.
-        if self.has(classes, Role::Space, c) {
-            return Some(self.run_end(classes, text, after, Role::Space));
+        if c & Role::Space.bit() != 0 {
+            return Some(self.roles.run_end(text, after, Role::Space.bit()));
         }
         None
     }
+
+    /// Calls `f` with each piece of `text` in order (see
+    /// [`Pattern::for_each_match`]): a position no alternative matches at
+    /// is passed over by one character, as the iterator does.
+    #[inline(always)]
+    fn for_each_match<F: FnMut(usize, usize)>(&self, classes: &[Class], text: &str, f: &mut F) {
+        each_match(text, |pos| self.match_at(classes, text, pos), f);
+    }
+}
+
+/// The end of the first of `clitics` (each the classes of its characters in
+/// order) whose characters follow at `pos`, if one does.
+#[inline(never)]
+pub(super) fn clitic_match(
+    classes: &[Class],
+    text: &str,
+    pos: usize,
+    clitics: &[Vec<usize>],
+) -> Option<usize> {
+    'alternatives: for alternative in clitics {
+        let mut p = pos;
+        for &class in alternative {
+            match next_char(text, p) {
+                Some((d, n)) if classes[class].contains(d) => p += n,
+                _ => continue 'alternatives,
+            }
+        }
+        return Some(p);
+    }
+    None
 }
 
 /// The class of a node that is one character of a class.
@@ -951,9 +1114,14 @@ impl Iterator for Matches<'_, '_> {
     fn next(&mut self) -> Option<(usize, usize)> {
         while self.pos < self.text.len() {
             let start = self.pos;
-            let end = match &self.pattern.scanner {
-                Some(scanner) => scanner.match_at(&self.pattern.classes, self.text, start),
-                None => self.pattern.match_at(self.text, start, &mut self.choices),
+            let end = match &self.pattern.matcher {
+                Matcher::Template(scanner) => {
+                    scanner.match_at(&self.pattern.classes, self.text, start)
+                }
+                Matcher::Cased(scanner) => {
+                    scanner.match_at(&self.pattern.classes, self.text, start)
+                }
+                Matcher::Program => self.pattern.match_at(self.text, start, &mut self.choices),
             };
             match end {
                 Some(end) if end > start => {
@@ -1038,6 +1206,34 @@ fn first_sets(node: &mut Node, classes: &[Class]) -> First {
             nullable: true,
             ..First::default()
         },
+    }
+}
+
+/// Calls `f` with each match of `text` in order, each continuing after the
+/// last, `match_at(pos)` giving the end of the match that starts at `pos`:
+/// a position no alternative matches at is passed over by one character,
+/// as [`Matches::next`] does. The one loop behind the scanners'
+/// `for_each_match`, compiled into each with its own `match_at`.
+#[inline(always)]
+pub(super) fn each_match<M, F>(text: &str, mut match_at: M, f: &mut F)
+where
+    M: FnMut(usize) -> Option<usize>,
+    F: FnMut(usize, usize),
+{
+    let mut pos = 0;
+    while pos < text.len() {
+        match match_at(pos) {
+            Some(end) if end > pos => {
+                f(pos, end);
+                pos = end;
+            }
+            _ => {
+                let Some((_, len)) = next_char(text, pos) else {
+                    return;
+                };
+                pos += len;
+            }
+        }
     }
 }
 
@@ -1305,8 +1501,25 @@ impl Parser<'_> {
             "Lt" => CAT_TITLECASE,
             "Lm" => CAT_MODIFIER_LETTER,
             "Lo" => CAT_OTHER_LETTER,
+            "Han" => CAT_HAN,
             _ => return None,
         })
+    }
+
+    /// `[^\p{X}...]` after `&&` inside a class: the properties it takes out
+    /// of the class. Nothing else may stand on either side of the `&&`.
+    fn parse_subtracted_properties(&mut self) -> Option<u16> {
+        if self.chars.next()? != '[' || self.chars.next()? != '^' {
+            return None;
+        }
+        let mut categories = 0;
+        loop {
+            match self.chars.next()? {
+                ']' if categories != 0 => return Some(categories),
+                '\\' if self.chars.next()? == 'p' => categories |= self.parse_property()?,
+                _ => return None,
+            }
+        }
     }
 
     /// The body of `[...]`, after the opening bracket.
@@ -1335,9 +1548,23 @@ impl Parser<'_> {
                     'P' | 'S' | 'd' | 'D' | 'w' | 'W' | 'h' | 'H' => return None,
                     other => escaped_literal(other)?,
                 },
-                // Nested classes, intersections and POSIX brackets are not supported.
+                // An intersection with a negated property class closes the
+                // class: `[...&&[^\p{Han}]]`. Nested classes, other
+                // intersections and POSIX brackets are not supported.
+                '&' if self.chars.peek() == Some(&'&') => {
+                    // Nothing before the intersection would be the empty
+                    // set: declined, as every other shape of it is.
+                    if first {
+                        return None;
+                    }
+                    self.chars.next();
+                    class.without = self.parse_subtracted_properties()?;
+                    if self.chars.next()? != ']' {
+                        return None;
+                    }
+                    break;
+                }
                 '[' => return None,
-                '&' if self.chars.peek() == Some(&'&') => return None,
                 literal => literal,
             };
             first = false;
@@ -1397,6 +1624,8 @@ fn escaped_literal(c: char) -> Option<char> {
 
 #[cfg(test)]
 mod tests {
+    use rustc_hash::FxHashMap;
+    use tiktoken_rs::CoreBPE;
     use tokenizers::utils::SysRegex;
 
     use super::*;
@@ -1414,9 +1643,29 @@ mod tests {
     const CJK: &str = "[一-龥぀-ゟ゠-ヿ]+";
     const DEEPSEEK: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
     const CASED: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+    /// The cased template without the clitic group and with one digit at a
+    /// time (the Mistral tekken template), and with the group and one digit.
+    const TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+    const CASED_ONE_DIGIT: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-    const PATTERNS: [&str; 10] = [
-        GPT2, QWEN2, QWEN35, CL100K, TWO_DIGITS, ANY_DIGITS, DIGITS, CJK, DEEPSEEK, CASED,
+    /// The Kimi template: ideograph runs first, the cased letter runs
+    /// without the ideographs, the rest as cl100k's.
+    const KIMI: &str = r"[\p{Han}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+    const PATTERNS: [&str; 13] = [
+        GPT2,
+        QWEN2,
+        QWEN35,
+        CL100K,
+        TWO_DIGITS,
+        ANY_DIGITS,
+        DIGITS,
+        CJK,
+        DEEPSEEK,
+        CASED,
+        TEKKEN,
+        CASED_ONE_DIGIT,
+        KIMI,
     ];
 
     /// Characters that exercise every class the patterns use: ASCII of all
@@ -1518,6 +1767,12 @@ mod tests {
         '中',
         '文',
         '龥',
+        '々',
+        '〇',
+        '〡',
+        '⺀',
+        '𠀀',
+        '𮯰',
         'あ',
         'ん',
         'ア',
@@ -1627,9 +1882,16 @@ mod tests {
             r"a++",
             r"[[:alpha:]]",
             r"[a&&b]",
+            r"[\p{L}&&\p{Han}]",
+            r"[\p{L}&&[^a]]",
+            r"[\p{L}&&[^\p{Han}]a]",
+            r"[&&[^\p{Han}]]",
+            r"[&&a]",
+            r"[^&&a]",
+            r"[\p{L}&&[^]]",
             r"\d+",
             r"(?=a)",
-            r"\p{Han}",
+            r"\p{Hiragana}",
             r"a{3,1}",
             r"[z-a]",
             r"(?:ab)+",
@@ -1655,6 +1917,87 @@ mod tests {
         }
     }
 
+    /// The code points the two cross-engine sweeps below check: every one of
+    /// the four planes that hold assigned scripts (0 to 3) and plane 14's
+    /// first block (tags and variation selectors), then a stride over the
+    /// unassigned and private planes. A script a Unicode version adds,
+    /// however small, lies inside the part swept whole.
+    fn code_points_swept() -> impl Iterator<Item = u32> + Clone {
+        (0u32..0x4_0000)
+            .chain(0xE_0000..0xE_1000)
+            .chain((0x4_0000..=0x10_FFFF).step_by(97))
+    }
+
+    /// The `Han` property and a class with it taken out agree with the
+    /// engine character by character over [`code_points_swept`], for the
+    /// property alone, negated, taken out of the Kimi template's two letter
+    /// classes, and taken out under an outer negation.
+    #[test]
+    fn han_and_the_classes_it_is_taken_out_of_agree_with_the_engine() {
+        let patterns = [
+            r"\p{Han}",
+            r"[^\p{Han}]",
+            r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]",
+            r"[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]",
+            r"[^\p{L}\p{N}&&[^\p{Han}]]",
+            r"[a-z\p{M}&&[^\p{Han}\p{Lo}]]",
+        ];
+        let codes = code_points_swept();
+        let mut buf = String::new();
+        for pattern in patterns {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            let engine = SysRegex::new(pattern).expect("the engine compiles the pattern");
+            for code in codes.clone() {
+                let Some(c) = char::from_u32(code) else {
+                    continue;
+                };
+                buf.clear();
+                buf.push(c);
+                let ours = parsed.find_iter(&buf).next() == Some((0, buf.len()));
+                let theirs = engine.find_iter(&buf).next() == Some((0, buf.len()));
+                assert_eq!(ours, theirs, "{pattern} at U+{code:04X}");
+            }
+        }
+    }
+
+    /// The classes of the tiktoken templates the direct path reads, checked
+    /// over [`code_points_swept`] against the file's own encoder (a `CoreBPE`
+    /// whose pattern is the class alone encodes a code point it matches and
+    /// drops one it does not): the two engines' Unicode tables agree today,
+    /// and a version apart between them, a new script included, would show
+    /// here.
+    #[test]
+    fn the_tiktoken_template_classes_agree_with_the_files_own_encoder() {
+        let ranks: FxHashMap<Vec<u8>, u32> = (0..=255u8).map(|b| (vec![b], u32::from(b))).collect();
+        let classes = [
+            r"[\p{Han}]",
+            r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]",
+            r"[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]",
+            r"[^\r\n\p{L}\p{N}]",
+            r"\p{L}",
+            r"\p{N}",
+            r"[^\s\p{L}\p{N}]",
+            r"\s",
+        ];
+        let codes = code_points_swept();
+        let mut buf = String::new();
+        for class in classes {
+            let parsed = Pattern::parse(class).expect("parses");
+            let own = CoreBPE::new(ranks.clone(), FxHashMap::default(), class)
+                .expect("the file's own encoder compiles the class");
+            for code in codes.clone() {
+                let Some(c) = char::from_u32(code) else {
+                    continue;
+                };
+                buf.clear();
+                buf.push(c);
+                let ours = parsed.find_iter(&buf).next() == Some((0, buf.len()));
+                let theirs = !own.encode_ordinary(&buf).is_empty();
+                assert_eq!(ours, theirs, "{class} at U+{code:04X}");
+            }
+        }
+    }
+
     #[test]
     fn matches_agree_with_the_engine_on_random_text() {
         let mut state = 0x2545_F491_4F6C_DD1Du64;
@@ -1668,7 +2011,7 @@ mod tests {
                     oracle_matches(pattern, &text),
                     "pattern {pattern:?} text {text:?}"
                 );
-                if parsed.scanner.is_some() {
+                if !matches!(parsed.matcher, Matcher::Program) {
                     let program: Vec<(usize, usize)> =
                         parsed.program_only().find_iter(&text).collect();
                     assert_eq!(ours, program, "pattern {pattern:?} text {text:?}");
@@ -1686,10 +2029,10 @@ mod tests {
             (TWO_DIGITS, 2),
             (ANY_DIGITS, u32::MAX),
         ] {
-            let scanner = Pattern::parse(pattern)
-                .expect("parses")
-                .scanner
-                .expect("the template takes the scanner");
+            let parsed = Pattern::parse(pattern).expect("parses");
+            let Matcher::Template(scanner) = &parsed.matcher else {
+                panic!("the template takes the scanner: {pattern}");
+            };
             assert_eq!(scanner.digit_cap, digit_cap, "{pattern}");
             assert_eq!(scanner.clitics.len(), 7, "{pattern}");
             assert!(!scanner.clitic_beyond_ascii, "{pattern}");
@@ -1704,13 +2047,54 @@ mod tests {
             DIGITS,
             CJK,
             DEEPSEEK,
-            CASED,
+            KIMI,
             SWAPPED,
             TWO_OR_MORE,
             LEAD_IN_RUN,
         ] {
             assert!(
-                Pattern::parse(pattern).expect("parses").scanner.is_none(),
+                matches!(
+                    Pattern::parse(pattern).expect("parses").matcher,
+                    Matcher::Program
+                ),
+                "{pattern}"
+            );
+        }
+    }
+
+    /// The cased-letter template with the clitic group, without it and with
+    /// one digit at a time, and no other shape: the group in one letter
+    /// alternative only, the letter alternatives the other way round, a
+    /// required lead-in, a non-optional group.
+    #[test]
+    fn the_cased_template_takes_its_scanner_and_no_other_shape_does() {
+        for (pattern, digit_cap, clitics) in
+            [(CASED, 3, 7), (TEKKEN, 1, 0), (CASED_ONE_DIGIT, 1, 7)]
+        {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            let Matcher::Cased(scanner) = &parsed.matcher else {
+                panic!("the cased template takes its scanner: {pattern}");
+            };
+            assert_eq!(scanner.digit_cap(), digit_cap, "{pattern}");
+            assert_eq!(scanner.clitics(), clitics, "{pattern}");
+        }
+        const ONE_GROUP: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        const UPPER_FIRST: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        const LEAD_IN_REQUIRED: &str = r"[^\r\n\p{L}\p{N}][\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}][\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        const GROUP_REQUIRED: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        for pattern in [
+            ONE_GROUP,
+            UPPER_FIRST,
+            LEAD_IN_REQUIRED,
+            GROUP_REQUIRED,
+            CL100K,
+            KIMI,
+        ] {
+            assert!(
+                !matches!(
+                    Pattern::parse(pattern).expect("parses").matcher,
+                    Matcher::Cased(_)
+                ),
                 "{pattern}"
             );
         }
@@ -1728,12 +2112,22 @@ mod tests {
             "'", "'s", "'S", "'ll", "'LL", "'ve", "'re", "'d", "'m", "'t", "'x", "'ſ", ":", ",",
             ".", "{", "}", "[", "]", "(", ")", "-", "_", "a", "Word", "ſ", "é", "ß", "1", "22",
             "333", "4444", "٣", "²", "中", "ก", "\u{301}", "\u{93E}", "😀", "\u{200D}", "\u{FE0F}",
-            "x",
+            "x", "ABC", "AbC", "aBC", "ǅx", "xǅ", "ʰa", "Aʰ", "中A", "A中", "\u{301}A", "/", "//",
+            ".../", "\n/", "I'M", "WE'LL", "'S",
         ];
         let mut state = 0x9E37_79B9_7F4A_7C15u64;
-        for pattern in [QWEN2, QWEN35, CL100K, TWO_DIGITS, ANY_DIGITS] {
+        for pattern in [
+            QWEN2,
+            QWEN35,
+            CL100K,
+            TWO_DIGITS,
+            ANY_DIGITS,
+            CASED,
+            TEKKEN,
+            CASED_ONE_DIGIT,
+        ] {
             let parsed = Pattern::parse(pattern).expect("parses");
-            assert!(parsed.scanner.is_some(), "{pattern}");
+            assert!(!matches!(parsed.matcher, Matcher::Program), "{pattern}");
             let program = parsed.program_only();
             for round in 0..2000 {
                 let text: String = (0..1 + round % 40)
@@ -1988,5 +2382,69 @@ mod tests {
         worker
             .join()
             .expect("the matcher must not overflow a small stack");
+    }
+
+    /// The plane bitmap of a class answers as its range and category tables
+    /// do: every category table over the whole plane, a negated class with
+    /// ranges and categories over the whole plane, and every class of every
+    /// pattern over a stride of the plane, the pool and the planes above.
+    #[test]
+    fn the_plane_bitmap_agrees_with_the_tables() {
+        let plane = || (0u32..0x1_0000).filter_map(char::from_u32);
+        for &(bit, table) in &CATEGORY_TABLES {
+            let class = Class {
+                categories: bit,
+                ..Class::default()
+            }
+            .finish();
+            for c in plane() {
+                let code = u32::from(c);
+                assert_eq!(
+                    class.contains(c),
+                    in_ranges(table, code),
+                    "category {bit:#x} at U+{code:04X}"
+                );
+            }
+        }
+        let negated = Class {
+            negated: true,
+            categories: CAT_LETTER | CAT_MARK,
+            ranges: vec![(0x80, 0x9F), (0x3000, 0x303F), (0x1F600, 0x1F64F)],
+            ..Class::default()
+        }
+        .finish();
+        for c in plane() {
+            let code = u32::from(c);
+            assert_eq!(
+                negated.contains(c),
+                negated.contains_slow(code),
+                "the negated class at U+{code:04X}"
+            );
+        }
+        let beyond = [
+            '\u{1F600}',
+            '\u{1F3FD}',
+            '\u{20000}',
+            '\u{E0001}',
+            '\u{10FFFF}',
+        ];
+        for pattern in PATTERNS {
+            let parsed = Pattern::parse(pattern).expect("the pattern parses");
+            for (i, class) in parsed.classes().iter().enumerate() {
+                let sample = (0u32..0x1_0000)
+                    .step_by(7)
+                    .filter_map(char::from_u32)
+                    .chain(POOL.iter().copied())
+                    .chain(beyond);
+                for c in sample {
+                    let code = u32::from(c);
+                    assert_eq!(
+                        class.contains(c),
+                        class.contains_slow(code),
+                        "{pattern}: class {i} at U+{code:04X}"
+                    );
+                }
+            }
+        }
     }
 }

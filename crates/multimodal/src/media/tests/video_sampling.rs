@@ -10,37 +10,81 @@ fn cfg() -> VideoFetchConfig {
     }
 }
 
-fn interval_cfg(sample_fps: f64, max_frames: usize) -> VideoFetchConfig {
+/// The interval walk under the connector's default bounds (`min_frames` 4,
+/// `max_frames` 768), as a request reaches it.
+fn interval_cfg(sample_fps: f64) -> VideoFetchConfig {
     VideoFetchConfig {
-        min_frames: 1,
-        max_frames,
         sample_fps,
-        max_long_side_pixel: None,
         sampling: FrameSampling::Interval,
+        ..VideoFetchConfig::default()
     }
 }
 
 #[test]
 fn interval_sampling_takes_one_frame_per_interval_and_keeps_the_last() {
     assert_eq!(
-        sampled_frame_indices(360, 30.0, interval_cfg(1.0, 768)),
+        sampled_frame_indices(360, 30.0, interval_cfg(1.0)),
         vec![0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 359]
     );
     assert_eq!(
-        sampled_frame_indices(60, 30.0, interval_cfg(1.0, 768)),
+        sampled_frame_indices(60, 30.0, interval_cfg(1.0)),
         vec![0, 30, 59]
     );
     assert_eq!(
-        sampled_frame_indices(100, 25.0, interval_cfg(0.5, 768)),
+        sampled_frame_indices(100, 25.0, interval_cfg(0.5)),
         vec![0, 50, 99]
     );
     assert_eq!(
-        sampled_frame_indices(300, 29.97, interval_cfg(2.0, 768)),
+        sampled_frame_indices(300, 29.97, interval_cfg(2.0)),
         vec![
             0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180, 195, 210, 225, 240, 255, 270,
             285, 299
         ]
     );
+}
+
+/// The walk's picks are its loader's whatever their number: a clip shorter
+/// than four intervals gives the frames the loader takes (no four-frame
+/// floor), a clip of more than 768 intervals every one of them (no thinning).
+/// The picks are the family's video loader's own on these clips.
+#[test]
+fn interval_sampling_takes_the_loaders_count_below_the_floor_and_above_the_cap() {
+    // Half a second, one second and two seconds at 30 fps: the first frame,
+    // then the last.
+    assert_eq!(
+        sampled_frame_indices(15, 30.0, interval_cfg(1.0)),
+        vec![0, 14]
+    );
+    assert_eq!(
+        sampled_frame_indices(30, 30.0, interval_cfg(1.0)),
+        vec![0, 29]
+    );
+    assert_eq!(
+        sampled_frame_indices(60, 30.0, interval_cfg(1.0)),
+        vec![0, 30, 59]
+    );
+    // Three seconds at 24 fps and five seconds at the NTSC rate.
+    assert_eq!(
+        sampled_frame_indices(72, 24.0, interval_cfg(1.0)),
+        vec![0, 24, 48, 71]
+    );
+    assert_eq!(
+        sampled_frame_indices(150, 29.97, interval_cfg(1.0)),
+        vec![0, 30, 60, 90, 120, 149]
+    );
+    // A single frame, and a clip of two frames at 1 fps.
+    assert_eq!(sampled_frame_indices(1, 30.0, interval_cfg(1.0)), vec![0]);
+    assert_eq!(sampled_frame_indices(2, 1.0, interval_cfg(1.0)), vec![0, 1]);
+    // A clip of 800 seconds at 1 fps: every frame is a pick, past the 768 bound.
+    let long = sampled_frame_indices(800, 1.0, interval_cfg(1.0));
+    assert_eq!(long.len(), 800);
+    assert_eq!(&long[..4], &[0, 1, 2, 3]);
+    assert_eq!(&long[796..], &[796, 797, 798, 799]);
+    // Twenty minutes at 30 fps: 1200 intervals and the last frame.
+    let twenty_minutes = sampled_frame_indices(36_000, 30.0, interval_cfg(1.0));
+    assert_eq!(twenty_minutes.len(), 1201);
+    assert_eq!(&twenty_minutes[..3], &[0, 30, 60]);
+    assert_eq!(&twenty_minutes[1198..], &[35_940, 35_970, 35_999]);
 }
 
 fn up_to_then_rate_cfg(sample_fps: f64) -> VideoFetchConfig {
@@ -334,7 +378,98 @@ fn rate_walk_picks_what_the_familys_loader_picks() {
     assert_eq!(walk.with_frame_budget(Some(16)), walk);
     assert_eq!(walk.with_frame_budget(Some(0)), walk);
     assert!(walk.follows_the_loader());
-    assert!(!FrameSampling::EvenRounded.follows_the_loader());
+    // The rounded even spread is a loader's rule as well: its engine loader
+    // picks over the container's claim like the walk's.
+    assert!(FrameSampling::EvenRounded.follows_the_loader());
+    assert!(!FrameSampling::Even.follows_the_loader());
+    assert!(!FrameSampling::Interval.follows_the_loader());
+}
+
+/// Under the stepped-groups rule a container that states a rate but no
+/// frame count is told to state its count, not to lengthen the clip; a
+/// counted clip too short for one temporal group keeps the group sentence,
+/// and a clip the rule samples passes.
+#[test]
+fn a_rate_without_a_frame_count_names_the_missing_count() {
+    let probed = |fps, frames| VideoMetadata {
+        width: 64,
+        height: 48,
+        duration_seconds: None,
+        source_fps: fps,
+        total_frames: frames,
+        container_frames: frames,
+        from_container: false,
+    };
+    let cfg = VideoFetchConfig {
+        sampling: FrameSampling::SteppedGroups {
+            temporal_patch_size: 2,
+            max_frames: 768,
+        },
+        ..VideoFetchConfig::default()
+    };
+    assert_eq!(
+        refused_by_the_familys_rule(probed(Some(30.0), None), cfg).as_deref(),
+        Some(
+            "the model's video sampling needs the clip's frame count, which the container does \
+             not state (30 fps)"
+        )
+    );
+    let short = refused_by_the_familys_rule(probed(Some(30.0), Some(1)), cfg).expect("refused");
+    assert!(
+        short.contains("1 frames at 30 fps: shorter than one temporal group of 2 frames"),
+        "{short}"
+    );
+    assert_eq!(
+        refused_by_the_familys_rule(probed(Some(30.0), Some(30)), cfg),
+        None
+    );
+}
+
+/// Under the rounded even spread a container that states a rate and a
+/// stream count but no claim its loader would read (a format duration under
+/// one frame) is refused before any decode, as the engine's loader, holding
+/// a count of zero, hands its processor no frame rather than the stream's
+/// count; the default loader's rule reads its first frame alone there, a
+/// claimed clip passes, and the processor-side spread is never refused.
+#[test]
+fn a_container_claiming_no_frames_is_refused_under_the_rounded_spread_as_its_loader_reads_nothing()
+{
+    let probed = |claim| VideoMetadata {
+        width: 64,
+        height: 48,
+        duration_seconds: Some(3.0),
+        source_fps: Some(30.0),
+        total_frames: Some(90),
+        container_frames: claim,
+        from_container: false,
+    };
+    let rounded = VideoFetchConfig {
+        sampling: FrameSampling::EvenRounded,
+        ..VideoFetchConfig::default()
+    };
+    for claim in [None, Some(0)] {
+        assert_eq!(
+            refused_by_the_familys_rule(probed(claim), rounded).as_deref(),
+            Some(
+                "the model's video sampling needs the clip's frame count, which the container \
+                 does not state (30 fps)"
+            ),
+            "{claim:?}"
+        );
+        assert_eq!(FrameSelection::from_metadata(probed(claim), rounded), None);
+        let first = FrameSelection::from_metadata(probed(claim), up_to_cfg(32))
+            .expect("the generic loader reads the first frame of such a container");
+        assert_eq!(first.frame_indices, vec![0]);
+        assert_eq!(
+            refused_by_the_familys_rule(probed(claim), up_to_cfg(32)),
+            None
+        );
+        assert_eq!(
+            refused_by_the_familys_rule(probed(claim), VideoFetchConfig::default()),
+            None
+        );
+    }
+    assert_eq!(refused_by_the_familys_rule(probed(Some(90)), rounded), None);
 }
 
 /// A clip the family's rule picks nothing of is refused before any
@@ -449,20 +584,26 @@ fn the_loader_sizes_a_clip_by_what_it_can_see() {
     assert_eq!(loader_frame_indices(60, 0, 32), Vec::<usize>::new());
 }
 
+/// The connector's bounds, however tight or wide, leave the walk's picks
+/// alone: a budget of 10 frames does not thin a 100 s clip, the 768 default
+/// does not thin a 30 minute one, and the four-frame minimum does not pad a
+/// two-frame clip; an empty clip has no picks.
 #[test]
-fn interval_sampling_thins_to_the_frame_budget_and_fills_to_the_minimum() {
-    assert_eq!(
-        sampled_frame_indices(3000, 30.0, interval_cfg(1.0, 10)),
-        vec![0, 330, 660, 990, 1320, 1680, 2010, 2340, 2670, 2999]
-    );
-    let long = sampled_frame_indices(54_000, 30.0, interval_cfg(1.0, 768));
-    assert_eq!(long.len(), 768);
+fn interval_sampling_ignores_the_frame_budget_and_the_minimum() {
+    let tight = VideoFetchConfig {
+        min_frames: 4,
+        max_frames: 10,
+        ..interval_cfg(1.0)
+    };
+    let hundred_seconds = sampled_frame_indices(3000, 30.0, tight);
+    assert_eq!(hundred_seconds.len(), 101);
+    assert_eq!(&hundred_seconds[..3], &[0, 30, 60]);
+    assert_eq!(&hundred_seconds[99..], &[2970, 2999]);
+    let long = sampled_frame_indices(54_000, 30.0, interval_cfg(1.0));
+    assert_eq!(long.len(), 1801);
     assert_eq!(long.last(), Some(&53_999));
-
-    let mut short = interval_cfg(1.0, 768);
-    short.min_frames = 4;
-    assert_eq!(sampled_frame_indices(2, 30.0, short), vec![0, 0, 0, 1]);
-    assert_eq!(sampled_frame_indices(0, 30.0, short), Vec::<usize>::new());
+    assert_eq!(sampled_frame_indices(2, 30.0, tight), vec![0, 1]);
+    assert_eq!(sampled_frame_indices(0, 30.0, tight), Vec::<usize>::new());
 }
 
 fn metadata(source_fps: Option<f64>, total_frames: Option<usize>) -> VideoMetadata {
@@ -611,6 +752,15 @@ fn up_to_selection_follows_the_container_claim_and_the_stream_length() {
     .expect("frame rate and counts");
     assert_eq!(selection.total_frames, 60);
     assert_eq!(selection.frame_indices, spread_evenly(60, 32));
+    // A decode one frame under the stream's estimate: the recovery sizes the
+    // clip against the container's claim of 77, which the loader cuts to the
+    // 59 frames seen, not against the 60 it was first cut to (a claim one
+    // frame long would stand and keep the pick past the end out instead).
+    let Resized::Selection(cut) = selection.sized_to_visible(59, cfg) else {
+        panic!("one frame under the estimate: a selection over the visible frames");
+    };
+    assert_eq!(cut.total_frames, 59);
+    assert_eq!(cut.frame_indices, spread_evenly(59, 32));
     // Longer by one frame: the claim stands, the pick past the end is left out.
     let selection = FrameSelection::from_metadata(
         VideoMetadata {
@@ -688,6 +838,52 @@ fn up_to_selection_follows_the_container_claim_and_the_stream_length() {
     let even = FrameSelection::from_metadata(metadata(Some(30.0), Some(60)), self::cfg())
         .expect("frame rate and count");
     assert_eq!(even.sized_to_visible(40, self::cfg()), Resized::Unchanged);
+    // The rounded even spread follows its loader like the budgeted rules: the
+    // container's claim cut to the stream where that runs two or more frames
+    // shorter, a claim one frame too long kept with the pick past the end
+    // left out, and a decode that shows the stream shorter resized the
+    // loader's way.
+    let rounded = VideoFetchConfig {
+        sampling: FrameSampling::EvenRounded,
+        ..VideoFetchConfig::default()
+    };
+    let selection = FrameSelection::from_metadata(
+        VideoMetadata {
+            total_frames: Some(60),
+            container_frames: Some(77),
+            ..metadata(Some(30.0), None)
+        },
+        rounded,
+    )
+    .expect("frame rate and counts");
+    assert_eq!(selection.total_frames, 60);
+    assert_eq!(selection.frame_indices, vec![0, 20, 39, 59]);
+    let Resized::Selection(cut) = selection.sized_to_visible(59, rounded) else {
+        panic!("one frame under the estimate: a selection over the visible frames");
+    };
+    assert_eq!(cut.total_frames, 59);
+    assert_eq!(cut.frame_indices, vec![0, 19, 39, 58]);
+    let selection = FrameSelection::from_metadata(
+        VideoMetadata {
+            total_frames: Some(60),
+            container_frames: Some(61),
+            ..metadata(Some(30.0), None)
+        },
+        rounded,
+    )
+    .expect("frame rate and counts");
+    assert_eq!(selection.total_frames, 61);
+    assert_eq!(selection.frame_indices, vec![0, 20, 40]);
+    let claimed = FrameSelection::from_metadata(metadata(Some(30.0), Some(58)), rounded)
+        .expect("frame rate and count");
+    assert_eq!(claimed.frame_indices, vec![0, 19, 38, 57]);
+    let Resized::Selection(resized) = claimed.sized_to_visible(40, rounded) else {
+        panic!("shorter than claimed: a selection over the visible frames");
+    };
+    assert_eq!(resized.total_frames, 40);
+    assert_eq!(resized.frame_indices, vec![0, 13, 26, 39]);
+    assert_eq!(claimed.sized_to_visible(58, rounded), Resized::Unchanged);
+    assert_eq!(claimed.sized_to_visible(0, rounded), Resized::Unchanged);
 }
 
 #[test]
@@ -696,12 +892,15 @@ fn select_filter_escapes_commas_and_lists_each_distinct_index_once() {
         .expect("frame rate and count are known");
     assert_eq!(selection.frame_indices, vec![0, 0, 0, 1]);
     assert_eq!(selection.unique_count(), 2);
-    assert_eq!(selection.select_filter(), r"select='eq(n\,0)+eq(n\,1)'");
+    assert_eq!(
+        selection.select_filter().expect("two terms are listed"),
+        r"select='eq(n\,0)+eq(n\,1)'"
+    );
 
     let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(60)), cfg())
         .expect("frame rate and count are known");
     assert_eq!(
-        selection.select_filter(),
+        selection.select_filter().expect("four terms are listed"),
         r"select='eq(n\,0)+eq(n\,19)+eq(n\,39)+eq(n\,59)'"
     );
 }
@@ -732,11 +931,46 @@ fn a_long_selection_is_described_rather_than_listed() {
             .expect("frame rate and count are known");
         assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS);
 
-        let filter = selection.select_filter();
+        let filter = selection.select_filter().expect("described");
         assert_eq!(filter, expected, "{sampling:?}");
         assert!(
             filter.matches('+').count() < FFMPEG_MAX_SELECT_TERMS,
             "a selection past the cutoff is described, not listed"
+        );
+    }
+}
+
+/// A long interval selection is described, not listed, while its stride is
+/// stable: its picks are a fixed stride from the first frame plus the clip's
+/// last frame, so the filter is the spread of its own frames plus one
+/// trailing term, a string of constant size (what [`PICK_RECORD_BYTES`]
+/// counts on for these clips). A stride that sits by a whole number (a
+/// request rate of 1.999600079984003 at 30 fps, a container rate of
+/// 30.003000300030003 at 1 fps) flips between two values and is listed
+/// instead; that path is priced in the same constant and bounded by the
+/// argument length, a known limit.
+#[test]
+fn a_long_interval_selection_is_described_in_constant_size_at_a_stable_stride() {
+    let interval = VideoFetchConfig {
+        sampling: FrameSampling::Interval,
+        sample_fps: 1.0,
+        ..cfg()
+    };
+    for fps in [30.0, 29.97, 25.0, 24.0, 23.976, 60.0, 15.0] {
+        let selection =
+            FrameSelection::from_metadata(metadata(Some(fps), Some(1_080_000)), interval)
+                .expect("frame rate and count are known");
+        assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS, "{fps}");
+        let filter = selection.select_filter().expect("described");
+        assert!(
+            filter.starts_with("select='eq(n\\,floor("),
+            "{fps}: described, not listed: {filter}"
+        );
+        assert!(
+            filter.matches('+').count() <= FFMPEG_SPREAD_EXTRA_TERMS && filter.len() < 256,
+            "{fps}: {} explicit terms, {} bytes: {filter}",
+            filter.matches('+').count(),
+            filter.len()
         );
     }
 }
@@ -749,14 +983,7 @@ fn a_long_selection_is_described_rather_than_listed() {
 #[tokio::test]
 async fn the_selection_picks_the_same_frames_through_ffmpeg() {
     use std::process::{Command as Sync, Stdio};
-    let have = |tool: &str| {
-        Sync::new(tool)
-            .arg("-version")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false)
-    };
-    if !have("ffmpeg") {
+    if !crate::test_support::video_tools_available() {
         return;
     }
     let dir = tempfile::tempdir().expect("temp dir");
@@ -856,7 +1083,7 @@ async fn the_selection_picks_the_same_frames_through_ffmpeg() {
         ("loader spread", up_to_cfg(300), 0),
         (
             "rate spread ending on the last frame",
-            interval_cfg(15.0, 768),
+            interval_cfg(15.0),
             1,
         ),
         (
@@ -876,7 +1103,7 @@ async fn the_selection_picks_the_same_frames_through_ffmpeg() {
             "{label}: {} distinct frames are past the list limit",
             selection.unique_count()
         );
-        let filter = selection.select_filter();
+        let filter = selection.select_filter().expect("described");
         assert!(
             filter.starts_with("select='eq(n\\,floor("),
             "{label}: described, not listed: {filter}"
@@ -890,6 +1117,7 @@ async fn the_selection_picks_the_same_frames_through_ffmpeg() {
         command.arg(&path);
         FfmpegFrameArgs::selected(&selection)
             .await
+            .expect("described, under the list bound")
             .apply(&mut command);
         command.args([
             "-f",
@@ -996,14 +1224,7 @@ fn rotate_first_track(path: &Path) {
 /// `None` where the tools are not installed.
 fn small_clip(dir: &Path, name: &str) -> Option<PathBuf> {
     use std::process::Command as Sync;
-    let have = |tool: &str| {
-        Sync::new(tool)
-            .arg("-version")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false)
-    };
-    if !have("ffmpeg") || !have("ffprobe") {
+    if !crate::test_support::video_tools_available() {
         return None;
     }
     let path = dir.join(name);
@@ -1203,6 +1424,70 @@ fn the_described_selection_covers_the_same_frames() {
             );
         }
     }
+    // The same shapes under the rounded spread with the container claiming
+    // one frame past the stream: the pick at the claimed end is dropped, and
+    // the expression (the spread of one step more, bounded below that frame,
+    // plus its explicit terms) selects exactly the remaining picks.
+    for (fps, total, max_frames) in cases {
+        let claimed = total + 1;
+        let selection = FrameSelection::from_metadata(
+            VideoMetadata {
+                total_frames: Some(total),
+                container_frames: Some(claimed),
+                ..metadata(Some(fps), None)
+            },
+            VideoFetchConfig {
+                max_frames,
+                sampling: FrameSampling::EvenRounded,
+                ..cfg()
+            },
+        )
+        .expect("frame rate and counts are known");
+        let last = claimed - 1;
+        assert_eq!(selection.total_frames, claimed);
+        assert!(selection
+            .frame_indices
+            .last()
+            .is_some_and(|end| *end < last));
+        let filter = selection
+            .spread_select_filter()
+            .unwrap_or_else(|| panic!("cut: total={total} max_frames={max_frames}: not described"));
+        assert!(
+            filter.contains(&format!("*lt(n\\,{last})")),
+            "cut: total={total} max_frames={max_frames}: {filter}"
+        );
+        // The planned spread had one pick more than the selection keeps.
+        let denom = selection.frame_indices.len();
+        let frame_at = |step: f64| (step * (last as f64 / denom as f64)).round_ties_even() as usize;
+        let mut described: Vec<usize> = (0..last)
+            .filter(|index| {
+                let step = ((index * denom) as f64 / last as f64).round();
+                frame_at(step) == *index
+            })
+            .collect();
+        described.extend(explicit_terms(&filter));
+        described.sort_unstable();
+        described.dedup();
+        let listed: Vec<usize> = selection
+            .unique_frames
+            .iter()
+            .map(|(index, _)| *index)
+            .collect();
+        assert_eq!(
+            described, listed,
+            "cut: total={total} max_frames={max_frames}"
+        );
+    }
+}
+
+/// The frames a described filter lists explicitly beside its spread, the
+/// `+eq(n\,N)` terms.
+fn explicit_terms(filter: &str) -> Vec<usize> {
+    filter
+        .split("+eq(n\\,")
+        .skip(1)
+        .filter_map(|rest| rest.split(')').next()?.parse().ok())
+        .collect()
 }
 
 #[test]
@@ -1224,7 +1509,7 @@ fn a_nearest_frame_tie_is_described_to_even() {
         .expect("a tie to even is described");
     assert!(described.contains("mod(floor("), "{described}");
     assert_eq!(
-        selection.select_filter(),
+        selection.select_filter().expect("five terms are listed"),
         r"select='eq(n\,0)+eq(n\,2)+eq(n\,4)+eq(n\,7)+eq(n\,9)'"
     );
 }
@@ -1258,6 +1543,36 @@ fn every_nearest_frame_spread_over_the_term_limit_is_described() {
         }
     }
     assert!(checked > 8_000, "{checked} selections checked");
+    // The same lengths with the container claiming one frame past the
+    // stream: the loader's read drops the pick at the claimed end, and the
+    // selection is still described (the spread of one step more, bounded
+    // below that frame) rather than listed.
+    let mut checked_cut = 0usize;
+    for (fps, stride) in [(24usize, 1usize), (25, 13), (30, 13), (60, 13)] {
+        for total in (51 * fps..=400 * fps).step_by(stride) {
+            let selection = FrameSelection::from_metadata(
+                VideoMetadata {
+                    total_frames: Some(total),
+                    container_frames: Some(total + 1),
+                    ..metadata(Some(fps as f64), None)
+                },
+                rounded,
+            )
+            .expect("frame rate and counts are known");
+            if selection.unique_count() <= FFMPEG_MAX_SELECT_TERMS {
+                continue;
+            }
+            checked_cut += 1;
+            assert_eq!(selection.total_frames, total + 1);
+            assert!(
+                selection.spread_select_filter().is_some(),
+                "{fps} fps, {total} of {} frames ({} picks): listed, not described",
+                total + 1,
+                selection.unique_count()
+            );
+        }
+    }
+    assert!(checked_cut > 8_000, "{checked_cut} cut selections checked");
 }
 
 /// A selection with no even spread in it (gaps alternating 4 and 2) keeps
@@ -1272,12 +1587,15 @@ fn a_selection_the_formula_misses_keeps_the_explicit_list() {
         .map(|index| (index * 3 + index % 2, 1))
         .collect();
     assert!(selection.spread_select_filter().is_none());
-    assert!(selection.select_filter().starts_with(r"select='eq(n\,0)+"));
+    assert!(selection
+        .select_filter()
+        .expect("a short list is built")
+        .starts_with(r"select='eq(n\,0)+"));
 
     selection.unique_frames = (0..FFMPEG_MAX_SELECT_TERMS + 1)
         .map(|index| (index * 3, 1))
         .collect();
-    let filter = selection.select_filter();
+    let filter = selection.select_filter().expect("described");
     assert_eq!(
         filter,
         r"select='eq(n\,floor(round(n*99/297)*297/99))*lte(n\,297)+eq(n\,300)'"
@@ -1298,10 +1616,119 @@ fn a_frame_count_the_container_made_up_still_builds_a_filter() {
     )
     .expect("frame rate and count are known");
 
-    let filter = selection.select_filter();
+    let filter = selection.select_filter().expect("described");
     assert!(
         filter.contains("floor(round("),
         "described, not listed: {filter}"
+    );
+}
+
+/// An interval walk no spread describes (two picks a second less a hair, at
+/// 30 fps: strides of 15 and 16) is stated as the walk itself, in constant
+/// size whatever the clip's length, the first frame named outright (not
+/// through the start value of `prev_selected_n`, which differs between
+/// ffmpeg builds) and the clip's last frame named when the walk kept it; a
+/// walk a spread describes keeps the spread.
+#[test]
+fn an_interval_walk_no_spread_describes_is_stated_as_the_walk() {
+    let rate = 1.999_600_079_984_003;
+    let long =
+        FrameSelection::from_metadata(metadata(Some(30.0), Some(600_000)), interval_cfg(rate))
+            .expect("frame rate and count are known");
+    assert!(long.spread_select_filter().is_none());
+    assert_eq!(long.unique_frames.last(), Some(&(599_999, 1)));
+    let filter = long.select_filter().expect("stated, not listed");
+    assert_eq!(
+        filter,
+        r"select='eq(n\,0)+eq(n\,max(ceil(((prev_selected_n/30.0)+(1/1.999600079984003)-0.0001)*30.0)\,prev_selected_n+1))+eq(n\,599999)'"
+    );
+    assert!(filter.len() < 180, "{}", filter.len());
+    // The same length for a clip a thousand times shorter.
+    let short =
+        FrameSelection::from_metadata(metadata(Some(30.0), Some(6_000)), interval_cfg(rate))
+            .expect("frame rate and count are known");
+    assert_eq!(
+        short.select_filter().expect("stated").len(),
+        filter.len() - 2,
+        "two digits fewer in the last frame"
+    );
+    // A stable stride keeps the proven spread.
+    let stable =
+        FrameSelection::from_metadata(metadata(Some(30.0), Some(600_000)), interval_cfg(1.0))
+            .expect("frame rate and count are known");
+    assert!(stable
+        .select_filter()
+        .expect("described")
+        .starts_with(r"select='eq(n\,floor("));
+    // Under the term cutoff the picks are listed as before.
+    let few = FrameSelection::from_metadata(metadata(Some(30.0), Some(900)), interval_cfg(rate))
+        .expect("frame rate and count are known");
+    assert!(few.unique_count() <= FFMPEG_MAX_SELECT_TERMS);
+    assert!(few
+        .select_filter()
+        .expect("listed")
+        .starts_with(r"select='eq(n\,0)+eq(n\,"));
+    // A selection built without the walk's rate (the OpenCV path's, a test's)
+    // is not stated as the walk.
+    let unmarked = FrameSelection::new(30.0, 600_000, 600_000, long.frame_indices.clone());
+    assert!(unmarked.interval_walk_filter().is_none());
+}
+
+/// A list longer than the decoder can be given is refused before it is
+/// built, with its own error naming the picks, the list's length and the
+/// bound; a list under the bound is built, past 64 KiB as under it. No rule
+/// builds such a list today (the interval walk is stated as itself), so the
+/// selection is built by hand from the walk's picks.
+#[test]
+fn a_listed_selection_longer_than_the_decoder_can_be_given_is_refused() {
+    let rate = 1.999_600_079_984_003;
+    let long = FrameSelection::new(
+        30.0,
+        600_000,
+        600_000,
+        sampled_frame_indices(600_000, 30.0, interval_cfg(rate)),
+    );
+    assert!(long.spread_select_filter().is_none());
+    let listed = format!(
+        "select='{}'",
+        long.unique_indices()
+            .iter()
+            .map(|index| format!("eq(n\\,{index})"))
+            .collect::<Vec<_>>()
+            .join("+")
+    );
+    assert!(listed.len() > FFMPEG_MAX_LISTED_FILTER_BYTES);
+    let error = long.select_filter().expect_err("too long to be given");
+    assert!(
+        matches!(
+            error,
+            MediaConnectorError::FrameListTooLong { picks, bytes, limit }
+                if picks == long.unique_count()
+                    && bytes == listed.len()
+                    && limit == FFMPEG_MAX_LISTED_FILTER_BYTES
+        ),
+        "{error}"
+    );
+    assert_eq!(error.fault(), crate::error::MediaFault::Client);
+    assert_eq!(error.code().as_str(), "media_too_large");
+
+    let mut lengths = Vec::new();
+    for total_frames in [60_000, 120_000] {
+        let short = FrameSelection::new(
+            30.0,
+            total_frames,
+            total_frames,
+            sampled_frame_indices(total_frames, 30.0, interval_cfg(rate)),
+        );
+        assert!(short.unique_count() > FFMPEG_MAX_SELECT_TERMS);
+        let filter = short.select_filter().expect("under the bound, listed");
+        assert_eq!(filter.len(), short.listed_filter_len());
+        assert!(filter.starts_with(r"select='eq(n\,0)+eq(n\,"), "{filter}");
+        lengths.push(filter.len());
+    }
+    assert!(
+        lengths[0] < 64 * 1024 && lengths[1] > 64 * 1024,
+        "a list past 64 KiB is built like one under it: {lengths:?}"
     );
 }
 
@@ -1320,13 +1747,29 @@ fn expanding_selected_frames_repeats_them_to_match_the_indices() {
     assert!(selection.expand(vec!['a', 'b', 'c']).is_err());
 }
 
+/// A stated release of 5.1 or later takes the current flag, and so does a
+/// build that states no release: a git snapshot (the static downloads), a
+/// dated build, an empty banner, unless its `libavcodec` line is older than
+/// release 5.1's (59.37). A stated release before 5.1 takes the flag those
+/// builds know, and so does a snapshot with that older library line.
 #[test]
 fn passthrough_flag_follows_the_ffmpeg_version() {
+    // A static snapshot build's `-version` output: banner and library lines.
+    const SNAPSHOT: &str = "ffmpeg version N-128433-gdb8537d8cc-20261105 Copyright (c) 2000-2026 the FFmpeg developers\nbuilt with gcc 16.2.0 (crosstool-NG 1.29.0.7_b1a94f6)\nconfiguration: --prefix=/ffbuild/prefix --enable-gpl\nlibavutil      61. 20.100 / 61. 20.100\nlibavcodec     63. 26.101 / 63. 26.101\nlibavformat    63. 18.100 / 63. 18.100\n";
+    // Snapshots on either side of release 5.1's libavcodec 59.37.
+    const SNAPSHOT_AT_5_1: &str = "ffmpeg version N-107000-g0123456789-20220722 Copyright (c) 2000-2022 the FFmpeg developers\nlibavutil      57. 28.100 / 57. 28.100\nlibavcodec     59. 37.100 / 59. 37.100\n";
+    const SNAPSHOT_BEFORE_5_1: &str = "ffmpeg version N-105000-g0123456789-20220501 Copyright (c) 2000-2022 the FFmpeg developers\nbuilt with gcc 11\nlibavutil      57. 17.100 / 57. 17.100\nlibavcodec     59. 18.100 / 59. 18.100\n";
     for version in [
+        SNAPSHOT,
+        SNAPSHOT_AT_5_1,
         "ffmpeg version 6.1.1 Copyright (c) 2000-2023 the FFmpeg developers\nbuilt with gcc",
         "ffmpeg version 5.1.4-0+deb12u1 Copyright (c) 2000-2023 the FFmpeg developers",
         "ffmpeg version n7.0.2-6-gabcdef Copyright (c) 2000-2024 the FFmpeg developers",
         "ffmpeg version 7.1-full_build-www.gyan.dev Copyright (c) 2000-2024",
+        "ffmpeg version N-128406-g1fe6854fd9-20261104 Copyright (c) 2000-2026 the FFmpeg developers",
+        "ffmpeg version N-112345-gabcdef Copyright (c) 2000-2023 the FFmpeg developers",
+        "ffmpeg version 2025-10-30-git-abcdef1234-full_build-www.gyan.dev Copyright (c) 2000-2025",
+        "",
     ] {
         assert_eq!(
             passthrough_flag_for_version(version),
@@ -1337,8 +1780,7 @@ fn passthrough_flag_follows_the_ffmpeg_version() {
     for version in [
         "ffmpeg version 5.0.3 Copyright (c) 2000-2022 the FFmpeg developers",
         "ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright (c) 2000-2021 the FFmpeg developers",
-        "ffmpeg version N-112345-gabcdef Copyright (c) 2000-2023 the FFmpeg developers",
-        "",
+        SNAPSHOT_BEFORE_5_1,
     ] {
         assert_eq!(
             passthrough_flag_for_version(version),
@@ -1346,6 +1788,23 @@ fn passthrough_flag_follows_the_ffmpeg_version() {
             "{version}"
         );
     }
+    assert_eq!(libavcodec_version(SNAPSHOT), Some((63, 26)));
+    assert_eq!(libavcodec_version(SNAPSHOT_BEFORE_5_1), Some((59, 18)));
+    assert_eq!(libavcodec_version("ffmpeg version N-1-gabc\n"), None);
+}
+
+/// The fallback tells a selection that came back short, a property of the
+/// clip, from a run the decoder refused.
+#[test]
+fn a_short_selection_is_told_from_a_refused_run() {
+    assert!(is_short_selection(&short_selection(9, 10)));
+    assert_eq!(
+        short_selection(9, 10).to_string(),
+        "video decode error: ffmpeg produced 9 selected frames, expected 10"
+    );
+    assert!(!is_short_selection(&MediaConnectorError::VideoDecode(
+        "ffmpeg failed: Unrecognized option 'vsync'.".to_string()
+    )));
 }
 
 #[test]
@@ -1504,34 +1963,12 @@ async fn unsized_clip_decodes(probed_frames: usize, expected: usize) {
 async fn ffmpeg_path_decodes_exactly_the_sampled_source_frames() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("clip.mp4");
-    let generated = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=size=64x48:rate=30:duration=2",
-            "-c:v",
-            "mpeg4",
-            "-pix_fmt",
-            "yuv420p",
-            "-y",
-        ])
-        .arg(&path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    let probed = Command::new("ffprobe")
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    if !matches!((generated, probed), (Ok(generated), Ok(probed)) if generated.success() && probed.success())
+    if !generate_clip(
+        &path,
+        "testsrc=size=64x48:rate=30:duration=2",
+        &["-c:v", "mpeg4", "-pix_fmt", "yuv420p"],
+    )
+    .await
     {
         return;
     }
@@ -1544,28 +1981,7 @@ async fn ffmpeg_path_decodes_exactly_the_sampled_source_frames() {
     let decoded = decode_video_with_ffmpeg(&path, input_bytes, cfg())
         .await
         .expect("ffmpeg decode");
-    let (frames, sampling): (Vec<Vec<u8>>, _) = match decoded {
-        DecodedVideoFrames::Rgb {
-            video, sampling, ..
-        } => (
-            video
-                .frame_refs()
-                .expect("frame refs")
-                .iter()
-                .map(|frame| frame.data.to_vec())
-                .collect(),
-            sampling,
-        ),
-        DecodedVideoFrames::Images {
-            frames, sampling, ..
-        } => (
-            frames
-                .iter()
-                .map(|frame| frame.to_rgb8().into_raw())
-                .collect(),
-            sampling,
-        ),
-    };
+    let (frames, sampling) = frames_and_sampling(decoded);
     let sampling = sampling.expect("ffprobe reports the frame rate and count");
     assert!(
         (sampling.source_fps - 30.0).abs() < 1e-6,
@@ -1635,34 +2051,12 @@ async fn ffmpeg_path_converts_frames_like_the_engine_loader() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("clip.mp4");
     // Rows of 16 pixels and an even height: the sizes the SIMD converters take.
-    let generated = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=size=64x48:rate=30:duration=1",
-            "-c:v",
-            "mpeg4",
-            "-pix_fmt",
-            "yuv420p",
-            "-y",
-        ])
-        .arg(&path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    let probed = Command::new("ffprobe")
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    if !matches!((generated, probed), (Ok(generated), Ok(probed)) if generated.success() && probed.success())
+    if !generate_clip(
+        &path,
+        "testsrc=size=64x48:rate=30:duration=1",
+        &["-c:v", "mpeg4", "-pix_fmt", "yuv420p"],
+    )
+    .await
     {
         return;
     }

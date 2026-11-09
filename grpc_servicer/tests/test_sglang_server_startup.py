@@ -20,6 +20,13 @@ def _module(name, **attrs):
     return module
 
 
+@pytest.fixture(autouse=True)
+def python_servicer(monkeypatch):
+    """These tests drive the Python servicer's start-up: since the Rust servicer
+    became the default, the Python one is an explicit choice."""
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "python")
+
+
 @pytest.fixture
 def server_mod(monkeypatch):
     """Load server.py with lightweight stand-ins for optional runtime deps."""
@@ -695,7 +702,7 @@ def test_request_tracing_initializes_after_the_runtime_context_is_published(
 
     monkeypatch.setattr(server_mod, "init_request_tracing", init_tracing)
     monkeypatch.setattr(server_mod, "_launch_scheduler_with_request_manager", stop_here)
-    monkeypatch.delenv("SMG_SGLANG_SERVICER_IMPL", raising=False)
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "python")
     with pytest.raises(RuntimeError, match="stop here"):
         asyncio.run(server_mod.serve_grpc(SimpleNamespace(disaggregation_mode="null")))
     assert events == ["publish:tokenizer", "tracing", "launch"]
@@ -711,7 +718,7 @@ def test_the_python_servicer_turns_the_kv_event_publisher_on_by_default_too(
     and the same log line."""
     from smg_grpc_servicer.sglang import rust as sglang_rust
 
-    monkeypatch.delenv("SMG_SGLANG_SERVICER_IMPL", raising=False)
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "python")
     monkeypatch.delenv(sglang_rust.KV_EVENTS_ENV, raising=False)
 
     def serve(configure):
@@ -768,7 +775,7 @@ def test_a_host_with_no_free_publisher_port_is_a_named_exit_on_the_python_path_t
     from smg_grpc_servicer import rust_lifecycle
     from smg_grpc_servicer.sglang import rust as sglang_rust
 
-    monkeypatch.delenv("SMG_SGLANG_SERVICER_IMPL", raising=False)
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "python")
     monkeypatch.delenv(sglang_rust.KV_EVENTS_ENV, raising=False)
     refusal = "no block of 1 consecutive free ports for the KV event publishers"
 
@@ -787,3 +794,71 @@ def test_a_host_with_no_free_publisher_port_is_a_named_exit_on_the_python_path_t
     assert raised.value.code == 2
     assert refusal in caplog.text and "--kv-events-config" in caplog.text
     launched.assert_not_called()
+
+
+def test_the_sidecar_note_on_the_rust_servicer_names_metrics_and_warns_when_asked_for(
+    monkeypatch, server_mod, caplog
+):
+    """On the Rust servicer SGLang's HTTP sidecar never starts, so its /metrics,
+    admin and profiling endpoints stay off: a note on every launch that hands
+    the request-manager callback, naming the Rust servicer's own metrics
+    endpoint and the Python servicer as the way to keep the sidecar; a WARNING
+    when the launch asked for the sidecar's metrics (--enable-metrics), which
+    nothing serves then."""
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "rust")
+
+    async def rust_served(_server_args):
+        return 0
+
+    monkeypatch.setattr(server_mod, "serve_rust", rust_served)
+
+    def launch(enable_metrics):
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            with pytest.raises(SystemExit) as raised:
+                asyncio.run(
+                    server_mod.serve_grpc(
+                        SimpleNamespace(disaggregation_mode="null", enable_metrics=enable_metrics),
+                        on_request_manager_ready=lambda _manager: None,
+                    )
+                )
+        assert raised.value.code == 0
+        return [r for r in caplog.records if "HTTP sidecar" in r.getMessage()]
+
+    (note,) = launch(False)
+    assert note.levelno == logging.INFO
+    assert "(its /metrics, admin and profiling endpoints stay off)" in note.getMessage()
+    assert "--metrics-port / SMG_SGLANG_SERVICER_METRICS_PORT" in note.getMessage()
+    assert "(--servicer-impl python / SMG_SGLANG_SERVICER_IMPL=python) keeps the sidecar" in (
+        note.getMessage()
+    )
+    (warning,) = launch(True)
+    assert warning.levelno == logging.WARNING
+    assert warning.getMessage() == note.getMessage()
+
+
+def test_the_handshake_vocabulary_is_the_loaded_model_configs_not_a_constant(server_mod):
+    """The gateway bounds a pretokenized prompt's ids by the ``vocab_size`` label
+    this model info becomes. The scheduler's ready message carries no vocabulary
+    (status, running figures, start-up time), so the figure is the loaded model
+    config's, whatever the model serves; a constant of one model family would let
+    an id past a smaller table reach the engine as an out-of-range index."""
+    server_args = SimpleNamespace(model_path="org/model", context_length=None)
+    ready = {
+        "status": "ready",
+        "max_total_num_tokens": 4096,
+        "max_req_input_len": 2048,
+        "startup_time": 1.0,
+    }
+    facts = SimpleNamespace(
+        vocab_size=32000, model_type="llama", architectures=["X"], id2label=None, num_labels=0
+    )
+
+    info = server_mod.handshake_model_info(server_args, ready, facts)
+
+    assert info["vocab_size"] == 32000
+    assert info["max_context_length"] == 4096
+    assert info["max_req_input_len"] == 2048
+    # A ready message that does carry a vocabulary is the engine's own figure.
+    told = server_mod.handshake_model_info(server_args, {**ready, "vocab_size": 151936}, facts)
+    assert told["vocab_size"] == 151936

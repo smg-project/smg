@@ -15,7 +15,16 @@ DEFAULT_AMD_OPTIONS = (
 )
 
 
-def plan(tmp_path, engines="", enabled="false", options="", test_filter="", base_options=""):
+def plan(
+    tmp_path,
+    engines="",
+    enabled="false",
+    options="",
+    test_filter="",
+    base_options="",
+    event_name="workflow_dispatch",
+    schedule="",
+):
     workflow = yaml.safe_load(WORKFLOW.read_text())
     script = workflow["jobs"]["plan"]["steps"][0]["run"]
     output = tmp_path / "outputs"
@@ -24,6 +33,8 @@ def plan(tmp_path, engines="", enabled="false", options="", test_filter="", base
         env=os.environ
         | {
             "ENGINES": engines,
+            "EVENT_NAME": event_name,
+            "SCHEDULE": schedule,
             "AMD_ENABLED": enabled,
             "AMD_CONTAINER_OPTIONS": base_options,
             "AMD_RDMA_OPTIONS": options,
@@ -137,4 +148,26 @@ def test_write_dispatch_needs_no_read_device_options(tmp_path):
     assert result.returncode == 0, result.stderr
     assert [row["kv_backend"] for row in values["matrix"]] == ["nixl", "moriio"]
     assert values["matrix"][1]["moriio_mode"] == "write"
+    assert "amd_read_rdma_options_json" not in values
+
+
+@pytest.mark.parametrize(
+    "schedule,enabled,expected_vendors",
+    [
+        ("45 9 * * 0", "true", ["nvidia"] * 5),
+        ("35 22 * * 0", "true", ["amd"] * 2),
+        ("35 22 * * 0", "false", []),
+        ("45 9 * * 1-6", "true", ["nvidia"] * 5 + ["amd"] * 2),
+    ],
+)
+def test_read_addition_preserves_shared_node_schedule_split(
+    tmp_path,
+    schedule,
+    enabled,
+    expected_vendors,
+):
+    result, values = plan(tmp_path, enabled=enabled, event_name="schedule", schedule=schedule)
+    assert result.returncode == 0, result.stderr
+    assert [row.get("vendor", "nvidia") for row in values["matrix"]] == expected_vendors
+    assert not any(row.get("moriio_mode") == "read" for row in values["matrix"])
     assert "amd_read_rdma_options_json" not in values

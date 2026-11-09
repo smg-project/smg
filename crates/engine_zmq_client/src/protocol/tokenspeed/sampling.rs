@@ -1,7 +1,7 @@
-// TokenSpeed `SamplingParams` — a Python `msgspec.Struct(kw_only=True,
-// array_like=True)` (runtime/sampling/sampling_params.py), so it rides the
-// wire as an untagged positional msgpack array nested inside the tokenized
-// request. **Field order is the wire contract** — append only, never reorder.
+//! TokenSpeed `SamplingParams` — a Python `msgspec.Struct(kw_only=True,
+//! array_like=True)` (runtime/sampling/sampling_params.py), so it rides the
+//! wire as an untagged positional msgpack array nested inside the tokenized
+//! request. **Field order is the wire contract** — append only, never reorder.
 
 use std::collections::HashMap;
 
@@ -75,8 +75,8 @@ pub struct SamplingParams {
     pub custom_params: Option<OpaqueValue>,
     /// Streaming flush interval override. Not set by SMG.
     pub stream_interval: Option<u32>,
-    /// Per-token logit bias, keyed by stringified token id. SMG rejects
-    /// logit_bias upstream (no support on this backend).
+    /// Per-token logit bias, keyed by stringified token id, as the chat and
+    /// completion requests carry it (validated to -100..=100 at the gateway).
     pub logit_bias: Option<HashMap<String, f64>>,
     /// Random seed. `None` lets the engine derive one from the rid so all
     /// TP/DP ranks agree.

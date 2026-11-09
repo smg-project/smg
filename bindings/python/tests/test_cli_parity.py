@@ -49,9 +49,7 @@ LAUNCHER_ONLY = {
 }
 
 # Flags on both sides whose literal defaults differ, with the reason.
-DEFAULT_DIFFERS = {
-    "--eviction-interval": "the launcher's 60 s predates the CLI's 120 s; kept until reconciled",
-}
+DEFAULT_DIFFERS: dict[str, str] = {}
 
 
 @dataclass
@@ -341,6 +339,106 @@ def test_shared_flags_share_their_literal_defaults(rust, launcher):
     assert not stale, f"defaults that no longer differ; drop them: {stale}"
 
 
+# Constructor parameters whose literal default differs from the CLI flag of the
+# same name, with the reason.
+CONSTRUCTOR_DEFAULT_DIFFERS: dict[str, str] = {}
+
+
+def signature_literal(raw: str) -> object:
+    """A default of the ``#[pyo3(signature)]`` block as a Python value, or None when
+    it is not a literal; an enum variant reads as the CLI's spelling of it. A
+    ``Some(...)`` wrapper, an integer type suffix, a product or a power of integers
+    and a ``vec![...]`` read as the value they stand for, as ``literal_default``
+    reads the CLI's."""
+    if raw in ("true", "false"):
+        return raw == "true"
+    quoted = re.fullmatch(r'String::from\("([^"]*)"\)', raw)
+    if quoted:
+        return quoted.group(1)
+    wrapped = re.fullmatch(r"Some\((.*)\)", raw)
+    if wrapped:
+        return signature_literal(wrapped.group(1).strip())
+    vector = re.fullmatch(r"vec!\[(.*)\]", raw)
+    if vector:  # a list default reads as the CLI's comma-joined spelling of it
+        elements = [signature_literal(e.strip()) for e in vector.group(1).split(",") if e.strip()]
+        return None if any(e is None for e in elements) else ",".join(str(e) for e in elements)
+    power = re.fullmatch(r"(\d+)(?:[ui](?:8|16|32|64|128|size))?\.pow\((\d+)\)", raw)
+    if power:
+        return int(power.group(1)) ** int(power.group(2))
+    variant = re.fullmatch(r"[A-Za-z]+::([A-Z][A-Za-z0-9]*)", raw)
+    if variant:
+        return re.sub(r"(?<!^)(?=[A-Z])", "_", variant.group(1)).lower()
+    number = raw.replace("_", "")
+    number = re.sub(r"(?<=\d)(u8|u16|u32|u64|u128|usize|i8|i16|i32|i64|isize|f32|f64)$", "", number)
+    factors = [factor.strip() for factor in number.split("*")]
+    if len(factors) > 1 and all(re.fullmatch(r"\d+", factor) for factor in factors):
+        product = 1
+        for factor in factors:
+            product *= int(factor)
+        return product
+    try:
+        return int(number)
+    except ValueError:
+        pass
+    try:
+        return float(number)
+    except ValueError:
+        return None
+
+
+def constructor_defaults() -> dict[str, tuple[str, object]]:
+    """The parameters of the Rust ``Router`` constructor with their defaults as the
+    Rust text and the literal it reads as (None when it is not a literal), read
+    from the ``#[pyo3(signature)]`` block of ``lib.rs``."""
+    text = (MAIN_RS.parents[2] / "bindings" / "python" / "src" / "lib.rs").read_text()
+    start = text.index("#[pyo3(signature = (", text.index("impl Router {"))
+    block = text[start : text.index("))]", start)]
+    defaults: dict[str, tuple[str, object]] = {}
+    for line in block.splitlines()[1:]:
+        entry = line.split("//", 1)[0].strip().rstrip(",")
+        if not entry or entry == "*":
+            continue
+        name, _, raw = entry.partition("=")
+        raw = raw.strip()
+        defaults[name.strip()] = (raw, signature_literal(raw) if raw else None)
+    return defaults
+
+
+def test_the_constructor_defaults_are_the_cli_defaults(rust):
+    """A direct ``Router(...)`` call and the binary start from the same values: the
+    constructor's literal defaults equal those of the CLI flags of the same names."""
+    defaults = constructor_defaults()
+    assert len(defaults) > 100, "the signature block was not read whole"
+    differs = {}
+    unreadable = []
+    for name, (raw, default) in defaults.items():
+        spelling = f"--{name.replace('_', '-')}"
+        cli_default = rust.flags.get(rust.aliases.get(spelling, spelling))
+        if cli_default is None or raw in ("", "None"):
+            continue
+        if default is None:
+            unreadable.append(f"{name} = {raw}")  # a CLI literal the reader skipped
+            continue
+        if isinstance(default, bool) or isinstance(cli_default, bool):
+            same = default is cli_default
+        elif isinstance(default, (int, float)) and isinstance(cli_default, (int, float)):
+            same = abs(float(default) - float(cli_default)) < 1e-9
+        else:
+            same = str(default) == str(cli_default)
+        if not same:
+            differs[name] = (cli_default, default)
+    assert not unreadable, (
+        f"constructor defaults with a CLI literal that signature_literal cannot read, "
+        f"so the test would skip them: {unreadable}"
+    )
+    unexpected = {n: pair for n, pair in differs.items() if n not in CONSTRUCTOR_DEFAULT_DIFFERS}
+    assert not unexpected, (
+        f"constructor defaults that differ from the CLI's (CLI, constructor): {unexpected}"
+    )
+    stale = [name for name in CONSTRUCTOR_DEFAULT_DIFFERS if name not in differs]
+    assert not stale, f"defaults that no longer differ; drop them: {stale}"
+
+
 def test_every_option_has_its_router_prefixed_spelling():
     plain = launcher_options()
     prefixed = launcher_options(use_router_prefix=True)
@@ -356,6 +454,23 @@ def test_every_option_has_its_router_prefixed_spelling():
     assert not missing, f"options without a --router- spelling: {missing}"
 
 
+def test_the_launcher_backend_choices_are_the_cli_backends(launcher):
+    """``--backend`` takes the same names on both sides, in the CLI's order, so a
+    provider route the binary runs can be chosen from Python and the chart."""
+    enum = MAIN_RS.read_text().split("pub enum Backend {", 1)[1].split("}", 1)[0]
+    assert launcher["--backend"].choices == re.findall(r'#\[value\(name = "([a-z]+)"\)\]', enum)
+
+
+def test_the_launcher_encode_policy_choices_are_the_cli_choices(launcher):
+    """``--encode-policy`` takes the same three names on both sides; the binding
+    refuses the other policies from ``start()`` with those names in its message."""
+    attribute = re.search(r"#\[arg\(([^\n]*)\)\]\n\s*encode_policy: Option<String>,", cli_source())
+    assert attribute, "the CLI's --encode-policy attribute moved"
+    cli_choices = re.findall(r'"([a-z_]+)"', attribute.group(1).split("value_parser", 1)[1])
+    assert cli_choices == ["random", "round_robin", "consistent_hashing"]
+    assert list(launcher["--encode-policy"].choices) == cli_choices
+
+
 @pytest.mark.parametrize("use_router_prefix", [False, True])
 @pytest.mark.parametrize("settle", [None, 0, 5, 30, 120])
 def test_shutdown_settle_option(use_router_prefix, settle):
@@ -367,3 +482,22 @@ def test_shutdown_settle_option(use_router_prefix, settle):
     args = RouterArgs.from_cli_args(parser.parse_args(flags), use_router_prefix=use_router_prefix)
     assert args.shutdown_settle_secs == settle
     assert args.shutdown_grace_period_secs == 180
+
+
+def test_the_eviction_interval_default_is_one_value_on_every_surface(rust, launcher):
+    """The CLI, the launcher, the Python Router and the chart evict the cache tree
+    on one cadence. The launcher's 60 s predated the CLI's 120 s and was never
+    followed; the three other surfaces agreed on 120."""
+    repo = MAIN_RS.parents[2]
+    lib_rs = repo / "bindings" / "python" / "src" / "lib.rs"
+    chart_values = repo / "deploy" / "helm" / "smg" / "values.yaml"
+    signature = re.search(r"\beviction_interval_secs = (\d+)", lib_rs.read_text())
+    chart = re.search(r"^\s*evictionIntervalSecs:\s*(\d+)\s*$", chart_values.read_text(), re.M)
+    assert signature and chart, "the Python Router's signature or the chart's value moved"
+    surfaces = {
+        "cli": rust.flags["--eviction-interval"],
+        "launcher": launcher["--eviction-interval"].default,
+        "python_router": int(signature.group(1)),
+        "chart": int(chart.group(1)),
+    }
+    assert set(surfaces.values()) == {120}, surfaces

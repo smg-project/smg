@@ -1,10 +1,10 @@
-//! The `tokenspeed.grpc.scheduler.TokenSpeedScheduler` servicer in Rust: the
-//! contract the Python `smg_grpc_servicer.tokenspeed` package serves, over
-//! the msgpack ZMQ wire a headless TokenSpeed scheduler dials (what
-//! `ts serve --headless` speaks to the Router's direct lane). The Router
-//! cannot tell the two implementations apart; Python keeps the lifecycle,
-//! launching the headless scheduler and driving this server through the
-//! binding.
+//! The `tokenspeed.grpc.scheduler.TokenSpeedScheduler` servicer in Rust, the
+//! default for TokenSpeed: the contract the deprecated Python servicer in
+//! `smg_grpc_servicer.tokenspeed` serves, over the msgpack ZMQ wire a
+//! headless TokenSpeed scheduler dials (what `ts serve --headless` speaks to
+//! the Router's direct lane). The Router cannot tell the two implementations
+//! apart; Python keeps the lifecycle, launching the headless scheduler and
+//! driving this server through the binding.
 
 mod encode;
 mod engine;
@@ -30,6 +30,7 @@ use tonic::service::Routes;
 
 use crate::{
     engine_link::{EngineLink, TokenizerSlot},
+    health_probe,
     kv_events::KvEventRelay,
     metrics::{Identity, ServicerMetrics},
     servicer::{self, Shared, WireState},
@@ -43,8 +44,9 @@ pub const SERVICE_NAME: &str = "tokenspeed.grpc.scheduler.TokenSpeedScheduler";
 pub const ENCODER_SERVICE_NAME: &str = "tokenspeed.grpc.encoder.TokenSpeedEncoder";
 /// The `wire` label of this servicer's metrics.
 const WIRE: &str = "tokenspeed";
-/// What `HealthCheck`'s message says of a serving engine on this wire.
-const HEALTHY: &str = "healthy";
+/// The knob the Python servicer reads its health probe's bound from, in
+/// seconds; this servicer reads the same one.
+const HEALTH_CHECK_TIMEOUT_ENV: &str = "TOKENSPEED_HEALTH_CHECK_TIMEOUT";
 
 /// What `GetModelInfo` and `GetServerInfo` report: the facts the Python
 /// servicer reads off TokenSpeed's `ModelConfig` and `ServerArgs`, which the
@@ -286,16 +288,24 @@ pub struct TokenSpeedServicerConfig {
 /// attaches to every batch it streams.
 impl crate::kv_events::RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
-        let response = info::loads(self, dp_rank).ok()?;
-        // The engine reports no queued token-work on this wire yet: the
-        // record's `waiting_uncached_tokens` stays unset.
-        Some(smg_grpc_client::common_proto::EngineLoad::from(
-            response.loads.first()?,
-        ))
+        // A connected rank reads its own entry (zero-filled until its first
+        // load tail), never another rank's figures; a rank past the
+        // connected ones gets no record, an encode worker none at all.
+        let load = info::rank_load(self, dp_rank)?;
+        // The queued token-work is this servicer's own estimate for the
+        // rank (see `info::rank_load`), so every rank's record reports it.
+        let mut record = smg_grpc_client::common_proto::EngineLoad::from(&load);
+        record.waiting_uncached_tokens =
+            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+        Some(record)
     }
 
     fn engine_link(&self) -> &EngineLink {
         &self.shared.engine
+    }
+
+    fn rank_count(&self) -> usize {
+        self.shared.rank_count(self.model.data_parallel_size)
     }
 }
 
@@ -312,6 +322,9 @@ pub(super) struct State {
     /// `Generate` refused, and the engine's handshake must list the encode
     /// request.
     pub(super) encode_role: Option<EncodeRendezvous>,
+    /// How long `HealthCheck`'s probe waits for the scheduler
+    /// ([`HEALTH_CHECK_TIMEOUT_ENV`]).
+    pub(super) health_probe_timeout: Duration,
 }
 
 impl WireState for State {
@@ -382,9 +395,15 @@ impl TokenSpeedServicerServer {
         let encode_role = encode_role(&config.model)?;
         let state = Arc::new(State {
             model: config.model,
-            shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
+            shared: Shared::new(
+                kv_relay,
+                metrics,
+                config.servicer.tokenizer_dir.clone(),
+                config.servicer.warmup_nonce.clone(),
+            ),
             tokenizer: TokenizerSlot::new(),
             encode_role,
+            health_probe_timeout: health_probe::timeout_from_env(HEALTH_CHECK_TIMEOUT_ENV),
         });
         if let Some(tokenizer) = tokenizer {
             let _ = state.tokenizer.set(Some(tokenizer));
@@ -465,7 +484,8 @@ impl TokenSpeedServicerServer {
 
     /// Hold (`false`) or release (`true`) readiness alone: health flips as
     /// with `set_serving`, admission stays open to the lifecycle owner's own
-    /// requests (its planned warm-up before SERVING, `smg-warmup-<n>`) and to
+    /// requests (its planned warm-up before SERVING, `smg-warmup-<nonce>-<n>`
+    /// with the configured `warmup_nonce`, else `smg-warmup-<n>`) and to
     /// nothing else, so the warm-up's steps share the engine with no client
     /// request. `set_serving(false)` is the drain switch and closes admission
     /// as well.

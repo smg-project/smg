@@ -140,7 +140,10 @@ fn local_tokenizer_source_error(path: &Path) -> Result<(), SourceProblem> {
         entry.is_ok_and(|entry| {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            name == "tokenizer.json" || name == "tiktoken.model" || name.ends_with(".tiktoken")
+            name == "tokenizer.json"
+                || name == "tekken.json"
+                || name == "tiktoken.model"
+                || name.ends_with(".tiktoken")
         })
     }) || (path.join("vocab.json").is_file()
         && path.join("merges.txt").is_file());
@@ -148,7 +151,7 @@ fn local_tokenizer_source_error(path: &Path) -> Result<(), SourceProblem> {
         Ok(())
     } else {
         Err(unusable(
-            "contains no tokenizer file (tokenizer.json, tiktoken.model, *.tiktoken, or vocab.json with merges.txt)"
+            "contains no tokenizer file (tokenizer.json, tekken.json, tiktoken.model, *.tiktoken, or vocab.json with merges.txt)"
                 .to_string(),
         ))
     }
@@ -1055,7 +1058,6 @@ impl ConfigValidator {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
-                max_waiting_requests: _,
             } => {
                 if !kv_pressure_weight.is_finite() || *kv_pressure_weight < 0.0 {
                     return Err(ConfigError::invalid_value(
@@ -4492,7 +4494,6 @@ mod tests {
                     kv_pressure_weight: 0.15,
                     mean_prefill_tokens: 1024,
                     default_throughput: 2000.0,
-                    max_waiting_requests: 0,
                 }),
                 prefill_policy: None,
                 decode_policy: None,
@@ -4611,6 +4612,32 @@ mod tests {
             }) if field == expected_field => (value, reason),
             other => panic!("expected a {expected_field} error, got {other:?}"),
         }
+    }
+
+    /// The validator's directory rule is the loader's: a directory holding
+    /// `tekken.json` alone is a tokenizer source, and the exact name is the
+    /// rule (the loader's directory arm reads that file; another name is a
+    /// single-file source, not a directory layout).
+    #[test]
+    fn a_directory_holding_a_tekken_file_alone_is_a_tokenizer_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tekken.json"), "{}").unwrap();
+        assert!(local_tokenizer_source_error(dir.path()).is_ok());
+        let config = RouterConfig {
+            tokenizer_path: Some(dir.path().to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("tekken_v3.json"), "{}").unwrap();
+        let (_, reason) = refused_source(
+            &RouterConfig {
+                tokenizer_path: Some(other.path().to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            "tokenizer_path",
+        );
+        assert!(reason.contains("contains no tokenizer file"), "{reason}");
     }
 
     #[test]

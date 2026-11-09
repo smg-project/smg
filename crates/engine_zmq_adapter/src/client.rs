@@ -1,6 +1,6 @@
 //! [`ZmqEngineClient`]: the connected engine behind each engine's gRPC client
-//! surface (vLLM and TokenSpeed today), plus the connect entry points and
-//! metadata reads.
+//! surface, one connection for any of the four dialects of [`ZmqDialect`],
+//! plus the connect entry points and metadata reads.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -11,7 +11,7 @@ use std::{
 
 use engine_zmq_client::{
     check_engine_layouts,
-    codec::{tensor::encode_with_aux_frames, OpaqueValue},
+    codec::{add_request_capacity, tensor::encode_with_aux_frames, OpaqueValue},
     connect_handshake,
     connector::{Client, EngineCoreClient, SglangClient, TokenSpeedClient, TrtllmClient},
     protocol::{
@@ -31,11 +31,13 @@ use futures::StreamExt;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerType};
 use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto as vllm};
+use tokio::time::Instant;
 
 #[cfg(unix)]
 use crate::sockets::unlink_stale_socket;
 use crate::{
     eos::EosTokenIds,
+    pin_yield::PinYieldNote,
     sglang::{
         aggregate_control, constraint_ref as sglang_constraint_ref, control_outcome,
         encode_media_refs, fan_out_sglang_requests, translate_embed_request_sglang,
@@ -156,6 +158,9 @@ pub(crate) struct ZmqConnectionMeta {
     /// disagrees yielding to it
     /// (see [`ZmqEngineClient::note_engine_places_by_rendezvous_room`]).
     engine_places_by_rendezvous_room: OnceLock<()>,
+    /// A pin's yield to the room on this connection: the first is logged at
+    /// WARN, the rest at DEBUG (`PinYieldNote`).
+    pin_yield: PinYieldNote,
     /// The bound on every generate request this connection opens, from its
     /// dispatch to its last message, set once by the caller that knows it
     /// (see [`ZmqEngineClient::set_request_timeout`]); unset leaves the
@@ -390,6 +395,7 @@ impl ZmqEngineClient {
                 supported_tasks: tokio::sync::OnceCell::new(),
                 engine_truncates_long_prompts: OnceLock::new(),
                 engine_places_by_rendezvous_room: OnceLock::new(),
+                pin_yield: PinYieldNote::default(),
                 request_timeout: OnceLock::new(),
             }),
         };
@@ -485,10 +491,11 @@ impl ZmqEngineClient {
     /// pair whose engine follows the room, where the engine's KV sender
     /// fails a request that runs elsewhere and the decode side looks for the
     /// KV. A request with a room goes to that rank on this connection from
-    /// now, a pin that disagrees yielding to it with a warning; a request
-    /// without a room, and every request on a connection nobody notes this
-    /// on (an aggregated engine, a decode side), is placed by its pin. Set
-    /// once: a later call changes nothing.
+    /// now, a pin that disagrees yielding to it (logged at WARN once per
+    /// connection, at DEBUG after); a request without a room, and every
+    /// request on a connection nobody notes this on (an aggregated engine, a
+    /// decode side), is placed by its pin. Set once: a later call changes
+    /// nothing.
     pub fn note_engine_places_by_rendezvous_room(&self) {
         let _ = self.meta.engine_places_by_rendezvous_room.set(());
     }
@@ -994,6 +1001,7 @@ impl ZmqEngineClient {
                 max_model_len,
                 &ranks,
                 logprobs,
+                &self.meta.pin_yield,
             )
             .map_err(tonic::Status::invalid_argument)?;
             let stream = client.submit(request).await.map_err(zmq_status)?;
@@ -1040,7 +1048,8 @@ impl ZmqEngineClient {
         }
         let request =
             translate_encode_request(req, rendezvous).map_err(tonic::Status::invalid_argument)?;
-        let (payload, aux_frames) = encode_with_aux_frames(&request).map_err(zmq_status)?;
+        let (payload, aux_frames) =
+            encode_with_aux_frames(&request, add_request_capacity(0)).map_err(zmq_status)?;
         let residue = request.bootstrap_room.rem_euclid(encoders.len() as i64) as usize;
         client
             .send_typed(
@@ -1168,8 +1177,14 @@ impl ZmqEngineClient {
                 .transpose()
                 .map_err(tonic::Status::invalid_argument)?
                 .flatten();
-            let mut request = translate_request_sglang(sub, max_model_len, ranks, placement)
-                .map_err(tonic::Status::invalid_argument)?;
+            let mut request = translate_request_sglang(
+                sub,
+                max_model_len,
+                ranks,
+                placement,
+                &self.meta.pin_yield,
+            )
+            .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);
             if let (Some(hasher), Some(mm)) = (hasher, request.mm_inputs.as_mut()) {
                 hasher
@@ -1540,9 +1555,11 @@ impl ZmqEngineClient {
         Ok(())
     }
 
-    /// Latest per-rank load for one engine index, if the backend has reported
-    /// it: every dialect piggybacks it on its output batches.
-    fn engine_load(&self, engine_index: u32) -> Option<EngineLoad> {
+    /// The latest load tail one rank sent (running, waiting, KV usage),
+    /// `None` before its first batch: every dialect piggybacks it on its
+    /// output batches. What [`Self::get_loads`] lists per rank, for a caller
+    /// that wants one rank's without the whole report.
+    pub fn engine_load(&self, engine_index: u32) -> Option<EngineLoad> {
         match &self.backend {
             ZmqBackend::Vllm(client) => client.engine_load(engine_index),
             ZmqBackend::TokenSpeed(client) => client.engine_load(engine_index),
@@ -1560,6 +1577,18 @@ impl ZmqEngineClient {
             ZmqBackend::TokenSpeed(client) => client.output_silence(),
             ZmqBackend::Sglang(client) => client.output_silence(),
             ZmqBackend::Trtllm(client) => client.output_silence(),
+        }
+    }
+
+    /// When the engine last sent an output batch of any kind, `None` before
+    /// the first (the ZMQ client's `last_output_at`): read whether or not
+    /// anything is in flight, and never moved by a dispatch.
+    pub fn last_output_at(&self) -> Option<Instant> {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.last_output_at(),
+            ZmqBackend::TokenSpeed(client) => client.last_output_at(),
+            ZmqBackend::Sglang(client) => client.last_output_at(),
+            ZmqBackend::Trtllm(client) => client.last_output_at(),
         }
     }
 
@@ -1585,6 +1614,18 @@ impl ZmqEngineClient {
             ZmqBackend::TokenSpeed(client) => client.note_reports_steps(),
             ZmqBackend::Sglang(client) => client.note_reports_steps(),
             ZmqBackend::Trtllm(client) => client.note_reports_steps(),
+        }
+    }
+
+    /// A sign of the engine's progress from outside its output wire, a live
+    /// KV-event batch it published: the engine's silence ends now, as on an
+    /// output of any kind (the ZMQ client's `note_progress`).
+    pub fn note_progress(&self) {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.note_progress(),
+            ZmqBackend::TokenSpeed(client) => client.note_progress(),
+            ZmqBackend::Sglang(client) => client.note_progress(),
+            ZmqBackend::Trtllm(client) => client.note_progress(),
         }
     }
 
@@ -1630,17 +1671,7 @@ impl ZmqEngineClient {
         let loads: Vec<SchedulerLoadSnapshot> = self
             .engines()
             .iter()
-            .filter_map(|engine| {
-                let dp_rank = engine.engine_id.engine_index()?;
-                let load = self.engine_load(dp_rank)?;
-                Some(SchedulerLoadSnapshot {
-                    dp_rank: i32::try_from(dp_rank).unwrap_or(i32::MAX),
-                    num_running_reqs: i32::try_from(load.num_running).unwrap_or(i32::MAX),
-                    num_waiting_reqs: i32::try_from(load.num_waiting).unwrap_or(i32::MAX),
-                    token_usage: load.kv_cache_usage,
-                    ..Default::default()
-                })
-            })
+            .filter_map(|engine| self.rank_load(engine.engine_id.engine_index()?))
             .collect();
         WorkerLoadResponse {
             timestamp: String::new(),
@@ -1648,6 +1679,25 @@ impl ZmqEngineClient {
             loads,
             ..Default::default()
         }
+    }
+
+    /// One connected rank's entry of [`get_loads`](Self::get_loads), read
+    /// alone: what a per-rank reader (the relay's load record) wants, without
+    /// the vector of the other ranks. `None` for a rank not connected or not
+    /// reported yet.
+    pub fn rank_load(&self, dp_rank: u32) -> Option<SchedulerLoadSnapshot> {
+        self.engines()
+            .iter()
+            .any(|engine| engine.engine_id.engine_index() == Some(dp_rank))
+            .then(|| self.engine_load(dp_rank))
+            .flatten()
+            .map(|load| SchedulerLoadSnapshot {
+                dp_rank: i32::try_from(dp_rank).unwrap_or(i32::MAX),
+                num_running_reqs: i32::try_from(load.num_running).unwrap_or(i32::MAX),
+                num_waiting_reqs: i32::try_from(load.num_waiting).unwrap_or(i32::MAX),
+                token_usage: load.kv_cache_usage,
+                ..Default::default()
+            })
     }
 
     /// Keep the KV-transfer samples the engines report from now on, for
@@ -1819,6 +1869,7 @@ fn zmq_status_of(error: &engine_zmq_client::Error) -> tonic::Status {
         engine_zmq_client::Error::EngineCoreDead
         | engine_zmq_client::Error::EngineInputBlocked { .. }
         | engine_zmq_client::Error::EngineInputFull { .. }
+        | engine_zmq_client::Error::EngineInputBytesFull { .. }
         | engine_zmq_client::Error::ClientClosed { .. } => {
             tonic::Status::unavailable(error.to_string())
         }
@@ -2001,6 +2052,20 @@ mod tests {
             request_id: "req-1".to_string(),
         });
         assert_eq!(engine_failure.code(), Code::Internal, "{engine_failure:?}");
+    }
+
+    /// Byte-budget rejection remains retryable, including shared errors.
+    #[test]
+    fn retained_input_exhaustion_answers_unavailable() {
+        let status = zmq_status(engine_zmq_client::Error::Shared(Arc::new(
+            engine_zmq_client::Error::EngineInputBytesFull {
+                retained_bytes: 10,
+                request_bytes: 1,
+                limit_bytes: 10,
+            },
+        )));
+        assert_eq!(status.code(), Code::Unavailable);
+        assert!(status.message().contains("10 bytes"));
     }
 
     /// The failure the connector fans out to the requests in flight when its

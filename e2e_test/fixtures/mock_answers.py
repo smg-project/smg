@@ -48,6 +48,13 @@ def set_class_workers(workers: list[Worker]) -> None:
     _CLASS_WORKERS[:] = list(workers)
 
 
+def class_workers() -> list[Worker]:
+    """The class's workers, every role: a test that reads one worker's own
+    admin API (an encode worker's count of the completions it served, which
+    the gateway does not count) finds it here."""
+    return list(_CLASS_WORKERS)
+
+
 def clear_class_workers() -> None:
     _CLASS_WORKERS.clear()
 

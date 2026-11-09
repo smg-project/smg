@@ -36,9 +36,56 @@ pub struct TrackerOutput {
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct FetchKey {
     modality: Modality,
-    settings: String,
+    settings: FetchSettings,
     kind: u8,
     len: usize,
+}
+
+/// The settings a fetch runs under, the part of its key that is not the
+/// payload: two parts share a fetch exactly when these are equal. A `Copy`
+/// value compared field by field; the request's settings are one value, so
+/// every part of a request carries the same key without building it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FetchSettings {
+    Image {
+        config: ImageFetchConfig,
+        minimax_cap: Option<u32>,
+        sglang: bool,
+    },
+    Video {
+        min_frames: usize,
+        max_frames: usize,
+        /// The sampling rate's bits: two rates are the same setting exactly
+        /// when they are the same number (the rate is finite and positive by
+        /// the time it is a setting).
+        sample_fps_bits: u64,
+        max_long_side_pixel: Option<u32>,
+        sampling: FrameSampling,
+        sglang: bool,
+    },
+    Audio,
+}
+
+impl FetchSettings {
+    fn video(cfg: &VideoFetchConfig, sglang: bool) -> Self {
+        // Exhaustive: a field added to the video config must find its place
+        // in the key, or this stops compiling.
+        let VideoFetchConfig {
+            min_frames,
+            max_frames,
+            sample_fps,
+            max_long_side_pixel,
+            sampling,
+        } = *cfg;
+        Self::Video {
+            min_frames,
+            max_frames,
+            sample_fps_bits: sample_fps.to_bits(),
+            max_long_side_pixel,
+            sampling,
+            sglang,
+        }
+    }
 }
 
 /// How many distinct payloads of one `FetchKey` a new part is compared
@@ -381,7 +428,7 @@ impl AsyncMultiModalTracker {
     fn same_media_as(
         &mut self,
         modality: Modality,
-        settings: String,
+        settings: FetchSettings,
         source: &Arc<FetchSource>,
     ) -> Option<usize> {
         let next = self.pending.entry(modality).or_default().len();
@@ -447,10 +494,10 @@ impl AsyncMultiModalTracker {
         self.enqueue(
             Modality::Image,
             uuid,
-            if sglang {
-                format!("{config:?}/{minimax_cap:?}/sglang")
-            } else {
-                format!("{config:?}/{minimax_cap:?}")
+            FetchSettings::Image {
+                config,
+                minimax_cap,
+                sglang,
             },
             source,
             move |connector, source| async move {
@@ -483,11 +530,7 @@ impl AsyncMultiModalTracker {
             self.video_frame_sampling,
         )?;
         let sglang = self.minimax_sglang_resize;
-        let key = if sglang {
-            format!("{cfg:?}/sglang")
-        } else {
-            format!("{cfg:?}")
-        };
+        let key = FetchSettings::video(&cfg, sglang);
         if sglang {
             // Native MiniMax applies Pillow once, after source-resolution decode.
             cfg.max_long_side_pixel = None;
@@ -520,7 +563,7 @@ impl AsyncMultiModalTracker {
         self.enqueue(
             Modality::Audio,
             uuid,
-            String::new(),
+            FetchSettings::Audio,
             source,
             |connector, source| async move {
                 let clip = connector.fetch_audio_from(&source).await?;
@@ -536,7 +579,7 @@ impl AsyncMultiModalTracker {
         &mut self,
         modality: Modality,
         uuid: Option<String>,
-        settings: String,
+        settings: FetchSettings,
         source: MediaSource,
         fetch: F,
     ) where
@@ -806,6 +849,15 @@ mod repeat_tests {
         }
     }
 
+    /// The settings an image part carries under the default configuration.
+    fn image_settings() -> FetchSettings {
+        FetchSettings::Image {
+            config: ImageFetchConfig::default(),
+            minimax_cap: None,
+            sglang: false,
+        }
+    }
+
     fn tracker() -> AsyncMultiModalTracker {
         let connector = MediaConnector::new(
             crate::test_support::http_client_builder(),
@@ -942,11 +994,14 @@ mod repeat_tests {
     }
 
     /// Only native SGLang defers the cap to its Pillow processor; vLLM still
-    /// receives decoder-scaled frames. Explicit caps survive both paths.
+    /// receives decoder-scaled frames. Explicit caps survive both paths. Runs
+    /// where ffmpeg and ffprobe are installed, skips elsewhere.
     #[tokio::test]
-    #[ignore = "requires ffmpeg and ffprobe; run explicitly for MiniMax validation"]
     async fn minimax_video_cap_is_deferred_only_for_sglang() {
         use base64::{engine::general_purpose::STANDARD, Engine};
+        if !crate::test_support::video_tools_available() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.mp4");
         let status = std::process::Command::new("ffmpeg")
@@ -1109,34 +1164,74 @@ mod repeat_tests {
         let clip = Arc::new(FetchSource::Url("https://example.test/clip.mp4".into()));
         // Same length and kind, different bytes: never merged.
         let other = Arc::new(FetchSource::Url("https://example.test/clop.mp4".into()));
+        let one = FetchSettings::video(&VideoFetchConfig::default(), false);
+        let two = FetchSettings::video(
+            &VideoFetchConfig {
+                sample_fps: 1.0,
+                ..VideoFetchConfig::default()
+            },
+            false,
+        );
 
+        assert_eq!(tracker.same_media_as(Modality::Video, one, &clip), None);
+        assert_eq!(tracker.same_media_as(Modality::Video, one, &clip), Some(0));
+        assert_eq!(tracker.same_media_as(Modality::Video, two, &clip), None);
+        assert_eq!(tracker.same_media_as(Modality::Image, one, &clip), None);
+        assert_eq!(tracker.same_media_as(Modality::Video, one, &other), None);
+        assert_eq!(tracker.same_media_as(Modality::Video, one, &other), Some(0));
+        assert_eq!(tracker.same_media_as(Modality::Video, one, &clip), Some(0));
+    }
+
+    /// The settings key says what the formatted text said: equal settings are
+    /// one key, a difference in any field (the rate included) another.
+    #[test]
+    fn fetch_settings_differ_exactly_where_the_settings_do() {
+        let base = VideoFetchConfig::default();
         assert_eq!(
-            tracker.same_media_as(Modality::Video, "one".into(), &clip),
-            None
+            FetchSettings::video(&base, false),
+            FetchSettings::video(&VideoFetchConfig::default(), false)
         );
-        assert_eq!(
-            tracker.same_media_as(Modality::Video, "one".into(), &clip),
-            Some(0)
+        assert_ne!(
+            FetchSettings::video(&base, false),
+            FetchSettings::video(&base, true)
         );
-        assert_eq!(
-            tracker.same_media_as(Modality::Video, "two".into(), &clip),
-            None
+        assert_ne!(
+            FetchSettings::video(&base, false),
+            FetchSettings::video(
+                &VideoFetchConfig {
+                    sample_fps: base.sample_fps + 0.5,
+                    ..base
+                },
+                false
+            )
         );
+        let image = ImageFetchConfig::default();
         assert_eq!(
-            tracker.same_media_as(Modality::Image, "one".into(), &clip),
-            None
+            FetchSettings::Image {
+                config: image,
+                minimax_cap: None,
+                sglang: false
+            },
+            FetchSettings::Image {
+                config: ImageFetchConfig::default(),
+                minimax_cap: None,
+                sglang: false
+            }
         );
-        assert_eq!(
-            tracker.same_media_as(Modality::Video, "one".into(), &other),
-            None
-        );
-        assert_eq!(
-            tracker.same_media_as(Modality::Video, "one".into(), &other),
-            Some(0)
-        );
-        assert_eq!(
-            tracker.same_media_as(Modality::Video, "one".into(), &clip),
-            Some(0)
+        assert_ne!(
+            FetchSettings::Image {
+                config: image,
+                minimax_cap: None,
+                sglang: false
+            },
+            FetchSettings::Image {
+                config: ImageFetchConfig {
+                    detail: ImageDetail::High,
+                    ..image
+                },
+                minimax_cap: None,
+                sglang: false
+            }
         );
     }
 
@@ -1164,7 +1259,7 @@ mod repeat_tests {
             .collect();
         for source in &sources {
             assert_eq!(
-                tracker.same_media_as(Modality::Image, String::new(), source),
+                tracker.same_media_as(Modality::Image, image_settings(), source),
                 None,
                 "every distinct payload fetches"
             );
@@ -1179,7 +1274,7 @@ mod repeat_tests {
         // Every repeat, in either region of the bucket, finds its first slot.
         for (slot, source) in sources.iter().enumerate().rev() {
             assert_eq!(
-                tracker.same_media_as(Modality::Image, String::new(), source),
+                tracker.same_media_as(Modality::Image, image_settings(), source),
                 Some(slot)
             );
         }
@@ -1204,7 +1299,7 @@ mod repeat_tests {
         // A lone payload of another length is neither compared nor hashed.
         let lone = Arc::new(FetchSource::DataUrl(format!("{TINY_PNG_URL}=")));
         assert_eq!(
-            tracker.same_media_as(Modality::Image, String::new(), &lone),
+            tracker.same_media_as(Modality::Image, image_settings(), &lone),
             None
         );
         let lone_bucket = tracker

@@ -1,10 +1,10 @@
-// The TensorRT-LLM dialect's request: a tagged positional array (the shape of
-// a `msgspec.Struct(tag=True, array_like=True)` on the engine side) that the
-// engine-side shim decodes into its own struct and turns into one LLM API
-// `SamplingParams`. **Field order is the wire contract**: append only, never
-// reorder. The shim declares both layouts at the handshake
-// (`positional_layouts`) and the protocol compares the prefixes encoded here
-// against them once per connection.
+//! The TensorRT-LLM dialect's request: a tagged positional array (the shape of
+//! a `msgspec.Struct(tag=True, array_like=True)` on the engine side) that the
+//! engine-side shim decodes into its own struct and turns into one LLM API
+//! `SamplingParams`. **Field order is the wire contract**: append only, never
+//! reorder. The shim declares both layouts at the handshake
+//! (`positional_layouts`) and the protocol compares the prefixes encoded here
+//! against them once per connection.
 
 use std::collections::BTreeMap;
 
@@ -414,7 +414,7 @@ mod tests {
     use rmpv::Value;
 
     use super::*;
-    use crate::codec::{decode_msgpack, decode_value, encode_msgpack};
+    use crate::codec::{decode_msgpack, decode_value, encode_msgpack, hex};
 
     /// A request with every field set, as the translation builds one (the
     /// floats exactly representable, so the shim's float64 and this side's
@@ -474,18 +474,6 @@ mod tests {
          6d61a27b7dc30793ac636f6e746578745f6f6e6c79a56374782d31c001a473616c7481ab7472\
          616365706172656e74ad30302d6162632d6465662d3031cb3ff8000000000000";
 
-    fn hex(s: &str) -> Vec<u8> {
-        let hex: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-        (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-            .collect()
-    }
-
-    fn to_hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
     /// The array is the declared layout: the tag, then the ten fields; the
     /// nested sampling block the tag and its thirty.
     #[test]
@@ -529,10 +517,7 @@ mod tests {
             }
         );
         let encoded = encode_msgpack(&request).unwrap();
-        assert_eq!(
-            to_hex(&encoded),
-            RUST_REQUEST_VECTOR.replace(char::is_whitespace, "")
-        );
+        assert_eq!(encoded, hex(RUST_REQUEST_VECTOR));
         let round_trip: TrtllmGenerateReqInput = decode_msgpack(&encoded).unwrap();
         assert_eq!(
             round_trip,

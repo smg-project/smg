@@ -30,8 +30,8 @@ jobs:
             group: benchmark-tokenizer-refs/pull/{0}/merge
           - workflow: Benchmark - Radix Tree
             group: benchmark-radix-tree-refs/pull/{0}/merge
-          - workflow: Benchmark - Tool Parser
-            group: benchmark-tool-parser-refs/pull/{0}/merge
+          - workflow: Benchmark - Symphony
+            group: benchmark-symphony-refs/pull/{0}/merge
           - workflow: Benchmark - Request Processing
             group: benchmark-request-processing-refs/pull/{0}/merge
           - workflow: Benchmark - Manual Policy

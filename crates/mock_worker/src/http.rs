@@ -32,14 +32,23 @@ use axum::{
 };
 use futures::{stream, Stream};
 use serde_json::{json, Value};
-use tokio::{net::TcpListener, sync::mpsc};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, watch},
+};
 
 use crate::{
-    config::Config,
+    admin_ops::{AdminOps, ProfileOptions},
+    config::{Config, Role},
     drain::{InFlight, WorkerInFlight},
     engine::{self, Engine, NewRequest},
     script::{self, Answer},
 };
+
+/// The bootstrap port a scheduler takes without being told one, and the
+/// one the gateway probes for a prefill worker registered without a port:
+/// what a missing or null `bootstrap_port` in a request means.
+const DEFAULT_BOOTSTRAP_PORT: u16 = 8998;
 
 /// Per-listener HTTP state: shared config plus an optional engine simulator.
 struct AppState {
@@ -51,6 +60,12 @@ struct AppState {
     /// The requests this worker is serving: what its load report counts as
     /// running when no engine simulation runs.
     in_flight: WorkerInFlight,
+    /// The flush and profile operations the gateway fans out, and their counts.
+    ops: Arc<AdminOps>,
+    /// The bootstrap port a prefill worker bound and advertises: where its
+    /// decode partner's engine would rendezvous, the port the gateway tells
+    /// both sides of (`None` on every other worker).
+    bootstrap_port: Option<u16>,
 }
 
 /// Build the router serving the mock HTTP worker contract.
@@ -62,6 +77,11 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/v1/completions", post(completions))
         .route("/generate", post(chat_completions))
         .route("/v1/loads", get(loads))
+        .route("/server_info", get(server_info))
+        .route("/get_server_info", get(server_info))
+        .route("/flush_cache", post(flush_cache))
+        .route("/start_profile", post(start_profile))
+        .route("/stop_profile", post(stop_profile))
         .with_state(state)
 }
 
@@ -106,10 +126,25 @@ pub async fn serve_with_listener_until(
         tracing::error!("http worker {port} cannot load script: {e}");
         return;
     }
+    // A prefill worker's bootstrap port, numbered by the worker's offset from
+    // the base port as a gRPC worker's is: bound before the worker serves, as
+    // an engine's bootstrap server is up when its health answers; a port that
+    // cannot be bound stops the worker as its own port would.
+    let bootstrap_port = port
+        .checked_sub(cfg.http_base_port)
+        .and_then(|index| cfg.bootstrap_port_for(index));
+    let bootstrap = match crate::bootstrap::bind(&cfg.host, bootstrap_port).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("http worker {port} {e}");
+            return;
+        }
+    };
     // One simulated engine per listener (i.e. per virtual worker), registered
     // in the process fleet under `http:<port>` for the oracle and admin API.
     let name = format!("http:{port}");
     script::register(&name);
+    let ops = AdminOps::register(&name);
     let engine = cfg
         .realistic
         .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
@@ -118,6 +153,8 @@ pub async fn serve_with_listener_until(
         name,
         engine,
         in_flight: WorkerInFlight::default(),
+        ops,
+        bootstrap_port,
     });
     // TCP_NODELAY: without it Nagle holds each small SSE frame until the
     // gateway's delayed ACK (~40ms) arrives, which stalls every streamed
@@ -127,12 +164,27 @@ pub async fn serve_with_listener_until(
             tracing::warn!("http worker {port}: set_nodelay failed: {e}");
         }
     });
-    if let Err(e) = axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown)
-        .await
-    {
-        tracing::error!("http worker {port} stopped: {e}");
-    }
+    // The bootstrap listener ends with the worker: the shutdown that stops
+    // the server stops its accept loop.
+    let (stop, stopped) = watch::channel(false);
+    let shutdown = async move {
+        shutdown.await;
+        let _ = stop.send(true);
+    };
+    let bootstrap = async {
+        if let Some(listener) = bootstrap {
+            crate::bootstrap::accept_and_close(listener, stopped).await;
+        }
+    };
+    let server = async {
+        if let Err(e) = axum::serve(listener, router(state))
+            .with_graceful_shutdown(shutdown)
+            .await
+        {
+            tracing::error!("http worker {port} stopped: {e}");
+        }
+    };
+    tokio::join!(server, bootstrap);
 }
 
 async fn health() -> &'static str {
@@ -217,25 +269,232 @@ async fn completions(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
     handle(Endpoint::Completions, state, body).await
 }
 
+/// `POST /flush_cache`: the engine's cache cleared at once (a canned worker
+/// has none), answered 200 as the engines' servers answer it.
+async fn flush_cache(State(state): State<Arc<AppState>>) -> Response {
+    let message = state.ops.flush(state.engine.iter());
+    Json(json!({ "status": "ok", "message": message })).into_response()
+}
+
+/// `POST /start_profile` with the profile options as its JSON body (an
+/// empty body is the defaults); a run already in progress is a 409.
+async fn start_profile(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let options = if body.is_empty() {
+        ProfileOptions::default()
+    } else {
+        match serde_json::from_slice::<ProfileOptions>(&body) {
+            Ok(options) => options,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("profile options: {e}")).into_response()
+            }
+        }
+    };
+    profile_answer(state.ops.start_profile(options))
+}
+
+/// `POST /stop_profile`: the run's trace file written; no run is a 409.
+async fn stop_profile(State(state): State<Arc<AppState>>) -> Response {
+    profile_answer(state.ops.stop_profile())
+}
+
+fn profile_answer(result: Result<String, String>) -> Response {
+    match result {
+        Ok(message) => Json(json!({ "status": "ok", "message": message })).into_response(),
+        Err(message) => (StatusCode::CONFLICT, message).into_response(),
+    }
+}
+
+/// `GET /server_info` (and its older spelling `/get_server_info`): what the
+/// gateway's metadata read of an HTTP engine asks for. A disaggregated worker
+/// reports its role and, on the prefill side, the port its partners
+/// rendezvous on, as the engines' server info carries them; the mock moves
+/// no KV cache and names the one transport the gateway pairs its workers on.
+async fn server_info(State(state): State<Arc<AppState>>) -> Response {
+    let mut info = json!({ "model_path": state.cfg.model_id });
+    if let Some(role) = state.cfg.role {
+        info["disaggregation_mode"] = json!(role.as_str());
+        info["disaggregation_transfer_backend"] = json!(crate::grpc::KV_TRANSPORT);
+        if let Some(port) = state.bootstrap_port {
+            info["disaggregation_bootstrap_port"] = json!(port);
+        }
+    }
+    Json(info).into_response()
+}
+
+/// What a disaggregated worker reads of the rendezvous the gateway injected
+/// into the request: a `bootstrap_room` (one, or one per prompt of a batch)
+/// on either side, as the engines' disaggregated servers require of every
+/// request; on a prefill side that bound its port, a `bootstrap_port` naming
+/// that port, the one its decode partner would come to for the handoff this
+/// mock stands in for.
+fn bootstrap_of(request: &Value, own_port: Option<u16>) -> Result<(), String> {
+    match request.get("bootstrap_room") {
+        Some(room) if !room.is_null() => {}
+        _ => return Err("a disaggregated request carries no bootstrap_room".to_string()),
+    }
+    let Some(own) = own_port else {
+        return Ok(());
+    };
+    // A missing or null port is the engines' default: a scheduler fills it
+    // with its own bootstrap port (8998 unless told otherwise), and the
+    // gateway, which sends null for a prefill worker registered without a
+    // port, probes that default for it. A worker on another port refuses
+    // it, as the pairing would send the decode side elsewhere.
+    let names_own = |port: &Value| match port {
+        Value::Null => own == DEFAULT_BOOTSTRAP_PORT,
+        port => port.as_u64() == Some(u64::from(own)),
+    };
+    let named: &[Value] = match request.get("bootstrap_port") {
+        Some(Value::Array(ports)) => ports,
+        Some(port) => std::slice::from_ref(port),
+        None => &[Value::Null],
+    };
+    if named.is_empty() || !named.iter().all(names_own) {
+        return Err(format!(
+            "bootstrap_port {} is not this worker's {own} (a missing port means {DEFAULT_BOOTSTRAP_PORT})",
+            request.get("bootstrap_port").unwrap_or(&Value::Null)
+        ));
+    }
+    Ok(())
+}
+
+/// A request this side cannot serve, refused as the engines' servers refuse
+/// one: a 400 with an OpenAI-shaped error body naming the reason.
+fn bad_request(why: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": {"message": why, "type": "invalid_request_error"}})),
+    )
+        .into_response()
+}
+
+/// The prompt side's admission: the realistic engine's fault and admission
+/// hooks as the regular path counts them ([`Engine::admit_without_tokens`]),
+/// then the canned delay. The finish reason of the completion to answer
+/// (`error` for an armed `finish=error`), or the status to answer instead.
+async fn prompt_side_admission(state: &AppState) -> Result<&'static str, Response> {
+    let mut finish_reason = "stop";
+    if let Some(engine) = &state.engine {
+        if engine
+            .admit_without_tokens()
+            .await
+            .map_err(injected_error)?
+        {
+            finish_reason = "error";
+        }
+    }
+    if !state.cfg.gen_delay.is_zero() {
+        tokio::time::sleep(state.cfg.gen_delay).await;
+    }
+    Ok(finish_reason)
+}
+
+/// The prompt side's completion: no output, the prompt's tokens and the
+/// finish reason, in the endpoint's shape; one body, or a stream of its
+/// finish frame and `[DONE]` when the request asked for one (what the
+/// gateway drains on the prefill side).
+fn prompt_side_response(
+    endpoint: Endpoint,
+    model: &str,
+    prompt_len: usize,
+    finish_reason: &str,
+    stream: bool,
+    in_flight: InFlight,
+) -> Response {
+    if stream {
+        let finish = match endpoint {
+            Endpoint::Chat => json!({"index": 0, "delta": {}, "finish_reason": finish_reason}),
+            Endpoint::Completions => {
+                json!({"index": 0, "text": "", "finish_reason": finish_reason})
+            }
+        };
+        let frames: [Result<Event, Infallible>; 2] = [
+            Ok(Event::default().data(scripted_chunk(endpoint, model, finish).to_string())),
+            Ok(Event::default().data("[DONE]")),
+        ];
+        return Sse::new(in_flight.until_done(stream::iter(frames))).into_response();
+    }
+    let usage = json!({
+        "prompt_tokens": prompt_len,
+        "completion_tokens": 0,
+        "total_tokens": prompt_len,
+    });
+    let body = match endpoint {
+        Endpoint::Chat => json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "created": 0,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": ""},
+                "finish_reason": finish_reason,
+            }],
+            "usage": usage,
+        }),
+        Endpoint::Completions => json!({
+            "id": "cmpl-mock",
+            "object": "text_completion",
+            "created": 0,
+            "model": model,
+            "choices": [{"index": 0, "text": "", "finish_reason": finish_reason}],
+            "usage": usage,
+        }),
+    };
+    Json(body).into_response()
+}
+
 async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Response {
     // In flight from here until the response is complete or its stream is
     // done, so a shutdown knows what it waits for and this worker's load
     // report counts it.
     let in_flight = InFlight::enter_on(&state.in_flight);
     let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    // A disaggregated worker reads the rendezvous the gateway injected before
+    // anything is spent on the request: a request without it went to the
+    // wrong pool, or came from a gateway that is not pairing. The check is
+    // pure, so an armed fault waits for a request this side serves.
+    if state.cfg.role.is_some() {
+        if let Err(why) = bootstrap_of(&parsed, state.bootstrap_port) {
+            return bad_request(why);
+        }
+    }
     let stream_requested = parsed
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     // The prompt as this wire knows it: its text, and synthetic ids, one per
     // whitespace word, the realistic engine's prompt and the script's key
-    // alike. The canned path does without them until something is scripted.
-    let prompt_text = if script::active() || state.engine.is_some() {
-        extract_prompt_text(&parsed)
-    } else {
-        String::new()
-    };
+    // alike (and the prompt side's count). The canned path does without them
+    // until something is scripted.
+    let prompt_text =
+        if script::active() || state.engine.is_some() || state.cfg.role == Some(Role::Prefill) {
+            extract_prompt_text(&parsed)
+        } else {
+            String::new()
+        };
     let prompt_ids = synth_token_ids(&prompt_text);
+
+    // A prefill worker's answer: the prompt side's completion alone, ahead
+    // of the script and of either engine mode. The decode side of the pair
+    // has the prompt and generates the output, so nothing is scripted here
+    // and nothing counts as a miss; the realistic engine's fault and
+    // admission hooks apply as to any request, and the canned delay paces
+    // it as it paces a canned answer.
+    if state.cfg.role == Some(Role::Prefill) {
+        let finish_reason = match prompt_side_admission(&state).await {
+            Ok(finish_reason) => finish_reason,
+            Err(refused) => return refused,
+        };
+        return prompt_side_response(
+            endpoint,
+            &state.cfg.model_id,
+            prompt_ids.len(),
+            finish_reason,
+            stream_requested,
+            in_flight,
+        );
+    }
 
     // A scripted answer, ahead of either engine mode: the worker's queue, the
     // prompt's text or its key decides ([`crate::script`]).
@@ -1048,6 +1307,57 @@ mod tests {
         );
     }
 
+    /// The admin fan-out's three routes on a canned worker, through their
+    /// handlers: the flush is a 200, a profiling run ends with one trace file
+    /// in the requested directory, a second start and a stop with no run are
+    /// 409s, a body that is not the options is a 400.
+    #[tokio::test]
+    async fn the_admin_fan_out_routes_answer_on_a_canned_worker() {
+        let state = Arc::new(AppState {
+            cfg: Arc::new(Config::default()),
+            name: "http:test".to_string(),
+            engine: None,
+            in_flight: WorkerInFlight::default(),
+            ops: AdminOps::register("http:test"),
+            bootstrap_port: None,
+        });
+        let start =
+            |body: &str| start_profile(State(Arc::clone(&state)), Bytes::from(body.to_string()));
+        let stop = || stop_profile(State(Arc::clone(&state)));
+
+        assert_eq!(
+            flush_cache(State(Arc::clone(&state))).await.status(),
+            StatusCode::OK
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let traces = dir.path().join("traces");
+        let options =
+            json!({ "output_dir": traces.display().to_string(), "num_steps": 2 }).to_string();
+        assert_eq!(start(&options).await.status(), StatusCode::OK);
+        assert_eq!(
+            start(&options).await.status(),
+            StatusCode::CONFLICT,
+            "a run is in progress"
+        );
+        assert_eq!(stop().await.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_dir(&traces)
+                .expect("the output directory")
+                .count(),
+            1
+        );
+        assert_eq!(
+            stop().await.status(),
+            StatusCode::CONFLICT,
+            "no run in progress"
+        );
+        assert_eq!(start("{not json").await.status(), StatusCode::BAD_REQUEST);
+        let ops = AdminOps::find("http:test").expect("the worker's operations");
+        assert_eq!(ops.status()["flushes"], 1);
+        assert_eq!(ops.status()["profiles_stopped"], 1);
+    }
+
     #[tokio::test]
     async fn a_cut_stream_ends_in_an_error_after_the_given_frames() {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1135,5 +1445,268 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR
         );
         assert_eq!(injected_error(429).status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// A canned worker of `role` for the handler-level tests: no engine, a
+    /// name of its own in the script store, the bootstrap port it would have
+    /// bound.
+    fn state_of(role: Option<Role>, bootstrap_port: Option<u16>, name: &str) -> Arc<AppState> {
+        script::register(name);
+        Arc::new(AppState {
+            cfg: Arc::new(Config {
+                role,
+                output_tokens: 2,
+                ..Config::default()
+            }),
+            name: name.to_string(),
+            engine: None,
+            in_flight: WorkerInFlight::default(),
+            ops: AdminOps::register(name),
+            bootstrap_port,
+        })
+    }
+
+    /// A chat request as the gateway's disaggregated dispatch sends it to
+    /// both sides: the prompt, and the rendezvous it injected (the room and
+    /// the prefill side's port).
+    fn disaggregated_chat(room: Option<u64>, port: Option<Value>, stream: bool) -> Bytes {
+        let mut body = json!({
+            "messages": [{"role": "user", "content": "say apricot now"}],
+            "stream": stream,
+        });
+        if let Some(room) = room {
+            body["bootstrap_host"] = json!("127.0.0.1");
+            body["bootstrap_room"] = json!(room);
+        }
+        if let Some(port) = port {
+            body["bootstrap_port"] = port;
+        }
+        Bytes::from(body.to_string())
+    }
+
+    async fn text_of(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body");
+        String::from_utf8(bytes.to_vec()).expect("utf-8")
+    }
+
+    async fn json_of(response: Response) -> Value {
+        serde_json::from_str(&text_of(response).await).expect("json")
+    }
+
+    /// The prompt side's completion in both shapes and as a stream, with
+    /// the scripted answer left where the decode side takes it.
+    #[tokio::test]
+    async fn a_prefill_worker_answers_the_prompt_side_alone_and_leaves_the_script_to_decode() {
+        let state = state_of(Some(Role::Prefill), Some(8998), "http:prefill-test");
+        let scripted =
+            script::Answer::parse(&json!({"output_text": "apricot"})).expect("an answer");
+        script::enqueue("http:prefill-test", vec![scripted]).expect("a known worker");
+
+        for stream in [false, true] {
+            let response = handle(
+                Endpoint::Chat,
+                Arc::clone(&state),
+                disaggregated_chat(Some(7), Some(json!(8998)), stream),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let text = text_of(response).await;
+            if stream {
+                assert!(
+                    text.contains(r#""finish_reason":"stop""#) && text.contains("[DONE]"),
+                    "the finish frame and the end: {text}"
+                );
+                assert!(
+                    !text.contains(r#""content":"x""#),
+                    "no output on the prompt side: {text}"
+                );
+            } else {
+                let body: Value = serde_json::from_str(&text).expect("json");
+                assert_eq!(body["choices"][0]["message"]["content"], "");
+                assert_eq!(body["choices"][0]["finish_reason"], "stop");
+                assert_eq!(
+                    (
+                        body["usage"]["prompt_tokens"].as_u64(),
+                        body["usage"]["completion_tokens"].as_u64()
+                    ),
+                    (Some(3), Some(0)),
+                    "the prompt's words, no output: {body}"
+                );
+            }
+        }
+        let completion = json_of(
+            handle(
+                Endpoint::Completions,
+                Arc::clone(&state),
+                Bytes::from(
+                    json!({"prompt": "say apricot", "bootstrap_room": 1, "bootstrap_port": 8998})
+                        .to_string(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(completion["object"], "text_completion");
+        assert_eq!(completion["choices"][0]["text"], "");
+        let status = script::status("http:prefill-test").expect("a known worker");
+        assert_eq!(
+            (
+                status["queued"].as_u64(),
+                status["hits"].as_u64(),
+                status["misses"].as_u64()
+            ),
+            (Some(1), Some(0), Some(0)),
+            "the scripted answer waits for the decode side, and no miss is counted: {status}"
+        );
+    }
+
+    /// Either side of a disaggregated pair refuses a request that carries no
+    /// rendezvous; a regular worker reads none.
+    #[tokio::test]
+    async fn a_disaggregated_worker_refuses_a_request_without_its_bootstrap_room() {
+        for role in [Role::Prefill, Role::Decode] {
+            let state = state_of(
+                Some(role),
+                None,
+                &format!("http:{}-room-test", role.as_str()),
+            );
+            let refused = handle(
+                Endpoint::Chat,
+                Arc::clone(&state),
+                disaggregated_chat(None, None, false),
+            )
+            .await;
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{role:?}");
+            let body = json_of(refused).await;
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("bootstrap_room")),
+                "{body}"
+            );
+            let served = handle(
+                Endpoint::Chat,
+                state,
+                disaggregated_chat(Some(3), Some(json!(8998)), false),
+            )
+            .await;
+            assert_eq!(served.status(), StatusCode::OK, "{role:?}");
+        }
+        let regular = state_of(None, None, "http:regular-room-test");
+        assert_eq!(
+            handle(
+                Endpoint::Chat,
+                regular,
+                disaggregated_chat(None, None, false)
+            )
+            .await
+            .status(),
+            StatusCode::OK,
+            "a regular worker reads no rendezvous"
+        );
+    }
+
+    /// A prefill worker that bound its port takes requests naming that port
+    /// alone (one, or one per prompt of a batch). A missing or null port is
+    /// the engines' default, 8998: the worker on that port takes it, one on
+    /// another refuses it. One that bound none is told nothing to check.
+    #[tokio::test]
+    async fn a_prefill_worker_takes_the_bootstrap_port_it_bound_alone() {
+        let bound = state_of(Some(Role::Prefill), Some(8998), "http:port-test");
+        for (port, status) in [
+            (json!(8998), StatusCode::OK),
+            (json!([8998, 8998]), StatusCode::OK),
+            (json!(null), StatusCode::OK),
+            (json!([null, 8998]), StatusCode::OK),
+            (json!(8999), StatusCode::BAD_REQUEST),
+            (json!([8998, 8999]), StatusCode::BAD_REQUEST),
+            (json!("8998"), StatusCode::BAD_REQUEST),
+            (json!([]), StatusCode::BAD_REQUEST),
+        ] {
+            let response = handle(
+                Endpoint::Chat,
+                Arc::clone(&bound),
+                disaggregated_chat(Some(1), Some(port.clone()), false),
+            )
+            .await;
+            assert_eq!(response.status(), status, "bootstrap_port {port}");
+        }
+        let missing = handle(
+            Endpoint::Chat,
+            Arc::clone(&bound),
+            disaggregated_chat(Some(1), None, false),
+        )
+        .await;
+        assert_eq!(
+            missing.status(),
+            StatusCode::OK,
+            "no port named: the default"
+        );
+        let elsewhere = state_of(Some(Role::Prefill), Some(9001), "http:elsewhere-test");
+        for port in [Some(json!(null)), None] {
+            let response = handle(
+                Endpoint::Chat,
+                Arc::clone(&elsewhere),
+                disaggregated_chat(Some(1), port.clone(), false),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "bootstrap_port {port:?} on a worker off the default port"
+            );
+        }
+        let unbound = state_of(Some(Role::Prefill), None, "http:unbound-test");
+        assert_eq!(
+            handle(
+                Endpoint::Chat,
+                unbound,
+                disaggregated_chat(Some(1), Some(json!(8999)), false)
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+    }
+
+    /// The server info names the role and, on the prefill side, the
+    /// bootstrap port; a regular worker reports neither.
+    #[tokio::test]
+    async fn the_server_info_reports_the_role_and_the_bootstrap_port() {
+        let regular =
+            json_of(server_info(State(state_of(None, None, "http:info-regular"))).await).await;
+        assert_eq!(regular["model_path"], Config::default().model_id);
+        assert!(regular.get("disaggregation_mode").is_none(), "{regular}");
+        let prefill = json_of(
+            server_info(State(state_of(
+                Some(Role::Prefill),
+                Some(8998),
+                "http:info-prefill",
+            )))
+            .await,
+        )
+        .await;
+        assert_eq!(prefill["disaggregation_mode"], "prefill");
+        assert_eq!(prefill["disaggregation_bootstrap_port"], 8998);
+        assert_eq!(
+            prefill["disaggregation_transfer_backend"],
+            crate::grpc::KV_TRANSPORT
+        );
+        let decode = json_of(
+            server_info(State(state_of(
+                Some(Role::Decode),
+                None,
+                "http:info-decode",
+            )))
+            .await,
+        )
+        .await;
+        assert_eq!(decode["disaggregation_mode"], "decode");
+        assert!(
+            decode.get("disaggregation_bootstrap_port").is_none(),
+            "{decode}"
+        );
     }
 }

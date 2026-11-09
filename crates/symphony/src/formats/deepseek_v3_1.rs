@@ -538,7 +538,7 @@ mod tests {
     fn written_call(tool: &Tool) -> Value {
         value!({"type": "sequence", "elements": [
             {"type": "const_string", "value": format!("<｜tool▁call▁begin｜>{}<｜tool▁sep｜>", tool.function.name)},
-            {"type": "json_schema", "json_schema": tool.function.parameters},
+            {"type": "json_schema", "json_schema": tool.function.parameters_schema()},
             {"type": "const_string", "value": "<｜tool▁call▁end｜>"},
         ]})
     }
