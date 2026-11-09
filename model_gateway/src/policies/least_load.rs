@@ -1161,13 +1161,18 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
     /// also on a worker it has not picked yet. A pick whose guard is not taken
     /// yet when the poll runs is dropped as well; once its guard is taken the
     /// live count holds it, and the next poll brings the picks back in step.
+    /// A worker with nothing in flight gets no entry here: a poll can outlast
+    /// the worker's removal, and no later poll would clear the entry.
     fn reconcile_in_flight(&self, worker_url: &str, in_flight: usize) {
-        self.tally
+        let mut tally = self
+            .tally
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(worker_url.to_string())
-            .or_default()
-            .picked = in_flight as u64;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if in_flight > 0 {
+            tally.entry(worker_url.to_string()).or_default().picked = in_flight as u64;
+        } else if let Some(dispatch) = tally.get_mut(worker_url) {
+            dispatch.picked = 0;
+        }
     }
 
     fn reset(&self) {
@@ -1630,6 +1635,17 @@ mod tests {
             }
             assert_eq!(hits, [2, 5], "burst {seed}");
         }
+    }
+
+    /// A poll can outlast the removal of a worker it listed. It must not
+    /// bring a drained worker's entry back, since no later poll would clear it.
+    #[test]
+    fn a_load_poll_that_outlasts_a_removal_leaves_no_entry() {
+        let policy = LeastLoadPolicy::new();
+        policy.reconcile_in_flight("http://a:8000", 1);
+        policy.remove_worker("http://a:8000");
+        policy.reconcile_in_flight("http://a:8000", 0);
+        assert!(policy.tally.read().unwrap().is_empty());
     }
 
     #[test]
