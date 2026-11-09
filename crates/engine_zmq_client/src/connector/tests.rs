@@ -975,24 +975,7 @@ async fn tokenspeed_client_submits_and_streams() {
         sampling::SamplingParams,
     };
 
-    let ns = IpcNamespace::new().unwrap();
-    let (handshake, input, output) = (
-        ns.handshake_endpoint(),
-        ns.input_endpoint(),
-        ns.output_endpoint(),
-    );
-    // Held for the test duration so the ipc files outlive the client.
-    let _ns = ns;
-    let (transport, engine) = tokio::join!(
-        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    let client = TokenSpeedClient::new(transport.unwrap());
-    let mut engine = engine.unwrap();
+    let (client, mut engine, _ns) = connect_wire::<TokenSpeedProtocol>().await;
 
     let request = TokenizedGenerateReqInput {
         rid: "ts-1".to_string(),
@@ -1096,23 +1079,7 @@ async fn a_request_reported_at_intervals_counts_no_silence() {
     use crate::protocol::tokenspeed::{
         output::BatchTokenIDOutSlim, request::TokenizedGenerateReqInput, sampling::SamplingParams,
     };
-    let ns = IpcNamespace::new().unwrap();
-    let (handshake, input, output) = (
-        ns.handshake_endpoint(),
-        ns.input_endpoint(),
-        ns.output_endpoint(),
-    );
-    let _ns = ns;
-    let (transport, engine) = tokio::join!(
-        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    let client = TokenSpeedClient::new(transport.unwrap());
-    let mut engine = engine.unwrap();
+    let (client, mut engine, _ns) = connect_wire::<TokenSpeedProtocol>().await;
     let request =
         |rid: &str, input_ids: Vec<u32>, stream: bool, stream_interval| TokenizedGenerateReqInput {
             rid: rid.to_string(),
@@ -1223,23 +1190,7 @@ async fn an_sglang_request_reported_at_intervals_counts_no_silence() {
         request::{SglangRequest, TokenizedEmbeddingReqInput, TokenizedGenerateReqInput},
         sampling::SamplingParams,
     };
-    let ns = IpcNamespace::new().unwrap();
-    let (handshake, input, output) = (
-        ns.handshake_endpoint(),
-        ns.input_endpoint(),
-        ns.output_endpoint(),
-    );
-    let _ns = ns;
-    let (transport, engine) = tokio::join!(
-        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    let client = SglangClient::new(transport.unwrap());
-    let mut engine = engine.unwrap();
+    let (client, mut engine, _ns) = connect_wire::<SglangProtocol>().await;
     let generate = |rid: &str, input_ids: Vec<u32>, stream: bool, stream_interval| {
         SglangRequest::Generate(TokenizedGenerateReqInput {
             rid: rid.to_string(),
@@ -3173,25 +3124,7 @@ use crate::protocol::tokenspeed::request::TokenizedGenerateReqInput as TaggedWir
 
 /// A client of that protocol over the same mock engine.
 async fn connect_tagged() -> (TokenSpeedClient, MockEngine, IpcNamespace) {
-    let ns = IpcNamespace::new().unwrap();
-    let (handshake, input, output) = (
-        ns.handshake_endpoint(),
-        ns.input_endpoint(),
-        ns.output_endpoint(),
-    );
-    let (transport, engine) = tokio::join!(
-        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    (
-        TokenSpeedClient::new(transport.unwrap()),
-        engine.unwrap(),
-        ns,
-    )
+    connect_wire::<TokenSpeedProtocol>().await
 }
 
 /// A request of that wire with a 64 MiB typed feature tensor.
