@@ -69,7 +69,7 @@ async fn answer_adds(engine: MockEngine) {
             let batch = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
                 engine_index: 0,
                 outputs: vec![EngineCoreOutput {
-                    request_id: id.clone(),
+                    request_id: id.clone().into(),
                     new_token_ids: vec![token + 10],
                     finish_reason: finish,
                     ..Default::default()

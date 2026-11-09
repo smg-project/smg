@@ -371,7 +371,7 @@ fn batch(
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: request_id.to_string(),
+            request_id: request_id.into(),
             new_token_ids: tokens,
             finish_reason: finish,
             ..Default::default()
@@ -2274,7 +2274,7 @@ async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
         .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 1,
             outputs: vec![EngineCoreOutput {
-                request_id: "r1".to_string(),
+                request_id: "r1".into(),
                 new_token_ids: vec![10, 11, 12, 13],
                 prefill_stats: Some(PrefillStats {
                     num_prompt_tokens: 3,
@@ -2420,7 +2420,7 @@ async fn the_entries_before_the_first_snapshot_carry_the_servicers_own_figures()
         .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
             outputs: vec![EngineCoreOutput {
-                request_id: "r1".to_string(),
+                request_id: "r1".into(),
                 new_token_ids: vec![10, 11, 12, 13],
                 prefill_stats: Some(PrefillStats {
                     num_prompt_tokens: 3,
@@ -2500,7 +2500,7 @@ async fn prefill_capacity_reaches_grpc_and_push_per_rank() {
                 engine_index: 1,
                 timestamp: start + 0.5,
                 outputs: vec![EngineCoreOutput {
-                    request_id: id.to_string(),
+                    request_id: id.into(),
                     new_token_ids: vec![10],
                     finish_reason: Some(EngineCoreFinishReason::Length),
                     events: Some(vec![
@@ -3339,7 +3339,7 @@ fn pooling_model_info() -> VllmModelInfo {
 fn pooled_batch(request_id: &str, values: Vec<f32>) -> EngineCoreOutputs {
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         outputs: vec![EngineCoreOutput {
-            request_id: request_id.to_string(),
+            request_id: request_id.into(),
             pooling_output: Some(Box::new(PoolingOutput::new(
                 WireTensor::from_f32(vec![values.len()], values).unwrap(),
             ))),
@@ -4592,7 +4592,7 @@ async fn concurrent_streams_keep_their_own_chunk_sequences() {
         let last = step + 1 == STEPS;
         let outputs = (0..STREAMS)
             .map(|i| EngineCoreOutput {
-                request_id: format!("c{i}"),
+                request_id: format!("c{i}").into(),
                 new_token_ids: vec![token(i, step)],
                 finish_reason: last.then_some(EngineCoreFinishReason::Length),
                 ..Default::default()
@@ -5963,7 +5963,7 @@ async fn a_burst_of_overlapping_prefills_reads_the_capacity_of_the_whole_batch()
                 engine_index: 0,
                 timestamp: 10.5,
                 outputs: vec![EngineCoreOutput {
-                    request_id: id.clone(),
+                    request_id: id.clone().into(),
                     new_token_ids: vec![10],
                     finish_reason: Some(EngineCoreFinishReason::Length),
                     events: Some(vec![EngineCoreEvent {

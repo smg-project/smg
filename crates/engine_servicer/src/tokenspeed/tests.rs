@@ -199,7 +199,7 @@ fn batch(
 ) -> BatchTokenIDOutSlim {
     let (num_running, num_waiting, kv_active_pages, kv_total_pages) = load.unwrap_or_default();
     BatchTokenIDOutSlim {
-        rids: vec![rid.to_string()],
+        rids: vec![rid.into()],
         output_ids: vec![tokens],
         finished_reasons: vec![finish.unwrap_or_default().to_string()],
         prompt_tokens: vec![3],

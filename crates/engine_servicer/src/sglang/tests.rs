@@ -195,7 +195,7 @@ fn batch(
 ) -> BatchTokenIDSlimOutput {
     let (num_running, num_waiting, kv_used_tokens, kv_total_tokens) = load.unwrap_or_default();
     BatchTokenIDSlimOutput {
-        rids: vec![rid.to_string()],
+        rids: vec![rid.into()],
         output_ids: vec![tokens],
         finished_reasons: vec![finish.unwrap_or_default().to_string()],
         finished_messages: vec![None],
