@@ -115,3 +115,16 @@ def test_every_mode_has_a_prompt_and_a_closed_schema():
 def test_every_job_runs_on_the_review_runner_set(workflow):
     for name, job in workflow["jobs"].items():
         assert "k8s-runner-cpu" in job["runs-on"], name
+
+
+def test_the_acl_package_is_installed_before_codex_drops_sudo(workflow):
+    codex = workflow["jobs"]["codex"]
+    names = [s.get("name") or s.get("uses") for s in codex["steps"]]
+    acl = names.index("Install the acl package drop-sudo needs")
+    run = next(
+        i
+        for i, s in enumerate(codex["steps"])
+        if str(s.get("uses", "")).startswith("openai/codex-action@")
+    )
+    assert acl < run
+    assert "setfacl" in codex["steps"][acl]["run"]

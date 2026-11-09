@@ -137,6 +137,17 @@ jobs:
           # The guide's skills call their scripts through this variable.
           echo "CLAUDE_PLUGIN_ROOT=$RUNNER_TEMP/smg-dev-guide" >> "$GITHUB_ENV"
 
+      # The action's drop-sudo strategy removes the runner's sudo with setfacl, which the
+      # runner image lacks; install it while sudo is still available (one short apt call).
+      - name: Install the acl package drop-sudo needs
+        if: steps.context.outputs.skip != 'true'
+        run: |
+          if ! command -v setfacl >/dev/null; then
+            sudo -n apt-get update -qq
+            sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends acl
+          fi
+          command -v setfacl
+
       # The key is an input of this step alone: the action feeds it to its local proxy on
       # stdin, and the Codex process sees only the proxy. It is never in the job environment.
       - name: Run Codex
