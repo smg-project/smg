@@ -142,6 +142,8 @@ def test_oracle_variables_are_read_by_the_launcher(monkeypatch):
 
 def helm_template(settings: tuple[str, ...], files: tuple[Path, ...] = ()):
     command = ["helm", "template", "smg", str(CHART), "--kube-version", KUBE_VERSION]
+    # Pinned so the render never follows the kube context (in a cluster, the pod's own namespace).
+    command += ["--namespace", "default"]
     for file in files:
         command += ["-f", str(file)]
     for setting in settings:
