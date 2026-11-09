@@ -379,10 +379,7 @@ fn split_instructions(messages: &[ChatMessage]) -> (Option<String>, &[ChatMessag
         Some((
             ChatMessage::System { content, .. } | ChatMessage::Developer { content, .. },
             rest,
-        )) => {
-            let instructions = content.to_simple_string();
-            ((!instructions.is_empty()).then_some(instructions), rest)
-        }
+        )) => (content.has_text().then(|| content.to_simple_string()), rest),
         _ => (None, messages),
     }
 }
@@ -2066,6 +2063,17 @@ mod tests {
             (
                 "an empty system message",
                 json!({"model": "gpt-oss-120b", "messages": [{"role": "system", "content": ""}, user]}),
+                without_commentary(SIMPLE_USER),
+            ),
+            (
+                "a system message of empty text parts",
+                json!({"model": "gpt-oss-120b", "messages": [
+                    {"role": "system", "content": [
+                        {"type": "text", "text": ""},
+                        {"type": "text", "text": ""}
+                    ]},
+                    user
+                ]}),
                 without_commentary(SIMPLE_USER),
             ),
             // A tool list, even an empty one, keeps the commentary channel.
