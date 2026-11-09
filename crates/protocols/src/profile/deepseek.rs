@@ -11,8 +11,8 @@
 //! for where the engine starts it, after the thought or around it), and the
 //! vendor's own API refuses it by itself where it still does.
 //!
-//! The sampling and length fields are the client's, as under every other
-//! profile. The family's reference library (the vendor's own request
+//! The sampling and length fields are the client's: this profile fills none
+//! of them. The family's reference library (the vendor's own request
 //! conversion, deepseek-recipe 0.2.0) resolves them for the vendor's serving:
 //! `temperature` 1.0 in thinking mode; `top_p` at least 0.95 under V4.1
 //! thinking, 0.95 under V4 thinking with tools, 1.0 under V4 thinking without
