@@ -1,8 +1,8 @@
-"""The Rust servicer's metrics endpoint on the three launchers: one flag pair
-(``--metrics-port``, ``--metrics-host``) with one precedence (the flag, else
-the engine's variable, else no endpoint), one refusal of a clash with the gRPC
-port before the engine starts, one refusal under the Python servicer, and the
-bind address handed to the Rust server."""
+"""The Rust servicer's metrics endpoint on the three launchers, with distinct
+TokenSpeed flags to leave the engine's metrics alone. The flag takes precedence
+over the environment, and neither enables an endpoint by default. The tests also
+cover gRPC port clashes, Python-servicer refusals, and the Rust server's bind
+address."""
 
 from __future__ import annotations
 
@@ -22,9 +22,6 @@ from smg_grpc_servicer.vllm import rust as vllm_rust
 LAUNCHERS = [
     pytest.param(vllm_rust.VllmLauncher, "SMG_VLLM_SERVICER_METRICS", id="vllm"),
     pytest.param(sglang_rust.SglangLauncher, "SMG_SGLANG_SERVICER_METRICS", id="sglang"),
-    pytest.param(
-        tokenspeed_rust.TokenSpeedLauncher, "SMG_TOKENSPEED_SERVICER_METRICS", id="tokenspeed"
-    ),
 ]
 
 
@@ -151,23 +148,31 @@ def test_the_flags_join_a_parser_once_and_export_their_variables(monkeypatch):
     assert "--metrics-port" in parser.format_help()
 
 
-def test_the_three_launchers_register_the_same_flags():
+def test_the_three_launchers_register_their_metrics_flags():
     """The vLLM plugin adds the flags to a parser that serves gRPC, the SGLang
-    plugin and the TokenSpeed launcher to theirs: the same pair, once."""
+    plugin and the TokenSpeed launcher to theirs, once."""
     from smg_grpc_servicer.sglang import plugin as sglang_plugin
     from smg_grpc_servicer.vllm import plugin as vllm_plugin
 
     grpc_parser = argparse.ArgumentParser()
     grpc_parser.add_argument("--grpc", action="store_true")
-    for add, parser in (
-        (vllm_plugin.add_metrics_arguments, grpc_parser),
-        (sglang_plugin.add_metrics_arguments, argparse.ArgumentParser()),
-        (tokenspeed_rust.add_metrics_arguments, argparse.ArgumentParser()),
+    for add, parser, flags in (
+        (vllm_plugin.add_metrics_arguments, grpc_parser, {"--metrics-port", "--metrics-host"}),
+        (
+            sglang_plugin.add_metrics_arguments,
+            argparse.ArgumentParser(),
+            {"--metrics-port", "--metrics-host"},
+        ),
+        (
+            tokenspeed_rust.add_metrics_arguments,
+            argparse.ArgumentParser(),
+            {"--servicer-metrics-port", "--servicer-metrics-host"},
+        ),
     ):
         assert add(parser) is True
         assert add(parser) is False
         actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry
-        assert {"--metrics-port", "--metrics-host"} <= set(actions)
+        assert flags <= set(actions)
     # A parser of another vLLM command is left alone.
     plain = argparse.ArgumentParser()
     assert vllm_plugin.add_metrics_arguments(plain) is False

@@ -5,7 +5,7 @@
 //! implementation's own image path gives for each image of its corpus: the decoded RGB bytes,
 //! the u8 patches, the bf16 and the f32 pixel tensors, each as a SHA-256. This example gives the
 //! same for SMG: each listed file decoded the way the gateway decodes inline image bytes (EXIF
-//! orientation applied, no size cap), the family's processor built from its
+//! orientation applied, no size cap, the transparency policy given), the family's processor built from its
 //! `preprocessor_config.json`, the pixel tensor written as the gateway writes it on the wire, in
 //! bf16 and in f32, and the digests of all four, so that a recorded line and SMG's line for an
 //! image compare field by field. Comparing a whole fixture set is a test's business; by hand,
@@ -21,6 +21,7 @@
 //! | `--processor <name>` | `SMG_DUMP_PROCESSOR` | `qwen2_vl`, `qwen3_vl`, `minimax_m3` or `muse_spark`: the processor family |
 //! | `--config <file>` | `SMG_DUMP_CONFIG` | the family's `preprocessor_config.json` |
 //! | `--mode <hash\|raw>` | `SMG_DUMP_MODE` | `hash` unless given |
+//! | `--transparency <policy>` | `SMG_DUMP_TRANSPARENCY` | what the decode does with an alpha channel: `keep_alpha` unless given, `composite_over_white` (the policy of the vLLM reference lines) or `drop_alpha` |
 //!
 //! `hash` writes one JSON object per image: `name` (the file name, the key a recorded line and a
 //! dump line share), `path` (as listed), `w` and `h` (the decoded size), `alpha` (whether the
@@ -61,10 +62,10 @@ use std::{
     process::ExitCode,
 };
 
-use image::{DynamicImage, ImageReader};
+use image::{DynamicImage, ImageDecoder as _, ImageReader};
 use llm_multimodal::{
     encoder_inputs::{EncoderDtype, EncoderInput, ModelSpecificValue},
-    types::{ImageDetail, ImageFrame, ImageSize, ImageSource},
+    types::{ImageDetail, ImageFrame, ImageSize, ImageSource, TransparencyPolicy},
     vision::{
         processors::{
             MiniMaxM3VisionProcessor, MuseSparkVisionProcessor, Qwen2VLProcessor, Qwen3VLProcessor,
@@ -88,6 +89,7 @@ const USAGE: &str = "bellwether_dump: SMG's media pipeline over a list of image 
     \x20 --processor <name>   SMG_DUMP_PROCESSOR  qwen2_vl, qwen3_vl, minimax_m3 or muse_spark\n\
     \x20 --config <file>      SMG_DUMP_CONFIG     the family's preprocessor_config.json\n\
     \x20 --mode <hash|raw>    SMG_DUMP_MODE       hash unless given\n\
+    \x20 --transparency <p>   SMG_DUMP_TRANSPARENCY  keep_alpha unless given, composite_over_white or drop_alpha\n\
     \x20 --help               this text";
 
 /// What the run writes: digests per image to one file, or the artifacts into a directory.
@@ -121,12 +123,13 @@ struct Options {
     processor: String,
     config: PathBuf,
     mode: Mode,
+    transparency: TransparencyPolicy,
 }
 
 impl Options {
     /// `None` when `--help` was asked for and printed.
     fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Self>, Fault> {
-        let mut given: [Option<String>; 5] = Default::default();
+        let mut given: [Option<String>; 6] = Default::default();
         while let Some(arg) = args.next() {
             if arg == "--help" || arg == "-h" {
                 usage();
@@ -138,6 +141,7 @@ impl Options {
                 "--processor" => 2,
                 "--config" => 3,
                 "--mode" => 4,
+                "--transparency" => 5,
                 other => return Err(format!("unknown argument {other:?}\n{USAGE}").into()),
             };
             let value = args
@@ -158,14 +162,37 @@ impl Options {
             Some(name) if !name.is_empty() => Mode::parse(&name)?,
             _ => Mode::Hash,
         };
+        let transparency = match given[5]
+            .clone()
+            .or_else(|| env::var("SMG_DUMP_TRANSPARENCY").ok())
+        {
+            Some(name) if !name.is_empty() => transparency_policy(&name)?,
+            _ => TransparencyPolicy::KeepAlpha,
+        };
         Ok(Some(Self {
             list: PathBuf::from(setting(0, "SMG_DUMP_LIST", "--list")?),
             out: PathBuf::from(setting(1, "SMG_DUMP_OUT", "--out")?),
             processor: setting(2, "SMG_DUMP_PROCESSOR", "--processor")?,
             config: PathBuf::from(setting(3, "SMG_DUMP_CONFIG", "--config")?),
             mode,
+            transparency,
         }))
     }
+}
+
+/// The transparency policy spelled as its configuration name.
+fn transparency_policy(name: &str) -> Result<TransparencyPolicy, Fault> {
+    [
+        TransparencyPolicy::KeepAlpha,
+        TransparencyPolicy::CompositeOverWhite,
+        TransparencyPolicy::DropAlpha,
+    ]
+    .into_iter()
+    .find(|policy| policy.as_str() == name)
+    .ok_or_else(|| {
+        format!("transparency {name:?} is none of keep_alpha, composite_over_white and drop_alpha")
+            .into()
+    })
 }
 
 #[expect(clippy::print_stdout, reason = "the usage text is what --help prints")]
@@ -201,13 +228,22 @@ fn sha256(bytes: &[u8]) -> String {
 
 /// The decoded pixels of encoded image bytes, as the gateway decodes an inline image: the
 /// header gives the frame its size, the frame decodes on first use with EXIF orientation
-/// applied and no size cap.
-fn decode(bytes: Vec<u8>) -> Result<DynamicImage, String> {
-    let (width, height) = ImageReader::new(Cursor::new(&bytes))
-        .with_guessed_format()
-        .map_err(|e| e.to_string())?
-        .into_dimensions()
-        .map_err(|e| e.to_string())?;
+/// applied, no size cap and `transparency` applied to an alpha channel. Beside the pixels,
+/// whether the file carried an alpha channel, read from the header before the policy
+/// applies (the policy may drop it).
+fn decode(
+    bytes: Vec<u8>,
+    transparency: TransparencyPolicy,
+) -> Result<(DynamicImage, bool), String> {
+    let (width, height, alpha) = {
+        let decoder = ImageReader::new(Cursor::new(&bytes))
+            .with_guessed_format()
+            .map_err(|e| e.to_string())?
+            .into_decoder()
+            .map_err(|e| e.to_string())?;
+        let (width, height) = decoder.dimensions();
+        (width, height, decoder.color_type().has_alpha())
+    };
     let frame = ImageFrame::encoded(
         bytes::Bytes::from(bytes),
         ImageDetail::Auto,
@@ -215,8 +251,10 @@ fn decode(bytes: Vec<u8>) -> Result<DynamicImage, String> {
         String::new(),
         ImageSize::new(width, height),
         None,
-    );
-    frame.image().cloned().map_err(|e| e.to_string())
+    )
+    .with_transparency(transparency);
+    let image = frame.image().cloned().map_err(|e| e.to_string())?;
+    Ok((image, alpha))
 }
 
 /// Everything the pipeline gives for one image.
@@ -286,9 +324,12 @@ fn grid(value: Option<&ModelSpecificValue>) -> Vec<i64> {
 }
 
 /// Decode and preprocess one image.
-fn process(processor: &dyn VisionPreProcessor, bytes: Vec<u8>) -> Result<Artifacts, String> {
-    let image = decode(bytes)?;
-    let alpha = image.color().has_alpha();
+fn process(
+    processor: &dyn VisionPreProcessor,
+    bytes: Vec<u8>,
+    transparency: TransparencyPolicy,
+) -> Result<Artifacts, String> {
+    let (image, alpha) = decode(bytes, transparency)?;
     let rgb = image.to_rgb8();
     let (width, height) = rgb.dimensions();
     let inputs = processor.preprocess(&[&image]).map_err(|e| e.to_string())?;
@@ -319,9 +360,13 @@ fn process(processor: &dyn VisionPreProcessor, bytes: Vec<u8>) -> Result<Artifac
 }
 
 /// One image through the pipeline, with a panic in it reported as that image's error.
-fn one(processor: &dyn VisionPreProcessor, path: &Path) -> Result<Artifacts, String> {
+fn one(
+    processor: &dyn VisionPreProcessor,
+    path: &Path,
+    transparency: TransparencyPolicy,
+) -> Result<Artifacts, String> {
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
-    match panic::catch_unwind(AssertUnwindSafe(|| process(processor, bytes))) {
+    match panic::catch_unwind(AssertUnwindSafe(|| process(processor, bytes, transparency))) {
         Ok(result) => result,
         Err(payload) => {
             let message = payload
@@ -419,14 +464,17 @@ fn run() -> Result<(), Fault> {
     let (mut ok, mut failed) = (0usize, 0usize);
     for ((name, path), stem) in images.iter().zip(&stems) {
         let path_text = path.to_string_lossy();
-        let result = one(processor.as_ref(), path).and_then(|artifacts| match options.mode {
-            Mode::Hash => Ok(artifacts.line(name, &path_text)),
-            Mode::Raw => artifacts.write(&options.out, stem).map(|()| {
-                let mut described = artifacts.describe(name, &path_text);
-                described["artifact"] = json!(stem);
-                described
-            }),
-        });
+        let result =
+            one(processor.as_ref(), path, options.transparency).and_then(|artifacts| match options
+                .mode
+            {
+                Mode::Hash => Ok(artifacts.line(name, &path_text)),
+                Mode::Raw => artifacts.write(&options.out, stem).map(|()| {
+                    let mut described = artifacts.describe(name, &path_text);
+                    described["artifact"] = json!(stem);
+                    described
+                }),
+            });
         let line = match result {
             Ok(line) => {
                 ok += 1;

@@ -15,8 +15,9 @@
 //! memset of the tags alone. The encoder builds one table at load from the
 //! vocabulary, read by a thread for a piece it has not met; each thread keeps
 //! the pieces it met in a table of its own (see `native`), which starts at
-//! [`MIN_SLOTS`] and doubles as the thread meets pieces, up to the slots for
-//! the thread's share, so a thread that encodes little holds little.
+//! [`MIN_SLOTS`] and grows as the thread meets pieces (by four up to
+//! `GROW_BY_FOUR_UP_TO` slots, by two above), up to the slots for the
+//! thread's share, so a thread that encodes little holds little.
 
 /// Longest piece the table keys: its bytes and length fit a `u128`.
 pub(super) const SHORT_PIECE_MAX_BYTES: usize = 15;
@@ -35,6 +36,14 @@ const MAX_IDS: usize = 15;
 /// Fewest slots a table has, whatever it was sized for; a thread's table
 /// starts here and grows.
 pub(super) const MIN_SLOTS: usize = 64;
+
+/// Slots up to which a table grows by four at a time (the entries placed
+/// again over that growth are a fourth of what doublings place); above them
+/// it doubles. Above 4,096 slots the sizes are the ones doubling gives;
+/// up to it, a table that has just grown holds up to about 5.3 slots per
+/// entry (four times the slots it had at its fill bound), at most 2,048
+/// slots, about 66 KiB, more than doubling would, per thread.
+const GROW_BY_FOUR_UP_TO: usize = 4_096;
 /// The tag of an empty slot; a stored slot's tag has its high bit set.
 const EMPTY_TAG: u8 = 0;
 /// The two halves of a key are salted before they are multiplied, so a
@@ -54,6 +63,26 @@ const KEEP_LOW: [u128; 16] = {
     }
     masks
 };
+
+/// A short piece the table does not hold: its key and where the probe that
+/// missed ended (the empty slot it stopped on, the key's tag and the table's
+/// mask at the time; a table grown or made anew since has other slots). The
+/// insert that follows the miss stores there without hashing and probing
+/// again (see [`ShortPieceTable::insert_at`]).
+#[derive(Clone, Copy)]
+pub(super) struct Vacancy {
+    key: ShortPieceKey,
+    slot: u32,
+    mask: u32,
+    tag: u8,
+}
+
+impl Vacancy {
+    /// The key of the piece the probe missed.
+    pub(super) fn key(&self) -> ShortPieceKey {
+        self.key
+    }
+}
 
 /// A piece of 1..=15 bytes as one integer: the bytes little-endian in the
 /// low 120 bits, the length above them, so two keys are equal exactly when
@@ -219,6 +248,15 @@ impl ShortPieceTable {
     /// the piece.
     #[inline(always)]
     pub(super) fn ids_into(&self, key: ShortPieceKey, out: &mut Vec<u32>) -> bool {
+        self.lookup(key, out).is_none()
+    }
+
+    /// The probe: a hit appends the piece's ids (all four inline ids, then
+    /// the length set to the count; a spilled entry from the spill) and
+    /// returns `None`; a miss returns where it ended, for the insert that
+    /// follows it ([`Self::ids_into`] is this probe read as a hit test).
+    #[inline(always)]
+    pub(super) fn lookup(&self, key: ShortPieceKey, out: &mut Vec<u32>) -> Option<Vacancy> {
         let (mut slot, tag) = self.first_slot(key);
         loop {
             let found = self.tags[slot];
@@ -227,28 +265,32 @@ impl ShortPieceTable {
                 if entry.key & KEY_MASK == key.0 {
                     let count = (entry.key >> COUNT_SHIFT) as usize;
                     if count <= INLINE_IDS {
-                        // All four ids, then the length set to the count: a
-                        // fixed copy, where a copy of `count` ids is a call.
                         out.extend_from_slice(&entry.ids);
                         out.truncate(out.len() - (INLINE_IDS - count));
                     } else {
                         let start = entry.ids[0] as usize;
                         out.extend_from_slice(&self.spill[start..start + count]);
                     }
-                    return true;
+                    return None;
                 }
             } else if found == EMPTY_TAG {
-                return false;
+                return Some(Vacancy {
+                    key,
+                    slot: slot as u32,
+                    mask: self.mask as u32,
+                    tag,
+                });
             }
             slot = (slot + 1) & self.mask;
         }
     }
 
     /// Stores `ids` as the piece's encoding and answers true. A table at its
-    /// fill bound with fewer slots than `bound` entries take doubles its
-    /// slots first (every stored entry placed again; the spill stays), so a
-    /// table starts small and grows with use, up to the slots for `bound`;
-    /// there it refuses, as it does ids that are not 1..=15 in number, and
+    /// fill bound with fewer slots than `bound` entries take grows first
+    /// (by four while small, by two above `GROW_BY_FOUR_UP_TO` slots, up to
+    /// the slots for `bound`; every stored entry placed again, the spill
+    /// stays), so a table starts small and grows with use; at the bound it
+    /// refuses, as it does ids that are not 1..=15 in number, and
     /// the piece is merged again on every encode. A piece already stored
     /// keeps its ids (they are the model's for that piece either way).
     pub(super) fn insert(&mut self, key: ShortPieceKey, ids: &[u32], bound: usize) -> bool {
@@ -259,7 +301,7 @@ impl ShortPieceTable {
             if self.slots() >= Self::slots_for(bound) {
                 return false;
             }
-            self.grow();
+            self.grow(Self::slots_for(bound));
         }
         let (mut slot, tag) = self.first_slot(key);
         while self.tags[slot] != EMPTY_TAG {
@@ -268,26 +310,83 @@ impl ShortPieceTable {
             }
             slot = (slot + 1) & self.mask;
         }
-        let mut inline = [0u32; INLINE_IDS];
-        if ids.len() <= INLINE_IDS {
-            inline[..ids.len()].copy_from_slice(ids);
-        } else {
-            inline[0] = self.spill.len() as u32;
-            self.spill.extend_from_slice(ids);
+        self.store(slot, tag, key, ids);
+        true
+    }
+
+    /// [`Self::insert`] of the piece a probe missed, at the vacancy the probe
+    /// ended on: the miss has done the hashing and the walk. The vacancy must
+    /// be of this table as it is, with no [`Self::clear`] between the
+    /// [`Self::lookup`] that made it and this call (a cleared table keeps its
+    /// slots and would take the entry off its probe path; a caller that
+    /// cleared inserts by probing). A table grown since, or at its fill
+    /// bound, or a slot taken since, sends the insert through the probe.
+    pub(super) fn insert_at(&mut self, vacancy: Vacancy, ids: &[u32], bound: usize) -> bool {
+        let slot = vacancy.slot as usize;
+        if vacancy.mask as usize == self.mask
+            && self.len < self.fill_bound()
+            && self.tags[slot] == EMPTY_TAG
+            && !ids.is_empty()
+            && ids.len() <= MAX_IDS
+        {
+            debug_assert!(
+                self.occupied_up_to(vacancy.key, slot),
+                "a vacancy of the table as it is: no clear between the probe and the insert"
+            );
+            self.store(slot, vacancy.tag, vacancy.key, ids);
+            return true;
         }
+        self.insert(vacancy.key, ids, bound)
+    }
+
+    /// Whether every slot from `key`'s home slot up to `slot` is occupied:
+    /// the condition under which an entry stored at `slot` is on the probe
+    /// path of `key`.
+    fn occupied_up_to(&self, key: ShortPieceKey, slot: usize) -> bool {
+        let (mut at, _) = self.first_slot(key);
+        while at != slot {
+            if self.tags[at] == EMPTY_TAG {
+                return false;
+            }
+            at = (at + 1) & self.mask;
+        }
+        true
+    }
+
+    /// Writes the entry of `key` at the empty `slot`: up to four ids in the
+    /// entry (a fixed pattern per count, no copy call), more in the spill.
+    #[inline(always)]
+    fn store(&mut self, slot: usize, tag: u8, key: ShortPieceKey, ids: &[u32]) {
+        let inline = match *ids {
+            [a] => [a, 0, 0, 0],
+            [a, b] => [a, b, 0, 0],
+            [a, b, c] => [a, b, c, 0],
+            [a, b, c, d] => [a, b, c, d],
+            _ => {
+                let at = self.spill.len() as u32;
+                self.spill.extend_from_slice(ids);
+                [at, 0, 0, 0]
+            }
+        };
         self.tags[slot] = tag;
         self.entries[slot] = Entry {
             key: key.0 | ((ids.len() as u128) << COUNT_SHIFT),
             ids: inline,
         };
         self.len += 1;
-        true
     }
 
-    /// Doubles the slots and places every stored entry again. A tag does not
-    /// depend on the slot count, so the tags move with their entries.
-    fn grow(&mut self) {
-        let slots = self.entries.len() * 2;
+    /// Grows the slots (by four up to `GROW_BY_FOUR_UP_TO`, by two above, to
+    /// `most` at the most) and places every stored entry again. A tag does
+    /// not depend on the slot count, so the tags move with their entries.
+    fn grow(&mut self, most: usize) {
+        let slots = self.entries.len();
+        let slots = if slots < GROW_BY_FOUR_UP_TO {
+            slots * 4
+        } else {
+            slots * 2
+        }
+        .min(most);
         let tags = std::mem::replace(&mut self.tags, vec![EMPTY_TAG; slots]);
         let entries = std::mem::replace(&mut self.entries, vec![Entry::EMPTY; slots]);
         self.mask = slots - 1;
@@ -451,12 +550,13 @@ mod tests {
         assert_eq!(table.len(), 1);
     }
 
-    /// A thread's table: the fewest slots at first, doubled at the fill
-    /// bound while `bound` entries take more slots, every piece kept across
-    /// the doublings (the spilled ones too), and at the slots for `bound` the
-    /// fill bound refuses and a probe still ends.
+    /// A thread's table: the fewest slots at first, grown at the fill bound
+    /// while `bound` entries take more slots (by four while small, by two
+    /// above `GROW_BY_FOUR_UP_TO`), every piece kept across the growths (the
+    /// spilled ones too), and at the slots for `bound` the fill bound refuses
+    /// and a probe still ends.
     #[test]
-    fn a_table_starts_small_doubles_with_use_and_refuses_at_its_bound() {
+    fn a_table_starts_small_grows_by_four_then_doubles_and_refuses_at_its_bound() {
         let mut table = ShortPieceTable::new();
         let bound = 1000;
         let fifteen: Vec<u32> = (100..115).collect();
@@ -470,7 +570,7 @@ mod tests {
                 sizes.push(table.slots());
             }
         }
-        assert_eq!(sizes, [64, 128, 256, 512, 1024, 2048]);
+        assert_eq!(sizes, [64, 256, 1024, 2048]);
         assert_eq!(table.slots(), ShortPieceTable::slots_for(bound));
         assert_eq!(stored, table.fill_bound());
         assert_eq!(table.len(), stored);
@@ -490,6 +590,73 @@ mod tests {
         assert!(table.insert(key(b"one more"), &[1], bound * 2));
         assert_eq!(table.slots(), 4096);
         assert_eq!(ids_of(&table, b"one more"), Some(vec![1]));
+    }
+
+    #[test]
+    fn a_miss_hands_its_vacancy_to_the_insert_and_the_piece_reads_back() {
+        let mut table = ShortPieceTable::new();
+        let mut out = Vec::new();
+        let vacancy = table.lookup(key(b"piece"), &mut out).expect("a miss");
+        assert!(out.is_empty());
+        assert!(table.insert_at(vacancy, &[7, 8], 1000));
+        assert_eq!(ids_of(&table, b"piece"), Some(vec![7, 8]));
+        assert!(table.lookup(key(b"piece"), &mut out).is_none());
+        assert_eq!(out, [7, 8]);
+        // A slot taken since the probe (here by the same piece) sends the
+        // insert through the probe, which finds the piece: no duplicate.
+        let stale = table.lookup(key(b"other"), &mut out).expect("a miss");
+        assert!(table.insert(key(b"other"), &[9], 1000));
+        assert!(table.insert_at(stale, &[9], 1000));
+        assert_eq!(ids_of(&table, b"other"), Some(vec![9]));
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn a_vacancy_taken_at_the_fill_bound_inserts_by_probing_and_the_table_grows() {
+        let mut table = ShortPieceTable::new();
+        let bound = 1000;
+        let mut stored: usize = 0;
+        while table.len() < table.fill_bound() {
+            assert!(table.insert(key(&stored.to_le_bytes()), &[stored as u32], bound));
+            stored += 1;
+        }
+        let slots = table.slots();
+        let mut out = Vec::new();
+        let vacancy = table
+            .lookup(key(b"at the bound"), &mut out)
+            .expect("a miss");
+        assert!(table.insert_at(vacancy, &[1, 2, 3], bound));
+        assert_eq!(table.slots(), 4 * slots);
+        assert_eq!(ids_of(&table, b"at the bound"), Some(vec![1, 2, 3]));
+        for i in 0..stored {
+            assert_eq!(
+                ids_of(&table, &i.to_le_bytes()),
+                Some(vec![i as u32]),
+                "{i}"
+            );
+        }
+        assert_eq!(table.len(), stored + 1);
+    }
+
+    #[test]
+    fn a_table_at_the_regime_boundary_doubles() {
+        let mut table = ShortPieceTable::for_entries(3_000);
+        assert_eq!(table.slots(), GROW_BY_FOUR_UP_TO);
+        let bound = 100_000;
+        let mut stored: usize = 0;
+        while table.slots() == GROW_BY_FOUR_UP_TO {
+            assert!(table.insert(key(&stored.to_le_bytes()), &[stored as u32], bound));
+            stored += 1;
+        }
+        assert_eq!(table.slots(), 2 * GROW_BY_FOUR_UP_TO);
+        assert_eq!(table.len(), stored);
+        for i in 0..stored {
+            assert_eq!(
+                ids_of(&table, &i.to_le_bytes()),
+                Some(vec![i as u32]),
+                "{i}"
+            );
+        }
     }
 
     #[test]

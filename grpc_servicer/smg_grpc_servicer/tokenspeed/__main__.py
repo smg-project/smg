@@ -4,7 +4,7 @@ Usage::
 
     python -m smg_grpc_servicer.tokenspeed --model <model> --host 127.0.0.1 --port 50051
 
-``--servicer-impl {python,rust}``, ``--metrics-port`` and ``--metrics-host``
+``--servicer-impl {python,rust}``, ``--servicer-metrics-port`` and ``--servicer-metrics-host``
 are this package's flags; every other flag is TokenSpeed's
 :class:`ServerArgs`, parsed by ``prepare_server_args`` so there is no flag
 drift vs the HTTP frontend. The contract is served from Rust by default
@@ -30,6 +30,7 @@ from smg_grpc_servicer.rust_lifecycle import (
 )
 from smg_grpc_servicer.tokenspeed.rust import (
     METRICS_PORT_ENV,
+    METRICS_PORT_FLAG,
     SERVICER_IMPL_ENV,
     add_metrics_arguments,
     add_servicer_impl_argument,
@@ -88,7 +89,7 @@ def main(argv: list[str] | None = None) -> None:
         if impl == "rust":
             raise SystemExit(asyncio.run(serve_rust(server_args)))
         # A metrics port under the Python servicer is a port nobody serves.
-        check_metrics_port_needs_rust(impl, ours, METRICS_PORT_ENV)
+        check_metrics_port_needs_rust(impl, ours, METRICS_PORT_ENV, flag=METRICS_PORT_FLAG)
     except ServicerConfigError as error:
         # A knob the servicer cannot use: one named ERROR line and exit code
         # 2, before any engine work, not a traceback.

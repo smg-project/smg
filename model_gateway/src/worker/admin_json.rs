@@ -1,9 +1,10 @@
-//! The JSON body extractor of the worker administration endpoints
-//! (`POST /workers`, `PUT` and `PATCH /workers/{id}`): a body the type does
-//! not take is refused in the control plane's own error envelope
-//! (`{"error": ..., "code": ...}`, the shape its 400s already use), not with
-//! the framework's plain-text 422, so a client reads one shape from these
-//! endpoints whatever went wrong.
+//! The JSON body extractor of the control-plane management endpoints (the
+//! worker, WASM module and tokenizer routes): a body the type does not take
+//! is refused in the control plane's own error envelope (`{"error": ...,
+//! "code": ...}`, the shape its 400s already use), not with the framework's
+//! plain-text 422, so a client reads one shape from these endpoints whatever
+//! went wrong. [`refusal`] renders the same envelope for a handler's own
+//! refusals.
 
 use axum::{
     extract::{
@@ -17,7 +18,7 @@ use axum::{
 use openai_protocol::worker::WorkerErrorResponse;
 use serde::de::DeserializeOwned;
 
-/// A JSON body of the worker administration endpoints.
+/// A JSON body of the control-plane management endpoints.
 pub(crate) struct AdminJson<T>(pub T);
 
 impl<S, T> FromRequest<S> for AdminJson<T>
@@ -68,6 +69,12 @@ fn refuse(rejection: JsonRejection) -> Response {
             format!("Failed to parse JSON: {other}"),
         ),
     };
+    refusal(status, code, error)
+}
+
+/// The control plane's refusal envelope: `status` with `{"error", "code"}`,
+/// the shape the worker routes answer, for a handler's own refusal.
+pub(crate) fn refusal(status: StatusCode, code: &str, error: String) -> Response {
     (
         status,
         Json(WorkerErrorResponse {
@@ -153,6 +160,23 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{text}");
+    }
+
+    /// `refusal` renders a handler's own refusal in the same envelope.
+    #[tokio::test]
+    async fn a_handler_refusal_carries_the_status_the_code_and_the_reason() {
+        let response = refusal(
+            StatusCode::NOT_FOUND,
+            "WORKER_NOT_FOUND",
+            "no such worker".to_string(),
+        );
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let refusal = envelope("refusal", &String::from_utf8_lossy(&bytes));
+        assert_eq!(refusal.code, "WORKER_NOT_FOUND");
+        assert_eq!(refusal.error, "no such worker");
     }
 
     /// A body without the JSON content type is refused in the same envelope.

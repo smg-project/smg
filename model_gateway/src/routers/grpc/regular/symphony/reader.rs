@@ -422,6 +422,15 @@ impl Reader {
         out: &mut Events<'d>,
     ) -> Result<bool, SymphonyError> {
         delta.clear();
+        // The step's tokens, reserved before the first push: a whole output read in one step
+        // (the request that does not stream) grew both vectors by doubling from empty, eight
+        // regrows and 3.3 KiB moved for an answer of forty tokens. A step of one token skips
+        // the reserve: its push grows an empty vector the same way, and a stream's delta keeps
+        // its capacity from the step before, so the check found the room there on every step.
+        if token_ids.len() > 1 {
+            delta.spans.reserve(token_ids.len());
+            delta.tokens.reserve(token_ids.len());
+        }
         let mut stopped = false;
         for &token_id in token_ids {
             let start = delta.text.len();
@@ -628,7 +637,7 @@ impl Reader {
                         text,
                         why: DropReason::Whitespace,
                     } => {
-                        self.unshown.push_str(&text.text);
+                        hold_text(&mut self.unshown, &text.text);
                     }
                     Event::Content(_)
                     | Event::Reasoning(_)
@@ -661,7 +670,10 @@ impl Reader {
     /// marker and it follows it, so a run of whitespace is one entry however it arrived.
     fn hold_framing(&mut self, text: &str, at: usize, marker: bool) {
         let start = self.framing_text.len();
-        self.framing_text.push_str(text);
+        hold_text(&mut self.framing_text, text);
+        if self.framing.capacity() == 0 {
+            self.framing.reserve(HELD_RUNS_FLOOR);
+        }
         match self.framing.last_mut() {
             Some(last) if !marker && !last.marker && last.at + last.text.len() == at => {
                 last.text.end = self.framing_text.len();
@@ -690,10 +702,10 @@ impl Reader {
             0
         };
         for run in self.framing.drain(from..) {
-            self.refused.push_str(&self.framing_text[run.text]);
+            hold_text(&mut self.refused, &self.framing_text[run.text]);
         }
         self.clear_framing();
-        self.refused.push_str(text);
+        hold_text(&mut self.refused, text);
     }
 
     /// The held runs go, their one buffer kept for the next.
@@ -709,6 +721,23 @@ impl Reader {
         self.refused.clear();
         self.clear_framing();
     }
+}
+
+/// The capacity a held buffer takes on its first push: the runs a turn of a few calls drops (its
+/// markers, the whitespace between its blocks) and a refused block fit without a regrow, where the
+/// buffers grew by doubling from empty (the tool-call path's allocation census: eight regrows and
+/// 3.3 KiB moved per request). Nothing is reserved before the first push, so an output that holds
+/// nothing allocates nothing here.
+const HELD_BYTES_FLOOR: usize = 256;
+/// The runs `framing` holds before its first regrow.
+const HELD_RUNS_FLOOR: usize = 8;
+
+/// `text` onto `held`, the buffer reserved to the floor on its first push.
+fn hold_text(held: &mut String, text: &str) {
+    if held.capacity() == 0 {
+        held.reserve(HELD_BYTES_FLOOR.max(text.len()));
+    }
+    held.push_str(text);
 }
 
 /// A run the table dropped, held until what follows says whose it is: a refused block's opener

@@ -28,8 +28,8 @@ use crate::{
         metrics::{metrics_labels, Metrics},
     },
     policies::{
-        policy_filters_unavailable_workers, CacheNamespace, LoadBalancingPolicy, PolicyRegistry,
-        SelectWorkerInfo, WorkerRole,
+        as_consistent_hashing, policy_filters_unavailable_workers, CacheNamespace,
+        LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
     routers::{
         common::{header_utils, overload, pd_admission, retry::mark_non_retryable},
@@ -84,17 +84,24 @@ impl WireConstraint {
     }
 }
 
+/// Whether an explicit target under consistent hashing holds the request
+/// to that worker: it indexes the unfiltered candidate set and stays
+/// strict, so the request waits for that worker (checked after selection,
+/// or at the gate) instead of moving to another one. The one spelling of
+/// the rule for the admission pre-filters and the retry's narrowing.
+pub(crate) fn strict_target(policy: &dyn LoadBalancingPolicy, headers: Option<&HeaderMap>) -> bool {
+    as_consistent_hashing(policy).is_some()
+        && header_utils::extract_target_worker(headers).is_some()
+}
+
 /// Whether an admission pre-filter may drop full workers from a role's
 /// candidate set before `policy` runs over it (Prefill admission's capacity,
-/// the decode pick's rooms). An explicit target under consistent hashing is
-/// exempt: it indexes the unfiltered set and stays strict, so the request
-/// waits for that worker (checked after selection, or at the gate) instead
-/// of moving to another one.
+/// the decode pick's rooms): never under a [`strict_target`].
 pub(crate) fn admission_prefilters(
     policy: &dyn LoadBalancingPolicy,
     headers: Option<&HeaderMap>,
 ) -> bool {
-    policy.name() != "consistent_hashing" || header_utils::extract_target_worker(headers).is_none()
+    !strict_target(policy, headers)
 }
 
 /// A per-request candidate predicate: a worker it rejects is never selected.
@@ -305,13 +312,12 @@ pub(crate) fn select_from(
     };
     // The engines this request already tried step aside for its retry while
     // another available candidate remains; otherwise the pool is used whole.
-    // An explicit target under consistent hashing indexes this slice and
-    // stays strict (as `admission_prefilters` keeps it), so it is never
-    // narrowed: the retry goes back to the targeted worker.
-    let strict_target = policy.name() == "consistent_hashing"
-        && header_utils::extract_target_worker(inputs.headers).is_some();
+    // A strict target indexes this slice (as `admission_prefilters` keeps
+    // it), so it is never narrowed: the retry goes back to the targeted
+    // worker.
+    let keeps_target = strict_target(policy.as_ref(), inputs.headers);
     let untried;
-    let available: &[Arc<dyn Worker>] = if inputs.tried.is_empty() || strict_target {
+    let available: &[Arc<dyn Worker>] = if inputs.tried.is_empty() || keeps_target {
         available
     } else {
         untried = available

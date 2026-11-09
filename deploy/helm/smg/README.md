@@ -61,7 +61,7 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 | `router` | Router deployment, routing policy, networking, observability |
 | `workers` | Worker (inference engine) deployments |
 | `huggingface` | HuggingFace token for gated model downloads |
-| `auth` | API key authentication, rate limiting |
+| `auth` | API key authentication, control-plane keys, rate limiting |
 | `history` | Storage backend (none/memory/postgres/redis/oracle) and the Secret its connection URL or credentials come from |
 | `serviceAccount` | Service account creation and annotations |
 | `rbac` | RBAC for reading pods through the Kubernetes API (Kubernetes discovery, mesh peer discovery) |
@@ -236,6 +236,31 @@ The gateway also reads its other secrets from the environment or from files, whi
 The gateway reads the key file once, at start-up, so a rotated key reaches a pod when the pod restarts. A rotated `auth.apiKey` rolls the router pods by itself: the pod template carries a `checksum/auth` annotation over the chart-managed Secret, so `helm upgrade` with a new key is a rolling update. A rotated `auth.existingSecret` is not seen by the chart; roll the pods by hand after updating it, or the running pods keep accepting the old key until they restart. By label, which covers both workload kinds and every release name: `kubectl rollout restart deployment,statefulset -l app.kubernetes.io/instance=<release>,app.kubernetes.io/component=router` (the workload is `<fullname>-router`, where `<fullname>` is `<release>-smg` unless the release name contains `smg` or `fullnameOverride` is set).
 
 An older gateway image does not know `--api-key-file`; a chart of this version with such an image refuses to start rather than starting without the key.
+
+#### Control Plane
+
+`router.adminPort` starts the admin listener (`--admin-port`): the control-plane routes (the admin routes, `/workers` and `/v1/rl`) are served on that container port, with the probes, and the data port answers 404 for them. The chart renders a second Service, `<fullname>-router-admin` (`router.adminService`, ClusterIP by default), so the control plane has a name of its own inside the cluster; the ingress never names it. `router.adminHost` binds the listener on another address.
+
+The control-plane API keys (`auth.controlPlane`) reach the gateway as a file, like the shared key: `auth.controlPlane.apiKeys` (one `id:name:role:key` entry per line, role `admin` or `user`) is written into a chart-managed Secret, or `auth.controlPlane.existingSecret` names one, mounted at `/etc/smg/control-plane` and read with `--control-plane-api-keys-file`. A rotated `auth.controlPlane.apiKeys` rolls the router pods (`checksum/control-plane`); a rotated existing Secret needs the rollout restart described above. [`examples/with-admin-plane.yaml`](examples/with-admin-plane.yaml) sets both.
+
+```bash
+kubectl create secret generic smg-control-plane \
+  --from-file=control-plane-api-keys=./control-plane-keys.txt
+helm install smg deploy/helm/smg \
+  --set router.adminPort=9001 \
+  --set auth.controlPlane.existingSecret=smg-control-plane
+```
+
+#### Admission Config
+
+`router.tenantRateLimit` and `router.priorityScheduler` carry the admission configuration the gateway reads from files: `enabled` renders the feature's flag (`--tenant-rate-limit-enabled`, `--priority-scheduler-enabled`), and `configMap.name` names a ConfigMap of yours, mounted whole at `/etc/smg/rate-limit` or `/etc/smg/scheduler` and read through `--tenant-rate-limit-config` or `--priority-scheduler-config` (`configMap.key` names the file: `rate-limit.yaml` and `scheduler.yaml` by default). The chart refuses what the gateway would refuse or ignore: the rate limit enabled without its ConfigMap, and a scheduler ConfigMap without the scheduler enabled.
+
+```bash
+kubectl create configmap smg-rate-limit --from-file=rate-limit.yaml=./rate-limit.yaml
+helm install smg deploy/helm/smg \
+  --set router.tenantRateLimit.enabled=true \
+  --set router.tenantRateLimit.configMap.name=smg-rate-limit
+```
 
 #### Store URLs
 

@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 use smg::{
     config::{
-        secrets::{entries_of, SecretFile},
+        secrets::{
+            entries_of, SecretFile, API_KEY_FILE, CONTROL_PLANE_API_KEYS_FILE, TENANT_API_KEYS_FILE,
+        },
         ConfigError, ConfigResult,
     },
     server::posture::SecretSource,
@@ -20,7 +22,7 @@ use smg::{
 pub(crate) struct SecretSetting {
     /// The file's names: what the secret is, the field a bad file is
     /// reported under, the shape of an entry.
-    file: SecretFile,
+    rules: SecretFile,
     /// The flag taking the value.
     flag: &'static str,
     /// The environment variable taking the value.
@@ -32,11 +34,7 @@ pub(crate) struct SecretSetting {
 }
 
 pub(crate) const API_KEY_SETTING: SecretSetting = SecretSetting {
-    file: SecretFile {
-        what: "the shared API key",
-        field: "api-key-file",
-        entry: "",
-    },
+    rules: API_KEY_FILE,
     flag: "--api-key",
     env: "SMG_API_KEY",
     file_flag: "--api-key-file",
@@ -44,11 +42,7 @@ pub(crate) const API_KEY_SETTING: SecretSetting = SecretSetting {
 };
 
 pub(crate) const TENANT_API_KEYS_SETTING: SecretSetting = SecretSetting {
-    file: SecretFile {
-        what: "the tenant API keys",
-        field: "tenant-api-keys-file",
-        entry: "tenant_id:key",
-    },
+    rules: TENANT_API_KEYS_FILE,
     flag: "--tenant-api-key",
     env: "SMG_TENANT_API_KEYS",
     file_flag: "--tenant-api-keys-file",
@@ -56,11 +50,7 @@ pub(crate) const TENANT_API_KEYS_SETTING: SecretSetting = SecretSetting {
 };
 
 pub(crate) const CONTROL_PLANE_API_KEYS_SETTING: SecretSetting = SecretSetting {
-    file: SecretFile {
-        what: "the control-plane API keys",
-        field: "control-plane-api-keys-file",
-        entry: "id:name:role:key",
-    },
+    rules: CONTROL_PLANE_API_KEYS_FILE,
     flag: "--control-plane-api-keys",
     env: "CONTROL_PLANE_API_KEYS",
     file_flag: "--control-plane-api-keys-file",
@@ -68,7 +58,7 @@ pub(crate) const CONTROL_PLANE_API_KEYS_SETTING: SecretSetting = SecretSetting {
 };
 
 pub(crate) const POSTGRES_DB_URL_SETTING: SecretSetting = SecretSetting {
-    file: SecretFile {
+    rules: SecretFile {
         what: "the PostgreSQL connection URL",
         field: "postgres-db-url-file",
         entry: "",
@@ -80,7 +70,7 @@ pub(crate) const POSTGRES_DB_URL_SETTING: SecretSetting = SecretSetting {
 };
 
 pub(crate) const REDIS_URL_SETTING: SecretSetting = SecretSetting {
-    file: SecretFile {
+    rules: SecretFile {
         what: "the Redis connection URL",
         field: "redis-url-file",
         entry: "",
@@ -121,7 +111,11 @@ pub(crate) fn env_value(
 
 impl SecretSetting {
     /// The file the flag or, failing that, the environment names.
-    fn file(&self, flag_value: Option<&Path>, env: EnvLookup<'_>) -> ConfigResult<Option<PathBuf>> {
+    pub(crate) fn file(
+        &self,
+        flag_value: Option<&Path>,
+        env: EnvLookup<'_>,
+    ) -> ConfigResult<Option<PathBuf>> {
         Ok(match flag_value {
             Some(path) => Some(path.to_path_buf()),
             None => env(self.file_env)?.map(PathBuf::from),
@@ -134,7 +128,7 @@ impl SecretSetting {
         ConfigError::IncompatibleConfig {
             reason: format!(
                 "{} is given twice, by {} (or {}) and by {} (or {}); give one source",
-                self.file.what, self.flag, self.env, self.file_flag, self.file_env
+                self.rules.what, self.flag, self.env, self.file_flag, self.file_env
             ),
         }
     }
@@ -162,7 +156,7 @@ impl SecretSetting {
             (Some(_), Some(_)) => Err(self.given_twice()),
             (Some(value), None) => Ok(Some(value)),
             (None, None) => Ok(None),
-            (None, Some(path)) => Ok(Some((self.file.value(&path)?, SecretSource::File))),
+            (None, Some(path)) => Ok(Some((self.rules.value(&path)?, SecretSource::File))),
         }
     }
 
@@ -190,7 +184,7 @@ impl SecretSetting {
                             value: "<empty>".to_string(),
                             reason: format!(
                                 "set but holds no entry; {} are {} entries separated by ',' or a newline",
-                                self.file.what, self.file.entry
+                                self.rules.what, self.rules.entry
                             ),
                         });
                     }
@@ -205,7 +199,7 @@ impl SecretSetting {
             (Some(_), Some(_)) => Err(self.given_twice()),
             (Some(value), None) => Ok(Some(value)),
             (None, None) => Ok(None),
-            (None, Some(path)) => Ok(Some((self.file.entries(&path)?, SecretSource::File))),
+            (None, Some(path)) => Ok(Some((self.rules.entries(&path)?, SecretSource::File))),
         }
     }
 }

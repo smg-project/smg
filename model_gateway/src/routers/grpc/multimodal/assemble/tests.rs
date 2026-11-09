@@ -69,6 +69,22 @@ fn inline_image(payload: &'static [u8], hash: &str) -> Arc<ImageFrame> {
     ))
 }
 
+/// Two items bound one after the other, each at its own prompt offset: a
+/// two-token structural span and one patch of the same span, the batch shape
+/// the assembly tests share.
+fn two_item_bindings(offsets: [usize; 2]) -> Vec<PromptBinding> {
+    offsets
+        .into_iter()
+        .enumerate()
+        .map(|(item, offset)| PromptBinding {
+            item_index: item,
+            prompt_ordinal: item,
+            structural: PlaceholderRange { offset, length: 2 },
+            patches: vec![PlaceholderRange { offset, length: 2 }],
+        })
+        .collect()
+}
+
 /// One image whose flat span is the whole encoder input: the tensor
 /// handed over by value moves into the item's payload, and the item is
 /// the same as the one written from a view of it. (Shared with the encode
@@ -272,32 +288,7 @@ fn two_image_intermediate() -> PrecomputedMultimodalIntermediate {
     PrecomputedMultimodalIntermediate {
         preprocessed,
         media: MediaBatch::Images(images),
-        bindings: vec![
-            PromptBinding {
-                item_index: 0,
-                prompt_ordinal: 0,
-                structural: PlaceholderRange {
-                    offset: 10,
-                    length: 2,
-                },
-                patches: vec![PlaceholderRange {
-                    offset: 10,
-                    length: 2,
-                }],
-            },
-            PromptBinding {
-                item_index: 1,
-                prompt_ordinal: 1,
-                structural: PlaceholderRange {
-                    offset: 20,
-                    length: 2,
-                },
-                patches: vec![PlaceholderRange {
-                    offset: 20,
-                    length: 2,
-                }],
-            },
-        ],
+        bindings: two_item_bindings([10, 20]),
         placeholder_token_id: Some(151655),
         field_layouts: EncoderFieldLayouts::new(
             FieldLayout::flat("patches_per_image"),
@@ -487,32 +478,7 @@ fn assemble_tokenspeed_v41_layouts_stay_inline_when_shm_disabled() {
     let intermediate = PrecomputedMultimodalIntermediate {
         preprocessed,
         media: MediaBatch::Images(images),
-        bindings: vec![
-            PromptBinding {
-                item_index: 0,
-                prompt_ordinal: 0,
-                structural: PlaceholderRange {
-                    offset: 10,
-                    length: 2,
-                },
-                patches: vec![PlaceholderRange {
-                    offset: 10,
-                    length: 2,
-                }],
-            },
-            PromptBinding {
-                item_index: 1,
-                prompt_ordinal: 1,
-                structural: PlaceholderRange {
-                    offset: 20,
-                    length: 2,
-                },
-                patches: vec![PlaceholderRange {
-                    offset: 20,
-                    length: 2,
-                }],
-            },
-        ],
+        bindings: two_item_bindings([10, 20]),
         placeholder_token_id: Some(129264),
         field_layouts: EncoderFieldLayouts::new(
             FieldLayout::flat("patches_per_image"),
@@ -749,32 +715,7 @@ fn assemble_tokenspeed_splits_video_items() {
     let intermediate = PrecomputedMultimodalIntermediate {
         preprocessed,
         media: MediaBatch::Videos(videos),
-        bindings: vec![
-            PromptBinding {
-                item_index: 0,
-                prompt_ordinal: 0,
-                structural: PlaceholderRange {
-                    offset: 30,
-                    length: 2,
-                },
-                patches: vec![PlaceholderRange {
-                    offset: 30,
-                    length: 2,
-                }],
-            },
-            PromptBinding {
-                item_index: 1,
-                prompt_ordinal: 1,
-                structural: PlaceholderRange {
-                    offset: 40,
-                    length: 2,
-                },
-                patches: vec![PlaceholderRange {
-                    offset: 40,
-                    length: 2,
-                }],
-            },
-        ],
+        bindings: two_item_bindings([30, 40]),
         placeholder_token_id: Some(151656),
         field_layouts: EncoderFieldLayouts::new(
             FieldLayout::flat("patches_per_video"),
@@ -973,32 +914,7 @@ fn assemble_tokenspeed_splits_audio_items_as_bfloat16_by_default() {
     let intermediate = PrecomputedMultimodalIntermediate {
         preprocessed,
         media: MediaBatch::Audios(audios),
-        bindings: vec![
-            PromptBinding {
-                item_index: 0,
-                prompt_ordinal: 0,
-                structural: PlaceholderRange {
-                    offset: 30,
-                    length: 2,
-                },
-                patches: vec![PlaceholderRange {
-                    offset: 30,
-                    length: 2,
-                }],
-            },
-            PromptBinding {
-                item_index: 1,
-                prompt_ordinal: 1,
-                structural: PlaceholderRange {
-                    offset: 40,
-                    length: 2,
-                },
-                patches: vec![PlaceholderRange {
-                    offset: 40,
-                    length: 2,
-                }],
-            },
-        ],
+        bindings: two_item_bindings([30, 40]),
         placeholder_token_id: Some(42),
         field_layouts: EncoderFieldLayouts::new(
             FieldLayout::flat("row_lengths"),

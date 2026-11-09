@@ -2876,7 +2876,7 @@ mod tests {
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
         middleware::ReportedRefusal,
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
-        policies::CacheAwarePolicy,
+        policies::as_cache_aware,
         routers::common::{
             body_policy::{
                 REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT, REASON_RETRYABLE,
@@ -2886,9 +2886,10 @@ mod tests {
             test_support::fast_retry_config,
         },
         service_discovery::testing::create_test_app_context,
-        test_support::RefusedAddress,
         worker::{
-            circuit_breaker::CircuitState, test_support::no_health_check, BasicWorkerBuilder,
+            circuit_breaker::CircuitState,
+            test_support::{no_health_check, RefusedAddress},
+            BasicWorkerBuilder,
         },
     };
 
@@ -4407,11 +4408,7 @@ mod tests {
             vec![plain_worker(&url_a), plain_worker(&url_b)],
         );
         let workers = router.worker_registry.get_all();
-        router
-            .policy_registry
-            .get_default_policy()
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
+        as_cache_aware(router.policy_registry.get_default_policy().as_ref())
             .unwrap()
             .init_workers(&workers);
 

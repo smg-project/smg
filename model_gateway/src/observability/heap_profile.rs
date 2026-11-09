@@ -189,7 +189,7 @@ mod jemalloc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::text_of;
+    use crate::middleware::test_support::text_of;
 
     /// Each refusal names its remedy: the feature, the flag, the conf.
     #[tokio::test]

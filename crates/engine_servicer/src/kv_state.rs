@@ -2,16 +2,22 @@
 //! serves a subscriber from that record.
 //!
 //! [`LiveState`] is a function of the normalized stream the relay forwards,
-//! kept per data-parallel rank, tier and engine hash: a `Stored` adds one
-//! physical copy of each of its blocks together with what emitting the block
-//! again takes (parent, tokens, LoRA id, cache level, extra keys, and the
-//! event's tier, medium, group, locality, ownership, session and namespace);
-//! a `Removed` takes one copy away and drops the block at zero; an
-//! `AllBlocksCleared` empties the rank. Copies are capped per block the way
-//! the gateway caps them ([`COPIES_CAP`]), so a snapshot rebuilds the copy
-//! counts the gateway would hold after the same stream. Memory is one entry
-//! per live `(rank, tier, hash)`, about 230 bytes at block size 16; nothing
-//! is kept per relayed batch.
+//! kept per data-parallel rank, tier, cache-group lane and engine hash: a
+//! `Stored` adds one physical copy of each of its blocks together with what
+//! emitting the block again takes (parent, tokens, LoRA id, cache level,
+//! extra keys, and the event's tier, medium, group, locality, ownership,
+//! session and namespace); a `Removed` takes one copy away and drops the
+//! block at zero; an `AllBlocksCleared` empties the rank. Copies are capped
+//! per block the way the gateway caps them ([`COPIES_CAP`]), so a snapshot
+//! rebuilds the copy counts the gateway would hold after the same stream.
+//! The lane keeps a hybrid model's groups apart: the main-attention group's
+//! blocks (and every block of a publisher without groups) are lane 0, and a
+//! sliding-window or state group's block, published under the same hash, is
+//! its own entry on its group's lane, not a second copy of the main one, so
+//! a snapshot replays the group's memberships as the stream carried them.
+//! Memory is one entry per live `(rank, tier, lane, hash)`, about 230 bytes
+//! at block size 16 on the main lane and about 100 bytes on a group lane
+//! (no tokens); nothing is kept per relayed batch.
 //!
 //! A snapshot ([`LiveState::snapshot`]) is one pass over the entries that
 //! clones the per-block `Arc`s. The relay takes it under its lock together
@@ -49,6 +55,8 @@ use std::{
 
 use prost::Message;
 use smg_grpc_client::common_proto::{self as common, kv_cache_event, KvCacheTier};
+
+use crate::kv_wire::MAIN_ATTENTION_KINDS;
 
 /// The most physical copies of one block counted per tier: the gateway's
 /// `COPIES_CAP` in `kv_event_monitor.rs`, mirrored so a snapshot rebuilds
@@ -125,6 +133,10 @@ pub(crate) struct LiveBlock {
     pub parent: Option<i64>,
     /// The tier it is live on (a `KvCacheTier` value).
     pub tier: i32,
+    /// The cache-group lane it is live on: 0 for the main-attention group
+    /// and for a publisher without groups, `group_idx + 1` for a group of
+    /// another kind (see [`LiveState`]).
+    pub lane: u32,
     pub tokens: Box<[u32]>,
     pub block_size: i32,
     pub lora_id: Option<i64>,
@@ -157,14 +169,22 @@ struct Entry {
     copies: u32,
 }
 
+/// What names one live entry of a rank: the tier, the cache-group lane and
+/// the engine hash.
+type BlockKey = (i32, u32, i64);
+
+/// The main-attention lane: every block of a publisher without groups, and
+/// the main group's blocks of one with them.
+const MAIN_LANE: u32 = 0;
+
 /// One rank's live blocks: a dense slot vector in store order (freed slots
-/// are reused) under a `(tier, hash)` index, so a snapshot is one
+/// are reused) under a `(tier, lane, hash)` index, so a snapshot is one
 /// sequential scan whose `Arc` clones follow the records' allocation order
 /// instead of a hash map's.
 #[derive(Default)]
 struct RankBlocks {
     slots: Vec<Option<Entry>>,
-    index: HashMap<(i32, i64), u32>,
+    index: HashMap<BlockKey, u32>,
     free: Vec<u32>,
     live: usize,
 }
@@ -178,18 +198,18 @@ impl RankBlocks {
         self.live == 0
     }
 
-    fn get(&self, key: (i32, i64)) -> Option<&Entry> {
+    fn get(&self, key: BlockKey) -> Option<&Entry> {
         let slot = *self.index.get(&key)?;
         self.slots[slot as usize].as_ref()
     }
 
-    fn get_mut(&mut self, key: (i32, i64)) -> Option<&mut Entry> {
+    fn get_mut(&mut self, key: BlockKey) -> Option<&mut Entry> {
         let slot = *self.index.get(&key)?;
         self.slots[slot as usize].as_mut()
     }
 
-    /// Store a block the rank does not hold on that tier.
-    fn insert(&mut self, key: (i32, i64), entry: Entry) {
+    /// Store a block the rank does not hold on that tier and lane.
+    fn insert(&mut self, key: BlockKey, entry: Entry) {
         let slot = match self.free.pop() {
             Some(slot) => {
                 self.slots[slot as usize] = Some(entry);
@@ -204,7 +224,7 @@ impl RankBlocks {
         self.live += 1;
     }
 
-    fn remove(&mut self, key: (i32, i64)) -> Option<Entry> {
+    fn remove(&mut self, key: BlockKey) -> Option<Entry> {
         let slot = self.index.remove(&key)?;
         let entry = self.slots[slot as usize].take();
         if entry.is_some() {
@@ -238,6 +258,10 @@ pub(crate) struct StateCounts {
 #[derive(Default)]
 pub struct LiveState {
     ranks: BTreeMap<Option<i32>, RankBlocks>,
+    /// Per rank and cache group, whether the group's kind is main attention,
+    /// learned from the stores (which name the kind) for the removals (which
+    /// do not). Kept across a clear: the groups describe the model.
+    groups: HashMap<(Option<i32>, u32), bool>,
     /// The last store's tail, shared with the next store that repeats it.
     last_tail: Option<Arc<StoredTail>>,
     order: u64,
@@ -290,6 +314,29 @@ impl LiveState {
         tail
     }
 
+    /// The lane an event's cache group puts it on: a store names its kind
+    /// and teaches the group; a removal, or a store without a kind, follows
+    /// what the group taught; a group never seen, or no group, is the main
+    /// lane (a publisher with a single group names none).
+    fn lane_of(&mut self, rank: Option<i32>, group_idx: Option<u32>, kind: Option<&str>) -> u32 {
+        let Some(group) = group_idx else {
+            return MAIN_LANE;
+        };
+        let main = match kind {
+            Some(kind) => {
+                let main = MAIN_ATTENTION_KINDS.contains(&kind);
+                self.groups.insert((rank, group), main);
+                main
+            }
+            None => self.groups.get(&(rank, group)).copied().unwrap_or(true),
+        };
+        if main {
+            MAIN_LANE
+        } else {
+            group + 1
+        }
+    }
+
     fn store(&mut self, rank: Option<i32>, stored: &common::KvBlocksStored) {
         if stored.blocks.is_empty() {
             return;
@@ -298,11 +345,12 @@ impl LiveState {
             stored.tier,
             stored.blocks.first().and_then(|block| block.cache_level),
         );
+        let lane = self.lane_of(rank, stored.group_idx, stored.kv_cache_spec_kind.as_deref());
         let tail = self.tail_for(stored);
         let blocks = self.ranks.entry(rank).or_default();
         let mut parent = stored.parent_block_hash;
         for block in &stored.blocks {
-            let key = (tier, block.block_hash);
+            let key = (tier, lane, block.block_hash);
             if let Some(entry) = blocks.get_mut(key) {
                 if entry.copies < COPIES_CAP {
                     entry.copies += 1;
@@ -319,6 +367,7 @@ impl LiveState {
                             hash: block.block_hash,
                             parent,
                             tier,
+                            lane,
                             tokens: block.token_ids.clone().into_boxed_slice(),
                             block_size: block.block_size,
                             lora_id: block.lora_id,
@@ -340,12 +389,13 @@ impl LiveState {
 
     fn remove(&mut self, rank: Option<i32>, removed: &common::KvBlocksRemoved) {
         let tier = tier_key(removed.tier, removed.cache_level);
+        let lane = self.lane_of(rank, removed.group_idx, None);
         let Some(blocks) = self.ranks.get_mut(&rank) else {
             self.counts.removed_unknown += removed.block_hashes.len() as u64;
             return;
         };
         for &hash in &removed.block_hashes {
-            let key = (tier, hash);
+            let key = (tier, lane, hash);
             let Some(entry) = blocks.get_mut(key) else {
                 self.counts.removed_unknown += 1;
                 continue;
@@ -370,11 +420,12 @@ impl LiveState {
     /// Forget everything: the publisher started over.
     pub fn clear(&mut self) {
         self.ranks.clear();
+        self.groups.clear();
         self.last_tail = None;
         self.blocks = 0;
     }
 
-    /// Live `(rank, tier, hash)` entries.
+    /// Live `(rank, tier, lane, hash)` entries.
     pub fn entries(&self) -> usize {
         self.ranks.values().map(RankBlocks::len).sum()
     }
@@ -393,11 +444,24 @@ impl LiveState {
         &self.counts
     }
 
-    /// Live copies of `hash` on `tier` for `rank`.
+    /// Live copies of `hash` on `tier` for `rank`, on the main lane.
     pub fn copies(&self, rank: Option<i32>, tier: KvCacheTier, hash: i64) -> u32 {
         self.ranks
             .get(&rank)
-            .and_then(|blocks| blocks.get((tier as i32, hash)))
+            .and_then(|blocks| blocks.get((tier as i32, MAIN_LANE, hash)))
+            .map_or(0, |entry| entry.copies)
+    }
+
+    /// Live copies of `hash` on `tier` for `rank` on cache group `group`'s
+    /// own lane: 0 for a main-attention group, whose blocks are on the main
+    /// lane.
+    pub fn group_copies(&self, rank: Option<i32>, tier: KvCacheTier, group: u32, hash: i64) -> u32 {
+        if self.groups.get(&(rank, group)).copied().unwrap_or(true) {
+            return 0;
+        }
+        self.ranks
+            .get(&rank)
+            .and_then(|blocks| blocks.get((tier as i32, group + 1, hash)))
             .map_or(0, |entry| entry.copies)
     }
 
@@ -482,11 +546,22 @@ impl SnapshotChunks {
     /// its rank (the stamp moves that rank's cursor at the gateway).
     pub fn new(snapshot: Snapshot, cuts: &BTreeMap<Option<i32>, RankCut>, timestamp: f64) -> Self {
         let blocks = snapshot.blocks;
-        let ranks: Vec<(Option<i32>, Vec<Arc<LiveBlock>>)> = snapshot
+        let mut ranks: Vec<(Option<i32>, Vec<Arc<LiveBlock>>)> = snapshot
             .ranks
             .into_iter()
             .map(|(rank, entries)| (rank, order_rank(entries)))
             .collect();
+        // A rank with a group-lane entry goes first: the ranks of one engine
+        // share one view at a gateway that pools them, and the view must
+        // exist before any rank's main lane is applied (its leading entry,
+        // see `order_rank`). Each rank's chunks are stamped from its own cut,
+        // so the rank order moves no cursor.
+        if let Some(first) = ranks
+            .iter()
+            .position(|(_, units)| units.first().is_some_and(|unit| unit.lane != MAIN_LANE))
+        {
+            ranks.swap(0, first);
+        }
         let cut_of = |rank: &Option<i32>| cuts.get(rank).copied().unwrap_or_default();
         let largest_units = ranks
             .iter()
@@ -658,19 +733,40 @@ fn cut_chunks(
     cuts
 }
 
-/// One rank's entries in emission order, one unit per physical copy: store
-/// order, with the live ancestors of a block hoisted ahead of it when they
+/// One rank's entries in emission order, one unit per physical copy: one
+/// group-lane entry first when the rank has any, then the main lane in store
+/// order with the live ancestors of a block hoisted ahead of it when they
 /// were stored later (a parent evicted and stored again under a surviving
 /// child), so the gateway's index derives every position from a parent it
-/// already holds.
-fn order_rank(mut entries: Vec<SnapshotEntry>) -> Vec<Arc<LiveBlock>> {
+/// already holds, then the remaining group lanes in store order. The gateway
+/// names a batch's main blocks in a worker's group view only once a group's
+/// store has given it one, so the leading entry puts the view in the rank's
+/// first chunk ([`SnapshotChunks::new`] puts a rank that has one first) and
+/// every main block is named in chain order; the group entries that follow
+/// the main lane then land on named blocks, and the leading one waits for
+/// its own. Left among the main lane they would hoist a main block ahead of
+/// its own parent; all ahead of it, a whole lane would wait.
+fn order_rank(entries: Vec<SnapshotEntry>) -> Vec<Arc<LiveBlock>> {
+    let (mut entries, mut grouped): (Vec<SnapshotEntry>, Vec<SnapshotEntry>) = entries
+        .into_iter()
+        .partition(|entry| entry.block.lane == MAIN_LANE);
     entries.sort_unstable_by_key(|entry| entry.block.order);
+    grouped.sort_unstable_by_key(|entry| entry.block.order);
     let mut by_hash: HashMap<i64, Vec<usize>> = HashMap::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         by_hash.entry(entry.block.hash).or_default().push(index);
     }
-    let units: usize = entries.iter().map(|entry| entry.copies as usize).sum();
+    let units: usize = entries
+        .iter()
+        .chain(&grouped)
+        .map(|entry| entry.copies as usize)
+        .sum();
     let mut out = Vec::with_capacity(units);
+    let mut grouped = grouped.into_iter();
+    let leading = grouped.next();
+    if let Some(entry) = &leading {
+        out.push(Arc::clone(&entry.block));
+    }
     let mut done = vec![false; entries.len()];
     let mut path: Vec<i64> = Vec::new();
     let push_units = |index: usize, out: &mut Vec<Arc<LiveBlock>>| {
@@ -711,6 +807,16 @@ fn order_rank(mut entries: Vec<SnapshotEntry>) -> Vec<Arc<LiveBlock>> {
                 done[sibling] = true;
                 push_units(sibling, &mut out);
             }
+        }
+    }
+    if let Some(entry) = &leading {
+        for _ in 1..entry.copies {
+            out.push(Arc::clone(&entry.block));
+        }
+    }
+    for entry in grouped {
+        for _ in 0..entry.copies {
+            out.push(Arc::clone(&entry.block));
         }
     }
     out
@@ -969,6 +1075,192 @@ mod tests {
         assert_eq!(state.counts().capped, 20 - u64::from(COPIES_CAP));
         let chunks = chunks_of(&state, 19);
         assert_eq!(emitted(&chunks).len(), COPIES_CAP as usize);
+    }
+
+    /// A store of a cache group other than main attention, as the relay
+    /// forwards it: the group's hashes and fields, no tokens.
+    fn group_stored(group: u32, kind: &str, window: Option<u32>, hashes: &[i64]) -> KvCacheEvent {
+        KvCacheEvent {
+            event_id: 1,
+            data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                blocks: hashes
+                    .iter()
+                    .map(|&hash| KvBlock {
+                        block_hash: hash,
+                        block_size: 4,
+                        ..Default::default()
+                    })
+                    .collect(),
+                parent_block_hash: None,
+                tier: Some(KvCacheTier::Device as i32),
+                medium: Some("GPU".to_string()),
+                group_idx: Some(group),
+                kv_cache_spec_kind: Some(kind.to_string()),
+                kv_cache_spec_sliding_window: window,
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn group_removed(group: u32, hashes: &[i64]) -> KvCacheEvent {
+        KvCacheEvent {
+            event_id: 1,
+            data: Some(kv_cache_event::Data::Removed(KvBlocksRemoved {
+                block_hashes: hashes.to_vec(),
+                tier: Some(KvCacheTier::Device as i32),
+                group_idx: Some(group),
+                ..Default::default()
+            })),
+        }
+    }
+
+    /// A hybrid model's window and state groups publish their blocks under
+    /// the main group's hashes: each group's block is an entry on the
+    /// group's own lane, not a second copy of the main one, its removal
+    /// takes only its own entry, and a snapshot replays one group-lane
+    /// entry first, the main lane, and the other group lanes after it, each
+    /// as stores of their own.
+    #[test]
+    fn group_lanes_are_kept_apart_from_the_main_lane_and_one_entry_leads_it() {
+        let device = KvCacheTier::Device;
+        let mut state = LiveState::new();
+        state.apply(&batch(
+            1,
+            Some(0),
+            vec![
+                group_stored(1, "sliding_window", Some(8), &[2, 3]),
+                group_stored(2, "mamba", None, &[3]),
+                stored(None, &[1, 2, 3], device),
+            ],
+        ));
+        assert_eq!((state.entries(), state.blocks()), (6, 6));
+        assert_eq!(state.copies(Some(0), device, 3), 1, "one main-lane copy");
+        assert_eq!(state.group_copies(Some(0), device, 1, 3), 1);
+        assert_eq!(state.group_copies(Some(0), device, 2, 3), 1);
+        assert_eq!(
+            state.group_copies(Some(0), device, 0, 3),
+            0,
+            "a main-attention group's blocks are on the main lane"
+        );
+        // The window moves on: its removal names its group and leaves the
+        // main lane's copy and the state group's entry alone.
+        state.apply(&batch(2, Some(0), vec![group_removed(1, &[2])]));
+        assert_eq!(state.copies(Some(0), device, 2), 1);
+        assert_eq!(state.group_copies(Some(0), device, 1, 2), 0);
+        assert_eq!(state.counts().removed_unknown, 0);
+        let chunks = chunks_of(&state, 2);
+        assert_eq!(chunks.len(), 1);
+        let chunk = &chunks[0];
+        assert_eq!(chunk.snapshot.as_ref().map(|marker| marker.blocks), Some(5));
+        let stores: Vec<&KvBlocksStored> = chunk
+            .events
+            .iter()
+            .filter_map(|event| match &event.data {
+                Some(kv_cache_event::Data::Stored(stored)) => Some(stored),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stores.len(), 3, "{stores:#?}");
+        assert_eq!(stores[1].group_idx, Some(0), "the main lane comes second");
+        assert_eq!(
+            stores[1]
+                .blocks
+                .iter()
+                .map(|block| block.block_hash)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(stores[1].blocks[0].token_ids, block(1).token_ids);
+        type LaneRow<'a> = (Option<u32>, Option<&'a str>, Option<u32>, Vec<(i64, usize)>);
+        let lanes: Vec<LaneRow> = [&stores[0], &stores[2]]
+            .into_iter()
+            .map(|stored| {
+                (
+                    stored.group_idx,
+                    stored.kv_cache_spec_kind.as_deref(),
+                    stored.kv_cache_spec_sliding_window,
+                    stored
+                        .blocks
+                        .iter()
+                        .map(|block| (block.block_hash, block.token_ids.len()))
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            lanes,
+            vec![
+                (Some(1), Some("sliding_window"), Some(8), vec![(3, 0)]),
+                (Some(2), Some("mamba"), None, vec![(3, 0)]),
+            ],
+            "one group entry leads and the other follows, hashes only, the removed block gone"
+        );
+        // The main lane's removal leaves the group lanes' entries alone.
+        state.apply(&batch(3, Some(0), vec![removed(&[3], device)]));
+        assert_eq!(state.copies(Some(0), device, 3), 0);
+        assert_eq!(state.group_copies(Some(0), device, 2, 3), 1);
+        // A clear empties every lane and keeps the groups: the next store of
+        // group 2 without a kind still lands on its lane.
+        state.apply(&batch(4, Some(0), vec![cleared()]));
+        assert_eq!((state.entries(), state.blocks()), (0, 0));
+        let mut kindless = group_stored(2, "mamba", None, &[9]);
+        if let Some(kv_cache_event::Data::Stored(stored)) = &mut kindless.data {
+            stored.kv_cache_spec_kind = None;
+        }
+        state.apply(&batch(5, Some(0), vec![kindless]));
+        assert_eq!(state.group_copies(Some(0), device, 2, 9), 1);
+        assert_eq!(state.copies(Some(0), device, 9), 0);
+    }
+
+    /// Two ranks of one engine, the first holding main blocks alone: the
+    /// snapshot puts the rank with a group entry first, so a gateway that
+    /// pools the ranks in one view has the view before any main lane.
+    #[test]
+    fn a_rank_with_a_group_entry_leads_a_snapshot_of_several_ranks() {
+        let device = KvCacheTier::Device;
+        let mut state = LiveState::new();
+        state.apply(&batch(1, Some(0), vec![stored(None, &[1, 2], device)]));
+        state.apply(&batch(
+            1,
+            Some(1),
+            vec![
+                group_stored(1, "sliding_window", Some(8), &[4]),
+                stored(None, &[3, 4], device),
+            ],
+        ));
+        let chunks = chunks_of(&state, 1);
+        let stores: Vec<(Option<u32>, Vec<i64>)> = chunks
+            .iter()
+            .flat_map(|chunk| chunk.events.iter())
+            .filter_map(|event| match &event.data {
+                Some(kv_cache_event::Data::Stored(stored)) => Some((
+                    stored.group_idx,
+                    stored.blocks.iter().map(|block| block.block_hash).collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stores,
+            vec![
+                (Some(1), vec![4]),
+                (Some(0), vec![3, 4]),
+                (Some(0), vec![1, 2])
+            ],
+            "the group entry of rank 1 leads, then its main lane, then rank 0"
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.dp_rank == Some(1))
+                .count()
+                + chunks
+                    .iter()
+                    .filter(|chunk| chunk.dp_rank == Some(0))
+                    .count(),
+            chunks.len(),
+            "every chunk carries its own rank"
+        );
     }
 
     #[test]

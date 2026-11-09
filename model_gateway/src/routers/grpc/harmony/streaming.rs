@@ -162,11 +162,15 @@ impl HarmonyStreamingProcessor {
         // The reading of the engine's answer, by execution mode; the response
         // body drives it (see `DrivenBody`).
         let reading: Reading = match execution_result {
-            context::ExecutionResult::Single { stream } => Box::pin(async move {
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start,
+            } => Box::pin(async move {
                 // The request's reading, isolated: a panic in it ends this
                 // response with an error event and `[DONE]`, not the task
                 // polling the body (see `utils::isolation`).
                 let result = utils::isolation::isolated(Self::process_single_stream(
+                    dispatch_start,
                     stream,
                     dispatch,
                     chat_request,
@@ -243,6 +247,7 @@ impl HarmonyStreamingProcessor {
 
     /// Process streaming chunks from a single stream
     async fn process_single_stream(
+        start_time: Instant,
         grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
@@ -253,6 +258,7 @@ impl HarmonyStreamingProcessor {
         let mut prompt_tokens = HashMap::new();
         let mut cached_tokens = HashMap::new();
         Self::process_chat_decode_stream(
+            start_time,
             grpc_stream,
             &dispatch,
             &original_request,
@@ -296,6 +302,7 @@ impl HarmonyStreamingProcessor {
         // Phase 2: Decode (shared helper). Pass pd_timing so the first decode
         // token yields honest PD TTFT.
         Self::process_chat_decode_stream(
+            pd_timing.prefill_start,
             decode_stream,
             &dispatch,
             &original_request,
@@ -325,6 +332,7 @@ impl HarmonyStreamingProcessor {
     /// yields honest PD TTFT (prefill start to first decode token).
     #[expect(clippy::too_many_arguments)]
     async fn process_chat_decode_stream(
+        start_time: Instant,
         mut decode_stream: ProtoStream,
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
@@ -335,7 +343,7 @@ impl HarmonyStreamingProcessor {
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
-        let mut decode = ChatDecode::new(pd_timing);
+        let mut decode = ChatDecode::new(start_time, pd_timing);
         while let Some(result) = decode_stream.next().await {
             let response = result.map_err(|e| {
                 utils::StreamFailure::upstream(e, decode.completion_tokens.delivered())
@@ -569,7 +577,7 @@ impl HarmonyStreamingProcessor {
         router_stop_strings: &[String],
     ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
         match execution_result {
-            context::ExecutionResult::Single { stream } => {
+            context::ExecutionResult::Single { stream, .. } => {
                 debug!("Processing Responses API single stream mode");
                 Self::process_decode_stream(
                     stream,
@@ -1410,9 +1418,9 @@ struct ChatDecode {
 }
 
 impl ChatDecode {
-    fn new(pd_timing: Option<context::PdTiming>) -> Self {
+    fn new(start_time: Instant, pd_timing: Option<context::PdTiming>) -> Self {
         Self {
-            start_time: Instant::now(),
+            start_time,
             first_token_time: None,
             pd_timing,
             parsers: HashMap::new(),
@@ -1851,16 +1859,9 @@ impl ChatDecode {
             .await?;
         }
 
-        // In PD mode this task only starts once the decode stream exists -- for sequential PD
-        // that is after prefill completes, with the first decode chunk already buffered -- so
-        // `start_time` would report a near-zero TTFT. Anchor at the prefill dispatch instant
-        // instead, as the chat stream does; generation duration must share the base or TPOT
-        // underflows.
-        let stream_base = self
-            .pd_timing
-            .as_ref()
-            .map(|timing| timing.prefill_start)
-            .unwrap_or(self.start_time);
+        // Headers may arrive with the first chunk. Both clocks start at the
+        // dispatch carried in `start_time` (the prefill dispatch for PD).
+        let stream_base = self.start_time;
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: metrics_labels::BACKEND_HARMONY,

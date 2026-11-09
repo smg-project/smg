@@ -278,6 +278,20 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     Ok(())
 }
 
+/// The encode side takes three policies. This is the one list: the mode walk
+/// of the validator reads it in EPD mode, and the Python binding asks it in
+/// every mode, which covers an encode policy given outside EPD.
+pub fn validate_encode_policy(policy: &PolicyConfig) -> ConfigResult<()> {
+    match policy {
+        PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::ConsistentHashing => Ok(()),
+        _ => Err(ConfigError::invalid_value(
+            "encode_policy",
+            policy.name(),
+            "expected random, round_robin or consistent_hashing",
+        )),
+    }
+}
+
 /// Parse a listener host as operators write it: an IP literal, with or
 /// without the brackets an IPv6 address carries inside a `host:port` string
 /// (`0.0.0.0`, `::`, `[::]`, `::1`, `[fd00::1]`). Every bind flag goes
@@ -668,13 +682,26 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validates `tenant_api_keys`: non-empty `tenant_id`/`key`, and no two
-    /// credentials (including the shared `api_key`) sharing a secret value —
-    /// duplicates would silently attribute one tenant's traffic to another.
-    /// Runs regardless of construction path, since `TenantApiKeyEntry` is a
-    /// public deserializable struct. Compares hashes only; errors never
-    /// include a raw key value.
+    /// Validates `tenant_api_keys` against the shared `api_key`: the rules
+    /// of [`Self::tenant_credentials`] over the start's configuration. Runs
+    /// regardless of construction path, since `TenantApiKeyEntry` is a
+    /// public deserializable struct.
     fn validate_tenant_api_keys(config: &RouterConfig) -> ConfigResult<()> {
+        Self::tenant_credentials(config.api_key.as_deref(), &config.tenant_api_keys)
+    }
+
+    /// The rules of a serving key set, the shared key and the tenant
+    /// entries that are in force together: non-empty `tenant_id`/`key`
+    /// without surrounding whitespace, a `tenant_id` within its column, and
+    /// no two credentials (the shared key included) sharing a secret value —
+    /// duplicates would silently attribute one tenant's traffic to another.
+    /// The start runs it over its configuration, and a reload over the set
+    /// it is about to put in force. Compares hashes only; errors never
+    /// include a raw key value.
+    pub(crate) fn tenant_credentials(
+        api_key: Option<&str>,
+        entries: &[TenantApiKeyEntry],
+    ) -> ConfigResult<()> {
         fn hash(key: &str) -> [u8; 32] {
             Sha256::digest(key.as_bytes()).into()
         }
@@ -682,11 +709,11 @@ impl ConfigValidator {
         let mut seen: std::collections::HashMap<[u8; 32], String> =
             std::collections::HashMap::new();
 
-        if let Some(api_key) = &config.api_key {
+        if let Some(api_key) = api_key {
             seen.insert(hash(api_key), "the shared api_key".to_string());
         }
 
-        for entry in &config.tenant_api_keys {
+        for entry in entries {
             let trimmed_tenant_id = entry.tenant_id.trim();
             if trimmed_tenant_id.is_empty() {
                 return Err(ConfigError::ValidationFailed {
@@ -883,7 +910,7 @@ impl ConfigValidator {
                 }
                 if let Some(policy) = encode_policy {
                     Self::validate_policy(policy)?;
-                    Self::validate_encode_policy(policy)?;
+                    validate_encode_policy(policy)?;
                 }
                 if let Some(policy) = prefill_policy {
                     Self::validate_policy(policy)?;
@@ -1157,18 +1184,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    fn validate_encode_policy(policy: &PolicyConfig) -> ConfigResult<()> {
-        match policy {
-            PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::ConsistentHashing => {
-                Ok(())
-            }
-            _ => Err(ConfigError::IncompatibleConfig {
-                reason: "Encode policy supports random, round_robin, or consistent_hashing"
-                    .to_string(),
-            }),
-        }
-    }
-
     /// Validate listener settings and mode-specific serving constraints.
     fn validate_server_settings(config: &RouterConfig) -> ConfigResult<()> {
         if let Err(reason) = parse_bind_host(&config.host) {
@@ -1372,6 +1387,13 @@ impl ConfigValidator {
             return Err(ConfigError::invalid_value(
                 "max_connections",
                 config.max_connections,
+                format!("Must be at most {} (0 = no bound)", Semaphore::MAX_PERMITS),
+            ));
+        }
+        if config.admin_max_connections > Semaphore::MAX_PERMITS {
+            return Err(ConfigError::invalid_value(
+                "admin_max_connections",
+                config.admin_max_connections,
                 format!("Must be at most {} (0 = no bound)", Semaphore::MAX_PERMITS),
             ));
         }
@@ -4483,7 +4505,18 @@ mod tests {
             },
             PolicyConfig::Random,
         );
-        assert!(ConfigValidator::validate(&invalid_cache_aware).is_err());
+        match ConfigValidator::validate(&invalid_cache_aware) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "encode_policy");
+                assert_eq!(value, "cache_aware");
+                assert_eq!(reason, "expected random, round_robin or consistent_hashing");
+            }
+            other => panic!("expected the field-named refusal, got {other:?}"),
+        }
 
         let invalid_least_load = RouterConfig::new(
             RoutingMode::EncodePrefillDecode {
@@ -4500,7 +4533,10 @@ mod tests {
             },
             PolicyConfig::Random,
         );
-        assert!(ConfigValidator::validate(&invalid_least_load).is_err());
+        assert!(matches!(
+            ConfigValidator::validate(&invalid_least_load),
+            Err(ConfigError::InvalidValue { field, .. }) if field == "encode_policy"
+        ));
     }
 
     #[test]
@@ -5082,6 +5118,35 @@ mod tests {
                 assert!(reason.contains("0 = no bound"), "{reason}");
             }
             other => panic!("expected an invalid max_connections, got {other:?}"),
+        }
+    }
+
+    /// The admin listener's bound has the same ceiling, refused by its own
+    /// name; no bound (0) and ordinary counts pass.
+    #[test]
+    fn an_admin_connection_limit_above_the_permit_maximum_is_rejected() {
+        let config = |admin_max_connections: usize| RouterConfig {
+            admin_max_connections,
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            ..Default::default()
+        };
+        for accepted in [0, 1, 4096, Semaphore::MAX_PERMITS] {
+            ConfigValidator::validate(&config(accepted))
+                .unwrap_or_else(|e| panic!("admin_max_connections {accepted}: {e}"));
+        }
+        match ConfigValidator::validate(&config(Semaphore::MAX_PERMITS + 1)) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "admin_max_connections");
+                assert_eq!(value, (Semaphore::MAX_PERMITS + 1).to_string());
+                assert!(reason.contains("0 = no bound"), "{reason}");
+            }
+            other => panic!("expected an invalid admin_max_connections, got {other:?}"),
         }
     }
 

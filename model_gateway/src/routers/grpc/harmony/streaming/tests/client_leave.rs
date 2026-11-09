@@ -90,7 +90,10 @@ async fn a_client_that_leaves_while_the_engine_is_parked_ends_the_iteration_at_o
     let (tx, rx) = sse_channel();
     let started = Instant::now();
     let read = HarmonyStreamingProcessor::process_responses_iteration_stream(
-        context::ExecutionResult::Single { stream },
+        context::ExecutionResult::Single {
+            stream,
+            dispatch_start: Instant::now(),
+        },
         &mut emitter,
         &tx,
         None,
@@ -127,7 +130,10 @@ async fn a_client_that_left_before_the_first_read_reads_nothing() {
     let (tx, rx) = sse_channel();
     drop(rx);
     let outcome = HarmonyStreamingProcessor::process_responses_iteration_stream(
-        context::ExecutionResult::Single { stream },
+        context::ExecutionResult::Single {
+            stream,
+            dispatch_start: Instant::now(),
+        },
         &mut emitter,
         &tx,
         None,
@@ -165,7 +171,10 @@ async fn a_client_that_stays_reads_the_answer_to_its_end() {
     };
     let read = async {
         let outcome = HarmonyStreamingProcessor::process_responses_iteration_stream(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             &mut emitter,
             &tx,
             None,

@@ -29,6 +29,7 @@ use smg::{
         AccessLogField, PowerOfTwoLoadMetric, TurboJpegPolicy, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     observability::metrics::register_jemalloc_as_global_allocator,
+    secrets::SecretFiles,
     server::{self, posture::SecretSources, ServerConfig},
     version,
 };
@@ -1242,6 +1243,16 @@ struct ServingArgs {
     #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
     max_connections: usize,
 
+    /// Most client connections the admin listener (--admin-port) holds open
+    /// at once, the bound --max-connections puts on the data listener: a
+    /// connection beyond it is closed at accept, unanswered, and counted in
+    /// smg_http_connections_rejected_total. 0 = no bound. The bound is the
+    /// admin listener's own, so the control plane stays reachable while the
+    /// data plane is saturated, and a client that reaches the admin listener
+    /// cannot hold it open without limit
+    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
+    admin_max_connections: usize,
+
     /// Origins a browser may call the gateway from (exact origins,
     /// space-separated), or `*` alone for any origin. Without this flag the
     /// gateway makes no cross-origin allowance
@@ -1793,6 +1804,24 @@ struct IntegrationArgs {
     #[arg(skip)]
     secret_sources: SecretSources,
 
+    /// The files the keys above were read from, where a file was the
+    /// source, filled by `resolve_secret_sources` for the reload route; not
+    /// a flag.
+    #[arg(skip)]
+    secret_files: SecretFiles,
+
+    /// Watch the key files (`--api-key-file`, `--tenant-api-keys-file`,
+    /// `--control-plane-api-keys-file`) and put a changed file's keys in
+    /// force, as `POST /secrets/reload` does: a mounted secret rotated in
+    /// place takes effect without a restart. Off by default; a start with no
+    /// key file has nothing to watch and says so.
+    #[arg(
+        long,
+        default_value_t = false,
+        help_heading = "Control Plane Authentication"
+    )]
+    secrets_auto_reload: bool,
+
     // ==================== Mesh Server ====================
     /// Start the mesh: several gateways find each other, keep one membership
     /// table and replicate the workers each of them registered locally.
@@ -2203,6 +2232,14 @@ mod tests {
                 vec!["--storage-context-headers", "noeq"],
                 "storage_context_headers",
             ),
+            (vec!["--selector", "app=engine", "tier"], "selector"),
+            (vec!["--selector", "=engine"], "selector"),
+            (vec!["--selector", "app=engine tier"], "selector"),
+            (vec!["--selector", " "], "selector"),
+            (vec!["--encode-selector", "noeq"], "encode_selector"),
+            (vec!["--prefill-selector", "noeq"], "prefill_selector"),
+            (vec!["--decode-selector", "noeq"], "decode_selector"),
+            (vec!["--router-selector", "noeq"], "router_selector"),
             (
                 vec!["--request-id-headers", "bad header"],
                 "request_id_headers",
@@ -2235,6 +2272,13 @@ mod tests {
             "1",
             "--storage-context-headers",
             "x-tenant=tenant",
+            "--selector",
+            "app=engine",
+            "tier=prod",
+            "--prefill-selector",
+            "app=engine role=prefill",
+            "--router-selector",
+            "role=router",
             "--request-id-headers",
             "x-request-id",
             "--api-key",
@@ -3087,6 +3131,19 @@ mod tests {
         assert_eq!(defaults.max_connections, 0);
     }
 
+    /// `--admin-max-connections` is the admin listener's own bound and must
+    /// flow into `RouterConfig`; without the flag there is no bound.
+    #[test]
+    fn admin_max_connections_flag_flows_into_router_config() {
+        let bounded = cli_args_from(&["--admin-max-connections", "64"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert_eq!(bounded.admin_max_connections, 64);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.admin_max_connections, 0);
+    }
+
     /// The SSE keep-alive interval is a router-only setting and must flow
     /// into `RouterConfig`; it is on by default.
     #[test]
@@ -3236,6 +3293,46 @@ mod tests {
         let server = cli.to_server_config(router).unwrap();
         assert!(server.service_discovery_config.is_some());
         assert!(server.mesh_discovery_config.is_none());
+    }
+
+    /// One selector argument may carry several `key=value` pairs separated
+    /// by whitespace, the form a quoted chart value passes; the CLI reads
+    /// them as the launcher does, into one map.
+    #[test]
+    fn service_discovery_selector_reads_several_pairs_in_one_argument() {
+        let cli = cli_args_from(&[
+            "--service-discovery",
+            "--selector",
+            "app=engine role=prefill",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let server = cli.to_server_config(router).unwrap();
+        let RuntimeDiscoveryConfig::Kubernetes(discovery) = server
+            .service_discovery_config
+            .expect("service discovery config")
+        else {
+            panic!("the selector configures Kubernetes discovery");
+        };
+        assert_eq!(
+            discovery.selector.get("app").map(String::as_str),
+            Some("engine")
+        );
+        assert_eq!(
+            discovery.selector.get("role").map(String::as_str),
+            Some("prefill")
+        );
+    }
+
+    /// The refusal names the offending token, the text the launcher prints
+    /// for the same line.
+    #[test]
+    fn a_bad_selector_token_is_named_in_the_refusal() {
+        let error = cli_args_from(&["--selector", "app=engine tier"])
+            .to_router_config(vec![], vec![])
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("tier - expected 'key=value'"), "{text}");
+        assert!(!text.contains("app=engine tier -"), "{text}");
     }
 
     /// The router selector reaches the new independent mesh task unchanged.

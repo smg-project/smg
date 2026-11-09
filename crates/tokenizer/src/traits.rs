@@ -465,6 +465,20 @@ pub trait Tokenizer: Encoder + Decoder {
         })
     }
 
+    /// [`Self::apply_chat_template_with_encoding`] on messages the caller
+    /// hands over. A renderer that shapes the messages before it renders
+    /// them (the Jinja renderer gives an OpenAI-format template every string
+    /// content as a one-item text part list) shapes them in place instead of
+    /// copying every message; the default renders the slice as borrowed.
+    fn apply_chat_template_with_encoding_owned(
+        &self,
+        messages: Vec<serde_json::Value>,
+        params: ChatTemplateParams,
+        assistant_prefix: Option<&str>,
+    ) -> Result<ChatTemplateOutput> {
+        self.apply_chat_template_with_encoding(&messages, params, assistant_prefix)
+    }
+
     /// Get the content format expected by the chat template.
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
         ChatTemplateContentFormat::default()

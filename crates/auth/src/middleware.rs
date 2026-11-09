@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     audit::{AuditContext, AuditLogger, AuditResource},
-    config::{ControlPlaneAuthConfig, Role},
+    config::{ApiKeySet, ControlPlaneAuthConfig, Role},
     jwt::JwtValidator,
     RequestId,
 };
@@ -79,8 +79,12 @@ impl<B> PrincipalExt for http::Request<B> {
 /// State for the control plane authentication middleware.
 #[derive(Clone)]
 pub struct ControlPlaneAuthState {
-    /// Authentication configuration
+    /// Authentication configuration, as the start read it.
     pub config: ControlPlaneAuthConfig,
+
+    /// The API keys in force: the configuration's at start, the key file's
+    /// after a reload.
+    pub keys: ApiKeySet,
 
     /// JWT validator (if JWT auth is configured)
     pub jwt_validator: Option<Arc<JwtValidator>>,
@@ -98,8 +102,10 @@ impl ControlPlaneAuthState {
     /// Create a new control plane auth state.
     pub fn new(config: ControlPlaneAuthConfig, jwt_validator: Option<Arc<JwtValidator>>) -> Self {
         let audit_logger = AuditLogger::new(config.audit_enabled);
+        let keys = ApiKeySet::new(config.api_keys.clone());
         Self {
             config,
+            keys,
             jwt_validator,
             audit_logger,
             admin_only_reads: &[],
@@ -406,7 +412,7 @@ pub async fn control_plane_auth_middleware(
     }
 
     // Try API key validation
-    if let Some(api_key_entry) = auth_state.config.find_api_key(token) {
+    if let Some(api_key_entry) = auth_state.keys.find(token) {
         let principal = Principal {
             id: api_key_entry.id.clone(),
             name: Some(api_key_entry.name.clone()),

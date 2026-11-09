@@ -529,6 +529,17 @@ impl Tokenizer for CachedTokenizer {
             .apply_chat_template_with_encoding(messages, params, assistant_prefix)
     }
 
+    fn apply_chat_template_with_encoding_owned(
+        &self,
+        messages: Vec<serde_json::Value>,
+        params: ChatTemplateParams,
+        assistant_prefix: Option<&str>,
+    ) -> Result<ChatTemplateOutput> {
+        // Forwarded for the same reason as the borrowed entry.
+        self.inner
+            .apply_chat_template_with_encoding_owned(messages, params, assistant_prefix)
+    }
+
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
         self.inner.chat_template_content_format()
     }

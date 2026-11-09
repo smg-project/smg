@@ -25,6 +25,21 @@ use crate::{
 pub struct WasmModuleConfigRequest {
     /// Module descriptor containing name, file_path, attach_points, etc.
     pub descriptor: WasmModuleDescriptor,
+    /// The uuid the module registers under: assigned by the submitter, so
+    /// the answer names the module the job registered, and the job's key.
+    pub module_uuid: Uuid,
+    /// The uuid as the job key (`Job::worker_url` lends it).
+    pub(crate) uuid_string: String,
+}
+
+impl WasmModuleConfigRequest {
+    pub fn new(descriptor: WasmModuleDescriptor, module_uuid: Uuid) -> Self {
+        Self {
+            descriptor,
+            module_uuid,
+            uuid_string: module_uuid.to_string(),
+        }
+    }
 }
 
 /// Sensitive system directories that WASM modules cannot be loaded from.
@@ -483,7 +498,7 @@ impl StepExecutor<WasmRegistrationWorkflowData> for RegisterModuleStep {
             .unwrap_or_else(|_| Duration::from_nanos(0))
             .as_nanos() as u64;
 
-        let module_uuid = Uuid::now_v7();
+        let module_uuid = context.data.config.module_uuid;
 
         let module = WasmModule {
             module_uuid,

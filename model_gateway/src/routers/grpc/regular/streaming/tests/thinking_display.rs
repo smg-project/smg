@@ -144,7 +144,10 @@ async fn the_thinking_text_is_in_the_message_unless_the_display_is_omitted() {
                     utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
                 let (message, _counts) = response_processor()
                     .process_non_streaming_messages_response(
-                        context::ExecutionResult::Single { stream },
+                        context::ExecutionResult::Single {
+                            stream,
+                            dispatch_start: Instant::now(),
+                        },
                         spec(display, with_symphony),
                         dispatch(),
                         tokenizer,
