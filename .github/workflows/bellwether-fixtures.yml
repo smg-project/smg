@@ -96,25 +96,58 @@ jobs:
       # the CPU runner image carries no git-lfs, so the job brings its own: the
       # release binary for the runner's architecture, checked against the
       # checksum pinned here, on PATH for the rest of the job. No root needed.
+      # The tarball comes from the Actions cache, keyed by version and
+      # architecture, and from the release download only when the cache has
+      # no entry: a release-download outage killed five runs of one pull
+      # request in this step. The checksum decides either way, and the step
+      # says which source served it.
+      - name: Name the git-lfs tarball
+        id: lfs
+        env:
+          GIT_LFS_VERSION: "3.8.0"
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64)  arch=amd64 ;;
+            aarch64) arch=arm64 ;;
+            *) echo "::error::no git-lfs build pinned for $(uname -m)"; exit 1 ;;
+          esac
+          echo "arch=$arch" >> "$GITHUB_OUTPUT"
+          echo "tarball=git-lfs-linux-${arch}-v${GIT_LFS_VERSION}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the git-lfs tarball
+        id: lfs-tarball
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/git-lfs/${{ steps.lfs.outputs.tarball }}
+          key: git-lfs-tarball-${{ steps.lfs.outputs.tarball }}
+
       - name: Install git-lfs
         env:
           GIT_LFS_VERSION: "3.8.0"
           GIT_LFS_SHA256_AMD64: e455e00f15d9b95661b8d53498ffb0c3367962cf1ec73c31ab7369516cd6ab8d
           GIT_LFS_SHA256_ARM64: ac9c8efac980bb0505ead384d087e2acb6486fd8498691a2165fa174ec6118c2
+          ARCH: ${{ steps.lfs.outputs.arch }}
+          TARBALL: ${{ steps.lfs.outputs.tarball }}
+          CACHE_HIT: ${{ steps.lfs-tarball.outputs.cache-hit }}
         run: |
           set -euo pipefail
-          case "$(uname -m)" in
-            x86_64)  arch=amd64; sha="$GIT_LFS_SHA256_AMD64" ;;
-            aarch64) arch=arm64; sha="$GIT_LFS_SHA256_ARM64" ;;
-            *) echo "::error::no git-lfs build pinned for $(uname -m)"; exit 1 ;;
+          case "$ARCH" in
+            amd64) sha="$GIT_LFS_SHA256_AMD64" ;;
+            arm64) sha="$GIT_LFS_SHA256_ARM64" ;;
+            *) echo "::error::no git-lfs checksum pinned for $ARCH"; exit 1 ;;
           esac
           dir="$RUNNER_TEMP/git-lfs"
           mkdir -p "$dir"
-          tarball="git-lfs-linux-${arch}-v${GIT_LFS_VERSION}.tar.gz"
-          curl -fsSL --retry 3 -o "$dir/$tarball" \
-            "https://github.com/git-lfs/git-lfs/releases/download/v${GIT_LFS_VERSION}/${tarball}"
-          echo "${sha}  $dir/$tarball" | sha256sum -c -
-          tar -xzf "$dir/$tarball" -C "$dir"
+          if [ "$CACHE_HIT" = "true" ] && [ -s "$dir/$TARBALL" ]; then
+            echo "git-lfs ${GIT_LFS_VERSION} tarball: the Actions cache"
+          else
+            echo "git-lfs ${GIT_LFS_VERSION} tarball: the release download (no cache entry)"
+            bash scripts/ci_retry.sh 3 20 curl -fsSL --connect-timeout 10 --max-time 300 -o "$dir/$TARBALL" \
+              "https://github.com/git-lfs/git-lfs/releases/download/v${GIT_LFS_VERSION}/${TARBALL}"
+          fi
+          echo "${sha}  $dir/$TARBALL" | sha256sum -c -
+          tar -xzf "$dir/$TARBALL" -C "$dir"
           install -m 0755 "$dir/git-lfs-${GIT_LFS_VERSION}/git-lfs" "$dir/git-lfs"
           echo "$dir" >> "$GITHUB_PATH"
           "$dir/git-lfs" version
@@ -122,6 +155,16 @@ jobs:
           # the LFS filters are in the git configuration; set them for the
           # runner user, outside any repository.
           "$dir/git-lfs" install --skip-repo
+
+      # A run on `main` saves a tarball it had to download, so every later run
+      # of this version restores it; a pull request's save would be visible to
+      # that pull request alone.
+      - name: Save the git-lfs tarball
+        if: github.ref == 'refs/heads/main' && steps.lfs-tarball.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/git-lfs/${{ steps.lfs.outputs.tarball }}
+          key: ${{ steps.lfs-tarball.outputs.cache-primary-key }}
 
       - name: Check out bellwether
         uses: actions/checkout@v7
