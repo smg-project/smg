@@ -24,3 +24,15 @@ where
     });
     handle.render()
 }
+
+/// The `_sum` or `_count` sample of the histogram `family` whose label set
+/// holds every fragment of `labels` (`endpoint="chat"`, say), parsed; None
+/// when the family was not emitted with those labels.
+pub fn sample(rendered: &str, family: &str, field: &str, labels: &[&str]) -> Option<f64> {
+    let prefix = format!("{family}_{field}{{");
+    rendered
+        .lines()
+        .find(|line| line.starts_with(&prefix) && labels.iter().all(|label| line.contains(label)))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse().ok())
+}
