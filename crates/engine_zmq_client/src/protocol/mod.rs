@@ -79,6 +79,9 @@ pub trait EngineOutput {
     /// of the request: an output waiting in its stream then keeps no view of
     /// the step frame it was decoded from.
     fn own_request_id(&mut self, id: FrameStr);
+    /// The id as this output holds it, shared by a reference count: the
+    /// step's finished set keeps it without a copy.
+    fn request_id_shared(&self) -> FrameStr;
 }
 
 /// One decoded engine tick: the per-request outputs plus the piggybacked load
@@ -92,8 +95,9 @@ pub struct EngineBatch<O> {
     /// Request ids finished in this tick, including ones the connector could
     /// derive from a terminal output: a protocol without an out-of-band finish
     /// channel may list them here too. The connector unions both sources, so
-    /// the overlap is harmless.
-    pub finished_request_ids: Vec<String>,
+    /// the overlap is harmless. Each id is shared with the output or the frame
+    /// it came from, never a copy of its own.
+    pub finished_request_ids: Vec<FrameStr>,
     /// Per-rank load signal, when the protocol carries it (`None` otherwise).
     pub load: Option<EngineLoad>,
     /// The KV-transfer samples the rank's connector reported with this tick,

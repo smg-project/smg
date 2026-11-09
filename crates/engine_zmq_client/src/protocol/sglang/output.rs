@@ -307,6 +307,10 @@ impl EngineOutput for SglangOutput {
         self.request_id = id;
     }
 
+    fn request_id_shared(&self) -> FrameStr {
+        self.request_id.clone()
+    }
+
     fn finished(&self) -> bool {
         self.finish_reason.is_some()
     }
@@ -666,11 +670,11 @@ pub(crate) fn decode_slim_batch(frames: &[Bytes]) -> Result<EngineBatch<SglangOu
             });
         }
     };
-    // The one owned copy of an id, made at the finish alone.
+    // The finish's id, shared with its output: no copy of its own.
     let finished_request_ids = outputs
         .iter()
         .filter(|output| output.finish_reason.is_some())
-        .map(|output| String::from(&output.request_id))
+        .map(|output| output.request_id.clone())
         .collect();
     Ok(EngineBatch {
         engine_index,
