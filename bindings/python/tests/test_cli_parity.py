@@ -363,6 +363,16 @@ def test_the_launcher_backend_choices_are_the_cli_backends(launcher):
     assert launcher["--backend"].choices == re.findall(r'#\[value\(name = "([a-z]+)"\)\]', enum)
 
 
+def test_the_launcher_encode_policy_choices_are_the_cli_choices(launcher):
+    """``--encode-policy`` takes the same three names on both sides; the binding
+    refuses the other policies from ``start()`` with those names in its message."""
+    attribute = re.search(r"#\[arg\(([^\n]*)\)\]\n\s*encode_policy: Option<String>,", cli_source())
+    assert attribute, "the CLI's --encode-policy attribute moved"
+    cli_choices = re.findall(r'"([a-z_]+)"', attribute.group(1).split("value_parser", 1)[1])
+    assert cli_choices == ["random", "round_robin", "consistent_hashing"]
+    assert list(launcher["--encode-policy"].choices) == cli_choices
+
+
 @pytest.mark.parametrize("use_router_prefix", [False, True])
 @pytest.mark.parametrize("settle", [None, 0, 5, 30, 120])
 def test_shutdown_settle_option(use_router_prefix, settle):

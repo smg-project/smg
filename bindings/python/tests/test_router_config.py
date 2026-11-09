@@ -6,6 +6,7 @@ including validation of configuration parameters and their interactions.
 """
 
 import inspect
+import re
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -691,3 +692,49 @@ class TestTheRouterRefusesWhatTheCliRefuses:
         jwt = PyJwtConfig("https://issuer.example", "aud", None, {"": "admin"})
         with pytest.raises(ValueError, match="the IdP role must not be empty"):
             self.router(control_plane_auth=PyControlPlaneAuthConfig(jwt=jwt)).start()
+
+    # The encode side takes the three names the CLI's --encode-policy takes;
+    # the other seven policies are refused with those names in the message.
+    ENCODE_ACCEPTED = {
+        "random": PolicyType.Random,
+        "round_robin": PolicyType.RoundRobin,
+        "consistent_hashing": PolicyType.ConsistentHashing,
+    }
+    ENCODE_REFUSED = {
+        "passthrough": PolicyType.Passthrough,
+        "cache_aware": PolicyType.CacheAware,
+        "power_of_two": PolicyType.PowerOfTwo,
+        "least_load": PolicyType.LeastLoad,
+        "bucket": PolicyType.Bucket,
+        "manual": PolicyType.Manual,
+        "prefix_hash": PolicyType.PrefixHash,
+    }
+
+    @staticmethod
+    def epd_router(**kwargs) -> _Router:
+        return _Router(
+            worker_urls=[],
+            epd_disaggregation=True,
+            encode_urls=[("http://encode:8000", None)],
+            prefill_urls=[("http://prefill:8000", None)],
+            decode_urls=["http://decode:8000"],
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize("name", sorted(ENCODE_REFUSED))
+    def test_an_encode_policy_the_cli_refuses_is_refused(self, name):
+        refusal = (
+            f"Invalid value for field 'encode_policy': {name}"
+            " - expected random, round_robin or consistent_hashing"
+        )
+        with pytest.raises(ValueError, match=re.escape(refusal)):
+            self.epd_router(encode_policy=self.ENCODE_REFUSED[name]).start()
+
+    @pytest.mark.parametrize("name", sorted(ENCODE_ACCEPTED))
+    def test_an_encode_policy_the_cli_takes_passes(self, name):
+        # `port=0` is refused by the shared validator after the encode policy
+        # is read: the refusal that arrives shows the policy passed and that
+        # nothing bound.
+        with pytest.raises(ValueError, match=re.escape("Invalid value for field 'port'")) as info:
+            self.epd_router(encode_policy=self.ENCODE_ACCEPTED[name], port=0).start()
+        assert "encode_policy" not in str(info.value)
