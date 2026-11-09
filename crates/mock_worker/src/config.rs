@@ -719,11 +719,25 @@ fn parse_kv_cache_groups(raw: String, flag: &str) -> Result<Vec<KvCacheGroup>, S
         return Err(format!("{flag} takes one to eight groups"));
     }
     if !KvCacheGroup::MAIN_KINDS.contains(&groups[0].kind.as_str()) {
-        return Err(format!(
-            "{flag}: the first group is the main-attention group (one of {}), not {}",
-            KvCacheGroup::MAIN_KINDS.join(", "),
-            groups[0].kind
-        ));
+        let has_main = groups
+            .iter()
+            .any(|group| KvCacheGroup::MAIN_KINDS.contains(&group.kind.as_str()));
+        if has_main {
+            return Err(format!(
+                "{flag}: the first group is the main-attention group (one of {}), not {}",
+                KvCacheGroup::MAIN_KINDS.join(", "),
+                groups[0].kind
+            ));
+        }
+        // A model without a main-attention group (every attention layer a
+        // sliding window) starts with its window group.
+        if !KvCacheGroup::WINDOW_KINDS.contains(&groups[0].kind.as_str()) {
+            return Err(format!(
+                "{flag}: a model without a main-attention group starts with a window group (one of {}), not {}",
+                KvCacheGroup::WINDOW_KINDS.join(", "),
+                groups[0].kind
+            ));
+        }
     }
     Ok(groups)
 }
@@ -956,6 +970,12 @@ mod tests {
             .is_ok(),
             "one group is the SGLang wire's shape"
         );
+        for spec in ["sliding_window:64", "sliding_window:64,mamba"] {
+            assert!(
+                with(&["--kv-cache-groups", spec]).is_ok(),
+                "{spec}: a model without a main-attention group"
+            );
+        }
         for (spec, reason) in [
             ("sliding_window", "needs its window"),
             ("full_attention,sliding_window_mla:0", "needs its window"),
@@ -963,7 +983,8 @@ mod tests {
             ("full_attention:64", "has no window"),
             ("swa:128", "unknown cache group kind"),
             ("sliding-window:128", "unknown cache group kind"),
-            ("mamba", "the first group is the main-attention group"),
+            ("mamba", "starts with a window group"),
+            ("mamba,sliding_window:64", "starts with a window group"),
             (
                 "sliding_window:64,full_attention",
                 "the first group is the main-attention group",

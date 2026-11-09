@@ -1226,12 +1226,13 @@ impl Engine {
             .read()
             .unwrap_or_else(|p| p.into_inner());
         let main = keys.iter().take_while(|k| mirror.contains_key(k)).count();
+        let unrecorded = unrecorded_mask(&self.shared.kv_cache_groups);
         hit_over_groups(
             main,
             keys,
             &self.shared.kv_cache_groups,
             self.shared.block_size.max(1) as usize,
-            |key| mirror.get(&key).copied().unwrap_or(1),
+            |key| mirror.get(&key).copied().unwrap_or(unrecorded),
         )
     }
 
@@ -1487,12 +1488,13 @@ fn handle_msg(
                         .read()
                         .unwrap_or_else(|p| p.into_inner());
                     let main = keys.iter().take_while(|k| own.contains_key(k)).count();
+                    let unrecorded = unrecorded_mask(&params.kv_cache_groups);
                     hit_over_groups(
                         main,
                         &keys,
                         &params.kv_cache_groups,
                         params.block_size.max(1) as usize,
-                        |key| own.get(&key).copied().unwrap_or(1),
+                        |key| own.get(&key).copied().unwrap_or(unrecorded),
                     )
                 };
                 (fleet_best.max(own_best) as u32 * params.block_size)
@@ -1657,12 +1659,13 @@ impl BlockPool {
             .iter()
             .take_while(|k| self.refs.contains_key(k))
             .count();
+        let unrecorded = unrecorded_mask(&p.kv_cache_groups);
         hit_over_groups(
             main,
             keys,
             &p.kv_cache_groups,
             p.block_size.max(1) as usize,
-            |key| self.groups.get(&key).copied().unwrap_or(1),
+            |key| self.groups.get(&key).copied().unwrap_or(unrecorded),
         )
     }
 
@@ -2323,9 +2326,15 @@ impl SchedulerState {
             })
         };
 
+        let unrecorded = unrecorded_mask(&p.kv_cache_groups);
         let inserted = inserted
             .into_iter()
-            .map(|key| (key, self.pool.groups.get(&key).copied().unwrap_or(1)))
+            .map(|key| {
+                (
+                    key,
+                    self.pool.groups.get(&key).copied().unwrap_or(unrecorded),
+                )
+            })
             .collect();
         Step {
             duration,
@@ -2512,11 +2521,13 @@ impl SchedulerState {
             return;
         }
         let group_count = p.kv_cache_groups.len().clamp(1, 8);
+        let unrecorded = unrecorded_mask(&p.kv_cache_groups);
         let mut per_group: Vec<Vec<i64>> = vec![Vec::new(); group_count];
         for key in freed {
-            // A block without a recorded mask was stored by group 0 alone: the
-            // main-attention group the flag requires first, which keeps every block.
-            let mask = self.pool.groups.remove(&key).unwrap_or(1);
+            // A block without a recorded mask was stored by group 0 alone when
+            // that is the main-attention group, which keeps every block; an
+            // engine without one never stored it ([`unrecorded_mask`]).
+            let mask = self.pool.groups.remove(&key).unwrap_or(unrecorded);
             for (group, hashes) in per_group.iter_mut().enumerate() {
                 if mask & (1u8 << group) != 0 {
                     hashes.push(key as i64);
@@ -2729,7 +2740,23 @@ fn fnv_hash_str(s: &str) -> u64 {
 /// block_size)` contiguous kept blocks ending at the hit, searched from the
 /// candidate down, else the leading run of kept blocks from the first; a
 /// Mamba group needs the rightmost kept block at or below the candidate. A
-/// kind without a rule (the main-attention kinds) leaves the candidate.
+/// kind without a rule (the main-attention kinds) leaves the candidate. An
+/// engine without a main-attention group (its first group is a window or
+/// state group) has no leading run to start from: the candidate is the
+/// whole prompt and the groups' rules alone decide, as the engine's own
+/// managers do for such a model.
+/// The mask of a cached block without a recorded one: group 0 alone when
+/// the first group is the main-attention group, which stores every block;
+/// nothing when the engine has no main group, since a window or state group
+/// records what it keeps and a block it did not is not kept by anyone.
+fn unrecorded_mask(groups: &[KvCacheGroup]) -> u8 {
+    u8::from(
+        groups
+            .first()
+            .is_none_or(|group| KvCacheGroup::MAIN_KINDS.contains(&group.kind.as_str())),
+    )
+}
+
 fn hit_over_groups(
     main: usize,
     keys: &[u64],
@@ -2737,8 +2764,15 @@ fn hit_over_groups(
     block_size: usize,
     mask_of: impl Fn(u64) -> u8,
 ) -> usize {
-    let mut cur = main.min(keys.len());
-    if cur == 0 || groups.len() <= 1 {
+    let no_main_group = groups
+        .first()
+        .is_some_and(|group| !KvCacheGroup::MAIN_KINDS.contains(&group.kind.as_str()));
+    let mut cur = if no_main_group {
+        keys.len()
+    } else {
+        main.min(keys.len())
+    };
+    if cur == 0 || (!no_main_group && groups.len() <= 1) {
         return cur;
     }
     loop {
@@ -3857,6 +3891,39 @@ mod tests {
         let plain = vec![KvCacheGroup::full_attention()];
         assert_eq!(hit_over_groups(7, &keys, &plain, 4, |_| 1), 7);
         assert_eq!(hit_over_groups(12, &keys, &plain, 4, |_| 1), 10);
+    }
+
+    /// An engine whose only group is a sliding window (no main-attention
+    /// group): the hit is the window rule from the prompt's end, whatever
+    /// leading run the caller measured; a window of 13 tokens at block 4
+    /// needs three kept blocks ending at the hit, else the leading run of
+    /// kept blocks from the first.
+    #[test]
+    fn a_window_only_engines_hit_is_the_window_rule_from_the_prompts_end() {
+        let keys: Vec<u64> = (0..10).collect();
+        let window_only = vec![KvCacheGroup {
+            kind: "sliding_window".to_string(),
+            sliding_window: 13,
+        }];
+        let cells: &[(&[u64], usize, &str)] = &[
+            (&[7, 8, 9], 10, "the tail kept: the whole prompt"),
+            (&[6, 7, 8], 9, "a run ending one block early"),
+            (&[2, 3, 4], 5, "a run in the middle: up to its end"),
+            (&[0, 1, 2], 3, "the leading run"),
+            (&[8, 9], 0, "two blocks are no tail"),
+            (&[0, 1], 2, "two leading blocks: the leading run"),
+            (&[], 0, "nothing kept"),
+        ];
+        for (kept, want, note) in cells {
+            let mask = |key: u64| u8::from(kept.contains(&key));
+            for main in [0usize, 3, 10] {
+                assert_eq!(
+                    hit_over_groups(main, &keys, &window_only, 4, mask),
+                    *want,
+                    "{note} (main {main})"
+                );
+            }
+        }
     }
 
     #[test]

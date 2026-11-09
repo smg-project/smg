@@ -39,10 +39,13 @@ impl KvEventMonitor {
                 match worker_blocks.admit(
                     stored.kv_cache_spec_kind.as_deref(),
                     stored.group_idx,
+                    tokenful(stored),
                     stored.locality,
                     stored.ownership.as_deref(),
                 ) {
-                    Admission::Main => {
+                    // A kind-less store of a group that was the main signal
+                    // is the index's, as its tokenful stores were.
+                    Admission::Main | Admission::MainAndGroup(_) => {
                         Self::apply_stored(stored, worker_id, indexer, worker_blocks);
                     }
                     Admission::Group(mask) => {
@@ -55,11 +58,23 @@ impl KvEventMonitor {
                 match worker_blocks.admit(
                     None,
                     removed.group_idx,
+                    false,
                     removed.locality,
                     removed.ownership.as_deref(),
                 ) {
                     Admission::Main => {
+                        if removed
+                            .group_idx
+                            .is_some_and(|group| worker_blocks.is_main_signal(group))
+                        {
+                            worker_blocks.counters.window_only_removals += 1;
+                        }
                         Self::apply_removed(removed, worker_id, indexer, worker_blocks);
+                    }
+                    Admission::MainAndGroup(mask) => {
+                        worker_blocks.counters.window_only_removals += 1;
+                        Self::apply_removed(removed, worker_id, indexer, worker_blocks);
+                        Self::apply_group_removed(removed, mask, worker_blocks);
                     }
                     Admission::Group(mask) => {
                         Self::apply_group_removed(removed, mask, worker_blocks);
@@ -68,7 +83,7 @@ impl KvEventMonitor {
                 }
             }
             kv_cache_event::Data::Cleared(cleared) => {
-                if worker_blocks.admit(None, None, None, cleared.ownership.as_deref())
+                if worker_blocks.admit(None, None, false, None, cleared.ownership.as_deref())
                     == Admission::Main
                 {
                     Self::apply_cleared(worker_id, indexer, worker_blocks);
@@ -92,15 +107,33 @@ impl KvEventMonitor {
         indexer: &KvIndex,
         worker_blocks: &mut WorkerIndexState,
     ) {
+        // The main group first, so a window group's store ahead of it in
+        // the batch reads as a group's, not as the worker's main signal.
+        for event in events {
+            if let Some(kv_cache_event::Data::Stored(stored)) = &event.data {
+                match (stored.kv_cache_spec_kind.as_deref(), stored.group_idx) {
+                    (Some(kind), _) if MAIN_ATTENTION_KINDS.contains(&kind) => {
+                        worker_blocks.main_shown = true;
+                    }
+                    (None, None) => worker_blocks.main_shown = true,
+                    _ => {}
+                }
+            }
+        }
         let mut hybrid = false;
         for event in events {
             if let Some(kv_cache_event::Data::Stored(stored)) = &event.data {
                 if let (Some(kind), Some(group)) =
                     (stored.kv_cache_spec_kind.as_deref(), stored.group_idx)
                 {
-                    if !MAIN_ATTENTION_KINDS.contains(&kind) {
+                    if MAIN_ATTENTION_KINDS.contains(&kind) {
+                        continue;
+                    }
+                    if worker_blocks.main_shown || !tokenful(stored) {
                         worker_blocks.show_group(group);
                         hybrid = true;
+                    } else {
+                        worker_blocks.main_signal(group);
                     }
                 }
             }
@@ -380,6 +413,16 @@ fn indexed_tier(tier: Option<i32>, cache_level: Option<i32>) -> Option<IndexedTi
 /// engine does ([`WorkerGroups::cap`]).
 const MAIN_ATTENTION_KINDS: [&str; 3] = ["full_attention", "mla_attention", "sink_full_attention"];
 
+/// Whether every block of a store carries its tokens: a main-lane store
+/// does, a group lane's store (hashes only) does not.
+fn tokenful(stored: &KvBlocksStored) -> bool {
+    !stored.blocks.is_empty()
+        && stored
+            .blocks
+            .iter()
+            .all(|block| !block.token_ids.is_empty())
+}
+
 /// Cache-group kinds that keep a sliding window of the sequence.
 const WINDOW_KINDS: [&str; 2] = ["sliding_window", "sliding_window_mla"];
 
@@ -406,13 +449,15 @@ fn group_kind(kind: Option<&str>, window: Option<u32>) -> Option<GroupKind> {
 /// Where an event goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Admission {
-    /// The main attention group: the index.
+    /// The prefix index's: a main-attention store, a plain worker's event,
+    /// or the main signal of a worker without a main group.
     Main,
-    /// Other cache groups, one bit per group index: the worker's view. An
-    /// engine publishing per group sets one bit; one publishing a boundary's
-    /// hashes once with the groups that keep them would set several.
+    /// The worker's view's, under the groups' mask.
     Group(u16),
-    /// Neither: counted, not kept.
+    /// A removal of a group that was the worker's main signal before a main
+    /// group moved it to the view: both hold its blocks, both let go.
+    MainAndGroup(u16),
+    /// Counted, not applied.
     Skip,
 }
 
@@ -454,6 +499,12 @@ pub(crate) struct WorkerIndexCounters {
     pub(crate) group_view_late: u64,
     /// Main stores with a block that carried no tokens: nothing to index under.
     pub(crate) tokenless_stores: u64,
+    /// Stores of a group other than main attention that carried tokens on a
+    /// worker that has shown no main group: the worker's main signal, the
+    /// prefix index's.
+    pub(crate) window_only_stores: u64,
+    /// Kind-less removals of such a group: they leave the prefix index.
+    pub(crate) window_only_removals: u64,
     /// Events for blocks not local to the worker.
     pub(crate) remote: u64,
     /// Events owned by a residency agent rather than the engine.
@@ -550,6 +601,19 @@ pub(crate) struct WorkerIndexState {
     /// event of one of them (a removal never names its kind) is the group's,
     /// never the main group's.
     non_main_groups: Vec<u32>,
+    /// Whether the worker has shown a main-attention group: a store with a
+    /// main-attention kind, or one naming no kind and no group (an engine
+    /// with one group names nothing). Until it has, a store of another group
+    /// that carries tokens is the worker's main signal, the shape the relay
+    /// gives a rank whose attention is all sliding window (a group lane's
+    /// store carries no tokens): the prefix index takes it as a plain
+    /// worker's. Learned per batch ahead of its events and kept across
+    /// clears, like the groups, so a snapshot replay reads as the stream did.
+    main_shown: bool,
+    /// The groups whose tokenful stores were the worker's main signal: a
+    /// kind-less removal of one leaves the prefix index, and the view too
+    /// once a main group shown later moved the group there.
+    main_signal_groups: Vec<u32>,
     /// Tokens per block of the widest block the worker's stores carried so
     /// far, 0 until a store names a width: the worker's block of record.
     block_of_record: i32,
@@ -564,11 +628,16 @@ impl WorkerIndexState {
     /// Where an event with these attributes goes. A store names its group's
     /// kind; later events for that group may omit it, so the groups the view
     /// learned decide for them, and an unlearned group without a kind is the
-    /// main group (an engine with one group names nothing).
+    /// main group (an engine with one group names nothing). A store of a
+    /// group other than main attention that carries tokens, on a worker that
+    /// has shown no main group, is the worker's main signal
+    /// ([`Self::main_shown`]): the index's, and its group's kind-less
+    /// removals follow it there.
     fn admit(
         &mut self,
         kind: Option<&str>,
         group_idx: Option<u32>,
+        tokenful: bool,
         locality: Option<i32>,
         ownership: Option<&str>,
     ) -> Admission {
@@ -582,9 +651,15 @@ impl WorkerIndexState {
         }
         match (kind, group_idx) {
             (Some(kind), group) if MAIN_ATTENTION_KINDS.contains(&kind) => {
+                self.main_shown = true;
                 if let Some(group) = group {
                     self.non_main_groups.retain(|&known| known != group);
                 }
+                Admission::Main
+            }
+            (Some(_), Some(group)) if tokenful && !self.main_shown => {
+                self.main_signal(group);
+                self.counters.window_only_stores += 1;
                 Admission::Main
             }
             (Some(_), Some(group)) => {
@@ -595,8 +670,12 @@ impl WorkerIndexState {
                 self.counters.group_nameless += 1;
                 Admission::Skip
             }
-            (None, Some(group)) if self.knows_group(group) => Admission::Group(group_mask(group)),
-            (None, _) => Admission::Main,
+            (None, Some(group)) => match (self.is_main_signal(group), self.knows_group(group)) {
+                (true, true) => Admission::MainAndGroup(group_mask(group)),
+                (false, true) => Admission::Group(group_mask(group)),
+                _ => Admission::Main,
+            },
+            (None, None) => Admission::Main,
         }
     }
 
@@ -612,13 +691,27 @@ impl WorkerIndexState {
         }
     }
 
+    /// Whether tokenful stores of `group` were the worker's main signal.
+    fn is_main_signal(&self, group: u32) -> bool {
+        self.main_signal_groups.contains(&group)
+    }
+
+    /// A tokenful store of `group` on a worker that has shown no main group.
+    fn main_signal(&mut self, group: u32) {
+        if !self.main_signal_groups.contains(&group) {
+            self.main_signal_groups.push(group);
+        }
+    }
+
     /// Whether a store belongs to a cache group other than main attention
     /// ([`Self::admit`] without the counting): the stores a batch applies
     /// last.
     fn is_group_store(&self, stored: &KvBlocksStored) -> bool {
         match (stored.kv_cache_spec_kind.as_deref(), stored.group_idx) {
-            (Some(kind), Some(_)) => !MAIN_ATTENTION_KINDS.contains(&kind),
-            (None, Some(group)) => self.knows_group(group),
+            (Some(kind), Some(_)) => {
+                !MAIN_ATTENTION_KINDS.contains(&kind) && (self.main_shown || !tokenful(stored))
+            }
+            (None, Some(group)) => self.knows_group(group) && !self.is_main_signal(group),
             _ => false,
         }
     }
@@ -1916,6 +2009,203 @@ mod tests {
         assert_eq!(
             wb.record_before_clear, 0,
             "the first store after the clear settles it"
+        );
+    }
+
+    /// A store of a window group that carries tokens, the way the relay
+    /// forwards a rank without a main-attention group.
+    fn window_only_store(
+        group: u32,
+        hash: i64,
+        parent: Option<i64>,
+        tokens: &[u32],
+    ) -> KvCacheEvent {
+        store_event(KvBlocksStored {
+            blocks: vec![KvBlock {
+                block_hash: hash,
+                token_ids: tokens.to_vec(),
+                block_size: tokens.len() as i32,
+                lora_id: None,
+                cache_level: None,
+                ..Default::default()
+            }],
+            parent_block_hash: parent,
+            group_idx: Some(group),
+            kv_cache_spec_kind: Some("sliding_window".to_string()),
+            kv_cache_spec_sliding_window: Some(64),
+            ..Default::default()
+        })
+    }
+
+    /// A kind-less removal naming its group, as the engines publish them.
+    fn removal_in(group: u32, hash: i64) -> KvCacheEvent {
+        let mut removed = removed_event(hash);
+        removed.group_idx = Some(group);
+        remove_event(removed)
+    }
+
+    fn overlap(indexer: &KvIndex, worker: u32, hashes: &[ContentHash]) -> u32 {
+        indexer
+            .find_matches(hashes, false)
+            .scores
+            .get(&worker)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    const SECOND: [u32; 4] = [50, 60, 70, 80];
+
+    /// A worker whose attention is all sliding window has no main group:
+    /// its window stores carry tokens and are the prefix index's, as a plain
+    /// worker's; no view is made for it; a kind-less removal of the group
+    /// leaves the index.
+    #[test]
+    fn a_window_only_workers_stores_and_removals_are_the_prefix_indexs() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let both: Vec<u32> = TOKENS.iter().chain(SECOND.iter()).copied().collect();
+        let hashes = compute_request_content_hashes(&both, 4);
+        let one = compute_request_content_hashes(&TOKENS, 4);
+
+        KvEventMonitor::apply_events(
+            &[
+                window_only_store(0, 1, None, &TOKENS),
+                window_only_store(0, 2, Some(1), &SECOND),
+            ],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert!(
+            wb.groups.is_none(),
+            "no view for a worker without a main group"
+        );
+        assert_eq!(indexer.current_size(), 2);
+        let full = overlap(&indexer, w1, &hashes);
+        assert!(full > 0 && full > overlap(&indexer, w1, &one));
+        assert_eq!(
+            (wb.counters.window_only_stores, wb.counters.group_stores),
+            (2, 0)
+        );
+
+        KvEventMonitor::apply_events(&[removal_in(0, 2)], w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 1);
+        assert_eq!(overlap(&indexer, w1, &hashes), overlap(&indexer, w1, &one));
+        assert_eq!(
+            (wb.counters.window_only_removals, wb.counters.group_removals),
+            (1, 0)
+        );
+    }
+
+    /// A relay snapshot replays the stores after a clear in one batch: the
+    /// batch reads as the stream did, and a removal after it still leaves
+    /// the index.
+    #[test]
+    fn a_window_only_workers_snapshot_replay_reads_as_its_stream() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let both: Vec<u32> = TOKENS.iter().chain(SECOND.iter()).copied().collect();
+        let hashes = compute_request_content_hashes(&both, 4);
+        KvEventMonitor::apply_events(
+            &[window_only_store(0, 1, None, &TOKENS)],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        let cleared = KvCacheEvent {
+            event_id: 1,
+            data: Some(kv_cache_event::Data::Cleared(KvCacheCleared::default())),
+        };
+        KvEventMonitor::apply_events(
+            &[
+                cleared,
+                window_only_store(0, 1, None, &TOKENS),
+                window_only_store(0, 2, Some(1), &SECOND),
+            ],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert!(wb.groups.is_none());
+        assert_eq!(indexer.current_size(), 2);
+        assert!(routable(&indexer, w1, &hashes));
+        assert_eq!(wb.counters.window_only_stores, 3);
+
+        KvEventMonitor::apply_events(&[removal_in(0, 1), removal_in(0, 2)], w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 0);
+        assert!(!routable(&indexer, w1, &hashes));
+        assert_eq!(wb.counters.window_only_removals, 2);
+    }
+
+    /// A main group shown after window-only stores makes the worker hybrid:
+    /// the window group's later stores (no tokens) are the view's, and a
+    /// removal of a block indexed before leaves the index and the view both.
+    #[test]
+    fn a_main_group_shown_later_moves_the_window_group_to_the_view() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let one = compute_request_content_hashes(&TOKENS, 4);
+        KvEventMonitor::apply_events(
+            &[window_only_store(0, 1, None, &TOKENS)],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert!(routable(&indexer, w1, &one));
+
+        let mut main = stored_event(3, &SECOND);
+        main.group_idx = Some(1);
+        main.kv_cache_spec_kind = Some("full_attention".to_string());
+        KvEventMonitor::apply_events(
+            &[
+                group_store(0, Some("sliding_window"), Some(64), &[3]),
+                store_event(main),
+            ],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert!(
+            wb.groups.is_some(),
+            "the main group makes the worker hybrid"
+        );
+        assert_eq!(indexer.current_size(), 2);
+        assert_eq!(wb.counters.group_stores, 1);
+
+        KvEventMonitor::apply_events(&[removal_in(0, 1)], w1, &indexer, &mut wb);
+        assert!(!routable(&indexer, w1, &one), "the index let the block go");
+        assert_eq!(indexer.current_size(), 1);
+        assert_eq!(
+            (wb.counters.window_only_removals, wb.counters.group_removals),
+            (1, 1)
+        );
+    }
+
+    /// A hybrid worker whose window stores carry tokens (an engine that
+    /// publishes every group's blocks with their tokens): the main group's
+    /// store in the same batch keeps them the view's.
+    #[test]
+    fn a_hybrid_workers_tokenful_window_store_stays_in_the_view() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let mut main = stored_event(1, &TOKENS);
+        main.group_idx = Some(0);
+        main.kv_cache_spec_kind = Some("full_attention".to_string());
+        KvEventMonitor::apply_events(
+            &[window_only_store(1, 1, None, &TOKENS), store_event(main)],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert!(wb.groups.is_some());
+        assert_eq!(indexer.current_size(), 1);
+        assert_eq!(
+            (wb.counters.window_only_stores, wb.counters.group_stores),
+            (0, 1)
         );
     }
 }
