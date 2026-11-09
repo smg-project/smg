@@ -4,12 +4,15 @@
 
 use super::*;
 
-/// Hash array capacity class: `8, 16, .., 128` in steps of 8, then four classes per octave
-/// (`160, 192, 224, 256, 320, ..`), so an array wastes at most a quarter of its words to the
-/// class, not half; a run of 140 blocks with its slack lands in 160, not 256.
+/// Hash array capacity class: `8, 12, .., 32` in steps of 4, `40, 48, .., 128` in steps of 8,
+/// then four classes per octave (`160, 192, 224, 256, 320, ..`), so an array wastes at most a
+/// quarter of its words to the class, not half; a run of 140 blocks with its slack lands in 160,
+/// not 256, and a run of 12 in 12, not 16.
 pub(super) fn array_class(capacity: usize) -> usize {
-    if capacity <= 8 * SMALL_ARRAY_CLASSES {
-        capacity.div_ceil(8).max(1) - 1
+    if capacity <= 4 * (FINE_ARRAY_CLASSES + 1) {
+        capacity.div_ceil(4).max(2) - 2
+    } else if capacity <= 8 * (SMALL_ARRAY_CLASSES - FINE_ARRAY_CLASSES + 4) {
+        FINE_ARRAY_CLASSES + capacity.div_ceil(8) - 5
     } else {
         // `capacity` in `(low, 2 * low]` with `low` a power of two from 128 up.
         let bits = usize::BITS - (capacity - 1).leading_zeros();
@@ -20,8 +23,10 @@ pub(super) fn array_class(capacity: usize) -> usize {
 }
 
 pub(super) fn class_capacity(class: usize) -> usize {
-    if class < SMALL_ARRAY_CLASSES {
-        8 * (class + 1)
+    if class < FINE_ARRAY_CLASSES {
+        4 * (class + 2)
+    } else if class < SMALL_ARRAY_CLASSES {
+        8 * (class - FINE_ARRAY_CLASSES + 5)
     } else {
         let above = class - SMALL_ARRAY_CLASSES;
         let low = 1usize << (7 + above / 4);

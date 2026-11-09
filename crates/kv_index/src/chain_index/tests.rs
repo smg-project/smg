@@ -28,10 +28,27 @@ fn scores(index: &ChainIndex, query: &[ContentHash]) -> Vec<(u32, u32)> {
 
 #[test]
 fn array_classes_round_up_and_back() {
-    for capacity in [1usize, 8, 9, 16, 100, 128, 129, 256, 257, 1000, 4096, 5000] {
+    for capacity in [
+        1usize, 4, 8, 9, 12, 13, 16, 28, 32, 33, 40, 41, 100, 128, 129, 256, 257, 1000, 4096, 5000,
+    ] {
         let class = array_class(capacity);
         assert!(class_capacity(class) >= capacity, "capacity {capacity}");
         assert_eq!(array_class(class_capacity(class)), class);
+    }
+    assert_eq!(class_capacity(array_class(1)), 8, "the 8-word floor");
+    assert_eq!(class_capacity(array_class(9)), 12, "a 4-word step to 32");
+    assert_eq!(class_capacity(array_class(13)), 16);
+    assert_eq!(class_capacity(array_class(33)), 40, "an 8-word step to 128");
+    assert_eq!(
+        class_capacity(array_class(129)),
+        160,
+        "a quarter octave above"
+    );
+    for class in 1..ARRAY_CLASSES {
+        assert!(
+            class_capacity(class) > class_capacity(class - 1),
+            "classes grow: {class}"
+        );
     }
     assert_eq!(table_class(2), 0);
     assert_eq!(table_class(4), 1);
@@ -276,6 +293,51 @@ fn dead_runs_and_arrays_are_reused() {
         "arena words were not recycled: {stats:?}"
     );
     assert_eq!(index.current_size(), 0);
+}
+
+/// A chain stored as four blocks and grown one block at a time to twelve, the shape of a short
+/// prompt with its decode, ends with its hashes in a 12-word class: the one reallocation at the
+/// ninth block asks for eleven words and gets twelve, not sixteen.
+#[test]
+fn a_short_chain_grown_block_by_block_sits_in_a_twelve_word_class() {
+    let index = ChainIndex::with_max_workers(8);
+    let w = index.intern_worker("w").expect("id");
+    let mut mw = ChainBlockMap::default();
+    let held: Vec<ContentHash> = (0..12).map(|p| content(3, p)).collect();
+    let blocks = blocks_of(&held);
+    index
+        .apply_stored(w, &blocks[..4], None, &mut mw)
+        .expect("prompt");
+    let first = mw.get(blocks[0].seq_hash).expect("held").run;
+    let prompt_array = index.slab.run(first).block.load(Ordering::Relaxed);
+    assert_eq!(
+        index.arena.array_capacity(prompt_array),
+        8,
+        "four blocks and their slack take the 8-word floor"
+    );
+    for b in 4..12 {
+        index
+            .apply_stored(w, &blocks[b..b + 1], Some(blocks[b - 1].seq_hash), &mut mw)
+            .expect("decode block");
+    }
+    assert_eq!(scores(&index, &held), vec![(w, 12)]);
+    let at = mw.get(blocks[11].seq_hash).expect("held");
+    let run = index.slab.run(at.run);
+    assert_eq!(run.len(), 12, "one run");
+    let (block, engine) = (
+        run.block.load(Ordering::Relaxed),
+        run.engine.load(Ordering::Relaxed),
+    );
+    assert_eq!(
+        index.arena.array_capacity(block),
+        12,
+        "the content array's class"
+    );
+    assert_eq!(
+        index.arena.array_capacity(engine),
+        12,
+        "the engine twin's class"
+    );
 }
 
 #[test]
