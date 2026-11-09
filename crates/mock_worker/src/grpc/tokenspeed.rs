@@ -55,6 +55,8 @@ impl TokenSpeedScheduler for MockScheduler {
                 logprobs: req
                     .return_logprob
                     .then(|| usize::try_from(req.top_logprobs_num).unwrap_or(0)),
+                // This proto carries no scores row for requested token ids.
+                score_ids: Vec::new(),
                 pin: req.data_parallel_rank,
             })
             .await?;

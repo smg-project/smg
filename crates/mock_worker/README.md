@@ -405,7 +405,11 @@ gRPC, ZMQ), ahead of either engine mode. Two sources feed one store:
   optional: `finish_reason` defaults to `stop`; `matched_stop` is a token id
   or a string; `prompt_tokens` defaults to the request's own count;
   `logprobs` holds the sampled token's logprob per output token and is sent
-  when the request asks for logprobs; `delay_ms` is the pause before every
+  when the request asks for logprobs; `token_id_logprobs` holds the logprob
+  of each token id a scoring request asks for (`token_ids_logprob` on the
+  SGLang wire), in the request's order, on an answer of no tokens
+  (`"output_text": ""`), for a request that asks for logprobs, as the engine
+  computes the row only then; `delay_ms` is the pause before every
   frame but the first; `chunk_tokens` the tokens per frame (1 by default).
 - `POST /admin/script/{worker}` on the admin API, with one such answer or an
   array of them: the answers the worker's next requests get, in order
