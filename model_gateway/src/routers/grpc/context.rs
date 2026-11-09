@@ -1618,6 +1618,8 @@ impl ClientSelection {
 pub(crate) enum ExecutionResult {
     Single {
         stream: ProtoStream,
+        /// Captured before the RPC, whose headers may wait for the first chunk.
+        dispatch_start: Instant,
     },
     PrefillDecode {
         prefill: ProtoStream,
@@ -1636,13 +1638,9 @@ pub(crate) enum ExecutionResult {
         prefill_input_logprobs: Option<ProtoInputLogProbs>,
     },
     /// Embedding requests return a single response, not a stream
-    Embedding {
-        response: ProtoEmbedComplete,
-    },
+    Embedding { response: ProtoEmbedComplete },
     /// Batched completion fan-out: one result per prompt, in prompt order.
-    Batch {
-        results: Vec<ExecutionResult>,
-    },
+    Batch { results: Vec<ExecutionResult> },
 }
 
 impl ExecutionResult {
@@ -1654,8 +1652,12 @@ impl ExecutionResult {
     #[must_use]
     pub(crate) fn until_client_gone(self, client: &SseSender, request_id: &str) -> Self {
         match self {
-            Self::Single { stream } => Self::Single {
+            Self::Single {
+                stream,
+                dispatch_start,
+            } => Self::Single {
                 stream: stream.until_client_gone(client, request_id),
+                dispatch_start,
             },
             Self::PrefillDecode {
                 prefill,
@@ -1686,7 +1688,7 @@ impl ExecutionResult {
     /// answer, already in hand.
     pub(crate) fn apply_deadline(&mut self, deadline: RequestDeadline) {
         match self {
-            Self::Single { stream } => stream.apply_deadline(deadline),
+            Self::Single { stream, .. } => stream.apply_deadline(deadline),
             Self::PrefillDecode {
                 prefill, decode, ..
             } => {

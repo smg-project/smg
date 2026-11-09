@@ -90,7 +90,7 @@ pub(crate) async fn collect_responses(
     merge_logprobs: bool,
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
     let all_responses = match execution_result {
-        ExecutionResult::Single { mut stream } => {
+        ExecutionResult::Single { mut stream, .. } => {
             let responses = collect_stream_responses(&mut stream, "Single", None, None).await?;
             stream.mark_completed();
             responses

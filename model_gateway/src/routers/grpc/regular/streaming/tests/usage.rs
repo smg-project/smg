@@ -223,7 +223,10 @@ async fn non_streamed_chat(
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
     let answer = response_processor()
         .process_non_streaming_chat_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             ChatResponseSpec::from(request),
             dispatch(),
             tokenizer,
@@ -250,7 +253,10 @@ async fn streamed_completion_usage(
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_COMPLETIONS);
     let response = Arc::new(processor(false))
         .process_completion_streaming_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             CompletionResponseSpec::new(request, Vec::new()),
             dispatch,
             tokenizer(),
@@ -281,7 +287,10 @@ async fn non_streamed_completion(
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
     let response = response_processor()
         .process_non_streaming_completion_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             CompletionResponseSpec::new(request, Vec::new()),
             dispatch(),
             &tokenizer,
@@ -345,7 +354,10 @@ async fn non_streamed_generate(
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
     let responses = response_processor()
         .process_non_streaming_generate_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             dispatch(),
             &mut decoder,
             false,
@@ -393,7 +405,10 @@ async fn non_streamed_messages(
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
     let answer = response_processor()
         .process_non_streaming_messages_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             spec,
             dispatch(),
             tokenizer,
