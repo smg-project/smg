@@ -8,7 +8,8 @@ name: Claude Code Review
 # (scripts/codex_review_post.py gate, and the action checks the actor itself). The PR event
 # is `pull_request`, not `pull_request_target`: the action's App-token exchange rejects the
 # OIDC token of a `pull_request_target` run ("Invalid OIDC token"), and the comment events
-# run from `main` anyway.
+# run from `main` anyway. The exchange also requires this file to match the copy on `main`,
+# so on a pull request that edits it the action skips with a warning instead of reviewing.
 on:
   pull_request:
     types: [opened, synchronize, reopened]

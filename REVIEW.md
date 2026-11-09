@@ -34,7 +34,9 @@ fork never gets either, and the commands below are ignored on one and from anyon
 write access. Both post inline comments with the markers above, and each approves when it finds
 nothing 🔴 Important. The API keys never enter a job: they stay in the cluster's secrets and are
 served by a sidecar in the runner pod that the reviewer's own process cannot read, so nothing
-in a pull request can reach them.
+in a pull request can reach them. A pull request that edits one of the two workflow files gets
+no Claude run from the edited workflow: the action's token exchange requires the workflow file
+to match the copy on `main`, and skips with a warning otherwise.
 
 - `@claude review` or `@codex review` in a PR comment runs a full review on demand.
 - A human reply in a thread Codex opened, or a comment that mentions `@codex`, gets an answer
