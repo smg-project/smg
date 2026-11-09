@@ -61,6 +61,10 @@ impl EngineOutput for EngineCoreOutput {
         self.request_id = id;
     }
 
+    fn request_id_shared(&self) -> FrameStr {
+        self.request_id.clone()
+    }
+
     fn finished(&self) -> bool {
         EngineCoreOutput::finished(self)
     }
@@ -169,7 +173,7 @@ impl EngineProtocol for VllmProtocol {
                     .collect(),
                 finished_request_ids: batch
                     .finished_requests
-                    .map(|ids| ids.into_iter().collect())
+                    .map(|ids| ids.into_iter().map(FrameStr::from).collect())
                     .unwrap_or_default(),
                 load: batch.scheduler_stats.map(EngineLoad::from),
                 kv_transfer: batch.kv_transfer,

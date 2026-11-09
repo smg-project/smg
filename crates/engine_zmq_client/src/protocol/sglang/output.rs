@@ -19,6 +19,7 @@ use crate::{
     error::{Error, Result},
     protocol::{
         control::read_control_reply_after_tag,
+        finished_request_ids,
         positional::{drain_trailing, expect_tag, next_field},
         EngineBatch, EngineLoad, EngineOutput, UtilityReply,
     },
@@ -305,6 +306,10 @@ impl EngineOutput for SglangOutput {
 
     fn own_request_id(&mut self, id: FrameStr) {
         self.request_id = id;
+    }
+
+    fn request_id_shared(&self) -> FrameStr {
+        self.request_id.clone()
     }
 
     fn finished(&self) -> bool {
@@ -666,12 +671,8 @@ pub(crate) fn decode_slim_batch(frames: &[Bytes]) -> Result<EngineBatch<SglangOu
             });
         }
     };
-    // The one owned copy of an id, made at the finish alone.
-    let finished_request_ids = outputs
-        .iter()
-        .filter(|output| output.finish_reason.is_some())
-        .map(|output| String::from(&output.request_id))
-        .collect();
+    // Each finish's id shared with its output, the list sized once.
+    let finished_request_ids = finished_request_ids(&outputs);
     Ok(EngineBatch {
         engine_index,
         outputs,
