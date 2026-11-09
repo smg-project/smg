@@ -3,9 +3,9 @@
 //! Measures the full per-request cost (build + serialize) across three points,
 //! all using the real `WorkerInfo` type (no parallel/duplicate response shape):
 //!
-//!   1. `original_value_plus_deepclone` — deep-clone each `WorkerSpec` into a
-//!      `WorkerInfo`, then build an intermediate `serde_json::Value` (`json!`)
-//!      and serialize that. A per-worker hash map plus a double pass.
+//!   1. `original_value_plus_deepclone` — the shipped `WorkerInfo` with its
+//!      `WorkerSpec` deep-cloned, then an intermediate `serde_json::Value`
+//!      (`json!`) serialized. A per-worker hash map plus a double pass.
 //!   2. `serde_direct_plus_deepclone` — still deep-clones the spec, but
 //!      serializes a typed struct directly (single `serde_json::to_vec`).
 //!   3. `serde_direct_plus_arc` — `WorkerSpec` is shared via `Arc`, so building
@@ -85,23 +85,14 @@ fn build_workers(n: usize) -> Vec<Arc<dyn Worker>> {
     (0..n).map(make_worker).collect()
 }
 
-/// Replicates the OLD per-worker cost: deep-clone the whole `WorkerSpec`.
+/// Replicates the OLD per-worker cost: the shipped view with the whole
+/// `WorkerSpec` deep-cloned in place of the shared one. Deriving it from
+/// `worker_to_info` keeps every stage on one set of fields, so a field added
+/// to the endpoint's view cannot split the stages' JSON.
 fn deep_clone_info(w: &Arc<dyn Worker>) -> WorkerInfo {
-    let meta = w.metadata();
-    let status = w.status();
-    WorkerInfo {
-        id: w.url().to_string(),
-        model_id: meta.spec.models.primary().map(|m| m.id.clone()),
-        spec: Arc::new((*meta.spec).clone()), // deep clone, then wrap
-        is_healthy: status == WorkerStatus::Ready,
-        status: Some(status),
-        load: w.load(),
-        http2: meta.http2,
-        pd_pairing: None,
-        stalled: None,
-        engine_load: None,
-        job_status: None,
-    }
+    let mut info = worker_to_info(w);
+    info.spec = Arc::new((*info.spec).clone()); // deep clone, then wrap
+    info
 }
 
 #[derive(Serialize)]
@@ -163,7 +154,8 @@ fn bench_workers(c: &mut Criterion) {
     const N: usize = 2000;
     let workers = build_workers(N);
 
-    // Sanity: all three implementations produce equivalent JSON.
+    // Sanity: all three implementations produce equivalent JSON (the stages
+    // share one worker view, so a new field reaches all of them).
     let s1 = stage_original(&workers);
     let s2 = stage_direct_deepclone(&workers);
     let s3 = stage_arc_direct(&workers);

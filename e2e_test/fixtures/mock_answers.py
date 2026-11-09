@@ -246,6 +246,15 @@ class MockAnswers:
             raise ValueError("state an analysis, a final text or a tool call")
         self.enqueue("<|start|>assistant".join(segments), **answer)
 
+    def enqueue_scores(self, logprobs: list[float]) -> None:
+        """State the mock worker's next scoring answer: the logprob of each token
+        id the request asks a score for, in the request's order, on a completion
+        of no output tokens (what a prefill-only scoring request reads: the
+        gateway's Decisions stage sends one per question on the SGLang wire, its
+        candidate labels' ids in the question's order). No-op on a real engine.
+        """
+        self.enqueue("", token_id_logprobs=list(logprobs))
+
     def enqueue_with_logprobs(self, output_text: str, logprob: float = -0.1, **answer: Any) -> None:
         """State the mock worker's next answer with a logprob per token.
 

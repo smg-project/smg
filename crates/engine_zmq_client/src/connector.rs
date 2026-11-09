@@ -37,7 +37,7 @@ use tracing::{info, trace, warn};
 use zeromq::{RouterSendHalf, SocketRecv};
 
 use crate::{
-    codec::OpaqueValue,
+    codec::{FrameStr, OpaqueValue},
     error::{Error, Result},
     protocol::{
         kv_transfer::KvTransferStats, sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol,
@@ -70,8 +70,10 @@ pub type TrtllmStream = RequestStream<TrtllmProtocol>;
 /// other request on the transport — and backpressuring further, into the
 /// output PULL socket, would wedge the engine itself. Unboundedness is not
 /// unbounded memory: a request's queue is capped by its own generation
-/// (`max_tokens` outputs), a dropped stream auto-aborts it on the engine, and
-/// the buffer is freed with the stream.
+/// (`max_tokens` outputs), each output in it carries its request's own id
+/// rather than a view of the step frame it was decoded from
+/// ([`EngineOutput::own_request_id`]), a dropped stream auto-aborts it on the
+/// engine, and the buffer is freed with the stream.
 type OutputSender<O> = mpsc::UnboundedSender<Result<O>>;
 type OutputReceiver<O> = mpsc::UnboundedReceiver<Result<O>>;
 
@@ -135,6 +137,11 @@ struct RequestRegistry<O> {
 /// its first output, the prompt the engine still has to prefill for it.
 struct InFlight<O> {
     sender: OutputSender<O>,
+    /// The request's own id, copied once at registration and shared by
+    /// every output it is handed at dispatch in place of the step frame's
+    /// view (the first hand-over adds the shared header; a terminal output
+    /// takes the id itself).
+    id: FrameStr,
     prompt_tokens: u64,
     handed: bool,
     started: bool,
@@ -205,10 +212,14 @@ impl<O: EngineOutput> RequestRegistry<O> {
             self.in_flight_since = Some(now);
             self.busy_started.notify_one();
         }
+        // The request's own copy of its id, outside any frame: every output
+        // it is handed shares it in place of the step frame's view.
+        let id = FrameStr::from(request_id.as_str());
         self.requests.insert(
             request_id,
             InFlight {
                 sender,
+                id,
                 prompt_tokens,
                 handed: false,
                 started: false,
@@ -325,12 +336,14 @@ impl<O: EngineOutput> RequestRegistry<O> {
     ///
     /// The lookup key stays borrowed from the output, so the hot path — a
     /// non-terminal token batch — never allocates one.
-    fn route(&mut self, output: O) {
+    fn route(&mut self, mut output: O) {
         if output.finished() {
             // Terminal: retire the entry before handing the output over, while
             // its request id is still borrowable.
             match self.retire(output.request_id()) {
                 Some(entry) => {
+                    // The entry is owned here: its id moves, nothing is cloned.
+                    output.own_request_id(entry.id);
                     let _ = entry.sender.send(Ok(output));
                 }
                 None => trace!(
@@ -355,6 +368,8 @@ impl<O: EngineOutput> RequestRegistry<O> {
                 self.prefill_pending = self.prefill_pending.saturating_sub(entry.prompt_tokens);
             }
         }
+        // The queued output keeps the request's id, not the step frame.
+        output.own_request_id(entry.id.clone());
         // A failed send hands the output back, so the receiver-gone (stream
         // dropped) path retires the entry without an owned key either.
         if let Err(mpsc::error::SendError(Ok(undelivered))) = entry.sender.send(Ok(output)) {
@@ -363,7 +378,7 @@ impl<O: EngineOutput> RequestRegistry<O> {
     }
 
     /// Remove finished/aborted request ids reported out-of-band by the engine.
-    fn remove_all<'a>(&mut self, request_ids: impl IntoIterator<Item = &'a String>) {
+    fn remove_all<'a>(&mut self, request_ids: impl IntoIterator<Item = &'a str>) {
         for request_id in request_ids {
             self.retire(request_id);
         }
@@ -793,7 +808,7 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// every request, so an empty in-flight set is ground truth that the
     /// rank's queue is empty; the KV term is left as reported (cache pages
     /// outlive requests).
-    fn release<'a>(&self, engine_index: u32, request_ids: impl IntoIterator<Item = &'a String>) {
+    fn release<'a>(&self, engine_index: u32, request_ids: impl IntoIterator<Item = &'a str>) {
         let mut routing = self.routing.lock();
         let Some(ids) = routing.inflight.get_mut(&engine_index) else {
             return;
@@ -810,7 +825,7 @@ impl<P: EngineProtocol> ClientInner<P> {
     }
 
     /// Retire one request from the rank named by `engine_id`, if it has one.
-    fn release_one(&self, engine_id: &EngineId, request_id: &String) {
+    fn release_one(&self, engine_id: &EngineId, request_id: &str) {
         if let Some(index) = engine_id.engine_index() {
             self.release(index, [request_id]);
         }
@@ -1705,7 +1720,7 @@ impl<P: EngineProtocol> Client<P> {
         {
             Ok(engine_id) => engine_id,
             Err(error) => {
-                self.inner.registry.lock().remove_all([&request_id]);
+                self.inner.registry.lock().remove_all([request_id.as_str()]);
                 return Err(error);
             }
         };
@@ -1769,7 +1784,7 @@ impl<P: EngineProtocol> Client<P> {
     /// Explicitly abort an in-flight request.
     pub async fn abort(&self, engine_id: &EngineId, request_id: &str) -> Result<()> {
         let request_id = request_id.to_string();
-        self.inner.registry.lock().remove_all([&request_id]);
+        self.inner.registry.lock().remove_all([request_id.as_str()]);
         self.inner.release_one(engine_id, &request_id);
         self.inner.abort(engine_id, &request_id).await
     }
@@ -2070,25 +2085,25 @@ impl<P: EngineProtocol> Dispatcher<P> {
         }
         // Unique finished ids: a terminal output and the out-of-band finished
         // list may name the same request.
-        let mut finished: HashSet<String> = batch.finished_request_ids.into_iter().collect();
+        let mut finished: HashSet<FrameStr> = batch.finished_request_ids.into_iter().collect();
         let mut registry = inner.registry.lock();
         if let Some(reply) = batch.utility {
             registry.resolve_utility(reply);
         }
         for output in batch.outputs {
             if output.finished() {
-                finished.insert(output.request_id().to_string());
+                finished.insert(output.request_id_shared());
             }
             registry.route(output);
         }
-        registry.remove_all(&finished);
+        registry.remove_all(finished.iter().map(FrameStr::as_str));
         // The work in hand is what the batch left pending; the watchdog counts
         // from its end.
         let now = Instant::now();
         registry.work_resumes(now);
         let next = registry.next_tick(now);
         drop(registry);
-        inner.release(batch.engine_index, &finished);
+        inner.release(batch.engine_index, finished.iter().map(FrameStr::as_str));
         next
     }
 
@@ -2124,7 +2139,7 @@ impl<P: EngineProtocol> Dispatcher<P> {
     /// routing the output of every rank. The input writer reports a write
     /// that failed.
     fn forward_abort(&self, engine_id: EngineId, request_id: String) {
-        self.inner.registry.lock().remove_all([&request_id]);
+        self.inner.registry.lock().remove_all([request_id.as_str()]);
         self.inner.release_one(&engine_id, &request_id);
         if let Err(error) = self.inner.queue_abort(&engine_id, &request_id) {
             warn!(%error, %request_id, "failed to queue abort");
@@ -2349,7 +2364,10 @@ impl<P: EngineProtocol> SubmitGuard<'_, P> {
     /// later read the add frame.
     fn take_back(&mut self, abort: bool) {
         self.armed = false;
-        self.inner.registry.lock().remove_all([&self.request_id]);
+        self.inner
+            .registry
+            .lock()
+            .remove_all([self.request_id.as_str()]);
         self.inner.release_one(&self.engine_id, &self.request_id);
         if abort {
             let _ = self

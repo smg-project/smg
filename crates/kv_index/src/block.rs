@@ -60,6 +60,12 @@ pub enum ApplyError {
     WorkerNotTracked,
     /// The specified `parent_seq_hash` was not found in this worker's reverse lookup.
     ParentBlockNotFound,
+    /// A run's child table or hash array would outgrow an arena chunk (the fan-out and
+    /// run-length caps): the store is declined from the block that would pass the cap and
+    /// counted. Its `placed` leading blocks were placed as any store's (a worker that matched a
+    /// run at the cap is a holder of what it matched, in the index and in its lane map); the
+    /// rest are in neither.
+    ArenaCapReached { placed: usize },
 }
 
 impl fmt::Display for ApplyError {
@@ -67,6 +73,11 @@ impl fmt::Display for ApplyError {
         match self {
             Self::WorkerNotTracked => write!(f, "worker not tracked in index"),
             Self::ParentBlockNotFound => write!(f, "parent block hash not found for worker"),
+            Self::ArenaCapReached { placed } => write!(
+                f,
+                "a run's child table or hash array would outgrow the index arena's chunk \
+                 ({placed} leading blocks placed)"
+            ),
         }
     }
 }

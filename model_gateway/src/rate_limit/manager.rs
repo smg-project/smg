@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::{
     backend::{RateLimitBackend, ReserveOutcome, ReserveRequest, UsageSettlement},
     config::RateLimitYaml,
-    local_backend::LocalRateLimitBackend,
+    local_backend::{LocalRateLimitBackend, PolicyReplacement},
     policy::CompiledPolicySet,
     reservation::SharedReservationHandle,
 };
@@ -122,6 +122,21 @@ impl RateLimitManager {
         Ok(Self {
             backend: Backend::Local(backend),
         })
+    }
+
+    /// Puts `policy` in force on the in-memory backend (its
+    /// `replace_policy`). The caller holds the document the set was compiled
+    /// from to the start's checks (a `header:` tenant key needs the trusted
+    /// tenant header), since a compiled set carries no such rule. A backend
+    /// behind the trait object takes no new policy while running: `Err`
+    /// says so.
+    pub fn replace_policy(&self, policy: CompiledPolicySet) -> Result<PolicyReplacement, String> {
+        match &self.backend {
+            Backend::Local(backend) => Ok(backend.replace_policy(policy)),
+            Backend::Dyn(_) => {
+                Err("the rate-limit backend in use takes no new policy while running".to_string())
+            }
+        }
     }
 
     pub async fn reserve(&self, request: ReserveRequest<'_>) -> Reservation {

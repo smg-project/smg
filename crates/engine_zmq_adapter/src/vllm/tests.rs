@@ -32,7 +32,7 @@ fn batch(
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: request_id.to_string(),
+            request_id: request_id.into(),
             new_token_ids: vec![token],
             new_logprobs,
             finish_reason: finish,
@@ -202,7 +202,7 @@ async fn generate_shapes_top_logprobs_to_requested_count() {
     let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: "r1".to_string(),
+            request_id: "r1".into(),
             new_token_ids: vec![10],
             new_logprobs: Some(Logprobs {
                 positions: vec![position],
@@ -314,7 +314,7 @@ async fn generate_streams_prompt_logprobs() {
     let prefill = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: "r1".to_string(),
+            request_id: "r1".into(),
             new_token_ids: vec![10],
             new_prompt_logprobs_tensors: Some(prompt_tensors),
             ..Default::default()
@@ -324,7 +324,7 @@ async fn generate_streams_prompt_logprobs() {
     let decode = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: "r1".to_string(),
+            request_id: "r1".into(),
             new_token_ids: vec![11],
             finish_reason: Some(EngineCoreFinishReason::Length),
             ..Default::default()

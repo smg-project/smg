@@ -357,7 +357,7 @@ impl ConsulProviderConfig {
                 format!("CONSUL_CLIENT_CERT and CONSUL_CLIENT_KEY do not parse: {error}")
             })?;
         let make_builder = || {
-            let mut builder = crate::clients::http_client_builder()
+            let mut builder = crate::server::http_client_builder()
                 .connect_timeout(Duration::from_secs(10))
                 .redirect(reqwest::redirect::Policy::none());
             if https {
@@ -939,7 +939,7 @@ mod tests {
     use crate::{
         config::test_support::{pd_routing_mode, regular_routing_mode},
         service_discovery::testing::{create_test_app_context, live_app_context},
-        test_support::RefusedAddress,
+        worker::test_support::RefusedAddress,
     };
 
     const PASSING_2_0_4: &str = include_str!("testdata/consul/health-passing-2.0.4.json");

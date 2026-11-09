@@ -123,18 +123,12 @@ pub async fn serve_with_listener_until(
         .map(|a| a.port())
         .and_then(|port| port.checked_sub(cfg.grpc_base_port))
         .and_then(|index| cfg.bootstrap_port_for(index));
-    let bootstrap = match bootstrap_port {
-        Some(port) => match TcpListener::bind((cfg.host.as_str(), port)).await {
-            Ok(listener) => Some(listener),
-            Err(e) => {
-                tracing::error!(
-                    "grpc worker {addr:?} bootstrap port bind {}:{port} failed: {e}",
-                    cfg.host
-                );
-                return;
-            }
-        },
-        None => None,
+    let bootstrap = match crate::bootstrap::bind(&cfg.host, bootstrap_port).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("grpc worker {addr:?} {e}");
+            return;
+        }
     };
     let max_message_bytes = cfg.grpc_max_message_bytes;
     // The stop reaches the service's streams that have no end of their own
@@ -152,7 +146,8 @@ pub async fn serve_with_listener_until(
         stopped: stopped.clone(),
         wire,
     };
-    let bootstrap = bootstrap.map(|listener| accept_and_close(listener, stopped.clone()));
+    let bootstrap =
+        bootstrap.map(|listener| crate::bootstrap::accept_and_close(listener, stopped.clone()));
     let service = MockScheduler {
         cfg,
         name,
@@ -236,34 +231,6 @@ pub async fn serve_with_listener_until(
     tokio::select! {
         () = &mut server => {}
         () = sides => server.await,
-    }
-}
-
-/// A prefill worker's bootstrap port: where a decode partner's engine would
-/// rendezvous for the KV handoff, which the mock never performs (the decode
-/// side has the prompt). Each connection is accepted and closed, which is
-/// all the gateway's probe of the port asks, until the worker stops.
-async fn accept_and_close(listener: TcpListener, mut stopped: watch::Receiver<bool>) {
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((connection, _)) => drop(connection),
-                Err(e) => {
-                    tracing::warn!(
-                        "bootstrap port {:?}: accept failed: {e}",
-                        listener.local_addr().ok()
-                    );
-                    // A listener out of descriptors would fail every accept
-                    // at once; a pause keeps the loop from spinning on it.
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            },
-            // The wait's guard stays inside its own future: a select arm
-            // that yielded it would hold it across the loop's awaits.
-            () = async {
-                let _ = stopped.wait_for(|stop| *stop).await;
-            } => break,
-        }
     }
 }
 
@@ -411,8 +378,9 @@ impl MockScheduler {
 /// What a wire's `Generate` asks of the core, whatever its proto's spelling:
 /// the gateway's token ids and the prompt it rendered them from, how many
 /// choices the request samples, its token limit, whether it streams, the
-/// logprobs it wants (the alternatives per token; `None` for none) and the
-/// rank it is pinned to.
+/// logprobs it wants (the alternatives per token; `None` for none), the token
+/// ids it asks a score for (a prefill-only scoring request's; empty on the
+/// wires without the field) and the rank it is pinned to.
 pub(crate) struct GenerateInput {
     pub(crate) request_id: String,
     pub(crate) prompt_ids: Vec<u32>,
@@ -421,16 +389,19 @@ pub(crate) struct GenerateInput {
     pub(crate) max_new: Option<u32>,
     pub(crate) stream: bool,
     pub(crate) logprobs: Option<usize>,
+    pub(crate) score_ids: Vec<u32>,
     pub(crate) pin: Option<i32>,
 }
 
-/// The logprobs of a frame's tokens: the sampled token's per position and
-/// the alternatives the request asked for.
+/// The logprobs of a frame's tokens: the sampled token's per position, the
+/// alternatives the request asked for, and on a completion the score of each
+/// token id the request asked for (empty elsewhere).
 #[derive(Clone, Debug)]
 pub(crate) struct LogProbs {
     pub(crate) token_logprobs: Vec<f32>,
     pub(crate) token_ids: Vec<u32>,
     pub(crate) top: Vec<script::TopAlternatives>,
+    pub(crate) scores: Vec<(u32, f32)>,
 }
 
 /// A streamed frame: the tokens new since the frame before, and the running
@@ -489,12 +460,9 @@ pub(crate) fn service_name(wire: SchedulerWire) -> &'static str {
 impl MockScheduler {
     /// The realistic engine's fault and admission hooks for a side that
     /// serves no tokens (the prefill role's prompt-side completion, the
-    /// encode role's encoder completion), as the regular path counts them:
-    /// the stall, a status before admission (a failure, or a cut when it
-    /// names a token count), the admission delay and rate, then the canned
-    /// delay. `Ok(true)` when the fault asks for a `finish=error` completion,
-    /// counted as a cut. The engine never runs the prompt: nothing is
-    /// admitted, no record is left.
+    /// encode role's encoder completion), as the regular path counts them
+    /// ([`Engine::admit_without_tokens`]), then the canned delay. `Ok(true)`
+    /// when the fault asks for a `finish=error` completion, counted as a cut.
     pub(crate) async fn admit_without_tokens(
         &self,
         request_id: &str,
@@ -507,24 +475,11 @@ impl MockScheduler {
                 let line = rank_line(request_id, pin, rank);
                 tracing::info!("{line}");
             }
-            let engine = &self.ranks[rank].engine;
-            if let Some(fault) = engine.inject() {
-                if !fault.stall.is_zero() {
-                    tokio::time::sleep(fault.stall).await;
-                }
-                if fault.finish_error {
-                    engine.cut_counter().fetch_add(1, Ordering::Relaxed);
-                    finish_error = true;
-                } else if fault.status != 0 {
-                    if fault.after_tokens.is_some() {
-                        engine.cut_counter().fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        engine.record_failure();
-                    }
-                    return Err(injected_status(fault.status));
-                }
-            }
-            engine.admit().await;
+            finish_error = self.ranks[rank]
+                .engine
+                .admit_without_tokens()
+                .await
+                .map_err(injected_status)?;
         }
         if !self.cfg.gen_delay.is_zero() {
             tokio::time::sleep(self.cfg.gen_delay).await;
@@ -596,6 +551,7 @@ impl MockScheduler {
                 input.prompt_ids.len(),
                 input.stream,
                 input.logprobs,
+                input.score_ids,
             );
             return Ok(Box::pin(in_flight.until_done(stream)));
         }
@@ -1246,6 +1202,7 @@ fn scripted_stream(
     prompt_len: usize,
     stream_chunks: bool,
     logprobs: Option<usize>,
+    score_ids: Vec<u32>,
 ) -> FrameStream {
     struct Choice {
         index: u32,
@@ -1260,6 +1217,7 @@ fn scripted_stream(
         prompt_len: usize,
         stream_chunks: bool,
         logprobs: Option<usize>,
+        score_ids: Vec<u32>,
     }
     let choices = answers
         .into_iter()
@@ -1277,6 +1235,7 @@ fn scripted_stream(
         prompt_len,
         stream_chunks,
         logprobs,
+        score_ids,
     };
     Box::pin(stream::unfold(init, |mut st| async move {
         loop {
@@ -1289,7 +1248,7 @@ fn scripted_stream(
                 // the next choice from its first frame.
                 let choice = st.choices.pop_front()?;
                 let answer = &choice.answer;
-                let logprobs = st.logprobs.and_then(|top| {
+                let mut logprobs = st.logprobs.and_then(|top| {
                     answer
                         .logprobs
                         .as_ref()
@@ -1298,8 +1257,45 @@ fn scripted_stream(
                             token_logprobs: logprobs.clone(),
                             token_ids: answer.output_ids.clone(),
                             top: answer.top_logprobs(&answer.output_ids, logprobs, top),
+                            scores: Vec::new(),
                         })
                 });
+                // A scoring answer: the score of each token id the request asked
+                // for, in the request's order, on the completion. The engine
+                // computes the row only for a request that asks for logprobs,
+                // so one that does not is refused, as a wrong count is.
+                if let Some(values) = &answer.token_id_logprobs {
+                    if st.logprobs.is_none() {
+                        let status = Status::failed_precondition(format!(
+                            "the scripted answer scores {} token ids, the request asks for no logprobs",
+                            values.len()
+                        ));
+                        return Some((Err(status), st));
+                    }
+                    if values.len() != st.score_ids.len() {
+                        let status = Status::failed_precondition(format!(
+                            "the scripted answer scores {} token ids, the request asks for {}",
+                            values.len(),
+                            st.score_ids.len()
+                        ));
+                        return Some((Err(status), st));
+                    }
+                    let scores = st
+                        .score_ids
+                        .iter()
+                        .copied()
+                        .zip(values.iter().copied())
+                        .collect();
+                    logprobs = Some(match logprobs {
+                        Some(logprobs) => LogProbs { scores, ..logprobs },
+                        None => LogProbs {
+                            token_logprobs: Vec::new(),
+                            token_ids: Vec::new(),
+                            top: Vec::new(),
+                            scores,
+                        },
+                    });
+                }
                 let complete = Frame::Complete(Complete {
                     output_ids: answer.output_ids.clone(),
                     finish_reason: answer.finish_reason.clone(),
@@ -1329,6 +1325,7 @@ fn scripted_stream(
                     token_logprobs: frame.logprobs.clone(),
                     token_ids: frame.ids.clone(),
                     top: choice.answer.top_logprobs(&frame.ids, &frame.logprobs, top),
+                    scores: Vec::new(),
                 });
             let chunk = Frame::Chunk(Chunk {
                 token_ids: frame.ids,

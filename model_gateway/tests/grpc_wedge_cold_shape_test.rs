@@ -108,7 +108,7 @@ impl MockEngine {
                 let _ = admin_stopped.await;
             },
         ));
-        let client = smg::clients::http_client_builder()
+        let client = smg::server::http_client_builder()
             .no_proxy()
             .build()
             .expect("test client");

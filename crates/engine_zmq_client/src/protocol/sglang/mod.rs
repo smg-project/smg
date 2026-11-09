@@ -37,7 +37,10 @@ pub mod sampling;
 use bytes::Bytes;
 
 use crate::{
-    codec::{encode_msgpack, tensor::encode_with_aux_frames, OpaqueValue},
+    codec::{
+        add_request_capacity, encode_msgpack, encode_msgpack_with_capacity,
+        tensor::encode_with_aux_frames, OpaqueValue,
+    },
     error::Result,
     protocol::{
         handshake::EngineCoreReadyResponse,
@@ -92,10 +95,7 @@ impl EngineProtocol for SglangProtocol {
     }
 
     fn prompt_tokens(request: &Self::Request) -> u64 {
-        match request {
-            SglangRequest::Generate(request) => request.input_ids.len() as u64,
-            SglangRequest::Embed(request) => request.input_ids.len() as u64,
-        }
+        request.input_ids().len() as u64
     }
 
     fn reported_every_step(request: &Self::Request) -> bool {
@@ -193,10 +193,11 @@ impl EngineProtocol for SglangProtocol {
         // its frame's one-based index, the frame shares the tensor's storage.
         // Any other scheduler is sent every tensor inline, as SGLang's own
         // encoder writes them.
+        let capacity = add_request_capacity(request.input_ids().len());
         let (payload, mut aux_frames) = if layout.tensor_aux_frames {
-            encode_with_aux_frames(request)?
+            encode_with_aux_frames(request, capacity)?
         } else {
-            (encode_msgpack(request)?, Vec::new())
+            (encode_msgpack_with_capacity(request, capacity)?, Vec::new())
         };
         // The request's metadata (the caller's trace context) rides as the
         // LAST frame, behind the tensor frames: the positional array is the

@@ -29,10 +29,15 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 
 use crate::{
-    codec::{encode_msgpack, tensor::encode_with_aux_frames, OpaqueValue},
+    codec::{
+        add_request_capacity, encode_msgpack,
+        tensor::{decode_within_frame, encode_with_aux_frames},
+        OpaqueValue,
+    },
     error::Result,
     protocol::{
         control::{CONTROL_REPLY_SLIM_TAG, CONTROL_REPLY_WIRE_FIELDS},
+        finished_request_ids,
         handshake::EngineCoreReadyResponse,
         positional::check_prefix,
         tokenspeed::{
@@ -122,12 +127,13 @@ impl EngineProtocol for TokenSpeedProtocol {
     /// frames ([`encode_with_aux_frames`]): the engine's `MsgpackDecoder`
     /// resolves a tensor's frame index against the message's frames, the
     /// payload being frame 0, as it resolves its own encoder's. A text
-    /// request, or one whose tensors are all small, keeps its one frame.
+    /// request, or one whose tensors are all small, keeps its one frame, in a
+    /// buffer sized from the prompt before the write.
     fn encode_add(
         request: &Self::Request,
         _layout: &SlimOutputLayout,
     ) -> Result<(Vec<u8>, Vec<Bytes>)> {
-        encode_with_aux_frames(request)
+        encode_with_aux_frames(request, add_request_capacity(request.input_ids.len()))
     }
 
     fn encode_abort(request_id: &str) -> Result<Vec<u8>> {
@@ -179,8 +185,10 @@ impl EngineProtocol for TokenSpeedProtocol {
                  has no tensor fields)"
             );
         }
-        let payload = frames.first().map(AsRef::as_ref).unwrap_or_default();
-        let batch = match decode_wire_output(payload, layout)? {
+        let empty = Bytes::new();
+        let frame = frames.first().unwrap_or(&empty);
+        // Within the frame's scope, so every request id is a view of it, not a copy.
+        let batch = match decode_within_frame(frame, || decode_wire_output(frame, layout))? {
             TokenSpeedWireOutput::Tokens(batch) => *batch,
             TokenSpeedWireOutput::ControlReply(reply) => {
                 return Ok(EngineBatch {
@@ -206,11 +214,8 @@ impl EngineProtocol for TokenSpeedProtocol {
         // TokenSpeed has no out-of-band finish channel: every finish is carried
         // by its own output. Reporting them here anyway keeps the batch shape
         // self-describing for consumers that only read the finished list.
-        let finished_request_ids = outputs
-            .iter()
-            .filter(|output| output.finish_reason.is_some())
-            .map(|output| output.request_id.clone())
-            .collect();
+        // Each finish's id shared with its output, the list sized once.
+        let finished_request_ids = finished_request_ids(&outputs);
         Ok(EngineBatch {
             engine_index,
             outputs,

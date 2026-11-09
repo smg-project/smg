@@ -7,24 +7,20 @@
 //! Each case runs on a current-thread runtime under a thread-local Prometheus
 //! recorder, so the request path's mode decision lands in the rendered text.
 
-use std::{
-    future::Future,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use common::{
     decode_stream::{chunk, complete},
     engine_answers::{VllmAnswers, VllmGenerateStream},
     grpc_harness::{build_grpc_router, grpc_router_config, grpc_worker, serve_engine},
+    metrics_capture::render_after,
 };
-use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::model_card::ModelCard;
 use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
     tenant::TenantKey,
-    test_support::RefusedAddress,
-    worker::{RuntimeType, Worker, WorkerType},
+    worker::{test_support::RefusedAddress, RuntimeType, Worker, WorkerType},
 };
 use smg_grpc_client::vllm_proto as proto;
 use tokio::sync::mpsc;
@@ -170,29 +166,6 @@ async fn one_streaming_chat(router: &dyn RouterTrait) -> (http::StatusCode, Stri
         status,
         String::from_utf8(bytes.to_vec()).expect("utf-8 body"),
     )
-}
-
-/// Run `case` on a current-thread runtime under a thread-local recorder and
-/// return the rendered `/metrics` text.
-#[expect(
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
-fn render_after<F, Fut>(case: F) -> String
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let handle = recorder.handle();
-    metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("current-thread runtime");
-        rt.block_on(case());
-    });
-    handle.render()
 }
 
 /// The `smg_pd_kv_connector_mode_total` sample for `mode`, if emitted.

@@ -18,10 +18,10 @@ use tracing::{debug, info, warn};
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    get_healthy_worker_indices,
+    as_cache_aware, get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
-    normalize_model_key, BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy,
-    ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
+    normalize_model_key, BucketPolicy, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig,
+    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
@@ -535,7 +535,7 @@ impl PolicyRegistry {
         policy: &Arc<dyn LoadBalancingPolicy>,
         monitor: Option<&Arc<KvEventMonitor>>,
     ) {
-        if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+        if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
             cache_aware.set_kv_event_monitor(monitor.cloned());
         }
     }
@@ -582,8 +582,8 @@ impl PolicyRegistry {
 
     /// Attach the mesh outbound bridge (thread-safe, can be called after
     /// initialization). Every existing cache-aware policy gets the adapter
-    /// wired in and its `populate_hash_index` flag flipped on (both flip
-    /// atomically inside [`CacheAwarePolicy::set_mesh_tree_sync`]); every
+    /// wired in and its mesh flag raised (both flip
+    /// atomically inside [`super::CacheAwarePolicy::set_mesh_tree_sync`]); every
     /// future cache-aware policy created here inherits both. Pass `None`
     /// to detach.
     pub fn set_mesh_tree_sync(&self, adapter: Option<Arc<TreeSyncAdapter>>) {
@@ -607,13 +607,13 @@ impl PolicyRegistry {
     }
 
     /// Inject the mesh adapter into a policy if it's cache-aware.
-    /// The setter also flips `populate_hash_index` to match adapter
+    /// The setter also flips the policy's mesh flag to match adapter
     /// presence, so callers do not need to touch that flag directly.
     fn maybe_inject_mesh_tree_sync(
         policy: &Arc<dyn LoadBalancingPolicy>,
         adapter: Option<&Arc<TreeSyncAdapter>>,
     ) {
-        if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+        if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
             cache_aware.set_mesh_tree_sync(adapter.cloned());
         }
     }
@@ -1014,15 +1014,13 @@ impl PolicyRegistry {
     pub fn init_cache_aware_policy(&self, model_id: &str, workers: &[Arc<dyn Worker>]) {
         // Get the policy for this model
         if let Some(policy) = self.get_policy(model_id) {
-            if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
-                    debug!(
-                        "Initializing cache-aware policy with {} workers for model {}",
-                        workers.len(),
-                        model_id
-                    );
-                    cache_aware.init_workers(workers);
-                }
+            if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
+                debug!(
+                    "Initializing cache-aware policy with {} workers for model {}",
+                    workers.len(),
+                    model_id
+                );
+                cache_aware.init_workers(workers);
             }
         }
     }
@@ -1032,14 +1030,12 @@ impl PolicyRegistry {
     pub fn remove_worker_from_cache_aware(&self, model_id: &str, worker_url: &str) {
         // Get the policy for this model
         if let Some(policy) = self.get_policy(model_id) {
-            if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
-                    cache_aware.remove_worker_by_url(worker_url);
-                    debug!(
-                        "Removed worker {} from cache-aware policy for model {}",
-                        worker_url, model_id
-                    );
-                }
+            if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
+                cache_aware.remove_worker_by_url(worker_url);
+                debug!(
+                    "Removed worker {} from cache-aware policy for model {}",
+                    worker_url, model_id
+                );
             }
         }
     }
@@ -1053,14 +1049,12 @@ impl PolicyRegistry {
             ("encode", self.encode_policy.get()),
         ] {
             if let Some(policy) = policy {
-                if policy.name() == "cache_aware" {
-                    if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
-                        cache_aware.remove_worker_by_url(worker_url);
-                        debug!(
-                            "Removed worker {} from {} cache-aware policy",
-                            worker_url, worker_type
-                        );
-                    }
+                if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
+                    cache_aware.remove_worker_by_url(worker_url);
+                    debug!(
+                        "Removed worker {} from {} cache-aware policy",
+                        worker_url, worker_type
+                    );
                 }
             }
         }
@@ -1077,15 +1071,13 @@ impl PolicyRegistry {
         // `policies_for_model` deduplicates shared policy instances so each
         // tree is cleaned at most once.
         for policy in self.policies_for_model(model_id) {
-            if policy.name() == "cache_aware" {
-                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
-                    cache_aware.remove_workers_from_model(model_id, worker_urls);
-                    debug!(
-                        "Removed {} workers from cache-aware policy for model {}",
-                        worker_urls.len(),
-                        model_id
-                    );
-                }
+            if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
+                cache_aware.remove_workers_from_model(model_id, worker_urls);
+                debug!(
+                    "Removed {} workers from cache-aware policy for model {}",
+                    worker_urls.len(),
+                    model_id
+                );
             }
         }
     }
@@ -1106,33 +1098,26 @@ impl PolicyRegistry {
     ) {
         // Initialize prefill policy if it's cache-aware (lock-free via OnceLock::get)
         if let Some(prefill_policy) = self.prefill_policy.get() {
-            if prefill_policy.name() == "cache_aware" {
-                if let Some(cache_aware) =
-                    prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>()
-                {
-                    if !prefill_workers.is_empty() {
-                        debug!(
-                            "Initializing prefill cache-aware policy with {} workers",
-                            prefill_workers.len()
-                        );
-                        cache_aware.init_workers(prefill_workers);
-                    }
+            if let Some(cache_aware) = as_cache_aware(prefill_policy.as_ref()) {
+                if !prefill_workers.is_empty() {
+                    debug!(
+                        "Initializing prefill cache-aware policy with {} workers",
+                        prefill_workers.len()
+                    );
+                    cache_aware.init_workers(prefill_workers);
                 }
             }
         }
 
         // Initialize decode policy if it's cache-aware (lock-free via OnceLock::get)
         if let Some(decode_policy) = self.decode_policy.get() {
-            if decode_policy.name() == "cache_aware" {
-                if let Some(cache_aware) = decode_policy.as_any().downcast_ref::<CacheAwarePolicy>()
-                {
-                    if !decode_workers.is_empty() {
-                        debug!(
-                            "Initializing decode cache-aware policy with {} workers",
-                            decode_workers.len()
-                        );
-                        cache_aware.init_workers(decode_workers);
-                    }
+            if let Some(cache_aware) = as_cache_aware(decode_policy.as_ref()) {
+                if !decode_workers.is_empty() {
+                    debug!(
+                        "Initializing decode cache-aware policy with {} workers",
+                        decode_workers.len()
+                    );
+                    cache_aware.init_workers(decode_workers);
                 }
             }
         }
@@ -1181,7 +1166,7 @@ mod tests {
     use crate::{
         policies::{
             test_support::headers_with_routing_key, BucketConfig, CacheAwareConfig,
-            LeastLoadPolicy, SelectWorkerInfo,
+            CacheAwarePolicy, LeastLoadPolicy, SelectWorkerInfo,
         },
         worker::{
             load_state::LoadSnapshot, test_support::worker_of, HashRing, Worker, WorkerLoadGuard,
@@ -1923,9 +1908,7 @@ mod tests {
             worker_of("http://w1", WorkerType::Regular),
             worker_of("http://w2", WorkerType::Regular),
         ];
-        policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
+        as_cache_aware(policy.as_ref())
             .unwrap()
             .init_workers(&workers);
 
@@ -2406,11 +2389,7 @@ mod tests {
         let policy = registry.on_worker_added("llama-3", Some("cache_aware"));
         assert!(!Arc::ptr_eq(&policy, &registry.get_default_policy()));
 
-        let config = policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .unwrap()
-            .config_for_test();
+        let config = as_cache_aware(policy.as_ref()).unwrap().config_for_test();
         assert_eq!(config.cache_threshold, 0.9);
         assert_eq!(config.balance_abs_threshold, 64);
         assert_eq!(config.balance_rel_threshold, 2.5);
@@ -2422,11 +2401,7 @@ mod tests {
 
         // Aliases accepted by create_by_name inherit too.
         let alias = registry.on_worker_added("llama-4", Some("CacheAware"));
-        let alias_config = alias
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .unwrap()
-            .config_for_test();
+        let alias_config = as_cache_aware(alias.as_ref()).unwrap().config_for_test();
         assert_eq!(alias_config.max_tree_size, 4096);
     }
 
@@ -2480,11 +2455,7 @@ mod tests {
                 handle.join().unwrap();
             }
             for entry in registry.model_policies.iter() {
-                let cache_aware = entry
-                    .value()
-                    .as_any()
-                    .downcast_ref::<CacheAwarePolicy>()
-                    .unwrap();
+                let cache_aware = as_cache_aware(entry.value().as_ref()).unwrap();
                 assert!(
                     cache_aware.kv_event_monitor_is_set_for_test(),
                     "policy for {} missed the concurrently-set monitor",
@@ -2529,7 +2500,7 @@ mod tests {
         registry.set_encode_policy(Arc::clone(&encode));
 
         for (role, policy) in [("prefill", prefill), ("decode", decode), ("encode", encode)] {
-            let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap();
+            let cache_aware = as_cache_aware(policy.as_ref()).unwrap();
             assert!(
                 cache_aware.kv_event_monitor_is_set_for_test(),
                 "{role} policy missed the KV event monitor"
@@ -2539,7 +2510,7 @@ mod tests {
                 "{role} policy missed the load feed"
             );
             assert!(
-                cache_aware.should_populate_hash_index_for_test(),
+                cache_aware.mesh_attached_for_test(),
                 "{role} policy missed the mesh tree bridge"
             );
         }
@@ -2549,11 +2520,7 @@ mod tests {
     fn hinted_policy_without_operator_config_uses_type_defaults() {
         let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let policy = registry.on_worker_added("llama-3", Some("cache_aware"));
-        let config = policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .unwrap()
-            .config_for_test();
+        let config = as_cache_aware(policy.as_ref()).unwrap().config_for_test();
         let defaults = CacheAwareConfig::default();
         assert_eq!(config.cache_threshold, defaults.cache_threshold);
         assert_eq!(config.max_tree_size, defaults.max_tree_size);

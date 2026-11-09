@@ -30,8 +30,30 @@ router:
   # -- Routing policy: random, round_robin, passthrough, cache_aware, power_of_two,
   #    least_load, manual, consistent_hashing or prefix_hash (the launcher's --policy
   #    choices; values.schema.json lists them). bucket is a prefill-side policy:
-  #    --prefill-policy bucket through extraArgs.
+  #    router.disaggregation.prefillPolicy.
   policy: cache_aware
+
+  # -- Disaggregated serving: the roles the gateway's --pd-disaggregation and
+  #    --epd-disaggregation take. mode "" (the default) is a regular fleet, "pd"
+  #    prefill and decode workers, "epd" encode, prefill and decode workers. The
+  #    role policies are the launcher's --prefill-policy, --decode-policy and
+  #    --encode-policy ("" leaves the gateway's default); values.schema.json
+  #    lists their choices. The role workers are static URLs, rendered as
+  #    --prefill URL [BOOTSTRAP_PORT], --decode URL and --encode URL
+  #    [BOOTSTRAP_PORT]; under Kubernetes discovery the role selectors
+  #    (router.discovery.kubernetes.prefillSelector, decodeSelector,
+  #    encodeSelector) find the role's pods instead. A role given without its
+  #    mode is refused at render.
+  disaggregation:
+    mode: ""
+    prefillPolicy: ""
+    decodePolicy: ""
+    encodePolicy: ""
+    prefill: []          # - url: http://prefill-0:8000
+                         #   bootstrapPort: 8998    # optional
+    decode: []           # - url: http://decode-0:8000
+    encode: []           # - url: http://encode-0:8000
+                         #   bootstrapPort: 8998    # optional
 
   # -- Enable IGW (Inference Gateway) mode for multi-model support
   enableIgw: false
@@ -83,6 +105,9 @@ router:
       clusterWide: false   # watch all namespaces (ClusterRole/ClusterRoleBinding)
       namespace: ""        # defaults to release namespace
       selector: ""         # e.g. "app=sglang-worker"; empty matches no pod
+      prefillSelector: ""  # the prefill pods under router.disaggregation.mode pd or epd
+      decodeSelector: ""   # the decode pods under router.disaggregation.mode pd or epd
+      encodeSelector: ""   # the encode pods under router.disaggregation.mode epd
       port: 80             # for pods without a smg.ai/worker-ports annotation
       modelIdFrom: ""      # "namespace", "label:key", or "annotation:key"
 
@@ -153,6 +178,14 @@ router:
                                # -1 = the host-derived bound (1024 per available core, at least 4096), 0 = no bound
   queueSize: 100
   queueTimeoutSecs: 60
+
+  # -- Multimodal: what the gateway does when libjpeg-turbo (libturbojpeg.so.0)
+  #    cannot be loaded. require (the default) refuses to start, so a gateway
+  #    never decodes JPEGs with the pure-Rust fallback, whose pixels differ from
+  #    the engine's by a few levels; prefer decodes with the fallback, says so
+  #    once and sets the gauge smg_mm_turbojpeg_available to 0. The published
+  #    image ships the library; a custom image without it needs prefer.
+  mmTurbojpeg: require
 
   # -- Resilience: retry
   retry:

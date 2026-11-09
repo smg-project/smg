@@ -9,11 +9,13 @@ use std::collections::HashMap;
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        bind_socket_addr, validate_mesh_server_name, CacheIndexKind, CircuitBreakerConfig,
-        ConfigError, ConfigResult, ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig,
-        HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode,
-        MemoryConfig, MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig,
-        PolicyConfig, PostgresConfig, ReadinessRoleConfig, RedisConfig, RetryConfig, RouterConfig,
+        bind_socket_addr,
+        secrets::{parse_control_plane_api_key, parse_tenant_api_key},
+        validate_mesh_server_name, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
+        ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig, HealthCheckConfig,
+        HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode, MemoryConfig,
+        MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
+        PostgresConfig, ReadinessRoleConfig, RedisConfig, RetryConfig, RouterConfig,
         RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, SlurmDiscoveryConfig,
         TokenizerCacheConfig, TraceConfig, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
     },
@@ -33,7 +35,7 @@ use super::{
         EnvLookup, API_KEY_SETTING, CONTROL_PLANE_API_KEYS_SETTING, POSTGRES_DB_URL_SETTING,
         REDIS_URL_SETTING, TENANT_API_KEYS_SETTING,
     },
-    value::{parse_control_plane_api_key, parse_role_mapping, parse_tenant_api_key},
+    value::parse_role_mapping,
 };
 use crate::{Backend, CliArgs, DiscoveryProvider};
 
@@ -218,6 +220,21 @@ impl CliArgs {
         enable
     }
 
+    /// The `key=value` entries of a discovery label selector as a map. One
+    /// argument may carry several entries separated by whitespace, the form
+    /// a quoted chart value or an operator passes, as the launcher reads it;
+    /// every token has passed `validate_flag_formats`.
+    fn parse_label_selector(selector_list: &[String]) -> HashMap<String, String> {
+        let tokens: Vec<String> = selector_list
+            .iter()
+            .flat_map(|entry| entry.split_whitespace())
+            .map(str::to_string)
+            .collect();
+        Self::parse_selector(&tokens)
+    }
+
+    /// The `key=value` entries of a list as a map. Every list this reads has
+    /// passed `validate_flag_formats`, so no entry lacks a `=`.
     fn parse_selector(selector_list: &[String]) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for item in selector_list {
@@ -661,6 +678,31 @@ impl CliArgs {
                 ));
             }
         }
+        // A selector entry without `=` or without a key used to be dropped,
+        // and the selector that remained matched more pods than the line said.
+        for (field, entries) in [
+            ("selector", &self.discovery.selector),
+            ("encode_selector", &self.discovery.encode_selector),
+            ("prefill_selector", &self.discovery.prefill_selector),
+            ("decode_selector", &self.discovery.decode_selector),
+            ("router_selector", &self.discovery.router_selector),
+        ] {
+            for entry in entries {
+                // One argument may carry several entries separated by
+                // whitespace; each token is one `key=value`, as the launcher
+                // reads it, and the refusal names the token.
+                let mut tokens = entry.split_whitespace().peekable();
+                if tokens.peek().is_none() {
+                    return Err(invalid(field, entry, "expected 'key=value'"));
+                }
+                for token in tokens {
+                    match token.split_once('=') {
+                        Some((key, _)) if !key.is_empty() => {}
+                        _ => return Err(invalid(field, token, "expected 'key=value'")),
+                    }
+                }
+            }
+        }
         for mapping in &self.integrations.jwt_role_mapping {
             match mapping.split_once('=') {
                 Some((idp_role, gateway_role))
@@ -868,15 +910,15 @@ impl CliArgs {
                     namespace: self.discovery.service_discovery_namespace.clone(),
                     port: self.discovery.service_discovery_port,
                     check_interval_secs: interval,
-                    selector: Self::parse_selector(&self.discovery.selector),
-                    encode_selector: Self::parse_selector(&self.discovery.encode_selector),
-                    prefill_selector: Self::parse_selector(&self.discovery.prefill_selector),
-                    decode_selector: Self::parse_selector(&self.discovery.decode_selector),
+                    selector: Self::parse_label_selector(&self.discovery.selector),
+                    encode_selector: Self::parse_label_selector(&self.discovery.encode_selector),
+                    prefill_selector: Self::parse_label_selector(&self.discovery.prefill_selector),
+                    decode_selector: Self::parse_label_selector(&self.discovery.decode_selector),
                     bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
                     worker_ports_annotation: "smg.ai/worker-ports".to_string(),
                     kv_connector_annotation: self.discovery.kv_connector_annotation.clone(),
                     kv_engine_id_annotation: self.discovery.kv_engine_id_annotation.clone(),
-                    router_selector: Self::parse_selector(&self.discovery.router_selector),
+                    router_selector: Self::parse_label_selector(&self.discovery.router_selector),
                     router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                     model_id_source: self.discovery.model_id_from.clone(),
                 }))

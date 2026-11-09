@@ -5,10 +5,11 @@ pub mod decode_stream;
 pub mod engine_answers;
 pub mod grpc_harness;
 pub mod held_worker;
-/// The gateway's copy of the hub fetcher (compiled by path from this crate's
-/// `src/hub_fetch.rs`), re-exported so a test binary that links both crates has
-/// one module and one download lock.
-pub use smg::test_support::hub_fetch;
+/// The gateway's hub fetcher (beside the checkpoint tokenizer fixtures of the
+/// gRPC router's tests), re-exported so a test binary that links both crates
+/// has one module and one download lock.
+pub use smg::routers::grpc::tokenizer_cache::hub_fetch;
+pub mod metrics_capture;
 pub mod mock_mcp_server;
 #[cfg(feature = "provider-openai")]
 pub mod mock_openai_server;
@@ -96,7 +97,7 @@ impl WorkerTestContext {
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let client = smg::clients::http_client_builder()
+        let client = smg::server::http_client_builder()
             .no_proxy()
             .build()
             .map_err(|e| format!("test client: {e}"))?;
@@ -128,7 +129,7 @@ impl WorkerTestContext {
     ) -> Result<Vec<String>, String> {
         use futures_util::StreamExt;
 
-        let client = smg::clients::http_client_builder()
+        let client = smg::server::http_client_builder()
             .no_proxy()
             .build()
             .map_err(|e| format!("test client: {e}"))?;
@@ -406,6 +407,20 @@ impl AppTestContext {
         )
     }
 
+    /// The production routers with initialized control-plane auth.
+    pub fn create_apps_with_auth(
+        &self,
+        control_plane_auth: Option<smg_auth::ControlPlaneAuthState>,
+        admin_listener: bool,
+    ) -> smg::server::GatewayApps {
+        test_app::create_test_apps_with_context_and_auth(
+            Arc::clone(&self.router),
+            Arc::clone(&self.app_context),
+            control_plane_auth,
+            admin_listener,
+        )
+    }
+
     pub async fn shutdown(mut self) {
         for worker in &mut self.workers {
             worker.stop().await;
@@ -436,7 +451,7 @@ async fn build_test_app_context(
     use smg_mcp::McpOrchestrator;
 
     // See `test_app::create_test_app_context`: no environment proxy in a test's path.
-    let client = smg::clients::http_client_builder()
+    let client = smg::server::http_client_builder()
         .no_proxy()
         .build()
         .expect("test client");
@@ -773,7 +788,7 @@ pub fn ensure_tokenizer_cached() -> PathBuf {
     let url = std::env::var(TINYLLAMA_TOKENIZER_URL_ENV)
         .unwrap_or_else(|_| TINYLLAMA_TOKENIZER_URL.to_string());
     let path = PathBuf::from(CACHE_DIR).join(TINYLLAMA_TOKENIZER_FILENAME);
-    hub_fetch::cached_download(&smg::clients::blocking_http_client(), &url, &path, 100);
+    hub_fetch::cached_download(&smg::server::blocking_http_client(), &url, &path, 100);
     path
 }
 

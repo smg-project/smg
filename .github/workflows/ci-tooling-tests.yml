@@ -7,6 +7,8 @@ on:
       - .github/workflows/pr-test-rust.yml
       - .github/workflows/e2e-gpu-job.yml
       - .github/workflows/nightly-bfcl.yml
+      - .github/workflows/pr-naming-check.yml
+      - .pre-commit-config.yaml
       - scripts/**
       - e2e_test/**
       - grpc_servicer/**

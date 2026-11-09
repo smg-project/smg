@@ -31,7 +31,7 @@ use smg::{
         RouterFactory,
     },
     tenant::{RouteRequestMeta, TenantKey},
-    worker::{BasicWorkerBuilder, RuntimeType, Worker, WorkerType},
+    worker::{test_support::RefusedAddress, BasicWorkerBuilder, RuntimeType, Worker, WorkerType},
 };
 use smg_data_connector::{ResponseId, StoredResponse};
 use smg_external_router::{openai::OpenAIRouter, ExternalRouter};
@@ -917,7 +917,7 @@ async fn test_openai_router_circuit_breaker() {
     // A loopback port that refuses connections, held for the whole test.
     // Every attempt fails at connect, with no resolver and no proxy involved,
     // whatever the environment.
-    let refused = smg::test_support::RefusedAddress::reserve();
+    let refused = RefusedAddress::reserve();
     register_external_worker(&ctx, &refused.http_url(), None);
     let router = OpenAIRouter::new(&external_context(&ctx)).await.unwrap();
 

@@ -2933,18 +2933,20 @@ mod tests {
     use super::*;
     use crate::{
         config::{types::PdPairingMode, PolicyConfig},
-        middleware::ReportedRefusal,
+        middleware::{test_support::json_of, ReportedRefusal},
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
         routers::common::sse::SSE_CHANNEL_BUFFER,
         tenant::TenantKey,
-        test_support::RefusedAddress,
-        worker::{circuit_breaker::CircuitState, BasicWorkerBuilder, WorkerType},
+        worker::{
+            circuit_breaker::CircuitState, test_support::RefusedAddress, BasicWorkerBuilder,
+            WorkerType,
+        },
     };
 
     /// A call that never reached its worker, with the worker's URL on the
     /// error as reqwest attaches it.
     async fn call_refused_by(addr: std::net::SocketAddr) -> reqwest::Error {
-        crate::clients::http_client_builder()
+        crate::server::http_client_builder()
             .build()
             .unwrap()
             .get(format!("http://{addr}/generate"))
@@ -2955,10 +2957,7 @@ mod tests {
 
     /// The message of the error envelope `response` carries.
     async fn error_message(response: Response) -> String {
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
+        let body = json_of(response).await;
         body["error"]["message"].as_str().unwrap().to_string()
     }
 
@@ -3004,7 +3003,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let worker = BasicWorkerBuilder::new(format!("http://{addr}")).build();
-        let error = crate::clients::http_client_builder()
+        let error = crate::server::http_client_builder()
             .timeout(std::time::Duration::from_millis(100))
             .build()
             .unwrap()
@@ -3568,7 +3567,7 @@ mod tests {
                 ..Default::default()
             };
             let client = Arc::new(
-                crate::clients::http_client_builder()
+                crate::server::http_client_builder()
                     .timeout(std::time::Duration::from_secs(1))
                     .build()
                     .unwrap(),
@@ -3672,7 +3671,7 @@ mod tests {
             ..Default::default()
         };
         let client = Arc::new(
-            crate::clients::http_client_builder()
+            crate::server::http_client_builder()
                 .timeout(std::time::Duration::from_secs(1))
                 .build()
                 .unwrap(),
@@ -3970,7 +3969,7 @@ mod tests {
         for head_sent in [false, true] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = Arc::new(
-                crate::clients::http_client_builder()
+                crate::server::http_client_builder()
                     .timeout(std::time::Duration::from_millis(100))
                     .build()
                     .unwrap(),

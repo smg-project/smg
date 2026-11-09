@@ -156,7 +156,7 @@ fn batch(
     matched: Option<MatchedStop>,
 ) -> BatchTokenIDSlimOutput {
     BatchTokenIDSlimOutput {
-        rids: vec![rid.to_string()],
+        rids: vec![rid.into()],
         output_ids: vec![tokens],
         finished_reasons: vec![finish.unwrap_or_default().to_string()],
         finished_messages: vec![None],

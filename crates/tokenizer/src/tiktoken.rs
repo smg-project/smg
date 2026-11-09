@@ -31,11 +31,12 @@ use crate::{
             apply_kimi_k3_xtml_with_effort_default, render_kimi_k3_xtml_prompt, KimiXtml,
             RenderedXtml,
         },
-        PromptSegment, RendererProfile, TemplateAnswers,
+        marks, PromptSegment, RendererProfile, TemplateAnswers,
     },
     factory::discover_chat_template_in_dir,
     kimi_k2_tokenizer,
-    native::NativeEncoder,
+    native::{AddedTokens, NativeEncoder},
+    tekken,
     traits::{
         past_emitted, ChatTemplateOutput, DecodeStep, Decoder, EncodeJob, Encoder, Encoding,
         IncrementalDecoder, PromptEncoding, RendererCapabilities, SpecialTokens, TokenIdType,
@@ -196,7 +197,8 @@ fn parse_special_tokens(config: &serde_json::Value) -> SpecialTokens {
     }
 }
 
-/// Tiktoken tokenizer wrapper — supports both built-in OpenAI encodings and hub-loaded models.
+/// Tiktoken tokenizer wrapper — supports the built-in OpenAI encodings, hub-loaded
+/// tiktoken models and `tekken.json` vocabularies (see `tekken.rs`).
 pub struct TiktokenTokenizer {
     /// Shared so a deferred chat encode can own a handle and run on another
     /// thread after the render call returned.
@@ -230,6 +232,51 @@ pub struct TiktokenTokenizer {
     /// `tokenization_kimi.py` sorts them in its `apply_chat_template`
     /// (Kimi K3's class, which renders its own format, does not).
     tools_key_sorted: bool,
+    /// The id `add_special_tokens` puts first: a tekken.json vocabulary's
+    /// own encoder prepends BOS on request and frames nothing else; a
+    /// tiktoken file's has no frame, so `None`, and the flag adds nothing.
+    bos: Option<TokenIdType>,
+    /// The matcher over the special spellings of a vocabulary whose own
+    /// reader writes a request's control tokens structurally and encodes
+    /// every request string as plain text (a `tekken.json` file, see
+    /// `tekken.rs`): the templates are compiled with the spellings between
+    /// marks (see `encoders::marks`), so the render tells the template's
+    /// control tokens from the same spelling typed into a message, which
+    /// stays text; the matcher says whether a flat encode of the rendered
+    /// text would cut out exactly the template's controls (see
+    /// `apply_chat_template_with_encoding`). `None` reads every spelling in
+    /// a rendered prompt as its token, as the flat encode does.
+    controls: Option<AddedTokens>,
+    /// The special tokens between the marks, for the marked templates'
+    /// context (`Some` with `controls`).
+    special_tokens_marked: Option<SpecialTokens>,
+}
+
+/// What a vocabulary file gives the tokenizer before the directory beside it
+/// is read: the engines are built over these; the chat template, the EOS ids
+/// and the renderer come from the directory (see
+/// [`TiktokenTokenizer::from_vocabulary`]).
+struct FileVocabulary {
+    /// Token bytes to id.
+    ranks: FxHashMap<Vec<u8>, Rank>,
+    /// The split pattern the ranks were trained under.
+    pattern: Cow<'static, str>,
+    /// Special token spellings to id: recognized in text, decoded by spelling.
+    specials: HashMap<String, TokenIdType>,
+    /// The ids `skip_special_tokens` strips.
+    skip_token_ids: HashSet<TokenIdType>,
+    /// The named special tokens (BOS, EOS, ...).
+    special_tokens: SpecialTokens,
+    /// The id `add_special_tokens` puts first, when the file's own encoder
+    /// has that frame.
+    bos: Option<TokenIdType>,
+    /// Encode a text in the checkpoint's pieces (see [`checkpoint_pieces`]).
+    checkpoint_pieces: bool,
+    /// The file's own reader writes a request's control tokens structurally
+    /// and encodes every request string as plain text: the chat templates
+    /// render under the backend's structural form (see
+    /// [`TiktokenTokenizer::controls`]).
+    structural_controls: bool,
 }
 
 /// Supported Tiktoken models
@@ -300,6 +347,9 @@ impl TiktokenTokenizer {
             byte_level,
             checkpoint_pieces: false,
             tools_key_sorted: false,
+            bos: None,
+            controls: None,
+            special_tokens_marked: None,
         })
     }
 
@@ -338,7 +388,7 @@ impl TiktokenTokenizer {
         let tiktoken_path_str = tiktoken_path
             .to_str()
             .ok_or_else(|| Error::msg("Tiktoken file path is not valid UTF-8"))?;
-        let encoder = load_tiktoken_bpe(tiktoken_path_str)?;
+        let ranks = load_tiktoken_bpe(tiktoken_path_str)?;
 
         // 2. Parse tokenizer_config.json from the same directory
         let dir = tiktoken_path
@@ -352,34 +402,120 @@ impl TiktokenTokenizer {
         // already-parsed tokenizer_config.json so we don't re-read it.
         let kimi = kimi_k2_tokenizer::matches(tokenizer_config_value.as_ref(), dir);
         let pattern = if kimi {
-            kimi_k2_tokenizer::apply_reserved_special_tokens(
-                &mut config.added_tokens,
-                encoder.len(),
-            );
+            kimi_k2_tokenizer::apply_reserved_special_tokens(&mut config.added_tokens, ranks.len());
             kimi_k2_tokenizer::KIMI_K2_PATTERN
         } else {
             CL100K_BASE_PATTERN
         };
+        Self::from_vocabulary(
+            FileVocabulary {
+                ranks,
+                pattern: Cow::Borrowed(pattern),
+                specials: config.added_tokens,
+                skip_token_ids: config.skip_token_ids,
+                special_tokens: config.special_tokens,
+                // The file's encoder frames nothing: the flag adds nothing.
+                bos: None,
+                // The same file gives the pattern and the piece rule.
+                checkpoint_pieces: kimi,
+                structural_controls: false,
+            },
+            dir,
+            chat_template_path,
+            config.chat_template,
+        )
+    }
 
-        // 3. Build special tokens encoder for CoreBPE (needs FxHashMap)
-        let special_tokens_encoder: FxHashMap<String, Rank> = config
-            .added_tokens
-            .iter()
-            .map(|(k, &v)| (k.clone(), v))
-            .collect();
+    /// Create from a `tekken.json` vocabulary file (see `tekken.rs`): the
+    /// ranks, the split pattern and the special tokens are the file's, laid
+    /// out as its reference reader lays them out. `tokenizer_config.json`,
+    /// the chat template and the EOS ids are read beside the file as for a
+    /// tiktoken file; the file's own sentence markers stand in where the
+    /// configuration names none. `add_special_tokens` prepends the file's
+    /// BOS. The chat templates render under the structural form (see
+    /// `controls`): a control spelling typed into a request stays text, as
+    /// the file's own reader encodes it, while the flat `encode` reads the
+    /// spelling as its token, as the checkpoint's conversion does.
+    pub fn from_tekken_file(path: &Path) -> Result<Self> {
+        Self::from_tekken_file_with_chat_template(path, None)
+    }
 
-        // 4. Calculate true vocab size from max token ID (handles sparse/reserved IDs),
-        //    build string-based vocab maps (borrows encoder), then pass encoder by value to CoreBPE
-        let vocab_size = encoder
+    /// [`Self::from_tekken_file`] with an optional chat template file path.
+    pub fn from_tekken_file_with_chat_template(
+        path: &Path,
+        chat_template_path: Option<&str>,
+    ) -> Result<Self> {
+        let file = tekken::read(path)?;
+        let dir = path
+            .parent()
+            .ok_or_else(|| Error::msg("Cannot determine parent directory of the tekken file"))?;
+        let (config, _) = load_tiktoken_config_from_dir(dir)?;
+        let mut special_tokens = config.special_tokens;
+        let named = |spelling: &str| file.special(spelling).map(|_| spelling.to_string());
+        special_tokens.bos_token = special_tokens.bos_token.or_else(|| named(tekken::BOS));
+        special_tokens.eos_token = special_tokens.eos_token.or_else(|| named(tekken::EOS));
+        special_tokens.unk_token = special_tokens.unk_token.or_else(|| named(tekken::UNK));
+        special_tokens.pad_token = special_tokens.pad_token.or_else(|| named(tekken::PAD));
+        // The file's decode rule: a skip drops every id of the special
+        // block, fillers included.
+        let skip_token_ids = file.specials.values().copied().collect();
+        // The file's own encoder prepends BOS on request.
+        let bos = file.special(tekken::BOS);
+        Self::from_vocabulary(
+            FileVocabulary {
+                ranks: file.ranks,
+                pattern: Cow::Owned(file.pattern),
+                specials: file.specials,
+                skip_token_ids,
+                special_tokens,
+                bos,
+                checkpoint_pieces: false,
+                // The file's own reader writes control tokens structurally.
+                structural_controls: true,
+            },
+            dir,
+            chat_template_path,
+            config.chat_template,
+        )
+    }
+
+    /// The tokenizer over a file's vocabulary: the engines over its ranks and
+    /// the vocabulary maps, then what the directory beside it gives (the chat
+    /// template from an explicit path, else the configuration's, else a file
+    /// beside the vocabulary; the EOS ids; the renderer).
+    fn from_vocabulary(
+        vocabulary: FileVocabulary,
+        dir: &Path,
+        chat_template_path: Option<&str>,
+        config_chat_template: ConfigChatTemplates,
+    ) -> Result<Self> {
+        let FileVocabulary {
+            ranks,
+            pattern,
+            specials,
+            skip_token_ids,
+            special_tokens,
+            bos,
+            checkpoint_pieces,
+            structural_controls,
+        } = vocabulary;
+
+        // Build special tokens encoder for CoreBPE (needs FxHashMap)
+        let special_tokens_encoder: FxHashMap<String, Rank> =
+            specials.iter().map(|(k, &v)| (k.clone(), v)).collect();
+
+        // Calculate true vocab size from max token ID (handles sparse/reserved IDs),
+        // build string-based vocab maps (borrows the ranks), then pass the ranks by value to CoreBPE
+        let vocab_size = ranks
             .values()
             .copied()
             .chain(special_tokens_encoder.values().copied())
             .max()
             .map(|id| id as usize + 1)
             .unwrap_or(0);
-        let (vocab, reverse_vocab) = build_vocab_maps(&encoder, &config.added_tokens);
-        let native = Self::native_encoder(&encoder, pattern, &config.added_tokens);
-        let tokenizer = Arc::new(CoreBPE::new(encoder, special_tokens_encoder, pattern)?);
+        let (vocab, reverse_vocab) = build_vocab_maps(&ranks, &specials);
+        let native = Self::native_encoder(&ranks, &pattern, &specials);
+        let tokenizer = Arc::new(CoreBPE::new(ranks, special_tokens_encoder, &pattern)?);
         // Counted and announced once the file's own encoder has loaded too,
         // the point the Hugging Face path counts at as well (before the chat
         // template is read).
@@ -388,16 +524,16 @@ impl TiktokenTokenizer {
             tracing::info!(path = %EncodePath::Native, "tiktoken encode path");
         }
 
-        // 5. Load chat template — propagate errors for explicit paths,
-        //    silently fall back for auto-discovery
-        //    A template file stands alone (no `tool_use` beside it).
+        // Load chat template — propagate errors for explicit paths,
+        // silently fall back for auto-discovery
+        // A template file stands alone (no `tool_use` beside it).
         let chat_template = if let Some(p) = chat_template_path {
             ConfigChatTemplates {
                 default: load_chat_template_from_file(p)?,
                 tool_use: None,
             }
-        } else if config.chat_template.is_some() {
-            config.chat_template
+        } else if config_chat_template.is_some() {
+            config_chat_template
         } else {
             ConfigChatTemplates {
                 default: discover_chat_template_in_dir(dir)
@@ -410,8 +546,7 @@ impl TiktokenTokenizer {
         // plus the tokenizer's own eos_token (structured-output grammars end on it).
         let eos_token_ids = crate::eos::with_tokenizer_eos(
             crate::eos::load_eos_token_ids(dir),
-            config
-                .special_tokens
+            special_tokens
                 .eos_token
                 .as_deref()
                 .and_then(|token| vocab.get(token).copied()),
@@ -419,28 +554,61 @@ impl TiktokenTokenizer {
 
         // Detect which chat-template renderer to use based on config.json::architectures
         let renderer = detect_renderer_from_config(dir);
-        let byte_level = byte_level_table(&tokenizer, vocab_size, &config.skip_token_ids);
+        let byte_level = byte_level_table(&tokenizer, vocab_size, &skip_token_ids);
+
+        // The templates of a vocabulary whose own reader writes control
+        // tokens structurally are compiled marked over the special spellings
+        // (see `controls`); a special block the matcher declines keeps the
+        // flat reading, as the conversion of such a checkpoint does.
+        // The processor's legacy template beside the files, for the requests
+        // without tools, read as the conversion of the checkpoint reads it
+        // (`factory::processor_chat_template`, one read for both backends).
+        let processor_template =
+            crate::factory::processor_chat_template(Some(dir), chat_template_path);
+        let mut chat_template =
+            ChatTemplateState::from_checkpoint(chat_template, processor_template)?;
+        let controls = structural_controls
+            .then(|| {
+                let spellings: Vec<(String, TokenIdType)> = specials
+                    .iter()
+                    .map(|(spelling, &id)| (spelling.clone(), id))
+                    .collect();
+                AddedTokens::build(&spellings).unwrap_or_else(|declined| {
+                    tracing::debug!(%declined, "no matcher over the special tokens; a control spelling typed into a request is the control");
+                    None
+                })
+            })
+            .flatten();
+        let special_tokens_marked = match &controls {
+            Some(controls) => {
+                chat_template.mark_controls(controls)?;
+                Some(marks::marked_special_tokens(&special_tokens))
+            }
+            None => None,
+        };
 
         Ok(TiktokenTokenizer {
             tokenizer,
             native,
-            special_tokens: config.special_tokens,
+            special_tokens,
             vocab,
             reverse_vocab,
             vocab_size,
-            chat_template: ChatTemplateState::from_config(chat_template)?,
+            chat_template,
             eos_token_ids,
-            skip_token_ids: config.skip_token_ids,
+            skip_token_ids,
             profile: renderer.profile(),
             renderer,
             byte_level,
-            // The same file gives the pattern and the piece rule.
-            checkpoint_pieces: kimi,
+            checkpoint_pieces,
             tools_key_sorted: match renderer {
                 Renderer::KimiK25Tools => true,
                 Renderer::KimiXtml(_) => false,
-                Renderer::Jinja => kimi,
+                Renderer::Jinja => checkpoint_pieces,
             },
+            bos,
+            controls,
+            special_tokens_marked,
         })
     }
 
@@ -531,15 +699,39 @@ impl TiktokenTokenizer {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<(String, bool)> {
-        // Inject special tokens if the caller didn't provide them
-        let params = if params.special_tokens.is_some() {
-            params
+        let (text, continued_final_message) = self.render(messages, params)?;
+        // A marked render (see `controls`) is the flat prompt once its marks
+        // are gone.
+        let text = if self.chat_template.marked() {
+            marks::strip(&text).into_owned()
         } else {
-            ChatTemplateParams {
-                special_tokens: Some(&self.special_tokens),
-                ..params
-            }
+            text
         };
+        Ok((text, continued_final_message))
+    }
+
+    /// The render of `messages` under `params`, marked when the templates
+    /// are (see `controls`), and whether the prompt continues the final
+    /// message.
+    fn render(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+    ) -> Result<(String, bool)> {
+        // A marked template writes its control tokens between marks, the
+        // special tokens it reads included, and reads every request string
+        // (messages, tools, documents, template kwargs) with its marks
+        // removed, so no request can forge one; else the tokenizer's special
+        // tokens stand in when the caller passed none.
+        let inputs = marks::TemplateInputs::new(
+            messages,
+            &params,
+            self.special_tokens_marked
+                .as_ref()
+                .filter(|_| self.chat_template.marked()),
+            &self.special_tokens,
+        );
+        let (messages, params) = inputs.split(params);
         // The checkpoint's own class sorts the tools' keys before anything
         // reads them: so here, from the kept sorted form of the prepared set
         // when the caller hands one (made once per set), else sorted now.
@@ -575,6 +767,50 @@ impl TiktokenTokenizer {
                 false,
             )),
         }
+    }
+
+    /// The prompt of a marked template (see `controls`), encoded by
+    /// segments so that a control spelling typed in a message stays text:
+    /// as text all the same when the flat encode would cut out exactly the
+    /// template's control tokens (the ids are then the same, and the text
+    /// takes every path and cache a flat encode takes), else as a deferred
+    /// encode of the segments, the text between two controls as plain BPE.
+    fn apply_marked_with_encoding(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+        assistant_prefix: Option<&str>,
+    ) -> Result<ChatTemplateOutput> {
+        let generation_prompt_unless_continued = params.generation_prompt_unless_continued();
+        let (mut marked, continued_final_message) = self.render(messages, params)?;
+        if let Some(prefix) = assistant_prefix {
+            // Request text: a mark a client wrote into it is no mark.
+            marked.push_str(&marks::strip(prefix));
+        }
+        let (text, controls) = marks::flatten(&marked)?;
+        let flat_encode_is_segment_encode = match &self.controls {
+            Some(matcher) => matcher.ranges(&text).eq(controls.iter().cloned()),
+            None => controls.is_empty(),
+        };
+        let encoding = if flat_encode_is_segment_encode {
+            PromptEncoding::FromText
+        } else {
+            let segments = marks::segments(&marked)?;
+            let bpe = Arc::clone(&self.tokenizer);
+            let native = self.native.clone();
+            let checkpoint_pieces = self.checkpoint_pieces;
+            PromptEncoding::Deferred(EncodeJob::new(move || {
+                encode_segments(&bpe, native.as_deref(), &segments, checkpoint_pieces)
+                    .map(Encoding::Tiktoken)
+            }))
+        };
+        Ok(ChatTemplateOutput {
+            text,
+            encoding,
+            unbilled_prompt_tokens: 0,
+            continued_final_message,
+            generation_prompt: generation_prompt_unless_continued && !continued_final_message,
+        })
     }
 }
 
@@ -906,13 +1142,15 @@ fn encode_with_special_tokens(
 }
 
 impl Encoder for TiktokenTokenizer {
-    fn encode(&self, input: &str, _add_special_tokens: bool) -> Result<Encoding> {
-        // tiktoken ignores `add_special_tokens` (it means BOS/EOS prepend on HF
-        // backends, which tiktoken has no concept of) and always recognizes
-        // special-token patterns, so chat-template tokens like <|media_pad|> stay
-        // atomic instead of splitting into BPE sub-tokens.
+    fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
+        // The special tokens' spellings are recognized whatever the flag asks:
+        // a rendered chat prompt carries its control tokens as text
+        // (`<|media_pad|>`, `[INST]`), so they stay atomic instead of
+        // splitting into BPE sub-tokens. The flag adds the frame the
+        // vocabulary's own encoder adds: BOS for a tekken.json file, nothing
+        // for a tiktoken file (no concept of one).
         let native = self.native.as_deref();
-        let tokens = if self.checkpoint_pieces {
+        let mut tokens: Vec<TokenIdType> = if self.checkpoint_pieces {
             checkpoint_pieces(input)
                 .into_iter()
                 .flat_map(|piece| encode_with_special_tokens(&self.tokenizer, native, piece))
@@ -920,6 +1158,9 @@ impl Encoder for TiktokenTokenizer {
         } else {
             encode_with_special_tokens(&self.tokenizer, native, input)
         };
+        if let Some(bos) = self.bos.filter(|_| add_special_tokens) {
+            tokens.insert(0, bos);
+        }
         Ok(Encoding::Tiktoken(tokens))
     }
 
@@ -1110,6 +1351,12 @@ impl TokenizerTrait for TiktokenTokenizer {
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
         let Renderer::KimiXtml(model) = self.renderer else {
+            // A marked template (see `controls`): the prompt is encoded by
+            // segments, so that a control spelling typed in a message stays
+            // text.
+            if self.chat_template.marked() {
+                return self.apply_marked_with_encoding(messages, params, assistant_prefix);
+            }
             let generation_prompt_unless_continued = params.generation_prompt_unless_continued();
             let (mut text, continued_final_message) =
                 self.apply_with_continuation(messages, params)?;
@@ -1222,7 +1469,10 @@ impl TokenizerTrait for TiktokenTokenizer {
     }
 
     fn set_chat_template(&mut self, template: String) -> Result<()> {
-        self.chat_template.set(template)
+        // Replaced and marked as one step: a template that fails to mark
+        // leaves the previous one in force (see `replace_marked`).
+        self.chat_template
+            .replace_marked(template, self.controls.as_ref())
     }
 }
 
@@ -1809,6 +2059,48 @@ mod tests {
         )
         .unwrap();
         dir
+    }
+
+    /// A tiktoken-file checkpoint reads the processor's legacy
+    /// `chat_template.json` beside it as the conversion of a checkpoint
+    /// does: a request without tools renders through the processor's
+    /// template, a request with tools through the configuration's.
+    #[test]
+    fn a_tiktoken_file_checkpoint_reads_the_processor_template_for_tool_less_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tiktoken.model"),
+            full_byte_tiktoken_model(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template": "config"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("chat_template.json"),
+            r#"{"chat_template": "processor"}"#,
+        )
+        .unwrap();
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        let messages = [serde_json::json!({"role": "user", "content": "hello"})];
+        let tools =
+            [serde_json::json!({"type": "function", "function": {"name": "f", "parameters": {}}})];
+        let without_tools = tokenizer
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(without_tools, "processor");
+        let with_tools = ChatTemplateParams {
+            tools: Some(tools.as_slice()),
+            ..ChatTemplateParams::default()
+        };
+        assert_eq!(
+            tokenizer
+                .apply_chat_template(&messages, with_tools)
+                .unwrap(),
+            "config"
+        );
     }
 
     #[test]

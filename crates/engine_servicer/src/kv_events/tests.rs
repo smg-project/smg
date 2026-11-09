@@ -581,7 +581,7 @@ async fn every_batch_a_subscriber_receives_carries_the_load_record() {
     .await;
     let batch2 = golden::bytes(golden::BATCH2);
     lab.publish(1, &batch2).await;
-    lab.wait_relayed(2).await;
+    wait_relayed(&lab.relay, 2).await;
     // History first (0 and 1), then live (2).
     let mut stream = lab.subscribe(0).expect("history");
     let first = read(&mut stream).await;
@@ -617,7 +617,7 @@ async fn every_batch_a_subscriber_receives_carries_the_load_record() {
     )
     .await;
     rolled.publish(1, &batch2).await;
-    rolled.wait_relayed(2).await;
+    wait_relayed(&rolled.relay, 2).await;
     let mut whole = rolled.subscribe(0).expect("history");
     assert_eq!(record_of(&read(&mut whole).await).running_requests, 1);
     // No source: no record.
@@ -756,7 +756,7 @@ async fn a_live_batch_is_the_engines_progress_a_duplicate_a_heartbeat_and_a_repl
     wait_progress(&loads, 1).await;
     let batch2 = golden::bytes(golden::BATCH2);
     lab.publish(1, &batch2).await;
-    lab.wait_relayed(2).await;
+    wait_relayed(&lab.relay, 2).await;
     wait_progress(&loads, 2).await;
     // Heartbeats to a subscriber are the relay's own, not the engine's.
     let mut stream = lab.subscribe(0).expect("history");
@@ -791,7 +791,7 @@ async fn a_live_batch_is_the_engines_progress_a_duplicate_a_heartbeat_and_a_repl
         ],
     )
     .await;
-    late.wait_relayed(4).await;
+    wait_relayed(&late.relay, 4).await;
     wait_progress(&late_loads, 1).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
@@ -839,6 +839,21 @@ async fn start_lab_without_replay_socket_yet() -> (Lab, String) {
     )
 }
 
+/// Polls the relay (250 times, 20 ms apart) until it has relayed `count`
+/// batches; fails the test naming the count it saw.
+async fn wait_relayed(relay: &KvEventRelay, count: u64) {
+    for _ in 0..250 {
+        if relay.counts().relayed >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "the relay relayed {} batches, not {count}",
+        relay.counts().relayed
+    );
+}
+
 impl Lab {
     async fn publish(&mut self, sequence: u64, payload: &[u8]) {
         self.publisher
@@ -859,19 +874,6 @@ impl Lab {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("the relay never saw sequence 0");
-    }
-
-    async fn wait_relayed(&self, count: u64) {
-        for _ in 0..250 {
-            if self.relay.counts().relayed >= count {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!(
-            "the relay relayed {} batches, not {count}",
-            self.relay.counts().relayed
-        );
     }
 
     fn subscribe(&self, cursor: u64) -> Result<BoxStream<common::KvEventBatch>, Status> {
@@ -997,7 +999,7 @@ async fn history_serves_a_cursor_inside_the_window_then_live() {
     for sequence in 1..=5 {
         lab.publish(sequence, &batch2).await;
     }
-    lab.wait_relayed(6).await;
+    wait_relayed(&lab.relay, 6).await;
 
     let mut stream = lab.subscribe(2).expect("inside the window");
     for expected in 3..=5 {
@@ -1027,7 +1029,7 @@ async fn cursors_outside_the_window_are_out_of_range() {
     for sequence in 1..=9 {
         lab.publish(sequence, &batch2).await;
     }
-    lab.wait_relayed(10).await;
+    wait_relayed(&lab.relay, 10).await;
     // The window is 7..=9: cursor 6 wants 7, served; cursor 5 wants 6, gone.
     let mut stream = lab.subscribe(6).expect("the oldest batch is wanted");
     for expected in 7..=9 {
@@ -1049,7 +1051,7 @@ async fn a_subscriber_without_a_cursor_gets_the_whole_history_or_a_snapshot() {
     let batch2 = golden::bytes(golden::BATCH2);
     lab.publish(1, &batch2).await;
     lab.publish(2, &batch2).await;
-    lab.wait_relayed(3).await;
+    wait_relayed(&lab.relay, 3).await;
     // Everything since the publisher's first batch is here: hand it over.
     let mut stream = lab.subscribe(0).expect("live");
     for expected in 0..=2 {
@@ -1105,7 +1107,7 @@ async fn a_publisher_gap_is_filled_from_the_engines_replay() {
     lab.prime().await;
     let batch2 = golden::bytes(golden::BATCH2);
     lab.publish(1, &batch2).await;
-    lab.wait_relayed(2).await;
+    wait_relayed(&lab.relay, 2).await;
     let mut stream = lab.subscribe(1).expect("caught up");
 
     // 2 and 3 never reach the SUB; 4 reveals the gap.
@@ -1151,7 +1153,7 @@ async fn a_gap_the_engine_cannot_fill_leaves_a_hole_not_a_dead_end() {
     lab.prime().await;
     let batch2 = golden::bytes(golden::BATCH2);
     lab.publish(1, &batch2).await;
-    lab.wait_relayed(2).await;
+    wait_relayed(&lab.relay, 2).await;
     let mut stream = lab.subscribe(1).expect("caught up");
     lab.publish(4, &batch2).await;
     assert_eq!(
@@ -1239,7 +1241,7 @@ async fn a_sequence_regression_ends_live_streams_and_clears_the_history() {
     for sequence in 1..=3 {
         lab.publish(sequence, &batch2).await;
     }
-    lab.wait_relayed(4).await;
+    wait_relayed(&lab.relay, 4).await;
     let mut stream = lab.subscribe(0).expect("whole history");
     for expected in 0..=3 {
         assert_eq!(read(&mut stream).await.sequence_number, expected);
@@ -1342,7 +1344,7 @@ async fn the_engines_startup_clear_under_a_passed_cursor_is_a_restart() {
     for sequence in 1..=3 {
         lab.publish(sequence, &batch2).await;
     }
-    lab.wait_relayed(4).await;
+    wait_relayed(&lab.relay, 4).await;
     let mut stream = lab.subscribe(3).expect("caught up");
     // A repeated sequence without a clear is a duplicate.
     lab.publish(3, &batch2).await;
@@ -1376,7 +1378,7 @@ async fn a_counter_back_at_its_start_is_a_restart() {
     for sequence in 1..=5 {
         lab.publish(sequence, &batch2).await;
     }
-    lab.wait_relayed(6).await;
+    wait_relayed(&lab.relay, 6).await;
     let mut stream = lab.subscribe(5).expect("caught up");
     lab.publish(1, &batch2).await;
     let status = read_error(&mut stream).await;
@@ -1416,7 +1418,7 @@ async fn a_publisher_already_counting_when_the_relay_joins_is_replayed_from_its_
         ],
     )
     .await;
-    lab.wait_relayed(4).await;
+    wait_relayed(&lab.relay, 4).await;
     let counts = lab.relay.counts();
     assert_eq!(
         (
@@ -1460,7 +1462,7 @@ async fn a_replay_that_starts_past_zero_leaves_the_earlier_sequences_unknown() {
         ],
     )
     .await;
-    lab.wait_relayed(3).await;
+    wait_relayed(&lab.relay, 3).await;
     let counts = lab.relay.counts();
     assert_eq!(
         (
@@ -1554,7 +1556,7 @@ async fn a_clear_after_a_late_join_ends_the_unknown_stretch() {
     assert_eq!(late.relay.counts().unknown_before_start, 5);
     // The engine resets its cache: BATCH1 ends with its clear.
     late.publish(6, &golden::bytes(golden::BATCH1)).await;
-    late.wait_relayed(2).await;
+    wait_relayed(&late.relay, 2).await;
     let mut fresh = late.subscribe(0).expect("a snapshot");
     let chunk = read(&mut fresh).await;
     assert_eq!((chunk.sequence_number, chunk.dp_rank), (6, Some(0)));
@@ -1592,7 +1594,7 @@ async fn a_clear_among_the_replayed_batches_ends_the_unknown_stretch_too() {
         ],
     )
     .await;
-    lab.wait_relayed(3).await;
+    wait_relayed(&lab.relay, 3).await;
     let counts = lab.relay.counts();
     assert_eq!(
         (counts.gap_batches_lost, counts.unknown_before_start),
@@ -1652,7 +1654,7 @@ async fn the_relay_takes_the_publishers_replay_at_start_before_any_live_batch() 
         ],
     )
     .await;
-    lab.wait_relayed(3).await;
+    wait_relayed(&lab.relay, 3).await;
     let counts = lab.relay.counts();
     assert_eq!(
         (
@@ -1735,7 +1737,7 @@ async fn a_start_replay_that_begins_past_the_publishers_start_marks_the_rest_unk
     lab.router = Some(router);
     lab.answer_replay(0, &[(6, batch2.clone()), (7, batch2.clone())])
         .await;
-    lab.wait_relayed(2).await;
+    wait_relayed(&lab.relay, 2).await;
     let counts = lab.relay.counts();
     assert_eq!(
         (
@@ -1840,19 +1842,6 @@ impl RankLab {
         panic!("the relay never saw every rank's sequence 0");
     }
 
-    async fn wait_relayed(&self, count: u64) {
-        for _ in 0..250 {
-            if self.relay.counts().relayed >= count {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!(
-            "the relay relayed {} batches, not {count}",
-            self.relay.counts().relayed
-        );
-    }
-
     fn subscribe(&self, cursor: u64) -> Result<BoxStream<common::KvEventBatch>, Status> {
         self.relay.subscribe(common::SubscribeKvEventsRequest {
             start_sequence_number: cursor,
@@ -1888,7 +1877,7 @@ async fn every_rank_of_a_data_parallel_publisher_is_relayed_under_its_own_sequen
     lab.publish(0, 1, &store_payload(1.0, &[2], Some(1))).await;
     lab.publish(0, 2, &store_payload(2.0, &[3], Some(2))).await;
     lab.publish(1, 1, &store_payload(1.0, &[12], Some(1))).await;
-    lab.wait_relayed(5).await;
+    wait_relayed(&lab.relay, 5).await;
     assert_eq!(lab.relay.live_ranks(), 2, "both ranks' blocks are recorded");
 
     let mut stream = lab.subscribe(0).expect("both windows");
@@ -1922,7 +1911,7 @@ async fn a_cursor_on_a_relay_over_several_ranks_is_refused_for_a_resubscription_
     lab.publish(0, 1, &store_payload(1.0, &[2], Some(1))).await;
     lab.publish(0, 2, &store_payload(2.0, &[3], Some(2))).await;
     lab.publish(1, 1, &store_payload(1.0, &[12], Some(1))).await;
-    lab.wait_relayed(5).await;
+    wait_relayed(&lab.relay, 5).await;
 
     let status = refused(lab.subscribe(1));
     assert_eq!(status.code(), tonic::Code::OutOfRange);
@@ -1958,7 +1947,7 @@ async fn a_snapshot_stamps_each_rank_at_its_own_cursor() {
             .await;
     }
     lab.publish(1, 1, &store_payload(1.0, &[100], None)).await;
-    lab.wait_relayed(7).await;
+    wait_relayed(&lab.relay, 7).await;
 
     let mut stream = lab.subscribe(0).expect("a snapshot");
     let first = read(&mut stream).await;
@@ -2013,7 +2002,7 @@ async fn a_restart_on_one_rank_clears_that_ranks_window_only() {
     lab.publish(1, 1, &store_payload(1.0, &[12], Some(1))).await;
     lab.publish(1, 2, &store_payload(2.0, &[13], Some(12)))
         .await;
-    lab.wait_relayed(5).await;
+    wait_relayed(&lab.relay, 5).await;
     let mut stream = lab.subscribe(0).expect("both windows");
     assert_eq!(tagged(&mut stream, 5).await.len(), 5);
 
@@ -2021,7 +2010,7 @@ async fn a_restart_on_one_rank_clears_that_ranks_window_only() {
     let status = read_error(&mut stream).await;
     assert_eq!(status.code(), tonic::Code::DataLoss);
     assert!(status.message().contains("restarted"));
-    lab.wait_relayed(6).await;
+    wait_relayed(&lab.relay, 6).await;
     assert_eq!(lab.relay.counts().publisher_restarts, 1);
 
     let mut fresh = lab.subscribe(0).expect("both windows again");
@@ -2089,11 +2078,11 @@ async fn after_the_window_rolled_a_subscriber_without_a_cursor_gets_a_snapshot_t
     lab.publish(3, &store_payload(3.0, &[20], None)).await;
     lab.publish(4, &remove_payload(&[20])).await;
     lab.publish(5, &store_payload(5.0, &[21, 22], None)).await;
-    lab.wait_relayed(6).await;
+    wait_relayed(&lab.relay, 6).await;
     let mut stream = lab.subscribe(0).expect("a snapshot");
     // Published before the first poll: must follow the snapshot.
     lab.publish(6, &store_payload(6.0, &[30], Some(22))).await;
-    lab.wait_relayed(7).await;
+    wait_relayed(&lab.relay, 7).await;
     let chunk = read(&mut stream).await;
     assert_eq!(chunk.sequence_number, 5, "stamped at the cut");
     assert_eq!(
@@ -2134,7 +2123,7 @@ async fn a_stale_cursor_below_the_window_is_refused_and_zero_gets_the_snapshot()
         lab.publish(seq, &store_payload(seq as f64, &[seq as i64 * 10], None))
             .await;
     }
-    lab.wait_relayed(5).await;
+    wait_relayed(&lab.relay, 5).await;
     // The window is 3..=4; cursor 1 wants 2, gone.
     let status = refused(lab.subscribe(1));
     assert_eq!(status.code(), tonic::Code::OutOfRange);
@@ -2355,7 +2344,7 @@ async fn the_relays_wire_counts_follow_the_normalizer() {
     assert_eq!(lab.relay.wire_counts(), WireCounts::default());
     lab.prime().await;
     lab.publish(1, &golden::bytes(golden::BATCH2)).await;
-    lab.wait_relayed(2).await;
+    wait_relayed(&lab.relay, 2).await;
     let wire = lab.relay.wire_counts();
     assert!(
         wire.forwarded_stored + wire.forwarded_removed + wire.forwarded_cleared > 0,

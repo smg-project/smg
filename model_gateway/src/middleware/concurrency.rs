@@ -368,7 +368,7 @@ mod tests {
         health::ProbeState,
         middleware::{
             edge_body::at_the_edge,
-            test_support::{echo_request, echo_route},
+            test_support::{echo_request, echo_route, ECHO_PATH},
             HttpMetricsLayer,
         },
         observability::inflight_tracker::InFlightRequestTracker,
@@ -384,7 +384,7 @@ mod tests {
         let router_config = RouterConfig::default();
         let context = Arc::new(
             AppContext::builder()
-                .client(crate::clients::http_client())
+                .client(crate::server::http_client())
                 .rate_limiter(Some(bucket))
                 .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
                 .reasoning_parser_factory(None)
@@ -403,6 +403,7 @@ mod tests {
                 .unwrap(),
         );
         Arc::new(AppState {
+            secret_sources: Default::default(),
             router: Arc::new(Gateway::new(context.worker_registry.clone())),
             probe_state: ProbeState::new(context.inflight_tracker.clone()),
             context,
@@ -417,7 +418,7 @@ mod tests {
     /// builds the one body wrapper that holds the token).
     fn echo_app(app_state: Arc<AppState>) -> Router {
         Router::new()
-            .route("/echo", echo_route())
+            .route(ECHO_PATH, echo_route())
             .layer(ConcurrencyLimitLayer::new(app_state))
             .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
     }
@@ -437,7 +438,7 @@ mod tests {
         };
         let app = Router::new()
             .route("/stream", post(stream))
-            .route("/echo", echo_route())
+            .route(ECHO_PATH, echo_route())
             .layer(ConcurrencyLimitLayer::new(test_app_state(bucket, None)))
             .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()));
         (app, frame_tx)
@@ -759,7 +760,7 @@ mod tests {
         };
         let app = Router::new()
             .route("/hold", post(hold))
-            .route("/echo", echo_route())
+            .route(ECHO_PATH, echo_route())
             .layer(ConcurrencyLimitLayer::new(test_app_state(
                 bucket,
                 Some(queue),

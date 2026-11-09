@@ -23,7 +23,7 @@ use super::{
         convert_to_u32, decode_error, decode_f32_vec, decode_float_vec, known_spelling,
         parse_dtype, Endianness, ScalarType,
     },
-    encode_msgpack,
+    encode_msgpack_with_capacity,
 };
 use crate::error::Result;
 
@@ -324,7 +324,7 @@ pub(crate) fn lies_within(frame: &Bytes, view: &[u8]) -> bool {
 
 /// `view` as [`Bytes`]: a slice of the frame under decode when it lies inside
 /// that frame's buffer, a copy otherwise.
-fn raw_view_bytes(view: &[u8]) -> Bytes {
+pub(crate) fn frame_view_bytes(view: &[u8]) -> Bytes {
     DECODING_FRAME.with(|current| {
         current
             .borrow()
@@ -337,7 +337,7 @@ fn raw_view_bytes(view: &[u8]) -> Bytes {
     })
 }
 
-/// The payload of a raw-view ext as [`Bytes`], through [`raw_view_bytes`].
+/// The payload of a raw-view ext as [`Bytes`], through [`frame_view_bytes`].
 struct RawViewPayload(Bytes);
 
 impl<'de> Deserialize<'de> for RawViewPayload {
@@ -358,7 +358,7 @@ impl<'de> Deserialize<'de> for RawViewPayload {
                 self,
                 view: &'de [u8],
             ) -> std::result::Result<Self::Value, E> {
-                Ok(RawViewPayload(raw_view_bytes(view)))
+                Ok(RawViewPayload(frame_view_bytes(view)))
             }
 
             fn visit_bytes<E: de::Error>(self, view: &[u8]) -> std::result::Result<Self::Value, E> {
@@ -560,13 +560,16 @@ pub fn tensor_placement<T: TensorFields + ?Sized>(payload: &T) -> TensorPlacemen
 /// Encode `payload` as msgpack with its large tensors as auxiliary frames, in
 /// visiting order and addressed one-based (frame 0 is the payload itself). A
 /// payload whose tensors stay inline ([`tensor_placement`]) is encoded as it
-/// is, without a clone; `payload` is never changed either way.
-pub fn encode_with_aux_frames<T>(payload: &T) -> Result<(Vec<u8>, Vec<Bytes>)>
+/// is, without a clone; `payload` is never changed either way. The payload's
+/// buffer is reserved at `capacity` bytes before the write
+/// ([`encode_msgpack_with_capacity`]; [`super::add_request_capacity`] for an
+/// add-request).
+pub fn encode_with_aux_frames<T>(payload: &T, capacity: usize) -> Result<(Vec<u8>, Vec<Bytes>)>
 where
     T: Serialize + Clone + TensorFields + fmt::Debug,
 {
     if tensor_placement(payload) == TensorPlacement::Inline {
-        return Ok((encode_msgpack(payload)?, Vec::new()));
+        return Ok((encode_msgpack_with_capacity(payload, capacity)?, Vec::new()));
     }
     // Tensor storage is `Bytes`: the clone shares every buffer, and the
     // frames below share them again.
@@ -580,7 +583,7 @@ where
             }
         }
     });
-    Ok((encode_msgpack(&wire)?, frames))
+    Ok((encode_msgpack_with_capacity(&wire, capacity)?, frames))
 }
 
 /// A decoded rank-2 array with its dimensions.
@@ -791,7 +794,7 @@ mod tests {
     use rmpv::Value;
 
     use super::*;
-    use crate::codec::hex;
+    use crate::codec::{encode_msgpack, hex};
 
     /// A raw-view array decoded as part of its message's frame shares the
     /// frame's buffer; decoded from a plain slice, it is copied.
@@ -1023,7 +1026,7 @@ mod tests {
         let tensor = |n: usize| WireNdArray::from_raw("uint8", vec![n], vec![n as u8; n]);
         let small = vec![tensor(0), tensor(255), tensor(TENSOR_AUX_MIN_BYTES - 1)];
         assert_eq!(tensor_placement(&small), TensorPlacement::Inline);
-        let (payload, frames) = encode_with_aux_frames(&small).unwrap();
+        let (payload, frames) = encode_with_aux_frames(&small, 0).unwrap();
         assert!(frames.is_empty());
         assert_eq!(payload, encode_msgpack(&small).unwrap());
 
@@ -1034,7 +1037,7 @@ mod tests {
         ];
         assert_eq!(tensor_placement(&mixed), TensorPlacement::AuxFrames);
         let inline = encode_msgpack(&mixed).unwrap();
-        let (payload, frames) = encode_with_aux_frames(&mixed).unwrap();
+        let (payload, frames) = encode_with_aux_frames(&mixed, 0).unwrap();
         assert_eq!(
             frames.iter().map(Bytes::len).collect::<Vec<_>>(),
             vec![TENSOR_AUX_MIN_BYTES, 2 * TENSOR_AUX_MIN_BYTES]
@@ -1062,7 +1065,7 @@ mod tests {
         let mut indexed = mixed.clone();
         indexed[1].data = WireArrayData::AuxIndex(1);
         assert_eq!(tensor_placement(&indexed), TensorPlacement::Inline);
-        let (payload, frames) = encode_with_aux_frames(&indexed).unwrap();
+        let (payload, frames) = encode_with_aux_frames(&indexed, 0).unwrap();
         assert!(frames.is_empty());
         assert_eq!(payload, encode_msgpack(&indexed).unwrap());
     }

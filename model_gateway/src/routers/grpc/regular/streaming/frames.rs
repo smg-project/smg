@@ -225,6 +225,40 @@ fn push_json<W: io::Write, T: Serialize + ?Sized>(writer: W, value: &T) {
     let _ = serde_json::to_writer(writer, value);
 }
 
+/// A generate choice's text so far as the contents of its JSON string: the
+/// bytes serde writes between the quotes, escaped once as each chunk arrives.
+/// Every event of a generate stream carries the choice's whole text, and the
+/// stream only appends to it (each chunk is decoded on its own and pushed),
+/// so the escaped form is extended in step and never rewritten, and an event
+/// copies the text into its frame instead of escaping it again (serde's
+/// escape walked every byte of the answer on every event, a cost growing
+/// with the square of the answer's length). The bytes are serde's own:
+/// `tests::generate_event_frames_write_the_bytes_of_the_serialized_event`
+/// pins an event written from this text against the serialized event with
+/// the raw text.
+#[derive(Default)]
+pub(super) struct EscapedText(Vec<u8>);
+
+impl EscapedText {
+    /// Append `text` escaped by serde_json's own rule: it is written onto the
+    /// end as a JSON string literal and the two quotes it was written between
+    /// are removed (the closing one popped, the opening one by a move of the
+    /// chunk's few bytes).
+    pub(super) fn push_str(&mut self, text: &str) {
+        let start = self.0.len();
+        push_json(&mut self.0, text);
+        self.0.pop();
+        self.0.remove(start);
+    }
+
+    /// Append the JSON string literal of the text so far to `buffer`.
+    pub(super) fn write_literal(&self, buffer: &mut BytesMut) {
+        buffer.extend_from_slice(b"\"");
+        buffer.extend_from_slice(&self.0);
+        buffer.extend_from_slice(b"\"");
+    }
+}
+
 /// The SSE frame of the per-token chunks of one completion stream.
 ///
 /// Every chunk of a stream repeats the same `id`, `object`, `created`,

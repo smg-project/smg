@@ -37,7 +37,7 @@
 use std::{any::Any, fmt, future::Future, panic::AssertUnwindSafe, sync::OnceLock};
 
 use futures::FutureExt;
-use tracing::error;
+use tracing::{error, Span};
 
 use crate::routers::grpc::regular::symphony::telemetry;
 
@@ -89,13 +89,16 @@ impl Panicked {
     }
 
     /// Records the failure: one increment under the table's `panicked`
-    /// outcome when a table read the response, and one ERROR line with the
+    /// outcome when a table read the response, the outcome and the table on
+    /// the request's span (current here: the whole response's handler, or
+    /// the stream's failure sent under the span), and one ERROR line with the
     /// request id, the model, the table and the message. Once per request,
     /// where the request's answer is decided.
     pub(crate) fn record(&self, request_id: &str, model: &str) {
         if let Some(table) = self.table {
             telemetry::record_panicked(table);
         }
+        telemetry::mark_panicked(&Span::current(), self.table);
         error!(
             request_id,
             model,

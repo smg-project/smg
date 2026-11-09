@@ -123,6 +123,9 @@ message EngineLoad {
   optional uint32 prefill_pending_tokens = 21;
   // Computed input tokens per active prefill second; absent if unknown or stale.
   optional double prefill_throughput = 22;
+  // Context tokens (prompt plus committed output) of every request the rank
+  // holds. Part of the routing core: sent on every record when reported.
+  optional uint64 num_resident_tokens = 23;
 }
 
 // The sections below mirror the SGLang scheduler's GetLoads messages field

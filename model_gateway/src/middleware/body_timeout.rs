@@ -321,11 +321,11 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{super::request_start::RequestStarted, *};
-    use crate::middleware::test_support::{echo_request, echo_route};
+    use crate::middleware::test_support::{echo_request, echo_route, json_of, ECHO_PATH};
 
     fn app(timeouts: RequestBodyTimeouts) -> Router {
         Router::new()
-            .route("/echo", echo_route())
+            .route(ECHO_PATH, echo_route())
             .layer(timeouts.layer())
     }
 
@@ -348,8 +348,7 @@ mod tests {
     }
 
     async fn error_code(response: Response) -> String {
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let json = json_of(response).await;
         json["error"]["code"].as_str().unwrap().to_string()
     }
 

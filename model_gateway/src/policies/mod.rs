@@ -171,6 +171,12 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
+/// The cache-aware policy behind a policy handle, when it is one: the one
+/// spelling of that downcast for the registry, the mesh wiring and the tests.
+pub(crate) fn as_cache_aware(policy: &dyn LoadBalancingPolicy) -> Option<&CacheAwarePolicy> {
+    policy.as_any().downcast_ref::<CacheAwarePolicy>()
+}
+
 /// Whether a built-in policy applies the complete [`Worker::is_available`]
 /// predicate before selecting. Other policies keep the caller-side filter.
 pub(crate) fn policy_filters_unavailable_workers(policy: &dyn LoadBalancingPolicy) -> bool {

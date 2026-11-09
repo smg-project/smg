@@ -14,8 +14,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{
-    chain_prefix_hash, compute_content_hash, request_prefix_hashes, ChainBlockMap, ContentHash,
-    ReferenceIndexer, SequenceHash, ShardedChainIndex, StoredBlock,
+    chain_prefix_hash, compute_content_hash, request_prefix_hashes, ApplyError, ChainBlockMap,
+    ContentHash, ReferenceIndexer, SequenceHash, ShardedChainIndex, StoredBlock,
 };
 
 /// Order among equal-age blocks when a worker frees past its capacity.
@@ -261,6 +261,9 @@ pub struct StepReport {
     pub healed_blocks: usize,
     /// Decode blocks stored (private tails).
     pub decoded_blocks: usize,
+    /// Blocks of stores the index declined at an arena cap (a run's fan-out or length): the
+    /// worker does not hold them as far as the index knows, so it does not hold them here.
+    pub refused_blocks: usize,
 }
 
 pub struct Churn {
@@ -379,6 +382,8 @@ impl Churn {
         let capacity = self.cfg.cache_blocks;
         let worker = &mut self.workers[worker_index];
         let known = worker.held_prefix(chain);
+        let mut refused = false;
+        let mut stored_to = known;
         if known < prefix {
             let blocks = &chain.blocks[known..prefix];
             let parent = (known > 0).then(|| chain.blocks[known - 1].seq_hash);
@@ -387,17 +392,37 @@ impl Churn {
                 .iter()
                 .filter(|b| worker.held.contains_key(&b.seq_hash))
                 .count();
-            index
-                .apply_stored(worker.id, blocks, parent, &mut worker.map)
-                .expect("store after a held parent");
-            if let Some(reference) = reference.as_mut() {
-                reference
-                    .apply_stored(worker.id, blocks, parent)
-                    .expect("reference store");
+            match index.apply_stored(worker.id, blocks, parent, &mut worker.map) {
+                // Declined at an arena cap past `placed` leading blocks: those are held as any
+                // store's (mirrored and touched like one), the rest by neither index and not
+                // by the worker, so a later request stores them again.
+                Err(ApplyError::ArenaCapReached { placed }) => {
+                    let placed_blocks = &blocks[..placed];
+                    if let Some(reference) =
+                        reference.as_mut().filter(|_| !placed_blocks.is_empty())
+                    {
+                        reference
+                            .apply_stored(worker.id, placed_blocks, parent)
+                            .expect("reference store of the placed prefix");
+                    }
+                    report.stored_blocks = placed;
+                    report.refused_blocks = blocks.len() - placed;
+                    stored_to = known + placed;
+                    refused = true;
+                }
+                stored => {
+                    stored.expect("store after a held parent");
+                    if let Some(reference) = reference.as_mut() {
+                        reference
+                            .apply_stored(worker.id, blocks, parent)
+                            .expect("reference store");
+                    }
+                    report.stored_blocks = blocks.len();
+                }
             }
-            report.stored_blocks = blocks.len();
         }
-        for (position, block) in chain.blocks[..prefix].iter().enumerate() {
+        let touched = if refused { stored_to } else { prefix };
+        for (position, block) in chain.blocks[..touched].iter().enumerate() {
             worker.touch(
                 free_order,
                 chain_pick,
@@ -409,7 +434,7 @@ impl Churn {
         }
         // Decode: private blocks appended under the prefix, one store per block as the mock
         // emits them, touched with the request and released with it.
-        if self.cfg.decode_blocks > 0 && self.rng.unit() < self.cfg.decode_probability {
+        if !refused && self.cfg.decode_blocks > 0 && self.rng.unit() < self.cfg.decode_probability {
             let mut previous = chain.blocks[prefix - 1].seq_hash;
             for k in 0..self.cfg.decode_blocks {
                 let content = compute_content_hash(&[
@@ -421,14 +446,19 @@ impl Churn {
                     seq_hash: chain_prefix_hash(previous, content),
                     content_hash: content,
                 };
-                index
-                    .apply_stored(
-                        worker.id,
-                        std::slice::from_ref(&block),
-                        Some(previous),
-                        &mut worker.map,
-                    )
-                    .expect("decode store under the block before");
+                match index.apply_stored(
+                    worker.id,
+                    std::slice::from_ref(&block),
+                    Some(previous),
+                    &mut worker.map,
+                ) {
+                    // One block: nothing of it was placed.
+                    Err(ApplyError::ArenaCapReached { .. }) => {
+                        report.refused_blocks += 1;
+                        break;
+                    }
+                    stored => stored.expect("decode store under the block before"),
+                }
                 if let Some(reference) = reference.as_mut() {
                     reference
                         .apply_stored(worker.id, std::slice::from_ref(&block), Some(previous))
@@ -483,5 +513,54 @@ impl Churn {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two workers whose chains all share a first block, under a cap of twelve children per
+    /// run, one of them restarting cold every three hundred requests and taking the requests
+    /// until the next restart, so the other holds every live child when it goes cold: its first
+    /// store matches the shared block in the run at the cap and is declined past it, the shared
+    /// block placed for it and the rest not. Checked after every step, the index and the
+    /// reference agree (they did not while the generator took a declined store as nothing
+    /// stored; the worker's next store closed the gap within a request or two, so a sparser
+    /// check misses it).
+    #[test]
+    fn the_index_and_the_reference_agree_under_refusals() {
+        let mut index = ShardedChainIndex::new(1, 8);
+        index.lower_arena_cap(64);
+        let mut reference = ReferenceIndexer::new();
+        let cfg = ChurnConfig {
+            workers: 2,
+            chains: 60,
+            min_chain_len: 2,
+            max_chain_len: 2,
+            share: 1.0,
+            cache_blocks: 40,
+            free_order: FreeOrder::TailFirst,
+            decode_blocks: 0,
+            decode_probability: 0.0,
+            restart_every: 300,
+            refill_requests: 300,
+            seed: 7,
+        };
+        let mut churn = Churn::new(cfg, &index);
+        let (mut refused, mut partial) = (0, 0);
+        for _ in 0..6000 {
+            let report = churn.step(&index, Some(&mut reference));
+            refused += report.refused_blocks;
+            partial += usize::from(report.stored_blocks > 0 && report.refused_blocks > 0);
+            churn
+                .check_exact(&index, &reference, 4)
+                .expect("the index and the reference agree");
+        }
+        assert!(refused > 0, "the shape reaches the cap");
+        assert!(
+            partial > 0,
+            "a store is declined past its placed leading block"
+        );
     }
 }

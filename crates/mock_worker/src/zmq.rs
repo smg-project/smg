@@ -160,6 +160,10 @@ struct LockstepGroup {
 }
 
 struct SyncState {
+    /// The ranks the group was made for.
+    size: usize,
+    /// The ranks that have joined so far; the group is full at `size`.
+    joined: usize,
     /// The ranks still in the group; a rank that ends leaves.
     members: usize,
     arrived: usize,
@@ -182,6 +186,8 @@ impl LockstepGroup {
     fn new(size: usize) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(SyncState {
+                size,
+                joined: 0,
                 members: size,
                 arrived: 0,
                 with_work: 0,
@@ -219,13 +225,29 @@ impl LockstepGroup {
             .outcome
     }
 
-    /// A rank ended: the group's syncs no longer wait for it.
-    fn leave(&self) {
+    /// Join one more rank, unless the group is full (the ranks it was made
+    /// for have joined) or ending (a rank has left). Either way a rank set
+    /// started at the same address gets a group of its own: never a place
+    /// among the leavers, never a share of a set that is complete.
+    fn join(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.joined < state.size && state.members == state.size {
+            state.joined += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A rank ended: the group's syncs no longer wait for it. Returns whether
+    /// it was the last one, which drains the group.
+    fn leave(&self) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.members = state.members.saturating_sub(1);
         if state.members > 0 && state.arrived >= state.members {
             self.complete(&mut state);
         }
+        state.members == 0
     }
 
     /// Every member is in: decide the step and release the waiting ranks.
@@ -244,26 +266,58 @@ impl LockstepGroup {
 }
 
 /// A rank's membership of its group, given up when the rank's writer ends.
-struct Membership(Arc<LockstepGroup>);
+/// The last membership to go drains the group and takes it out of the
+/// registry.
+struct Membership {
+    group: Arc<LockstepGroup>,
+    handshake_address: String,
+}
 
 impl Drop for Membership {
     fn drop(&mut self) {
-        self.0.leave();
+        if self.group.leave() {
+            forget_lockstep_group(&self.handshake_address, &self.group);
+        }
     }
 }
 
 static LOCKSTEP_GROUPS: OnceLock<Mutex<HashMap<String, Arc<LockstepGroup>>>> = OnceLock::new();
 
+fn lockstep_groups() -> &'static Mutex<HashMap<String, Arc<LockstepGroup>>> {
+    LOCKSTEP_GROUPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// The lockstep group of the `size` ranks of this process that dial
-/// `handshake_address`, created on first use.
+/// `handshake_address`: the one under that address while it is not full
+/// and none of its ranks has left, else a new one in its place. The rank
+/// joins under the registry's lock, so two ranks arriving together cannot
+/// both start a group.
 fn lockstep_group(handshake_address: &str, size: usize) -> Arc<LockstepGroup> {
-    LOCKSTEP_GROUPS
-        .get_or_init(|| Mutex::new(HashMap::new()))
+    let mut groups = lockstep_groups()
         .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .entry(handshake_address.to_string())
-        .or_insert_with(|| LockstepGroup::new(size))
-        .clone()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(group) = groups.get(handshake_address) {
+        if group.join() {
+            return group.clone();
+        }
+    }
+    let group = LockstepGroup::new(size);
+    group.join();
+    groups.insert(handshake_address.to_string(), group.clone());
+    group
+}
+
+/// Forget a drained `group`, unless a newer one has taken its address.
+fn forget_lockstep_group(handshake_address: &str, group: &Arc<LockstepGroup>) {
+    let mut groups = lockstep_groups()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if groups
+        .get(handshake_address)
+        .is_some_and(|current| Arc::ptr_eq(current, group))
+    {
+        groups.remove(handshake_address);
+    }
 }
 
 /// A rank's side of its lockstep group, in the hands of its writer: the
@@ -474,7 +528,10 @@ pub async fn serve_until(
     let mut lockstep = group_size.map(|size| {
         let group = lockstep_group(&handshake_address, size);
         Lockstep {
-            _membership: Membership(group.clone()),
+            _membership: Membership {
+                group: group.clone(),
+                handshake_address: handshake_address.clone(),
+            },
             group,
             wave: 0,
             unfinished: unfinished.clone(),
@@ -998,7 +1055,7 @@ async fn scripted_request(
         let batch = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index,
             outputs: vec![EngineCoreOutput {
-                request_id: request_id.clone(),
+                request_id: request_id.clone().into(),
                 new_token_ids: frame.ids,
                 new_logprobs,
                 finish_reason,
@@ -1089,7 +1146,7 @@ fn token_batch(
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index,
         outputs: vec![EngineCoreOutput {
-            request_id,
+            request_id: request_id.into(),
             new_token_ids,
             finish_reason,
             ..Default::default()
@@ -1149,12 +1206,13 @@ impl StepQueue {
         let finished = batch.finished_requests.unwrap_or_default();
         let mut named = BTreeSet::new();
         for output in batch.outputs {
-            let done = finished.contains(&output.request_id);
-            named.insert(output.request_id.clone());
-            self.queue_of(output.request_id.clone()).push_back(Pending {
-                output: Some(output),
-                finished: done,
-            });
+            let done = finished.contains(output.request_id.as_str());
+            named.insert(String::from(&output.request_id));
+            self.queue_of(String::from(&output.request_id))
+                .push_back(Pending {
+                    output: Some(output),
+                    finished: done,
+                });
         }
         for request_id in finished.into_iter().filter(|id| !named.contains(id)) {
             self.queue_of(request_id).push_back(Pending {
@@ -1801,5 +1859,110 @@ mod tests {
             .expect("the leaver releases the sync")
             .expect("the sync task ends");
         assert_eq!(outcome, Step::Run);
+    }
+
+    /// A drained group leaves the registry: a rank set started at the same
+    /// address after the last one ended syncs among its own ranks.
+    #[tokio::test]
+    async fn a_rank_set_started_after_the_last_one_ended_gets_a_group_of_its_own() {
+        let address = "lockstep-registry-two-waves";
+        let first = lockstep_group(address, 2);
+        assert!(
+            Arc::ptr_eq(&first, &lockstep_group(address, 2)),
+            "one group per address"
+        );
+        let membership = |group: &Arc<LockstepGroup>| Membership {
+            group: group.clone(),
+            handshake_address: address.to_string(),
+        };
+        drop((membership(&first), membership(&first)));
+        assert!(
+            !lockstep_groups().lock().unwrap().contains_key(address),
+            "a drained group stays in the registry"
+        );
+
+        let second = lockstep_group(address, 2);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the new set inherited the drained group"
+        );
+        let alone = {
+            let group = second.clone();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the task ends with the sync the test releases"
+            )]
+            tokio::spawn(async move { group.sync(false).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !alone.is_finished(),
+            "a sync completed without every member of the new set"
+        );
+        assert_eq!(lockstep_group(address, 2).sync(false).await, Step::Park);
+        let outcome = tokio::time::timeout(Duration::from_secs(1), alone)
+            .await
+            .expect("the second rank releases the sync")
+            .expect("the sync task ends");
+        assert_eq!(outcome, Step::Park);
+    }
+
+    /// A group one of whose ranks has left takes no new rank: a set started
+    /// while the last one ends gets a group of its own, and the ending
+    /// group's last leave does not take the new group out of the registry.
+    #[tokio::test]
+    async fn a_rank_joining_while_the_last_set_ends_gets_a_group_of_its_own() {
+        let address = "lockstep-registry-overlapping-waves";
+        let old = lockstep_group(address, 2);
+        let membership = |group: &Arc<LockstepGroup>| Membership {
+            group: group.clone(),
+            handshake_address: address.to_string(),
+        };
+        let (first_rank, second_rank) = (membership(&old), membership(&old));
+        drop(first_rank);
+        let new = lockstep_group(address, 2);
+        assert!(
+            !Arc::ptr_eq(&old, &new),
+            "a rank joined a group that is ending"
+        );
+        drop(second_rank);
+        let current = lockstep_groups().lock().unwrap().get(address).cloned();
+        assert!(
+            current.is_some_and(|current| Arc::ptr_eq(&current, &new)),
+            "the ending group's last leave took the new group out of the registry"
+        );
+    }
+
+    /// A full group takes no new rank either: a set whose joins straddle the
+    /// last set's first leave shares one group of its own, instead of one
+    /// rank placed among the old set and the other waiting alone in a new
+    /// group.
+    #[tokio::test]
+    async fn a_set_whose_joins_straddle_the_last_sets_first_leave_shares_one_group() {
+        let address = "lockstep-registry-straddling-waves";
+        let old = lockstep_group(address, 2);
+        assert!(
+            Arc::ptr_eq(&old, &lockstep_group(address, 2)),
+            "one group per set"
+        );
+        let membership = |group: &Arc<LockstepGroup>| Membership {
+            group: group.clone(),
+            handshake_address: address.to_string(),
+        };
+        let (first_rank, second_rank) = (membership(&old), membership(&old));
+        let new_first = lockstep_group(address, 2);
+        assert!(!Arc::ptr_eq(&old, &new_first), "a rank joined a full group");
+        drop(first_rank);
+        let new_second = lockstep_group(address, 2);
+        assert!(
+            Arc::ptr_eq(&new_first, &new_second),
+            "the new set was split across two groups"
+        );
+        drop(second_rank);
+        let current = lockstep_groups().lock().unwrap().get(address).cloned();
+        assert!(
+            current.is_some_and(|current| Arc::ptr_eq(&current, &new_first)),
+            "the old set's last leave took the new group out of the registry"
+        );
     }
 }

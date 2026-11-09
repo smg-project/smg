@@ -1137,6 +1137,15 @@ pub(crate) fn init_metrics() {
         "Blocks of the sub-block stores, by worker"
     );
     describe_counter!(
+        "smg_kv_event_cap_refused_stores_total",
+        "Stores the KV index declined because a run's child table or hash array would outgrow \
+         an arena chunk (the fan-out and run-length caps), by worker"
+    );
+    describe_counter!(
+        "smg_kv_event_cap_refused_blocks_total",
+        "Blocks the declined stores left out of the index, by worker"
+    );
+    describe_counter!(
         "smg_kv_event_blocks_total",
         "Blocks named by applied KV events, by worker and op (stored, removed; snapshot: \
          the live set a relay state snapshot listed)"
@@ -1187,6 +1196,11 @@ pub(crate) fn init_metrics() {
         "Bytes of the chain index's word arena sitting in free lists, by model"
     );
     describe_gauge!(
+        "smg_kv_index_arena_chunk_bytes",
+        "Bytes the chain index's word arena holds from the allocator: whole 8 MiB chunks, \
+         each kept once taken, by model"
+    );
+    describe_gauge!(
         "smg_kv_index_slab_bytes",
         "Bytes the chain index's run slab holds from the allocator, by model"
     );
@@ -1199,6 +1213,11 @@ pub(crate) fn init_metrics() {
         "smg_kv_index_engine_conflicts",
         "Stored blocks whose engine hash differed from the one the chain index holds for \
          the block, a fleet whose engines do not name content alike (cumulative), by model"
+    );
+    describe_gauge!(
+        "smg_kv_index_cap_refusals",
+        "Stores the chain index declined because a run's child table or hash array would \
+         outgrow an arena chunk (the fan-out and run-length caps; cumulative), by model"
     );
     describe_gauge!(
         "smg_kv_index_blocks",
@@ -3162,6 +3181,10 @@ impl Metrics {
             .increment(0);
         counter!("smg_kv_event_sub_block_blocks_total", "worker" => Arc::clone(&worker))
             .increment(0);
+        counter!("smg_kv_event_cap_refused_stores_total", "worker" => Arc::clone(&worker))
+            .increment(0);
+        counter!("smg_kv_event_cap_refused_blocks_total", "worker" => Arc::clone(&worker))
+            .increment(0);
         gauge!("smg_kv_event_degraded_ranks", "worker" => worker).set(0.0);
     }
 
@@ -3293,6 +3316,15 @@ impl Metrics {
         counter!("smg_kv_event_parentless_blocks_total", "worker" => worker).increment(blocks);
     }
 
+    /// Count the stores a batch had declined at an arena cap (a run's fan-out or
+    /// length) and the blocks they left out of the index.
+    pub fn record_kv_event_cap_refused(worker_url: &str, stores: u64, blocks: u64) {
+        let worker = intern_string(worker_url);
+        counter!("smg_kv_event_cap_refused_stores_total", "worker" => worker.clone())
+            .increment(stores);
+        counter!("smg_kv_event_cap_refused_blocks_total", "worker" => worker).increment(blocks);
+    }
+
     /// Count the stores a batch left out of the index as narrower than the
     /// worker's block of record, and the blocks they carried.
     pub fn record_kv_event_sub_block(worker_url: &str, stores: u64, blocks: u64) {
@@ -3351,11 +3383,14 @@ impl Metrics {
         gauge!("smg_kv_index_arena_bytes", "model" => model.clone()).set(stats.arena_bytes as f64);
         gauge!("smg_kv_index_arena_free_bytes", "model" => model.clone())
             .set(stats.arena_free_bytes as f64);
+        gauge!("smg_kv_index_arena_chunk_bytes", "model" => model.clone())
+            .set(stats.arena_chunk_bytes as f64);
         gauge!("smg_kv_index_slab_bytes", "model" => model.clone()).set(stats.slab_bytes as f64);
         gauge!("smg_kv_index_moved_hashes", "model" => model.clone())
             .set(stats.moved_hashes as f64);
-        gauge!("smg_kv_index_engine_conflicts", "model" => model)
+        gauge!("smg_kv_index_engine_conflicts", "model" => model.clone())
             .set(stats.engine_conflicts as f64);
+        gauge!("smg_kv_index_cap_refusals", "model" => model).set(stats.cap_refusals as f64);
     }
 
     // ========================================================================

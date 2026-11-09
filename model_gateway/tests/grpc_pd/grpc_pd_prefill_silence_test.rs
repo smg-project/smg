@@ -58,7 +58,6 @@
 //! decode worker and nothing on the prefill.
 
 use std::{
-    future::Future,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -75,9 +74,9 @@ use common::{
         build_grpc_router, grpc_router_config, grpc_worker, serve_canned_worker, serve_engine,
         Canned,
     },
+    metrics_capture::render_after,
 };
 use futures::future::join_all;
-use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::model_card::ModelCard;
 use smg::{
     middleware::TenantRequestMeta,
@@ -660,29 +659,6 @@ fn assert_all_answered_past_the_bound(answers: &[(http::StatusCode, String, Dura
     );
 }
 
-/// Run `case` on a current-thread runtime under a thread-local recorder and
-/// return the rendered `/metrics` text.
-#[expect(
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
-fn render_after<F, Fut>(case: F) -> String
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let handle = recorder.handle();
-    metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("current-thread runtime");
-        rt.block_on(case());
-    });
-    handle.render()
-}
-
 /// The value of the `smg_worker_errors_total` sample for `worker_type` and
 /// `error_type` (any connection), zero when it was not emitted.
 fn worker_errors(rendered: &str, worker_type: &str, error_type: &str) -> f64 {
@@ -825,6 +801,12 @@ fn a_non_streaming_request_is_not_bound_by_the_decode_sides_first_token() {
         .await;
         let (status, body, elapsed) = one_chat(router.as_ref(), false).await;
         assert_eq!(status, http::StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON answer");
+        assert_eq!(
+            json["usage"]["completion_tokens"].as_u64(),
+            Some(u64::from(OUTPUT_TOKENS)),
+            "the usage carries the decode's completion count: {body}"
+        );
         assert!(
             elapsed >= BOUND + Duration::from_secs(1) && elapsed < CASE_CAP,
             "answered when the decode answered, past the bound: {elapsed:?}"

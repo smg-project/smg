@@ -12,7 +12,7 @@ use serde::{
 };
 
 use crate::{
-    codec::decode_msgpack_seed,
+    codec::{decode_msgpack_seed, FrameStr},
     error::{Error, Result},
     protocol::{
         control::{read_control_reply_after_tag, ControlReplySlim, CONTROL_REPLY_SLIM_TAG},
@@ -167,7 +167,8 @@ pub fn decode_slim_batch(bytes: &[u8], layout: &SlimOutputLayout) -> Result<Batc
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BatchTokenIDOutSlim {
     /// Request ids, one per column.
-    pub rids: Vec<String>,
+    /// The request ids, views of the frame they were decoded within.
+    pub rids: Vec<FrameStr>,
     /// Newly generated token ids per request this step.
     pub output_ids: Vec<Vec<u32>>,
     /// Finish reason per request (`"stop"`, `"length"`, `"abort"`); an empty
@@ -456,8 +457,9 @@ pub fn decode_wire_output(bytes: &[u8], layout: &SlimOutputLayout) -> Result<Tok
 /// shape the connector routes to per-request streams.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TokenSpeedOutput {
-    /// The request id this output belongs to.
-    pub request_id: String,
+    /// The request id this output belongs to, a view of the frame it was
+    /// decoded within.
+    pub request_id: FrameStr,
     /// Newly generated token ids this step.
     pub output_ids: Vec<u32>,
     /// Finish reason; `None` while the request is still generating.
@@ -499,7 +501,15 @@ pub struct TokenSpeedOutput {
 
 impl EngineOutput for TokenSpeedOutput {
     fn request_id(&self) -> &str {
-        &self.request_id
+        self.request_id.as_str()
+    }
+
+    fn own_request_id(&mut self, id: FrameStr) {
+        self.request_id = id;
+    }
+
+    fn request_id_shared(&self) -> FrameStr {
+        self.request_id.clone()
     }
 
     fn finished(&self) -> bool {

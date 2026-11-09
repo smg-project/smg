@@ -35,6 +35,11 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A GLM-5.3 request with a `minimal`, `medium` or `xhigh` effort is served. The profile reads the
+  name as `low`, `high` or `max`, as z.ai does, in `reasoning_effort` and in `thinking.effort`.
+  Since 1.11.0 the profile refused those names with `reasoning_effort_not_allowed`, and `medium`
+  is the default most clients send (#5181). `none` is still refused, because the series cannot
+  switch thinking off.
 - An assistant message with its reasoning under both `reasoning_content` and `reasoning` (the key
   of vLLM and OpenRouter, which agent clients send too) is accepted when the two texts are the
   same. Since 1.12.0 the serde alias between the two keys refused such a message as a duplicate

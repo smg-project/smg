@@ -842,7 +842,7 @@ mod tests {
     async fn the_sglang_http_read_combines_the_three_endpoints_with_the_engines_own_labels_first() {
         use http::StatusCode;
 
-        use crate::test_support::serve_json_routes;
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         let base = serve_json_routes(vec![
             (
@@ -871,7 +871,7 @@ mod tests {
         ])
         .await;
 
-        let labels = fetch_sglang_http_metadata(&crate::clients::http_client(), &base, None).await;
+        let labels = fetch_sglang_http_metadata(&crate::server::http_client(), &base, None).await;
         assert_eq!(
             label(&labels, "model_path"),
             Some("org/model-a"),
@@ -900,7 +900,7 @@ mod tests {
     async fn the_sglang_http_read_takes_the_older_spelling_and_tolerates_an_endpoint_not_offered() {
         use http::StatusCode;
 
-        use crate::test_support::serve_json_routes;
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         let base = serve_json_routes(vec![
             (
@@ -915,7 +915,7 @@ mod tests {
             ),
         ])
         .await;
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
 
         let tolerant = fetch_sglang_http_metadata(&client, &base, None).await;
         assert_eq!(label(&tolerant, "model_path"), Some("org/model-b"));
@@ -940,7 +940,7 @@ mod tests {
     {
         use http::StatusCode;
 
-        use crate::test_support::serve_json_routes;
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         let base = serve_json_routes(vec![
             (
@@ -960,7 +960,7 @@ mod tests {
             ),
         ])
         .await;
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
 
         let tolerant = fetch_sglang_http_metadata(&client, &base, None).await;
         assert_eq!(label(&tolerant, "model_path"), Some("org/model-c"));
@@ -982,12 +982,12 @@ mod tests {
     async fn the_vllm_http_read_takes_the_model_list_and_the_version() {
         use http::StatusCode;
 
-        use crate::test_support::serve_json_routes;
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         let models = serde_json::json!({"data": [
             {"id": "served-d", "root": "org/model-d", "max_model_len": 8192}
         ]});
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
 
         let base = serve_json_routes(vec![
             ("/v1/models", StatusCode::OK, models.clone()),
@@ -1017,11 +1017,11 @@ mod tests {
     #[tokio::test]
     async fn an_engine_that_refuses_the_connection_leaves_registration_empty_and_fails_a_strict_read(
     ) {
-        use crate::test_support::RefusedAddress;
+        use crate::worker::test_support::RefusedAddress;
 
         let refused = RefusedAddress::reserve();
         let base = refused.http_url();
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
 
         assert!(fetch_vllm_http_metadata(&client, &base, None)
             .await
@@ -1212,7 +1212,7 @@ mod tests {
     /// named, strict or not.
     #[tokio::test]
     async fn an_engine_that_refuses_the_connection_fails_the_grpc_read_at_the_dial() {
-        use crate::test_support::RefusedAddress;
+        use crate::worker::test_support::RefusedAddress;
 
         let refused = RefusedAddress::reserve();
         let url = format!("grpc://{}", refused.addr());
@@ -1313,7 +1313,7 @@ mod tests {
         use http::StatusCode;
         use serde_json::json;
 
-        use crate::test_support::serve_json_routes;
+        use crate::workflow::steps::local::test_support::serve_json_routes;
 
         let base = serve_json_routes(vec![(
             "/v1/models",
@@ -1331,7 +1331,7 @@ mod tests {
         )])
         .await;
 
-        let labels = fetch_sglang_http_metadata(&crate::clients::http_client(), &base, None).await;
+        let labels = fetch_sglang_http_metadata(&crate::server::http_client(), &base, None).await;
 
         assert_eq!(
             labels.get("served_model_name").map(String::as_str),
@@ -1372,7 +1372,7 @@ mod tests {
         });
 
         let err = get_server_info(
-            &crate::clients::http_client(),
+            &crate::server::http_client(),
             &format!("http://user:secret@127.0.0.1:{port}"),
             None,
         )

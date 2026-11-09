@@ -8007,6 +8007,8 @@ dependencies = [
  "http",
  "http-body-util",
  "llm-tokenizer",
+ "metrics",
+ "metrics-exporter-prometheus",
  "mock-worker",
  "openai-protocol",
  "openssl",

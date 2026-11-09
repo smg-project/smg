@@ -413,7 +413,7 @@ impl EncoderInput {
             Self::Wire {
                 dtype, norm, shape, ..
             } => {
-                let mut bytes = Vec::new();
+                let mut byte_len = 0usize;
                 let mut rows = 0usize;
                 for part in parts {
                     match part {
@@ -426,7 +426,9 @@ impl EncoderInput {
                             && part_norm == norm
                             && part_shape.get(1..) == shape.get(1..) =>
                         {
-                            bytes.extend_from_slice(part_bytes);
+                            byte_len = byte_len
+                                .checked_add(part_bytes.len())
+                                .context("joined wire byte length overflows usize")?;
                             rows += part_shape.first().copied().unwrap_or(0);
                         }
                         Self::Wire { .. } => anyhow::bail!(
@@ -435,6 +437,15 @@ impl EncoderInput {
                         Self::F32(_) | Self::U8 { .. } => anyhow::bail!(
                             "encoder inputs of the batch parts mix wire bytes with other forms"
                         ),
+                    }
+                }
+                let mut bytes = Vec::with_capacity(byte_len);
+                for part in parts {
+                    if let Self::Wire {
+                        bytes: part_bytes, ..
+                    } = part
+                    {
+                        bytes.extend_from_slice(part_bytes);
                     }
                 }
                 let mut joined = shape.clone();
@@ -1307,6 +1318,20 @@ impl PreprocessedEncoderInputs {
         if parts.len() == 1 {
             return parts.into_iter().next().context("cannot join zero batches");
         }
+        Self::concat_refs(&parts.iter().collect::<Vec<_>>(), layouts)
+    }
+
+    /// Join shared cache outputs directly into the final batch without cloning
+    /// each input first. A single input is cloned once; layouts and validation
+    /// are the same as for the owned batch join.
+    pub fn concat_refs(
+        parts: &[&Self],
+        layouts: &HashMap<String, FieldLayout>,
+    ) -> AnyhowResult<Self> {
+        anyhow::ensure!(!parts.is_empty(), "cannot join zero batches");
+        if parts.len() == 1 {
+            return Ok(parts[0].clone());
+        }
         let inputs = parts
             .iter()
             .map(|part| &part.encoder_input)
@@ -1364,8 +1389,8 @@ impl PreprocessedEncoderInputs {
         let mut feature_token_counts = Vec::new();
         let mut item_sizes = Vec::new();
         for part in parts {
-            feature_token_counts.extend(part.feature_token_counts);
-            item_sizes.extend(part.item_sizes);
+            feature_token_counts.extend_from_slice(&part.feature_token_counts);
+            item_sizes.extend_from_slice(&part.item_sizes);
         }
         Ok(Self {
             encoder_input,
@@ -1553,6 +1578,34 @@ mod tests {
             &layouts
         )
         .is_err());
+    }
+
+    /// Repeated borrowed cache entries retain request order and independent output storage.
+    #[test]
+    fn borrowed_concat_preserves_repeated_entries_and_input_storage() {
+        let first = clip(16, 1, 1.0);
+        let second = clip(32, 2, 0.5);
+        let joined =
+            PreprocessedEncoderInputs::concat_refs(&[&second, &first, &second], &video_layouts())
+                .unwrap();
+        assert_eq!(joined.encoder_input_shape(), vec![80, 3]);
+        assert_eq!(joined.feature_token_counts, vec![8, 4, 8]);
+        let values = joined.encoder_input_flat();
+        assert!(values[..32 * 3].iter().all(|&v| v == 32.0));
+        assert!(values[32 * 3..48 * 3].iter().all(|&v| v == 16.0));
+        assert!(values[48 * 3..].iter().all(|&v| v == 32.0));
+        assert!(matches!(
+            &joined.model_specific["video_grid_thw"],
+            ModelSpecificValue::IntTensor { data, shape }
+                if data == &vec![2, 4, 4, 1, 4, 4, 2, 4, 4] && shape == &vec![3, 3]
+        ));
+        let mut single =
+            PreprocessedEncoderInputs::concat_refs(&[&first], &HashMap::new()).unwrap();
+        if let EncoderInput::F32(array) = &mut single.encoder_input {
+            array.fill(0.0);
+        }
+        assert!(first.encoder_input_flat().iter().all(|&v| v == 16.0));
+        assert!(PreprocessedEncoderInputs::concat_refs(&[], &HashMap::new()).is_err());
     }
 
     #[test]

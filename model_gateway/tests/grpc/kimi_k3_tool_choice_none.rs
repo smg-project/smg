@@ -37,15 +37,13 @@ use openai_protocol::{
     chat::ChatCompletionRequest, messages::CreateMessageRequest, validated::Normalizable,
 };
 use serde_json::{json, Value};
-use smg::{
-    routers::grpc::{
-        utils::{
-            process_chat_messages_with_encoding, process_messages_with_encoding,
-            request_as_rendered, template_tools,
-        },
-        ProcessedMessages,
+use smg::routers::grpc::{
+    tokenizer_cache::{ensure_kimi_k3_cached, KIMI_K3_TOKENIZER_DIR_ENV},
+    utils::{
+        process_chat_messages_with_encoding, process_messages_with_encoding, request_as_rendered,
+        template_tools,
     },
-    test_support::{ensure_kimi_k3_cached, KIMI_K3_TOKENIZER_DIR_ENV},
+    ProcessedMessages,
 };
 use validator::Validate;
 

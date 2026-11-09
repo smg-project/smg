@@ -516,7 +516,7 @@ fn engine_step(request_id: &str, token_ids: Vec<u32>) -> EngineCoreOutputs {
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: request_id.to_string(),
+            request_id: request_id.into(),
             new_token_ids: token_ids,
             ..Default::default()
         }],
@@ -799,7 +799,7 @@ fn finished_step(request_id: &str, token_ids: Vec<u32>, stop_id: u32) -> EngineC
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: request_id.to_string(),
+            request_id: request_id.into(),
             new_token_ids: token_ids,
             finish_reason: Some(EngineCoreFinishReason::Stop),
             stop_reason: Some(StopReason::TokenId(stop_id)),

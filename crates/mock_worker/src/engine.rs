@@ -1052,6 +1052,35 @@ impl Engine {
         tokio::time::sleep_until(slot.into()).await;
     }
 
+    /// The fault and admission hooks for a side that serves no tokens (a
+    /// prefill worker's prompt side, an encode worker's completion), as the
+    /// regular path counts them: the stall, a status before admission (a
+    /// failure, or a cut when it names a token count), then the admission
+    /// delay and rate. `Ok(true)` when the fault asks for a `finish=error`
+    /// completion, counted as a cut; `Err` is the status to answer. The
+    /// engine never runs the prompt: nothing is admitted, no record is left.
+    pub(crate) async fn admit_without_tokens(&self) -> Result<bool, u16> {
+        let mut finish_error = false;
+        if let Some(fault) = self.inject() {
+            if !fault.stall.is_zero() {
+                tokio::time::sleep(fault.stall).await;
+            }
+            if fault.finish_error {
+                self.cut_counter().fetch_add(1, Ordering::Relaxed);
+                finish_error = true;
+            } else if fault.status != 0 {
+                if fault.after_tokens.is_some() {
+                    self.cut_counter().fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.record_failure();
+                }
+                return Err(fault.status);
+            }
+        }
+        self.admit().await;
+        Ok(finish_error)
+    }
+
     /// Restart the publisher: sequence numbers start over, the replay buffer
     /// is emptied, the cache is kept. Returns once the actor has applied it
     /// (after its current pass, at most), so a status read right after sees

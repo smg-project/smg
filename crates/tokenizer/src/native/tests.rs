@@ -595,7 +595,9 @@ fn a_long_text_encodes_the_same_on_the_pool_as_in_one_piece() {
 /// bars among `<` tokens (the chain shape), one of tokens beyond ASCII only,
 /// one with more than three first bytes (tab and newline runs, `<`, `[` and
 /// runs of a mark beyond ASCII), one whose prefixes stand whole (every
-/// token shorter than the prefix length), and two sets of added words whose
+/// token shorter than the prefix length), one the library declines as it
+/// stands (one-byte tab and newline tokens among twenty-two prefixes: the
+/// tokens' five first bytes stand in), and two sets of added words whose
 /// prefixes would be under the floor (they keep the automaton's search).
 #[test]
 fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
@@ -645,6 +647,8 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
         "<t>",
         "<t",
         "</tx",
+        "<u3>",
+        "<u1",
         "<\u{FF5C}x",
         "<\u{FF5C}x\u{FF5C}>",
         "<\u{FF5C}xy\u{FF5C}>",
@@ -697,12 +701,21 @@ fn added_tokens_are_found_where_the_unanchored_search_finds_them() {
             ]
         })
         .collect();
+    // A set the library declines as it stands (one-byte tab and newline
+    // tokens among twenty-two prefixes): the tokens' five first bytes stand
+    // in, and the anchored automaton decides at each.
+    let tags: Vec<String> = (0..16).map(|i| format!("<u{i}>")).collect();
+    let declined: Vec<&str> = ["\t", "\t\t", "\n", "\n\n", "[b]", "\u{2581}\u{2581}"]
+        .into_iter()
+        .chain(tags.iter().map(String::as_str))
+        .collect();
     let mut all: Vec<(Vec<&str>, bool)> = sets
         .iter()
         .map(|(tokens, by_prefixes)| (tokens.to_vec(), *by_prefixes))
         .collect();
     all.push((words_one.iter().map(String::as_str).collect(), false));
     all.push((words_two.iter().map(String::as_str).collect(), false));
+    all.push((declined, true));
     let mut state = 0x2545_F491_4F6C_DD1Du64;
     for (tokens, by_prefixes) in &all {
         let list: Vec<(String, u32)> = tokens
@@ -1630,6 +1643,82 @@ fn a_vocabulary_with_gaps_in_its_ids_keeps_the_whole_piece_lookup() {
 }
 
 #[test]
+fn a_long_entry_the_merges_do_not_reach_is_its_own_id_under_ignore_merges() {
+    // A 20-byte entry the merges never build lies past the seed's keys: the
+    // whole-piece lookup of `ignore_merges` finds it, and the filter over
+    // the long entries, built from the bytes the pass read back from the
+    // alphabet, must admit the bytes the piece arrives with. A 20-byte piece
+    // that is no entry merges (to its bytes here: no merge reaches it).
+    let long = "abcdefghijklmnopqrst";
+    let other = "abcdefghijklmnopqrsu";
+    let mut vocab = Vocab::default();
+    for (id, c) in bytes_char().iter().enumerate() {
+        vocab.insert(c.to_string(), id as u32);
+    }
+    let xy = vocab.len() as u32;
+    vocab.insert("xy".to_owned(), xy);
+    let entry = vocab.len() as u32;
+    vocab.insert(long.to_owned(), entry);
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, vec![("x".to_owned(), "y".to_owned())])
+        .ignore_merges(true)
+        .build()
+        .expect("bpe");
+    let mut tokenizer = HfTokenizer::new(bpe);
+    tokenizer.with_pre_tokenizer(Some(byte_level(true)));
+    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    assert!(native
+        .long_entries
+        .as_ref()
+        .is_some_and(|filter| filter.may_hold(long.as_bytes())));
+    assert_eq!(
+        tokenizer.encode(long, false).expect("encode").get_ids(),
+        [entry]
+    );
+    assert_eq!(native.encode(Some(model), long, false), Ok(vec![entry]));
+    let merged: Vec<u32> = tokenizer
+        .encode(other, false)
+        .expect("encode")
+        .get_ids()
+        .to_vec();
+    assert_eq!(merged.len(), other.len());
+    assert_eq!(native.encode(Some(model), other, false), Ok(merged));
+}
+
+#[test]
+fn a_vocabulary_with_gaps_in_its_ids_keeps_the_whole_piece_lookup_for_long_entries_too() {
+    // As above with the long entry at 301, past the 258 ids the seed's pass
+    // reads: the pass did not read every entry, so there is no filter and
+    // the lookup stays for long pieces as for short ones.
+    let long = "abcdefghijklmnopqrst";
+    let mut vocab = Vocab::default();
+    for (id, c) in bytes_char().iter().enumerate() {
+        vocab.insert(c.to_string(), id as u32);
+    }
+    vocab.insert("xy".to_owned(), 300);
+    vocab.insert(long.to_owned(), 301);
+    assert_eq!(vocab.len(), 258);
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, vec![("x".to_owned(), "y".to_owned())])
+        .ignore_merges(true)
+        .build()
+        .expect("bpe");
+    let mut tokenizer = HfTokenizer::new(bpe);
+    tokenizer.with_pre_tokenizer(Some(byte_level(true)));
+    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    assert!(native.long_entries.is_none());
+    assert_eq!(
+        tokenizer.encode(long, false).expect("encode").get_ids(),
+        [301]
+    );
+    assert_eq!(native.encode(Some(model), long, false), Ok(vec![301]));
+}
+
+#[test]
 fn the_seed_answers_a_vocabulary_piece_before_the_model_does() {
     // The encoder is built over a model with `ignore_merges` on, so its seed
     // holds "xyz" as the entry's own id; the encode then runs over a copy of
@@ -1688,10 +1777,7 @@ fn the_seed_answers_a_vocabulary_piece_before_the_model_does() {
         .iter_mut()
         .map(|cache| {
             let cache = cache.get_mut();
-            (
-                cache.packed.as_ref().map_or(0, ShortPieceTable::len),
-                cache.short.len(),
-            )
+            (cache.packed.len(), cache.short.len())
         })
         .collect();
     assert_eq!(caches, [(2, 0)]);
@@ -1767,13 +1853,7 @@ fn piece_caches_stay_within_their_bound_across_threads() {
     let slots: Vec<usize> = native
         .piece_cache
         .iter_mut()
-        .map(|cache| {
-            cache
-                .get_mut()
-                .packed
-                .as_ref()
-                .map_or(0, ShortPieceTable::slots)
-        })
+        .map(|cache| cache.get_mut().packed.slots())
         .collect();
     assert!(
         slots
@@ -1797,8 +1877,10 @@ fn a_threads_packed_table_grows_with_use_and_follows_a_fallen_share() {
         let caches: Vec<(usize, usize)> = native
             .piece_cache
             .iter_mut()
-            .filter_map(|cache| cache.get_mut().packed.as_ref())
-            .map(|packed| (packed.slots(), packed.len()))
+            .map(|cache| {
+                let packed = &cache.get_mut().packed;
+                (packed.slots(), packed.len())
+            })
             .collect();
         assert_eq!(caches.len(), 1, "{caches:?}");
         caches[0]

@@ -320,16 +320,20 @@ the request arrives); an HTTP worker answers the bare 499.
 
 ## Prefill/decode roles
 
-`--worker-type prefill|decode` gives the gRPC workers a role in a
-disaggregated fleet, so a gateway in PD mode (`--prefill <url> <bootstrap
-port> --decode <url>`) runs with no engine behind it. The gateway detects
-the mock by the scheduler service it serves and runs that wire's PD
-protocol: both sides get the same request, with the rendezvous the gateway
-mints (`kv_bootstrap_info`), and the client reads the decode side's output.
+`--worker-type prefill|decode` gives the HTTP or the gRPC workers of a
+process a role in a disaggregated fleet, so a gateway in PD mode (`--prefill
+<url> <bootstrap port> --decode <url>`) runs with no engine behind it. The
+gateway detects the mock by the scheduler service it serves (or, on the HTTP
+wire, by its model list) and runs that wire's PD protocol: both sides get the
+same request, with the rendezvous the gateway mints (`kv_bootstrap_info` on
+the gRPC wires; `bootstrap_host`, `bootstrap_port` and `bootstrap_room` in
+the request body on the HTTP wire, whose PD router is its own code path), and
+the client reads the decode side's output.
 
 - A **prefill** worker answers every request with the prompt side's
   completion alone (`prompt_tokens`, no output, `stop`), ahead of the script
-  and of either engine mode, and advertises `disaggregation_mode: prefill`.
+  and of either engine mode, and advertises `disaggregation_mode: prefill`
+  (in its server args on the gRPC wires, in `/server_info` on the HTTP wire).
   With `--bootstrap-base-port <port>`, worker `i` also binds `port + i`,
   where a decode partner's engine would rendezvous for the KV handoff: it
   accepts and closes each connection (the gateway probes the port once the
@@ -339,15 +343,26 @@ mints (`kv_bootstrap_info`), and the client reads the decode side's output.
   scripted: the answers a test states go to the decode side) and advertises
   `disaggregation_mode: decode`.
 
-No KV moves between the two: the decode side has the prompt. HTTP and ZMQ
-workers take no role.
+- On the HTTP wire either side refuses a request that carries no
+  `bootstrap_room` (a 400, as the engines' disaggregated servers answer one),
+  and a prefill worker one whose `bootstrap_port` is not the port it bound:
+  its decode partner would rendezvous elsewhere for the handoff this mock
+  stands in for. A missing or null `bootstrap_port` reads as the engines'
+  default, 8998 (what the gateway sends for a prefill worker registered
+  without a port): the worker on that port takes it, one on another
+  refuses it.
+
+No KV moves between the two: the decode side has the prompt. ZMQ workers
+take no role, and one process gives the role to one wire's workers (worker
+`i` of either wire would bind the same bootstrap port); the encode role is
+the vLLM gRPC wire's alone.
 
 Every gRPC worker advertises the pairing protocol its environment names
 (`SMG_PAIRING_PROTOCOL`) as `pairing_protocol`, as the engine servicers do:
 a prefill and a decode that name the same one pair; name different ones for
 the two to see the gateway refuse the pair.
 
-In realistic mode (`--engine realistic`) a prefill worker honors the
+In realistic mode (`--engine realistic`) a prefill worker, on either wire, honors the
 [fault hooks](#fault-hooks) as any request: the stall, a status before
 admission (`fail?status=S`, counted under `failed_total`), the admission
 delay and rate (`pause` freezes the passes, which the prompt side never
@@ -390,7 +405,11 @@ gRPC, ZMQ), ahead of either engine mode. Two sources feed one store:
   optional: `finish_reason` defaults to `stop`; `matched_stop` is a token id
   or a string; `prompt_tokens` defaults to the request's own count;
   `logprobs` holds the sampled token's logprob per output token and is sent
-  when the request asks for logprobs; `delay_ms` is the pause before every
+  when the request asks for logprobs; `token_id_logprobs` holds the logprob
+  of each token id a scoring request asks for (`token_ids_logprob` on the
+  SGLang wire), in the request's order, on an answer of no tokens
+  (`"output_text": ""`), for a request that asks for logprobs, as the engine
+  computes the row only then; `delay_ms` is the pause before every
   frame but the first; `chunk_tokens` the tokens per frame (1 by default).
 - `POST /admin/script/{worker}` on the admin API, with one such answer or an
   array of them: the answers the worker's next requests get, in order

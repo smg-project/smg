@@ -2,9 +2,10 @@
 //! or Messages stream is driven the way the streaming tests drive theirs:
 //! over an engine stream of pre-encoded gRPC frames decoded by the client's
 //! own codec (no socket under it), writing to the bounded SSE channel a
-//! client reads from, with the bytes written as the result. `crate::bench_support`
-//! is the face `benches/stream_state_machines.rs` sees; the module is
-//! compiled for the crate's test targets only.
+//! client reads from, with the bytes written as the result. The gRPC router
+//! module re-exports `EngineScript` and `StreamBench`, the face
+//! `benches/stream_state_machines.rs` sees; the module is compiled for the
+//! crate's test targets only.
 
 #![expect(
     clippy::expect_used,
@@ -36,7 +37,7 @@ use tonic::{
 };
 use tool_parser::ParserFactory as ToolParserFactory;
 
-use super::{GenerateStreamContext, StreamingProcessor};
+use super::{character_tokenizer::CharacterTokenizer, GenerateStreamContext, StreamingProcessor};
 use crate::{
     routers::{
         common::sse::{sse_channel, SseReceiver},
@@ -48,7 +49,6 @@ use crate::{
             utils::ParserResolver,
         },
     },
-    test_support::CharacterTokenizer,
     worker::WorkerRegistry,
 };
 
@@ -175,6 +175,8 @@ impl StreamBench {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            span: tracing::Span::none(),
+            marked: Arc::default(),
         });
         let completion_request: CompletionRequest = serde_json::from_value(json!({
             "model": MODEL, "prompt": COMPLETION_PROMPT, "stream": true

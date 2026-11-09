@@ -211,13 +211,17 @@ impl KvEventMonitor {
             parent_seq_hash,
             &mut worker_blocks.blocks,
         ) {
-            Ok(()) => Some(parent_seq_hash),
+            Ok(()) => Some((parent_seq_hash, blocks.len())),
             Err(ApplyError::WorkerNotTracked | ApplyError::ParentBlockNotFound) => {
                 // Cold start or parent evicted — retry without parent to start a new chain.
                 worker_blocks.counters.parentless_stores += 1;
                 worker_blocks.counters.parentless_blocks += blocks.len() as u64;
                 match indexer.apply_stored(worker_id, &blocks, None, &mut worker_blocks.blocks) {
-                    Ok(()) => Some(None),
+                    Ok(()) => Some((None, blocks.len())),
+                    Err(ApplyError::ArenaCapReached { placed }) => {
+                        Self::note_cap_refusal(worker_blocks, worker_id, blocks.len() - placed);
+                        Some((None, placed))
+                    }
                     Err(e) => {
                         warn!(
                             worker_id = worker_id,
@@ -228,14 +232,37 @@ impl KvEventMonitor {
                     }
                 }
             }
+            Err(ApplyError::ArenaCapReached { placed }) => {
+                Self::note_cap_refusal(worker_blocks, worker_id, blocks.len() - placed);
+                Some((parent_seq_hash, placed))
+            }
         };
-        if let (Some(parent), Some(view)) = (placed_after, &worker_blocks.groups) {
+        // A store the index declined at an arena cap placed its leading
+        // blocks alone: the group view records those, as the index holds them.
+        if let (Some((parent, placed)), Some(view)) = (placed_after, &worker_blocks.groups) {
             let named: Vec<(SequenceHash, ContentHash)> = blocks
                 .iter()
+                .take(placed)
                 .map(|block| (block.seq_hash, block.content_hash))
                 .collect();
             worker_blocks.counters.group_blocks += view.main_stored(parent, &named) as u64;
             worker_blocks.counters.group_unnamed = view.unnamed_blocks();
+        }
+    }
+
+    /// A store the index declined at an arena cap (a run's fan-out or length) from its
+    /// `refused` last blocks on: the engine keeps them, the index does not route by them.
+    /// Counted per worker (published beside the parent-less counters), said once per worker.
+    fn note_cap_refusal(worker_blocks: &mut WorkerIndexState, worker_id: u32, refused: usize) {
+        worker_blocks.counters.cap_refused_stores += 1;
+        worker_blocks.counters.cap_refused_blocks += refused as u64;
+        if worker_blocks.counters.cap_refused_stores == 1 {
+            warn!(
+                worker_id = worker_id,
+                blocks = refused,
+                "KV index declined a store at an arena cap (a run's fan-out or length); \
+                 further refusals for this worker are counted, not logged"
+            );
         }
     }
 
@@ -572,6 +599,12 @@ pub(crate) struct WorkerIndexCounters {
     /// where fragmentation of the chain index is looked for first.
     pub(crate) parentless_stores: u64,
     pub(crate) parentless_blocks: u64,
+    /// Stores the index declined because a run's child table or hash array would outgrow
+    /// an arena chunk, and the blocks they left out (the leading blocks a declined store
+    /// placed are not among them); `smg_kv_index_cap_refusals` counts the stores over the
+    /// index, these are per worker.
+    pub(crate) cap_refused_stores: u64,
+    pub(crate) cap_refused_blocks: u64,
     /// Stores of blocks narrower than the worker's block of record, and the
     /// blocks they carried: a hybrid engine's prefix entries at its hash
     /// granularity (the prompt's tail inside its last block), or an engine's
@@ -589,6 +622,14 @@ impl WorkerIndexCounters {
         (
             self.parentless_stores - before.parentless_stores,
             self.parentless_blocks - before.parentless_blocks,
+        )
+    }
+
+    /// Stores declined at an arena cap and the blocks they left out since `before`.
+    pub(super) fn cap_refused_since(&self, before: &Self) -> (u64, u64) {
+        (
+            self.cap_refused_stores - before.cap_refused_stores,
+            self.cap_refused_blocks - before.cap_refused_blocks,
         )
     }
 

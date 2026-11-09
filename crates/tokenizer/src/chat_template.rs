@@ -3327,6 +3327,26 @@ impl ChatTemplateState {
         self.marked
     }
 
+    /// [`Self::set`] and [`Self::mark_controls`] as one step: the template
+    /// is replaced only when it both builds and marks, so a template that
+    /// fails to mark leaves the previous one in force, marks included (set
+    /// first and marked after, a failed mark left the new template installed
+    /// unmarked, and every later render read a typed control spelling as
+    /// its token). The fresh state is what `set` would leave: the template's
+    /// own answers, no nested templates, the length hint starting over.
+    pub(crate) fn replace_marked(
+        &mut self,
+        template: String,
+        controls: Option<&AddedTokens>,
+    ) -> Result<()> {
+        let mut fresh = Self::new(Some(template))?;
+        if let Some(controls) = controls {
+            fresh.mark_controls(controls)?;
+        }
+        *self = fresh;
+        Ok(())
+    }
+
     pub fn set(&mut self, template: String) -> Result<()> {
         let (
             content_format,

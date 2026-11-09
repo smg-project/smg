@@ -58,9 +58,14 @@ pub mod connection_timeouts;
 pub mod posture;
 pub(crate) mod tls;
 
+// The HTTP client constructors and the process crypto provider they install
+// first live beside the private-key-file check in `tls`; callers read them as
+// `server::http_client()` and its siblings.
+pub use tls::{blocking_http_client, http_client, http_client_builder, install_crypto_provider};
+
 use crate::{
     app_context::AppContext,
-    config::{ParserChoice, RouterConfig},
+    config::{redacted, ParserChoice, RouterConfig},
     endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
     mesh::{
         discovery::{start_mesh_discovery, MeshDiscoveryConfig},
@@ -112,6 +117,9 @@ pub struct AppState {
     /// probe listener. Maintained event-driven by
     /// [`crate::health::spawn_readiness_maintainer`].
     pub probe_state: Arc<crate::health::ProbeState>,
+    /// Where this start read its secrets (the command line, the environment
+    /// or a file), for the configuration view; the values are not here.
+    pub secret_sources: posture::SecretSources,
 }
 
 async fn parse_function_call(
@@ -864,6 +872,36 @@ async fn inflight_requests(State(state): State<Arc<AppState>>) -> Response {
     Json(state.context.inflight_tracker.snapshot()).into_response()
 }
 
+/// The control-plane reads the `admin` role alone may make: the gate
+/// refuses the `user` role there before any handler and writes the denial
+/// line, as for a mutation ([`smg_auth::ControlPlaneAuthState::with_admin_only_reads`]).
+pub const ADMIN_ONLY_READS: &[&str] = &["/config"];
+
+/// `GET /config`: the effective configuration with every secret
+/// redacted. The `admin` role alone reads it ([`ADMIN_ONLY_READS`]): the
+/// view names the store addresses, which the `user` role's reads do not.
+async fn admin_config(State(state): State<Arc<AppState>>) -> Response {
+    match redacted::effective(&state.context.router_config, &state.secret_sources) {
+        Ok(view) => Json(view).into_response(),
+        Err(error) => {
+            error!("the configuration view did not serialize: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// The control-plane routes that exist only behind control-plane
+/// authentication, mounted by `build_apps` when it is configured: the
+/// routes that expose addresses or change the configuration. A route
+/// that joins this group is listed in [`GATED_ROUTES`] too, which the
+/// start-up record prints and the role matrix test reads.
+fn gated_control_plane_routes() -> Router<Arc<AppState>> {
+    Router::new().route("/config", get(admin_config))
+}
+
+/// The gated routes by name, in the order of `gated_control_plane_routes`.
+pub const GATED_ROUTES: &[(&str, &str)] = &[("GET", "/config")];
+
 async fn list_workers_rest(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListWorkersQuery>,
@@ -1125,6 +1163,10 @@ pub fn build_apps(
     cors_allowed_origins: Vec<String>,
     admin_listener: bool,
 ) -> Result<GatewayApps, InvalidHeaderName> {
+    // The admin-only reads join the state once, for every attachment of
+    // the control-plane layer below: the shared groups and the gated group.
+    let control_plane_auth_state =
+        control_plane_auth_state.map(|state| state.with_admin_only_reads(ADMIN_ONLY_READS));
     // Pending (upgrade not completed): 30s TTL
     // Disconnected: 60 min TTL
     app_state.context.realtime_registry.start_reaper(
@@ -1400,6 +1442,18 @@ pub fn build_apps(
     let admin_routes = apply_control_plane_auth(admin_routes);
     let worker_routes = apply_control_plane_auth(worker_routes);
 
+    // The gated routes exist only behind control-plane authentication:
+    // their layer is the control-plane check alone, never the shared-key
+    // fallback or the open pass-through above, and a start without
+    // control-plane authentication does not mount them, so the path is
+    // unknown and answers 404 on both listeners.
+    let gated_routes = control_plane_auth_state.as_ref().map(|cp_state| {
+        gated_control_plane_routes().route_layer(axum::middleware::from_fn_with_state(
+            cp_state.clone(),
+            smg_auth::control_plane_auth_middleware,
+        ))
+    });
+
     // RL control plane: mounted only when the flag built an `RlState`, so
     // with `--enable-rl` off nothing under /v1/rl exists and the sink 404s.
     let rl_routes = app_state.context.rl.as_ref().map(|rl| {
@@ -1418,6 +1472,9 @@ pub fn build_apps(
         .merge(multipart_upload_routes)
         .merge(public_routes);
     let mut control_plane = Router::new().merge(admin_routes).merge(worker_routes);
+    if let Some(gated_routes) = gated_routes {
+        control_plane = control_plane.merge(gated_routes);
+    }
     if let Some(rl_routes) = rl_routes {
         control_plane = control_plane.merge(rl_routes);
     }
@@ -2039,7 +2096,7 @@ fn serve_listeners(
 
 /// Start the gateway listeners and drain them within the configured shutdown budget.
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    crate::clients::install_crypto_provider();
+    install_crypto_provider();
 
     // Defense in depth: the CLI and Python bindings both validate via
     // `RouterConfigBuilder::build()` before reaching here, but `RouterConfig`
@@ -2358,6 +2415,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         mesh_handler,
         mesh_adapters,
         probe_state,
+        secret_sources: config.secret_sources,
     });
     // For the shutdown task below: the mesh is told of the stop before the
     // listeners drain (`app_state` moves into the route groups first).
@@ -2441,6 +2499,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     );
     // And where a keyed start's secrets came from, sources alone.
     posture::log_secret_sources(&config.secret_sources);
+    // And whether the gated routes are mounted: they need control-plane
+    // authentication, so a start without it says they are off.
+    posture::log_gated_routes(control_plane_auth_state.is_some(), GATED_ROUTES);
 
     let apps = build_apps(
         app_state,
@@ -3807,10 +3868,7 @@ mod tests {
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>());
             let checking = async {
                 let addr = handle.listening().await.expect("HTTP server did not bind");
-                let client = crate::clients::http_client_builder()
-                    .no_proxy()
-                    .build()
-                    .unwrap();
+                let client = http_client_builder().no_proxy().build().unwrap();
                 for (path, content_type, expected) in [
                     ("plain", "application/json", "{\"ok\":true}"),
                     (
