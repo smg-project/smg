@@ -2482,7 +2482,18 @@ fn the_scans_count_whole_characters_around_the_word_edges() {
     // (the difference inside a character), by one of another width, or by
     // ending there (a prefix). The character count and the byte offset are the
     // character-wise walk's, in both argument orders.
-    let cases: [(char, char, char); 3] = [('é', 'è', 'z'), ('中', '丮', 'é'), ('😀', '😁', '中')];
+    // The near character differs in the last byte (the three first cases),
+    // in the second byte of a three- and a four-byte character, and in the
+    // third byte of a four-byte character: every byte position of a
+    // character where the scan can stop.
+    let cases: [(char, char, char); 6] = [
+        ('é', 'è', 'z'),
+        ('中', '丮', 'é'),
+        ('😀', '😁', '中'),
+        ('中', '乐', 'é'),
+        ('😀', '𐀀', '中'),
+        ('😀', '🙀', '中'),
+    ];
     for (wide, near, other) in cases {
         for lead in 0..=8 {
             for count in 0..=12 {

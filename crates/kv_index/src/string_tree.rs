@@ -383,28 +383,19 @@ impl PartialEq for EvictionEntry {
 // Note that in rust, `.len()` or slice is operated on the "byte" level. It causes issues for UTF-8 characters because one character might use multiple bytes.
 // https://en.wikipedia.org/wiki/UTF-8
 
-/// Count matching prefix characters between two strings.
-/// Returns the number of characters that match from the start.
-/// Optimized: uses fast byte comparison for ASCII, falls back to char iteration for UTF-8.
+/// Count matching prefix characters between two strings: the character
+/// count of `shared_prefix_len`, one scan on the ASCII path and the
+/// multi-byte path alike.
 #[inline]
 fn shared_prefix_count(a: &str, b: &str) -> usize {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-
-    let common_byte_len = common_byte_prefix(a_bytes, b_bytes);
-
-    // If the common byte prefix is all ASCII, byte count == char count
-    // Otherwise, fall back to char-by-char comparison for UTF-8 safety
-    if a_bytes[..common_byte_len].is_ascii() {
-        common_byte_len
-    } else {
-        shared_prefix_count_chars(a, b)
-    }
+    shared_prefix_len(a, b).0
 }
 
 /// Common prefix of `a` and `b` as (chars, bytes), so the caller can slice
-/// past it without a second walk over the matched text.
-#[inline]
+/// past it without a second walk over the matched text. Inlined into its
+/// callers explicitly: left to the inliner, the fused walk lost it once the
+/// helper had a second caller (a call per entry compared, measured).
+#[inline(always)]
 fn shared_prefix_len(a: &str, b: &str) -> (usize, usize) {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
@@ -412,26 +403,12 @@ fn shared_prefix_len(a: &str, b: &str) -> (usize, usize) {
     if a_bytes[..common_byte_len].is_ascii() {
         return (common_byte_len, common_byte_len);
     }
-    // The byte-level prefix may end inside a character: count whole chars.
-    let mut chars = 0;
-    let mut bytes = 0;
-    for ((offset, a_char), b_char) in a.char_indices().zip(b.chars()) {
-        if a_char != b_char {
-            break;
-        }
-        chars += 1;
-        bytes = offset + a_char.len_utf8();
-    }
-    (chars, bytes)
-}
-
-/// Fallback char-by-char comparison for strings with non-ASCII characters.
-#[inline]
-fn shared_prefix_count_chars(a: &str, b: &str) -> usize {
-    a.chars()
-        .zip(b.chars())
-        .take_while(|(a_char, b_char)| a_char == b_char)
-        .count()
+    // The byte position may sit inside a character: back it to that
+    // character's first byte (at most three bytes) and count the whole
+    // characters before it. The two strings agree byte for byte up to the
+    // position, so their character boundaries coincide there.
+    let bytes = a.floor_char_boundary(common_byte_len);
+    (a[..bytes].chars().count(), bytes)
 }
 
 /// The bytes `a` and `b` share from the start. The span of the shorter run is
