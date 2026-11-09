@@ -578,6 +578,11 @@ struct RoutingArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
 
+    /// Which implementation decides worker selection: the legacy policies
+    /// over worker handles, or the policy engine over its bounded view
+    #[arg(long, default_value = "legacy", value_parser = ["legacy", "engine"], help_heading = "Routing Policy")]
+    policy_engine: String,
+
     /// Sticky sessions: route every request of a conversation to the same
     /// worker, on any policy. Valid routing-key headers take priority over
     /// a key derived from the request body's rid, with per-turn/per-retry

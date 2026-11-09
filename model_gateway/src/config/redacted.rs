@@ -86,6 +86,7 @@ const PLAIN: &[&str] = &[
     "rdma_slot_ttl_s",
     "log_mm_timing",
     "dp_aware",
+    "policy_engine",
     "dp_minimum_tokens_scheduler",
     "discovery",
     "metrics",

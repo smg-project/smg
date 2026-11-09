@@ -8,7 +8,11 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use super::*;
-use crate::{middleware::scheduler, policies::cost as selection_cost, worker::endpoint::Endpoint};
+use crate::{
+    middleware::scheduler,
+    policies::{cost as selection_cost, engine_host::preset_name},
+    worker::endpoint::Endpoint,
+};
 
 /// Each listener needs its own port. `listeners` are `(field, flag, port)`
 /// in configuration order; the first two on one port are refused under the
@@ -397,10 +401,34 @@ pub fn available_cpus() -> usize {
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 impl ConfigValidator {
+    /// Under `--policy-engine engine` every policy that decides must be
+    /// one whose stages the engine carries in this build.
+    fn validate_policy_engine(config: &RouterConfig) -> ConfigResult<()> {
+        if config.policy_engine != PolicyEngineMode::Engine {
+            return Ok(());
+        }
+        let policies = [
+            Some(&config.policy),
+            config.mode.prefill_policy(),
+            config.mode.decode_policy(),
+        ];
+        for policy in policies.into_iter().flatten() {
+            if preset_name(policy).is_none() {
+                return Err(ConfigError::invalid_value(
+                    "policy_engine",
+                    policy.name(),
+                    "the policy engine carries random, round_robin, passthrough, power_of_two and least_load in this build",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
+        Self::validate_policy_engine(config)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
         Self::validate_cors_allowed_origins(config)?;

@@ -87,6 +87,9 @@ pub struct RouterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zmq_engine_count: Option<usize>,
     pub policy: PolicyConfig,
+    /// Which implementation decides worker selection (`--policy-engine`).
+    #[serde(default)]
+    pub policy_engine: PolicyEngineMode,
     /// Token positions at which serving engines retain reusable prefix state;
     /// cache-affinity policies hash request heads at the deepest applicable
     /// boundary. Ascending; empty disables boundary-based keying.
@@ -1015,6 +1018,24 @@ pub enum RoutingMode {
 }
 
 impl RoutingMode {
+    /// The prefill policy of a disaggregated mode, when one is configured.
+    pub fn prefill_policy(&self) -> Option<&PolicyConfig> {
+        match self {
+            Self::PrefillDecode { prefill_policy, .. }
+            | Self::EncodePrefillDecode { prefill_policy, .. } => prefill_policy.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The decode policy of a disaggregated mode, when one is configured.
+    pub fn decode_policy(&self) -> Option<&PolicyConfig> {
+        match self {
+            Self::PrefillDecode { decode_policy, .. }
+            | Self::EncodePrefillDecode { decode_policy, .. } => decode_policy.as_ref(),
+            _ => None,
+        }
+    }
+
     /// This mode with every worker URL masked like [`Endpoint::redacted`]:
     /// what the start-up lines and the configuration view show.
     pub fn redacted(&self) -> Self {
@@ -1305,6 +1326,28 @@ impl Default for RoutingKeyOverrideConfig {
             max_idle_secs: default_manual_max_idle_secs(),
             assignment_mode: default_override_assignment_mode(),
             headers: default_routing_key_headers(),
+        }
+    }
+}
+
+/// Which implementation decides worker selection: the legacy policy trait
+/// over worker handles, or the policy engine over the bounded view
+/// (`--policy-engine`). The flag is the rollback of the migration step.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyEngineMode {
+    #[default]
+    Legacy,
+    Engine,
+}
+
+impl PolicyEngineMode {
+    /// Parse the flag's value; anything but `engine` is the legacy path.
+    pub fn parse(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("engine") {
+            Self::Engine
+        } else {
+            Self::Legacy
         }
     }
 }
@@ -2225,6 +2268,7 @@ impl Default for RouterConfig {
             rdma_slot_ttl_s: None,
             log_mm_timing: false,
             dp_aware: false,
+            policy_engine: PolicyEngineMode::Legacy,
             dp_minimum_tokens_scheduler: false,
             api_key: None,
             tenant_api_keys: Vec::new(),

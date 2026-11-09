@@ -18,13 +18,18 @@ use tracing::{debug, info, warn};
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    as_bucket, as_cache_aware, get_healthy_worker_indices,
+    as_bucket, as_cache_aware,
+    engine_host::Decider,
+    get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
     normalize_model_key, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
     PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
 use crate::{
-    config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
+    config::types::{
+        ManualAssignmentMode, PdPairingMode, PolicyConfig, PolicyEngineMode,
+        RoutingKeyOverrideConfig,
+    },
     mesh::adapters::TreeSyncAdapter,
     observability::{cache_trace, metrics::Metrics},
     routers::common::header_utils::{
@@ -179,6 +184,10 @@ pub struct PolicyRegistry {
     routing_key_headers: Arc<Vec<HeaderName>>,
     /// How strictly PD placement pairs prefill and decode descriptors.
     pd_pairing_mode: PdPairingMode,
+    /// The policy engine, when `--policy-engine engine` selected it: the
+    /// placement sites decide through it and the legacy policies above stand
+    /// for the keyed sticky path alone.
+    decider: Option<Arc<Decider>>,
 }
 
 /// A sticky key with this many of its own requests already in flight on its
@@ -260,7 +269,47 @@ impl PolicyRegistry {
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
+            decider: None,
         }
+    }
+
+    /// Select the implementation that decides (`--policy-engine`). The
+    /// validator refuses a configuration the engine cannot serve at start;
+    /// a direct construction that reaches here with one keeps the legacy
+    /// path and says so.
+    #[must_use]
+    pub fn with_policy_engine(
+        mut self,
+        mode: PolicyEngineMode,
+        prefill: Option<&PolicyConfig>,
+        decode: Option<&PolicyConfig>,
+    ) -> Self {
+        if mode == PolicyEngineMode::Engine {
+            match Decider::from_configs(&self.default_policy_config, prefill, decode) {
+                Ok(decider) => {
+                    info!(needs = ?decider.engine().needs(), "Policy engine decides worker selection");
+                    self.decider = Some(Arc::new(decider));
+                }
+                Err(error) => {
+                    warn!(%error, "The policy engine cannot serve this configuration; the legacy policies decide");
+                }
+            }
+        }
+        self
+    }
+
+    /// The policy engine, when it decides.
+    pub fn decider(&self) -> Option<&Arc<Decider>> {
+        self.decider.as_ref()
+    }
+
+    /// Whether the routing-key sticky override takes a keyed request
+    /// away from `policy_name`: the engine path leaves those requests to the
+    /// legacy sticky selection in this step.
+    pub(crate) fn sticky_override_takes(&self, policy_name: &str, info: &SelectWorkerInfo) -> bool {
+        self.routing_key_sticky.is_some()
+            && Self::routing_key_override_applies(policy_name)
+            && self.effective_sticky_key(info).is_some()
     }
 
     /// Set how strictly PD placement pairs prefill and decode descriptors.
@@ -549,6 +598,9 @@ impl PolicyRegistry {
             guard.clone_from(&rx);
         }
         self.each_policy(|policy| policy.set_load_receiver(rx.clone()));
+        if let Some(decider) = &self.decider {
+            decider.set_load_receiver(rx);
+        }
     }
 
     /// Visit every policy the registry holds once: the default, the PD and

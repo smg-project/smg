@@ -15,8 +15,8 @@ use smg::{
         ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig, HealthCheckConfig,
         HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode, MemoryConfig,
         MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
-        PostgresConfig, ReadinessRoleConfig, RedisConfig, RetryConfig, RouterConfig,
-        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, SlurmDiscoveryConfig,
+        PolicyEngineMode, PostgresConfig, ReadinessRoleConfig, RedisConfig, RetryConfig,
+        RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, SlurmDiscoveryConfig,
         TokenizerCacheConfig, TraceConfig, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
     },
     mesh::discovery::MeshDiscoveryConfig,
@@ -1290,6 +1290,7 @@ impl CliArgs {
             .maybe_tool_call_parser(self.model.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.model.mcp_config_path.as_ref())
             .dp_aware(self.routing.dp_aware)
+            .policy_engine(PolicyEngineMode::parse(&self.routing.policy_engine))
             .pd_pairing_mode(
                 PdPairingMode::parse(&self.routing.pd_pairing_mode).unwrap_or_default(),
             )
