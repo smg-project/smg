@@ -182,8 +182,8 @@ fn sample(rendered: &str, family: &str, field: &str, label: &str) -> Option<f64>
         .and_then(|value| value.parse().ok())
 }
 
-/// The route's stream metrics anchor at the prefill dispatch: one record, a
-/// TTFT of at least the prefill offset (a clock the task started itself
+/// The route's stream metrics anchor at dispatch: one record, a
+/// TTFT of at least the dispatch offset (a clock the task started itself
 /// would read milliseconds) and a generation duration on the same base.
 fn assert_stream_anchor(rendered: &str, route: &str, endpoint: &'static str) {
     let label = format!("endpoint=\"{endpoint}\"");
@@ -206,7 +206,7 @@ fn assert_stream_anchor(rendered: &str, route: &str, endpoint: &'static str) {
     let floor = PREFILL_OFFSET.as_secs_f64();
     assert!(
         ttft >= floor,
-        "{endpoint}: TTFT {ttft} s anchors after the prefill dispatch ({floor} s before)"
+        "{endpoint}: TTFT {ttft} s anchors after dispatch ({floor} s before)"
     );
     assert!(
         generation >= ttft,
@@ -423,4 +423,72 @@ fn a_pd_harmony_responses_iteration_records_the_pd_pair_at_its_first_decode_fram
         servers
     });
     assert_pd_pair(&rendered, "harmony responses", 1.0, PREFILL_OFFSET);
+}
+
+/// A Single RPC can have its first chunk buffered when the stream starts.
+#[test]
+fn a_single_harmony_chat_stream_anchors_at_dispatch() {
+    let rendered = render_after(|| async {
+        let (stream, server) = scripted_stream(harmony_frames(), "0").await;
+        let response = Arc::new(HarmonyStreamingProcessor::new())
+            .process_streaming_chat_response(
+                ExecutionResult::Single {
+                    stream,
+                    dispatch_start: pd_timing(PREFILL_OFFSET).prefill_start,
+                },
+                Arc::new(chat_request()),
+                dispatch(),
+                Vec::new(),
+                None,
+                None,
+                source(metrics_labels::ENDPOINT_CHAT),
+            )
+            .await;
+        read_to_end(response).await;
+        vec![server]
+    });
+    assert_stream_anchor(
+        &rendered,
+        "single harmony chat",
+        metrics_labels::ENDPOINT_CHAT,
+    );
+}
+
+/// The earliest dispatch belongs to the second prompt, not the first one.
+#[test]
+fn a_batched_single_completion_stream_anchors_at_its_earliest_dispatch() {
+    let rendered = render_after(|| async {
+        let (first, first_server) = scripted_stream(text_frames(), "0").await;
+        let (second, second_server) = scripted_stream(text_frames(), "0").await;
+        let timing = pd_timing(PREFILL_OFFSET);
+        let response = Arc::new(processor(false))
+            .process_completion_streaming_response(
+                ExecutionResult::Batch {
+                    results: vec![
+                        ExecutionResult::Single {
+                            stream: first,
+                            dispatch_start: timing.decode_sent,
+                        },
+                        ExecutionResult::Single {
+                            stream: second,
+                            dispatch_start: timing.prefill_start,
+                        },
+                    ],
+                },
+                completion_spec(json!(["one", "two"])),
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                None,
+                None,
+                source(metrics_labels::ENDPOINT_COMPLETIONS),
+            )
+            .await;
+        read_to_end(response).await;
+        vec![first_server, second_server]
+    });
+    assert_stream_anchor(
+        &rendered,
+        "batched single completions",
+        metrics_labels::ENDPOINT_COMPLETIONS,
+    );
 }

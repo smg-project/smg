@@ -2237,8 +2237,8 @@ mod tests {
         },
         tenant::TenantKey,
         worker::{
-            test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard,
-            PrefillReservation, WorkerLoadGuard,
+            test_support::{no_health_check, select_worker},
+            BasicWorkerBuilder, ConnectionMode, ModelCard, PrefillReservation, WorkerLoadGuard,
         },
     };
 
@@ -2316,11 +2316,8 @@ mod tests {
 
     /// Occupy one of `worker`'s admission slots.
     async fn occupy(admission: &PrefillAdmission, worker: &Arc<dyn Worker>) -> PrefillReservation {
-        let worker = Arc::clone(worker);
         admission
-            .admit(None, move |capacity| {
-                capacity.select(Arc::clone(&worker), ())
-            })
+            .admit(None, select_worker(worker))
             .await
             .map(|admitted| admitted.reservation)
             .unwrap_or_else(|_| panic!("admission of an idle worker should succeed"))
@@ -2808,17 +2805,7 @@ mod tests {
         let worker_registry = Arc::new(WorkerRegistry::new());
         register_zmq_pd_workers(&worker_registry, model_id, RuntimeType::Sglang, 9000);
 
-        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        policy_registry
-            .set_prefill_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
-        policy_registry
-            .set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
-        let stage = WorkerSelectionStage::new(
-            Arc::clone(&worker_registry),
-            Arc::clone(&policy_registry),
-            WorkerSelectionMode::PrefillDecode,
-            None,
-        );
+        let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
 
         assert!(
             stage
@@ -2856,17 +2843,7 @@ mod tests {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let (prefill_url, decode_url) =
             register_zmq_pd_workers(&worker_registry, model_id, RuntimeType::TokenSpeed, 9200);
-        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        policy_registry
-            .set_prefill_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
-        policy_registry
-            .set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
-        let stage = WorkerSelectionStage::new(
-            Arc::clone(&worker_registry),
-            Arc::clone(&policy_registry),
-            WorkerSelectionMode::PrefillDecode,
-            None,
-        );
+        let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
 
         let (prefill, decode, _) = stage
             .select_pd_pair(
@@ -3184,7 +3161,6 @@ mod tests {
             sticky_key: None,
             clients: None,
             encode_outputs: None,
-            image_anchor: None,
             dispatch: None,
             load_guards: None,
             multimodal_inflight: None,
@@ -5074,17 +5050,7 @@ mod tests {
                 true,
             ))
             .unwrap();
-        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        policy_registry
-            .set_prefill_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
-        policy_registry
-            .set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
-        let stage = WorkerSelectionStage::new(
-            Arc::clone(&worker_registry),
-            Arc::clone(&policy_registry),
-            WorkerSelectionMode::PrefillDecode,
-            None,
-        );
+        let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
 
         let response = stage
             .select_pd_pair(
@@ -5270,17 +5236,7 @@ mod tests {
                 .register(vllm_grpc_worker(url, model_id, worker_type, refs))
                 .unwrap();
         }
-        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        policy_registry
-            .set_prefill_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
-        policy_registry
-            .set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
-        let stage = WorkerSelectionStage::new(
-            Arc::clone(&worker_registry),
-            Arc::clone(&policy_registry),
-            WorkerSelectionMode::PrefillDecode,
-            None,
-        );
+        let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
 
         let response = stage
             .select_pd_pair(
@@ -5330,17 +5286,7 @@ mod tests {
                 false,
             ))
             .unwrap();
-        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        policy_registry
-            .set_prefill_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
-        policy_registry
-            .set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
-        let stage = WorkerSelectionStage::new(
-            Arc::clone(&worker_registry),
-            Arc::clone(&policy_registry),
-            WorkerSelectionMode::PrefillDecode,
-            None,
-        );
+        let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
 
         let response = stage
             .select_pd_pair(
@@ -6069,6 +6015,8 @@ mod tests {
         Arc::new(builder.build())
     }
 
+    /// A prefill/decode stage over `worker_registry` with independent round-robin
+    /// prefill and decode policies and no admission.
     fn round_robin_pd_stage(worker_registry: Arc<WorkerRegistry>) -> WorkerSelectionStage {
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
         policy_registry

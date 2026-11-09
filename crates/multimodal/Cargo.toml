@@ -57,6 +57,13 @@ futures.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 
+# The x86-64 vector paths: `multiversion` dispatches a function to its
+# feature-specific clone from safe code, and `bytemuck` moves vector words in
+# and out of byte arrays without pointers, so the kernels carry no `unsafe`.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+bytemuck = { version = "1.25", features = ["must_cast"] }
+multiversion = "0.9"
+
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 http.workspace = true

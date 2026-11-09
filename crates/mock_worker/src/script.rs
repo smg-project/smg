@@ -88,6 +88,12 @@ pub struct Answer {
     /// once the ids are known (the encode of a text answer), so a scripted
     /// text can answer a request that asks for logprobs on a token wire.
     pub sampled_logprobs: bool,
+    /// The logprob of each token id the request asks a score for
+    /// (`token_ids_logprob` on the SGLang wire), in the request's order: the
+    /// answer of a prefill-only scoring request, whose output is empty. The
+    /// request asks for logprobs too, as the engine computes the row only
+    /// then; one that does not is refused.
+    pub token_id_logprobs: Option<Vec<f32>>,
     /// The pause before every frame but the first.
     pub delay: Duration,
     /// Tokens per frame.
@@ -167,7 +173,7 @@ impl Answer {
     ///  "output_ids": [...], "output_text": "..." | ["piece", ...],
     ///  "finish_reason": "stop", "matched_stop": 2 | "</s>",
     ///  "cached_tokens": 0, "prompt_tokens": 12, "logprobs": [-0.1, ...],
-    ///  "delay_ms": 0, "chunk_tokens": 1}
+    ///  "token_id_logprobs": [-0.2, ...], "delay_ms": 0, "chunk_tokens": 1}
     /// ```
     ///
     /// Everything is optional but one of `output_ids` and `output_text`;
@@ -178,6 +184,8 @@ impl Answer {
     /// `output_text` without `output_ids` is an answer of no tokens: the
     /// completion alone, as an engine answers a request it may not generate
     /// for. Beside ids, an empty string is one whole-text piece like any other.
+    /// `token_id_logprobs` scores the token ids a request asks for, in the
+    /// request's order: the answer of a prefill-only scoring request.
     pub fn parse(value: &Value) -> Result<Scripted, String> {
         let object = value.as_object().ok_or("an answer is a JSON object")?;
         let known = [
@@ -191,6 +199,7 @@ impl Answer {
             "cached_tokens",
             "prompt_tokens",
             "logprobs",
+            "token_id_logprobs",
             "delay_ms",
             "chunk_tokens",
         ];
@@ -343,6 +352,23 @@ impl Answer {
                 ))
             }
         };
+        let token_id_logprobs = match object.get("token_id_logprobs") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(values)) => Some(
+                values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_f64()
+                            .map(|v| v as f32)
+                            .ok_or_else(|| format!("token_id_logprobs: {value} is not a number"))
+                    })
+                    .collect::<Result<Vec<f32>, String>>()?,
+            ),
+            Some(other) => {
+                return Err(format!("token_id_logprobs: expected an array, got {other}"))
+            }
+        };
         let delay = Duration::from_millis(count("delay_ms")?.unwrap_or(0));
         let chunk_tokens = match count("chunk_tokens")? {
             None => 1,
@@ -363,6 +389,7 @@ impl Answer {
                 prompt_tokens,
                 logprobs,
                 sampled_logprobs,
+                token_id_logprobs,
                 delay,
                 chunk_tokens,
             },
@@ -923,10 +950,11 @@ pub fn take_ids(cfg: &Config, worker: &str, prompt_ids: &[u32]) -> Result<Option
 }
 
 /// `answer` with its ids for a token wire: a text-only answer encoded with
-/// the worker's tokenizer, any other as it is, its sampled logprobs made up
-/// once the ids are known either way.
+/// the worker's tokenizer, any other as it is (an answer of no tokens, a
+/// scoring answer's, needs none), its sampled logprobs made up once the ids
+/// are known either way.
 fn encode_for_wire(cfg: &Config, worker: &str, mut answer: Answer) -> Result<Answer, String> {
-    if !answer.output_ids.is_empty() || answer.output_text.is_none() {
+    if !answer.output_ids.is_empty() || answer.output_text.as_ref().is_none_or(Vec::is_empty) {
         answer.synthesize_logprobs();
         return Ok(answer);
     }

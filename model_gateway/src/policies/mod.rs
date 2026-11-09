@@ -171,6 +171,26 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
+/// The consistent-hashing policy behind a policy handle, when it is one: the
+/// one spelling of that downcast for the placement rules and the tests.
+pub(crate) fn as_consistent_hashing(
+    policy: &dyn LoadBalancingPolicy,
+) -> Option<&ConsistentHashingPolicy> {
+    policy.as_any().downcast_ref::<ConsistentHashingPolicy>()
+}
+
+/// The cache-aware policy behind a policy handle, when it is one: the one
+/// spelling of that downcast for the registry, the mesh wiring and the tests.
+pub(crate) fn as_cache_aware(policy: &dyn LoadBalancingPolicy) -> Option<&CacheAwarePolicy> {
+    policy.as_any().downcast_ref::<CacheAwarePolicy>()
+}
+
+/// The bucket policy behind a policy handle, when it is one: the one
+/// spelling of that downcast for the registry and the tests.
+pub(crate) fn as_bucket(policy: &dyn LoadBalancingPolicy) -> Option<&BucketPolicy> {
+    policy.as_any().downcast_ref::<BucketPolicy>()
+}
+
 /// Whether a built-in policy applies the complete [`Worker::is_available`]
 /// predicate before selecting. Other policies keep the caller-side filter.
 pub(crate) fn policy_filters_unavailable_workers(policy: &dyn LoadBalancingPolicy) -> bool {

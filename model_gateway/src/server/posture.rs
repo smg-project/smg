@@ -73,8 +73,10 @@ pub(crate) const SOURCES_HEADLINE: &str =
     "CREDENTIAL SOURCES: where this start read its secrets (the values are never logged)";
 
 /// Logs the sources record, one INFO, when a secret was given: one field per
-/// secret naming its source, `flag`, `env` or `file`.
-pub(crate) fn log_secret_sources(sources: &SecretSources) {
+/// secret naming its source, `flag`, `env` or `file`, and whether the key
+/// files are watched for changes (`secrets_auto_reload`: `off`, or `on` with
+/// the count of files watched).
+pub(crate) fn log_secret_sources(sources: &SecretSources, secrets_auto_reload: &str) {
     if !sources.any() {
         return;
     }
@@ -89,6 +91,7 @@ pub(crate) fn log_secret_sources(sources: &SecretSources) {
         control_plane_api_keys = control_plane_api_keys.as_deref(),
         postgres_db_url = sources.postgres_db_url.map(SecretSource::as_str),
         redis_url = sources.redis_url.map(SecretSource::as_str),
+        secrets_auto_reload,
         "{SOURCES_HEADLINE}"
     );
 }
@@ -502,15 +505,19 @@ mod tests {
     #[traced_test]
     #[test]
     fn the_sources_record_names_sources_alone() {
-        log_secret_sources(&SecretSources {
-            api_key: Some(SecretSource::File),
-            tenant_api_keys: Some((SecretSource::Environment, 3)),
-            control_plane_api_keys: Some((SecretSource::File, 2)),
-            postgres_db_url: Some(SecretSource::Flag),
-            redis_url: None,
-        });
+        log_secret_sources(
+            &SecretSources {
+                api_key: Some(SecretSource::File),
+                tenant_api_keys: Some((SecretSource::Environment, 3)),
+                control_plane_api_keys: Some((SecretSource::File, 2)),
+                postgres_db_url: Some(SecretSource::Flag),
+                redis_url: None,
+            },
+            "on (2 files)",
+        );
 
         assert!(logs_contain("CREDENTIAL SOURCES"));
+        assert!(logs_contain("secrets_auto_reload=\"on (2 files)\""));
         assert!(logs_contain("api_key=\"file\""));
         assert!(logs_contain("tenant_api_keys=\"env (3 entries)\""));
         assert!(logs_contain("control_plane_api_keys=\"file (2 entries)\""));
@@ -540,7 +547,7 @@ mod tests {
     fn a_start_without_secrets_logs_no_sources_record() {
         assert!(!SecretSources::default().any());
 
-        log_secret_sources(&SecretSources::default());
+        log_secret_sources(&SecretSources::default(), "off");
 
         assert!(!logs_contain("CREDENTIAL SOURCES"));
     }

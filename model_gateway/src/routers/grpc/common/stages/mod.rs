@@ -60,8 +60,7 @@ pub(crate) mod encode;
 pub(crate) mod helpers;
 pub(crate) mod pd_protocol;
 mod rate_limit;
-mod request_execution;
-mod vllm_encode;
+pub(crate) mod request_execution;
 mod worker_selection;
 
 // Export stage implementations

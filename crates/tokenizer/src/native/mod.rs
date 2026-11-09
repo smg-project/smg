@@ -93,7 +93,7 @@ use merge::{ByteTokens, MergeTable};
 use nfc::NfcQuick;
 use pattern::Pattern;
 use sentencepiece::{CharSymbols, Marker, WORD_MARKER};
-use short_pieces::{ShortPieceKey, ShortPieceTable, SHORT_PIECE_MAX_BYTES};
+use short_pieces::{ShortPieceKey, ShortPieceTable, Vacancy, SHORT_PIECE_MAX_BYTES};
 
 use crate::{
     encode_path::{Declined, Fallback},
@@ -155,30 +155,31 @@ const LONG_PIECE_MAX_BYTES: usize = 16 << 10;
 const PIECE_CACHE_CAPACITY: usize = 262_144;
 /// Entries all threads together hold for one encoder: a thread's own cap is
 /// this divided by the number of threads that have encoded with the encoder
-/// (and never more than `PIECE_CACHE_CAPACITY`). A thread's packed table
-/// starts at 64 slots (2 KiB) and doubles as the thread meets pieces, up to
-/// the slots for its cap, and is made anew for a smaller cap when it is
-/// cleared, so a thread that encodes little holds little and the packed
-/// tables of one tokenizer stay under 352 MiB however many runtime and
-/// blocking threads encode with it (sixteen threads at the full bound hold
-/// 264 MiB; more threads share the total, each table rounded up to a power
-/// of two slots, at most eight thirds of the total in slots). The maps of
-/// the pieces of 16 to 64 bytes share the count at about 140 bytes a
-/// typical entry (430 at most, see `PIECE_CACHE_CAPACITY`), and a clear
-/// keeps the packed slots and the map's buckets (both made anew for a
-/// smaller share), so the count-bounded tiers of one tokenizer hold at
-/// most the sum of the two: about 820 MiB at sixteen threads with typical
-/// map entries (about 2.2 GiB, sixteen times the 140 MiB of a thread, were
-/// every map entry the worst case), toward 352 + 560 MiB with the rounding
-/// of more threads; the long pieces add `LONG_PIECE_BYTES_TOTAL` at most.
-/// A thread reads its share at every miss and at the start of every encode
-/// call, so after threads join it is within the smaller share from its
-/// next call on, entries, packed slots and map buckets alike, and holds at
-/// most its earlier share until then, or until it exits if it never
-/// encodes again: right after a join the total is the earlier share times
-/// the threads that had it plus the new share times the rest, and settles
-/// as they encode. Before this bound the same ceilings were a sixteenth of
-/// these. All of it is freed with the encoder.
+/// (and never more than `PIECE_CACHE_CAPACITY`). A thread's packed table starts
+/// at 64 slots (2 KiB) and grows as the thread meets pieces (by four up to
+/// 4,096 slots, by two above), up to the slots for its cap, and is made anew
+/// for a smaller cap when it is cleared, so a thread that encodes little holds
+/// little and the packed tables of one tokenizer stay under 352 MiB however
+/// many runtime and blocking threads encode with it (sixteen threads at the
+/// full bound hold 264 MiB; more threads share the total, each table rounded up
+/// to a power of two slots, at most eight thirds of the total in slots). The
+/// maps of the pieces of 16 to 64 bytes share the count at about 140 bytes a
+/// typical entry (430 at most, see `PIECE_CACHE_CAPACITY`), and a clear keeps
+/// the packed slots and the map's buckets (both made anew for a smaller share),
+/// so the count-bounded tiers of one tokenizer hold at most the sum of the two:
+/// about 820 MiB at sixteen threads with typical map entries (about 2.2 GiB,
+/// sixteen times the 140 MiB of a thread, were every map entry the worst case),
+/// toward 352 + 560 MiB with the rounding of more threads; the long pieces add
+/// `LONG_PIECE_BYTES_TOTAL` at most. A thread reads its share at the start of
+/// every encode call and keeps it for that call's misses (a call that was
+/// running when threads joined keeps its earlier share until it ends; the long
+/// tier reads the live share at every miss), so after threads join it is within
+/// the smaller share from its next call on, entries, packed slots and map
+/// buckets alike, and holds at most its earlier share until then, or until it
+/// exits if it never encodes again: right after a join the total is the earlier
+/// share times the threads that had it plus the new share times the rest, and
+/// settles as they encode. Before this bound the same ceilings were a sixteenth
+/// of these. All of it is freed with the encoder.
 const PIECE_CACHE_TOTAL_CAPACITY: usize = 16 * PIECE_CACHE_CAPACITY;
 /// Bytes of long pieces (each piece, its ids and their slot) a thread holds
 /// for one encoder before its long entries are cleared, at most; see
@@ -243,12 +244,13 @@ enum Seeded {
 
 /// One thread's cache of the pieces it met with one encoder, each with the
 /// ids the encoder's seed or the model gave it.
-#[derive(Default)]
 struct PieceCache {
-    /// Pieces of up to `SHORT_PIECE_MAX_BYTES`, packed; made at the first
-    /// such piece with the fewest slots and grown with the pieces the thread
-    /// meets, up to its share. Bounded by count together with `short`.
-    packed: Option<ShortPieceTable>,
+    /// Pieces of up to `SHORT_PIECE_MAX_BYTES`, packed: a table made with
+    /// the fewest slots when the cache is, grown with the pieces the thread
+    /// meets, up to its share, and held plain (not in an `Option`): the hit
+    /// path reads it at an offset of the cache, with no test of its
+    /// presence per piece. Bounded by count together with `short`.
+    packed: ShortPieceTable,
     /// Pieces of more than `SHORT_PIECE_MAX_BYTES`, up to
     /// `CACHED_PIECE_MAX_BYTES`, bounded by their count together with
     /// `packed`.
@@ -264,17 +266,35 @@ struct PieceCache {
     /// unit (see `Native::encode_unit`): the cold pieces of such a unit take
     /// the byte merge without a test of their own.
     unit_ascii: bool,
+    /// The thread's share of the count-bounded tiers, read at the start of
+    /// every encode call (`piece_cache_for_call`); the misses of the call
+    /// read it here.
+    share: usize,
 }
 
 impl PieceCache {
-    /// Entries of the tiers bounded by count, `packed` and `short`.
-    fn short_entries(&self) -> usize {
-        self.packed.as_ref().map_or(0, ShortPieceTable::len) + self.short.len()
+    /// The empty cache of a thread whose share of the count-bounded tiers
+    /// is `share`: the packed table with the fewest slots, the maps empty.
+    fn with_share(share: usize) -> Self {
+        Self {
+            packed: ShortPieceTable::new(),
+            short: PieceIds::default(),
+            long: PieceIds::default(),
+            long_bytes: 0,
+            symbols: Vec::new(),
+            unit_ascii: false,
+            share,
+        }
     }
 
-    /// Slots of the packed tier, none before the thread's first short piece.
+    /// Entries of the tiers bounded by count, `packed` and `short`.
+    fn short_entries(&self) -> usize {
+        self.packed.len() + self.short.len()
+    }
+
+    /// Slots of the packed tier.
     fn packed_slots(&self) -> usize {
-        self.packed.as_ref().map_or(0, ShortPieceTable::slots)
+        self.packed.slots()
     }
 
     /// Entries the map tier has room for without growing: its buckets, a
@@ -290,9 +310,7 @@ impl PieceCache {
     /// map that grew under the share stays under that, so the check never
     /// fires at a steady share and a clear at the bound keeps the buckets).
     fn clear_short(&mut self, share: usize) {
-        if let Some(packed) = &mut self.packed {
-            packed.clear(share);
-        }
+        self.packed.clear(share);
         if self.short.capacity() > 2 * share {
             self.short = PieceIds::default();
         } else {
@@ -1969,15 +1987,14 @@ impl NativeEncoder {
     ) -> Result<(), Fallback> {
         // The hot path of a warm encode, and nothing else in this function:
         // the key of a short piece and the packed table's probe.
-        let key = ShortPieceKey::of(piece.as_bytes());
-        if let Some(key) = key {
-            if let Some(packed) = &cache.packed {
-                if packed.ids_into(key, ids) {
-                    return Ok(());
-                }
-            }
-        }
-        self.tokenize_piece_slow(model, piece, key, mapped, ids, cache)
+        let vacancy = match ShortPieceKey::of(piece.as_bytes()) {
+            Some(key) => match cache.packed.lookup(key, ids) {
+                None => return Ok(()),
+                vacancy => vacancy,
+            },
+            None => None,
+        };
+        self.tokenize_piece_slow(model, piece, vacancy, mapped, ids, cache)
     }
 
     /// A unit of a single-stage encoder: the stage's matches through the
@@ -2049,15 +2066,14 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
-        let key = ShortPieceKey::at(text.as_bytes(), piece.start, piece.end);
-        if let Some(key) = key {
-            if let Some(packed) = &cache.packed {
-                if packed.ids_into(key, ids) {
-                    return Ok(());
-                }
-            }
-        }
-        self.tokenize_piece_slow(model, &text[piece], key, mapped, ids, cache)
+        let vacancy = match ShortPieceKey::at(text.as_bytes(), piece.start, piece.end) {
+            Some(key) => match cache.packed.lookup(key, ids) {
+                None => return Ok(()),
+                vacancy => vacancy,
+            },
+            None => None,
+        };
+        self.tokenize_piece_slow(model, &text[piece], vacancy, mapped, ids, cache)
     }
 
     /// [`Self::tokenize_piece_at`] for a gap between two matches of a
@@ -2085,14 +2101,14 @@ impl NativeEncoder {
         &self,
         model: Option<&ModelWrapper>,
         piece: &str,
-        key: Option<ShortPieceKey>,
+        vacancy: Option<Vacancy>,
         mapped: &mut String,
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) -> Result<(), Fallback> {
         let bytes = piece.as_bytes();
         let cacheable = bytes.len() <= LONG_PIECE_MAX_BYTES;
-        if key.is_none() && cacheable {
+        if vacancy.is_none() && cacheable {
             if let Some(found) = cache.get(bytes) {
                 ids.extend_from_slice(found);
                 return Ok(());
@@ -2107,14 +2123,16 @@ impl NativeEncoder {
             self.chars.is_none(),
             "a sentencepiece piece takes tokenize_raw_piece_slow"
         );
-        if !key.is_some_and(|key| self.seed.ids_into(key, ids)) {
+        if !vacancy.is_some_and(|vacancy| self.seed.ids_into(vacancy.key(), ids)) {
             if let Some(table) = &self.merges {
                 // Under `ignore_merges` a piece that is an entry is that entry:
                 // the model's map is asked when the piece can be one (the
                 // lookup is the piece mapped to the alphabet as a string, its
                 // hash, a probe of the map and a compare: a memory latency and
                 // more on a cold piece, measured).
-                let whole = if table.ignore_merges && self.may_be_entry(key, bytes) {
+                let whole = if table.ignore_merges
+                    && self.may_be_entry(vacancy.map(|vacancy| vacancy.key()), bytes)
+                {
                     model.and_then(|model| model.token_to_id(self.mapped(bytes, mapped)))
                 } else {
                     None
@@ -2138,7 +2156,7 @@ impl NativeEncoder {
                 }
             }
         }
-        self.remember_piece(bytes, key, start, ids, cache);
+        self.remember_piece(bytes, vacancy, start, ids, cache);
         Ok(())
     }
 
@@ -2153,22 +2171,23 @@ impl NativeEncoder {
     fn remember_piece(
         &self,
         piece: &[u8],
-        key: Option<ShortPieceKey>,
+        vacancy: Option<Vacancy>,
         start: usize,
         ids: &[u32],
         cache: &mut PieceCache,
     ) {
-        if let Some(key) = key {
-            let share = self.piece_cache_share();
+        if let Some(vacancy) = vacancy {
+            let share = cache.share;
             if cache.short_entries() >= share {
+                // The vacancy named a slot of the table as it was: the cleared
+                // table is probed again.
                 cache.clear_short(share);
+                cache.packed.insert(vacancy.key(), &ids[start..], share);
+            } else {
+                cache.packed.insert_at(vacancy, &ids[start..], share);
             }
-            cache
-                .packed
-                .get_or_insert_with(ShortPieceTable::new)
-                .insert(key, &ids[start..], share);
         } else if piece.len() <= CACHED_PIECE_MAX_BYTES {
-            let share = self.piece_cache_share();
+            let share = cache.share;
             if cache.short_entries() >= share {
                 cache.clear_short(share);
             }
@@ -2238,15 +2257,14 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) {
-        let key = ShortPieceKey::at(text.as_bytes(), piece.start, piece.end);
-        if let Some(key) = key {
-            if let Some(packed) = &cache.packed {
-                if packed.ids_into(key, ids) {
-                    return;
-                }
-            }
-        }
-        self.tokenize_raw_piece_slow(chars, &text[piece], key, mapped, ids, cache);
+        let vacancy = match ShortPieceKey::at(text.as_bytes(), piece.start, piece.end) {
+            Some(key) => match cache.packed.lookup(key, ids) {
+                None => return,
+                vacancy => vacancy,
+            },
+            None => None,
+        };
+        self.tokenize_raw_piece_slow(chars, &text[piece], vacancy, mapped, ids, cache);
     }
 
     /// The first piece of a unit the word marker goes before: the marker,
@@ -2263,15 +2281,14 @@ impl NativeEncoder {
         let mut spaced = String::with_capacity(piece.len() + 1);
         spaced.push(' ');
         spaced.push_str(piece);
-        let key = ShortPieceKey::of(spaced.as_bytes());
-        if let Some(key) = key {
-            if let Some(packed) = &cache.packed {
-                if packed.ids_into(key, ids) {
-                    return;
-                }
-            }
-        }
-        self.tokenize_raw_piece_slow(chars, &spaced, key, mapped, ids, cache);
+        let vacancy = match ShortPieceKey::of(spaced.as_bytes()) {
+            Some(key) => match cache.packed.lookup(key, ids) {
+                None => return,
+                vacancy => vacancy,
+            },
+            None => None,
+        };
+        self.tokenize_raw_piece_slow(chars, &spaced, vacancy, mapped, ids, cache);
     }
 
     /// The rest of [`Self::tokenize_raw_piece`], out of line: the longer
@@ -2283,27 +2300,27 @@ impl NativeEncoder {
         &self,
         chars: &CharSymbols,
         raw: &str,
-        key: Option<ShortPieceKey>,
+        vacancy: Option<Vacancy>,
         mapped: &mut String,
         ids: &mut Vec<u32>,
         cache: &mut PieceCache,
     ) {
         let bytes = raw.as_bytes();
-        if key.is_none() && bytes.len() <= LONG_PIECE_MAX_BYTES {
+        if vacancy.is_none() && bytes.len() <= LONG_PIECE_MAX_BYTES {
             if let Some(found) = cache.get(bytes) {
                 ids.extend_from_slice(found);
                 return;
             }
         }
         let start = ids.len();
-        if !key.is_some_and(|key| self.seed.ids_into(key, ids)) {
+        if !vacancy.is_some_and(|vacancy| self.seed.ids_into(vacancy.key(), ids)) {
             chars.merge(
                 CharSymbols::normalized(raw, mapped),
                 &mut cache.symbols,
                 ids,
             );
         }
-        self.remember_piece(bytes, key, start, ids, cache);
+        self.remember_piece(bytes, vacancy, start, ids, cache);
     }
 
     /// The calling thread's piece cache for this encoder, made at the
@@ -2318,7 +2335,7 @@ impl NativeEncoder {
             if let Some(merges) = &self.merges {
                 merges.read_through();
             }
-            RefCell::default()
+            RefCell::new(PieceCache::with_share(self.piece_cache_share()))
         })
     }
 
@@ -2329,13 +2346,15 @@ impl NativeEncoder {
     /// the capacity of its map (arrays grown for the earlier share keep
     /// their size through a clear at the bound; here they are made anew for
     /// the share), so every thread that still encodes is within the share
-    /// from its next call on (a miss during a call reads the share too, see
-    /// [`Self::tokenize_piece`]; a thread that never encodes again holds
-    /// what it had until it exits). One relaxed load and three compares per
-    /// call.
+    /// from its next call on (the share is read here once and kept in the
+    /// cache for the call's misses, so a call that was running when threads
+    /// joined keeps the share it started with until it ends; a thread that
+    /// never encodes again holds what it had until it exits). One relaxed
+    /// load, one store and three compares per call.
     fn piece_cache_for_call(&self) -> RefMut<'_, PieceCache> {
         let mut cache = self.thread_piece_cache().borrow_mut();
         let share = self.piece_cache_share();
+        cache.share = share;
         let slots = ShortPieceTable::slots_for(share);
         if cache.short_entries() > share
             || cache.packed_slots() > slots

@@ -117,7 +117,10 @@ async fn a_reader_panic_ends_the_chat_stream_with_an_error_event_and_done() {
     let (payloads, scrape) = scraped(async {
         let response = Arc::new(processor(true))
             .process_streaming_response(
-                context::ExecutionResult::Single { stream },
+                context::ExecutionResult::Single {
+                    stream,
+                    dispatch_start: Instant::now(),
+                },
                 assigned(chat_spec(true), qwen3(CallSyntax::Json), PROMPT),
                 dispatch,
                 Arc::new(CharacterTokenizer::default()),
@@ -166,7 +169,10 @@ async fn a_reader_panic_answers_the_whole_chat_with_a_500_under_its_code() {
     let mut decoder =
         StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), false);
     let (result, scrape) = scraped(whole_reader().process_non_streaming_chat_response(
-        context::ExecutionResult::Single { stream },
+        context::ExecutionResult::Single {
+            stream,
+            dispatch_start: Instant::now(),
+        },
         assigned(chat_spec(true), qwen3(CallSyntax::Json), PROMPT),
         dispatch(),
         tokenizer,
@@ -199,7 +205,10 @@ async fn a_reader_panic_ends_the_messages_stream_with_its_error_event() {
     let (payloads, scrape) = scraped(async {
         let response = Arc::new(processor(true))
             .process_messages_streaming_response(
-                context::ExecutionResult::Single { stream },
+                context::ExecutionResult::Single {
+                    stream,
+                    dispatch_start: Instant::now(),
+                },
                 assigned_message(qwen3(CallSyntax::Json), PROMPT, false),
                 dispatch,
                 Arc::new(CharacterTokenizer::default()),
@@ -236,7 +245,10 @@ async fn a_reader_panic_answers_the_whole_message_with_a_500_under_its_code() {
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
     let (result, scrape) = scraped(whole_reader().process_non_streaming_messages_response(
-        context::ExecutionResult::Single { stream },
+        context::ExecutionResult::Single {
+            stream,
+            dispatch_start: Instant::now(),
+        },
         assigned_message(qwen3(CallSyntax::Json), PROMPT, false),
         dispatch(),
         tokenizer,
@@ -264,7 +276,10 @@ async fn a_reading_that_does_not_panic_is_untouched_by_the_isolation() {
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
     let response = Arc::new(processor(true))
         .process_streaming_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             assigned(chat_spec(true), qwen3(CallSyntax::Json), PROMPT),
             dispatch,
             Arc::new(CharacterTokenizer::default()),

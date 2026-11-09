@@ -29,6 +29,12 @@
 repeats = 3
 filter = "^(json_serialization|json_deserialization|bootstrap_injection|full_round_trip)/"
 
+# The files that feed this binary beyond the measured crate: the base side is built with them as the
+# pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
+# gated rows through the binary's inlining (symphony.toml records the case). A new row goes to a
+# bench target of its own.
+sources = ["model_gateway/benches/request_processing.rs"]
+
 [[gate]]
 pattern = "^(json_serialization|json_deserialization|bootstrap_injection|full_round_trip)/"
 threshold = 0.15

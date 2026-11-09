@@ -378,8 +378,9 @@ impl MockScheduler {
 /// What a wire's `Generate` asks of the core, whatever its proto's spelling:
 /// the gateway's token ids and the prompt it rendered them from, how many
 /// choices the request samples, its token limit, whether it streams, the
-/// logprobs it wants (the alternatives per token; `None` for none) and the
-/// rank it is pinned to.
+/// logprobs it wants (the alternatives per token; `None` for none), the token
+/// ids it asks a score for (a prefill-only scoring request's; empty on the
+/// wires without the field) and the rank it is pinned to.
 pub(crate) struct GenerateInput {
     pub(crate) request_id: String,
     pub(crate) prompt_ids: Vec<u32>,
@@ -388,16 +389,19 @@ pub(crate) struct GenerateInput {
     pub(crate) max_new: Option<u32>,
     pub(crate) stream: bool,
     pub(crate) logprobs: Option<usize>,
+    pub(crate) score_ids: Vec<u32>,
     pub(crate) pin: Option<i32>,
 }
 
-/// The logprobs of a frame's tokens: the sampled token's per position and
-/// the alternatives the request asked for.
+/// The logprobs of a frame's tokens: the sampled token's per position, the
+/// alternatives the request asked for, and on a completion the score of each
+/// token id the request asked for (empty elsewhere).
 #[derive(Clone, Debug)]
 pub(crate) struct LogProbs {
     pub(crate) token_logprobs: Vec<f32>,
     pub(crate) token_ids: Vec<u32>,
     pub(crate) top: Vec<script::TopAlternatives>,
+    pub(crate) scores: Vec<(u32, f32)>,
 }
 
 /// A streamed frame: the tokens new since the frame before, and the running
@@ -547,6 +551,7 @@ impl MockScheduler {
                 input.prompt_ids.len(),
                 input.stream,
                 input.logprobs,
+                input.score_ids,
             );
             return Ok(Box::pin(in_flight.until_done(stream)));
         }
@@ -1197,6 +1202,7 @@ fn scripted_stream(
     prompt_len: usize,
     stream_chunks: bool,
     logprobs: Option<usize>,
+    score_ids: Vec<u32>,
 ) -> FrameStream {
     struct Choice {
         index: u32,
@@ -1211,6 +1217,7 @@ fn scripted_stream(
         prompt_len: usize,
         stream_chunks: bool,
         logprobs: Option<usize>,
+        score_ids: Vec<u32>,
     }
     let choices = answers
         .into_iter()
@@ -1228,6 +1235,7 @@ fn scripted_stream(
         prompt_len,
         stream_chunks,
         logprobs,
+        score_ids,
     };
     Box::pin(stream::unfold(init, |mut st| async move {
         loop {
@@ -1240,7 +1248,7 @@ fn scripted_stream(
                 // the next choice from its first frame.
                 let choice = st.choices.pop_front()?;
                 let answer = &choice.answer;
-                let logprobs = st.logprobs.and_then(|top| {
+                let mut logprobs = st.logprobs.and_then(|top| {
                     answer
                         .logprobs
                         .as_ref()
@@ -1249,8 +1257,45 @@ fn scripted_stream(
                             token_logprobs: logprobs.clone(),
                             token_ids: answer.output_ids.clone(),
                             top: answer.top_logprobs(&answer.output_ids, logprobs, top),
+                            scores: Vec::new(),
                         })
                 });
+                // A scoring answer: the score of each token id the request asked
+                // for, in the request's order, on the completion. The engine
+                // computes the row only for a request that asks for logprobs,
+                // so one that does not is refused, as a wrong count is.
+                if let Some(values) = &answer.token_id_logprobs {
+                    if st.logprobs.is_none() {
+                        let status = Status::failed_precondition(format!(
+                            "the scripted answer scores {} token ids, the request asks for no logprobs",
+                            values.len()
+                        ));
+                        return Some((Err(status), st));
+                    }
+                    if values.len() != st.score_ids.len() {
+                        let status = Status::failed_precondition(format!(
+                            "the scripted answer scores {} token ids, the request asks for {}",
+                            values.len(),
+                            st.score_ids.len()
+                        ));
+                        return Some((Err(status), st));
+                    }
+                    let scores = st
+                        .score_ids
+                        .iter()
+                        .copied()
+                        .zip(values.iter().copied())
+                        .collect();
+                    logprobs = Some(match logprobs {
+                        Some(logprobs) => LogProbs { scores, ..logprobs },
+                        None => LogProbs {
+                            token_logprobs: Vec::new(),
+                            token_ids: Vec::new(),
+                            top: Vec::new(),
+                            scores,
+                        },
+                    });
+                }
                 let complete = Frame::Complete(Complete {
                     output_ids: answer.output_ids.clone(),
                     finish_reason: answer.finish_reason.clone(),
@@ -1280,6 +1325,7 @@ fn scripted_stream(
                     token_logprobs: frame.logprobs.clone(),
                     token_ids: frame.ids.clone(),
                     top: choice.answer.top_logprobs(&frame.ids, &frame.logprobs, top),
+                    scores: Vec::new(),
                 });
             let chunk = Frame::Chunk(Chunk {
                 token_ids: frame.ids,

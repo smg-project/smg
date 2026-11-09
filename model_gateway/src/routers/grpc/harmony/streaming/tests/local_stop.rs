@@ -52,7 +52,10 @@ async fn a_router_stop_ends_the_read_and_the_engine_request() {
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
     let response = Arc::new(HarmonyStreamingProcessor::new())
         .process_streaming_chat_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
             Arc::new(request),
             dispatch,
             vec!["STOP".to_string()],

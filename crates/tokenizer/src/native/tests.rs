@@ -1777,10 +1777,7 @@ fn the_seed_answers_a_vocabulary_piece_before_the_model_does() {
         .iter_mut()
         .map(|cache| {
             let cache = cache.get_mut();
-            (
-                cache.packed.as_ref().map_or(0, ShortPieceTable::len),
-                cache.short.len(),
-            )
+            (cache.packed.len(), cache.short.len())
         })
         .collect();
     assert_eq!(caches, [(2, 0)]);
@@ -1856,13 +1853,7 @@ fn piece_caches_stay_within_their_bound_across_threads() {
     let slots: Vec<usize> = native
         .piece_cache
         .iter_mut()
-        .map(|cache| {
-            cache
-                .get_mut()
-                .packed
-                .as_ref()
-                .map_or(0, ShortPieceTable::slots)
-        })
+        .map(|cache| cache.get_mut().packed.slots())
         .collect();
     assert!(
         slots
@@ -1886,8 +1877,10 @@ fn a_threads_packed_table_grows_with_use_and_follows_a_fallen_share() {
         let caches: Vec<(usize, usize)> = native
             .piece_cache
             .iter_mut()
-            .filter_map(|cache| cache.get_mut().packed.as_ref())
-            .map(|packed| (packed.slots(), packed.len()))
+            .map(|cache| {
+                let packed = &cache.get_mut().packed;
+                (packed.slots(), packed.len())
+            })
             .collect();
         assert_eq!(caches.len(), 1, "{caches:?}");
         caches[0]

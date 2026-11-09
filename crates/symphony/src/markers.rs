@@ -435,6 +435,12 @@ fn heads_alike(a: &str, b: &str) -> bool {
 /// no loop over its bytes and no branch on each; prose fed whole is read eight bytes a step.
 #[inline(always)]
 fn find_any(text: &[u8], bytes: &[u8]) -> Option<usize> {
+    // No start byte, a table with no terminal: nothing can be found, so nothing is read. The
+    // walk below would read the whole text to find nothing, once per prompt replayed and once
+    // per delta.
+    if bytes.is_empty() {
+        return None;
+    }
     // One or two start bytes, which the tables have, without the loop over them.
     let lanes = |word: u64| match *bytes {
         [byte] => lanes_with(word, byte),

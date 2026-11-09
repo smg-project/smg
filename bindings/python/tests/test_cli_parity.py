@@ -34,6 +34,10 @@ def cli_source() -> str:
 # Flags of the Rust CLI the launcher does not take, with the reason.
 CLI_ONLY = {
     "--disable-audit-logging": "the launcher's switch is --control-plane-audit-enabled",
+    "--secrets-auto-reload": (
+        "the launcher hands the binding key values, not their files, so there is nothing to"
+        " watch yet; the option comes with the file paths"
+    ),
 }
 
 # Options of the launcher with no Rust CLI flag of that spelling, with the reason.
@@ -64,18 +68,35 @@ class RustCli:
         return set(self.flags) | set(self.aliases) | self.pre_clap
 
 
-def literal_default(attribute: str) -> object:
-    """The clap default as a Python value, or None when there is none or it is
-    not a literal (an expression the launcher cannot be compared with)."""
-    quoted = re.search(r'\bdefault_value\s*=\s*"([^"]*)"', attribute)
-    if quoted:
-        return quoted.group(1)
-    # The capture stops at the next argument, or at the attribute's own
-    # closing `)]` when `default_value_t` is its last argument.
-    typed = re.search(r"\bdefault_value_t\s*=\s*([^,)\]]+)", attribute)
-    if not typed:
-        return None
-    raw = typed.group(1).strip().replace("_", "")
+# Where a named CLI default is declared when the CLI sources do not declare it
+# themselves: the config types module main.rs imports its constants from.
+CONST_SOURCES = (MAIN_RS.parent / "config" / "types.rs",)
+
+
+@dataclass(frozen=True)
+class UnreadDefault:
+    """A clap default the reader could not turn into a value: an expression, or a
+    name no source declares as a constant. The default tests report it by name
+    instead of skipping the flag in silence."""
+
+    raw: str
+
+
+def named_constant(name: str) -> str | None:
+    """The literal of ``pub const <name>: T = <literal>;`` in the CLI sources or the
+    config types module, or None when no such constant is declared."""
+    pattern = re.compile(rf"\bconst\s+{re.escape(name)}\s*:[^=;]+=\s*([^;]+);")
+    for text in (cli_source(), *(path.read_text() for path in CONST_SOURCES)):
+        declared = pattern.search(text)
+        if declared:
+            return declared.group(1).strip()
+    return None
+
+
+def literal_value(raw: str) -> object:
+    """A Rust literal as a Python value (a bool, an int or a float, the digit
+    separators and the type suffix dropped), or None when the text is not one."""
+    raw = raw.replace("_", "")
     raw = re.sub(r"(?<=\d)(u8|u16|u32|u64|u128|usize|i8|i16|i32|i64|isize|f32|f64)$", "", raw)
     if raw in ("true", "false"):
         return raw == "true"
@@ -87,6 +108,24 @@ def literal_default(attribute: str) -> object:
         return float(raw)
     except ValueError:
         return None
+
+
+def literal_default(attribute: str) -> object:
+    """The clap default as a Python value: None when the attribute carries none, the
+    value of a literal or of the constant a name stands for, and an
+    ``UnreadDefault`` for an expression the reader cannot compare."""
+    quoted = re.search(r'\bdefault_value\s*=\s*"([^"]*)"', attribute)
+    if quoted:
+        return quoted.group(1)
+    # The capture stops at the next argument, or at the attribute's own
+    # closing `)]` when `default_value_t` is its last argument.
+    typed = re.search(r"\bdefault_value_t\s*=\s*([^,)\]]+)", attribute)
+    if not typed:
+        return None
+    raw = typed.group(1).strip()
+    declared = named_constant(raw) if re.fullmatch(r"[A-Z][A-Z0-9_]*", raw) else None
+    value = literal_value(raw if declared is None else declared)
+    return UnreadDefault(raw) if value is None else value
 
 
 def arg_attributes(text: str) -> int:
@@ -319,8 +358,12 @@ def test_exception_lists_are_current(rust, launcher):
 
 def test_shared_flags_share_their_literal_defaults(rust, launcher):
     differs = {}
+    unread = []
     for flag, cli_default in rust.flags.items():
         if cli_default is None or flag not in launcher:
+            continue
+        if isinstance(cli_default, UnreadDefault):
+            unread.append(f"{flag} = {cli_default.raw}")  # a CLI default the reader skipped
             continue
         launcher_default = launcher[flag].default
         if launcher_default is None or isinstance(launcher_default, list):
@@ -333,6 +376,9 @@ def test_shared_flags_share_their_literal_defaults(rust, launcher):
             same = str(cli_default) == str(launcher_default)
         if not same:
             differs[flag] = (cli_default, launcher_default)
+    assert not unread, (
+        f"CLI defaults that literal_default cannot read, so the test would skip them: {unread}"
+    )
     unexpected = {flag: pair for flag, pair in differs.items() if flag not in DEFAULT_DIFFERS}
     assert not unexpected, f"defaults that differ from the Rust CLI's (CLI, launcher): {unexpected}"
     stale = [flag for flag in DEFAULT_DIFFERS if flag not in differs]
@@ -348,8 +394,7 @@ def signature_literal(raw: str) -> object:
     """A default of the ``#[pyo3(signature)]`` block as a Python value, or None when
     it is not a literal; an enum variant reads as the CLI's spelling of it. A
     ``Some(...)`` wrapper, an integer type suffix, a product or a power of integers
-    and a ``vec![...]`` read as the value they stand for, as ``literal_default``
-    reads the CLI's."""
+    and a ``vec![...]`` read as the value they stand for."""
     if raw in ("true", "false"):
         return raw == "true"
     quoted = re.fullmatch(r'String::from\("([^"]*)"\)', raw)
@@ -416,8 +461,11 @@ def test_the_constructor_defaults_are_the_cli_defaults(rust):
         cli_default = rust.flags.get(rust.aliases.get(spelling, spelling))
         if cli_default is None or raw in ("", "None"):
             continue
+        if isinstance(cli_default, UnreadDefault):
+            unreadable.append(f"{name}: the CLI default {cli_default.raw}")  # the CLI side skipped
+            continue
         if default is None:
-            unreadable.append(f"{name} = {raw}")  # a CLI literal the reader skipped
+            unreadable.append(f"{name} = {raw}")  # a constructor literal the reader skipped
             continue
         if isinstance(default, bool) or isinstance(cli_default, bool):
             same = default is cli_default
@@ -428,7 +476,7 @@ def test_the_constructor_defaults_are_the_cli_defaults(rust):
         if not same:
             differs[name] = (cli_default, default)
     assert not unreadable, (
-        f"constructor defaults with a CLI literal that signature_literal cannot read, "
+        f"constructor defaults with a literal that neither reader can read on one side, "
         f"so the test would skip them: {unreadable}"
     )
     unexpected = {n: pair for n, pair in differs.items() if n not in CONSTRUCTOR_DEFAULT_DIFFERS}
@@ -501,3 +549,13 @@ def test_the_eviction_interval_default_is_one_value_on_every_surface(rust, launc
         "chart": int(chart.group(1)),
     }
     assert set(surfaces.values()) == {120}, surfaces
+
+
+def test_a_selector_entry_is_refused_with_the_cli_text(rust):
+    """A discovery selector entry without ``key=value`` is refused on both sides
+    with the one reason the CLI prints, so one slip reads the same everywhere."""
+    reason = "expected 'key=value'"
+    assert reason in cli_source(), "the CLI's selector refusal changed: update the launcher's"
+    refusal = f"Invalid value for field 'decode_selector': tier - {reason}"
+    with pytest.raises(ValueError, match=re.escape(refusal)):
+        RouterArgs._parse_selector(["app=engine tier"], "decode_selector")

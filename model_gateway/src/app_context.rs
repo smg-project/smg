@@ -985,8 +985,8 @@ mod tests {
     use crate::{
         config::types::PolicyConfig,
         worker::{
-            test_support::worker_of, BasicWorkerBuilder, PrefillAdmissionAttempt, Worker,
-            WorkerType,
+            test_support::{select_worker, worker_of},
+            BasicWorkerBuilder, PrefillAdmissionAttempt, Worker, WorkerType,
         },
     };
 
@@ -1185,7 +1185,7 @@ mod tests {
     /// cache-aware deployments get waiting-prefill and KV-usage data.
     #[test]
     fn worker_monitor_wires_load_receiver_into_policies() {
-        use crate::policies::CacheAwarePolicy;
+        use crate::policies::as_cache_aware;
 
         let config = config_with_policy(PolicyConfig::CacheAware {
             cache_threshold: 0.5,
@@ -1219,10 +1219,7 @@ mod tests {
             .as_ref()
             .expect("policy registry set")
             .get_default_policy();
-        let cache_aware = policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .expect("default policy is cache-aware");
+        let cache_aware = as_cache_aware(policy.as_ref()).expect("default policy is cache-aware");
         assert!(cache_aware.has_load_receiver_for_test());
     }
 
@@ -1246,7 +1243,7 @@ mod tests {
     /// workers get the event-driven index rather than the approximate tree.
     #[test]
     fn a_cache_aware_policy_from_a_worker_label_gets_the_kv_event_monitor() {
-        use crate::policies::CacheAwarePolicy;
+        use crate::policies::as_cache_aware;
 
         let config = config_with_policy(PolicyConfig::Random);
         let builder = AppContextBuilder::new()
@@ -1258,10 +1255,8 @@ mod tests {
             .as_ref()
             .expect("policy registry set");
         let policy = registry.on_worker_added("affine", Some("cache_aware"));
-        let cache_aware = policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .expect("the label's policy is cache-aware");
+        let cache_aware =
+            as_cache_aware(policy.as_ref()).expect("the label's policy is cache-aware");
         assert!(cache_aware.kv_event_monitor_is_set_for_test());
     }
 
@@ -1364,13 +1359,7 @@ policy:
 
         let first = worker_of("http://prefill-1:8000", WorkerType::Prefill);
         registry.register(Arc::clone(&first)).unwrap();
-        let occupied = admission
-            .admit(None, {
-                let first = Arc::clone(&first);
-                move |capacity| capacity.select(Arc::clone(&first), ())
-            })
-            .await
-            .unwrap();
+        let occupied = admission.admit(None, select_worker(&first)).await.unwrap();
 
         let attempts = Arc::new(AtomicUsize::new(0));
         #[expect(
