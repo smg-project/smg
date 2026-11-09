@@ -54,8 +54,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{
     config::{
-        BuiltinToolType, McpConfig, McpProxyConfig, McpServerConfig, McpTransport, Prompt,
-        RawResource,
+        BuiltinToolType, McpConfig, McpProxyConfig, McpServerConfig, McpTransport, Prompt, Resource,
     },
     handler::{HandlerRequestContext, RefreshRequest, SmgClientHandler},
     metrics::McpMetrics,
@@ -129,7 +128,7 @@ async fn prompts_of<S: rmcp::service::Service<RoleClient>>(
 async fn resources_of<S: rmcp::service::Service<RoleClient>>(
     client: &RunningService<RoleClient, S>,
     server_key: &str,
-) -> Option<Vec<(String, RawResource)>> {
+) -> Option<Vec<(String, Resource)>> {
     match client.peer().list_all_resources().await {
         Ok(resources) => {
             info!(
@@ -140,7 +139,7 @@ async fn resources_of<S: rmcp::service::Service<RoleClient>>(
             Some(
                 resources
                     .into_iter()
-                    .map(|resource| (resource.uri.clone(), resource.raw))
+                    .map(|resource| (resource.uri.clone(), resource))
                     .collect(),
             )
         }
@@ -162,7 +161,7 @@ fn install_prompts(inventory: &ToolInventory, server_key: &str, prompts: Vec<(St
 fn install_resources(
     inventory: &ToolInventory,
     server_key: &str,
-    resources: Vec<(String, RawResource)>,
+    resources: Vec<(String, Resource)>,
 ) {
     for (uri, resource) in resources {
         inventory.insert_resource(uri, server_key.to_string(), resource);
@@ -713,7 +712,7 @@ impl McpOrchestrator {
                 )
                 .map_err(|e| McpError::Transport(format!("create stdio transport: {e}")))?;
 
-                handler.serve(transport).await.map_err(|e| {
+                Box::pin(handler.serve(transport)).await.map_err(|e| {
                     McpError::ConnectionFailed(format!("initialize stdio client: {e}"))
                 })
             }
@@ -733,7 +732,7 @@ impl McpOrchestrator {
 
                 let transport = StreamableHttpClientTransport::with_client(http_client, cfg);
 
-                handler.serve(transport).await.map_err(|e| {
+                Box::pin(handler.serve(transport)).await.map_err(|e| {
                     McpError::ConnectionFailed(format!("initialize streamable client: {e}"))
                 })
             }
@@ -1610,7 +1609,7 @@ impl McpOrchestrator {
                         let transport =
                             StreamableHttpClientTransport::with_client(http_client, cfg_http);
 
-                        ().serve(transport)
+                        Box::pin(().serve(transport))
                             .await
                             .map_err(|e| McpError::ConnectionFailed(format!("streamable: {e}")))
                     }

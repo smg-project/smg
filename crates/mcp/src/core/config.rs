@@ -4,7 +4,7 @@
 
 use std::{collections::HashMap, fmt, time::Duration};
 
-pub use rmcp::model::{Prompt, RawResource, Tool};
+pub use rmcp::model::{Prompt, Resource, Tool};
 use serde::{Deserialize, Serialize};
 
 /// Default upper bound for a single tool call (seconds).
