@@ -71,6 +71,7 @@ from infra.constants import (
     vllm_kv_backend,
     vllm_moriio_mode,
 )
+from infra.http_pd_stream_fault import assert_http_fault_outcomes, wait_for_fault_streams
 from infra.model_specs import get_model_spec
 from infra.pd_logs import (
     LOG_FLUSH_TIMEOUT_S,
@@ -1522,3 +1523,155 @@ class TestPDAssembledAtRuntime:
             gateway.shutdown()
             stop_workers(prefill + decode)
             logger.info("router logs kept at %s", _LOG_DIR)
+
+
+@pytest.mark.engine("vllm")
+@pytest.mark.gpu(4)
+@pytest.mark.e2e
+@pytest.mark.model(_MODEL)
+@pytest.mark.workers(parallel_start=True)
+@pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=_GATEWAY_ARGS)
+@pytest.mark.parametrize(
+    "setup_backend",
+    [
+        pytest.param(("pd_grpc", (p, d)), id=f"{p}p{d}d-http-mori-fault")
+        for p, d in [(1, 2), (1, 3), (2, 2)]
+    ],
+    indirect=True,
+)
+@pytest.mark.skipif(not _moriio_lane(), reason="HTTP MoRI relay fault contract only")
+class TestHTTPMoRIDecodeStreamFault:
+    """One isolated fleet per topology; no same-GPU restart or KV-release claim."""
+
+    @pytest.mark.flaky(reruns=0)
+    def test_http_decode_death_terminates_streams_and_survivor_serves(self, setup_backend):
+        mode, model, client, gateway = setup_backend
+        assert mode == "pd_http", "MoRI must use the HTTP PD relay"
+        decodes = gateway.decode_workers
+        assert len(decodes) >= 2
+        victim = decodes[-1]
+        peers = {worker.base_url for worker in decodes[:-1]}
+        owned = [*gateway.prefill_workers, *decodes]
+        outcomes: list[_StreamOutcome] = []
+        first_chunks = [threading.Event() for _ in range(4 * len(decodes))]
+
+        def stream(event):
+            outcomes.append(_stream_chat(gateway, model, max_tokens=600, first_token=event))
+
+        threads = [
+            threading.Thread(target=stream, args=(event,), daemon=True) for event in first_chunks
+        ]
+        try:
+            before = len(_pairs_logged())
+            for thread in threads:
+                thread.start()
+            deadline = time.monotonic() + 60.0
+            for event in first_chunks:
+                assert event.wait(max(0.0, deadline - time.monotonic())), (
+                    "HTTP stream did not produce a chunk within 60s"
+                )
+            pairs = _wait_for_pairs(before + len(threads))[before:]
+            assert victim.base_url in {decode for _, decode in pairs}, (
+                f"no live traffic reached victim {victim.base_url}: {pairs}"
+            )
+            assert all(thread.is_alive() for thread in threads), (
+                "a stream finished before fault injection; live-fault coverage is ambiguous"
+            )
+            killed = victim.kill_engine()
+            assert killed, "no victim engine process was killed"
+            wait_for_fault_streams(threads, timeout=120.0)
+            assert len(outcomes) == len(threads)
+            kinds = assert_http_fault_outcomes(outcomes)
+            logger.info("HTTP MoRI engine-fault outcomes (interruptions are failures): %s", kinds)
+            _wait_for_status(gateway, victim.base_url, "unhealthy", timeout=30.0)
+            before = len(_pairs_logged())
+            for i in range(6):
+                response = _ask(client, model, f"Reply with the number {i}.", max_tokens=8)
+                assert _answer_text(response).strip(), "survivor returned an empty answer"
+            pairs = _wait_for_pairs(before + 6)[before:]
+            used = {decode for _, decode in pairs}
+            assert used and used <= peers, f"fresh traffic did not stay on survivors: {used}"
+        finally:
+            # This class owns its complete fixture. Stop both roles without
+            # reloading the victim while MoRI peers may still map its memory.
+            # The fixture's repeated teardown is idempotent. No shared resources
+            # outside this explicitly owned fleet are touched.
+            try:
+                gateway.shutdown()
+            finally:
+                stop_workers(owned)
+            for thread in threads:
+                if thread.ident is not None:
+                    thread.join(timeout=1.0)
+
+
+def _wait_for_pairing_protocols(gateway: Gateway, expected: dict[str, str], timeout: float) -> None:
+    """Wait for effective pairing keys, not merely accepted operator labels."""
+    deadline = time.monotonic() + timeout
+    observed = _pairing_keys(gateway)
+    while observed != expected and time.monotonic() < deadline:
+        time.sleep(0.1)
+        observed = _pairing_keys(gateway)
+    assert observed == expected, f"effective pairing keys {observed}, expected {expected}"
+
+
+@pytest.mark.engine("vllm")
+@pytest.mark.gpu(4)
+@pytest.mark.e2e
+@pytest.mark.model(_MODEL)
+@pytest.mark.workers(parallel_start=True)
+@pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=_GATEWAY_ARGS)
+@pytest.mark.parametrize(
+    "setup_backend",
+    [pytest.param(("pd_grpc", (1, 1)), id="1p1d-http-mori-label-protocol")],
+    indirect=True,
+)
+@pytest.mark.skipif(not _moriio_lane(), reason="HTTP MoRI operator-label contract only")
+class TestHTTPMoRILabelPairingProtocol:
+    """Operator labels enforce HTTP pairing; engine env reporting remains separate."""
+
+    def test_operator_protocol_mismatch_refuses_and_matching_pair_serves(self, setup_backend):
+        mode, model, client, gateway = setup_backend
+        assert mode == "pd_http"
+        prefills, decodes = gateway.prefill_workers, gateway.decode_workers
+        assert len(prefills) == len(decodes) == 1
+        owned = [*prefills, *decodes]
+        try:
+            _wait_for_healthy_workers(gateway, 2, timeout=120.0)
+            baseline = _ask(client, model, "Reply only with the number 10837.", max_tokens=32)
+            assert "10837" in _answer_text(baseline), "baseline request did not return its nonce"
+            gateway.label_workers(prefills, {"pairing_protocol": "http-mori-v1"})
+            gateway.label_workers(decodes, {"pairing_protocol": "http-mori-v2"})
+            _wait_for_pairing_protocols(
+                gateway,
+                {
+                    prefills[0].base_url: "http-mori-v1",
+                    decodes[0].base_url: "http-mori-v2",
+                },
+                timeout=10.0,
+            )
+            response = _raw_chat(gateway, model, "Say hello.", timeout=30.0)
+            assert response.status_code == 503, response.text
+            assert _error_code(response) == "no_compatible_pd_pair", response.text
+
+            # No engine restarts or env changes: repair only the operator label,
+            # then require the effective metadata and a new useful model answer.
+            gateway.label_workers(decodes, {"pairing_protocol": "http-mori-v1"})
+            _wait_for_pairing_protocols(
+                gateway,
+                {
+                    prefills[0].base_url: "http-mori-v1",
+                    decodes[0].base_url: "http-mori-v1",
+                },
+                timeout=10.0,
+            )
+            before = len(_pairs_logged())
+            answer = _ask(client, model, "Reply only with the number 59281.", max_tokens=32)
+            assert "59281" in _answer_text(answer), "matching pair failed the fresh nonce request"
+            pairs = _wait_for_pairs(before + 1)[before:]
+            assert (prefills[0].base_url, decodes[0].base_url) in pairs, pairs
+        finally:
+            try:
+                gateway.shutdown()
+            finally:
+                stop_workers(owned)
