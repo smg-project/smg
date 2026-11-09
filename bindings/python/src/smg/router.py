@@ -340,7 +340,7 @@ class Router:
             estimate later picks read. Misses, spills and decode picks keep the
             whole prompt. Default: False
         eviction_interval_secs: Interval in seconds between cache eviction operations
-            in cache-aware routing. Default: 60
+            in cache-aware routing. Default: 120
         overlap_decay: Cache-aware anti-hotspot decay: each candidate's overlap score
             is divided by 1 + overlap_decay * x, where x is the worker's
             waiting-prefill backlog (blocks above the candidate minimum) per request

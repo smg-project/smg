@@ -49,9 +49,7 @@ LAUNCHER_ONLY = {
 }
 
 # Flags on both sides whose literal defaults differ, with the reason.
-DEFAULT_DIFFERS = {
-    "--eviction-interval": "the launcher's 60 s predates the CLI's 120 s; kept until reconciled",
-}
+DEFAULT_DIFFERS: dict[str, str] = {}
 
 
 @dataclass
@@ -374,3 +372,22 @@ def test_shutdown_settle_option(use_router_prefix, settle):
     args = RouterArgs.from_cli_args(parser.parse_args(flags), use_router_prefix=use_router_prefix)
     assert args.shutdown_settle_secs == settle
     assert args.shutdown_grace_period_secs == 180
+
+
+def test_the_eviction_interval_default_is_one_value_on_every_surface(rust, launcher):
+    """The CLI, the launcher, the Python Router and the chart evict the cache tree
+    on one cadence. The launcher's 60 s predated the CLI's 120 s and was never
+    followed; the three other surfaces agreed on 120."""
+    repo = MAIN_RS.parents[2]
+    lib_rs = repo / "bindings" / "python" / "src" / "lib.rs"
+    chart_values = repo / "deploy" / "helm" / "smg" / "values.yaml"
+    signature = re.search(r"\beviction_interval_secs = (\d+)", lib_rs.read_text())
+    chart = re.search(r"^\s*evictionIntervalSecs:\s*(\d+)\s*$", chart_values.read_text(), re.M)
+    assert signature and chart, "the Python Router's signature or the chart's value moved"
+    surfaces = {
+        "cli": rust.flags["--eviction-interval"],
+        "launcher": launcher["--eviction-interval"].default,
+        "python_router": int(signature.group(1)),
+        "chart": int(chart.group(1)),
+    }
+    assert set(surfaces.values()) == {120}, surfaces
