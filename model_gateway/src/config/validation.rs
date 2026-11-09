@@ -278,6 +278,20 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     Ok(())
 }
 
+/// The encode side takes three policies. This is the one list: the mode walk
+/// of the validator reads it in EPD mode, and the Python binding asks it in
+/// every mode, which covers an encode policy given outside EPD.
+pub fn validate_encode_policy(policy: &PolicyConfig) -> ConfigResult<()> {
+    match policy {
+        PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::ConsistentHashing => Ok(()),
+        _ => Err(ConfigError::invalid_value(
+            "encode_policy",
+            policy.name(),
+            "expected random, round_robin or consistent_hashing",
+        )),
+    }
+}
+
 /// Parse a listener host as operators write it: an IP literal, with or
 /// without the brackets an IPv6 address carries inside a `host:port` string
 /// (`0.0.0.0`, `::`, `[::]`, `::1`, `[fd00::1]`). Every bind flag goes
@@ -883,7 +897,7 @@ impl ConfigValidator {
                 }
                 if let Some(policy) = encode_policy {
                     Self::validate_policy(policy)?;
-                    Self::validate_encode_policy(policy)?;
+                    validate_encode_policy(policy)?;
                 }
                 if let Some(policy) = prefill_policy {
                     Self::validate_policy(policy)?;
@@ -1155,18 +1169,6 @@ impl ConfigValidator {
             ));
         }
         Ok(())
-    }
-
-    fn validate_encode_policy(policy: &PolicyConfig) -> ConfigResult<()> {
-        match policy {
-            PolicyConfig::Random | PolicyConfig::RoundRobin | PolicyConfig::ConsistentHashing => {
-                Ok(())
-            }
-            _ => Err(ConfigError::IncompatibleConfig {
-                reason: "Encode policy supports random, round_robin, or consistent_hashing"
-                    .to_string(),
-            }),
-        }
     }
 
     /// Validate listener settings and mode-specific serving constraints.
@@ -4483,7 +4485,18 @@ mod tests {
             },
             PolicyConfig::Random,
         );
-        assert!(ConfigValidator::validate(&invalid_cache_aware).is_err());
+        match ConfigValidator::validate(&invalid_cache_aware) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "encode_policy");
+                assert_eq!(value, "cache_aware");
+                assert_eq!(reason, "expected random, round_robin or consistent_hashing");
+            }
+            other => panic!("expected the field-named refusal, got {other:?}"),
+        }
 
         let invalid_least_load = RouterConfig::new(
             RoutingMode::EncodePrefillDecode {
@@ -4500,7 +4513,10 @@ mod tests {
             },
             PolicyConfig::Random,
         );
-        assert!(ConfigValidator::validate(&invalid_least_load).is_err());
+        assert!(matches!(
+            ConfigValidator::validate(&invalid_least_load),
+            Err(ConfigError::InvalidValue { field, .. }) if field == "encode_policy"
+        ));
     }
 
     #[test]
