@@ -801,6 +801,12 @@ fn a_non_streaming_request_is_not_bound_by_the_decode_sides_first_token() {
         .await;
         let (status, body, elapsed) = one_chat(router.as_ref(), false).await;
         assert_eq!(status, http::StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON answer");
+        assert_eq!(
+            json["usage"]["completion_tokens"].as_u64(),
+            Some(u64::from(OUTPUT_TOKENS)),
+            "the usage carries the decode's completion count: {body}"
+        );
         assert!(
             elapsed >= BOUND + Duration::from_secs(1) && elapsed < CASE_CAP,
             "answered when the decode answered, past the bound: {elapsed:?}"

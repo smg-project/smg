@@ -159,3 +159,57 @@ async fn generate_stream_bytes_match_the_recorded_fixtures() {
         assert_recorded_bytes(scenario.name, scenario.must_contain, &actual);
     }
 }
+
+/// Text that needs escaping reaches the client as serde writes it, on both
+/// loops: every event's `text` is the choice's text so far, written as the
+/// JSON string literal serde makes of it, and it reads back as that text.
+#[tokio::test]
+async fn generate_events_write_text_that_needs_escaping_as_serde_does() {
+    let chunks = [
+        "say \"hi\"",
+        "\n\ttab\\",
+        " caf\u{e9} \u{1f600}",
+        " \u{0}\u{1f}",
+    ];
+    let mut texts_so_far = Vec::new();
+    let mut text = String::new();
+    for chunk in chunks {
+        text.push_str(chunk);
+        texts_so_far.push(text.clone());
+    }
+    // The finish event carries the whole text once more.
+    texts_so_far.push(text);
+    for logprobs_loop in [false, true] {
+        let mut frames: Vec<_> = chunks.iter().map(|text| chunk(0, text)).collect();
+        frames.push(complete(0, "stop"));
+        let scenario = GenerateScenario {
+            name: "generate_escapes",
+            logprobs_loop,
+            input_token_logprobs: None,
+            weight_version: "default",
+            expected_choices: 1,
+            frames,
+            must_contain: "",
+        };
+        let bytes = stream_bytes(&scenario).await;
+        let events: Vec<&str> = std::str::from_utf8(&bytes)
+            .expect("UTF-8 SSE")
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect();
+        assert_eq!(
+            events.len(),
+            texts_so_far.len(),
+            "logprobs loop {logprobs_loop}: one event per chunk and the finish"
+        );
+        for (event, text) in events.iter().zip(&texts_so_far) {
+            let literal = serde_json::to_string(text).expect("a string serializes");
+            assert!(
+                event.starts_with(&format!("{{\"text\":{literal},\"output_ids\":")),
+                "logprobs loop {logprobs_loop}: {event}"
+            );
+            let parsed: Value = serde_json::from_str(event).expect("the event parses");
+            assert_eq!(parsed["text"].as_str(), Some(text.as_str()));
+        }
+    }
+}

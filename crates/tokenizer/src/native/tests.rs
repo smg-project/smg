@@ -1630,6 +1630,82 @@ fn a_vocabulary_with_gaps_in_its_ids_keeps_the_whole_piece_lookup() {
 }
 
 #[test]
+fn a_long_entry_the_merges_do_not_reach_is_its_own_id_under_ignore_merges() {
+    // A 20-byte entry the merges never build lies past the seed's keys: the
+    // whole-piece lookup of `ignore_merges` finds it, and the filter over
+    // the long entries, built from the bytes the pass read back from the
+    // alphabet, must admit the bytes the piece arrives with. A 20-byte piece
+    // that is no entry merges (to its bytes here: no merge reaches it).
+    let long = "abcdefghijklmnopqrst";
+    let other = "abcdefghijklmnopqrsu";
+    let mut vocab = Vocab::default();
+    for (id, c) in bytes_char().iter().enumerate() {
+        vocab.insert(c.to_string(), id as u32);
+    }
+    let xy = vocab.len() as u32;
+    vocab.insert("xy".to_owned(), xy);
+    let entry = vocab.len() as u32;
+    vocab.insert(long.to_owned(), entry);
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, vec![("x".to_owned(), "y".to_owned())])
+        .ignore_merges(true)
+        .build()
+        .expect("bpe");
+    let mut tokenizer = HfTokenizer::new(bpe);
+    tokenizer.with_pre_tokenizer(Some(byte_level(true)));
+    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    assert!(native
+        .long_entries
+        .as_ref()
+        .is_some_and(|filter| filter.may_hold(long.as_bytes())));
+    assert_eq!(
+        tokenizer.encode(long, false).expect("encode").get_ids(),
+        [entry]
+    );
+    assert_eq!(native.encode(Some(model), long, false), Ok(vec![entry]));
+    let merged: Vec<u32> = tokenizer
+        .encode(other, false)
+        .expect("encode")
+        .get_ids()
+        .to_vec();
+    assert_eq!(merged.len(), other.len());
+    assert_eq!(native.encode(Some(model), other, false), Ok(merged));
+}
+
+#[test]
+fn a_vocabulary_with_gaps_in_its_ids_keeps_the_whole_piece_lookup_for_long_entries_too() {
+    // As above with the long entry at 301, past the 258 ids the seed's pass
+    // reads: the pass did not read every entry, so there is no filter and
+    // the lookup stays for long pieces as for short ones.
+    let long = "abcdefghijklmnopqrst";
+    let mut vocab = Vocab::default();
+    for (id, c) in bytes_char().iter().enumerate() {
+        vocab.insert(c.to_string(), id as u32);
+    }
+    vocab.insert("xy".to_owned(), 300);
+    vocab.insert(long.to_owned(), 301);
+    assert_eq!(vocab.len(), 258);
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, vec![("x".to_owned(), "y".to_owned())])
+        .ignore_merges(true)
+        .build()
+        .expect("bpe");
+    let mut tokenizer = HfTokenizer::new(bpe);
+    tokenizer.with_pre_tokenizer(Some(byte_level(true)));
+    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+    let native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    assert!(native.long_entries.is_none());
+    assert_eq!(
+        tokenizer.encode(long, false).expect("encode").get_ids(),
+        [301]
+    );
+    assert_eq!(native.encode(Some(model), long, false), Ok(vec![301]));
+}
+
+#[test]
 fn the_seed_answers_a_vocabulary_piece_before_the_model_does() {
     // The encoder is built over a model with `ignore_merges` on, so its seed
     // holds "xyz" as the entry's own id; the encode then runs over a copy of
