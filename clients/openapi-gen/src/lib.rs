@@ -413,7 +413,8 @@ pub const CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
 ];
 
 /// The RL control-plane routes, behind the same authentication, mounted only
-/// with `--enable-rl`.
+/// with `--enable-rl`. The gateway's route-list test reads this list against
+/// the RL crate's router; the test below reads it against the document.
 pub const RL_CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/rl/workers"),
     ("GET", "/v1/rl/workers/{worker_id}"),
