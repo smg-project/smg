@@ -22,7 +22,7 @@ pub mod structured_outputs;
 use bytes::Bytes;
 
 use crate::{
-    codec::{encode_msgpack, tensor::encode_with_aux_frames, OpaqueValue},
+    codec::{encode_msgpack, tensor::encode_with_aux_frames, FrameStr, OpaqueValue},
     error::Result,
     protocol::{
         vllm::{
@@ -53,6 +53,10 @@ impl From<SchedulerStats> for EngineLoad {
 impl EngineOutput for EngineCoreOutput {
     fn request_id(&self) -> &str {
         self.request_id.as_str()
+    }
+
+    fn own_request_id(&mut self, id: FrameStr) {
+        self.request_id = id;
     }
 
     fn finished(&self) -> bool {

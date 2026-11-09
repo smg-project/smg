@@ -37,7 +37,7 @@ use tracing::{info, trace, warn};
 use zeromq::{RouterSendHalf, SocketRecv};
 
 use crate::{
-    codec::OpaqueValue,
+    codec::{FrameStr, OpaqueValue},
     error::{Error, Result},
     protocol::{
         kv_transfer::KvTransferStats, sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol,
@@ -70,8 +70,10 @@ pub type TrtllmStream = RequestStream<TrtllmProtocol>;
 /// other request on the transport — and backpressuring further, into the
 /// output PULL socket, would wedge the engine itself. Unboundedness is not
 /// unbounded memory: a request's queue is capped by its own generation
-/// (`max_tokens` outputs), a dropped stream auto-aborts it on the engine, and
-/// the buffer is freed with the stream.
+/// (`max_tokens` outputs), each output in it carries its request's own id
+/// rather than a view of the step frame it was decoded from
+/// ([`EngineOutput::own_request_id`]), a dropped stream auto-aborts it on the
+/// engine, and the buffer is freed with the stream.
 type OutputSender<O> = mpsc::UnboundedSender<Result<O>>;
 type OutputReceiver<O> = mpsc::UnboundedReceiver<Result<O>>;
 
@@ -135,6 +137,9 @@ struct RequestRegistry<O> {
 /// its first output, the prompt the engine still has to prefill for it.
 struct InFlight<O> {
     sender: OutputSender<O>,
+    /// The request's own id, one block per request, handed to each of its
+    /// outputs at dispatch in place of the step frame's view.
+    id: FrameStr,
     prompt_tokens: u64,
     handed: bool,
     started: bool,
@@ -205,10 +210,12 @@ impl<O: EngineOutput> RequestRegistry<O> {
             self.in_flight_since = Some(now);
             self.busy_started.notify_one();
         }
+        let id = FrameStr::owned(&request_id);
         self.requests.insert(
             request_id,
             InFlight {
                 sender,
+                id,
                 prompt_tokens,
                 handed: false,
                 started: false,
@@ -325,12 +332,13 @@ impl<O: EngineOutput> RequestRegistry<O> {
     ///
     /// The lookup key stays borrowed from the output, so the hot path — a
     /// non-terminal token batch — never allocates one.
-    fn route(&mut self, output: O) {
+    fn route(&mut self, mut output: O) {
         if output.finished() {
             // Terminal: retire the entry before handing the output over, while
             // its request id is still borrowable.
             match self.retire(output.request_id()) {
                 Some(entry) => {
+                    output.own_request_id(entry.id.clone());
                     let _ = entry.sender.send(Ok(output));
                 }
                 None => trace!(
@@ -355,6 +363,8 @@ impl<O: EngineOutput> RequestRegistry<O> {
                 self.prefill_pending = self.prefill_pending.saturating_sub(entry.prompt_tokens);
             }
         }
+        // The queued output keeps the request's id, not the step frame.
+        output.own_request_id(entry.id.clone());
         // A failed send hands the output back, so the receiver-gone (stream
         // dropped) path retires the entry without an owned key either.
         if let Err(mpsc::error::SendError(Ok(undelivered))) = entry.sender.send(Ok(output)) {

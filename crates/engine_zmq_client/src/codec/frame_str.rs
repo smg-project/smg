@@ -17,6 +17,12 @@ use super::tensor::frame_view_bytes;
 pub struct FrameStr(Bytes);
 
 impl FrameStr {
+    /// A copy of `text` of its own, outside any frame: the id a request keeps
+    /// for every output it is handed.
+    pub(crate) fn owned(text: &str) -> Self {
+        FrameStr(Bytes::copy_from_slice(text.as_bytes()))
+    }
+
     /// The string.
     pub fn as_str(&self) -> &str {
         // UTF-8 by construction: every constructor takes a `str`. The check
@@ -178,8 +184,8 @@ mod tests {
         assert!(copy_range.start < frame_range.start || copy_range.start >= frame_range.end);
     }
 
-    /// The string round-trips through the encoder as a plain msgpack string
-    /// and reads as one in every comparison and format.
+    /// A bytes-typed id reads as text, as a `String` field reads one, and
+    /// bytes that are not UTF-8 are refused.
     #[test]
     fn a_bytes_typed_id_decodes_as_text_and_refuses_other_bytes() {
         // msgpack bin8 of "req-bin", the shape a `String` field also accepts.
@@ -191,6 +197,8 @@ mod tests {
         assert!(decode_msgpack::<FrameStr>(&broken).is_err());
     }
 
+    /// The string round-trips through the encoder as a plain msgpack string
+    /// and reads as one in every comparison and format.
     #[test]
     fn a_frame_string_encodes_and_compares_as_a_string() {
         let text = FrameStr::from("req-1");

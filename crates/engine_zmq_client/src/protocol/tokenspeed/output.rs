@@ -504,6 +504,10 @@ impl EngineOutput for TokenSpeedOutput {
         self.request_id.as_str()
     }
 
+    fn own_request_id(&mut self, id: FrameStr) {
+        self.request_id = id;
+    }
+
     fn finished(&self) -> bool {
         self.finish_reason.is_some()
     }
