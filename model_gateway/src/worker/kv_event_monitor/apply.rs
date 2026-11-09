@@ -2263,6 +2263,28 @@ mod tests {
             ),
             (1, 0, 1, 1)
         );
+
+        // The group pass's own case: a worker whose main group has shown
+        // gets a foreign window store, which would show that group and give
+        // the worker a view; skipped, the worker keeps none.
+        let w2 = indexer.intern_worker("http://w2:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let mut remote_window = window_only_store(2, 9, None, &THIRD);
+        if let Some(kv_cache_event::Data::Stored(stored)) = &mut remote_window.data {
+            stored.locality = Some(KvCacheLocality::Remote as i32);
+        }
+        KvEventMonitor::apply_events(
+            &[store_event(stored_event(1, &TOKENS)), remote_window],
+            w2,
+            &indexer,
+            &mut wb,
+        );
+        assert!(wb.main_shown, "the main store shows the main group");
+        assert!(
+            wb.groups.is_none(),
+            "a foreign window store after the main group shows no group"
+        );
+        assert_eq!((wb.counters.group_stores, wb.counters.remote), (0, 1));
     }
 
     /// A relay snapshot replays the stores after a clear in one batch: the
