@@ -1283,7 +1283,7 @@ class TestPDMismatchedTransport:
     [
         pytest.param(
             (
-                "pd_grpc",
+                "pd_http" if _moriio_lane() else "pd_grpc",
                 (
                     1,
                     1,
@@ -1297,10 +1297,6 @@ class TestPDMismatchedTransport:
         )
     ],
     indirect=True,
-)
-@pytest.mark.skipif(
-    _moriio_lane(),
-    reason="the gRPC servicer reports SMG_PAIRING_PROTOCOL; a MoRI-IO lane's workers are HTTP",
 )
 class TestPDMismatchedProtocol:
     """A pairing protocol set in the engine's environment reaches placement.
@@ -1325,6 +1321,71 @@ class TestPDMismatchedProtocol:
         resp = _raw_chat(gateway, model, "Say hello.", timeout=60.0)
         assert resp.status_code == 503, resp.text
         assert _error_code(resp) == "no_compatible_pd_pair", resp.text
+
+
+@pytest.mark.engine("sglang", "vllm", "tokenspeed", "mock")
+@pytest.mark.gpu(4)
+@pytest.mark.e2e
+@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"], mock=_MODEL_BY_ENGINE["mock"])
+@pytest.mark.workers(parallel_start=True)
+@pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=_GATEWAY_ARGS)
+@pytest.mark.parametrize(
+    "setup_backend",
+    [
+        pytest.param(
+            (
+                "pd_http" if _moriio_lane() else "pd_grpc",
+                (
+                    1,
+                    1,
+                    {
+                        "prefill_env": {"SMG_PAIRING_PROTOCOL": "kv-v1"},
+                        "decode_env": {"SMG_PAIRING_PROTOCOL": "kv-v1"},
+                    },
+                ),
+            ),
+            id="1p1d-protocol-match",
+        )
+    ],
+    indirect=True,
+)
+class TestPDMatchingProtocol:
+    """Equal engine environments pair without operator protocol labels."""
+
+    def test_workers_with_equal_engine_protocols_answer(self, setup_backend, mock_answers):
+        _, model, _, gateway = setup_backend
+        _wait_for_healthy_workers(gateway, 2, timeout=120.0)
+        keys = _pairing_keys(gateway)
+        roles = _workers_by_role(gateway)
+        by_url = {worker.url: role for role, workers in roles.items() for worker in workers}
+        assert {by_url.get(url, url): key for url, key in keys.items()} == {
+            "prefill": "kv-v1",
+            "decode": "kv-v1",
+        }, keys
+        nonce = f"pair{time.time_ns():x}"
+        prompt = f"Repeat exactly this code and nothing else: {nonce}"
+        mock_answers.enqueue(nonce, prompt_contains=nonce)
+        before = len(_pairs_logged())
+        response = httpx.post(
+            f"{gateway.base_url}/v1/chat/completions",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 48,
+                "temperature": 0,
+            },
+            timeout=60.0,
+        )
+        assert response.status_code == 200, response.text[:500]
+        choices = response.json().get("choices", [])
+        assert len(choices) == 1, response.text[:500]
+        assert nonce in (choices[0].get("message", {}).get("content") or ""), response.text[:500]
+        pairs = _wait_for_pairs(before + 1)[before:]
+        assert pairs and all(
+            prefill in {worker.url for worker in roles["prefill"]}
+            and decode in {worker.url for worker in roles["decode"]}
+            for prefill, decode in pairs
+        ), pairs
 
 
 # ---------------------------------------------------------------------------

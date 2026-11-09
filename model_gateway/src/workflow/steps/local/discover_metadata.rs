@@ -90,6 +90,15 @@ pub(super) struct ModelsResponse {
     pub data: Vec<ModelsResponseEntry>,
 }
 
+// Keep the optional SMG extension scoped to vLLM; SGLang's existing parser
+// continues to ignore unrelated model-list fields.
+#[derive(Debug, Deserialize)]
+struct VllmModelsResponse {
+    #[serde(flatten)]
+    models: ModelsResponse,
+    pairing_protocol: Option<String>,
+}
+
 /// vLLM `/version` response.
 #[derive(Debug, Deserialize)]
 struct VersionResponse {
@@ -363,11 +372,23 @@ async fn fetch_vllm_http_metadata_checked(
     let mut labels = HashMap::new();
 
     // /v1/models — vLLM uses `root` as model_path, `id` as served_model_name
-    match http_get_json_classified::<ModelsResponse>(client, &format!("{base}/v1/models"), api_key)
-        .await
+    match http_get_json_classified::<VllmModelsResponse>(
+        client,
+        &format!("{base}/v1/models"),
+        api_key,
+    )
+    .await
     {
         Ok(models) => {
-            if let Some(m) = models.data.first() {
+            if let Some(protocol) = models
+                .pairing_protocol
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                labels.insert("pairing_protocol".to_string(), protocol.to_string());
+            }
+            if let Some(m) = models.models.data.first() {
                 if let Some(ref root) = m.root {
                     labels.insert("model_path".to_string(), root.clone());
                 }
@@ -1010,6 +1031,78 @@ mod tests {
             .expect("a version endpoint the engine does not offer fails no read");
         assert_eq!(label(&labels, "model_path"), Some("org/model-d"));
         assert_eq!(label(&labels, "version"), None, "{labels:?}");
+    }
+
+    #[tokio::test]
+    async fn vllm_smg_http_extension_reaches_pairing_and_preserves_explicit_priority() {
+        use http::StatusCode;
+        use openai_protocol::worker::WorkerSpec;
+
+        use crate::{
+            worker::pd_pairing::PdPairing, workflow::steps::local::test_support::serve_json_routes,
+        };
+
+        for (value, expected) in [
+            (None, None),
+            (Some(serde_json::Value::Null), None),
+            (Some(serde_json::json!("   ")), None),
+            (Some(serde_json::json!(" kv-v1 ")), Some("kv-v1")),
+            (Some(serde_json::json!("kv-v2")), Some("kv-v2")),
+        ] {
+            let mut models = serde_json::json!({"object": "list", "data": [{"id": "m"}]});
+            if let Some(value) = value {
+                models["pairing_protocol"] = value;
+            }
+            let base = serve_json_routes(vec![("/v1/models", StatusCode::OK, models)]).await;
+            let (labels, _) = discover_engine_labels(
+                &crate::server::http_client(),
+                &base,
+                ConnectionMode::Http,
+                "vllm",
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(label(&labels, "pairing_protocol"), expected);
+            assert_eq!(label(&labels, "served_model_name"), Some("m"));
+            let mut spec = WorkerSpec::new(base);
+            spec.labels = labels;
+            assert_eq!(PdPairing::derive(&spec).explicit(), expected);
+            spec.labels
+                .insert("pairing_protocol".into(), "operator".into());
+            assert_eq!(PdPairing::derive(&spec).explicit(), Some("operator"));
+            spec.pairing_protocol = Some("spec-override".into());
+            assert_eq!(PdPairing::derive(&spec).explicit(), Some("spec-override"));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_smg_http_extension_fails_strict_refresh_without_changing_sglang_schema() {
+        use http::StatusCode;
+
+        use crate::workflow::steps::local::test_support::serve_json_routes;
+        for invalid in [
+            serde_json::json!(4),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let models = serde_json::json!({"data": [{"id": "m"}], "pairing_protocol": invalid});
+            // This field is interpreted only on the opted-in vLLM path.
+            assert!(serde_json::from_value::<ModelsResponse>(models.clone()).is_ok());
+            let base = serve_json_routes(vec![("/v1/models", StatusCode::OK, models)]).await;
+            let client = crate::server::http_client();
+            let error = fetch_vllm_http_metadata_checked(&client, &base, None, true)
+                .await
+                .unwrap_err();
+            assert!(error.starts_with("/v1/models: "), "{error}");
+            assert!(
+                fetch_vllm_http_metadata_checked(&client, &base, None, false)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     /// An engine that refuses the connection leaves registration with no

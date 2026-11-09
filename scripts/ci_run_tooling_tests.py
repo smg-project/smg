@@ -34,6 +34,11 @@ COMPONENTS = (
 # that brings the suite, and both paths must exist: a suite the tree lacks is an
 # error, not a notice, so a deleted or renamed suite is noticed at once.
 REGRESSIONS = (
+    (
+        "grpc_servicer/smg_grpc_servicer/http_metadata.py",
+        "grpc_servicer/tests/test_http_metadata.py",
+    ),
+    ("e2e_test/infra/worker.py", "e2e_test/infra/test_worker_env.py"),
     ("e2e_test/infra/worker.py", "e2e_test/infra/test_worker_grpc_health.py"),
     ("e2e_test/infra/gateway.py", "e2e_test/infra/test_cloud_mcp_readiness.py"),
     (

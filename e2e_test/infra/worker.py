@@ -572,9 +572,31 @@ class Worker:
 
     def _build_vllm_http_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
         """Build vLLM HTTP (OpenAI-compatible) server command."""
-        return self._build_vllm_base_cmd(
+        cmd = self._build_vllm_base_cmd(
             "vllm.entrypoints.openai.api_server", model_path, tp_size, spec
         )
+        # Match _build_env's final override order without invoking that method
+        # here (it also allocates backend ports). The module ships in the
+        # installed servicer package; vLLM imports it in the engine process.
+        protocol = (
+            (self.extra_env or {})
+            .get("SMG_PAIRING_PROTOCOL", os.environ.get("SMG_PAIRING_PROTOCOL", ""))
+            .strip()
+        )
+        middleware = "smg_grpc_servicer.http_metadata.PairingProtocolMiddleware"
+        extras = self.extra_engine_args or []
+        already_enabled = any(
+            arg == f"--middleware={middleware}"
+            or (
+                arg == "--middleware"
+                and index + 1 < len(extras)
+                and extras[index + 1] == middleware
+            )
+            for index, arg in enumerate(extras)
+        )
+        if protocol and not already_enabled:
+            cmd += ["--middleware", middleware]
+        return cmd
 
     def _build_vllm_base_cmd(
         self, entrypoint: str, model_path: str, tp_size: int, spec: dict
