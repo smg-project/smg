@@ -36,3 +36,46 @@ pub fn sample(rendered: &str, family: &str, field: &str, labels: &[&str]) -> Opt
         .and_then(|line| line.rsplit(' ').next())
         .and_then(|value| value.parse().ok())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::sample;
+
+    /// Two series of one family, apart by their endpoint label.
+    const RENDERED: &str = "# TYPE smg_router_ttft_seconds histogram\n\
+        smg_router_ttft_seconds_sum{backend_type=\"regular\",endpoint=\"chat\"} 0.5\n\
+        smg_router_ttft_seconds_count{backend_type=\"regular\",endpoint=\"chat\"} 1\n\
+        smg_router_ttft_seconds_sum{backend_type=\"regular\",endpoint=\"completions\"} 2.5\n\
+        smg_router_ttft_seconds_count{backend_type=\"regular\",endpoint=\"completions\"} 2\n";
+
+    #[test]
+    fn a_sample_is_read_from_the_series_carrying_every_label() {
+        let family = "smg_router_ttft_seconds";
+        assert_eq!(
+            sample(RENDERED, family, "sum", &["endpoint=\"completions\""]),
+            Some(2.5)
+        );
+        assert_eq!(
+            sample(
+                RENDERED,
+                family,
+                "count",
+                &["backend_type=\"regular\"", "endpoint=\"chat\""]
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            sample(RENDERED, family, "sum", &["endpoint=\"generate\""]),
+            None
+        );
+        assert_eq!(
+            sample(
+                RENDERED,
+                family,
+                "sum",
+                &["backend_type=\"pd\"", "endpoint=\"chat\""]
+            ),
+            None
+        );
+    }
+}

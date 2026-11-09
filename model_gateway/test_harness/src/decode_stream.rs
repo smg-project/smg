@@ -28,14 +28,20 @@ pub fn chunk(id: u32) -> proto::GenerateResponse {
     }
 }
 
-/// The completion after `tokens` tokens, with `finish_reason`.
+/// The completion after `tokens` tokens (the ids `1..=tokens`), with `finish_reason`.
 pub fn complete(finish_reason: &str, tokens: u32) -> proto::GenerateResponse {
+    complete_with(finish_reason, (1..=tokens).collect())
+}
+
+/// The completion naming `output_ids`, with `finish_reason`.
+pub fn complete_with(finish_reason: &str, output_ids: Vec<u32>) -> proto::GenerateResponse {
+    let completion_tokens = u32::try_from(output_ids.len()).unwrap_or(u32::MAX);
     proto::GenerateResponse {
         response: Some(GenResp::Complete(proto::GenerateComplete {
-            output_ids: (1..=tokens).collect(),
+            output_ids,
             finish_reason: finish_reason.to_string(),
             prompt_tokens: 1,
-            completion_tokens: tokens,
+            completion_tokens,
             index: 0,
             ..Default::default()
         })),
@@ -51,19 +57,27 @@ pub fn produce_after(tx: GenerateTx, delay: Duration, tokens: u32) {
 /// Feed one generate stream from the chunk `first` on: the chunks
 /// `first..=tokens` after `delay`, then the `stop` completion naming all
 /// `tokens` (the chunks before `first` were sent by the caller).
+pub fn produce_from(tx: GenerateTx, delay: Duration, first: u32, tokens: u32) {
+    let skip = usize::try_from(first.saturating_sub(1)).unwrap_or(usize::MAX);
+    produce_ids(tx, delay, (1..=tokens).collect(), skip);
+}
+
+/// Feed one generate stream from `ids[skip..]` on: one chunk per id after
+/// `delay`, then the `stop` completion naming all `ids` (the first `skip`
+/// were sent by the caller).
 #[expect(
     clippy::disallowed_methods,
     reason = "test mock; the producer task ends with its stream"
 )]
-pub fn produce_from(tx: GenerateTx, delay: Duration, first: u32, tokens: u32) {
+pub fn produce_ids(tx: GenerateTx, delay: Duration, ids: Vec<u32>, skip: usize) {
     tokio::spawn(async move {
         tokio::time::sleep(delay).await;
-        for id in first..=tokens {
+        for &id in &ids[skip.min(ids.len())..] {
             if tx.send(Ok(chunk(id))).await.is_err() {
                 return;
             }
         }
-        let _ = tx.send(Ok(complete("stop", tokens))).await;
+        let _ = tx.send(Ok(complete_with("stop", ids))).await;
     });
 }
 
@@ -71,14 +85,17 @@ pub fn produce_from(tx: GenerateTx, delay: Duration, first: u32, tokens: u32) {
 /// shape. `hold` is the wait before the generate call returns its stream: an
 /// engine server that flushes its response headers with the first message
 /// holds them that long. With `first_chunk_buffered` the first chunk is in the
-/// stream when the call returns. `first_token_after` is the stream's own wait
-/// before its remaining tokens, `output_tokens` the count of them all.
-#[derive(Clone, Copy, Debug)]
+/// stream when the call returns. `in_stream_delay` is the stream's own wait
+/// before its remaining tokens (the second chunk on, under a buffered first
+/// chunk), `output_tokens` the count of them all (the ids `1..=output_tokens`),
+/// unless `output_ids` names the ids themselves.
+#[derive(Clone, Debug)]
 pub struct HeldHeadersEngine {
     pub hold: Duration,
     pub first_chunk_buffered: bool,
-    pub first_token_after: Duration,
+    pub in_stream_delay: Duration,
     pub output_tokens: u32,
+    pub output_ids: Option<Vec<u32>>,
 }
 
 impl HeldHeadersEngine {
@@ -87,8 +104,9 @@ impl HeldHeadersEngine {
         Self {
             hold: Duration::ZERO,
             first_chunk_buffered: false,
-            first_token_after: delay,
+            in_stream_delay: delay,
             output_tokens,
+            output_ids: None,
         }
     }
 
@@ -98,8 +116,9 @@ impl HeldHeadersEngine {
         Self {
             hold,
             first_chunk_buffered: false,
-            first_token_after: Duration::ZERO,
+            in_stream_delay: Duration::ZERO,
             output_tokens,
+            output_ids: None,
         }
     }
 }
@@ -115,14 +134,18 @@ impl VllmAnswers for HeldHeadersEngine {
         if !self.hold.is_zero() {
             tokio::time::sleep(self.hold).await;
         }
-        let mut first = 1;
-        if self.first_chunk_buffered {
-            tx.send(Ok(chunk(1)))
+        let ids = self
+            .output_ids
+            .clone()
+            .unwrap_or_else(|| (1..=self.output_tokens).collect());
+        let mut skip = 0;
+        if let (true, Some(&first)) = (self.first_chunk_buffered, ids.first()) {
+            tx.send(Ok(chunk(first)))
                 .await
                 .map_err(|_| Status::cancelled("stream closed"))?;
-            first = 2;
+            skip = 1;
         }
-        produce_from(tx, self.first_token_after, first, self.output_tokens);
+        produce_ids(tx, self.in_stream_delay, ids, skip);
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
