@@ -1132,6 +1132,16 @@ impl RouterTrait for Gateway {
         .await
     }
 
+    /// The answer of the router a request for `model_id` goes to, as
+    /// [`Self::select_router_for_request`] decides for `dispatch`: the
+    /// single-router default whatever the fleet lists, an external worker's
+    /// provider router, or the families' draw. The chat extractor asks this
+    /// only for a request carrying a hosted feature.
+    fn forwards_to_provider(&self, model_id: &str) -> bool {
+        self.select_router_for_request(Some(model_id))
+            .is_some_and(|router| router.forwards_to_provider(model_id))
+    }
+
     fn router_type(&self) -> &'static str {
         "manager"
     }
@@ -2567,5 +2577,94 @@ mod tests {
             "a client header under the second name wins: nothing is added under the first"
         );
         assert_eq!(placed(&seen).as_deref(), Some("mine"));
+    }
+
+    /// A provider's stub: it forwards hosted features, as the external
+    /// router adapter does.
+    #[derive(Debug)]
+    struct ProviderStubRouter;
+
+    #[async_trait]
+    impl RouterTrait for ProviderStubRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn router_type(&self) -> &'static str {
+            "openai"
+        }
+
+        fn forwards_to_provider(&self, _model_id: &str) -> bool {
+            true
+        }
+    }
+
+    /// An external worker listing `models`, as a keyed provider registers.
+    fn external_worker(models: &[&str]) -> Arc<dyn crate::worker::Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new("http://provider.invalid")
+                .runtime_type(RuntimeType::External)
+                .models(
+                    models
+                        .iter()
+                        .map(|model| ModelCard::new(*model))
+                        .collect::<Vec<_>>(),
+                )
+                .build(),
+        )
+    }
+
+    /// A single-router gateway sends every request to its default router,
+    /// so that router answers for the hosted features whatever the fleet
+    /// lists: a keyless passthrough gateway (one wildcard external worker,
+    /// listing no model) forwards any model's, an engine gateway refuses them
+    /// even for a model an external worker lists.
+    #[test]
+    fn hosted_features_follow_the_default_router() {
+        let keyless = Arc::new(WorkerRegistry::new());
+        keyless
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://provider.invalid")
+                    .runtime_type(RuntimeType::External)
+                    .build(),
+            ))
+            .unwrap();
+        let mut passthrough = Gateway::new(keyless);
+        passthrough.enable_igw = false;
+        passthrough.register_router(router_ids::HTTP_OPENAI, Arc::new(ProviderStubRouter));
+        assert!(passthrough.forwards_to_provider("sonar-pro"));
+
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(external_worker(&["prod-chat"])).unwrap();
+        let mut engine = Gateway::new(registry);
+        engine.enable_igw = false;
+        engine.register_router(router_ids::GRPC_REGULAR, Arc::new(StubRouter));
+        assert!(!engine.forwards_to_provider("prod-chat"));
+    }
+
+    /// A multi-router gateway answers for the router its selection hands the
+    /// request to: an external worker's model goes to its provider's router,
+    /// an engine's model to the engine family, an unknown model to the
+    /// default router.
+    #[test]
+    fn hosted_features_follow_the_selected_router() {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.register(external_worker(&["sonar-pro"])).unwrap();
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("grpc://engine:8080")
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(RuntimeType::Sglang)
+                    .model(ModelCard::new("local-chat"))
+                    .build(),
+            ))
+            .unwrap();
+        let mut gateway = Gateway::new(registry);
+        gateway.enable_igw = true;
+        gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(StubRouter));
+        gateway.register_router(router_ids::HTTP_OPENAI, Arc::new(ProviderStubRouter));
+        assert!(gateway.forwards_to_provider("sonar-pro"));
+        assert!(!gateway.forwards_to_provider("local-chat"));
+        assert!(!gateway.forwards_to_provider("absent-model"));
     }
 }

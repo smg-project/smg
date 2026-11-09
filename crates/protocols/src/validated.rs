@@ -92,6 +92,18 @@ pub(crate) fn rejection(
     response
 }
 
+/// The envelope for one rule judged outside the shared validation by a caller
+/// that knows what the request's fields cannot say (the gateway's chat
+/// extractor and the hosted features): the status, code, `param` and message
+/// the extractor would have produced for that error inside its report.
+#[cfg(feature = "axum")]
+pub fn rejection_of(error: ValidationError) -> Response {
+    let mut errors = ValidationErrors::new();
+    errors.add(WHOLE_REQUEST_KEY, error);
+    let (param, code) = first_violation(&errors);
+    rejection(StatusCode::BAD_REQUEST, &code, param, message_of(&errors))
+}
+
 /// The axum prefix of a body that deserialized into the wrong shape; the rest
 /// is serde's message, with the path to the offending value in front when the
 /// value is nested (`messages[0].content: invalid type ...`).
@@ -106,7 +118,9 @@ const DESERIALIZE_PREFIX: &str = "Failed to deserialize the JSON body into the t
 /// integer where the field cannot be negative, `invalid_type` for a value of
 /// the wrong shape (a body that is not an object included; a JSON array
 /// where an object was expected is a wrong type too, whether serde reports
-/// the type or the length of the sequence).
+/// the type or the length of the sequence). One reason is this crate's own:
+/// the chat tool types refuse the contract's custom tool kind with words
+/// that open `unsupported_tool_type` (`common::Tool`, `common::ToolChoice`).
 #[cfg(feature = "axum")]
 const SERDE_REASONS: &[(&str, &str)] = &[
     ("missing field `", "missing_required_parameter"),
@@ -117,6 +131,7 @@ const SERDE_REASONS: &[(&str, &str)] = &[
     ("invalid type", "invalid_type"),
     ("invalid length", "invalid_type"),
     ("data did not match any variant", "invalid_type"),
+    ("unsupported tool type `", "unsupported_tool_type"),
 ];
 
 /// Whether `text` opens with one of serde's reasons.
@@ -759,6 +774,34 @@ mod tests {
         assert!(body.to_string().contains("syntax"), "{body}");
     }
 
+    /// A rule judged outside the report (the gateway's chat extractor and
+    /// the hosted features) renders as the extractor renders one inside it:
+    /// the same status, code, `param`, message and extension.
+    #[tokio::test]
+    async fn a_rule_judged_outside_the_report_renders_like_one_inside_it() {
+        let response = rejection_of(crate::common::invalid_at(
+            "store",
+            "unsupported_parameter",
+            "store is not supported: this server keeps no completions",
+        ));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.extensions().get::<RejectionCode>(),
+            Some(&RejectionCode("unsupported_parameter".to_string()))
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["code"], "unsupported_parameter");
+        assert_eq!(json["error"]["param"], "store");
+        assert_eq!(
+            json["error"]["message"],
+            "store is not supported: this server keeps no completions"
+        );
+    }
+
     /// A rejection carries its code as the `RejectionCode` extension (the
     /// gateway's metrics read it), the same code the envelope shows.
     #[tokio::test]
@@ -1150,6 +1193,37 @@ mod tests {
             ));
         }
         Ok(())
+    }
+
+    /// The chat types refuse the contract's custom tool kind as the body is
+    /// read: the code names the kind, the param the tool or the choice, and
+    /// the message says what this server runs.
+    #[tokio::test]
+    async fn the_chat_requests_custom_tool_kinds_are_refused_by_name() {
+        use crate::chat::ChatCompletionRequest;
+
+        for (body, param, name) in [
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"custom","custom":{"name":"code_exec","description":"runs code"}}]}"#,
+                "tools[0]",
+                "code_exec",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}],"tool_choice":{"type":"custom","custom":{"name":"f"}}}"#,
+                "tool_choice",
+                "f",
+            ),
+        ] {
+            let (status, json) = rejected::<ChatCompletionRequest>(body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], "unsupported_tool_type", "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            let message = json["error"]["message"].as_str().unwrap_or_default();
+            let refusal = format!(
+                "unsupported tool type `custom` of `{name}`: this server runs function tools only"
+            );
+            assert!(message.contains(&refusal), "{json}");
+        }
     }
 
     /// The status and body of a rejected body of type `T`.

@@ -698,6 +698,35 @@ impl WorkerRegistry {
             .unwrap_or_else(|| Arc::from(Self::EMPTY_WORKERS))
     }
 
+    /// Whether a request for `model_id` drawn from `pool` can only reach a
+    /// provider's worker (an external runtime), the one kind that runs the
+    /// contract's hosted features: every worker the request can land on is
+    /// one, and there is at least one. A pool that also holds an engine may
+    /// land the request on the engine, which drops the fields, so it does
+    /// not count. A model nobody lists reads the global pool through the
+    /// selection's own filter, `supports_model`: the untagged workers take
+    /// it, an engine listing other models does not.
+    pub(crate) fn pool_forwards_to_provider(&self, model_id: &str, pool: RoutingPool) -> bool {
+        let is_provider =
+            |worker: &Arc<dyn Worker>| worker.metadata().spec.runtime_type == RuntimeType::External;
+        let listed = self.get_routing_pool(model_id, pool);
+        if !listed.is_empty() || model_id == UNKNOWN_MODEL_ID {
+            return !listed.is_empty() && listed.iter().all(is_provider);
+        }
+        let global = self.get_routing_pool(UNKNOWN_MODEL_ID, pool);
+        let mut takers = global
+            .iter()
+            .filter(|worker| worker.supports_model(model_id))
+            .peekable();
+        if takers.peek().is_none() {
+            // Dispatch refreshes the external workers' model lists on a miss:
+            // after that only a provider can take the model, and the route
+            // answers 404 when none does.
+            return global.iter().any(is_provider);
+        }
+        takers.all(is_provider)
+    }
+
     /// Return a shared route-specific candidate snapshot for a model.
     ///
     /// The first lookup after a membership change builds the projection once;
