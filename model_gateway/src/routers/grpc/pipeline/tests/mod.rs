@@ -453,6 +453,16 @@ impl TokenSpeedScheduler for GatedScheduler {
     }
 }
 
+/// A current-thread runtime for a test that drives its pipeline by hand: the
+/// metrics recorder is thread-local, so what the pipeline records is read on
+/// the thread that ran it.
+fn current_thread_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime")
+}
+
 /// The stub engine served on a loopback port bound before it is handed out.
 async fn spawn_stub(scheduler: GatedScheduler) -> u16 {
     let router = Server::builder().add_service(TokenSpeedSchedulerServer::new(scheduler));
@@ -1398,10 +1408,7 @@ fn a_decode_side_that_fails_mid_way_counts_against_its_worker_for_a_non_streamed
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     let attempts = metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
+        let rt = current_thread_runtime();
         rt.block_on(async {
             let decode_calls = Arc::new(Mutex::new(Vec::new()));
             let prefill_port = spawn_stub(GatedScheduler::default()).await;
@@ -1451,10 +1458,7 @@ fn a_prefill_side_that_fails_mid_way_counts_against_its_worker_for_a_non_streame
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
+        let rt = current_thread_runtime();
         rt.block_on(async {
             let prefill_port = spawn_stub(GatedScheduler {
                 fail_mid_stream: true,
@@ -1492,10 +1496,7 @@ fn a_decode_side_that_fails_mid_way_is_counted_once_for_a_streamed_answer() {
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
+        let rt = current_thread_runtime();
         rt.block_on(async {
             let prefill_port = spawn_stub(GatedScheduler::default()).await;
             let decode_port = spawn_stub(GatedScheduler {
@@ -1614,10 +1615,7 @@ async fn retry_replays_identical_token_ids_from_the_retained_plan() {
 /// request: the attempts are the retry families' count, not this one's.
 #[test]
 fn a_retried_request_counts_once_with_its_whole_duration_and_no_error() {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a current-thread runtime");
+    let rt = current_thread_runtime();
     let backoff = Duration::from_millis(50);
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
@@ -3505,10 +3503,7 @@ fn a_refusal_before_the_first_token_counts_against_the_worker_once_per_attempt()
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
+        let rt = current_thread_runtime();
         rt.block_on(async {
             let seen = Arc::new(Mutex::new(Vec::new()));
             let port = spawn_stub(GatedScheduler {
@@ -3548,10 +3543,7 @@ fn a_worker_stream_that_fails_mid_way_counts_against_the_worker_for_a_non_stream
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
+        let rt = current_thread_runtime();
         rt.block_on(async {
             let port = spawn_stub(GatedScheduler {
                 fail_mid_stream: true,
