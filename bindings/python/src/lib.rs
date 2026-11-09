@@ -503,6 +503,7 @@ struct Router {
     /// The optional fields of the access-log record.
     access_log_fields: Vec<String>,
     admin_host: Option<String>,
+    admin_max_connections: usize,
     admin_port: Option<u16>,
     api_key: Option<String>,
     assignment_mode: Option<String>,
@@ -1353,6 +1354,7 @@ impl Router {
             .header_read_timeout_secs(self.header_read_timeout_secs)
             .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
             .max_connections(self.max_connections)
+            .admin_max_connections(self.admin_max_connections)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
@@ -1412,6 +1414,7 @@ impl Router {
         *,
         access_log_fields = vec![],
         admin_host = None,
+        admin_max_connections = 0,
         admin_port = None,
         api_key = None,
         assignment_mode = None,
@@ -1633,6 +1636,7 @@ impl Router {
         // Keyword-only, in the signature's order (pyo3 wants the two orders to agree).
         access_log_fields: Vec<String>,
         admin_host: Option<String>,
+        admin_max_connections: usize,
         admin_port: Option<u16>,
         api_key: Option<String>,
         assignment_mode: Option<String>,
@@ -1890,6 +1894,7 @@ impl Router {
             port,
             access_log_fields,
             admin_host,
+            admin_max_connections,
             admin_port,
             api_key,
             assignment_mode,

@@ -1960,6 +1960,21 @@ class TestMaxConnections:
             parse_router_args(["--max-connections", "-1"])
 
 
+class TestAdminMaxConnections:
+    """The admin listener's own connection bound: no bound by default, a
+    bound parses, a negative count is refused by the parser."""
+
+    def test_default_is_no_bound(self):
+        assert parse_router_args([]).admin_max_connections == 0
+
+    def test_flag_parses(self):
+        assert parse_router_args(["--admin-max-connections", "64"]).admin_max_connections == 64
+
+    def test_negative_is_refused(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--admin-max-connections", "-1"])
+
+
 class TestPrometheusHostDefault:
     """--prometheus-host is unset by default: the router derives the metrics
     bind address from --host's family (:: for an IPv6 host, 0.0.0.0 otherwise)
