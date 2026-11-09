@@ -1392,9 +1392,9 @@ impl Router {
     #[new]
     #[pyo3(signature = (
         worker_urls,
-        policy = PolicyType::RoundRobin,
+        policy = PolicyType::CacheAware,
         host = String::from("0.0.0.0"),
-        port = 3001,
+        port = 30000,
         // Every other parameter is keyword-only, in alphabetical order (the struct's
         // note says where a new one goes).
         *,
@@ -1601,7 +1601,7 @@ impl Router {
         worker_stall_secs = 2,
         worker_startup_check_interval = 30,
         worker_startup_delay = 0,
-        worker_startup_timeout_secs = 600,
+        worker_startup_timeout_secs = 1800,
         worker_warmup_blocks = 1024,
         worker_warmup_divert_every = 8,
         worker_warmup_secs = 60,
