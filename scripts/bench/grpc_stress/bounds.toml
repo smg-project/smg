@@ -14,11 +14,19 @@
 # bound, of which the bound admits 4,197 and sheds 5,803 every night, so its shed and failed counts are
 # that figure. A bound is moved by a change that explains the new level in its own PR, never by the
 # night that breached it.
+#
+# The anon-RSS slope bound judges the steady-state slope (`report.py`: the fit over the second
+# half of the measured window). A cold gateway grows through the first 15 to 20 s of load
+# (allocator arenas, first connections, caches filling), and a whole-window fit records that
+# growth instead of a leak: 662 MB/min in the idle cell and 190 in the responses cell at the
+# most over the recorded nights, against 11 and 42 over the second half. Set 2026-11-09 from the
+# 24 nights recorded between 2026-10-17 and 2026-11-09, by the rule above (the largest steady
+# slope seen plus a quarter of it, at least one unit).
 
 [idle-default-idle10k]
 failed_max = 5803
 shed_max = 5803
-rss_anon_slope_mb_per_min_max = 828
+rss_anon_steady_slope_mb_per_min_max = 14
 cpu_ms_per_req_max = 1.7
 ttft_p99_ms_max = 62400
 e2e_p99_ms_max = 62800
@@ -27,7 +35,7 @@ rss_mb_max_max = 542
 [long-l128k]
 failed_max = 0
 shed_max = 0
-rss_anon_slope_mb_per_min_max = 9
+rss_anon_steady_slope_mb_per_min_max = 13
 cpu_ms_per_req_max = 44.1
 ttft_p99_ms_max = 161
 e2e_p99_ms_max = 161
@@ -36,7 +44,7 @@ rss_mb_max_max = 293
 [long-l32k]
 failed_max = 0
 shed_max = 0
-rss_anon_slope_mb_per_min_max = 32
+rss_anon_steady_slope_mb_per_min_max = 39
 cpu_ms_per_req_max = 11.9
 ttft_p99_ms_max = 130
 e2e_p99_ms_max = 130
@@ -45,7 +53,7 @@ rss_mb_max_max = 312
 [responses-resp500]
 failed_max = 1
 shed_max = 0
-rss_anon_slope_mb_per_min_max = 238
+rss_anon_steady_slope_mb_per_min_max = 52
 cpu_ms_per_req_max = 1.9
 ttft_p99_ms_max = 128
 e2e_p99_ms_max = 128
@@ -54,7 +62,7 @@ rss_mb_max_max = 419
 [stream-s1500]
 failed_max = 0
 shed_max = 0
-rss_anon_slope_mb_per_min_max = 128
+rss_anon_steady_slope_mb_per_min_max = 109
 cpu_ms_per_req_max = 2.2
 ttft_p99_ms_max = 956
 e2e_p99_ms_max = 1970
@@ -63,7 +71,7 @@ rss_mb_max_max = 412
 [stream-s500]
 failed_max = 0
 shed_max = 0
-rss_anon_slope_mb_per_min_max = 39
+rss_anon_steady_slope_mb_per_min_max = 68
 cpu_ms_per_req_max = 3.1
 ttft_p99_ms_max = 34
 e2e_p99_ms_max = 917
@@ -72,7 +80,7 @@ rss_mb_max_max = 329
 [tenants-t200]
 failed_max = 0
 shed_max = 0
-rss_anon_slope_mb_per_min_max = 45
+rss_anon_steady_slope_mb_per_min_max = 54
 cpu_ms_per_req_max = 1.5
 ttft_p99_ms_max = 128
 e2e_p99_ms_max = 128
@@ -81,7 +89,7 @@ rss_mb_max_max = 308
 [tools-tools500]
 failed_max = 0
 shed_max = 0
-rss_anon_slope_mb_per_min_max = 64
+rss_anon_steady_slope_mb_per_min_max = 70
 cpu_ms_per_req_max = 2.6
 ttft_p99_ms_max = 132
 e2e_p99_ms_max = 132
@@ -90,7 +98,7 @@ rss_mb_max_max = 304
 [tools-tools500s]
 failed_max = 0
 shed_max = 0
-rss_anon_slope_mb_per_min_max = 42
+rss_anon_steady_slope_mb_per_min_max = 33
 cpu_ms_per_req_max = 4.1
 ttft_p99_ms_max = 40
 e2e_p99_ms_max = 932
@@ -99,7 +107,7 @@ rss_mb_max_max = 341
 [unary-u1k]
 failed_max = 0
 shed_max = 0
-rss_anon_slope_mb_per_min_max = 31
+rss_anon_steady_slope_mb_per_min_max = 41
 cpu_ms_per_req_max = 1.5
 ttft_p99_ms_max = 128
 e2e_p99_ms_max = 128
@@ -108,7 +116,7 @@ rss_mb_max_max = 319
 [unary-u3k]
 failed_max = 0
 shed_max = 0
-rss_anon_slope_mb_per_min_max = 46
+rss_anon_steady_slope_mb_per_min_max = 66
 cpu_ms_per_req_max = 1.4
 ttft_p99_ms_max = 129
 e2e_p99_ms_max = 129
@@ -117,7 +125,7 @@ rss_mb_max_max = 275
 [unary-u5k]
 failed_max = 0
 shed_max = 0
-rss_anon_slope_mb_per_min_max = 104
+rss_anon_steady_slope_mb_per_min_max = 45
 cpu_ms_per_req_max = 1.4
 ttft_p99_ms_max = 160
 e2e_p99_ms_max = 160

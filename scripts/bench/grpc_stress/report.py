@@ -2,7 +2,9 @@
 """Turn the cells of a run into the tables: per cell the gateway's CPU per
 request and per streamed frame over the sampled window (from the sampler's
 utime+stime), the RSS/anon before and after with the slope over the window
-(a leak shows as a slope), the allocator gauges, the client's latency
+and over its second half (a leak shows as a slope; the second half's is the
+steady-state slope the verdict judges, past a cold gateway's warm-up growth),
+the allocator gauges, the client's latency
 percentiles and its status/error counts, the shed counters from the metrics;
 then the mean over the repeats of each cell name (`<name>-r<k>`); and, with
 `--bounds`, the verdict: every cell against the bounds its name has in the
@@ -125,6 +127,15 @@ def analyze(cell_dir):
         out["rss_anon_mb_end"] = a1 / 1024 if a1 is not None else None
         s = slope_per_min(apts)
         out["rss_anon_slope_mb_per_min"] = s / 1024 if s is not None else None
+        # The slope the verdict judges: over the window's second half, past the
+        # growth of a cold gateway (allocator arenas, first connections, caches
+        # filling). In the recorded nights that growth ends 15 to 20 s into the
+        # load and dominates a whole-window fit: 660 and 190 MB/min at the most
+        # in the idle and responses cells, against 11 and 42 over the second half.
+        half = [r for r in win if r["t"] >= w0 + cj["duration"] / 2]
+        _, _, spts = first_last(half, "rssanon_kb")
+        s = slope_per_min(spts)
+        out["rss_anon_steady_slope_mb_per_min"] = s / 1024 if s is not None else None
         r0, r1, _ = first_last(win, "vmrss_kb")
         out["rss_mb_start"] = r0 / 1024 if r0 is not None else None
         out["rss_mb_end"] = r1 / 1024 if r1 is not None else None
@@ -197,6 +208,7 @@ COLUMNS = [
     ("rss_anon_mb_start", "anon MB start", 0),
     ("rss_anon_mb_end", "anon MB end", 0),
     ("rss_anon_slope_mb_per_min", "anon MB/min", 2),
+    ("rss_anon_steady_slope_mb_per_min", "anon MB/min steady", 2),
     ("rss_mb_max", "RSS MB max", 0),
     ("alloc_allocated_mb_end", "jemalloc live MB", 0),
     ("shed", "shed", None),
@@ -260,7 +272,11 @@ def aggregate(cells):
 BOUNDS = [
     ("failed_max", "failed", lambda f: f.get("failed")),
     ("shed_max", "shed", lambda f: f.get("shed")),
-    ("rss_anon_slope_mb_per_min_max", "anon MB/min", lambda f: f.get("rss_anon_slope_mb_per_min")),
+    (
+        "rss_anon_steady_slope_mb_per_min_max",
+        "anon MB/min steady",
+        lambda f: f.get("rss_anon_steady_slope_mb_per_min"),
+    ),
     ("cpu_ms_per_req_max", "CPU ms/req", lambda f: f.get("cpu_ms_per_req")),
     ("ttft_p99_ms_max", "TTFT p99", lambda f: f.get("ttft_p99")),
     ("e2e_p99_ms_max", "e2e p99", lambda f: f.get("e2e_p99")),
