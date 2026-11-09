@@ -1369,6 +1369,61 @@ async fn a_messages_call_whose_arguments_are_not_json_carries_the_prefixes_value
 
 #[tracing_test::traced_test]
 #[tokio::test]
+async fn scraped_takes_its_lines_from_series_of_its_own() {
+    // Forty malformed outputs read under one scrape drain the table's bucket; the output read
+    // under the next scrape still writes its line, and counts none of the flow's suppressed
+    // lines: the series are the scrape's own. The flow's written count is read after it, so the
+    // pin does not lean on the bucket's burst size.
+    let flow = 40;
+    let written = |lines: &[&str]| {
+        lines
+            .iter()
+            .filter(|line| line.contains("did not read the whole output"))
+            .count()
+    };
+    scraped(async {
+        for _ in 0..flow {
+            fold("Hello <tool_call>\nnot a call\n</tool_call>").await;
+        }
+    })
+    .await;
+    let after_the_flow = std::cell::Cell::new(0);
+    logs_assert(|lines: &[&str]| {
+        let count = written(lines);
+        after_the_flow.set(count);
+        if count < flow {
+            Ok(())
+        } else {
+            Err(format!(
+                "no line of the flow was suppressed: {count} written"
+            ))
+        }
+    });
+    scraped(fold("Hello <tool_call>\nnot a call\n</tool_call>")).await;
+    logs_assert(|lines: &[&str]| {
+        let count = written(lines);
+        let last = lines
+            .iter()
+            .rev()
+            .find(|line| line.contains("did not read the whole output"));
+        match last {
+            Some(line)
+                if count == after_the_flow.get() + 1 && line.contains("suppressed_lines=0") =>
+            {
+                Ok(())
+            }
+            Some(line) => Err(format!(
+                "the line after the flow is missing or counts the flow's suppressed lines \
+                 ({count} written after {}): {line}",
+                after_the_flow.get()
+            )),
+            None => Err("no line at all".to_string()),
+        }
+    });
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
 async fn a_clean_whole_output_is_counted_and_writes_nothing() {
     let ((choice, _), scrape) = scraped(fold("Hello there")).await;
     assert_eq!(choice.message.content.as_deref(), Some("Hello there"));
