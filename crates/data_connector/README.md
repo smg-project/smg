@@ -117,6 +117,10 @@ The stores report their record counts through `stored_record_count()` (the
 gateway samples them into `smg_history_memory_records{kind}`); the other
 backends answer `None`.
 
+The gateway's Messages route keeps its message threads in a store of this
+kind under every backend: at most `max_responses` turns, each kept for
+`retention_secs`.
+
 ### `PostgresConfig`
 
 | Field | Type | Description |

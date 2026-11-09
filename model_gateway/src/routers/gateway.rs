@@ -41,6 +41,7 @@ use openai_protocol::{
     transcription::{AudioFile, TranscriptionRequest},
     UNKNOWN_MODEL_ID,
 };
+use smg_data_connector::MemoryConfig;
 use smg_external_router::spec_for_provider;
 use tracing::{debug, info, warn};
 
@@ -176,6 +177,13 @@ impl Gateway {
         self
     }
 
+    /// The gateway with its message threads in a store bounded as the
+    /// operator's `memory` section says.
+    fn with_thread_bounds(mut self, memory: &MemoryConfig) -> Self {
+        self.threads = MessageThreads::from_config(memory);
+        self
+    }
+
     fn try_register(
         &self,
         id: RouterId,
@@ -197,8 +205,18 @@ impl Gateway {
         config: &ServerConfig,
         app_context: &Arc<AppContext>,
     ) -> Result<Arc<Self>, String> {
+        let memory = config.router_config.memory.unwrap_or_default();
+        memory.validate()?;
+        info!(
+            "Message threads: at most {} turns, retention {}",
+            memory.max_responses,
+            memory
+                .retention()
+                .map_or_else(|| "none".to_string(), |r| format!("{} s", r.as_secs()))
+        );
         let mut gateway = Self::new(app_context.worker_registry.clone())
-            .with_policies(app_context.policy_registry.clone());
+            .with_policies(app_context.policy_registry.clone())
+            .with_thread_bounds(&memory);
         gateway.enable_igw = config.router_config.enable_igw;
         let gateway = Arc::new(gateway);
 
