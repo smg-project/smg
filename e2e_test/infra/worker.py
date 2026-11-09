@@ -686,6 +686,16 @@ class Worker:
         if self.admin_port is None:
             self.admin_port = get_open_port()
             self._admin_port_auto = True
+        # The disaggregation roles are the HTTP and the gRPC workers'; the
+        # encode role is the gRPC vLLM wire's alone (the mock answers the
+        # encoder-cache handoff there); the ZMQ workers take none.
+        if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE, WorkerType.ENCODE):
+            if self.mode == ConnectionMode.ZMQ:
+                raise ValueError(
+                    "the mock engine's prefill, decode and encode roles are HTTP or gRPC workers"
+                )
+            if self.worker_type == WorkerType.ENCODE and self.mode != ConnectionMode.GRPC:
+                raise ValueError("the mock engine's encode role is a gRPC worker")
         cmd = [
             os.environ.get("MOCK_WORKER_BIN", "mock-worker"),
             "--host",
@@ -722,14 +732,10 @@ class Worker:
         # The disaggregation role, as the engines take theirs: a prefill or
         # an encode worker also binds the bootstrap port the gateway is told
         # of, where the probe finds it; all advertise the role in their
-        # server args. The encode role is the vLLM wire's (the mock answers
-        # the encoder-cache handoff there), whatever the lane's wire; a
-        # class's own wire still comes after, and the mock takes the last.
+        # server args (the HTTP workers in ``/server_info``). The encode
+        # role takes the vLLM wire whatever the lane's wire; a class's own
+        # wire still comes after, and the mock takes the last.
         if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE, WorkerType.ENCODE):
-            if self.mode != ConnectionMode.GRPC:
-                raise ValueError(
-                    "the mock engine's prefill, decode and encode roles are gRPC workers"
-                )
             cmd += ["--worker-type", self.worker_type.value]
             if self.worker_type == WorkerType.ENCODE:
                 cmd += ["--grpc-wire", "vllm"]
