@@ -223,6 +223,53 @@ Called from the router Deployment template.
 - {{ .Values.router.port | quote }}
 - "--policy"
 - {{ .Values.router.policy | quote }}
+{{- with .Values.router.disaggregation }}
+{{- $mode := .mode | default "" }}
+{{- /* The role flags of disaggregated serving, typed: a role given without
+     its mode would be ignored by the gateway with a warning, so the chart
+     refuses it at render; the encode role exists only under epd. */}}
+{{- if and (not $mode) (or .prefillPolicy .decodePolicy .encodePolicy .prefill .decode .encode) -}}
+{{- fail "router.disaggregation names a role (a policy or workers) without router.disaggregation.mode: set mode to pd or epd" -}}
+{{- end }}
+{{- if and (ne $mode "epd") (or .encodePolicy .encode) -}}
+{{- fail (printf "router.disaggregation.encodePolicy and router.disaggregation.encode need router.disaggregation.mode=epd (mode is %q)" $mode) -}}
+{{- end }}
+{{- if eq $mode "pd" }}
+- "--pd-disaggregation"
+{{- else if eq $mode "epd" }}
+- "--epd-disaggregation"
+{{- end }}
+{{- if .prefillPolicy }}
+- "--prefill-policy"
+- {{ .prefillPolicy | quote }}
+{{- end }}
+{{- if .decodePolicy }}
+- "--decode-policy"
+- {{ .decodePolicy | quote }}
+{{- end }}
+{{- if .encodePolicy }}
+- "--encode-policy"
+- {{ .encodePolicy | quote }}
+{{- end }}
+{{- range .prefill }}
+- "--prefill"
+- {{ .url | quote }}
+{{- if .bootstrapPort }}
+- {{ .bootstrapPort | quote }}
+{{- end }}
+{{- end }}
+{{- range .decode }}
+- "--decode"
+- {{ .url | quote }}
+{{- end }}
+{{- range .encode }}
+- "--encode"
+- {{ .url | quote }}
+{{- if .bootstrapPort }}
+- {{ .bootstrapPort | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- if .Values.router.enableIgw }}
 - "--enable-igw"
 {{- end }}
@@ -313,6 +360,25 @@ Called from the router Deployment template.
 {{- if .selector }}
 - "--selector"
 - {{ .selector | quote }}
+{{- end }}
+{{- $mode := $.Values.router.disaggregation.mode | default "" }}
+{{- if and (not $mode) (or .prefillSelector .decodeSelector .encodeSelector) -}}
+{{- fail "router.discovery.kubernetes names a role selector (prefillSelector, decodeSelector or encodeSelector) without router.disaggregation.mode: set mode to pd or epd" -}}
+{{- end }}
+{{- if and (ne $mode "epd") .encodeSelector -}}
+{{- fail (printf "router.discovery.kubernetes.encodeSelector needs router.disaggregation.mode=epd (mode is %q)" $mode) -}}
+{{- end }}
+{{- if .prefillSelector }}
+- "--prefill-selector"
+- {{ .prefillSelector | quote }}
+{{- end }}
+{{- if .decodeSelector }}
+- "--decode-selector"
+- {{ .decodeSelector | quote }}
+{{- end }}
+{{- if .encodeSelector }}
+- "--encode-selector"
+- {{ .encodeSelector | quote }}
 {{- end }}
 - "--service-discovery-port"
 - {{ .port | quote }}
