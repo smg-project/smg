@@ -94,6 +94,7 @@ jobs:
           ANTHROPIC_BASE_URL: ${{ env.AI_KEY_PROXY }}/anthropic
         with:
           anthropic_api_key: ${{ env.PROXY_PLACEHOLDER_KEY }}
+          track_progress: true  # a tracking comment from the first second, updated as it works
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ env.PR_NUMBER }}
@@ -216,12 +217,22 @@ jobs:
                  | jq -s '.[-50:]'
             4. Read changed files for context.
             5. Post inline comments for issues found.
-            6. If EVENT is "opened" or "reopened" (full review) AND no 🔴
-               Important issues were found, submit an APPROVE review:
-               gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/reviews \
-                 -f event=APPROVE
-               Do NOT approve on "synchronize" (incremental) reviews — only
-               full reviews have enough context to approve.
+            6. Submit the verdict:
+               a. If any 🔴 Important issue stands (found in this run, or raised by an
+                  earlier claude[bot] review and still not addressed), request changes:
+                  gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/reviews \
+                    -f event=REQUEST_CHANGES -f body="<one line per Important finding: path:line and the defect>"
+               b. Else, if EVENT is "opened" or "reopened" (full review), approve:
+                  gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/reviews \
+                    -f event=APPROVE
+               c. Else (synchronize, nothing Important stands): do NOT approve, only full
+                  reviews have enough context to approve. But if an earlier claude[bot]
+                  review still requests changes, lift it, since the push settled them:
+                  gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/reviews \
+                    --jq '.[] | select(.user.login == "claude[bot]" and .state == "CHANGES_REQUESTED") | .id'
+                  then for each id:
+                  gh api -X PUT repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/reviews/<id>/dismissals \
+                    -f message="Addressed in <head sha>" -f event=DISMISS
           claude_args: |
             --model claude-opus-5-5
             --effort xhigh
