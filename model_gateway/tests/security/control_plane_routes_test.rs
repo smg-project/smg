@@ -53,25 +53,30 @@ async fn every_listed_route_sits_behind_the_control_plane_authentication_and_ans
     ctx.shutdown().await;
 }
 
-/// The (method, path) pairs `build_apps` registers on its control-plane
-/// groups, read from the server source: every `.route("<path>", <methods>)`
-/// between the admin group's start and the authentication closure.
+/// The server source the route groups are read from.
+const SERVER_SOURCE: &str = include_str!("../../src/server.rs");
+
+/// The region of the server source from one marker to the next, the first
+/// one included.
 #[expect(
     clippy::expect_used,
     reason = "test helper: a missing marker in the server source is a test bug"
 )]
-fn registered_routes() -> BTreeSet<(String, String)> {
-    let source = include_str!("../../src/server.rs");
-    let start = source
-        .find("let admin_routes = Router::new()")
-        .expect("the admin route group");
-    let end = source[start..]
-        .find("let apply_control_plane_auth")
-        .expect("the control-plane authentication closure");
-    let groups = &source[start..start + end];
+fn source_between(start_marker: &str, end_marker: &str) -> &'static str {
+    let start = SERVER_SOURCE.find(start_marker).expect(start_marker);
+    let end = SERVER_SOURCE[start..].find(end_marker).expect(end_marker);
+    &SERVER_SOURCE[start..start + end]
+}
 
+/// The (method, path) pairs a region of the server source registers: every
+/// `.route("<path>", <methods>)` in it.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a route call without a path is a test bug"
+)]
+fn routes_in(region: &str) -> BTreeSet<(String, String)> {
     let mut routes = BTreeSet::new();
-    for call in groups.split(".route(").skip(1) {
+    for call in region.split(".route(").skip(1) {
         let path = call.split('"').nth(1).expect("a route call names its path");
         for method in ["get", "post", "put", "patch", "delete"] {
             let builder = &call[call.find('"').map_or(0, |at| at + path.len() + 2)..];
@@ -88,11 +93,39 @@ fn registered_routes() -> BTreeSet<(String, String)> {
     routes
 }
 
+/// The (method, path) pairs `build_apps` registers on its control-plane
+/// groups: between the admin group's start and the authentication closure.
+fn registered_routes() -> BTreeSet<(String, String)> {
+    routes_in(source_between(
+        "let admin_routes = Router::new()",
+        "let apply_control_plane_auth",
+    ))
+}
+
+/// The (method, path) pairs `gated_control_plane_routes` registers: the
+/// function's body, up to its closing brace.
+fn gated_group_routes() -> BTreeSet<(String, String)> {
+    routes_in(source_between("fn gated_control_plane_routes()", "\n}\n"))
+}
+
+#[test]
+fn every_route_the_gated_group_registers_is_listed() {
+    let listed: BTreeSet<(String, String)> = GATED_ROUTES
+        .iter()
+        .map(|(method, path)| (method.to_string(), path.to_string()))
+        .collect();
+    assert_eq!(
+        gated_group_routes(),
+        listed,
+        "the gated group's routes and GATED_ROUTES differ"
+    );
+}
+
 #[test]
 fn every_route_the_table_registers_is_listed() {
     // The gated group is a function of its own, outside the parsed region;
-    // the gated-routes test pins its list against the route table, so the
-    // list stands in for the group here.
+    // the test above reads it against its list both ways, so the list stands
+    // in for the group here.
     let mut registered = registered_routes();
     registered.extend(
         GATED_ROUTES
