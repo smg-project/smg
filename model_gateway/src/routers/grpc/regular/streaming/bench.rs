@@ -208,6 +208,8 @@ impl StreamBench {
                 thinking_text_returned: true,
                 reasoning_in_prefill: false,
                 prompt_tokens: 8,
+                max_tokens: 4096,
+                context_window: None,
                 tool_choice: None,
                 has_tools: false,
                 history_tool_calls_count: 0,

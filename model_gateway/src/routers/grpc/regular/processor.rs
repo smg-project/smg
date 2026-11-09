@@ -331,6 +331,11 @@ impl ResponseProcessor {
             Some(messages::StopReason::EndTurn) if stop_sequence.is_some() => {
                 Some(messages::StopReason::StopSequence)
             }
+            // The reader's `max_tokens` is the engine's `length`: the budget
+            // or the window, told apart from the counts.
+            Some(messages::StopReason::MaxTokens) => Some(
+                request.length_stop_reason(complete.prompt_tokens(), complete.completion_tokens()),
+            ),
             stop_reason => stop_reason,
         };
         let stop_sequence = stop_sequence
@@ -1057,9 +1062,14 @@ impl ResponseProcessor {
         let finish_reason_str = finish_after_local_stop(stopped, complete);
         let stop_sequence = matched_stop_string(stop_decoder, complete);
 
-        // Parsed calls do not override a truncation, as in Chat.
+        // Parsed calls do not override a truncation, as in Chat. The engines
+        // report the request's budget and the model's window alike as
+        // `length`; the spec tells them apart from the counts.
         let stop_reason = if finish_reason_str == "length" {
-            Some(messages::StopReason::MaxTokens)
+            Some(
+                messages_request
+                    .length_stop_reason(complete.prompt_tokens(), complete.completion_tokens()),
+            )
         } else if tool_calls.is_some() || finish_reason_str == "tool_calls" {
             Some(messages::StopReason::ToolUse)
         } else if stop_sequence.is_some() {

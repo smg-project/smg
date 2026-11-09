@@ -335,6 +335,10 @@ fn test_stop_reason_values() {
         (StopReason::ToolUse, "tool_use"),
         (StopReason::PauseTurn, "pause_turn"),
         (StopReason::Refusal, "refusal"),
+        (
+            StopReason::ModelContextWindowExceeded,
+            "model_context_window_exceeded",
+        ),
     ] {
         let s = serde_json::to_string(&reason).unwrap();
         assert_eq!(s, format!("\"{expected}\""));
