@@ -18,6 +18,15 @@ jobs:
       contents: read
       pull-requests: write
     steps:
+      # The rule is the repository's script, read from the default branch so a
+      # pull request cannot loosen the rule it is judged by; the pre-push hook
+      # runs the same script. No credentials stay in the checkout.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: scripts/branch-name-check.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - name: Validate branch name
         env:
           BRANCH: ${{ github.head_ref }}
@@ -25,9 +34,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
-          REGEX='^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?(/[a-zA-Z0-9._-]+)+$'
-
-          if [[ "$BRANCH" =~ $REGEX ]]; then
+          if bash scripts/branch-name-check.sh "$BRANCH"; then
             echo "✅ Branch name is valid: '$BRANCH'"
             exit 0
           fi
@@ -42,6 +49,8 @@ jobs:
           - \`<username>/<description>\` — e.g. \`changsu/fix-routing\`
 
           Allowed types: \`feat\`, \`fix\`, \`chore\`, \`docs\`, \`refactor\`, \`test\`, \`ci\`, \`perf\`
+
+          Names are lowercase; the rule is \`scripts/branch-name-check.sh\`, the one the pre-push hook runs.
 
           To fix, rename your branch locally, push the new branch, and open a new PR:
           \`\`\`bash

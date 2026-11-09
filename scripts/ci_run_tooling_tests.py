@@ -17,6 +17,7 @@ COMPONENTS = (
     ("scripts/ci_responses_evidence.py", "scripts/tests/test_ci_responses_evidence.py"),
     ("e2e_test/infra/mcp_readiness.py", "e2e_test/infra/test_mcp_readiness.py"),
     ("scripts/release/release.sh", "scripts/tests/test_release_tools.py"),
+    ("scripts/branch-name-check.sh", "scripts/tests/test_branch_name_check.py"),
     ("scripts/ci_version_only.py", "scripts/tests/test_ci_version_only.py"),
     ("scripts/bfcl/arm_probe.py", "scripts/tests/test_bfcl_arm_probe.py"),
 )

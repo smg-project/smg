@@ -33,7 +33,7 @@ pip install pre-commit
 pre-commit install
 pre-commit install --hook-type commit-msg
 
-# 4. Create a branch (must match <type>/<desc> or <username>/<desc>)
+# 4. Create a branch (lowercase <type>/<desc> or <username>/<desc>; the rule is scripts/branch-name-check.sh)
 git checkout -b feat/my-change
 
 # 5. Build and test

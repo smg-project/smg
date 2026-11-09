@@ -76,15 +76,8 @@ repos:
 
       - id: branch-name-check
         name: Branch naming convention
-        description: Ensure branch name follows <type>/<desc> or <username>/<desc> format
-        entry: |
-          bash -c '
-            branch=$(git rev-parse --abbrev-ref HEAD)
-            if [[ "$branch" != "main" && ! "$branch" =~ ^[a-z0-9]([a-z0-9._-]*[a-z0-9])?/[a-z0-9._-]+$ ]]; then
-              echo "Branch \"$branch\" does not follow naming convention: <type>/<description> or <username>/<description>"
-              exit 1
-            fi
-          '
+        description: Ensure the branch name follows the rule in scripts/branch-name-check.sh, the one the pull-request workflow reads too
+        entry: scripts/branch-name-check.sh
         language: system
         stages: [pre-push]
         always_run: true
