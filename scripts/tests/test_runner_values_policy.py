@@ -98,3 +98,19 @@ def test_the_codex_app_key_lives_in_the_key_proxy_and_is_only_exchanged_for_an_h
     assert "/run/secrets/codex-github-app/" in script
     assert "RSASSA-PKCS1-v1_5" in script and "/access_tokens" in script
     assert "exp: now + 540" in script  # a JWT good for nine minutes buys a token good for an hour
+
+
+def test_the_token_endpoint_admits_only_a_job_that_presents_a_github_oidc_token():
+    values = yaml.safe_load(CPU.read_text())
+    proxy = next(c for c in values["template"]["spec"]["initContainers"] if c["name"] == KEY_HOLDER)
+    script = next(e for e in proxy["env"] if e["name"] == "NGINX_JS")["value"]
+    # the caller's GitHub Actions OIDC token, checked against GitHub's signing keys and pinned to
+    # this repository, this workflow file and the audience the post job asks for
+    assert "https://token.actions.githubusercontent.com/.well-known/jwks" in script
+    assert "'https://token.actions.githubusercontent.com'" in script
+    assert "'ai-key-proxy'" in script
+    assert "'smg-project/smg'" in script
+    assert "'.github/workflows/codex-code-review.yml@'" in script
+    assert "crypto.subtle.verify" in script
+    assert "r.headersIn.Authorization" in script
+    assert "r.return(401" in script

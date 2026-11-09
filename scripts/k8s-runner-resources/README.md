@@ -59,7 +59,10 @@ The same sidecar holds the private key of the **SMG Codex Review** GitHub App (s
 `codex-github-app` with `app-id`, `installation-id` and `private-key`, the key in PKCS#8 form:
 `openssl pkcs8 -topk8 -nocrypt -in downloaded.pem`) and mints one-hour installation tokens for it
 on `POST http://127.0.0.1:8787/github/app-token`, which the Codex workflow's post job uses to post
-as `smg-codex-review[bot]`. The key never leaves the pod; a job sees only the token. To rotate it,
+as `smg-codex-review[bot]`. The endpoint requires the calling job's GitHub Actions OIDC token
+(audience `ai-key-proxy`), checked against GitHub's signing keys and pinned to this repository and
+the Codex workflow file, so a fork's run, which gets no OIDC token, or another workflow's job on
+the same pod cannot mint. The key never leaves the pod; a job sees only the token. To rotate it,
 generate a new key on the App's settings page, replace the secret, and roll the runner set.
 
 ## 2. Create or update the Kubernetes secret

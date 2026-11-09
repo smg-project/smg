@@ -86,7 +86,8 @@ def test_the_post_job_runs_only_after_a_successful_review_from_the_default_branc
     post = workflow["jobs"]["post"]
     assert post["needs"] == "codex"
     assert "needs.codex.result == 'success'" in post["if"]
-    assert post["permissions"] == {"contents": "read"}  # the App token posts, not the job token
+    # the App token posts, not the job token; id-token lets the job prove itself to the sidecar
+    assert post["permissions"] == {"contents": "read", "id-token": "write"}
     checkout = step(post, "actions/checkout@")
     assert "ref" not in checkout.get("with", {})  # the default ref of a main-defined run is main
 
@@ -139,6 +140,13 @@ def test_the_post_job_posts_as_the_codex_app_with_a_token_the_sidecar_mints(work
     mint = next(s for s in steps if s.get("id") == "app-token")
     assert "${{ env.AI_KEY_PROXY }}/github/app-token" in mint["run"]
     assert "::add-mask::" in mint["run"]
+    # the job proves itself with its GitHub OIDC token; the codex job, where the model runs, has
+    # no id-token permission and so cannot obtain one
+    assert "ACTIONS_ID_TOKEN_REQUEST_URL" in mint["run"] and "audience=ai-key-proxy" in mint["run"]
+    assert "Authorization: Bearer" in mint["run"]
+    assert "id-token" not in workflow["jobs"]["codex"]["permissions"]
+    # a non-JSON reply (an nginx error page) must still reach the error line
+    assert "2>/dev/null || true" in mint["run"]
     posting = next(s for s in steps if "codex_review_post.py post" in str(s.get("run", "")))
     assert steps.index(mint) < steps.index(posting)
     assert posting["env"]["GITHUB_TOKEN"] == "${{ steps.app-token.outputs.token }}"

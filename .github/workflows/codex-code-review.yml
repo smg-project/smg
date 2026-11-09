@@ -15,7 +15,8 @@ name: Codex Code Review
 # token of a `pull_request_target` run, and the comment events run from `main` anyway.
 # Codex runs in a read-only sandbox in a job with read permissions; a second job posts its
 # result as the SMG Codex Review GitHub App, with a one-hour installation token the sidecar
-# mints from the App key it holds, so no job token here can write. The review-comment events
+# mints from the App key it holds once the job has proved itself with its GitHub OIDC token;
+# the codex and post jobs' own tokens cannot write. The review-comment events
 # (`pull_request_review`, `pull_request_review_comment`) run the pull request's own copy of
 # this file, so a branch older than a change here keeps the old behaviour for its thread
 # replies and verdicts until it takes `main`.
@@ -191,6 +192,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      id-token: write  # the job's OIDC token is how it proves itself to the sidecar
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -207,12 +209,20 @@ jobs:
           path: .codex-review
 
       # The posting token is the Codex App's: the runner pod's sidecar mints it from the App
-      # key it holds (scripts/k8s-runner-resources/README.md). It lives an hour and is masked.
+      # key it holds (scripts/k8s-runner-resources/README.md) for a caller that presents this
+      # job's GitHub OIDC token, which a fork's run or another workflow cannot obtain. The
+      # token lives an hour and is masked.
       - name: Mint the posting token from the sidecar
         id: app-token
         run: |
-          reply=$(curl -sS -X POST "${{ env.AI_KEY_PROXY }}/github/app-token" || true)
-          token=$(jq -r '.token // empty' <<<"$reply")
+          oidc=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=ai-key-proxy" | jq -r '.value // empty')
+          if [ -z "$oidc" ]; then
+            echo "::error::this job got no GitHub OIDC token to prove itself with"
+            exit 1
+          fi
+          reply=$(curl -sS -X POST -H "Authorization: Bearer $oidc" "${{ env.AI_KEY_PROXY }}/github/app-token" || true)
+          token=$(jq -r '.token // empty' <<<"$reply" 2>/dev/null || true)
           if [ -z "$token" ]; then
             echo "::error::the key-proxy sidecar minted no posting token: ${reply:0:300}"
             exit 1
