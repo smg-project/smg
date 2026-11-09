@@ -73,7 +73,7 @@ jobs:
             && github.event.pull_request.head.repo.full_name == github.repository
             && github.event.review.user.login == 'claude[bot]')
       )
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    runs-on: ${{ vars.SMG_RUNNER_REVIEW || 'ai-review-cpu' }}
     timeout-minutes: 30
     environment: ai-review
     permissions:
@@ -166,7 +166,7 @@ jobs:
     name: Post Codex review
     needs: codex
     if: needs.codex.result == 'success' && needs.codex.outputs.skip != 'true'
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    runs-on: ${{ vars.SMG_RUNNER_REVIEW || 'ai-review-cpu' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -197,7 +197,7 @@ jobs:
     name: Claude verifies Codex findings
     needs: [codex, post]
     if: needs.post.result == 'success' && needs.codex.outputs.mode == 'review'
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    runs-on: ${{ vars.SMG_RUNNER_REVIEW || 'ai-review-cpu' }}
     timeout-minutes: 20
     environment: ai-review
     permissions:

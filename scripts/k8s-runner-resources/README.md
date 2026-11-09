@@ -46,7 +46,21 @@ every workflow runs in these pods, so a key in their environment is readable by 
 that reaches a runner. The review workflows take their keys from the `ai-review` GitHub
 environment, which releases them only to runs from `main`, and hand them to a proxy process the
 reviewer cannot read. A live scale set whose pods still carry `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`
-or `XAI_API_KEY` has drifted from these values; `helm upgrade` from the files here removes them.
+or `XAI_API_KEY`, or whose runner container is privileged (only the `dind` sidecar may be), has
+drifted from these values; `helm upgrade` from the files here removes both.
+
+The review workflows run on their own set, `ai-review-cpu`
+([`runner-values-ai-review-cpu.yaml`](runner-values-ai-review-cpu.yaml)): no Docker, no
+privileged container, no credentials in the environment, one warm runner, a plain CPU node pool.
+Nothing but the two review workflows should target that label.
+
+```bash
+helm upgrade --install ai-review-cpu \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+  --version 0.14.2 \
+  -n actions-runner-system --create-namespace \
+  -f scripts/k8s-runner-resources/runner-values-ai-review-cpu.yaml
+```
 
 ## 2. Create or update the Kubernetes secret
 

@@ -58,3 +58,8 @@ def test_the_key_appears_nowhere_but_the_proxy_steps():
     assert text.count("secrets.ANTHROPIC_API_KEY") == len(KEY_JOBS)
     assert "export-pod-api-key" not in text
     assert "env.ANTHROPIC_API_KEY" not in text
+
+
+def test_every_job_runs_on_the_review_runner_set(workflow):
+    for name, job in workflow["jobs"].items():
+        assert "ai-review-cpu" in job["runs-on"], name

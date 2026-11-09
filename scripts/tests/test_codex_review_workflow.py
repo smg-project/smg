@@ -110,3 +110,8 @@ def test_every_mode_has_a_prompt_and_a_closed_schema():
         assert set(schema["required"]) == set(schema["properties"])
     review = json.loads((ROOT / ".github/codex/review-schema.json").read_text())
     assert "prior_findings_still_open" in review["required"]
+
+
+def test_every_job_runs_on_the_review_runner_set(workflow):
+    for name, job in workflow["jobs"].items():
+        assert "ai-review-cpu" in job["runs-on"], name
