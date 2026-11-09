@@ -29,15 +29,17 @@ After posting all inline comments, write a brief summary with a count per severi
 
 Two reviewers run on every pull request, drafts included, that a user with write access opens from a
 branch of this repository: Claude (`.github/workflows/claude-code-review.yml`) and Codex
-(`.github/workflows/codex-code-review.yml`, prompts in `.github/codex/`). A pull request from a
-fork never gets either, and the commands below are ignored on one and from anyone without
-write access. Both post inline comments with the markers above, and each approves when it finds
-nothing 🔴 Important. Claude posts as `claude[bot]`, Codex as `smg-codex-review[bot]`, a GitHub
-App the organization owns. The API keys and the App's key never enter a job: they stay in the
-cluster's secrets, and a sidecar in the runner pod serves the API calls and mints Codex's
-one-hour posting token, so nothing in a pull request can reach the keys. A pull request that edits one of the two workflow files gets
-no Claude run from the edited workflow: the action's token exchange requires the workflow file
-to match the copy on `main`, and skips with a warning otherwise.
+(`.github/workflows/codex-code-review.yml`, prompts in `.github/codex/`). A pull request from a fork
+never gets either, and the commands below are ignored on one and from anyone without write access.
+Both post inline comments with the markers above, and each approves when it finds nothing 🔴
+Important. Claude posts as `claude[bot]`, Codex as `smg-codex-review[bot]`, a GitHub App the
+organization owns. The API keys and the App's key never enter a job: they stay in the cluster's
+secrets, and a sidecar in the runner pod serves the API calls and mints Codex's one-hour posting
+token, so nothing in a pull request can reach the keys. A pull request older than a change to these
+workflows keeps the old copy for its thread replies and verdicts until it takes `main`. A pull
+request that edits one of the two workflow files gets no Claude run from the edited workflow: the
+action's token exchange requires the workflow file to match the copy on `main`, and skips with a
+warning otherwise.
 
 - `@claude review` or `@codex review` in a PR comment runs a full review on demand.
 - A human reply in a thread Codex opened, or a comment that mentions `@codex`, gets an answer
