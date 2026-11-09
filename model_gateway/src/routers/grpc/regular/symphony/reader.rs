@@ -424,10 +424,13 @@ impl Reader {
         delta.clear();
         // The step's tokens, reserved before the first push: a whole output read in one step
         // (the request that does not stream) grew both vectors by doubling from empty, eight
-        // regrows and 3.3 KiB moved for an answer of forty tokens. A step of one token reserves
-        // what its push would.
-        delta.spans.reserve(token_ids.len());
-        delta.tokens.reserve(token_ids.len());
+        // regrows and 3.3 KiB moved for an answer of forty tokens. A step of one token skips
+        // the reserve: its push grows an empty vector the same way, and a stream's delta keeps
+        // its capacity from the step before, so the check found the room there on every step.
+        if token_ids.len() > 1 {
+            delta.spans.reserve(token_ids.len());
+            delta.tokens.reserve(token_ids.len());
+        }
         let mut stopped = false;
         for &token_id in token_ids {
             let start = delta.text.len();
