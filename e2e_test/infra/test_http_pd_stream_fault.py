@@ -11,6 +11,7 @@ import pytest
 
 SCRIPT = Path(__file__).with_name("http_pd_stream_fault.py")
 spec = importlib.util.spec_from_file_location("http_pd_stream_fault", SCRIPT)
+assert spec is not None and spec.loader is not None
 fault = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fault)
 
