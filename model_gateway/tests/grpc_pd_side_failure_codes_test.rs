@@ -371,6 +371,25 @@ async fn a_side_failure_is_named_by_the_shared_vocabulary_on_the_sequential_shap
     );
 }
 
+/// Both sides complete: the answer's usage carries the token count the
+/// decode's completion scripted, so the count the rows' engines send is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completing_pair_answers_with_the_scripted_completion_count() {
+    let prefill_port = start_engine(Behaviour::Completes).await;
+    let decode_port = start_engine(Behaviour::Completes).await;
+    let router = build_pd_router(prefill_port, decode_port, RuntimeType::Vllm).await;
+
+    let (status, body) = one_chat(router.as_ref(), false).await;
+
+    assert_eq!(status, http::StatusCode::OK, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON answer");
+    assert_eq!(
+        json["usage"]["completion_tokens"].as_u64(),
+        Some(u64::from(OUTPUT_TOKENS)),
+        "the usage carries the decode's completion count: {body}"
+    );
+}
+
 /// A decode stream that fails once the streamed response began, at its
 /// first item or after its tokens, cannot change the status: the typed
 /// `stream_error` event ends the stream, with the engine's words, as the HTTP
