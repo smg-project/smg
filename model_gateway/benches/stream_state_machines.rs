@@ -15,7 +15,7 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use smg::bench_support::{EngineScript, StreamBench};
+use smg::routers::grpc::{EngineScript, StreamBench};
 
 /// The tokens of one stream: the chunks before the completion.
 const TOKENS: usize = 300;
