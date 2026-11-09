@@ -1,12 +1,13 @@
 //! Mock HTTP worker endpoints — the vLLM/SGLang-compatible surface the SMG
 //! gateway probes and routes to.
 //!
-//! In canned mode every response is fixed (no model). In realistic mode each
-//! worker is backed by the engine simulator ([`crate::engine`]); since the HTTP
-//! path carries text rather than token ids, the prompt is approximated into
-//! synthetic token ids (one per whitespace word) so shared text prefixes still
-//! produce cache hits and prompt length still drives prefill latency. Token-id
-//! KV events (event-driven `cache_aware`) remain a gRPC-path feature.
+//! In canned mode every response is fixed (no model), in the shape of the
+//! route it answers. In realistic mode each worker is backed by the engine
+//! simulator ([`crate::engine`]); since the HTTP path carries text rather
+//! than token ids, the prompt is approximated into synthetic token ids (one
+//! per whitespace word) so shared text prefixes still produce cache hits and
+//! prompt length still drives prefill latency. Token-id KV events
+//! (event-driven `cache_aware`) remain a gRPC-path feature.
 
 use std::{
     convert::Infallible,
@@ -75,7 +76,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
-        .route("/generate", post(chat_completions))
+        .route("/generate", post(generate))
         .route("/v1/loads", get(loads))
         .route("/server_info", get(server_info))
         .route("/get_server_info", get(server_info))
@@ -261,12 +262,40 @@ enum Endpoint {
     Completions,
 }
 
+/// The completion routes as the request named them. The canned answer takes
+/// the route's own shape; the scripted, realistic and prompt-side answers
+/// take the shape of [`Route::endpoint`].
+#[derive(Clone, Copy)]
+enum Route {
+    Chat,
+    Completions,
+    Generate,
+}
+
+impl Route {
+    /// The shape of the scripted, realistic and prompt-side answers on the
+    /// route: `/generate` takes the chat completion's until something reads
+    /// the generate shape there (the gateway's generate tests drive the gRPC
+    /// wire).
+    fn endpoint(self) -> Endpoint {
+        match self {
+            Route::Chat | Route::Generate => Endpoint::Chat,
+            Route::Completions => Endpoint::Completions,
+        }
+    }
+}
+
 async fn chat_completions(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    handle(Endpoint::Chat, state, body).await
+    handle(Route::Chat, state, body).await
 }
 
 async fn completions(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    handle(Endpoint::Completions, state, body).await
+    handle(Route::Completions, state, body).await
+}
+
+/// `POST /generate`, the engine-native route.
+async fn generate(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    handle(Route::Generate, state, body).await
 }
 
 /// `POST /flush_cache`: the engine's cache cleared at once (a canned worker
@@ -444,7 +473,8 @@ fn prompt_side_response(
     Json(body).into_response()
 }
 
-async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Response {
+async fn handle(route: Route, state: Arc<AppState>, body: Bytes) -> Response {
+    let endpoint = route.endpoint();
     // In flight from here until the response is complete or its stream is
     // done, so a shutdown knows what it waits for and this worker's load
     // report counts it.
@@ -574,58 +604,98 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
         };
     }
 
-    // Canned mode: a single up-front delay, then a fixed chat-shaped response,
-    // whichever endpoint was called.
+    // Canned mode: a single up-front delay, then a fixed answer in the shape
+    // of the route that was called.
     if !state.cfg.gen_delay.is_zero() {
         tokio::time::sleep(state.cfg.gen_delay).await;
     }
     if stream_requested {
-        stream_chat(&state.cfg, in_flight).into_response()
+        canned_stream(route, &state.cfg, in_flight).into_response()
     } else {
-        Json(completion(&state.cfg)).into_response()
+        Json(canned_answer(route, &state.cfg)).into_response()
     }
 }
 
 // ── Canned responses ───────────────────────────────────────────────────────
 
-fn completion(cfg: &Config) -> Value {
-    json!({
-        "id": "chatcmpl-mock",
-        "object": "chat.completion",
-        "created": 0,
-        "model": cfg.model_id,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": "mock"},
-            "finish_reason": "stop",
-        }],
-        "usage": {
-            "prompt_tokens": 1,
-            "completion_tokens": cfg.output_tokens,
-            "total_tokens": u64::from(cfg.output_tokens) + 1,
-        },
-    })
+/// The canned answer in the route's own shape: a chat completion, a text
+/// completion, or the generate body (`text` and `meta_info`, as the engines
+/// answer it).
+fn canned_answer(route: Route, cfg: &Config) -> Value {
+    let usage = json!({
+        "prompt_tokens": 1,
+        "completion_tokens": cfg.output_tokens,
+        "total_tokens": u64::from(cfg.output_tokens) + 1,
+    });
+    match route {
+        Route::Chat => json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "created": 0,
+            "model": cfg.model_id,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "mock"},
+                "finish_reason": "stop",
+            }],
+            "usage": usage,
+        }),
+        Route::Completions => json!({
+            "id": "cmpl-mock",
+            "object": "text_completion",
+            "created": 0,
+            "model": cfg.model_id,
+            "choices": [{
+                "index": 0,
+                "text": "mock",
+                "logprobs": null,
+                "finish_reason": "stop",
+            }],
+            "usage": usage,
+        }),
+        Route::Generate => json!({
+            "text": "mock",
+            "meta_info": {
+                "prompt_tokens": 1,
+                "completion_tokens": cfg.output_tokens,
+                "completion_tokens_wo_jump_forward": cfg.output_tokens,
+                "input_token_logprobs": null,
+                "output_token_logprobs": null,
+                "first_token_latency": cfg.gen_delay.as_secs_f64(),
+                "time_to_first_token": cfg.gen_delay.as_secs_f64(),
+                "time_per_output_token": 0.0,
+                "finish_reason": {"type": "stop", "reason": "stop"},
+            },
+        }),
+    }
 }
 
-fn stream_chat(
+/// The canned stream in the route's own shape: one frame per output token
+/// and the finish frame on the chat and text completion routes; one frame
+/// with the whole answer on the generate route, as the engines' last frame
+/// carries it. `[DONE]` ends each.
+fn canned_stream(
+    route: Route,
     cfg: &Config,
     in_flight: InFlight,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut events: Vec<Result<Event, Infallible>> = Vec::new();
-    for _ in 0..cfg.output_tokens {
-        let frame = json!({
-            "id": "chatcmpl-mock",
-            "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": null}],
-        });
-        events.push(Ok(Event::default().data(frame.to_string())));
+    match route {
+        Route::Generate => {
+            events.push(Ok(
+                Event::default().data(canned_answer(route, cfg).to_string())
+            ));
+        }
+        Route::Chat | Route::Completions => {
+            let endpoint = route.endpoint();
+            for _ in 0..cfg.output_tokens {
+                let frame = token_chunk(endpoint, &cfg.model_id);
+                events.push(Ok(Event::default().data(frame.to_string())));
+            }
+            let frame = final_chunk(endpoint, &cfg.model_id);
+            events.push(Ok(Event::default().data(frame.to_string())));
+        }
     }
-    let final_frame = json!({
-        "id": "chatcmpl-mock",
-        "object": "chat.completion.chunk",
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-    });
-    events.push(Ok(Event::default().data(final_frame.to_string())));
     events.push(Ok(Event::default().data("[DONE]")));
     Sse::new(in_flight.until_done(stream::iter(events)))
 }
@@ -1506,7 +1576,7 @@ mod tests {
 
         for stream in [false, true] {
             let response = handle(
-                Endpoint::Chat,
+                Route::Chat,
                 Arc::clone(&state),
                 disaggregated_chat(Some(7), Some(json!(8998)), stream),
             )
@@ -1538,7 +1608,7 @@ mod tests {
         }
         let completion = json_of(
             handle(
-                Endpoint::Completions,
+                Route::Completions,
                 Arc::clone(&state),
                 Bytes::from(
                     json!({"prompt": "say apricot", "bootstrap_room": 1, "bootstrap_port": 8998})
@@ -1562,6 +1632,64 @@ mod tests {
         );
     }
 
+    /// The canned answers in each route's own shape: a chat completion, a
+    /// text completion (`choices[].text`, no logprobs, a `cmpl-` id) and the
+    /// generate body (`text`, `meta_info`); as a stream, the route's frames
+    /// and `[DONE]`.
+    #[tokio::test]
+    async fn the_canned_answers_take_the_shape_of_their_route() {
+        let state = state_of(None, None, "http:canned-shape-test");
+        let request = |stream: bool| {
+            Bytes::from(json!({"prompt": "say apricot", "stream": stream}).to_string())
+        };
+
+        let chat = json_of(handle(Route::Chat, Arc::clone(&state), request(false)).await).await;
+        assert_eq!(chat["object"], "chat.completion", "{chat}");
+        assert_eq!(chat["choices"][0]["message"]["content"], "mock");
+
+        let completion =
+            json_of(handle(Route::Completions, Arc::clone(&state), request(false)).await).await;
+        assert_eq!(completion["object"], "text_completion", "{completion}");
+        assert_eq!(completion["id"], "cmpl-mock");
+        assert_eq!(completion["choices"][0]["text"], "mock");
+        assert_eq!(completion["choices"][0]["logprobs"], Value::Null);
+        assert_eq!(completion["choices"][0]["finish_reason"], "stop");
+        assert!(
+            completion["choices"][0].get("message").is_none(),
+            "{completion}"
+        );
+        assert_eq!(completion["usage"]["completion_tokens"], 2);
+
+        let generate =
+            json_of(handle(Route::Generate, Arc::clone(&state), request(false)).await).await;
+        assert_eq!(generate["text"], "mock", "{generate}");
+        assert!(generate.get("choices").is_none(), "{generate}");
+        assert_eq!(generate["meta_info"]["prompt_tokens"], 1);
+        assert_eq!(generate["meta_info"]["completion_tokens"], 2);
+        assert_eq!(generate["meta_info"]["finish_reason"]["type"], "stop");
+
+        let frames =
+            text_of(handle(Route::Completions, Arc::clone(&state), request(true)).await).await;
+        assert_eq!(
+            frames.matches(r#""text":"x""#).count(),
+            2,
+            "one frame per output token: {frames}"
+        );
+        assert!(
+            frames.contains(r#""object":"text_completion""#)
+                && !frames.contains("delta")
+                && frames.ends_with("data: [DONE]\n\n"),
+            "{frames}"
+        );
+        let frames = text_of(handle(Route::Generate, state, request(true)).await).await;
+        assert!(
+            frames.contains(r#""text":"mock""#)
+                && frames.contains(r#""meta_info""#)
+                && frames.ends_with("data: [DONE]\n\n"),
+            "{frames}"
+        );
+    }
+
     /// Either side of a disaggregated pair refuses a request that carries no
     /// rendezvous; a regular worker reads none.
     #[tokio::test]
@@ -1573,7 +1701,7 @@ mod tests {
                 &format!("http:{}-room-test", role.as_str()),
             );
             let refused = handle(
-                Endpoint::Chat,
+                Route::Chat,
                 Arc::clone(&state),
                 disaggregated_chat(None, None, false),
             )
@@ -1587,7 +1715,7 @@ mod tests {
                 "{body}"
             );
             let served = handle(
-                Endpoint::Chat,
+                Route::Chat,
                 state,
                 disaggregated_chat(Some(3), Some(json!(8998)), false),
             )
@@ -1596,13 +1724,9 @@ mod tests {
         }
         let regular = state_of(None, None, "http:regular-room-test");
         assert_eq!(
-            handle(
-                Endpoint::Chat,
-                regular,
-                disaggregated_chat(None, None, false)
-            )
-            .await
-            .status(),
+            handle(Route::Chat, regular, disaggregated_chat(None, None, false))
+                .await
+                .status(),
             StatusCode::OK,
             "a regular worker reads no rendezvous"
         );
@@ -1626,7 +1750,7 @@ mod tests {
             (json!([]), StatusCode::BAD_REQUEST),
         ] {
             let response = handle(
-                Endpoint::Chat,
+                Route::Chat,
                 Arc::clone(&bound),
                 disaggregated_chat(Some(1), Some(port.clone()), false),
             )
@@ -1634,7 +1758,7 @@ mod tests {
             assert_eq!(response.status(), status, "bootstrap_port {port}");
         }
         let missing = handle(
-            Endpoint::Chat,
+            Route::Chat,
             Arc::clone(&bound),
             disaggregated_chat(Some(1), None, false),
         )
@@ -1647,7 +1771,7 @@ mod tests {
         let elsewhere = state_of(Some(Role::Prefill), Some(9001), "http:elsewhere-test");
         for port in [Some(json!(null)), None] {
             let response = handle(
-                Endpoint::Chat,
+                Route::Chat,
                 Arc::clone(&elsewhere),
                 disaggregated_chat(Some(1), port.clone(), false),
             )
@@ -1661,7 +1785,7 @@ mod tests {
         let unbound = state_of(Some(Role::Prefill), None, "http:unbound-test");
         assert_eq!(
             handle(
-                Endpoint::Chat,
+                Route::Chat,
                 unbound,
                 disaggregated_chat(Some(1), Some(json!(8999)), false)
             )
