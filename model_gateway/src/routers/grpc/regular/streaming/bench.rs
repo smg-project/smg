@@ -2,9 +2,10 @@
 //! or Messages stream is driven the way the streaming tests drive theirs:
 //! over an engine stream of pre-encoded gRPC frames decoded by the client's
 //! own codec (no socket under it), writing to the bounded SSE channel a
-//! client reads from, with the bytes written as the result. `crate::bench_support`
-//! is the face `benches/stream_state_machines.rs` sees; the module is
-//! compiled for the crate's test targets only.
+//! client reads from, with the bytes written as the result. The gRPC router
+//! module re-exports `EngineScript` and `StreamBench`, the face
+//! `benches/stream_state_machines.rs` sees; the module is compiled for the
+//! crate's test targets only.
 
 #![expect(
     clippy::expect_used,
