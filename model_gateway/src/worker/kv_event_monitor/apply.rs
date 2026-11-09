@@ -395,9 +395,9 @@ impl KvEventMonitor {
     /// hashes for the main group's names ([`WorkerGroups::restarted`],
     /// [`WorkerGroups::waiting`]), and it is complete from here; two signal
     /// groups leave whose block is whose unknown, and the view incomplete,
-    /// the overlap standing until a clear. The signal's groups move to the
-    /// view, whose events they publish from here on. `true` when the worker
-    /// needs its view.
+    /// the overlap standing until a clear, counted and logged as a late
+    /// view is. The signal's groups move to the view, whose events they
+    /// publish from here on. `true` when the worker needs its view.
     fn main_group_shown(
         worker_id: u32,
         indexer: &KvIndex,
@@ -420,8 +420,23 @@ impl KvEventMonitor {
         match groups.as_slice() {
             [group] if group_mask(*group) != 0 => {
                 view.waiting(group_mask(*group), &signal);
+                worker_blocks.counters.group_dropped = view.dropped_blocks();
             }
-            _ => view.created_over(signal.len()),
+            // Whose block is whose is unknown (or the one group is past the
+            // rule's reach): the rule stays off, on the record as a late
+            // view is.
+            _ => {
+                if !signal.is_empty() {
+                    worker_blocks.counters.group_view_late += 1;
+                    warn!(
+                        worker_id,
+                        indexed = signal.len(),
+                        groups = groups.len(),
+                        "KV cache group view restarted over the blocks of more than one main-signal group, or of one the rule cannot read; its rule stays off until the worker's next clear"
+                    );
+                }
+                view.created_over(signal.len());
+            }
         }
         for group in groups {
             worker_blocks.show_group(group);
@@ -2537,7 +2552,7 @@ mod tests {
 
     /// Two groups gave a worker its main signal: whose block is whose is
     /// unknown at the restart, so the view stays incomplete and the overlap
-    /// stands until a clear.
+    /// stands until a clear, counted as a late view is.
     #[test]
     fn two_signal_groups_leave_the_restarted_view_incomplete() {
         let indexer = KvIndex::chain();
@@ -2559,6 +2574,10 @@ mod tests {
         let view = wb.groups.clone().expect("the restart makes the view");
         assert!(!view.is_complete(), "whose block is whose is unknown");
         assert_eq!(wb.counters.main_signal_dropped, 2);
+        assert_eq!(
+            wb.counters.group_view_late, 1,
+            "on the record, as a late view"
+        );
         assert_eq!(view.retained_blocks(), 0);
         assert!(wb.knows_group(0) && wb.knows_group(2));
     }
