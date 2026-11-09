@@ -14,7 +14,7 @@
 
 use std::{collections::HashMap, hint::black_box, sync::Arc};
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use openai_protocol::worker::{HealthCheckConfig, WorkerLoadResponse};
 use smg::{
     config::types::{ManualAssignmentMode, PolicyConfig, RoutingKeyOverrideConfig},
@@ -137,7 +137,14 @@ fn bench_gather_and_select(c: &mut Criterion) {
 /// published report (queued token-work, running requests, KV pressure, a live rate on three of
 /// four) and in-flight requests on the router, fed to `policy`, which has picked from the pool
 /// often enough to know every worker.
-fn fed_pool(policy: &dyn LoadBalancingPolicy, workers: usize) -> (TestFeed, Vec<Arc<dyn Worker>>) {
+fn fed_pool(
+    policy: &dyn LoadBalancingPolicy,
+    workers: usize,
+) -> (
+    TestFeed,
+    Vec<Arc<dyn Worker>>,
+    HashMap<String, WorkerLoadResponse>,
+) {
     let feed = TestFeed::attached_to(policy);
     let pool: Vec<Arc<dyn Worker>> = (0..workers)
         .map(|i| {
@@ -185,7 +192,7 @@ fn fed_pool(policy: &dyn LoadBalancingPolicy, workers: usize) -> (TestFeed, Vec<
     for _ in 0..workers * 4 {
         black_box(policy.select_worker(&pool, &info));
     }
-    (feed, pool)
+    (feed, pool, reports)
 }
 
 /// One least-load decision over a fed pool: the eligibility walk, the expected-wait score of
@@ -197,7 +204,7 @@ fn bench_least_load_decision(c: &mut Criterion) {
     let tokens: Vec<u32> = (0..1_024).collect();
     for workers in [4, 8, 32, 128] {
         let policy = LeastLoadPolicy::new();
-        let (_feed, pool) = fed_pool(&policy, workers);
+        let (_feed, pool, _reports) = fed_pool(&policy, workers);
         let info = SelectWorkerInfo {
             tokens: Some(&tokens),
             ..Default::default()
@@ -205,6 +212,33 @@ fn bench_least_load_decision(c: &mut Criterion) {
         group.throughput(Throughput::Elements(1));
         group.bench_with_input(BenchmarkId::new("workers", workers), &workers, |b, _| {
             b.iter(|| black_box(policy.select_worker(black_box(&pool), black_box(&info))));
+        });
+    }
+    group.finish();
+}
+
+/// The first least-load decision after a fresh report, the regime in which the tally releases:
+/// the previous decision's dispatch is at or before the new report's sample, so the winner's
+/// credit is read and released in the same decision. The report is republished before each
+/// timed decision, outside the timing. Four workers take the held-guard shape, eight the split
+/// one.
+fn bench_least_load_after_report(c: &mut Criterion) {
+    let mut group = c.benchmark_group("least_load/after_report");
+    let tokens: Vec<u32> = (0..1_024).collect();
+    for workers in [4, 8] {
+        let policy = LeastLoadPolicy::new();
+        let (feed, pool, reports) = fed_pool(&policy, workers);
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        group.throughput(Throughput::Elements(1));
+        group.bench_with_input(BenchmarkId::new("workers", workers), &workers, |b, _| {
+            b.iter_batched(
+                || feed.publish(&reports),
+                |()| black_box(policy.select_worker(black_box(&pool), black_box(&info))),
+                BatchSize::PerIteration,
+            );
         });
     }
     group.finish();
@@ -275,7 +309,7 @@ fn bench_simple_policy_pick(c: &mut Criterion) {
             ("passthrough", Box::new(PassthroughPolicy::new())),
         ];
         for (name, policy) in &policies {
-            let (_feed, pool) = fed_pool(policy.as_ref(), workers);
+            let (_feed, pool, _reports) = fed_pool(policy.as_ref(), workers);
             let info = SelectWorkerInfo {
                 tokens: Some(&tokens),
                 ..Default::default()
@@ -373,6 +407,7 @@ criterion_group!(
     bench_select,
     bench_gather_and_select,
     bench_least_load_decision,
+    bench_least_load_after_report,
     bench_ring_policies,
     bench_simple_policy_pick,
     bench_keyed_sticky_hit
