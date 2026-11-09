@@ -55,6 +55,16 @@ key; what a job can do is spend through the proxy, which the keys' spend caps bo
 runner pods. A live set whose runner container carries a key, or runs privileged (only the `dind`
 sidecar may), has drifted from these values; `helm upgrade` from the files here removes both.
 
+The same sidecar holds the private key of the **SMG Codex Review** GitHub App (secret
+`codex-github-app` with `app-id`, `installation-id` and `private-key`, the key in PKCS#8 form:
+`openssl pkcs8 -topk8 -nocrypt -in downloaded.pem`) and mints one-hour installation tokens for it
+on `POST http://127.0.0.1:8787/github/app-token`, which the Codex workflow's post job uses to post
+as `smg-codex-review[bot]`. The endpoint requires the calling job's GitHub Actions OIDC token
+(audience `ai-key-proxy`), checked against GitHub's signing keys and pinned to this repository and
+the Codex workflow file, so a fork's run, which gets no OIDC token, or another workflow's job on
+the same pod cannot mint. The key never leaves the pod; a job sees only the token. To rotate it,
+generate a new key on the App's settings page, replace the secret, and roll the runner set.
+
 ## 2. Create or update the Kubernetes secret
 
 Never paste credentials into `archived/arc-secret-template.yaml` or commit a private key.

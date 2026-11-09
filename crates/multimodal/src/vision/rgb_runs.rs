@@ -140,7 +140,7 @@ mod neon {
 /// exact-size arrays. The detection is the crate's for its other x86-64
 /// paths; the shuffles themselves need SSSE3, which every AVX2 core has.
 #[cfg(target_arch = "x86_64")]
-mod avx2 {
+pub(crate) mod avx2 {
     use core::arch::x86_64::{__m128i, _mm_or_si128, _mm_shuffle_epi8};
 
     use multiversion::{multiversion, target::match_target};
@@ -236,15 +236,90 @@ mod avx2 {
     /// One plane of sixteen pixels from the run's three words.
     #[inline]
     #[target_feature(enable = "avx2")]
-    fn plane16(words: [__m128i; 3], masks: &[[u8; 16]; 3]) -> [u8; 16] {
-        let gathered = _mm_or_si128(
+    fn plane16(words: [__m128i; 3], masks: &[[u8; 16]; 3]) -> __m128i {
+        _mm_or_si128(
             _mm_or_si128(
                 _mm_shuffle_epi8(words[0], bytemuck::must_cast(masks[0])),
                 _mm_shuffle_epi8(words[1], bytemuck::must_cast(masks[1])),
             ),
             _mm_shuffle_epi8(words[2], bytemuck::must_cast(masks[2])),
-        );
-        bytemuck::must_cast(gathered)
+        )
+    }
+
+    /// Sixteen interleaved pixels (48 bytes) as their three planes of
+    /// sixteen bytes.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(in crate::vision) fn deinterleave16(run: [u8; 48]) -> [[u8; 16]; 3] {
+        let words: [__m128i; 3] = bytemuck::must_cast(run);
+        [
+            bytemuck::must_cast(plane16(words, &RED16)),
+            bytemuck::must_cast(plane16(words, &GREEN16)),
+            bytemuck::must_cast(plane16(words, &BLUE16)),
+        ]
+    }
+
+    // The inverse: output word `k`'s byte `i` is byte `(16 k + i) / 3` of
+    // plane `(16 k + i) % 3`.
+    const RED_OUT: [[u8; 16]; 3] = [
+        [
+            0x00, 0x80, 0x80, 0x01, 0x80, 0x80, 0x02, 0x80, 0x80, 0x03, 0x80, 0x80, 0x04, 0x80,
+            0x80, 0x05,
+        ],
+        [
+            0x80, 0x80, 0x06, 0x80, 0x80, 0x07, 0x80, 0x80, 0x08, 0x80, 0x80, 0x09, 0x80, 0x80,
+            0x0a, 0x80,
+        ],
+        [
+            0x80, 0x0b, 0x80, 0x80, 0x0c, 0x80, 0x80, 0x0d, 0x80, 0x80, 0x0e, 0x80, 0x80, 0x0f,
+            0x80, 0x80,
+        ],
+    ];
+    const GREEN_OUT: [[u8; 16]; 3] = [
+        [
+            0x80, 0x00, 0x80, 0x80, 0x01, 0x80, 0x80, 0x02, 0x80, 0x80, 0x03, 0x80, 0x80, 0x04,
+            0x80, 0x80,
+        ],
+        [
+            0x05, 0x80, 0x80, 0x06, 0x80, 0x80, 0x07, 0x80, 0x80, 0x08, 0x80, 0x80, 0x09, 0x80,
+            0x80, 0x0a,
+        ],
+        [
+            0x80, 0x80, 0x0b, 0x80, 0x80, 0x0c, 0x80, 0x80, 0x0d, 0x80, 0x80, 0x0e, 0x80, 0x80,
+            0x0f, 0x80,
+        ],
+    ];
+    const BLUE_OUT: [[u8; 16]; 3] = [
+        [
+            0x80, 0x80, 0x00, 0x80, 0x80, 0x01, 0x80, 0x80, 0x02, 0x80, 0x80, 0x03, 0x80, 0x80,
+            0x04, 0x80,
+        ],
+        [
+            0x80, 0x05, 0x80, 0x80, 0x06, 0x80, 0x80, 0x07, 0x80, 0x80, 0x08, 0x80, 0x80, 0x09,
+            0x80, 0x80,
+        ],
+        [
+            0x0a, 0x80, 0x80, 0x0b, 0x80, 0x80, 0x0c, 0x80, 0x80, 0x0d, 0x80, 0x80, 0x0e, 0x80,
+            0x80, 0x0f,
+        ],
+    ];
+
+    /// Three planes of sixteen bytes as sixteen interleaved pixels (48
+    /// bytes): the inverse of [`deinterleave16`].
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    pub(crate) fn interleave16(planes: [[u8; 16]; 3]) -> [u8; 48] {
+        let [r, g, b]: [__m128i; 3] = bytemuck::must_cast(planes);
+        let word = |k: usize| {
+            _mm_or_si128(
+                _mm_or_si128(
+                    _mm_shuffle_epi8(r, bytemuck::must_cast(RED_OUT[k])),
+                    _mm_shuffle_epi8(g, bytemuck::must_cast(GREEN_OUT[k])),
+                ),
+                _mm_shuffle_epi8(b, bytemuck::must_cast(BLUE_OUT[k])),
+            )
+        };
+        bytemuck::must_cast([word(0), word(1), word(2)])
     }
 
     /// One plane of eight pixels from the run's word and a half.
@@ -272,10 +347,7 @@ mod avx2 {
             .zip(g_wide.iter_mut())
             .zip(b_wide.iter_mut())
         {
-            let words: [__m128i; 3] = bytemuck::must_cast(*pixels);
-            *r = plane16(words, &RED16);
-            *g = plane16(words, &GREEN16);
-            *b = plane16(words, &BLUE16);
+            [*r, *g, *b] = deinterleave16(*pixels);
         }
         let (half, rest) = rest.as_chunks::<24>();
         let (r_half, r_rest) = r_rest.as_chunks_mut::<8>();

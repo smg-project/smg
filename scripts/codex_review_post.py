@@ -32,7 +32,8 @@ Modes:
             Codex verdict gets one, in its thread
 
 Environment:
-    GITHUB_TOKEN        the job's token
+    GITHUB_TOKEN        the token to post with: for `post`, the Codex App's installation
+                        token the runner pod's sidecar mints; for the rest, the job's
     GITHUB_REPOSITORY   owner/name
     GITHUB_EVENT_NAME, GITHUB_EVENT_PATH   the workflow event (context)
     GITHUB_API_URL      default https://api.github.com
@@ -55,7 +56,10 @@ from typing import Any
 
 MARKER = "<!-- codex-review -->"
 VERDICT_MARKER = "<!-- codex-verdict -->"
-BOT = "github-actions[bot]"
+BOT = "smg-codex-review[bot]"  # the GitHub App whose token the post job posts with
+LEGACY_BOT = "github-actions[bot]"  # what Codex posted as before the App; still ours
+OWN_BOTS = frozenset({BOT, LEGACY_BOT})
+STATUS_MARKER = "<!-- codex-status -->"  # the one status note per pull request
 OTHER_BOT = "claude[bot]"
 SEVERITY_INLINE = {
     "important": "🔴 **Important**",
@@ -225,7 +229,11 @@ def prior_findings(comments: list[dict]) -> list[dict]:
     found = []
     for c in comments:
         body = c.get("body") or ""
-        if c.get("in_reply_to_id") is not None or c["user"]["login"] != BOT or MARKER not in body:
+        if (
+            c.get("in_reply_to_id") is not None
+            or c["user"]["login"] not in OWN_BOTS
+            or MARKER not in body
+        ):
             continue
         text = body.replace(MARKER, "").strip()
         severity = next(
@@ -243,8 +251,19 @@ def prior_findings(comments: list[dict]) -> list[dict]:
     return found
 
 
+def strip_severity_label(body: str) -> str:
+    """The model sometimes opens the body with the label the renderer adds; keep one."""
+    text = body.strip()
+    for label in (*SEVERITY_INLINE.values(), *SEVERITY_LABEL.values()):
+        if text.startswith(label):
+            text = text[len(label) :].lstrip(" :").strip()
+    return text
+
+
 def render_finding(finding: dict) -> str:
-    return f"{MARKER}\n{SEVERITY_INLINE[finding['severity']]}: {finding['body'].strip()}"
+    return (
+        f"{MARKER}\n{SEVERITY_INLINE[finding['severity']]}: {strip_severity_label(finding['body'])}"
+    )
 
 
 def render_summary(
@@ -259,7 +278,8 @@ def render_summary(
     if outside:
         lines += ["", "Findings on lines outside this diff:", ""]
         lines += [
-            f"- `{f['path']}:{f['line']}` {SEVERITY_LABEL[f['severity']]}: {f['body'].strip()}"
+            f"- `{f['path']}:{f['line']}` {SEVERITY_LABEL[f['severity']]}: "
+            f"{strip_severity_label(f['body'])}"
             for f in outside
         ]
     return "\n".join(lines) + "\n"
@@ -300,11 +320,12 @@ def has_important(findings: list[dict]) -> bool:
 
 
 def review_event(findings: list[dict], live_approval: bool, open_prior: int = 0) -> str | None:
-    """APPROVE when nothing Important was found, no earlier Important finding is still open and
-    no Codex approval is live; COMMENT when there is something to say otherwise; None when a
-    clean rerun has nothing to add."""
+    """REQUEST_CHANGES when something Important was found or an earlier Important finding is
+    still open; APPROVE when nothing is and no Codex approval is live (the approval is what lifts
+    an earlier request); COMMENT when there is something to say otherwise; None when a clean
+    rerun has nothing to add."""
     if has_important(findings) or open_prior:
-        return "COMMENT"
+        return "REQUEST_CHANGES"
     if not live_approval:
         return "APPROVE"
     return "COMMENT" if findings else None
@@ -316,7 +337,7 @@ def live_approvals(reviews: list[dict]) -> list[int]:
         review["id"]
         for review in reviews
         if review.get("state") == "APPROVED"
-        and review.get("user", {}).get("login") == BOT
+        and review.get("user", {}).get("login") in OWN_BOTS
         and MARKER in (review.get("body") or "")
     ]
 
@@ -346,6 +367,8 @@ def post_review(
     )
     review["event"] = event
     created = api("POST", f"repos/{repo}/pulls/{pr}/reviews", review)
+    if isinstance(created, dict):
+        created = {**created, "event": event}
     if has_important(findings) or open_prior:
         for review_id in live:
             api(
@@ -358,6 +381,118 @@ def post_review(
                 },
             )
     return created
+
+
+# --- the status note ------------------------------------------------------------------------------
+
+
+VERDICT_WORDS = {
+    "REQUEST_CHANGES": "changes requested",
+    "APPROVE": "approved",
+    "COMMENT": "commented",
+}
+
+
+def render_status(state: str, info: dict) -> str:
+    """The one status note per pull request: what Codex is doing, then what it found."""
+    sha = info["head_sha"][:7]
+    run = info.get("run_url") or ""
+    lines = [STATUS_MARKER]
+    if state == "reviewing":
+        scope = "the new push" if info.get("incremental") else "the whole pull request"
+        lines += [
+            "> [!NOTE]",
+            f"> ⏳ **Codex is reviewing** commit `{sha}` ({scope}).",
+            "> Findings arrive as inline comments and the verdict as a review; this note "
+            "updates when it is done.",
+            ">",
+            f"> [Run]({run})",
+        ]
+        files = list(info.get("files") or [])
+        if files:
+            plural = "s" if len(files) != 1 else ""
+            lines += [
+                "",
+                "<details>",
+                f"<summary>{len(files)} file{plural} in the review</summary>",
+                "",
+            ]
+            lines += [f"- `{name}`" for name in files[:200]]
+            if len(files) > 200:
+                lines.append(f"- and {len(files) - 200} more")
+            lines += ["", "</details>"]
+    elif state == "done":
+        counts = info.get("counts") or {}
+        tally = " · ".join(f"{counts.get(sev, 0)} {label}" for sev, label in SEVERITY_LABEL.items())
+        verdict = VERDICT_WORDS.get(info.get("verdict") or "", "nothing new to say")
+        lines += [
+            "> [!NOTE]",
+            f"> ✅ **Codex reviewed** commit `{sha}`: {tally}. Verdict: {verdict}. [Run]({run})",
+        ]
+    elif state == "failed":
+        lines += [
+            "> [!CAUTION]",
+            f"> ❌ **Codex could not review** commit `{sha}`. See the [run]({run}); a new push "
+            "or `@codex review` tries again.",
+        ]
+    else:
+        raise ValueError(f"unknown status state {state!r}")
+    return "\n".join(lines) + "\n"
+
+
+def status_comment(comments: list[dict]) -> dict | None:
+    """Codex's status note among a pull request's comments, if it has one."""
+    return next(
+        (
+            c
+            for c in comments
+            if c.get("user", {}).get("login") in OWN_BOTS and STATUS_MARKER in (c.get("body") or "")
+        ),
+        None,
+    )
+
+
+def upsert_status(
+    api: Api,
+    repo: str,
+    pr: int,
+    body: str,
+    *,
+    head_sha: str | None = None,
+    only_if_absent_for_head: bool = False,
+) -> dict:
+    """Post the status note or update it in place. With `only_if_absent_for_head`, a note that
+    already names the head is left alone, so a late announcement never undoes the outcome."""
+    existing = status_comment(list_all(api, f"repos/{repo}/issues/{pr}/comments"))
+    if existing and only_if_absent_for_head and head_sha:
+        if f"`{head_sha[:7]}`" in (existing.get("body") or ""):
+            return existing
+    if existing:
+        return api("PATCH", f"repos/{repo}/issues/comments/{existing['id']}", {"body": body})
+    return api("POST", f"repos/{repo}/issues/{pr}/comments", {"body": body})
+
+
+def run_announce(api: Api, repo: str, context: dict, state: str, info: dict) -> dict | None:
+    """The status note for a review run: `reviewing` when it starts, `failed` when the review
+    job dies. Other modes and skipped runs get none; the post job writes the `done` state."""
+    if context.get("skip") or context.get("mode") != "review":
+        return None
+    pr, head = context["pr"], context["head_sha"]
+    details = {"head_sha": head, "incremental": bool(context.get("incremental")), **info}
+    if state == "reviewing":
+        files = list_all(api, f"repos/{repo}/pulls/{pr}/files")
+        details["files"] = [f["filename"] for f in files]
+        body = render_status("reviewing", details)
+        return upsert_status(api, repo, pr, body, head_sha=head, only_if_absent_for_head=True)
+    return upsert_status(api, repo, pr, render_status(state, details))
+
+
+def run_url_from_env() -> str:
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if not run_id:
+        return ""
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    return f"{server}/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{run_id}"
 
 
 # --- threads ------------------------------------------------------------------------------------
@@ -379,7 +514,7 @@ def thread_awaits_reply(comments: list[dict], root_id: int, mention: str | None 
     if not thread:
         return False
     root = thread[0]
-    ours = root["user"]["login"] == BOT and MARKER in (root.get("body") or "")
+    ours = root["user"]["login"] in OWN_BOTS and MARKER in (root.get("body") or "")
     mentioned = bool(mention and MENTION_RE.search(mention))
     if not (ours or mentioned):
         return False
@@ -603,15 +738,22 @@ def run_post(api: Api, repo: str, context: dict, output: Any, diff_text: str) ->
             for f in context.get("prior_findings", [])
             if f.get("severity") == "important"
         }
-        return post_review(
-            api,
-            repo,
-            pr,
-            context["head_sha"],
-            validate_findings(output),
-            diff_text,
-            prior_important,
+        document = validate_findings(output)
+        created = post_review(
+            api, repo, pr, context["head_sha"], document, diff_text, prior_important
         )
+        counts = {
+            sev: sum(1 for f in document["findings"] if f["severity"] == sev)
+            for sev in SEVERITY_LABEL
+        }
+        outcome = {
+            "head_sha": context["head_sha"],
+            "run_url": context.get("run_url", ""),
+            "counts": counts,
+            "verdict": created["event"] if created else None,
+        }
+        upsert_status(api, repo, pr, render_status("done", outcome))
+        return created
     if mode == "reply":
         return post_reply(api, repo, pr, context["root_comment_id"], render_reply(output))
     if mode == "verify":
@@ -641,6 +783,8 @@ def main(argv: list[str] | None = None) -> int:
     post_cmd = commands.add_parser("post", help="post Codex's output to the pull request")
     post_cmd.add_argument("--dir", required=True, type=Path)
     commands.add_parser("gate", help="admission verdict for another workflow, to GITHUB_OUTPUT")
+    announce_cmd = commands.add_parser("announce", help="post or update the status note")
+    announce_cmd.add_argument("--state", choices=("reviewing", "failed"), required=True)
     args = parser.parse_args(argv)
 
     token = os.environ.get("GITHUB_TOKEN")
@@ -663,6 +807,18 @@ def main(argv: list[str] | None = None) -> int:
                 handle.write(f"pr={verdict['pr'] or ''}\n")
                 handle.write(f"head_sha={verdict['head_sha']}\n")
         print("admitted" if verdict["allowed"] else f"refused: {verdict['reason']}")
+        return 0
+
+    if args.command == "announce":
+        event_name = os.environ["GITHUB_EVENT_NAME"]
+        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+        context = resolve_context(
+            event_name, event, api, repo, os.environ.get("CODEX_OTHER_BOT", OTHER_BOT)
+        )
+        info = {"run_url": run_url_from_env()}
+        note = run_announce(api, repo, context, args.state, info)
+        why = context.get("skip_reason") or context.get("mode")
+        print("status note written" if note else f"no status note: {why}")
         return 0
 
     if args.command == "context":
@@ -690,6 +846,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     diff_path = args.dir / "pr.diff"
     diff_text = diff_path.read_text() if diff_path.is_file() else ""
+    context["run_url"] = run_url_from_env()
     result = run_post(api, repo, context, load_output(output_path), diff_text)
     print(json.dumps({"mode": context["mode"], "posted": result is not None}))
     return 0

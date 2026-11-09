@@ -13,8 +13,13 @@ name: Codex Code Review
 # every run, and the Codex action checks the actor itself). The PR events use
 # `pull_request`, not `pull_request_target`: Claude's App-token exchange rejects the OIDC
 # token of a `pull_request_target` run, and the comment events run from `main` anyway.
-# Codex runs in a read-only sandbox in a job with read permissions; a second job with
-# pull-requests: write posts its result.
+# Codex runs in a read-only sandbox in a job with read permissions; a second job posts its
+# result as the SMG Codex Review GitHub App, with a one-hour installation token the sidecar
+# mints from the App key it holds once the job has proved itself with its GitHub OIDC token;
+# the codex and post jobs' own tokens cannot write. The review-comment events
+# (`pull_request_review`, `pull_request_review_comment`) run the pull request's own copy of
+# this file, so a branch older than a change here keeps the old behaviour for its thread
+# replies and verdicts until it takes `main`.
 
 on:
   pull_request:
@@ -51,11 +56,51 @@ env:
   CODEX_EFFORT: xhigh
   CODEX_VERSION: '0.167.0'
   CODEX_OTHER_BOT: claude[bot]
+  CODEX_BOT: smg-codex-review[bot]  # the GitHub App Codex posts as; scripts/codex_review_post.py agrees
   AI_KEY_PROXY: http://127.0.0.1:8787
   OPENAI_PLACEHOLDER_KEY: sk-placeholder-the-sidecar-holds-the-key
   ANTHROPIC_PLACEHOLDER_KEY: sk-ant-placeholder-the-sidecar-holds-the-key
 
 jobs:
+  # The status note, posted the moment a review run is admitted so the pull request shows what is
+  # happening while Codex works; the post job turns it into the outcome, and finish-status into
+  # a failure notice. Thread replies and verdict passes get none.
+  announce:
+    name: Codex review status
+    if: >-
+      github.repository == 'smg-project/smg'
+      && github.actor != 'dependabot[bot]'
+      && (
+        (github.event_name == 'pull_request'
+            && github.event.pull_request.head.repo.full_name == github.repository)
+        || (github.event_name == 'issue_comment'
+            && github.event.issue.pull_request
+            && github.event.comment.user.type != 'Bot'
+            && contains(github.event.comment.body, '@codex review'))
+      )
+    runs-on: ${{ vars.SMG_RUNNER_REVIEW || 'k8s-runner-cpu' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - uses: ./.github/actions/codex-posting-token
+        id: app-token
+
+      - name: Say that the review is under way
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: python scripts/codex_review_post.py announce --state reviewing
+
   codex:
     name: Codex review
     # A first filter from the event alone; the context step applies the full gate (fork,
@@ -186,7 +231,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      pull-requests: write
+      id-token: write  # the job's OIDC token is how it proves itself to the sidecar
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -202,13 +247,45 @@ jobs:
           name: codex-review-${{ github.run_id }}
           path: .codex-review
 
+      # The posting token is the Codex App's, minted by the runner pod's sidecar for this job's
+      # GitHub OIDC token (.github/actions/codex-posting-token). It lives an hour and is masked.
+      - uses: ./.github/actions/codex-posting-token
+        id: app-token
+
       - name: Post to the pull request
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
         run: python scripts/codex_review_post.py post --dir .codex-review
 
-  # Claude grades Codex's findings. A review posted with the job token raises no event, so
-  # this runs here, after the posting, instead of on pull_request_review.
+  finish-status:
+    name: Codex review status (failed)
+    needs: codex
+    if: always() && needs.codex.result == 'failure' && needs.codex.outputs.mode == 'review'
+    runs-on: ${{ vars.SMG_RUNNER_REVIEW || 'k8s-runner-cpu' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - uses: ./.github/actions/codex-posting-token
+        id: app-token
+
+      - name: Say that the review failed
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: python scripts/codex_review_post.py announce --state failed
+
+  # Claude grades Codex's findings here, right after the posting, rather than on the
+  # pull_request_review event the App-posted review raises: one pass per review, no extra run.
   verify-by-claude:
     name: Claude verifies Codex findings
     needs: [codex, post]
@@ -249,13 +326,13 @@ jobs:
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ needs.codex.outputs.pr }}
-            The Codex reviewer (user github-actions[bot]) posted findings on this pull
+            The Codex reviewer (user ${{ env.CODEX_BOT }}) posted findings on this pull
             request. Grade each one against the code and answer in its thread.
 
             1. List the review comments:
                  gh api repos/${{ github.repository }}/pulls/${{ needs.codex.outputs.pr }}/comments --paginate \
                    --jq '.[] | {id, in_reply_to_id, user: .user.login, path, line, body}'
-               A target is a comment by github-actions[bot] whose body contains
+               A target is a comment by ${{ env.CODEX_BOT }} whose body contains
                "<!-- codex-review -->" and whose in_reply_to_id is null, and for which no
                reply (a comment whose in_reply_to_id is the target's id) contains
                "<!-- claude-verdict -->".
