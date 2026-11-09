@@ -2150,9 +2150,6 @@ jobs:
       E2E_VENDOR: ${{ matrix.vendor }}
       E2E_GPU_TIER: "0"
       SHOW_ROUTER_LOGS: "1"
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
