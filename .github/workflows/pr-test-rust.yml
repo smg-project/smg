@@ -1100,6 +1100,7 @@ jobs:
               # registration workflow, the server and the entry points every lane
               ("model_gateway/tests/**",                         NONE),
               ("model_gateway/test_harness/**",                  NONE),
+              ("model_gateway/src/routers/grpc/tokenizer_cache/**", NONE),
               ("model_gateway/benches/**",                       NONE),
               ("model_gateway/src/endpoints/responses/**",       "agentic vendor"),
               ("model_gateway/src/endpoints/conversations/**",   "agentic vendor"),
