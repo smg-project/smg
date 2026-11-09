@@ -1493,6 +1493,10 @@ pub(crate) fn init_metrics() {
         "Bytes of preprocessed encoder inputs the pixel cache holds"
     );
     describe_gauge!("smg_mm_pixel_cache_entries", "Images the pixel cache holds");
+    describe_gauge!(
+        "smg_mm_inflight_bytes",
+        "Bytes of preprocessed media the gateway holds in flight for engines, summed over every router of the process (a gateway in IGW mode builds three, each with the configured budget, so the gauge may read up to three budgets)"
+    );
     // The media pipeline per request, from the clock reads and counts it
     // already makes: its stages' time, the items a request carries and its
     // fetches.
@@ -2189,6 +2193,26 @@ impl Metrics {
         counter!("smg_mm_pixel_cache_evictions_total").absolute(0);
         gauge!("smg_mm_pixel_cache_bytes").set(0.0);
         gauge!("smg_mm_pixel_cache_entries").set(0.0);
+    }
+
+    /// The in-flight bytes gauge at zero: called when the media pipeline is
+    /// built, so it is on the first scrape.
+    pub fn init_mm_inflight_series() {
+        gauge!("smg_mm_inflight_bytes").set(0.0);
+    }
+
+    /// A request's preprocessed media bytes from their reservation to their
+    /// release: with a budget the bytes the budget counts, without one the
+    /// count alone. The gauge moves by the bytes, so concurrent requests add
+    /// up, across every router of the process: a gateway in IGW mode builds
+    /// three gRPC routers, each with its own budget of the configured size, so
+    /// the one series may read up to three budgets while no router refuses.
+    pub fn record_mm_inflight_reserved(bytes: usize) {
+        gauge!("smg_mm_inflight_bytes").increment(bytes as f64);
+    }
+
+    pub fn record_mm_inflight_released(bytes: usize) {
+        gauge!("smg_mm_inflight_bytes").decrement(bytes as f64);
     }
 
     /// One pixel cache lookup for `model_id`: a hit served the image's
