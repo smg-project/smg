@@ -9,6 +9,7 @@ use wfaas::{
 };
 
 use crate::{
+    policies::as_cache_aware,
     worker::{ConnectionMode, SubscriptionKind, Worker},
     workflow::data::WorkerRegistrationData,
 };
@@ -149,7 +150,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
             let cache_aware = app_context
                 .policy_registry
                 .get_policy(&model_id)
-                .is_some_and(|policy| policy.name() == "cache_aware");
+                .is_some_and(|policy| as_cache_aware(policy.as_ref()).is_some());
             if cache_aware {
                 app_context
                     .policy_registry
