@@ -120,6 +120,9 @@ pub struct AppState {
     /// Where this start read its secrets (the command line, the environment
     /// or a file), for the configuration view; the values are not here.
     pub secret_sources: posture::SecretSources,
+    /// The reload of the keys from their files, when a key came from one;
+    /// without it `POST /secrets/reload` answers 409.
+    pub secrets: Option<Arc<crate::secrets::SecretReloader>>,
 }
 
 async fn parse_function_call(
@@ -890,6 +893,45 @@ async fn admin_config(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+/// `POST /secrets/reload`: the keys read again from their files and put in
+/// force. The `admin` role alone. 409 when no key came from a file; 422
+/// when a file cannot be used, every set standing as it was; 200 with the
+/// files read and whether each set changed.
+async fn reload_secrets(State(state): State<Arc<AppState>>) -> Response {
+    // The role is the control-plane gate's: it admits `admin` alone to a
+    // POST before any handler, and the role matrix test pins this route.
+    let Some(reloader) = state.secrets.clone() else {
+        return (
+            StatusCode::CONFLICT,
+            "No key was read from a file at start; nothing to reload",
+        )
+            .into_response();
+    };
+    match crate::secrets::reload_logged(reloader, "route").await {
+        Some(Ok(report)) => smg_auth::AuditResource::name(Json(report).into_response(), "secrets"),
+        Some(Err(crate::secrets::BadFile(error))) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+        None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// The control-plane routes that exist only behind control-plane
+/// authentication, mounted by `build_apps` when it is configured: the
+/// routes that expose addresses or change the configuration. A route
+/// that joins this group is listed in [`GATED_ROUTES`] too, which the
+/// start-up record prints and the role matrix test reads.
+fn gated_control_plane_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/config", get(admin_config))
+        .route("/secrets/reload", post(reload_secrets))
+}
+
+/// The gated routes by name, in the order of `gated_control_plane_routes`.
+pub const GATED_ROUTES: &[(&str, &str)] = &[("GET", "/config"), ("POST", "/secrets/reload")];
+
 async fn list_workers_rest(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListWorkersQuery>,
@@ -993,7 +1035,7 @@ async fn v1_detokenize(
 
 async fn v1_tokenizers_add(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<AddTokenizerRequest>,
+    AdminJson(request): AdminJson<AddTokenizerRequest>,
 ) -> Response {
     tokenize::add_tokenizer(&state.context, request).await
 }
@@ -1057,6 +1099,14 @@ pub struct ServerConfig {
     /// a caller that did not track them leaves the default, which logs
     /// nothing.
     pub secret_sources: posture::SecretSources,
+    /// The files the keys were read from, where a file was the source: the
+    /// targets of `POST /secrets/reload`; a caller that did not track them
+    /// leaves the default, and the route answers 409.
+    pub secret_files: crate::secrets::SecretFiles,
+    /// `--secrets-auto-reload`: the key files watched, a change reloading
+    /// them as the route does. Nothing to watch without a file source; the
+    /// start says so.
+    pub secrets_auto_reload: bool,
 }
 
 /// `Router::layer` for an application-wide layer a configuration may leave
@@ -1151,6 +1201,10 @@ pub fn build_apps(
     cors_allowed_origins: Vec<String>,
     admin_listener: bool,
 ) -> Result<GatewayApps, InvalidHeaderName> {
+    // The admin-only reads join the state once, for every attachment of
+    // the control-plane layer below: the shared groups and the gated group.
+    let control_plane_auth_state =
+        control_plane_auth_state.map(|state| state.with_admin_only_reads(ADMIN_ONLY_READS));
     // Pending (upgrade not completed): 30s TTL
     // Disconnected: 60 min TTL
     app_state.context.realtime_registry.start_reaper(
@@ -1165,8 +1219,9 @@ pub fn build_apps(
     // it: with no serving key configured it would pass every request through,
     // so it is an inert member of those groups' stacks then (a from_fn layer
     // clones its state and boxes its future per request whatever it does; an
-    // inert member is one match). The keys are fixed at start-up, so the
-    // decision at build time is the one the layer made per request.
+    // inert member is one match). Whether a serving key is configured is
+    // fixed at start-up (a reload swaps the keys, never their presence), so
+    // the decision at build time is the one the layer made per request.
     let serving_auth_layer = serving_auth_config.is_enabled().then(|| {
         axum::middleware::from_fn_with_state(
             serving_auth_config.clone(),
@@ -1402,15 +1457,6 @@ pub fn build_apps(
                 .delete(delete_worker),
         );
 
-    // The configuration view names every worker and store address, so it
-    // exists only where control-plane authentication guards it; without
-    // that, the path is unknown and answers 404 like any other.
-    let admin_routes = if control_plane_auth_state.is_some() {
-        admin_routes.route("/config", get(admin_config))
-    } else {
-        admin_routes
-    };
-
     // Fallback (no control-plane auth) normally uses `admin_auth_config`.
     // If only tenant keys are configured (no shared `--api-key`), there's no
     // credential that should reach these routes — deny outright instead of
@@ -1420,7 +1466,7 @@ pub fn build_apps(
     let apply_control_plane_auth = |routes: Router<Arc<AppState>>| {
         if let Some(ref cp_state) = control_plane_auth_state {
             routes.route_layer(axum::middleware::from_fn_with_state(
-                cp_state.clone().with_admin_only_reads(ADMIN_ONLY_READS),
+                cp_state.clone(),
                 smg_auth::control_plane_auth_middleware,
             ))
         } else if !admin_auth_config.is_enabled() && serving_auth_config.is_enabled() {
@@ -1434,6 +1480,18 @@ pub fn build_apps(
     };
     let admin_routes = apply_control_plane_auth(admin_routes);
     let worker_routes = apply_control_plane_auth(worker_routes);
+
+    // The gated routes exist only behind control-plane authentication:
+    // their layer is the control-plane check alone, never the shared-key
+    // fallback or the open pass-through above, and a start without
+    // control-plane authentication does not mount them, so the path is
+    // unknown and answers 404 on both listeners.
+    let gated_routes = control_plane_auth_state.as_ref().map(|cp_state| {
+        gated_control_plane_routes().route_layer(axum::middleware::from_fn_with_state(
+            cp_state.clone(),
+            smg_auth::control_plane_auth_middleware,
+        ))
+    });
 
     // RL control plane: mounted only when the flag built an `RlState`, so
     // with `--enable-rl` off nothing under /v1/rl exists and the sink 404s.
@@ -1453,6 +1511,9 @@ pub fn build_apps(
         .merge(multipart_upload_routes)
         .merge(public_routes);
     let mut control_plane = Router::new().merge(admin_routes).merge(worker_routes);
+    if let Some(gated_routes) = gated_routes {
+        control_plane = control_plane.merge(gated_routes);
+    }
     if let Some(rl_routes) = rl_routes {
         control_plane = control_plane.merge(rl_routes);
     }
@@ -1992,8 +2053,8 @@ fn serve_listeners(
     let max_connections = router_config.max_connections;
     info!(
         max_connections,
-        "HTTP connection limit on the data listener (0 = unlimited; the admin and probe listeners \
-         are outside it)"
+        "HTTP connection limit on the data listener (0 = unlimited; the admin listener has a bound \
+         of its own, the probe listener none)"
     );
     // The admission limit the bound is compared with is the effective one
     // (the one resolution of `max_concurrent_requests`, shared with the
@@ -2017,10 +2078,17 @@ fn serve_listeners(
     // TLS material and connection timeouts, but outside its connection limit
     // (`--max-connections`), so the control plane and the probes it serves
     // stay reachable while the data plane is saturated; it drains with it
-    // (`startup`'s shutdown handler closes both handles together).
+    // (`startup`'s shutdown handler closes both handles together). Its own
+    // bound (`--admin-max-connections`) is the same acceptor over its own
+    // permits, counted in the same series.
+    let admin_max_connections = router_config.admin_max_connections;
     let admin_serving: Serving = match (admin_listener, admin_app) {
         (Some(admin_listener), Some(admin_app)) => {
             let admin_addr = admin_listener.local_addr()?;
+            info!(
+                admin_max_connections,
+                "HTTP connection limit on the admin listener (0 = unlimited)"
+            );
             info!(
                 "Admin listener serving the control plane on {admin_addr} (--admin-port): the \
                  admin, worker-registry and RL routes answer there, and 404 on {addr}"
@@ -2029,13 +2097,21 @@ fn serve_listeners(
             match tls_config.clone() {
                 Some(tls_config) => Box::pin(
                     axum_server::from_tcp_rustls(admin_listener, tls_config)?
-                        .map(|acceptor| tls_acceptor(acceptor, connection_timeouts))
+                        .map(|acceptor| {
+                            ConnectionLimitAcceptor::new(
+                                tls_acceptor(acceptor, connection_timeouts),
+                                admin_max_connections,
+                            )
+                        })
                         .handle(admin_handle)
                         .serve(admin_app),
                 ),
                 None => Box::pin(
                     axum_server::from_tcp(admin_listener)?
-                        .acceptor(http_acceptor(connection_timeouts))
+                        .acceptor(ConnectionLimitAcceptor::new(
+                            http_acceptor(connection_timeouts),
+                            admin_max_connections,
+                        ))
                         .handle(admin_handle)
                         .serve(admin_app),
                 ),
@@ -2385,6 +2461,37 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // after this point, with these two bound.
     let probe_state = start_observability(&config, &app_context, metrics_handle).await?;
 
+    // Initialize control plane authentication if configured
+    let control_plane_auth_state =
+        smg_auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
+
+    // The reload of the keys a file gave, sharing the sets the layers read.
+    let secrets = crate::secrets::SecretReloader::new(
+        config.secret_files.clone(),
+        &config.secret_sources,
+        config.router_config.api_key.as_deref(),
+        &config.router_config.tenant_api_keys,
+        app_context.gateway_auth.clone(),
+        control_plane_auth_state
+            .as_ref()
+            .map(|state| state.keys.clone()),
+    )
+    .map(Arc::new);
+    // `--secrets-auto-reload`: the key files watched, a change reloading
+    // them as the route does; a directory that cannot be watched refuses the
+    // start. The sources record says which it is.
+    let secrets_auto_reload = match (config.secrets_auto_reload, &secrets) {
+        (false, _) => "off".to_string(),
+        (true, Some(reloader)) => {
+            crate::secrets::start_auto_reload(Arc::clone(reloader))?;
+            format!("on ({} files)", reloader.files().count())
+        }
+        (true, None) => {
+            warn!("--secrets-auto-reload is set and no key came from a file: nothing to watch");
+            "on (no file to watch)".to_string()
+        }
+    };
+
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
@@ -2394,6 +2501,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         mesh_adapters,
         probe_state,
         secret_sources: config.secret_sources,
+        secrets,
     });
     // For the shutdown task below: the mesh is told of the stop before the
     // listeners drain (`app_state` moves into the route groups first).
@@ -2440,10 +2548,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let serving_auth_config = app_context.gateway_auth.clone();
     let admin_auth_config = AuthConfig::new(config.router_config.api_key.clone());
 
-    // Initialize control plane authentication if configured
-    let control_plane_auth_state =
-        smg_auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
-
     // The admin listener's address, when the control plane has a listener of
     // its own (`--admin-port`); its bind host defaults to the data listener's.
     // Read from the router configuration, the copy `validate` above checked
@@ -2476,7 +2580,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         admin_addr,
     );
     // And where a keyed start's secrets came from, sources alone.
-    posture::log_secret_sources(&config.secret_sources);
+    posture::log_secret_sources(&config.secret_sources, &secrets_auto_reload);
+    // And whether the gated routes are mounted: they need control-plane
+    // authentication, so a start without it says they are off.
+    posture::log_gated_routes(control_plane_auth_state.is_some(), GATED_ROUTES);
 
     let apps = build_apps(
         app_state,
@@ -3888,6 +3995,8 @@ mod tests {
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
             secret_sources: Default::default(),
+            secret_files: Default::default(),
+            secrets_auto_reload: false,
         }
     }
 

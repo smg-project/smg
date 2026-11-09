@@ -104,14 +104,15 @@ mod tests {
     };
     use bytes::Bytes;
     use futures_util::stream;
-    use serde_json::Value;
     use tower::ServiceExt;
 
     use super::*;
     use crate::{
-        middleware::body_timeout::{crossed_payload_limit, REQUEST_BODY_TOO_LARGE},
+        middleware::{
+            body_timeout::{crossed_payload_limit, REQUEST_BODY_TOO_LARGE},
+            test_support::{json_of, text_of},
+        },
         routers::error::extract_error_code_from_response,
-        test_support::text_of,
     };
 
     /// The layer over two handlers: `/read` reads its body and answers its
@@ -182,7 +183,7 @@ mod tests {
             extract_error_code_from_response(&response),
             REQUEST_BODY_TOO_LARGE
         );
-        let json: Value = serde_json::from_str(&text_of(response).await).unwrap();
+        let json = json_of(response).await;
         assert_eq!(json["error"]["code"], REQUEST_BODY_TOO_LARGE, "{json}");
         assert_eq!(json["error"]["type"], "invalid_request_error", "{json}");
         assert_eq!(reads.load(Ordering::SeqCst), 0, "the handler never ran");

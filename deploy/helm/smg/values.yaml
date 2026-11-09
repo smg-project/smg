@@ -219,6 +219,40 @@ router:
     type: ClusterIP
     port: 80
     annotations: {}
+  # -- The admin listener (--admin-port): when set, the control-plane routes
+  #    (the admin routes, the worker-registry routes /workers and the RL
+  #    routes /v1/rl) are served on this container port, with the probes,
+  #    and the data port answers 404 for them. A second Service,
+  #    <release>-router-admin, exposes it inside the cluster; the ingress
+  #    never names it. null keeps the control plane on the data port.
+  adminPort: null
+  # -- Bind host of the admin listener (--admin-host); null binds it as the
+  #    data listener is bound
+  adminHost: null
+  adminService:
+    type: ClusterIP
+    port: 9001
+    annotations: {}
+  # -- Per-tenant rate limiting: enabled renders --tenant-rate-limit-enabled,
+  #    and the limits YAML comes from a ConfigMap of yours, mounted whole at
+  #    /etc/smg/rate-limit and read with --tenant-rate-limit-config (the key
+  #    names the file). Enabled without a ConfigMap is refused at render: the
+  #    gateway requires the file with the flag.
+  tenantRateLimit:
+    enabled: false
+    configMap:
+      name: ""
+      key: rate-limit.yaml
+  # -- The priority scheduler: enabled renders --priority-scheduler-enabled,
+  #    and its class table comes from a ConfigMap of yours, mounted whole at
+  #    /etc/smg/scheduler and read with --priority-scheduler-config. A
+  #    ConfigMap without enabled is refused at render: the gateway would
+  #    ignore it with a warning at start-up.
+  priorityScheduler:
+    enabled: false
+    configMap:
+      name: ""
+      key: scheduler.yaml
   ingress:
     enabled: false
     className: ""
@@ -378,6 +412,20 @@ auth:
 
   # -- Rate limiting
   rateLimitTokensPerSecond: -1  # -1 = disabled
+
+  # -- Control-plane API keys: the keys the admin, worker-registry and RL
+  #    routes require, one `id:name:role:key` entry per line (role admin or
+  #    user). Mounted into the router pod from a Secret at
+  #    /etc/smg/control-plane and read with --control-plane-api-keys-file;
+  #    never in the pod's arguments. existingSecret names a Secret the
+  #    operator manages; otherwise apiKeys, when set, is written into a
+  #    chart-managed Secret. With neither, the control plane keeps the
+  #    shared key's rules.
+  controlPlane:
+    existingSecret: ""
+    apiKeys: ""
+    # -- The key within the Secret holding the file
+    secretKey: "control-plane-api-keys"
 
 # =============================================================================
 # History / Storage Backend

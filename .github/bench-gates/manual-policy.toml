@@ -37,6 +37,12 @@
 repeats = 3
 filter = "^manual_policy/(fast_path|slow_path_vacant|no_routing_key|cache_size)/"
 
+# The files that feed this binary beyond the measured crate: the base side is built with them as the
+# pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
+# gated rows through the binary's inlining (symphony.toml records the case). A new row goes to a
+# bench target of its own.
+sources = ["model_gateway/benches/manual_policy_benchmark.rs"]
+
 [[gate]]
 pattern = "^manual_policy/"
 threshold = 0.25

@@ -20,9 +20,9 @@ use crate::{
         proto_wrapper::ENGINE_ERROR_MESSAGE,
         utils::{stream_failure::UpstreamStream, StreamFailure, StreamSource},
     },
-    test_support::RefusedAddress,
     worker::{
-        test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType,
+        test_support::{no_health_check, RefusedAddress},
+        BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType,
     },
 };
 

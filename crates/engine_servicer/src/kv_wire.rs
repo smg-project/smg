@@ -15,12 +15,15 @@
 //! - only blocks the engine manages itself (`ownership` other than a
 //!   residency agent);
 //! - the storage tier from `medium`, unknown media dropped;
-//! - the main-attention KV cache group where a rank has one (hybrid models
-//!   publish one group per attention kind under the same hashes, and the
-//!   sliding-window and state-space groups' events, stores and removals, are
-//!   dropped); a rank that publishes only sliding-window groups forwards
-//!   their stores, the hashes aligned to the tail of the tokens, as its only
-//!   signal (see [`Normalizer`]);
+//! - the KV cache groups by their kind: the main-attention group's stores
+//!   carry their tokens and feed the prefix index; the other groups' events
+//!   on a rank that has a main group (hybrid models publish one group per
+//!   attention kind under the same hashes) are forwarded with their hashes
+//!   and group fields and no tokens, what a consumer needs to bound a prefix
+//!   hit by the blocks a sliding-window or state group retains; a rank that
+//!   publishes only sliding-window groups forwards their stores, the hashes
+//!   aligned to the tail of the tokens, as its only signal (see
+//!   [`Normalizer`]);
 //! - whole blocks only (hash count × block size == token count, or the
 //!   tail of a longer span), no self-referencing hash chains, no offload
 //!   placeholders (a chunk key with no tokens);
@@ -604,7 +607,6 @@ pub enum DropReason {
     UnsupportedOwnership,
     NonLocalLocality,
     UnknownMedium,
-    NonMainAttentionGroup,
     UnalignedBlocks,
     SelfReferencingHashes,
     /// A store with nothing to index: an offload chunk placeholder (a chunk
@@ -621,7 +623,6 @@ impl DropReason {
             Self::UnsupportedOwnership => "unsupported_ownership",
             Self::NonLocalLocality => "non_local_locality",
             Self::UnknownMedium => "unknown_medium",
-            Self::NonMainAttentionGroup => "non_main_attention_group",
             Self::UnalignedBlocks => "unaligned_blocks",
             Self::SelfReferencingHashes => "self_referencing_hashes",
             Self::Placeholder => "placeholder",
@@ -656,6 +657,12 @@ pub struct Counts {
     /// Forwarded stores that named fewer blocks than their tokens spanned,
     /// the hashes aligned to the tail of the tokens.
     pub tail_aligned_stores: u64,
+    /// Forwarded stores and removals of a cache group other than main
+    /// attention on a rank that has a main group (a hybrid model's
+    /// sliding-window and state groups): hashes and group fields, no
+    /// tokens, see the group policy on [`Normalizer`].
+    pub group_stores: u64,
+    pub group_removals: u64,
     pub dropped: HashMap<DropReason, u64>,
 }
 
@@ -676,6 +683,8 @@ impl Counts {
         self.hash_unverifiable += other.hash_unverifiable;
         self.window_only_stores += other.window_only_stores;
         self.tail_aligned_stores += other.tail_aligned_stores;
+        self.group_stores += other.group_stores;
+        self.group_removals += other.group_removals;
         for (reason, count) in &other.dropped {
             *self.dropped.entry(*reason).or_insert(0) += count;
         }
@@ -720,7 +729,8 @@ struct RankState {
     /// KV cache groups seen on stores: whether each is a main-attention group.
     groups: HashMap<u32, bool>,
     /// Hashes forwarded from a sliding-window group while the rank had no
-    /// main-attention group, so their removals still go through once it has.
+    /// main-attention group: the record holds them as main-lane blocks, so
+    /// their removals reach it once the rank has a main group too.
     window_forwarded: HashSet<i64>,
 }
 
@@ -730,35 +740,56 @@ impl RankState {
     }
 }
 
-/// What the shared gates let through, and under which group policy.
+/// Which lane of the stream an admitted event belongs to: the group policy's
+/// answer for it (see [`Normalizer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lane {
+    /// The main-attention group, or an event with no group at all: whole
+    /// blocks with their tokens, what the prefix index is built from.
+    Main,
+    /// A sliding-window group's event on a rank without a main-attention
+    /// group, forwarded as the rank's only signal.
+    WindowOnly,
+    /// A cache group other than main attention on a rank that has a main
+    /// group: forwarded with its hashes and group fields, no tokens.
+    Group,
+}
+
+/// What the shared gates let through, and on which lane.
 struct Admitted {
     tier: KvCacheTier,
     locality: KvCacheLocality,
-    /// A sliding-window group's event on a rank without a main-attention
-    /// group, forwarded as the rank's only signal.
-    window_only: bool,
+    lane: Lane,
 }
 
 /// Per-stream normalization state (one engine endpoint, all its DP ranks).
 ///
 /// KV-cache groups: an event names its group (`group_idx`) and, on stores,
 /// the group's attention kind. A model with full attention alongside sliding
-/// windows (vLLM's hybrid KV-cache manager) publishes every block twice under
-/// the same hash, once per group: the full-attention group holds the whole
-/// prefix, which is what a prefix hit needs, while the window group names
-/// only the window's blocks against the whole computed span and removes them
-/// as the window moves on. So on a rank with a main-attention group every
-/// non-main event, store and removal alike, is dropped and counted
-/// ([`DropReason::NonMainAttentionGroup`]); forwarding the window group's
-/// removals would take the full group's copies out of the gateway's count.
-/// A rank that shows only sliding-window groups (a window-only model) would
-/// otherwise give the gateway nothing: its window stores are forwarded with
-/// their group identity, the hashes aligned to the tail of the tokens, and
-/// counted ([`Counts::window_only_stores`]). The groups are learned for the
-/// rank's life: an `AllBlocksCleared` empties the block records, not them,
-/// so the stores that share a batch with the clear (an engine that resets
-/// its prefix cache and stores the next prompt in one step) are judged
-/// like every other step's.
+/// windows or state-space layers (vLLM's hybrid KV-cache manager) publishes
+/// a block under the same hash once per group that keeps it: the
+/// full-attention group holds the whole prefix, which is what a prefix hit
+/// starts from, while a window group names only the window's blocks against
+/// the whole computed span and a state group the one block ending at a
+/// boundary, and each removes its own as it moves on. The engine's own hit
+/// is bounded by every group: the prefix it reuses ends where the window
+/// group's tail or the state group's boundary block is gone, however long
+/// the full-attention chain runs. So on a rank with a main-attention group
+/// the main group's events are forwarded whole and every other group's
+/// events, stores and removals alike, are forwarded on their own lane
+/// (`Lane::Group`): the hashes, the parent and the group fields, no
+/// tokens (a sparse group's token span is the step's whole range, not a
+/// token list per hash, and a consumer keys the group's blocks by their
+/// hash). The gateway keeps those memberships apart from its prefix index,
+/// so a window group's removal never takes a full-attention copy out of its
+/// count. A rank that shows only sliding-window groups (a window-only model)
+/// would otherwise give the gateway nothing: its window stores are forwarded
+/// with their group identity, the hashes aligned to the tail of the tokens,
+/// and counted ([`Counts::window_only_stores`]). The groups are learned for
+/// the rank's life: an `AllBlocksCleared` empties the block records, not
+/// them, so the stores that share a batch with the clear (an engine that
+/// resets its prefix cache and stores the next prompt in one step) are
+/// judged like every other step's.
 #[derive(Default)]
 pub struct Normalizer {
     ranks: HashMap<i32, RankState>,
@@ -771,7 +802,10 @@ pub struct Normalizer {
 /// relay in the process: `sglang` or `vllm-sha256-cbor`.
 pub const HASH_CHECK_ENV: &str = "SMG_KV_EVENT_HASH_CHECK";
 
-const MAIN_ATTENTION_KINDS: [&str; 3] = ["full_attention", "mla_attention", "sink_full_attention"];
+/// Cache-group kinds whose blocks hold the main attention KV: the lane the
+/// prefix index is built from. The gateway keeps the same list.
+pub(crate) const MAIN_ATTENTION_KINDS: [&str; 3] =
+    ["full_attention", "mla_attention", "sink_full_attention"];
 
 /// The tier an engine medium names: the device when the medium is absent,
 /// `None` for a medium this relay does not know.
@@ -973,16 +1007,14 @@ impl Normalizer {
         })
     }
 
-    /// The shared gates: ownership, locality, medium, cache group. `hashes`
-    /// are the event's, for the one non-main event a rank with a main group
-    /// still forwards: the removal of blocks it forwarded while window-only.
+    /// The shared gates: ownership, locality, medium, and the lane the
+    /// event's cache group puts it on.
     fn admit(
         &mut self,
         tail: &EventTail,
         rank: i32,
         event_id: u64,
         learn_group: bool,
-        hashes: &[BlockHash],
     ) -> Result<Admitted, DropReason> {
         if is_residency_agent(tail.ownership.as_deref()) {
             return Err(self.drop(DropReason::UnsupportedOwnership, event_id));
@@ -991,7 +1023,7 @@ impl Normalizer {
             .map_err(|()| self.drop(DropReason::NonLocalLocality, event_id))?;
         let tier = tier_of(tail.medium.as_deref())
             .ok_or_else(|| self.drop(DropReason::UnknownMedium, event_id))?;
-        let mut window_only = false;
+        let mut lane = Lane::Main;
         if let Some(group) = tail.group_idx {
             let state = self.ranks.entry(rank).or_default();
             let main = match tail.kv_cache_spec_kind.as_deref() {
@@ -1008,21 +1040,112 @@ impl Normalizer {
                 None => state.groups.get(&group).copied().unwrap_or(true),
             };
             if !main {
-                let forwarded_before = !learn_group
-                    && hashes
-                        .iter()
-                        .any(|hash| state.window_forwarded.contains(&hash.0));
-                if state.main_seen() && !forwarded_before {
-                    return Err(self.drop(DropReason::NonMainAttentionGroup, event_id));
-                }
-                window_only = true;
+                lane = if state.main_seen() {
+                    Lane::Group
+                } else {
+                    Lane::WindowOnly
+                };
             }
         }
         Ok(Admitted {
             tier,
             locality,
-            window_only,
+            lane,
         })
+    }
+
+    /// The forwarded store once a lane has shaped its blocks: the event's
+    /// tail and the namespace the lane settled on go through as they are,
+    /// and the store counts as forwarded.
+    fn forward_stored(
+        &mut self,
+        blocks: Vec<common::KvBlock>,
+        parent: Option<BlockHash>,
+        tier: KvCacheTier,
+        locality: KvCacheLocality,
+        tail: EventTail,
+        namespace: Namespace,
+    ) -> kv_cache_event::Data {
+        self.counts.forwarded_stored += 1;
+        let EventTail {
+            medium,
+            group_idx,
+            kv_cache_spec_kind,
+            kv_cache_spec_sliding_window,
+            ownership,
+            session_id,
+            group_mask,
+            ..
+        } = tail;
+        kv_cache_event::Data::Stored(common::KvBlocksStored {
+            blocks,
+            parent_block_hash: parent.map(|hash| hash.0),
+            tier: Some(tier as i32),
+            medium,
+            group_idx,
+            kv_cache_spec_kind,
+            kv_cache_spec_sliding_window,
+            locality: Some(locality as i32),
+            ownership,
+            session_id,
+            lora_name: namespace.lora_name,
+            cache_salt: namespace.cache_salt,
+            group_mask,
+        })
+    }
+
+    /// A non-main group's store on a rank with a main group: its hashes,
+    /// parent and group fields go through, its tokens do not. The engine
+    /// writes such a store with the step's whole token span and only the
+    /// hashes the group retains, so the tokens are not a per-block list, and
+    /// the consumer keys the group's blocks by hash. The relay's own record
+    /// of the main lane (namespaces, copies, the hash check) is not touched.
+    fn forward_group_stored(
+        &mut self,
+        stored: WireStored,
+        tier: KvCacheTier,
+        locality: KvCacheLocality,
+        event_id: u64,
+    ) -> Result<kv_cache_event::Data, DropReason> {
+        if stored.block_hashes.is_empty() {
+            return Err(self.drop(DropReason::Placeholder, event_id));
+        }
+        {
+            let mut seen = HashSet::with_capacity(stored.block_hashes.len() + 1);
+            if let Some(parent) = stored.parent_block_hash {
+                seen.insert(parent.0);
+            }
+            if stored.block_hashes.iter().any(|hash| !seen.insert(hash.0)) {
+                return Err(self.drop(DropReason::SelfReferencingHashes, event_id));
+            }
+        }
+        let cache_level = cache_level_of(tier);
+        let block_size = i32::try_from(stored.block_size).unwrap_or(i32::MAX).max(0);
+        let blocks = stored
+            .block_hashes
+            .iter()
+            .map(|hash| common::KvBlock {
+                block_hash: hash.0,
+                token_ids: Vec::new(),
+                block_size,
+                lora_id: stored.lora_id,
+                cache_level,
+                extra_keys: Vec::new(),
+            })
+            .collect();
+        self.counts.group_stores += 1;
+        let namespace = Namespace {
+            lora_name: stored.lora_name.filter(|name| !name.is_empty()),
+            cache_salt: stored.cache_salt.filter(|salt| !salt.is_empty()),
+        };
+        Ok(self.forward_stored(
+            blocks,
+            stored.parent_block_hash,
+            tier,
+            locality,
+            stored.tail,
+            namespace,
+        ))
     }
 
     fn normalize_stored(
@@ -1034,8 +1157,12 @@ impl Normalizer {
         let Admitted {
             tier,
             locality,
-            window_only,
-        } = self.admit(&stored.tail, rank, event_id, true, &stored.block_hashes)?;
+            lane,
+        } = self.admit(&stored.tail, rank, event_id, true)?;
+        if lane == Lane::Group {
+            return self.forward_group_stored(stored, tier, locality, event_id);
+        }
+        let window_only = lane == Lane::WindowOnly;
         // A bigram page lists (token, next token) per position; its tokens
         // are the first elements and the page grid is unchanged. The pairs
         // stay around for the engine-hash check, which hashes both words.
@@ -1200,32 +1327,14 @@ impl Normalizer {
                     .unwrap_or_default(),
             })
             .collect();
-        self.counts.forwarded_stored += 1;
-        let EventTail {
-            medium,
-            group_idx,
-            kv_cache_spec_kind,
-            kv_cache_spec_sliding_window,
-            ownership,
-            session_id,
-            group_mask,
-            ..
-        } = stored.tail;
-        Ok(kv_cache_event::Data::Stored(common::KvBlocksStored {
+        Ok(self.forward_stored(
             blocks,
-            parent_block_hash: stored.parent_block_hash.map(|hash| hash.0),
-            tier: Some(tier as i32),
-            medium,
-            group_idx,
-            kv_cache_spec_kind,
-            kv_cache_spec_sliding_window,
-            locality: Some(locality as i32),
-            ownership,
-            session_id,
-            lora_name: namespace.lora_name,
-            cache_salt: namespace.cache_salt,
-            group_mask,
-        }))
+            stored.parent_block_hash,
+            tier,
+            locality,
+            stored.tail,
+            namespace,
+        ))
     }
 
     fn normalize_removed(
@@ -1237,23 +1346,31 @@ impl Normalizer {
         let Admitted {
             tier,
             locality,
-            window_only,
-        } = self.admit(&removed.tail, rank, event_id, false, &removed.block_hashes)?;
-        let mut block_hashes: Vec<i64> = removed.block_hashes.iter().map(|hash| hash.0).collect();
+            lane,
+        } = self.admit(&removed.tail, rank, event_id, false)?;
+        let block_hashes: Vec<i64> = removed.block_hashes.iter().map(|hash| hash.0).collect();
         if let Some(state) = self.ranks.get_mut(&rank) {
-            if window_only {
-                // Once the rank has a main group, a window group's removal
-                // reaches only the blocks forwarded while it had none.
-                if state.main_seen() {
-                    block_hashes.retain(|hash| state.window_forwarded.contains(hash));
+            // The relay's record follows the main lane. A window-only rank's
+            // removal names blocks forwarded as its main signal; once the rank
+            // has a main group, a group's removal touches the record only for
+            // the blocks forwarded while it had none.
+            let recorded: Vec<i64> = match lane {
+                Lane::Main => block_hashes.clone(),
+                Lane::WindowOnly => {
+                    for hash in &block_hashes {
+                        state.window_forwarded.remove(hash);
+                    }
+                    block_hashes.clone()
                 }
-                for hash in &block_hashes {
-                    state.window_forwarded.remove(hash);
-                }
-            }
+                Lane::Group => block_hashes
+                    .iter()
+                    .copied()
+                    .filter(|hash| state.window_forwarded.remove(hash))
+                    .collect(),
+            };
             if let Some(blocks_state) = state.tiers.get_mut(&(tier as i32)) {
                 // One physical copy goes; the record goes with the last.
-                for hash in &block_hashes {
+                for hash in &recorded {
                     if let Some(record) = blocks_state.get_mut(hash) {
                         record.copies = record.copies.saturating_sub(1);
                         if record.copies == 0 {
@@ -1262,6 +1379,9 @@ impl Normalizer {
                     }
                 }
             }
+        }
+        if lane == Lane::Group {
+            self.counts.group_removals += 1;
         }
         self.counts.forwarded_removed += 1;
         let EventTail {

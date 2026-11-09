@@ -34,6 +34,12 @@
 repeats = 3
 filter = "^stream_state_machines/"
 
+# The files that feed this binary beyond the measured crate: the base side is built with them as the
+# pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
+# gated rows through the binary's inlining (symphony.toml records the case). A new row goes to a
+# bench target of its own.
+sources = ["model_gateway/benches/stream_state_machines.rs"]
+
 [[gate]]
 pattern = "^stream_state_machines/"
 threshold = 0.20

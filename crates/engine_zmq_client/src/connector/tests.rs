@@ -685,6 +685,155 @@ async fn an_emptied_rank_sheds_its_stale_queue_counts() {
     }
 }
 
+/// The step's finished set is the union of the out-of-band finished list
+/// and the terminal outputs. A finish the engine reports out of band alone,
+/// with no output for the request in the step, ends the request's stream
+/// as the closed-stream error (no output said how it ended) and frees its
+/// slot on the rank.
+#[tokio::test]
+async fn an_out_of_band_finish_without_a_terminal_output_ends_the_request() {
+    let (client, mut engine, _ns) = connect().await;
+    let mut stream = client.submit(request_for("req-1", 0)).await.unwrap();
+    engine.recv_request().await.unwrap();
+
+    let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+        engine_index: 0,
+        outputs: Vec::new(),
+        finished_requests: Some(std::collections::BTreeSet::from(["req-1".to_string()])),
+        ..Default::default()
+    });
+    engine
+        .send_output(vec![Bytes::from(encode_msgpack(&outputs).unwrap())])
+        .await
+        .unwrap();
+
+    let end = tokio::time::timeout(TIMEOUT, stream.next())
+        .await
+        .expect("the out-of-band finish should end the stream");
+    assert!(
+        matches!(end, Some(Err(Error::RequestStreamClosed { .. }))),
+        "an out-of-band finish without an output closes the stream as an error: {end:?}"
+    );
+    assert!(stream.next().await.is_none());
+    assert!(
+        !client
+            .inner
+            .routing
+            .lock()
+            .inflight
+            .values()
+            .any(|ids| ids.contains("req-1")),
+        "the out-of-band finish should free the request's slot"
+    );
+}
+
+/// A terminal output names its request's finish by itself: with no
+/// out-of-band list in the step, the stream ends and the slot is freed all
+/// the same, and a request the step did not finish keeps its slot.
+#[tokio::test]
+async fn a_terminal_output_alone_frees_its_slot_and_no_other() {
+    let (client, mut engine, _ns) = connect().await;
+    let mut done = client.submit(request_for("done", 0)).await.unwrap();
+    let _held = client.submit(request_for("held", 0)).await.unwrap();
+    engine.recv_request().await.unwrap();
+    engine.recv_request().await.unwrap();
+
+    let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+        engine_index: 0,
+        outputs: vec![EngineCoreOutput {
+            request_id: "done".into(),
+            new_token_ids: vec![7],
+            finish_reason: Some(EngineCoreFinishReason::Stop),
+            ..Default::default()
+        }],
+        finished_requests: None,
+        ..Default::default()
+    });
+    engine
+        .send_output(vec![Bytes::from(encode_msgpack(&outputs).unwrap())])
+        .await
+        .unwrap();
+
+    let last = tokio::time::timeout(TIMEOUT, done.next())
+        .await
+        .expect("the terminal output should arrive")
+        .unwrap()
+        .unwrap();
+    assert!(last.finished());
+    assert!(
+        done.next().await.is_none(),
+        "the terminal output ends the stream"
+    );
+    let routing = client.inner.routing.lock();
+    assert!(
+        !routing.inflight.values().any(|ids| ids.contains("done")),
+        "the terminal output should free the request's slot"
+    );
+    assert!(
+        routing.inflight.values().any(|ids| ids.contains("held")),
+        "a request the step did not finish keeps its slot"
+    );
+}
+
+/// A finish named twice in one step, by a terminal output and by the
+/// out-of-band list, retires once; a finish for an id the client never
+/// submitted touches nothing.
+#[tokio::test]
+async fn a_finish_named_twice_or_for_a_stranger_retires_at_most_once() {
+    let (client, mut engines, _ns) = connect_ranks(2, false).await;
+    let mut twice = client.submit(request_for("twice", 0)).await.unwrap();
+    let _held = client.submit(request_for("held", 0)).await.unwrap();
+    engines[0].recv().await.unwrap();
+    engines[0].recv().await.unwrap();
+
+    let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+        engine_index: 0,
+        outputs: vec![EngineCoreOutput {
+            request_id: "twice".into(),
+            new_token_ids: vec![7],
+            finish_reason: Some(EngineCoreFinishReason::Stop),
+            ..Default::default()
+        }],
+        finished_requests: Some(std::collections::BTreeSet::from([
+            "twice".to_string(),
+            "stranger".to_string(),
+        ])),
+        ..Default::default()
+    });
+    engines[0]
+        .send_output(vec![Bytes::from(encode_msgpack(&outputs).unwrap())])
+        .await
+        .unwrap();
+    while tokio::time::timeout(TIMEOUT, twice.next())
+        .await
+        .expect("the stream should end")
+        .is_some()
+    {}
+
+    // Engine 0 still holds "held": an unpinned request goes to the idle
+    // engine 1. It would go to 0 if the second retirement, or the
+    // stranger's, had freed a slot the step never finished.
+    let _next = client
+        .submit(EngineCoreRequest {
+            request_id: "next".into(),
+            prompt_token_ids: Some(vec![1, 2, 3]),
+            ..EngineCoreRequest::default()
+        })
+        .await
+        .unwrap();
+    match tokio::time::timeout(TIMEOUT, engines[1].recv())
+        .await
+        .expect("request should route to the idle engine")
+        .unwrap()
+    {
+        EngineInbound::Add(request) => assert_eq!(request.request_id, "next"),
+        other => panic!("expected Add on engine 1, got {other:?}"),
+    }
+    let routing = client.inner.routing.lock();
+    assert!(!routing.inflight.values().any(|ids| ids.contains("twice")));
+    assert!(routing.inflight.values().any(|ids| ids.contains("held")));
+}
+
 #[tokio::test]
 async fn selection_and_release_race_without_deadlocking() {
     // Selection reads the reported load and the in-flight sets together;
@@ -826,24 +975,7 @@ async fn tokenspeed_client_submits_and_streams() {
         sampling::SamplingParams,
     };
 
-    let ns = IpcNamespace::new().unwrap();
-    let (handshake, input, output) = (
-        ns.handshake_endpoint(),
-        ns.input_endpoint(),
-        ns.output_endpoint(),
-    );
-    // Held for the test duration so the ipc files outlive the client.
-    let _ns = ns;
-    let (transport, engine) = tokio::join!(
-        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    let client = TokenSpeedClient::new(transport.unwrap());
-    let mut engine = engine.unwrap();
+    let (client, mut engine, _ns) = connect_wire::<TokenSpeedProtocol>().await;
 
     let request = TokenizedGenerateReqInput {
         rid: "ts-1".to_string(),
@@ -947,23 +1079,7 @@ async fn a_request_reported_at_intervals_counts_no_silence() {
     use crate::protocol::tokenspeed::{
         output::BatchTokenIDOutSlim, request::TokenizedGenerateReqInput, sampling::SamplingParams,
     };
-    let ns = IpcNamespace::new().unwrap();
-    let (handshake, input, output) = (
-        ns.handshake_endpoint(),
-        ns.input_endpoint(),
-        ns.output_endpoint(),
-    );
-    let _ns = ns;
-    let (transport, engine) = tokio::join!(
-        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    let client = TokenSpeedClient::new(transport.unwrap());
-    let mut engine = engine.unwrap();
+    let (client, mut engine, _ns) = connect_wire::<TokenSpeedProtocol>().await;
     let request =
         |rid: &str, input_ids: Vec<u32>, stream: bool, stream_interval| TokenizedGenerateReqInput {
             rid: rid.to_string(),
@@ -1074,23 +1190,7 @@ async fn an_sglang_request_reported_at_intervals_counts_no_silence() {
         request::{SglangRequest, TokenizedEmbeddingReqInput, TokenizedGenerateReqInput},
         sampling::SamplingParams,
     };
-    let ns = IpcNamespace::new().unwrap();
-    let (handshake, input, output) = (
-        ns.handshake_endpoint(),
-        ns.input_endpoint(),
-        ns.output_endpoint(),
-    );
-    let _ns = ns;
-    let (transport, engine) = tokio::join!(
-        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    let client = SglangClient::new(transport.unwrap());
-    let mut engine = engine.unwrap();
+    let (client, mut engine, _ns) = connect_wire::<SglangProtocol>().await;
     let generate = |rid: &str, input_ids: Vec<u32>, stream: bool, stream_interval| {
         SglangRequest::Generate(TokenizedGenerateReqInput {
             rid: rid.to_string(),
@@ -3024,25 +3124,7 @@ use crate::protocol::tokenspeed::request::TokenizedGenerateReqInput as TaggedWir
 
 /// A client of that protocol over the same mock engine.
 async fn connect_tagged() -> (TokenSpeedClient, MockEngine, IpcNamespace) {
-    let ns = IpcNamespace::new().unwrap();
-    let (handshake, input, output) = (
-        ns.handshake_endpoint(),
-        ns.input_endpoint(),
-        ns.output_endpoint(),
-    );
-    let (transport, engine) = tokio::join!(
-        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    (
-        TokenSpeedClient::new(transport.unwrap()),
-        engine.unwrap(),
-        ns,
-    )
+    connect_wire::<TokenSpeedProtocol>().await
 }
 
 /// A request of that wire with a 64 MiB typed feature tensor.

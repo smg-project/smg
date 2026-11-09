@@ -43,6 +43,7 @@ const PLAIN: &[&str] = &[
     "header_read_timeout_secs",
     "idle_connection_timeout_secs",
     "max_connections",
+    "admin_max_connections",
     "request_timeout_secs",
     "grpc_request_timeout_secs",
     "sse_keepalive_secs",

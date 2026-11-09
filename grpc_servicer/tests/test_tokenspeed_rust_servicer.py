@@ -284,6 +284,66 @@ def test_the_launcher_lists_the_flag_ahead_of_tokenspeeds_help(launcher, capsys)
     assert raised.value.code == 2 and calls["argv"] is None
 
 
+def test_engine_metrics_flags_reach_both_servicer_implementations(launcher, monkeypatch):
+    module, calls = launcher
+    monkeypatch.delenv(rust.METRICS_PORT_ENV, raising=False)
+    monkeypatch.delenv(rust.METRICS_HOST_ENV, raising=False)
+    argv = [
+        "--model",
+        "org/m",
+        "--enable-metrics",
+        "--metrics-port",
+        "29100",
+        "--metrics-host",
+        "::1",
+    ]
+
+    with pytest.raises(SystemExit) as raised:
+        module.main(argv)
+    assert raised.value.code == 3 and calls["served"][0] == "rust"
+    assert calls["argv"] == argv
+    engine_args = argparse.Namespace(
+        host="127.0.0.1", port=50051, metrics_port=29100, metrics_host="::1"
+    )
+    assert rust.TokenSpeedLauncher().metrics_bind_address(engine_args) is None
+
+    module.main(["--servicer-impl=python", *argv])
+    assert calls["served"][0] == "python"
+    assert calls["argv"] == argv
+
+
+def test_servicer_metrics_flags_override_only_the_servicer_environment(
+    launcher, monkeypatch, caplog
+):
+    module, calls = launcher
+    monkeypatch.setenv(rust.METRICS_PORT_ENV, "29101")
+    monkeypatch.setenv(rust.METRICS_HOST_ENV, "127.0.0.2")
+    engine_argv = ["--model", "org/m", "--metrics-port", "29100", "--metrics-host", "127.0.0.1"]
+    argv = ["--servicer-metrics-port", "29102", "--servicer-metrics-host", "::1", *engine_argv]
+
+    with pytest.raises(SystemExit) as raised:
+        module.main(argv)
+    assert raised.value.code == 3 and calls["served"][0] == "rust"
+    assert calls["argv"] == engine_argv
+    engine_args = argparse.Namespace(
+        host="127.0.0.1", port=50051, metrics_port=29100, metrics_host="127.0.0.1"
+    )
+    rust_launcher = rust.TokenSpeedLauncher()
+    assert rust_launcher.metrics_bind_address(engine_args) == "[::1]:29102"
+
+    calls["served"] = None
+    with pytest.raises(SystemExit) as raised:
+        module.main(["--servicer-impl=python", *argv])
+    assert raised.value.code == 2 and calls["served"] is None
+    assert "--servicer-metrics-port" in caplog.text
+
+    monkeypatch.setenv(rust.METRICS_PORT_ENV, "50051")
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="--servicer-metrics-port=50051"):
+        rust_launcher.metrics_bind_address(engine_args)
+    monkeypatch.setenv(rust.METRICS_PORT_ENV, "0")
+    assert rust_launcher.metrics_bind_address(engine_args) == "[::1]:0"
+
+
 def test_model_facts_mirror_the_python_servicer(monkeypatch):
     _stub_servicer_module(monkeypatch, modalities=(1, 3))
     model_config = SimpleNamespace(

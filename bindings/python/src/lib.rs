@@ -50,25 +50,6 @@ pub enum PolicyType {
     PrefixHash,
 }
 
-impl PolicyType {
-    /// The name the CLI's policy flags take for this policy, for a message
-    /// that reads the same from the binary and from here.
-    fn cli_name(&self) -> &'static str {
-        match self {
-            Self::Random => "random",
-            Self::RoundRobin => "round_robin",
-            Self::Passthrough => "passthrough",
-            Self::CacheAware => "cache_aware",
-            Self::PowerOfTwo => "power_of_two",
-            Self::LeastLoad => "least_load",
-            Self::Bucket => "bucket",
-            Self::Manual => "manual",
-            Self::ConsistentHashing => "consistent_hashing",
-            Self::PrefixHash => "prefix_hash",
-        }
-    }
-}
-
 #[pyclass(eq, from_py_object)]
 #[derive(Clone, PartialEq, Debug)]
 pub enum BackendType {
@@ -522,6 +503,7 @@ struct Router {
     /// The optional fields of the access-log record.
     access_log_fields: Vec<String>,
     admin_host: Option<String>,
+    admin_max_connections: usize,
     admin_port: Option<u16>,
     api_key: Option<String>,
     assignment_mode: Option<String>,
@@ -1056,19 +1038,17 @@ impl Router {
         };
 
         // The encode side takes the three policies the CLI's `--encode-policy`
-        // takes. The CLI refuses the others at the flag and the launcher at
-        // parse time; the binding refuses them here, before anything binds.
-        if let Some(policy) = &self.encode_policy {
-            if !matches!(
-                policy,
-                PolicyType::Random | PolicyType::RoundRobin | PolicyType::ConsistentHashing
-            ) {
-                return Err(config::ConfigError::InvalidValue {
-                    field: "encode_policy".to_string(),
-                    value: policy.cli_name().to_string(),
-                    reason: "expected random, round_robin or consistent_hashing".to_string(),
-                });
-            }
+        // takes; the shared validator holds the one list and reads the encode
+        // policy in EPD mode. It is asked here before anything binds, for an
+        // encode policy given outside EPD as well. Converted once: the EPD arm
+        // below takes this value.
+        let encode_policy = self
+            .encode_policy
+            .as_ref()
+            .map(convert_policy)
+            .transpose()?;
+        if let Some(policy) = &encode_policy {
+            config::validate_encode_policy(policy)?;
         }
 
         // IGW selects routers per request; it does not change which configured
@@ -1084,11 +1064,7 @@ impl Router {
                 encode_urls: self.encode_urls.clone().unwrap_or_default(),
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
-                encode_policy: self
-                    .encode_policy
-                    .as_ref()
-                    .map(convert_policy)
-                    .transpose()?,
+                encode_policy,
                 prefill_policy: self
                     .prefill_policy
                     .as_ref()
@@ -1378,6 +1354,7 @@ impl Router {
             .header_read_timeout_secs(self.header_read_timeout_secs)
             .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
             .max_connections(self.max_connections)
+            .admin_max_connections(self.admin_max_connections)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
@@ -1437,6 +1414,7 @@ impl Router {
         *,
         access_log_fields = vec![],
         admin_host = None,
+        admin_max_connections = 0,
         admin_port = None,
         api_key = None,
         assignment_mode = None,
@@ -1658,6 +1636,7 @@ impl Router {
         // Keyword-only, in the signature's order (pyo3 wants the two orders to agree).
         access_log_fields: Vec<String>,
         admin_host: Option<String>,
+        admin_max_connections: usize,
         admin_port: Option<u16>,
         api_key: Option<String>,
         assignment_mode: Option<String>,
@@ -1915,6 +1894,7 @@ impl Router {
             port,
             access_log_fields,
             admin_host,
+            admin_max_connections,
             admin_port,
             api_key,
             assignment_mode,
@@ -2272,6 +2252,10 @@ impl Router {
                 // The launcher resolved the secrets' sources in Python; the
                 // record is the CLI's.
                 secret_sources: Default::default(),
+                secret_files: Default::default(),
+                // No file path reaches the binding yet, so there is nothing
+                // to watch; the flag follows with the paths.
+                secrets_auto_reload: false,
             }))
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))

@@ -1017,7 +1017,7 @@ mod tests {
     #[tokio::test]
     async fn an_engine_that_refuses_the_connection_leaves_registration_empty_and_fails_a_strict_read(
     ) {
-        use crate::test_support::RefusedAddress;
+        use crate::worker::test_support::RefusedAddress;
 
         let refused = RefusedAddress::reserve();
         let base = refused.http_url();
@@ -1212,7 +1212,7 @@ mod tests {
     /// named, strict or not.
     #[tokio::test]
     async fn an_engine_that_refuses_the_connection_fails_the_grpc_read_at_the_dial() {
-        use crate::test_support::RefusedAddress;
+        use crate::worker::test_support::RefusedAddress;
 
         let refused = RefusedAddress::reserve();
         let url = format!("grpc://{}", refused.addr());

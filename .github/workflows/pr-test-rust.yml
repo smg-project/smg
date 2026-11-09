@@ -241,6 +241,15 @@ jobs:
       - name: Install wheel
         run: pip install dist/*.whl
 
+      # The chart tests in bindings/python/tests/test_helm_chart_args.py render
+      # the chart and skip without helm. With helm here they run on every pull
+      # request, so a template edit that breaks one fails this job. The
+      # version is the chart workflow's (pr-helm.yml).
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.17.0
+
       - name: Run Python unit tests
         run: |
           cd bindings/python
@@ -1023,7 +1032,6 @@ jobs:
               (".github/actions/setup-trtllm/**",                TRTLLM),
               (".github/actions/setup-tokenspeed/**",            TOKENSPEED),
               (".github/actions/setup-gh/**",                    NONE),
-              (".github/actions/export-pod-api-key/**",          NONE),
               (".github/actions/publish-crate/**",               NONE),
               (".github/actions/**",                             FULL),
               (".github/versions/tokenspeed.ref",                TOKENSPEED),
@@ -1101,6 +1109,7 @@ jobs:
               # registration workflow, the server and the entry points every lane
               ("model_gateway/tests/**",                         NONE),
               ("model_gateway/test_harness/**",                  NONE),
+              ("model_gateway/src/routers/grpc/tokenizer_cache/**", NONE),
               ("model_gateway/benches/**",                       NONE),
               ("model_gateway/src/endpoints/responses/**",       "agentic vendor"),
               ("model_gateway/src/endpoints/conversations/**",   "agentic vendor"),

@@ -738,3 +738,15 @@ class TestTheRouterRefusesWhatTheCliRefuses:
         with pytest.raises(ValueError, match=re.escape("Invalid value for field 'port'")) as info:
             self.epd_router(encode_policy=self.ENCODE_ACCEPTED[name], port=0).start()
         assert "encode_policy" not in str(info.value)
+
+    def test_an_unsupported_encode_policy_outside_epd_is_refused(self):
+        # The shared validator reads the encode policy in EPD mode only; the
+        # binding asks it before anything binds, so the refusal reads the same
+        # without `epd_disaggregation`. `port=0` is the refusal that would
+        # arrive instead if the encode policy passed, so nothing binds either way.
+        refusal = (
+            "Invalid value for field 'encode_policy': cache_aware"
+            " - expected random, round_robin or consistent_hashing"
+        )
+        with pytest.raises(ValueError, match=re.escape(refusal)):
+            self.router(encode_policy=PolicyType.CacheAware, port=0).start()

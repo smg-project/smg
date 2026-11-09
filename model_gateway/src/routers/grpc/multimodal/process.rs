@@ -574,17 +574,15 @@ async fn cached_images(
     {
         return Ok(None);
     }
-    let mut config = serde_json::json!({
+    let config = serde_json::json!({
         "model_id": ctx.model_id,
         "model_type": ctx.model_type,
-        "model_config": ctx.model_config.config,
         "preprocessor_config": preprocessor_config_for(ctx.model_config, Modality::Image),
         // A one-pass result is only right for its own wire.
         "image_wire_dtype": ctx.image_wire_dtype.map(|dtype| dtype.to_string()),
         "transparency": ctx.transparency,
     });
-    config.sort_all_objects();
-    let fingerprint = config_fingerprint(ctx.tokenizer_id, &config);
+    let fingerprint = config_fingerprint(ctx.tokenizer_id, &config, &ctx.model_config.config)?;
     // Deduplicate within the request even if the result cannot fit
     // in the cache. Record every position before scheduling work.
     let mut unique = HashMap::new();
@@ -629,7 +627,7 @@ async fn cached_images(
         .encoder_field_layouts_for(Modality::Image)
         .model_specific;
     let image_count = images.len();
-    tokio::task::spawn_blocking(move || -> Result<_> {
+    on_pool(ctx.model_id, move || -> Result<_> {
         let mut ordered = vec![None; image_count];
         for (part, positions) in parts.into_iter().zip(positions) {
             let (&last, repeats) = positions
@@ -644,12 +642,52 @@ async fn cached_images(
             .into_iter()
             .collect::<Option<Vec<_>>>()
             .context("Missing image output position")?;
-        PreprocessedEncoderInputs::concat(parts, &layouts)
+        PreprocessedEncoderInputs::concat_refs(
+            &parts
+                .iter()
+                .map(|part| &part.preprocessed)
+                .collect::<Vec<_>>(),
+            &layouts,
+        )
     })
     .await
     .context("Image batch assembly task panicked")?
     .context("Image batch assembly failed")
     .map(Some)
+}
+
+/// `work` on the blocking pool, with the time its task waited in the pool's
+/// queue (the gap between the spawn and the closure's first instruction)
+/// recorded as the `pool_queue` stage of `model_id`: one observation per
+/// task, so a burst that queues behind the pool's threads is seen as waiting,
+/// apart from the work itself.
+async fn on_pool<T: Send + 'static>(
+    model_id: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<T, tokio::task::JoinError> {
+    let model = Metrics::interned_model_label(model_id);
+    on_pool_recording(work, move |waited| {
+        Metrics::record_mm_processing_stage(&model, "pool_queue", waited);
+    })
+    .await
+}
+
+/// `work` on the blocking pool; `record` takes the seconds its task waited
+/// for a pool thread, measured at the closure's first instruction on that
+/// thread. The record happens there and not on the awaiting side, so a task
+/// whose request was dropped while it queued, or whose work panics, still
+/// records its wait: under a burst those are the long tail this stage is
+/// for.
+async fn on_pool_recording<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+    record: impl FnOnce(f64) + Send + 'static,
+) -> std::result::Result<T, tokio::task::JoinError> {
+    let queued_at = Instant::now();
+    tokio::task::spawn_blocking(move || {
+        record(queued_at.elapsed().as_secs_f64());
+        work()
+    })
+    .await
 }
 
 /// The whole batch preprocessed on the blocking pool: the CPU-intensive
@@ -690,7 +728,7 @@ async fn preprocess_batch(
     };
     let image_wire_dtype = ctx.image_wire_dtype;
 
-    tokio::task::spawn_blocking(move || match media_for_preprocess {
+    on_pool(ctx.model_id, move || match media_for_preprocess {
         MediaBatch::Images(images) => {
             // Decode every frame first, in parallel on the preprocessing
             // pool, rather than one photo after another on this thread.
@@ -818,18 +856,19 @@ async fn preprocess_image_cached(
     model_id: String,
     fingerprint: u64,
     image_wire_dtype: Option<EncoderDtype>,
-) -> Result<PreprocessedEncoderInputs> {
+) -> Result<Arc<CachedPreprocessedItem>> {
     let key = PixelCacheKey {
         image_hash: image.hash.clone(),
         config_fingerprint: fingerprint,
     };
     if let Some(cached) = cache.get(&key) {
         Metrics::record_mm_pixel_cache_lookup(&model_id, true);
-        return Ok(cached.preprocessed.clone());
+        return Ok(cached);
     }
     Metrics::record_mm_pixel_cache_lookup(&model_id, false);
 
     let preprocessed = preprocess_image_batch(
+        &model_id,
         vision_processors,
         std::slice::from_ref(&image),
         image_wire_dtype,
@@ -839,22 +878,19 @@ async fn preprocess_image_cached(
     // dtype was resolved (twice the neutral bytes at the half widths, four
     // times at float32, against the same budget), so a hit skips the write
     // pass; the neutral patches otherwise.
-    cache.insert(
-        key,
-        Arc::new(CachedPreprocessedItem {
-            preprocessed: preprocessed.clone(),
-        }),
-    );
-    Ok(preprocessed)
+    let cached = Arc::new(CachedPreprocessedItem { preprocessed });
+    cache.insert(key, cached.clone());
+    Ok(cached)
 }
 
 async fn preprocess_image_batch(
+    model_id: &str,
     vision_processors: Arc<VisionProcessors>,
     images: &[Arc<ImageFrame>],
     image_wire_dtype: Option<EncoderDtype>,
 ) -> Result<PreprocessedEncoderInputs> {
     let images = images.to_vec();
-    tokio::task::spawn_blocking(move || {
+    on_pool(model_id, move || {
         // Borrowed from the frames' own cells, as the batch path borrows them.
         let decoded: Vec<&image::DynamicImage> = images
             .iter()
@@ -1094,6 +1130,108 @@ mod tests {
     };
 
     use super::*;
+    use crate::observability::metrics::test_support::global_recorder;
+
+    /// The queue wait is measured on the pool thread before the work and
+    /// recorded there: a task behind the one held thread records a wait of
+    /// at least the hold, and a task whose awaiting future was dropped while
+    /// it queued records its wait all the same.
+    #[test]
+    fn the_pool_queue_wait_is_recorded_on_the_pool_thread() {
+        use std::{collections::BTreeMap, future::Future, task::Poll};
+
+        use tokio::sync::mpsc;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let (tx, mut rx) = mpsc::unbounded_channel::<(&'static str, f64)>();
+            let hold = tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            });
+            // Polled once, so its task is queued behind the hold, then dropped.
+            let dropped_tx = tx.clone();
+            let mut dropped = Box::pin(on_pool_recording(
+                || (),
+                move |waited| {
+                    let _ = dropped_tx.send(("dropped", waited));
+                },
+            ));
+            std::future::poll_fn(|cx| {
+                let _ = dropped.as_mut().poll(cx);
+                Poll::Ready(())
+            })
+            .await;
+            drop(dropped);
+            // Its work takes 300 ms: a wait read before the work stays near
+            // the 50 ms hold, one read after it would pass 300 ms.
+            let awaited_tx = tx.clone();
+            let value = on_pool_recording(
+                || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    7
+                },
+                move |waited| {
+                    let _ = awaited_tx.send(("awaited", waited));
+                },
+            )
+            .await
+            .expect("the work ran");
+            assert_eq!(value, 7);
+            hold.await.expect("the hold ran");
+            drop(tx);
+            let mut seen = BTreeMap::new();
+            while let Some((who, waited)) = rx.recv().await {
+                seen.insert(who, waited);
+            }
+            for who in ["awaited", "dropped"] {
+                let waited = seen
+                    .get(who)
+                    .unwrap_or_else(|| panic!("{who}: no wait recorded"));
+                assert!(
+                    *waited >= 0.02,
+                    "{who}: waited {waited} s behind a 50 ms hold"
+                );
+            }
+            let awaited = seen["awaited"];
+            assert!(
+                awaited < 0.25,
+                "the wait was read before the work, not after: {awaited} s"
+            );
+        });
+    }
+
+    /// The production wiring: `on_pool` records the wait as the `pool_queue`
+    /// stage of the model's histogram. The record happens on the pool thread,
+    /// so the test reads the binary's one process-wide recorder
+    /// (`test_support::global_recorder`), which the local recorders of the
+    /// other tests take precedence over on their threads.
+    #[test]
+    fn the_pool_queue_stage_is_recorded_under_the_models_label() {
+        let handle = global_recorder();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let value = runtime
+            .block_on(on_pool("the-pool-queue-model", || 11))
+            .expect("the work ran");
+        assert_eq!(value, 11);
+        let rendered = handle.render();
+        let counted = rendered.lines().any(|line| {
+            line.starts_with("smg_mm_processing_seconds_count{")
+                && line.contains("model=\"the-pool-queue-model\"")
+                && line.contains("stage=\"pool_queue\"")
+                && line.rsplit(' ').next().and_then(|n| n.parse::<u64>().ok()) >= Some(1)
+        });
+        assert!(
+            counted,
+            "no pool_queue count under the model in:\n{rendered}"
+        );
+    }
 
     #[test]
     fn decoded_video_sample_fps_overrides_processor_default() {

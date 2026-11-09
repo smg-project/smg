@@ -1098,25 +1098,88 @@ impl Series {
 /// then the rest ([`OTHER_TABLE`]), then the series of a request no table reads ([`NO_TABLE`]).
 static SERIES: OnceLock<Vec<Series>> = OnceLock::new();
 
-/// The series of the table labelled `table`.
-fn series(table: &'static str) -> &'static Series {
-    let all = SERIES.get_or_init(|| {
-        Table::ALL
-            .iter()
-            .map(|table| table.name())
-            .chain([TEMPLATE, OTHER_TABLE, NO_TABLE])
-            .map(Series::new)
-            .collect()
-    });
-    let index = Table::ALL
+#[cfg(test)]
+thread_local! {
+    /// The series this thread reads in place of [`SERIES`] while a test holds an
+    /// [`OwnSeries`]: by the index a name resolves to in [`SERIES`], so an unregistered name
+    /// folds onto [`OTHER_TABLE`] here as it does there; built on first use and kept for the
+    /// process's life as the shared ones are (a key's address names its kept counter).
+    static OWN_SERIES: RefCell<Option<HashMap<usize, &'static Series>>> =
+        const { RefCell::new(None) };
+}
+
+/// The label of every series, in the order of [`SERIES`]: the registry's tables, then the
+/// template's format, the rest ([`OTHER_TABLE`]) and the request no table reads ([`NO_TABLE`]).
+fn series_labels() -> impl Iterator<Item = &'static str> {
+    Table::ALL
+        .iter()
+        .map(|table| table.name())
+        .chain([TEMPLATE, OTHER_TABLE, NO_TABLE])
+}
+
+/// Where the series of the table labelled `table` stands in [`SERIES`]: a name that is no
+/// table's, the template's or the no-table label stands with the rest.
+fn series_index(table: &'static str) -> usize {
+    Table::ALL
         .iter()
         .position(|candidate| candidate.name() == table)
         .unwrap_or_else(|| match table {
             TEMPLATE => Table::ALL.len(),
             NO_TABLE => Table::ALL.len() + 2,
             _ => Table::ALL.len() + 1,
-        });
+        })
+}
+
+/// The series of the table labelled `table`: the thread's own while a test holds them
+/// (`own_series`), else the shared ones; both resolve the name the same way.
+fn series(table: &'static str) -> &'static Series {
+    let index = series_index(table);
+    #[cfg(test)]
+    if let Some(own) = OWN_SERIES.with_borrow_mut(|own| {
+        own.as_mut().map(|own| {
+            *own.entry(index).or_insert_with(|| {
+                let label = series_labels().nth(index).expect("a label per series");
+                Box::leak(Box::new(Series::new(label)))
+            })
+        })
+    }) {
+        return own;
+    }
+    let all = SERIES.get_or_init(|| series_labels().map(Series::new).collect());
     &all[index]
+}
+
+/// For tests: the series this thread reads are its own until the guard drops, so the lines a
+/// scrape writes take from buckets no other test of the binary drains or fills. The counters
+/// were a test's own already, its recorder being a local one; the buckets of the shared series
+/// were not. A guard taken under another sees the same series.
+#[cfg(test)]
+pub(crate) fn own_series() -> OwnSeries {
+    let owner = OWN_SERIES.with_borrow_mut(|own| {
+        let first = own.is_none();
+        if first {
+            *own = Some(HashMap::new());
+        }
+        first
+    });
+    OwnSeries { owner }
+}
+
+/// The guard of [`own_series`]: the shared series are read again once the guard that made
+/// the thread's own drops.
+#[cfg(test)]
+#[must_use = "the series are the thread's own only while the guard lives"]
+pub(crate) struct OwnSeries {
+    owner: bool,
+}
+
+#[cfg(test)]
+impl Drop for OwnSeries {
+    fn drop(&mut self) {
+        if self.owner {
+            OWN_SERIES.with_borrow_mut(|own| *own = None);
+        }
+    }
 }
 
 /// A token bucket for one table's lines: a burst, then a steady rate; the lines it refuses are
@@ -2778,6 +2841,135 @@ mod tests {
                 None => Err("the undeclared-call flow suppressed the malformed line".to_string()),
             }
         });
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_scrape_takes_its_lines_from_series_of_its_own() {
+        // One scrape drains a table's bucket for a reason; the next scrape's first line of that
+        // reason, on the same table, is written and counts no suppressed line: the series are
+        // the scrape's own, not the binary's, so a flow in one test starves no other.
+        let flow: u32 = 40;
+        rendered(|| {
+            for choice in 0..flow {
+                let mut tally = Tally::default();
+                tally.see(
+                    &malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
+                    false,
+                );
+                tally.see(&finished(FinishReason::Stop), false);
+                tally.report(
+                    "qwen3",
+                    Who {
+                        request_id: "req-flow-of-another-scrape",
+                        model: "m",
+                        choice,
+                    },
+                );
+            }
+        });
+        rendered(|| {
+            let mut tally = Tally::default();
+            tally.see(
+                &malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
+                false,
+            );
+            tally.see(&finished(FinishReason::Stop), false);
+            tally.report(
+                "qwen3",
+                Who {
+                    request_id: "req-after-another-scrape",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        logs_assert(|lines: &[&str]| {
+            let written = lines
+                .iter()
+                .filter(|line| line.contains("req-flow-of-another-scrape"))
+                .count();
+            if written >= flow as usize {
+                return Err(format!(
+                    "no line of the flow was suppressed: {written} written"
+                ));
+            }
+            match lines
+                .iter()
+                .find(|line| line.contains("req-after-another-scrape"))
+            {
+                Some(line) if line.contains("suppressed_lines=0") => Ok(()),
+                Some(line) => Err(format!(
+                    "the line counts the other scrape's suppressed lines: {line}"
+                )),
+                None => Err("the other scrape's flow suppressed the line".to_string()),
+            }
+        });
+    }
+
+    #[test]
+    fn the_own_series_fold_an_unregistered_name_as_the_shared_ones_do() {
+        // Under the guard a name that is no table's reads the own series of the rest, labelled
+        // as the shared path labels it: a test sees the label production writes.
+        let _own = own_series();
+        let rest = series(OTHER_TABLE);
+        assert!(std::ptr::eq(series("markers"), rest));
+        assert!(std::ptr::eq(series("made-up"), rest));
+        assert!(!std::ptr::eq(series(Table::ALL[0].name()), rest));
+        assert!(rest.outputs[CLEAN]
+            .labels()
+            .any(|label| label.key() == "table" && label.value() == OTHER_TABLE));
+    }
+
+    #[test]
+    fn json_lines_take_their_lines_from_series_of_their_own() {
+        // The isolation `a_scrape_takes_its_lines_from_series_of_its_own` pins, through the
+        // log-line helper: a flow in one call's closure drains a table's bucket, the next call's
+        // one line is written and counts no suppressed line.
+        let flow: u32 = 40;
+        let drained = json_lines(|| {
+            for choice in 0..flow {
+                let mut tally = Tally::default();
+                tally.see(
+                    &malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
+                    false,
+                );
+                tally.see(&finished(FinishReason::Stop), false);
+                tally.report(
+                    "qwen3",
+                    Who {
+                        request_id: "req-flow-of-another-call",
+                        model: "m",
+                        choice,
+                    },
+                );
+            }
+        });
+        assert!(
+            drained.len() < flow as usize,
+            "no line of the flow was suppressed"
+        );
+        let after = json_lines(|| {
+            let mut tally = Tally::default();
+            tally.see(
+                &malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
+                false,
+            );
+            tally.see(&finished(FinishReason::Stop), false);
+            tally.report(
+                "qwen3",
+                Who {
+                    request_id: "req-after-another-call",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        let line = after
+            .iter()
+            .find(|line| line.to_string().contains("req-after-another-call"))
+            .expect("the line after the other call's flow");
+        assert_eq!(line["suppressed_lines"], 0, "{line}");
     }
 
     /// A table's failure classes exist at zero from the moment the table is published, so an

@@ -111,6 +111,7 @@ pub fn create_test_app(
         mesh_handler: None,
         mesh_adapters: None,
         secret_sources: Default::default(),
+        secrets: None,
     });
 
     // Configure request ID headers (use defaults if not specified)
@@ -189,6 +190,17 @@ pub fn create_test_apps_with_context(
     build_test_apps(router, app_context, None, admin_listener)
 }
 
+/// The production routers with initialized control-plane auth: the data
+/// listener's and, with `admin_listener`, the admin listener's.
+pub fn create_test_apps_with_context_and_auth(
+    router: Arc<dyn RouterTrait>,
+    app_context: Arc<AppContext>,
+    control_plane_auth: Option<smg_auth::ControlPlaneAuthState>,
+    admin_listener: bool,
+) -> GatewayApps {
+    build_test_apps(router, app_context, control_plane_auth, admin_listener)
+}
+
 fn build_test_apps(
     router: Arc<dyn RouterTrait>,
     app_context: Arc<AppContext>,
@@ -205,6 +217,7 @@ fn build_test_apps(
         mesh_handler: None,
         mesh_adapters: None,
         secret_sources: Default::default(),
+        secrets: None,
     });
 
     // Get config from the context

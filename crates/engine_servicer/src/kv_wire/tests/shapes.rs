@@ -470,6 +470,8 @@ struct WantCounts {
     cleared: u64,
     duplicate_stores: u64,
     bigram_stores: u64,
+    group_stores: u64,
+    group_removals: u64,
     dropped: BTreeMap<&'static str, u64>,
 }
 
@@ -542,11 +544,14 @@ fn check(scenario: &Scenario, batches: &[KvEventBatch], counts: &Counts) {
                 assert_eq!(got_tokens, want.tokens, "{at}: tokens");
                 for block in &stored.blocks {
                     assert_eq!(block.cache_level, want.cache_level, "{at}: cache_level");
-                    assert_eq!(
-                        block.block_size as usize,
-                        block.token_ids.len(),
-                        "{at}: block_size"
-                    );
+                    // A group lane's block carries no tokens; its width is
+                    // the engine's block size as published.
+                    let width = if block.token_ids.is_empty() {
+                        BLOCK_SIZE as usize
+                    } else {
+                        block.token_ids.len()
+                    };
+                    assert_eq!(block.block_size as usize, width, "{at}: block_size");
                 }
                 assert_eq!(
                     stored.lora_name.as_deref(),
@@ -621,6 +626,11 @@ fn check(scenario: &Scenario, batches: &[KvEventBatch], counts: &Counts) {
         counts.bigram_stores, want.bigram_stores,
         "{name}: bigram_stores"
     );
+    assert_eq!(
+        (counts.group_stores, counts.group_removals),
+        (want.group_stores, want.group_removals),
+        "{name}: group lane"
+    );
     let dropped: BTreeMap<&'static str, u64> = counts
         .dropped
         .iter()
@@ -667,7 +677,7 @@ fn vllm(layout: Layout) -> Scenario {
             }
             .wire(layout),
             // Sliding-window group: more tokens than hashes x block size, no
-            // hashes at all. Dropped by the group gate.
+            // hashes at all. Nothing to forward: a placeholder.
             VllmStored {
                 group_idx: Some(1),
                 spec_kind: Some("sliding_window"),
@@ -676,9 +686,9 @@ fn vllm(layout: Layout) -> Scenario {
             }
             .wire(layout),
             // The same group's usual shape: token_ids span the whole computed
-            // range and block_hashes name only the window's last blocks, so
-            // the hashes belong to the tail of the tokens. Dropped whole by
-            // the group gate, never sliced from the head.
+            // range and block_hashes name only the window's last blocks.
+            // Forwarded on the group's lane with its hashes and no tokens,
+            // never sliced from the head.
             VllmStored {
                 group_idx: Some(1),
                 spec_kind: Some("sliding_window"),
@@ -703,6 +713,10 @@ fn vllm(layout: Layout) -> Scenario {
                 vec![e("a"), e("b")],
                 vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]],
             )
+        }),
+        Want::Stored(WantStored {
+            group_idx: Some(1),
+            ..WantStored::device(vec![e("k")], vec![Vec::new()])
         }),
         Want::Stored(WantStored {
             parent: Some(e("b")),
@@ -878,14 +892,15 @@ fn vllm(layout: Layout) -> Scenario {
         batches,
         want,
         counts: WantCounts {
-            stored: 8,
+            stored: 9,
             removed: 3,
             cleared: 1,
             duplicate_stores: 1,
             bigram_stores: 0,
+            group_stores: 1,
+            group_removals: 0,
             dropped: [
-                ("non_main_attention_group", 2),
-                ("placeholder", 1),
+                ("placeholder", 2),
                 ("non_local_locality", 1),
                 ("unsupported_ownership", 1),
                 ("unknown_medium", 1),
@@ -1094,6 +1109,8 @@ fn sglang(layout: Layout) -> Scenario {
             cleared: 1,
             duplicate_stores: 0,
             bigram_stores: 1,
+            group_stores: 0,
+            group_removals: 0,
             dropped: [("unknown_type", 1)].into_iter().collect(),
         },
     }
@@ -1197,6 +1214,14 @@ fn index(batches: &[KvEventBatch]) -> ReferenceIndexer {
 
 fn apply_stored(indexer: &mut ReferenceIndexer, worker: u32, stored: &KvBlocksStored) {
     if !device_tier(stored.tier) {
+        return;
+    }
+    // A group lane's store is the gateway's group memberships, not a chain.
+    if stored
+        .kv_cache_spec_kind
+        .as_deref()
+        .is_some_and(|kind| !super::super::MAIN_ATTENTION_KINDS.contains(&kind))
+    {
         return;
     }
     let seed = namespace_seed(stored.lora_name.as_deref(), stored.cache_salt.as_deref());

@@ -264,8 +264,7 @@ mod tests {
     use crate::{
         observability::metrics::metrics_labels,
         routers::common::kv_transfer::{kv_connector_mode, KvConnectorMode},
-        test_support::RefusedAddress,
-        worker::BasicWorkerBuilder,
+        worker::{test_support::RefusedAddress, BasicWorkerBuilder},
     };
 
     /// A worker of one type and runtime, with the connector and the

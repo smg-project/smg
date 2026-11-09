@@ -503,7 +503,10 @@ fn cleared_map() -> Value {
 mod tests {
     use std::time::Duration;
 
-    use engine_servicer::kv_wire::{DropReason, Normalizer, WireBatch};
+    use engine_servicer::kv_wire::{Normalizer, WireBatch};
+
+    /// A relayed store as the hybrid-batch test reads it: the group and the (hash, token count) of every block.
+    type RelayedStore = (Option<u32>, Vec<(i64, usize)>);
     use tokio::time::timeout;
     use zeromq::{DealerSocket, SubSocket};
 
@@ -785,11 +788,12 @@ mod tests {
         assert_eq!(removed.block_hashes, [11]);
     }
 
-    /// What the relay makes of a hybrid engine's batch today: the main group's
-    /// store and removal go through, every other group's event is dropped and
-    /// counted, and nothing is stored twice under the shared hash.
+    /// What the relay makes of a hybrid engine's batch: the main group's
+    /// store and removal go through whole, every other group's event goes
+    /// through on its own lane (a store with its hashes and no tokens), and
+    /// nothing is stored twice under the shared hash on the main lane.
     #[test]
-    fn the_relay_forwards_a_hybrid_batch_main_group_alone_and_counts_the_rest() {
+    fn the_relay_forwards_every_group_of_a_hybrid_batch_the_sparse_ones_hashes_only() {
         let mut batch = sample_batch();
         batch.events.clear();
         let mut full = stored(&[11, -2], Some(10), &[&[1, 2, 3, 4], &[5, 6, 7, 8]]);
@@ -823,18 +827,29 @@ mod tests {
         let mut relay = Normalizer::new();
         let mut event_id = 0;
         let relayed = relay.normalize_batch(wire, 3, &mut event_id);
-        let stored_groups: Vec<Option<u32>> = relayed
+        let stores: Vec<RelayedStore> = relayed
             .events
             .iter()
             .filter_map(|e| match &e.data {
-                Some(common::kv_cache_event::Data::Stored(stored)) => Some(stored.group_idx),
+                Some(common::kv_cache_event::Data::Stored(stored)) => Some((
+                    stored.group_idx,
+                    stored
+                        .blocks
+                        .iter()
+                        .map(|block| (block.block_hash, block.token_ids.len()))
+                        .collect(),
+                )),
                 _ => None,
             })
             .collect();
         assert_eq!(
-            stored_groups,
-            [Some(0)],
-            "the main-attention group's store alone is forwarded"
+            stores,
+            [
+                (Some(1), vec![(-2, 0)]),
+                (Some(2), vec![(-2, 0)]),
+                (Some(0), vec![(11, 4), (-2, 4)]),
+            ],
+            "every group's store is forwarded; the sparse ones carry hashes, no tokens"
         );
         let removed_groups: Vec<Option<u32>> = relayed
             .events
@@ -844,14 +859,19 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(removed_groups, [Some(0)], "and its removal");
         assert_eq!(
-            relay.counts().dropped(DropReason::NonMainAttentionGroup),
-            4,
-            "two window-group stores and two removals dropped, not indexed under the shared hash"
+            removed_groups,
+            [Some(0), Some(1), Some(2)],
+            "and every removal"
         );
-        assert_eq!(relay.counts().forwarded_stored, 1);
-        assert_eq!(relay.counts().forwarded_removed, 1);
+        let counts = relay.counts();
+        assert_eq!((counts.group_stores, counts.group_removals), (2, 2));
+        assert_eq!((counts.forwarded_stored, counts.forwarded_removed), (3, 3));
+        assert_eq!(
+            counts.duplicate_stores, 0,
+            "a group lane's store is not a second copy on the main lane"
+        );
+        assert!(counts.dropped.is_empty(), "{:?}", counts.dropped);
     }
 
     #[test]

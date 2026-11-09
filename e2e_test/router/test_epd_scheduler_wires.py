@@ -1,7 +1,7 @@
 """The encode-prefill-decode gRPC path on the vLLM wire of the mock, on the CPU row.
 
 The gateway's vLLM form of encode-prefill-decode sends a request's media to
-one encode worker first (``vllm_encode.rs``): the encoder answers a token-less
+one encode worker first (the encode stage's push arm): the encoder answers a token-less
 completion with the media identity and one encoder-cache handle per item, the
 prefill side receives the identity and the handles, the decode side the
 identity alone. The mock worker serves the encode role on this wire

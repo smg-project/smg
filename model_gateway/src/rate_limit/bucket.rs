@@ -5,7 +5,10 @@
 //! completion can use more tokens than were reserved for it.
 
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -29,6 +32,7 @@ pub(crate) struct BucketState {
 
 pub(crate) struct ScopeBucket {
     state: Mutex<BucketState>,
+    limits: ScopeLimits,
     token_capacity: f64,
     token_refill_per_sec: f64,
     request_capacity: f64,
@@ -38,6 +42,10 @@ pub(crate) struct ScopeBucket {
     /// taking `state`'s lock — lets the backend's idle sweep read it
     /// without contending with the hot path.
     last_touched_ns: AtomicU64,
+    /// The bucket that replaced this one at new limits, once one has: a
+    /// reservation that holds this bucket settles on the live one through
+    /// it, so a change of limits forgives none of its completion tokens.
+    successor: OnceLock<Arc<ScopeBucket>>,
 }
 
 impl ScopeBucket {
@@ -50,13 +58,75 @@ impl ScopeBucket {
                 available_requests: request_capacity,
                 last_refill: Instant::now(),
             }),
+            limits,
             token_capacity,
             token_refill_per_sec: token_capacity / 60.0,
             request_capacity,
             request_refill_per_sec: request_capacity / 60.0,
             created_at: Instant::now(),
             last_touched_ns: AtomicU64::new(0),
+            successor: OnceLock::new(),
         }
+    }
+
+    /// The limits the bucket was built with.
+    pub fn limits(&self) -> ScopeLimits {
+        self.limits
+    }
+
+    /// Names the bucket that replaced this one. The first name stands.
+    fn succeeded_by(&self, successor: Arc<ScopeBucket>) {
+        let _first_name_stands = self.successor.set(successor);
+    }
+
+    /// Settles `delta` tokens on the bucket in force for this one's scope.
+    /// The successor is read under the lock, never before it: a replacement
+    /// names its successor under the old bucket's lock, so a settlement
+    /// that waited on that lock finds the successor and follows it instead
+    /// of debiting a bucket whose spending was already carried over.
+    /// Refilled first, or a later deferred refill can overshoot capacity
+    /// and clamp, erasing the delta.
+    pub fn settle_live(self: &Arc<Self>, delta: f64) {
+        let mut bucket = Arc::clone(self);
+        loop {
+            let mut state = bucket.lock_and_refill();
+            let Some(next) = bucket.successor.get().map(Arc::clone) else {
+                bucket.settle_tokens(&mut state, delta);
+                return;
+            };
+            drop(state);
+            bucket = next;
+        }
+    }
+
+    /// A bucket at `limits` that carries what this one has used: each
+    /// counter is refilled to now, the amount spent from its capacity is
+    /// read, and the new counter starts at the new capacity less that
+    /// amount. A raised limit opens headroom at once. A lowered one starts
+    /// at most empty: the new counter goes no deeper below zero than the
+    /// old one had gone (settlement debt, carried in full), so the scope is
+    /// admitted again within one refill window instead of paying the old
+    /// window's spending off at the new rate. Nothing is debited twice. The
+    /// new bucket starts untouched. It is named this bucket's successor
+    /// under this bucket's lock, so a settlement that takes the lock next
+    /// finds it and follows it (`settle_live`): no debit lands on a bucket
+    /// after its spending was carried over.
+    pub fn with_limits(self: &Arc<Self>, limits: ScopeLimits) -> Arc<Self> {
+        let replacement = Arc::new(Self::new(limits));
+        let state = self.lock_and_refill();
+        let used_tokens = self.token_capacity - state.available_tokens;
+        let used_requests = self.request_capacity - state.available_requests;
+        let token_debt = state.available_tokens.min(0.0);
+        let request_debt = state.available_requests.min(0.0);
+        {
+            let mut new_state = replacement.state.lock();
+            new_state.available_tokens = (replacement.token_capacity - used_tokens).max(token_debt);
+            new_state.available_requests =
+                (replacement.request_capacity - used_requests).max(request_debt);
+        }
+        self.succeeded_by(Arc::clone(&replacement));
+        drop(state);
+        replacement
     }
 
     /// The tests' lock: the touch and the guard, the refill left to the
@@ -193,7 +263,7 @@ impl ScopeBucket {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::*;
 
@@ -202,6 +272,84 @@ mod tests {
             tokens_per_minute: tpm,
             requests_per_minute: rpm,
         }
+    }
+
+    #[test]
+    fn a_settlement_through_a_replaced_bucket_lands_on_its_successor() {
+        let started = Instant::now();
+        let old = Arc::new(ScopeBucket::new(limits(200, 10)));
+        {
+            let mut state = old.lock_and_refill();
+            old.debit(&mut state, 100.0, 1.0);
+        }
+        // The handle a settlement resolved before the replacement.
+        let stale = Arc::clone(&old);
+        let successor = old.with_limits(limits(300, 10));
+        assert!(old
+            .successor
+            .get()
+            .is_some_and(|named| Arc::ptr_eq(named, &successor)));
+
+        // Forty tokens fewer than reserved: credited to the successor, which
+        // carried the hundred, never to the bucket nothing serves any more.
+        stale.settle_live(-40.0);
+        assert!(refilled_from(
+            successor.lock().available_tokens,
+            240.0,
+            300,
+            started
+        ));
+        assert!(refilled_from(
+            old.lock().available_tokens,
+            100.0,
+            200,
+            started
+        ));
+    }
+
+    /// `tokens` is `base` plus at most the refill a `tpm` bucket earns since
+    /// `started`: the counters refill on every lock, so a test that pauses
+    /// reads a little above the exact figure and never below it.
+    fn refilled_from(tokens: f64, base: f64, tpm: u32, started: Instant) -> bool {
+        let earned = f64::from(tpm) / 60.0 * started.elapsed().as_secs_f64();
+        tokens >= base - 1e-6 && tokens <= base + earned + 1e-6
+    }
+
+    #[test]
+    fn a_settlement_waiting_on_a_replaced_bucket_follows_the_successor_named_under_its_lock() {
+        let started = Instant::now();
+        let old = Arc::new(ScopeBucket::new(limits(200, 10)));
+        let successor = Arc::new(ScopeBucket::new(limits(300, 10)));
+        for bucket in [&old, &successor] {
+            let mut state = bucket.lock_and_refill();
+            bucket.debit(&mut state, 100.0, 1.0);
+        }
+        // The replacement's turn: the old bucket's lock held while the
+        // successor is named, as `with_limits` holds it.
+        let held = old.lock();
+        let stale = Arc::clone(&old);
+        let settled = std::thread::spawn(move || stale.settle_live(-40.0));
+        // The settlement waits on the lock (the pause only lets it get
+        // there first; the outcome does not depend on it).
+        std::thread::sleep(Duration::from_millis(50));
+        old.succeeded_by(Arc::clone(&successor));
+        drop(held);
+        settled.join().expect("the settlement thread finishes");
+
+        // Credited to the successor named under the lock it waited on,
+        // never to the bucket nothing serves any more.
+        assert!(refilled_from(
+            successor.lock().available_tokens,
+            240.0,
+            300,
+            started
+        ));
+        assert!(refilled_from(
+            old.lock().available_tokens,
+            100.0,
+            200,
+            started
+        ));
     }
 
     #[test]

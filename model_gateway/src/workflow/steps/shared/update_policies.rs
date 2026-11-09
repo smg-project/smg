@@ -146,15 +146,11 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
 
             // Check for configuration conflicts between prefill and decode
             Self::check_worker_conflicts(&model_id, &all_workers);
-            let cache_aware = app_context
+            // The registry tests the policy's type itself and does nothing
+            // for a policy that is not cache-aware.
+            app_context
                 .policy_registry
-                .get_policy(&model_id)
-                .is_some_and(|policy| policy.name() == "cache_aware");
-            if cache_aware {
-                app_context
-                    .policy_registry
-                    .init_cache_aware_policy(&model_id, &all_workers);
-            }
+                .init_cache_aware_policy(&model_id, &all_workers);
 
             // The worker's stream follows the policy that places it, the
             // role's policy for a prefill, decode or encode worker rather than
@@ -229,7 +225,7 @@ mod tests {
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
         config::{PolicyConfig, RouterConfig},
-        policies::PolicyFactory,
+        policies::{as_cache_aware, PolicyFactory},
         worker::{BasicWorkerBuilder, KvEventMonitor, ModelCard, WorkerRegistry},
         workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
     };
@@ -371,6 +367,25 @@ mod tests {
         .await;
 
         assert!(monitor.get_indexer(MODEL).is_some());
+        monitor.stop().await;
+    }
+
+    /// A worker registered under a cache-aware model policy is routed
+    /// through the model's tree by this step.
+    #[tokio::test]
+    async fn a_worker_under_a_cache_aware_policy_is_routed_through_the_models_tree() {
+        let (app_context, monitor) = context_over(cache_aware());
+
+        register(&app_context, grpc_worker(WorkerType::Regular), &[]).await;
+
+        let policy = app_context
+            .policy_registry
+            .get_policy(MODEL)
+            .expect("the model's policy");
+        let tenants = as_cache_aware(policy.as_ref())
+            .expect("a cache-aware policy")
+            .tree_tenants_for_test(MODEL);
+        assert_eq!(tenants, ["grpc://127.0.0.1:1"]);
         monitor.stop().await;
     }
 

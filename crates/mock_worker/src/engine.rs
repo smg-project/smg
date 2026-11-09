@@ -23,7 +23,7 @@
 //! which makes it deterministically unit-testable with no real timers.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -443,10 +443,11 @@ pub struct EngineParams {
     /// (`KvEventBatch.dp_rank`): 0 for a single-rank engine, the rank's index
     /// for one of a gRPC worker's `--grpc-dp-size` ranks.
     pub dp_rank: i32,
-    /// The KV cache groups the engine publishes, the first being its
-    /// main-attention group (one group of full attention by default). A
-    /// hybrid engine names more: every group's events carry its index, kind
-    /// and window ([`KvCacheGroup`]).
+    /// The KV cache groups the engine publishes, exactly one of them its
+    /// main-attention group, at any index (one group of full attention by
+    /// default). A hybrid engine names more: every group's events carry its
+    /// index, kind and window ([`KvCacheGroup`]); the main group's index is
+    /// [`KvCacheGroup::main_index`].
     pub kv_cache_groups: Vec<KvCacheGroup>,
 }
 
@@ -465,14 +466,17 @@ pub struct EngineParams {
 /// sparse group's store with the step's whole token span and the kept hashes
 /// only; so does the mock's vLLM wire (`Published::spans`). The gRPC stream
 /// carries every group's events unfiltered, the kept blocks with their own
-/// tokens: a servicer's relay forwards the main group alone today, and the
-/// gateway admits main-attention kinds only. The mock's own prefix hit and
-/// `cached_tokens` still come from the full-attention pool: a hybrid engine's
-/// hit is the fixed point over its groups, which the mock does not model yet.
+/// tokens: a servicer's relay forwards every group (a sparse group's store
+/// as its hashes), the gateway indexes the main group and keeps the other
+/// groups' blocks in a per-worker view that bounds its overlap the way the
+/// engine does. The mock's own prefix hit and `cached_tokens` are that
+/// engine rule: the fixed point over its groups (`hit_over_groups`).
 ///
 /// The kinds the flag takes are [`KvCacheGroup::KINDS_HELP`]: the dense
 /// main-attention kinds and `mamba` take no window, the window kinds need one,
-/// and the first group is a main-attention kind ([`KvCacheGroup::MAIN_KINDS`]).
+/// and at most one group is a main-attention kind ([`KvCacheGroup::MAIN_KINDS`]),
+/// at any index: an engine may publish its main group behind its window groups,
+/// and a model without one starts with a window group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KvCacheGroup {
     pub kind: String,
@@ -480,9 +484,9 @@ pub struct KvCacheGroup {
 }
 
 impl KvCacheGroup {
-    /// The main-attention kinds, the gateway's list: the first group is one
-    /// of them, the dense group every block is stored in (the pool's default
-    /// mask of an unrecorded block is group 0 alone).
+    /// The main-attention kinds, the gateway's list: exactly one group is one
+    /// of them, at any index, the dense group every block is stored in (the
+    /// pool's default mask of an unrecorded block is that group alone).
     pub const MAIN_KINDS: [&'static str; 3] =
         ["full_attention", "mla_attention", "sink_full_attention"];
     /// The kinds whose stores keep a window tail; a window in tokens is required.
@@ -504,6 +508,17 @@ impl KvCacheGroup {
             kind: "full_attention".to_string(),
             sliding_window: 0,
         }
+    }
+
+    /// The index of the main-attention group among `groups`: the one group of
+    /// a main-attention kind, wherever the engine publishes it (the flag
+    /// allows at most one); 0 for a list that names none, which a caller
+    /// reads only after `unrecorded_mask` or the kinds said there is one.
+    pub fn main_index(groups: &[KvCacheGroup]) -> usize {
+        groups
+            .iter()
+            .position(|group| Self::MAIN_KINDS.contains(&group.kind.as_str()))
+            .unwrap_or(0)
     }
 
     /// Whether this group keeps the block at `index` of a request whose
@@ -635,12 +650,15 @@ struct EngineShared {
     kv_replay: Mutex<VecDeque<common::KvEventBatch>>,
     prefix_cache: bool,
     block_size: u32,
+    /// The engine's KV cache groups, for the prefix hit over the mirror.
+    kv_cache_groups: Vec<KvCacheGroup>,
     /// Worker name for records and the admin API (`grpc:<port>` / `http:<port>`).
     name: String,
-    /// Mirror of the actor's cache block keys, so sibling engines and the
-    /// admin API can read it without entering the actor: the fleet oracle
-    /// ("which worker holds the most of this prompt") is a read over these.
-    cache_mirror: RwLock<HashSet<u64>>,
+    /// Mirror of the actor's cache block keys with the groups that keep each
+    /// (one bit per group index), so sibling engines and the admin API can
+    /// read it without entering the actor: the fleet oracle ("which worker
+    /// holds the most of this prompt") is a read over these.
+    cache_mirror: RwLock<HashMap<u64, u8>>,
     /// Fault hooks, switched on through the admin API.
     faults: Faults,
     /// Wakes a paused actor.
@@ -942,8 +960,9 @@ impl Engine {
             kv_replay: Mutex::new(VecDeque::new()),
             prefix_cache: params.prefix_cache,
             block_size: params.block_size,
+            kv_cache_groups: params.kv_cache_groups.clone(),
             name,
-            cache_mirror: RwLock::new(HashSet::new()),
+            cache_mirror: RwLock::new(HashMap::new()),
             faults: Faults::default(),
             resume: Notify::new(),
             output_clock: Instant::now(),
@@ -1241,14 +1260,23 @@ impl Engine {
         &self.shared.name
     }
 
-    /// Number of consecutive blocks from the start of `keys` this engine holds.
+    /// Blocks from the start of `keys` this engine would serve from cache:
+    /// the engine's hit over its KV cache groups ([`hit_over_groups`]).
     fn match_prefix(&self, keys: &[u64]) -> usize {
         let mirror = self
             .shared
             .cache_mirror
             .read()
             .unwrap_or_else(|p| p.into_inner());
-        keys.iter().take_while(|k| mirror.contains(k)).count()
+        let main = keys.iter().take_while(|k| mirror.contains_key(k)).count();
+        let unrecorded = unrecorded_mask(&self.shared.kv_cache_groups);
+        hit_over_groups(
+            main,
+            keys,
+            &self.shared.kv_cache_groups,
+            self.shared.block_size.max(1) as usize,
+            |key| mirror.get(&key).copied().unwrap_or(unrecorded),
+        )
     }
 
     /// A copy of the cached block keys.
@@ -1257,7 +1285,7 @@ impl Engine {
             .cache_mirror
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .iter()
+            .keys()
             .copied()
             .collect()
     }
@@ -1502,7 +1530,15 @@ fn handle_msg(
                         .cache_mirror
                         .read()
                         .unwrap_or_else(|p| p.into_inner());
-                    keys.iter().take_while(|k| own.contains(k)).count()
+                    let main = keys.iter().take_while(|k| own.contains_key(k)).count();
+                    let unrecorded = unrecorded_mask(&params.kv_cache_groups);
+                    hit_over_groups(
+                        main,
+                        &keys,
+                        &params.kv_cache_groups,
+                        params.block_size.max(1) as usize,
+                        |key| own.get(&key).copied().unwrap_or(unrecorded),
+                    )
                 };
                 (fleet_best.max(own_best) as u32 * params.block_size)
                     .min(req.prompt_token_ids.len() as u32)
@@ -1658,11 +1694,22 @@ impl BlockPool {
         self.refs.len()
     }
 
-    /// Number of consecutive cached blocks from the start of `keys`.
-    fn match_prefix(&self, keys: &[u64]) -> usize {
-        keys.iter()
+    /// Blocks from the start of `keys` the engine serves from cache: the
+    /// main group's leading run of cached blocks, bounded by what the other
+    /// groups keep ([`hit_over_groups`]).
+    fn match_prefix(&self, keys: &[u64], p: &EngineParams) -> usize {
+        let main = keys
+            .iter()
             .take_while(|k| self.refs.contains_key(k))
-            .count()
+            .count();
+        let unrecorded = unrecorded_mask(&p.kv_cache_groups);
+        hit_over_groups(
+            main,
+            keys,
+            &p.kv_cache_groups,
+            p.block_size.max(1) as usize,
+            |key| self.groups.get(&key).copied().unwrap_or(unrecorded),
+        )
     }
 
     /// Reserve `n` anonymous blocks, evicting idle cached blocks (LRU first)
@@ -1793,8 +1840,9 @@ struct Step {
     /// event index (see `Published::spans`).
     spans: Vec<(usize, Vec<u32>)>,
     snapshot: LoadSnapshot,
-    /// Cache deltas this pass, for the actor's mirror.
-    inserted: Vec<u64>,
+    /// Cache deltas this pass, for the actor's mirror: the inserted keys with
+    /// the groups that keep them.
+    inserted: Vec<(u64, u8)>,
     evicted: Vec<u64>,
     cleared: bool,
     admitted: Vec<Admitted>,
@@ -1924,7 +1972,7 @@ impl SchedulerState {
         let prompt_tokens = req.prompt_token_ids.len() as u32;
         let (keys, rolling_hash, _) = prompt_blocks(&req.prompt_token_ids, p.block_size as usize);
         let cached_blocks = if p.prefix_cache {
-            self.pool.match_prefix(&keys)
+            self.pool.match_prefix(&keys, p)
         } else {
             0
         };
@@ -2092,7 +2140,7 @@ impl SchedulerState {
             };
             let prompt_len = front.req.prompt_token_ids.len() as u32;
             let mut cached_blocks = if p.prefix_cache {
-                self.pool.match_prefix(&front.keys)
+                self.pool.match_prefix(&front.keys, p)
             } else {
                 0
             };
@@ -2321,6 +2369,16 @@ impl SchedulerState {
             })
         };
 
+        let unrecorded = unrecorded_mask(&p.kv_cache_groups);
+        let inserted = inserted
+            .into_iter()
+            .map(|key| {
+                (
+                    key,
+                    self.pool.groups.get(&key).copied().unwrap_or(unrecorded),
+                )
+            })
+            .collect();
         Step {
             duration,
             sends,
@@ -2383,7 +2441,7 @@ impl SchedulerState {
         let (keys, rolling_hash, _) = prompt_blocks(&seq, p.block_size.max(1) as usize);
         let len = seq.len() as u32;
         let cached = if p.prefix_cache {
-            (self.pool.match_prefix(&keys) as u32 * p.block_size).min(len)
+            (self.pool.match_prefix(&keys, p) as u32 * p.block_size).min(len)
         } else {
             0
         };
@@ -2494,8 +2552,8 @@ impl SchedulerState {
     }
 
     /// `Removed` events for evicted blocks: one per KV cache group that
-    /// stored them, the main group's first, as vLLM publishes an eviction per
-    /// hash and group.
+    /// stored them, in group order, as vLLM publishes an eviction per hash
+    /// and group.
     fn push_removed(
         &mut self,
         kv: &mut Vec<common::KvCacheEvent>,
@@ -2506,11 +2564,14 @@ impl SchedulerState {
             return;
         }
         let group_count = p.kv_cache_groups.len().clamp(1, 8);
+        let unrecorded = unrecorded_mask(&p.kv_cache_groups);
         let mut per_group: Vec<Vec<i64>> = vec![Vec::new(); group_count];
         for key in freed {
-            // A block without a recorded mask was stored by group 0 alone: the
-            // main-attention group the flag requires first, which keeps every block.
-            let mask = self.pool.groups.remove(&key).unwrap_or(1);
+            // A block without a recorded mask was stored by the main-attention
+            // group alone, which keeps every block, at whatever index the
+            // engine publishes it; an engine without one never stored it
+            // ([`unrecorded_mask`]).
+            let mask = self.pool.groups.remove(&key).unwrap_or(unrecorded);
             for (group, hashes) in per_group.iter_mut().enumerate() {
                 if mask & (1u8 << group) != 0 {
                     hashes.push(key as i64);
@@ -2709,6 +2770,84 @@ fn fnv_hash_str(s: &str) -> u64 {
         h = h.wrapping_mul(FNV_PRIME);
     }
     h
+}
+
+/// The mask of a cached block without a recorded one: the main-attention
+/// group alone, at whatever index the engine publishes it, since it stores
+/// every block; nothing when the engine has no main group, since a window or
+/// state group records what it keeps and a block it did not is not kept by
+/// anyone.
+fn unrecorded_mask(groups: &[KvCacheGroup]) -> u8 {
+    groups
+        .iter()
+        .position(|group| KvCacheGroup::MAIN_KINDS.contains(&group.kind.as_str()))
+        .map_or(0, |index| 1u8 << index)
+}
+
+/// The engine's prefix hit over its KV cache groups, vLLM's fixed point over
+/// its single-type managers: `main` leading blocks of `keys` are cached in
+/// the main group; every other group shrinks the candidate to what it keeps
+/// (`mask_of` a key: one bit per group index), and the rule repeats until
+/// nothing moves. A sliding-window group needs `ceil((window - 1) /
+/// block_size)` contiguous kept blocks ending at the hit, searched from the
+/// candidate down, else the leading run of kept blocks from the first; a
+/// Mamba group needs the rightmost kept block at or below the candidate. A
+/// kind without a rule (the main-attention kinds) leaves the candidate. An
+/// engine without a main-attention group (its first group is a window or
+/// state group) has no leading run to start from: the candidate is the
+/// whole prompt and the groups' rules alone decide, as the engine's own
+/// managers do for such a model.
+fn hit_over_groups(
+    main: usize,
+    keys: &[u64],
+    groups: &[KvCacheGroup],
+    block_size: usize,
+    mask_of: impl Fn(u64) -> u8,
+) -> usize {
+    let no_main_group = !groups
+        .iter()
+        .any(|group| KvCacheGroup::MAIN_KINDS.contains(&group.kind.as_str()));
+    let mut cur = if no_main_group {
+        keys.len()
+    } else {
+        main.min(keys.len())
+    };
+    if cur == 0 || (!no_main_group && groups.len() <= 1) {
+        return cur;
+    }
+    loop {
+        let start = cur;
+        for (index, group) in groups.iter().enumerate().take(8) {
+            let bit = 1u8 << index;
+            let kept = |at: usize| mask_of(keys[at]) & bit != 0;
+            let hit = match group.kind.as_str() {
+                "sliding_window" | "sliding_window_mla" => {
+                    let window = group.sliding_window.max(1) as usize;
+                    let need = (window - 1).div_ceil(block_size.max(1)).max(1);
+                    let mut run = 0usize;
+                    let mut found = None;
+                    for at in (0..cur).rev() {
+                        if kept(at) {
+                            run += 1;
+                            if run >= need {
+                                found = Some(at + run);
+                                break;
+                            }
+                        } else {
+                            run = 0;
+                        }
+                    }
+                    found.unwrap_or(run)
+                }
+                "mamba" => (0..cur).rev().find(|&at| kept(at)).map_or(0, |at| at + 1),
+                _ => cur,
+            };
+            cur = cur.min(hit);
+        }
+        if cur == start || cur == 0 {
+            return cur;
+        }
+    }
 }
 
 /// Chunk `ids` into `block_size`-token blocks, returning each full block's
@@ -3221,7 +3360,7 @@ mod tests {
         );
         let (keys, _, _) = prompt_blocks(&second_prompt, p.block_size as usize);
         assert_eq!(
-            st.pool.match_prefix(&keys),
+            st.pool.match_prefix(&keys, &p),
             0,
             "nothing of the dropped request's prompt was computed"
         );
@@ -3725,6 +3864,112 @@ mod tests {
         );
     }
 
+    /// The engine's hit over its groups, block 4: cells of the sliding-window
+    /// and Mamba rules the gateway's view mirrors, read right to left.
+    #[test]
+    fn the_hit_is_the_fixed_point_over_the_groups() {
+        let groups = vec![
+            KvCacheGroup::full_attention(),
+            KvCacheGroup {
+                kind: "sliding_window".to_string(),
+                sliding_window: 8,
+            },
+            KvCacheGroup {
+                kind: "mamba".to_string(),
+                sliding_window: 0,
+            },
+        ];
+        let keys: Vec<u64> = (0..10).collect();
+        // (window blocks, state blocks, main hit) -> hit
+        type Cell<'a> = (&'a [u64], &'a [u64], usize, usize, &'a str);
+        let cells: [Cell; 8] = [
+            (
+                &[8, 9],
+                &[9],
+                10,
+                10,
+                "the tail and the state end at the depth",
+            ),
+            (
+                &[8, 9],
+                &[9],
+                9,
+                0,
+                "a depth below the tail: no tail at or below it, no state",
+            ),
+            (
+                &[4, 5],
+                &[5],
+                10,
+                6,
+                "the rightmost tail below the depth, the state there",
+            ),
+            (
+                &[4, 5],
+                &[9],
+                10,
+                0,
+                "the state at 9 is out of reach once the window says 6",
+            ),
+            (
+                &[0, 1, 2],
+                &[2],
+                10,
+                3,
+                "a leading run, the state at its end",
+            ),
+            (&[0], &[0], 10, 1, "one leading block"),
+            (&[9], &[9], 10, 0, "one block is no tail and not leading"),
+            (&[], &[], 10, 0, "nothing kept by the sparse groups"),
+        ];
+        for (window, state, main, want, note) in cells {
+            let mask = |key: u64| {
+                1u8 | u8::from(window.contains(&key)) << 1 | u8::from(state.contains(&key)) << 2
+            };
+            assert_eq!(
+                hit_over_groups(main, &keys, &groups, 4, mask),
+                want,
+                "{note}"
+            );
+        }
+        let plain = vec![KvCacheGroup::full_attention()];
+        assert_eq!(hit_over_groups(7, &keys, &plain, 4, |_| 1), 7);
+        assert_eq!(hit_over_groups(12, &keys, &plain, 4, |_| 1), 10);
+    }
+
+    /// An engine whose only group is a sliding window (no main-attention
+    /// group): the hit is the window rule from the prompt's end, whatever
+    /// leading run the caller measured; a window of 13 tokens at block 4
+    /// needs three kept blocks ending at the hit, else the leading run of
+    /// kept blocks from the first.
+    #[test]
+    fn a_window_only_engines_hit_is_the_window_rule_from_the_prompts_end() {
+        let keys: Vec<u64> = (0..10).collect();
+        let window_only = vec![KvCacheGroup {
+            kind: "sliding_window".to_string(),
+            sliding_window: 13,
+        }];
+        let cells: &[(&[u64], usize, &str)] = &[
+            (&[7, 8, 9], 10, "the tail kept: the whole prompt"),
+            (&[6, 7, 8], 9, "a run ending one block early"),
+            (&[2, 3, 4], 5, "a run in the middle: up to its end"),
+            (&[0, 1, 2], 3, "the leading run"),
+            (&[8, 9], 0, "two blocks are no tail"),
+            (&[0, 1], 2, "two leading blocks: the leading run"),
+            (&[], 0, "nothing kept"),
+        ];
+        for (kept, want, note) in cells {
+            let mask = |key: u64| u8::from(kept.contains(&key));
+            for main in [0usize, 3, 10] {
+                assert_eq!(
+                    hit_over_groups(main, &keys, &window_only, 4, mask),
+                    *want,
+                    "{note} (main {main})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn prompt_blocks_emit_one_chained_stored_event() {
         let p = EngineParams {
@@ -3760,16 +4005,20 @@ mod tests {
         assert_eq!(stored[0].parent_block_hash, Some(second_key as i64));
     }
 
+    /// A hybrid engine's step stores one event per group, each naming the
+    /// index the engine declared its group at: the main group sits behind the
+    /// window group here, as an engine may publish it, and every store is
+    /// read by its kind, never by its position.
     #[test]
     fn a_hybrid_engine_stores_the_window_tail_and_the_state_block_beside_full_attention() {
         let p = EngineParams {
             block_size: 4,
             kv_cache_groups: vec![
-                KvCacheGroup::full_attention(),
                 KvCacheGroup {
                     kind: "sliding_window".to_string(),
                     sliding_window: 8,
                 },
+                KvCacheGroup::full_attention(),
                 KvCacheGroup {
                     kind: "mamba".to_string(),
                     sliding_window: 0,
@@ -3777,6 +4026,7 @@ mod tests {
             ],
             ..Default::default()
         };
+        assert_eq!(KvCacheGroup::main_index(&p.kv_cache_groups), 1);
         let mut st = SchedulerState::new();
         // 25 prompt tokens: six full blocks; the aligned replay boundary (24)
         // ends block 5.
@@ -3787,24 +4037,26 @@ mod tests {
         let stored = stored_events(&batch);
         assert_eq!(stored.len(), 3, "one store per group");
         let keys = Engine::block_keys(&(0..24).collect::<Vec<_>>(), 4);
-        assert_eq!(stored[0].group_idx, Some(0));
-        assert_eq!(
-            stored[0].kv_cache_spec_kind.as_deref(),
-            Some("full_attention")
+        let by_kind = |kind: &str| {
+            stored
+                .iter()
+                .find(|s| s.kv_cache_spec_kind.as_deref() == Some(kind))
+                .unwrap_or_else(|| panic!("a {kind} store"))
+        };
+        let (window, full, state) = (
+            by_kind("sliding_window"),
+            by_kind("full_attention"),
+            by_kind("mamba"),
         );
         assert_eq!(
-            stored[0].blocks.len(),
-            6,
-            "full attention keeps every block"
+            (window.group_idx, full.group_idx, state.group_idx),
+            (Some(0), Some(1), Some(2)),
+            "each store names the index the engine declared its group at"
         );
-        assert_eq!(stored[1].group_idx, Some(1));
+        assert_eq!(full.blocks.len(), 6, "full attention keeps every block");
+        assert_eq!(window.kv_cache_spec_sliding_window, Some(8));
         assert_eq!(
-            stored[1].kv_cache_spec_kind.as_deref(),
-            Some("sliding_window")
-        );
-        assert_eq!(stored[1].kv_cache_spec_sliding_window, Some(8));
-        assert_eq!(
-            stored[1]
+            window
                 .blocks
                 .iter()
                 .map(|b| b.block_hash)
@@ -3813,14 +4065,12 @@ mod tests {
             "a window of 8 over blocks of 4 keeps the two blocks ending at the boundary"
         );
         assert_eq!(
-            stored[1].parent_block_hash, stored[0].parent_block_hash,
+            window.parent_block_hash, full.parent_block_hash,
             "the step's chain parent, as the engine publishes it"
         );
-        assert_eq!(stored[2].group_idx, Some(2));
-        assert_eq!(stored[2].kv_cache_spec_kind.as_deref(), Some("mamba"));
-        assert_eq!(stored[2].kv_cache_spec_sliding_window, None);
+        assert_eq!(state.kv_cache_spec_sliding_window, None);
         assert_eq!(
-            stored[2]
+            state
                 .blocks
                 .iter()
                 .map(|b| b.block_hash)
@@ -3833,10 +4083,40 @@ mod tests {
                 .iter()
                 .map(|(at, span)| (*at, span.len()))
                 .collect::<Vec<_>>(),
-            vec![(1, 24), (2, 24)],
+            vec![(0, 24), (2, 24)],
             "the two sparse stores carry the step's whole span for the vLLM wire"
         );
         assert_eq!(step.spans[0].1, (0..24).collect::<Vec<u32>>());
+    }
+
+    /// A block the pool holds no mask for is evicted from the main-attention
+    /// group alone, at the index the engine declared it: behind a window
+    /// group here, not group 0.
+    #[test]
+    fn an_unrecorded_block_is_evicted_from_the_main_group_at_its_declared_index() {
+        let p = EngineParams {
+            block_size: 4,
+            prefix_cache: true,
+            kv_cache_groups: vec![
+                KvCacheGroup {
+                    kind: "sliding_window".to_string(),
+                    sliding_window: 8,
+                },
+                KvCacheGroup::full_attention(),
+            ],
+            ..Default::default()
+        };
+        let mut st = SchedulerState::new();
+        let mut kv = Vec::new();
+        st.push_removed(&mut kv, vec![42], &p);
+        let groups: Vec<Option<u32>> = kv
+            .iter()
+            .filter_map(|e| match &e.data {
+                Some(common::kv_cache_event::Data::Removed(r)) => Some(r.group_idx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(groups, [Some(1)], "the main group's eviction alone: {kv:?}");
     }
 
     #[test]
@@ -3846,15 +4126,19 @@ mod tests {
             block_size: 4,
             kv_capacity_tokens: 32,
             max_running: 64,
+            // The main group last, as an engine may publish it: the removals
+            // are read by the index the engine declared, never by position.
             kv_cache_groups: vec![
-                KvCacheGroup::full_attention(),
                 KvCacheGroup {
                     kind: "mamba".to_string(),
                     sliding_window: 0,
                 },
+                KvCacheGroup::full_attention(),
             ],
             ..Default::default()
         };
+        let main_idx = Some(KvCacheGroup::main_index(&p.kv_cache_groups) as u32);
+        assert_eq!(main_idx, Some(1), "the main group is the second one here");
         let mut st = SchedulerState::new();
         let mut rxs = Vec::new();
         let mut removed: Vec<(Option<u32>, Vec<i64>)> = Vec::new();
@@ -3875,12 +4159,12 @@ mod tests {
         }
         let main: Vec<i64> = removed
             .iter()
-            .filter(|(g, _)| *g == Some(0))
+            .filter(|(g, _)| *g == main_idx)
             .flat_map(|(_, h)| h.clone())
             .collect();
         let state: Vec<i64> = removed
             .iter()
-            .filter(|(g, _)| *g == Some(1))
+            .filter(|(g, _)| *g == Some(0))
             .flat_map(|(_, h)| h.clone())
             .collect();
         assert!(!main.is_empty(), "the main group's evictions: {removed:?}");

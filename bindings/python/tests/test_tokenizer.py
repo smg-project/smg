@@ -1172,50 +1172,73 @@ def test_a_child_forked_during_a_call_renders_with_the_inherited_tokenizer(
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
 def test_os_fork_waits_until_the_call_in_flight_ends(tokenizer: Tokenizer) -> None:
     # A thread decodes with the GIL released while this one forks: the fork
-    # starts only once the decode has ended. The decode runs inline, and
-    # takes as long here as it took alone before. The fork waits only for
-    # the detached part of the call: the id list's extraction and the text's
-    # conversion run with the GIL held and count in `alone` too (roughly
-    # half of it in a measured run). That part must still be running, by a
-    # wide margin, when the fork starts 10 ms in, whatever the decode's
-    # speed (the byte-level table decodes a few million ids in tens of
-    # milliseconds): the ids double until a decode alone takes a quarter of
-    # a second, within a bound on their count. Each size's figure is the
-    # minimum of three decodes: `alone` is the reference the fork's wait is
-    # held to, and one sample inflated by a descheduling on a loaded runner
-    # would otherwise stop the doubling at a size whose decode is far
-    # shorter and overstate that reference, a false failure.
-    def decode_alone(ids: list[int]) -> float:
+    # starts only once the decode has ended. The fork waits for the detached
+    # part of the call alone; the id list's extraction runs before it with
+    # the GIL held. The wait is held to the call's window from the moment
+    # this thread first runs: woken by the caller, it takes the GIL no
+    # earlier than the decode releases it (the switch interval is set long,
+    # so the caller is never made to hand it over), and the extraction is
+    # over by then. The window's tail, the text's conversion with the GIL
+    # taken back, is a small share of it. Held to a quarter of the call as
+    # a whole, the test failed on a runner whose extraction took the larger
+    # share, with the guard intact (a wait of 0.081 s for a 0.329 s call).
+    # The ids double until a window alone takes a quarter of a second,
+    # within a bound on their count; each size's figure is the minimum of
+    # three, since one sample inflated by a descheduling on a loaded runner
+    # would otherwise stop the doubling at a size whose window is far
+    # shorter and overstate the reference. The fork starts 10 ms into the
+    # window and its wait must cover more than half of the window measured
+    # alone (the forked run's own window would carry a stall of its tail,
+    # which runs after the fork, into the reference); a fork that did not
+    # wait returns within milliseconds.
+    def window(ids: list[int], fork: bool) -> tuple[float, float]:
+        calling = threading.Event()
+        ended = 0.0
+        failure: BaseException | None = None
+
+        def call() -> None:
+            nonlocal ended, failure
+            calling.set()
+            try:
+                tokenizer.decode(ids)
+            except BaseException as error:
+                failure = error
+            ended = time.perf_counter()
+
+        caller = threading.Thread(target=call)
+        caller.start()
+        calling.wait()
         start = time.perf_counter()
-        tokenizer.decode(ids)
-        return time.perf_counter() - start
+        waited = 0.0
+        if fork:
+            time.sleep(0.01)
+            forking = time.perf_counter()
+            pid = os.fork()
+            if pid == 0:
+                os._exit(0)
+            waited = time.perf_counter() - forking
+            os.waitpid(pid, 0)
+        caller.join()
+        if failure is not None:
+            raise failure
+        return ended - start, waited
 
-    ids = [HELLO, WORLD] * 1_000_000
-    while True:
-        alone = min(decode_alone(ids) for _ in range(3))
-        if alone >= 0.25 or len(ids) >= 16_000_000:
-            break
-        ids = ids * 2
-    calling = threading.Event()
-
-    def call() -> None:
-        calling.set()
-        tokenizer.decode(ids)
-
-    caller = threading.Thread(target=call)
-    caller.start()
-    calling.wait()
-    # The caller holds the GIL until its call releases it, so this thread
-    # wakes, at the earliest, with the call running.
-    time.sleep(0.01)
-    start = time.perf_counter()
-    pid = os.fork()
-    if pid == 0:
-        os._exit(0)
-    waited = time.perf_counter() - start
-    os.waitpid(pid, 0)
-    caller.join()
-    assert waited > alone / 4, f"the fork waited {waited:.3f}s for a {alone:.3f}s call"
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(100.0)
+    try:
+        ids = [HELLO, WORLD] * 1_000_000
+        while True:
+            alone = min(window(ids, fork=False)[0] for _ in range(3))
+            if alone >= 0.25 or len(ids) >= 16_000_000:
+                break
+            ids = ids * 2
+        remaining, waited = window(ids, fork=True)
+    finally:
+        sys.setswitchinterval(interval)
+    assert waited > alone / 2, (
+        f"the fork waited {waited:.3f}s for a call whose window takes {alone:.3f}s"
+        f" alone ({remaining:.3f}s in this run)"
+    )
 
 
 FORK_AFTER_AN_EARLIER_HOOK = """

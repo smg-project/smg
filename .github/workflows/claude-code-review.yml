@@ -1,5 +1,15 @@
 name: Claude Code Review
 
+# Trust boundary: no key reaches the job. The runner pod's key-proxy sidecar
+# (scripts/k8s-runner-resources/runner-values-cpu.yaml) holds it, and Claude gets a
+# placeholder key and ANTHROPIC_BASE_URL pointing at the sidecar on localhost, so a pull
+# request that edits this file can at most spend. A pull request from a fork is never
+# reviewed and its commands are ignored; the author or commenter must have write access
+# (scripts/codex_review_post.py gate, and the action checks the actor itself). The PR event
+# is `pull_request`, not `pull_request_target`: the action's App-token exchange rejects the
+# OIDC token of a `pull_request_target` run ("Invalid OIDC token"), and the comment events
+# run from `main` anyway. The exchange also requires this file to match the copy on `main`,
+# so on a pull request that edits it the action skips with a warning instead of reviewing.
 on:
   pull_request:
     types: [opened, synchronize, reopened]
@@ -17,51 +27,84 @@ permissions:
   issues: write
   id-token: write
 
+env:
+  PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+  REVIEW_EVENT: ${{ github.event_name == 'issue_comment' && 'opened' || github.event.action }}
+  PROXY_PLACEHOLDER_KEY: sk-ant-placeholder-the-sidecar-holds-the-key
+  AI_KEY_PROXY: http://127.0.0.1:8787
+  BEFORE_SHA: ${{ github.event.before }}
+
 jobs:
   # Auto-review on PR open/push
   review:
     name: Claude PR Review
     if: >-
-      github.event_name == 'pull_request'
-      && github.repository == 'smg-project/smg'
+      github.repository == 'smg-project/smg'
       && github.actor != 'dependabot[bot]'
-      && !github.event.pull_request.head.repo.fork
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+      && (
+        (github.event_name == 'pull_request'
+            && github.event.pull_request.head.repo.full_name == github.repository)
+        || (github.event_name == 'issue_comment'
+            && github.event.issue.pull_request
+            && github.event.comment.user.type != 'Bot'
+            && contains(github.event.comment.body, '@claude review'))
+      )
+    runs-on: ${{ vars.SMG_RUNNER_REVIEW || 'k8s-runner-cpu' }}
     timeout-minutes: 30
     concurrency:
-      group: claude-review-${{ github.event.pull_request.number }}
+      group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
       cancel-in-progress: true
     steps:
+      # The default branch: this workflow's scripts. The pull request's head is checked
+      # out below, after the gate, for Claude to read.
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Export API key from pod env
-        uses: ./.github/actions/export-pod-api-key
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Gate the run
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/codex_review_post.py gate
+
+      - name: Check out the pull request head
+        if: steps.gate.outputs.allowed == 'true'
+        run: |
+          git fetch --no-tags --quiet origin "refs/pull/${{ steps.gate.outputs.pr }}/head:refs/remotes/pr/${{ steps.gate.outputs.pr }}"
+          git checkout --quiet --detach "${{ steps.gate.outputs.head_sha }}"
 
       - name: Install gh CLI
+        if: steps.gate.outputs.allowed == 'true'
         uses: ./.github/actions/setup-gh
 
       - name: Record run start time
         id: run-start
+        if: steps.gate.outputs.allowed == 'true'
         run: echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - uses: anthropics/claude-code-action@v1
         id: claude-review
-        continue-on-error: true
+        if: steps.gate.outputs.allowed == 'true'
+        env:
+          ANTHROPIC_BASE_URL: ${{ env.AI_KEY_PROXY }}/anthropic
         with:
-          anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ env.PROXY_PLACEHOLDER_KEY }}
+          track_progress: true  # a tracking comment from the first second, updated as it works
           prompt: |
             REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number }}
-            EVENT: ${{ github.event.action }}
+            PR NUMBER: ${{ env.PR_NUMBER }}
+            EVENT: ${{ env.REVIEW_EVENT }}
             Review this pull request.
 
             IMPORTANT — Incremental vs full review:
             If EVENT is "synchronize" (new push to existing PR), this is a
             follow-up review. Previous review comments are your memory.
-            1. Run `git diff ${{ github.event.before }}..HEAD` to see only what this push changed.
+            1. Run `git diff ${{ env.BEFORE_SHA }}..HEAD` to see only what this push changed.
                If this fails (e.g., force-push rewrote history), fall back to
                `git diff origin/main...HEAD` for a full review instead.
             2. Use the comments from step 3 to see what was already flagged.
@@ -126,7 +169,7 @@ jobs:
 
             To check:
             a. Fetch the body:
-                 BODY=$(gh pr view ${{ github.event.pull_request.number }} \
+                 BODY=$(gh pr view ${{ env.PR_NUMBER }} \
                    --repo ${{ github.repository }} --json body --jq .body)
             b. Verify each required header appears in BODY.
             c. For each of Problem, Solution, Changes, Test Plan, verify the
@@ -137,14 +180,14 @@ jobs:
 
             Dedup by a hidden marker on a claude[bot] top-level (issue) comment:
                  EXISTING=$(gh api \
-                   repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+                   repos/${{ github.repository }}/issues/${{ env.PR_NUMBER }}/comments \
                    --paginate \
                    --jq '.[] | select(.user.login == "claude[bot]" and (.body | startswith("<!-- claude-pr-template-check -->"))) | .id' \
                    | head -1)
 
             Cases:
               gaps + no EXISTING → post a new comment:
-                gh pr comment ${{ github.event.pull_request.number }} \
+                gh pr comment ${{ env.PR_NUMBER }} \
                   --repo ${{ github.repository }} --body "$MSG"
               gaps + EXISTING → update in place (never post a second one):
                 gh api repos/${{ github.repository }}/issues/comments/$EXISTING \
@@ -169,17 +212,27 @@ jobs:
             1. Run the appropriate git diff (see incremental review rules above).
             2. Read REVIEW.md for severity format, focus areas, and domain knowledge.
             3. Fetch existing review comments (bot + human replies) for dedup and memory:
-               gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments \
+               gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments \
                  --paginate --jq '.[] | {id, path, line, body, user: .user.login, in_reply_to_id}' \
                  | jq -s '.[-50:]'
             4. Read changed files for context.
             5. Post inline comments for issues found.
-            6. If EVENT is "opened" or "reopened" (full review) AND no 🔴
-               Important issues were found, submit an APPROVE review:
-               gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews \
-                 -f event=APPROVE
-               Do NOT approve on "synchronize" (incremental) reviews — only
-               full reviews have enough context to approve.
+            6. Submit the verdict:
+               a. If any 🔴 Important issue stands (found in this run, or raised by an
+                  earlier claude[bot] review and still not addressed), request changes:
+                  gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/reviews \
+                    -f event=REQUEST_CHANGES -f body="<one line per Important finding: path:line and the defect>"
+               b. Else, if EVENT is "opened" or "reopened" (full review), approve:
+                  gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/reviews \
+                    -f event=APPROVE
+               c. Else (synchronize, nothing Important stands): do NOT approve, only full
+                  reviews have enough context to approve. But if an earlier claude[bot]
+                  review still requests changes, lift it, since the push settled them:
+                  gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/reviews \
+                    --jq '.[] | select(.user.login == "claude[bot]" and .state == "CHANGES_REQUESTED") | .id'
+                  then for each id:
+                  gh api -X PUT repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/reviews/<id>/dismissals \
+                    -f message="Addressed in <head sha>" -f event=DISMISS
           claude_args: |
             --model claude-opus-5-5
             --effort xhigh
@@ -194,11 +247,11 @@ jobs:
             https://github.com/smg-project/smg-dev-guide.git
 
       - name: Annotate on failure
-        if: steps.claude-review.outcome == 'failure'
+        if: failure() && steps.gate.outputs.allowed == 'true' && steps.claude-review.outcome == 'failure'
         run: echo "::warning::Claude review did not complete — may have hit turn limit or encountered an error."
 
       - name: Review summary
-        if: always()
+        if: always() && steps.gate.outputs.allowed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -228,8 +281,8 @@ jobs:
             FETCH_OK=false
             COMMENTS="[]"
           else
-            if COMMENTS=$(set -o pipefail; gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments \
-              --paginate --jq ".[] | select((.user.login == \"claude[bot]\" or .user.login == \"github-actions[bot]\") and .created_at >= \"${RUN_START}\") | {path, line, body}" \
+            if COMMENTS=$(set -o pipefail; gh api repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}/comments \
+              --paginate --jq ".[] | select((.user.login == \"claude[bot]\" or .user.login == \"github-actions[bot]\") and .created_at >= \"${RUN_START}\" and (.body | contains(\"<!-- codex-review -->\") | not)) | {path, line, body}" \
               | jq -s '.' 2>/dev/null); then
               : # fetch succeeded
             else
@@ -292,8 +345,10 @@ jobs:
     if: >-
       (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment')
       && contains(github.event.comment.body, '@claude')
+      && !contains(github.event.comment.body, '@claude review')
+      && github.event.comment.user.type != 'Bot'
       && github.repository == 'smg-project/smg'
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    runs-on: ${{ vars.SMG_RUNNER_REVIEW || 'k8s-runner-cpu' }}
     timeout-minutes: 30
     concurrency:
       group: claude-respond-${{ github.event.issue.number || github.event.pull_request.number }}
@@ -304,15 +359,32 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Export API key from pod env
-        uses: ./.github/actions/export-pod-api-key
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Gate the run
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/codex_review_post.py gate
+
+      - name: Check out the pull request head
+        if: steps.gate.outputs.allowed == 'true'
+        run: |
+          git fetch --no-tags --quiet origin "refs/pull/${{ steps.gate.outputs.pr }}/head:refs/remotes/pr/${{ steps.gate.outputs.pr }}"
+          git checkout --quiet --detach "${{ steps.gate.outputs.head_sha }}"
 
       - name: Install gh CLI
+        if: steps.gate.outputs.allowed == 'true'
         uses: ./.github/actions/setup-gh
 
       - uses: anthropics/claude-code-action@v1
+        if: steps.gate.outputs.allowed == 'true'
+        env:
+          ANTHROPIC_BASE_URL: ${{ env.AI_KEY_PROXY }}/anthropic
         with:
-          anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ env.PROXY_PLACEHOLDER_KEY }}
           claude_args: |
             --model claude-opus-5-5
             --max-turns 30

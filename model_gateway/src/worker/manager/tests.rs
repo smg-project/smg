@@ -128,6 +128,18 @@ fn test_config() -> WorkerManagerConfig {
     }
 }
 
+/// The completion of a passing probe of `worker`, launched while the worker
+/// was not ready: the result that brings a worker into service.
+fn passing_probe(worker_id: WorkerId, worker: &Arc<dyn Worker>) -> ProbeCompletion {
+    ProbeCompletion {
+        worker_id,
+        worker: Arc::clone(worker),
+        expected_revision: worker.revision(),
+        launched_status: WorkerStatus::NotReady,
+        probe_result: Ok(()),
+    }
+}
+
 /// The probes promote a demoted worker through `apply_probe_completion`,
 /// not through `transition_status`: that path has to put the worker's
 /// open circuit breaker on trial too, or a restarted engine is Ready and
@@ -151,13 +163,7 @@ async fn a_passing_probe_run_readmits_a_demoted_worker_with_its_breaker_on_trial
 
     // The engine is back on the same address: the first passing probe
     // (success threshold 1) promotes the worker.
-    let completion = ProbeCompletion {
-        worker_id,
-        worker: worker.clone(),
-        expected_revision: worker.revision(),
-        launched_status: WorkerStatus::NotReady,
-        probe_result: Ok(()),
-    };
+    let completion = passing_probe(worker_id, &worker);
     let applied = apply_probe_completion(&registry, completion, None, None).await;
     assert!(matches!(
         applied,
@@ -277,13 +283,7 @@ async fn a_transition_into_ready_submits_a_label_refresh() {
     let worker = discovered_worker("http://local:7");
     worker.set_status(WorkerStatus::NotReady);
     let worker_id = registry.register(worker.clone()).unwrap();
-    let completion = ProbeCompletion {
-        worker_id,
-        worker: worker.clone(),
-        expected_revision: worker.revision(),
-        launched_status: WorkerStatus::NotReady,
-        probe_result: Ok(()),
-    };
+    let completion = passing_probe(worker_id, &worker);
     let applied = apply_probe_completion(&registry, completion, None, Some(&job_queue)).await;
     assert!(matches!(
         applied,
@@ -314,13 +314,7 @@ async fn a_worker_registered_without_labels_is_refreshed_when_it_comes_into_serv
     assert!(worker.metadata().discovered_labels.is_empty());
     worker.set_status(WorkerStatus::NotReady);
     let worker_id = registry.register(worker.clone()).unwrap();
-    let completion = ProbeCompletion {
-        worker_id,
-        worker: worker.clone(),
-        expected_revision: worker.revision(),
-        launched_status: WorkerStatus::NotReady,
-        probe_result: Ok(()),
-    };
+    let completion = passing_probe(worker_id, &worker);
     let applied = apply_probe_completion(&registry, completion, None, Some(&job_queue)).await;
     assert!(matches!(
         applied,

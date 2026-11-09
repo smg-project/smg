@@ -39,6 +39,32 @@ https://github.com/organizations/smg-project/settings/installations/<installatio
 See GitHub's [ARC authentication documentation](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/authenticate-to-the-api)
 for the authoritative permission list.
 
+## 1a. No API keys in the runner container
+
+The runner container of every scale set carries no API key, and none may be added: every job of
+every workflow runs in that container, so a key in its environment is readable by any pull request
+that reaches a runner. The keys the automated reviews and the scheduled Claude workflows use stay in
+the Kubernetes secrets (`openai-api-key`, `anthropic-api-key`) and are mounted only into the
+`ai-key-proxy` sidecar of `runner-values-cpu.yaml`: an nginx container that listens on
+`127.0.0.1:8787`, pod-local, and puts the real key on each request it forwards to
+`api.anthropic.com` or `api.openai.com`. The workflows point Claude (`ANTHROPIC_BASE_URL`) and the
+Codex action (`responses-api-endpoint`) at it with placeholder keys. A separate container's
+environment and memory are unreadable from the runner container, so nothing a job runs can print a
+key; what a job can do is spend through the proxy, which the keys' spend caps bound. Rotating a key is
+`kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -` on the secret and a roll of the
+runner pods. A live set whose runner container carries a key, or runs privileged (only the `dind`
+sidecar may), has drifted from these values; `helm upgrade` from the files here removes both.
+
+The same sidecar holds the private key of the **SMG Codex Review** GitHub App (secret
+`codex-github-app` with `app-id`, `installation-id` and `private-key`, the key in PKCS#8 form:
+`openssl pkcs8 -topk8 -nocrypt -in downloaded.pem`) and mints one-hour installation tokens for it
+on `POST http://127.0.0.1:8787/github/app-token`, which the Codex workflow's post job uses to post
+as `smg-codex-review[bot]`. The endpoint requires the calling job's GitHub Actions OIDC token
+(audience `ai-key-proxy`), checked against GitHub's signing keys and pinned to this repository and
+the Codex workflow file, so a fork's run, which gets no OIDC token, or another workflow's job on
+the same pod cannot mint. The key never leaves the pod; a job sees only the token. To rotate it,
+generate a new key on the App's settings page, replace the secret, and roll the runner set.
+
 ## 2. Create or update the Kubernetes secret
 
 Never paste credentials into `archived/arc-secret-template.yaml` or commit a private key.

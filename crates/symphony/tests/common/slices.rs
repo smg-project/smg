@@ -8,7 +8,7 @@
 //! bellwether commit in `.github/versions/bellwether.ref`. `BELLWETHER_FIXTURES` names that tree.
 //! Without it, or for a group the tree has not recorded, the callers skip the rows and the seeds
 //! and say so; nothing here is read from the repository. Each table that stands for a call syntax
-//! names its group ([`GROUPS`]) and the prompt the group's template leaves before the output: the
+//! names its group ([`GROUPS`](crate::slices::GROUPS)) and the prompt the group's template leaves before the output: the
 //! turn's opener and, for a template with a thought, the thought open or closed as the case's
 //! request asks, so the output is read where the model wrote it. The slice of a family is the
 //! longest recorded output whose message has the family's shape, the first in the sets' order
@@ -16,13 +16,14 @@
 //! call in its text is not plain text); one call with arguments and nothing else; two or more
 //! calls and nothing else; a thought and a call. The malformed slice is derived from the one call's: the
 //! fewest trailing characters of the call's body before the terminal that closes the call (each
-//! group names its table's, [`Group::call_close`]) are cut that make the table report the call
+//! group names its table's, [`Group::call_close`](crate::slices::Group::call_close)) are cut that make the table report the call
 //! malformed, which the table itself is asked: one character for most (the `}` of a JSON object,
 //! the `>` of a tag, the `]` of a list), more where the table forgives a cut at the close (Gemma 4
 //! closes an open object at the call's end, so the string before it is cut open). A message's or
 //! a list's close after the call's, and the separators a table ignores, are not the call's close.
 //!
-//! Included by path from `benches/throughput.rs` and from the fuzz crate: one definition for both.
+//! Included by path from `benches/throughput.rs` and from the fuzz crate as the module `slices` of
+//! each root: one definition for both, whose doc links are written from the crate root.
 
 use std::{
     fs,

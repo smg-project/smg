@@ -118,6 +118,7 @@ struct Window {
     healed: u64,
     holders: u64,
     decoded: u64,
+    refused: u64,
 }
 
 impl Window {
@@ -128,6 +129,7 @@ impl Window {
         self.removed += r.removed_blocks as u64;
         self.healed += r.healed_blocks as u64;
         self.decoded += r.decoded_blocks as u64;
+        self.refused += r.refused_blocks as u64;
         self.holders += r.holders as u64;
     }
 }
@@ -232,11 +234,13 @@ fn main() -> anyhow::Result<()> {
                 "removed_blocks": window.removed,
                 "healed_blocks": window.healed,
                 "decoded_blocks": window.decoded,
+                "refused_blocks": window.refused,
+                "cap_refusals": stats.cap_refusals,
                 "restarts": churn.restarts,
                 "exact": exact.is_ok(),
             });
             println!(
-                "{:>9} req {:7.1}s lookup p50 {:6.2} p99 {:7.2} us walked mean {:5.2} p99 {:3} | runs live {:7} blocks live {:9} mean len {:6.1} | splits branch {} hole {} mid-run {} holders {} died {} mergeable {} ({} blocks) | stored {} removed {} healed {} | exact {}",
+                "{:>9} req {:7.1}s lookup p50 {:6.2} p99 {:7.2} us walked mean {:5.2} p99 {:3} | runs live {:7} blocks live {:9} mean len {:6.1} | splits branch {} hole {} mid-run {} holders {} died {} mergeable {} ({} blocks) | stored {} removed {} healed {} refused {} | exact {}",
                 request,
                 row["elapsed_s"].as_f64().unwrap_or(0.0),
                 row["lookup_p50_us"].as_f64().unwrap_or(0.0),
@@ -256,6 +260,7 @@ fn main() -> anyhow::Result<()> {
                 window.stored,
                 window.removed,
                 window.healed,
+                window.refused,
                 exact.is_ok(),
             );
             std::io::stdout().flush().ok();
