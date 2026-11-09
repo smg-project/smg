@@ -55,7 +55,7 @@ use crate::{
 /// The message a sequential decode side's silence verdict starts with (see
 /// [`decode_side_silent`]); it tells the verdict from an engine's own
 /// `DEADLINE_EXCEEDED`.
-const DECODE_SIDE_SILENCE_MESSAGE: &str = "decode leg produced nothing within";
+const DECODE_SIDE_SILENCE_MESSAGE: &str = "decode side produced nothing within";
 
 /// Give the decode side the media identity the prefill side produced, so it
 /// is served without pixels or references. Only on a side that will pull its
@@ -352,7 +352,7 @@ fn sequential_pd_decode_form(
         let mut response = error::bad_request(
             "pd_decode_language_model_only_mrope",
             "no decode worker with a vision encoder is paired for this model, and its \
-             decode leg needs the M-RoPE grid tensors a decode worker running with \
+             decode side needs the M-RoPE grid tensors a decode worker running with \
              --language-model-only cannot take; add a decode worker with the vision \
              encoder enabled for this model"
                 .to_string(),
@@ -381,7 +381,7 @@ fn sequential_pd_decode_form(
             "pd_decode_language_model_only_n_samples",
             "no decode worker with a vision encoder is paired for this model, and n>1 \
              parallel sampling of a multimodal prompt recomputes it on the decode \
-             leg, which a decode worker running with --language-model-only cannot \
+             side, which a decode worker running with --language-model-only cannot \
              do; add a decode worker with the vision encoder enabled"
                 .to_string(),
         );
@@ -455,7 +455,7 @@ impl SequentialPlan {
             }
             KvConnectorMode::Store => debug!(
                 "vLLM PD (KV store): the prefill writes its blocks to the shared store and the \
-                 decode reads them back by prefix hash; no connector params on either leg"
+                 decode reads them back by prefix hash; no connector params on either side"
             ),
             KvConnectorMode::Passthrough => {
                 // Warn once: PD without a discovered connector usually means GetServerInfo
@@ -906,7 +906,7 @@ fn relay_to_decode(
         error!(
             function = "execute_sequential_pd",
             request_id = %decode_request.request_id(),
-            "stripped multimodal decode leg has no kv_transfer_params to pull from"
+            "stripped multimodal decode side has no kv_transfer_params to pull from"
         );
         let mut response = error::bad_gateway(
             "pd_decode_missing_kv_transfer_params",
