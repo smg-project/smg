@@ -36,7 +36,7 @@
 //!   leaves sharing one) and child tables return to free lists when they die; a run id carries a
 //!   generation so a stale child entry or forwarding record to a reused id is recognised.
 //!   Children are an open-addressing table (linear probing, tombstones, rebuilt at 3/4 load), so
-//!   a node with many children, the root above all, inserts in constant time.
+//!   a node with many children, the root above all, inserts and unlinks one in constant time.
 //!
 //! Engine hashes: the index trusts the engine's parent pointers and block identities. Nothing is
 //! shared between workers through the maps, so one engine
@@ -774,14 +774,20 @@ impl ChainIndex {
         }
     }
 
-    /// Take `child` out of the run's table (the run is locked); an emptied table goes away once
-    /// no insert is in flight on it.
+    /// Take `child` out of the run's table (both runs are locked, the child's window still
+    /// standing): its slot is probed by the key it was linked under, its offset under the run
+    /// and its first content hash; an emptied table goes away once no insert is in flight on it.
     fn unlink_child(&self, run: &Run, child: u32) {
         let table = run.children.load(Ordering::Relaxed);
         if table == NONE {
             return;
         }
-        let live = self.arena.table_take(table, child);
+        let child_run = self.slab.run(child);
+        let key = Self::child_key(
+            child_run.start().saturating_sub(run.start()),
+            self.hash_at(child_run, 0),
+        );
+        let live = self.arena.table_take(table, key, child);
         if live == 0 {
             run.begin_update();
             run.wait_inflight();
