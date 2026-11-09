@@ -388,6 +388,29 @@ impl WorkerGroups {
         inner.incomplete = false;
     }
 
+    /// The worker's index restarted while the engine's cache stands (a main group showed on a
+    /// worker whose window group had been its main signal): the names go, the memberships stay.
+    /// Every retained block goes back to waiting under the worker's hash, beside the blocks
+    /// waiting already, for the main group's stores to name it anew ([`Self::main_stored`]
+    /// places it then); the extra copies go with the names, as a copy stored while waiting is
+    /// not counted; and the view is complete again.
+    pub fn restarted(&self) {
+        let inner = &mut *self.inner.write();
+        let named: Vec<(SequenceHash, SequenceHash)> = inner
+            .by_engine
+            .drain()
+            .chain(inner.lingering.drain())
+            .collect();
+        for (hash, prefix) in named {
+            if let Some(mask) = inner.retained.remove(&prefix) {
+                *inner.pending.entry(hash).or_insert(0) |= mask;
+            }
+        }
+        inner.retained.clear();
+        inner.extra_copies.clear();
+        inner.incomplete = false;
+    }
+
     /// The view was created while the index already held `blocks` of the worker's main blocks,
     /// none of them named here: with any, the rule leaves the worker's overlap standing until a
     /// clear ([`Self::is_complete`]).
@@ -621,6 +644,31 @@ mod tests {
     }
 
     const WINDOW: GroupKind = GroupKind::SlidingWindow { window: 64 };
+
+    /// A restart of the worker's index keeps the memberships the names had: a retained block
+    /// waits under the worker's hash and is placed again by the main store that names it, and
+    /// the hit it gave the rule is the same before and after.
+    #[test]
+    fn a_restart_keeps_the_memberships_for_the_names_to_come() {
+        let path = prefixes(4);
+        let view = view(1, WINDOW, 4, &[0, 1]);
+        assert_eq!(view.cap(&path, 4, 16).depth, 2, "the leading run of two");
+        view.restarted();
+        assert!(view.is_complete());
+        assert_eq!((view.named_blocks(), view.retained_blocks()), (0, 0));
+        let main: Vec<(SequenceHash, ContentHash)> = contents(4)
+            .into_iter()
+            .enumerate()
+            .map(|(at, content)| (engine(at), content))
+            .collect();
+        assert_eq!(
+            view.main_stored(None, &main),
+            2,
+            "the waiting blocks placed again"
+        );
+        assert_eq!(view.retained_blocks(), 2);
+        assert_eq!(view.cap(&path, 4, 16).depth, 2);
+    }
 
     /// Block 16, window 64: four contiguous retained blocks ending at the hit, else the leading
     /// run. The cells are the engine's sliding-window lookup read right to left.
