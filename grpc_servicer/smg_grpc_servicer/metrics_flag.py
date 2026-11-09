@@ -1,6 +1,6 @@
-"""The ``--metrics-port`` and ``--metrics-host`` flags the engine launchers
-register for the Rust servicer's Prometheus endpoint: their names and the one
-registration the three launchers share.
+"""The metrics flags the engine launchers register for the Rust servicer's
+Prometheus endpoint. TokenSpeed uses ``--servicer-metrics-port/host`` to keep
+its engine's ``--metrics-port/host`` arguments separate.
 
 Stdlib only on purpose, like the servicer-implementation flag: the engine
 plugins that add the flags are loaded in every engine process and import
@@ -54,16 +54,17 @@ def add_metrics_arguments(
     port_env: str,
     host_env: str,
     server_class: str,
+    port_flag: str = METRICS_PORT_FLAG,
+    host_flag: str = METRICS_HOST_FLAG,
 ) -> bool:
-    """Add ``--metrics-port`` and ``--metrics-host`` to a launcher's parser
+    """Add the servicer's metrics port and host flags to a launcher's parser
     that lacks them; returns whether they were added. ``server_class`` names
     the Rust server the help text points at."""
     actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry of option strings
-    if METRICS_PORT_FLAG in actions:
+    if port_flag in actions:
         return False
     parser.add_argument(
-        METRICS_PORT_FLAG,
-        dest="metrics_port",
+        port_flag,
         type=int,
         default=None,
         action=_EnvStoreAction,
@@ -76,8 +77,7 @@ def add_metrics_arguments(
         ),
     )
     parser.add_argument(
-        METRICS_HOST_FLAG,
-        dest="metrics_host",
+        host_flag,
         default=None,
         action=_EnvStoreAction,
         env_name=host_env,

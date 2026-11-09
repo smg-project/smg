@@ -95,7 +95,12 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
 from smg_grpc_servicer.servicer_impl_flag import (
     add_servicer_impl_argument as _add_servicer_impl_argument,
 )
-from smg_grpc_servicer.tokenspeed import METRICS_HOST_ENV, METRICS_PORT_ENV
+from smg_grpc_servicer.tokenspeed import (
+    METRICS_HOST_ENV,
+    METRICS_HOST_FLAG,
+    METRICS_PORT_ENV,
+    METRICS_PORT_FLAG,
+)
 from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 from smg_grpc_servicer.tokenspeed.loads import running_window
@@ -142,7 +147,7 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
 
 
 def add_metrics_arguments(parser: argparse.ArgumentParser) -> bool:
-    """Add ``--metrics-port`` and ``--metrics-host`` (the Rust servicer's
+    """Add ``--servicer-metrics-port`` and ``--servicer-metrics-host`` (the Rust servicer's
     Prometheus endpoint) to a launcher's parser that lacks them; returns
     whether they were added."""
     return _add_metrics_arguments(
@@ -150,6 +155,8 @@ def add_metrics_arguments(parser: argparse.ArgumentParser) -> bool:
         port_env=METRICS_PORT_ENV,
         host_env=METRICS_HOST_ENV,
         server_class="smg.servicer.TokenSpeedGrpcServer",
+        port_flag=METRICS_PORT_FLAG,
+        host_flag=METRICS_HOST_FLAG,
     )
 
 
@@ -770,6 +777,7 @@ class TokenSpeedLauncher(RustLauncher):
     prefill_tokens_per_sec_env = PREFILL_TOKENS_PER_SEC_ENV
     kv_events_env = KV_EVENTS_ENV
     metrics_port_env = METRICS_PORT_ENV
+    metrics_port_flag = METRICS_PORT_FLAG
     metrics_host_env = METRICS_HOST_ENV
     without_tokenizer = "string stops will be refused"
     warmup_env = WARMUP_ENV
@@ -783,6 +791,15 @@ class TokenSpeedLauncher(RustLauncher):
     # for the other roles and on an engine whose headless launcher hosts its
     # own.
     _bootstrap_server: Any = None
+
+    def metrics_bind_address(
+        self, args: Any, environ: Mapping[str, str] | None = None
+    ) -> str | None:
+        # ServerArgs.metrics_* belongs to the engine. The servicer's flags
+        # are exported to its environment by the argument parser.
+        return super().metrics_bind_address(
+            argparse.Namespace(host=args.host, port=args.port), environ=environ
+        )
 
     def model_config(self, args: Any) -> Any:
         if self._cached_model_config is None:
