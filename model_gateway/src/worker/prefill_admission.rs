@@ -214,6 +214,115 @@ where
     }
 }
 
+/// How many times a newcomer with nobody waiting decides and commits
+/// before it queues: the proposal and one re-decision after a commit miss.
+const NEWCOMER_ATTEMPTS: usize = 2;
+
+/// The per-worker capacity window as a decision reads it outside the
+/// admission lock: an atomic read of the worker's load against the limit.
+/// The commit under the lock re-validates it ([`PrefillSelectionContext`]).
+pub struct CapacityWindow {
+    max_inflight_requests_per_worker: usize,
+}
+
+impl CapacityWindow {
+    /// A window nothing bounds: admission is off.
+    pub fn unbounded() -> Self {
+        Self {
+            max_inflight_requests_per_worker: usize::MAX,
+        }
+    }
+
+    pub fn has_capacity(&self, worker: &Arc<dyn Worker>) -> bool {
+        worker.load() < self.max_inflight_requests_per_worker
+    }
+}
+
+/// What a decision made outside the admission lock proposes.
+pub enum PrefillProposal<P> {
+    /// A proposal the commit under the lock re-validates.
+    Proposed(P),
+    /// No candidate with capacity: wait for a slot.
+    AtCapacity,
+    /// No healthy, model-matching worker.
+    Unavailable,
+}
+
+/// [`acquire_prefill`] with the decision made outside the admission lock:
+/// `decide` runs with no lock held, only when this request may select (a
+/// newcomer with nobody waiting, or the queue head), and `commit` runs under
+/// the lock to re-validate the proposal and reserve. A decision books
+/// nothing; only the commit reserves, so a proposal the window refuses costs
+/// one more decision and no state.
+pub async fn acquire_prefill_decided<C, E, P, S, D, Pf>(
+    admission: Option<&PrefillAdmission>,
+    routing_key: Option<&str>,
+    prefill_of: Pf,
+    mut decide: D,
+    mut commit: S,
+) -> Result<(C, PrefillLoadGuard), PrefillAcquireError<E>>
+where
+    D: FnMut(&CapacityWindow) -> Result<P, E> + Send,
+    S: for<'a> FnMut(Option<&PrefillSelectionContext<'a>>, P) -> Result<C, E> + Send,
+    Pf: Fn(&C) -> &Arc<dyn Worker> + Send + Sync,
+    E: PrefillCandidateError + Send,
+    P: Send,
+{
+    let Some(admission) = admission else {
+        let proposal =
+            decide(&CapacityWindow::unbounded()).map_err(PrefillAcquireError::Candidate)?;
+        let candidate = commit(None, proposal).map_err(PrefillAcquireError::Candidate)?;
+        let guard = PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::with_key(Arc::clone(prefill_of(&candidate)), routing_key),
+        };
+        return Ok((candidate, guard));
+    };
+
+    let verdict: std::sync::Mutex<Option<E>> = std::sync::Mutex::new(None);
+    let record = |error: E| {
+        *verdict
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+    };
+    let admitted = admission
+        .admit_decided(
+            routing_key,
+            |window| match decide(window) {
+                Ok(proposal) => PrefillProposal::Proposed(proposal),
+                Err(error) if error.is_at_capacity() => PrefillProposal::AtCapacity,
+                Err(error) => {
+                    record(error);
+                    PrefillProposal::Unavailable
+                }
+            },
+            |capacity, proposal| match commit(Some(capacity), proposal) {
+                Ok(candidate) => capacity.select(Arc::clone(prefill_of(&candidate)), candidate),
+                Err(error) if error.is_at_capacity() => PrefillAdmissionAttempt::AtCapacity,
+                Err(error) => {
+                    record(error);
+                    PrefillAdmissionAttempt::Unavailable
+                }
+            },
+        )
+        .await;
+
+    let verdict = verdict
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match (admitted, verdict) {
+        (Ok(admitted), _) => Ok((
+            admitted.selected,
+            PrefillLoadGuard::Admission {
+                _reservation: Arc::new(admitted.reservation),
+            },
+        )),
+        (Err(PrefillAdmissionRejection::Unavailable), Some(error)) => {
+            Err(PrefillAcquireError::Candidate(error))
+        }
+        (Err(rejection), _) => Err(PrefillAcquireError::Rejected(rejection)),
+    }
+}
+
 /// Router-local, strict FIFO admission for the Prefill phase of PD requests.
 ///
 /// Waiting requests do not hold a worker. Only the queue head receives a
@@ -398,6 +507,192 @@ impl PrefillAdmission {
                 None => {}
             }
         }
+    }
+
+    /// [`Self::admit`] with the decision outside the lock.
+    ///
+    /// The invariant stays "only the queue head, or a newcomer with nobody
+    /// waiting, selects": that request reads the capacity window with no lock
+    /// held, decides, then takes the lock to re-validate and reserve. A
+    /// newcomer whose proposal the commit refuses decides once more (its
+    /// closures know the miss) and then joins the queue; the head whose
+    /// proposal is refused waits for the next wake. A decision books nothing,
+    /// so the serialized section is the commit alone.
+    pub async fn admit_decided<P, T, D, C>(
+        &self,
+        routing_key: Option<&str>,
+        mut decide: D,
+        mut commit: C,
+    ) -> Result<AdmittedPrefill<T>, PrefillAdmissionRejection>
+    where
+        D: FnMut(&CapacityWindow) -> PrefillProposal<P> + Send,
+        C: for<'a> FnMut(&PrefillSelectionContext<'a>, P) -> PrefillAdmissionAttempt<T> + Send,
+        P: Send,
+    {
+        let window = CapacityWindow {
+            max_inflight_requests_per_worker: self.inner.max_inflight_requests_per_worker,
+        };
+        // A newcomer decides at once when nobody waits: whether anyone does
+        // is read under the lock, the decision is made outside it, and the
+        // commit under it may still take a slot, since this request is older
+        // than anyone who queued meanwhile.
+        let newcomer_allowed = self.inner.state.lock().waiters.is_empty();
+        if newcomer_allowed {
+            // A newcomer's proposal can lose its slot to another newcomer
+            // that committed first, the one commit miss of this path; it
+            // decides once more before it queues, so two requests that read
+            // the same window do not turn one free slot into a queue.
+            for _ in 0..NEWCOMER_ATTEMPTS {
+                match decide(&window) {
+                    PrefillProposal::Unavailable => {
+                        Metrics::record_pd_prefill_admission_rejection("unavailable");
+                        return Err(PrefillAdmissionRejection::Unavailable);
+                    }
+                    PrefillProposal::AtCapacity => break,
+                    PrefillProposal::Proposed(proposal) => {
+                        let state = self.inner.state.lock();
+                        match self.commit_locked(&state, routing_key, &mut commit, proposal) {
+                            LockedAttempt::Selected(admitted) => return Ok(admitted),
+                            LockedAttempt::Unavailable => {
+                                Metrics::record_pd_prefill_admission_rejection("unavailable");
+                                return Err(PrefillAdmissionRejection::Unavailable);
+                            }
+                            LockedAttempt::AtCapacity => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        let (waiter, queued_at) = {
+            let mut state = self.inner.state.lock();
+            if state.waiters.len() >= self.inner.queue_size {
+                Metrics::record_pd_prefill_admission_rejection("queue_full");
+                return Err(PrefillAdmissionRejection::QueueFull);
+            }
+            let waiter = Arc::new(PrefillWaiter {
+                notify: Notify::new(),
+            });
+            let queued_at = Instant::now();
+            state.waiters.push_back(Arc::clone(&waiter));
+            Metrics::set_pd_prefill_admission_queued(state.waiters.len());
+            (waiter, queued_at)
+        };
+
+        let mut ticket = QueueTicket {
+            inner: Arc::clone(&self.inner),
+            waiter,
+            queued: true,
+            queued_at,
+        };
+        let timeout = tokio::time::sleep(self.inner.queue_timeout);
+        let deadline = timeout.deadline();
+        tokio::pin!(timeout);
+
+        loop {
+            let waiter = Arc::clone(&ticket.waiter);
+            let is_head = {
+                let state = self.inner.state.lock();
+                ticket.is_head(&state)
+            };
+            let recheck = tokio::time::sleep(HEAD_RECHECK_INTERVAL);
+            tokio::pin!(recheck);
+            tokio::select! {
+                biased;
+                () = &mut timeout => {
+                    Metrics::record_pd_prefill_admission_rejection("queue_timeout");
+                    return Err(PrefillAdmissionRejection::QueueTimeout);
+                }
+                () = waiter.notify.notified() => {}
+                () = &mut recheck, if is_head => {}
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                Metrics::record_pd_prefill_admission_rejection("queue_timeout");
+                return Err(PrefillAdmissionRejection::QueueTimeout);
+            }
+
+            let is_head = {
+                let state = self.inner.state.lock();
+                ticket.is_head(&state)
+            };
+            if !is_head {
+                continue;
+            }
+            // The head decides with no lock held; nobody else may select
+            // meanwhile, and only the head itself leaves the head position.
+            let proposal = match decide(&window) {
+                PrefillProposal::Proposed(proposal) => proposal,
+                PrefillProposal::AtCapacity => continue,
+                PrefillProposal::Unavailable => {
+                    let next = {
+                        let mut state = self.inner.state.lock();
+                        ticket.remove_head(&mut state)
+                    };
+                    if let Some(waiter) = next {
+                        waiter.notify.notify_one();
+                    }
+                    Metrics::record_pd_prefill_admission_rejection("unavailable");
+                    return Err(PrefillAdmissionRejection::Unavailable);
+                }
+            };
+            let decision = {
+                let mut state = self.inner.state.lock();
+                match self.commit_locked(&state, routing_key, &mut commit, proposal) {
+                    LockedAttempt::Selected(admitted) => {
+                        let next = ticket.remove_head(&mut state);
+                        Some(QueuedAttempt::Selected(admitted, next))
+                    }
+                    LockedAttempt::Unavailable => {
+                        let next = ticket.remove_head(&mut state);
+                        Some(QueuedAttempt::Unavailable(next))
+                    }
+                    LockedAttempt::AtCapacity => None,
+                }
+            };
+            match decision {
+                Some(QueuedAttempt::Selected(admitted, next)) => {
+                    if let Some(waiter) = next {
+                        waiter.notify.notify_one();
+                    }
+                    return Ok(admitted);
+                }
+                Some(QueuedAttempt::Unavailable(next)) => {
+                    if let Some(waiter) = next {
+                        waiter.notify.notify_one();
+                    }
+                    Metrics::record_pd_prefill_admission_rejection("unavailable");
+                    return Err(PrefillAdmissionRejection::Unavailable);
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// The commit of a proposal under the lock: re-validate through `commit`
+    /// (which answers through [`PrefillSelectionContext::select`]) and
+    /// reserve the slot, as [`Self::try_admit_locked`] does for a selection
+    /// made under the lock.
+    fn commit_locked<P, T, C>(
+        &self,
+        state: &PrefillAdmissionState,
+        routing_key: Option<&str>,
+        commit: &mut C,
+        proposal: P,
+    ) -> LockedAttempt<T>
+    where
+        C: for<'a> FnMut(&PrefillSelectionContext<'a>, P) -> PrefillAdmissionAttempt<T>,
+    {
+        let mut proposal = Some(proposal);
+        self.try_admit_locked(
+            state,
+            routing_key,
+            true,
+            &mut |capacity| match proposal.take() {
+                Some(proposal) => commit(capacity, proposal),
+                None => PrefillAdmissionAttempt::AtCapacity,
+            },
+        )
     }
 
     /// Wake the queue head after worker registration, removal, replacement, or
@@ -1086,5 +1381,192 @@ mod tests {
             spy.0.lock().unwrap().as_slice(),
             ["grpc://prefill-admitted"]
         );
+    }
+
+    /// A request through the decided path: a decision that proposes `worker`
+    /// each time it runs (counted in `decisions`) and a commit that
+    /// re-validates the window, as the engine's commit does.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test joins the task before it ends"
+    )]
+    fn decided_attempt(
+        admission: &PrefillAdmission,
+        worker: &Arc<dyn Worker>,
+        decisions: &Arc<AtomicUsize>,
+    ) -> JoinHandle<Result<AdmittedPrefill<()>, PrefillAdmissionRejection>> {
+        let admission = admission.clone();
+        let worker = Arc::clone(worker);
+        let decisions = Arc::clone(decisions);
+        tokio::spawn(async move {
+            admission
+                .admit_decided(
+                    None,
+                    |_window| {
+                        decisions.fetch_add(1, Ordering::Relaxed);
+                        PrefillProposal::Proposed(())
+                    },
+                    |capacity, ()| capacity.select(Arc::clone(&worker), ()),
+                )
+                .await
+        })
+    }
+
+    #[tokio::test]
+    async fn a_decided_newcomer_with_nobody_waiting_decides_once_and_reserves() {
+        let admission = PrefillAdmission::new(1, 0, Duration::from_secs(1));
+        let worker = worker("http://prefill-decided-newcomer");
+        let decisions = AtomicUsize::new(0);
+        let commits = AtomicUsize::new(0);
+
+        let admitted = admission
+            .admit_decided(
+                None,
+                |window| {
+                    decisions.fetch_add(1, Ordering::Relaxed);
+                    assert!(window.has_capacity(&worker));
+                    PrefillProposal::Proposed("proposed")
+                },
+                |capacity, proposal| {
+                    commits.fetch_add(1, Ordering::Relaxed);
+                    capacity.select(Arc::clone(&worker), proposal)
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(admitted.selected, "proposed");
+        assert_eq!(decisions.load(Ordering::Relaxed), 1);
+        assert_eq!(commits.load(Ordering::Relaxed), 1);
+        assert_eq!(worker.load(), 1);
+        drop(admitted.reservation);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_decided_proposal_the_window_refuses_at_the_commit_waits_as_the_head() {
+        let admission = PrefillAdmission::new(1, 1, Duration::from_secs(1));
+        let worker = worker("http://prefill-decided-miss");
+        let first = admission.admit(None, select_worker(&worker)).await.unwrap();
+
+        // The decision proposes the full worker (a stale read would); the
+        // commit's re-validation refuses it twice (the proposal and its one
+        // re-decision), and the request waits as the head instead of taking
+        // a second slot.
+        let decisions = Arc::new(AtomicUsize::new(0));
+        let waiter = decided_attempt(&admission, &worker, &decisions);
+        wait_for_queued(&admission, 1).await;
+        assert_eq!(worker.load(), 1);
+        assert_eq!(decisions.load(Ordering::Relaxed), 2);
+
+        drop(first);
+        let admitted = waiter.await.unwrap().unwrap();
+        assert!(decisions.load(Ordering::Relaxed) >= 3);
+        assert_eq!(worker.load(), 1);
+        assert_eq!(admission.queued_requests(), 0);
+        drop(admitted);
+    }
+
+    #[tokio::test]
+    async fn only_the_decided_head_decides_while_others_wait() {
+        let admission = PrefillAdmission::new(1, 2, Duration::from_secs(1));
+        let worker = worker("http://prefill-decided-head-only");
+        let first = admission.admit(None, select_worker(&worker)).await.unwrap();
+
+        let head_decisions = Arc::new(AtomicUsize::new(0));
+        let head = decided_attempt(&admission, &worker, &head_decisions);
+        wait_for_queued(&admission, 1).await;
+        let second_decisions = Arc::new(AtomicUsize::new(0));
+        let second = decided_attempt(&admission, &worker, &second_decisions);
+        wait_for_queued(&admission, 2).await;
+
+        // The second request found a waiter, so it never decided; the head
+        // decided twice on arrival (the proposal and its re-decision) and
+        // decides again only when it is woken.
+        assert_eq!(head_decisions.load(Ordering::Relaxed), 2);
+        assert_eq!(second_decisions.load(Ordering::Relaxed), 0);
+
+        drop(first);
+        let admitted_head = head.await.unwrap().unwrap();
+        assert_eq!(worker.load(), 1);
+        drop(admitted_head);
+        let admitted_second = second.await.unwrap().unwrap();
+        assert!(second_decisions.load(Ordering::Relaxed) >= 1);
+        assert_eq!(worker.load(), 1);
+        drop(admitted_second);
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_decision_rejects_the_newcomer_without_queueing() {
+        let admission = PrefillAdmission::new(1, 1, Duration::from_secs(1));
+        let result = admission
+            .admit_decided(
+                None,
+                |_window| PrefillProposal::<()>::Unavailable,
+                |_capacity, ()| PrefillAdmissionAttempt::<()>::Unavailable,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(PrefillAdmissionRejection::Unavailable)
+        ));
+        assert_eq!(admission.queued_requests(), 0);
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Refused;
+
+    impl PrefillCandidateError for Refused {
+        fn is_at_capacity(&self) -> bool {
+            false
+        }
+    }
+
+    fn same(worker: &Arc<dyn Worker>) -> &Arc<dyn Worker> {
+        worker
+    }
+
+    #[tokio::test]
+    async fn acquire_decided_without_admission_commits_once_under_an_unbounded_guard() {
+        let worker = worker("http://prefill-decided-unbounded");
+        let Ok((selected, guard)) = acquire_prefill_decided::<_, Refused, _, _, _, _>(
+            None,
+            None,
+            same,
+            |window| {
+                assert!(window.has_capacity(&worker));
+                Ok(())
+            },
+            |context, ()| {
+                assert!(context.is_none());
+                Ok(Arc::clone(&worker))
+            },
+        )
+        .await
+        else {
+            panic!("the unbounded path admits");
+        };
+        assert_eq!(selected.url(), worker.url());
+        assert_eq!(worker.load(), 1);
+        drop(guard);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn acquire_decided_reports_the_candidate_error_of_an_unavailable_decision() {
+        let admission = PrefillAdmission::new(1, 1, Duration::from_secs(1));
+        let result = acquire_prefill_decided::<Arc<dyn Worker>, Refused, (), _, _, _>(
+            Some(&admission),
+            None,
+            same,
+            |_window| Err(Refused),
+            |_context, ()| panic!("a refused decision never commits"),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(PrefillAcquireError::Candidate(Refused))
+        ));
+        assert_eq!(admission.queued_requests(), 0);
     }
 }
