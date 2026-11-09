@@ -641,6 +641,90 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # Initial advisory AMD PR performance slice: same regular HTTP/gRPC test,
+  # four TP1 workers and thresholds as NVIDIA. PD performance remains separate.
+  benchmarks-amd:
+    needs: [build-wheel, detect-changes]
+    if: >-
+      !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_ON_PRS == 'true'
+      && vars.SMG_RUN_AMD_PR_BENCHMARK == 'true'
+      && github.event_name == 'pull_request'
+      && needs.build-wheel.result == 'success'
+      && needs.detect-changes.result == 'success'
+      && needs.detect-changes.outputs.docs-only != 'true'
+      && needs.detect-changes.outputs.card-tier-from == ''
+    runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi300x' }}
+    container:
+      image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+      options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    continue-on-error: true
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      E2E_RUNTIME: sglang
+      E2E_MIN_SELECTED: '2'
+      GENAI_BENCH_TEST_TIMEOUT: '600'
+      E2E_AMD_REQUIRE_PASSING_CALL: '1'
+      E2E_STARTUP_TIMEOUT: '900'
+      ROUTER_LOCAL_MODEL_PATH: /models
+      GPU_TYPE: MI300
+      BENCH_ENFORCE_THRESHOLDS: '0'
+      E2E_LOG_DIR: benchmark-logs-amd
+    steps:
+      - uses: actions/checkout@v7
+      - name: Mark owned processes
+        run: echo "E2E_JOB_MARKER=benchmark-amd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
+      - name: Setup SGLang in its ROCm image
+        run: bash scripts/ci_setup_sglang_rocm_image.sh
+      - uses: ./.github/actions/download-build-artifacts
+        with:
+          wasm-fixtures: 'true'
+          client-types: 'true'
+      - name: Install wheel and test dependencies
+        run: |
+          pip uninstall -y smg || true
+          pip install wheel/*.whl
+          bash scripts/ci_install_e2e_deps.sh
+      - name: Install genai-bench
+        run: |
+          python3 -m venv "$RUNNER_TEMP/genai-bench"
+          bash scripts/ci_retry.sh 3 10 "$RUNNER_TEMP/genai-bench/bin/pip" install 'genai-bench==0.0.4' 'truststore<0.10.5'
+          echo "GENAI_BENCH_BIN=$RUNNER_TEMP/genai-bench/bin/genai-bench" >> "$GITHUB_ENV"
+      - name: Record runtime versions
+        run: |
+          mkdir -p benchmark-logs-amd
+          python3 -m pip freeze > benchmark-logs-amd/runtime-versions.txt
+          "$RUNNER_TEMP/genai-bench/bin/pip" freeze > benchmark-logs-amd/benchmark-versions.txt
+          printf '%s\n' "head=$GITHUB_SHA" "runner=$RUNNER_NAME" 'workers=4 protocol=http,grpc engine=sglang gpu=MI300' > benchmark-logs-amd/context.txt
+      - name: Run regular HTTP and gRPC benchmarks
+        run: |
+          SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1 pytest e2e_test/benchmarks/test_regular_perf.py -s -vv --junitxml=benchmark-logs-amd/junit.xml
+      - name: Explain measurement scope
+        if: always()
+        run: echo 'AMD initial slice measures request throughput and latency for regular HTTP/gRPC. The existing NVML utilization sampler cannot measure AMD utilization; its utilization output is not acceptance evidence. PD performance remains a separate gap.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Qualify raw AMD benchmark measurements
+        id: qualify
+        if: always()
+        run: python3 scripts/ci/validate_pr_benchmark.py --output benchmark-logs-amd/qualification.json
+      - name: Summarize AMD results
+        if: always() && steps.qualify.outcome == 'success'
+        run: python3 e2e_test/benchmarks/summarize.py
+      - name: Reap owned processes
+        if: always() && env.E2E_JOB_MARKER != ''
+        run: python3 scripts/ci_reap_job_processes.py "$E2E_JOB_MARKER"
+      - name: Upload AMD performance results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: genai-bench-results-amd-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            benchmark_**/
+            benchmark-logs-amd/
+          retention-days: 30
+
   detect-changes:
     runs-on: ubuntu-latest
     permissions:
