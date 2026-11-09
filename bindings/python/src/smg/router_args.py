@@ -71,6 +71,22 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _power_of_two_load_metric(value: str) -> str:
+    """argparse type for --power-of-two-load-metric: a metric name, or
+    resident_tokens:<request_tokens> with a non-negative integer cost, refused
+    here rather than by the binding's conversion after parsing."""
+    metric = value.strip().lower()
+    cost = metric.removeprefix("resident_tokens:")
+    if metric in ("expected_wait", "requests", "least_requests") or (
+        cost != metric and cost.isdigit()
+    ):
+        return value
+    raise argparse.ArgumentTypeError(
+        "expected expected_wait, requests, least_requests or "
+        f"resident_tokens:<request_tokens>, got {value!r}"
+    )
+
+
 def _ip_address(value: str) -> str | None:
     """argparse type for a listener address the router validates as an IP address:
     a plain IPv4 or IPv6 literal, surrounding whitespace aside (blank is unset, as
@@ -1023,10 +1039,13 @@ class RouterArgs:
         )
         routing_group.add_argument(
             f"--{prefix}power-of-two-load-metric",
-            type=str,
-            choices=["expected_wait", "requests", "least_requests"],
+            type=_power_of_two_load_metric,
             default=RouterArgs.power_of_two_load_metric,
-            help="What power_of_two compares: expected_wait, requests or least_requests",
+            help=(
+                "What power_of_two compares: expected_wait, requests, least_requests or"
+                " resident_tokens:<request_tokens> (resident context tokens plus that many"
+                " per request)"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}pd-pairing-mode",

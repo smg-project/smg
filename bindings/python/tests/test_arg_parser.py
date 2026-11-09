@@ -2560,6 +2560,19 @@ class TestPdPairingMode:
         assert _rust_router_kwargs(pd_pairing_mode="strict")["pd_pairing_mode"] == "strict"
 
 
+class TestPowerOfTwoLoadMetric:
+    """--power-of-two-load-metric takes resident_tokens:<request_tokens> besides the
+    metric names, and refuses it without a non-negative cost at parse time."""
+
+    def test_resident_tokens_parses(self):
+        args = parse_router_args(["--power-of-two-load-metric", "resident_tokens:62500"])
+        assert args.power_of_two_load_metric == "resident_tokens:62500"
+
+    def test_resident_tokens_without_a_cost_is_refused(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--power-of-two-load-metric", "resident_tokens"])
+
+
 class TestRuntimeWorkerThreads:
     """--runtime-worker-threads is a launcher option, unset by default as on the Rust
     CLI (the runtime's own size), and reaches the Rust router; a negative count is

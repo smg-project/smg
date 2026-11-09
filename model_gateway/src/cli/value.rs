@@ -18,7 +18,10 @@ pub(crate) fn parse_transport_mode(value: &str) -> Result<TransportMode, String>
 /// Parse the `--power-of-two-load-metric` value into a `PowerOfTwoLoadMetric`.
 pub(crate) fn parse_power_of_two_load_metric(value: &str) -> Result<PowerOfTwoLoadMetric, String> {
     PowerOfTwoLoadMetric::parse(value).ok_or_else(|| {
-        format!("invalid value '{value}'; expected expected_wait, requests, or least_requests")
+        format!(
+            "invalid value '{value}'; expected expected_wait, requests, least_requests, \
+             or resident_tokens:<request_tokens>"
+        )
     })
 }
 
