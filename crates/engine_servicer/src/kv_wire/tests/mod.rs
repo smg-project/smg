@@ -211,8 +211,12 @@ fn media_map_to_tiers_and_cache_levels() {
     assert_eq!(normalizer.counts().dropped(DropReason::UnknownMedium), 1);
 }
 
+/// On a rank with a main-attention group, every other group's event is
+/// forwarded on its own lane: a store with its hashes, parent and group
+/// fields and no tokens, a removal as it came; the groups are remembered
+/// for the events that omit the kind.
 #[test]
-fn non_main_attention_groups_are_dropped_and_remembered() {
+fn non_main_groups_are_forwarded_on_their_own_lane_and_remembered() {
     let sliding = |hash: i64| {
         let event = with(store(&[hash], None, &[1, 2, 3, 4]), "group_idx", json!(1));
         let event = with(event, "kv_cache_spec_kind", json!("sliding_window"));
@@ -256,7 +260,7 @@ fn non_main_attention_groups_are_dropped_and_remembered() {
             with(remove(&[2]), "group_idx", json!(0)),
             // An unlearned group without a kind counts as main.
             with(remove(&[7]), "group_idx", json!(9)),
-            // A kind-less store on a learned non-main group is dropped too.
+            // A kind-less store on a learned non-main group follows the group.
             with(
                 with(store(&[8], None, &[1, 2, 3, 4]), "group_idx", json!(4)),
                 "kv_cache_spec_kind",
@@ -264,28 +268,53 @@ fn non_main_attention_groups_are_dropped_and_remembered() {
             ),
         ]),
     ]);
-    assert_eq!(batches[0].events.len(), 3);
-    assert_eq!(batches[1].events.len(), 2);
-    assert_eq!(removed(&batches[1].events[0]).block_hashes, vec![2]);
-    assert_eq!(removed(&batches[1].events[1]).block_hashes, vec![7]);
-    assert_eq!(
-        normalizer
-            .counts()
-            .dropped(DropReason::NonMainAttentionGroup),
-        4
+    assert_eq!(batches[0].events.len(), 5, "{:?}", batches[0].events);
+    let window = stored(&batches[0].events[0]);
+    assert_eq!(window.group_idx, Some(1));
+    assert_eq!(window.kv_cache_spec_kind.as_deref(), Some("sliding_window"));
+    assert_eq!(window.kv_cache_spec_sliding_window, Some(128));
+    assert_eq!(window.blocks.len(), 1);
+    assert_eq!(window.blocks[0].block_hash, 1);
+    assert!(
+        window.blocks[0].token_ids.is_empty(),
+        "no tokens on a group lane"
     );
+    assert_eq!(window.blocks[0].block_size, 4);
     assert_eq!(
-        stored(&batches[0].events[1]).kv_cache_spec_kind.as_deref(),
+        stored(&batches[0].events[2]).kv_cache_spec_kind.as_deref(),
         Some("mla_attention")
     );
+    let state = stored(&batches[0].events[4]);
+    assert_eq!(state.group_idx, Some(4));
+    assert_eq!(state.kv_cache_spec_kind.as_deref(), Some("mamba"));
+    assert!(state.blocks[0].token_ids.is_empty());
+    assert_eq!(batches[1].events.len(), 4, "{:?}", batches[1].events);
+    let gone = removed(&batches[1].events[0]);
+    assert_eq!(
+        (gone.block_hashes.clone(), gone.group_idx),
+        (vec![1], Some(1))
+    );
+    assert_eq!(removed(&batches[1].events[1]).block_hashes, vec![2]);
+    assert_eq!(removed(&batches[1].events[2]).block_hashes, vec![7]);
+    let later = stored(&batches[1].events[3]);
+    assert_eq!(later.group_idx, Some(4));
+    assert!(
+        later.blocks[0].token_ids.is_empty(),
+        "the learned group decides"
+    );
+    let counts = normalizer.counts();
+    assert_eq!((counts.group_stores, counts.group_removals), (3, 1));
+    assert_eq!((counts.forwarded_stored, counts.forwarded_removed), (6, 3));
+    assert!(counts.dropped.is_empty(), "{:?}", counts.dropped);
 }
 
 /// An engine that resets its prefix cache and stores the next prompt in
 /// one step publishes the clear and the stores in one batch, the window
 /// groups' stores ahead of the main group's. The clear empties the block
-/// records but not the groups, so the window stores are dropped as on
-/// every other step and the main group's store is forwarded whole; the
-/// records cleared, the prompt's blocks are new, not duplicates.
+/// records but not the groups, so the window stores go on their group lane
+/// as on every other step (not as a window-only rank's main signal) and
+/// the main group's store is forwarded whole; the records cleared, the
+/// prompt's blocks are new, not duplicates.
 #[test]
 fn a_clear_in_the_batch_keeps_the_learned_groups() {
     let window = |hashes: &[i64], tokens: &[u32]| {
@@ -313,13 +342,24 @@ fn a_clear_in_the_batch_keeps_the_learned_groups() {
             store(&[4], Some(3), &[13, 14, 15, 16]),
         ]),
     ]);
-    assert_eq!(batches[0].events.len(), 1);
-    assert_eq!(batches[1].events.len(), 2, "{:?}", batches[1].events);
+    assert_eq!(batches[0].events.len(), 2);
+    assert_eq!(batches[1].events.len(), 3, "{:?}", batches[1].events);
     assert!(matches!(
         batches[1].events[0].data,
         Some(kv_cache_event::Data::Cleared(_))
     ));
-    let prompt_store = stored(&batches[1].events[1]);
+    let window_store = stored(&batches[1].events[1]);
+    assert_eq!(window_store.group_idx, Some(1));
+    assert_eq!(
+        window_store
+            .blocks
+            .iter()
+            .map(|block| (block.block_hash, block.token_ids.len()))
+            .collect::<Vec<_>>(),
+        vec![(2, 0), (3, 0)],
+        "the window group's blocks, hashes only"
+    );
+    let prompt_store = stored(&batches[1].events[2]);
     assert_eq!(
         prompt_store
             .blocks
@@ -329,11 +369,11 @@ fn a_clear_in_the_batch_keeps_the_learned_groups() {
         vec![1, 2, 3]
     );
     assert_eq!(prompt_store.group_idx, Some(0));
-    assert_eq!(batches[2].events.len(), 1);
+    assert_eq!(batches[2].events.len(), 2);
     let counts = normalizer.counts();
-    assert_eq!(counts.dropped(DropReason::NonMainAttentionGroup), 3);
+    assert_eq!(counts.group_stores, 3);
     assert_eq!(counts.window_only_stores, 0);
-    assert_eq!(counts.forwarded_stored, 3);
+    assert_eq!(counts.forwarded_stored, 6);
     assert_eq!(
         counts.duplicate_stores, 0,
         "block 1 was stored again after the clear: a new block, not a resend"
@@ -341,11 +381,12 @@ fn a_clear_in_the_batch_keeps_the_learned_groups() {
 }
 
 /// The relay's record of the reset step, as a snapshot hands it to a
-/// subscriber that joins afterwards: the whole prompt as one run under
-/// the main group, nothing under the window group. (Recorded under the
-/// window group, the blocks the window named would be left out of the
-/// main group's run and skipped by the gateway as non-main: a fresh
-/// subscriber would score the prompt's first blocks only.)
+/// subscriber that joins afterwards: one of the window group's blocks as a
+/// store of its own lane first, the whole prompt as one run under the main
+/// group, then the window group's other block. (Recorded as copies of the
+/// main lane, the blocks the window named would be left out of the main
+/// group's run: a fresh subscriber would score the prompt's first blocks
+/// only.)
 #[test]
 fn a_snapshot_after_a_reset_step_holds_the_prompt_under_the_main_group() {
     use crate::kv_state::{LiveState, SnapshotChunks};
@@ -375,13 +416,13 @@ fn a_snapshot_after_a_reset_step_holds_the_prompt_under_the_main_group() {
         SnapshotChunks::at(state.snapshot(), 1, 2.0, 0).collect();
     assert_eq!(chunks.len(), 1);
     let chunk = &chunks[0];
-    assert_eq!(chunk.snapshot.as_ref().map(|marker| marker.blocks), Some(6));
+    assert_eq!(chunk.snapshot.as_ref().map(|marker| marker.blocks), Some(8));
     assert!(matches!(
         chunk.events[0].data,
         Some(kv_cache_event::Data::Cleared(_))
     ));
-    assert_eq!(chunk.events.len(), 2, "{:?}", chunk.events);
-    let run = stored(&chunk.events[1]);
+    assert_eq!(chunk.events.len(), 4, "{:?}", chunk.events);
+    let run = stored(&chunk.events[2]);
     assert_eq!(run.parent_block_hash, None);
     assert_eq!(run.group_idx, Some(0));
     assert_eq!(run.kv_cache_spec_kind.as_deref(), Some("full_attention"));
@@ -392,6 +433,24 @@ fn a_snapshot_after_a_reset_step_holds_the_prompt_under_the_main_group() {
             .collect::<Vec<_>>(),
         vec![1, 2, 3, 4, 5, 6]
     );
+    let window_blocks: Vec<(i64, usize)> = [1usize, 3]
+        .into_iter()
+        .flat_map(|at| {
+            let window_run = stored(&chunk.events[at]);
+            assert_eq!(window_run.group_idx, Some(1));
+            assert_eq!(
+                window_run.kv_cache_spec_kind.as_deref(),
+                Some("sliding_window")
+            );
+            assert_eq!(window_run.kv_cache_spec_sliding_window, Some(8));
+            window_run
+                .blocks
+                .iter()
+                .map(|block| (block.block_hash, block.token_ids.len()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(window_blocks, vec![(5, 0), (6, 0)]);
 }
 
 #[test]
@@ -932,13 +991,35 @@ fn remove_in(hashes: &[i64], group: u32) -> Value {
     with(remove(hashes), "group_idx", json!(group))
 }
 
+/// A publisher that reports a boundary once for every group puts the group
+/// mask on a window group's store too. The group lane forwards it as the
+/// main lane does.
 #[test]
-fn two_groups_with_identical_hashes_index_the_full_attention_group_once() {
+fn a_group_lanes_store_carries_its_group_mask() {
+    let (batches, _) = normalize_all(vec![one(vec![
+        with(window(&[1], None, &[1, 2, 3, 4]), "group_mask", json!(2)),
+        with(store(&[2], None, &[1, 2, 3, 4]), "group_mask", json!(3)),
+    ])]);
+    assert_eq!(batches[0].events.len(), 2, "{:?}", batches[0].events);
+    let on_the_group_lane = stored(&batches[0].events[0]);
+    assert_eq!(on_the_group_lane.group_idx, Some(1));
+    assert_eq!(on_the_group_lane.group_mask, Some(2));
+    assert!(
+        on_the_group_lane.blocks[0].token_ids.is_empty(),
+        "a group lane's store"
+    );
+    assert_eq!(stored(&batches[0].events[1]).group_mask, Some(3));
+}
+
+#[test]
+fn two_groups_with_identical_hashes_keep_their_lanes_apart() {
     // vLLM's hybrid manager publishes every block in both groups under
     // the same hash, the window group's store first in the step and its
-    // removals as the window moves on; only the full-attention group's
-    // events are forwarded, stores and removals alike, so the gateway
-    // counts one copy per physical block.
+    // removals as the window moves on. The main group's events go through
+    // whole; the window group's go through on their own lane, hashes only,
+    // and never touch the relay's record of the main lane: the main group's
+    // second store is still the one duplicate, and the window group's
+    // removal takes no copy off the record.
     let (batches, normalizer) = normalize_all(vec![
         one(vec![
             window(&[2], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
@@ -951,19 +1032,30 @@ fn two_groups_with_identical_hashes_index_the_full_attention_group_once() {
             remove_in(&[1], 0),
         ]),
     ]);
-    assert_eq!(batches[0].events.len(), 1);
-    let full = stored(&batches[0].events[0]);
+    assert_eq!(batches[0].events.len(), 2);
+    let window_store = stored(&batches[0].events[0]);
+    assert_eq!(window_store.group_idx, Some(1));
+    assert_eq!(window_store.blocks.len(), 1);
+    assert_eq!(window_store.blocks[0].block_hash, 2);
+    assert!(window_store.blocks[0].token_ids.is_empty());
+    let full = stored(&batches[0].events[1]);
     assert_eq!(
         full.blocks.iter().map(|b| b.block_hash).collect::<Vec<_>>(),
         vec![1, 2]
     );
+    assert_eq!(full.blocks[1].token_ids, vec![5, 6, 7, 8]);
     assert_eq!(full.group_idx, Some(0));
-    assert_eq!(batches[1].events.len(), 3);
-    assert_eq!(removed(&batches[1].events[1]).block_hashes, vec![1]);
+    assert_eq!(batches[1].events.len(), 4);
+    let window_gone = removed(&batches[1].events[0]);
+    assert_eq!(
+        (window_gone.block_hashes.clone(), window_gone.group_idx),
+        (vec![2], Some(1))
+    );
     assert_eq!(removed(&batches[1].events[2]).block_hashes, vec![1]);
+    assert_eq!(removed(&batches[1].events[3]).block_hashes, vec![1]);
     let counts = normalizer.counts();
-    assert_eq!(counts.dropped(DropReason::NonMainAttentionGroup), 2);
-    assert_eq!((counts.forwarded_stored, counts.forwarded_removed), (2, 2));
+    assert_eq!((counts.group_stores, counts.group_removals), (1, 1));
+    assert_eq!((counts.forwarded_stored, counts.forwarded_removed), (3, 3));
     assert_eq!(
         (
             counts.duplicate_stores,
@@ -972,6 +1064,7 @@ fn two_groups_with_identical_hashes_index_the_full_attention_group_once() {
         ),
         (1, 0, 0)
     );
+    assert!(counts.dropped.is_empty(), "{:?}", counts.dropped);
 }
 
 #[test]
@@ -1023,21 +1116,37 @@ fn a_window_only_rank_is_forwarded_until_a_main_group_appears() {
         ]),
         one(vec![
             store(&[3], None, &[1, 2, 3, 4]), // a main-attention group shows up
-            window(&[4], Some(3), &[1, 2, 3, 4, 5, 6, 7, 8]),
-            remove_in(&[2], 1),    // forwarded while window-only: still removable
-            remove_in(&[9], 1),    // never forwarded: dropped
-            remove_in(&[2, 9], 1), // nothing left of it
+            window(&[4], Some(3), &[1, 2, 3, 4, 5, 6, 7, 8]), // from here: the group lane
+            remove_in(&[2], 1),               // forwarded while window-only: leaves the record too
+            remove_in(&[9], 1),               // a group removal, forwarded as it came
+            remove_in(&[2, 9], 1),
         ]),
     ]);
     assert_eq!(batches[0].events.len(), 3);
-    assert_eq!(batches[1].events.len(), 2);
-    assert_eq!(removed(&batches[1].events[1]).block_hashes, vec![2]);
+    let signal = stored(&batches[0].events[0]);
+    assert_eq!(
+        signal.blocks[0].token_ids,
+        vec![1, 2, 3, 4],
+        "the rank's main signal"
+    );
+    assert_eq!(batches[1].events.len(), 5, "{:?}", batches[1].events);
+    let window_store = stored(&batches[1].events[1]);
+    assert_eq!(window_store.group_idx, Some(1));
+    assert_eq!(window_store.parent_block_hash, Some(3));
+    assert!(
+        window_store.blocks[0].token_ids.is_empty(),
+        "once the rank has a main group the window group is a group lane"
+    );
+    assert_eq!(removed(&batches[1].events[2]).block_hashes, vec![2]);
+    assert_eq!(removed(&batches[1].events[3]).block_hashes, vec![9]);
+    assert_eq!(removed(&batches[1].events[4]).block_hashes, vec![2, 9]);
     let counts = normalizer.counts();
     assert_eq!(
         (counts.window_only_stores, counts.tail_aligned_stores),
         (2, 1)
     );
-    assert_eq!(counts.dropped(DropReason::NonMainAttentionGroup), 3);
+    assert_eq!((counts.group_stores, counts.group_removals), (1, 3));
+    assert!(counts.dropped.is_empty(), "{:?}", counts.dropped);
 }
 
 #[test]

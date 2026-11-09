@@ -1,4 +1,4 @@
-use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
+use kv_index::{compute_content_hash, ContentHash, GroupKind, SequenceHash, StoredBlock};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus};
 use tokio::sync::watch;
@@ -2458,6 +2458,174 @@ fn test_equal_overlap_forms_one_affinity_group() {
     );
 }
 
+/// A worker of a hybrid model in `indexer`: its main group holds the chain
+/// of `tokens` (block 4, engine hashes from `seq_base`), its sliding-window
+/// group (`window` tokens) retains the blocks at `retained`, its state group
+/// the blocks at `state`. The view is fed as the monitor's apply path feeds
+/// it: the main blocks named first, the groups' blocks placed through them.
+fn hybrid_worker(
+    indexer: &KvIndex,
+    url: &str,
+    tokens: &[u32],
+    seq_base: u64,
+    window: u32,
+    retained: &[usize],
+    state: &[usize],
+) -> u32 {
+    let worker = indexer.intern_worker(url).unwrap();
+    store_blocks(indexer, worker, tokens, 4, seq_base);
+    let named: Vec<(SequenceHash, ContentHash)> = tokens
+        .chunks(4)
+        .enumerate()
+        .map(|(i, chunk)| {
+            (
+                SequenceHash(seq_base + i as u64),
+                compute_content_hash(chunk),
+            )
+        })
+        .collect();
+    let view = indexer.groups().get_or_create(worker);
+    view.main_stored(None, &named);
+    view.learn(1, Some(GroupKind::SlidingWindow { window }), 4);
+    let hashes: Vec<SequenceHash> = retained
+        .iter()
+        .map(|&at| SequenceHash(seq_base + at as u64))
+        .collect();
+    view.group_stored(1, &hashes);
+    if !state.is_empty() {
+        view.learn(2, Some(GroupKind::State), 4);
+        let hashes: Vec<SequenceHash> = state
+            .iter()
+            .map(|&at| SequenceHash(seq_base + at as u64))
+            .collect();
+        view.group_stored(2, &hashes);
+    }
+    worker
+}
+
+/// Two workers of a hybrid model hold the same ten-block chain in their
+/// main group; what their window and state groups retain decides the
+/// affinity group, the engine's own rule (block 4, window 16: a tail is
+/// four contiguous blocks ending at the hit, else the leading run; a state
+/// group needs its rightmost block at or below the hit).
+#[test]
+fn hybrid_holders_are_ranked_at_what_their_groups_can_serve() {
+    let tokens: Vec<u32> = (1..=40).collect();
+    // (w1 window, w1 state, w2 window, w2 state) -> the affinity group, note
+    type Cell<'a> = (
+        &'a [usize],
+        &'a [usize],
+        &'a [usize],
+        &'a [usize],
+        &'a [usize],
+        &'a str,
+    );
+    let cells: [Cell; 6] = [
+        (
+            &[6, 7, 8, 9],
+            &[9],
+            &[4, 5, 6, 7],
+            &[7],
+            &[0],
+            "w1 serves all ten, w2 eight",
+        ),
+        (
+            &[6, 7, 8],
+            &[9],
+            &[4, 5, 6, 7],
+            &[7],
+            &[1],
+            "w1's tail is short: nothing; w2 eight",
+        ),
+        (
+            &[0, 1],
+            &[1],
+            &[0, 1, 2],
+            &[2],
+            &[1],
+            "leading runs of two and three",
+        ),
+        (
+            &[6, 7, 8, 9],
+            &[9],
+            &[6, 7, 8, 9],
+            &[9],
+            &[0, 1],
+            "equal: one affinity group",
+        ),
+        (
+            &[6, 7, 8, 9],
+            &[5],
+            &[2, 3, 4, 5],
+            &[5],
+            &[1],
+            "w1's state at 5 strands its tail; w2 six",
+        ),
+        (
+            &[],
+            &[],
+            &[],
+            &[],
+            &[0, 1],
+            "nothing placed: the rule cannot read the groups, both hold the index's ten",
+        ),
+    ];
+    for (w1_window, w1_state, w2_window, w2_state, want, note) in cells {
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let indexer = KvIndex::chain();
+        hybrid_worker(
+            &indexer,
+            "http://w1:8000",
+            &tokens,
+            100,
+            16,
+            w1_window,
+            w1_state,
+        );
+        hybrid_worker(
+            &indexer,
+            "http://w2:8000",
+            &tokens,
+            200,
+            16,
+            w2_window,
+            w2_state,
+        );
+        let group =
+            overlap_affinity_group(&workers, &tokens, &[0, 1], &indexer, 4, &default_tuning());
+        assert_eq!(group, want, "{note}");
+    }
+}
+
+/// A hybrid worker beside a plain one: the plain worker's overlap is the
+/// index's, the hybrid worker's what its groups can serve.
+#[test]
+fn a_plain_worker_keeps_the_index_overlap_beside_a_hybrid_one() {
+    let tokens: Vec<u32> = (1..=40).collect();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let indexer = KvIndex::chain();
+    hybrid_worker(
+        &indexer,
+        "http://w1:8000",
+        &tokens,
+        100,
+        16,
+        &[4, 5, 6, 7],
+        &[],
+    );
+    let plain = indexer.intern_worker("http://w2:8000").unwrap();
+    store_blocks(&indexer, plain, &tokens[..32], 4, 200);
+    let group = overlap_affinity_group(&workers, &tokens, &[0, 1], &indexer, 4, &default_tuning());
+    assert_eq!(group, vec![0, 1], "eight blocks each");
+    store_blocks(&indexer, plain, &tokens, 4, 200);
+    let group = overlap_affinity_group(&workers, &tokens, &[0, 1], &indexer, 4, &default_tuning());
+    assert_eq!(
+        group,
+        vec![1],
+        "the plain worker's ten beat the capped eight"
+    );
+}
+
 /// Two workers with identical cached blocks (the tie-test topology): both
 /// fully match the request.
 fn equal_overlap_fixture() -> (Vec<Arc<dyn Worker>>, Arc<KvIndex>) {
@@ -4583,6 +4751,7 @@ fn random_overlap_candidates(rng: &mut impl RngExt, workers: usize) -> Vec<Overl
             idx,
             raw_score: score,
             effective_score: decayed,
+            group_cap: None,
         });
     }
     candidates
@@ -4639,6 +4808,7 @@ fn default_policy_temperature_groups_are_score_groups() {
             idx,
             raw_score: if idx < 4 { 8.0 } else { 2.0 },
             effective_score: if idx < 4 { 8.0 } else { 2.0 },
+            group_cap: None,
         })
         .collect();
     let inputs = policy_inputs(&candidates, &urls);
@@ -5045,6 +5215,7 @@ fn merge_rows_unions_the_eligible_sample_with_the_holders_in_slice_order() {
             idx,
             raw_score: 1.0,
             effective_score: 1.0,
+            group_cap: None,
         })
         .collect();
     assert_eq!(

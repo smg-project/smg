@@ -736,10 +736,19 @@ fn parse_kv_cache_groups(raw: String, flag: &str) -> Result<Vec<KvCacheGroup>, S
         .iter()
         .filter(|group| KvCacheGroup::MAIN_KINDS.contains(&group.kind.as_str()))
         .count();
-    if main != 1 {
+    if main > 1 {
         return Err(format!(
-            "{flag}: exactly one group is the main-attention group (one of {}), at any index; got {main}",
+            "{flag}: at most one group is the main-attention group (one of {}), at any index; got {main}",
             KvCacheGroup::MAIN_KINDS.join(", ")
+        ));
+    }
+    // A model without a main-attention group (every attention layer a
+    // sliding window) starts with its window group.
+    if main == 0 && !KvCacheGroup::WINDOW_KINDS.contains(&groups[0].kind.as_str()) {
+        return Err(format!(
+            "{flag}: a model without a main-attention group starts with a window group (one of {}), not {}",
+            KvCacheGroup::WINDOW_KINDS.join(", "),
+            groups[0].kind
         ));
     }
     Ok(groups)
@@ -975,8 +984,11 @@ mod tests {
             .is_ok(),
             "one group is the SGLang wire's shape"
         );
-        // The main group at any index: behind a window group, or last.
+        // A model without a main-attention group, and the main group at any
+        // index: behind a window group, or last.
         for spec in [
+            "sliding_window:64",
+            "sliding_window:64,mamba",
             "sliding_window:64,full_attention",
             "mamba,full_attention",
             "mamba,mla_attention,sliding_window:32",
@@ -995,14 +1007,11 @@ mod tests {
             ("full_attention:64", "has no window"),
             ("swa:128", "unknown cache group kind"),
             ("sliding-window:128", "unknown cache group kind"),
-            ("mamba", "exactly one group is the main-attention group"),
+            ("mamba", "starts with a window group"),
+            ("mamba,sliding_window:64", "starts with a window group"),
             (
                 "full_attention,mla_attention",
-                "exactly one group is the main-attention group",
-            ),
-            (
-                "sliding_window:64,mamba",
-                "exactly one group is the main-attention group",
+                "at most one group is the main-attention group",
             ),
         ] {
             let err = with(&["--kv-cache-groups", spec]).expect_err(spec);
