@@ -1216,6 +1216,7 @@ def test_a_role_value_outside_the_launcher_choices_is_refused_by_the_schema(sett
 
 
 ADMIN_EXAMPLE = CHART / "examples" / "with-admin-plane.yaml"
+ADMISSION_EXAMPLE = CHART / "examples" / "with-admission-config.yaml"
 CONTROL_PLANE_KEYS = "ops:Operations:admin:hunter2\nro:Read only:user:hunter3\n"
 
 
@@ -1335,3 +1336,94 @@ def test_the_admin_plane_example_renders_arguments_the_launcher_parses():
     assert parsed.admin_port == 9001
     assert parsed.control_plane_api_keys_file == "/etc/smg/control-plane/control-plane-api-keys"
     assert "smg-router-admin" in services(documents)
+
+
+@needs_helm
+def test_without_admission_config_nothing_names_it():
+    """Neither block set: no flag, no mount, no volume."""
+    _, documents = render()
+    pod = router_pod(documents)
+    container = pod["spec"]["containers"][0]
+    flags = {
+        "--tenant-rate-limit-enabled",
+        "--tenant-rate-limit-config",
+        "--priority-scheduler-enabled",
+        "--priority-scheduler-config",
+    }
+    assert not flags & set(container["args"])
+    assert not {"rate-limit", "scheduler"} & {m["name"] for m in container["volumeMounts"]}
+    assert not {"rate-limit", "scheduler"} & {v["name"] for v in pod["spec"]["volumes"]}
+
+
+@needs_helm
+def test_admission_config_maps_mount_whole_and_render_their_flags():
+    """Each ConfigMap is mounted whole at its directory and its file reaches
+    the gateway through the config flag, beside the enable flag; the launcher
+    parses the result."""
+    _, documents = render(
+        "router.tenantRateLimit.enabled=true",
+        "router.tenantRateLimit.configMap.name=smg-rate-limit",
+        "router.priorityScheduler.enabled=true",
+        "router.priorityScheduler.configMap.name=smg-scheduler",
+        "router.priorityScheduler.configMap.key=classes.yaml",
+    )
+    pod = router_pod(documents)
+    container = pod["spec"]["containers"][0]
+    args = container["args"]
+    assert "--tenant-rate-limit-enabled" in args
+    assert (
+        args[args.index("--tenant-rate-limit-config") + 1] == "/etc/smg/rate-limit/rate-limit.yaml"
+    )
+    assert "--priority-scheduler-enabled" in args
+    assert args[args.index("--priority-scheduler-config") + 1] == "/etc/smg/scheduler/classes.yaml"
+    mounts = {m["name"]: m for m in container["volumeMounts"]}
+    assert mounts["rate-limit"] == {
+        "name": "rate-limit",
+        "mountPath": "/etc/smg/rate-limit",
+        "readOnly": True,
+    }
+    assert mounts["scheduler"] == {
+        "name": "scheduler",
+        "mountPath": "/etc/smg/scheduler",
+        "readOnly": True,
+    }
+    volumes = {v["name"]: v for v in pod["spec"]["volumes"]}
+    assert volumes["rate-limit"] == {"name": "rate-limit", "configMap": {"name": "smg-rate-limit"}}
+    assert volumes["scheduler"] == {"name": "scheduler", "configMap": {"name": "smg-scheduler"}}
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    RouterArgs.add_cli_args(parser)
+    parsed = parser.parse_args(args)
+    assert parsed.tenant_rate_limit_enabled
+    assert parsed.tenant_rate_limit_config == "/etc/smg/rate-limit/rate-limit.yaml"
+    assert parsed.priority_scheduler_enabled
+    assert parsed.priority_scheduler_config == "/etc/smg/scheduler/classes.yaml"
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    "setting, words",
+    [
+        ("router.tenantRateLimit.enabled=true", "router.tenantRateLimit.configMap.name"),
+        (
+            "router.priorityScheduler.configMap.name=smg-scheduler",
+            "router.priorityScheduler.enabled",
+        ),
+    ],
+)
+def test_admission_config_the_gateway_would_refuse_or_ignore_is_refused_at_render(setting, words):
+    """The rate limit enabled without its YAML fails at the gateway's start,
+    and a scheduler table without the scheduler is ignored with a warning;
+    the chart refuses both where the values are written."""
+    assert words in render_error(setting)
+
+
+@needs_helm
+def test_the_admission_config_example_renders_arguments_the_launcher_parses():
+    """The example installs: its flags are launcher options and parse."""
+    _, documents = render(files=(ADMISSION_EXAMPLE,))
+    args = router_pod(documents)["spec"]["containers"][0]["args"]
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    RouterArgs.add_cli_args(parser)
+    parsed = parser.parse_args(args)
+    assert parsed.tenant_rate_limit_config == "/etc/smg/rate-limit/rate-limit.yaml"
+    assert parsed.priority_scheduler_config == "/etc/smg/scheduler/scheduler.yaml"
