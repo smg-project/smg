@@ -5209,13 +5209,13 @@ mod tests {
                         Some("finish") => reply["choices"][0]["finish_reason"] = Value::Null,
                         Some("model") => reply["model"] = json!("other-model"),
                         Some("schema") => {
-                            reply["choices"][0]["message"] = json!({"role": "user", "content": 42})
+                            reply["choices"][0]["message"] = json!({"role": "user", "content": 42});
                         }
                         Some("count") => reply["choices"] = json!([]),
                         Some("total") => reply["usage"]["total_tokens"] = json!(8),
                         Some("details") => {
                             reply["usage"]["completion_tokens_details"] =
-                                json!({"reasoning_tokens": "bad"})
+                                json!({"reasoning_tokens": "bad"});
                         }
                         Some("missing_usage") => {
                             reply.as_object_mut().unwrap().remove("usage");
@@ -5429,12 +5429,16 @@ mod tests {
 
     #[tokio::test]
     async fn moriio_independent_choices_cancel_or_timeout_closes_current_child() {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+            task::JoinSet,
+        };
         for cancel in [true, false] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
-            let server = tokio::spawn(async move {
+            let mut servers = JoinSet::new();
+            servers.spawn(async move {
                 for index in 0..2 {
                     let (socket, _) = listener.accept().await.unwrap();
                     let mut stream = BufReader::new(socket);
@@ -5486,7 +5490,8 @@ mod tests {
                 Some(std::time::Duration::from_secs(2)),
             );
             let task_router = Arc::clone(&router);
-            let task = tokio::spawn(async move {
+            let mut requests = JoinSet::new();
+            let task = requests.spawn(async move {
                 moriio_call(&task_router, "/v1/completions", None, &json!({"n": 4})).await
             });
             tokio::time::timeout(ROUND_TRIP_GUARD, async {
@@ -5494,11 +5499,19 @@ mod tests {
                 assert_eq!(entered_rx.recv().await, Some(1));
                 if cancel {
                     task.abort();
-                    assert!(task.await.unwrap_err().is_cancelled());
+                    assert!(requests
+                        .join_next()
+                        .await
+                        .unwrap()
+                        .unwrap_err()
+                        .is_cancelled());
                 } else {
-                    assert_eq!(task.await.unwrap().status(), StatusCode::GATEWAY_TIMEOUT);
+                    assert_eq!(
+                        requests.join_next().await.unwrap().unwrap().status(),
+                        StatusCode::GATEWAY_TIMEOUT
+                    );
                 }
-                server.await.unwrap();
+                servers.join_next().await.unwrap().unwrap();
             })
             .await
             .unwrap();
