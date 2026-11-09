@@ -2057,8 +2057,8 @@ fn serve_listeners(
     let max_connections = router_config.max_connections;
     info!(
         max_connections,
-        "HTTP connection limit on the data listener (0 = unlimited; the admin and probe listeners \
-         are outside it)"
+        "HTTP connection limit on the data listener (0 = unlimited; the admin listener has a bound \
+         of its own, the probe listener none)"
     );
     // The admission limit the bound is compared with is the effective one
     // (the one resolution of `max_concurrent_requests`, shared with the
@@ -2082,10 +2082,17 @@ fn serve_listeners(
     // TLS material and connection timeouts, but outside its connection limit
     // (`--max-connections`), so the control plane and the probes it serves
     // stay reachable while the data plane is saturated; it drains with it
-    // (`startup`'s shutdown handler closes both handles together).
+    // (`startup`'s shutdown handler closes both handles together). Its own
+    // bound (`--admin-max-connections`) is the same acceptor over its own
+    // permits, counted in the same series.
+    let admin_max_connections = router_config.admin_max_connections;
     let admin_serving: Serving = match (admin_listener, admin_app) {
         (Some(admin_listener), Some(admin_app)) => {
             let admin_addr = admin_listener.local_addr()?;
+            info!(
+                admin_max_connections,
+                "HTTP connection limit on the admin listener (0 = unlimited)"
+            );
             info!(
                 "Admin listener serving the control plane on {admin_addr} (--admin-port): the \
                  admin, worker-registry and RL routes answer there, and 404 on {addr}"
@@ -2094,13 +2101,21 @@ fn serve_listeners(
             match tls_config.clone() {
                 Some(tls_config) => Box::pin(
                     axum_server::from_tcp_rustls(admin_listener, tls_config)?
-                        .map(|acceptor| tls_acceptor(acceptor, connection_timeouts))
+                        .map(|acceptor| {
+                            ConnectionLimitAcceptor::new(
+                                tls_acceptor(acceptor, connection_timeouts),
+                                admin_max_connections,
+                            )
+                        })
                         .handle(admin_handle)
                         .serve(admin_app),
                 ),
                 None => Box::pin(
                     axum_server::from_tcp(admin_listener)?
-                        .acceptor(http_acceptor(connection_timeouts))
+                        .acceptor(ConnectionLimitAcceptor::new(
+                            http_acceptor(connection_timeouts),
+                            admin_max_connections,
+                        ))
                         .handle(admin_handle)
                         .serve(admin_app),
                 ),
