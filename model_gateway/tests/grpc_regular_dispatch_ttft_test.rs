@@ -5,10 +5,10 @@
 use std::time::Duration;
 
 use common::{
-    decode_stream::{chunk, complete},
-    engine_answers::{VllmAnswers, VllmGenerateStream},
+    decode_stream::HeldHeadersEngine,
+    engine_answers::VllmAnswers,
     grpc_harness::{build_grpc_router, grpc_router_config, grpc_workers, serve_engine},
-    metrics_capture::render_after,
+    metrics_capture::{self, render_after},
 };
 use smg::{
     middleware::TenantRequestMeta,
@@ -16,52 +16,23 @@ use smg::{
     tenant::TenantKey,
     worker::{RuntimeType, WorkerType},
 };
-use smg_grpc_client::vllm_proto as proto;
 use smg_test_harness as common;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status};
 
 const MODEL: &str = "regular-dispatch-ttft-test-model";
 const OUTPUT_TOKENS: u32 = 3;
 const HELD_HEADERS_DELAY: Duration = Duration::from_millis(300);
 const POST_FIRST_DELAY: Duration = Duration::from_millis(120);
 
-#[derive(Clone)]
-struct HeldHeadersEngine;
-
-#[tonic::async_trait]
-impl VllmAnswers for HeldHeadersEngine {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "test mock - the producer ends with its response stream"
-    )]
-    async fn generate(
-        &self,
-        _request: Request<proto::GenerateRequest>,
-    ) -> Result<Response<VllmGenerateStream>, Status> {
-        let (tx, rx) = mpsc::channel(8);
-        // The RPC await absorbs this delay, with its first chunk already
-        // buffered when it returns, like a Python servicer holding headers.
-        tokio::time::sleep(HELD_HEADERS_DELAY).await;
-        tx.send(Ok(chunk(1)))
-            .await
-            .map_err(|_| Status::cancelled("stream closed"))?;
-        tokio::spawn(async move {
-            tokio::time::sleep(POST_FIRST_DELAY).await;
-            for id in 2..=OUTPUT_TOKENS {
-                if tx.send(Ok(chunk(id))).await.is_err() {
-                    return;
-                }
-            }
-            let _ = tx.send(Ok(complete("stop", OUTPUT_TOKENS))).await;
-        });
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
-    }
-}
-
 async fn regular_router() -> Box<dyn RouterTrait> {
-    let port = serve_engine(HeldHeadersEngine.into_server()).await;
+    // The RPC await absorbs the hold, with the first chunk already buffered
+    // when it returns, like a Python servicer holding headers.
+    let engine = HeldHeadersEngine {
+        hold: HELD_HEADERS_DELAY,
+        first_chunk_buffered: true,
+        first_token_after: POST_FIRST_DELAY,
+        output_tokens: OUTPUT_TOKENS,
+    };
+    let port = serve_engine(engine.into_server()).await;
     let config = grpc_router_config()
         .regular_mode(vec![])
         .random_policy()
@@ -189,18 +160,15 @@ async fn request(router: &dyn RouterTrait, route: Route, streaming: bool) -> Opt
     None
 }
 
+/// The regular router's `_sum` or `_count` sample of `family` on `endpoint`.
 fn sample(rendered: &str, family: &str, field: &str, endpoint: &str) -> Option<f64> {
-    let prefix = format!("{family}_{field}{{");
     let endpoint = format!("endpoint=\"{endpoint}\"");
-    rendered
-        .lines()
-        .find(|line| {
-            line.starts_with(&prefix)
-                && line.contains("backend_type=\"regular\"")
-                && line.contains(&endpoint)
-        })
-        .and_then(|line| line.rsplit(' ').next())
-        .and_then(|value| value.parse().ok())
+    metrics_capture::sample(
+        rendered,
+        family,
+        field,
+        &["backend_type=\"regular\"", endpoint.as_str()],
+    )
 }
 
 #[expect(clippy::expect_used, reason = "test helper")]
