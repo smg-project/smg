@@ -1,9 +1,16 @@
 ## GitHub config URL for the runner scale set
-## This file is the deployed release's values with no credential and no privileged runner:
-## every workflow's jobs run in these pods, so nothing secret may live in their environment
-## (the review workflows take their keys from the `ai-review` GitHub environment), and only
-## the `dind` sidecar may be privileged. The cap matches the live set. Re-apply with the
-## `helm upgrade` in README.md; a live set that differs from this file has drifted.
+## This file is the deployed release's values with no credential in the runner container and
+## no privileged runner: every workflow's jobs run in that container, so nothing secret may
+## live in its environment. The API keys live in the `ai-key-proxy` sidecar below, which the
+## runner reaches on localhost with a placeholder key; only the `dind` sidecar may be
+## privileged. The cap matches the live set. Re-apply with the `helm upgrade` in README.md; a
+## live set that differs from this file has drifted.
+## The `ai-key-proxy` init container (a native sidecar, like dind) is the only container that
+## holds an API key: the two keys come from the Kubernetes secrets into its environment, nginx
+## renders them into its config, and the environment is cleared before nginx starts. The runner
+## reaches it at http://127.0.0.1:8787, pod-local and unreachable from outside the pod, with a
+## placeholder key the proxy replaces on the way out; it listens on localhost only and verifies
+## the upstream certificates. It starts before the runner and stops with it.
 controllerServiceAccount:
   name: arc-gha-rs-controller
   namespace: org-actions-runner
@@ -90,6 +97,72 @@ template:
         name: dind-sock
       - mountPath: /home/runner/externals
         name: dind-externals
+    - name: ai-key-proxy
+      image: docker.io/library/nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+      restartPolicy: Always
+      command:
+      - /bin/sh
+      - -c
+      - |
+        printf '%s' "$NGINX_TEMPLATE" | envsubst '${ANTHROPIC_API_KEY} ${OPENAI_API_KEY}' > /etc/nginx/conf.d/default.conf
+        unset ANTHROPIC_API_KEY OPENAI_API_KEY NGINX_TEMPLATE
+        exec nginx -g 'daemon off;'
+      env:
+      - name: ANTHROPIC_API_KEY
+        valueFrom:
+          secretKeyRef:
+            key: ANTHROPIC_API_KEY
+            name: anthropic-api-key
+      - name: OPENAI_API_KEY
+        valueFrom:
+          secretKeyRef:
+            key: OPENAI_API_KEY
+            name: openai-api-key
+      - name: NGINX_TEMPLATE
+        value: |
+          server {
+            listen 127.0.0.1:8787;
+            access_log off;
+            client_max_body_size 64m;
+            proxy_http_version 1.1;
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_read_timeout 900s;
+            proxy_send_timeout 900s;
+            proxy_ssl_server_name on;
+            proxy_ssl_verify on;
+            proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+            proxy_ssl_protocols TLSv1.2 TLSv1.3;
+            location = /healthz { return 200 "ok"; }
+            location /anthropic/ {
+              proxy_pass https://api.anthropic.com/;
+              proxy_set_header Host api.anthropic.com;
+              proxy_set_header x-api-key "${ANTHROPIC_API_KEY}";
+              proxy_set_header Authorization "";
+            }
+            location /openai/ {
+              proxy_pass https://api.openai.com/;
+              proxy_set_header Host api.openai.com;
+              proxy_set_header Authorization "Bearer ${OPENAI_API_KEY}";
+            }
+          }
+      startupProbe:
+        exec:
+          command:
+          - wget
+          - -qO-
+          - http://127.0.0.1:8787/healthz
+        periodSeconds: 1
+        failureThreshold: 30
+      securityContext:
+        allowPrivilegeEscalation: false
+      resources:
+        requests:
+          cpu: 50m
+          memory: 32Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
     restartPolicy: Never
     terminationGracePeriodSeconds: 600
     tolerations:
