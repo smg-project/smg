@@ -858,7 +858,8 @@ pub(crate) fn resolve_string_stops(
 /// Inject PD bootstrap metadata when the runtime's rendezvous travels as
 /// SGLang-style `DisaggregatedParams` (bootstrap host/port/room).
 ///
-/// vLLM kv_transfer_params are handled in the request_execution stage.
+/// `kv_transfer_params`, the connector forms' handoff, are built and relayed
+/// by the sequential dispatch (`routers::grpc::sequential_pd`).
 pub(crate) fn maybe_inject_pd_metadata(
     request: &mut ProtoGenerateRequest,
     workers: &WorkerSelection,
