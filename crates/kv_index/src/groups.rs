@@ -1083,6 +1083,29 @@ mod tests {
         assert_eq!(view.dropped_blocks(), 8, "the refused blocks are counted");
     }
 
+    /// The restart seeds the signal's blocks as waiting under the signal group's bit, and that
+    /// wait is bounded as the store path's is: beyond the cap the rest are counted dropped, so
+    /// an engine's resend of a long signal era cannot grow the view without bound.
+    #[test]
+    fn the_restarts_wait_is_bounded() {
+        let view = WorkerGroups::new();
+        view.learn(0, Some(WINDOW), 64);
+        let signal: Vec<SequenceHash> = (0..PENDING_CAP as u64 + 2).map(SequenceHash).collect();
+        assert_eq!(
+            view.waiting(0b1, &signal),
+            PENDING_CAP,
+            "the cap's worth wait"
+        );
+        assert_eq!(view.pending_blocks(), PENDING_CAP, "the wait is bounded");
+        assert_eq!(view.dropped_blocks(), 2, "the refused blocks are counted");
+        assert_eq!(
+            view.waiting(0b1, &signal[..2]),
+            2,
+            "a waiting block is re-marked, not refused"
+        );
+        assert_eq!(view.dropped_blocks(), 2);
+    }
+
     /// A main store under a parent the index knew and the view does not (the view came after
     /// the parent was indexed) names nothing: a child chained from the first position would
     /// carry a name no request computes, so it is counted instead.
