@@ -22,7 +22,7 @@ use super::adapters::{
     RateLimitSyncAdapter, WorkerSyncAdapter,
 };
 use crate::{
-    policies::{CacheAwarePolicy, PolicyRegistry, TreeHandle, TreeKind},
+    policies::{as_cache_aware, CacheAwarePolicy, PolicyRegistry, TreeHandle, TreeKind},
     worker::WorkerRegistry,
 };
 
@@ -218,7 +218,7 @@ impl PolicyRegistryTreeHandle {
         let policies = self.registry.policies_for_model(model_id);
         let mut hit = false;
         for policy in &policies {
-            if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+            if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
                 hit = true;
                 f(cache_aware);
             }
@@ -389,10 +389,7 @@ mod tests {
         // A fresh model → policy created on demand should inherit the
         // adapter + populate flag from the registry.
         let policy = policy_registry.get_policy_or_default("llama-3");
-        let cache_aware = policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .expect("cache_aware default policy");
+        let cache_aware = as_cache_aware(policy.as_ref()).expect("cache_aware default policy");
         assert!(
             cache_aware.mesh_attached_for_test(),
             "wiring must raise the mesh flag when the adapter is attached",
@@ -471,10 +468,7 @@ mod tests {
         // Create a per-model cache-aware policy BEFORE wiring runs, so
         // it lives in `model_policies` at attach time.
         let preexisting = policy_registry.get_policy_or_default("qwen2");
-        let cache_aware = preexisting
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .expect("cache_aware model policy");
+        let cache_aware = as_cache_aware(preexisting.as_ref()).expect("cache_aware model policy");
         assert!(
             !cache_aware.mesh_attached_for_test(),
             "the mesh flag defaults off before wiring",
@@ -510,10 +504,7 @@ mod tests {
             policy_registry.clone(),
         );
         let policy = policy_registry.get_policy_or_default("llama-3");
-        let cache_aware = policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .expect("cache_aware default policy");
+        let cache_aware = as_cache_aware(policy.as_ref()).expect("cache_aware default policy");
         assert!(cache_aware.mesh_attached_for_test());
 
         policy_registry.set_mesh_tree_sync(None);
@@ -561,10 +552,7 @@ mod tests {
         ];
 
         let policy = policy_registry.get_policy_or_default(UNKNOWN_MODEL_ID);
-        let cache_aware = policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .expect("cache_aware policy");
+        let cache_aware = as_cache_aware(policy.as_ref()).expect("cache_aware policy");
         cache_aware.init_workers(&workers);
         assert_eq!(
             adapters
@@ -665,10 +653,8 @@ mod tests {
         // policy's string tree through a repair page (the path with its
         // hash) so `apply_known_remote_insert` has something to resolve.
         let default_policy = policy_registry.get_default_policy();
-        let cache_aware = default_policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .expect("default policy is cache-aware");
+        let cache_aware =
+            as_cache_aware(default_policy.as_ref()).expect("default policy is cache-aware");
         let text = "hello world";
         let path_hash = hash_node_path(text);
         let seed = TreeRepairPage {
