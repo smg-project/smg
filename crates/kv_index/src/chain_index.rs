@@ -942,7 +942,7 @@ impl ChainIndex {
         !coverage_is_empty(self.slab.coverage(run_id))
             || self
                 .arena
-                .partials_live(self.slab.run(run_id).partials.load(Ordering::Relaxed))
+                .table_live(self.slab.run(run_id).partials.load(Ordering::Relaxed))
                 > 0
     }
 
@@ -1053,7 +1053,7 @@ impl ChainIndex {
     fn cap_prefix_holders(&self, run_id: u32, meta: &mut RunMeta) {
         let run = self.slab.run(run_id);
         let table = run.partials.load(Ordering::Relaxed);
-        if table == NONE || self.arena.partials_live(table) <= PARTIAL_CAP {
+        if table == NONE || self.arena.table_live(table) <= PARTIAL_CAP {
             return;
         }
         let mut cutoffs: Vec<u32> = self
