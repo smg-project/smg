@@ -513,7 +513,7 @@ impl KvCacheGroup {
     /// The index of the main-attention group among `groups`: the one group of
     /// a main-attention kind, wherever the engine publishes it (the flag
     /// allows at most one); 0 for a list that names none, which a caller
-    /// reads only after [`unrecorded_mask`] or the kinds said there is one.
+    /// reads only after `unrecorded_mask` or the kinds said there is one.
     pub fn main_index(groups: &[KvCacheGroup]) -> usize {
         groups
             .iter()
