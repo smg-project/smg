@@ -301,7 +301,8 @@ class RouterArgs:
     api_key: str | None = None
     # Routing-key assignment; defaults: random (manual policy), delegate (override)
     assignment_mode: str | None = None
-    backend: str = "sglang"
+    # None pins no wire: the gateway detects it, as it does for the CLI without --backend
+    backend: str | None = None
     balance_abs_threshold: int = 64
     # The spill gate's price of a held prefix, in tokens per request (0: unpriced)
     balance_prefix_margin_tokens: int = 0
@@ -2645,10 +2646,11 @@ class RouterArgs:
             default=RouterArgs.backend,
             choices=["sglang", "vllm", "trtllm", "tokenspeed", "openai", "anthropic", "gemini"],
             help=(
-                "Backend runtime to use (default: sglang). Over ZMQ the backend names the "
-                "workers' engine and pins the wire protocol (it cannot be auto-detected): "
-                "pass vllm or tokenspeed for those engines; the default serves SGLang schedulers. "
-                "openai, anthropic and gemini select that provider's route"
+                "Backend runtime (default: none, the gateway detects it, as the Rust CLI does). "
+                "Over ZMQ the backend names the workers' engine and pins the wire protocol, "
+                "which the handshake cannot tell apart: pass sglang, vllm or tokenspeed for "
+                "that engine; an unpinned ZMQ worker gets the vLLM EngineCore wire and a "
+                "warning at start. openai, anthropic and gemini select that provider's route"
             ),
         )
         backend_group.add_argument(

@@ -92,6 +92,20 @@ impl BackendType {
         };
         Some(mode)
     }
+
+    /// The wire a startup worker over ZMQ speaks when this backend names its
+    /// engine. The shared EngineCore handshake carries no engine identity, so
+    /// the wire cannot be probed; a provider or TensorRT-LLM pins none, and
+    /// without a backend the detection step decides, as it does for the CLI
+    /// without `--backend`.
+    fn startup_worker_runtime(&self) -> Option<worker::RuntimeType> {
+        match self {
+            Self::Vllm => Some(worker::RuntimeType::Vllm),
+            Self::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
+            Self::Sglang => Some(worker::RuntimeType::Sglang),
+            Self::Openai | Self::Anthropic | Self::Trtllm | Self::Gemini => None,
+        }
+    }
 }
 
 #[pyclass(eq, from_py_object)]
@@ -492,7 +506,7 @@ struct Router {
     admin_port: Option<u16>,
     api_key: Option<String>,
     assignment_mode: Option<String>,
-    backend: BackendType,
+    backend: Option<BackendType>,
     balance_abs_threshold: usize,
     balance_prefix_margin_tokens: u32,
     balance_rel_threshold: f32,
@@ -1022,7 +1036,11 @@ impl Router {
 
         // IGW selects routers per request; it does not change which configured
         // workers are registered at startup, or override backend/disaggregated modes.
-        let mode = if let Some(provider) = self.backend.provider_mode(&self.worker_urls) {
+        let provider = self
+            .backend
+            .as_ref()
+            .and_then(|backend| backend.provider_mode(&self.worker_urls));
+        let mode = if let Some(provider) = provider {
             provider
         } else if self.epd_disaggregation {
             RoutingMode::EncodePrefillDecode {
@@ -1166,19 +1184,15 @@ impl Router {
             None
         };
 
-        // `backend` normally only steers the routing mode. Over ZMQ it
-        // additionally pins the startup workers' runtime: the shared EngineCore
-        // handshake carries no engine identity, so the wire protocol cannot be
-        // probed. HTTP/gRPC keep auto-detection (None). Mirrors
+        // `backend` normally only steers the routing mode. Over ZMQ an engine
+        // backend additionally pins the startup workers' runtime. HTTP/gRPC,
+        // and ZMQ without a backend, keep auto-detection (None). Mirrors
         // `to_router_config` in model_gateway/src/cli/configure.rs.
         let startup_worker_runtime_type =
             if matches!(self.connection_mode, worker::ConnectionMode::Zmq) {
-                match self.backend {
-                    BackendType::Vllm => Some(worker::RuntimeType::Vllm),
-                    BackendType::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
-                    BackendType::Sglang => Some(worker::RuntimeType::Sglang),
-                    _ => None,
-                }
+                self.backend
+                    .as_ref()
+                    .and_then(BackendType::startup_worker_runtime)
             } else {
                 None
             };
@@ -1389,7 +1403,7 @@ impl Router {
         admin_port = None,
         api_key = None,
         assignment_mode = None,
-        backend = BackendType::Sglang,
+        backend = None,
         balance_abs_threshold = 64,
         balance_prefix_margin_tokens = 0,
         balance_rel_threshold = 1.5,
@@ -1610,7 +1624,7 @@ impl Router {
         admin_port: Option<u16>,
         api_key: Option<String>,
         assignment_mode: Option<String>,
-        backend: BackendType,
+        backend: Option<BackendType>,
         balance_abs_threshold: usize,
         balance_prefix_margin_tokens: u32,
         balance_rel_threshold: f32,
@@ -2366,6 +2380,34 @@ mod tests {
                 engine.provider_mode(&urls).is_none(),
                 "{engine:?} is an engine backend: the disaggregation flags select its mode"
             );
+        }
+    }
+
+    /// An engine backend pins the wire its startup workers speak over ZMQ; no
+    /// backend, a provider and TensorRT-LLM leave the choice to the detection
+    /// step, as the CLI does without `--backend`.
+    #[test]
+    fn an_engine_backend_pins_its_wire_and_no_backend_pins_none() {
+        use worker::RuntimeType;
+        let pin = |backend: Option<BackendType>| {
+            backend
+                .as_ref()
+                .and_then(BackendType::startup_worker_runtime)
+        };
+        assert_eq!(pin(None), None);
+        assert_eq!(pin(Some(BackendType::Vllm)), Some(RuntimeType::Vllm));
+        assert_eq!(
+            pin(Some(BackendType::Tokenspeed)),
+            Some(RuntimeType::TokenSpeed)
+        );
+        assert_eq!(pin(Some(BackendType::Sglang)), Some(RuntimeType::Sglang));
+        for unpinned in [
+            BackendType::Openai,
+            BackendType::Anthropic,
+            BackendType::Trtllm,
+            BackendType::Gemini,
+        ] {
+            assert_eq!(unpinned.startup_worker_runtime(), None, "{unpinned:?}");
         }
     }
 
