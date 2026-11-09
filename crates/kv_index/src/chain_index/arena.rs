@@ -7,7 +7,7 @@ use super::*;
 /// Hash array capacity class: `8, 12, .., 32` in steps of 4, `40, 48, .., 128` in steps of 8,
 /// then four classes per octave (`160, 192, 224, 256, 320, ..`), so an array wastes at most a
 /// quarter of its words to the class, not half; a run of 140 blocks with its slack lands in 160,
-/// not 256, and a run of 12 in 12, not 16.
+/// not 256, and a run of 10 (or one grown past 8 a block at a time) in 12, not 16.
 pub(super) fn array_class(capacity: usize) -> usize {
     if capacity <= 4 * (FINE_ARRAY_CLASSES + 1) {
         capacity.div_ceil(4).max(2) - 2
