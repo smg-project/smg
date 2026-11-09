@@ -5,7 +5,7 @@
 //! when its last copy goes.
 
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{hash_map::Entry, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -43,10 +43,19 @@ impl KvEventMonitor {
                     stored.locality,
                     stored.ownership.as_deref(),
                 ) {
+                    Admission::Main => {
+                        if let Some(tier) =
+                            Self::apply_stored(stored, worker_id, indexer, worker_blocks)
+                        {
+                            worker_blocks.take_over(&stored.blocks, tier);
+                        }
+                    }
                     // A kind-less store of a group that was the main signal
                     // is the index's, as its tokenful stores were.
-                    Admission::Main | Admission::MainAndGroup(_) => {
-                        Self::apply_stored(stored, worker_id, indexer, worker_blocks);
+                    Admission::MainSignal | Admission::MainAndGroup(_) => {
+                        if Self::apply_stored(stored, worker_id, indexer, worker_blocks).is_some() {
+                            worker_blocks.note_main_signal(&stored.blocks);
+                        }
                     }
                     Admission::Group(mask) => {
                         Self::apply_group_stored(stored, mask, worker_id, indexer, worker_blocks);
@@ -63,17 +72,15 @@ impl KvEventMonitor {
                     removed.ownership.as_deref(),
                 ) {
                     Admission::Main => {
-                        if removed
-                            .group_idx
-                            .is_some_and(|group| worker_blocks.is_main_signal(group))
-                        {
-                            worker_blocks.counters.window_only_removals += 1;
-                        }
                         Self::apply_removed(removed, worker_id, indexer, worker_blocks);
+                    }
+                    Admission::MainSignal => {
+                        worker_blocks.counters.window_only_removals += 1;
+                        Self::apply_main_signal_removed(removed, worker_id, indexer, worker_blocks);
                     }
                     Admission::MainAndGroup(mask) => {
                         worker_blocks.counters.window_only_removals += 1;
-                        Self::apply_removed(removed, worker_id, indexer, worker_blocks);
+                        Self::apply_main_signal_removed(removed, worker_id, indexer, worker_blocks);
                         Self::apply_group_removed(removed, mask, worker_blocks);
                     }
                     Admission::Group(mask) => {
@@ -173,25 +180,28 @@ impl KvEventMonitor {
     /// the event's LoRA name and cache salt, so a salted block matches only a
     /// request hashed under the same namespace. A worker with a group view
     /// learns the blocks' names there too, as the index placed them.
+    ///
+    /// The tier the blocks were indexed on, `None` for a store dropped on
+    /// the way.
     fn apply_stored(
         stored: &KvBlocksStored,
         worker_id: u32,
         indexer: &KvIndex,
         worker_blocks: &mut WorkerIndexState,
-    ) {
+    ) -> Option<IndexedTier> {
         let first_level = stored.blocks.first().and_then(|block| block.cache_level);
         let Some(tier) = indexed_tier(stored.tier, first_level) else {
             worker_blocks.counters.untracked_tier += 1;
-            return;
+            return None;
         };
         if worker_blocks.sub_block(worker_id, &stored.blocks) {
-            return;
+            return None;
         }
         if stored.blocks.iter().any(|block| block.token_ids.is_empty()) {
             // A main block without tokens has no content hash to index under;
             // a group's hashes-only store that lost its group reads so too.
             worker_blocks.counters.tokenless_stores += 1;
-            return;
+            return None;
         }
 
         let seed = namespace_seed(stored.lora_name.as_deref(), stored.cache_salt.as_deref());
@@ -236,6 +246,7 @@ impl KvEventMonitor {
             worker_blocks.counters.group_blocks += view.main_stored(parent, &named) as u64;
             worker_blocks.counters.group_unnamed = view.unnamed_blocks();
         }
+        placed_after.map(|_| tier)
     }
 
     /// A store of cache groups other than main attention (`mask`, one bit
@@ -347,6 +358,36 @@ impl KvEventMonitor {
         }
     }
 
+    /// A kind-less removal of a group that was the worker's main signal: it
+    /// leaves the prefix index for the blocks that entered it as the signal
+    /// and are still its ([`WorkerIndexState::main_signal_blocks`]), never
+    /// for a block the main group stored after it showed.
+    fn apply_main_signal_removed(
+        removed: &KvBlocksRemoved,
+        worker_id: u32,
+        indexer: &KvIndex,
+        worker_blocks: &mut WorkerIndexState,
+    ) {
+        let mine: Vec<i64> = removed
+            .block_hashes
+            .iter()
+            .copied()
+            .filter(|&hash| {
+                worker_blocks
+                    .main_signal_blocks
+                    .remove(&SequenceHash::from(hash))
+            })
+            .collect();
+        if mine.is_empty() {
+            return;
+        }
+        let filtered = KvBlocksRemoved {
+            block_hashes: mine,
+            ..removed.clone()
+        };
+        Self::apply_removed(&filtered, worker_id, indexer, worker_blocks);
+    }
+
     /// Drop every block of a worker from the indexer and forget its copies
     /// and its block of record: a clear is the worker's new cache incarnation
     /// (its publisher restarted or resynced), and a worker that comes back
@@ -364,6 +405,7 @@ impl KvEventMonitor {
             view.clear();
         }
         worker_blocks.copies.clear();
+        worker_blocks.main_signal_blocks.clear();
         worker_blocks.record_before_clear = worker_blocks.block_of_record;
         worker_blocks.block_of_record = 0;
     }
@@ -449,13 +491,17 @@ fn group_kind(kind: Option<&str>, window: Option<u32>) -> Option<GroupKind> {
 /// Where an event goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Admission {
-    /// The prefix index's: a main-attention store, a plain worker's event,
-    /// or the main signal of a worker without a main group.
+    /// The prefix index's: a main-attention store or a plain worker's event.
     Main,
+    /// The prefix index's as the main signal of a worker without a main
+    /// group: a tokenful store of another group, or a kind-less event of a
+    /// group that gave such stores ([`WorkerIndexState::main_signal_blocks`]).
+    MainSignal,
     /// The worker's view's, under the groups' mask.
     Group(u16),
     /// A removal of a group that was the worker's main signal before a main
-    /// group moved it to the view: both hold its blocks, both let go.
+    /// group moved it to the view: the index lets go of the blocks that
+    /// entered it as the signal, the view of its own.
     MainAndGroup(u16),
     /// Counted, not applied.
     Skip,
@@ -614,6 +660,12 @@ pub(crate) struct WorkerIndexState {
     /// kind-less removal of one leaves the prefix index, and the view too
     /// once a main group shown later moved the group there.
     main_signal_groups: Vec<u32>,
+    /// The blocks that entered the prefix index as the worker's main signal
+    /// and are still the signal's: a removal of a main-signal group leaves
+    /// the index for these alone, never for a block the main group stored
+    /// after it showed (a main store takes a block out of this set). Cleared
+    /// with the worker's clear, as the index's blocks are.
+    main_signal_blocks: HashSet<SequenceHash>,
     /// Tokens per block of the widest block the worker's stores carried so
     /// far, 0 until a store names a width: the worker's block of record.
     block_of_record: i32,
@@ -660,7 +712,7 @@ impl WorkerIndexState {
             (Some(_), Some(group)) if tokenful && !self.main_shown => {
                 self.main_signal(group);
                 self.counters.window_only_stores += 1;
-                Admission::Main
+                Admission::MainSignal
             }
             (Some(_), Some(group)) => {
                 self.show_group(group);
@@ -672,8 +724,9 @@ impl WorkerIndexState {
             }
             (None, Some(group)) => match (self.is_main_signal(group), self.knows_group(group)) {
                 (true, true) => Admission::MainAndGroup(group_mask(group)),
+                (true, false) => Admission::MainSignal,
                 (false, true) => Admission::Group(group_mask(group)),
-                _ => Admission::Main,
+                (false, false) => Admission::Main,
             },
             (None, None) => Admission::Main,
         }
@@ -700,6 +753,37 @@ impl WorkerIndexState {
     fn main_signal(&mut self, group: u32) {
         if !self.main_signal_groups.contains(&group) {
             self.main_signal_groups.push(group);
+        }
+    }
+
+    /// The blocks a store of the worker's main signal gave the index.
+    fn note_main_signal(&mut self, blocks: &[KvBlock]) {
+        for block in blocks {
+            self.main_signal_blocks
+                .insert(SequenceHash::from(block.block_hash));
+        }
+    }
+
+    /// A main store, indexed on `tier`, of blocks the worker's main signal
+    /// gave the index: the same blocks seen through the main group, not
+    /// second copies. They leave the signal's set, and the copy
+    /// [`Self::note_stored`] counted for each is undone, so the main
+    /// group's own removal takes the block out.
+    fn take_over(&mut self, blocks: &[KvBlock], tier: IndexedTier) {
+        if self.main_signal_blocks.is_empty() {
+            return;
+        }
+        for block in blocks {
+            let hash = SequenceHash::from(block.block_hash);
+            if !self.main_signal_blocks.remove(&hash) {
+                continue;
+            }
+            if let Entry::Occupied(mut entry) = self.copies.entry(hash) {
+                let count = entry.get_mut().on(tier);
+                if *count > 1 {
+                    *count -= 1;
+                }
+            }
         }
     }
 
@@ -2175,13 +2259,58 @@ mod tests {
         assert_eq!(indexer.current_size(), 2);
         assert_eq!(wb.counters.group_stores, 1);
 
+        // A block the main group stored after the move: the window group's
+        // removal of it leaves the index standing.
+        let mut later = stored_event(4, &[90, 91, 92, 93]);
+        later.group_idx = Some(1);
+        later.kv_cache_spec_kind = Some("full_attention".to_string());
+        KvEventMonitor::apply_events(&[store_event(later)], w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 3);
+        KvEventMonitor::apply_events(&[removal_in(0, 4)], w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 3, "the main group's block stands");
+        assert_eq!(wb.counters.group_removals, 1);
+
         KvEventMonitor::apply_events(&[removal_in(0, 1)], w1, &indexer, &mut wb);
         assert!(!routable(&indexer, w1, &one), "the index let the block go");
-        assert_eq!(indexer.current_size(), 1);
+        assert_eq!(indexer.current_size(), 2);
         assert_eq!(
             (wb.counters.window_only_removals, wb.counters.group_removals),
-            (1, 1)
+            (2, 2)
         );
+    }
+
+    /// The main group storing a block the window-only phase indexed takes it
+    /// over: the window group's later removal leaves it in the index, the
+    /// main group's takes it out.
+    #[test]
+    fn a_main_store_takes_a_block_out_of_the_main_signals_set() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let one = compute_request_content_hashes(&TOKENS, 4);
+        KvEventMonitor::apply_events(
+            &[window_only_store(0, 1, None, &TOKENS)],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        let mut main = stored_event(1, &TOKENS);
+        main.group_idx = Some(1);
+        main.kv_cache_spec_kind = Some("full_attention".to_string());
+        KvEventMonitor::apply_events(&[store_event(main)], w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 1);
+
+        KvEventMonitor::apply_events(&[removal_in(0, 1)], w1, &indexer, &mut wb);
+        assert!(routable(&indexer, w1, &one), "the main group holds it now");
+        assert_eq!(indexer.current_size(), 1);
+        assert_eq!(wb.counters.window_only_removals, 1);
+
+        // The takeover counted no second copy: the main group's own removal
+        // takes the block out.
+        KvEventMonitor::apply_events(&[removal_in(1, 1)], w1, &indexer, &mut wb);
+        assert!(!routable(&indexer, w1, &one), "the main group let it go");
+        assert_eq!(indexer.current_size(), 0);
+        assert!(wb.copies.is_empty());
     }
 
     /// A hybrid worker whose window stores carry tokens (an engine that

@@ -2732,6 +2732,18 @@ fn fnv_hash_str(s: &str) -> u64 {
 /// cumulative-prefix content key, the rolling hash after all tokens, and the
 /// trailing partial block. The partial (< block_size) tail is never a block —
 /// matching real engines, which only cache full pages.
+/// The mask of a cached block without a recorded one: group 0 alone when
+/// the first group is the main-attention group, which stores every block;
+/// nothing when the engine has no main group, since a window or state group
+/// records what it keeps and a block it did not is not kept by anyone.
+fn unrecorded_mask(groups: &[KvCacheGroup]) -> u8 {
+    u8::from(
+        groups
+            .first()
+            .is_none_or(|group| KvCacheGroup::MAIN_KINDS.contains(&group.kind.as_str())),
+    )
+}
+
 /// The engine's prefix hit over its KV cache groups, vLLM's fixed point over
 /// its single-type managers: `main` leading blocks of `keys` are cached in
 /// the main group; every other group shrinks the candidate to what it keeps
@@ -2745,18 +2757,6 @@ fn fnv_hash_str(s: &str) -> u64 {
 /// state group) has no leading run to start from: the candidate is the
 /// whole prompt and the groups' rules alone decide, as the engine's own
 /// managers do for such a model.
-/// The mask of a cached block without a recorded one: group 0 alone when
-/// the first group is the main-attention group, which stores every block;
-/// nothing when the engine has no main group, since a window or state group
-/// records what it keeps and a block it did not is not kept by anyone.
-fn unrecorded_mask(groups: &[KvCacheGroup]) -> u8 {
-    u8::from(
-        groups
-            .first()
-            .is_none_or(|group| KvCacheGroup::MAIN_KINDS.contains(&group.kind.as_str())),
-    )
-}
-
 fn hit_over_groups(
     main: usize,
     keys: &[u64],
