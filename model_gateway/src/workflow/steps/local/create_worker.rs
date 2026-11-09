@@ -1151,7 +1151,7 @@ fn validate_zmq_dp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::RefusedAddress;
+    use crate::worker::test_support::RefusedAddress;
 
     /// Under `--parser symphony`, a gRPC worker's registration resolves the table whose failure
     /// classes are published at zero: the registry's table for an unlabeled worker of a model it

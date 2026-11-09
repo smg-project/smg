@@ -734,7 +734,7 @@ mod tests {
     use super::*;
     use crate::{
         config::PdReadinessConfig,
-        test_support::json_of,
+        middleware::test_support::json_of,
         worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker},
     };
 

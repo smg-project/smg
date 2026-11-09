@@ -3045,8 +3045,8 @@ mod tests {
 
     use super::*;
     use crate::{
+        middleware::test_support::text_of,
         routers::common::{attempt_ledger::FailedSide, retry::is_retryable_response},
-        test_support::text_of,
         worker::{
             BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, RuntimeType, Worker,
             WorkerType,

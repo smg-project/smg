@@ -446,7 +446,7 @@ mod tests {
         processing_failed_message, processing_failed_response, record_decoder_availability,
         report_jpeg_decoder, Response,
     };
-    use crate::{routers::common::retry::NonRetryable, test_support::json_of};
+    use crate::{middleware::test_support::json_of, routers::common::retry::NonRetryable};
 
     async fn status_and_error(response: Response) -> (u16, serde_json::Value) {
         let status = response.status().as_u16();

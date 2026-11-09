@@ -239,7 +239,9 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::{routers::common::header_utils::extract_auth_header, test_support::text_of};
+    use crate::{
+        middleware::test_support::text_of, routers::common::header_utils::extract_auth_header,
+    };
 
     async fn handler(request: Request<Body>) -> impl IntoResponse {
         request
