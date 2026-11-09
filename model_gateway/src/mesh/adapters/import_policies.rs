@@ -287,7 +287,9 @@ mod tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        policies::{BucketPolicy, CacheAwareConfig, CacheAwarePolicy, PolicyRegistry},
+        policies::{
+            as_cache_aware, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, PolicyRegistry,
+        },
         worker::{
             test_support::no_health_check, BasicWorkerBuilder, KvEventMonitor, WorkerMonitor,
         },
@@ -931,9 +933,7 @@ mod tests {
         policies
             .get_policy(model_id)
             .and_then(|policy| {
-                policy
-                    .as_any()
-                    .downcast_ref::<CacheAwarePolicy>()
+                as_cache_aware(policy.as_ref())
                     .map(|cache_aware| cache_aware.string_tree_tenants(model_id))
             })
             .unwrap_or_default()
@@ -941,10 +941,7 @@ mod tests {
 
     /// The tenants of the prefill policy's tree under `model_id`.
     fn prefill_tenants(policies: &PolicyRegistry, model_id: &str) -> Vec<String> {
-        policies
-            .get_prefill_policy()
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
+        as_cache_aware(policies.get_prefill_policy().as_ref())
             .map(|cache_aware| cache_aware.string_tree_tenants(model_id))
             .unwrap_or_default()
     }
