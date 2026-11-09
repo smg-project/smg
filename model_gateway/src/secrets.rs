@@ -9,7 +9,7 @@
 //! as the start read it, and a reload rebuilds the serving map from that
 //! fixed part and the files'.
 
-use std::{collections::HashSet, path::PathBuf};
+use std::path::PathBuf;
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -66,7 +66,8 @@ pub struct FileRead {
 pub struct ReloadReport {
     /// The files read, in the order of the sets.
     pub files: Vec<FileRead>,
-    /// Whether the serving keys in force changed.
+    /// Whether the serving keys in force changed: a key added or removed,
+    /// or a key moved to another tenant.
     pub serving_changed: bool,
     /// Whether the control-plane keys in force changed.
     pub control_plane_changed: bool,
@@ -235,10 +236,8 @@ impl SecretReloader {
                 return Err(BadFile(file.bad_file(path, &entry_refusal(error))));
             }
             let keys = AuthConfig::key_map(api_key, tenants);
-            let hashes: HashSet<[u8; 32]> = keys.keys().copied().collect();
-            let previous = self.serving.replace(keys);
-            report.serving_changed = previous.len() != hashes.len()
-                || previous.keys().any(|hash| !hashes.contains(hash));
+            let previous = self.serving.replace(keys.clone());
+            report.serving_changed = *previous != keys;
         }
         if let Some((set, entries)) = control_plane {
             report.control_plane_changed = set.load().as_slice() != entries.as_slice();
@@ -312,6 +311,49 @@ mod tests {
 
         let again = reloader.reload().expect("reloaded");
         assert!(!again.serving_changed, "the same file changes nothing");
+    }
+
+    #[test]
+    fn a_key_moved_to_another_tenant_changes_the_serving_set() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let tenants = write(dir.path(), "tenants", "acme:t-one\nbeta:t-two\n");
+        let start = [
+            TenantApiKeyEntry {
+                tenant_id: "acme".into(),
+                key: "t-one".into(),
+            },
+            TenantApiKeyEntry {
+                tenant_id: "beta".into(),
+                key: "t-two".into(),
+            },
+        ];
+        let serving = AuthConfig::with_tenant_keys(Some("flag-key".into()), &start);
+        let reloader = SecretReloader::new(
+            SecretFiles {
+                tenant_api_keys: Some(tenants),
+                ..SecretFiles::default()
+            },
+            &sources(SecretSource::Flag, Some(SecretSource::File)),
+            Some("flag-key"),
+            &start,
+            serving.clone(),
+            None,
+        )
+        .expect("a file source");
+        assert!(
+            !reloader.reload().expect("reloaded").serving_changed,
+            "the file as the start read it changes nothing"
+        );
+
+        // The same two keys, each under the other tenant: the hashes are
+        // the start's, the identities behind them are not.
+        write(dir.path(), "tenants", "beta:t-one\nacme:t-two\n");
+        let report = reloader.reload().expect("reloaded");
+        assert!(
+            report.serving_changed,
+            "a key moved to another tenant is a change"
+        );
+        assert!(serving.contains_token("t-one") && serving.contains_token("t-two"));
     }
 
     #[test]
