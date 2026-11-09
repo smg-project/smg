@@ -3,6 +3,7 @@ mod build_parity;
 mod chat_logit_bias;
 mod generate_body;
 mod glm53;
+mod messages_window_retry;
 mod model_label;
 mod pretokenized;
 mod rate_limit_reserve;
@@ -122,7 +123,9 @@ type TokenizerStream =
 /// the stream with the engine's own report before any frame, and
 /// `answer_after` stalls the generate RPC, standing in for an engine that
 /// answers only at its own deadline; `frame_gap` paces the response frames,
-/// for a stream that outlasts its dispatch. Every call's input token ids,
+/// for a stream that outlasts its dispatch; `finish_length` answers a
+/// `length` finish after that many tokens, the request's budget used whole,
+/// for the stop-reason tests. Every call's input token ids,
 /// prompt text, stop sequences, bias map and engine request id are
 /// recorded, as is every aborted request id.
 #[derive(Clone, Default)]
@@ -144,6 +147,7 @@ struct GatedScheduler {
     gate_after_first: Option<Arc<AtomicBool>>,
     answer_after: Option<Duration>,
     frame_gap: Option<Duration>,
+    finish_length: Option<u32>,
     calls: Arc<AtomicUsize>,
     seen_input_ids: Arc<Mutex<Vec<Vec<u32>>>>,
     seen_original_texts: Arc<Mutex<Vec<String>>>,
@@ -164,20 +168,30 @@ impl GatedScheduler {
     }
 }
 
-/// The stub's two frames for `request_id`: one token, then the finish, both counting
-/// `prompt_tokens` as the prompt the request carried, as an engine reports it.
+/// The stub's two frames for `request_id`: one token, then a `stop` finish,
+/// both counting `prompt_tokens` as the prompt the request carried, as an
+/// engine reports it; with `finish_length`, that many tokens and a `length`
+/// finish.
 fn generate_frames(
     request_id: &str,
     prompt_tokens: u32,
+    finish_length: Option<u32>,
 ) -> Vec<Result<ts::GenerateResponse, Status>> {
     use ts::generate_response::Response as GenResp;
+    let completion_tokens = finish_length.unwrap_or(1);
+    let token_ids = vec![100; completion_tokens as usize];
+    let finish_reason = if finish_length.is_some() {
+        "length"
+    } else {
+        "stop"
+    };
     vec![
         Ok(ts::GenerateResponse {
             request_id: request_id.to_string(),
             response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
-                token_ids: vec![100],
+                token_ids: token_ids.clone(),
                 prompt_tokens,
-                completion_tokens: 1,
+                completion_tokens,
                 cached_tokens: 0,
                 output_logprobs: None,
                 index: 0,
@@ -187,10 +201,10 @@ fn generate_frames(
         Ok(ts::GenerateResponse {
             request_id: request_id.to_string(),
             response: Some(GenResp::Complete(ts::GenerateComplete {
-                output_ids: vec![100],
-                finish_reason: "stop".to_string(),
+                output_ids: token_ids,
+                finish_reason: finish_reason.to_string(),
                 prompt_tokens,
-                completion_tokens: 1,
+                completion_tokens,
                 cached_tokens: 0,
                 output_logprobs: None,
                 matched_stop: None,
@@ -315,6 +329,7 @@ impl TokenSpeedScheduler for GatedScheduler {
         let probe = (!self.gate_rpc).then(|| self.probe.clone()).flatten();
         let released = Arc::clone(&self.released);
         let frame_gap = self.frame_gap;
+        let finish_length = self.finish_length;
         let fail_mid_stream = self.fail_mid_stream;
         let hold_after_first = self.hold_after_first;
         let gate_after_first = self.gate_after_first.clone();
@@ -322,7 +337,7 @@ impl TokenSpeedScheduler for GatedScheduler {
             if let Some(probe) = probe {
                 Self::await_probe(&probe, &released).await;
             }
-            for (index, frame) in generate_frames(&request_id, prompt_tokens)
+            for (index, frame) in generate_frames(&request_id, prompt_tokens, finish_length)
                 .into_iter()
                 .enumerate()
             {
