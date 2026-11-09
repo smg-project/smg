@@ -24,9 +24,23 @@ The repeat count, the id filter and the thresholds come from a TOML file
 (.github/bench-gates/<bench>.toml); the measured spreads that justify each threshold are
 documented there.
 
+The gate file also names the bench sources: the files that feed the gated binary beyond the
+crate it measures (the bench file and what it includes by path). The bench profile links one
+codegen unit under thin LTO, so a row added to that file changes the inlining of the code the
+other rows time, and the gated rows move with the measured crate untouched (+32 % on the
+Symphony prose rows from a bench-file-only change, 2026-11-08). The base side is therefore
+built with the pull request's bench sources (`build --sources-from`), so the two binaries
+differ in the measured code alone, and the report names the case where those sources do not
+build on the base. The rule for a change: a gated bench binary's sources stay byte-identical
+unless the change is to what they measure, and a new row goes to a bench target of its own.
+
 Usage:
-    bench_gate.py build --out FILE [--name BENCH] -- cargo bench ... --no-run
-        Run the cargo command and copy the bench executable it reports to FILE.
+    bench_gate.py build --out FILE [--name BENCH] [--gates FILE [--sources-from REV]]
+                   -- cargo bench ... --no-run
+        Run the cargo command and copy the bench executable it reports to FILE. With a gate
+        file, record the sha256 of each bench source it names in FILE.sources.json; with a
+        revision too, build with those files as REV has them, and fall back to the checkout's
+        own when they do not build, saying so in the record.
     bench_gate.py run --gates FILE --base BIN --pr BIN --out DIR [--cwd DIR] [--repeats N]
         Run both binaries interleaved, write DIR/results.json and DIR/gate.md, compare.
     bench_gate.py compare --gates FILE RESULTS_JSON [--summary FILE]
@@ -39,6 +53,7 @@ Exit code 1 means a gated regression, 2 a usage or run error.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -72,6 +87,7 @@ class Gates:
     repeats: int = 3
     filter: str | None = None
     bench_args: list[str] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
     gates: list[Gate] = field(default_factory=list)
 
     def threshold_for(self, bench_id: str) -> Gate | None:
@@ -82,7 +98,7 @@ class Gates:
         return None
 
 
-GATE_FILE_KEYS = {"repeats", "filter", "bench_args", "gate"}
+GATE_FILE_KEYS = {"repeats", "filter", "bench_args", "sources", "gate"}
 GATE_ENTRY_KEYS = {"pattern", "threshold", "note"}
 
 
@@ -107,7 +123,17 @@ def load_gates(path: Path) -> Gates:
     bench_args = raw.get("bench_args", [])
     if not isinstance(bench_args, list):
         raise ValueError(f"{path}: bench_args must be a list of strings, got {bench_args!r}")
-    gates = Gates(repeats=repeats, filter=filter_, bench_args=[str(arg) for arg in bench_args])
+    sources = raw.get("sources", [])
+    if not isinstance(sources, list) or not all(
+        isinstance(source, str) and source for source in sources
+    ):
+        raise ValueError(f"{path}: sources must be a list of file paths, got {sources!r}")
+    gates = Gates(
+        repeats=repeats,
+        filter=filter_,
+        bench_args=[str(arg) for arg in bench_args],
+        sources=sources,
+    )
     if gates.filter is not None:
         try:
             re.compile(gates.filter)
@@ -167,6 +193,69 @@ def select_bench_executable(messages: list[dict], name: str | None) -> str:
     return next(iter(found.values()))
 
 
+def run_cargo(cargo: list[str]) -> tuple[int, list[dict]]:
+    """The cargo command's exit code and the JSON messages it printed."""
+    print("+", " ".join(cargo), flush=True)
+    proc = subprocess.run(cargo, stdout=subprocess.PIPE, text=True, check=False)
+    messages = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            messages.append(json.loads(line))
+    return proc.returncode, messages
+
+
+def sources_at(paths: list[str], rev: str) -> dict[str, bytes | None]:
+    """The listed files as the commit `rev` has them, None for one it does not have."""
+    verify = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if verify.returncode != 0:
+        raise ValueError(f"--sources-from {rev}: not a commit of this repository")
+    contents: dict[str, bytes | None] = {}
+    for path in paths:
+        shown = subprocess.run(
+            ["git", "show", f"{rev}:./{path}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        contents[path] = shown.stdout if shown.returncode == 0 else None
+    return contents
+
+
+def place_sources(contents: dict[str, bytes | None]) -> dict[str, bytes | None]:
+    """Write each file as given (remove it for None) and return what was there, for the way
+    back."""
+    before: dict[str, bytes | None] = {}
+    for path, data in contents.items():
+        file = Path(path)
+        before[path] = file.read_bytes() if file.exists() else None
+        if data is None:
+            if file.exists():
+                file.unlink()
+        else:
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(data)
+    return before
+
+
+def digests(paths: list[str]) -> dict[str, str | None]:
+    """The sha256 of each listed file as it is now, None for one that is absent."""
+    return {
+        path: hashlib.sha256(Path(path).read_bytes()).hexdigest() if Path(path).exists() else None
+        for path in paths
+    }
+
+
+def sources_record_path(binary: Path) -> Path:
+    """Where `build` records the bench sources a binary was built from, beside it."""
+    return binary.with_name(binary.name + ".sources.json")
+
+
 def cmd_build(args: argparse.Namespace) -> int:
     cargo = list(args.cargo)
     if cargo and cargo[0] == "--":
@@ -177,16 +266,37 @@ def cmd_build(args: argparse.Namespace) -> int:
     if "--no-run" not in cargo:
         cargo.append("--no-run")
     cargo.append("--message-format=json-render-diagnostics")
-    print("+", " ".join(cargo), flush=True)
-    proc = subprocess.run(cargo, stdout=subprocess.PIPE, text=True, check=False)
-    if proc.returncode != 0:
-        print(f"build: cargo exited with {proc.returncode}", file=sys.stderr)
+    gates = load_gates(Path(args.gates)) if args.gates else None
+    sources = gates.sources if gates else []
+    if args.sources_from and not sources:
+        print("build: --sources-from needs a --gates file that names sources", file=sys.stderr)
         return 2
-    messages = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("{"):
-            messages.append(json.loads(line))
+    record: dict | None = None
+    if args.sources_from:
+        # The base side carries the pull request's bench sources, so the two binaries differ
+        # in the measured code alone; the checkout is its own again before anything else runs.
+        before = place_sources(sources_at(sources, args.sources_from))
+        try:
+            built = digests(sources)
+            code, messages = run_cargo(cargo)
+        finally:
+            place_sources(before)
+        record = {"rev": args.sources_from, "applied": code == 0, "files": built}
+        if code != 0:
+            record["reason"] = (
+                f"The bench sources of {args.sources_from} did not build here "
+                f"(cargo exited with {code})"
+            )
+            print(f"build: {record['reason']}, so the checkout's own are built", file=sys.stderr)
+            record["files"] = digests(sources)
+            code, messages = run_cargo(cargo)
+    else:
+        code, messages = run_cargo(cargo)
+        if gates is not None:
+            record = {"rev": None, "applied": None, "files": digests(sources)}
+    if code != 0:
+        print(f"build: cargo exited with {code}", file=sys.stderr)
+        return 2
     try:
         executable = select_bench_executable(messages, args.name)
     except ValueError as err:
@@ -197,6 +307,9 @@ def cmd_build(args: argparse.Namespace) -> int:
     shutil.copy2(executable, out)
     out.chmod(out.stat().st_mode | 0o111)
     print(f"build: {executable} -> {out}", flush=True)
+    if record is not None:
+        sources_record_path(out).write_text(json.dumps(record, indent=1, sort_keys=True) + "\n")
+        print(f"build: {len(sources)} bench sources recorded in {sources_record_path(out)}")
     return 0
 
 
@@ -262,11 +375,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     cwd = Path(args.cwd).resolve() if args.cwd else Path.cwd()
     binaries = {"base": Path(args.base).resolve(), "pr": Path(args.pr).resolve()}
     extra_args = [arg for arg in args.bench_args if arg != "--"]
+    sources: dict[str, dict | None] = {}
+    for side, binary in binaries.items():
+        record = sources_record_path(binary)
+        sources[side] = json.loads(record.read_text()) if record.exists() else None
     results = {
         "gates": str(args.gates),
         "repeats": repeats,
         "filter": gates.filter,
         "bench_args": gates.bench_args + extra_args,
+        "sources": sources,
         "order": [],
         "base": {"binary": str(binaries["base"]), "runs": [], "seconds": []},
         "pr": {"binary": str(binaries["pr"]), "runs": [], "seconds": []},
@@ -427,6 +545,36 @@ def fmt_pct(value: float | None, signed: bool = True) -> str:
     return f"{value:+.1%}" if signed else f"{value:.1%}"
 
 
+def sources_note(sources: dict | None) -> str:
+    """One line on the bench sources the two binaries were built from, when both builds
+    recorded them: byte-identical, so the rows compare the measured code alone, or the files
+    that differ and why the base side does not carry the pull request's."""
+    if not sources or any(sources.get(side) is None for side in SIDES):
+        return ""
+    base, pr = sources["base"]["files"], sources["pr"]["files"]
+    files = sorted(set(base) | set(pr))
+    if not files:
+        return ""
+    differing = [path for path in files if base.get(path) != pr.get(path)]
+    named = f"Bench sources ({len(files)} named by the gate file):"
+    if not differing:
+        return (
+            f"{named} byte-identical in the two binaries, so the rows compare the measured "
+            "code alone."
+        )
+    listed = ", ".join(f"`{path}`" for path in differing)
+    verb = "differs" if len(differing) == 1 else "differ"
+    why = ""
+    if sources["base"].get("applied") is False:
+        reason = sources["base"].get("reason", "the pull request's were not applied")
+        why = f" {reason}, so the base's binary carries its own."
+    return (
+        f"{named} {listed} {verb} between the two binaries.{why} A gated row that moves "
+        "without a change to what it measures is the binary's inlining of a neighbour: a row "
+        "this pull request adds goes to a bench target of its own."
+    )
+
+
 def markdown(results: dict, rows: list[Row]) -> str:
     repeats = results["repeats"]
     # Criterion results carry nanoseconds; another producer (crates/gateway_perf)
@@ -442,6 +590,11 @@ def markdown(results: dict, rows: list[Row]) -> str:
         "spread = the larger side's (max - min) / median. A gated id fails when its change is "
         "worse than the threshold and every pull-request run is worse (higher) than every base run.",
         "",
+    ]
+    note = sources_note(results.get("sources"))
+    if note:
+        lines += [note, ""]
+    lines += [
         "| benchmark | base | pull request | change | spread | threshold | verdict |",
         "|---|---|---|---|---|---|---|",
     ]
@@ -509,6 +662,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     build = sub.add_parser("build", help="build a bench binary and copy it to --out")
     build.add_argument("--out", required=True, help="where the bench executable is copied")
     build.add_argument("--name", help="the bench target when the command builds several")
+    build.add_argument("--gates", help="the TOML gate file: its bench sources are recorded")
+    build.add_argument(
+        "--sources-from",
+        metavar="REV",
+        help="build with the gate file's bench sources as this commit has them "
+        "(the base side carries the pull request's)",
+    )
     build.add_argument("cargo", nargs=argparse.REMAINDER, help="the cargo bench command")
     build.set_defaults(func=cmd_build)
 

@@ -66,6 +66,12 @@
 repeats = 3
 filter = "^benchmark_summary/(indexer|string|token)_(match|insert|store)_"
 
+# The files that feed this binary beyond the measured crate: the base side is built with them as the
+# pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
+# gated rows through the binary's inlining (symphony.toml records the case). A new row goes to a
+# bench target of its own.
+sources = ["model_gateway/benches/radix_tree_benchmark.rs"]
+
 [[gate]]
 pattern = "^benchmark_summary/"
 threshold = 0.25
