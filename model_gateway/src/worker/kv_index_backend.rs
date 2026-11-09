@@ -168,6 +168,18 @@ impl WorkerBlocks {
         self.len() == 0
     }
 
+    /// The engine's hashes of the blocks the worker holds, in no order.
+    pub fn hashes(&self) -> Vec<SequenceHash> {
+        if let Some(map) = &self.chain {
+            return map.iter().map(|(seq_hash, _)| seq_hash).collect();
+        }
+        #[cfg(test)]
+        if let Some(held) = &self.reference {
+            return held.hashes();
+        }
+        Vec::new()
+    }
+
     fn chain(&mut self) -> &mut ChainBlockMap {
         self.chain.get_or_insert_with(ChainBlockMap::default)
     }
@@ -424,6 +436,10 @@ mod reference {
     pub struct ReferenceBlocks(HashSet<SequenceHash>);
 
     impl ReferenceBlocks {
+        pub fn hashes(&self) -> Vec<SequenceHash> {
+            self.0.iter().copied().collect()
+        }
+
         pub fn contains(&self, seq_hash: SequenceHash) -> bool {
             self.0.contains(&seq_hash)
         }

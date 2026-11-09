@@ -393,7 +393,8 @@ impl WorkerGroups {
     /// Every retained block goes back to waiting under the worker's hash, beside the blocks
     /// waiting already, for the main group's stores to name it anew ([`Self::main_stored`]
     /// places it then); the extra copies go with the names, as a copy stored while waiting is
-    /// not counted; and the view is complete again.
+    /// not counted; and the view is complete again. The blocks the index held, the signal
+    /// group's own, come through [`Self::waiting`].
     pub fn restarted(&self) {
         let inner = &mut *self.inner.write();
         let named: Vec<(SequenceHash, SequenceHash)> = inner
@@ -409,6 +410,28 @@ impl WorkerGroups {
         inner.retained.clear();
         inner.extra_copies.clear();
         inner.incomplete = false;
+    }
+
+    /// The groups in `mask` retain `hashes` the view has no name for: they wait under the
+    /// worker's hash for the main group's stores to name them, as a group store ahead of its
+    /// main store does ([`Self::main_stored`] places them then). A worker whose main signal was
+    /// a window group restarts so: every block its index held was the signal group's. Returns
+    /// how many wait; beyond the waiting bound the rest are counted dropped.
+    pub fn waiting(&self, mask: u16, hashes: &[SequenceHash]) -> usize {
+        if mask == 0 {
+            return 0;
+        }
+        let inner = &mut *self.inner.write();
+        let mut waiting = 0;
+        for &hash in hashes {
+            if inner.pending.len() < PENDING_CAP || inner.pending.contains_key(&hash) {
+                *inner.pending.entry(hash).or_insert(0) |= mask;
+                waiting += 1;
+            } else {
+                inner.dropped += 1;
+            }
+        }
+        waiting
     }
 
     /// The view was created while the index already held `blocks` of the worker's main blocks,

@@ -352,13 +352,17 @@ impl KvEventMonitor {
     /// has a main group. The first on a worker whose main signal was a
     /// window group restarts it: the index lets the signal's blocks go
     /// (counted; the main group's stores rebuild it, in this very batch for
-    /// an engine whose group lane merely ran ahead of its main lane), a
-    /// view the worker has already restarts with it (a hashes-only store
-    /// of the group gave it one, created late and incomplete: its names go,
-    /// its memberships wait for the main group's names, and it is complete
-    /// from here; [`WorkerGroups::restarted`]), and the signal's groups move
-    /// to the view, whose events they publish from here on. `true` when the
-    /// worker needs its view.
+    /// an engine whose group lane merely ran ahead of its main lane), the
+    /// worker's view restarts with it (made now when the worker has none;
+    /// a hashes-only store of the group gave it one before, created late and
+    /// incomplete): its names go, its memberships and the signal's own
+    /// blocks, every one of them the signal group's, wait under the worker's
+    /// hashes for the main group's names ([`WorkerGroups::restarted`],
+    /// [`WorkerGroups::waiting`]), and it is complete from here; two signal
+    /// groups leave whose block is whose unknown, and the view incomplete,
+    /// the overlap standing until a clear. The signal's groups move to the
+    /// view, whose events they publish from here on. `true` when the worker
+    /// needs its view.
     fn main_group_shown(
         worker_id: u32,
         indexer: &KvIndex,
@@ -371,17 +375,20 @@ impl KvEventMonitor {
         if worker_blocks.main_signal_groups.is_empty() {
             return false;
         }
-        let dropped = worker_blocks.blocks.len();
+        let signal = worker_blocks.blocks.hashes();
         indexer.apply_cleared(worker_id, &mut worker_blocks.blocks);
         worker_blocks.copies.clear();
-        worker_blocks.counters.main_signal_dropped += dropped as u64;
-        // A view the worker has already: its names go with the blocks, its
-        // memberships wait for the main group's names, and it is complete
-        // from here.
-        if let Some(view) = &worker_blocks.groups {
-            view.restarted();
+        worker_blocks.counters.main_signal_dropped += signal.len() as u64;
+        let groups = std::mem::take(&mut worker_blocks.main_signal_groups);
+        let view = worker_blocks.view(indexer, worker_id);
+        view.restarted();
+        match groups.as_slice() {
+            [group] if group_mask(*group) != 0 => {
+                view.waiting(group_mask(*group), &signal);
+            }
+            _ => view.created_over(signal.len()),
         }
-        for group in std::mem::take(&mut worker_blocks.main_signal_groups) {
+        for group in groups {
             worker_blocks.show_group(group);
         }
         true
@@ -2100,6 +2107,7 @@ mod tests {
     }
 
     const SECOND: [u32; 4] = [50, 60, 70, 80];
+    const THIRD: [u32; 4] = [90, 91, 92, 93];
 
     /// A worker whose attention is all sliding window has no main group:
     /// its window stores carry tokens and are the prefix index's, as a plain
@@ -2256,7 +2264,8 @@ mod tests {
     /// the worker a view late, over the signal's blocks, incomplete; the main
     /// group's store restarts the worker: the view names its blocks from an
     /// empty index, complete, and the window group's memberships stay for
-    /// the names to come, so a path the engine serves keeps its credit.
+    /// the names to come, the retained ones and the signal's own, so a path
+    /// the engine serves keeps its credit.
     #[test]
     fn a_view_created_late_is_complete_after_the_restart() {
         let indexer = KvIndex::chain();
@@ -2264,6 +2273,7 @@ mod tests {
         let mut wb = WorkerIndexState::default();
         let one = compute_request_content_hashes(&TOKENS, 4);
         let two = compute_request_content_hashes(&SECOND, 4);
+        let three = compute_request_content_hashes(&THIRD, 4);
         KvEventMonitor::apply_events(
             &[window_only_store(0, 1, None, &TOKENS)],
             w1,
@@ -2284,7 +2294,8 @@ mod tests {
         assert_eq!(wb.counters.group_view_late, 1);
 
         // A second signal block, named by the view and retained by the
-        // window group through it.
+        // window group through it; a third with no hashes-only store of its
+        // own, named only.
         KvEventMonitor::apply_events(
             &[window_only_store(0, 2, None, &SECOND)],
             w1,
@@ -2297,14 +2308,20 @@ mod tests {
             &indexer,
             &mut wb,
         );
-        assert_eq!(view.retained_blocks(), 1);
+        KvEventMonitor::apply_events(
+            &[window_only_store(0, 3, None, &THIRD)],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert_eq!((view.named_blocks(), view.retained_blocks()), (2, 1));
 
         let mut main = stored_event(2, &SECOND);
         main.group_idx = Some(1);
         main.kv_cache_spec_kind = Some("full_attention".to_string());
         KvEventMonitor::apply_events(&[store_event(main)], w1, &indexer, &mut wb);
         assert!(view.is_complete(), "the restart cleared the names");
-        assert_eq!(wb.counters.main_signal_dropped, 2);
+        assert_eq!(wb.counters.main_signal_dropped, 3);
         assert!(!routable(&indexer, w1, &one), "the signal's block went");
         assert!(routable(&indexer, w1, &two));
         assert_eq!(indexer.current_size(), 1);
@@ -2319,6 +2336,96 @@ mod tests {
             Some(1),
             "the path the engine serves keeps its credit"
         );
+
+        // The third block, the signal's own: the main group's store names it
+        // and the window group's membership is there.
+        let mut third = stored_event(3, &THIRD);
+        third.group_idx = Some(1);
+        third.kv_cache_spec_kind = Some("full_attention".to_string());
+        KvEventMonitor::apply_events(&[store_event(third)], w1, &indexer, &mut wb);
+        assert_eq!((view.named_blocks(), view.retained_blocks()), (2, 2));
+        assert_eq!(capped(&indexer, w1, &three, 4).0, Some(1));
+    }
+
+    /// The signal's own blocks are the window group's: a worker whose window
+    /// stores were its main signal shows a main group, and after the restart
+    /// the view holds the window group's membership for every block the
+    /// index let go, so a path the engine serves keeps its credit once the
+    /// group can be read.
+    #[test]
+    fn the_signals_blocks_keep_the_window_groups_membership_across_the_restart() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let one = compute_request_content_hashes(&TOKENS, 4);
+        KvEventMonitor::apply_events(
+            &[window_only_store(0, 1, None, &TOKENS)],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert!(wb.groups.is_none());
+
+        let mut main = stored_event(1, &TOKENS);
+        main.group_idx = Some(1);
+        main.kv_cache_spec_kind = Some("full_attention".to_string());
+        KvEventMonitor::apply_events(&[store_event(main)], w1, &indexer, &mut wb);
+        let view = wb.groups.clone().expect("the restart makes the view");
+        assert!(view.is_complete());
+        assert_eq!(
+            view.retained_blocks(),
+            1,
+            "the signal's block waited and was placed as the window group's"
+        );
+
+        // The window group can be read once a store of its own names its
+        // kind.
+        let mut second = stored_event(2, &SECOND);
+        second.group_idx = Some(1);
+        second.kv_cache_spec_kind = Some("full_attention".to_string());
+        KvEventMonitor::apply_events(
+            &[
+                group_store(0, Some("sliding_window"), Some(64), &[2]),
+                store_event(second),
+            ],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert_eq!(view.retained_blocks(), 2);
+        assert_eq!(
+            capped(&indexer, w1, &one, 4).0,
+            Some(1),
+            "the path the engine serves keeps its credit"
+        );
+    }
+
+    /// Two groups gave a worker its main signal: whose block is whose is
+    /// unknown at the restart, so the view stays incomplete and the overlap
+    /// stands until a clear.
+    #[test]
+    fn two_signal_groups_leave_the_restarted_view_incomplete() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        KvEventMonitor::apply_events(
+            &[
+                window_only_store(0, 1, None, &TOKENS),
+                window_only_store(2, 2, None, &SECOND),
+            ],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        let mut main = stored_event(1, &TOKENS);
+        main.group_idx = Some(1);
+        main.kv_cache_spec_kind = Some("full_attention".to_string());
+        KvEventMonitor::apply_events(&[store_event(main)], w1, &indexer, &mut wb);
+        let view = wb.groups.clone().expect("the restart makes the view");
+        assert!(!view.is_complete(), "whose block is whose is unknown");
+        assert_eq!(wb.counters.main_signal_dropped, 2);
+        assert_eq!(view.retained_blocks(), 0);
+        assert!(wb.knows_group(0) && wb.knows_group(2));
     }
 
     /// A window-only worker's second copy of a block (an engine's resend)
