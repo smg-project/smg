@@ -1,4 +1,4 @@
-"""The committed runner values carry no API key, and only the dind sidecar is privileged."""
+"""The committed runner values keep API keys in the key-proxy sidecar only, and privilege in dind only."""
 
 from pathlib import Path
 
@@ -15,17 +15,21 @@ def containers(values):
     return spec.get("containers", []) + spec.get("initContainers", [])
 
 
-# The one credential a runner pod may carry: the read-only Hugging Face token the GPU lanes need
-# to download the gated Llama checkpoint. API keys never; see README "No API keys in the runner pods".
-ALLOWED_CREDENTIALS = {"HF_TOKEN"}
+# The containers that may hold a credential: the key-proxy sidecar holds the two API keys and
+# nothing else may; the GPU lanes' runner keeps the read-only Hugging Face token it downloads the
+# gated Llama checkpoint with. See README "No API keys in the runner container".
+KEY_HOLDER = "ai-key-proxy"
+ALLOWED_RUNNER_CREDENTIALS = {"HF_TOKEN"}
 
 
 @pytest.mark.parametrize("path", VALUES, ids=lambda p: p.name)
-def test_no_runner_values_file_puts_an_api_key_in_the_environment(path):
+def test_api_keys_live_in_the_key_proxy_sidecar_only(path):
     for container in containers(yaml.safe_load(path.read_text())):
         for env in container.get("env") or []:
             name = env["name"]
-            if name in ALLOWED_CREDENTIALS and path != CPU:
+            if container["name"] == KEY_HOLDER:
+                continue
+            if name in ALLOWED_RUNNER_CREDENTIALS and path != CPU:
                 continue
             assert not any(word in name for word in ("KEY", "TOKEN", "SECRET", "PASSWORD")), (
                 f"{path.name}: {container['name']} carries {name}"
@@ -39,13 +43,25 @@ def test_only_a_dind_sidecar_may_be_privileged(path):
         assert not privileged or container["name"] == "dind", f"{path.name}: {container['name']}"
 
 
-def test_the_cpu_set_the_reviews_run_on_carries_no_credential_at_all():
+def test_the_cpu_set_the_reviews_run_on_has_an_empty_runner_and_a_localhost_key_proxy():
     values = yaml.safe_load(CPU.read_text())
     assert values["runnerScaleSetName"] == "k8s-runner-cpu"
-    runner = next(c for c in values["template"]["spec"]["containers"] if c["name"] == "runner")
+    spec = values["template"]["spec"]
+    runner = next(c for c in spec["containers"] if c["name"] == "runner")
     assert [e["name"] for e in runner["env"]] == [
         "DOCKER_HOST",
         "RUNNER_WAIT_FOR_DOCKER_IN_SECONDS",
     ]
     assert not (runner.get("securityContext") or {}).get("privileged")
     assert values["maxRunners"] == 48
+    proxy = next(c for c in spec["initContainers"] if c["name"] == KEY_HOLDER)
+    assert proxy["restartPolicy"] == "Always"
+    assert "@sha256:" in proxy["image"]
+    env = {e["name"]: e for e in proxy["env"]}
+    assert env["ANTHROPIC_API_KEY"]["valueFrom"]["secretKeyRef"]["name"] == "anthropic-api-key"
+    assert env["OPENAI_API_KEY"]["valueFrom"]["secretKeyRef"]["name"] == "openai-api-key"
+    template = env["NGINX_TEMPLATE"]["value"]
+    assert "listen 127.0.0.1:8787;" in template
+    assert "proxy_ssl_verify on;" in template
+    assert 'proxy_set_header Authorization "";' in template
+    assert "unset ANTHROPIC_API_KEY OPENAI_API_KEY NGINX_TEMPLATE" in proxy["command"][2]

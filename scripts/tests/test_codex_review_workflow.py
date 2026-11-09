@@ -45,44 +45,38 @@ def test_forks_and_bots_are_refused_before_any_job_starts(workflow):
     assert "github.event.comment.user.type != 'Bot'" in condition
 
 
-def test_the_key_jobs_use_the_ai_review_environment_and_the_posting_job_has_no_key(workflow):
+def test_no_job_uses_an_environment_or_a_secret_and_no_shell_step_handles_a_key(workflow):
     jobs = workflow["jobs"]
-    assert jobs["codex"]["environment"] == "ai-review"
-    assert jobs["verify-by-claude"]["environment"] == "ai-review"
-    assert "environment" not in jobs["post"]
+    assert all("environment" not in job for job in jobs.values())
     text = WORKFLOW.read_text()
-    assert (
-        text.count("secrets.OPENAI_API_KEY") == 1 and text.count("secrets.ANTHROPIC_API_KEY") == 1
-    )
-    assert "export-pod-api-key" not in text
-    runs = "".join(str(s.get("run", "")) for s in jobs["codex"]["steps"])
-    assert "API_KEY" not in runs  # no shell step touches a key, so none can reach the job env
+    assert "secrets." not in text and "export-pod-api-key" not in text
+    assert "Start the Anthropic key proxy" not in text and "Drop sudo" not in text
+    runs = "".join(str(s.get("run", "")) for job in jobs.values() for s in job["steps"])
+    assert "API_KEY" not in runs
 
 
-def test_the_openai_key_is_only_the_actions_proxy_input(workflow):
+def test_codex_reaches_the_sidecar_through_the_actions_proxy_with_a_placeholder_key(workflow):
     codex = workflow["jobs"]["codex"]
     run = step(codex, "openai/codex-action@")
-    assert run["with"]["openai-api-key"] == "${{ secrets.OPENAI_API_KEY }}"
+    assert run["with"]["openai-api-key"] == "${{ env.OPENAI_PLACEHOLDER_KEY }}"
+    assert run["with"]["responses-api-endpoint"] == "${{ env.AI_KEY_PROXY }}/openai/v1/responses"
     assert run["with"]["permission-profile"] == ":read-only"
     assert run["with"]["working-directory"] == "pr"
     assert run["with"]["allow-bot-users"] == "claude[bot]"
     assert codex["permissions"] == {"contents": "read", "pull-requests": "read"}
+    assert workflow["env"]["AI_KEY_PROXY"] == "http://127.0.0.1:8787"
 
 
-def test_the_anthropic_key_feeds_a_root_proxy_and_sudo_is_dropped_before_claude(workflow):
+def test_claude_verifies_through_the_sidecar_with_a_placeholder_key(workflow):
     verify = workflow["jobs"]["verify-by-claude"]
+    claude = step(verify, "anthropics/")
+    assert claude["env"]["ANTHROPIC_BASE_URL"] == "${{ env.AI_KEY_PROXY }}/anthropic"
+    assert claude["with"]["anthropic_api_key"] == "${{ env.ANTHROPIC_PLACEHOLDER_KEY }}"
     names = [s.get("name") or s.get("uses") for s in verify["steps"]]
-    proxy = names.index("Start the Anthropic key proxy")
-    drop = names.index("Drop sudo for the rest of the job")
-    claude = next(
-        i for i, s in enumerate(verify["steps"]) if str(s.get("uses", "")).startswith("anthropics/")
+    assert (
+        "Start the Anthropic key proxy" not in names
+        and "Drop sudo for the rest of the job" not in names
     )
-    assert proxy < drop < claude
-    proxy_step = verify["steps"][proxy]
-    assert proxy_step["env"] == {"ANTHROPIC_API_KEY": "${{ secrets.ANTHROPIC_API_KEY }}"}
-    assert "sudo -n env -i" in proxy_step["run"] and "printf" in proxy_step["run"]
-    claude_step = verify["steps"][claude]
-    assert claude_step["with"]["anthropic_api_key"].startswith("sk-ant-placeholder")
 
 
 def test_the_post_job_runs_only_after_a_successful_review_from_the_default_branch(workflow):

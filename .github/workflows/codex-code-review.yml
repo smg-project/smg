@@ -8,12 +8,11 @@ name: Codex Code Review
 # Trust boundary. Every trigger here runs this file, the prompts, the schemas and the scripts
 # from `main`, never from the pull request (`pull_request_target` and the comment events). A
 # pull request from a fork is never reviewed and its commands are ignored; the author or the
-# commenter must have write access (scripts/codex_review_post.py gates every run). The keys
-# live in the `ai-review` environment, which releases them only to runs from `main`: the
-# OpenAI key goes to openai/codex-action's local proxy on stdin, the Anthropic key to
-# scripts/ci_anthropic_proxy.py running as root, and neither reviewer's process ever holds a
-# key. Codex runs in a read-only sandbox in a job with read permissions; a second job with
-# pull-requests: write and no key posts its result.
+# commenter must have write access (scripts/codex_review_post.py gates every run). No key
+# reaches any job: the runner pod's key-proxy sidecar (scripts/k8s-runner-resources/
+# runner-values-cpu.yaml) holds both keys, and the reviewers talk to it on localhost with
+# placeholder keys. Codex runs in a read-only sandbox in a job with read permissions; a
+# second job with pull-requests: write posts its result.
 
 on:
   pull_request_target:
@@ -50,6 +49,9 @@ env:
   CODEX_EFFORT: xhigh
   CODEX_VERSION: '0.167.0'
   CODEX_OTHER_BOT: claude[bot]
+  AI_KEY_PROXY: http://127.0.0.1:8787
+  OPENAI_PLACEHOLDER_KEY: sk-placeholder-the-sidecar-holds-the-key
+  ANTHROPIC_PLACEHOLDER_KEY: sk-ant-placeholder-the-sidecar-holds-the-key
 
 jobs:
   codex:
@@ -75,7 +77,6 @@ jobs:
       )
     runs-on: ${{ vars.SMG_RUNNER_REVIEW || 'k8s-runner-cpu' }}
     timeout-minutes: 30
-    environment: ai-review
     permissions:
       contents: read
       pull-requests: read
@@ -148,13 +149,14 @@ jobs:
           fi
           command -v setfacl
 
-      # The key is an input of this step alone: the action feeds it to its local proxy on
-      # stdin, and the Codex process sees only the proxy. It is never in the job environment.
+      # A placeholder key: the action's local proxy forwards to the pod's key-proxy sidecar,
+      # which puts the real key on the request. No key is in the job environment.
       - name: Run Codex
         if: steps.context.outputs.skip != 'true'
         uses: openai/codex-action@v1
         with:
-          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          openai-api-key: ${{ env.OPENAI_PLACEHOLDER_KEY }}
+          responses-api-endpoint: ${{ env.AI_KEY_PROXY }}/openai/v1/responses
           prompt-file: .github/codex/${{ steps.context.outputs.mode }}-prompt.md
           output-schema-file: .github/codex/${{ steps.context.outputs.mode }}-schema.json
           output-file: pr/.codex-review/output.json
@@ -210,7 +212,6 @@ jobs:
     if: needs.post.result == 'success' && needs.codex.outputs.mode == 'review'
     runs-on: ${{ vars.SMG_RUNNER_REVIEW || 'k8s-runner-cpu' }}
     timeout-minutes: 20
-    environment: ai-review
     permissions:
       contents: read
       pull-requests: write
@@ -227,26 +228,6 @@ jobs:
           name: codex-review-${{ github.run_id }}
           path: .codex-review
 
-      # The key arrives on stdin and lives only in a root-owned process; the job's user,
-      # Claude's tools included, can read neither its environment nor its memory.
-      - name: Start the Anthropic key proxy
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          if [ -z "${ANTHROPIC_API_KEY}" ]; then
-            echo "::error::ANTHROPIC_API_KEY is not set in the ai-review environment"
-            exit 1
-          fi
-          port_file="$RUNNER_TEMP/anthropic-proxy.port"
-          printf '%s\n' "${ANTHROPIC_API_KEY}" | sudo -n env -i PATH=/usr/bin:/bin \
-            /usr/bin/python3 scripts/ci_anthropic_proxy.py --port-file "$port_file" \
-            > "$RUNNER_TEMP/anthropic-proxy.log" 2>&1 &
-          for _ in $(seq 1 50); do [ -s "$port_file" ] && break; sleep 0.2; done
-          if [ ! -s "$port_file" ]; then
-            echo "::error::the Anthropic key proxy did not start"; cat "$RUNNER_TEMP/anthropic-proxy.log"; exit 1
-          fi
-          echo "ANTHROPIC_BASE_URL=http://127.0.0.1:$(cat "$port_file")" >> "$GITHUB_ENV"
-
       - name: Check out the pull request head
         run: |
           pr=${{ needs.codex.outputs.pr }}
@@ -257,16 +238,11 @@ jobs:
       - name: Install gh CLI
         uses: ./.github/actions/setup-gh
 
-      # Nothing after this point may become root: the proxy's memory stays out of reach.
-      - name: Drop sudo for the rest of the job
-        run: |
-          sudo -n /bin/sh -c 'rm -f /etc/sudoers.d/* && sed -i "/^runner\b/d; /^%sudo\b/d; /^%admin\b/d; /^%wheel\b/d" /etc/sudoers'
-          if sudo -n true 2>/dev/null; then echo "::error::sudo is still available"; exit 1; fi
-          echo "sudo dropped"
-
       - uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ env.AI_KEY_PROXY }}/anthropic
         with:
-          anthropic_api_key: sk-ant-placeholder-the-proxy-holds-the-key
+          anthropic_api_key: ${{ env.ANTHROPIC_PLACEHOLDER_KEY }}
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ needs.codex.outputs.pr }}
