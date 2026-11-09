@@ -9,7 +9,6 @@ use wfaas::{
 };
 
 use crate::{
-    policies::as_cache_aware,
     worker::{ConnectionMode, SubscriptionKind, Worker},
     workflow::data::WorkerRegistrationData,
 };
@@ -147,15 +146,11 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
 
             // Check for configuration conflicts between prefill and decode
             Self::check_worker_conflicts(&model_id, &all_workers);
-            let cache_aware = app_context
+            // The registry tests the policy's type itself and does nothing
+            // for a policy that is not cache-aware.
+            app_context
                 .policy_registry
-                .get_policy(&model_id)
-                .is_some_and(|policy| as_cache_aware(policy.as_ref()).is_some());
-            if cache_aware {
-                app_context
-                    .policy_registry
-                    .init_cache_aware_policy(&model_id, &all_workers);
-            }
+                .init_cache_aware_policy(&model_id, &all_workers);
 
             // The worker's stream follows the policy that places it, the
             // role's policy for a prefill, decode or encode worker rather than
