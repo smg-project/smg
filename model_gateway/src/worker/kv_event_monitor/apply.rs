@@ -108,10 +108,15 @@ impl KvEventMonitor {
         worker_blocks: &mut WorkerIndexState,
     ) {
         // The main group first, so a window group's store ahead of it in
-        // the batch reads as a group's, not as the worker's main signal.
+        // the batch reads as a group's, not as the worker's main signal. A
+        // store the index skips (a residency agent's, a remote tier's) shows
+        // no group here either.
         let mut hybrid = false;
         for event in events {
             if let Some(kv_cache_event::Data::Stored(stored)) = &event.data {
+                if foreign(stored) {
+                    continue;
+                }
                 let main = match (stored.kv_cache_spec_kind.as_deref(), stored.group_idx) {
                     (Some(kind), _) => MAIN_ATTENTION_KINDS.contains(&kind),
                     (None, None) => true,
@@ -124,6 +129,9 @@ impl KvEventMonitor {
         }
         for event in events {
             if let Some(kv_cache_event::Data::Stored(stored)) = &event.data {
+                if foreign(stored) {
+                    continue;
+                }
                 if let (Some(kind), Some(group)) =
                     (stored.kv_cache_spec_kind.as_deref(), stored.group_idx)
                 {
@@ -487,6 +495,24 @@ fn indexed_tier(tier: Option<i32>, cache_level: Option<i32>) -> Option<IndexedTi
 /// engine does ([`WorkerGroups::cap`]).
 const MAIN_ATTENTION_KINDS: [&str; 3] = ["full_attention", "mla_attention", "sink_full_attention"];
 
+/// A store or removal a residency agent (`kvcr`) owns: skipped and counted
+/// by [`WorkerIndexState::admit`], read by neither batch pre-scan.
+fn foreign_owner(ownership: Option<&str>) -> bool {
+    ownership.is_some_and(|owner| owner.eq_ignore_ascii_case("kvcr"))
+}
+
+/// An event about blocks on a remote tier: skipped like a foreign owner's.
+fn remote(locality: Option<i32>) -> bool {
+    locality.is_some_and(|locality| locality == KvCacheLocality::Remote as i32)
+}
+
+/// Whether [`WorkerIndexState::admit`] skips a store before it reads the
+/// store's group: the batch pre-scans skip it too, so a foreign store shows
+/// neither a main group nor a window group.
+fn foreign(stored: &KvBlocksStored) -> bool {
+    foreign_owner(stored.ownership.as_deref()) || remote(stored.locality)
+}
+
 /// Whether every block of a store carries its tokens: a main-lane store
 /// does, a group lane's store (hashes only) does not.
 fn tokenful(stored: &KvBlocksStored) -> bool {
@@ -735,11 +761,11 @@ impl WorkerIndexState {
         locality: Option<i32>,
         ownership: Option<&str>,
     ) -> Admission {
-        if ownership.is_some_and(|owner| owner.eq_ignore_ascii_case("kvcr")) {
+        if foreign_owner(ownership) {
             self.counters.foreign_owner += 1;
             return Admission::Skip;
         }
-        if locality.is_some_and(|locality| locality == KvCacheLocality::Remote as i32) {
+        if remote(locality) {
             self.counters.remote += 1;
             return Admission::Skip;
         }
@@ -2190,6 +2216,52 @@ mod tests {
         assert_eq!(
             (wb.counters.window_only_removals, wb.counters.group_removals),
             (1, 0)
+        );
+    }
+
+    /// A store the index skips (a residency agent's, a remote tier's) shows
+    /// no group in a batch: a foreign main store ahead of a window-only
+    /// worker's store leaves that store in the prefix index, and a foreign
+    /// window store shows no group.
+    #[test]
+    fn a_foreign_store_in_a_batch_shows_no_group() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let mut agent_main = stored_event(7, &THIRD);
+        agent_main.kv_cache_spec_kind = Some("full_attention".to_string());
+        agent_main.group_idx = Some(1);
+        agent_main.ownership = Some("kvcr".to_string());
+        let mut remote_window = window_only_store(2, 8, None, &SECOND);
+        if let Some(kv_cache_event::Data::Stored(stored)) = &mut remote_window.data {
+            stored.locality = Some(KvCacheLocality::Remote as i32);
+        }
+
+        KvEventMonitor::apply_events(
+            &[
+                store_event(agent_main),
+                window_only_store(0, 1, None, &TOKENS),
+                remote_window,
+            ],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert!(!wb.main_shown, "a foreign main store shows no main group");
+        assert!(wb.groups.is_none(), "a foreign window store shows no group");
+        assert_eq!(
+            indexer.current_size(),
+            1,
+            "the window store is the prefix index's"
+        );
+        assert_eq!(
+            (
+                wb.counters.window_only_stores,
+                wb.counters.group_stores,
+                wb.counters.foreign_owner,
+                wb.counters.remote,
+            ),
+            (1, 0, 1, 1)
         );
     }
 
