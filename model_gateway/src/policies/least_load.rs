@@ -410,7 +410,7 @@ impl LeastLoadPolicy {
     }
 
     /// One candidate as the decision reads it: one read of the snapshot and
-    /// one of the tally through `credit`, which answers `(tokens, requests,
+    /// one of the tally through `read_credit`, which answers `(tokens, requests,
     /// release)` for the worker's url and its report's sample instant: the
     /// dispatches made at or before the sample are the engine's by now and
     /// leave the credit, the later ones stay. The two guard shapes answer it
@@ -420,12 +420,12 @@ impl LeastLoadPolicy {
         idx: usize,
         worker: &Arc<dyn Worker>,
         snapshot: Option<&LoadSnapshot>,
-        credit: &mut impl FnMut(&str, Option<Instant>) -> (u64, u64, bool),
+        read_credit: &mut impl FnMut(&str, Option<Instant>) -> (u64, u64, bool),
     ) -> Candidate {
         let url = worker.url();
         let report = snapshot.and_then(|snapshot| snapshot.report(url));
         let sampled_at = report.map(|(_, sampled_at)| sampled_at);
-        let (since_poll_tokens, since_poll_requests, release) = credit(url, sampled_at);
+        let (since_poll_tokens, since_poll_requests, release) = read_credit(url, sampled_at);
         Candidate {
             idx,
             report: report.map(|(load, _)| self.report_facts(worker, load)),
@@ -459,10 +459,10 @@ impl LeastLoadPolicy {
             .tally
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut credit = |url: &str, sampled_at| credit_read(&tally, url, sampled_at);
+        let mut read_credit = |url: &str, sampled_at| credit_read(&tally, url, sampled_at);
         indices
             .iter()
-            .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &mut credit))
+            .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &mut read_credit))
             .collect()
     }
 
@@ -767,11 +767,12 @@ impl LeastLoadPolicy {
         resolved.clear();
         match held.as_deref_mut() {
             Some(tally) => {
-                let mut credit = |url: &str, sampled_at| credit_released(tally, url, sampled_at);
+                let mut read_credit =
+                    |url: &str, sampled_at| credit_released(tally, url, sampled_at);
                 resolved.extend(
                     candidates
                         .iter()
-                        .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &mut credit)),
+                        .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &mut read_credit)),
                 );
             }
             None => {
@@ -779,11 +780,11 @@ impl LeastLoadPolicy {
                     .tally
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let mut credit = |url: &str, sampled_at| credit_read(&tally, url, sampled_at);
+                let mut read_credit = |url: &str, sampled_at| credit_read(&tally, url, sampled_at);
                 resolved.extend(
                     candidates
                         .iter()
-                        .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &mut credit)),
+                        .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &mut read_credit)),
                 );
             }
         }
@@ -2120,10 +2121,11 @@ mod tests {
         );
     }
 
-    /// A read of the tally (a decision's resolve, the test view) subtracts
-    /// the dispatches a report reflects without releasing them; the
-    /// decision's write phase releases them for its candidates, once it
-    /// holds the guard, and credits its winner.
+    /// A read under the read guard (a split decision's resolve, the test
+    /// view) subtracts the dispatches a report reflects without releasing
+    /// them; a decision under the held guard releases them as it resolves;
+    /// a split decision releases them for its candidates in its write
+    /// phase, once it holds the guard. Either decision credits its winner.
     #[test]
     fn a_decision_releases_what_its_reports_reflect_and_a_read_does_not() {
         let policy = LeastLoadPolicy::new();
