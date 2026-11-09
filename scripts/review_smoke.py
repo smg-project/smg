@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import sys
 
-UNITS = {"Ki": 1000, "Mi": 1000**2, "Gi": 1000**3}
+UNITS = {"Ki": 1024, "Mi": 1024**2, "Gi": 1024**3}
 
 
 def parse_quantity(text: str) -> int:
@@ -19,7 +19,7 @@ def parse_quantity(text: str) -> int:
     try:
         for suffix, factor in UNITS.items():
             if text.endswith(suffix):
-                return int(float(text[:-2]) * factor)
+                return int(float(text[: -len(suffix)]) * factor)
         return int(text)
     except ValueError:
         return 0
