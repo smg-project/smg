@@ -4,13 +4,10 @@
 
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg::{
-    config::{
-        AccessLogField, ConfigError, ConfigResult, PowerOfTwoLoadMetric, TenantApiKeyEntry,
-        TurboJpegPolicy,
-    },
+    config::{AccessLogField, ConfigError, ConfigResult, PowerOfTwoLoadMetric, TurboJpegPolicy},
     service_discovery::ModelIdSource,
 };
-use smg_auth::{ApiKeyEntry, Role};
+use smg_auth::Role;
 
 /// Parse the `--multimodal-tensor-transport` value into a `TransportMode`.
 pub(crate) fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
@@ -138,60 +135,4 @@ pub(crate) fn parse_role_mapping(mapping: &str) -> ConfigResult<(String, Role)> 
         }
     };
     Ok((idp_role, gateway_role))
-}
-
-/// Parse a control-plane API key from CLI format "id:name:role:key". A
-/// malformed entry is a configuration error, never a dropped key: a dropped
-/// key would leave the control plane open (or lock an operator out) with
-/// nothing but a stderr line to show for it. The entry is not echoed, since
-/// it carries the credential.
-pub(crate) fn parse_control_plane_api_key(key_str: &str) -> ConfigResult<ApiKeyEntry> {
-    let parts: Vec<&str> = key_str.splitn(4, ':').collect();
-    if parts.len() != 4 {
-        return Err(ConfigError::InvalidValue {
-            field: "control-plane-api-keys".to_string(),
-            value: "<redacted>".to_string(),
-            reason: "expected 'id:name:role:key'".to_string(),
-        });
-    }
-    let id = parts[0];
-    let name = parts[1];
-    let role_str = parts[2];
-    let key = parts[3];
-
-    let role = match role_str.to_lowercase().as_str() {
-        "admin" => Role::Admin,
-        "user" => Role::User,
-        // The field is not named either: with the fields out of order it is the credential.
-        _ => {
-            return Err(ConfigError::InvalidValue {
-                field: "control-plane-api-keys".to_string(),
-                value: "<redacted>".to_string(),
-                reason: "the role must be 'admin' or 'user'".to_string(),
-            });
-        }
-    };
-
-    Ok(ApiKeyEntry::new(id, name, key, role))
-}
-
-/// Parse a tenant-scoped data-plane API key from CLI format "tenant_id:key".
-/// Only checks for the ':' separator; non-empty/duplicate checks live in
-/// `ConfigValidator::validate_tenant_api_keys` so they also cover
-/// `TenantApiKeyEntry` values from a config file or language binding. Fails
-/// hard (an empty `AuthConfig` disables auth entirely, not just narrows it)
-/// and never echoes `key_str`, which may be the plaintext credential.
-pub(crate) fn parse_tenant_api_key(key_str: &str) -> ConfigResult<TenantApiKeyEntry> {
-    let Some((tenant_id, key)) = key_str.split_once(':') else {
-        return Err(ConfigError::InvalidValue {
-            field: "tenant-api-key".to_string(),
-            value: "<redacted>".to_string(),
-            reason: "expected 'tenant_id:key' (missing ':' separator)".to_string(),
-        });
-    };
-
-    Ok(TenantApiKeyEntry {
-        tenant_id: tenant_id.trim().to_string(),
-        key: key.trim().to_string(),
-    })
 }
