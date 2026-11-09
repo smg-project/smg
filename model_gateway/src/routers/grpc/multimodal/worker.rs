@@ -507,7 +507,7 @@ impl WorkerMediaPipeline {
                     tokenizer: &RegistryTokenizer(tokenizer.as_ref()),
                     config: &loaded.config,
                 })
-                .is_some_and(|spec| spec.name() == "minimax_m3");
+                .is_some_and(|spec| spec.resizes_source_images());
         let loaded = if native_minimax {
             let mut image = loaded.preprocessor_config.clone();
             image.extra.insert(

@@ -324,7 +324,7 @@ async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> 
         .with_video_frame_sampling(frame_sampling)
         .with_image_transparency(ctx.transparency)
         .with_minimax_sglang_resize(
-            ctx.spec.name() == "minimax_m3"
+            ctx.spec.resizes_source_images()
                 && ctx
                     .model_config
                     .preprocessor_config
@@ -332,7 +332,7 @@ async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> 
                     .unwrap_or(false),
         )
         .with_minimax_image_resize(
-            ctx.spec.name() == "minimax_m3"
+            ctx.spec.resizes_source_images()
                 && !ctx
                     .model_config
                     .preprocessor_config

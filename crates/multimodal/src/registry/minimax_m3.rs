@@ -334,6 +334,12 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         matches!(modality, Modality::Image | Modality::Video)
     }
 
+    /// The source image is sized by the family's long-side rule
+    /// (`crate::minimax_resize`) before its processor runs.
+    fn resizes_source_images(&self) -> bool {
+        true
+    }
+
     fn placeholder_token_for(
         &self,
         metadata: &ModelMetadata,
