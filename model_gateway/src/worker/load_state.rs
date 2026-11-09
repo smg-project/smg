@@ -138,6 +138,12 @@ impl TestFeed {
         Self(tx)
     }
 
+    /// A receiver of this feed for a second reader (the policy engine's
+    /// decider beside the legacy policy, in a benchmark).
+    pub fn receiver(&self) -> LoadReceiver {
+        self.0.subscribe()
+    }
+
     /// Publish `loads` as the current snapshot; a report without a sample
     /// instant is sampled now.
     pub fn publish(&self, loads: &HashMap<String, WorkerLoadResponse>) {
