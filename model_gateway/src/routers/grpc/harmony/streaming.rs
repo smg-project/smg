@@ -39,7 +39,7 @@ use crate::{
         grpc::{
             common::{
                 response_collection::drain_prefill,
-                response_formatting::{CompletionTokenTracker, TokenCounts},
+                response_formatting::{known_spec_drafted, CompletionTokenTracker, TokenCounts},
                 responses::{
                     body_guards, build_sse_response_driven, driven_channel,
                     streaming::{
@@ -1305,7 +1305,10 @@ impl ResponsesDecode {
             cached: self.cached_tokens,
             reasoning: self.engine_reasoning_tokens,
             spec_accepted: self.spec_accepted,
-            spec_drafted: self.spec_drafted,
+            spec_drafted: known_spec_drafted(std::iter::once((
+                self.spec_accepted,
+                self.spec_drafted,
+            ))),
         }
     }
 
@@ -1808,7 +1811,22 @@ impl ChatDecode {
             cached: cached_tokens.values().copied().max().unwrap_or(0),
             reasoning: self.reasoning_tokens.values().sum(),
             spec_accepted: self.spec_accepted.values().sum(),
-            spec_drafted: self.spec_drafted.values().sum(),
+            spec_drafted: known_spec_drafted(
+                // Include requested and observed choices, not only those with a Complete.
+                // A chunk-only/missing terminal choice has unknown proposal accounting.
+                (0..original_request.choices())
+                    .chain(self.parsers.keys().copied())
+                    .chain(self.spec_accepted.keys().copied())
+                    .chain(self.spec_drafted.keys().copied())
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .map(|index| {
+                        (
+                            self.spec_accepted.get(&index).copied().unwrap_or(0),
+                            self.spec_drafted.get(&index).copied().unwrap_or(0),
+                        )
+                    }),
+            ),
         };
 
         if let Some(handle) = reservation {

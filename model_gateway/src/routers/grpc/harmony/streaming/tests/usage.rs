@@ -505,3 +505,83 @@ async fn harmony_chat_settlement_carries_the_engines_counts_streamed_and_not() {
     assert_eq!(whole, streamed);
     assert_eq!(settlement, expected);
 }
+
+#[tokio::test]
+async fn spec_usage_regression_harmony_streamed_and_nonstreamed_formatting() {
+    let tokens = tokio::task::spawn_blocking(|| harmony_tokens(Some("I think."), "Hello!"))
+        .await
+        .expect("initialize Harmony outside the async runtime");
+    for (first, second, rejected) in [
+        ((2, 0), (1, 10), None),
+        ((0, 0), (0, 10), None),
+        ((0, 7), (0, 0), None),
+        ((0, 7), (0, 10), Some(17)),
+        ((4, 2), (1, 10), None),
+        ((0, 0), (1, 10), None),
+        ((2, 3), (1, 10), Some(10)),
+        ((2, 2), (1, 1), Some(0)),
+        ((0, 0), (0, 0), Some(0)),
+    ] {
+        let counters = |(a, d)| Counters {
+            prompt: 10,
+            cached: 4,
+            spec_accepted: a,
+            spec_drafted: d,
+        };
+        let mut data = choice_frames(0, &tokens, counters(first));
+        data.extend(choice_frames(1, &tokens, counters(second)));
+        let streamed = streamed_chat_usage(data.clone(), 2, None).await;
+        let whole = non_streamed_chat_usage(data, 2).await;
+        assert_eq!(streamed, whole);
+        let details = &streamed["completion_tokens_details"];
+        assert_eq!(details["accepted_prediction_tokens"], first.0 + second.0);
+        assert!(details["reasoning_tokens"].as_u64().unwrap() > 0);
+        match rejected {
+            Some(n) => assert_eq!(details["rejected_prediction_tokens"], n),
+            None => assert!(
+                details.get("rejected_prediction_tokens").is_none(),
+                "{streamed}"
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn spec_usage_regression_harmony_missing_choice_is_unknown() {
+    let tokens = tokio::task::spawn_blocking(|| harmony_tokens(None, "Hello!"))
+        .await
+        .expect("initialize Harmony outside the async runtime");
+    for chunk_only in [false, true] {
+        let mut data = choice_frames(
+            0,
+            &tokens,
+            Counters {
+                prompt: 10,
+                cached: 4,
+                spec_accepted: 0,
+                spec_drafted: 10,
+            },
+        );
+        if chunk_only {
+            let mut partial = choice_frames(
+                1,
+                &tokens,
+                Counters {
+                    prompt: 10,
+                    cached: 4,
+                    spec_accepted: 0,
+                    spec_drafted: 0,
+                },
+            );
+            partial.pop(); // The second choice never supplies its terminal counters.
+            data.extend(partial);
+        }
+        let usage = streamed_chat_usage(data, 2, None).await;
+        let details = &usage["completion_tokens_details"];
+        assert_eq!(details["accepted_prediction_tokens"], 0);
+        assert!(
+            details.get("rejected_prediction_tokens").is_none(),
+            "{usage}"
+        );
+    }
+}

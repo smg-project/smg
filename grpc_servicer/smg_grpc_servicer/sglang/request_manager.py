@@ -847,6 +847,21 @@ class GrpcRequestManager:
                 },
             }
 
+            # Scheduler counters are cumulative snapshots, not per-chunk deltas.
+            # Only forward actual engine counters; verify counts cannot determine
+            # proposal totals when speculative decoding uses adaptive draft sizes.
+            for key in ("spec_num_correct_drafts", "spec_num_proposed_drafts"):
+                counters = getattr(batch_out, key, None)
+                if counters is not None and i < len(counters) and counters[i] is not None:
+                    # Proto scalar defaults cannot distinguish unknown accepted from
+                    # measured zero. Proposals alone would falsely imply all rejected.
+                    if (
+                        key == "spec_num_proposed_drafts"
+                        and "spec_num_correct_drafts" not in output_data["meta_info"]
+                    ):
+                        continue
+                    output_data["meta_info"][key] = counters[i]
+
             # Accumulate logprobs (following tokenizer_manager pattern)
             # Use getattr for safe access - not all request types have return_logprob
             # (e.g., TokenizedEmbeddingReqInput)

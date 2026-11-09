@@ -54,7 +54,8 @@ use crate::{
             common::{
                 response_collection::drain_prefill,
                 response_formatting::{
-                    chat_usage, effective_weight_version, CompletionTokenTracker, TokenCounts,
+                    chat_usage, effective_weight_version, known_spec_drafted,
+                    CompletionTokenTracker, TokenCounts,
                 },
                 responses::{
                     body_guards, build_sse_response_driven, build_sse_response_from_stream,
@@ -110,6 +111,15 @@ struct ChatStreamTokenCounts {
 }
 
 impl ChatStreamUsage {
+    fn new(expected_choices: u32) -> Self {
+        Self {
+            choices: (0..expected_choices)
+                .map(|index| (index, ChatStreamTokenCounts::default()))
+                .collect(),
+            reasoning_parsed: false,
+        }
+    }
+
     fn record_chunk(&mut self, chunk: &ProtoGenerateStreamChunk) {
         let counts = self.choices.entry(chunk.index()).or_default();
         counts.prompt = chunk.prompt_tokens();
@@ -150,7 +160,14 @@ impl ChatStreamUsage {
             cached: self.choices.values().map(|c| c.cached).max().unwrap_or(0),
             reasoning: self.choices.values().map(|c| c.reasoning).sum(),
             spec_accepted: self.choices.values().map(|c| c.spec_accepted).sum(),
-            spec_drafted: self.choices.values().map(|c| c.spec_drafted).sum(),
+            // Expected but unseen choices retain the proto's unknown zero
+            // sentinel: they invalidate a measured partial proposal sum while
+            // preserving legacy all-zero/no-speculation usage defaults.
+            spec_drafted: known_spec_drafted(
+                self.choices
+                    .values()
+                    .map(|c| (c.spec_accepted, c.spec_drafted)),
+            ),
         };
         chat_usage(
             counts.usage(),
@@ -212,7 +229,7 @@ impl GenerateStreamUsage {
             cached: self.cached,
             reasoning: self.reasoning.values().sum(),
             spec_accepted: 0,
-            spec_drafted: 0,
+            spec_drafted: Some(0),
         }
     }
 
@@ -2694,6 +2711,8 @@ impl StreamingProcessor {
                     let mut total_reasoning = 0u32;
                     let mut total_spec_accepted = 0u32;
                     let mut total_spec_drafted = 0u32;
+                    let mut has_unknown_spec_draft_tokens = false;
+                    let mut has_unavailable_spec_draft_tokens = false;
                     let mut total_completion = 0u32;
                     let mut first_token_time: Option<Instant> = None;
                     let mut all_saw_complete = true;
@@ -2702,7 +2721,10 @@ impl StreamingProcessor {
                         total_cached += outcome.cached_tokens;
                         total_reasoning += outcome.reasoning_tokens;
                         total_spec_accepted += outcome.spec_accepted_tokens;
-                        total_spec_drafted += outcome.spec_draft_tokens;
+                        total_spec_drafted += outcome.spec_draft_tokens.unwrap_or(0);
+                        has_unavailable_spec_draft_tokens |= outcome.spec_draft_tokens.is_none();
+                        has_unknown_spec_draft_tokens |= outcome.spec_draft_tokens.is_none()
+                            || outcome.spec_draft_tokens == Some(0);
                         total_completion += outcome.completion_tokens;
                         all_saw_complete &= outcome.saw_complete;
                         first_token_time = match (first_token_time, outcome.first_token_time) {
@@ -2748,7 +2770,15 @@ impl StreamingProcessor {
                                     cached: total_cached,
                                     reasoning: total_reasoning,
                                     spec_accepted: total_spec_accepted,
-                                    spec_drafted: total_spec_drafted,
+                                    spec_drafted: if has_unknown_spec_draft_tokens
+                                        && (total_spec_drafted > 0
+                                            || total_spec_accepted > 0
+                                            || has_unavailable_spec_draft_tokens)
+                                    {
+                                        None
+                                    } else {
+                                        Some(total_spec_drafted)
+                                    },
                                 }
                                 .usage(),
                             ),
@@ -3281,7 +3311,7 @@ impl<'a> ChatStream<'a> {
                     && opts.include_usage.unwrap_or(false)
                     && opts.continuous_usage_stats.unwrap_or(false)
             })
-            .map(|_| ChatStreamUsage::default());
+            .map(|_| ChatStreamUsage::new(spec.expected_choices));
 
         let reasoning_parser_name = processor
             .parser_resolver
@@ -4417,7 +4447,11 @@ impl<'a> ChatStream<'a> {
                 .unwrap_or(0),
             reasoning: choices.iter().map(|choice| choice.reasoning_tokens).sum(),
             spec_accepted: choices.iter().map(|choice| choice.spec_accepted).sum(),
-            spec_drafted: choices.iter().map(|choice| choice.spec_drafted).sum(),
+            spec_drafted: known_spec_drafted(
+                choices
+                    .iter()
+                    .map(|choice| (choice.spec_accepted, choice.spec_drafted)),
+            ),
         }
     }
 

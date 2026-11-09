@@ -18,20 +18,54 @@ use crate::{
 /// the max over the choices: summing would charge the prompt once per choice
 /// instead of once per request. Each choice is its own generation, so
 /// `completion`, `reasoning` (each choice's own reasoning trace) and the
-/// speculative counts sum. (Completion's own batched usage computation does
+/// accepted counts sum; drafted counts sum only if all choices supply
+/// consistent positive proposals (otherwise unavailable). (Completion's own batched usage computation does
 /// this per prompt and sums across prompts.)
 ///
 /// Every path that aggregates the engine's frames itself builds its usage
 /// from these counters, so the streamed and the non-streamed answer of a
 /// request carry one and the same usage object.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TokenCounts {
     pub prompt: u32,
     pub completion: u32,
     pub cached: u32,
     pub reasoning: u32,
     pub spec_accepted: u32,
-    pub spec_drafted: u32,
+    pub spec_drafted: Option<u32>,
+}
+
+impl Default for TokenCounts {
+    fn default() -> Self {
+        Self {
+            prompt: 0,
+            completion: 0,
+            cached: 0,
+            reasoning: 0,
+            spec_accepted: 0,
+            spec_drafted: Some(0),
+        }
+    }
+}
+
+/// Sum proposals only when every choice supplied a consistent positive count.
+/// Scalar proto zeros have no presence: all-zero legacy usage retains schema
+/// defaults, but a zero mixed with measured speculation makes rejections unknown.
+pub(crate) fn known_spec_drafted(counts: impl Iterator<Item = (u32, u32)>) -> Option<u32> {
+    let mut total = 0;
+    let mut has_unknown = false;
+    for (accepted, drafted) in counts {
+        if drafted < accepted {
+            return None;
+        }
+        has_unknown |= drafted == 0;
+        total += drafted;
+    }
+    if has_unknown && total > 0 {
+        None
+    } else {
+        Some(total)
+    }
 }
 
 impl TokenCounts {
@@ -51,7 +85,11 @@ impl TokenCounts {
                 .unwrap_or(0),
             reasoning: responses.iter().map(|r| r.reasoning_tokens()).sum(),
             spec_accepted: responses.iter().map(|r| r.spec_accepted_tokens()).sum(),
-            spec_drafted: responses.iter().map(|r| r.spec_draft_tokens()).sum(),
+            spec_drafted: known_spec_drafted(
+                responses
+                    .iter()
+                    .map(|r| (r.spec_accepted_tokens(), r.spec_draft_tokens())),
+            ),
         }
     }
 
@@ -82,7 +120,7 @@ impl TokenCounts {
                 .map(|r| r.meta_info.reasoning_tokens.unwrap_or(0))
                 .sum(),
             spec_accepted: 0,
-            spec_drafted: 0,
+            spec_drafted: Some(0),
         }
     }
 
@@ -90,10 +128,18 @@ impl TokenCounts {
     /// reasoning and speculative details the engine reported. The usage of
     /// a legacy completion, streamed or not, is this object.
     pub(crate) fn usage(self) -> Usage {
-        Usage::from_counts(self.prompt, self.completion)
+        let mut usage = Usage::from_counts(self.prompt, self.completion)
             .with_cached_tokens(self.cached)
             .with_reasoning_tokens(self.reasoning)
-            .with_speculative_tokens(self.spec_accepted, self.spec_drafted)
+            .with_speculative_tokens(self.spec_accepted, self.spec_drafted.unwrap_or(0));
+        if self.spec_drafted.is_none() {
+            // Keep aggregate availability separate from the old proto's zero sentinel.
+            // Explicit accepted zero must also preserve unknown rejected in chat usage.
+            let details = usage.completion_tokens_details.get_or_insert_default();
+            details.accepted_prediction_tokens = Some(self.spec_accepted);
+            details.rejected_prediction_tokens = None;
+        }
+        usage
     }
 
     /// The settlement of the request's reservation: the engine's counts as
@@ -113,8 +159,8 @@ impl TokenCounts {
 /// engine's counters make: the rendered prompt tokens the provider does not
 /// bill are dropped, the reasoning the gateway's own parser split off is
 /// accounted (`parsed_reasoning`, see `with_parsed_reasoning_tokens`), and
-/// every detail counter is present as the OpenAI API sends it on every chat
-/// completion, zero where nothing was counted. The streamed answer's usage
+/// default counters are present, except unavailable speculative rejections
+/// remain absent even when accepted is zero. The streamed answer's usage
 /// chunk and the non-streamed answer both build their usage here, so a
 /// request's two usage objects are the same.
 pub(crate) fn chat_usage(
@@ -352,7 +398,7 @@ mod tests {
             cached: 4,
             reasoning: 3,
             spec_accepted: 2,
-            spec_drafted: 3,
+            spec_drafted: Some(3),
         }
         .usage();
 
@@ -543,5 +589,81 @@ mod tests {
         tracker.record_local_stop(0);
         tracker.record_complete(&complete(0, 0, 42));
         assert_eq!(tracker.total(), 42, "the engine's own count of the step");
+    }
+
+    #[cfg(test)]
+    mod spec_usage_regression {
+        use smg_grpc_client::tokenspeed_proto as proto;
+
+        use super::*;
+
+        #[test]
+        fn mixed_unknown_proposals_do_not_become_measured_rejections() {
+            for (accepted, drafted) in [(2, 0), (4, 2), (0, 0)] {
+                let responses: Vec<_> = [(accepted, drafted), (1, 10)]
+                    .into_iter()
+                    .map(|(a, d)| {
+                        ProtoGenerateComplete::TokenSpeed(proto::GenerateComplete {
+                            spec_accepted_tokens: a,
+                            spec_draft_tokens: d,
+                            ..Default::default()
+                        })
+                    })
+                    .collect();
+                let usage = chat_usage(TokenCounts::of(&responses).usage(), Some(3), 0);
+                let json = serde_json::to_value(usage).unwrap();
+                assert_eq!(
+                    json["completion_tokens_details"]["accepted_prediction_tokens"],
+                    accepted + 1
+                );
+                assert!(
+                    json["completion_tokens_details"]
+                        .get("rejected_prediction_tokens")
+                        .is_none(),
+                    "{json}"
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod zero_accepted_aggregation_regression {
+        use smg_grpc_client::tokenspeed_proto as proto;
+
+        use super::*;
+
+        #[test]
+        fn partial_zero_accepted_proposals_stay_unknown() {
+            let responses: Vec<_> = [(0, 0), (0, 10)]
+                .into_iter()
+                .map(|(a, d)| {
+                    ProtoGenerateComplete::TokenSpeed(proto::GenerateComplete {
+                        spec_accepted_tokens: a,
+                        spec_draft_tokens: d,
+                        ..Default::default()
+                    })
+                })
+                .collect();
+            let usage = chat_usage(TokenCounts::of(&responses).usage(), Some(3), 0);
+            let details = usage.completion_tokens_details.unwrap();
+            assert_eq!(details.accepted_prediction_tokens, Some(0));
+            assert_eq!(details.rejected_prediction_tokens, None);
+        }
+    }
+
+    #[cfg(test)]
+    mod default_speculation_control {
+        use super::*;
+
+        #[test]
+        fn default_counts_keep_legacy_zero_rejected() {
+            let details = TokenCounts::default()
+                .usage()
+                .with_complete_details()
+                .completion_tokens_details
+                .unwrap();
+            assert_eq!(details.accepted_prediction_tokens, Some(0));
+            assert_eq!(details.rejected_prediction_tokens, Some(0));
+        }
     }
 }
