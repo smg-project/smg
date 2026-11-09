@@ -698,7 +698,10 @@ impl LeastLoadPolicy {
     /// decision's read and its write, so every decision in flight at once
     /// can pick the least-loaded worker before any of their credits lands:
     /// a herd of at most one decision per runtime thread, inside one
-    /// scoring window; every credit lands.
+    /// scoring window; every credit lands. A decision with no report among
+    /// its candidates keeps the write guard across the decision as well: it
+    /// scores only the picks, and a herd there is the burst they are counted
+    /// to spread.
     pub(super) fn select_min_expected_wait(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -778,6 +781,22 @@ impl LeastLoadPolicy {
                         .map(|&idx| self.resolve(idx, &workers[idx], snapshot, &tally)),
                 );
             }
+        }
+        // With no report among the candidates the score reads only the picks,
+        // and decisions in flight at once would all read the same ones. Such a
+        // decision reads them again under the write guard and keeps it, as a
+        // small one does: its scores are integer reads.
+        if held.is_none() && resolved.iter().all(|candidate| candidate.report.is_none()) {
+            let tally = self
+                .tally
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for candidate in resolved.iter_mut() {
+                candidate.picked = tally
+                    .get(workers[candidate.idx].url())
+                    .map_or(0, |dispatch| dispatch.picked);
+            }
+            held = Some(tally);
         }
 
         let (first, rest) = resolved.split_first()?;
@@ -1304,6 +1323,39 @@ mod tests {
                 }
                 assert_eq!(hits, vec![2; fleet], "{fleet} workers, burst {seed}");
             }
+        }
+    }
+
+    /// Eight decisions in flight at once over a dark fleet above
+    /// [`HELD_GUARD_CANDIDATES`]: each reads the picks the others have
+    /// landed, so no two share a worker while idle ones remain.
+    #[test]
+    fn dark_decisions_in_flight_at_once_pick_distinct_workers() {
+        let workers: Vec<Arc<dyn Worker>> = (0..HELD_GUARD_CANDIDATES + 5)
+            .map(|i| make_worker(&format!("http://w{i}:8000")))
+            .collect();
+        for round in 0..200 {
+            let policy = LeastLoadPolicy::new();
+            let barrier = std::sync::Barrier::new(8);
+            let mut picks: Vec<usize> = std::thread::scope(|scope| {
+                let threads: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            policy
+                                .select_worker(&workers, &SelectWorkerInfo::default())
+                                .expect("a healthy pool picks")
+                        })
+                    })
+                    .collect();
+                threads
+                    .into_iter()
+                    .map(|thread| thread.join().expect("a decision thread panicked"))
+                    .collect()
+            });
+            picks.sort_unstable();
+            picks.dedup();
+            assert_eq!(picks.len(), 8, "round {round}");
         }
     }
 
