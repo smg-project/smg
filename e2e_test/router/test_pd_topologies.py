@@ -1603,3 +1603,75 @@ class TestHTTPMoRIDecodeStreamFault:
             for thread in threads:
                 if thread.ident is not None:
                     thread.join(timeout=1.0)
+
+
+def _wait_for_pairing_protocols(gateway: Gateway, expected: dict[str, str], timeout: float) -> None:
+    """Wait for effective pairing keys, not merely accepted operator labels."""
+    deadline = time.monotonic() + timeout
+    observed = _pairing_keys(gateway)
+    while observed != expected and time.monotonic() < deadline:
+        time.sleep(0.1)
+        observed = _pairing_keys(gateway)
+    assert observed == expected, f"effective pairing keys {observed}, expected {expected}"
+
+
+@pytest.mark.engine("vllm")
+@pytest.mark.gpu(4)
+@pytest.mark.e2e
+@pytest.mark.model(_MODEL)
+@pytest.mark.workers(parallel_start=True)
+@pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=_GATEWAY_ARGS)
+@pytest.mark.parametrize(
+    "setup_backend",
+    [pytest.param(("pd_grpc", (1, 1)), id="1p1d-http-mori-label-protocol")],
+    indirect=True,
+)
+@pytest.mark.skipif(not _moriio_lane(), reason="HTTP MoRI operator-label contract only")
+class TestHTTPMoRILabelPairingProtocol:
+    """Operator labels enforce HTTP pairing; engine env reporting remains separate."""
+
+    def test_operator_protocol_mismatch_refuses_and_matching_pair_serves(self, setup_backend):
+        mode, model, client, gateway = setup_backend
+        assert mode == "pd_http"
+        prefills, decodes = gateway.prefill_workers, gateway.decode_workers
+        assert len(prefills) == len(decodes) == 1
+        owned = [*prefills, *decodes]
+        try:
+            _wait_for_healthy_workers(gateway, 2, timeout=120.0)
+            baseline = _ask(client, model, "Reply only with the number 10837.", max_tokens=32)
+            assert "10837" in _answer_text(baseline), "baseline request did not return its nonce"
+            gateway.label_workers(prefills, {"pairing_protocol": "http-mori-v1"})
+            gateway.label_workers(decodes, {"pairing_protocol": "http-mori-v2"})
+            _wait_for_pairing_protocols(
+                gateway,
+                {
+                    prefills[0].base_url: "http-mori-v1",
+                    decodes[0].base_url: "http-mori-v2",
+                },
+                timeout=10.0,
+            )
+            response = _raw_chat(gateway, model, "Say hello.", timeout=30.0)
+            assert response.status_code == 503, response.text
+            assert _error_code(response) == "no_compatible_pd_pair", response.text
+
+            # No engine restarts or env changes: repair only the operator label,
+            # then require the effective metadata and a new useful model answer.
+            gateway.label_workers(decodes, {"pairing_protocol": "http-mori-v1"})
+            _wait_for_pairing_protocols(
+                gateway,
+                {
+                    prefills[0].base_url: "http-mori-v1",
+                    decodes[0].base_url: "http-mori-v1",
+                },
+                timeout=10.0,
+            )
+            before = len(_pairs_logged())
+            answer = _ask(client, model, "Reply only with the number 59281.", max_tokens=32)
+            assert "59281" in _answer_text(answer), "matching pair failed the fresh nonce request"
+            pairs = _wait_for_pairs(before + 1)[before:]
+            assert (prefills[0].base_url, decodes[0].base_url) in pairs, pairs
+        finally:
+            try:
+                gateway.shutdown()
+            finally:
+                stop_workers(owned)
