@@ -196,6 +196,32 @@
             "annotations": { "type": "object" }
           }
         },
+        "tenantRateLimit": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "configMap": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
+        "priorityScheduler": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "configMap": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
         "service": {
           "type": "object",
           "properties": {
