@@ -1009,6 +1009,60 @@ fn pd_phase_families_describe_what_they_measure() {
     );
 }
 
+/// The router's first-token and generation families say on `/metrics` where
+/// their clock starts: at the answering attempt's RPC dispatch (the prefill
+/// dispatch of a pair, after a pushed encode call), so a refused attempt's
+/// wait and its backoff are in the request duration (the backoff alone in the
+/// backoff histogram, the attempt in the retry count), not in them.
+#[test]
+fn router_stream_families_name_the_attempt_anchor() {
+    let (rendered, ()) = with_test_recorder(|| {
+        init_metrics();
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_REGULAR,
+            model_id: "m",
+            endpoint: "chat",
+            ttft: Some(Duration::from_millis(5)),
+            generation_duration: Duration::from_millis(9),
+            input_tokens: None,
+            cached_tokens: None,
+            output_tokens: 2,
+        });
+    });
+    let help = |family: &str| -> String {
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("# HELP {family} ")))
+            .unwrap_or_else(|| panic!("no # HELP for {family}; rendered:\n{rendered}"))
+            .to_owned()
+    };
+    for family in [
+        "smg_router_ttft_seconds",
+        TIME_TO_FIRST_TOKEN_SECONDS,
+        "smg_router_generation_duration_seconds",
+    ] {
+        let text = help(family);
+        assert!(
+            text.contains("answering attempt's RPC dispatch"),
+            "{family}: {text}"
+        );
+    }
+    for family in [
+        "smg_router_ttft_seconds",
+        "smg_router_generation_duration_seconds",
+    ] {
+        let text = help(family);
+        assert!(
+            text.contains("smg_router_request_duration_seconds")
+                && text.contains("after the encode call when encode pushes")
+                && text.contains("smg_worker_retry_backoff_seconds")
+                && text.contains("smg_worker_retries_total"),
+            "{family}: {text}"
+        );
+    }
+}
+
 #[test]
 fn test_record_pd_kv_connector_mode_counts_by_mode() {
     let (rendered, ()) = with_test_recorder(|| {
