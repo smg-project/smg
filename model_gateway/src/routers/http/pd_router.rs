@@ -1196,15 +1196,19 @@ impl PDRouter {
             };
             if mode == KvConnectorMode::MoriIo {
                 let fanout = lease.with_view(|view| {
-                    serde_json::to_value(view.request).map(|body| {
-                        let routing = RoutingDerivatives {
-                            tokens: view.tokens.map(Vec::from),
-                            text: view.text.map(str::to_string),
-                            rid_key: view.rid_key.map(str::to_string),
-                            cache_namespace: view.cache_namespace,
-                        };
-                        (body, routing)
-                    })
+                    // Match the existing wire serializer: to_value widens
+                    // typed f32 parameters (0.8 -> 0.800000011920929).
+                    serialize_json_sized(view.request, raw_body_len)
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes))
+                        .map(|body| {
+                            let routing = RoutingDerivatives {
+                                tokens: view.tokens.map(Vec::from),
+                                text: view.text.map(str::to_string),
+                                rid_key: view.rid_key.map(str::to_string),
+                                cache_namespace: view.cache_namespace,
+                            };
+                            (body, routing)
+                        })
                 });
                 let (body, routing) = match fanout {
                     Ok(value) => value,
@@ -5291,7 +5295,11 @@ mod tests {
                     assert!(
                         transfers.insert(d["kv_transfer_params"]["transfer_id"].as_str().unwrap())
                     );
-                    assert!((d["temperature"].as_f64().unwrap() - 0.8).abs() < 1e-6);
+                    assert_eq!(
+                        d["temperature"],
+                        json!(0.8),
+                        "preserve original wire sampling number"
+                    );
                     assert_ne!(d["kv_transfer_params"]["remote_host"], "client-chosen");
                 }
                 assert_moriio_guards_released(&router);
