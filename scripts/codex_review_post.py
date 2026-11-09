@@ -23,8 +23,9 @@ request's author, or the commenter) must have write access to the repository. Th
 bot's own review activity is admitted on non-fork pull requests only.
 
 Modes:
-    review  a pull request opened, reopened or pushed (incremental), or `@codex review` in a
-            comment: findings become one review, APPROVE when nothing Important was found
+    review  a pull request opened, reopened or pushed (incremental), drafts included, or
+            `@codex review` in a comment: findings become one review, APPROVE when nothing
+            Important was found
     reply   a human replied in a thread Codex opened, or mentioned @codex in any thread:
             one reply in that thread
     verify  the other bot submitted review activity: every root finding of that bot without a
@@ -455,8 +456,6 @@ def resolve_context(
         pr = event["pull_request"]
         if is_fork(pr, repo):
             return _skip("pull request from a fork")
-        if pr.get("draft"):
-            return _skip("draft pull request")
         if not has_write(api, repo, pr["user"]["login"]):
             return _skip(f"author {pr['user']['login']} has no write access")
         incremental = event.get("action") == "synchronize"

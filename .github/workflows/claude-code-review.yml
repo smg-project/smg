@@ -1,13 +1,16 @@
 name: Claude Code Review
 
-# Trust boundary: every trigger runs this file from `main` (`pull_request_target` and the
-# comment events), never from the pull request. A pull request from a fork is never
+# Trust boundary: no key reaches the job. The runner pod's key-proxy sidecar
+# (scripts/k8s-runner-resources/runner-values-cpu.yaml) holds it, and Claude gets a
+# placeholder key and ANTHROPIC_BASE_URL pointing at the sidecar on localhost, so a pull
+# request that edits this file can at most spend. A pull request from a fork is never
 # reviewed and its commands are ignored; the author or commenter must have write access
-# (scripts/codex_review_post.py gate). No key reaches the job: the runner pod's key-proxy
-# sidecar (scripts/k8s-runner-resources/runner-values-cpu.yaml) holds it, and Claude gets a
-# placeholder key and ANTHROPIC_BASE_URL pointing at the sidecar on localhost.
+# (scripts/codex_review_post.py gate, and the action checks the actor itself). The PR event
+# is `pull_request`, not `pull_request_target`: the action's App-token exchange rejects the
+# OIDC token of a `pull_request_target` run ("Invalid OIDC token"), and the comment events
+# run from `main` anyway.
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, synchronize, reopened]
     paths-ignore:
       - '*.md'
@@ -38,7 +41,7 @@ jobs:
       github.repository == 'smg-project/smg'
       && github.actor != 'dependabot[bot]'
       && (
-        (github.event_name == 'pull_request_target'
+        (github.event_name == 'pull_request'
             && github.event.pull_request.head.repo.full_name == github.repository)
         || (github.event_name == 'issue_comment'
             && github.event.issue.pull_request
@@ -86,7 +89,6 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         id: claude-review
         if: steps.gate.outputs.allowed == 'true'
-        continue-on-error: true
         env:
           ANTHROPIC_BASE_URL: ${{ env.AI_KEY_PROXY }}/anthropic
         with:
@@ -233,7 +235,7 @@ jobs:
             https://github.com/smg-project/smg-dev-guide.git
 
       - name: Annotate on failure
-        if: steps.gate.outputs.allowed == 'true' && steps.claude-review.outcome == 'failure'
+        if: failure() && steps.gate.outputs.allowed == 'true' && steps.claude-review.outcome == 'failure'
         run: echo "::warning::Claude review did not complete — may have hit turn limit or encountered an error."
 
       - name: Review summary

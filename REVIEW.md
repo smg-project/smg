@@ -27,14 +27,14 @@ After posting all inline comments, write a brief summary with a count per severi
 
 ## Bots
 
-Two reviewers run on every non-draft pull request that a user with write access opens from a
+Two reviewers run on every pull request, drafts included, that a user with write access opens from a
 branch of this repository: Claude (`.github/workflows/claude-code-review.yml`) and Codex
 (`.github/workflows/codex-code-review.yml`, prompts in `.github/codex/`). A pull request from a
 fork never gets either, and the commands below are ignored on one and from anyone without
 write access. Both post inline comments with the markers above, and each approves when it finds
-nothing 🔴 Important. The workflows run from `main`, and the API keys never enter a job: they
-stay in the cluster's secrets and are served by a sidecar in the runner pod that the reviewer's
-own process cannot read, so nothing in a pull request can reach them.
+nothing 🔴 Important. The API keys never enter a job: they stay in the cluster's secrets and are
+served by a sidecar in the runner pod that the reviewer's own process cannot read, so nothing
+in a pull request can reach them.
 
 - `@claude review` or `@codex review` in a PR comment runs a full review on demand.
 - A human reply in a thread Codex opened, or a comment that mentions `@codex`, gets an answer
