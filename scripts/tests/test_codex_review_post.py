@@ -504,7 +504,9 @@ def test_the_status_note_says_what_codex_is_doing_and_then_what_it_found():
     reviewing = post.render_status("reviewing", info)
     assert reviewing.startswith(post.STATUS_MARKER)
     assert "Codex is reviewing" in reviewing and "`abc1234`" in reviewing
-    assert "gpt-6-astra" in reviewing and "xhigh" in reviewing and "https://x/run/1" in reviewing
+    assert "https://x/run/1" in reviewing
+    # which model and effort the review runs with stays out of the note
+    assert "gpt-6-astra" not in reviewing and "xhigh" not in reviewing
     assert "a.py" in reviewing and "b.rs" in reviewing
     done = post.render_status(
         "done",

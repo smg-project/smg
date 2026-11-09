@@ -402,8 +402,7 @@ def render_status(state: str, info: dict) -> str:
         scope = "the new push" if info.get("incremental") else "the whole pull request"
         lines += [
             "> [!NOTE]",
-            f"> ⏳ **Codex is reviewing** commit `{sha}` ({scope}) with `{info.get('model')}` "
-            f"at effort `{info.get('effort')}`.",
+            f"> ⏳ **Codex is reviewing** commit `{sha}` ({scope}).",
             "> Findings arrive as inline comments and the verdict as a review; this note "
             "updates when it is done.",
             ">",
@@ -816,11 +815,7 @@ def main(argv: list[str] | None = None) -> int:
         context = resolve_context(
             event_name, event, api, repo, os.environ.get("CODEX_OTHER_BOT", OTHER_BOT)
         )
-        info = {
-            "run_url": run_url_from_env(),
-            "model": os.environ.get("CODEX_MODEL", ""),
-            "effort": os.environ.get("CODEX_EFFORT", ""),
-        }
+        info = {"run_url": run_url_from_env()}
         note = run_announce(api, repo, context, args.state, info)
         why = context.get("skip_reason") or context.get("mode")
         print("status note written" if note else f"no status note: {why}")
