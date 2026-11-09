@@ -15,18 +15,25 @@ UNITS = {"Ki": 1024, "Mi": 1024**2, "Gi": 1024**3}
 
 
 def parse_quantity(text: str) -> int:
-    """Bytes for a quantity such as `16Gi`, `512Mi` or a bare number of bytes."""
+    """Bytes for a quantity such as `16Gi`, `512Mi` or a bare number of bytes.
+
+    Raises ValueError for anything else, so a typo never silently counts as zero.
+    """
     try:
         for suffix, factor in UNITS.items():
             if text.endswith(suffix):
                 return int(float(text[: -len(suffix)]) * factor)
         return int(text)
     except ValueError:
-        return 0
+        raise ValueError(f"not a quantity: {text!r}") from None
 
 
 def main(argv: list[str]) -> int:
-    print(sum(parse_quantity(arg) for arg in argv))
+    try:
+        print(sum(parse_quantity(arg) for arg in argv))
+    except ValueError as err:
+        print(err, file=sys.stderr)
+        return 2
     return 0
 
 
