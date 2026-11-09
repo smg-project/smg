@@ -265,6 +265,9 @@ struct ReportFacts {
     kv_pressure: f64,
     /// Resident token usage, for the trace record.
     token_usage: f64,
+    /// Context tokens of the requests the worker holds, when every rank
+    /// reports them (see `WorkerLoadResponse::total_resident_tokens`).
+    resident_tokens: Option<f64>,
     /// The worker's live drain rate when it has one (see
     /// `LeastLoadPolicy::live_drain_rate`): the live output rate of a decode
     /// or regular worker, the measured input capacity of a prefill worker.
@@ -278,6 +281,27 @@ struct ScoreInputs {
     fleet_has_loads: bool,
     /// The best-known reporting peer's score: what a worker without a
     /// fresh report scores before its own in-flight.
+    peer_baseline: f64,
+}
+
+/// What a decision minimizes.
+#[derive(Clone, Copy, Debug)]
+enum Objective {
+    /// The expected wait (see [`LeastLoadPolicy::score`]).
+    ExpectedWait,
+    /// The resident work, each request priced at `request_tokens` (see
+    /// [`LeastLoadPolicy::resident_score`]).
+    ResidentWork { request_tokens: u64 },
+}
+
+/// What one resident-work score reads besides the candidate and its worker.
+#[derive(Clone, Copy)]
+struct ResidentInputs {
+    request_tokens: f64,
+    /// Whether any candidate reports resident tokens.
+    fleet_has_resident: bool,
+    /// The best-known reporting peer's score: what a worker without resident
+    /// tokens scores before its own in-flight.
     peer_baseline: f64,
 }
 
@@ -415,6 +439,9 @@ impl LeastLoadPolicy {
                 .unwrap_or(0),
             kv_pressure: load.effective_kv_pressure(),
             token_usage: load.effective_token_usage(),
+            resident_tokens: load
+                .total_resident_tokens()
+                .map(|tokens| tokens.max(0) as f64),
             live_rate: Self::live_drain_rate(worker, load),
         }
     }
@@ -587,6 +614,83 @@ impl LeastLoadPolicy {
         inputs
     }
 
+    /// Resident-work score for a resolved candidate (lower is better), in
+    /// context tokens: the tokens the worker's report says it holds, the
+    /// prompts dispatched to it since that report, and `request_tokens` for
+    /// every request it holds. Requests the router holds beyond the report
+    /// and the credit ([`Self::unaccounted_requests`]) are priced at the
+    /// worker's mean context.
+    ///
+    /// A worker without resident tokens (no fresh report, or an engine that
+    /// does not count them) scores as the best-known reporting peer plus its
+    /// live in-flight, each request at the mean prefill and `request_tokens`;
+    /// with no candidate reporting them, the live in-flight count decides.
+    fn resident_score(
+        &self,
+        worker: &Arc<dyn Worker>,
+        candidate: &Candidate,
+        inputs: &ResidentInputs,
+    ) -> f64 {
+        let mean_prefill = f64::from(self.mean_prefill_tokens);
+        let reported = candidate.report.and_then(|report| {
+            report
+                .resident_tokens
+                .map(|resident| (report.reported_requests, resident))
+        });
+        match reported {
+            Some((reported_requests, resident)) => {
+                let unaccounted = Self::unaccounted_requests(
+                    worker,
+                    reported_requests,
+                    candidate.since_poll_requests,
+                );
+                let mean_context = if reported_requests > 0 {
+                    resident / reported_requests as f64
+                } else {
+                    mean_prefill
+                };
+                let requests = reported_requests + candidate.since_poll_requests + unaccounted;
+                resident
+                    + candidate.since_poll_tokens as f64
+                    + unaccounted as f64 * mean_context
+                    + inputs.request_tokens * requests as f64
+            }
+            None if inputs.fleet_has_resident => {
+                inputs.peer_baseline + worker.load() as f64 * (mean_prefill + inputs.request_tokens)
+            }
+            None => worker.load() as f64,
+        }
+    }
+
+    /// The resident-work inputs for one pass over the resolved `candidates`:
+    /// whether any reports resident tokens, and the best such score.
+    fn resident_inputs(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        candidates: &[Candidate],
+        request_tokens: u64,
+    ) -> ResidentInputs {
+        let mut inputs = ResidentInputs {
+            request_tokens: request_tokens as f64,
+            fleet_has_resident: false,
+            peer_baseline: 0.0,
+        };
+        let best_known = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .report
+                    .is_some_and(|report| report.resident_tokens.is_some())
+            })
+            .map(|candidate| self.resident_score(&workers[candidate.idx], candidate, &inputs))
+            .fold(f64::INFINITY, f64::min);
+        if best_known.is_finite() {
+            inputs.fleet_has_resident = true;
+            inputs.peer_baseline = best_known;
+        }
+        inputs
+    }
+
     /// Waiting-queue token-work for a worker.
     ///
     /// Prefers the backend's own `num_waiting_uncached_tokens`. Backends that
@@ -700,20 +804,49 @@ impl LeastLoadPolicy {
                 candidates,
                 info,
                 policy,
+                Objective::ExpectedWait,
                 credit,
                 &mut scratch.borrow_mut(),
             )
         })
     }
 
-    /// [`Self::select_min_expected_wait_credited`] over `resolved`, this
+    /// Argmin of the resident-work score ([`Self::resident_score`]) over
+    /// `candidates`, with each request priced at `request_tokens` context
+    /// tokens, crediting the winner with the request's prompt. The decision,
+    /// its tie-break and its credit are [`Self::select_min_expected_wait`]'s.
+    pub(super) fn select_min_resident_work(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        candidates: &[usize],
+        info: &SelectWorkerInfo,
+        policy: &'static str,
+        request_tokens: u64,
+    ) -> Option<usize> {
+        CANDIDATES.with(|scratch| {
+            self.decide(
+                workers,
+                candidates,
+                info,
+                policy,
+                Objective::ResidentWork { request_tokens },
+                None,
+                &mut scratch.borrow_mut(),
+            )
+        })
+    }
+
+    /// The argmin of `objective` over `candidates`, crediting the winner (see
+    /// [`Self::select_min_expected_wait_credited`]), with `resolved` this
     /// thread's scratch for the candidates it reads.
+    #[expect(clippy::too_many_arguments)]
     fn decide(
         &self,
         workers: &[Arc<dyn Worker>],
         candidates: &[usize],
         info: &SelectWorkerInfo,
         policy: &'static str,
+        objective: Objective,
         credit: Option<&dyn Fn(usize) -> u64>,
         resolved: &mut Vec<Candidate>,
     ) -> Option<usize> {
@@ -755,6 +888,16 @@ impl LeastLoadPolicy {
         let (first, rest) = resolved.split_first()?;
 
         let inputs = self.score_inputs(workers, resolved);
+        let resident = match objective {
+            Objective::ExpectedWait => None,
+            Objective::ResidentWork { request_tokens } => {
+                Some(self.resident_inputs(workers, resolved, request_tokens))
+            }
+        };
+        let score_of = |candidate: &Candidate| match &resident {
+            Some(resident) => self.resident_score(&workers[candidate.idx], candidate, resident),
+            None => self.score(&workers[candidate.idx], candidate, &inputs),
+        };
 
         // Argmin with reservoir tie-breaking: workers within
         // `TIE_EPSILON_SECS` of the minimum (the common idle/homogeneous case
@@ -764,6 +907,25 @@ impl LeastLoadPolicy {
             if cache_trace::enabled() {
                 let worker = &workers[candidate.idx];
                 let report = candidate.report;
+                if let Some(resident) = &resident {
+                    cache_trace::score(serde_json::json!({
+                        "source": "resident_work", "worker": worker.url(), "score": score,
+                        "score_unit": if resident.fleet_has_resident { "tokens" } else { "requests" },
+                        "resident_tokens": report.and_then(|report| report.resident_tokens),
+                        "reported_requests": report.map(|report| report.reported_requests),
+                        "since_poll_tokens": candidate.since_poll_tokens,
+                        "since_poll_requests": candidate.since_poll_requests,
+                        "unaccounted_requests": report.map(|report| {
+                            Self::unaccounted_requests(
+                                worker,
+                                report.reported_requests,
+                                candidate.since_poll_requests,
+                            )
+                        }),
+                        "fresh_load": report.is_some(),
+                    }));
+                    return;
+                }
                 cache_trace::score(serde_json::json!({
                     "source": "expected_wait", "worker": worker.url(), "score": score,
                     "score_unit": if inputs.fleet_has_loads { "seconds" } else { "requests" },
@@ -787,11 +949,11 @@ impl LeastLoadPolicy {
             }
         };
         let mut best = first;
-        let mut best_score = self.score(&workers[best.idx], best, &inputs);
+        let mut best_score = score_of(best);
         observe_score(best, best_score);
         let mut tied = 1u32;
         for candidate in rest {
-            let s = self.score(&workers[candidate.idx], candidate, &inputs);
+            let s = score_of(candidate);
             observe_score(candidate, s);
             if s < best_score - TIE_EPSILON_SECS {
                 best = candidate;

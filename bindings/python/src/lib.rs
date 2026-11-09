@@ -977,7 +977,9 @@ impl Router {
         .ok_or_else(|| config::ConfigError::InvalidValue {
             field: "power_of_two_load_metric".to_string(),
             value: self.power_of_two_load_metric.clone(),
-            reason: "expected expected_wait, requests or least_requests".to_string(),
+            reason: "expected expected_wait, requests, least_requests or \
+                     resident_tokens:<request_tokens>"
+                .to_string(),
         })?;
 
         let convert_policy = |policy: &PolicyType| -> config::ConfigResult<ConfigPolicyConfig> {

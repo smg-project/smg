@@ -568,7 +568,8 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
     least_load_mean_prefill_tokens: u32,
 
-    /// What power_of_two compares: expected_wait (default), requests or least_requests
+    /// What power_of_two compares: expected_wait (default), requests, least_requests or
+    /// resident_tokens:<request_tokens> (resident context tokens plus that many per request)
     #[arg(long, default_value = "expected_wait", value_parser = parse_power_of_two_load_metric, help_heading = "Routing Policy")]
     power_of_two_load_metric: PowerOfTwoLoadMetric,
 

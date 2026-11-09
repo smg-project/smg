@@ -1324,12 +1324,24 @@ pub enum PowerOfTwoLoadMetric {
     Requests,
     /// Router in-flight requests of every healthy worker, then expected wait.
     LeastRequests,
+    /// Resident context tokens of every healthy worker, each request also
+    /// priced at `request_tokens`: the decode step's attention and per-request
+    /// work in one token unit.
+    ResidentTokens { request_tokens: u64 },
 }
 
 impl PowerOfTwoLoadMetric {
-    /// Parse the CLI spelling (`expected_wait` / `requests` / `least_requests`).
+    /// Parse the CLI spelling (`expected_wait` / `requests` / `least_requests`
+    /// / `resident_tokens:<request_tokens>`).
     pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
+        let value = value.trim().to_ascii_lowercase();
+        if let Some(cost) = value.strip_prefix("resident_tokens:") {
+            return cost
+                .parse()
+                .ok()
+                .map(|request_tokens| Self::ResidentTokens { request_tokens });
+        }
+        match value.as_str() {
             "expected_wait" => Some(Self::ExpectedWait),
             "requests" => Some(Self::Requests),
             "least_requests" => Some(Self::LeastRequests),
@@ -3291,6 +3303,14 @@ mod tests {
 
     #[test]
     fn test_power_of_two_parameters() {
+        assert_eq!(
+            PowerOfTwoLoadMetric::parse("resident_tokens:62500"),
+            Some(PowerOfTwoLoadMetric::ResidentTokens {
+                request_tokens: 62_500
+            })
+        );
+        assert_eq!(PowerOfTwoLoadMetric::parse("resident_tokens"), None);
+        assert_eq!(PowerOfTwoLoadMetric::parse("resident_tokens:-1"), None);
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_metric: PowerOfTwoLoadMetric::LeastRequests,
         };

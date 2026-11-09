@@ -531,6 +531,7 @@ impl From<tokenspeed_proto::SchedulerLoad> for openai_protocol::worker::Schedule
             max_total_num_tokens: load.max_total_num_tokens,
             token_usage: load.token_usage,
             active_token_usage: load.active_token_usage,
+            num_resident_tokens: load.num_resident_tokens,
             gen_throughput: load.gen_throughput,
             prefill_throughput: load.prefill_throughput,
             cache_hit_rate: load.cache_hit_rate,
@@ -683,6 +684,7 @@ mod load_conversion_tests {
                     paused: 0,
                     retracted: 0,
                 }),
+                num_resident_tokens: None,
             }],
             aggregate: Some(tokenspeed_proto::AggregateMetrics {
                 total_running_reqs: 3,

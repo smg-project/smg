@@ -1508,6 +1508,10 @@ pub struct SchedulerLoadSnapshot {
     /// Older backends omit this; pressure then uses their legacy token usage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_token_usage: Option<f64>,
+    /// Context tokens (prompt plus committed output) of every request the
+    /// rank holds. Older backends omit this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_resident_tokens: Option<i64>,
     pub gen_throughput: f64,
     /// Actual non-cached input tokens per active prefill second; unknown/stale is None.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1685,6 +1689,16 @@ impl WorkerLoadResponse {
             .iter()
             .map(|l| l.num_waiting_uncached_tokens as i64)
             .sum()
+    }
+
+    /// Resident context tokens summed across all DP ranks; `None` unless
+    /// every rank reports them.
+    pub fn total_resident_tokens(&self) -> Option<i64> {
+        self.loads
+            .iter()
+            .map(|l| l.num_resident_tokens)
+            .sum::<Option<i64>>()
+            .filter(|_| !self.loads.is_empty())
     }
 
     /// Total running requests summed across all DP ranks.
