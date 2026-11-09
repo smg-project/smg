@@ -32,7 +32,8 @@ Modes:
             Codex verdict gets one, in its thread
 
 Environment:
-    GITHUB_TOKEN        the job's token
+    GITHUB_TOKEN        the token to post with: for `post`, the Codex App's installation
+                        token the runner pod's sidecar mints; for the rest, the job's
     GITHUB_REPOSITORY   owner/name
     GITHUB_EVENT_NAME, GITHUB_EVENT_PATH   the workflow event (context)
     GITHUB_API_URL      default https://api.github.com
@@ -55,7 +56,9 @@ from typing import Any
 
 MARKER = "<!-- codex-review -->"
 VERDICT_MARKER = "<!-- codex-verdict -->"
-BOT = "github-actions[bot]"
+BOT = "smg-codex-review[bot]"  # the GitHub App whose token the post job posts with
+LEGACY_BOT = "github-actions[bot]"  # what Codex posted as before the App; still ours
+OWN_BOTS = frozenset({BOT, LEGACY_BOT})
 OTHER_BOT = "claude[bot]"
 SEVERITY_INLINE = {
     "important": "🔴 **Important**",
@@ -225,7 +228,11 @@ def prior_findings(comments: list[dict]) -> list[dict]:
     found = []
     for c in comments:
         body = c.get("body") or ""
-        if c.get("in_reply_to_id") is not None or c["user"]["login"] != BOT or MARKER not in body:
+        if (
+            c.get("in_reply_to_id") is not None
+            or c["user"]["login"] not in OWN_BOTS
+            or MARKER not in body
+        ):
             continue
         text = body.replace(MARKER, "").strip()
         severity = next(
@@ -243,8 +250,19 @@ def prior_findings(comments: list[dict]) -> list[dict]:
     return found
 
 
+def strip_severity_label(body: str) -> str:
+    """The model sometimes opens the body with the label the renderer adds; keep one."""
+    text = body.strip()
+    for label in (*SEVERITY_INLINE.values(), *SEVERITY_LABEL.values()):
+        if text.startswith(label):
+            text = text[len(label) :].lstrip(" :").strip()
+    return text
+
+
 def render_finding(finding: dict) -> str:
-    return f"{MARKER}\n{SEVERITY_INLINE[finding['severity']]}: {finding['body'].strip()}"
+    return (
+        f"{MARKER}\n{SEVERITY_INLINE[finding['severity']]}: {strip_severity_label(finding['body'])}"
+    )
 
 
 def render_summary(
@@ -259,7 +277,8 @@ def render_summary(
     if outside:
         lines += ["", "Findings on lines outside this diff:", ""]
         lines += [
-            f"- `{f['path']}:{f['line']}` {SEVERITY_LABEL[f['severity']]}: {f['body'].strip()}"
+            f"- `{f['path']}:{f['line']}` {SEVERITY_LABEL[f['severity']]}: "
+            f"{strip_severity_label(f['body'])}"
             for f in outside
         ]
     return "\n".join(lines) + "\n"
@@ -316,7 +335,7 @@ def live_approvals(reviews: list[dict]) -> list[int]:
         review["id"]
         for review in reviews
         if review.get("state") == "APPROVED"
-        and review.get("user", {}).get("login") == BOT
+        and review.get("user", {}).get("login") in OWN_BOTS
         and MARKER in (review.get("body") or "")
     ]
 
@@ -379,7 +398,7 @@ def thread_awaits_reply(comments: list[dict], root_id: int, mention: str | None 
     if not thread:
         return False
     root = thread[0]
-    ours = root["user"]["login"] == BOT and MARKER in (root.get("body") or "")
+    ours = root["user"]["login"] in OWN_BOTS and MARKER in (root.get("body") or "")
     mentioned = bool(mention and MENTION_RE.search(mention))
     if not (ours or mentioned):
         return False

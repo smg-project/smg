@@ -32,9 +32,10 @@ branch of this repository: Claude (`.github/workflows/claude-code-review.yml`) a
 (`.github/workflows/codex-code-review.yml`, prompts in `.github/codex/`). A pull request from a
 fork never gets either, and the commands below are ignored on one and from anyone without
 write access. Both post inline comments with the markers above, and each approves when it finds
-nothing 🔴 Important. The API keys never enter a job: they stay in the cluster's secrets and are
-served by a sidecar in the runner pod that the reviewer's own process cannot read, so nothing
-in a pull request can reach them. A pull request that edits one of the two workflow files gets
+nothing 🔴 Important. Claude posts as `claude[bot]`, Codex as `smg-codex-review[bot]`, a GitHub
+App the organization owns. The API keys and the App's key never enter a job: they stay in the
+cluster's secrets, and a sidecar in the runner pod serves the API calls and mints Codex's
+one-hour posting token, so nothing in a pull request can reach the keys. A pull request that edits one of the two workflow files gets
 no Claude run from the edited workflow: the action's token exchange requires the workflow file
 to match the copy on `main`, and skips with a warning otherwise.
 

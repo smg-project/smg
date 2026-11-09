@@ -417,3 +417,68 @@ def test_a_draft_pull_request_is_reviewed_like_any_other():
         "pull_request", {"action": "opened", "pull_request": pr}, GateApi(), "o/r"
     )
     assert context["skip"] is False and context["mode"] == "review"
+
+
+def test_codex_posts_as_its_github_app_and_still_owns_what_the_actions_bot_posted():
+    assert post.BOT == "smg-codex-review[bot]"
+    assert post.LEGACY_BOT == "github-actions[bot]"
+    comments = [
+        {
+            "id": 1,
+            "in_reply_to_id": None,
+            "user": {"login": post.BOT},
+            "path": "p",
+            "line": 1,
+            "body": f"{post.MARKER}\n🔴 **Important**: New identity.",
+        },
+        {
+            "id": 2,
+            "in_reply_to_id": None,
+            "user": {"login": post.LEGACY_BOT},
+            "path": "p",
+            "line": 2,
+            "body": f"{post.MARKER}\n🟡 **Nit**: Old identity.",
+        },
+        {
+            "id": 3,
+            "in_reply_to_id": None,
+            "user": {"login": "claude[bot]"},
+            "path": "p",
+            "line": 3,
+            "body": "🔴 **Important**: Theirs.",
+        },
+        {"id": 4, "in_reply_to_id": 2, "user": {"login": "simo"}, "body": "why?"},
+    ]
+    assert [f["comment_id"] for f in post.prior_findings(comments)] == [1, 2]
+    assert post.thread_awaits_reply(comments, root_id=2) is True
+    reviews = [
+        {"id": 10, "state": "APPROVED", "user": {"login": post.BOT}, "body": f"{post.MARKER} ok"},
+        {
+            "id": 11,
+            "state": "APPROVED",
+            "user": {"login": post.LEGACY_BOT},
+            "body": f"{post.MARKER} ok",
+        },
+        {
+            "id": 12,
+            "state": "APPROVED",
+            "user": {"login": "claude[bot]"},
+            "body": f"{post.MARKER} ok",
+        },
+    ]
+    assert post.live_approvals(reviews) == [10, 11]
+
+
+def test_a_severity_label_the_model_repeats_in_the_body_is_rendered_once():
+    finding = {
+        "path": "p",
+        "line": 1,
+        "severity": "important",
+        "body": "🔴 **Important**: Binary suffixes use decimal multipliers.",
+    }
+    assert post.render_finding(finding) == (
+        f"{post.MARKER}\n🔴 **Important**: Binary suffixes use decimal multipliers."
+    )
+    outside = [{"path": "p", "line": 1, "severity": "nit", "body": "🟡 **Nit**: Name."}]
+    summary = post.render_summary([], "Looked at it.", outside)
+    assert "🟡 Nit: Name." in summary and "🟡 Nit: 🟡" not in summary

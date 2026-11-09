@@ -86,7 +86,7 @@ def test_the_post_job_runs_only_after_a_successful_review_from_the_default_branc
     post = workflow["jobs"]["post"]
     assert post["needs"] == "codex"
     assert "needs.codex.result == 'success'" in post["if"]
-    assert post["permissions"] == {"contents": "read", "pull-requests": "write"}
+    assert post["permissions"] == {"contents": "read"}  # the App token posts, not the job token
     checkout = step(post, "actions/checkout@")
     assert "ref" not in checkout.get("with", {})  # the default ref of a main-defined run is main
 
@@ -125,3 +125,23 @@ def test_the_acl_package_is_installed_before_codex_drops_sudo(workflow):
     )
     assert acl < run
     assert "setfacl" in codex["steps"][acl]["run"]
+
+
+def test_the_post_job_posts_as_the_codex_app_with_a_token_the_sidecar_mints(workflow):
+    import sys
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import codex_review_post
+
+    assert workflow["env"]["CODEX_BOT"] == codex_review_post.BOT == "smg-codex-review[bot]"
+    post = workflow["jobs"]["post"]
+    steps = post["steps"]
+    mint = next(s for s in steps if s.get("id") == "app-token")
+    assert "${{ env.AI_KEY_PROXY }}/github/app-token" in mint["run"]
+    assert "::add-mask::" in mint["run"]
+    posting = next(s for s in steps if "codex_review_post.py post" in str(s.get("run", "")))
+    assert steps.index(mint) < steps.index(posting)
+    assert posting["env"]["GITHUB_TOKEN"] == "${{ steps.app-token.outputs.token }}"
+    text = WORKFLOW.read_text()
+    assert "github-actions[bot]" not in text  # the verify prompt names the App's login via env
+    assert "${{ env.CODEX_BOT }}" in text
