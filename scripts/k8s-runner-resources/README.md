@@ -39,28 +39,21 @@ https://github.com/organizations/smg-project/settings/installations/<installatio
 See GitHub's [ARC authentication documentation](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/authenticate-to-the-api)
 for the authoritative permission list.
 
-## 1a. No API keys in the runner pods
+## 1a. No API keys in the runner container
 
-The runner pod templates in this directory carry no API keys, and none may be added: every job of
-every workflow runs in these pods, so a key in their environment is readable by any pull request
-that reaches a runner. The review workflows take their keys from the `ai-review` GitHub
-environment, which releases them only to runs from `main`, and hand them to a proxy process the
-reviewer cannot read. A live scale set whose pods still carry `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`
-or `XAI_API_KEY`, or whose runner container is privileged (only the `dind` sidecar may be), has
-drifted from these values; `helm upgrade` from the files here removes both.
-
-The review workflows run on their own set, `ai-review-cpu`
-([`runner-values-ai-review-cpu.yaml`](runner-values-ai-review-cpu.yaml)): no Docker, no
-privileged container, no credentials in the environment, one warm runner, a plain CPU node pool.
-Nothing but the two review workflows should target that label.
-
-```bash
-helm upgrade --install ai-review-cpu \
-  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
-  --version 0.14.2 \
-  -n actions-runner-system --create-namespace \
-  -f scripts/k8s-runner-resources/runner-values-ai-review-cpu.yaml
-```
+The runner container of every scale set carries no API key, and none may be added: every job of
+every workflow runs in that container, so a key in its environment is readable by any pull request
+that reaches a runner. The keys the automated reviews and the scheduled Claude workflows use stay in
+the Kubernetes secrets (`openai-api-key`, `anthropic-api-key`) and are mounted only into the
+`ai-key-proxy` sidecar of `runner-values-cpu.yaml`: an nginx container that listens on
+`127.0.0.1:8787`, pod-local, and puts the real key on each request it forwards to
+`api.anthropic.com` or `api.openai.com`. The workflows point Claude (`ANTHROPIC_BASE_URL`) and the
+Codex action (`responses-api-endpoint`) at it with placeholder keys. A separate container's
+environment and memory are unreadable from the runner container, so nothing a job runs can print a
+key; what a job can do is spend through the proxy, which the keys' spend caps bound. Rotating a key is
+`kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -` on the secret and a roll of the
+runner pods. A live set whose runner container carries a key, or runs privileged (only the `dind`
+sidecar may), has drifted from these values; `helm upgrade` from the files here removes both.
 
 ## 2. Create or update the Kubernetes secret
 

@@ -32,8 +32,8 @@ branch of this repository: Claude (`.github/workflows/claude-code-review.yml`) a
 (`.github/workflows/codex-code-review.yml`, prompts in `.github/codex/`). A pull request from a
 fork never gets either, and the commands below are ignored on one and from anyone without
 write access. Both post inline comments with the markers above, and each approves when it finds
-nothing 🔴 Important. The workflows run from `main`, the API keys live in the `ai-review`
-environment that only `main` can use, and each key is held by a proxy process the reviewer's
+nothing 🔴 Important. The workflows run from `main`, and the API keys never enter a job: they
+stay in the cluster's secrets and are served by a sidecar in the runner pod that the reviewer's
 own process cannot read, so nothing in a pull request can reach them.
 
 - `@claude review` or `@codex review` in a PR comment runs a full review on demand.
