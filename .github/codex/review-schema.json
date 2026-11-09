@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex pull-request review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "findings",
+    "prior_findings_still_open"
+  ],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "One to three sentences on the change and the review's outcome."
+    },
+    "findings": {
+      "type": "array",
+      "description": "One entry per defect, on the line of the new file it sits on.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "line",
+          "severity",
+          "body"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Repository-relative path of the file."
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number in the new version of the file."
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "important",
+              "nit",
+              "pre_existing"
+            ]
+          },
+          "body": {
+            "type": "string",
+            "description": "The defect, its evidence and the fix."
+          }
+        }
+      }
+    },
+    "prior_findings_still_open": {
+      "type": "array",
+      "description": "The comment_id of every earlier Codex finding (from context.json prior_findings) that still applies at this head; empty when none does.",
+      "items": {
+        "type": "integer"
+      }
+    }
+  }
+}

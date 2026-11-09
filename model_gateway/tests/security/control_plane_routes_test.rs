@@ -84,14 +84,46 @@ fn source_between(start_marker: &str, end_marker: &str) -> &'static str {
     between(SERVER_SOURCE, start_marker, end_marker)
 }
 
-/// The (method, path) pairs a region of the server source registers: every
-/// `.route("<path>", <methods>)` in it.
+/// `source` without its `//` line comments (outside string literals), so a
+/// route call a comment holds or mentions is not read as a registered one.
+fn without_line_comments(source: &str) -> String {
+    let mut kept = String::with_capacity(source.len());
+    for line in source.lines() {
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut previous = None;
+        let mut cut = line.len();
+        for (at, c) in line.char_indices() {
+            match c {
+                '\\' if in_string && !escaped => {
+                    escaped = true;
+                    continue;
+                }
+                '"' if !escaped => in_string = !in_string,
+                '/' if !in_string && previous == Some('/') => {
+                    cut = at - 1;
+                    break;
+                }
+                _ => {}
+            }
+            escaped = false;
+            previous = Some(c);
+        }
+        kept.push_str(&line[..cut]);
+        kept.push('\n');
+    }
+    kept
+}
+
+/// The (method, path) pairs a region of a source registers: every
+/// `.route("<path>", <methods>)` in it outside its comments.
 #[expect(
     clippy::expect_used,
     reason = "test helper: a route call without a path is a test bug"
 )]
 fn routes_in(region: &str) -> BTreeSet<(String, String)> {
     let mut routes = BTreeSet::new();
+    let region = without_line_comments(region);
     for call in region.split(".route(").skip(1) {
         let path = call.split('"').nth(1).expect("a route call names its path");
         for method in ["get", "post", "put", "patch", "delete"] {
@@ -124,18 +156,46 @@ fn gated_group_routes() -> BTreeSet<(String, String)> {
     routes_in(source_between("fn gated_control_plane_routes()", "\n}\n"))
 }
 
+/// The RL router's path parameters by the names the API document uses: the
+/// router names them for its handlers, the document for its clients, and the
+/// list test reads the router's paths through this table.
+const RL_PARAMETER_NAMES: &[(&str, &str)] = &[("{id}", "{worker_id}"), ("{*path}", "{path}")];
+
 /// The (method, path) pairs `smg_rl::router` registers, as the gateway mounts
 /// them: under `/v1/rl`, with the parameter names the API document uses.
 fn rl_router_routes() -> BTreeSet<(String, String)> {
     routes_in(between(RL_SOURCE, "pub fn router<", "\n}\n"))
         .into_iter()
         .map(|(method, path)| {
-            let path = path
-                .replace("{id}", "{worker_id}")
-                .replace("{*path}", "{path}");
+            let path = RL_PARAMETER_NAMES
+                .iter()
+                .fold(path, |path, (router, document)| {
+                    path.replace(router, document)
+                });
             (method, format!("/v1/rl{path}"))
         })
         .collect()
+}
+
+#[test]
+fn a_route_call_in_a_comment_is_not_a_registered_route() {
+    let region = r#"
+        Router::new()
+            // .route("/retired", get(handler))
+            .route("/live", get(handler)) // once .route("/noted", post(handler))
+            .route("/paths//doubled", delete(handler))
+            .route("/quoted", post(handler))
+    "#;
+    let registered = |method: &str, path: &str| (method.to_string(), path.to_string());
+
+    assert_eq!(
+        routes_in(region),
+        BTreeSet::from([
+            registered("DELETE", "/paths//doubled"),
+            registered("GET", "/live"),
+            registered("POST", "/quoted"),
+        ])
+    );
 }
 
 #[test]

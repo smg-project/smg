@@ -25,7 +25,10 @@
 //! report for every worker and puts requests in flight on them, so the
 //! expected wait scores the candidates as it does over engines that report.
 //! `T6_INDEX=tree` routes on the approximate token tree of a fleet without KV
-//! events, filled by routing every session once. `T6_THREADS` (1) runs that
+//! events, filled by routing every session once. `T6_HYBRID=1` makes every
+//! worker a hybrid model's (a sliding-window tail and a state block stored
+//! beside each chain), so every holder's overlap passes the cache groups'
+//! rule in the decision. `T6_THREADS` (1) runs that
 //! many decision loops on the one policy, each at `T6_RATE`, the row taking
 //! the latencies of all of them. A configuration other than the default has
 //! its own criterion id (`decision/chain/temperature-0.1/fed`), so criterion's
@@ -96,6 +99,10 @@ struct Variant {
     feed: bool,
     tree: bool,
     threads: usize,
+    /// Every worker is a hybrid model's: beside each chain's main-group
+    /// stores, its sliding-window group's tail and its state group's last
+    /// block, so every holder's overlap passes the cache groups' rule.
+    hybrid: bool,
 }
 
 impl Variant {
@@ -118,6 +125,7 @@ impl Variant {
             feed: env_or("T6_FEED", 0u8) != 0,
             tree,
             threads: env_or("T6_THREADS", 1usize).max(1),
+            hybrid: env_or("T6_HYBRID", 0u8) != 0,
         }
     }
 
@@ -149,6 +157,9 @@ impl Variant {
         }
         if self.feed {
             id.push_str("/fed");
+        }
+        if self.hybrid {
+            id.push_str("/hybrid");
         }
         id
     }
@@ -216,6 +227,51 @@ impl Chain {
 
     fn tokens(&self, blocks: usize) -> Vec<u32> {
         self.token_blocks[..blocks].concat()
+    }
+
+    /// The chain's stores and, for a hybrid model's worker, the stores of its
+    /// other cache groups after them.
+    fn events(&self, variant: &Variant) -> Vec<KvCacheEvent> {
+        let mut events = self.stores();
+        if variant.hybrid {
+            events.extend(self.group_stores());
+        }
+        events
+    }
+
+    /// The stores of a hybrid model's other cache groups for this chain, as
+    /// an engine publishes them under its default retention: the
+    /// sliding-window group (four blocks of window) keeps the four blocks
+    /// ending at the chain's end, the state group the last block; hashes
+    /// only, no tokens.
+    fn group_stores(&self) -> Vec<KvCacheEvent> {
+        let len = self.token_blocks.len();
+        let store = |group: u32, kind: &str, window: Option<u32>, from: usize| KvCacheEvent {
+            event_id: 0,
+            data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                blocks: (from..len)
+                    .map(|i| KvBlock {
+                        block_hash: self.hashes[i],
+                        token_ids: Vec::new(),
+                        block_size: BLOCK as i32,
+                        ..Default::default()
+                    })
+                    .collect(),
+                group_idx: Some(group),
+                kv_cache_spec_kind: Some(kind.to_string()),
+                kv_cache_spec_sliding_window: window,
+                ..Default::default()
+            })),
+        };
+        vec![
+            store(
+                1,
+                "sliding_window",
+                Some(4 * BLOCK as u32),
+                len.saturating_sub(4),
+            ),
+            store(2, "mamba", None, len.saturating_sub(1)),
+        ]
     }
 
     /// Stores of at most 16 blocks each, chained by parent, as vLLM publishes.
@@ -394,7 +450,7 @@ fn setup(worker_count: usize, blocks_per_worker: usize, variant: &Variant) -> Se
                     feed.apply(
                         &index,
                         &KvEventBatch {
-                            events: chain.stores(),
+                            events: chain.events(variant),
                             ..Default::default()
                         },
                     );
@@ -405,7 +461,7 @@ fn setup(worker_count: usize, blocks_per_worker: usize, variant: &Variant) -> Se
             feed.apply(
                 &index,
                 &KvEventBatch {
-                    events: chain.stores(),
+                    events: chain.events(variant),
                     ..Default::default()
                 },
             );

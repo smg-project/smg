@@ -1493,12 +1493,16 @@ pub(crate) fn init_metrics() {
         "Bytes of preprocessed encoder inputs the pixel cache holds"
     );
     describe_gauge!("smg_mm_pixel_cache_entries", "Images the pixel cache holds");
+    describe_gauge!(
+        "smg_mm_inflight_bytes",
+        "Bytes of preprocessed media the gateway holds in flight for engines, summed over every router of the process (a gateway in IGW mode builds three, each with the configured budget, so the gauge may read up to three budgets)"
+    );
     // The media pipeline per request, from the clock reads and counts it
     // already makes: its stages' time, the items a request carries and its
     // fetches.
     describe_histogram!(
         "smg_mm_processing_seconds",
-        "Seconds a multimodal request spent in a processing stage (config_lookup, media_fetch_decode, preprocess, token_expand, total), by model"
+        "Seconds a multimodal request spent in a processing stage (config_lookup, media_fetch_decode, preprocess, token_expand, total), by model; pool_queue is one observation per blocking task, the wait for a pool thread, so its count is tasks, not requests"
     );
     describe_histogram!(
         "smg_mm_media_per_request",
@@ -2191,6 +2195,26 @@ impl Metrics {
         gauge!("smg_mm_pixel_cache_entries").set(0.0);
     }
 
+    /// The in-flight bytes gauge at zero: called when the media pipeline is
+    /// built, so it is on the first scrape.
+    pub fn init_mm_inflight_series() {
+        gauge!("smg_mm_inflight_bytes").set(0.0);
+    }
+
+    /// A request's preprocessed media bytes from their reservation to their
+    /// release: with a budget the bytes the budget counts, without one the
+    /// count alone. The gauge moves by the bytes, so concurrent requests add
+    /// up, across every router of the process: a gateway in IGW mode builds
+    /// three gRPC routers, each with its own budget of the configured size, so
+    /// the one series may read up to three budgets while no router refuses.
+    pub fn record_mm_inflight_reserved(bytes: usize) {
+        gauge!("smg_mm_inflight_bytes").increment(bytes as f64);
+    }
+
+    pub fn record_mm_inflight_released(bytes: usize) {
+        gauge!("smg_mm_inflight_bytes").decrement(bytes as f64);
+    }
+
     /// One pixel cache lookup for `model_id`: a hit served the image's
     /// preprocessed encoder input, a miss preprocessed it. Both series exist
     /// from the model's first lookup, so a hit rate reads from the start.
@@ -2254,7 +2278,9 @@ impl Metrics {
 
     /// One processing stage of a multimodal request: `seconds` spent in
     /// `stage` (`config_lookup`, `media_fetch_decode`, `preprocess`,
-    /// `token_expand`, `total`), the clock reads the timing log makes.
+    /// `token_expand`, `total`), the clock reads the timing log makes; and
+    /// `pool_queue`, one observation per blocking task, the time it waited
+    /// in the pool's queue before it ran.
     pub fn record_mm_processing_stage(model_id: &str, stage: &'static str, seconds: f64) {
         let model = intern_model_label(model_id);
         histogram!("smg_mm_processing_seconds", "model" => model, "stage" => stage).record(seconds);
@@ -3814,7 +3840,22 @@ impl Metrics {
 /// Metrics helpers for tests elsewhere in the crate.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use metrics_exporter_prometheus::PrometheusBuilder;
+    use std::sync::OnceLock;
+
+    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+    /// The lib test binary's one process-wide recorder, for records made on
+    /// threads no local recorder covers (the blocking pool). Installed once;
+    /// every other test keeps its own local recorder, which takes precedence
+    /// on its thread.
+    pub(crate) fn global_recorder() -> &'static PrometheusHandle {
+        static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+        HANDLE.get_or_init(|| {
+            PrometheusBuilder::new()
+                .install_recorder()
+                .expect("the lib test binary's one global recorder")
+        })
+    }
 
     /// Run `f` under a thread-local Prometheus recorder and return the
     /// rendered `/metrics` text — the same scrape output the :29000 endpoint

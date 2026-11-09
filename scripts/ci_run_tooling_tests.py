@@ -20,6 +20,14 @@ COMPONENTS = (
     ("scripts/branch-name-check.sh", "scripts/tests/test_branch_name_check.py"),
     ("scripts/ci_version_only.py", "scripts/tests/test_ci_version_only.py"),
     ("scripts/bfcl/arm_probe.py", "scripts/tests/test_bfcl_arm_probe.py"),
+    ("scripts/codex_review_post.py", "scripts/tests/test_codex_review_post.py"),
+    ("scripts/codex_review_skills.py", "scripts/tests/test_codex_review_skills.py"),
+    (".github/workflows/codex-code-review.yml", "scripts/tests/test_codex_review_workflow.py"),
+    (".github/workflows/claude-code-review.yml", "scripts/tests/test_claude_review_workflow.py"),
+    (
+        "scripts/k8s-runner-resources/runner-values-cpu.yaml",
+        "scripts/tests/test_runner_values_policy.py",
+    ),
 )
 # Regression suites of scripts that predate them. A pair is named in the change
 # that brings the suite, and both paths must exist: a suite the tree lacks is an

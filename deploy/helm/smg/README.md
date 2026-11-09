@@ -251,6 +251,17 @@ helm install smg deploy/helm/smg \
   --set auth.controlPlane.existingSecret=smg-control-plane
 ```
 
+#### Admission Config
+
+`router.tenantRateLimit` and `router.priorityScheduler` carry the admission configuration the gateway reads from files: `enabled` renders the feature's flag (`--tenant-rate-limit-enabled`, `--priority-scheduler-enabled`), and `configMap.name` names a ConfigMap of yours, mounted whole at `/etc/smg/rate-limit` or `/etc/smg/scheduler` and read through `--tenant-rate-limit-config` or `--priority-scheduler-config` (`configMap.key` names the file: `rate-limit.yaml` and `scheduler.yaml` by default). The chart refuses what the gateway would refuse or ignore: the rate limit enabled without its ConfigMap, and a scheduler ConfigMap without the scheduler enabled.
+
+```bash
+kubectl create configmap smg-rate-limit --from-file=rate-limit.yaml=./rate-limit.yaml
+helm install smg deploy/helm/smg \
+  --set router.tenantRateLimit.enabled=true \
+  --set router.tenantRateLimit.configMap.name=smg-rate-limit
+```
+
 #### Store URLs
 
 The connection URL of the history store (`history.postgres.url`, `history.redis.url`) carries the database password, so the chart writes it into a chart-managed Secret and the router pod gets it as the environment variable the gateway reads (`SMG_POSTGRES_DB_URL`, `SMG_REDIS_URL`); the URL is never in the pod's arguments, so it is not in the Deployment object, the process listing or `/proc`. A URL managed outside the chart's values comes from an existing Secret the same way:

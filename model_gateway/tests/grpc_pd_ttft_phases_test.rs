@@ -369,16 +369,23 @@ fn parallel_dispatch_reports_the_decode_phase_as_the_whole_ttft() {
 /// duration at the prefill dispatch: on the sequential pair the route's TTFT
 /// carries the prefill worker's delay and the decode worker's, and the PD
 /// first-token pair is recorded once. A stream clocked from its own start
-/// would read the time to the decode side's first buffered chunk alone.
+/// would read the time to the decode side's first buffered chunk alone. With
+/// `decode_holds` the decode worker holds its response headers through its
+/// delay, so the hold sits inside the RPC await and not inside the stream.
 #[expect(
     clippy::panic,
     reason = "test helper - panicking on failure is intentional"
 )]
-fn route_anchors_at_the_prefill_dispatch(route: Route) {
+fn route_anchors_at_the_prefill_dispatch(route: Route, decode_holds: bool) {
     let rendered = render_after(|| async {
         let prefill =
             start_mock_engine(HeldHeadersEngine::eager(PREFILL_DELAY, OUTPUT_TOKENS)).await;
-        let decode = start_mock_engine(HeldHeadersEngine::eager(DECODE_DELAY, OUTPUT_TOKENS)).await;
+        let decode_engine = if decode_holds {
+            HeldHeadersEngine::holding(DECODE_DELAY, OUTPUT_TOKENS)
+        } else {
+            HeldHeadersEngine::eager(DECODE_DELAY, OUTPUT_TOKENS)
+        };
+        let decode = start_mock_engine(decode_engine).await;
         let router = build_pd_router(prefill, decode, RuntimeType::Vllm).await;
         one_streaming_request(router.as_ref(), route).await;
     });
@@ -422,19 +429,44 @@ fn route_anchors_at_the_prefill_dispatch(route: Route) {
         Some(1.0),
         "{endpoint}: the PD pair recorded once:\n{rendered}"
     );
+    let Some(tpot) = metrics_capture::sample(&rendered, "smg_router_tpot_seconds", "sum", &labels)
+    else {
+        panic!("{endpoint}: the TPOT record is missing:\n{rendered}");
+    };
+    let expected = (generation - ttft) / f64::from(OUTPUT_TOKENS - 1);
+    assert!(
+        (tpot - expected).abs() < 1e-6,
+        "{endpoint}: TPOT {tpot} != (generation {generation} - TTFT {ttft}) / {}",
+        OUTPUT_TOKENS - 1
+    );
 }
 
 #[test]
 fn the_chat_route_anchors_its_ttft_at_the_prefill_dispatch() {
-    route_anchors_at_the_prefill_dispatch(Route::Chat);
+    route_anchors_at_the_prefill_dispatch(Route::Chat, false);
 }
 
 #[test]
 fn the_messages_route_anchors_its_ttft_at_the_prefill_dispatch() {
-    route_anchors_at_the_prefill_dispatch(Route::Messages);
+    route_anchors_at_the_prefill_dispatch(Route::Messages, false);
 }
 
 #[test]
 fn the_completions_route_anchors_its_ttft_at_the_prefill_dispatch() {
-    route_anchors_at_the_prefill_dispatch(Route::Completions);
+    route_anchors_at_the_prefill_dispatch(Route::Completions, false);
+}
+
+#[test]
+fn the_chat_route_anchors_at_the_prefill_dispatch_under_held_headers() {
+    route_anchors_at_the_prefill_dispatch(Route::Chat, true);
+}
+
+#[test]
+fn the_messages_route_anchors_at_the_prefill_dispatch_under_held_headers() {
+    route_anchors_at_the_prefill_dispatch(Route::Messages, true);
+}
+
+#[test]
+fn the_completions_route_anchors_at_the_prefill_dispatch_under_held_headers() {
+    route_anchors_at_the_prefill_dispatch(Route::Completions, true);
 }

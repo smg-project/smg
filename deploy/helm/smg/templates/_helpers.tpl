@@ -137,6 +137,22 @@ the ConfigMap's key under /etc/smg/discovery, where the router pod mounts it.
 {{- end -}}
 {{- end }}
 
+{{- /*
+Admission config validation -- the values the gateway would refuse at
+start-up or ignore with a warning: the tenant rate limit enabled without its
+YAML (the gateway requires --tenant-rate-limit-config with the flag), and a
+scheduler ConfigMap without the scheduler enabled (--priority-scheduler-config
+is ignored without --priority-scheduler-enabled). Renders nothing.
+*/}}
+{{- define "smg.validateAdmission" -}}
+{{- if and .Values.router.tenantRateLimit.enabled (not .Values.router.tenantRateLimit.configMap.name) -}}
+{{- fail "router.tenantRateLimit.enabled needs router.tenantRateLimit.configMap.name: the gateway requires --tenant-rate-limit-config with --tenant-rate-limit-enabled" -}}
+{{- end -}}
+{{- if and .Values.router.priorityScheduler.configMap.name (not .Values.router.priorityScheduler.enabled) -}}
+{{- fail "router.priorityScheduler.configMap.name without router.priorityScheduler.enabled: the gateway ignores --priority-scheduler-config without --priority-scheduler-enabled" -}}
+{{- end -}}
+{{- end -}}
+
 {{/*
 Discovery validation -- refuses at render time what the gateway would refuse
 at start-up, or run without telling: two spellings of the worker provider,
@@ -637,6 +653,20 @@ Called from the router Deployment template.
 {{- if include "smg.controlPlaneSecretName" . }}
 - "--control-plane-api-keys-file"
 - {{ printf "/etc/smg/control-plane/%s" (include "smg.controlPlaneSecretKey" .) | quote }}
+{{- end }}
+{{- if .Values.router.tenantRateLimit.enabled }}
+- "--tenant-rate-limit-enabled"
+{{- end }}
+{{- if .Values.router.tenantRateLimit.configMap.name }}
+- "--tenant-rate-limit-config"
+- {{ printf "/etc/smg/rate-limit/%s" .Values.router.tenantRateLimit.configMap.key | quote }}
+{{- end }}
+{{- if .Values.router.priorityScheduler.enabled }}
+- "--priority-scheduler-enabled"
+{{- end }}
+{{- if .Values.router.priorityScheduler.configMap.name }}
+- "--priority-scheduler-config"
+- {{ printf "/etc/smg/scheduler/%s" .Values.router.priorityScheduler.configMap.key | quote }}
 {{- end }}
 {{- range .Values.router.extraArgs }}
 - {{ . | quote }}

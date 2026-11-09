@@ -1390,6 +1390,13 @@ impl ConfigValidator {
                 format!("Must be at most {} (0 = no bound)", Semaphore::MAX_PERMITS),
             ));
         }
+        if config.admin_max_connections > Semaphore::MAX_PERMITS {
+            return Err(ConfigError::invalid_value(
+                "admin_max_connections",
+                config.admin_max_connections,
+                format!("Must be at most {} (0 = no bound)", Semaphore::MAX_PERMITS),
+            ));
+        }
 
         if config.queue_size > 0 && config.queue_timeout_secs == 0 {
             return Err(ConfigError::invalid_value(
@@ -5111,6 +5118,35 @@ mod tests {
                 assert!(reason.contains("0 = no bound"), "{reason}");
             }
             other => panic!("expected an invalid max_connections, got {other:?}"),
+        }
+    }
+
+    /// The admin listener's bound has the same ceiling, refused by its own
+    /// name; no bound (0) and ordinary counts pass.
+    #[test]
+    fn an_admin_connection_limit_above_the_permit_maximum_is_rejected() {
+        let config = |admin_max_connections: usize| RouterConfig {
+            admin_max_connections,
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            ..Default::default()
+        };
+        for accepted in [0, 1, 4096, Semaphore::MAX_PERMITS] {
+            ConfigValidator::validate(&config(accepted))
+                .unwrap_or_else(|e| panic!("admin_max_connections {accepted}: {e}"));
+        }
+        match ConfigValidator::validate(&config(Semaphore::MAX_PERMITS + 1)) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "admin_max_connections");
+                assert_eq!(value, (Semaphore::MAX_PERMITS + 1).to_string());
+                assert!(reason.contains("0 = no bound"), "{reason}");
+            }
+            other => panic!("expected an invalid admin_max_connections, got {other:?}"),
         }
     }
 

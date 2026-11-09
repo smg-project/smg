@@ -1032,7 +1032,6 @@ jobs:
               (".github/actions/setup-trtllm/**",                TRTLLM),
               (".github/actions/setup-tokenspeed/**",            TOKENSPEED),
               (".github/actions/setup-gh/**",                    NONE),
-              (".github/actions/export-pod-api-key/**",          NONE),
               (".github/actions/publish-crate/**",               NONE),
               (".github/actions/**",                             FULL),
               (".github/versions/tokenspeed.ref",                TOKENSPEED),

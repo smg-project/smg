@@ -1152,6 +1152,7 @@ impl CliArgs {
             .header_read_timeout_secs(self.serving.header_read_timeout_secs)
             .idle_connection_timeout_secs(self.serving.idle_connection_timeout_secs)
             .max_connections(self.serving.max_connections)
+            .admin_max_connections(self.serving.admin_max_connections)
             .request_timeout_secs(self.serving.request_timeout_secs)
             .grpc_request_timeout_secs(self.serving.grpc_request_timeout_secs)
             .sse_keepalive_secs(self.serving.sse_keepalive_secs)
