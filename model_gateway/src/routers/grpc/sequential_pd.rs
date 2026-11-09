@@ -1016,6 +1016,8 @@ async fn sequential_decode_side(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
     use crate::{
         middleware::test_support::text_of,
@@ -1029,7 +1031,10 @@ mod tests {
                 proto_wrapper::FanoutStream,
             },
         },
-        worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
+        worker::{
+            BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType,
+            MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
+        },
     };
 
     fn three_second_decode_bound() -> DecodeBound {
@@ -1473,6 +1478,193 @@ mod tests {
         assert_eq!(
             req.kv_transfer_params_json.as_deref(),
             Some(NIXL_PREFILL_KV_PARAMS)
+        );
+    }
+
+    /// A streaming text request of `n` samples, the client's side of every
+    /// recorded pair below.
+    fn recorded_request(n: u32) -> ProtoGenerateRequest {
+        ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: "chatcmpl-recorded-pair".to_string(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    original_text: "the pair on the wire".to_string(),
+                    input_ids: vec![11, 12, 13, 14, 15],
+                },
+            )),
+            sampling_params: Some(vllm::SamplingParams {
+                temperature: Some(0.7),
+                top_p: 0.9,
+                max_tokens: Some(48),
+                n,
+                seed: Some(7),
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        }))
+    }
+
+    /// A prefill/decode pair whose prefill worker reports `connector`, and the
+    /// engine id a worker reports when it has one.
+    fn connector_pair(connector: &str, engine_id: Option<&str>) -> WorkerSelection {
+        let mut prefill = BasicWorkerBuilder::new("grpc://prefill:30000")
+            .worker_type(WorkerType::Prefill)
+            .runtime_type(RuntimeType::Vllm)
+            .connection_mode(ConnectionMode::Grpc)
+            .kv_connector(connector)
+            .bootstrap_port(Some(8998));
+        if let Some(engine_id) = engine_id {
+            prefill = prefill.kv_engine_id(engine_id);
+        }
+        let prefill: Arc<dyn Worker> = Arc::new(prefill.build());
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc)
+                .build(),
+        );
+        WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill,
+            decode,
+            runtime_type: RuntimeType::Vllm,
+        }
+    }
+
+    /// The parameters a prefill engine returns under a NIXL handoff.
+    const NIXL_RETURNED: &str = r#"{"do_remote_prefill":true,"remote_block_ids":[3,4,5],"remote_engine_id":"prefill-engine","remote_host":"10.0.0.2","remote_port":5600}"#;
+
+    /// The bytes a request is sent as, in hex.
+    fn wire(request: &ProtoGenerateRequest) -> String {
+        let ProtoGenerateRequest::Vllm(request) = request else {
+            panic!("the sequential pair rides one wire");
+        };
+        prost::Message::encode_to_vec(request.as_ref())
+            .into_iter()
+            .fold(String::new(), |mut hex, byte| {
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            })
+    }
+
+    /// The pair the plan sends for `request`: the prefill side as built, the
+    /// decode side once `prefill_kv_params` (what the prefill returned) is
+    /// relayed onto it.
+    fn sent_pair(
+        plan: &SequentialPlan,
+        request: ProtoGenerateRequest,
+        workers: &WorkerSelection,
+        prefill_kv_params: Option<&str>,
+    ) -> (String, String) {
+        let (prefill, mut decode) = plan.requests(request, workers);
+        relay_to_decode(
+            plan,
+            workers,
+            &mut decode,
+            prefill_kv_params.map(str::to_owned),
+            None,
+        )
+        .expect("a handoff the plan can send");
+        (wire(&prefill), wire(&decode))
+    }
+
+    /// The prefill side of a NIXL handoff: one token, no stream, tagged for the
+    /// remote decode; its decode side carries what the prefill returned.
+    const NIXL_PREFILL: &str = "0a1663686174636d706c2d7265636f726465642d70616972121d0a147468652070616972206f6e20746865207769726512050b0c0d0e0f22130d3333333f156666663f400170017801c0010742337b22646f5f72656d6f74655f6465636f6465223a747275652c22646f5f72656d6f74655f70726566696c6c223a66616c73657d";
+    const NIXL_DECODE: &str = "0a1663686174636d706c2d7265636f726465642d70616972121d0a147468652070616972206f6e20746865207769726512050b0c0d0e0f22110d3333333f156666663f40307801c0010728014285017b22646f5f72656d6f74655f70726566696c6c223a747275652c2272656d6f74655f626c6f636b5f696473223a5b332c342c355d2c2272656d6f74655f656e67696e655f6964223a2270726566696c6c2d656e67696e65222c2272656d6f74655f686f7374223a2231302e302e302e32222c2272656d6f74655f706f7274223a353630307d";
+    /// A minted Mooncake handoff: the prefill side pinned under the minted id,
+    /// the decode side's parameters synthesized from the prefill worker.
+    const MOONCAKE_MINTED_PREFILL: &str = "0a1663686174636d706c2d7265636f726465642d70616972121d0a147468652070616972206f6e20746865207769726512050b0c0d0e0f22130d3333333f156666663f400170017801c0010742517b22646f5f72656d6f74655f6465636f6465223a747275652c22646f5f72656d6f74655f70726566696c6c223a66616c73652c227472616e736665725f6964223a22786665722d7265636f72646564227d";
+    const MOONCAKE_MINTED_DECODE: &str = "0a1663686174636d706c2d7265636f726465642d70616972121d0a147468652070616972206f6e20746865207769726512050b0c0d0e0f22110d3333333f156666663f40307801c001072801429d017b22646f5f72656d6f74655f6465636f6465223a66616c73652c22646f5f72656d6f74655f70726566696c6c223a747275652c227472616e736665725f6964223a22786665722d7265636f72646564222c2272656d6f74655f656e67696e655f6964223a22656e67696e652d61222c2272656d6f74655f626f6f7473747261705f61646472223a22687474703a2f2f70726566696c6c3a38393938227d";
+    /// The legacy Mooncake handoff of a worker without an engine id: the typed
+    /// host and port on the decode side, nothing on the prefill side.
+    const MOONCAKE_LEGACY_PREFILL: &str = "0a1663686174636d706c2d7265636f726465642d70616972121d0a147468652070616972206f6e20746865207769726512050b0c0d0e0f22130d3333333f156666663f400170017801c00107";
+    const MOONCAKE_LEGACY_DECODE: &str = "0a1663686174636d706c2d7265636f726465642d70616972121d0a147468652070616972206f6e20746865207769726512050b0c0d0e0f22110d3333333f156666663f40307801c001072801320c0a0770726566696c6c10a646";
+    /// An n>1 request under NIXL: no handoff on either side, the decode side
+    /// recomputes the prompt for its samples.
+    const N2_PREFILL: &str = "0a1663686174636d706c2d7265636f726465642d70616972121d0a147468652070616972206f6e20746865207769726512050b0c0d0e0f22130d3333333f156666663f400170017801c00107";
+    const N2_DECODE: &str = "0a1663686174636d706c2d7265636f726465642d70616972121d0a147468652070616972206f6e20746865207769726512050b0c0d0e0f22110d3333333f156666663f40307802c001072801";
+
+    /// Each connector form's pair goes on the wire byte for byte as the
+    /// dispatch stage sent it before this module (the constants above were
+    /// recorded there, from these inputs).
+    #[test]
+    fn a_nixl_pair_is_sent_as_recorded() {
+        let workers = connector_pair(NIXL_CONNECTOR, None);
+        let plan = SequentialPlan::decide(&recorded_request(1), &workers).expect("a NIXL pair");
+        assert_eq!(plan.mode, KvConnectorMode::Nixl);
+        assert_eq!(
+            sent_pair(&plan, recorded_request(1), &workers, Some(NIXL_RETURNED)),
+            (NIXL_PREFILL.to_string(), NIXL_DECODE.to_string())
+        );
+    }
+
+    #[test]
+    fn a_minted_mooncake_pair_is_sent_as_recorded() {
+        let workers = connector_pair(MOONCAKE_CONNECTOR, Some("engine-a"));
+        let mut plan =
+            SequentialPlan::decide(&recorded_request(1), &workers).expect("a Mooncake pair");
+        assert!(
+            matches!(
+                plan.mode,
+                KvConnectorMode::Mooncake {
+                    engine_id: Some(_),
+                    ..
+                }
+            ),
+            "{:?}",
+            plan.mode
+        );
+        assert!(plan.mooncake_transfer_id.is_some(), "a minted id");
+        // The id is minted fresh per request; the record pins the form under one.
+        plan.mooncake_transfer_id = Some("xfer-recorded".to_string());
+        assert_eq!(
+            sent_pair(&plan, recorded_request(1), &workers, None),
+            (
+                MOONCAKE_MINTED_PREFILL.to_string(),
+                MOONCAKE_MINTED_DECODE.to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_legacy_mooncake_pair_is_sent_as_recorded() {
+        let workers = connector_pair(MOONCAKE_CONNECTOR, None);
+        let plan = SequentialPlan::decide(&recorded_request(1), &workers).expect("a Mooncake pair");
+        assert!(
+            matches!(
+                plan.mode,
+                KvConnectorMode::Mooncake {
+                    engine_id: None,
+                    ..
+                }
+            ),
+            "{:?}",
+            plan.mode
+        );
+        assert_eq!(
+            plan.mooncake_transfer_id, None,
+            "nothing minted without an engine id"
+        );
+        assert_eq!(
+            sent_pair(&plan, recorded_request(1), &workers, None),
+            (
+                MOONCAKE_LEGACY_PREFILL.to_string(),
+                MOONCAKE_LEGACY_DECODE.to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn an_n_greater_than_one_pair_is_sent_as_recorded() {
+        let workers = connector_pair(NIXL_CONNECTOR, None);
+        let plan = SequentialPlan::decide(&recorded_request(2), &workers).expect("a NIXL pair");
+        assert!(!plan.relay_kv_params, "n>1 relays no handoff");
+        assert_eq!(
+            sent_pair(&plan, recorded_request(2), &workers, None),
+            (N2_PREFILL.to_string(), N2_DECODE.to_string())
         );
     }
 }
