@@ -12,14 +12,19 @@
 //! the whole, and the piece cache, the seed and the merge table of the
 //! byte-level path serve them. The byte tokens take no part in any merge (a
 //! vocabulary with a token that spells one inside it is declined), so the
-//! cuts are read from the bytes of the tokens' own text.
-
-use std::borrow::Cow;
+//! cuts are read from the bytes of the tokens' own text. The scan runs over
+//! the raw text, a space standing for the marker (the bridge table is built
+//! in that form), and a piece is keyed in the caches by its raw bytes, so a
+//! hit reads the text once and copies nothing; a piece met for the first
+//! time is written in the vocabulary's form for the merge alone.
 
 use rustc_hash::FxHashMap;
 use tokenizers::models::ModelWrapper;
 
-use super::merge::{ByteTokens, MergeTable};
+use super::{
+    merge::{ByteTokens, MergeTable},
+    short_pieces::ShortPieceKey,
+};
 use crate::encode_path::Declined;
 
 /// The word marker of a sentencepiece vocabulary.
@@ -55,8 +60,12 @@ pub(super) struct CharSymbols {
     ascii: [u32; 128],
     /// The token of each other character the vocabulary has, by scalar value.
     beyond: FxHashMap<u32, u32>,
-    /// Bit `prev << 8 | cur`: some vocabulary token holds the bytes `prev`,
-    /// `cur` adjacent.
+    /// Bit `prev << 8 | cur`: no piece cut goes between the raw bytes
+    /// `prev` and `cur`: some vocabulary token holds them adjacent (a space
+    /// read as the marker, its last byte before the cut and its first byte
+    /// after it), or `cur` continues a UTF-8 character. Read from the
+    /// tokens' text, then rewritten for the raw text by
+    /// [`Self::bridge_raw_text`].
     bridge: Box<[u64; BRIDGE_WORDS]>,
     marker: Marker,
     /// The model's merges over its own ids.
@@ -90,6 +99,7 @@ impl CharSymbols {
         for (token, id) in bpe.get_vocab() {
             symbols.read_token(&token, id)?;
         }
+        symbols.bridge_raw_text();
         Ok(symbols)
     }
 
@@ -117,6 +127,41 @@ impl CharSymbols {
         Ok(())
     }
 
+    /// Rewrites the bridge table, read from the tokens' text, for the raw
+    /// text the scan runs over: a space is the marker (what precedes a cut
+    /// after a space is the marker's last byte, what follows a cut before
+    /// one is its first byte), and no cut goes before a byte that continues
+    /// a character.
+    fn bridge_raw_text(&mut self) {
+        let mut raw = Box::new([0u64; BRIDGE_WORDS]);
+        for prev in 0..=255u8 {
+            for cur in 0..=255u8 {
+                let before = if prev == b' ' { MARKER_BYTES[2] } else { prev };
+                let after = if cur == b' ' { MARKER_BYTES[0] } else { cur };
+                if is_continuation(cur) || self.bridged(before, after) {
+                    let bit = usize::from(prev) << 8 | usize::from(cur);
+                    raw[bit >> 6] |= 1 << (bit & 63);
+                }
+            }
+        }
+        self.bridge = raw;
+    }
+
+    /// The cache key of a vocabulary entry on this path: its text in the raw
+    /// form (the marker as a space), when that is a short piece. An entry
+    /// that holds a space of its own has no key: no text reaches it (a space
+    /// of the text is the marker), and its raw form would be another entry's.
+    pub(super) fn entry_key(entry: &str) -> Option<ShortPieceKey> {
+        if entry.contains(' ') {
+            return None;
+        }
+        if entry.contains(WORD_MARKER) {
+            ShortPieceKey::of(entry.replace(WORD_MARKER, " ").as_bytes())
+        } else {
+            ShortPieceKey::of(entry.as_bytes())
+        }
+    }
+
     /// Bytes the tables hold, for the load log.
     pub(super) fn bytes(&self) -> usize {
         size_of::<Self>()
@@ -141,7 +186,8 @@ impl CharSymbols {
         }
     }
 
-    /// Whether some vocabulary token holds `prev` and `cur` adjacent.
+    /// Whether no cut goes between the raw bytes `prev` and `cur` (see the
+    /// field).
     #[inline(always)]
     fn bridged(&self, prev: u8, cur: u8) -> bool {
         let bit = usize::from(prev) << 8 | usize::from(cur);
@@ -159,58 +205,41 @@ impl CharSymbols {
         }
     }
 
-    /// `text` with its spaces as word markers, and the marker before it when
-    /// `prepend` says so and it does not start with one already (a space at
-    /// its start is one, replaced); borrowed when nothing changes.
-    pub(super) fn marked(text: &str, prepend: bool) -> Cow<'_, str> {
-        let prepend = prepend && !(text.starts_with(WORD_MARKER) || text.starts_with(' '));
-        if !prepend && !text.as_bytes().contains(&b' ') {
-            return Cow::Borrowed(text);
-        }
-        let mut out = String::with_capacity(text.len() + text.len() / 2 + 3);
-        if prepend {
+    /// `piece` (raw text) in the vocabulary's form, written into `out`: its
+    /// spaces as the word marker.
+    pub(super) fn normalized<'o>(piece: &str, out: &'o mut String) -> &'o str {
+        out.clear();
+        let mut parts = piece.split(' ');
+        out.push_str(parts.next().unwrap_or_default());
+        for part in parts {
             out.push(WORD_MARKER);
+            out.push_str(part);
         }
-        for c in text.chars() {
-            out.push(if c == ' ' { WORD_MARKER } else { c });
-        }
-        Cow::Owned(out)
+        out
     }
 
-    /// Calls `f` with each piece of `text` (normalized): the text cut, at
-    /// character boundaries, between two bytes no vocabulary token holds
-    /// adjacent.
-    pub(super) fn pieces(&self, text: &str, f: &mut dyn FnMut(&str)) {
-        let bytes = text.as_bytes();
+    /// Calls `f` with the start and end of each piece of the raw `text`:
+    /// the text cut between two bytes it does not bridge (see the module
+    /// documentation; a space reads as the marker). `f` is taken by value so
+    /// that the per-piece work compiles into the loop.
+    #[inline(always)]
+    pub(super) fn pieces<F: FnMut(usize, usize)>(&self, text: &[u8], mut f: F) {
         let mut start = 0;
-        for i in 1..bytes.len() {
-            let cur = bytes[i];
-            if is_continuation(cur) || self.bridged(bytes[i - 1], cur) {
-                continue;
+        for (i, pair) in text.windows(2).enumerate() {
+            if !self.bridged(pair[0], pair[1]) {
+                f(start, i + 1);
+                start = i + 1;
             }
-            f(&text[start..i]);
-            start = i;
         }
-        if start < bytes.len() {
-            f(&text[start..]);
+        if start < text.len() {
+            f(start, text.len());
         }
     }
 
-    /// Whether a cut of the raw text at `p` (past its first byte, before
-    /// its last) is a cut of its normalized form too: the spaces either side
-    /// of it read as the marker's bytes.
-    pub(super) fn raw_cut_ok(&self, bytes: &[u8], p: usize) -> bool {
-        let prev = if bytes[p - 1] == b' ' {
-            MARKER_BYTES[2]
-        } else {
-            bytes[p - 1]
-        };
-        let cur = if bytes[p] == b' ' {
-            MARKER_BYTES[0]
-        } else {
-            bytes[p]
-        };
-        !is_continuation(cur) && !self.bridged(prev, cur)
+    /// Whether the raw text is cut at `p` (past its first byte, before its
+    /// end): the bytes either side of it are not bridged.
+    pub(super) fn cuts_at(&self, bytes: &[u8], p: usize) -> bool {
+        !self.bridged(bytes[p - 1], bytes[p])
     }
 
     /// Appends the ids `piece` (normalized text) merges to: its initial
@@ -252,4 +281,41 @@ fn is_byte_token(token: &str) -> bool {
 #[inline(always)]
 fn is_continuation(byte: u8) -> bool {
     (0x80..0xC0).contains(&byte)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_entry_is_keyed_by_its_raw_form_and_one_with_a_space_of_its_own_has_none() {
+        assert_eq!(
+            CharSymbols::entry_key("\u{2581}the"),
+            ShortPieceKey::of(b" the")
+        );
+        assert_eq!(
+            CharSymbols::entry_key("\u{2581}the\u{2581}"),
+            ShortPieceKey::of(b" the ")
+        );
+        assert_eq!(CharSymbols::entry_key("the"), ShortPieceKey::of(b"the"));
+        assert_eq!(CharSymbols::entry_key(" the"), None);
+        assert_eq!(CharSymbols::entry_key(&"\u{2581}".repeat(16)), None);
+        assert!(CharSymbols::entry_key(&"\u{2581}".repeat(15)).is_some());
+    }
+
+    #[test]
+    fn a_raw_piece_is_written_in_the_vocabularys_form() {
+        let mut out = String::new();
+        assert_eq!(
+            CharSymbols::normalized(" the cat", &mut out),
+            "\u{2581}the\u{2581}cat"
+        );
+        assert_eq!(CharSymbols::normalized("x", &mut out), "x");
+        assert_eq!(CharSymbols::normalized("", &mut out), "");
+        assert_eq!(CharSymbols::normalized("  ", &mut out), "\u{2581}\u{2581}");
+        assert_eq!(
+            CharSymbols::normalized("\u{2581}y z", &mut out),
+            "\u{2581}y\u{2581}z"
+        );
+    }
 }
