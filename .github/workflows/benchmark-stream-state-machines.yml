@@ -19,8 +19,7 @@ on:
       - '!model_gateway/src/**/tests/**'
       - '!model_gateway/src/**/*_test.rs'
       - '!model_gateway/src/**/test_*.rs'
-      # After the test exclusions: the rows decode with the streaming module's character tokenizer.
-      - 'model_gateway/src/routers/grpc/regular/streaming/character_tokenizer.rs'
+      - '!model_gateway/src/routers/grpc/tokenizer_cache/**'
   pull_request:
     branches: [ main, release/** ]
     paths:
@@ -39,8 +38,7 @@ on:
       - '!model_gateway/src/**/tests/**'
       - '!model_gateway/src/**/*_test.rs'
       - '!model_gateway/src/**/test_*.rs'
-      # After the test exclusions: the rows decode with the streaming module's character tokenizer.
-      - 'model_gateway/src/routers/grpc/regular/streaming/character_tokenizer.rs'
+      - '!model_gateway/src/routers/grpc/tokenizer_cache/**'
   workflow_dispatch:
   schedule:
     - cron: '0 0 * * 0'
