@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn the_load_poll_releases_a_pick_the_router_never_dispatched() {
         // b holds one request; each pick on a is dropped before its guard is
-        // taken, and the poll that follows sets a back to the router's zero.
+        // taken, and the second poll that follows sets a back to the router's zero.
         let policy = PowerOfTwoPolicy::new();
         let a = make_worker("http://a:8000");
         let b = make_worker("http://b:8000");
@@ -356,7 +356,9 @@ mod tests {
                 policy.select_worker(&workers, &SelectWorkerInfo::default()),
                 Some(0)
             );
-            policy.reconcile_in_flight(workers[0].url(), workers[0].load());
+            for _ in 0..2 {
+                policy.reconcile_in_flight(workers[0].url(), workers[0].load());
+            }
         }
     }
 

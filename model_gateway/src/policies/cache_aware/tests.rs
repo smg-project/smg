@@ -4195,7 +4195,7 @@ fn hash_mode_untokenized_text_stays_dark_fleet_expected_wait() {
 #[test]
 fn the_load_poll_releases_a_pick_the_router_never_dispatched() {
     // w1 holds one request; each pick on w2 is dropped before its guard is
-    // taken, and the poll that follows sets w2 back to the router's zero.
+    // taken, and the second poll that follows sets w2 back to the router's zero.
     let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     workers[0].increment_load();
@@ -4203,7 +4203,9 @@ fn the_load_poll_releases_a_pick_the_router_never_dispatched() {
     let tokens: Vec<u32> = (0..8).collect();
     for _ in 0..50 {
         assert_eq!(route_tokens(&policy, &workers, &tokens), 1);
-        policy.reconcile_in_flight(workers[1].url(), workers[1].load());
+        for _ in 0..2 {
+            policy.reconcile_in_flight(workers[1].url(), workers[1].load());
+        }
     }
 }
 

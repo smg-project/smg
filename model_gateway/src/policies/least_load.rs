@@ -63,11 +63,13 @@ struct SincePollDispatch {
     /// read under the tally's write guard, so the pushes keep the clock's order.
     dispatches: VecDeque<(Instant, u64)>,
     /// Requests this policy picked the worker for that have not ended: raised
-    /// at the pick, lowered when the request's load guard drops, and set to
-    /// the router's live count at each load poll. The router counts a request
-    /// only once it takes that guard, after the pick; until then this is the
-    /// only record of it.
+    /// at the pick, lowered when the request's load guard drops, and brought
+    /// back to the router's live count by the load polls ([`Self::reconcile`]).
+    /// The router counts a request only once it takes that guard, after the
+    /// pick; until then this is the only record of it.
     picked: u64,
+    /// The picks above the router's live count that the last load poll kept.
+    kept_by_poll: u64,
 }
 
 impl SincePollDispatch {
@@ -83,6 +85,20 @@ impl SincePollDispatch {
         if self.dispatches.len() > SINCE_POLL_DISPATCHES_KEPT {
             self.pop_oldest();
         }
+    }
+
+    /// A load poll: the picks become the router's live count, plus the picks
+    /// above it that the last poll did not keep. A pick above the live count
+    /// has no guard. One waiting for its guard has it by the next poll, one
+    /// the router dropped never will, and nothing reaches the policy when a
+    /// guard is taken, so the first poll to find a pick keeps it and the next
+    /// drops it.
+    fn reconcile(&mut self, in_flight: u64) {
+        self.kept_by_poll = self
+            .picked
+            .saturating_sub(in_flight)
+            .saturating_sub(self.kept_by_poll);
+        self.picked = in_flight + self.kept_by_poll;
     }
 
     /// Release the dispatches a report sampled at `sampled_at` already
@@ -1163,23 +1179,25 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
         }
     }
 
-    /// The load poll sets the worker's picks to the router's live count: a
-    /// pick the router dropped before taking its guard never ends and leaves
-    /// here, and a request this policy did not pick is counted from here on,
-    /// also on a worker it has not picked yet. A pick whose guard is not taken
-    /// yet when the poll runs is dropped as well; once its guard is taken the
-    /// live count holds it, and the next poll brings the picks back in step.
-    /// A worker with nothing in flight gets no entry here: a poll can outlast
-    /// the worker's removal, and no later poll would clear the entry.
+    /// The load poll brings the worker's picks to the router's live count
+    /// ([`SincePollDispatch::reconcile`]): a pick the router dropped before
+    /// taking its guard never ends and leaves here, at the second poll to find
+    /// it, and a request this policy did not pick is counted from here on,
+    /// also on a worker it has not picked yet. A worker with nothing in flight
+    /// gets no entry here: a poll can outlast the worker's removal, and no
+    /// later poll would clear the entry.
     fn reconcile_in_flight(&self, worker_url: &str, in_flight: usize) {
         let mut tally = self
             .tally
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if in_flight > 0 {
-            tally.entry(worker_url.to_string()).or_default().picked = in_flight as u64;
-        } else if let Some(dispatch) = tally.get_mut(worker_url) {
-            dispatch.picked = 0;
+        let dispatch = if in_flight > 0 {
+            Some(tally.entry(worker_url.to_string()).or_default())
+        } else {
+            tally.get_mut(worker_url)
+        };
+        if let Some(dispatch) = dispatch {
+            dispatch.reconcile(in_flight as u64);
         }
     }
 
@@ -1584,14 +1602,82 @@ mod tests {
     fn the_load_poll_releases_a_pick_the_router_never_dispatched() {
         // b holds one request. Every pick goes to a and is then dropped before
         // its guard is taken, as the router's overload re-check does, so it
-        // never ends; the poll that follows sets a back to the router's zero.
+        // never ends; the second poll that follows sets a back to the router's
+        // zero.
         let policy = LeastLoadPolicy::new().with_tie_break_seed(7);
         let workers = make_workers(&["http://a:8000", "http://b:8000"]);
         workers[1].increment_load();
         let info = SelectWorkerInfo::default();
         for _ in 0..50 {
             assert_eq!(policy.select_worker(&workers, &info), Some(0));
-            policy.reconcile_in_flight(workers[0].url(), workers[0].load());
+            for _ in 0..2 {
+                policy.reconcile_in_flight(workers[0].url(), workers[0].load());
+            }
+        }
+    }
+
+    /// A poll can land between a pick and its guard. The picks it finds without
+    /// one still count, so a burst stays even wherever the poll lands in it.
+    #[test]
+    fn a_poll_inside_a_dark_burst_keeps_the_picks_waiting_for_their_guards() {
+        for picks_before_the_poll in 1..8 {
+            for seed in 0..30 {
+                let policy = LeastLoadPolicy::new().with_tie_break_seed(seed);
+                let workers = make_workers(&[
+                    "http://a:8000",
+                    "http://b:8000",
+                    "http://c:8000",
+                    "http://d:8000",
+                ]);
+                let mut hits = [0usize; 4];
+                for pick in 0..8 {
+                    if pick == picks_before_the_poll {
+                        for worker in &workers {
+                            policy.reconcile_in_flight(worker.url(), worker.load());
+                        }
+                    }
+                    hits[policy
+                        .select_worker(&workers, &SelectWorkerInfo::default())
+                        .unwrap()] += 1;
+                }
+                assert_eq!(
+                    hits,
+                    [2, 2, 2, 2],
+                    "poll after {picks_before_the_poll} picks, burst {seed}"
+                );
+            }
+        }
+    }
+
+    /// Nothing tells a pick the router dropped from one waiting for its guard,
+    /// so the first poll to find it keeps it and the second clears it.
+    #[test]
+    fn a_pick_that_never_gets_a_guard_leaves_at_the_second_poll() {
+        let policy = LeastLoadPolicy::new();
+        let workers = make_workers(&["http://a:8000", "http://b:8000"]);
+        let best = policy
+            .select_worker(&workers, &SelectWorkerInfo::default())
+            .unwrap();
+        for picked in [1, 0, 0] {
+            policy.reconcile_in_flight(workers[best].url(), 0);
+            assert_eq!(policy.resolve_for_test(&workers, &[best])[0].picked, picked);
+        }
+    }
+
+    /// A kept pick that then gets its guard is in the live count, and counts once.
+    #[test]
+    fn a_kept_pick_that_gets_its_guard_counts_once() {
+        let policy = LeastLoadPolicy::new();
+        let workers = make_workers(&["http://a:8000", "http://b:8000"]);
+        let best = policy
+            .select_worker(&workers, &SelectWorkerInfo::default())
+            .unwrap();
+        policy.reconcile_in_flight(workers[best].url(), 0);
+        assert_eq!(policy.resolve_for_test(&workers, &[best])[0].picked, 1);
+        workers[best].increment_load();
+        for _ in 0..2 {
+            policy.reconcile_in_flight(workers[best].url(), workers[best].load());
+            assert_eq!(policy.resolve_for_test(&workers, &[best])[0].picked, 1);
         }
     }
 
