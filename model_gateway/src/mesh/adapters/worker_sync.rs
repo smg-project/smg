@@ -1055,7 +1055,17 @@ mod tests {
     /// An adapter for `node-a` over an empty membership view (every owner
     /// unknown, hence live).
     fn adapter(ns: Arc<CrdtNamespace>, registry: Arc<WorkerRegistry>) -> Arc<WorkerSyncAdapter> {
-        adapter_in(ns, registry, empty_cluster())
+        adapter_as(ns, registry, "node-a")
+    }
+
+    /// An adapter under another node's name over an empty membership view:
+    /// the two-life tests run an owner as `node-p` beside its peer as `node-s`.
+    fn adapter_as(
+        ns: Arc<CrdtNamespace>,
+        registry: Arc<WorkerRegistry>,
+        node: &str,
+    ) -> Arc<WorkerSyncAdapter> {
+        WorkerSyncAdapter::new(ns, registry, node.into(), empty_cluster())
     }
 
     fn adapter_in(
@@ -1496,8 +1506,7 @@ mod tests {
         // The importer is another member: under the publisher's own name it
         // would take the key for a leftover of an earlier life and tombstone it.
         let sub_registry = Arc::new(WorkerRegistry::new());
-        let subscriber =
-            WorkerSyncAdapter::new(ns, sub_registry.clone(), "node-b".into(), empty_cluster());
+        let subscriber = adapter_as(ns, sub_registry.clone(), "node-b");
         subscriber.start();
 
         let worker: Arc<dyn Worker> = Arc::new(
@@ -1543,8 +1552,7 @@ mod tests {
         publisher.start();
 
         let sub_registry = Arc::new(WorkerRegistry::new());
-        let subscriber =
-            WorkerSyncAdapter::new(ns, sub_registry.clone(), "node-b".into(), empty_cluster());
+        let subscriber = adapter_as(ns, sub_registry.clone(), "node-b");
         subscriber.start();
 
         let url = "http://remote:9000";
@@ -2042,12 +2050,7 @@ mod tests {
         // process runs nothing afterwards); the peer imports it under the
         // id that life gave it.
         let first_registry = Arc::new(WorkerRegistry::new());
-        let first_life = WorkerSyncAdapter::new(
-            ns.clone(),
-            first_registry.clone(),
-            "node-p".into(),
-            empty_cluster(),
-        );
+        let first_life = adapter_as(ns.clone(), first_registry.clone(), "node-p");
         let first_id = first_registry.register(local_worker(url)).unwrap();
         first_life.resync_local(&mut HashMap::new());
         let first_key = format!("worker:{}", first_id.as_str());
@@ -2059,12 +2062,7 @@ mod tests {
         drop(first_registry);
 
         let peer_registry = Arc::new(WorkerRegistry::new());
-        let peer = WorkerSyncAdapter::new(
-            ns.clone(),
-            peer_registry.clone(),
-            "node-s".into(),
-            empty_cluster(),
-        );
+        let peer = adapter_as(ns.clone(), peer_registry.clone(), "node-s");
         peer.start();
         assert!(
             wait_for(|| peer_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
@@ -2077,12 +2075,7 @@ mod tests {
         let second_registry = Arc::new(WorkerRegistry::new());
         let second_id = second_registry.register(local_worker(url)).unwrap();
         assert_ne!(second_id, first_id, "a fresh registry mints a fresh id");
-        let second_life = WorkerSyncAdapter::new(
-            ns.clone(),
-            second_registry.clone(),
-            "node-p".into(),
-            empty_cluster(),
-        );
+        let second_life = adapter_as(ns.clone(), second_registry.clone(), "node-p");
         second_life.start();
 
         assert!(
@@ -2119,12 +2112,7 @@ mod tests {
         let ns = worker_namespace(&mesh);
         let url = "http://engine:8080";
         let first_registry = Arc::new(WorkerRegistry::new());
-        let first_life = WorkerSyncAdapter::new(
-            ns.clone(),
-            first_registry.clone(),
-            "node-p".into(),
-            empty_cluster(),
-        );
+        let first_life = adapter_as(ns.clone(), first_registry.clone(), "node-p");
         let first_id = first_registry.register(local_worker(url)).unwrap();
         first_life.resync_local(&mut HashMap::new());
         let first_key = format!("worker:{}", first_id.as_str());
@@ -2133,12 +2121,7 @@ mod tests {
         drop(first_registry);
 
         let peer_registry = Arc::new(WorkerRegistry::new());
-        let peer = WorkerSyncAdapter::new(
-            ns.clone(),
-            peer_registry.clone(),
-            "node-s".into(),
-            empty_cluster(),
-        );
+        let peer = adapter_as(ns.clone(), peer_registry.clone(), "node-s");
         peer.start();
         assert!(
             wait_for(|| peer_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
@@ -2148,12 +2131,7 @@ mod tests {
         // The owner comes back under its name with an empty registry: the
         // key of its earlier life reaches it before anything registers.
         let second_registry = Arc::new(WorkerRegistry::new());
-        let second_life = WorkerSyncAdapter::new(
-            ns.clone(),
-            second_registry.clone(),
-            "node-p".into(),
-            empty_cluster(),
-        );
+        let second_life = adapter_as(ns.clone(), second_registry.clone(), "node-p");
         second_life.start();
         assert!(
             wait_for(|| second_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
@@ -2289,12 +2267,7 @@ mod tests {
         let ns = worker_namespace(&mesh);
         let url = "http://engine:8080";
         let first_registry = Arc::new(WorkerRegistry::new());
-        let first_life = WorkerSyncAdapter::new(
-            ns.clone(),
-            first_registry.clone(),
-            "node-p".into(),
-            empty_cluster(),
-        );
+        let first_life = adapter_as(ns.clone(), first_registry.clone(), "node-p");
         let first_id = first_registry
             .register(local_worker_of(url, "model-a"))
             .unwrap();
@@ -2315,12 +2288,7 @@ mod tests {
         drop(first_registry);
 
         let peer_registry = Arc::new(WorkerRegistry::new());
-        let peer = WorkerSyncAdapter::new(
-            ns.clone(),
-            peer_registry.clone(),
-            "node-s".into(),
-            empty_cluster(),
-        );
+        let peer = adapter_as(ns.clone(), peer_registry.clone(), "node-s");
         peer.start();
         assert!(
             wait_for(|| peer_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
@@ -2336,12 +2304,7 @@ mod tests {
         // The owner comes back under its name, imports its earlier life's
         // key, and the start-up upsert claims it with the new configuration.
         let second_registry = Arc::new(WorkerRegistry::new());
-        let second_life = WorkerSyncAdapter::new(
-            ns.clone(),
-            second_registry.clone(),
-            "node-p".into(),
-            empty_cluster(),
-        );
+        let second_life = adapter_as(ns.clone(), second_registry.clone(), "node-p");
         second_life.start();
         assert!(
             wait_for(|| second_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
@@ -2383,12 +2346,7 @@ mod tests {
         let ns = worker_namespace(&mesh);
         let url = "http://engine:8080";
         let first_registry = Arc::new(WorkerRegistry::new());
-        let first_life = WorkerSyncAdapter::new(
-            ns.clone(),
-            first_registry.clone(),
-            "node-p".into(),
-            empty_cluster(),
-        );
+        let first_life = adapter_as(ns.clone(), first_registry.clone(), "node-p");
         let first_id = first_registry
             .register(local_worker_of(url, "model-a"))
             .unwrap();
@@ -2406,12 +2364,7 @@ mod tests {
         drop(first_registry);
 
         let peer_registry = Arc::new(WorkerRegistry::new());
-        let peer = WorkerSyncAdapter::new(
-            ns.clone(),
-            peer_registry.clone(),
-            "node-s".into(),
-            empty_cluster(),
-        );
+        let peer = adapter_as(ns.clone(), peer_registry.clone(), "node-s");
         peer.start();
         assert!(
             wait_for(|| peer_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
@@ -2419,12 +2372,7 @@ mod tests {
         );
 
         let second_registry = Arc::new(WorkerRegistry::new());
-        let second_life = WorkerSyncAdapter::new(
-            ns.clone(),
-            second_registry.clone(),
-            "node-p".into(),
-            empty_cluster(),
-        );
+        let second_life = adapter_as(ns.clone(), second_registry.clone(), "node-p");
         second_life.start();
         assert!(
             wait_for(|| second_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
