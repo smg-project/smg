@@ -21,7 +21,7 @@
 //! probe) sit outside it: they forward the caller's header as they did and
 //! add no credential of their own, since there "no header" means anonymous.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fmt::Write as _, sync::Arc};
 
 use axum::{
     body::Body,
@@ -100,6 +100,22 @@ impl AuthConfig {
 
 fn hash_key(key: &str) -> [u8; 32] {
     Sha256::digest(key.as_bytes()).into()
+}
+
+/// The first 16 hex digits of the key's SHA-256: how the access log and the
+/// configuration view name a key without writing it.
+pub fn key_fingerprint(key: &str) -> String {
+    fingerprint_of(&hash_key(key))
+}
+
+/// [`key_fingerprint`] of a key already hashed.
+pub(crate) fn fingerprint_of(key_hash: &[u8; 32]) -> String {
+    let mut id = String::with_capacity(16);
+    for byte in &key_hash[..8] {
+        // Writing into a String cannot fail.
+        let _ = write!(id, "{byte:02x}");
+    }
+    id
 }
 
 /// The header names a provider reads its own key from, which an SDK may fill
@@ -223,7 +239,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::routers::common::header_utils::extract_auth_header;
+    use crate::{routers::common::header_utils::extract_auth_header, test_support::text_of};
 
     async fn handler(request: Request<Body>) -> impl IntoResponse {
         request
@@ -293,7 +309,7 @@ mod tests {
             .unwrap();
         let response = app().oneshot(twice).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_text(response).await, "");
+        assert_eq!(text_of(response).await, "");
 
         let own = Request::builder()
             .uri("/")
@@ -303,7 +319,7 @@ mod tests {
             .unwrap();
         let response = app().oneshot(own).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_text(response).await, "x-api-key=providers-own-key");
+        assert_eq!(text_of(response).await, "x-api-key=providers-own-key");
 
         // The caller's own key first, the gateway's key in a later value of
         // the same header: the whole name goes, since one value is the
@@ -317,7 +333,7 @@ mod tests {
             .unwrap();
         let response = app().oneshot(repeated).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_text(response).await, "");
+        assert_eq!(text_of(response).await, "");
     }
 
     async fn authorization_after(auth_config: AuthConfig, bearer: Option<&str>) -> String {
@@ -330,7 +346,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        body_text(response).await
+        text_of(response).await
     }
 
     /// A matched gateway key ends at the middleware: the route sees the
@@ -387,7 +403,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        body_text(response).await
+        text_of(response).await
     }
 
     /// What leaves for the upstream: under gateway auth the configured
@@ -448,7 +464,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        body_text(response).await
+        text_of(response).await
     }
 
     /// With no key configured the middleware authenticates nothing and leaves
@@ -464,13 +480,6 @@ mod tests {
             authorization_after(AuthConfig::new(None), None).await,
             "absent"
         );
-    }
-
-    async fn body_text(response: Response) -> String {
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        std::str::from_utf8(&body).unwrap().to_string()
     }
 
     #[tokio::test]
@@ -499,7 +508,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_text(response).await, expected.to_string());
+        assert_eq!(text_of(response).await, expected.to_string());
     }
 
     #[tokio::test]
@@ -524,7 +533,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_text(response).await, "auth:team-red");
+        assert_eq!(text_of(response).await, "auth:team-red");
     }
 
     #[tokio::test]
@@ -559,7 +568,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(body_text(response).await, expected_tenant);
+            assert_eq!(text_of(response).await, expected_tenant);
         }
     }
 
@@ -637,7 +646,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(challenge(&response), "Bearer realm=\"data-plane\"");
-        let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&text_of(response).await).unwrap();
         assert_eq!(body["error"]["code"], "invalid_api_key");
         assert!(
             body["error"]["message"]

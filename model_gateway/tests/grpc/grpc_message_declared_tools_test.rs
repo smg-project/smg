@@ -12,12 +12,8 @@
 //! special tokens on its own account when they do, whatever the tools say, which would hide the
 //! gate under test.
 
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::sync::{Arc, Mutex};
 
-use axum::{body::to_bytes, http::StatusCode, response::Response};
 use llm_tokenizer::{traits::Tokenizer, TokenizerRegistry};
 use openai_protocol::{
     chat::ChatCompletionRequest, model_card::ModelCard, validated::Normalizable,
@@ -33,9 +29,10 @@ use smg::{
     worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
 };
 use smg_grpc_client::tokenspeed_scheduler::tokenspeed_proto as ts;
-use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
+use tokio::{net::TcpListener, task::JoinHandle};
 use validator::Validate;
 
+use super::{events, read, tokens};
 use crate::{common, scripted_tokenizer, scripted_worker};
 
 /// A model id under the profile that reads tools declared on system and developer messages;
@@ -53,25 +50,6 @@ const OUTPUT: &str = concat!(
     "<|close|>tools<|sep|>",
     "<|im_end|>",
 );
-
-/// Model output as tokens: each `<|...|>` alone, other text four characters at a time.
-fn tokens(output: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut rest = output;
-    while !rest.is_empty() {
-        let len = if rest.starts_with("<|") {
-            rest.find("|>").map_or(rest.len(), |end| end + 2)
-        } else {
-            let special = rest.find("<|").unwrap_or(rest.len());
-            rest.char_indices()
-                .nth(4)
-                .map_or(special, |(at, _)| at.min(special))
-        };
-        tokens.push(rest[..len].to_string());
-        rest = &rest[len..];
-    }
-    tokens
-}
 
 struct Gateway {
     router: Box<dyn RouterTrait>,
@@ -163,28 +141,6 @@ async fn serve() -> Gateway {
 
 fn tenant() -> TenantRequestMeta {
     TenantRequestMeta::new(TenantKey::new("test-tenant"))
-}
-
-#[expect(clippy::unwrap_used, clippy::expect_used, reason = "test helper")]
-async fn read(response: impl std::future::Future<Output = Response>) -> String {
-    let response = timeout(Duration::from_secs(30), response)
-        .await
-        .expect("request should finish");
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-    let body = String::from_utf8(bytes.to_vec()).unwrap();
-    assert_eq!(status, StatusCode::OK, "{body}");
-    body
-}
-
-/// JSON payloads of an SSE body.
-#[expect(clippy::unwrap_used, reason = "test helper")]
-fn events(body: &str) -> Vec<Value> {
-    body.lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter(|data| *data != "[DONE]")
-        .map(|data| serde_json::from_str(data).unwrap())
-        .collect()
 }
 
 fn tool(name: &str) -> Value {

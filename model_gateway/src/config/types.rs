@@ -739,7 +739,11 @@ pub enum AccessLogField {
     /// end; a body that ended early (a client that left, a stream that
     /// failed) has the bytes out so far on that line as
     /// `response_bytes_sent`, a key of its own, so the length is never
-    /// recorded twice.
+    /// recorded twice. A streamed body's end line is written after the
+    /// output was read, so it also carries what the request learned while
+    /// it streamed: the `symphony.*` fields of an output the Symphony reader
+    /// did not read clean, which the finish line of a stream goes out too
+    /// early to carry.
     ResponseBytes,
     /// The worker the request was routed to.
     Worker,
@@ -1002,11 +1006,10 @@ pub enum RoutingMode {
     Gemini { worker_urls: Vec<String> },
 }
 
-/// The derive, with every worker URL masked like [`Endpoint::redacted`]: the
-/// mode is in the gateway's start-up lines, and the derive would have written
-/// the configured URLs with their credentials.
-impl std::fmt::Debug for RoutingMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl RoutingMode {
+    /// This mode with every worker URL masked like [`Endpoint::redacted`]:
+    /// what the start-up lines and the configuration view show.
+    pub fn redacted(&self) -> Self {
         fn masked(urls: &[String]) -> Vec<String> {
             urls.iter().map(|url| Endpoint::redacted_str(url)).collect()
         }
@@ -1016,9 +1019,57 @@ impl std::fmt::Debug for RoutingMode {
                 .collect()
         }
         match self {
+            RoutingMode::Regular { worker_urls } => RoutingMode::Regular {
+                worker_urls: masked(worker_urls),
+            },
+            RoutingMode::PrefillDecode {
+                prefill_urls,
+                decode_urls,
+                prefill_policy,
+                decode_policy,
+            } => RoutingMode::PrefillDecode {
+                prefill_urls: masked_with_ports(prefill_urls),
+                decode_urls: masked(decode_urls),
+                prefill_policy: prefill_policy.clone(),
+                decode_policy: decode_policy.clone(),
+            },
+            RoutingMode::EncodePrefillDecode {
+                encode_urls,
+                prefill_urls,
+                decode_urls,
+                encode_policy,
+                prefill_policy,
+                decode_policy,
+            } => RoutingMode::EncodePrefillDecode {
+                encode_urls: masked_with_ports(encode_urls),
+                prefill_urls: masked_with_ports(prefill_urls),
+                decode_urls: masked(decode_urls),
+                encode_policy: encode_policy.clone(),
+                prefill_policy: prefill_policy.clone(),
+                decode_policy: decode_policy.clone(),
+            },
+            RoutingMode::OpenAI { worker_urls } => RoutingMode::OpenAI {
+                worker_urls: masked(worker_urls),
+            },
+            RoutingMode::Anthropic { worker_urls } => RoutingMode::Anthropic {
+                worker_urls: masked(worker_urls),
+            },
+            RoutingMode::Gemini { worker_urls } => RoutingMode::Gemini {
+                worker_urls: masked(worker_urls),
+            },
+        }
+    }
+}
+
+/// The derive's shape over [`RoutingMode::redacted`]: the mode is in the
+/// gateway's start-up lines, and the derive would have written the configured
+/// URLs with their credentials.
+impl std::fmt::Debug for RoutingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.redacted() {
             RoutingMode::Regular { worker_urls } => f
                 .debug_struct("Regular")
-                .field("worker_urls", &masked(worker_urls))
+                .field("worker_urls", &worker_urls)
                 .finish(),
             RoutingMode::PrefillDecode {
                 prefill_urls,
@@ -1027,10 +1078,10 @@ impl std::fmt::Debug for RoutingMode {
                 decode_policy,
             } => f
                 .debug_struct("PrefillDecode")
-                .field("prefill_urls", &masked_with_ports(prefill_urls))
-                .field("decode_urls", &masked(decode_urls))
-                .field("prefill_policy", prefill_policy)
-                .field("decode_policy", decode_policy)
+                .field("prefill_urls", &prefill_urls)
+                .field("decode_urls", &decode_urls)
+                .field("prefill_policy", &prefill_policy)
+                .field("decode_policy", &decode_policy)
                 .finish(),
             RoutingMode::EncodePrefillDecode {
                 encode_urls,
@@ -1041,24 +1092,24 @@ impl std::fmt::Debug for RoutingMode {
                 decode_policy,
             } => f
                 .debug_struct("EncodePrefillDecode")
-                .field("encode_urls", &masked_with_ports(encode_urls))
-                .field("prefill_urls", &masked_with_ports(prefill_urls))
-                .field("decode_urls", &masked(decode_urls))
-                .field("encode_policy", encode_policy)
-                .field("prefill_policy", prefill_policy)
-                .field("decode_policy", decode_policy)
+                .field("encode_urls", &encode_urls)
+                .field("prefill_urls", &prefill_urls)
+                .field("decode_urls", &decode_urls)
+                .field("encode_policy", &encode_policy)
+                .field("prefill_policy", &prefill_policy)
+                .field("decode_policy", &decode_policy)
                 .finish(),
             RoutingMode::OpenAI { worker_urls } => f
                 .debug_struct("OpenAI")
-                .field("worker_urls", &masked(worker_urls))
+                .field("worker_urls", &worker_urls)
                 .finish(),
             RoutingMode::Anthropic { worker_urls } => f
                 .debug_struct("Anthropic")
-                .field("worker_urls", &masked(worker_urls))
+                .field("worker_urls", &worker_urls)
                 .finish(),
             RoutingMode::Gemini { worker_urls } => f
                 .debug_struct("Gemini")
-                .field("worker_urls", &masked(worker_urls))
+                .field("worker_urls", &worker_urls)
                 .finish(),
         }
     }
@@ -1460,7 +1511,11 @@ pub enum PolicyConfig {
     },
 
     /// Consistent hashing policy using hash ring for session affinity:
-    /// - X-SMG-Target-Worker: Direct routing to a specific worker by URL
+    /// - X-SMG-Target-Worker: Direct routing to a specific worker by its index
+    ///   (0-based) among the workers available when the request arrives; an
+    ///   index past them is answered as no available worker, except in a pool
+    ///   with every worker vetoed, which the all-vetoed fallback serves without
+    ///   reading the header
     /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
     /// - Provides O(log n) lookup with minimal redistribution (~1/N keys) on topology change
     #[serde(rename = "consistent_hashing")]

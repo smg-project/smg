@@ -617,6 +617,67 @@ fn array_and_map_layouts_decode_alike() {
 }
 
 #[test]
+fn a_group_mask_after_the_layouts_last_slot_is_forwarded() {
+    // A publisher that reports a boundary once for every group appends the
+    // mask after the reference layout's last slot: the sixteenth of a store,
+    // the seventh of a removal. It rides through to the gateway beside
+    // group_idx, which names the lowest group the event is about; a map
+    // layout carries it under its name.
+    let array = json!([
+        1700000000.5,
+        [
+            [
+                "BlockStored",
+                [1, 2],
+                7,
+                [1, 2, 3, 4, 5, 6, 7, 8],
+                4,
+                null,
+                "GPU",
+                null,
+                null,
+                0,
+                "full_attention",
+                null,
+                null,
+                null,
+                null,
+                3
+            ],
+            ["BlockRemoved", [1], "GPU", 0, null, null, 2],
+        ],
+        0
+    ]);
+    let map = one(vec![
+        with(
+            with(
+                store(&[1, 2], Some(7), &[1, 2, 3, 4, 5, 6, 7, 8]),
+                "group_idx",
+                json!(0),
+            ),
+            "group_mask",
+            json!(3),
+        ),
+        with(
+            with(remove(&[1]), "group_idx", json!(0)),
+            "group_mask",
+            json!(2),
+        ),
+    ]);
+    let (from_array, _) = normalize_all(vec![array]);
+    let (from_map, _) = normalize_all(vec![map]);
+    assert_eq!(from_array, from_map);
+    let first = stored(&from_array[0].events[0]);
+    assert_eq!(first.group_idx, Some(0));
+    assert_eq!(first.group_mask, Some(3));
+    assert_eq!(removed(&from_array[0].events[1]).group_mask, Some(2));
+
+    // A publisher that reports each group on its own carries no mask.
+    let (plain, _) = normalize_all(vec![one(vec![store(&[1], None, &[1, 2, 3, 4])])]);
+    assert_eq!(stored(&plain[0].events[0]).group_mask, None);
+}
+
+#[test]
 fn legacy_arrays_keep_their_trailing_slots_in_order() {
     // ownership is the removal's sixth slot and must gate the event even
     // when locality (the fifth) is set.

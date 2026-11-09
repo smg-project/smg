@@ -21,6 +21,8 @@ pub(crate) mod spec;
 pub(crate) mod test_engine;
 #[cfg(test)]
 pub(crate) mod testing;
+#[cfg(any(test, feature = "test-util"))]
+pub mod tokenizer_cache;
 pub mod utils; // Used by routers/http and bindings/golang
 pub mod zmq_client; // ZMQ backend adapter behind the vLLM client surface
 

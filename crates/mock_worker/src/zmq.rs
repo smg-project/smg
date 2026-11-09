@@ -3,14 +3,16 @@
 //! the HTTP/gRPC workers (which bind and are dialed by the gateway), a ZMQ mock
 //! engine *dials* the frontend's `ipc://` handshake address, then registers,
 //! receives `EngineCoreRequest`s, and pushes `EngineCoreOutputs` — driven by the
-//! same continuous-batching [`Engine`] simulator the other protocols use.
+//! same continuous-batching [`Engine`] simulator the other protocols use. With
+//! `--zmq-lockstep` the ranks of one process step as one data-parallel group
+//! and play the engine side of the wave protocol (`LockstepGroup`).
 
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     future::{pending, Future},
     pin::pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock, PoisonError,
     },
     time::Duration,
@@ -19,21 +21,23 @@ use std::{
 use engine_zmq_client::{
     codec::OpaqueValue,
     mock_engine::{
-        connect_to_frontend, default_ready_response, wait_for_endpoint, EngineInbound,
-        MockEngineOutput,
+        default_ready_response, hello_in_group, wait_for_endpoint, EngineInbound, MockEngineOutput,
     },
     protocol::vllm::{
         logprobs::{Logprobs, PositionLogprobs, TokenLogprob},
         output::{
-            EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
-            StopReason, UtilityCallOutput, UtilityOutput,
+            DpControlMessage, DpControlOutput, EngineCoreFinishReason, EngineCoreOutput,
+            EngineCoreOutputs, RequestBatchOutputs, StopReason, UtilityCallOutput, UtilityOutput,
         },
         stats::{PrefillStats, SchedulerStats},
     },
     EngineId, Error,
 };
 use tokio::{
-    sync::mpsc,
+    sync::{
+        mpsc::{self, error::TryRecvError},
+        watch,
+    },
     task::{AbortHandle, JoinSet},
     time::Instant,
 };
@@ -63,13 +67,18 @@ const OUTPUT_LINGER: Duration = Duration::from_secs(1);
 const DIAL_ROUNDS: u32 = 3;
 
 /// What a rank has pushed on its output socket: the messages that carried
-/// request outputs and the outputs in them (a utility reply is neither). The
-/// admin API reads them (`GET /admin/zmq/{worker}`), where a test tells a
-/// step of many outputs from one message per token.
+/// request outputs and the outputs in them (a utility reply is neither); and,
+/// for a rank of a lockstep group, its side of the wave protocol: the waves
+/// it parked on, the wave starts it accepted and its current wave. The admin
+/// API reads them (`GET /admin/zmq/{worker}`), where a test tells a step of
+/// many outputs from one message per token, and a park from a wake.
 #[derive(Default)]
 pub struct OutputCounts {
     batch_messages: AtomicU64,
     outputs: AtomicU64,
+    parks: AtomicU64,
+    wakes: AtomicU64,
+    wave: AtomicU64,
 }
 
 impl OutputCounts {
@@ -82,11 +91,33 @@ impl OutputCounts {
         }
     }
 
+    /// The rank parked on a drained wave and moved on to `next`.
+    fn parked(&self, next: u64) {
+        self.parks.fetch_add(1, Ordering::Relaxed);
+        self.wave.store(next, Ordering::Relaxed);
+    }
+
+    /// The rank accepted the start of `wave`.
+    fn woken(&self, wave: u64) {
+        self.wakes.fetch_add(1, Ordering::Relaxed);
+        self.wave.store(wave, Ordering::Relaxed);
+    }
+
     /// The messages that carried request outputs, and the outputs in them.
     pub fn read(&self) -> (u64, u64) {
         (
             self.batch_messages.load(Ordering::Relaxed),
             self.outputs.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The waves the rank parked on, the wave starts it accepted and its
+    /// current wave; zero on an independent rank.
+    pub fn waves(&self) -> (u64, u64, u64) {
+        (
+            self.parks.load(Ordering::Relaxed),
+            self.wakes.load(Ordering::Relaxed),
+            self.wave.load(Ordering::Relaxed),
         )
     }
 }
@@ -112,6 +143,245 @@ pub fn rank_output_counts(name: &str) -> Option<Arc<OutputCounts>> {
         .unwrap_or_else(PoisonError::into_inner)
         .get(name)
         .cloned()
+}
+
+/// The ranks of one process that step as one data-parallel group
+/// (`--zmq-lockstep`), the engine side of the wave protocol the gateway's
+/// connector drives. Every rank joins one sync per step, as the ranks of an
+/// engine group all-reduce every step, and a rank that is not stepping (it
+/// parked) holds the others at the sync until a wave start brings it back,
+/// as the collective holds an engine whose peers are asleep. A sync in which
+/// a rank has work runs the step; one in which none has parks the group:
+/// every rank reports the drained wave and moves its clock past it.
+struct LockstepGroup {
+    state: Mutex<SyncState>,
+    /// The number of completed syncs, for the ranks waiting on one.
+    completed: watch::Sender<u64>,
+}
+
+struct SyncState {
+    /// The ranks the group was made for.
+    size: usize,
+    /// The ranks still in the group; a rank that ends leaves.
+    members: usize,
+    arrived: usize,
+    with_work: usize,
+    /// The sync being gathered, and the outcome of the last one.
+    round: u64,
+    outcome: Step,
+}
+
+/// What a sync decided for the step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// A rank has work: the step runs on every rank, dummies on the idle ones.
+    Run,
+    /// No rank has work: the group parks on the drained wave.
+    Park,
+}
+
+impl LockstepGroup {
+    fn new(size: usize) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(SyncState {
+                size,
+                members: size,
+                arrived: 0,
+                with_work: 0,
+                round: 0,
+                outcome: Step::Park,
+            }),
+            completed: watch::Sender::new(0),
+        })
+    }
+
+    /// Join the step's sync, saying whether this rank has work, and wait for
+    /// the whole group: the step runs when any rank has work, the group parks
+    /// otherwise.
+    async fn sync(&self, has_work: bool) -> Step {
+        let mut completed = self.completed.subscribe();
+        let round = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.arrived += 1;
+            if has_work {
+                state.with_work += 1;
+            }
+            if state.arrived >= state.members {
+                return self.complete(&mut state);
+            }
+            state.round
+        };
+        while *completed.borrow_and_update() <= round {
+            if completed.changed().await.is_err() {
+                return Step::Park;
+            }
+        }
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .outcome
+    }
+
+    /// Whether a rank has left. A group that is ending takes no new rank: a
+    /// rank set started at the same address while the last one ends gets a
+    /// group of its own instead of a seat among the leavers.
+    fn ending(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.members < state.size
+    }
+
+    /// A rank ended: the group's syncs no longer wait for it. Returns whether
+    /// it was the last one, which drains the group.
+    fn leave(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.members = state.members.saturating_sub(1);
+        if state.members > 0 && state.arrived >= state.members {
+            self.complete(&mut state);
+        }
+        state.members == 0
+    }
+
+    /// Every member is in: decide the step and release the waiting ranks.
+    fn complete(&self, state: &mut SyncState) -> Step {
+        state.outcome = if state.with_work > 0 {
+            Step::Run
+        } else {
+            Step::Park
+        };
+        state.round += 1;
+        state.arrived = 0;
+        state.with_work = 0;
+        self.completed.send_replace(state.round);
+        state.outcome
+    }
+}
+
+/// A rank's membership of its group, given up when the rank's writer ends.
+/// The last membership to go drains the group and takes it out of the
+/// registry.
+struct Membership {
+    group: Arc<LockstepGroup>,
+    handshake_address: String,
+}
+
+impl Drop for Membership {
+    fn drop(&mut self) {
+        if self.group.leave() {
+            forget_lockstep_group(&self.handshake_address, &self.group);
+        }
+    }
+}
+
+static LOCKSTEP_GROUPS: OnceLock<Mutex<HashMap<String, Arc<LockstepGroup>>>> = OnceLock::new();
+
+fn lockstep_groups() -> &'static Mutex<HashMap<String, Arc<LockstepGroup>>> {
+    LOCKSTEP_GROUPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The lockstep group of the `size` ranks of this process that dial
+/// `handshake_address`: the one under that address while none of its ranks
+/// has left, else a new one in its place.
+fn lockstep_group(handshake_address: &str, size: usize) -> Arc<LockstepGroup> {
+    let mut groups = lockstep_groups()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(group) = groups.get(handshake_address) {
+        if !group.ending() {
+            return group.clone();
+        }
+    }
+    let group = LockstepGroup::new(size);
+    groups.insert(handshake_address.to_string(), group.clone());
+    group
+}
+
+/// Forget a drained `group`, unless a newer one has taken its address.
+fn forget_lockstep_group(handshake_address: &str, group: &Arc<LockstepGroup>) {
+    let mut groups = lockstep_groups()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if groups
+        .get(handshake_address)
+        .is_some_and(|current| Arc::ptr_eq(current, group))
+    {
+        groups.remove(handshake_address);
+    }
+}
+
+/// A rank's side of its lockstep group, in the hands of its writer: the
+/// group, the rank's wave clock and the count of its unfinished requests.
+struct Lockstep {
+    group: Arc<LockstepGroup>,
+    _membership: Membership,
+    wave: u64,
+    unfinished: Arc<AtomicUsize>,
+}
+
+/// A request among the rank's unfinished ones, from the moment its add
+/// reaches the rank's loop until its forwarder ends (its last output in the
+/// writer's channel by then).
+struct Unfinished(Arc<AtomicUsize>);
+
+impl Unfinished {
+    fn enter(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count.clone())
+    }
+}
+
+impl Drop for Unfinished {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// When an add reaches the rank's loop: as it is read, or after the hand-over
+/// delay of `--zmq-add-delay-ms`, as an engine's input thread decodes and
+/// preprocesses a request before its loop sees it (a wave start it hands
+/// over at once). Until then the request is not among the rank's unfinished
+/// ones, so a group with nothing else to do parks with the add on its way:
+/// the drain racing the submit, which the connector's re-wake answers.
+enum HandOver {
+    Now(Unfinished),
+    After(Duration, Arc<AtomicUsize>),
+}
+
+impl HandOver {
+    fn new(delay: Duration, unfinished: &Arc<AtomicUsize>) -> Self {
+        if delay.is_zero() {
+            Self::Now(Unfinished::enter(unfinished))
+        } else {
+            Self::After(delay, unfinished.clone())
+        }
+    }
+
+    /// The add in the loop's hands: the request is unfinished from here on.
+    async fn landed(self) -> Unfinished {
+        match self {
+            Self::Now(unfinished) => unfinished,
+            Self::After(delay, count) => {
+                tokio::time::sleep(delay).await;
+                Unfinished::enter(&count)
+            }
+        }
+    }
+}
+
+/// Whether a wave start is for this rank. A frontend may name the one rank it
+/// excludes, the rank that started the wave on its own add; every other rank
+/// wakes. The gateway's connector wakes every rank and names none, so the rule
+/// is pinned here as a unit.
+fn wave_start_is_for(engine_index: u32, exclude_engine_index: Option<u32>) -> bool {
+    exclude_engine_index != Some(engine_index)
+}
+
+/// The rank's report of a drained wave (vLLM `wave_complete`).
+fn wave_complete(engine_index: u32, wave: u64) -> EngineCoreOutputs {
+    EngineCoreOutputs::DpControl(DpControlOutput {
+        engine_index,
+        timestamp: 0.0,
+        control: DpControlMessage::WaveComplete(wave),
+    })
 }
 
 /// Run one mock ZMQ EngineCore rank: connect to `handshake_address`, then serve
@@ -141,6 +411,13 @@ pub async fn serve_until(
     let mut ready = default_ready_response();
     ready.data_parallel_rank = engine_index;
     ready.instance_id = format!("mock-zmq-{engine_index}");
+    // A lockstep group says its size, in its HELLO (a frontend not told the
+    // count awaits the whole group) and in the ready response (what makes the
+    // connector wake the group); independent ranks are groups of one.
+    let group_size = cfg.zmq_lockstep.then(|| usize::from(cfg.zmq_count));
+    if let Some(size) = group_size {
+        ready.data_parallel_size = size as u64;
+    }
 
     // The frontend's handshake endpoint, waited for in rounds: a round that
     // ends without it is logged, the last one ends the rank; a stop during
@@ -180,11 +457,16 @@ pub async fn serve_until(
             );
             return;
         }
-        connected = connect_to_frontend(
-            &handshake_address,
-            EngineId::from_engine_index(engine_index),
-            ready,
-        ) => match connected {
+        connected = async {
+            hello_in_group(
+                &handshake_address,
+                EngineId::from_engine_index(engine_index),
+                group_size,
+            )
+            .await?
+            .ready(ready)
+            .await
+        } => match connected {
             Ok(mock) => mock,
             Err(error) => {
                 tracing::error!("zmq engine {engine_index} handshake failed: {error}");
@@ -222,8 +504,27 @@ pub async fn serve_until(
     // the frontend's abort drops them (an answer the engine itself ends with
     // `Abort` keeps its tokens, as without a period).
     let (abort_tx, mut abort_rx) = mpsc::unbounded_channel::<(String, EngineCoreOutputs)>();
+    // The wave starts the loop reads, for the writer, which steps the rank;
+    // only a rank of a lockstep group keeps the sender.
+    let (wake_tx, mut wakes) = mpsc::unbounded_channel::<u64>();
+    let wake_tx = cfg.zmq_lockstep.then_some(wake_tx);
     let step = (cfg.zmq_step_ms > 0).then(|| Duration::from_millis(cfg.zmq_step_ms));
     let counts = output_counts(&name);
+    // The rank's unfinished requests: its vote at the group's sync.
+    let unfinished = Arc::new(AtomicUsize::new(0));
+    let add_delay = Duration::from_millis(cfg.zmq_add_delay_ms);
+    let mut lockstep = group_size.map(|size| {
+        let group = lockstep_group(&handshake_address, size);
+        Lockstep {
+            _membership: Membership {
+                group: group.clone(),
+                handshake_address: handshake_address.clone(),
+            },
+            group,
+            wave: 0,
+            unfinished: unfinished.clone(),
+        }
+    });
     #[expect(
         clippy::disallowed_methods,
         reason = "the writer ends with the output and abort channels; a drain awaits it"
@@ -233,7 +534,10 @@ pub async fn serve_until(
         // With a period, an engine's step clock: what the forwarders push
         // waits in the step queue and every period one message goes out with
         // the next output of every request that has one; a utility reply
-        // goes as it came. Without one, every message goes as it came.
+        // goes as it came. Without one, every message goes as it came. A
+        // rank of a lockstep group steps at the period too, but the group's
+        // sync decides every step first: the step's outputs go out when a
+        // rank of the group has work, and an idle group parks instead.
         let mut steps = step.map(|period| (StepQueue::default(), period));
         let mut next_step_at: Option<Instant> = None;
         let (mut outputs_open, mut aborts_open) = (true, true);
@@ -250,15 +554,103 @@ pub async fn serve_until(
             tokio::select! {
                 biased;
                 () = due => {
-                    if let Some((queue, period)) = steps.as_mut() {
-                        match queue.next_step() {
-                            Some(message) => {
-                                if !push(&mut output, &counts, &message).await {
-                                    return;
+                    let Some((queue, period)) = steps.as_mut() else {
+                        continue;
+                    };
+                    if let Some(group) = lockstep.as_mut() {
+                        // The step's sync. The count of forwards in flight is
+                        // read before the channels are drained: a forwarder
+                        // sends its terminal and only then lets the count go,
+                        // so a count of zero means the terminal, if any, is
+                        // already in a channel for the drain below; then the
+                        // group decides.
+                        let unfinished = group.unfinished.load(Ordering::SeqCst) > 0;
+                        loop {
+                            match out_rx.try_recv() {
+                                Ok(EngineCoreOutputs::RequestBatch(batch)) => queue.push(batch),
+                                Ok(message) => {
+                                    if !push(&mut output, &counts, &message).await {
+                                        return;
+                                    }
                                 }
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Disconnected) => {
+                                    outputs_open = false;
+                                    break;
+                                }
+                            }
+                        }
+                        loop {
+                            match abort_rx.try_recv() {
+                                Ok((request_id, EngineCoreOutputs::RequestBatch(batch))) => {
+                                    queue.abort(&request_id);
+                                    queue.push(batch);
+                                }
+                                Ok((request_id, other)) => {
+                                    queue.abort(&request_id);
+                                    if !push(&mut output, &counts, &other).await {
+                                        return;
+                                    }
+                                }
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Disconnected) => {
+                                    aborts_open = false;
+                                    break;
+                                }
+                            }
+                        }
+                        let has_work = unfinished || !queue.is_empty();
+                        if group.group.sync(has_work).await == Step::Park {
+                            // The group drained the wave: report it, move the
+                            // clock past it and stop stepping until a wave
+                            // start or an add of this rank's own.
+                            let drained = group.wave;
+                            group.wave += 1;
+                            counts.parked(group.wave);
+                            let report = wave_complete(engine_index, drained);
+                            if !push(&mut output, &counts, &report).await {
+                                return;
+                            }
+                            next_step_at = None;
+                            continue;
+                        }
+                        // The step: its outputs, or a dummy step with none;
+                        // the next sync one period on.
+                        if let Some(message) = queue.next_step() {
+                            if !push(&mut output, &counts, &message).await {
+                                return;
+                            }
+                        }
+                        next_step_at = Some(Instant::now() + *period);
+                        continue;
+                    }
+                    match queue.next_step() {
+                        Some(message) => {
+                            if !push(&mut output, &counts, &message).await {
+                                return;
+                            }
+                            next_step_at = Some(Instant::now() + *period);
+                        }
+                        None => next_step_at = None,
+                    }
+                }
+                Some(wave) = wakes.recv(), if lockstep.is_some() => {
+                    // A start of a wave at or above the rank's own is obeyed:
+                    // the clock moves to it and a parked rank steps again (a
+                    // dummy step first, as an engine woken with nothing to
+                    // run); a stale one is dropped, as an engine drops it.
+                    if let (Some(group), Some((_, period))) = (lockstep.as_mut(), steps.as_ref()) {
+                        if wave >= group.wave {
+                            group.wave = wave;
+                            counts.woken(wave);
+                            if next_step_at.is_none() {
                                 next_step_at = Some(Instant::now() + *period);
                             }
-                            None => next_step_at = None,
+                        } else {
+                            tracing::debug!(
+                                "zmq engine {engine_index} drops the start of wave {wave}, below its own {}",
+                                group.wave
+                            );
                         }
                     }
                 }
@@ -300,6 +692,9 @@ pub async fn serve_until(
                 },
             }
         }
+        // The rank leaves its group before the linger, so the group's next
+        // sync does not wait a second for it.
+        drop(lockstep);
         tokio::time::sleep(OUTPUT_LINGER).await;
         drop(output);
     });
@@ -363,6 +758,9 @@ pub async fn serve_until(
                     .unwrap_or(cfg.output_tokens);
 
                 let in_flight = InFlight::enter();
+                // When the add reaches the rank's loop: now, or after the
+                // hand-over delay ([`HandOver`]).
+                let hand_over = HandOver::new(add_delay, &unfinished);
                 // A scripted answer, ahead of either engine mode: the rank's
                 // queue or the prompt's key decides ([`crate::script`]).
                 let scripted = match script::take_ids(&cfg, &name, &prompt) {
@@ -396,7 +794,7 @@ pub async fn serve_until(
                         .as_ref()
                         .and_then(|params| params.logprobs)
                         .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
-                    let forwarder = forwarders.spawn(scripted_request(
+                    let scripted = scripted_request(
                         request_id.clone(),
                         engine_index,
                         prompt.len(),
@@ -405,37 +803,61 @@ pub async fn serve_until(
                         out_tx.clone(),
                         engine.clone(),
                         in_flight,
-                    ));
+                    );
+                    let forwarder = forwarders.spawn(async move {
+                        let _unfinished = hand_over.landed().await;
+                        scripted.await;
+                    });
                     inflight.insert(request_id, forwarder);
                     continue;
                 }
+                // The simulated or canned engine takes the request when the
+                // add lands: now, in the loop and in arrival order, as a loop
+                // hands its scheduler one add after another; or in the
+                // forwarder's task once a late add is in.
                 let (gen_tx, gen_rx) = mpsc::unbounded_channel::<GenEvent>();
-                match &engine {
-                    Some(engine) => engine.submit(NewRequest {
-                        request_id: request_id.clone(),
-                        prompt_token_ids: prompt,
-                        max_new,
-                        events: gen_tx,
-                    }),
-                    None => {
-                        let delay = cfg.gen_delay;
-                        let prefix = cfg.engine.output_prefix.clone();
-                        #[expect(
-                            clippy::disallowed_methods,
-                            reason = "canned producer self-terminates after Done"
-                        )]
-                        let _canned = tokio::spawn(canned_generate(gen_tx, max_new, delay, prefix));
+                let start = {
+                    let (engine, request_id) = (engine.clone(), request_id.clone());
+                    let (gen_delay, prefix) = (cfg.gen_delay, cfg.engine.output_prefix.clone());
+                    move || match &engine {
+                        Some(engine) => engine.submit(NewRequest {
+                            request_id,
+                            prompt_token_ids: prompt,
+                            max_new,
+                            events: gen_tx,
+                        }),
+                        None => {
+                            #[expect(
+                                clippy::disallowed_methods,
+                                reason = "canned producer self-terminates after Done"
+                            )]
+                            let _canned =
+                                tokio::spawn(canned_generate(gen_tx, max_new, gen_delay, prefix));
+                        }
                     }
-                }
-
-                let forwarder = forwarders.spawn(forward_request(
+                };
+                let forward = forward_request(
                     request_id.clone(),
                     engine_index,
                     gen_rx,
                     out_tx.clone(),
                     engine.clone(),
                     in_flight,
-                ));
+                );
+                let forwarder = match hand_over {
+                    HandOver::Now(unfinished) => {
+                        start();
+                        forwarders.spawn(async move {
+                            let _unfinished = unfinished;
+                            forward.await;
+                        })
+                    }
+                    late => forwarders.spawn(async move {
+                        let _unfinished = late.landed().await;
+                        start();
+                        forward.await;
+                    }),
+                };
                 inflight.insert(request_id, forwarder);
             }
             Ok(EngineInbound::Abort(request_ids)) => {
@@ -453,11 +875,19 @@ pub async fn serve_until(
                     let _ = abort_tx.send((request_id, terminal));
                 }
             }
-            Ok(EngineInbound::StartDpWave { wave, .. }) => {
-                // The mock is a single independent engine, never a lockstep
-                // group, so it never pauses and has no wave to start.
-                tracing::debug!("zmq engine {engine_index} ignoring start of wave {wave}");
-            }
+            Ok(EngineInbound::StartDpWave {
+                wave,
+                exclude_engine_index,
+            }) => match &wake_tx {
+                // A rank of a lockstep group starts the wave unless it is the
+                // one excluded; the writer, which steps the rank, reads it.
+                Some(wake_tx) if wave_start_is_for(engine_index, exclude_engine_index) => {
+                    let _ = wake_tx.send(wave);
+                }
+                Some(_) => {}
+                // An independent engine never pauses and has no wave to start.
+                None => tracing::debug!("zmq engine {engine_index} ignoring start of wave {wave}"),
+            },
             Ok(EngineInbound::Utility(call)) => {
                 // A prefix-cache reset is acknowledged and leaves the simulated
                 // engine's cache as it is; no other EngineCore method exists here.
@@ -613,7 +1043,7 @@ async fn scripted_request(
         let batch = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index,
             outputs: vec![EngineCoreOutput {
-                request_id: request_id.clone(),
+                request_id: request_id.clone().into(),
                 new_token_ids: frame.ids,
                 new_logprobs,
                 finish_reason,
@@ -704,7 +1134,7 @@ fn token_batch(
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index,
         outputs: vec![EngineCoreOutput {
-            request_id,
+            request_id: request_id.into(),
             new_token_ids,
             finish_reason,
             ..Default::default()
@@ -764,12 +1194,13 @@ impl StepQueue {
         let finished = batch.finished_requests.unwrap_or_default();
         let mut named = BTreeSet::new();
         for output in batch.outputs {
-            let done = finished.contains(&output.request_id);
-            named.insert(output.request_id.clone());
-            self.queue_of(output.request_id.clone()).push_back(Pending {
-                output: Some(output),
-                finished: done,
-            });
+            let done = finished.contains(output.request_id.as_str());
+            named.insert(String::from(&output.request_id));
+            self.queue_of(String::from(&output.request_id))
+                .push_back(Pending {
+                    output: Some(output),
+                    finished: done,
+                });
         }
         for request_id in finished.into_iter().filter(|id| !named.contains(id)) {
             self.queue_of(request_id).push_back(Pending {
@@ -1230,5 +1661,263 @@ mod tests {
                 "rank {rank} answers with output_tokens tokens"
             );
         }
+    }
+
+    /// A lockstep group of two ranks, `start` and `start + 1`, stepping every
+    /// `step_ms` milliseconds with the add hand-over delayed by `add_delay_ms`,
+    /// and the frontend connected to it.
+    async fn lockstep_pair(
+        dir: &tempfile::TempDir,
+        start: u32,
+        step_ms: u64,
+        add_delay_ms: u64,
+    ) -> EngineCoreClient {
+        let endpoint = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (
+            endpoint("hs.sock"),
+            endpoint("in.sock"),
+            endpoint("out.sock"),
+        );
+        let cfg = Arc::new(Config {
+            zmq_count: 2,
+            zmq_start_index: start,
+            zmq_step_ms: step_ms,
+            zmq_lockstep: true,
+            zmq_add_delay_ms: add_delay_ms,
+            ..test_config()
+        });
+        for rank in start..start + 2 {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "serve loops until the test drops its handles"
+            )]
+            let _engine = tokio::spawn(serve(cfg.clone(), handshake.clone(), rank));
+        }
+        let transport = connect_handshake(&handshake, 2, &input, &output, Duration::from_secs(10))
+            .await
+            .expect("frontend handshake");
+        let client = EngineCoreClient::new(transport);
+        assert!(
+            client
+                .engines()
+                .iter()
+                .all(|engine| engine.ready_response.data_parallel_size == 2),
+            "a lockstep group advertises its size"
+        );
+        client
+    }
+
+    /// One prompt pinned to `rank`, streamed to its end within ten seconds;
+    /// the tokens it got.
+    async fn prompt(client: &EngineCoreClient, request_id: &str, rank: u32) -> usize {
+        let mut stream = client
+            .submit(EngineCoreRequest {
+                request_id: request_id.to_string(),
+                prompt_token_ids: Some(vec![1, 2, 3]),
+                data_parallel_rank: Some(rank),
+                ..Default::default()
+            })
+            .await
+            .expect("submit");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut tokens = 0;
+            while let Some(item) = stream.next().await {
+                let output = item.expect("output ok");
+                tokens += output.new_token_ids.len();
+                if output.finished() {
+                    return tokens;
+                }
+            }
+            panic!("{request_id}: the stream ended without a terminal output");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{request_id}: no answer in ten seconds, the group hangs"))
+    }
+
+    /// A rank's waves once it has parked `parks` times or more and every
+    /// wave start it accepted ended in a park: (parks, wakes, wave).
+    async fn at_rest(name: &str, parks: u64) -> (u64, u64, u64) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(waves) = rank_output_counts(name).map(|counts| counts.waves()) {
+                    if waves.0 >= parks && waves.0 == waves.1 {
+                        return waves;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{name} did not come to rest after {parks} park(s)"))
+    }
+
+    /// A lockstep group starts parked. A prompt to one rank wakes both (the
+    /// connector's one wave start each): the holder answers it while its
+    /// peer steps dummies, and once the answer is out the group parks again,
+    /// every rank reporting the drained wave. The next prompt, to the other
+    /// rank, does it once more at the next wave.
+    #[tokio::test]
+    async fn a_lockstep_group_wakes_for_a_prompt_and_parks_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = lockstep_pair(&dir, 10, 5, 0).await;
+
+        assert_eq!(prompt(&client, "first", 10).await, 4);
+        for name in ["zmq:10", "zmq:11"] {
+            assert_eq!(
+                at_rest(name, 1).await,
+                (1, 1, 2),
+                "{name} after the first prompt"
+            );
+        }
+
+        assert_eq!(prompt(&client, "second", 11).await, 4);
+        for name in ["zmq:10", "zmq:11"] {
+            assert_eq!(
+                at_rest(name, 2).await,
+                (2, 2, 4),
+                "{name} after the second prompt"
+            );
+        }
+    }
+
+    /// With the add's hand-over delayed past the first sync after the wake
+    /// (by a step and three quarters: well past the first sync, well before
+    /// the fourth, where the connector's three re-wakes per prompt run out),
+    /// the group parks with the add on its way (the drain racing the submit)
+    /// and the holder, once it reads the add, steps alone. The prompt is
+    /// answered because the connector wakes the group again: both ranks
+    /// count a second wave start and a second park.
+    #[tokio::test]
+    async fn a_prompt_whose_add_lands_after_the_park_is_served_through_the_rewake() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = lockstep_pair(&dir, 20, 200, 350).await;
+
+        assert_eq!(prompt(&client, "late", 20).await, 4);
+        for name in ["zmq:20", "zmq:21"] {
+            let (parks, wakes, _) = at_rest(name, 2).await;
+            assert!(
+                wakes >= 2,
+                "{name} accepted {wakes} wave start(s) for {parks} park(s): never woken again"
+            );
+        }
+    }
+
+    /// A wave start wakes every rank but the one the frontend excludes, the
+    /// rank that started the wave on its own add.
+    #[test]
+    fn a_wave_start_wakes_every_rank_but_the_excluded_one() {
+        assert!(wave_start_is_for(3, None));
+        assert!(wave_start_is_for(3, Some(4)));
+        assert!(!wave_start_is_for(3, Some(3)));
+    }
+
+    /// The group's sync: the step runs when any member has work, the group
+    /// parks when none has, and a member that left no longer holds the sync.
+    #[tokio::test]
+    async fn a_sync_runs_on_any_work_parks_an_idle_group_and_lets_a_leaver_go() {
+        let group = LockstepGroup::new(2);
+        assert_eq!(
+            tokio::join!(group.sync(true), group.sync(false)),
+            (Step::Run, Step::Run)
+        );
+        assert_eq!(
+            tokio::join!(group.sync(false), group.sync(false)),
+            (Step::Park, Step::Park)
+        );
+
+        // One member in, the other asleep: the sync holds.
+        let alone = {
+            let group = group.clone();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the task ends with the sync the test releases"
+            )]
+            tokio::spawn(async move { group.sync(true).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !alone.is_finished(),
+            "a sync completed without every member"
+        );
+
+        // The other member leaves: the sync completes for the one in it.
+        group.leave();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), alone)
+            .await
+            .expect("the leaver releases the sync")
+            .expect("the sync task ends");
+        assert_eq!(outcome, Step::Run);
+    }
+
+    /// A drained group leaves the registry: a rank set started at the same
+    /// address after the last one ended syncs among its own ranks.
+    #[tokio::test]
+    async fn a_rank_set_started_after_the_last_one_ended_gets_a_group_of_its_own() {
+        let address = "lockstep-registry-two-waves";
+        let first = lockstep_group(address, 2);
+        assert!(
+            Arc::ptr_eq(&first, &lockstep_group(address, 2)),
+            "one group per address"
+        );
+        let membership = |group: &Arc<LockstepGroup>| Membership {
+            group: group.clone(),
+            handshake_address: address.to_string(),
+        };
+        drop((membership(&first), membership(&first)));
+        assert!(
+            !lockstep_groups().lock().unwrap().contains_key(address),
+            "a drained group stays in the registry"
+        );
+
+        let second = lockstep_group(address, 2);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the new set inherited the drained group"
+        );
+        let alone = {
+            let group = second.clone();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the task ends with the sync the test releases"
+            )]
+            tokio::spawn(async move { group.sync(false).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !alone.is_finished(),
+            "a sync completed without every member of the new set"
+        );
+        assert_eq!(lockstep_group(address, 2).sync(false).await, Step::Park);
+        let outcome = tokio::time::timeout(Duration::from_secs(1), alone)
+            .await
+            .expect("the second rank releases the sync")
+            .expect("the sync task ends");
+        assert_eq!(outcome, Step::Park);
+    }
+
+    /// A group one of whose ranks has left takes no new rank: a set started
+    /// while the last one ends gets a group of its own, and the ending
+    /// group's last leave does not take the new group out of the registry.
+    #[tokio::test]
+    async fn a_rank_joining_while_the_last_set_ends_gets_a_group_of_its_own() {
+        let address = "lockstep-registry-overlapping-waves";
+        let old = lockstep_group(address, 2);
+        let membership = |group: &Arc<LockstepGroup>| Membership {
+            group: group.clone(),
+            handshake_address: address.to_string(),
+        };
+        let (first_rank, second_rank) = (membership(&old), membership(&old));
+        drop(first_rank);
+        let new = lockstep_group(address, 2);
+        assert!(
+            !Arc::ptr_eq(&old, &new),
+            "a rank joined a group that is ending"
+        );
+        drop(second_rank);
+        let current = lockstep_groups().lock().unwrap().get(address).cloned();
+        assert!(
+            current.is_some_and(|current| Arc::ptr_eq(&current, &new)),
+            "the ending group's last leave took the new group out of the registry"
+        );
     }
 }

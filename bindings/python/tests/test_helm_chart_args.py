@@ -889,6 +889,30 @@ def test_the_schema_says_what_the_concurrency_sentinels_do():
 
 
 @needs_helm
+def test_the_default_render_requires_the_native_jpeg_decoder():
+    """The default deployment passes ``--mm-turbojpeg require``: a gateway whose
+    image lacks libjpeg-turbo refuses to start, where the launcher's own default
+    decodes JPEGs with the pure-Rust fallback and only says so in a log line."""
+    _, documents = render()
+    assert launcher_args(router_container(documents)["args"]).mm_turbojpeg == "require"
+
+
+@needs_helm
+def test_the_turbojpeg_policy_reaches_the_launcher_as_given():
+    """``router.mmTurbojpeg: prefer`` is the fallback-tolerant setting a custom
+    image without the library needs."""
+    _, documents = render("router.mmTurbojpeg=prefer")
+    assert launcher_args(router_container(documents)["args"]).mm_turbojpeg == "prefer"
+
+
+@needs_helm
+def test_a_turbojpeg_policy_outside_the_two_names_is_refused_by_the_schema():
+    assert "router.mmTurbojpeg must be one of the following" in render_error(
+        "router.mmTurbojpeg=never"
+    )
+
+
+@needs_helm
 @pytest.mark.parametrize("settle", [None, 0, 5, 30])
 def test_shutdown_settle_window(settle):
     """Omit the optional window by default and preserve explicit values, including zero."""
@@ -900,3 +924,54 @@ def test_shutdown_settle_window(settle):
         assert flag not in args
     else:
         assert args[args.index(flag) + 1] == str(settle)
+
+
+def worker_container(documents: list[dict], name: str) -> dict:
+    """The engine container of the chart worker ``name``."""
+    (deployment,) = [
+        document
+        for document in documents
+        if document["kind"] == "Deployment" and document["metadata"]["name"] == f"smg-worker-{name}"
+    ]
+    return deployment["spec"]["template"]["spec"]["containers"][0]
+
+
+GRPC_WORKER_FORMS = {
+    # (engine, the port value given, the serving port the probe must name)
+    "vllm-default-port": ("vllm", None, 8000),
+    "sglang-default-port": ("sglang", None, 30000),
+    "vllm-explicit-port": ("vllm", 9100, 9100),
+    "sglang-explicit-port": ("sglang", 9200, 9200),
+}
+
+
+@needs_helm
+@pytest.mark.parametrize("form", sorted(GRPC_WORKER_FORMS))
+def test_a_grpc_worker_startup_probe_names_its_serving_port_as_an_integer(form):
+    """The gRPC probe takes a port number, never a name or a string: an edit that
+    quotes it or names it passes ``helm lint`` and fails only on the cluster."""
+    engine, port, serving = GRPC_WORKER_FORMS[form]
+    settings = [
+        "workers[0].name=engine",
+        f"workers[0].engine={engine}",
+        "workers[0].model=org/model",
+        "workers[0].image.tag=tag",
+        "workers[0].connectionMode=grpc",
+    ]
+    if port is not None:
+        settings.append(f"workers[0].port={port}")
+    container = worker_container(render(*settings)[1], "engine")
+    probe = container["startupProbe"]
+    assert "httpGet" not in probe
+    assert probe["grpc"]["port"] is not True and isinstance(probe["grpc"]["port"], int)
+    assert probe["grpc"]["port"] == serving
+    (serve,) = [p for p in container["ports"] if p["name"] == "serve"]
+    assert serve["containerPort"] == serving
+
+
+@needs_helm
+def test_an_http_worker_renders_no_grpc_probe():
+    container = worker_container(render(*WORKER)[1], "llama")
+    probe = container["startupProbe"]
+    assert "grpc" not in probe
+    assert probe["httpGet"] == {"path": "/health", "port": "serve"}

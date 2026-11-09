@@ -3,15 +3,17 @@
 //! prompt in a `oneof` the gateway always fills with token ids) and the
 //! core's frames shaped into its chunks and completions; its info (a struct
 //! of named fields, not a bag of server args: the width is
-//! `data_parallel_size`, a role is `kv_role` behind `kv_connector`), loads
-//! and KV-event subscription.
+//! `data_parallel_size`, a role is `kv_role` behind `kv_connector` and, for
+//! the encoder-cache handoff, `ec_role` behind `ec_connector`), loads and
+//! KV-event subscription. An encode worker answers the encoder's completion
+//! alone ([`encoder_completion`]).
 //! The admin fan-out's flush and profile RPCs are answered by the core, the
 //! same on every wire.
 
 use std::pin::Pin;
 
 use futures::{Stream, StreamExt};
-use serde_json::Value;
+use serde_json::{json, Value};
 use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
 use tonic::{Request, Response, Status};
 use vllm::{
@@ -20,7 +22,12 @@ use vllm::{
 };
 
 use super::{Frame, GenerateInput, LogProbs, MockScheduler, TokenizerStream};
-use crate::{config::Role, engine::KvEventStream, script::MatchedStop};
+use crate::{
+    config::{Config, Role},
+    drain::InFlight,
+    engine::KvEventStream,
+    script::MatchedStop,
+};
 
 pub(super) type Server = VllmEngineServer<MockScheduler>;
 type GenStream = Pin<Box<dyn Stream<Item = Result<vllm::GenerateResponse, Status>> + Send>>;
@@ -31,6 +38,19 @@ const SERVER_TYPE: &str = "vllm-grpc";
 /// that carries the mock's transport (`super::KV_TRANSPORT`), which the
 /// gateway reads the transport off.
 const KV_CONNECTOR: &str = "MooncakeConnector";
+/// The encoder-cache connector an encode worker and a prefill worker
+/// advertise on this wire: the pull connector, whose handles name the
+/// encoder's own address (`peer_host`, `peer_port`) and whose consumer
+/// advertises no destination list, so the gateway reserves nothing before
+/// the encode and validates the handles alone.
+const EC_CONNECTOR: &str = "ECCPUConnector";
+/// The media processor an encode worker advertises (`mm_processor`): the
+/// gateway forwards media references to a vLLM encoder that names one, and
+/// this worker turns each reference into a hash and a handle.
+const MOCK_PROCESSOR: &str = "mock";
+/// The reference schemes an encode worker takes (`mm_media_ref_schemes`):
+/// it fetches nothing, so any scheme the gateway forwards is fine.
+const MOCK_REF_SCHEMES: &str = "http,https,data";
 
 #[tonic::async_trait]
 impl VllmEngine for MockScheduler {
@@ -42,7 +62,32 @@ impl VllmEngine for MockScheduler {
         &self,
         request: Request<vllm::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        let req = request.into_inner();
+        let mut req = request.into_inner();
+        // An encode worker answers the encoder's completion alone: nothing
+        // reaches the core and no script is read, but the realistic engine's
+        // fault and admission hooks apply as to the prefill role, and the
+        // request counts in flight until its completion is out. The
+        // completion's own checks come first, as the prefill role checks its
+        // input before the hooks: a request sent to the wrong pool is refused
+        // without spending an armed fault.
+        if self.cfg.role == Some(Role::Encode) {
+            let in_flight = InFlight::enter_on(&self.in_flight);
+            let request_id = std::mem::take(&mut req.request_id);
+            let pin = req.data_parallel_rank;
+            let mut complete = encoder_completion(&self.cfg, self.port(), req)?;
+            let finish_error = self.admit_without_tokens(&request_id, pin).await?;
+            if finish_error {
+                if let Some(vllm::generate_response::Response::Complete(complete)) =
+                    complete.response.as_mut()
+                {
+                    complete.finish_reason = "error".to_string();
+                }
+            }
+            self.ops.record_encode();
+            let stream: GenStream =
+                Box::pin(in_flight.until_done(futures::stream::once(async move { Ok(complete) })));
+            return Ok(Response::new(stream));
+        }
         let (prompt_ids, rendered) = match req.input {
             Some(vllm::generate_request::Input::Tokenized(tokenized)) => {
                 (tokenized.input_ids, tokenized.original_text)
@@ -139,8 +184,13 @@ impl VllmEngine for MockScheduler {
             vocab_size: 32000,
             // On this wire the field is the servicer's own verdict, so the
             // gateway reads a `false` as one: a text-only mock, unless the
-            // admin API says otherwise.
-            supports_vision: self.overrides.info_bool("supports_vision").unwrap_or(false),
+            // admin API says otherwise. An encode worker is the vision side
+            // of its fleet: it takes the media, so it reads as vision-capable
+            // unless the admin API says otherwise.
+            supports_vision: self
+                .overrides
+                .info_bool("supports_vision")
+                .unwrap_or(self.cfg.role == Some(Role::Encode)),
             served_model_name: self.cfg.model_id.clone(),
             tokenizer_path: self.cfg.tokenizer_path.clone(),
             model_type: "mock".to_string(),
@@ -165,16 +215,40 @@ impl VllmEngine for MockScheduler {
             ..Default::default()
         };
         // A disaggregated worker advertises its role as this wire's servicer
-        // does: the connector of the KV handoff and its side of it. The
-        // rendezvous port is the operator's to tell the gateway, as for the
-        // engine.
+        // does: the connector of the KV handoff and its side of it (the
+        // prefill side produces, the decode side consumes), and the connector
+        // of the encoder-cache handoff and its side of it (an encode worker
+        // produces, a prefill worker consumes; a decode worker takes no
+        // part). The rendezvous port is the operator's to tell the gateway,
+        // as for the engine.
         if let Some(role) = self.cfg.role {
-            info.kv_connector = KV_CONNECTOR.to_string();
-            info.kv_role = match role {
-                Role::Prefill => "kv_producer",
-                Role::Decode => "kv_consumer",
+            let kv_role = match role {
+                Role::Prefill => Some("kv_producer"),
+                Role::Decode => Some("kv_consumer"),
+                Role::Encode => None,
+            };
+            if let Some(kv_role) = kv_role {
+                info.kv_connector = KV_CONNECTOR.to_string();
+                info.kv_role = kv_role.to_string();
             }
-            .to_string();
+            let ec_role = match role {
+                Role::Encode => Some("ec_producer"),
+                Role::Prefill => Some("ec_consumer"),
+                Role::Decode => None,
+            };
+            if let Some(ec_role) = ec_role {
+                info.supports_ec_transfer = true;
+                info.ec_connector = EC_CONNECTOR.to_string();
+                info.ec_role = ec_role.to_string();
+            }
+            // An encode worker processes the media references the gateway
+            // forwards to it (it names each one by a digest and hands out a
+            // handle), as an engine encoder with a worker-side processor
+            // does, so it advertises one and the schemes it takes.
+            if role == Role::Encode {
+                info.mm_processor = MOCK_PROCESSOR.to_string();
+                info.mm_media_ref_schemes = MOCK_REF_SCHEMES.to_string();
+            }
         }
         // The configured server args and the admin API's info patch land in
         // the fields they name.
@@ -287,6 +361,146 @@ fn logprobs(logprobs: LogProbs) -> vllm::OutputLogProbs {
     }
 }
 
+/// An encode worker's answer to a `Generate`: the encoder's token-less
+/// completion the gateway consumes (`finish_reason` stop, no output), with
+/// the media identity (the prompt ids as sent, one hash per media item under
+/// its placeholder) and one encoder-cache transfer handle per hash in the
+/// pull connector's shape (`peer_host`, `peer_port`, `size_bytes`). The
+/// hashes are the request's own for router-preprocessed batches, whose
+/// tensors the identity drops, and a digest of each reference's URL for
+/// media references, so a repeated image repeats its hash and its handle.
+/// A request without transfer parameters, or without a media item, is
+/// refused: the gateway sends such a request to a worker it did not select
+/// as an encoder.
+fn encoder_completion(
+    cfg: &Config,
+    port: u16,
+    req: vllm::GenerateRequest,
+) -> Result<vllm::GenerateResponse, Status> {
+    let params = req
+        .ec_transfer_params_json
+        .as_deref()
+        .filter(|params| !params.is_empty())
+        .ok_or_else(|| {
+            Status::invalid_argument(
+                "mock-worker: an encode worker takes requests with ec_transfer_params_json; one \
+                 without them was sent to the wrong pool",
+            )
+        })?;
+    let params: Value = serde_json::from_str(params).map_err(|e| {
+        Status::invalid_argument(format!(
+            "mock-worker: ec_transfer_params_json is not JSON: {e}"
+        ))
+    })?;
+    if !params.is_object() {
+        return Err(Status::invalid_argument(
+            "mock-worker: ec_transfer_params_json must be a JSON object",
+        ));
+    }
+    let prompt_token_ids = match req.input {
+        Some(vllm::generate_request::Input::Tokenized(tokenized)) => tokenized.input_ids,
+        Some(vllm::generate_request::Input::Text(_)) => {
+            return Err(Status::invalid_argument(
+                "mock-worker: this wire takes token ids, not a text prompt",
+            ));
+        }
+        None => Vec::new(),
+    };
+    let (mm_inputs, extra_mm_inputs) = match req.media_refs.filter(|refs| !refs.items.is_empty()) {
+        Some(refs) => {
+            let mm_hashes: Vec<String> = refs.items.iter().map(reference_hash).collect();
+            let mm_placeholders = (0..mm_hashes.len())
+                .map(|index| vllm::PlaceholderRange {
+                    offset: u32::try_from(index).unwrap_or(u32::MAX),
+                    length: 1,
+                })
+                .collect();
+            let batch = vllm::MultimodalInputs {
+                mm_hashes,
+                mm_placeholders,
+                modality: refs.items[0].modality,
+                ..Default::default()
+            };
+            (Some(batch), Vec::new())
+        }
+        None => (
+            req.mm_inputs.map(without_tensors),
+            req.extra_mm_inputs
+                .into_iter()
+                .map(without_tensors)
+                .collect(),
+        ),
+    };
+    let hashes: Vec<&String> = mm_inputs
+        .iter()
+        .chain(extra_mm_inputs.iter())
+        .flat_map(|batch| batch.mm_hashes.iter())
+        .collect();
+    if hashes.is_empty() {
+        return Err(Status::invalid_argument(
+            "mock-worker: an encode worker takes a request with a media item (media_refs, or \
+             mm_hashes on its multimodal inputs)",
+        ));
+    }
+    let handles: serde_json::Map<String, Value> = hashes
+        .iter()
+        .enumerate()
+        .map(|(index, hash)| {
+            (
+                (*hash).clone(),
+                json!({
+                    "peer_host": cfg.host,
+                    "peer_port": port,
+                    "size_bytes": 4096 * (index + 1),
+                }),
+            )
+        })
+        .collect();
+    let prompt_tokens = u32::try_from(prompt_token_ids.len()).unwrap_or(u32::MAX);
+    Ok(vllm::GenerateResponse {
+        response: Some(GenResp::Complete(vllm::GenerateComplete {
+            finish_reason: "stop".to_string(),
+            prompt_tokens,
+            media_identity: Some(vllm::MediaIdentity {
+                prompt_token_ids,
+                mm_inputs,
+                extra_mm_inputs,
+            }),
+            ec_transfer_params_json: Some(Value::Object(handles).to_string()),
+            ..Default::default()
+        })),
+    })
+}
+
+/// The hash an encode worker gives a media reference: a digest of its
+/// modality and URL (FNV-1a over the bytes), hex under a `mock-` prefix, the
+/// same for the same reference.
+fn reference_hash(item: &vllm::MediaRef) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in item
+        .modality
+        .to_le_bytes()
+        .iter()
+        .chain(item.url.as_bytes())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("mock-{hash:016x}")
+}
+
+/// A multimodal batch without its tensors: the hashes, placeholders, token id
+/// and modality a decode side reads, as a prefill side's identity carries them.
+fn without_tensors(batch: vllm::MultimodalInputs) -> vllm::MultimodalInputs {
+    vllm::MultimodalInputs {
+        im_token_id: batch.im_token_id,
+        mm_placeholders: batch.mm_placeholders,
+        mm_hashes: batch.mm_hashes,
+        modality: batch.modality,
+        ..Default::default()
+    }
+}
+
 /// Set the field of `info` that `key` names, from a configured server arg
 /// or an admin info patch: the keys the gateway reads off this wire's info,
 /// with the other wires' spellings of the width and the running window
@@ -303,10 +517,38 @@ fn set_field(info: &mut vllm::GetServerInfoResponse, key: &str, value: &Value) {
             .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
             .and_then(|number| i32::try_from(number).ok())
     };
+    let flag = || {
+        value
+            .as_bool()
+            .or_else(|| value.as_str().map(|text| text == "true"))
+            .unwrap_or(false)
+    };
     match key {
         "kv_connector" => info.kv_connector = text(),
         "kv_role" => info.kv_role = text(),
         "kv_engine_id" => info.kv_engine_id = text(),
+        "supports_ec_transfer" => info.supports_ec_transfer = flag(),
+        "ec_connector" => info.ec_connector = text(),
+        "ec_role" => info.ec_role = text(),
+        "ec_zmq_addrs" => {
+            info.ec_zmq_addrs = match value {
+                Value::Array(addrs) => addrs
+                    .iter()
+                    .map(|addr| {
+                        addr.as_str()
+                            .map_or_else(|| addr.to_string(), str::to_string)
+                    })
+                    .collect(),
+                other => other
+                    .as_str()
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|addr| !addr.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            }
+        }
         "shm_namespace_id" => info.shm_namespace_id = text(),
         "kv_cache_dtype" => info.kv_cache_dtype = text(),
         "attention_backend" => info.attention_backend = text(),
@@ -340,12 +582,7 @@ fn set_field(info: &mut vllm::GetServerInfoResponse, key: &str, value: &Value) {
                 info.mm_encoder_budget = budget;
             }
         }
-        "mm_device_do_normalize" => {
-            info.mm_device_do_normalize = value
-                .as_bool()
-                .or_else(|| value.as_str().map(|text| text == "true"))
-                .unwrap_or(false);
-        }
+        "mm_device_do_normalize" => info.mm_device_do_normalize = flag(),
         // The model info's, read there.
         "supports_vision" => {}
         other => tracing::warn!(
@@ -594,9 +831,11 @@ mod tests {
     }
 
     /// A prefill worker answers the prompt side's completion alone and
-    /// advertises its role as this wire's servicer does: the KV connector and
-    /// the producer side of the handoff; a decode worker the consumer side; a
-    /// regular worker neither.
+    /// advertises its roles as this wire's servicer does: the KV connector
+    /// and the producer side of that handoff, the encoder-cache connector and
+    /// the consumer side of that one; a decode worker the KV consumer side
+    /// alone; an encode worker the encoder-cache producer side alone; a
+    /// regular worker none of them.
     #[tokio::test]
     async fn the_roles_are_advertised_as_kv_role_behind_the_connector() {
         let (prefill, _stop) = MockScheduler::for_tests(
@@ -623,6 +862,15 @@ mod tests {
             (info.kv_connector.as_str(), info.kv_role.as_str()),
             (KV_CONNECTOR, "kv_producer")
         );
+        assert_eq!(
+            (
+                info.supports_ec_transfer,
+                info.ec_connector.as_str(),
+                info.ec_role.as_str()
+            ),
+            (true, EC_CONNECTOR, "ec_consumer"),
+            "a prefill worker consumes the encoder's cache"
+        );
         let (decode, _stop) = MockScheduler::for_tests(
             Config {
                 role: Some(Role::Decode),
@@ -636,6 +884,58 @@ mod tests {
             .expect("info")
             .into_inner();
         assert_eq!(info.kv_role, "kv_consumer");
+        assert!(
+            !info.supports_ec_transfer && info.ec_connector.is_empty() && info.ec_role.is_empty(),
+            "a decode worker takes no part in the encoder-cache handoff"
+        );
+        let (encode, _stop) = MockScheduler::for_tests(
+            Config {
+                role: Some(Role::Encode),
+                grpc_wire: SchedulerWire::Vllm,
+                ..Config::default()
+            },
+            65_210,
+        );
+        let info = encode
+            .get_server_info(Request::new(vllm::GetServerInfoRequest {}))
+            .await
+            .expect("info")
+            .into_inner();
+        assert_eq!(
+            (
+                info.supports_ec_transfer,
+                info.ec_connector.as_str(),
+                info.ec_role.as_str()
+            ),
+            (true, EC_CONNECTOR, "ec_producer")
+        );
+        assert!(
+            info.kv_connector.is_empty() && info.kv_role.is_empty(),
+            "an encode worker moves no KV cache"
+        );
+        assert_eq!(
+            (
+                info.mm_processor.as_str(),
+                info.mm_media_ref_schemes.as_str()
+            ),
+            (MOCK_PROCESSOR, MOCK_REF_SCHEMES),
+            "an encode worker takes the media references the gateway forwards"
+        );
+        let model = encode
+            .get_model_info(Request::new(vllm::GetModelInfoRequest {}))
+            .await
+            .expect("model info")
+            .into_inner();
+        assert!(
+            model.supports_vision,
+            "an encode worker is its fleet's vision side"
+        );
+        let model = prefill
+            .get_model_info(Request::new(vllm::GetModelInfoRequest {}))
+            .await
+            .expect("model info")
+            .into_inner();
+        assert!(!model.supports_vision, "the other roles stay text-only");
         let (regular, _stop) = MockScheduler::for_tests(Config::default(), 65_207);
         let info = regular
             .get_server_info(Request::new(vllm::GetServerInfoRequest {}))
@@ -643,6 +943,153 @@ mod tests {
             .expect("info")
             .into_inner();
         assert!(info.kv_connector.is_empty() && info.kv_role.is_empty());
+        assert!(!info.supports_ec_transfer && info.ec_role.is_empty());
+    }
+
+    /// An encode worker answers the encoder's completion alone, in the shape
+    /// the gateway's encode stage consumes: no output, `stop`, the prompt
+    /// ids as sent, one hash per media item under its placeholder, and one
+    /// pull-connector handle per hash naming this worker's address. A
+    /// reference's hash is a digest of the reference, so a repeated image
+    /// repeats it; a router-preprocessed batch keeps its own hashes and
+    /// loses its tensors. A request without transfer parameters or without
+    /// a media item is refused.
+    #[tokio::test]
+    async fn an_encode_worker_answers_the_encoder_completion_with_a_handle_per_item() {
+        let (encode, _stop) = MockScheduler::for_tests(
+            Config {
+                role: Some(Role::Encode),
+                grpc_wire: SchedulerWire::Vllm,
+                ..Config::default()
+            },
+            65_211,
+        );
+        let refs = |urls: &[&str]| vllm::MediaRefs {
+            items: urls
+                .iter()
+                .map(|url| vllm::MediaRef {
+                    modality: common::Modality::Image as i32,
+                    url: (*url).to_string(),
+                })
+                .collect(),
+        };
+        let handles_of = |complete: &vllm::GenerateComplete| -> serde_json::Map<String, Value> {
+            serde_json::from_str::<Value>(
+                complete
+                    .ec_transfer_params_json
+                    .as_deref()
+                    .expect("the handles"),
+            )
+            .expect("JSON")
+            .as_object()
+            .expect("an object")
+            .clone()
+        };
+
+        let mut req = request("vw-encode", &[1, 2, 3], false);
+        req.media_refs = Some(refs(&[
+            "https://x/a.png",
+            "https://x/b.png",
+            "https://x/a.png",
+        ]));
+        req.ec_transfer_params_json = Some("{}".to_string());
+        let frames = read_frames(&encode, req).await;
+        let [GenResp::Complete(complete)] = frames.as_slice() else {
+            panic!("not the encoder's completion alone: {frames:?}");
+        };
+        assert!(complete.output_ids.is_empty());
+        assert_eq!(
+            (complete.finish_reason.as_str(), complete.prompt_tokens),
+            ("stop", 3)
+        );
+        let identity = complete.media_identity.as_ref().expect("the identity");
+        assert_eq!(identity.prompt_token_ids, vec![1, 2, 3]);
+        let batch = identity.mm_inputs.as_ref().expect("one batch");
+        assert_eq!(batch.mm_hashes.len(), 3);
+        assert_eq!(
+            batch.mm_hashes[0], batch.mm_hashes[2],
+            "the same reference hashes the same"
+        );
+        assert_ne!(batch.mm_hashes[0], batch.mm_hashes[1]);
+        assert_eq!(
+            batch
+                .mm_placeholders
+                .iter()
+                .map(|range| (range.offset, range.length))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (1, 1), (2, 1)]
+        );
+        assert!(batch.pixel_values.is_none());
+        let handles = handles_of(complete);
+        assert_eq!(handles.len(), 2, "one handle per distinct hash");
+        for hash in &batch.mm_hashes {
+            let handle = &handles[hash];
+            assert_eq!(handle["peer_host"], "127.0.0.1");
+            assert_eq!(handle["peer_port"], 65_211);
+            assert!(handle["size_bytes"].as_u64().is_some_and(|size| size > 0));
+        }
+
+        // A router-preprocessed batch: its hashes and placeholders stay, its
+        // tensors go, the handles follow its hashes.
+        let mut req = request("vw-encode-pixels", &[4, 5], false);
+        req.mm_inputs = Some(vllm::MultimodalInputs {
+            pixel_values: Some(vllm::TensorData::default()),
+            mm_hashes: vec!["h1".to_string(), "h2".to_string()],
+            mm_placeholders: vec![
+                vllm::PlaceholderRange {
+                    offset: 0,
+                    length: 1,
+                },
+                vllm::PlaceholderRange {
+                    offset: 1,
+                    length: 1,
+                },
+            ],
+            ..Default::default()
+        });
+        req.ec_transfer_params_json = Some("{}".to_string());
+        let frames = read_frames(&encode, req).await;
+        let [GenResp::Complete(complete)] = frames.as_slice() else {
+            panic!("not the encoder's completion alone: {frames:?}");
+        };
+        let batch = complete
+            .media_identity
+            .as_ref()
+            .and_then(|identity| identity.mm_inputs.as_ref())
+            .expect("the batch");
+        assert_eq!(batch.mm_hashes, vec!["h1", "h2"]);
+        assert!(
+            batch.pixel_values.is_none(),
+            "the identity carries no tensors"
+        );
+        assert_eq!(
+            handles_of(complete).keys().cloned().collect::<Vec<_>>(),
+            vec!["h1", "h2"]
+        );
+
+        // Refusals: no transfer parameters, and no media item.
+        let plain = request("vw-encode-plain", &[1], false);
+        let status = encode
+            .generate(Request::new(plain))
+            .await
+            .err()
+            .expect("refused without transfer parameters");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("ec_transfer_params_json"));
+        let mut bare = request("vw-encode-bare", &[1], false);
+        bare.ec_transfer_params_json = Some("{}".to_string());
+        let status = encode
+            .generate(Request::new(bare))
+            .await
+            .err()
+            .expect("refused without a media item");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("media item"));
+        assert_eq!(
+            encode.ops.status()["encodes"],
+            2,
+            "the two completions are counted on the admin status, the refusals are not"
+        );
     }
 
     /// A configured server arg or an admin info patch lands in the field it
@@ -654,6 +1101,10 @@ mod tests {
         set_field(&mut info, "dp_size", &json!("4"));
         set_field(&mut info, "kv_engine_id", &json!("engine-a"));
         set_field(&mut info, "mm_device_do_normalize", &json!(true));
+        set_field(&mut info, "supports_ec_transfer", &json!("true"));
+        set_field(&mut info, "ec_role", &json!("ec_consumer"));
+        set_field(&mut info, "ec_connector", &json!("ECMooncakeConnector"));
+        set_field(&mut info, "ec_zmq_addrs", &json!(["tcp://10.0.0.1:1", ""]));
         set_field(&mut info, "rl.control_url", &json!("http://127.0.0.1:1"));
         assert_eq!(
             (
@@ -664,6 +1115,29 @@ mod tests {
             (8, 4, "engine-a")
         );
         assert!(info.mm_device_do_normalize);
+        assert_eq!(
+            (
+                info.supports_ec_transfer,
+                info.ec_role.as_str(),
+                info.ec_connector.as_str(),
+                info.ec_zmq_addrs.clone()
+            ),
+            (
+                true,
+                "ec_consumer",
+                "ECMooncakeConnector",
+                vec!["tcp://10.0.0.1:1".to_string(), String::new()]
+            )
+        );
+        set_field(
+            &mut info,
+            "ec_zmq_addrs",
+            &json!("tcp://10.0.0.2:2, tcp://10.0.0.3:3"),
+        );
+        assert_eq!(
+            info.ec_zmq_addrs,
+            vec!["tcp://10.0.0.2:2", "tcp://10.0.0.3:3"]
+        );
     }
 
     /// The admin fan-out's three RPCs on this wire call the core's answers:

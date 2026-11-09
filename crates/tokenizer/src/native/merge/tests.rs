@@ -1227,6 +1227,60 @@ fn a_character_pre_forms_only_under_the_three_conditions() {
     }
 }
 
+/// A rank vocabulary pre-forms a character under the same three conditions
+/// as a model's, to the file's own encoder's ids; the model table of the
+/// same vocabulary pre-forms the same character and answers the same
+/// pieces, token for token.
+#[test]
+fn a_rank_vocabulary_pre_forms_its_characters() {
+    let (_, alphabet) = alphabet_vocab();
+    let zhong = mapped(&alphabet, "中".as_bytes());
+    let [e4, b8, ad] = [0, 1, 2].map(|i| zhong.chars().nth(i).expect("a byte").to_string());
+    let e4b8 = format!("{e4}{b8}");
+    // (1) and (2) hold, no fragment: pre-formed, and the pre-formed path
+    // answers a run of the character to the encoder's ids.
+    let merges =
+        [(&e4, &b8), (&e4b8, &ad), (&zhong, &zhong)].map(|(a, b)| (a.as_str(), b.as_str()));
+    let ranks = ranks_of(&merges, false);
+    let table = MergeTable::from_ranks(&ranks).expect("a complete table");
+    assert_eq!(table.preformed_characters(), 1);
+    let model = model_with(&merges, false);
+    let from_model = table_of(&model);
+    assert_eq!(from_model.preformed_characters(), 1);
+    let own = own_encoder(&ranks);
+    let token_of_rank: FxHashMap<u32, &Vec<u8>> =
+        ranks.iter().map(|(token, &rank)| (rank, token)).collect();
+    for text in ["中", "中中", "中中中", "a中", "中a中"] {
+        let (ids, answered) = table_ids_preformed(&table, text.as_bytes());
+        assert!(answered, "{text}");
+        assert_eq!(ids, own.encode_ordinary(text), "{text}");
+        // The model table answers the same pieces to the same tokens (its
+        // ids name them by their alphabet spelling).
+        let (model_ids, model_answered) = table_ids_preformed(&from_model, text.as_bytes());
+        assert!(model_answered, "model: {text}");
+        let via_model: Vec<Vec<u8>> = model_ids
+            .iter()
+            .map(|&id| unmapped(&alphabet, &model.id_to_token(id).expect("a token")))
+            .collect();
+        let via_ranks: Vec<Vec<u8>> = ids.iter().map(|id| token_of_rank[id].to_vec()).collect();
+        assert_eq!(via_model, via_ranks, "model: {text}");
+    }
+    // (2) fails: (中, 中) ranks before (E4B8, AD): the character is not
+    // pre-formed, the bytes merge as the encoder's do.
+    let ranks = ranks_of(
+        &[(&e4, &b8), (&zhong, &zhong), (&e4b8, &ad)].map(|(a, b)| (a.as_str(), b.as_str())),
+        false,
+    );
+    let table = MergeTable::from_ranks(&ranks).expect("a complete table");
+    assert_eq!(table.preformed_characters(), 0);
+    let own = own_encoder(&ranks);
+    for text in ["中中", "a中"] {
+        let (ids, answered) = table_ids_preformed(&table, text.as_bytes());
+        assert!(!answered, "{text}");
+        assert_eq!(ids, own.encode_ordinary(text), "{text}");
+    }
+}
+
 #[test]
 fn a_run_of_one_character_overflows_the_stack_arrays_and_a_pair_no_token_holds_is_cut() {
     // 中 pre-forms and (中, 中) merges: a run of n 中 is one segment of n

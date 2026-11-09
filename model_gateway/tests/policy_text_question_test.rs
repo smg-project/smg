@@ -13,6 +13,10 @@
 //! decisions, on a kept handle. A separate executable, so it can declare
 //! the counting allocator the pins need.
 
+#![expect(
+    clippy::print_stderr,
+    reason = "the count a pin reads is printed for the Numbers table"
+)]
 #![expect(unsafe_code, reason = "a global allocator that counts allocations")]
 
 use std::{
@@ -198,8 +202,8 @@ fn a_least_load_decision_allocates_its_eligible_list_and_nothing_else() {
 
 /// Eight ready regular workers (no health checker behind them) on a ring: a
 /// consistent-hashing request keyed by a session pays the ring's own lookup
-/// (the ring dedupes its virtual nodes in a small set per lookup) and nothing
-/// besides; a prefix-hash request of 1,024 tokens over the boundaries 64 and
+/// (the ring marks the workers it asked on the stack: no allocation) and
+/// nothing besides; a prefix-hash request of 1,024 tokens over the boundaries 64 and
 /// 256 pays one ring lookup (the deeper level's owner is under its load
 /// margin), its eligible list (a filter collected without a size hint: four
 /// entries, then eight) and its boundary list, and nothing besides. The
@@ -224,10 +228,13 @@ fn a_ring_policy_request_pays_the_ring_lookup_and_nothing_besides() {
         })
         .collect();
     let ring = Arc::new(HashRing::new(workers.iter().map(|worker| worker.url())));
-    // The ring's own cost per lookup, read on the ring alone.
+    // The ring's own cost per lookup, read on the ring alone: a keyed lookup
+    // marks the workers it asked on the stack and allocates nothing.
     let ring_lookup = allocations_during(|| {
         black_box(ring.find_healthy_url("session-0001", |_| true));
     });
+    eprintln!("allocation calls per keyed ring lookup: {ring_lookup}");
+    assert_eq!(ring_lookup, 0, "allocation calls per keyed ring lookup");
 
     let consistent = ConsistentHashingPolicy::new();
     let keyed = SelectWorkerInfo {

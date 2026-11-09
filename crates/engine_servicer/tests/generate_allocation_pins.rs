@@ -20,7 +20,11 @@ use std::{
 };
 
 use common::counting_alloc::{self, Counting};
-use engine_servicer::{ServicerConfig, VllmModelInfo, VllmServicerConfig, VllmServicerServer};
+use engine_servicer::{
+    ServicerConfig, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
+    TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer, VllmModelInfo,
+    VllmServicerConfig, VllmServicerServer,
+};
 use engine_zmq_client::{
     mock_engine::{connect_to_frontend, default_ready_response, EngineInbound, MockEngine},
     protocol::{
@@ -33,9 +37,11 @@ use engine_zmq_client::{
 };
 use futures::{future::join_all, StreamExt};
 use smg_grpc_client::{
-    common_proto, vllm_proto as vllm, vllm_proto::vllm_engine_client::VllmEngineClient,
+    common_proto, sglang_proto::sglang_scheduler_client::SglangSchedulerClient,
+    tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient, vllm_proto as vllm,
+    vllm_proto::vllm_engine_client::VllmEngineClient,
 };
-use tonic::transport::Channel;
+use tonic::{transport::Channel, Streaming};
 
 #[global_allocator]
 static GLOBAL: Counting = Counting;
@@ -63,7 +69,7 @@ async fn answer_adds(engine: MockEngine) {
             let batch = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
                 engine_index: 0,
                 outputs: vec![EngineCoreOutput {
-                    request_id: id.clone(),
+                    request_id: id.clone().into(),
                     new_token_ids: vec![token + 10],
                     finish_reason: finish,
                     ..Default::default()
@@ -92,16 +98,7 @@ impl Bed {
     async fn start(ranks: u32) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let handshake = format!("ipc://{}", dir.path().join("handshake").display());
-        let servicer = ServicerConfig {
-            engine_startup_timeout: Duration::from_secs(30),
-            engine_startup_ceiling: None,
-            engine_count: ranks as usize,
-            ..ServicerConfig::new(
-                "127.0.0.1:0",
-                format!("ipc://{}", dir.path().join("engine").display()),
-                &handshake,
-            )
-        };
+        let servicer = servicer_config(dir.path(), &handshake, ranks);
         let model = VllmModelInfo {
             model_path: "org/model".to_string(),
             served_model_name: "served".to_string(),
@@ -118,17 +115,7 @@ impl Bed {
             media_processor: None,
         })
         .expect("the servicer starts");
-        let engines = join_all((0..ranks).map(|index| {
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(index),
-                EngineCoreReadyResponse {
-                    data_parallel_rank: index,
-                    ..default_ready_response()
-                },
-            )
-        }))
-        .await;
+        let engines = handshaken_mocks(&handshake, ranks).await;
         while !server.engine_ready() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -137,16 +124,11 @@ impl Bed {
                 clippy::disallowed_methods,
                 reason = "the mock engine answers until the test's runtime drops"
             )]
-            let _mock = tokio::spawn(answer_adds(engine.expect("the mock engine handshakes")));
+            let _mock = tokio::spawn(answer_adds(engine));
         }
-        let channel = Channel::from_shared(format!("http://{}", server.address()))
-            .unwrap()
-            .connect()
-            .await
-            .expect("the gRPC channel connects");
         Self {
+            client: VllmEngineClient::new(channel(server.address()).await),
             server,
-            client: VllmEngineClient::new(channel),
             sent: 0,
             _dir: dir,
         }
@@ -265,25 +247,7 @@ fn an_idle_loads_only_subscription_allocates_this_much_per_second() {
                 .await
                 .expect("the records are subscribed")
                 .into_inner();
-            for _ in 0..ranks {
-                stream
-                    .message()
-                    .await
-                    .expect("stream open")
-                    .expect("a record");
-            }
-            let before = counting_alloc::total_calls();
-            let window = tokio::time::sleep(Duration::from_secs(IDLE_SECONDS));
-            tokio::pin!(window);
-            loop {
-                tokio::select! {
-                    () = &mut window => break,
-                    item = stream.message() => {
-                        item.expect("stream open").expect("a record");
-                    }
-                }
-            }
-            counting_alloc::total_calls() - before
+            idle_calls_per_second(&mut stream, ranks).await
         });
         let rate = calls as f64 / IDLE_SECONDS as f64;
         eprintln!(
@@ -297,5 +261,203 @@ fn an_idle_loads_only_subscription_allocates_this_much_per_second() {
         per_second.iter().all(|&rate| rate <= 1.0),
         "allocation calls per second: {per_second:?} (0 with the record read once per tick; 57 and \
          114 at one and two ranks with the whole answer built per rank per tick)"
+    );
+}
+
+/// The allocation calls an idle loads-only subscription makes over `stream`
+/// during [`IDLE_SECONDS`], once the records before the window (one per
+/// rank) are taken: every thread's calls, the servicer's tick and heartbeats
+/// and the client's receipt of them.
+async fn idle_calls_per_second(
+    stream: &mut Streaming<common_proto::KvEventBatch>,
+    ranks: u32,
+) -> usize {
+    for _ in 0..ranks {
+        stream
+            .message()
+            .await
+            .expect("stream open")
+            .expect("a record");
+    }
+    let before = counting_alloc::total_calls();
+    let window = tokio::time::sleep(Duration::from_secs(IDLE_SECONDS));
+    tokio::pin!(window);
+    loop {
+        tokio::select! {
+            () = &mut window => break,
+            item = stream.message() => {
+                item.expect("stream open").expect("a record");
+            }
+        }
+    }
+    counting_alloc::total_calls() - before
+}
+
+/// A servicer configuration over `ranks` engines handshaking at `handshake`.
+fn servicer_config(dir: &std::path::Path, handshake: &str, ranks: u32) -> ServicerConfig {
+    ServicerConfig {
+        engine_startup_timeout: Duration::from_secs(30),
+        engine_startup_ceiling: None,
+        engine_count: ranks as usize,
+        ..ServicerConfig::new(
+            "127.0.0.1:0",
+            format!("ipc://{}", dir.join("engine").display()),
+            handshake,
+        )
+    }
+}
+
+/// `ranks` mock engines handshaken at `handshake`, each its own
+/// data-parallel rank.
+async fn handshaken_mocks(handshake: &str, ranks: u32) -> Vec<MockEngine> {
+    join_all((0..ranks).map(|index| {
+        connect_to_frontend(
+            handshake,
+            EngineId::from_engine_index(index),
+            EngineCoreReadyResponse {
+                data_parallel_rank: index,
+                ..default_ready_response()
+            },
+        )
+    }))
+    .await
+    .into_iter()
+    .map(|engine| engine.expect("the mock engine handshakes"))
+    .collect()
+}
+
+/// A gRPC channel to the servicer at `address`.
+async fn channel(address: impl std::fmt::Display) -> Channel {
+    Channel::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect()
+        .await
+        .expect("the gRPC channel connects")
+}
+
+/// What an idle subscription to the load records alone allocates per second
+/// at one and at two ranks on the SGLang wire: the same bed shape as the
+/// vLLM pin above, the mock engines handshaken and idle.
+#[test]
+fn an_idle_loads_only_subscription_on_the_sglang_wire_allocates_this_much_per_second() {
+    let _one_at_a_time = ONE_PIN_AT_A_TIME
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut per_second = Vec::new();
+    for ranks in [1u32, 2] {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (server, calls) = runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let handshake = format!("ipc://{}", dir.path().join("handshake").display());
+            let server = SglangServicerServer::start(SglangServicerConfig {
+                servicer: servicer_config(dir.path(), &handshake, ranks),
+                model: SglangModelInfo {
+                    model_path: "org/model".to_string(),
+                    served_model_name: "served".to_string(),
+                    tokenizer_path: "org/model".to_string(),
+                    is_generation: true,
+                    max_context_length: 4096,
+                    vocab_size: 1024,
+                    max_running_requests: 64,
+                    data_parallel_size: i32::try_from(ranks).unwrap(),
+                    ..Default::default()
+                },
+                encode_dispatcher: None,
+                media_processor: None,
+            })
+            .expect("the servicer starts");
+            let _engines = handshaken_mocks(&handshake, ranks).await;
+            while !server.engine_ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let mut client = SglangSchedulerClient::new(channel(server.address()).await);
+            let mut stream = client
+                .subscribe_kv_events(common_proto::SubscribeKvEventsRequest {
+                    loads_only: true,
+                    ..Default::default()
+                })
+                .await
+                .expect("the records are subscribed")
+                .into_inner();
+            let calls = idle_calls_per_second(&mut stream, ranks).await;
+            (server, calls)
+        });
+        let rate = calls as f64 / IDLE_SECONDS as f64;
+        eprintln!(
+            "allocation calls per second of an idle loads-only subscription on the SGLang wire at \
+             {ranks} rank(s): {rate:.0}"
+        );
+        per_second.push(rate);
+        server.stop(Duration::from_secs(5)).unwrap();
+    }
+    assert!(
+        per_second.iter().all(|&rate| rate <= 1.0),
+        "allocation calls per second: {per_second:?} (0 with one rank's entry read alone per tick; \
+         the whole answer built per read before)"
+    );
+}
+
+/// What an idle subscription to the load records alone allocates per second
+/// at one and at two ranks on the TokenSpeed wire: the same bed shape as
+/// the vLLM pin above, the mock engines handshaken and idle.
+#[test]
+fn an_idle_loads_only_subscription_on_the_tokenspeed_wire_allocates_this_much_per_second() {
+    let _one_at_a_time = ONE_PIN_AT_A_TIME
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut per_second = Vec::new();
+    for ranks in [1u32, 2] {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (server, calls) = runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let handshake = format!("ipc://{}", dir.path().join("handshake").display());
+            let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
+                servicer: servicer_config(dir.path(), &handshake, ranks),
+                model: TokenSpeedModelInfo {
+                    model_path: "org/model".to_string(),
+                    served_model_name: "served".to_string(),
+                    tokenizer_path: "org/model".to_string(),
+                    max_context_length: 4096,
+                    vocab_size: 1024,
+                    max_running_requests: 64,
+                    data_parallel_size: i32::try_from(ranks).unwrap(),
+                    ..Default::default()
+                },
+            })
+            .expect("the servicer starts");
+            let _engines = handshaken_mocks(&handshake, ranks).await;
+            while !server.engine_ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let mut client = TokenSpeedSchedulerClient::new(channel(server.address()).await);
+            let mut stream = client
+                .subscribe_kv_events(common_proto::SubscribeKvEventsRequest {
+                    loads_only: true,
+                    ..Default::default()
+                })
+                .await
+                .expect("the records are subscribed")
+                .into_inner();
+            let calls = idle_calls_per_second(&mut stream, ranks).await;
+            (server, calls)
+        });
+        let rate = calls as f64 / IDLE_SECONDS as f64;
+        eprintln!(
+            "allocation calls per second of an idle loads-only subscription on the TokenSpeed wire \
+             at {ranks} rank(s): {rate:.0}"
+        );
+        per_second.push(rate);
+        server.stop(Duration::from_secs(5)).unwrap();
+    }
+    assert!(
+        per_second.iter().all(|&rate| rate <= 1.0),
+        "allocation calls per second: {per_second:?} (0 with one rank's entry read alone per tick; \
+         the whole answer built per read before)"
     );
 }

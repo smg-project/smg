@@ -16,17 +16,17 @@
 //! Each case runs on a current-thread runtime under a thread-local Prometheus
 //! recorder, so the request path's emissions land in the rendered text.
 
-use std::{future::Future, time::Duration};
+use std::time::Duration;
 
 use common::{
+    decode_stream::produce_after,
     engine_answers::{VllmAnswers, VllmGenerateStream},
     grpc_harness::{
         build_grpc_router, grpc_router_config, grpc_workers, serve_canned_worker, serve_engine,
         Canned,
     },
+    metrics_capture::render_after,
 };
-use metrics_exporter_prometheus::PrometheusBuilder;
-use proto::generate_response::Response as GenResp;
 use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
@@ -50,8 +50,6 @@ const DECODE_DELAY: Duration = Duration::from_millis(400);
 /// absorbed the other worker's delay fails its upper bound.
 const SLACK: Duration = Duration::from_millis(250);
 
-type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
-
 /// A sequential-dispatch mock engine: every generate call answers with
 /// `OUTPUT_TOKENS` chunks and a completion after `delay`. With `hold_headers`
 /// the call itself waits out the delay before it returns the stream, like an
@@ -61,48 +59,6 @@ type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
 struct DelayedEngine {
     delay: Duration,
     hold_headers: bool,
-}
-
-fn chunk(id: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Chunk(proto::GenerateStreamChunk {
-            token_ids: vec![id],
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-fn complete() -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Complete(proto::GenerateComplete {
-            output_ids: (1..=OUTPUT_TOKENS).collect(),
-            finish_reason: "stop".to_string(),
-            prompt_tokens: 1,
-            completion_tokens: OUTPUT_TOKENS,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-/// Feed one generate stream: the tokens after `delay`, then the completion.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "test mock; the producer task ends with its stream"
-)]
-fn produce_after(tx: GenerateTx, delay: Duration) {
-    tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        for id in 1..=OUTPUT_TOKENS {
-            if tx.send(Ok(chunk(id))).await.is_err() {
-                return;
-            }
-        }
-        let _ = tx.send(Ok(complete())).await;
-    });
 }
 
 #[tonic::async_trait]
@@ -118,7 +74,7 @@ impl VllmAnswers for DelayedEngine {
         } else {
             self.delay
         };
-        produce_after(tx, in_stream_delay);
+        produce_after(tx, in_stream_delay, OUTPUT_TOKENS);
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
@@ -187,7 +143,7 @@ impl Route {
     clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
-async fn one_streaming_request(router: &dyn RouterTrait, route: Route) {
+async fn one_streaming_request(router: &dyn RouterTrait, route: Route) -> String {
     let response = match route {
         Route::Chat => {
             let request = serde_json::from_value(serde_json::json!({
@@ -195,6 +151,7 @@ async fn one_streaming_request(router: &dyn RouterTrait, route: Route) {
                 "messages": [{"role": "user", "content": "Hello world"}],
                 "max_tokens": 8,
                 "stream": true,
+                "stream_options": {"include_usage": true},
             }))
             .unwrap();
             router.route_chat(None, &tenant(), request, MODEL).await
@@ -233,34 +190,39 @@ async fn one_streaming_request(router: &dyn RouterTrait, route: Route) {
         Route::Messages => body.contains("event: message_stop"),
     };
     assert!(ended, "{body}");
+    body
 }
 
-/// One streaming chat through `router`, read to its `[DONE]`.
-async fn one_streaming_chat(router: &dyn RouterTrait) {
-    one_streaming_request(router, Route::Chat).await;
-}
-
-/// Run `case` on a current-thread runtime under a thread-local recorder and
-/// return the rendered `/metrics` text.
+/// A chat stream's content deltas and the completion count of its usage
+/// chunk: every `data:` line but the terminator is one chunk.
 #[expect(
     clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
+    reason = "test helper - a chunk that is not JSON fails the test"
 )]
-fn render_after<F, Fut>(case: F) -> String
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let handle = recorder.handle();
-    metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("current-thread runtime");
-        rt.block_on(case());
-    });
-    handle.render()
+fn chat_stream_counts(body: &str) -> (u32, Option<u64>) {
+    let mut deltas = 0;
+    let mut completion_tokens = None;
+    for data in body.lines().filter_map(|line| line.strip_prefix("data: ")) {
+        if data == "[DONE]" {
+            continue;
+        }
+        let chunk: serde_json::Value = serde_json::from_str(data).expect("a JSON chunk");
+        if chunk["choices"][0]["delta"]["content"]
+            .as_str()
+            .is_some_and(|content| !content.is_empty())
+        {
+            deltas += 1;
+        }
+        if let Some(count) = chunk["usage"]["completion_tokens"].as_u64() {
+            completion_tokens = Some(count);
+        }
+    }
+    (deltas, completion_tokens)
+}
+
+/// One streaming chat through `router`, read to its `[DONE]`: the body.
+async fn one_streaming_chat(router: &dyn RouterTrait) -> String {
+    one_streaming_request(router, Route::Chat).await
 }
 
 /// The `_sum` or `_count` sample of `family` whose labels contain `label`, if
@@ -344,7 +306,8 @@ fn report(label: &str, phases: &Phases) {
 /// Sequential dispatch with a worker that returns its stream at once: the
 /// prefill phase carries the prefill worker's delay, the relay phase is the
 /// gateway's own work, the decode phase carries the decode worker's delay,
-/// and the three add up to the TTFT exactly.
+/// and the three add up to the TTFT exactly. The stream carries one content
+/// delta per scripted token and the decode's completion count in its usage.
 #[test]
 fn sequential_dispatch_phases_add_up_to_the_pd_ttft() {
     let rendered = render_after(|| async {
@@ -359,7 +322,17 @@ fn sequential_dispatch_phases_add_up_to_the_pd_ttft() {
         })
         .await;
         let router = build_pd_router(prefill, decode, RuntimeType::Vllm).await;
-        one_streaming_chat(router.as_ref()).await;
+        let body = one_streaming_chat(router.as_ref()).await;
+        let (deltas, completion_tokens) = chat_stream_counts(&body);
+        assert_eq!(
+            deltas, OUTPUT_TOKENS,
+            "one content delta per scripted token: {body}"
+        );
+        assert_eq!(
+            completion_tokens,
+            Some(u64::from(OUTPUT_TOKENS)),
+            "the usage chunk carries the decode's completion count: {body}"
+        );
     });
     let phases = Phases::of(&rendered, RuntimeType::Vllm.as_str());
     report("sequential, eager headers", &phases);

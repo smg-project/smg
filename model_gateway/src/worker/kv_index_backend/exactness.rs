@@ -29,15 +29,18 @@ use kv_index::{
     SequenceHash,
 };
 use smg_grpc_client::common_proto::{
-    kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheCleared, KvCacheEvent,
-    KvCacheTier, KvEventBatch,
+    kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent, KvCacheTier,
+    KvEventBatch,
 };
 
 use super::{
     mock_streams::{self, Shape, Stream},
     KvIndex,
 };
-use crate::worker::kv_event_monitor::{KvEventMonitor, WorkerIndexState};
+use crate::worker::{
+    kv_event_monitor::{KvEventMonitor, WorkerIndexState},
+    test_support::kv_cache_cleared,
+};
 
 // ---------------------------------------------------------------------------
 // The two backends side by side
@@ -678,13 +681,6 @@ fn removed(hashes: Vec<i64>, tier: Option<KvCacheTier>) -> KvCacheEvent {
     }
 }
 
-fn cleared() -> KvCacheEvent {
-    KvCacheEvent {
-        event_id: 0,
-        data: Some(kv_cache_event::Data::Cleared(KvCacheCleared::default())),
-    }
-}
-
 fn batch(events: Vec<KvCacheEvent>) -> KvEventBatch {
     KvEventBatch {
         events,
@@ -964,7 +960,7 @@ impl Corpus {
 
     fn clear(&mut self, pair: &mut Pair) {
         let worker = self.worker();
-        pair.apply(&worker, &batch(vec![cleared()]));
+        pair.apply(&worker, &batch(vec![kv_cache_cleared()]));
         self.held.remove(&worker);
     }
 

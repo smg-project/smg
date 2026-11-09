@@ -807,6 +807,7 @@ mod tests {
     use crate::{
         config::types::PolicyConfig,
         policies::PolicyRegistry,
+        routers::grpc::test_engine::serve_on_loopback,
         worker::{basic::StallReason, BasicWorkerBuilder, WorkerRegistry, UNKNOWN_MODEL_ID},
     };
 
@@ -1005,16 +1006,6 @@ mod tests {
         }
     }
 
-    async fn wait_until_listening(addr: SocketAddr) {
-        for _ in 0..100 {
-            if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("test scheduler did not start listening on {addr}");
-    }
-
     fn grpc_worker(addr: SocketAddr) -> Arc<dyn Worker> {
         Arc::new(
             BasicWorkerBuilder::new(format!("grpc://{addr}"))
@@ -1045,22 +1036,12 @@ mod tests {
         )
     }
 
-    /// The test scheduler served on a free port, listening.
+    /// The test scheduler served on a loopback port bound before it is
+    /// handed out, as its address and its server task.
     async fn serve(behaviour: Subscribe) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-        let port = portpicker::pick_unused_port().expect("a free port");
-        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the test scheduler lives as long as the test"
-        )]
-        let server = tokio::spawn(async move {
-            let _ = Server::builder()
-                .add_service(TokenSpeedSchedulerServer::new(TestScheduler(behaviour)))
-                .serve(addr)
-                .await;
-        });
-        wait_until_listening(addr).await;
-        (addr, server)
+        let router =
+            Server::builder().add_service(TokenSpeedSchedulerServer::new(TestScheduler(behaviour)));
+        serve_on_loopback(router).await
     }
 
     /// A gRPC worker at `addr` and its backend client.
@@ -1595,20 +1576,7 @@ mod tests {
     /// on the call the task lived on and `on_worker_removed` never returned.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn removal_ends_a_subscribe_call_that_never_answers() {
-        let port = portpicker::pick_unused_port().expect("a free port");
-        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the test scheduler lives as long as the test"
-        )]
-        let server = tokio::spawn(
-            Server::builder()
-                .add_service(TokenSpeedSchedulerServer::new(TestScheduler(
-                    Subscribe::Hang,
-                )))
-                .serve(addr),
-        );
-        wait_until_listening(addr).await;
+        let (addr, server) = serve(Subscribe::Hang).await;
 
         let worker = grpc_worker(addr);
         let monitor = KvEventMonitor::new();
@@ -1650,21 +1618,8 @@ mod tests {
     /// it ever receives reaches the wedge rule through no other record.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_subscription_asks_for_load_records_before_the_first_batch() {
-        let port = portpicker::pick_unused_port().expect("a free port");
-        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let seen = Arc::new(Mutex::new(None));
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the test scheduler lives as long as the test"
-        )]
-        let server = tokio::spawn(
-            Server::builder()
-                .add_service(TokenSpeedSchedulerServer::new(TestScheduler(
-                    Subscribe::RecordRequest(Arc::clone(&seen)),
-                )))
-                .serve(addr),
-        );
-        wait_until_listening(addr).await;
+        let (addr, server) = serve(Subscribe::RecordRequest(Arc::clone(&seen))).await;
         let worker = grpc_worker(addr);
         let monitor = KvEventMonitor::new();
         monitor
@@ -1704,28 +1659,15 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let port = portpicker::pick_unused_port().expect("a free port");
-        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         // One thread, so the subscription task's metrics land on this
         // thread's recorder.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        metrics::with_local_recorder(&recorder, || {
+        let addr = metrics::with_local_recorder(&recorder, || {
             runtime.block_on(async {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "the test scheduler lives as long as the test"
-                )]
-                let server = tokio::spawn(
-                    Server::builder()
-                        .add_service(TokenSpeedSchedulerServer::new(TestScheduler(
-                            Subscribe::FailFirstMessage(Arc::clone(&calls)),
-                        )))
-                        .serve(addr),
-                );
-                wait_until_listening(addr).await;
+                let (addr, server) = serve(Subscribe::FailFirstMessage(Arc::clone(&calls))).await;
                 let worker = grpc_worker(addr);
                 let monitor = KvEventMonitor::new();
                 monitor
@@ -1734,7 +1676,8 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(1_900)).await;
                 monitor.on_worker_removed(worker.url()).await;
                 server.abort();
-            });
+                addr
+            })
         });
 
         // Attempts at about 0, 100, 300, 700 and 1,500 ms: five in 1.9 s,
@@ -1800,20 +1743,7 @@ mod tests {
                 .build()
                 .unwrap();
             rt.block_on(async {
-                let port = portpicker::pick_unused_port().expect("a free port");
-                let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "the test scheduler lives as long as the test"
-                )]
-                let server = tokio::spawn(
-                    Server::builder()
-                        .add_service(TokenSpeedSchedulerServer::new(TestScheduler(
-                            Subscribe::Unimplemented,
-                        )))
-                        .serve(addr),
-                );
-                wait_until_listening(addr).await;
+                let (addr, server) = serve(Subscribe::Unimplemented).await;
 
                 let worker = grpc_worker(addr);
                 let monitor = KvEventMonitor::new();

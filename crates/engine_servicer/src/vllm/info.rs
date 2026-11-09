@@ -11,7 +11,7 @@ use tracing::info;
 
 use super::{State, HEALTHY, SERVER_TYPE};
 use crate::{
-    load_report::{rank_entries, RankFigures},
+    load_report::{rank_entries, rank_entry, RankFigures},
     servicer::proto_token_ids,
 };
 
@@ -152,6 +152,10 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         kv_connector: model.kv_connector.clone(),
         kv_role: model.kv_role.clone(),
         kv_engine_id: model.kv_engine_id.clone(),
+        supports_ec_transfer: model.supports_ec_transfer,
+        ec_connector: model.ec_connector.clone(),
+        ec_role: model.ec_role.clone(),
+        ec_zmq_addrs: model.ec_zmq_addrs.clone(),
         kv_cache_dtype: model.kv_cache_dtype.clone(),
         attention_backend: model.attention_backend.clone(),
         pairing_protocol: model.pairing_protocol.clone(),
@@ -283,18 +287,12 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<vllm::GetLoad
 pub(super) fn rank_load(state: &State, dp_rank: Option<i32>) -> Option<vllm::SchedulerLoad> {
     let client = state.shared.engine().ok()?;
     let capacity = Capacity::of(state);
-    let ranks = state.shared.rank_count(state.model.data_parallel_size);
-    let rank = dp_rank.unwrap_or(0);
-    let index = u32::try_from(rank).ok()?;
-    let entry = match client.rank_load(index) {
-        Some(load) => {
-            let figures = RankFigures::of(&load, capacity.max_total_num_tokens);
-            reported_entry(state, &load, &figures, &capacity)
-        }
-        None if usize::try_from(index).is_ok_and(|index| index < ranks) => {
-            unreported_entry(state, rank, &capacity)
-        }
-        None => return None,
-    };
-    Some(entry)
+    rank_entry(
+        |index| client.rank_load(index),
+        capacity.max_total_num_tokens,
+        state.shared.rank_count(state.model.data_parallel_size),
+        dp_rank,
+        |load, figures| reported_entry(state, load, figures, &capacity),
+        |rank| unreported_entry(state, rank, &capacity),
+    )
 }

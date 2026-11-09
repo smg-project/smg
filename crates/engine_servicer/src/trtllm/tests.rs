@@ -156,7 +156,7 @@ fn batch(
     matched: Option<MatchedStop>,
 ) -> BatchTokenIDSlimOutput {
     BatchTokenIDSlimOutput {
-        rids: vec![rid.to_string()],
+        rids: vec![rid.into()],
         output_ids: vec![tokens],
         finished_reasons: vec![finish.unwrap_or_default().to_string()],
         finished_messages: vec![None],
@@ -1317,5 +1317,35 @@ async fn a_burst_of_overlapping_prefills_reads_the_capacity_of_the_whole_batch()
         rate <= 15_360.0 && rate >= floor,
         "{rate} tokens per second from {samples} samples, expected within [{floor}, 15360]"
     );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The record the relay attaches to a batch for a rank is the `GetLoads`
+/// entry of that rank, read alone (here before any load tail: the
+/// zero-filled entry with the capacity figures and the servicer's own
+/// estimate); `None` names rank 0; a rank past the connected ones has no
+/// record.
+#[tokio::test]
+async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
+    use crate::kv_events::RankLoads;
+
+    let mut h = harness(model_info()).await;
+    let idle = h
+        .client
+        .get_loads(trt::GetLoadsRequest {
+            dp_rank: Some(0),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let load = &idle.loads[0];
+    let mut expected = common::EngineLoad::from(load);
+    expected.waiting_uncached_tokens =
+        Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+    let state = &h.server.state;
+    assert_eq!(state.rank_load(Some(0)), Some(expected));
+    assert_eq!(state.rank_load(None), state.rank_load(Some(0)));
+    assert!(state.rank_load(Some(1)).is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

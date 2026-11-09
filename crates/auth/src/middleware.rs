@@ -15,7 +15,7 @@ use axum::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    audit::{AuditContext, AuditLogger},
+    audit::{AuditContext, AuditLogger, AuditResource},
     config::{ControlPlaneAuthConfig, Role},
     jwt::JwtValidator,
     RequestId,
@@ -87,6 +87,11 @@ pub struct ControlPlaneAuthState {
 
     /// Audit logger
     pub audit_logger: AuditLogger,
+
+    /// The paths whose reads the `admin` role alone may make: a view that
+    /// shows what the `user` role's reads do not. The gate refuses a user
+    /// there like any other control-plane 403, denial line included.
+    pub admin_only_reads: &'static [&'static str],
 }
 
 impl ControlPlaneAuthState {
@@ -97,7 +102,21 @@ impl ControlPlaneAuthState {
             config,
             jwt_validator,
             audit_logger,
+            admin_only_reads: &[],
         }
+    }
+
+    /// The same state with `paths` as the reads the `admin` role alone may
+    /// make; the gateway names them where it attaches the layer.
+    #[must_use]
+    pub fn with_admin_only_reads(mut self, paths: &'static [&'static str]) -> Self {
+        self.admin_only_reads = paths;
+        self
+    }
+
+    /// Whether a read of `path` needs the `admin` role.
+    fn is_admin_only_read(&self, path: &str) -> bool {
+        self.admin_only_reads.contains(&path)
     }
 
     /// Create from config, initializing JWT validator if needed.
@@ -158,41 +177,17 @@ impl ControlPlaneAuthState {
     }
 }
 
-/// Whether `role` may perform `method` on a control plane route: `admin`
-/// every method, `user` the read-only ones (GET and HEAD).
-fn role_allows(role: Role, method: &str) -> bool {
-    role.is_admin() || matches!(method, "GET" | "HEAD")
+/// Whether `method` reads: the `user` role may use it, and no outcome line
+/// follows its handler.
+fn is_read(method: &str) -> bool {
+    matches!(method, "GET" | "HEAD")
 }
 
-/// Check the role against the request method and log a denial.
-/// Returns Some(Response) if denied, None if allowed.
-fn check_role(
-    principal_id: &str,
-    auth_method: &str,
-    role: Role,
-    method: &str,
-    path: &str,
-    request_id: Option<&str>,
-    audit_logger: &AuditLogger,
-) -> Option<Response> {
-    if role_allows(role, method) {
-        return None;
-    }
-
-    warn!(
-        "{} {} has role {:?} but admin is required for {} {}",
-        auth_method, principal_id, role, method, path
-    );
-    let ctx = AuditContext::new(principal_id, auth_method, role, method, path, request_id);
-    audit_logger.log_denied(&ctx, "Admin role required for this control plane operation");
-
-    Some(
-        (
-            StatusCode::FORBIDDEN,
-            "Admin role required for this control plane operation",
-        )
-            .into_response(),
-    )
+/// Whether `role` may perform `method` on a control plane route: `admin`
+/// every method, `user` the read-only ones (GET and HEAD) unless the route
+/// is one of the admin-only reads (`admin_only`).
+fn role_allows(role: Role, method: &str, admin_only: bool) -> bool {
+    role.is_admin() || (is_read(method) && !admin_only)
 }
 
 /// Log successful authentication.
@@ -238,16 +233,52 @@ pub fn bearer_token(header_value: &str) -> Option<&str> {
 struct Attempt {
     method: String,
     path: String,
+    /// The path is one of the reads the `admin` role alone may make.
+    admin_only: bool,
     request_id: Option<String>,
 }
 
 impl Attempt {
-    fn of(request: &Request<Body>) -> Self {
+    fn of(request: &Request<Body>, auth_state: &ControlPlaneAuthState) -> Self {
+        let path = request.uri().path();
         Self {
             method: request.method().to_string(),
-            path: request.uri().path().to_string(),
+            admin_only: auth_state.is_admin_only_read(path),
+            path: path.to_string(),
             request_id: request.extensions().get::<RequestId>().map(|r| r.0.clone()),
         }
+    }
+
+    /// The role check: `None` when `role` may make this request, else
+    /// the 403 with the denial line written.
+    fn refuse_by_role(
+        &self,
+        principal_id: &str,
+        auth_method: &str,
+        role: Role,
+        audit_logger: &AuditLogger,
+    ) -> Option<Response> {
+        let (method, path, admin_only) =
+            (self.method.as_str(), self.path.as_str(), self.admin_only);
+        let request_id = self.request_id.as_deref();
+        if role_allows(role, method, admin_only) {
+            return None;
+        }
+
+        warn!(
+            "{} {} has role {:?} but admin is required for {} {}",
+            auth_method, principal_id, role, method, path
+        );
+        let ctx = AuditContext::new(principal_id, auth_method, role, method, path, request_id);
+        audit_logger.log_denied(&ctx, "Admin role required for this control plane operation");
+
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                "Admin role required for this control plane operation",
+            )
+                .into_response(),
+        )
     }
 
     /// Refuse the request: the audit line with `reason`, then a 401 whose
@@ -263,8 +294,10 @@ impl Attempt {
     }
 
     /// Admit `principal`, whichever credential proved it: the role check (a
-    /// 403 for a method the role may not use), the audit line, the extension
-    /// the handlers read, then the request itself.
+    /// 403 for a method the role may not use), the admission line, the
+    /// extension the handlers read, the request itself and, for a request
+    /// that is not a read, the outcome line with the status the handler
+    /// answered and the resource it named.
     async fn admit(
         &self,
         audit_logger: &AuditLogger,
@@ -273,15 +306,7 @@ impl Attempt {
         next: Next,
     ) -> Response {
         let kind = principal.auth_method.kind();
-        if let Some(resp) = check_role(
-            &principal.id,
-            kind,
-            principal.role,
-            &self.method,
-            &self.path,
-            self.request_id.as_deref(),
-            audit_logger,
-        ) {
+        if let Some(resp) = self.refuse_by_role(&principal.id, kind, principal.role, audit_logger) {
             return resp;
         }
         log_auth_success(
@@ -292,8 +317,23 @@ impl Attempt {
             self.request_id.as_deref(),
             audit_logger,
         );
+        let outcome = (audit_logger.is_enabled() && !is_read(&self.method))
+            .then(|| (principal.id.clone(), principal.role));
         request.extensions_mut().insert(principal);
-        next.run(request).await
+        let response = next.run(request).await;
+        if let Some((principal_id, role)) = outcome {
+            let ctx = AuditContext::new(
+                &principal_id,
+                kind,
+                role,
+                &self.method,
+                &self.path,
+                self.request_id.as_deref(),
+            );
+            let resource = response.extensions().get::<AuditResource>();
+            audit_logger.log_outcome(&ctx, response.status(), resource.map(|r| r.0.as_str()));
+        }
+        response
     }
 }
 
@@ -305,7 +345,8 @@ impl Attempt {
 /// 3. Falls back to API key validation (if configured)
 /// 4. Checks the principal's role against the request: `admin` for every
 ///    method, `user` for the read-only ones (GET, HEAD)
-/// 5. Logs audit events for control plane access
+/// 5. Writes the admission audit line and, after the handler of a request
+///    that is not a read, the outcome line with its status and resource
 ///
 /// Returns 401 Unauthorized if authentication fails.
 /// Returns 403 Forbidden if the principal's role does not allow the method.
@@ -319,7 +360,7 @@ pub async fn control_plane_auth_middleware(
         return next.run(request).await;
     }
 
-    let attempt = Attempt::of(&request);
+    let attempt = Attempt::of(&request, &auth_state);
     let audit_logger = &auth_state.audit_logger;
 
     // Extract Bearer token from Authorization header
@@ -481,16 +522,22 @@ mod tests {
     #[test]
     fn admin_may_use_every_method() {
         for method in ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] {
-            assert!(role_allows(Role::Admin, method), "{method}");
+            assert!(role_allows(Role::Admin, method, false), "{method}");
+            assert!(
+                role_allows(Role::Admin, method, true),
+                "{method}, admin-only"
+            );
         }
     }
 
     #[test]
-    fn user_may_only_read() {
-        assert!(role_allows(Role::User, "GET"));
-        assert!(role_allows(Role::User, "HEAD"));
+    fn user_may_only_read_and_not_an_admin_only_read() {
+        assert!(role_allows(Role::User, "GET", false));
+        assert!(role_allows(Role::User, "HEAD", false));
+        assert!(!role_allows(Role::User, "GET", true), "an admin-only read");
+        assert!(!role_allows(Role::User, "HEAD", true), "an admin-only read");
         for method in ["POST", "PUT", "PATCH", "DELETE"] {
-            assert!(!role_allows(Role::User, method), "{method}");
+            assert!(!role_allows(Role::User, method, false), "{method}");
         }
     }
 
@@ -665,5 +712,238 @@ mod tests {
             (status, body),
             (StatusCode::OK, "ops via api_key:ops as Admin".to_string())
         );
+    }
+
+    /// The audit lines one call through the middleware writes, with its
+    /// status: `method` on `/workers` with `key`, carrying the request id the
+    /// gateway's edge layer would have set.
+    async fn audited_call(
+        audit_enabled: bool,
+        method: &str,
+        key: &str,
+    ) -> (StatusCode, Vec<Vec<(String, String)>>) {
+        use axum::{middleware::from_fn_with_state, routing::post, Router};
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+
+        use crate::{audit::tests::FieldCapture, config::ApiKeyEntry};
+
+        async fn register() -> Response {
+            AuditResource::name(StatusCode::ACCEPTED.into_response(), "worker-1")
+        }
+        async fn refuse() -> Response {
+            StatusCode::BAD_REQUEST.into_response()
+        }
+        async fn list() -> Response {
+            StatusCode::OK.into_response()
+        }
+        let state = ControlPlaneAuthState::new(
+            ControlPlaneAuthConfig {
+                jwt: None,
+                api_keys: vec![
+                    ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin),
+                    ApiKeyEntry::new("reader", "Reader", "reader-key", Role::User),
+                ],
+                audit_enabled,
+            },
+            None,
+        );
+        let app = Router::new()
+            .route("/workers", post(register).get(list))
+            .route("/refused", post(refuse))
+            .layer(from_fn_with_state(state, control_plane_auth_middleware));
+        let path = if method == "REFUSED" {
+            "/refused"
+        } else {
+            "/workers"
+        };
+        let method = if method == "REFUSED" { "POST" } else { method };
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(RequestId("req-7".to_string()));
+
+        let capture = Arc::new(FieldCapture::default());
+        let response = app
+            .oneshot(request)
+            .with_subscriber(capture.clone())
+            .await
+            .unwrap();
+        let events = capture.events.lock().unwrap().clone();
+        (response.status(), events)
+    }
+
+    #[tokio::test]
+    async fn a_mutation_writes_an_outcome_line_after_the_admission_line() {
+        use crate::audit::tests::field;
+
+        let (status, events) = audited_call(true, "POST", "admin-key").await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(
+            events.len(),
+            2,
+            "the admission line, then the outcome line: {events:?}"
+        );
+        let (admission, outcome) = (&events[0], &events[1]);
+        assert_eq!(
+            field(admission, "message"),
+            Some("control_plane_audit"),
+            "{admission:?}"
+        );
+        assert_eq!(
+            field(admission, "status"),
+            None,
+            "the admission line is written before the handler: {admission:?}"
+        );
+        assert_eq!(
+            field(outcome, "message"),
+            Some("control_plane_mutation"),
+            "{outcome:?}"
+        );
+        assert_eq!(field(outcome, "status"), Some("202"), "{outcome:?}");
+        assert_eq!(field(outcome, "outcome"), Some("success"), "{outcome:?}");
+        assert_eq!(field(outcome, "resource"), Some("worker-1"), "{outcome:?}");
+        for line in [admission, outcome] {
+            assert_eq!(field(line, "principal"), Some("admin"), "{line:?}");
+            assert_eq!(field(line, "auth_method"), Some("api_key"), "{line:?}");
+            assert_eq!(field(line, "role"), Some("admin"), "{line:?}");
+            assert_eq!(field(line, "method"), Some("POST"), "{line:?}");
+            assert_eq!(field(line, "path"), Some("/workers"), "{line:?}");
+            assert_eq!(
+                field(line, "request_id"),
+                Some("req-7"),
+                "one request id correlates both lines: {line:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mutation_the_handler_refused_is_logged_as_failed_with_its_status() {
+        use crate::audit::tests::field;
+
+        let (status, events) = audited_call(true, "REFUSED", "admin-key").await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(events.len(), 2, "{events:?}");
+        let outcome = &events[1];
+        assert_eq!(field(outcome, "status"), Some("400"), "{outcome:?}");
+        assert_eq!(field(outcome, "outcome"), Some("failed"), "{outcome:?}");
+        assert_eq!(
+            field(outcome, "resource"),
+            None,
+            "a refused mutation names no resource: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_writes_the_admission_line_alone() {
+        use crate::audit::tests::field;
+
+        let (status, events) = audited_call(true, "GET", "reader-key").await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(
+            field(&events[0], "message"),
+            Some("control_plane_audit"),
+            "{events:?}"
+        );
+    }
+
+    /// A read the gateway named admin-only: the `user` role is refused by
+    /// the gate with the denial line and no admission line, as for a
+    /// mutation; the `admin` role reads it with the admission line alone.
+    #[tokio::test]
+    async fn an_admin_only_read_refuses_the_user_role_with_the_denial_line() {
+        use axum::{middleware::from_fn_with_state, routing::get, Router};
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+
+        use crate::{
+            audit::tests::{field, FieldCapture},
+            config::ApiKeyEntry,
+        };
+
+        async fn view() -> Response {
+            StatusCode::OK.into_response()
+        }
+        let state = ControlPlaneAuthState::new(
+            ControlPlaneAuthConfig {
+                jwt: None,
+                api_keys: vec![
+                    ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin),
+                    ApiKeyEntry::new("reader", "Reader", "reader-key", Role::User),
+                ],
+                audit_enabled: true,
+            },
+            None,
+        )
+        .with_admin_only_reads(&["/config"]);
+        let app = Router::new()
+            .route("/config", get(view))
+            .route("/workers", get(view))
+            .layer(from_fn_with_state(state, control_plane_auth_middleware));
+
+        let call = |path: &'static str, key: &'static str| {
+            let app = app.clone();
+            async move {
+                let request = Request::builder()
+                    .uri(path)
+                    .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap();
+                let capture = Arc::new(FieldCapture::default());
+                let response = app
+                    .oneshot(request)
+                    .with_subscriber(capture.clone())
+                    .await
+                    .unwrap();
+                let events = capture.events.lock().unwrap().clone();
+                (response.status(), events)
+            }
+        };
+
+        let (status, events) = call("/config", "reader-key").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(field(&events[0], "outcome"), Some("denied"), "{events:?}");
+
+        let (status, events) = call("/config", "admin-key").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(field(&events[0], "outcome"), Some("success"), "{events:?}");
+
+        let (status, _) = call("/workers", "reader-key").await;
+        assert_eq!(status, StatusCode::OK, "a plain read stays the user's");
+    }
+
+    #[tokio::test]
+    async fn a_mutation_the_role_may_not_make_writes_the_denial_line_alone() {
+        use crate::audit::tests::field;
+
+        let (status, events) = audited_call(true, "POST", "reader-key").await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(field(&events[0], "outcome"), Some("denied"), "{events:?}");
+        assert_eq!(
+            field(&events[0], "status"),
+            None,
+            "no handler answered: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_audit_logger_writes_neither_line() {
+        let (status, events) = audited_call(false, "POST", "admin-key").await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(events.is_empty(), "{events:?}");
     }
 }

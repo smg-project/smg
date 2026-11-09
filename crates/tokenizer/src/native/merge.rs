@@ -325,7 +325,18 @@ impl MergeTable {
             for (byte, &c) in alphabet.iter().enumerate() {
                 byte_of[c as usize] = Some(byte as u8);
             }
-            table.preformed = Box::new(Preformed::analyse(&table, bpe, &byte_of, &min_operand));
+            let raw_of = |token: &str| -> Option<Vec<u8>> {
+                token
+                    .chars()
+                    .map(|c| byte_of.get(c as usize).copied().flatten())
+                    .collect()
+            };
+            let raws = bpe
+                .get_vocab()
+                .into_iter()
+                .filter_map(|(token, id)| raw_of(&token).map(|raw| (id, raw)))
+                .collect();
+            table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));
         }
         Ok(table)
     }
@@ -336,6 +347,9 @@ impl MergeTable {
     /// token its own bytes do not merge back into (the file's encoder looks
     /// a whole piece up before it merges; the table does not, so every token
     /// must be the merge of its bytes for the two to agree on every piece).
+    /// The table pre-forms characters as a model's does (see `preformed`):
+    /// the tokens are raw bytes already, and an id's least operand rank is
+    /// the least rank of a split that takes it as either half.
     pub(super) fn from_ranks(ranks: &FxHashMap<Vec<u8>, u32>) -> Result<Self, Declined> {
         let mut byte_ids = [0u32; 256];
         for (byte, id) in byte_ids.iter_mut().enumerate() {
@@ -393,6 +407,18 @@ impl MergeTable {
                 )));
             }
         }
+        // The least rank of a merge that takes each id as an operand: every
+        // split the table holds is such a merge, at the token's rank.
+        let mut min_operand = vec![NO_RANK; ranks_end];
+        for &(left, right, rank) in &splits {
+            min_operand[left as usize] = min_operand[left as usize].min(rank);
+            min_operand[right as usize] = min_operand[right as usize].min(rank);
+        }
+        let raws = ranks
+            .iter()
+            .map(|(token, &rank)| (rank, token.clone()))
+            .collect();
+        table.preformed = Box::new(Preformed::analyse(&table, raws, &min_operand));
         Ok(table)
     }
 

@@ -37,7 +37,7 @@ use tracing::{info, trace, warn};
 use zeromq::{RouterSendHalf, SocketRecv};
 
 use crate::{
-    codec::OpaqueValue,
+    codec::{FrameStr, OpaqueValue},
     error::{Error, Result},
     protocol::{
         kv_transfer::KvTransferStats, sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol,
@@ -70,8 +70,10 @@ pub type TrtllmStream = RequestStream<TrtllmProtocol>;
 /// other request on the transport — and backpressuring further, into the
 /// output PULL socket, would wedge the engine itself. Unboundedness is not
 /// unbounded memory: a request's queue is capped by its own generation
-/// (`max_tokens` outputs), a dropped stream auto-aborts it on the engine, and
-/// the buffer is freed with the stream.
+/// (`max_tokens` outputs), each output in it carries its request's own id
+/// rather than a view of the step frame it was decoded from
+/// ([`EngineOutput::own_request_id`]), a dropped stream auto-aborts it on the
+/// engine, and the buffer is freed with the stream.
 type OutputSender<O> = mpsc::UnboundedSender<Result<O>>;
 type OutputReceiver<O> = mpsc::UnboundedReceiver<Result<O>>;
 
@@ -135,6 +137,11 @@ struct RequestRegistry<O> {
 /// its first output, the prompt the engine still has to prefill for it.
 struct InFlight<O> {
     sender: OutputSender<O>,
+    /// The request's own id, copied once at registration and shared by
+    /// every output it is handed at dispatch in place of the step frame's
+    /// view (the first hand-over adds the shared header; a terminal output
+    /// takes the id itself).
+    id: FrameStr,
     prompt_tokens: u64,
     handed: bool,
     started: bool,
@@ -205,10 +212,14 @@ impl<O: EngineOutput> RequestRegistry<O> {
             self.in_flight_since = Some(now);
             self.busy_started.notify_one();
         }
+        // The request's own copy of its id, outside any frame: every output
+        // it is handed shares it in place of the step frame's view.
+        let id = FrameStr::from(request_id.as_str());
         self.requests.insert(
             request_id,
             InFlight {
                 sender,
+                id,
                 prompt_tokens,
                 handed: false,
                 started: false,
@@ -284,9 +295,10 @@ impl<O: EngineOutput> RequestRegistry<O> {
         Some(entry)
     }
 
-    /// The engine answered (an output of any kind): nothing in flight is
-    /// unanswered any more, and the busy period, if one is on, counts from
-    /// `now`. The work in hand is read again once the batch is routed
+    /// The engine answered (an output of any kind, or a sign of progress
+    /// noted outside its output wire): nothing in flight is unanswered any
+    /// more, and the busy period, if one is on, counts from `now`. The work
+    /// in hand is read again once the batch is routed, or at once for a note
     /// ([`Self::work_resumes`]).
     fn output_seen(&mut self, now: Instant) {
         self.unanswered_before = Duration::ZERO;
@@ -324,12 +336,14 @@ impl<O: EngineOutput> RequestRegistry<O> {
     ///
     /// The lookup key stays borrowed from the output, so the hot path — a
     /// non-terminal token batch — never allocates one.
-    fn route(&mut self, output: O) {
+    fn route(&mut self, mut output: O) {
         if output.finished() {
             // Terminal: retire the entry before handing the output over, while
             // its request id is still borrowable.
             match self.retire(output.request_id()) {
                 Some(entry) => {
+                    // The entry is owned here: its id moves, nothing is cloned.
+                    output.own_request_id(entry.id);
                     let _ = entry.sender.send(Ok(output));
                 }
                 None => trace!(
@@ -354,6 +368,8 @@ impl<O: EngineOutput> RequestRegistry<O> {
                 self.prefill_pending = self.prefill_pending.saturating_sub(entry.prompt_tokens);
             }
         }
+        // The queued output keeps the request's id, not the step frame.
+        output.own_request_id(entry.id.clone());
         // A failed send hands the output back, so the receiver-gone (stream
         // dropped) path retires the entry without an owned key either.
         if let Err(mpsc::error::SendError(Ok(undelivered))) = entry.sender.send(Ok(output)) {
@@ -655,9 +671,17 @@ struct ClientInner<P: EngineProtocol> {
     /// The engine's last output of any kind (a token, a completion, a
     /// stats-only step), in milliseconds on `output_clock`; 0 before the
     /// first. Read by [`Client::last_output_at`] and, beside
-    /// `step_reports_since_ms`, by [`Client::output_silence`].
+    /// `step_reports_since_ms` and `last_progress_ms`, by
+    /// [`Client::output_silence`].
     output_clock: Instant,
     last_output_ms: AtomicU64,
+    /// The engine's last sign of progress noted outside its output wire (a
+    /// live KV-event batch, [`Client::note_progress`]), in milliseconds on
+    /// `output_clock`; 0 before the first. Read beside `last_output_ms` by
+    /// [`Client::output_silence`], never by [`Client::last_output_at`]: a
+    /// probe that waits for the engine to speak on its wire is not answered
+    /// by a block it stored.
+    last_progress_ms: AtomicU64,
     /// When the first request the engine reports every step was dispatched
     /// after a spell without one, in milliseconds on `output_clock`: the
     /// silence such a request sees counts from its own dispatch, not from an
@@ -1312,6 +1336,7 @@ impl<P: EngineProtocol> Client<P> {
             next_call_id: AtomicI64::new(1),
             output_clock: Instant::now(),
             last_output_ms: AtomicU64::new(0),
+            last_progress_ms: AtomicU64::new(0),
             step_reports_since_ms: AtomicU64::new(0),
             steps_reported: AtomicBool::new(false),
             kv_transfer_wanted: AtomicBool::new(false),
@@ -1543,10 +1568,12 @@ impl<P: EngineProtocol> Client<P> {
     /// How long the engine has produced nothing while this client holds
     /// requests in flight on it that the engine reports on every step
     /// ([`EngineProtocol::reported_every_step`]): the time since its last
-    /// output batch of any kind (a token, a completion, a stats-only step),
-    /// counted from the dispatch of the first such request after a spell
-    /// without one; `None` while none is in flight. A request the engine
-    /// reports at intervals (one that does not stream, one streamed every so
+    /// output batch of any kind (a token, a completion, a stats-only step)
+    /// or sign of progress noted outside its output wire
+    /// ([`Self::note_progress`]), counted from the dispatch of the first such
+    /// request after a spell without one; `None` while none is in flight. A
+    /// request the engine reports at intervals (one that does not stream, one
+    /// streamed every so
     /// many tokens) is quiet while healthy, so it counts no silence of its
     /// own, though its prompt counts in [`Self::prefill_pending_tokens`]
     /// (its prefill silences the rest). A frozen engine keeps its connection
@@ -1563,6 +1590,7 @@ impl<P: EngineProtocol> Client<P> {
             self.inner
                 .last_output_ms
                 .load(Ordering::Relaxed)
+                .max(self.inner.last_progress_ms.load(Ordering::Relaxed))
                 .max(self.inner.step_reports_since_ms.load(Ordering::Relaxed)),
         );
         Some(self.inner.output_clock.elapsed().saturating_sub(since))
@@ -1608,6 +1636,30 @@ impl<P: EngineProtocol> Client<P> {
     /// behind the routing lock of a client nobody drains.
     pub fn keep_kv_transfer(&self) {
         self.inner.kv_transfer_wanted.store(true, Ordering::Relaxed);
+    }
+
+    /// A sign of the engine's progress from outside its output wire: a
+    /// KV-event batch its publisher sent, read live and in sequence by the
+    /// servicer's relay, which reports it here. It ends the engine's silence
+    /// as an output of any kind does: [`Self::output_silence`] counts from
+    /// it, and the silence watchdog counts its window from it, past the
+    /// prefill work still in hand from `now`. So an engine that stores the
+    /// blocks of a long prefill chunk by chunk is not given up on while it
+    /// does, though its wire says nothing until the prompt's first token.
+    /// Only the engine's own work belongs here: a replayed batch, a relay
+    /// heartbeat or a process-alive poll is not progress, and a frozen
+    /// scheduler is still given up on at the window past its allowance,
+    /// counted from its last sign of life. [`Self::last_output_at`] does
+    /// not move: it says when the engine last spoke on its wire, which is
+    /// what a probe waits for.
+    pub fn note_progress(&self) {
+        let now = Instant::now();
+        self.inner
+            .last_progress_ms
+            .store(self.inner.clock_ms().max(1), Ordering::Relaxed);
+        let mut registry = self.inner.registry.lock();
+        registry.output_seen(now);
+        registry.work_resumes(now);
     }
 
     /// Prompt tokens of the requests the engine has accepted (their add
@@ -1871,9 +1923,14 @@ const ENGINE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// work counts. A wire that reports every scheduler step is never silent
 /// through a prefill; one that carries token batches only says nothing until
 /// a prompt's first token, and a batch of million-token prompts is silent for
-/// as long as their prefill takes, which no fixed window covers. Both figures
-/// are per client ([`Client::set_silence_death_timeout`]); neither removes
-/// the watchdog: without it a killed engine hangs its requests forever.
+/// as long as their prefill takes, which no fixed window covers. A sign of
+/// progress a caller reports from outside the wire, a KV-event batch the
+/// engine published, ends the silence as an output does
+/// ([`Client::note_progress`]):
+/// a chunked prefill stores its blocks chunk by chunk, so an engine whose
+/// publisher is on is not silent through one. Both figures are per client
+/// ([`Client::set_silence_death_timeout`]); neither removes the watchdog:
+/// without it a killed engine hangs its requests forever.
 pub const ENGINE_SILENCE_DEATH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// `at + after`, or an instant that never comes when the sum does not fit
@@ -2144,10 +2201,13 @@ async fn run_dispatcher<P: EngineProtocol>(
     mut abort_rx: mpsc::UnboundedReceiver<(EngineId, String)>,
     inner: Arc<ClientInner<P>>,
 ) {
-    // Positive-liveness watchdog: only output from the engine resets it. The
-    // aborts this loop also handles are the client's own events and say
-    // nothing about the engine; a steady trickle of them (a gateway retrying
-    // into a stalled engine) must not keep a silent engine alive.
+    // Positive-liveness watchdog: only output from the engine, or a sign of
+    // its progress a caller reported from outside the wire
+    // (`Client::note_progress`), resets it. The aborts this loop also
+    // handles are the client's own
+    // events and say nothing about the engine; a steady trickle of them (a
+    // gateway retrying into a stalled engine) must not keep a silent engine
+    // alive.
     let (window, busy_started) = {
         let registry = inner.registry.lock();
         (registry.silence_window, registry.busy_started.clone())

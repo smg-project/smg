@@ -6,7 +6,12 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from fixtures.mock_answers import MockAnswers
+from fixtures.mock_answers import (
+    MockAnswers,
+    class_workers,
+    clear_class_workers,
+    set_class_workers,
+)
 from infra.constants import WorkerType
 from infra.worker import Worker
 from tokenizers import Tokenizer, decoders, pre_tokenizers
@@ -375,3 +380,24 @@ def test_the_copies_left_on_the_other_workers_are_dropped_once_every_stated_answ
     answers.enqueue("blue", prompt_contains="colour")
     assert deleted == [], "marigold is still waiting"
     assert answers.leftovers() == 2
+
+
+def test_the_class_workers_are_read_in_every_role_as_a_copy():
+    encode = Worker(
+        model_id="twin",
+        engine="mock",
+        port=300,
+        gpu_ids=[],
+        worker_type=WorkerType.ENCODE,
+        admin_port=400,
+    )
+    decodes = _decodes(2)
+    set_class_workers([encode, *decodes])
+    try:
+        workers = class_workers()
+        assert workers == [encode, *decodes], "every role, in the order the backend set"
+        workers.clear()
+        assert len(class_workers()) == 3, "a copy: the class's list is not the caller's to change"
+    finally:
+        clear_class_workers()
+    assert class_workers() == []

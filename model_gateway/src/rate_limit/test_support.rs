@@ -1,5 +1,6 @@
 //! A backend that records what the request paths settle, for the tests of
-//! the settle sites.
+//! the settle sites, and the reservation request the backends' tests
+//! reserve with.
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -14,6 +15,7 @@ use super::{
     backend::{RateLimitBackend, ReserveOutcome, ReserveRequest, UsageSettlement},
     SharedReservationHandle,
 };
+use crate::tenant::TenantKey;
 
 /// Admits everything and records every settlement and close.
 #[derive(Default)]
@@ -61,5 +63,16 @@ impl RateLimitBackend for RecordingBackend {
 
     async fn abandon(&self, _request_charge_id: Uuid) {
         self.closes.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A reservation of `tokens` input tokens for `tenant`: a fresh charge id and
+/// no model, as the backends' tests reserve.
+pub(crate) fn reserve_request(tenant: &str, tokens: u32) -> ReserveRequest<'static> {
+    ReserveRequest {
+        request_charge_id: Uuid::now_v7(),
+        tenant_key: TenantKey::new(tenant),
+        model_id: None,
+        estimated_input_tokens: tokens,
     }
 }

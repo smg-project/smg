@@ -22,7 +22,9 @@ pub mod structured_outputs;
 use bytes::Bytes;
 
 use crate::{
-    codec::{encode_msgpack, tensor::encode_with_aux_frames, OpaqueValue},
+    codec::{
+        add_request_capacity, encode_msgpack, tensor::encode_with_aux_frames, FrameStr, OpaqueValue,
+    },
     error::Result,
     protocol::{
         vllm::{
@@ -52,7 +54,11 @@ impl From<SchedulerStats> for EngineLoad {
 
 impl EngineOutput for EngineCoreOutput {
     fn request_id(&self) -> &str {
-        &self.request_id
+        self.request_id.as_str()
+    }
+
+    fn own_request_id(&mut self, id: FrameStr) {
+        self.request_id = id;
     }
 
     fn finished(&self) -> bool {
@@ -104,9 +110,11 @@ impl EngineProtocol for VllmProtocol {
 
     /// Encode the request with its large typed tensors as auxiliary frames
     /// ([`encode_with_aux_frames`]); raw features keep the encoding their
-    /// producer gave them, and the text path its one allocation.
+    /// producer gave them, and the text path its one allocation: the payload's
+    /// buffer is sized from the prompt before the write.
     fn encode_add(request: &Self::Request, _layout: &()) -> Result<(Vec<u8>, Vec<Bytes>)> {
-        encode_with_aux_frames(request)
+        let prompt_tokens = request.prompt_token_ids.as_ref().map_or(0, Vec::len);
+        encode_with_aux_frames(request, add_request_capacity(prompt_tokens))
     }
 
     fn encode_abort(request_id: &str) -> Result<Vec<u8>> {

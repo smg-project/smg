@@ -20,8 +20,8 @@ on:
       - '!model_gateway/src/**/tests/**'
       - '!model_gateway/src/**/*_test.rs'
       - '!model_gateway/src/**/test_*.rs'
-      # After the test exclusions: the rows decode with this file's character tokenizer.
-      - 'model_gateway/src/test_support.rs'
+      # After the test exclusions: the rows decode with the streaming module's character tokenizer.
+      - 'model_gateway/src/routers/grpc/regular/streaming/character_tokenizer.rs'
   pull_request:
     branches: [ main, release/** ]
     paths:
@@ -41,8 +41,8 @@ on:
       - '!model_gateway/src/**/tests/**'
       - '!model_gateway/src/**/*_test.rs'
       - '!model_gateway/src/**/test_*.rs'
-      # After the test exclusions: the rows decode with this file's character tokenizer.
-      - 'model_gateway/src/test_support.rs'
+      # After the test exclusions: the rows decode with the streaming module's character tokenizer.
+      - 'model_gateway/src/routers/grpc/regular/streaming/character_tokenizer.rs'
   workflow_dispatch:
   schedule:
     - cron: '0 0 * * 0'
@@ -59,6 +59,14 @@ jobs:
     name: Stream State Machines
     if: github.repository == 'smg-project/smg' || vars.SMG_RUN_BENCHMARKS == 'true'
     runs-on: ubuntu-latest
+    env:
+      # Every bench binary of this job, the gate's pair and the summary run's,
+      # places every function on a 64-byte boundary, so a pull request's code
+      # size does not move the unchanged hot functions into another placement
+      # class (the two speed states of identical code described in
+      # .github/bench-gates/stream-state-machines.toml). RUSTFLAGS replaces the list in
+      # .cargo/config.toml, so the outliner flag is repeated here.
+      RUSTFLAGS: -C llvm-args=-enable-machine-outliner=never -C llvm-args=-align-all-functions=6
     steps:
       - uses: actions/checkout@v7
         with:

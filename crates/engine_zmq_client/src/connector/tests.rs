@@ -5,7 +5,7 @@ use zeromq::{util::PeerIdentity, Endpoint, SocketEvent};
 
 use super::*;
 use crate::{
-    codec::{decode_msgpack, encode_msgpack},
+    codec::{decode_msgpack, encode_msgpack, tensor::lies_within},
     mock_engine::{
         connect_to_frontend, default_ready_response, hello, redial_input, EngineInbound,
         IpcNamespace, MockEngine,
@@ -144,7 +144,7 @@ fn wave_control(engine_index: u32, control: DpControlMessage) -> Vec<Bytes> {
 fn batch(engine_index: u32, output: EngineCoreOutput) -> Vec<Bytes> {
     let finished = output.finish_reason.map(|_| {
         let mut set = std::collections::BTreeSet::new();
-        set.insert(output.request_id.clone());
+        set.insert(String::from(&output.request_id));
         set
     });
     let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
@@ -977,7 +977,7 @@ async fn a_request_reported_at_intervals_counts_no_silence() {
             ..TokenizedGenerateReqInput::default()
         };
     let done = |rid: &str, prompt_tokens: u32| BatchTokenIDOutSlim {
-        rids: vec![rid.to_string()],
+        rids: vec![rid.into()],
         output_ids: vec![vec![11]],
         finished_reasons: vec!["stop".into()],
         prompt_tokens: vec![prompt_tokens],
@@ -1105,7 +1105,7 @@ async fn an_sglang_request_reported_at_intervals_counts_no_silence() {
         })
     };
     let done = |rid: &str, prompt_tokens: u32| BatchTokenIDSlimOutput {
-        rids: vec![rid.to_string()],
+        rids: vec![rid.into()],
         output_ids: vec![vec![11]],
         finished_reasons: vec!["stop".into()],
         finished_messages: vec![None],
@@ -1157,7 +1157,7 @@ async fn an_sglang_request_reported_at_intervals_counts_no_silence() {
     assert_eq!(client.prefill_pending_tokens(), 7);
     // Its result ends it, and the silence with it.
     let result = BatchEmbeddingSlimOutput {
-        rids: vec!["sg-embed".to_string()],
+        rids: vec!["sg-embed".into()],
         embeddings: vec![vec![0.5]],
         prompt_tokens: vec![2],
         cached_tokens: vec![0],
@@ -3323,36 +3323,49 @@ async fn a_pending_prompt_extends_the_bound_on_the_vllm_wire() {
     .await;
 }
 
+/// A streaming add-request of `prompt_tokens` prompt tokens on the
+/// TokenSpeed wire, reported every step.
+fn tokenspeed_request(
+    rid: &str,
+    prompt_tokens: usize,
+) -> <TokenSpeedProtocol as EngineProtocol>::Request {
+    use crate::protocol::tokenspeed::{
+        request::TokenizedGenerateReqInput, sampling::SamplingParams,
+    };
+    TokenizedGenerateReqInput {
+        rid: rid.to_string(),
+        input_ids: vec![1; prompt_tokens],
+        sampling_params: SamplingParams {
+            max_new_tokens: Some(4),
+            ..SamplingParams::default()
+        },
+        stream: true,
+        ..TokenizedGenerateReqInput::default()
+    }
+}
+
+/// The TokenSpeed wire's finished output for `rid`: one token, `stop`.
+fn tokenspeed_done(rid: &str, prompt_tokens: u32) -> Vec<Bytes> {
+    use crate::protocol::tokenspeed::output::BatchTokenIDOutSlim;
+    let done = BatchTokenIDOutSlim {
+        rids: vec![rid.into()],
+        output_ids: vec![vec![11]],
+        finished_reasons: vec!["stop".into()],
+        prompt_tokens: vec![prompt_tokens],
+        completion_tokens: vec![1],
+        cached_tokens: vec![0],
+        output_token_logprobs_val: vec![vec![]],
+        output_token_logprobs_idx: vec![vec![]],
+        ..Default::default()
+    };
+    vec![Bytes::from(encode_msgpack(&done).unwrap())]
+}
+
 #[tokio::test]
 async fn a_pending_prompt_extends_the_bound_on_the_tokenspeed_wire() {
-    use crate::protocol::tokenspeed::{
-        output::BatchTokenIDOutSlim, request::TokenizedGenerateReqInput, sampling::SamplingParams,
-    };
     a_pending_prompt_extends_the_bound_and_nothing_pending_does_not::<TokenSpeedProtocol>(
-        |rid, prompt_tokens| TokenizedGenerateReqInput {
-            rid: rid.to_string(),
-            input_ids: vec![1; prompt_tokens],
-            sampling_params: SamplingParams {
-                max_new_tokens: Some(4),
-                ..SamplingParams::default()
-            },
-            stream: true,
-            ..TokenizedGenerateReqInput::default()
-        },
-        |rid, prompt_tokens| {
-            let done = BatchTokenIDOutSlim {
-                rids: vec![rid.to_string()],
-                output_ids: vec![vec![11]],
-                finished_reasons: vec!["stop".into()],
-                prompt_tokens: vec![prompt_tokens],
-                completion_tokens: vec![1],
-                cached_tokens: vec![0],
-                output_token_logprobs_val: vec![vec![]],
-                output_token_logprobs_idx: vec![vec![]],
-                ..Default::default()
-            };
-            vec![Bytes::from(encode_msgpack(&done).unwrap())]
-        },
+        tokenspeed_request,
+        tokenspeed_done,
     )
     .await;
 }
@@ -3379,7 +3392,7 @@ async fn a_pending_prompt_extends_the_bound_on_the_sglang_wire() {
         },
         |rid, prompt_tokens| {
             let done = BatchTokenIDSlimOutput {
-                rids: vec![rid.to_string()],
+                rids: vec![rid.into()],
                 output_ids: vec![vec![11]],
                 finished_reasons: vec!["stop".into()],
                 finished_messages: vec![None],
@@ -3396,6 +3409,86 @@ async fn a_pending_prompt_extends_the_bound_on_the_sglang_wire() {
         },
     )
     .await;
+}
+
+/// A sign of the engine's progress noted outside its output wire ends its
+/// silence as an output does: a prompt whose prefill runs past the window
+/// and its
+/// allowance is served while the notes keep coming and the silence the
+/// servicer reports restarts at each; once the notes stop, the engine is
+/// given up on at the window past its allowance, counted from the last
+/// note.
+#[tokio::test]
+async fn a_sign_of_progress_noted_outside_the_wire_ends_the_silence_like_an_output() {
+    let (client, mut engine, _ns) = connect_wire::<TokenSpeedProtocol>().await;
+    let window = Duration::from_millis(400);
+    client.set_silence_death_timeout(window);
+    // 4k prompt tokens at 10k tokens/s: an allowance of one window, so a
+    // silent engine would be given up on two windows after the dispatch.
+    client.set_prefill_tokens_per_sec(10_000);
+    let allowance = window;
+    let mut stream = client
+        .submit(tokenspeed_request("req-long", 4_000))
+        .await
+        .unwrap();
+    engine.recv_request().await.unwrap();
+    // Five windows of silence on the wire with a note every half window:
+    // a prefill in progress, not a dead engine.
+    for _ in 0..10 {
+        tokio::time::sleep(window / 2).await;
+        client.note_progress();
+        assert_eq!(
+            client.last_output_at(),
+            None,
+            "a note is not an output on the wire: the health probe's stamp stays put"
+        );
+        let silence = client.output_silence().expect("a request is in flight");
+        assert!(
+            silence < window / 4,
+            "the note restarted the silence: {silence:?}"
+        );
+    }
+    assert!(
+        client.is_alive(),
+        "served through five windows of silence on the wire"
+    );
+    engine
+        .send_output(tokenspeed_done("req-long", 4_000))
+        .await
+        .unwrap();
+    let output = stream
+        .next()
+        .await
+        .expect("an item")
+        .expect("served, not failed by the watchdog");
+    assert!(output.finished());
+    assert!(stream.next().await.is_none());
+    // The notes stop on the next prompt: the engine is given up on at the
+    // window past the prompt's allowance, counted from the last note.
+    let mut stream = client
+        .submit(tokenspeed_request("req-stalled", 4_000))
+        .await
+        .unwrap();
+    engine.recv_request().await.unwrap();
+    for _ in 0..3 {
+        tokio::time::sleep(window / 2).await;
+        client.note_progress();
+    }
+    let last_note = std::time::Instant::now();
+    let error = match stream.next().await {
+        Some(Err(error)) => error,
+        Some(Ok(_)) => {
+            panic!("an engine silent past the window and its allowance is dead, not serving")
+        }
+        None => panic!("the stream ended without the engine's death"),
+    };
+    assert!(is_engine_dead(&error), "{error:?}");
+    let since_last_note = last_note.elapsed();
+    assert!(
+        since_last_note >= window + allowance && since_last_note < 2 * window + allowance,
+        "given up on at the window past the allowance, from the last note: {since_last_note:?}"
+    );
+    assert!(!client.is_alive());
 }
 
 /// With no prefill allowance (zero tokens per second) the bound is the
@@ -3609,6 +3702,43 @@ async fn an_add_the_engine_never_received_queues_no_allowance_on_the_wire() {
         "at the window, nothing queued for the prompts the engine never got: {elapsed:?}"
     );
     assert!(!client.is_alive());
+}
+
+/// A decoded output's id is a view of its step frame; the routed output
+/// carries its request's own id instead, so a stream that reads slowly
+/// holds its outputs' bytes and not every step frame they came in.
+#[test]
+fn a_routed_output_keeps_its_request_id_and_frees_the_step_frame() {
+    let mut registry = RequestRegistry::<<VllmProtocol as EngineProtocol>::Output>::default();
+    let mut receiver = registry
+        .register("req-1".to_string(), 1, true)
+        .expect("register");
+    let mut frames = batch(
+        0,
+        EngineCoreOutput {
+            request_id: "req-1".into(),
+            new_token_ids: vec![10],
+            ..Default::default()
+        },
+    );
+    let decoded = VllmProtocol::decode_batch(&frames, &()).expect("decode");
+    let output = decoded.outputs.into_iter().next().expect("one output");
+    assert!(
+        lies_within(&frames[0], output.request_id().as_bytes()),
+        "decoded within the frame, the id is a view of it"
+    );
+    registry.route(output);
+    let routed = receiver.try_recv().expect("routed").expect("an output");
+    assert_eq!(routed.request_id(), "req-1");
+    assert!(
+        !lies_within(&frames[0], routed.request_id().as_bytes()),
+        "the routed id is the request's own"
+    );
+    let frame = frames.pop().expect("the frame");
+    assert!(
+        frame.try_into_mut().is_ok(),
+        "nothing else holds the step frame"
+    );
 }
 
 /// The registry's side of it: a registered prompt is neither pending nor

@@ -28,8 +28,10 @@
 //!   worker of the process has is a 404, as on the fault routes.
 //! - `GET /admin/zmq/{worker}`: a ZMQ rank's `batch_messages` (the output
 //!   messages that carried request outputs) and `outputs` (the outputs in
-//!   them) since it connected: cumulative, a reset does not clear them; a
-//!   rank name, not `all`.
+//!   them) since it connected, and its side of the wave protocol when it is
+//!   a rank of a lockstep group: `parks` (the waves it drained and parked
+//!   on), `wakes` (the wave starts it accepted) and `wave` (its current
+//!   wave); cumulative, a reset does not clear them; a rank name, not `all`.
 //!
 //! Worker names are `grpc:<port>` / `http:<port>` / `zmq:<index>`; `all`
 //! addresses every worker on the routes that take it.
@@ -418,15 +420,21 @@ fn injected_failures() -> Value {
 /// What a ZMQ rank has pushed since it connected: the messages that carried
 /// request outputs and the outputs in them, cumulative (a reset does not
 /// clear them), so a test tells an engine's step of many outputs from one
-/// message per token.
+/// message per token; and the waves a rank of a lockstep group parked on,
+/// the wave starts it accepted and its current wave, so a test tells a park
+/// from a wake.
 async fn zmq_rank(Path(worker): Path<String>) -> Response {
     match crate::zmq::rank_output_counts(&worker) {
         Some(counts) => {
             let (batch_messages, outputs) = counts.read();
+            let (parks, wakes, wave) = counts.waves();
             Json(json!({
                 "worker": worker,
                 "batch_messages": batch_messages,
                 "outputs": outputs,
+                "parks": parks,
+                "wakes": wakes,
+                "wave": wave,
             }))
             .into_response()
         }

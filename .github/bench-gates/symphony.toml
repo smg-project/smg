@@ -35,6 +35,28 @@
 # identical-build spread and 1.5 x the across-build change, never under 10 %. Every job uploads
 # bench-gate/results.json with the raw per-run medians of both sides; a second null case can
 # tighten the setup rows further. The last entry catches a row added later at the provisional 25 %.
+#
+# Placement. The workflow's benchmark job builds its binaries, the gate's pair and the summary
+# run's, with every function on a 64-byte boundary (RUSTFLAGS: `-C
+# llvm-args=-align-all-functions=6`, beside the outliner flag of .cargo/config.toml). Without it the
+# prose/whole rows of six marker tables (gemma4, glm, kimi_k3, lfm2.5, qwen3, qwen3_tagged) have two
+# states, about 540 and 790 ns, chosen by where the unchanged scanner code lands: the same bytes
+# linked 32 bytes later read +46 to +48 % on all six and flat elsewhere, linked 16 or 48 bytes later
+# they read flat, and a pull request whose code size moved the unchanged functions by 16 bytes
+# modulo 64 failed this gate at +45 to +47 % on the hosted runner while its parser code was
+# byte-identical. With functions aligned that pull request's pair reads -0.7 to +0.3 % on the six
+# rows with both arms in the 540 ns state, and the same-bytes floor reads 0 failed with the
+# prose/whole rows inside 1 %. An inserted regression of one dependent multiply-add per 32 bytes of
+# every delta reads +16 to +22 % on the six rows under the aligned build: five of them fail and
+# lfm2.5 passes at +16.3 %, prose/whole/json (+21.2 %) and prose/whole/plain (+38.2 %) fail beside
+# them, 7 of 57 ids. The default build in its 540 ns state reads the same regression at +22 to +23 %
+# on all six, json passing at +16.5 %, 7 of 57 as well. Aligning loops too (`-align-loops=64`) or
+# every block without fall-through parks both arms in the 790 ns state, where the six read +14 to
+# +15 % and none fails (1 and 2 of 57): functions only keeps the failed count and five of the six
+# rows. A regression of this size sits at the edge of the 20 % threshold on the six rows under
+# either build: the threshold comes from the null-case rule above, not from this regression. The hot
+# code's own placement still follows its function's body, so a change to the scanner itself is
+# measured at the placement its own code produces, as any code change is.
 
 repeats = 3
 filter = "^((parse|prose)/|setup/(table|engine)/|setup/declared$)"

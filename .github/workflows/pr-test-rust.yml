@@ -761,7 +761,8 @@ jobs:
               - 'scripts/ci_install_rust.sh'
               - 'scripts/ci_apt_mirror.sh'
             # The gateway and everything it links: every crate but the radix tree,
-            # plus the sources two gateway integration tests read from disk
+            # the OpenAPI generator (the gateway's control-plane route test reads
+            # its route list), plus the sources two gateway integration tests read from disk
             # (the metrics catalogue test walks model_gateway, crates, clients,
             # bindings and examples for recorder and family names, Rust sources
             # only; the dashboard test reads the Helm chart), which the previous
@@ -772,6 +773,7 @@ jobs:
               - 'model_gateway/**'
               - 'crates/**'
               - '!crates/radix_tree/**'
+              - 'clients/openapi-gen/**'
               - 'bindings/python/src/**/*.rs'
               - 'bindings/golang/src/**/*.rs'
               - 'clients/**/*.rs'
@@ -1877,7 +1879,10 @@ jobs:
           # smoke of SGLang over NIXL (its venv gets NIXL only on this row,
           # #2498). The peer-restart test stays out of the NIXL smoke: the
           # SGLang prefill segfaults when its decode comes back on the same
-          # address (#2503). The full sweeps run in nightly-pd.
+          # address (#2503). The smoke carries the 1p1d-http row too: the
+          # HTTP PD router is its own code path (pairing, error answers and
+          # the KV handoff on SGLang), and this is its one pull-request
+          # signal. The other HTTP rows and the full sweeps run in nightly-pd.
           - engine: vllm
             kv_backend: mooncake
             timeout: 50
@@ -1886,7 +1891,7 @@ jobs:
             kv_backend: nixl
             timeout: 60
             test_timeout: 50
-            test_filter: -k "1p1d and not http and not sole_leg_outage"
+            test_filter: -k "1p1d and not sole_leg_outage"
             min_selected: 11
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
@@ -1962,6 +1967,7 @@ jobs:
         deepseek-ai/DeepSeek-R1-Distill-Qwen-7B@916b56a44061fd5cd7d6a8fb632557ed4f724f60
         Qwen/Qwen2.5-14B-Instruct@cf98f3b3bbb457ad9e2bb7baf9a0125b6b88caa8
         openai/gpt-oss-20b@6cee5e81ee83917806bbde320786a8fb61efebee
+        Qwen/Qwen3-VL-8B-Instruct@0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
       SHOW_ROUTER_LOGS: "1"
     steps:
       - name: Checkout code
@@ -2040,25 +2046,31 @@ jobs:
         env:
           SHOW_WORKER_LOGS: "0"
           E2E_LOG_DIR: e2e-logs
-          # floor ≈ 95% of the 514 cases the mock marker selects: the chat
+          # floor ≈ 95% of the 539 cases the mock marker selects: the chat
           # completion, request-id, concurrency, reasoning-content, EOS
           # stripping, function-calling, tool-choice (three models),
           # multi-turn and sampling-defaults classes, the constraint-failure
           # and the reader-panic classes, the completions classes, the
           # context-length and load-report classes (the disaggregated ones
-          # included), the disaggregated topology, pairing-protocol,
-          # runtime-assembled fleet, Messages and Responses classes on mock
-          # prefill and decode workers, the Responses local
+          # included), the disaggregated topology (its gRPC rows, and its
+          # HTTP rows on the mock's HTTP prefill and decode workers),
+          # pairing-protocol, runtime-assembled fleet, Messages and
+          # Responses classes on mock prefill and decode workers, the
+          # Responses local
           # classes (state, background, streaming events, sampling
           # parameters, item references, the object shape), and the gpt-oss
           # classes of chat and Responses on the Harmony token stream (the
           # mock's tokenizer turns a scripted answer's channel markers into
           # the special tokens), the scheduler-wire classes (a chat, a
           # streamed and a tool-call turn through the gateway on each of the
-          # three gRPC protos the mock serves), and the worker API classes
-          # (the list routes, IGW mode, disable-health-check, the REST
-          # semantics)
-          E2E_MIN_SELECTED: "488"
+          # three gRPC protos the mock serves), the disaggregated
+          # scheduler-wire classes (a chat and a streamed turn on a prefill
+          # and a decode worker on the sglang and the vllm wires), the
+          # encode-prefill-decode scheduler-wire class (a text and an image
+          # turn on an encode, a prefill and a decode worker on the vllm
+          # wire), and the worker API classes (the list routes, IGW mode,
+          # disable-health-check, the REST semantics)
+          E2E_MIN_SELECTED: "512"
           MOCK_WORKER_BIN: ${{ github.workspace }}/target/debug/mock-worker
           ROUTER_LOCAL_MODEL_PATH: ${{ runner.temp }}/models
           TIKTOKEN_ENCODINGS_BASE: ${{ runner.temp }}/models/tiktoken

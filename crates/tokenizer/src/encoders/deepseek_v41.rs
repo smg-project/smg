@@ -11,9 +11,10 @@
 
 use serde_json::{json, Value};
 
-// `DsEncodingError` lives in `deepseek_common` (shared with V4); re-exported
-// here because it is part of this module's public API, and `pub(super)` items
-// are not reachable from outside `encoders` on their own.
+// `DsEncodingError` lives in `deepseek_common` (one type for the three
+// renderers); re-exported here because it is part of this module's public
+// API, and `pub(super)` items are not reachable from outside `encoders` on
+// their own.
 pub use super::deepseek_common::DsEncodingError;
 pub use super::deepseek_common::{
     BOS_TOKEN, DSML_TOKEN, EOS_TOKEN, THINKING_END_TOKEN, THINKING_START_TOKEN,
@@ -431,13 +432,7 @@ fn render_message(
     reasoning_effort: Option<ReasoningEffort>,
     effort_table: EffortTable,
 ) -> Result<String, DsEncodingError> {
-    let Some(msg) = messages.get(index) else {
-        return Err(DsEncodingError::IndexOutOfRange {
-            index,
-            len: messages.len(),
-        });
-    };
-    let turn = Turn::read(index, msg);
+    let turn = Turn::read(index, messages)?;
     let last_user_idx = find_last_turn_index(messages);
     let mut prompt = render_prefix(&turn, thinking_mode, reasoning_effort, effort_table);
     match turn.role {
@@ -504,16 +499,11 @@ fn render_system(turn: &Turn<'_>, prompt: &mut String) {
     );
 }
 
-/// A developer turn renders as a user turn; an empty one is an error.
+/// A developer turn renders as a user turn; an empty one is refused.
 fn render_developer(turn: &Turn<'_>, prompt: &mut String) -> Result<(), DsEncodingError> {
-    if turn.content.is_empty() {
-        return Err(DsEncodingError::InvalidMessage {
-            role: turn.role.to_string(),
-            msg: turn.msg.to_string(),
-        });
-    }
+    let content = turn.developer_content()?;
     prompt.push_str(USER);
-    prompt.push_str(turn.content);
+    prompt.push_str(content);
     push_tools_and_response_format(
         prompt,
         turn.tools.as_deref(),

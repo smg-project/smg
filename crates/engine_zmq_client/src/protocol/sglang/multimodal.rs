@@ -530,9 +530,8 @@ pub(crate) mod recorded {
 mod tests {
     use super::*;
     use crate::codec::{
-        decode_msgpack, decode_value,
+        decode_msgpack, decode_value, hex,
         tensor::{encode_with_aux_frames, TENSOR_AUX_MIN_BYTES},
-        unhex,
     };
 
     /// `msgspec.msgpack.Encoder(enc_hook=sglang.srt.utils.msgpack_utils.enc_hook)`
@@ -596,15 +595,15 @@ mod tests {
     /// own encoder writes.
     #[test]
     fn tensors_encode_as_sglangs_own_extension() {
-        assert_eq!(encode_msgpack(&pixels()).unwrap(), unhex(PYTHON_PIXELS));
-        assert_eq!(encode_msgpack(&grid()).unwrap(), unhex(PYTHON_GRID));
+        assert_eq!(encode_msgpack(&pixels()).unwrap(), hex(PYTHON_PIXELS));
+        assert_eq!(encode_msgpack(&grid()).unwrap(), hex(PYTHON_GRID));
         let empty = SglangWireTensor::new("bfloat16", vec![0, 4], Bytes::new()).unwrap();
         assert_eq!(
             encode_msgpack(&empty).unwrap(),
-            unhex("c715020000001193920004a862666c6f61743136a3637075")
+            hex("c715020000001193920004a862666c6f61743136a3637075")
         );
-        for (hex, tensor) in [(PYTHON_PIXELS, pixels()), (PYTHON_GRID, grid())] {
-            let back: SglangWireTensor = decode_msgpack(&unhex(hex)).unwrap();
+        for (pin, tensor) in [(PYTHON_PIXELS, pixels()), (PYTHON_GRID, grid())] {
+            let back: SglangWireTensor = decode_msgpack(&hex(pin)).unwrap();
             assert_eq!(back, tensor);
         }
     }
@@ -638,7 +637,7 @@ mod tests {
     /// the format as enum values, the offsets as `[start, end]` pairs.
     #[test]
     fn the_processor_output_matches_sglangs_own_encoding() {
-        assert_eq!(encode_msgpack(&inputs()).unwrap(), unhex(PYTHON_OUTPUT));
+        assert_eq!(encode_msgpack(&inputs()).unwrap(), hex(PYTHON_OUTPUT));
         let no_offsets = SglangWireMmInputs {
             mm_items: vec![SglangWireMmItem {
                 modality: SglangWireModality::Image,
@@ -652,9 +651,9 @@ mod tests {
         };
         assert_eq!(
             encode_msgpack(&no_offsets).unwrap(),
-            unhex(PYTHON_OUTPUT_NO_OFFSETS)
+            hex(PYTHON_OUTPUT_NO_OFFSETS)
         );
-        let Value::Array(slots) = decode_value(&unhex(PYTHON_OUTPUT)).unwrap() else {
+        let Value::Array(slots) = decode_value(&hex(PYTHON_OUTPUT)).unwrap() else {
             panic!("expected a positional array");
         };
         assert_eq!(slots.len(), PROCESSOR_OUTPUT_WIRE_FIELDS.len());
@@ -677,7 +676,7 @@ mod tests {
         // The engine's own encoding of the same output writes all 18 slots, the
         // fourteen past the prefix nil: it decodes to the same value.
         let all_slots = format!("dc0012{}{}", &PYTHON_OUTPUT[2..], "c0".repeat(14));
-        let back: SglangWireMmInputs = decode_msgpack(&unhex(&all_slots)).unwrap();
+        let back: SglangWireMmInputs = decode_msgpack(&hex(&all_slots)).unwrap();
         assert_eq!(back, inputs());
     }
 
@@ -704,10 +703,10 @@ mod tests {
         };
         // ext 8, 13 bytes, type 100: `[[2, 4], "float32", 1]`
         const FRAMED: &str = "c70d6493920204a7666c6f6174333201";
-        assert_eq!(encode_msgpack(&framed).unwrap(), unhex(FRAMED));
-        let back: SglangWireTensor = decode_msgpack(&unhex(FRAMED)).unwrap();
+        assert_eq!(encode_msgpack(&framed).unwrap(), hex(FRAMED));
+        let back: SglangWireTensor = decode_msgpack(&hex(FRAMED)).unwrap();
         assert_eq!(back, framed);
-        for (hex, needle) in [
+        for (pin, needle) in [
             (
                 "c70c6492920204a7666c6f61743332",
                 "[shape, dtype, index], got 2 elements",
@@ -727,10 +726,10 @@ mod tests {
             ("c7016401", "the list [shape, dtype, index]"),
             ("c7020700ff", "got type 7"),
         ] {
-            let error = decode_msgpack::<SglangWireTensor>(&unhex(hex))
+            let error = decode_msgpack::<SglangWireTensor>(&hex(pin))
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains(needle), "{hex}: {error}");
+            assert!(error.contains(needle), "{pin}: {error}");
         }
     }
 
@@ -789,7 +788,7 @@ mod tests {
         )
         .unwrap();
         let mixed = vec![large.clone(), tensor(16)];
-        let (payload, frames) = encode_with_aux_frames(&mixed).unwrap();
+        let (payload, frames) = encode_with_aux_frames(&mixed, 0).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(
             frames[0].as_ptr(),

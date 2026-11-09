@@ -11,7 +11,6 @@
 //! side completes, one decode worker cancels every call before its stream.
 
 use std::{
-    future::Future,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -20,11 +19,11 @@ use std::{
 };
 
 use common::{
+    decode_stream::produce_after,
     engine_answers::{VllmAnswers, VllmGenerateStream},
     grpc_harness::{build_grpc_router, grpc_router_config, grpc_workers, serve_engine},
+    metrics_capture::render_after,
 };
-use metrics_exporter_prometheus::PrometheusBuilder;
-use proto::generate_response::Response as GenResp;
 use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
@@ -47,8 +46,6 @@ const OUTPUT_TOKENS: u32 = 3;
 const CASE_CAP: Duration = Duration::from_secs(30);
 /// The words tonic puts on a call whose connection closed under it.
 const CANCEL_MESSAGE: &str = "operation was canceled";
-
-type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
 
 /// What a mock engine does with a generate call.
 #[derive(Clone, Copy)]
@@ -80,47 +77,6 @@ impl Engine {
     }
 }
 
-fn chunk(id: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Chunk(proto::GenerateStreamChunk {
-            token_ids: vec![id],
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-fn complete(finish_reason: &str, tokens: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Complete(proto::GenerateComplete {
-            output_ids: (1..=tokens).collect(),
-            finish_reason: finish_reason.to_string(),
-            prompt_tokens: 1,
-            completion_tokens: tokens,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-/// Feed one generate stream: the tokens, then the completion.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "test mock; the producer task ends with its stream"
-)]
-fn produce(tx: GenerateTx) {
-    tokio::spawn(async move {
-        for id in 1..=OUTPUT_TOKENS {
-            if tx.send(Ok(chunk(id))).await.is_err() {
-                return;
-            }
-        }
-        let _ = tx.send(Ok(complete("stop", OUTPUT_TOKENS))).await;
-    });
-}
-
 #[tonic::async_trait]
 impl VllmAnswers for Engine {
     async fn generate(
@@ -132,7 +88,7 @@ impl VllmAnswers for Engine {
             return Err(Status::cancelled(CANCEL_MESSAGE));
         }
         let (tx, rx) = mpsc::channel(8);
-        produce(tx);
+        produce_after(tx, Duration::ZERO, OUTPUT_TOKENS);
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
@@ -190,29 +146,6 @@ async fn one_streaming_chat(router: &dyn RouterTrait) -> (http::StatusCode, Stri
         status,
         String::from_utf8(bytes.to_vec()).expect("utf-8 body"),
     )
-}
-
-/// Run `case` on a current-thread runtime under a thread-local recorder and
-/// return the rendered `/metrics` text.
-#[expect(
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
-fn render_after<F, Fut>(case: F) -> String
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let recorder = PrometheusBuilder::new().build_recorder();
-    let handle = recorder.handle();
-    metrics::with_local_recorder(&recorder, || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("current-thread runtime");
-        rt.block_on(case());
-    });
-    handle.render()
 }
 
 /// The sum of a counter's samples carrying every one of `labels`; zero when

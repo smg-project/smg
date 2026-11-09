@@ -20,7 +20,7 @@ use crate::{
     codec::{
         decode_msgpack, deserialize_tolerant_seq,
         tensor::{decode_within_frame, WireTensor},
-        OpaqueValue, TrailingTolerant,
+        FrameStr, OpaqueValue, TrailingTolerant,
     },
     error::{Error, Result},
     protocol::{
@@ -91,7 +91,8 @@ pub struct EngineCoreEvent {
 pub struct EngineCoreOutput {
     /// Local metadata copied from the enclosing batch; never serialized.
     pub batch_timestamp: Option<f64>,
-    pub request_id: String,
+    /// The request's id, a view of the frame it was decoded within.
+    pub request_id: FrameStr,
     pub new_token_ids: Vec<u32>,
     /// Decoded sample logprobs for the newly generated positions.
     pub new_logprobs: Option<Logprobs>,
@@ -177,7 +178,7 @@ impl Serialize for EngineCoreOutput {
         let new_logprobs = wire_logprobs(self.new_logprobs.as_ref())?;
         let new_prompt_logprobs_tensors = wire_logprobs(self.new_prompt_logprobs_tensors.as_ref())?;
         WireEngineCoreOutputRef {
-            request_id: &self.request_id,
+            request_id: self.request_id.as_str(),
             new_token_ids: &self.new_token_ids,
             new_logprobs: new_logprobs.as_ref(),
             new_prompt_logprobs_tensors: new_prompt_logprobs_tensors.as_ref(),
@@ -215,7 +216,7 @@ fn wire_logprobs<E: serde::ser::Error>(
 /// [`EngineCoreOutput`] is built.
 #[derive(Debug, Clone, PartialEq, Deserialize_tuple, DefaultFromSerde)]
 struct WireEngineCoreOutput {
-    request_id: String,
+    request_id: FrameStr,
     new_token_ids: Vec<u32>,
     #[serde(default)]
     new_logprobs: Option<Box<WireLogprobs>>,
@@ -709,7 +710,6 @@ mod tests {
         codec::{
             decode_value, encode_msgpack, hex,
             tensor::{lies_within, WireArrayData, WireNdArray},
-            unhex,
         },
         protocol::vllm::logprobs::{PositionLogprobs, TokenLogprob},
     };
@@ -726,7 +726,7 @@ mod tests {
 
     #[test]
     fn decode_vllm_pooling_output_inline() {
-        let frame = Bytes::from(unhex(VLLM_POOLING_OUTPUTS_INLINE));
+        let frame = Bytes::from(hex(VLLM_POOLING_OUTPUTS_INLINE));
         let batch = decode_engine_core_outputs(std::slice::from_ref(&frame))
             .unwrap()
             .into_request_batch()
@@ -762,7 +762,7 @@ mod tests {
                 .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<_>>(),
         );
-        let frames = vec![Bytes::from(unhex(VLLM_POOLING_OUTPUTS_AUX)), aux.clone()];
+        let frames = vec![Bytes::from(hex(VLLM_POOLING_OUTPUTS_AUX)), aux.clone()];
         let batch = decode_engine_core_outputs(&frames)
             .unwrap()
             .into_request_batch()
@@ -783,7 +783,7 @@ mod tests {
     #[test]
     fn pooling_output_roundtrips_through_the_mock_send_path() {
         let outputs = batch(vec![EngineCoreOutput {
-            request_id: "req-1".to_string(),
+            request_id: "req-1".into(),
             pooling_output: Some(Box::new(PoolingOutput::new(
                 WireTensor::from_f32(vec![2], vec![1.0, -2.0]).unwrap(),
             ))),
@@ -821,7 +821,7 @@ mod tests {
             per_step_drafted: Some(vec![2, 2]),
         };
         let outputs = batch(vec![EngineCoreOutput {
-            request_id: "req-1".to_string(),
+            request_id: "req-1".into(),
             new_token_ids: vec![1],
             spec_decode_metrics: Some(Box::new(metrics.clone())),
             ..Default::default()
@@ -886,7 +886,7 @@ mod tests {
     #[test]
     fn engine_core_outputs_roundtrip_finished_fields() {
         let outputs = batch(vec![EngineCoreOutput {
-            request_id: "req-1".to_string(),
+            request_id: "req-1".into(),
             new_token_ids: vec![42],
             finish_reason: Some(EngineCoreFinishReason::Length),
             stop_reason: Some(StopReason::Text("stop".to_string())),
@@ -917,7 +917,7 @@ mod tests {
             }],
         };
         let outputs = batch(vec![EngineCoreOutput {
-            request_id: "req-1".to_string(),
+            request_id: "req-1".into(),
             new_token_ids: vec![5],
             new_logprobs: Some(logprobs.clone()),
             ..Default::default()
@@ -954,7 +954,7 @@ mod tests {
         };
         let wire = WireEngineCoreOutputs {
             outputs: vec![WireEngineCoreOutput {
-                request_id: "req-1".to_string(),
+                request_id: "req-1".into(),
                 new_token_ids: vec![7],
                 new_logprobs: Some(Box::new(WireLogprobs {
                     logprob_token_ids: aux(1),
@@ -993,7 +993,7 @@ mod tests {
     fn classify_request_batch() {
         let wire = WireEngineCoreOutputs {
             outputs: vec![WireEngineCoreOutput {
-                request_id: "req-1".to_string(),
+                request_id: "req-1".into(),
                 new_token_ids: vec![7],
                 ..Default::default()
             }],
@@ -1118,7 +1118,7 @@ mod tests {
     fn classify_rejects_mixed_shape() {
         let wire = WireEngineCoreOutputs {
             outputs: vec![WireEngineCoreOutput {
-                request_id: "req-1".to_string(),
+                request_id: "req-1".into(),
                 new_token_ids: vec![7],
                 ..Default::default()
             }],
@@ -1151,7 +1151,7 @@ mod tests {
         // A newer engine appends fields to both the envelope and each output;
         // the elements this client knows must still decode.
         let mut output = wire_array(&EngineCoreOutput {
-            request_id: "req-1".to_string(),
+            request_id: "req-1".into(),
             new_token_ids: vec![7],
             mm_cache_miss_hashes: Some(vec!["hash-1".to_string()]),
             ..Default::default()
@@ -1373,7 +1373,7 @@ mod tests {
     #[test]
     fn decode_engine_core_outputs_from_single_frame() {
         let outputs = batch(vec![EngineCoreOutput {
-            request_id: "req-1".to_string(),
+            request_id: "req-1".into(),
             new_token_ids: vec![1, 2, 3],
             ..Default::default()
         }]);

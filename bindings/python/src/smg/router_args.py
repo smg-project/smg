@@ -121,6 +121,8 @@ class _SecretSources:
     file_env: str
     # The history backend a store URL belongs to; None for a key.
     backend: str | None = None
+    # The shape of one entry of a list-valued secret, named in its refusals.
+    entry: str = "tenant_id:key"
 
 
 _API_KEY_SOURCES = _SecretSources(
@@ -132,6 +134,14 @@ _TENANT_API_KEYS_SOURCES = _SecretSources(
     "SMG_TENANT_API_KEYS",
     "--tenant-api-keys-file",
     "SMG_TENANT_API_KEYS_FILE",
+)
+_CONTROL_PLANE_API_KEYS_SOURCES = _SecretSources(
+    "the control-plane API keys",
+    "--control-plane-api-keys",
+    "CONTROL_PLANE_API_KEYS",
+    "--control-plane-api-keys-file",
+    "CONTROL_PLANE_API_KEYS_FILE",
+    entry="id:name:role:key",
 )
 _POSTGRES_DB_URL_SOURCES = _SecretSources(
     "the PostgreSQL connection URL",
@@ -214,20 +224,20 @@ def _entries_from_environment(sources: _SecretSources) -> list[str]:
     entries = _entries_of(text, r"[,\n]")
     if not entries:
         raise ValueError(
-            f"{sources.env} is set but holds no entry; {sources.what} are tenant_id:key"
+            f"{sources.env} is set but holds no entry; {sources.what} are {sources.entry}"
             " entries separated by ',' or a newline"
         )
     return entries
 
 
-def _read_entries_file(path: str, file_flag: str) -> list[str]:
+def _read_entries_file(path: str, sources: _SecretSources) -> list[str]:
     """The entries of a list-valued secret's file, one per line; blank lines
     and lines starting with '#' are skipped. A file without an entry is
     refused."""
-    entries = _entries_of(_read_text(path, file_flag), r"\n")
+    entries = _entries_of(_read_text(path, sources.file_flag), r"\n")
     if not entries:
         raise ValueError(
-            f"{file_flag} {path!r}: the file holds no entry; one tenant_id:key per line,"
+            f"{sources.file_flag} {path!r}: the file holds no entry; one {sources.entry} per line,"
             " blank and # lines skipped"
         )
     return entries
@@ -380,7 +390,7 @@ class RouterArgs:
     # policy (--engine-metrics)
     engine_metrics: bool = False
     epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
-    eviction_interval_secs: int = 60
+    eviction_interval_secs: int = 120
     # Seconds a request to a gRPC worker may take from its dispatch to its last
     # message; 0 (the default) arms no deadline
     grpc_request_timeout_secs: int = 0
@@ -2979,7 +2989,20 @@ class RouterArgs:
                 "API keys for control plane authentication. Format: 'id:name:role:key'"
                 " where role is 'admin' or 'user'."
                 " Example: --control-plane-api-keys 'key1:Service Account:admin:secret123'"
-                " 'key2:Read Only:user:secret456'"
+                " 'key2:Read Only:user:secret456'."
+                " Also read from the environment (CONTROL_PLANE_API_KEYS, entries separated"
+                " by ',' or a newline) or a file (--control-plane-api-keys-file); the flag"
+                " beats the environment, and entries together with a file are refused."
+            ),
+        )
+        auth_group.add_argument(
+            f"--{prefix}control-plane-api-keys-file",
+            type=str,
+            default=None,
+            help=(
+                "File holding the control-plane API keys, one id:name:role:key per line"
+                " (blank lines and lines starting with # are skipped), such as a mounted"
+                " secret (env: CONTROL_PLANE_API_KEYS_FILE)."
             ),
         )
         auth_group.add_argument(
@@ -3222,11 +3245,6 @@ class RouterArgs:
         args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
         args_dict["worker_ports_annotation"] = "smg.ai/worker-ports"
 
-        # Parse control plane API keys
-        args_dict["control_plane_api_keys"] = cls._parse_control_plane_api_keys(
-            cli_args_dict.get(f"{prefix}control_plane_api_keys", [])
-        )
-
         # Parse JWT role mapping
         args_dict["jwt_role_mapping"] = cls._parse_jwt_role_mapping(
             cli_args_dict.get(f"{prefix}jwt_role_mapping", [])
@@ -3283,8 +3301,24 @@ class RouterArgs:
         if tenant_file is not None:
             if tenant_entries:
                 raise _given_twice(_TENANT_API_KEYS_SOURCES)
-            tenant_entries = _read_entries_file(tenant_file, _TENANT_API_KEYS_SOURCES.file_flag)
+            tenant_entries = _read_entries_file(tenant_file, _TENANT_API_KEYS_SOURCES)
         args_dict["tenant_api_keys"] = cls._parse_tenant_api_keys(tenant_entries)
+
+        # The control-plane keys under the same rule: the flag's entries, else
+        # the environment's, else the file's.
+        control_plane_entries = list(cli_args_dict.get(f"{prefix}control_plane_api_keys") or [])
+        if not control_plane_entries:
+            control_plane_entries = _entries_from_environment(_CONTROL_PLANE_API_KEYS_SOURCES)
+        control_plane_file = file_option(_CONTROL_PLANE_API_KEYS_SOURCES)
+        if control_plane_file is not None:
+            if control_plane_entries:
+                raise _given_twice(_CONTROL_PLANE_API_KEYS_SOURCES)
+            control_plane_entries = _read_entries_file(
+                control_plane_file, _CONTROL_PLANE_API_KEYS_SOURCES
+            )
+        args_dict["control_plane_api_keys"] = cls._parse_control_plane_api_keys(
+            control_plane_entries
+        )
 
         return cls(**args_dict)
 

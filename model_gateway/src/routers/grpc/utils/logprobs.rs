@@ -57,19 +57,26 @@ pub(crate) fn convert_proto_logprobs(
     }
 }
 
+/// The candidates per position a chat answer carries for the request's
+/// `top_logprobs`: exactly that many, none when the request named none. The
+/// engine may report more, e.g. the chosen token when only its own logprob
+/// was requested; every chat path cuts to this count before it decodes, so
+/// the rule lives here once.
+pub(crate) fn requested_alternatives(top_logprobs: Option<u32>) -> usize {
+    top_logprobs.unwrap_or(0) as usize
+}
+
 /// Convert OutputLogProbs to OpenAI ChatLogProbs format using a Tokenizer.
 ///
 /// `top_logprobs` is the number of alternatives the request asked for per
-/// token (`None` when it asked for none). The engine may report more, e.g.
-/// the chosen token when only its own logprob was requested; the OpenAI API
-/// returns exactly the requested alternatives, an empty list when none were,
-/// and only those are decoded.
+/// token (`None` when it asked for none); [`requested_alternatives`] turns it
+/// into the candidates the answer carries, and only those are decoded.
 pub(crate) fn convert_proto_to_openai_logprobs(
     proto_logprobs: ProtoOutputLogProbs<'_>,
     tokenizer: &Arc<dyn Tokenizer>,
     top_logprobs: Option<u32>,
 ) -> ChatLogProbs {
-    let requested = Some(top_logprobs.unwrap_or(0) as usize);
+    let requested = Some(requested_alternatives(top_logprobs));
     convert_proto_logprobs(proto_logprobs, requested, |token_id| {
         tokenizer
             .decode(&[token_id], false)
@@ -200,6 +207,7 @@ pub(crate) fn completion_logprobs(
 
 #[cfg(test)]
 mod tests {
+    use llm_tokenizer::mock::MockTokenizer;
     use smg_grpc_client::{trtllm_proto as trtllm, vllm_proto as vllm};
 
     use super::*;
@@ -332,6 +340,45 @@ mod tests {
             (42, 20),
             "a count above the list is the list"
         );
+    }
+
+    /// The chat converter hands the request's `top_logprobs` to the one rule:
+    /// the candidates per position are the request's count, none when it
+    /// named none, and the engine's surplus stays behind.
+    #[test]
+    fn the_chat_converter_keeps_the_requested_candidates_per_position() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+        let four_per_position = vllm::OutputLogProbs {
+            token_logprobs: vec![-0.1, -0.2],
+            token_ids: vec![1, 2],
+            top_logprobs: (0..2u32)
+                .map(|position| vllm::TopLogProbs {
+                    values: (0..4).map(|k| -(f32::from(k as u8) + 0.5)).collect(),
+                    token_ids: (0..4).map(|k| 10 + position * 4 + k).collect(),
+                })
+                .collect(),
+        };
+        for (top_logprobs, expected) in [(None, 0), (Some(0), 0), (Some(1), 1), (Some(3), 3)] {
+            let logprobs = convert_proto_to_openai_logprobs(
+                ProtoOutputLogProbs::Vllm(&four_per_position),
+                &tokenizer,
+                top_logprobs,
+            );
+            let ChatLogProbs::Detailed {
+                content: Some(items),
+                ..
+            } = logprobs
+            else {
+                panic!("detailed logprobs expected");
+            };
+            let per_position: Vec<usize> =
+                items.iter().map(|item| item.top_logprobs.len()).collect();
+            assert_eq!(
+                per_position,
+                vec![expected; 2],
+                "top_logprobs {top_logprobs:?}"
+            );
+        }
     }
 
     fn alternatives(top_logprobs: Option<u32>) -> Vec<Vec<String>> {

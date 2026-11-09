@@ -31,8 +31,8 @@ use super::{
     super::*,
     eof::{
         chunk, collect_events, data_frame, decoded_stream, gated_stream, messages_spec,
-        mock_worker_endpoint, processor, response_processor, scripted_stream, trailers_frame,
-        CharacterTokenizer,
+        mock_worker_endpoint, processor, response_processor, runtime, scripted_stream,
+        trailers_frame, CharacterTokenizer,
     },
     symphony_chat::assigned_message,
 };
@@ -949,14 +949,9 @@ fn a_collected_answer_records_its_token_and_generation_families() {
     let completion_request: CompletionRequest =
         serde_json::from_value(json!({"model": "eof-test", "prompt": "hi", "n": 1}))
             .expect("completion request");
-    // The recorder is thread-local: a current-thread runtime keeps every
-    // record on this thread.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a runtime");
+    let rt = runtime();
     let rendered = render_with_recorder(|| {
-        runtime.block_on(async {
+        rt.block_on(async {
             non_streamed_chat(
                 engine_stream(frames(&["ab", "c"], 1, counters)).await,
                 &chat_request,
@@ -1041,14 +1036,9 @@ fn a_collected_symphony_message_records_its_token_and_generation_families() {
         spec_accepted: 0,
         spec_drafted: 0,
     };
-    // The recorder is thread-local: a current-thread runtime keeps every
-    // record on this thread.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a runtime");
+    let rt = runtime();
     let rendered = render_with_recorder(|| {
-        runtime.block_on(async {
+        rt.block_on(async {
             let (_, counts) = non_streamed_messages(
                 engine_stream(frames(&["hi"], 1, counters)).await,
                 assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false),

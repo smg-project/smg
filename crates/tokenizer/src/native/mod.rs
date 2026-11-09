@@ -66,7 +66,9 @@ use std::{
     time::Instant,
 };
 
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use aho_corasick::{
+    packed, AhoCorasick, AhoCorasickBuilder, Anchored, Input, MatchKind, Span, StartKind,
+};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
@@ -77,6 +79,7 @@ use unicode_normalization_alignments::UnicodeNormalization;
 
 mod cased;
 mod chain;
+mod long_entries;
 mod merge;
 mod nfc;
 mod pattern;
@@ -85,6 +88,7 @@ mod sentencepiece;
 mod short_pieces;
 mod unicode;
 
+use long_entries::LongEntryFilter;
 use merge::{ByteTokens, MergeTable};
 use nfc::NfcQuick;
 use pattern::Pattern;
@@ -227,6 +231,14 @@ impl SeededIds {
     fn as_slice(&self) -> &[u32] {
         &self.ids[..usize::from(self.count)]
     }
+}
+
+/// One vocabulary entry as the pass over the vocabulary reads it: a short
+/// piece with its ids, for the seed, or the bytes of a long one, for the
+/// filter the whole-piece lookup consults (see `long_entries`).
+enum Seeded {
+    Short(ShortPieceKey, SeededIds),
+    Long(Box<[u8]>),
 }
 
 /// One thread's cache of the pieces it met with one encoder, each with the
@@ -467,10 +479,109 @@ struct Stage {
 type AddedTokenList = Vec<(String, u32)>;
 
 /// One set of added tokens, matched leftmost-longest as `AddedVocabulary`
-/// matches them.
+/// matches them. The automaton's own search scans a text for the tokens'
+/// first bytes when there are at most three of them, all ASCII; a set the
+/// scan cannot take (a token starting beyond ASCII, or more than three
+/// first bytes) it searches by the tokens' rarest bytes instead, which for a
+/// vocabulary of a thousand `<` tokens and one fenced in fullwidth bars were
+/// the bars' continuation bytes, frequent in CJK text: that search was a
+/// third of a 2 KB encode (measured). Such a set takes its candidates from
+/// the library's packed searcher over the tokens' distinct prefixes
+/// ([`Prefixes`]), one pass with the prefix verified, and asks the automaton
+/// anchored at each: nothing on text without the prefixes, the tokens
+/// themselves on text with them.
 pub(crate) struct AddedTokens {
     automaton: AhoCorasick,
     ids: Vec<u32>,
+    prefixes: Option<Prefixes>,
+}
+
+/// The distinct prefixes of a set's tokens as a packed searcher: the longest
+/// length up to [`Self::MAX_LEN`] bytes at which there are at most
+/// [`Self::MAX_COUNT`] of them (a token shorter than the length stands
+/// whole), so a hit is as close to a token as the set allows. A set whose
+/// prefixes would be shorter than [`Self::MIN_LEN`] bytes keeps the
+/// automaton's own search. When the library declines the prefixes that fit
+/// (its SIMD searcher takes a one-byte pattern among at most sixteen, and a
+/// set with newline or tab runs among its tokens has such prefixes), the
+/// tokens' distinct first bytes stand in when there are at most
+/// [`Self::MAX_FIRST_BYTES`]: a hit then is a byte that starts some token,
+/// and the automaton anchored there decides, where the unanchored automaton
+/// walked every byte of the text (measured at about thirty instructions per
+/// byte on a 6,415-token set).
+struct Prefixes {
+    searcher: packed::Searcher,
+}
+
+impl Prefixes {
+    const MAX_LEN: usize = 16;
+    const MIN_LEN: usize = 3;
+    const MAX_COUNT: usize = 64;
+    const MAX_FIRST_BYTES: usize = 16;
+
+    /// Whether the automaton's start-byte scan declines `tokens`: a first
+    /// byte beyond ASCII, or more than three distinct first bytes.
+    fn wanted(tokens: &[(String, u32)]) -> bool {
+        let mut firsts: Vec<u8> = tokens
+            .iter()
+            .filter_map(|(content, _)| content.bytes().next())
+            .collect();
+        firsts.sort_unstable();
+        firsts.dedup();
+        firsts.len() > 3 || firsts.iter().any(|first| !first.is_ascii())
+    }
+
+    /// The searcher over the prefixes of `tokens`; none when the prefixes
+    /// that fit are shorter than [`Self::MIN_LEN`] bytes for a token longer
+    /// than them (a set of added words: the pass would stop at nearly every
+    /// byte of ordinary text, where the automaton's own walk is cheaper),
+    /// when even the one-byte prefixes exceed [`Self::MAX_COUNT`], or when
+    /// the library declines the set.
+    fn of(tokens: &[(String, u32)]) -> Option<Self> {
+        let distinct = |len: usize| {
+            let mut prefixes: Vec<&[u8]> = tokens
+                .iter()
+                .map(|(content, _)| &content.as_bytes()[..content.len().min(len)])
+                .collect();
+            prefixes.sort_unstable();
+            prefixes.dedup();
+            prefixes
+        };
+        let mut len = Self::MAX_LEN;
+        let mut prefixes = distinct(len);
+        while prefixes.len() > Self::MAX_COUNT && len > 1 {
+            len -= 1;
+            prefixes = distinct(len);
+        }
+        let cut_short = tokens.iter().any(|(content, _)| content.len() > len);
+        if prefixes.len() > Self::MAX_COUNT || (cut_short && len < Self::MIN_LEN) {
+            return None;
+        }
+        let searcher = Self::searcher(&prefixes).or_else(|| {
+            let firsts = distinct(1);
+            (firsts.len() <= Self::MAX_FIRST_BYTES)
+                .then(|| Self::searcher(&firsts))
+                .flatten()
+        })?;
+        Some(Self { searcher })
+    }
+
+    /// The library's packed searcher over `patterns`, none when it declines
+    /// them.
+    fn searcher(patterns: &[&[u8]]) -> Option<packed::Searcher> {
+        packed::Config::new()
+            .match_kind(packed::MatchKind::LeftmostFirst)
+            .builder()
+            .extend(patterns)
+            .build()
+    }
+
+    /// The first position at or after `from` where a prefix stands.
+    fn next(&self, text: &str, from: usize) -> Option<usize> {
+        self.searcher
+            .find_in(text, Span::from(from..text.len()))
+            .map(|found| found.start())
+    }
 }
 
 impl AddedTokens {
@@ -479,33 +590,64 @@ impl AddedTokens {
         if tokens.is_empty() {
             return Ok(None);
         }
+        let prefixes = Prefixes::wanted(tokens)
+            .then(|| Prefixes::of(tokens))
+            .flatten();
         let automaton = AhoCorasickBuilder::new()
             .match_kind(MatchKind::LeftmostLongest)
+            .start_kind(if prefixes.is_some() {
+                StartKind::Anchored
+            } else {
+                StartKind::Unanchored
+            })
             .build(tokens.iter().map(|(content, _)| content.as_bytes()))
             .map_err(|e| Declined::from(format!("the added tokens form no automaton: {e}")))?;
         Ok(Some(Self {
             automaton,
             ids: tokens.iter().map(|(_, id)| *id).collect(),
+            prefixes,
         }))
+    }
+
+    /// The added tokens in `text`, in order, each as its byte range and its
+    /// index in the list: the leftmost-longest matches, each continuing after
+    /// the last. With prefixes, a token starts only where a prefix stands, so
+    /// the first prefix at or after the last match that begins a token begins
+    /// the next one, and the longest token there is the match.
+    fn matches<'a>(&'a self, text: &'a str) -> impl Iterator<Item = (Range<usize>, usize)> + 'a {
+        let mut at = 0;
+        std::iter::from_fn(move || loop {
+            let Some(prefixes) = &self.prefixes else {
+                let input = Input::new(text).range(at..);
+                let found = self.automaton.find(input)?;
+                at = found.end();
+                return Some((found.range(), found.pattern().as_usize()));
+            };
+            let start = prefixes.next(text, at)?;
+            let input = Input::new(text).range(start..).anchored(Anchored::Yes);
+            if let Some(found) = self.automaton.find(input) {
+                at = found.end();
+                return Some((found.range(), found.pattern().as_usize()));
+            }
+            at = start + 1;
+        })
     }
 
     /// The byte ranges of the added tokens in `text`, in order.
     pub(crate) fn ranges<'a>(&'a self, text: &'a str) -> impl Iterator<Item = Range<usize>> + 'a {
-        self.automaton
-            .find_iter(text)
-            .map(|found| found.start()..found.end())
+        self.matches(text).map(|(range, _)| range)
     }
 
     /// Calls `f` with each segment in order: an added token's id, or a text
     /// span between added tokens.
     fn split<'t>(&self, text: &'t str, mut f: impl FnMut(Segment<'t>)) {
         let mut cursor = 0;
-        for found in self.automaton.find_iter(text) {
-            if cursor < found.start() {
-                f(Segment::Text(&text[cursor..found.start()]));
+        for (range, index) in self.matches(text) {
+            if cursor < range.start {
+                f(Segment::Text(&text[cursor..range.start]));
             }
-            f(Segment::Added(self.ids[found.pattern().as_usize()]));
-            cursor = found.end();
+            f(Segment::Added(self.ids[index]));
+            cursor = range.end;
         }
         if cursor < text.len() {
             f(Segment::Text(&text[cursor..]));
@@ -621,6 +763,14 @@ pub(crate) struct NativeEncoder {
     /// (see [`Self::tokenize_piece`]). A vocabulary with gaps in its ids has
     /// entries past that range the seed did not read, and keeps the lookup.
     seed_covers_short_entries: bool,
+    /// The vocabulary's entries longer than the seed's keys as a filter,
+    /// read with the seed when the pass read every entry (`None` on the
+    /// paths without the pass, on the sentencepiece path, whose pass reads
+    /// no long entry, and for a vocabulary with gaps, whose entries past the
+    /// range went unread): the whole-piece lookup `ignore_merges` asks for
+    /// on a long piece is spared when the filter refuses it (see
+    /// `long_entries` and [`Self::tokenize_piece`]).
+    long_entries: Option<LongEntryFilter>,
     /// The model's merges as a table a piece neither the thread's cache nor
     /// the seed holds is merged over; `None` for a model the table cannot
     /// stand in for, whose such pieces the model itself tokenizes.
@@ -732,6 +882,7 @@ impl NativeEncoder {
             alphabet: bytes_char(),
             seed: ShortPieceTable::for_entries(0),
             seed_covers_short_entries: false,
+            long_entries: None,
             merges,
             chars: None,
             piece_cache: ThreadLocal::new(),
@@ -787,6 +938,7 @@ impl NativeEncoder {
             alphabet: bytes_char(),
             seed: ShortPieceTable::for_entries(0),
             seed_covers_short_entries: false,
+            long_entries: None,
             merges: None,
             chars: Some(Box::new(chars)),
             piece_cache: ThreadLocal::new(),
@@ -1077,7 +1229,7 @@ impl NativeEncoder {
     /// of the pool, and the crate never clears a thread's cache of a dropped
     /// model.
     pub(crate) fn seed_vocabulary(&mut self, model: &ModelWrapper) {
-        (self.seed, self.seed_covers_short_entries) =
+        (self.seed, self.seed_covers_short_entries, self.long_entries) =
             Self::vocabulary_seed(model, &self.alphabet, self.chars.is_some());
     }
 
@@ -1089,12 +1241,12 @@ impl NativeEncoder {
         model: &ModelWrapper,
         alphabet: &[char; 256],
         chars: bool,
-    ) -> (ShortPieceTable, bool) {
+    ) -> (ShortPieceTable, bool, Option<LongEntryFilter>) {
         let ModelWrapper::BPE(bpe) = model else {
-            return (ShortPieceTable::for_entries(0), false);
+            return (ShortPieceTable::for_entries(0), false, None);
         };
         if bpe.dropout.is_some_and(|dropout| dropout > 0.0) {
-            return (ShortPieceTable::for_entries(0), false);
+            return (ShortPieceTable::for_entries(0), false, None);
         }
         let started = Instant::now();
         // The byte each alphabet character stands for, by character.
@@ -1102,48 +1254,80 @@ impl NativeEncoder {
         for (byte, &c) in alphabet.iter().enumerate() {
             byte_of[c as usize] = Some(byte as u8);
         }
-        // One slot per id that is an entry: the seeded piece, or `None` for an
-        // entry that is no short byte-level piece.
-        let entries: Vec<Option<(ShortPieceKey, SeededIds)>> = (0..bpe.get_vocab_size() as u32)
+        // One slot per id that is an entry: the seeded piece, the bytes of a
+        // long byte-level piece, or `None` for an entry that is no
+        // byte-level piece.
+        let entries: Vec<Option<Seeded>> = (0..bpe.get_vocab_size() as u32)
             .into_par_iter()
             .with_min_len(2048)
             .filter_map(|id| {
                 let entry = bpe.id_to_token(id)?;
                 let seeded = (|| {
-                    let key = if chars {
-                        ShortPieceKey::of(entry.as_bytes())?
-                    } else {
-                        let mut piece = [0u8; SHORT_PIECE_MAX_BYTES];
-                        let mut len = 0;
-                        for c in entry.chars() {
-                            *piece.get_mut(len)? = byte_of.get(c as usize).copied().flatten()?;
-                            len += 1;
+                    let ids_of = |entry: &str| {
+                        let mut ids = SeededIds::default();
+                        for token in &model.tokenize(entry).ok()? {
+                            ids.push(token.id)?;
                         }
-                        ShortPieceKey::of(&piece[..len])?
+                        Some(ids)
                     };
-                    let mut ids = SeededIds::default();
-                    for token in &model.tokenize(&entry).ok()? {
-                        ids.push(token.id)?;
+                    if chars {
+                        let key = ShortPieceKey::of(entry.as_bytes())?;
+                        return Some(Seeded::Short(key, ids_of(entry.as_str())?));
                     }
-                    Some((key, ids))
+                    let mut piece = [0u8; SHORT_PIECE_MAX_BYTES];
+                    let mut len = 0;
+                    // The bytes of an entry past the key's length, with the
+                    // key's bytes in front: a long entry for the filter.
+                    let mut long = Vec::new();
+                    for c in entry.chars() {
+                        let byte = byte_of.get(c as usize).copied().flatten()?;
+                        if len < SHORT_PIECE_MAX_BYTES {
+                            piece[len] = byte;
+                            len += 1;
+                        } else {
+                            if long.is_empty() {
+                                long.extend_from_slice(&piece);
+                            }
+                            long.push(byte);
+                        }
+                    }
+                    if !long.is_empty() {
+                        return Some(Seeded::Long(long.into_boxed_slice()));
+                    }
+                    let key = ShortPieceKey::of(&piece[..len])?;
+                    Some(Seeded::Short(key, ids_of(entry.as_str())?))
                 })();
                 Some(seeded)
             })
             .collect();
         let covers = entries.len() == bpe.get_vocab_size();
-        let seeded = entries.iter().flatten().count();
-        let mut table = ShortPieceTable::for_entries(seeded);
-        for (key, ids) in entries.iter().flatten() {
-            table.insert(*key, ids.as_slice(), seeded);
+        let short = entries
+            .iter()
+            .flatten()
+            .filter(|seeded| matches!(seeded, Seeded::Short(..)))
+            .count();
+        let long = entries.iter().flatten().count() - short;
+        let mut table = ShortPieceTable::for_entries(short);
+        let mut filter = LongEntryFilter::for_entries(long);
+        for seeded in entries.iter().flatten() {
+            match seeded {
+                Seeded::Short(key, ids) => {
+                    table.insert(*key, ids.as_slice(), short);
+                }
+                Seeded::Long(bytes) => filter.insert(bytes),
+            }
         }
+        let filter = (covers && !chars).then_some(filter);
         tracing::debug!(
             entries = table.len(),
             slots = table.slots(),
+            long_entries = long,
+            long_entry_bytes = filter.as_ref().map_or(0, LongEntryFilter::bytes),
             covers_short_entries = covers,
             ms = started.elapsed().as_millis() as u64,
             "the native encoder's vocabulary pieces"
         );
-        (table, covers)
+        (table, covers, filter)
     }
 
     /// This path's encoder for a tiktoken vocabulary, `ranks` as the file
@@ -1193,6 +1377,7 @@ impl NativeEncoder {
         tracing::debug!(
             merges = merges.merges(),
             bytes = merges.bytes(),
+            preformed_characters = merges.preformed_characters(),
             "the native encode path merges a tiktoken vocabulary's piece-cache misses itself"
         );
         let stages = vec![Stage {
@@ -1211,6 +1396,7 @@ impl NativeEncoder {
             alphabet: bytes_char(),
             seed: Self::ranks_seed(ranks),
             seed_covers_short_entries: false,
+            long_entries: None,
             merges: Some(merges),
             chars: None,
             piece_cache: ThreadLocal::new(),
@@ -1703,16 +1889,15 @@ impl NativeEncoder {
         cache.unit_ascii = text.is_ascii();
         // One walk per unit. A single-stage encoder hands the unit to
         // `encode_single_stage`, out of line, where the scanner's own loop
-        // probes each piece in place (no recursive walk); the chain hands its
-        // pieces to the same probe through its static callback; any other
-        // shape walks.
+        // probes each piece in place (no recursive walk); the chain hands
+        // its pieces, as offsets into the unit, to the same probe through
+        // its static callback; any other shape walks.
         match (&self.chain, self.stages.as_slice()) {
             (Some(chain), _) => {
-                chain.pieces(text, &mut |piece: &str| {
-                    if piece.is_empty() {
-                        return;
-                    }
-                    if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
+                chain.pieces(text, &mut |start, end| {
+                    if let Err(declined) =
+                        self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
+                    {
                         fallback = Some(declined);
                     }
                 });
@@ -1820,21 +2005,31 @@ impl NativeEncoder {
         let keep_gaps = stage.keep_gaps;
         let mut cursor = 0;
         let mut fallback = None;
-        stage.pattern.for_each_match(text, |start, end| {
-            if keep_gaps && cursor < start {
+        // The probe compiles into the scanner's loop. As a closure of its
+        // own it was a call per piece: a six-register frame, a reload of
+        // every captured reference and the spills the slow path needs, 135
+        // instructions for a hit of which the probe is about 50 (counted on
+        // the long warm cells). The gap piece stays out of line: a scanner's
+        // alternatives tile the text, so a gap is the rare case there.
+        stage.pattern.for_each_match(
+            text,
+            #[inline(always)]
+            |start, end| {
+                if keep_gaps && cursor < start {
+                    if let Err(declined) =
+                        self.tokenize_gap(model, text, cursor..start, mapped, ids, cache)
+                    {
+                        fallback = Some(declined);
+                    }
+                }
                 if let Err(declined) =
-                    self.tokenize_piece_at(model, text, cursor..start, mapped, ids, cache)
+                    self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
                 {
                     fallback = Some(declined);
                 }
-            }
-            if let Err(declined) =
-                self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
-            {
-                fallback = Some(declined);
-            }
-            cursor = end;
-        });
+                cursor = end;
+            },
+        );
         if keep_gaps && cursor < text.len() {
             if let Err(declined) =
                 self.tokenize_piece_at(model, text, cursor..text.len(), mapped, ids, cache)
@@ -1869,6 +2064,24 @@ impl NativeEncoder {
         self.tokenize_piece_slow(model, &text[piece], key, mapped, ids, cache)
     }
 
+    /// [`Self::tokenize_piece_at`] for a gap between two matches of a
+    /// single-stage encoder, out of line: the scanners' alternatives tile
+    /// the text, so the gap is the rare piece and its code stays out of the
+    /// per-piece loop.
+    #[cold]
+    #[inline(never)]
+    fn tokenize_gap(
+        &self,
+        model: Option<&ModelWrapper>,
+        text: &str,
+        piece: Range<usize>,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        self.tokenize_piece_at(model, text, piece, mapped, ids, cache)
+    }
+
     /// The rest of [`Self::tokenize_piece`], out of line: the longer pieces'
     /// cache, the seed, the merge or the model, and the cache insert.
     #[inline(never)]
@@ -1898,17 +2111,15 @@ impl NativeEncoder {
                 chars.merge(piece, &mut cache.symbols, ids);
             } else if let Some(table) = &self.merges {
                 // Under `ignore_merges` a piece that is an entry is that entry:
-                // the model's map is asked, except for a short piece the seed,
-                // holding every short entry, has just missed, which is none
-                // (the lookup is the piece mapped to the alphabet as a string,
-                // its hash, a probe of the map and a compare: a memory latency
-                // and more on a cold piece, measured).
-                let whole =
-                    if table.ignore_merges && !(self.seed_covers_short_entries && key.is_some()) {
-                        model.and_then(|model| model.token_to_id(self.mapped(bytes, mapped)))
-                    } else {
-                        None
-                    };
+                // the model's map is asked when the piece can be one (the
+                // lookup is the piece mapped to the alphabet as a string, its
+                // hash, a probe of the map and a compare: a memory latency and
+                // more on a cold piece, measured).
+                let whole = if table.ignore_merges && self.may_be_entry(key, bytes) {
+                    model.and_then(|model| model.token_to_id(self.mapped(bytes, mapped)))
+                } else {
+                    None
+                };
                 match whole {
                     Some(id) => ids.push(id),
                     // A cold piece of a unit with a non-ASCII byte merges
@@ -1996,6 +2207,21 @@ impl NativeEncoder {
             cache.clear_short(share);
         }
         cache
+    }
+
+    /// Whether a piece the thread's cache and the seed missed can still be
+    /// an entry of the vocabulary: a short piece (`key`) only when the seed
+    /// does not hold every short entry; a long piece only when the filter
+    /// over the long entries, when the seed's pass read them all, may hold
+    /// it (see `long_entries`).
+    fn may_be_entry(&self, key: Option<ShortPieceKey>, bytes: &[u8]) -> bool {
+        match key {
+            Some(_) => !self.seed_covers_short_entries,
+            None => self
+                .long_entries
+                .as_ref()
+                .is_none_or(|filter| filter.may_hold(bytes)),
+        }
     }
 
     /// The piece in the byte-level alphabet, the form the model's vocabulary

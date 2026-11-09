@@ -4,16 +4,24 @@ request and per streamed frame over the sampled window (from the sampler's
 utime+stime), the RSS/anon before and after with the slope over the window
 (a leak shows as a slope), the allocator gauges, the client's latency
 percentiles and its status/error counts, the shed counters from the metrics;
-then the mean over the repeats of each cell name (`<name>-r<k>`).
-Standard library only: `report.py <run dir | cell dirs...> [--json out.json] [--md out.md]`."""
+then the mean over the repeats of each cell name (`<name>-r<k>`); and, with
+`--bounds`, the verdict: every cell against the bounds its name has in the
+file (`bounds.toml` beside this script for the nightly), a breach named with
+the cell, the figure and the bound, and exit status 3 when there is one (2 when
+the bounds file names a figure the report does not judge; the tables are
+written either way).
+Standard library only:
+`report.py <run dir | cell dirs...> [--json out.json] [--md out.md] [--bounds bounds.toml]`."""
 
 import argparse
 import csv
 import glob
 import json
+import math
 import os
 import re
 import sys
+import tomllib
 
 
 def read_samples(path):
@@ -120,9 +128,8 @@ def analyze(cell_dir):
         r0, r1, _ = first_last(win, "vmrss_kb")
         out["rss_mb_start"] = r0 / 1024 if r0 is not None else None
         out["rss_mb_end"] = r1 / 1024 if r1 is not None else None
-        out["rss_mb_max"] = (
-            max((r["vmrss_kb"] for r in rows if r.get("vmrss_kb") is not None), default=0) / 1024
-        )
+        peak = max((r["vmrss_kb"] for r in rows if r.get("vmrss_kb") is not None), default=None)
+        out["rss_mb_max"] = peak / 1024 if peak is not None else None
         c0, c1, cpts = first_last(win, "cg_anon")
         out["cg_anon_mb_start"] = c0 / 2**20 if c0 is not None else None
         out["cg_anon_mb_end"] = c1 / 2**20 if c1 is not None else None
@@ -138,23 +145,30 @@ def analyze(cell_dir):
     try:
         before = open(os.path.join(cell_dir, "before.prom")).read()
         after = open(os.path.join(cell_dir, "after.prom")).read()
-        out["shed_admission"] = prom_sum(after, "smg_admission_queue_rejected_total") - prom_sum(
-            before, "smg_admission_queue_rejected_total"
-        )
-        out["shed_overload"] = prom_sum(after, "smg_worker_overload_shed_total") - prom_sum(
-            before, "smg_worker_overload_shed_total"
-        )
-        out["router_errors"] = prom_sum(after, "smg_router_request_errors_total") - prom_sum(
-            before, "smg_router_request_errors_total"
-        )
+    except OSError:
+        before = after = None
+    out["shed_admission"] = counter_delta(before, after, "smg_admission_queue_rejected_total")
+    out["shed_overload"] = counter_delta(before, after, "smg_worker_overload_shed_total")
+    out["router_errors"] = counter_delta(before, after, "smg_router_request_errors_total")
+    if before is not None and after is not None:
         _, sb = prom_sum(before, "smg_http_responses_total", "status_code")
         _, sa = prom_sum(after, "smg_http_responses_total", "status_code")
         out["http_status_delta"] = {
             k: sa.get(k, 0) - sb.get(k, 0) for k in set(sa) | set(sb) if sa.get(k, 0) - sb.get(k, 0)
         }
-    except OSError:
-        pass
     return out
+
+
+def counter_delta(before, after, name):
+    """A counter's growth over the cell, or None when a scrape is missing or
+    empty (unreadable files, a gateway dead before the end-of-cell scrape) or
+    the counter went down (a gateway restarted, a counter renamed between the
+    scrapes): an absent figure, never a zero. A counter a scrape does not carry
+    reads as 0, since a counter is published at its first increment."""
+    if before is None or after is None or not before.strip() or not after.strip():
+        return None
+    delta = prom_sum(after, name) - prom_sum(before, name)
+    return delta if delta >= 0 else None
 
 
 def fmt(v, digits=2):
@@ -197,7 +211,8 @@ def flat(c):
         f[k + "_p99"] = c.get(k + "_ms", {}).get("p99")
     f["gap_p50"] = c.get("gap_us", {}).get("p50")
     f["gap_p99"] = c.get("gap_us", {}).get("p99")
-    f["shed"] = int((c.get("shed_admission") or 0) + (c.get("shed_overload") or 0))
+    admission, overload = c.get("shed_admission"), c.get("shed_overload")
+    f["shed"] = int(admission + overload) if None not in (admission, overload) else None
     return f
 
 
@@ -218,11 +233,16 @@ def table(cells):
     return "\n".join(lines)
 
 
+def base_name(cell):
+    """A cell's name without its repeat suffix (`-r<k>`): the name the mean over
+    the repeats and the bounds file use."""
+    return re.sub(r"-r\d+$", "", cell)
+
+
 def aggregate(cells):
     groups = {}
     for c in cells:
-        name = re.sub(r"-r\d+$", "", c["cell"])
-        groups.setdefault(name, []).append(flat(c))
+        groups.setdefault(base_name(c["cell"]), []).append(flat(c))
     rows = []
     for name, members in groups.items():
         agg = {"cell": f"{name} (n={len(members)})"}
@@ -235,11 +255,134 @@ def aggregate(cells):
     return rows
 
 
+# What a cell is judged on: the bound's key in the file, the figure's name in
+# the tables and how it is read off a flattened cell.
+BOUNDS = [
+    ("failed_max", "failed", lambda f: f.get("failed")),
+    ("shed_max", "shed", lambda f: f.get("shed")),
+    ("rss_anon_slope_mb_per_min_max", "anon MB/min", lambda f: f.get("rss_anon_slope_mb_per_min")),
+    ("cpu_ms_per_req_max", "CPU ms/req", lambda f: f.get("cpu_ms_per_req")),
+    ("ttft_p99_ms_max", "TTFT p99", lambda f: f.get("ttft_p99")),
+    ("e2e_p99_ms_max", "e2e p99", lambda f: f.get("e2e_p99")),
+    ("rss_mb_max_max", "RSS MB max", lambda f: f.get("rss_mb_max")),
+]
+
+
+def judge(cells, bounds):
+    """Every cell against the bounds of its name without the repeat suffix: the
+    breaches, as (cell, figure, value, bound), and the cells the file does not
+    name. A bounded figure a cell does not report is a breach with the value
+    None: a figure that goes missing, renamed or dropped, does not void its
+    bound in silence."""
+    breaches = []
+    unbounded = []
+    for c in cells:
+        cell_bounds = bounds.get(base_name(c["cell"]))
+        if cell_bounds is None:
+            unbounded.append(c["cell"])
+            continue
+        f = flat(c)
+        for key, figure, get in BOUNDS:
+            bound = cell_bounds.get(key)
+            if bound is None:
+                continue
+            value = get(f)
+            if not isinstance(value, (int, float)):
+                breaches.append((c["cell"], figure, None, bound))
+            elif value > bound:
+                breaches.append((c["cell"], figure, value, bound))
+    return breaches, unbounded
+
+
+def verdict(breaches, unbounded):
+    """The verdict section: every breach as a line, the unbounded cells named."""
+    lines = ["## Verdict", ""]
+    if breaches:
+        lines.append(f"{len(breaches)} figure(s) outside the bounds or not reported:")
+        lines.append("")
+        lines += [
+            f"- `{cell}`: {figure} {fmt(value, 3)} is above its bound {fmt(bound, 3)}"
+            if value is not None
+            else f"- `{cell}`: {figure} is not reported, its bound is {fmt(bound, 3)}"
+            for cell, figure, value, bound in breaches
+        ]
+    else:
+        lines.append("Every bounded cell is within its bounds.")
+    if unbounded:
+        lines.append("")
+        lines.append(
+            "Unbounded, judged by nothing: " + ", ".join(f"`{c}`" for c in unbounded) + "."
+        )
+    return "\n".join(lines)
+
+
+BOUND_KEYS = {key for key, _, _ in BOUNDS}
+
+
+class BoundsError(ValueError):
+    """A bounds file the report cannot judge by (missing, not TOML or not UTF-8,
+    a value that is not a finite number, a key no figure answers to): the
+    report still writes its tables and exits 2 with the reason."""
+
+
+def read_bounds(path):
+    """The bounds per cell name, or a BoundsError naming what is wrong with the
+    file: a misspelt bound is void, and never in silence."""
+    try:
+        with open(path, "rb") as f:
+            bounds = tomllib.load(f)
+    except (OSError, ValueError) as e:  # a TOML error and a bad encoding are ValueErrors
+        raise BoundsError(f"{path}: {e}") from e
+    for cell, table in bounds.items():
+        if not isinstance(table, dict):
+            raise BoundsError(f"{path}: {cell} is not a table of bounds")
+        unknown = sorted(set(table) - BOUND_KEYS)
+        if unknown:
+            raise BoundsError(
+                f"{path}: [{cell}] names no figure the report judges: {', '.join(unknown)}"
+                f" (the keys are {', '.join(sorted(BOUND_KEYS))})"
+            )
+        for key, bound in table.items():
+            number = not isinstance(bound, bool) and isinstance(bound, (int, float))
+            if not number or not math.isfinite(bound):
+                raise BoundsError(f"{path}: [{cell}] {key} = {bound!r} is not a finite number")
+    return bounds
+
+
+def render(cells, bounds_path):
+    """The report's text and JSON for the cells, and the exit status: 0, 3 on
+    a breach, 2 when the bounds file is unusable (a BoundsError, which covers
+    a missing or malformed file too). The tables are rendered before the
+    bounds are judged, so a bad bounds file never costs a night its tables."""
+    md = ["## Cells", "", table(cells), "", "## Mean over repeats", "", table(aggregate(cells))]
+    out = {"cells": cells, "mean": aggregate(cells)}
+    code = 0
+    if bounds_path:
+        try:
+            breaches, unbounded = judge(cells, read_bounds(bounds_path))
+        except BoundsError as e:
+            md += ["", "## Verdict", "", f"No verdict: {e}"]
+            out["setup_error"] = str(e)
+            code = 2
+        else:
+            md += ["", verdict(breaches, unbounded)]
+            out["breaches"] = [
+                {"cell": cell, "figure": figure, "value": value, "bound": bound}
+                for cell, figure, value, bound in breaches
+            ]
+            out["unbounded"] = unbounded
+            code = 3 if breaches else 0
+    return "\n".join(md), out, code
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("paths", nargs="+")
     ap.add_argument("--json")
     ap.add_argument("--md")
+    ap.add_argument(
+        "--bounds", help="a TOML file of per-cell bounds; a breach exits 3, an unusable file 2"
+    )
     a = ap.parse_args()
     dirs = []
     for p in a.paths:
@@ -252,14 +395,15 @@ def main():
                 if os.path.exists(os.path.join(d, "cell.json"))
             )
     cells = [analyze(d) for d in dirs]
-    md = ["## Cells", "", table(cells), "", "## Mean over repeats", "", table(aggregate(cells))]
-    text = "\n".join(md)
+    text, out, code = render(cells, a.bounds)
     print(text)
     if a.md:
         open(a.md, "w").write(text + "\n")
     if a.json:
-        json.dump({"cells": cells, "mean": aggregate(cells)}, open(a.json, "w"), indent=1)
-    return 0
+        json.dump(out, open(a.json, "w"), indent=1)
+    if "setup_error" in out:
+        print(out["setup_error"], file=sys.stderr)
+    return code
 
 
 if __name__ == "__main__":

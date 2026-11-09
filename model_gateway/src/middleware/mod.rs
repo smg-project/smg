@@ -22,7 +22,10 @@ pub mod tenant_resolution;
 pub mod token_bucket;
 pub mod wasm;
 
-pub use auth::{auth_middleware, deny_all_middleware, AuthConfig};
+#[cfg(test)]
+pub(crate) mod test_support;
+
+pub use auth::{auth_middleware, deny_all_middleware, key_fingerprint, AuthConfig};
 pub use body_limit::{RequestBodyLimit, RequestBodyLimitLayer};
 pub use body_timeout::{RequestBodyTimeoutLayer, RequestBodyTimeouts};
 pub use concurrency::{AdmissionQueue, ConcurrencyLimitLayer};

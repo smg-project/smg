@@ -19,8 +19,8 @@ use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
 use tonic::codec::Codec;
 use tool_parser::types::ToolCallItem;
 
+pub(super) use super::super::character_tokenizer::CharacterTokenizer;
 use super::super::*;
-pub(super) use crate::test_support::CharacterTokenizer;
 use crate::{
     routers::{
         common::sse::SseReceiver,
@@ -31,6 +31,16 @@ use crate::{
         BasicWorkerBuilder, Worker, WorkerRegistry,
     },
 };
+
+/// A current-thread runtime for a test that drives its stream by hand: the
+/// metrics recorder is thread-local, so what the stream records is read on
+/// the thread that ran it.
+pub(super) fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime")
+}
 
 pub(crate) fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
     chunk_of_ids(index, text.chars().map(u32::from).collect())

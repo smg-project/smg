@@ -498,6 +498,7 @@ mod tests {
     use super::*;
     use crate::{
         config::types::TenantApiKeyEntry,
+        test_support::json_of,
         worker::{test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerType},
     };
 
@@ -524,7 +525,7 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("application/json")
         );
-        let body = json_body(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["error"]["code"], "no_models_available", "{body}");
         assert_eq!(body["error"]["message"], "No models available", "{body}");
         assert!(body["error"]["type"].is_string(), "{body}");
@@ -537,7 +538,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = json_body(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["type"], "error", "{body}");
         assert_eq!(body["error"]["message"], "No models available", "{body}");
         assert_eq!(body["request_id"], "req_2", "{body}");
@@ -590,7 +591,7 @@ mod tests {
         );
         registry.register(internal_worker);
 
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
         let gateway_auth = AuthConfig::with_tenant_keys(
             Some("shared-secret".to_string()),
             &[TenantApiKeyEntry {
@@ -711,7 +712,7 @@ mod tests {
             "runtime_type": "external",
             "provider": "anthropic",
         })));
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
         let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
 
         let mut openai_style = HeaderMap::new();
@@ -719,7 +720,7 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer key-for-one-provider"),
         );
-        let listed = json_body(
+        let listed = json_of(
             list_models_with(
                 &registry,
                 &client,
@@ -749,7 +750,7 @@ mod tests {
             "x-api-key",
             HeaderValue::from_static("key-for-one-provider"),
         );
-        let listed = json_body(
+        let listed = json_of(
             list_models_with(
                 &registry,
                 &client,
@@ -809,7 +810,7 @@ mod tests {
             headers: &HeaderMap,
             query: Option<&str>,
         ) -> Response {
-            let client = crate::clients::http_client();
+            let client = crate::server::http_client();
             let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
             list_models_with(registry, &client, &gateway_auth, headers, query, rid()).await
         }
@@ -822,20 +823,20 @@ mod tests {
             Some("limit=2&after_id=m-b"),
             Some("before_id=alias-z"),
         ] {
-            let listed = json_body(list(&one, &headers, query).await).await;
-            let same = json_body(list(&other, &headers, query).await).await;
+            let listed = json_of(list(&one, &headers, query).await).await;
+            let same = json_of(list(&other, &headers, query).await).await;
             assert_eq!(listed, same, "{query:?}");
         }
-        let all = json_body(list(&one, &headers, None).await).await;
+        let all = json_of(list(&one, &headers, None).await).await;
         assert_eq!(
             listed_ids(&all),
             ["m-a", "m-b", "m-c", "alias-a", "alias-z"],
             "{all}"
         );
-        let first = json_body(list(&other, &headers, Some("limit=1")).await).await;
+        let first = json_of(list(&other, &headers, Some("limit=1")).await).await;
         assert_eq!(listed_ids(&first), ["m-a"], "{first}");
         assert_eq!(first["has_more"], true, "{first}");
-        let openai = json_body(list(&other, &HeaderMap::new(), None).await).await;
+        let openai = json_of(list(&other, &HeaderMap::new(), None).await).await;
         assert_eq!(
             listed_ids(&openai),
             ["m-a", "m-b", "m-c", "alias-a", "alias-z"],
@@ -894,7 +895,7 @@ mod tests {
             "runtime_type": "external",
             "provider": "anthropic",
         })));
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
         let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
         let mut headers = HeaderMap::new();
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
@@ -910,7 +911,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let page = json_body(response).await;
+        let page = json_of(response).await;
         assert_eq!(
             *seen.lock().unwrap(),
             ["limit=1&after_id=claude-new"],
@@ -1035,13 +1036,6 @@ mod tests {
         "req_test".to_owned()
     }
 
-    async fn json_body(response: Response) -> Value {
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        serde_json::from_slice(&bytes).unwrap()
-    }
-
     /// The same inventory answers both API families, each in its own shape:
     /// the OpenAI list by default, the Anthropic list (page markers, `type`,
     /// `display_name`, `created_at`) when the request carries the header
@@ -1051,10 +1045,10 @@ mod tests {
         let mut card = ModelCard::new("m1");
         card.display_name = Some("Model One".to_owned());
         let registry = registry_with(vec![card]);
-        let client = crate::clients::http_client();
+        let client = crate::server::http_client();
         let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
 
-        let openai = json_body(
+        let openai = json_of(
             list_models_with(
                 &registry,
                 &client,
@@ -1073,7 +1067,7 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-        let anthropic = json_body(
+        let anthropic = json_of(
             list_models_with(
                 &registry,
                 &client,
@@ -1120,11 +1114,11 @@ mod tests {
             headers: &HeaderMap,
             query: Option<&str>,
         ) -> (StatusCode, Value) {
-            let client = crate::clients::http_client();
+            let client = crate::server::http_client();
             let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
             let response =
                 list_models_with(registry, &client, &gateway_auth, headers, query, rid()).await;
-            (response.status(), json_body(response).await)
+            (response.status(), json_of(response).await)
         }
         let mut aliased = ModelCard::new("m1");
         aliased.aliases = vec!["alias-1a".to_owned(), "alias-1b".to_owned()];
@@ -1208,7 +1202,7 @@ mod tests {
 
         let by_id = retrieve_model_with(&registry, &HeaderMap::new(), "m1", rid()).await;
         assert_eq!(by_id.status(), StatusCode::OK);
-        let body = json_body(by_id).await;
+        let body = json_of(by_id).await;
         assert_eq!(body["object"], "model");
         assert_eq!(body["id"], "m1");
 
@@ -1216,7 +1210,7 @@ mod tests {
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         let by_alias = retrieve_model_with(&registry, &headers, "alias-1", rid()).await;
         assert_eq!(by_alias.status(), StatusCode::OK);
-        let body = json_body(by_alias).await;
+        let body = json_of(by_alias).await;
         assert_eq!(body["type"], "model");
         assert_eq!(body["id"], "m1");
 
@@ -1234,7 +1228,7 @@ mod tests {
 
         let openai = retrieve_model_with(&registry, &HeaderMap::new(), "nope", rid()).await;
         assert_eq!(openai.status(), StatusCode::NOT_FOUND);
-        let body = json_body(openai).await;
+        let body = json_of(openai).await;
         assert_eq!(body["error"]["code"], "model_not_found", "{body}");
         assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
         assert!(body.get("type").is_none(), "{body}");
@@ -1250,7 +1244,7 @@ mod tests {
             "{:?}",
             messages.headers()
         );
-        let body = json_body(messages).await;
+        let body = json_of(messages).await;
         assert_eq!(body["type"], "error", "{body}");
         assert_eq!(body["error"]["type"], "not_found_error", "{body}");
         assert_eq!(
@@ -1273,7 +1267,7 @@ mod tests {
         aliased.aliases = vec!["alias-1a".to_owned(), "alias-1b".to_owned()];
         let registry = registry_with(vec![aliased, ModelCard::new("m2")]);
 
-        let openai = json_body(
+        let openai = json_of(
             registry_models_response(&registry, ModelShape::OpenAi, &Default::default(), rid())
                 .await,
         )
@@ -1294,7 +1288,7 @@ mod tests {
             "{openai}"
         );
 
-        let anthropic = json_body(
+        let anthropic = json_of(
             registry_models_response(&registry, ModelShape::Anthropic, &Default::default(), rid())
                 .await,
         )
@@ -1333,7 +1327,7 @@ mod tests {
             Some("org/first")
         );
 
-        let body = json_body(
+        let body = json_of(
             registry_models_response(&registry, ModelShape::Anthropic, &Default::default(), rid())
                 .await,
         )
@@ -1358,7 +1352,7 @@ mod tests {
         third.aliases = vec!["shared".to_owned()];
         let registry = registry_with(vec![first, ModelCard::new("org/second"), third]);
 
-        let body = json_body(
+        let body = json_of(
             registry_models_response(&registry, ModelShape::OpenAi, &Default::default(), rid())
                 .await,
         )
@@ -1390,7 +1384,7 @@ mod tests {
 
         let response = retrieve_model_with(&registry, &HeaderMap::new(), "org/second", rid()).await;
         assert_eq!(response.status(), StatusCode::OK);
-        let body = json_body(response).await;
+        let body = json_of(response).await;
         assert_eq!(body["id"], "org/second");
     }
 }

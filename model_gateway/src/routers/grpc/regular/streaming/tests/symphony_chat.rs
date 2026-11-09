@@ -54,6 +54,8 @@ pub(super) fn assigned(
         prompt: prompt.to_string(),
         forbids_calls: false,
         past_the_end: false,
+        span: Span::none(),
+        marked: Arc::default(),
     });
     spec
 }
@@ -693,6 +695,8 @@ pub(super) fn assigned_message(
             prompt: prompt.to_string(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
+            marked: Arc::default(),
         }),
         parser_names: None,
     }

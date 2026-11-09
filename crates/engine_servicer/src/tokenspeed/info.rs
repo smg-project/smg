@@ -10,6 +10,7 @@ use std::{
 
 use engine_zmq_adapter::ZmqEngineClient;
 use futures::StreamExt;
+use openai_protocol::worker::SchedulerLoadSnapshot;
 use prost_types::Timestamp;
 use smg_grpc_client::tokenspeed_proto as ts;
 use tonic::Status;
@@ -17,7 +18,7 @@ use tonic::Status;
 use super::{generate, State};
 use crate::{
     health_probe::{self, Verdict},
-    load_report::{mean, rank_entries},
+    load_report::{mean, rank_entries, rank_entry, RankFigures},
     proto_json::{insert_capacity, struct_from_json},
     servicer::{proto_token_ids, RequestOrigin},
 };
@@ -223,54 +224,15 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsR
             aggregate: Some(ts::AggregateMetrics::default()),
         });
     }
-    let max_total_num_tokens = state.shared.kv_capacity_tokens();
-    let max_running_requests = state
-        .shared
-        .running_window(state.model.max_running_requests);
+    let capacity = Capacity::of(state);
     let ranks = state.shared.rank_count(state.model.data_parallel_size);
     let (loads, aggregate) = rank_entries(
         client.get_loads().loads,
-        max_total_num_tokens,
+        capacity.max_total_num_tokens,
         ranks,
         dp_rank,
-        |load, figures| {
-            let estimate = state
-                .shared
-                .loads
-                .estimate(load.dp_rank, load.num_waiting_reqs);
-            ts::SchedulerLoad {
-                dp_rank: figures.dp_rank,
-                num_running_reqs: figures.running,
-                num_waiting_reqs: figures.waiting,
-                num_total_reqs: figures.total,
-                num_used_tokens: figures.used_tokens,
-                max_total_num_tokens,
-                max_running_requests,
-                token_usage: figures.usage,
-                utilization: figures.usage,
-                // The direct TokenSpeed wire reports active pages, excluding
-                // retained cache (unlike the Python legacy GetLoad projection).
-                active_token_usage: Some(figures.usage),
-                num_waiting_uncached_tokens: estimate.queued_token_work,
-                gen_throughput: estimate.gen_throughput,
-                prefill_throughput: estimate.prefill_throughput,
-                cache_hit_rate: estimate.cache_hit_rate,
-                ..Default::default()
-            }
-        },
-        |dp_rank| {
-            let estimate = state.shared.loads.estimate(dp_rank, i32::MAX);
-            ts::SchedulerLoad {
-                dp_rank,
-                max_running_requests,
-                max_total_num_tokens,
-                num_waiting_uncached_tokens: estimate.queued_token_work,
-                gen_throughput: estimate.gen_throughput,
-                prefill_throughput: estimate.prefill_throughput,
-                cache_hit_rate: estimate.cache_hit_rate,
-                ..Default::default()
-            }
-        },
+        |load, figures| reported_entry(state, load, figures, &capacity),
+        |dp_rank| unreported_entry(state, dp_rank, &capacity),
     );
     let aggregate = ts::AggregateMetrics {
         total_running_reqs: aggregate.running,
@@ -287,4 +249,95 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsR
         loads,
         aggregate: Some(aggregate),
     })
+}
+
+/// One rank's entry of [`loads`], built as that answer builds it and read
+/// alone: no timestamp, no version, no vector of the other ranks and this
+/// rank's estimate only, for the record the relay attaches to every batch
+/// and tick. `None` names the answer's first entry, rank 0 (a connected
+/// engine makes it a rank); a rank past the connected ones has no entry, and
+/// an encode worker has none at all (it answers `GetLoads` with no rank).
+pub(super) fn rank_load(state: &State, dp_rank: Option<i32>) -> Option<ts::SchedulerLoad> {
+    let client = state.shared.engine().ok()?;
+    if state.encode_role.is_some() {
+        return None;
+    }
+    let capacity = Capacity::of(state);
+    rank_entry(
+        |index| client.rank_load(index),
+        capacity.max_total_num_tokens,
+        state.shared.rank_count(state.model.data_parallel_size),
+        dp_rank,
+        |load, figures| reported_entry(state, load, figures, &capacity),
+        |rank| unreported_entry(state, rank, &capacity),
+    )
+}
+
+/// The capacity figures every rank's entry carries: the running window and
+/// the KV capacity the servicer knows.
+struct Capacity {
+    max_running_requests: i32,
+    max_total_num_tokens: i32,
+}
+
+impl Capacity {
+    fn of(state: &State) -> Self {
+        Self {
+            max_running_requests: state
+                .shared
+                .running_window(state.model.max_running_requests),
+            max_total_num_tokens: state.shared.kv_capacity_tokens(),
+        }
+    }
+}
+
+/// A reported rank's entry: the snapshot's figures with, from this
+/// servicer's own bookkeeping ([`crate::load_tracker`]), the queued
+/// token-work, prefill/generation throughput and hit rate this wire's load
+/// tail does not carry, the rank's own.
+fn reported_entry(
+    state: &State,
+    load: &SchedulerLoadSnapshot,
+    figures: &RankFigures,
+    capacity: &Capacity,
+) -> ts::SchedulerLoad {
+    let estimate = state
+        .shared
+        .loads
+        .estimate(load.dp_rank, load.num_waiting_reqs);
+    ts::SchedulerLoad {
+        dp_rank: figures.dp_rank,
+        num_running_reqs: figures.running,
+        num_waiting_reqs: figures.waiting,
+        num_total_reqs: figures.total,
+        num_used_tokens: figures.used_tokens,
+        max_total_num_tokens: capacity.max_total_num_tokens,
+        max_running_requests: capacity.max_running_requests,
+        token_usage: figures.usage,
+        utilization: figures.usage,
+        // The direct TokenSpeed wire reports active pages, excluding
+        // retained cache (unlike the Python legacy GetLoad projection).
+        active_token_usage: Some(figures.usage),
+        num_waiting_uncached_tokens: estimate.queued_token_work,
+        gen_throughput: estimate.gen_throughput,
+        prefill_throughput: estimate.prefill_throughput,
+        cache_hit_rate: estimate.cache_hit_rate,
+        ..Default::default()
+    }
+}
+
+/// A connected rank no load tail has reported yet: a zero-filled entry with
+/// the servicer's own figures for the rank (see [`rank_entries`]).
+fn unreported_entry(state: &State, dp_rank: i32, capacity: &Capacity) -> ts::SchedulerLoad {
+    let estimate = state.shared.loads.estimate(dp_rank, i32::MAX);
+    ts::SchedulerLoad {
+        dp_rank,
+        max_running_requests: capacity.max_running_requests,
+        max_total_num_tokens: capacity.max_total_num_tokens,
+        num_waiting_uncached_tokens: estimate.queued_token_work,
+        gen_throughput: estimate.gen_throughput,
+        prefill_throughput: estimate.prefill_throughput,
+        cache_hit_rate: estimate.cache_hit_rate,
+        ..Default::default()
+    }
 }

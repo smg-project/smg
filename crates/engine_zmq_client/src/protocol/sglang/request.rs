@@ -751,6 +751,14 @@ impl SglangRequest {
             Self::Embed(request) => &request.rid,
         }
     }
+
+    /// The prompt's token ids.
+    pub fn input_ids(&self) -> &[u32] {
+        match self {
+            Self::Generate(request) => &request.input_ids,
+            Self::Embed(request) => &request.input_ids,
+        }
+    }
 }
 
 impl From<TokenizedGenerateReqInput> for SglangRequest {
@@ -895,7 +903,7 @@ mod tests {
 
     use super::{recorded::*, *};
     use crate::{
-        codec::{decode_msgpack, encode_msgpack},
+        codec::{decode_msgpack, encode_msgpack, hex},
         protocol::sglang::sampling::{
             recorded::PYTHON_PINNED_0_5_22, WIRE_FIELDS as SAMPLING_WIRE_FIELDS,
         },
@@ -908,13 +916,6 @@ mod tests {
     /// `require_reasoning=True`, the 19 defaulted fields between them at
     /// their defaults.
     const PYTHON_REQUEST: &str = "dc0022b9546f6b656e697a656447656e6572617465526571496e707574a27231c0c093010203c0c0c0dc002008c0c0c0cb3ff0000000000000cb3ff000000000000001cb0000000000000000cb0000000000000000cb0000000000000000cb3ff00000000000000001c0c0c0c0c0c2c3c3c2c0c0c0c0c0c00000c2c2c2ff00c0c3c2c2c2c200c2c0c0c0c0c0c0c0c0c0c0c0c0c0c3";
-
-    fn hex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
 
     #[test]
     fn encodes_the_prefix_through_require_reasoning_with_the_tag_first() {

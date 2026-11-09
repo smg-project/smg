@@ -13,7 +13,12 @@ use axum::{
 use openai_protocol::profile::ProviderProfile;
 use tracing::{debug, error, warn};
 
-use super::{context_length::pair_context_length, helpers, ContextRequirements, PipelineStage};
+use super::{
+    context_length::pair_context_length,
+    helpers,
+    pd_protocol::{EncodeHandoff, PdProtocol},
+    ContextRequirements, PipelineStage,
+};
 #[cfg(test)]
 use crate::observability::log_throttle::KeyedLogThrottle;
 use crate::{
@@ -507,9 +512,11 @@ impl WorkerSelectionStage {
         if let Some(guard) = prefill_guard {
             ctx.state.pd_prefill_guard = Some(guard);
         }
+        // Only an encoder that processes the media itself (a push handoff)
+        // takes references; a rendezvous encoder takes router-processed items.
         if self.mode == WorkerSelectionMode::EncodePrefillDecode
             && inputs.media_refs
-            && selection_runtime(&workers) != RuntimeType::Vllm
+            && workers.encode_handoff() != Some(EncodeHandoff::Push)
         {
             return Err(multimodal::MmRefsError::EncodeNotSupported.into_response());
         }
@@ -707,7 +714,7 @@ impl WorkerSelectionStage {
         ctx: &mut DispatchContext,
         plan: &ExecutionPlan,
     ) -> Result<(), Response> {
-        if plan.has_replica_bound_ec_handoff() {
+        if plan.replays_replica_bound_handoff(PdProtocol::encode_handoff(ctx.wire.runtime)) {
             let mut response = error::bad_gateway(
                 "ec_retry_unsupported",
                 "Cannot replay a replica-bound EC handoff from the pre-encode request",
@@ -793,9 +800,13 @@ impl WorkerSelectionStage {
                         media,
                         PairDemands::new(
                             self.prefill_side_needs_vision(ctx.routing.needs_vision),
+                            // Under a push handoff the decode side still reads
+                            // the identity's grids; a rendezvous embedding
+                            // reaches it without a vision encoder.
                             ctx.routing.decode_needs_vision
                                 && (self.mode != WorkerSelectionMode::EncodePrefillDecode
-                                    || ctx.wire.runtime == RuntimeType::Vllm),
+                                    || PdProtocol::encode_handoff(ctx.wire.runtime)
+                                        == Some(EncodeHandoff::Push)),
                         )
                         .with_media_refs(media_refs, ctx.wire.pipeline)
                         .with_context(context_requirements),
@@ -1961,12 +1972,16 @@ impl WorkerSelectionStage {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let needs_encode = !encode_item_hashes.is_empty();
         let mut available_encode = Self::available_workers(&snapshot, RoutingPool::GrpcEncode);
+        // An encoder serves the request by its runtime's encode handoff: a
+        // push encoder must advertise the producer role of a connector and
+        // may take references (it processes the media itself); a rendezvous
+        // encoder takes router-processed items only.
         let capable_for = |worker: &Arc<dyn Worker>, media: MediaDemands| {
             media.accepts(worker.as_ref())
-                && match worker.metadata().spec.runtime_type {
-                    RuntimeType::Vllm => ec_role(worker.as_ref(), "ec_producer"),
-                    RuntimeType::TokenSpeed => !media.media_refs,
-                    _ => false,
+                && match PdProtocol::encode_handoff(worker.metadata().spec.runtime_type) {
+                    Some(EncodeHandoff::Push) => ec_role(worker.as_ref(), "ec_producer"),
+                    Some(EncodeHandoff::Rendezvous) => !media.media_refs,
+                    None => false,
                 }
         };
         let capable = |worker: &Arc<dyn Worker>| capable_for(worker, demand.encode);
@@ -1989,7 +2004,8 @@ impl WorkerSelectionStage {
             {
                 EpdSelectionFailure::EncodeVisionUnsupported
             } else if registered_encode.iter().any(|worker| {
-                worker.metadata().spec.runtime_type == RuntimeType::Vllm
+                PdProtocol::encode_handoff(worker.metadata().spec.runtime_type)
+                    == Some(EncodeHandoff::Push)
                     && demand.encode.accepts(worker.as_ref())
             }) {
                 EpdSelectionFailure::EcIncompatible
@@ -2004,7 +2020,7 @@ impl WorkerSelectionStage {
         let compatible = |encoder: &Arc<dyn Worker>, worker: &dyn Worker| {
             let runtime = worker.metadata().spec.runtime_type;
             encoder.metadata().spec.runtime_type == runtime
-                && (runtime != RuntimeType::Vllm
+                && (PdProtocol::encode_handoff(runtime) != Some(EncodeHandoff::Push)
                     || worker.worker_type() != &WorkerType::Prefill
                     || ec_pair(encoder.as_ref(), worker))
         };
@@ -2053,14 +2069,16 @@ impl WorkerSelectionStage {
             },
         )
         .map_err(EpdSelectionFailure::Placement)?;
+        let handoff = PdProtocol::encode_handoff(pair.runtime);
         available_encode.retain(|worker| {
             worker.metadata().spec.runtime_type == pair.runtime
-                && (pair.runtime != RuntimeType::Vllm
+                && (handoff != Some(EncodeHandoff::Push)
                     || ec_pair(worker.as_ref(), pair.prefill.as_ref()))
         });
-        // vLLM encodes the whole prompt on one worker; TokenSpeed routes items.
+        // A push encoder processes the whole prompt on one worker; a
+        // rendezvous encode routes each item by its own content hash.
         let prompt_hash;
-        let hashes = if pair.runtime == RuntimeType::Vllm && needs_encode {
+        let hashes = if handoff == Some(EncodeHandoff::Push) && needs_encode {
             let mut hash = blake3::Hasher::new();
             for item in encode_item_hashes {
                 hash.update(&(item.len() as u64).to_le_bytes());

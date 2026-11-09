@@ -1,7 +1,9 @@
 //! What the crate's tests build their workers with: a health-check
 //! configuration that leaves the worker as the test built it, a ready
-//! worker built with it, a labelled gRPC worker and the registry holding
-//! a test's workers, and the admission attempt that selects one worker.
+//! worker and a worker of a given role built with it, a labelled gRPC
+//! worker and the registry holding a test's workers, the admission attempt
+//! that selects one worker, and the KV cache event that clears a worker's
+//! cache.
 
 use std::sync::Arc;
 
@@ -9,6 +11,7 @@ use openai_protocol::{
     model_card::ModelCard,
     worker::{HealthCheckConfig, RuntimeType, WorkerStatus, WorkerType},
 };
+use smg_grpc_client::common_proto::{kv_cache_event, KvCacheCleared, KvCacheEvent};
 
 use crate::worker::{
     prefill_admission::{PrefillAdmissionAttempt, PrefillSelectionContext},
@@ -35,6 +38,17 @@ pub(crate) fn ready_worker(url: &str, model: &str) -> Arc<dyn Worker> {
         .build();
     worker.set_status(WorkerStatus::Ready);
     Arc::new(worker)
+}
+
+/// A worker of `worker_type` at `url` with no health checker behind it: what
+/// a test fills a pool with when no health checker may run.
+pub(crate) fn worker_of(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
+    Arc::new(
+        BasicWorkerBuilder::new(url)
+            .worker_type(worker_type)
+            .health_config(no_health_check())
+            .build(),
+    )
 }
 
 /// The attempt a test makes when it wants exactly `worker`: it is selected,
@@ -74,4 +88,13 @@ pub(crate) fn registry_with(workers: Vec<Arc<dyn Worker>>) -> WorkerRegistry {
         registry.register(worker).expect("register");
     }
     registry
+}
+
+/// The KV cache event that clears a worker's whole cache: the state the KV
+/// event monitor's and the index backends' tests start over from.
+pub(crate) fn kv_cache_cleared() -> KvCacheEvent {
+    KvCacheEvent {
+        event_id: 0,
+        data: Some(kv_cache_event::Data::Cleared(KvCacheCleared::default())),
+    }
 }

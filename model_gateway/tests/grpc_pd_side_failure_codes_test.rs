@@ -20,6 +20,7 @@
 use std::time::Duration;
 
 use common::{
+    decode_stream::{chunk, complete, GenerateTx},
     engine_answers::{
         TokenSpeedAnswers, TokenSpeedGenerateStream, VllmAnswers, VllmGenerateStream,
     },
@@ -28,7 +29,6 @@ use common::{
         Canned,
     },
 };
-use proto::generate_response::Response as GenResp;
 use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
@@ -50,8 +50,6 @@ const OUTPUT_TOKENS: u32 = 3;
 const CASE_CAP: Duration = Duration::from_secs(30);
 /// The words the failing engines put on their status.
 const REASON: &str = "the engine says no";
-
-type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
 
 /// What a mock engine does with a generate call.
 #[derive(Clone, Copy, Debug)]
@@ -76,31 +74,6 @@ struct Engine {
     behaviour: Behaviour,
 }
 
-fn chunk(id: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Chunk(proto::GenerateStreamChunk {
-            token_ids: vec![id],
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
-fn complete(tokens: u32) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenResp::Complete(proto::GenerateComplete {
-            output_ids: (1..=tokens).collect(),
-            finish_reason: "stop".to_string(),
-            prompt_tokens: 1,
-            completion_tokens: tokens,
-            index: 0,
-            ..Default::default()
-        })),
-    }
-}
-
 /// Feed one generate stream as `behaviour` says.
 #[expect(
     clippy::disallowed_methods,
@@ -120,7 +93,7 @@ fn produce(tx: GenerateTx, behaviour: Behaviour) {
                 }
                 let last = match behaviour {
                     Behaviour::FailsAfterTokens(code) => Err(Status::new(code, REASON)),
-                    _ => Ok(complete(OUTPUT_TOKENS)),
+                    _ => Ok(complete("stop", OUTPUT_TOKENS)),
                 };
                 let _ = tx.send(last).await;
             }
@@ -185,47 +158,6 @@ impl TokenSpeedAnswers for CutPrefill {
             let _ = tx.send(Err(Status::new(code, REASON))).await;
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
-    }
-
-    async fn health_check(
-        &self,
-        _request: Request<ts::HealthCheckRequest>,
-    ) -> Result<Response<ts::HealthCheckResponse>, Status> {
-        Ok(Response::new(ts::HealthCheckResponse {
-            healthy: true,
-            message: "ok".to_string(),
-        }))
-    }
-
-    async fn abort(
-        &self,
-        _request: Request<ts::AbortRequest>,
-    ) -> Result<Response<ts::AbortResponse>, Status> {
-        Ok(Response::new(ts::AbortResponse {
-            success: true,
-            message: String::new(),
-        }))
-    }
-
-    async fn get_model_info(
-        &self,
-        _request: Request<ts::GetModelInfoRequest>,
-    ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
-        Ok(Response::new(ts::GetModelInfoResponse::default()))
-    }
-
-    async fn get_server_info(
-        &self,
-        _request: Request<ts::GetServerInfoRequest>,
-    ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
-        Ok(Response::new(ts::GetServerInfoResponse::default()))
-    }
-
-    async fn get_loads(
-        &self,
-        _request: Request<ts::GetLoadsRequest>,
-    ) -> Result<Response<ts::GetLoadsResponse>, Status> {
-        Ok(Response::new(ts::GetLoadsResponse::default()))
     }
 }
 
@@ -436,6 +368,25 @@ async fn a_side_failure_is_named_by_the_shared_vocabulary_on_the_sequential_shap
         "{} of {total} rows do not answer the shared vocabulary:\n{}",
         mismatches.len(),
         mismatches.join("\n")
+    );
+}
+
+/// Both sides complete: the answer's usage carries the token count the
+/// decode's completion scripted, so the count the rows' engines send is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completing_pair_answers_with_the_scripted_completion_count() {
+    let prefill_port = start_engine(Behaviour::Completes).await;
+    let decode_port = start_engine(Behaviour::Completes).await;
+    let router = build_pd_router(prefill_port, decode_port, RuntimeType::Vllm).await;
+
+    let (status, body) = one_chat(router.as_ref(), false).await;
+
+    assert_eq!(status, http::StatusCode::OK, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("a JSON answer");
+    assert_eq!(
+        json["usage"]["completion_tokens"].as_u64(),
+        Some(u64::from(OUTPUT_TOKENS)),
+        "the usage carries the decode's completion count: {body}"
     );
 }
 

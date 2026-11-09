@@ -15,8 +15,11 @@
 use std::{sync::Arc, time::Duration};
 
 use axum::http::StatusCode;
-use common::grpc_harness::{
-    build_grpc_router, grpc_router_config, grpc_worker, serve_canned_worker, Canned,
+use common::{
+    grpc_harness::{
+        build_grpc_router, grpc_router_config, grpc_worker, serve_canned_worker, Canned,
+    },
+    test_app::read_body,
 };
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, model_card::ModelCard,
@@ -136,17 +139,6 @@ fn batched_completion(token_counts: &[usize]) -> CompletionRequest {
 
 fn tenant() -> TenantRequestMeta {
     TenantRequestMeta::new(TenantKey::new("context-length-test-tenant"))
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
-async fn read_body(response: axum::response::Response) -> String {
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-        .await
-        .expect("response body");
-    String::from_utf8(bytes.to_vec()).expect("utf-8 body")
 }
 
 #[expect(

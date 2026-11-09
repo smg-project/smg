@@ -74,6 +74,10 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 
 `router.maxConcurrentRequests` is the gateway's `--max-concurrent-requests`: the in-flight requests it admits before shedding with 429 or 503, each permit held for the whole response, streaming bodies included. `-1` (the default) derives the bound from the host, 1024 per available core and at least 4096; `0` lifts the bound; a positive value is the bound.
 
+### Native JPEG Decoder
+
+`router.mmTurbojpeg` is the gateway's `--mm-turbojpeg`: what it does when libjpeg-turbo (`libturbojpeg.so.0`) cannot be loaded. `require` (the default) refuses to start, so a gateway never decodes JPEGs with the pure-Rust fallback, whose pixels differ from the engine's by a few levels. `prefer` decodes with the fallback, says so once at start-up and sets the gauge `smg_mm_turbojpeg_available` to 0. The published image ships the library; a custom image without it needs `prefer`.
+
 ### Workers
 
 Each entry in `workers[]` creates a Deployment + Service:
@@ -321,7 +325,7 @@ The budget is not a startup probe on the router's `/readiness`: a startup probe 
 Model loading takes from a minute to tens of minutes, depending on the checkpoint and where it is streamed from. Workers have startup probes with these defaults (`initialDelaySeconds` plus `failureThreshold` times `periodSeconds`: 360 s of budget):
 
 - HTTP mode: `httpGet /health` with `initialDelaySeconds: 60`, `failureThreshold: 30`
-- gRPC mode: `tcpSocket` probe (not all engines implement gRPC health checking yet)
+- gRPC mode: `grpc` probe on the serving port, the same budget. The probe asks the servicer's `grpc.health.v1` service, which every servicer serves (the Rust servicer for every engine, the Python servicers alike) and which answers `SERVING` once the engine serves. The pod therefore counts as started when the engine does, not when the servicer binds its port. The built-in gRPC probe needs Kubernetes 1.24 or later; the chart requires 1.26.
 
 Override per worker:
 

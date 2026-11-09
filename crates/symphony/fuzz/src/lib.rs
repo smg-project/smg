@@ -1644,7 +1644,7 @@ mod tests {
     }
 
     /// The judge of every fragment names a refusal by what the partial parser makes of the text,
-    /// so that the scheduled run's allowance of `tolerated-json` hides no `json-prefix`: what
+    /// so that an allowance of `tolerated-json` hides no `json-prefix`: what
     /// both refuse is `json-prefix`, what the judge refuses and the parser takes whole is
     /// `tolerated-json`, at the fragment that brings it, and what the judge takes is no breach.
     #[test]

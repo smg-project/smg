@@ -32,6 +32,25 @@ const PLANE: u32 = 0x1_0000;
 /// Code points per block of the plane table.
 const BLOCK: usize = 256;
 
+/// The code point of the character beyond ASCII whose lead byte `lead`
+/// stands at `pos` of `bytes`, and its length. The text is valid UTF-8 and
+/// `pos` a character boundary, so the lead byte gives the length and the
+/// continuation bytes follow; the reads stay checked all the same.
+#[inline(always)]
+pub(super) fn char_beyond_ascii(bytes: &[u8], pos: usize, lead: u8) -> (u32, usize) {
+    let tail = |i: usize| u32::from(bytes.get(pos + i).copied().unwrap_or(0) & 0x3F);
+    if lead < 0xE0 {
+        ((u32::from(lead & 0x1F) << 6) | tail(1), 2)
+    } else if lead < 0xF0 {
+        ((u32::from(lead & 0x0F) << 12) | (tail(1) << 6) | tail(2), 3)
+    } else {
+        (
+            (u32::from(lead & 0x07) << 18) | (tail(1) << 12) | (tail(2) << 6) | tail(3),
+            4,
+        )
+    }
+}
+
 /// The role tables of one scanner; see the module documentation.
 #[derive(Clone)]
 pub(super) struct Roles {
@@ -107,22 +126,10 @@ impl Roles {
     }
 
     /// The role bits of the character beyond ASCII whose lead byte `lead`
-    /// stands at `pos`, and its length. The text is valid UTF-8 and `pos` a
-    /// character boundary, so the lead byte gives the length and the
-    /// continuation bytes follow; the reads stay checked all the same.
+    /// stands at `pos`, and its length.
     #[inline(always)]
     fn beyond(&self, bytes: &[u8], pos: usize, lead: u8) -> (Bits, usize) {
-        let tail = |i: usize| u32::from(bytes.get(pos + i).copied().unwrap_or(0) & 0x3F);
-        let (code, len) = if lead < 0xE0 {
-            ((u32::from(lead & 0x1F) << 6) | tail(1), 2)
-        } else if lead < 0xF0 {
-            ((u32::from(lead & 0x0F) << 12) | (tail(1) << 6) | tail(2), 3)
-        } else {
-            (
-                (u32::from(lead & 0x07) << 18) | (tail(1) << 12) | (tail(2) << 6) | tail(3),
-                4,
-            )
-        };
+        let (code, len) = char_beyond_ascii(bytes, pos, lead);
         let bits = if code < PLANE {
             let row = usize::from(self.block_rows[(code >> 8) as usize]);
             self.rows[(row << 8) | (code & 0xFF) as usize]
@@ -159,28 +166,6 @@ impl Roles {
             } else {
                 let (bits, len) = self.beyond(bytes, pos, lead);
                 if bits & bit == 0 {
-                    break;
-                }
-                pos += len;
-            }
-        }
-        pos
-    }
-
-    /// The end of the run of characters holding none of `bits` that starts
-    /// at `pos`.
-    #[inline(always)]
-    pub(super) fn run_end_without(&self, text: &str, mut pos: usize, bits: Bits) -> usize {
-        let bytes = text.as_bytes();
-        while let Some(&lead) = bytes.get(pos) {
-            if lead < 0x80 {
-                if self.bytes[usize::from(lead)] & bits != 0 {
-                    break;
-                }
-                pos += 1;
-            } else {
-                let (held, len) = self.beyond(bytes, pos, lead);
-                if held & bits != 0 {
                     break;
                 }
                 pos += len;
@@ -271,9 +256,6 @@ mod tests {
         ] {
             assert_eq!(roles.run_end(text, 0, letters), end, "{text:?}");
         }
-        assert_eq!(roles.run_end_without("abc  d", 0, spaces), 3);
-        assert_eq!(roles.run_end_without("  ab", 0, spaces), 0);
-        assert_eq!(roles.run_end_without("中文 x", 0, spaces), 6);
         assert_eq!(roles.run_end_marked("abc ", 0, letters, spaces), (3, None));
         assert_eq!(
             roles.run_end_marked("a b", 0, letters | spaces, spaces),
