@@ -1005,7 +1005,7 @@ async fn v1_detokenize(
 
 async fn v1_tokenizers_add(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<AddTokenizerRequest>,
+    AdminJson(request): AdminJson<AddTokenizerRequest>,
 ) -> Response {
     tokenize::add_tokenizer(&state.context, request).await
 }
