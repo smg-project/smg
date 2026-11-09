@@ -50,6 +50,25 @@ pub enum PolicyType {
     PrefixHash,
 }
 
+impl PolicyType {
+    /// The name the CLI's policy flags take for this policy, for a message
+    /// that reads the same from the binary and from here.
+    fn cli_name(&self) -> &'static str {
+        match self {
+            Self::Random => "random",
+            Self::RoundRobin => "round_robin",
+            Self::Passthrough => "passthrough",
+            Self::CacheAware => "cache_aware",
+            Self::PowerOfTwo => "power_of_two",
+            Self::LeastLoad => "least_load",
+            Self::Bucket => "bucket",
+            Self::Manual => "manual",
+            Self::ConsistentHashing => "consistent_hashing",
+            Self::PrefixHash => "prefix_hash",
+        }
+    }
+}
+
 #[pyclass(eq, from_py_object)]
 #[derive(Clone, PartialEq, Debug)]
 pub enum BackendType {
@@ -1035,6 +1054,22 @@ impl Router {
                 },
             })
         };
+
+        // The encode side takes the three policies the CLI's `--encode-policy`
+        // takes. The CLI refuses the others at the flag and the launcher at
+        // parse time; the binding refuses them here, before anything binds.
+        if let Some(policy) = &self.encode_policy {
+            if !matches!(
+                policy,
+                PolicyType::Random | PolicyType::RoundRobin | PolicyType::ConsistentHashing
+            ) {
+                return Err(config::ConfigError::InvalidValue {
+                    field: "encode_policy".to_string(),
+                    value: policy.cli_name().to_string(),
+                    reason: "expected random, round_robin or consistent_hashing".to_string(),
+                });
+            }
+        }
 
         // IGW selects routers per request; it does not change which configured
         // workers are registered at startup, or override backend/disaggregated modes.
