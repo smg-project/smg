@@ -1169,8 +1169,9 @@ mod tests {
             CacheAwarePolicy, LeastLoadPolicy, SelectWorkerInfo,
         },
         worker::{
-            load_state::LoadSnapshot, test_support::worker_of, HashRing, Worker, WorkerLoadGuard,
-            WorkerType,
+            load_state::LoadSnapshot,
+            test_support::{ready_worker, worker_of},
+            HashRing, Worker, WorkerLoadGuard, WorkerType,
         },
     };
 
@@ -2566,6 +2567,76 @@ mod tests {
 
         registry.remove_worker_from_pd_cache_aware("http://prefill-1:8000");
         registry.remove_worker_from_pd_cache_aware("http://decode-1:8000");
+    }
+
+    /// The worker URLs a cache-aware policy's string tree routes to for `model`.
+    fn tree_of(policy: &Arc<dyn LoadBalancingPolicy>, model: &str) -> Vec<String> {
+        as_cache_aware(policy.as_ref())
+            .expect("a cache-aware policy")
+            .tree_tenants_for_test(model)
+    }
+
+    /// A registry whose policy for `llama-3` is cache-aware, and two of that
+    /// model's workers, routed by `init_cache_aware_policy`.
+    fn cache_aware_model() -> (
+        PolicyRegistry,
+        Arc<dyn LoadBalancingPolicy>,
+        Vec<Arc<dyn Worker>>,
+    ) {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let policy = registry.on_worker_added("llama-3", Some("cache_aware"));
+        let workers = vec![
+            ready_worker("http://w1:8000", "llama-3"),
+            ready_worker("http://w2:8000", "llama-3"),
+        ];
+        assert!(
+            tree_of(&policy, "llama-3").is_empty(),
+            "a fresh tree is empty"
+        );
+        registry.init_cache_aware_policy("llama-3", &workers);
+        (registry, policy, workers)
+    }
+
+    #[test]
+    fn init_cache_aware_policy_fills_the_models_tree() {
+        let (_registry, policy, _workers) = cache_aware_model();
+        assert_eq!(
+            tree_of(&policy, "llama-3"),
+            ["http://w1:8000", "http://w2:8000"]
+        );
+    }
+
+    #[test]
+    fn remove_worker_from_cache_aware_drops_the_worker_from_the_tree() {
+        let (registry, policy, _workers) = cache_aware_model();
+        registry.remove_worker_from_cache_aware("llama-3", "http://w1:8000");
+        assert_eq!(tree_of(&policy, "llama-3"), ["http://w2:8000"]);
+    }
+
+    #[test]
+    fn remove_workers_from_cache_aware_empties_the_models_tree() {
+        let (registry, policy, workers) = cache_aware_model();
+        let urls: HashSet<String> = workers.iter().map(|w| w.url().to_string()).collect();
+        registry.remove_workers_from_cache_aware("llama-3", &urls);
+        assert!(tree_of(&policy, "llama-3").is_empty());
+    }
+
+    #[test]
+    fn init_pd_cache_aware_policies_fills_both_role_trees() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry.set_prefill_policy(cache_aware_policy());
+        registry.set_decode_policy(cache_aware_policy());
+        let prefill = vec![worker_of("http://prefill-1:8000", WorkerType::Prefill)];
+        let decode = vec![worker_of("http://decode-1:8000", WorkerType::Decode)];
+        registry.init_pd_cache_aware_policies(&prefill, &decode);
+        assert_eq!(
+            tree_of(&registry.get_prefill_policy(), prefill[0].model_id()),
+            ["http://prefill-1:8000"]
+        );
+        assert_eq!(
+            tree_of(&registry.get_decode_policy(), decode[0].model_id()),
+            ["http://decode-1:8000"]
+        );
     }
 
     /// A policy that remembers completions and reconciliation ticks.
