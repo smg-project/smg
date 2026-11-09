@@ -280,7 +280,9 @@ mod tests {
 
     use super::*;
     use crate::worker::{
-        circuit_breaker::CircuitBreakerConfig, test_support::no_health_check, BasicWorkerBuilder,
+        circuit_breaker::CircuitBreakerConfig,
+        test_support::{no_health_check, RefusedAddress},
+        BasicWorkerBuilder,
     };
 
     const CAUSE: &str = "error decoding response body: error reading a body from connection: \
@@ -328,7 +330,7 @@ mod tests {
     /// A call to a worker nobody listens at: the connect is refused, and the
     /// error carries the worker's URL as reqwest attaches it.
     async fn refused_call() -> (std::net::SocketAddr, reqwest::Error) {
-        let refused = crate::test_support::RefusedAddress::reserve();
+        let refused = RefusedAddress::reserve();
         let addr = refused.addr();
         let error = crate::server::http_client_builder()
             .build()

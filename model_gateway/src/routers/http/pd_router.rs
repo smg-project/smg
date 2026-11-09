@@ -2933,12 +2933,14 @@ mod tests {
     use super::*;
     use crate::{
         config::{types::PdPairingMode, PolicyConfig},
-        middleware::ReportedRefusal,
+        middleware::{test_support::json_of, ReportedRefusal},
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
         routers::common::sse::SSE_CHANNEL_BUFFER,
         tenant::TenantKey,
-        test_support::{json_of, RefusedAddress},
-        worker::{circuit_breaker::CircuitState, BasicWorkerBuilder, WorkerType},
+        worker::{
+            circuit_breaker::CircuitState, test_support::RefusedAddress, BasicWorkerBuilder,
+            WorkerType,
+        },
     };
 
     /// A call that never reached its worker, with the worker's URL on the

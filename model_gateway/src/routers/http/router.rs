@@ -2886,9 +2886,10 @@ mod tests {
             test_support::fast_retry_config,
         },
         service_discovery::testing::create_test_app_context,
-        test_support::RefusedAddress,
         worker::{
-            circuit_breaker::CircuitState, test_support::no_health_check, BasicWorkerBuilder,
+            circuit_breaker::CircuitState,
+            test_support::{no_health_check, RefusedAddress},
+            BasicWorkerBuilder,
         },
     };
 

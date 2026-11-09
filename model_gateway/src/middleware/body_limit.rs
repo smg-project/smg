@@ -109,9 +109,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        middleware::body_timeout::{crossed_payload_limit, REQUEST_BODY_TOO_LARGE},
+        middleware::{
+            body_timeout::{crossed_payload_limit, REQUEST_BODY_TOO_LARGE},
+            test_support::text_of,
+        },
         routers::error::extract_error_code_from_response,
-        test_support::text_of,
     };
 
     /// The layer over two handlers: `/read` reads its body and answers its

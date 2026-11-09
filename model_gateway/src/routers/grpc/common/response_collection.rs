@@ -333,8 +333,7 @@ mod tests {
     use super::*;
     use crate::{
         routers::grpc::proto_wrapper::{ProtoGenerateResponse, ENGINE_ERROR_MESSAGE},
-        test_support::RefusedAddress,
-        worker::{BasicWorkerBuilder, ConnectionMode, WorkerType},
+        worker::{test_support::RefusedAddress, BasicWorkerBuilder, ConnectionMode, WorkerType},
     };
 
     /// A stream that is already at EOF, as sequential PD hands to the

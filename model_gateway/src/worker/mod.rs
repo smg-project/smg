@@ -34,8 +34,8 @@ pub mod runtime;
 pub mod sampling_defaults;
 pub mod service;
 pub mod stream;
-#[cfg(test)]
-pub(crate) mod test_support;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_support;
 
 // Re-export commonly used types for convenience
 pub(crate) use basic::ConnectionModeExt;

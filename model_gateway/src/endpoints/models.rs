@@ -498,7 +498,7 @@ mod tests {
     use super::*;
     use crate::{
         config::types::TenantApiKeyEntry,
-        test_support::json_of,
+        middleware::test_support::json_of,
         worker::{test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerType},
     };
 
