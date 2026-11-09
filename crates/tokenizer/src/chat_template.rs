@@ -2683,12 +2683,6 @@ impl Object for RenderContext {
 #[derive(Debug, Default)]
 pub(crate) struct RenderedLength(AtomicUsize);
 
-impl Clone for RenderedLength {
-    fn clone(&self) -> Self {
-        Self(AtomicUsize::new(self.0.load(Ordering::Relaxed)))
-    }
-}
-
 /// The most a render pre-allocates from the hint, whatever the last length.
 const RENDERED_LENGTH_CAP: usize = 64 * 1024;
 
@@ -2920,7 +2914,6 @@ impl ConfigChatTemplates {
 ///
 /// `Environment<'static>` is both `Send` and `Sync`, so embedding this in
 /// tokenizer structs shared across threads is safe.
-#[derive(Clone)]
 pub struct ChatTemplateState {
     /// Cached, fully-configured environment. `None` when no template is set.
     env: Option<Environment<'static>>,
@@ -3339,14 +3332,14 @@ impl ChatTemplateState {
     /// fails to mark leaves the previous one in force, marks included (set
     /// first and marked after, a failed mark left the new template installed
     /// unmarked, and every later render read a typed control spelling as
-    /// its token).
+    /// its token). The fresh state is what `set` would leave: the template's
+    /// own answers, no nested templates, the length hint starting over.
     pub(crate) fn replace_marked(
         &mut self,
         template: String,
         controls: Option<&AddedTokens>,
     ) -> Result<()> {
-        let mut fresh = self.clone();
-        fresh.set(template)?;
+        let mut fresh = Self::new(Some(template))?;
         if let Some(controls) = controls {
             fresh.mark_controls(controls)?;
         }

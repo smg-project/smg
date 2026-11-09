@@ -2061,6 +2061,48 @@ mod tests {
         dir
     }
 
+    /// A tiktoken-file checkpoint reads the processor's legacy
+    /// `chat_template.json` beside it as the conversion of a checkpoint
+    /// does: a request without tools renders through the processor's
+    /// template, a request with tools through the configuration's.
+    #[test]
+    fn a_tiktoken_file_checkpoint_reads_the_processor_template_for_tool_less_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tiktoken.model"),
+            full_byte_tiktoken_model(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template": "config"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("chat_template.json"),
+            r#"{"chat_template": "processor"}"#,
+        )
+        .unwrap();
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        let messages = [serde_json::json!({"role": "user", "content": "hello"})];
+        let tools =
+            [serde_json::json!({"type": "function", "function": {"name": "f", "parameters": {}}})];
+        let without_tools = tokenizer
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(without_tools, "processor");
+        let with_tools = ChatTemplateParams {
+            tools: Some(tools.as_slice()),
+            ..ChatTemplateParams::default()
+        };
+        assert_eq!(
+            tokenizer
+                .apply_chat_template(&messages, with_tools)
+                .unwrap(),
+            "config"
+        );
+    }
+
     #[test]
     fn test_incremental_decode_holds_a_split_character_without_a_lossy_fallback() {
         let tokenizer: Arc<dyn Tokenizer> =

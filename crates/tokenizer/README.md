@@ -92,7 +92,11 @@ as of `tokenizer/src/*`.
 - `create_tokenizer{,_async}` accept either a filesystem path or a model identifier. Logic:
    1. Paths are loaded directly; a directory takes `tekken.json`, then `tokenizer.json`, then
       `vocab.json` + `merges.txt` under a Qwen2 class, then a tiktoken vocabulary; a single file's
-      extension (or JSON autodetection) selects the backend, `tekken.json` by its name.
+      extension (or JSON autodetection) selects the backend, `tekken.json` by its name. Both
+      backends read the processor's legacy `chat_template.json` beside the files for the requests
+      without tools (`processor_chat_template`, one read): the tiktoken backend does so for every
+      vocabulary format it loads (`tiktoken.model`, `*.tiktoken`, `tekken.json`), as the engine's
+      processor and the conversion of the same checkpoint do.
    2. Strings that look like OpenAI model names (`gpt-*`, `davinci`, `curie`, `babbage`, `ada`) use
       `TiktokenTokenizer`.
    3. Everything else attempts a Hugging Face Hub download via `download_tokenizer_from_hf`.
