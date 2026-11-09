@@ -1,6 +1,6 @@
 //! Harmony response processor for non-streaming responses
 
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
 use axum::response::Response;
 use openai_protocol::{
@@ -125,7 +125,7 @@ impl HarmonyResponseProcessor {
         dispatch: DispatchMetadata,
         router_stop_strings: &[String],
     ) -> Result<(ChatCompletionResponse, response_formatting::TokenCounts), Response> {
-        let started = generation_start(&execution_result, Instant::now());
+        let started = generation_start(&execution_result);
         let request_logprobs = chat_request.logprobs;
 
         // Collect all completed responses (one per choice)
