@@ -1,15 +1,11 @@
 //! Benchmark: what a pixel-cache hit copies.
 //!
-//! The gateway's pixel cache keeps a preprocessed image behind a shared pointer and hands a hit
-//! out as a clone of the whole preprocessed item (the encoder input and its side tensors), and a
-//! request with several cached images clones each hit and then joins the parts into one batch, a
-//! copy of every byte again. Both copies are of this crate's types, so the rows here price them on
-//! a 1,024-patch image (512 x 512 under the Qwen3-VL geometry: 32 x 32 patches of 16 px, 256
-//! merged tokens): one image, the clone a hit returns, and four images, four clones and the join;
-//! as the image's own bytes, the form the cache holds when no wire dtype is resolved, and as the
-//! bfloat16 and float32 wires it holds otherwise. The rows time the copies; what they produce is
-//! dropped outside the measurement. Beside the rows, the allocation calls one hit makes, counted
-//! by this binary's own allocator.
+//! The gateway's pixel cache keeps processor outputs behind shared pointers. A single
+//! image is cloned into the owned response; a batch borrows the cached outputs and
+//! copies their bytes directly into the final concatenation. The rows price both
+//! paths on 512 x 512 images (1,024 patches, 256 merged tokens), as the processor's
+//! own bytes and as bfloat16/float32 wire bytes. Outputs are dropped outside the
+//! measurement; allocation counts are printed beside the timing rows.
 //!
 //! Run:  cargo bench -p llm-multimodal --bench pixel_cache_hit
 
@@ -120,19 +116,18 @@ fn entry(processor: &Qwen3VLProcessor, wire: Option<EncoderDtype>) -> Preprocess
     preprocessed
 }
 
-/// What the gateway does on a hit: the cached item cloned out of its shared pointer.
+/// A single-image cache hit clones the cached item into the owned response.
 fn hit(cached: &Arc<PreprocessedEncoderInputs>) -> PreprocessedEncoderInputs {
     (**cached).clone()
 }
 
-/// What the gateway does for a request of several cached images: one hit per image, then the
-/// parts joined into the request's batch.
+/// Borrow each cached image and join its bytes directly into the request batch.
 fn batch(
     cached: &[Arc<PreprocessedEncoderInputs>],
     layouts: &HashMap<String, FieldLayout>,
 ) -> PreprocessedEncoderInputs {
-    let parts = cached.iter().map(hit).collect();
-    PreprocessedEncoderInputs::concat(parts, layouts).unwrap()
+    let parts = cached.iter().map(Arc::as_ref).collect::<Vec<_>>();
+    PreprocessedEncoderInputs::concat_refs(&parts, layouts).unwrap()
 }
 
 #[expect(
@@ -163,7 +158,7 @@ fn bench_pixel_cache_hit(c: &mut Criterion) {
         let bytes = cached.encoder_input.nbytes() as u64;
         println!(
             "pixel_cache_hit/{form}: {bytes} encoder bytes per image; one hit: {} allocation \
-             calls; four hits and the join: {} allocation calls",
+             calls; four borrowed parts joined: {} allocation calls",
             allocations_during(|| hit(&cached)),
             allocations_during(|| batch(&four, &layouts)),
         );
