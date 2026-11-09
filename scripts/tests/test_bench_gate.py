@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -445,24 +446,30 @@ def test_build_falls_back_to_the_checkout_sources_when_the_named_ones_do_not_bui
 
 
 FAKE_BENCH = """#!/usr/bin/env python3
-import json, os, sys
+import json, os, re, sys
 from pathlib import Path
 home = Path(os.environ["CRITERION_HOME"])
 assert sys.argv[1:3] == ["--bench", "--noplot"], sys.argv
-assert sys.argv[-1] == "^(encode|decode)/", sys.argv
-values = json.loads(Path(__file__).with_suffix(".json").read_text())
+bench_filter = sys.argv[-1]  # the gate file's filter, or the exact ids of a re-measurement
+values = json.loads(Path(r"__SERIES__").read_text())  # written by fake_bench; the copies read it too
 run = len([p for p in home.parent.iterdir() if p.is_dir()])  # 1-based index of this run
 for bench_id, series in values.items():
+    if not re.search(bench_filter, bench_id):
+        continue
     new = home.joinpath(*bench_id.split("/")) / "new"
     new.mkdir(parents=True)
+    value = series[min(run, len(series)) - 1]  # a series shorter than the runs repeats its last
     (new / "benchmark.json").write_text(json.dumps({"full_id": bench_id}))
-    (new / "estimates.json").write_text(json.dumps({"median": {"point_estimate": series[run - 1]}}))
-print("fake bench", sys.argv[1:], file=sys.stderr)
+    (new / "estimates.json").write_text(json.dumps({"median": {"point_estimate": value}}))
+print("fake bench", sys.argv[1:], "link", os.path.islink(__file__), file=sys.stderr)
 """
 
 
 def fake_bench(path: Path, values: dict[str, list[float]]) -> Path:
-    path.write_text(FAKE_BENCH)
+    # Two sides are two different files: the gate passes binaries of the same bytes without a run.
+    path.write_text(
+        FAKE_BENCH.replace("__SERIES__", str(path.with_suffix(".json"))) + f"# {path.name}\n"
+    )
     path.with_suffix(".json").write_text(json.dumps(values))
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
@@ -480,10 +487,32 @@ def test_run_interleaves_and_compares(mod, gates, tmp_path, monkeypatch):
     )
     assert rc == 1
     saved = json.loads((out / "results.json").read_text())
-    assert saved["order"] == ["base-1", "pr-1", "pr-2", "base-2", "base-3", "pr-3"]
-    assert [run["encode/a"] for run in saved["base"]["runs"]] == [100, 101, 102]
-    assert [run["encode/a"] for run in saved["pr"]["runs"]] == [130, 131, 132]
+    # three interleaved runs, then the failing id once more per side, the pull request first
+    assert saved["order"] == [
+        "base-1",
+        "pr-1",
+        "pr-2",
+        "base-2",
+        "base-3",
+        "pr-3",
+        "pr-4",
+        "base-4",
+    ]
+    assert [run["encode/a"] for run in saved["base"]["runs"]] == [100, 101, 102, 102]
+    assert [run["encode/a"] for run in saved["pr"]["runs"]] == [130, 131, 132, 132]
+    assert saved["pr"]["runs"][3] == {"encode/a": 132}, (
+        "the re-measurement runs the failing id alone"
+    )
+    assert saved["recheck"] == {"ids": ["encode/a"], "rounds": 1}
+    assert saved["identical"] is False
     assert (out / "base" / "run-2.log").read_text().startswith("+ ")
+    # each side ran from a fresh copy of its binary (a file, not a link) through paths of one
+    # length, and the copies are gone after the runs: the output directory is the artifact
+    for side in ("base", "head"):
+        log = (out / side / "run-1.log").read_text()
+        assert log.startswith(f"+ {out / side / 'bench'} --bench") and "link False" in log
+        assert not (out / side / "bench").exists()
+    assert (out / "head" / "run-1").is_dir()
     assert "FAIL regression" in (out / "gate.md").read_text()
     # the same results re-evaluated against a looser gate pass
     loose = tmp_path / "loose.toml"
@@ -537,6 +566,7 @@ def test_run_names_the_bench_sources_the_two_binaries_carry(mod, tmp_path, monke
 def test_run_output_dir_is_resolved_before_the_bench_runs_under_cwd(mod, tmp_path, monkeypatch):
     """A relative --out must not land under --cwd: the bench gets it through the environment."""
     base = fake_bench(tmp_path / "base.py", {"encode/a": [100], "decode/x": [1]})
+    pr = fake_bench(tmp_path / "pr.py", {"encode/a": [100], "decode/x": [1]})
     gate_file = tmp_path / "gates.toml"
     gate_file.write_text(GATE_TOML.replace("repeats = 3", "repeats = 1"))
     bench_cwd = tmp_path / "crate"
@@ -551,7 +581,7 @@ def test_run_output_dir_is_resolved_before_the_bench_runs_under_cwd(mod, tmp_pat
             "--base",
             str(base),
             "--pr",
-            str(base),
+            str(pr),
             "--cwd",
             "crate",
             "--out",
@@ -568,6 +598,9 @@ def test_run_reports_a_crashing_bench(mod, tmp_path, capsys):
     crash = tmp_path / "crash.py"
     crash.write_text("#!/usr/bin/env python3\nraise SystemExit(3)\n")
     crash.chmod(crash.stat().st_mode | stat.S_IXUSR)
+    other = tmp_path / "other.py"
+    other.write_text("#!/usr/bin/env python3\nraise SystemExit(3)  # the other side\n")
+    other.chmod(other.stat().st_mode | stat.S_IXUSR)
     gate_file = tmp_path / "gates.toml"
     gate_file.write_text("repeats = 1\n")
     rc = mod.main(
@@ -578,7 +611,7 @@ def test_run_reports_a_crashing_bench(mod, tmp_path, capsys):
             "--base",
             str(crash),
             "--pr",
-            str(crash),
+            str(other),
             "--out",
             str(tmp_path / "o"),
         ]
@@ -590,6 +623,167 @@ def test_run_reports_a_crashing_bench(mod, tmp_path, capsys):
 def test_interleaved_order(mod):
     assert mod.interleaved_order(1) == [(1, "base"), (1, "pr")]
     assert mod.interleaved_order(2) == [(1, "base"), (1, "pr"), (2, "pr"), (2, "base")]
+    assert mod.round_sides(4) == ("pr", "base")
+
+
+def test_identical_binaries_pass_without_a_run(mod, tmp_path, monkeypatch):
+    bench = fake_bench(tmp_path / "same.py", {"encode/a": [100, 101, 102]})
+    gate_file = tmp_path / "gates.toml"
+    gate_file.write_text(GATE_TOML)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    out = tmp_path / "out"
+    args = ["run", "--gates", str(gate_file), "--base", str(bench), "--pr", str(bench)]
+    assert mod.main([*args, "--out", str(out)]) == 0
+    saved = json.loads((out / "results.json").read_text())
+    assert saved["identical"] is True and saved["order"] == []
+    assert saved["binaries"]["base"]["sha256"] == saved["binaries"]["pr"]["sha256"]
+    text = (out / "gate.md").read_text()
+    assert text.startswith("### Benchmark gate: PASS (identical binaries)")
+    assert "the same bytes" in text
+    assert not (out / "base").exists()
+    assert mod.main(["compare", "--gates", str(gate_file), str(out / "results.json")]) == 0
+
+
+def test_a_failing_id_is_re_measured_before_the_verdict(mod, tmp_path, monkeypatch):
+    # The fourth value is the re-measurement, read within its round: a slow one confirms
+    # the regression, a fast one does not, which is suspect, never a failure.
+    gate_file = tmp_path / "gates.toml"
+    gate_file.write_text(GATE_TOML)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    base = fake_bench(tmp_path / "base.py", {"encode/a": [100, 101, 102, 101]})
+    burst = fake_bench(tmp_path / "burst.py", {"encode/a": [130, 131, 132, 95]})
+    args = ["run", "--gates", str(gate_file), "--base", str(base)]
+    out = tmp_path / "burst"
+    assert mod.main([*args, "--pr", str(burst), "--out", str(out)]) == 0
+    text = (out / "gate.md").read_text()
+    assert "suspect (not confirmed by the re-measurement)" in text
+    assert "Re-measured before the verdict" in text and "`encode/a`" in text
+    assert (
+        "pull request runs [130, 131, 132] ns; re-measured base 101 ns, pull request 95 ns (-5.9%)"
+        in text
+    )
+    slow = fake_bench(tmp_path / "slow.py", {"encode/a": [130, 131, 132, 133]})
+    out = tmp_path / "slow"
+    assert mod.main([*args, "--pr", str(slow), "--out", str(out)]) == 1
+    assert "FAIL regression" in (out / "gate.md").read_text()
+    out = tmp_path / "none"
+    assert mod.main([*args, "--pr", str(burst), "--out", str(out), "--recheck", "0"]) == 1
+    saved = json.loads((out / "results.json").read_text())
+    assert "recheck" not in saved and len(saved["order"]) == 6
+
+
+def test_every_re_measured_round_runs_the_same_ids(mod, tmp_path, monkeypatch):
+    # `--recheck 2`: a first round that does not confirm does not end the re-measurement;
+    # both rounds run on the ids the full rounds failed, and the median reads them.
+    gate_file = tmp_path / "gates.toml"
+    gate_file.write_text(GATE_TOML)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    base = fake_bench(tmp_path / "base.py", {"encode/a": [100, 101, 102, 101, 100]})
+    pr = fake_bench(tmp_path / "pr.py", {"encode/a": [130, 131, 132, 95, 131]})
+    out = tmp_path / "two"
+    args = ["run", "--gates", str(gate_file), "--base", str(base), "--pr", str(pr)]
+    assert mod.main([*args, "--out", str(out), "--recheck", "2"]) == 1
+    saved = json.loads((out / "results.json").read_text())
+    assert saved["recheck"] == {"ids": ["encode/a"], "rounds": 2} and len(saved["order"]) == 10
+    assert (
+        "re-measured base 101 ns, pull request 95 ns (-5.9%); base 100 ns, pull request 131 ns (+31.0%)"
+        in (out / "gate.md").read_text()
+    )
+
+
+def test_host_load_is_recorded_and_a_busy_host_is_not_judged(mod, tmp_path, monkeypatch):
+    gate_file = tmp_path / "gates.toml"
+    gate_file.write_text(GATE_TOML.replace("repeats = 3", "repeats = 1"))
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    base = fake_bench(tmp_path / "base.py", {"encode/a": [100], "decode/x": [1]})
+    pr = fake_bench(tmp_path / "pr.py", {"encode/a": [100], "decode/x": [1]})
+    args = ["run", "--gates", str(gate_file), "--base", str(base), "--pr", str(pr)]
+    monkeypatch.setattr(mod, "host_load", lambda: 3.5)
+    out = tmp_path / "quiet"
+    assert mod.main([*args, "--out", str(out), "--busy-above", "4"]) == 0
+    saved = json.loads((out / "results.json").read_text())
+    assert saved["base"]["load"] == [3.5] and saved["pr"]["load"] == [3.5]
+    assert (
+        "Host load (one minute) before each run: base [3.5], pr [3.5]."
+        in (out / "gate.md").read_text()
+    )
+    monkeypatch.setattr(mod, "host_load", lambda: 9.0)
+    out = tmp_path / "busy"
+    rc = mod.main([*args, "--out", str(out), "--busy-above", "4", "--busy-wait", "0"])
+    assert rc == 2
+    saved = json.loads((out / "results.json").read_text())
+    assert saved["not_judged"].startswith("host busy: the one-minute load 9.0 stayed above 4")
+    assert saved["order"] == []
+    assert (out / "gate.md").read_text().startswith("### Benchmark gate: NOT JUDGED")
+    # A host turning busy after the first run: the rows it left one-sided are not missing
+    # ids, the saved file re-evaluates to 2, and the copies are gone.
+    loads = iter([3.5, 3.5, 9.0, 9.0])
+    monkeypatch.setattr(mod, "host_load", lambda: next(loads))
+    out = tmp_path / "stopped"
+    assert mod.main([*args, "--out", str(out), "--busy-above", "4", "--busy-wait", "0"]) == 2
+    saved = json.loads((out / "results.json").read_text())
+    assert saved["order"] == ["base-1"]
+    text = (out / "gate.md").read_text()
+    assert text.startswith("### Benchmark gate: NOT JUDGED")
+    assert "FAIL missing" not in text and "| not judged (the run stopped) |" in text
+    assert mod.report(saved, mod.load_gates(gate_file), None, None) == 2
+    assert not (out / "base" / "bench").exists() and not (out / "head" / "bench").exists()
+
+
+def test_cpu_pins_the_bench(mod, tmp_path, monkeypatch):
+    if shutil.which("taskset") is None:
+        pytest.skip("no taskset on this host")
+    gate_file = tmp_path / "gates.toml"
+    gate_file.write_text(GATE_TOML.replace("repeats = 3", "repeats = 1"))
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    base = fake_bench(tmp_path / "base.py", {"encode/a": [100], "decode/x": [1]})
+    pr = fake_bench(tmp_path / "pr.py", {"encode/a": [100], "decode/x": [1]})
+    out = tmp_path / "out"
+    args = ["run", "--gates", str(gate_file), "--base", str(base), "--pr", str(pr), "--out"]
+    assert mod.main([*args, str(out), "--cpu", "0"]) == 0
+    assert (out / "base" / "run-1.log").read_text().startswith("+ taskset -c 0 ")
+
+
+def test_per_run_values_are_listed_for_suspect_rows(mod, gates):
+    res = results({"encode/a": [100, 101, 102]}, {"encode/a": [115, 116, 101]})
+    text = mod.markdown(res, mod.compare(res, gates))
+    assert (
+        "- `encode/a`: suspect (runs overlap), +13.9%; base runs [100, 101, 102] ns, "
+        "pull request runs [115, 116, 101] ns." in text
+    )
+
+
+def test_the_re_measured_round_is_read_within_itself(mod, gates):
+    # A process that runs the failing ids alone sits on levels of its own: both sides read
+    # 30 % faster in the re-measured round. Pooled, the runs would overlap; within the
+    # round the regression stands.
+    res = results({"encode/a": [10, 10, 10, 7.0]}, {"encode/a": [13, 13, 13, 9.1]})
+    assert verdicts(mod, gates, res)["encode/a"] == "regression"
+    text = mod.markdown(res, mod.compare(res, gates))
+    assert "re-measured base 7 ns, pull request 9.1 ns (+30.0%)" in text
+    # A re-measured round under half the threshold makes the row suspect.
+    res = results({"encode/a": [10, 10, 10, 10]}, {"encode/a": [13, 13, 13, 10.3]})
+    assert verdicts(mod, gates, res)["encode/a"] == "suspect (not confirmed by the re-measurement)"
+
+
+def test_the_re_measured_round_rules_out_a_burst_not_the_size(mod, gates):
+    # A real +30 % on a 25 % gate whose one re-measured pair swings to +21.8 % stays a
+    # regression: the bar is half the threshold. Near zero, the failure was a burst.
+    res = results({"decode/slow": [100, 102, 104, 101]}, {"decode/slow": [132, 133, 135, 123]})
+    assert verdicts(mod, gates, res)["decode/slow"] == "regression"
+    res = results({"decode/slow": [100, 102, 104, 101]}, {"decode/slow": [132, 133, 135, 103]})
+    assert (
+        verdicts(mod, gates, res)["decode/slow"] == "suspect (not confirmed by the re-measurement)"
+    )
+    # Two re-measured rounds are read on their median: one swing does not undo the other.
+    res = results(
+        {"decode/slow": [100, 102, 104, 101, 100]}, {"decode/slow": [132, 133, 135, 103, 131]}
+    )
+    assert verdicts(mod, gates, res)["decode/slow"] == "regression"
+
+
+def test_per_run_values_print_millisecond_rows_without_an_exponent(mod):
+    assert mod.fmt_runs([1500000.0, 2.5, 999999.4]) == "[1,500,000, 2.5, 999999]"
 
 
 def test_executable_bit(mod):
