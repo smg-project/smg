@@ -2691,13 +2691,13 @@ fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
     );
 }
 
-/// The gateway's test harness and the tokenizer crate's tests carry the same
-/// `hub_fetch.rs`, so a fix to the retry or the download lock in one reaches
+/// The gateway and the tokenizer crate's tests carry the same `hub_fetch.rs`,
+/// so a fix to the retry or the download lock in one reaches
 /// the other: the two files are checked byte for byte.
 #[test]
 fn the_hub_fetch_module_is_the_tokenizer_crate_s_copy() {
     assert_eq!(
-        include_str!("../test_harness/src/hub_fetch.rs"),
+        include_str!("../src/routers/grpc/tokenizer_cache/hub_fetch.rs"),
         include_str!("../../crates/tokenizer/tests/common/hub_fetch.rs"),
         "the two hub_fetch.rs copies have drifted"
     );
