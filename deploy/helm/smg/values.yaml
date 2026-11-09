@@ -154,6 +154,14 @@ router:
   queueSize: 100
   queueTimeoutSecs: 60
 
+  # -- Multimodal: what the gateway does when libjpeg-turbo (libturbojpeg.so.0)
+  #    cannot be loaded. require (the default) refuses to start, so a gateway
+  #    never decodes JPEGs with the pure-Rust fallback, whose pixels differ from
+  #    the engine's by a few levels; prefer decodes with the fallback, says so
+  #    once and sets the gauge smg_mm_turbojpeg_available to 0. The published
+  #    image ships the library; a custom image without it needs prefer.
+  mmTurbojpeg: require
+
   # -- Resilience: retry
   retry:
     enabled: true

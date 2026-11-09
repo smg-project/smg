@@ -416,6 +416,8 @@ Called from the router Deployment template.
 - {{ int .Values.router.maxPayloadSize | quote }}
 - "--request-timeout-secs"
 - {{ .Values.router.requestTimeoutSecs | quote }}
+- "--mm-turbojpeg"
+- {{ .Values.router.mmTurbojpeg | quote }}
 {{- if .Values.router.grpcRequestTimeoutSecs }}
 - "--grpc-request-timeout-secs"
 - {{ .Values.router.grpcRequestTimeoutSecs | quote }}

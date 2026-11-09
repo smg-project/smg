@@ -74,6 +74,10 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 
 `router.maxConcurrentRequests` is the gateway's `--max-concurrent-requests`: the in-flight requests it admits before shedding with 429 or 503, each permit held for the whole response, streaming bodies included. `-1` (the default) derives the bound from the host, 1024 per available core and at least 4096; `0` lifts the bound; a positive value is the bound.
 
+### Native JPEG Decoder
+
+`router.mmTurbojpeg` is the gateway's `--mm-turbojpeg`: what it does when libjpeg-turbo (`libturbojpeg.so.0`) cannot be loaded. `require` (the default) refuses to start, so a gateway never decodes JPEGs with the pure-Rust fallback, whose pixels differ from the engine's by a few levels. `prefer` decodes with the fallback, says so once at start-up and sets the gauge `smg_mm_turbojpeg_available` to 0. The published image ships the library; a custom image without it needs `prefer`.
+
 ### Workers
 
 Each entry in `workers[]` creates a Deployment + Service:
