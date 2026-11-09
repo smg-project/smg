@@ -918,9 +918,12 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
             .remove(url);
     }
 
-    /// The request's load guard dropped: its pick is no longer in flight. A
-    /// request this policy did not pick (the single-worker shortcut, one in
-    /// flight across a `reset`) finds no pick left to release.
+    /// The request's load guard dropped: its pick is no longer in flight. The
+    /// hook names the worker and not the request, so a request this policy
+    /// did not pick (the single-worker shortcut, the sticky override, one in
+    /// flight across a `reset`) releases another request's pick if one is
+    /// held. The count then runs short, the score still reads at least the
+    /// router's live count, and the next load poll sets the count right.
     fn on_request_complete(&self, worker_url: &str) {
         if let Some(dispatch) = self
             .tally
@@ -934,19 +937,17 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
 
     /// The load poll sets the worker's picks to the router's live count: a
     /// pick the router dropped before taking its guard never ends and leaves
-    /// here, and a request this policy did not pick is counted from here on.
-    /// A pick racing the poll (made after it read the router's count) is
-    /// dropped as well; once its guard is taken the live count holds it, and
-    /// the next poll brings the picks back in step.
+    /// here, and a request this policy did not pick is counted from here on,
+    /// also on a worker it has not picked yet. A pick whose guard is not taken
+    /// yet when the poll runs is dropped as well; once its guard is taken the
+    /// live count holds it, and the next poll brings the picks back in step.
     fn reconcile_in_flight(&self, worker_url: &str, in_flight: usize) {
-        if let Some(dispatch) = self
-            .tally
+        self.tally
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get_mut(worker_url)
-        {
-            dispatch.picked = in_flight as u64;
-        }
+            .entry(worker_url.to_string())
+            .or_default()
+            .picked = in_flight as u64;
     }
 
     fn reset(&self) {
@@ -1284,6 +1285,28 @@ mod tests {
         }
     }
 
+    /// On each side of [`HELD_GUARD_CANDIDATES`], with one guard held across
+    /// the decision and with the read and the write apart, a pick counts the
+    /// picks before it.
+    #[test]
+    fn a_dark_burst_splits_evenly_under_both_guard_shapes() {
+        for fleet in [HELD_GUARD_CANDIDATES, HELD_GUARD_CANDIDATES + 1] {
+            for seed in 0..30 {
+                let policy = LeastLoadPolicy::new().with_tie_break_seed(seed);
+                let workers: Vec<Arc<dyn Worker>> = (0..fleet)
+                    .map(|i| make_worker(&format!("http://w{i}:8000")))
+                    .collect();
+                let mut hits = vec![0usize; fleet];
+                for _ in 0..fleet * 2 {
+                    hits[policy
+                        .select_worker(&workers, &SelectWorkerInfo::default())
+                        .unwrap()] += 1;
+                }
+                assert_eq!(hits, vec![2; fleet], "{fleet} workers, burst {seed}");
+            }
+        }
+    }
+
     #[test]
     fn the_load_poll_releases_a_pick_the_router_never_dispatched() {
         // b holds one request. Every pick goes to a and is then dropped before
@@ -1319,6 +1342,30 @@ mod tests {
             let first = policy.select_worker(&workers, &info);
             let second = policy.select_worker(&workers, &info);
             assert_ne!(first, second, "burst {seed}");
+        }
+    }
+
+    #[test]
+    fn the_load_poll_counts_the_requests_on_a_worker_not_picked_yet() {
+        // a holds three requests this policy did not pick and has never been
+        // picked itself. Once the poll has counted them, each pick on a moves
+        // its score, so seven picks made before their guards level the two
+        // workers at five each.
+        for seed in 0..30 {
+            let policy = LeastLoadPolicy::new().with_tie_break_seed(seed);
+            let workers = make_workers(&["http://a:8000", "http://b:8000"]);
+            for _ in 0..3 {
+                workers[0].increment_load();
+            }
+            for worker in &workers {
+                policy.reconcile_in_flight(worker.url(), worker.load());
+            }
+            let info = SelectWorkerInfo::default();
+            let mut hits = [0usize; 2];
+            for _ in 0..7 {
+                hits[policy.select_worker(&workers, &info).unwrap()] += 1;
+            }
+            assert_eq!(hits, [2, 5], "burst {seed}");
         }
     }
 
