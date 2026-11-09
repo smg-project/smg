@@ -6,7 +6,10 @@ use async_trait::async_trait;
 use tracing::debug;
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{policies::as_cache_aware, workflow::data::WorkerUpdateWorkflowData};
+use crate::{
+    policies::{as_cache_aware, PolicyRegistration},
+    workflow::data::WorkerUpdateWorkflowData,
+};
 
 /// Step to update policies for updated workers.
 ///
@@ -66,11 +69,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdatePoliciesForWorkerStep {
             }
         }
 
-        let prefill_workers = app_context.worker_registry.get_prefill_workers();
-        let decode_workers = app_context.worker_registry.get_decode_workers();
-        app_context
-            .policy_registry
-            .init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
+        PolicyRegistration::of(app_context).init_pd_policies();
 
         Ok(StepResult::Success)
     }

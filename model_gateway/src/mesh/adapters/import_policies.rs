@@ -115,7 +115,7 @@ impl Sync {
         match event {
             WorkerEvent::Registered { worker_id, worker } => {
                 if self.is_import(&worker_id) {
-                    self.admit(worker_id, worker).await;
+                    self.admit_one(worker_id, worker).await;
                 }
             }
             WorkerEvent::Replaced { worker_id, new, .. } => {
@@ -141,25 +141,33 @@ impl Sync {
     }
 
     /// Admit the import, with the `policy` label its spec carries as the
-    /// hint a local registration's label gives. An import with a prefill or
-    /// decode role then refreshes the PD policies' worker sets, as the
-    /// registration step does after its admissions.
-    async fn admit(&mut self, worker_id: WorkerId, worker: Arc<dyn Worker>) {
+    /// hint a local registration's label gives. Answers whether the import
+    /// has a prefill or decode role: the caller then refreshes the PD
+    /// policies' worker sets, as the registration step does after its
+    /// admissions, once per event or once per resync.
+    async fn admit(&mut self, worker_id: WorkerId, worker: Arc<dyn Worker>) -> bool {
         if self.tracked.contains_key(&worker_id) {
-            return;
+            return false;
         }
         let hint = worker.metadata().spec.labels.get("policy").cloned();
         self.registration.admit(&worker, hint.as_deref()).await;
-        if has_pd_role(&worker) {
-            self.registration.init_pd_policies();
-        }
         debug!(
             worker_id = %worker_id.as_str(),
             url = worker.redacted_url(),
             model = worker.model_id(),
             "Mesh import admitted to the policies"
         );
+        let pd_role = has_pd_role(&worker);
         self.tracked.insert(worker_id, worker);
+        pd_role
+    }
+
+    /// Admit one import on its own event and refresh the PD policies'
+    /// worker sets if it has a prefill or decode role.
+    async fn admit_one(&mut self, worker_id: WorkerId, worker: Arc<dyn Worker>) {
+        if self.admit(worker_id, worker).await {
+            self.registration.init_pd_policies();
+        }
     }
 
     /// An owner's in-place rebuild of the import under `worker_id` (a
@@ -182,7 +190,7 @@ impl Sync {
         };
         if old.worker_type() != new.worker_type() {
             self.registration.release(&old).await;
-            self.admit(worker_id.clone(), Arc::clone(&new)).await;
+            self.admit_one(worker_id.clone(), Arc::clone(&new)).await;
             debug!(
                 worker_id = %worker_id.as_str(),
                 url = new.redacted_url(),
@@ -191,7 +199,7 @@ impl Sync {
             );
             return;
         }
-        self.admit(worker_id.clone(), Arc::clone(&new)).await;
+        self.admit_one(worker_id.clone(), Arc::clone(&new)).await;
         self.registration.hand_over(&old, &new).await;
         debug!(
             worker_id = %worker_id.as_str(),
@@ -268,8 +276,12 @@ impl Sync {
                 None => self.release_or_hand_over(&worker_id).await,
             }
         }
+        let mut pd_import = false;
         for (worker_id, worker) in imports {
-            self.admit(worker_id, worker).await;
+            pd_import |= self.admit(worker_id, worker).await;
+        }
+        if pd_import {
+            self.registration.init_pd_policies();
         }
     }
 }
@@ -283,6 +295,7 @@ mod tests {
         worker::{ConnectionMode, WorkerModels, WorkerSpec},
     };
     use smg_mesh::WorkerState;
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::{
@@ -1044,6 +1057,45 @@ mod tests {
             held - 1,
             "the restarted stream's task held the new worker's object"
         );
+    }
+
+    /// A resync admits every import it finds in one pass and refreshes the
+    /// PD policies' worker sets once after it, not once per prefill or
+    /// decode import.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_resync_refreshes_the_pd_policies_once() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let (registration, policies, _monitor) = streaming_registration(&registry);
+        policies.set_prefill_policy(Arc::new(CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        })));
+        let mut sync = sync_by_hand(&registry, &registration);
+        for i in 1..=3 {
+            registry.on_remote_worker_state(&prefill_remote_state(
+                &format!("peer-p{i}"),
+                &format!("grpc://127.0.0.1:{i}"),
+                "m1",
+            ));
+        }
+
+        sync.resync().await;
+
+        assert_eq!(prefill_tenants(&policies, "m1").len(), 3);
+        logs_assert(|lines: &[&str]| {
+            let refreshes = lines
+                .iter()
+                .filter(|line| line.contains("Initializing prefill cache-aware policy"))
+                .count();
+            if refreshes == 1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{refreshes} refreshes of the prefill policy, one expected"
+                ))
+            }
+        });
     }
 
     /// A prefill import rebuilt as a decode worker under the same model:

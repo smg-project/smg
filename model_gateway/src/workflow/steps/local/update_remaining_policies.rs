@@ -5,7 +5,9 @@ use tracing::{debug, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    policies::as_cache_aware, worker::endpoint::Endpoint, workflow::data::WorkerRemovalWorkflowData,
+    policies::{as_cache_aware, PolicyRegistration},
+    worker::endpoint::Endpoint,
+    workflow::data::WorkerRemovalWorkflowData,
 };
 
 /// Step to update cache-aware policies for remaining workers.
@@ -51,11 +53,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for UpdateRemainingPoliciesStep {
             }
         }
 
-        let prefill_workers = app_context.worker_registry.get_prefill_workers();
-        let decode_workers = app_context.worker_registry.get_decode_workers();
-        app_context
-            .policy_registry
-            .init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
+        PolicyRegistration::of(app_context).init_pd_policies();
 
         // Log final result at info level
         if worker_urls.len() == 1 {
