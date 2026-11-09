@@ -39,8 +39,10 @@ pub(super) const MIN_SLOTS: usize = 64;
 
 /// Slots up to which a table grows by four at a time (the entries placed
 /// again over that growth are a fourth of what doublings place); above them
-/// it doubles, so a large table never holds more than twice the slots its
-/// entries take.
+/// it doubles. Above 4,096 slots the sizes are the ones doubling gives;
+/// up to it, a table that has just grown holds up to about 5.3 slots per
+/// entry (four times the slots it had at its fill bound), at most 2,048
+/// slots, about 66 KiB, more than doubling would, per thread.
 const GROW_BY_FOUR_UP_TO: usize = 4_096;
 /// The tag of an empty slot; a stored slot's tag has its high bit set.
 const EMPTY_TAG: u8 = 0;
