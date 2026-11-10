@@ -62,6 +62,7 @@ pub(super) async fn preprocess(
                 .try_fold(budget / storage_width, usize::checked_sub)
                 .is_none();
             if over_budget {
+                Metrics::record_mm_pixel_cache_budget_bypass(&model_id);
                 return preprocess_image_frames(&images, &processors, wire_dtype);
             }
         }

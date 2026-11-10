@@ -352,13 +352,9 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         images: &[&DynamicImage],
         wire_dtype: Option<EncoderDtype>,
     ) -> Option<Result<Vec<PreprocessedEncoderInputs>, TransformError>> {
-        let preprocess = |image: &&DynamicImage| {
-            let one = std::slice::from_ref(image);
-            wire_dtype
-                .filter(|dtype| *dtype == EncoderDtype::BFloat16)
-                .and_then(|dtype| self.inner.preprocess_wire(one, dtype))
-                .unwrap_or_else(|| self.inner.preprocess(one))
-        };
+        let wire_dtype = wire_dtype.filter(|dtype| *dtype == EncoderDtype::BFloat16);
+        let preprocess =
+            |image: &&DynamicImage| self.inner.preprocess_owned_image(image, wire_dtype);
         let source_bytes = images.iter().map(|image| image.as_bytes().len()).sum();
         let tasks = execution::task_count(source_bytes, images.len(), 1);
         if tasks <= 1 {
@@ -463,6 +459,30 @@ mod tests {
 
     /// The fused BF16 path preserves pixels, geometry, and metadata under
     /// checkpoint/default settings and the gateway's decode-time resizing.
+    /// Cache entries must hold only the bytes the pixel budget charges.
+    #[test]
+    fn owned_cache_items_have_no_spare_pixel_capacity() {
+        let processor = MiniMaxM3VisionProcessor::new();
+        let image = DynamicImage::new_rgb8(560, 560);
+        for dtype in [None, Some(EncoderDtype::BFloat16)] {
+            let item = processor
+                .preprocess_image_items(&[&image], dtype)
+                .unwrap()
+                .unwrap()
+                .pop()
+                .unwrap();
+            let pixels = item.encoder_input.nbytes();
+            let buffer = match item.encoder_input {
+                crate::EncoderInput::U8 { patches, .. } => patches.into_raw_vec_and_offset().0,
+                crate::EncoderInput::Wire { bytes, .. } => bytes,
+                crate::EncoderInput::F32(_) => panic!("expected owned pixel bytes"),
+            };
+            assert!((1 << 20..64 << 20).contains(&pixels));
+            assert!(!pixels.is_power_of_two());
+            assert_eq!(buffer.capacity(), pixels);
+        }
+    }
+
     #[test]
     fn bf16_wire_matches_neutral_pixels() {
         let images = [(56, 84), (700, 672), (112, 56)].map(|(w, h)| {

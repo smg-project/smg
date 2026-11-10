@@ -1485,6 +1485,10 @@ pub(crate) fn init_metrics() {
         "Pixel cache lookups that had to preprocess the image, by model"
     );
     describe_counter!(
+        "smg_mm_pixel_cache_budget_bypasses_total",
+        "Image requests that bypassed the pixel cache because their working set exceeds its byte budget, by model"
+    );
+    describe_counter!(
         "smg_mm_pixel_cache_evictions_total",
         "Entries the pixel cache dropped to stay within its byte budget"
     );
@@ -2223,6 +2227,15 @@ impl Metrics {
         counter!("smg_mm_pixel_cache_hits_total", "model" => model.clone())
             .increment(u64::from(hit));
         counter!("smg_mm_pixel_cache_misses_total", "model" => model).increment(u64::from(!hit));
+    }
+
+    /// A request bypassed pixel cache lookup because its working set is too large.
+    pub fn record_mm_pixel_cache_budget_bypass(model_id: &str) {
+        counter!(
+            "smg_mm_pixel_cache_budget_bypasses_total",
+            "model" => intern_model_label(model_id)
+        )
+        .increment(1);
     }
 
     /// The pixel cache after an insert: the entries it dropped to stay within
