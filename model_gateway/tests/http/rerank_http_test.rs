@@ -252,3 +252,27 @@ async fn a_document_object_from_the_worker_is_the_document_and_dropped_when_not_
         "return_documents false drops the echoed document"
     );
 }
+
+#[tokio::test]
+async fn a_model_less_v1_rerank_reaches_a_worker_without_a_model_key() {
+    let upstream = upstream(results_object()).await;
+    let app = app_for(&upstream).await;
+
+    let response = app
+        .oneshot(request(
+            "/v1/rerank",
+            json!({"query": "what is rust", "documents": ["a kind of oxide", "a systems language"]}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = upstream.state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].1.get("model"),
+        None,
+        "the gateway's wildcard is not the worker's model: {}",
+        requests[0].1
+    );
+}

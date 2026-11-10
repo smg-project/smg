@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use validator::Validate;
 
@@ -15,6 +15,12 @@ fn current_timestamp() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_else(|_| std::time::Duration::from_secs(0))
         .as_secs() as i64
+}
+
+/// Whether `model` is the gateway's wildcard (a `/v1/rerank` body that named
+/// none): it selects any worker and is left out of the body forwarded to it.
+fn is_unknown_model(model: &str) -> bool {
+    model == super::UNKNOWN_MODEL_ID
 }
 
 // ============================================================================
@@ -32,7 +38,11 @@ pub struct RerankRequest {
     #[validate(custom(function = "validate_documents"))]
     pub documents: Vec<String>,
 
-    /// Model to use for reranking
+    /// Model to use for reranking. The gateway's wildcard (`unknown`, a
+    /// `/v1/rerank` body that named none) selects any worker and is not
+    /// written to the body forwarded to it, so a single-model server applies
+    /// its own model instead of refusing a name it does not serve.
+    #[serde(skip_serializing_if = "is_unknown_model")]
     pub model: String,
 
     /// Maximum number of documents to return (optional)
@@ -148,22 +158,59 @@ pub struct RerankResult {
 }
 
 /// A result's document as the contracts write it: the text itself, the
-/// `{text}` object of the Cohere-style contract, or nothing.
+/// `{text}` object of the Cohere-style contract, or nothing. Read by a
+/// visitor rather than an untagged enum, so a wrong shape is refused in
+/// serde's own words and nothing is buffered first.
 fn deserialize_document<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Document {
-        Text(String),
-        Object { text: Option<String> },
+    struct DocumentVisitor;
+
+    impl<'de> de::Visitor<'de> for DocumentVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a document as text, as an object with `text`, or null")
+        }
+
+        fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
+            Ok(Some(text.to_owned()))
+        }
+
+        fn visit_string<E: de::Error>(self, text: String) -> Result<Self::Value, E> {
+            Ok(Some(text))
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> Result<Self::Value, D2::Error> {
+            deserializer.deserialize_any(DocumentVisitor)
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut text = None;
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "text" {
+                    text = map.next_value::<Option<String>>()?;
+                } else {
+                    map.next_value::<de::IgnoredAny>()?;
+                }
+            }
+            Ok(text)
+        }
     }
-    Ok(match Option::<Document>::deserialize(deserializer)? {
-        Some(Document::Text(text)) => Some(text),
-        Some(Document::Object { text }) => text,
-        None => None,
-    })
+
+    deserializer.deserialize_any(DocumentVisitor)
 }
 
 /// A rerank worker's answer: the ranked results as the bare list the gateway
@@ -172,14 +219,52 @@ where
 /// of the OpenAI-compatible rerank servers (`relevance_score`, the document
 /// as text or as `{text}`; the object's `id`, `model` and `usage` are not
 /// read). One `from_slice` reads every shape; the results keep the worker's
-/// order, which every contract sorts by score, highest first.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+/// order, which every contract sorts by score, highest first. Read by a
+/// visitor on the first token rather than an untagged enum, so a body in no
+/// rerank shape is refused in serde's own words (the field a new server's
+/// spelling lacks, not "no variant matched") and the body streams through
+/// without being buffered first.
+#[derive(Debug)]
 pub enum RerankWorkerResponse {
     /// The results as a bare list.
     List(Vec<RerankResult>),
     /// The results under `results`.
     Object { results: Vec<RerankResult> },
+}
+
+impl<'de> Deserialize<'de> for RerankWorkerResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ResponseVisitor;
+
+        impl<'de> de::Visitor<'de> for ResponseVisitor {
+            type Value = RerankWorkerResponse;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a list of rerank results or an object with `results`")
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                Vec::deserialize(de::value::SeqAccessDeserializer::new(seq))
+                    .map(RerankWorkerResponse::List)
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut results = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "results" {
+                        results = Some(map.next_value()?);
+                    } else {
+                        map.next_value::<de::IgnoredAny>()?;
+                    }
+                }
+                results
+                    .map(|results| RerankWorkerResponse::Object { results })
+                    .ok_or_else(|| de::Error::missing_field("results"))
+            }
+        }
+
+        deserializer.deserialize_any(ResponseVisitor)
+    }
 }
 
 impl RerankWorkerResponse {
@@ -268,6 +353,14 @@ pub struct V1RerankReqInput {
     /// Whether the documents are returned with their scores (the default).
     #[serde(default = "default_true")]
     pub return_documents: bool,
+
+    /// Request ID for tracking, as on the native route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rid: Option<StringOrArray>,
+
+    /// User identifier, as on the native route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 /// Convert V1RerankReqInput to RerankRequest
@@ -281,8 +374,8 @@ impl From<V1RerankReqInput> for RerankRequest {
                 .unwrap_or_else(|| super::UNKNOWN_MODEL_ID.to_string()),
             top_k: v1.top_n.filter(|n| *n > 0),
             return_documents: v1.return_documents,
-            rid: None,
-            user: None,
+            rid: v1.rid,
+            user: v1.user,
         }
     }
 }

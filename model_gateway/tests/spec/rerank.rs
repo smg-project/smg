@@ -362,6 +362,8 @@ fn test_v1_rerank_req_input_serialization() {
         model: Some("test-model".to_string()),
         top_n: Some(1),
         return_documents: false,
+        rid: Some(StringOrArray::String("req-123".to_string())),
+        user: Some("user-456".to_string()),
     };
 
     let serialized = to_string(&v1_input).unwrap();
@@ -372,6 +374,8 @@ fn test_v1_rerank_req_input_serialization() {
     assert_eq!(deserialized.model, v1_input.model);
     assert_eq!(deserialized.top_n, v1_input.top_n);
     assert_eq!(deserialized.return_documents, v1_input.return_documents);
+    assert_eq!(deserialized.rid, v1_input.rid);
+    assert_eq!(deserialized.user, v1_input.user);
 }
 
 #[test]
@@ -673,4 +677,57 @@ fn test_full_rerank_workflow() {
     let deserialized: RerankResponse = from_str(&serialized).unwrap();
     assert_eq!(deserialized.results.len(), 2);
     assert_eq!(deserialized.model, response.model);
+}
+
+/// A body in no rerank shape is refused in serde's own words, naming the
+/// field a server's spelling lacks, so the gateway's build-failure log says
+/// what was missing rather than that no variant matched.
+#[test]
+fn a_body_in_no_rerank_shape_names_the_missing_field() {
+    let err = from_str::<RerankWorkerResponse>(r#"[{"index": 0}]"#)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("missing field `score`"), "{err}");
+
+    let err = from_str::<RerankWorkerResponse>(r#"{"error": {"message": "no reranker"}}"#)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("missing field `results`"), "{err}");
+
+    let err = from_str::<RerankWorkerResponse>("7")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("expected a list of rerank results or an object with `results`"),
+        "{err}"
+    );
+
+    let err = from_str::<RerankResult>(r#"{"index": 0, "score": 0.5, "document": 7}"#)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("expected a document as text"), "{err}");
+}
+
+/// The wildcard model of a model-less `/v1/rerank` body selects any worker
+/// and is left out of the body forwarded to it; a named model, `rid` and
+/// `user` are written as the client sent them.
+#[test]
+fn the_wildcard_model_is_not_written_to_the_worker() {
+    let request: RerankRequest =
+        from_str::<V1RerankReqInput>(r#"{"query": "q", "documents": ["d"]}"#)
+            .unwrap()
+            .into();
+    assert_eq!(request.model, "unknown");
+    let json: Value = from_str(&to_string(&request).unwrap()).unwrap();
+    assert_eq!(json.get("model"), None, "{json}");
+
+    let request: RerankRequest = from_str::<V1RerankReqInput>(
+        r#"{"query": "q", "documents": ["d"], "model": "m", "rid": "r-1", "user": "u"}"#,
+    )
+    .unwrap()
+    .into();
+    let json: Value = from_str(&to_string(&request).unwrap()).unwrap();
+    assert_eq!(json["model"], "m");
+    assert_eq!(json["rid"], "r-1");
+    assert_eq!(json["user"], "u");
 }
