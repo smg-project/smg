@@ -28,7 +28,7 @@
 
 use super::{
     cased, chain,
-    scan::{Bits, Roles},
+    scan::{Bits, Roles, WordScan},
     unicode,
 };
 
@@ -845,12 +845,20 @@ impl Scanner {
         if c & Role::WordPrefix.bit() != 0 {
             if let Some((d, n)) = self.roles.at(text, after) {
                 if d & Role::Word.bit() != 0 {
-                    return Some(self.roles.run_end(text, after + n, Role::Word.bit()));
+                    return Some(self.roles.run_end_as::<{ WordScan::LETTERS }>(
+                        text,
+                        after + n,
+                        Role::Word.bit(),
+                    ));
                 }
             }
         }
         if c & Role::Word.bit() != 0 {
-            return Some(self.roles.run_end(text, after, Role::Word.bit()));
+            return Some(self.roles.run_end_as::<{ WordScan::LETTERS }>(
+                text,
+                after,
+                Role::Word.bit(),
+            ));
         }
         // 3. Up to the bound of digits.
         if c & Role::Digit.bit() != 0 {
@@ -907,7 +915,9 @@ impl Scanner {
         // 6. Whitespace before a non-space: the greedy run gives back its last
         //    character while a non-space follows it, down to one.
         if c & Role::TrailSpace.bit() != 0 {
-            let mut end = self.roles.run_end(text, after, Role::TrailSpace.bit());
+            let mut end =
+                self.roles
+                    .run_end_as::<{ WordScan::SPACES }>(text, after, Role::TrailSpace.bit());
             loop {
                 match self.roles.at(text, end) {
                     Some((d, _)) if d & Role::NotTrail.bit() != 0 => {}
@@ -922,7 +932,11 @@ impl Scanner {
         }
         // 7. The whitespace run.
         if c & Role::Space.bit() != 0 {
-            return Some(self.roles.run_end(text, after, Role::Space.bit()));
+            return Some(self.roles.run_end_as::<{ WordScan::SPACES }>(
+                text,
+                after,
+                Role::Space.bit(),
+            ));
         }
         None
     }
@@ -932,7 +946,15 @@ impl Scanner {
     /// is passed over by one character, as the iterator does.
     #[inline(always)]
     fn for_each_match<F: FnMut(usize, usize)>(&self, classes: &[Class], text: &str, f: &mut F) {
-        each_match(text, |pos| self.match_at(classes, text, pos), f);
+        // The closure stays inside the encoder's loop (the compiler's budget
+        // would leave it out of line with the word scans compiled into
+        // `match_at`, and the call per piece would be back).
+        each_match(
+            text,
+            #[inline(always)]
+            |pos| self.match_at(classes, text, pos),
+            f,
+        );
     }
 }
 

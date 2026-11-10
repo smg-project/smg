@@ -48,7 +48,7 @@ use super::{
     pattern::{
         clitic_match, concat, each_match, plain_class, previous_boundary, repeat, Class, Node,
     },
-    scan::{Bits, Roles},
+    scan::{Bits, Roles, WordScan},
 };
 
 /// A part of the template that one class fills: its bit in a character's
@@ -308,7 +308,9 @@ impl Scanner {
         let (p, last_lower_end) = self.roles.run_end_marked(text, q, upper.bit(), lower.bit());
         if let Some((bits, len)) = self.roles.at(text, p) {
             if bits & lower.bit() != 0 {
-                let end = self.roles.run_end(text, p + len, lower.bit());
+                let end = self
+                    .roles
+                    .run_end_as::<{ WordScan::LOWER }>(text, p + len, lower.bit());
                 return Some(self.clitic_end(classes, text, end, clitics));
             }
         }
@@ -331,8 +333,12 @@ impl Scanner {
         if bits & upper.bit() == 0 {
             return None;
         }
-        let end = self.roles.run_end(text, q + len, upper.bit());
-        let end = self.roles.run_end(text, end, lower.bit());
+        let end = self
+            .roles
+            .run_end_as::<{ WordScan::UPPER }>(text, q + len, upper.bit());
+        let end = self
+            .roles
+            .run_end_as::<{ WordScan::LOWER }>(text, end, lower.bit());
         Some(self.clitic_end(classes, text, end, clitics))
     }
 
@@ -447,7 +453,9 @@ impl Scanner {
         // 6. Whitespace before a non-space: the greedy run gives back its last
         //    character while a non-space follows it, down to one.
         if c & Role::TrailSpace.bit() != 0 {
-            let mut end = self.roles.run_end(text, after, Role::TrailSpace.bit());
+            let mut end =
+                self.roles
+                    .run_end_as::<{ WordScan::SPACES }>(text, after, Role::TrailSpace.bit());
             loop {
                 match self.roles.at(text, end) {
                     Some((d, _)) if d & Role::NotTrail.bit() != 0 => {}
@@ -462,7 +470,11 @@ impl Scanner {
         }
         // 7. The whitespace run.
         if c & Role::Space.bit() != 0 {
-            return Some(self.roles.run_end(text, after, Role::Space.bit()));
+            return Some(self.roles.run_end_as::<{ WordScan::SPACES }>(
+                text,
+                after,
+                Role::Space.bit(),
+            ));
         }
         None
     }
@@ -477,6 +489,14 @@ impl Scanner {
         text: &str,
         f: &mut F,
     ) {
-        each_match(text, |pos| self.match_at(classes, text, pos), f);
+        // The closure stays inside the encoder's loop (the compiler's budget
+        // would leave it out of line with the word scans compiled into
+        // `match_at`, and the call per piece would be back).
+        each_match(
+            text,
+            #[inline(always)]
+            |pos| self.match_at(classes, text, pos),
+            f,
+        );
     }
 }
