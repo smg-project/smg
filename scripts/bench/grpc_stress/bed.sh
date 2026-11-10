@@ -28,7 +28,7 @@
 #                (memory accounting on: the gateway's cgroup memory can be sampled, and neither is throttled by
 #                the memory controller of the shell's own cgroup) [auto: when systemd-run works]
 # The prefill-decode fleet (FLEET=prefill-decode; WORKERS counts the decode engines, on MOCK_BASE.. with ADMIN_PORT):
-#   PREFILL_WORKERS      prefill engines [1]
+#   PREFILL_WORKERS      prefill engines, one or more [1]
 #   PREFILL_BASE         first port of the prefill engines [MOCK_BASE + WORKERS]
 #   BOOTSTRAP_BASE       first bootstrap port of the prefill engines; engine i binds BOOTSTRAP_BASE + i and the gateway
 #                        probes it at registration [PREFILL_BASE + PREFILL_WORKERS]
@@ -67,7 +67,12 @@ SCOPE=${SCOPE:-auto}
 GW=http://127.0.0.1:$GW_PORT
 ts() { date -u +%FT%TZ; }
 die() { echo "$(ts) bed: $*" >&2; exit 1; }
-case "$FLEET" in grpc|prefill-decode) ;; *) die "FLEET=$FLEET: grpc or prefill-decode" ;; esac
+case "$FLEET" in
+  grpc) ;;
+  prefill-decode)
+    [ "$PREFILL_WORKERS" -ge 1 ] 2>/dev/null || die "PREFILL_WORKERS=$PREFILL_WORKERS: one prefill engine or more" ;;
+  *) die "FLEET=$FLEET: grpc or prefill-decode" ;;
+esac
 # The prefix that runs a command in a transient systemd user scope of its own (memory accounting on), so the bed's
 # processes are not throttled by the memory controller of the shell's cgroup and the gateway's memory can be read
 # from its cgroup. Empty when systemd-run is not usable here (SCOPE=0 forces that).
