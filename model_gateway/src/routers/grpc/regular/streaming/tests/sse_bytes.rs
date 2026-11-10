@@ -23,6 +23,7 @@ use super::{
         staged_stream, CharacterTokenizer,
     },
 };
+use crate::routers::common::sse::SseReceiver;
 
 struct Scenario {
     name: &'static str,
@@ -352,6 +353,25 @@ async fn completion_stream_bytes_match_the_recorded_fixtures() {
     }
 }
 
+/// Read `rx` to its end: the `before` frames of the messages ready before
+/// the gate first (the reader parks at the gate only after they all left),
+/// then `gate` opens and the rest are read as they come.
+async fn frames_through_the_gate(
+    mut rx: SseReceiver,
+    before: usize,
+    gate: oneshot::Sender<()>,
+) -> Vec<Bytes> {
+    let mut frames = Vec::new();
+    for _ in 0..before {
+        frames.push(rx.recv().await.expect("a frame").expect("a write"));
+    }
+    gate.send(()).expect("the reader waits at the gate");
+    while let Some(frame) = rx.recv().await {
+        frames.push(frame.expect("a write"));
+    }
+    frames
+}
+
 /// The frame carrying the first token leaves on its own as soon as the
 /// message is processed, whatever the engine has ready behind it (the role
 /// chunk shares it: both are written before the engine is polled again).
@@ -374,7 +394,7 @@ async fn ready_engine_messages_share_a_frame_after_the_first_token() {
         "0",
     )
     .await;
-    let (tx, mut rx) = sse_channel();
+    let (tx, rx) = sse_channel();
     let request: ChatCompletionRequest =
         serde_json::from_value(request("fixture-model", json!({}))).expect("chat request");
     let dispatch = context::DispatchMetadata {
@@ -399,20 +419,7 @@ async fn ready_engine_messages_share_a_frame_after_the_first_token() {
         drop(tx);
         result
     };
-    let reader = async {
-        let mut frames = Vec::new();
-        // The two messages ready at once: the reader parks at the gate only
-        // after both frames left.
-        for _ in 0..2 {
-            frames.push(rx.recv().await.expect("a frame").expect("a write"));
-        }
-        gate.send(()).expect("the reader waits at the gate");
-        while let Some(frame) = rx.recv().await {
-            frames.push(frame.expect("a write"));
-        }
-        frames
-    };
-    let (result, frames) = tokio::join!(reading, reader);
+    let (result, frames) = tokio::join!(reading, frames_through_the_gate(rx, 2, gate));
     server.abort();
     assert!(result.is_ok(), "{result:?}");
     let events: Vec<(usize, String)> = frames
@@ -460,7 +467,7 @@ async fn ready_engine_chunks_share_a_frame_after_the_first_token_on_the_completi
         "0",
     )
     .await;
-    let (tx, mut rx) = sse_channel();
+    let (tx, rx) = sse_channel();
     let request: CompletionRequest = serde_json::from_value(json!({
         "model": "fixture-model", "prompt": "frames", "stream": true
     }))
@@ -490,20 +497,7 @@ async fn ready_engine_chunks_share_a_frame_after_the_first_token_on_the_completi
         drop(tx);
         result
     };
-    let reader = async {
-        let mut frames = Vec::new();
-        // The two messages ready at once: the reader parks at the gate only
-        // after their two frames left.
-        for _ in 0..2 {
-            frames.push(rx.recv().await.expect("a frame").expect("a write"));
-        }
-        gate.send(()).expect("the reader waits at the gate");
-        while let Some(frame) = rx.recv().await {
-            frames.push(frame.expect("a write"));
-        }
-        frames
-    };
-    let (result, frames) = tokio::join!(reading, reader);
+    let (result, frames) = tokio::join!(reading, frames_through_the_gate(rx, 2, gate));
     server.abort();
     assert!(result.is_ok(), "the completion stream failed");
     let chunks: Vec<(usize, String)> = frames
