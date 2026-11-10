@@ -42,6 +42,7 @@ from infra import (
     get_runtime,
     launch_cloud_gateway,
 )
+from infra.cloud_credentials import resolve_cloud_credentials
 from infra.constants import vllm_kv_backend, zmq_backend
 from infra.model_specs import get_model_spec
 from infra.process_utils import ProcessExitedError
@@ -895,10 +896,9 @@ def _setup_epd(
 def _setup_cloud(backend_name, request, gateway_config):
     """Launch cloud gateway (no local workers), yield result tuple, tear down."""
     cfg = THIRD_PARTY_MODELS[backend_name]
-    api_key_env = cfg.get("api_key_env")
-
-    if api_key_env and not os.environ.get(api_key_env):
-        pytest.fail(f"{api_key_env} not set for {backend_name} tests")
+    credentials = resolve_cloud_credentials(backend_name, require_key=False)
+    if not credentials.api_key:
+        pytest.fail(f"{credentials.api_key_env} not set for {backend_name} tests")
 
     storage_backend = get_marker_value(request, "storage", default="memory")
 
@@ -909,7 +909,7 @@ def _setup_cloud(backend_name, request, gateway_config):
         extra_args=gateway_config.get("extra_args"),
     )
 
-    api_key = os.environ.get(api_key_env) if api_key_env else "not-used"
+    api_key = credentials.api_key
     model_path = cfg["model"]
 
     client: openai.OpenAI | anthropic.Anthropic

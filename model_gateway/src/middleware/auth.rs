@@ -155,6 +155,11 @@ pub async fn auth_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    // The map is read once and let go before the inner service runs: a
+    // guard kept across a streaming response would hold one of the thread's
+    // few fast load slots for the response's whole life, and every later
+    // load on that thread, this map's or any other swap's, would pay the
+    // shared count instead.
     let keys = auth_config.keys.load();
     if !keys.is_empty() {
         let token_hash = request
@@ -187,7 +192,8 @@ pub async fn auth_middleware(
         // gateway key presented a second time under a provider's own header
         // name goes with it (every value of a repeated header is read, since
         // the removal takes the whole name), where a caller's own provider
-        // key there stays.
+        // key there stays. The map already in hand answers, not a second
+        // load.
         request.headers_mut().remove(header::AUTHORIZATION);
         for name in PROVIDER_KEY_HEADERS {
             let is_a_gateway_key = request
@@ -195,12 +201,13 @@ pub async fn auth_middleware(
                 .get_all(name)
                 .iter()
                 .filter_map(|value| value.to_str().ok())
-                .any(|value| auth_config.contains_token(value.trim()));
+                .any(|value| keys.contains_key(&hash_key(value.trim())));
             if is_a_gateway_key {
                 request.headers_mut().remove(name);
             }
         }
     }
+    drop(keys);
 
     next.run(request).await
 }

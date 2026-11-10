@@ -395,9 +395,9 @@ impl KvEventMonitor {
     /// hashes for the main group's names ([`WorkerGroups::restarted`],
     /// [`WorkerGroups::waiting`]), and it is complete from here; two signal
     /// groups leave whose block is whose unknown, and the view incomplete,
-    /// the overlap standing until a clear. The signal's groups move to the
-    /// view, whose events they publish from here on. `true` when the worker
-    /// needs its view.
+    /// the overlap standing until a clear, counted and logged as a late
+    /// view is. The signal's groups move to the view, whose events they
+    /// publish from here on. `true` when the worker needs its view.
     fn main_group_shown(
         worker_id: u32,
         indexer: &KvIndex,
@@ -420,8 +420,23 @@ impl KvEventMonitor {
         match groups.as_slice() {
             [group] if group_mask(*group) != 0 => {
                 view.waiting(group_mask(*group), &signal);
+                worker_blocks.counters.group_dropped = view.dropped_blocks();
             }
-            _ => view.created_over(signal.len()),
+            // Whose block is whose is unknown (or the one group is past the
+            // rule's reach): the rule stays off, on the record as a late
+            // view is.
+            _ => {
+                if !signal.is_empty() {
+                    worker_blocks.counters.group_view_late += 1;
+                    warn!(
+                        worker_id,
+                        indexed = signal.len(),
+                        groups = groups.len(),
+                        "KV cache group view restarted over the blocks of more than one main-signal group, or of one the rule cannot read; its rule stays off until the worker's next clear"
+                    );
+                }
+                view.created_over(signal.len());
+            }
         }
         for group in groups {
             worker_blocks.show_group(group);
@@ -2535,9 +2550,119 @@ mod tests {
         );
     }
 
+    /// The restart keeps every membership the view holds, retained or waiting,
+    /// not only the signal group's. A state group's hashes-only store of the
+    /// signal's first block (the view made late over it) waits for a name; its
+    /// store of a second signal block, one the view names, is retained. The
+    /// restart moves the retained membership back to waiting beside the
+    /// waiting one, and the main group's names place both, each beside the
+    /// signal group's seeded bit. A clear in place of the move drops both; the
+    /// move dropped alone loses the retained one.
+    #[test]
+    fn another_groups_memberships_survive_the_restart() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let one = compute_request_content_hashes(&TOKENS, 4);
+        let two = compute_request_content_hashes(&SECOND, 4);
+        let placed_by = |view: &WorkerGroups, index: u32| {
+            view.groups()
+                .iter()
+                .find(|group| group.index == index)
+                .map_or(0, |group| group.placed)
+        };
+        KvEventMonitor::apply_events(
+            &[window_only_store(0, 1, None, &TOKENS)],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        // The state group's store of the signal's first block: the view is
+        // made late over the block, which it cannot name, so the membership
+        // waits under the state group's bit.
+        KvEventMonitor::apply_events(
+            &[group_store(2, Some("mamba"), None, &[1])],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        let view = wb
+            .groups
+            .clone()
+            .expect("the hashes-only store gives a view");
+        assert!(!view.is_complete(), "created over the signal's block");
+        // A second signal block, named by the view, and the state group's
+        // store of it: retained.
+        KvEventMonitor::apply_events(
+            &[window_only_store(0, 2, None, &SECOND)],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        KvEventMonitor::apply_events(
+            &[group_store(2, Some("mamba"), None, &[2])],
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert_eq!(
+            (
+                view.named_blocks(),
+                view.retained_blocks(),
+                view.pending_blocks()
+            ),
+            (1, 1, 1),
+            "block 2 named and retained, block 1 waiting"
+        );
+        assert_eq!(placed_by(&view, 2), 1);
+
+        // The restart: the main group names block 2 anew. The retained
+        // membership moved back to waiting and is placed with the name, the
+        // waiting one keeps waiting; the signal group's bit is seeded beside.
+        let mut main = stored_event(2, &SECOND);
+        main.group_idx = Some(1);
+        main.kv_cache_spec_kind = Some("full_attention".to_string());
+        KvEventMonitor::apply_events(&[store_event(main)], w1, &indexer, &mut wb);
+        assert!(view.is_complete(), "the restart cleared the names");
+        assert_eq!(wb.counters.main_signal_dropped, 2);
+        assert_eq!(
+            (
+                view.named_blocks(),
+                view.retained_blocks(),
+                view.pending_blocks()
+            ),
+            (1, 1, 1),
+            "block 2 placed again, block 1 still waiting"
+        );
+        assert_eq!(
+            placed_by(&view, 2),
+            2,
+            "the retained membership came back with the name (placed twice: before and after)"
+        );
+        assert_eq!(
+            placed_by(&view, 0),
+            1,
+            "the signal group's seeded bit placed"
+        );
+        assert_eq!(
+            capped(&indexer, w1, &two, 4).0,
+            Some(1),
+            "the state group reads block 2: the path keeps its credit"
+        );
+
+        // The main group names block 1: the waiting membership is placed too.
+        let mut first = stored_event(1, &TOKENS);
+        first.group_idx = Some(1);
+        first.kv_cache_spec_kind = Some("full_attention".to_string());
+        KvEventMonitor::apply_events(&[store_event(first)], w1, &indexer, &mut wb);
+        assert_eq!((view.retained_blocks(), view.pending_blocks()), (2, 0));
+        assert_eq!((placed_by(&view, 2), placed_by(&view, 0)), (3, 2));
+        assert_eq!(capped(&indexer, w1, &one, 4).0, Some(1));
+    }
+
     /// Two groups gave a worker its main signal: whose block is whose is
     /// unknown at the restart, so the view stays incomplete and the overlap
-    /// stands until a clear.
+    /// stands until a clear, counted as a late view is.
     #[test]
     fn two_signal_groups_leave_the_restarted_view_incomplete() {
         let indexer = KvIndex::chain();
@@ -2559,6 +2684,10 @@ mod tests {
         let view = wb.groups.clone().expect("the restart makes the view");
         assert!(!view.is_complete(), "whose block is whose is unknown");
         assert_eq!(wb.counters.main_signal_dropped, 2);
+        assert_eq!(
+            wb.counters.group_view_late, 1,
+            "on the record, as a late view"
+        );
         assert_eq!(view.retained_blocks(), 0);
         assert!(wb.knows_group(0) && wb.knows_group(2));
     }

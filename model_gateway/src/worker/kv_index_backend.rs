@@ -285,7 +285,8 @@ impl KvIndex {
     /// its depth shrunk to what its sliding-window and state groups can serve
     /// ([`kv_index::WorkerGroups::cap`]), and a holder shrunk to nothing
     /// leaves the scores. Returns the holders it shrank, for the decision
-    /// trace. One atomic load on a fleet without such workers.
+    /// trace. One atomic load on a fleet without such workers, one read of
+    /// the views table for every holder on a fleet with them.
     pub fn cap_by_groups(
         &self,
         content_hashes: &[ContentHash],
@@ -296,10 +297,11 @@ impl KvIndex {
         if views.is_empty() {
             return Vec::new();
         }
+        let table = views.read();
         let mut prefixes = Vec::new();
         let mut caps = Vec::new();
         overlap.scores.retain(|&worker, depth| {
-            let Some(view) = views.get(worker) else {
+            let Some(view) = table.view(worker) else {
                 return true;
             };
             if prefixes.is_empty() {

@@ -241,7 +241,7 @@ impl ByteLevelTable {
     /// Unknown IDs are dropped, as in tokenizers; lossy UTF-8 conversion happens
     /// only after concatenation so characters may span token boundaries.
     pub(crate) fn decode(&self, ids: &[TokenIdType], skip_special_tokens: bool) -> String {
-        let mut bytes = Vec::with_capacity(ids.len().saturating_mul(4));
+        let mut bytes = Vec::with_capacity(self.decode_capacity(ids, skip_special_tokens));
         for &id in ids {
             if let Some((token_bytes, special)) = self.token_bytes(id) {
                 if !skip_special_tokens || !special {
@@ -250,6 +250,48 @@ impl ByteLevelTable {
             }
         }
         text_of(bytes).0
+    }
+
+    /// The ids of one streamed chunk: few enough that the exact sizing pass
+    /// of [`Self::decode_capacity`] reads the entries the concatenation reads
+    /// right after, from cache.
+    /// Measured on the crate's decode bench over the four pinned vocabularies
+    /// with sliding windows of 1 to 64 ids (the sweep in #5556's Numbers
+    /// table): the exact sizing wins or ties at every length up to
+    /// eight, 19 to 23 percent at one id and 2 to 5 percent at eight, and loses
+    /// from sixteen on by 9 percent and more, so eight is the last length at
+    /// which it pays on every vocabulary.
+    const CHUNK_IDS: usize = 8;
+
+    /// The buffer [`Self::decode`] starts with for `ids`. A chunk's worth of
+    /// ids is sized from the pieces themselves: the table knows every id's
+    /// length, and a guess of four bytes an id made the one-token decode of
+    /// a stream's chunk grow its buffer on most words (a word with its
+    /// leading space is longer than four bytes), a second allocator call per
+    /// streamed event. A longer decode keeps the four-byte estimate and its
+    /// amortized regrows: a pass over its entries is a second walk of the
+    /// table, one to three nanoseconds an id on the crate's decode bench,
+    /// more than the regrows it would save.
+    fn decode_capacity(&self, ids: &[TokenIdType], skip_special_tokens: bool) -> usize {
+        if ids.len() <= Self::CHUNK_IDS {
+            self.decoded_len(ids, skip_special_tokens)
+        } else {
+            ids.len().saturating_mul(4)
+        }
+    }
+
+    /// The length of the bytes [`Self::decode`] concatenates for `ids`: the
+    /// spans of the known ids, less the special ones when they are skipped.
+    /// Out of line: inlined (twice) it doubled the body every decode shares,
+    /// and a long decode, which never takes this pass, paid about seventy
+    /// instructions more per call for the larger frame.
+    #[inline(never)]
+    fn decoded_len(&self, ids: &[TokenIdType], skip_special_tokens: bool) -> usize {
+        ids.iter()
+            .filter_map(|&id| self.token_bytes(id))
+            .filter(|(_, special)| !skip_special_tokens || !special)
+            .map(|(token_bytes, _)| token_bytes.len())
+            .sum()
     }
 
     /// [`Self::decode`] for a vocabulary that does not drop unknown ids:
@@ -263,7 +305,7 @@ impl ByteLevelTable {
         ids: &[TokenIdType],
         skip_special_tokens: bool,
     ) -> Option<(String, bool)> {
-        let mut bytes = Vec::with_capacity(ids.len().saturating_mul(4));
+        let mut bytes = Vec::with_capacity(self.decode_capacity(ids, skip_special_tokens));
         for &id in ids {
             let (token_bytes, special) = self.token_bytes(id)?;
             if !skip_special_tokens || !special {
@@ -851,6 +893,30 @@ pub(crate) mod tests {
                 table.decode(&ids, false),
                 tokenizer.decode(&ids, false).unwrap()
             );
+        }
+    }
+
+    /// The sizing pass of a short decode applies the filter of both
+    /// concatenations it sizes (unknown ids dropped, specials dropped when
+    /// skipped), so the buffer is exactly the text: a drift between the pass
+    /// and either loop shows up here as a regrow, which the decoded bytes
+    /// alone never show.
+    #[test]
+    fn short_decode_is_sized_from_its_pieces() {
+        let tokenizer = byte_level_tokenizer();
+        let table = ByteLevelTable::build(&tokenizer).expect("table");
+        let hello = tokenizer.token_to_id("hello").expect("hello");
+        let world = tokenizer.token_to_id("Ġworld").expect("Ġworld");
+        let special = tokenizer.token_to_id(SPECIAL).expect("special");
+        for skip in [false, true] {
+            // A known word, a special, an unknown id, a word with its space.
+            let text = table.decode(&[hello, special, u32::MAX, world], skip);
+            assert_eq!(text.capacity(), text.len(), "skip={skip}");
+            // The tiktoken backend's decode: every id known, or it is `None`.
+            let (text, _) = table
+                .decode_known(&[hello, special, world], skip)
+                .expect("every id known");
+            assert_eq!(text.capacity(), text.len(), "decode_known skip={skip}");
         }
     }
 

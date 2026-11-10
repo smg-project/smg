@@ -28,9 +28,8 @@ use std::sync::{
     Arc,
 };
 
-use dashmap::DashMap;
-use parking_lot::RwLock;
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use parking_lot::{RwLock, RwLockReadGuard};
+use rustc_hash::FxHashMap;
 
 use crate::block::{chain_prefix_hash, ContentHash, SequenceHash};
 
@@ -579,11 +578,31 @@ fn bits(mask: u16) -> impl Iterator<Item = u32> {
 
 /// One model's views, by worker id: the registry the routing decision reads. A worker's view
 /// appears at its first non-main group event and goes with the worker, so a plain
-/// full-attention fleet pays one atomic load per decision.
+/// full-attention fleet pays one atomic load per decision. The views sit in a table under the
+/// worker's interned id, the index's own shape for its per-worker counters, and a decision reads
+/// the table once under one lock: a holder's view is one index into it, with no hash and no
+/// reference count moved per holder.
 #[derive(Default)]
 pub struct GroupViews {
     count: AtomicUsize,
-    views: DashMap<u32, Arc<WorkerGroups>, FxBuildHasher>,
+    views: RwLock<Vec<Option<Arc<WorkerGroups>>>>,
+}
+
+/// One model's views held for one decision: every holder's view is one index into the table
+/// while the guard lives. A worker's view is created or removed only by its own event stream,
+/// which waits for the decision's read to end.
+pub struct GroupViewsRead<'a> {
+    views: RwLockReadGuard<'a, Vec<Option<Arc<WorkerGroups>>>>,
+}
+
+impl GroupViewsRead<'_> {
+    /// `worker`'s view, if it has one.
+    #[inline]
+    pub fn view(&self, worker: u32) -> Option<&WorkerGroups> {
+        self.views
+            .get(worker as usize)
+            .and_then(|slot| slot.as_deref())
+    }
 }
 
 impl GroupViews {
@@ -602,17 +621,33 @@ impl GroupViews {
         self.count.load(Ordering::Relaxed)
     }
 
+    /// The table for one decision: one read lock for every holder it caps.
+    #[inline]
+    pub fn read(&self) -> GroupViewsRead<'_> {
+        GroupViewsRead {
+            views: self.views.read(),
+        }
+    }
+
     /// `worker`'s view, if it has one.
     pub fn get(&self, worker: u32) -> Option<Arc<WorkerGroups>> {
-        self.views.get(&worker).map(|view| Arc::clone(&view))
+        self.views
+            .read()
+            .get(worker as usize)
+            .and_then(|slot| slot.clone())
     }
 
     /// `worker`'s view, created at its first non-main group event.
     pub fn get_or_create(&self, worker: u32) -> Arc<WorkerGroups> {
-        if let Some(view) = self.views.get(&worker) {
-            return Arc::clone(&view);
+        if let Some(view) = self.get(worker) {
+            return view;
         }
-        Arc::clone(&self.views.entry(worker).or_insert_with(|| {
+        let mut views = self.views.write();
+        let at = worker as usize;
+        if views.len() <= at {
+            views.resize_with(at + 1, || None);
+        }
+        Arc::clone(views[at].get_or_insert_with(|| {
             self.count.fetch_add(1, Ordering::Relaxed);
             Arc::new(WorkerGroups::new())
         }))
@@ -620,14 +655,24 @@ impl GroupViews {
 
     /// The worker left: its view goes.
     pub fn remove(&self, worker: u32) {
-        if self.views.remove(&worker).is_some() {
+        let taken = self
+            .views
+            .write()
+            .get_mut(worker as usize)
+            .and_then(Option::take);
+        if taken.is_some() {
             self.count.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     /// Blocks retained by non-main groups over every worker's view.
     pub fn retained_blocks(&self) -> usize {
-        self.views.iter().map(|view| view.retained_blocks()).sum()
+        self.views
+            .read()
+            .iter()
+            .flatten()
+            .map(|view| view.retained_blocks())
+            .sum()
     }
 }
 
@@ -1083,6 +1128,29 @@ mod tests {
         assert_eq!(view.dropped_blocks(), 8, "the refused blocks are counted");
     }
 
+    /// The restart seeds the signal's blocks as waiting under the signal group's bit, and that
+    /// wait is bounded as the store path's is: beyond the cap the rest are counted dropped, so
+    /// an engine's resend of a long signal era cannot grow the view without bound.
+    #[test]
+    fn the_restarts_wait_is_bounded() {
+        let view = WorkerGroups::new();
+        view.learn(0, Some(WINDOW), 64);
+        let signal: Vec<SequenceHash> = (0..PENDING_CAP as u64 + 2).map(SequenceHash).collect();
+        assert_eq!(
+            view.waiting(0b1, &signal),
+            PENDING_CAP,
+            "the cap's worth wait"
+        );
+        assert_eq!(view.pending_blocks(), PENDING_CAP, "the wait is bounded");
+        assert_eq!(view.dropped_blocks(), 2, "the refused blocks are counted");
+        assert_eq!(
+            view.waiting(0b1, &signal[..2]),
+            2,
+            "a waiting block is re-marked, not refused"
+        );
+        assert_eq!(view.dropped_blocks(), 2);
+    }
+
     /// A main store under a parent the index knew and the view does not (the view came after
     /// the parent was indexed) names nothing: a child chained from the first position would
     /// carry a name no request computes, so it is counted instead.
@@ -1147,5 +1215,24 @@ mod tests {
         views.remove(7);
         assert!(views.is_empty());
         assert!(views.get(7).is_none());
+    }
+
+    #[test]
+    fn the_registry_is_a_table_by_worker_id() {
+        let views = GroupViews::new();
+        let far = views.get_or_create(300);
+        let near = views.get_or_create(2);
+        assert_eq!(views.len(), 2);
+        {
+            let table = views.read();
+            assert!(std::ptr::eq(table.view(300).expect("the far view"), &*far));
+            assert!(std::ptr::eq(table.view(2).expect("the near view"), &*near));
+            assert!(table.view(1).is_none(), "an id never given a view");
+            assert!(table.view(4096).is_none(), "an id past the table's end");
+        }
+        views.remove(2);
+        assert_eq!(views.len(), 1);
+        assert!(views.read().view(2).is_none());
+        assert!(views.read().view(300).is_some(), "the far view stays");
     }
 }

@@ -1,4 +1,4 @@
-"""The Claude review workflow runs from main, admits writers only, and never holds the key."""
+"""The Claude review workflow admits writers only, never holds the key, and fails loudly."""
 
 from pathlib import Path
 
@@ -16,10 +16,17 @@ def workflow():
     return yaml.safe_load(WORKFLOW.read_text())
 
 
-def test_every_trigger_runs_the_workflow_from_the_default_branch(workflow):
+def test_the_triggers_are_the_pull_request_event_and_the_comment_events(workflow):
     triggers = workflow[True]
-    assert set(triggers) == {"pull_request_target", "issue_comment", "pull_request_review_comment"}
-    assert "pull_request" not in triggers
+    assert set(triggers) == {"pull_request", "issue_comment", "pull_request_review_comment"}
+    # pull_request, not pull_request_target: the action's App-token exchange rejects the latter's OIDC token
+    assert "pull_request_target" not in triggers
+
+
+def test_a_failing_claude_action_fails_the_job(workflow):
+    review = workflow["jobs"]["review"]
+    claude = next(s for s in review["steps"] if str(s.get("uses", "")).startswith("anthropics/"))
+    assert "continue-on-error" not in claude
 
 
 def test_forks_and_bot_comments_are_refused_before_any_job_starts(workflow):
@@ -58,3 +65,28 @@ def test_no_secret_and_no_pod_key_anywhere():
     assert "sudo" not in text
     workflow = yaml.safe_load(text)
     assert workflow["env"]["AI_KEY_PROXY"] == SIDECAR
+
+
+def test_claude_tracks_progress_in_a_comment_and_requests_changes_on_important_findings(workflow):
+    review = workflow["jobs"]["review"]
+    action = next(
+        s
+        for s in review["steps"]
+        if str(s.get("uses", "")).startswith("anthropics/claude-code-action@")
+    )
+    assert action["with"]["track_progress"] is True
+    prompt = action["with"]["prompt"]
+    assert "event=REQUEST_CHANGES" in prompt and "event=APPROVE" in prompt
+    assert "dismissals" in prompt  # a later push that settles the findings lifts the request
+
+
+def test_only_a_review_trigger_shares_the_cancelling_group(workflow):
+    # The action's tracking comment and the other bots' notes are issue_comment events on the
+    # same pull request. A run they start must never claim the review's concurrency group, or
+    # it cancels the review in progress (seen on #5564, 2026-11-09).
+    group = workflow["jobs"]["review"]["concurrency"]["group"]
+    assert workflow["jobs"]["review"]["concurrency"]["cancel-in-progress"] is True
+    assert "github.event_name == 'pull_request'" in group
+    assert "github.event.comment.user.type != 'Bot'" in group
+    assert "contains(github.event.comment.body, '@claude review')" in group
+    assert "format('noop-{0}', github.run_id)" in group

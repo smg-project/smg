@@ -173,21 +173,32 @@ pub fn pil_cmyk_to_rgb(c: u8, m: u8, y: u8, k: u8) -> [u8; 3] {
 /// Convert a packed CMYK8 buffer (as decoded by libjpeg) to packed RGB8, PIL's
 /// way, in place: pixel `i` is read from `4i..4i+4` before `3i..3i+3` is
 /// written, so no unread byte is overwritten and the decoded buffer stays the
-/// one allocation `MAX_DECODED_BYTES` bounds. On AArch64 the vector unit does
-/// sixteen pixels at a time with the same arithmetic in 16-bit lanes; the
-/// rest, and every other target, is the formula pixel by pixel.
+/// one allocation `MAX_DECODED_BYTES` bounds. On AArch64 and x86-64 the
+/// vector unit does sixteen pixels at a time with the same arithmetic in
+/// 16-bit lanes; the rest, and every other target, is the formula pixel by
+/// pixel.
 fn cmyk_to_rgb_like_pil(mut buf: Vec<u8>) -> Vec<u8> {
     let pixels = buf.len() / 4;
     #[cfg(target_arch = "aarch64")]
     let start = neon::convert_in_place(&mut buf[..4 * pixels]);
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    let start = avx2::convert_in_place(&mut buf[..4 * pixels]);
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let start = 0;
-    for i in start..pixels {
+    convert_pixels(&mut buf[..4 * pixels], start);
+    buf.truncate(pixels * 3);
+    buf
+}
+
+/// Pixels `from` onwards of `buf` (`4 * n` bytes of CMYK) converted in place
+/// to RGB at `3i` by the pixel formula; returns `n`.
+fn convert_pixels(buf: &mut [u8], from: usize) -> usize {
+    let pixels = buf.len() / 4;
+    for i in from..pixels {
         let [c, m, y, k] = [buf[4 * i], buf[4 * i + 1], buf[4 * i + 2], buf[4 * i + 3]];
         buf[3 * i..3 * i + 3].copy_from_slice(&pil_cmyk_to_rgb(c, m, y, k));
     }
-    buf.truncate(pixels * 3);
-    buf
+    pixels
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -244,6 +255,178 @@ mod neon {
                 );
                 vst3q_u8(base.add(3 * i), rgb);
             }
+            i += 16;
+        }
+        full
+    }
+}
+
+/// The x86-64 path of the CMYK conversion: sixteen pixels per step, the four
+/// planes gathered with byte shuffles, `MULDIV255` in 16-bit lanes, the three
+/// result planes rejoined with the channel-run module's shuffles. The entry
+/// is dispatched by `multiversion`; the clone for a core without AVX2 is the
+/// pixel formula. No `unsafe` of its own: the words move through `bytemuck`
+/// casts of exact-size arrays.
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use core::arch::x86_64::{
+        __m128i, _mm_add_epi16, _mm_mullo_epi16, _mm_or_si128, _mm_packus_epi16, _mm_set1_epi16,
+        _mm_setzero_si128, _mm_shuffle_epi8, _mm_srli_epi16, _mm_unpackhi_epi8, _mm_unpacklo_epi8,
+    };
+
+    use multiversion::{multiversion, target::match_target};
+
+    use crate::vision::rgb_runs::avx2::interleave16;
+
+    /// The leading whole blocks of sixteen CMYK pixels of `buf` (`4 * n`
+    /// bytes) converted in place to RGB at `3i`; returns the pixels done, the
+    /// rest (fewer than sixteen) is the caller's. Zero on a core without the
+    /// vector unit.
+    pub(super) fn convert_in_place(buf: &mut [u8]) -> usize {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return 0;
+        }
+        convert_blocks(buf)
+    }
+
+    #[multiversion(targets("x86_64+avx2"))]
+    fn convert_blocks(buf: &mut [u8]) -> usize {
+        match_target! {
+            "x86_64+avx2" => convert_blocks_avx2(buf),
+            _ => super::convert_pixels(buf, 0),
+        }
+    }
+
+    // Plane `p` of sixteen four-byte pixels: byte `i` is source byte
+    // `4 i + p`, in word `i / 4` of the four.
+    const PLANE_C: [[u8; 16]; 4] = [
+        [
+            0x00, 0x04, 0x08, 0x0c, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            0x80, 0x80,
+        ],
+        [
+            0x80, 0x80, 0x80, 0x80, 0x00, 0x04, 0x08, 0x0c, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            0x80, 0x80,
+        ],
+        [
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x04, 0x08, 0x0c, 0x80, 0x80,
+            0x80, 0x80,
+        ],
+        [
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x04,
+            0x08, 0x0c,
+        ],
+    ];
+    const PLANE_M: [[u8; 16]; 4] = [
+        [
+            0x01, 0x05, 0x09, 0x0d, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            0x80, 0x80,
+        ],
+        [
+            0x80, 0x80, 0x80, 0x80, 0x01, 0x05, 0x09, 0x0d, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            0x80, 0x80,
+        ],
+        [
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 0x05, 0x09, 0x0d, 0x80, 0x80,
+            0x80, 0x80,
+        ],
+        [
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 0x05,
+            0x09, 0x0d,
+        ],
+    ];
+    const PLANE_Y: [[u8; 16]; 4] = [
+        [
+            0x02, 0x06, 0x0a, 0x0e, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            0x80, 0x80,
+        ],
+        [
+            0x80, 0x80, 0x80, 0x80, 0x02, 0x06, 0x0a, 0x0e, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            0x80, 0x80,
+        ],
+        [
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02, 0x06, 0x0a, 0x0e, 0x80, 0x80,
+            0x80, 0x80,
+        ],
+        [
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02, 0x06,
+            0x0a, 0x0e,
+        ],
+    ];
+    const PLANE_K: [[u8; 16]; 4] = [
+        [
+            0x03, 0x07, 0x0b, 0x0f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            0x80, 0x80,
+        ],
+        [
+            0x80, 0x80, 0x80, 0x80, 0x03, 0x07, 0x0b, 0x0f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            0x80, 0x80,
+        ],
+        [
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x03, 0x07, 0x0b, 0x0f, 0x80, 0x80,
+            0x80, 0x80,
+        ],
+        [
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x03, 0x07,
+            0x0b, 0x0f,
+        ],
+    ];
+
+    /// One plane of sixteen pixels from the block's four words.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn plane(words: [__m128i; 4], masks: &[[u8; 16]; 4]) -> __m128i {
+        _mm_or_si128(
+            _mm_or_si128(
+                _mm_shuffle_epi8(words[0], bytemuck::must_cast(masks[0])),
+                _mm_shuffle_epi8(words[1], bytemuck::must_cast(masks[1])),
+            ),
+            _mm_or_si128(
+                _mm_shuffle_epi8(words[2], bytemuck::must_cast(masks[2])),
+                _mm_shuffle_epi8(words[3], bytemuck::must_cast(masks[3])),
+            ),
+        )
+    }
+
+    /// `MULDIV255(ink, k)` on sixteen pixels in 16-bit lanes: `ink * k + 128`
+    /// is at most 65,153 and `t + (t >> 8)` at most 65,407, both within a
+    /// `u16`, and the high byte of the latter is the scalar formula's value.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    fn muldiv255(ink: __m128i, k: __m128i) -> __m128i {
+        let zero = _mm_setzero_si128();
+        let bias = _mm_set1_epi16(128);
+        let low = _mm_add_epi16(
+            _mm_mullo_epi16(_mm_unpacklo_epi8(ink, zero), _mm_unpacklo_epi8(k, zero)),
+            bias,
+        );
+        let high = _mm_add_epi16(
+            _mm_mullo_epi16(_mm_unpackhi_epi8(ink, zero), _mm_unpackhi_epi8(k, zero)),
+            bias,
+        );
+        let low = _mm_add_epi16(low, _mm_srli_epi16::<8>(low));
+        let high = _mm_add_epi16(high, _mm_srli_epi16::<8>(high));
+        _mm_packus_epi16(_mm_srli_epi16::<8>(low), _mm_srli_epi16::<8>(high))
+    }
+
+    /// The whole blocks of sixteen pixels: the 64 bytes at `4 i` are read
+    /// before the 48 bytes at `3 i` are written (which end before `4 i + 64`),
+    /// so no pixel still to be read is overwritten.
+    #[target_feature(enable = "avx2")]
+    fn convert_blocks_avx2(buf: &mut [u8]) -> usize {
+        let pixels = buf.len() / 4;
+        let full = pixels - pixels % 16;
+        let mut i = 0;
+        while i < full {
+            let block: [u8; 64] = bytemuck::pod_read_unaligned(&buf[4 * i..4 * i + 64]);
+            let words: [__m128i; 4] = bytemuck::must_cast(block);
+            let k = plane(words, &PLANE_K);
+            let rgb = interleave16([
+                bytemuck::must_cast(muldiv255(plane(words, &PLANE_C), k)),
+                bytemuck::must_cast(muldiv255(plane(words, &PLANE_M), k)),
+                bytemuck::must_cast(muldiv255(plane(words, &PLANE_Y), k)),
+            ]);
+            buf[3 * i..3 * i + 48].copy_from_slice(&rgb);
             i += 16;
         }
         full

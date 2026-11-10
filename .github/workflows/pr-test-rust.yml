@@ -2148,6 +2148,8 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
     env:
       E2E_VENDOR: ${{ matrix.vendor }}
+      # Pod-local sidecar owns the real keys. Never map provider secrets here.
+      E2E_AI_KEY_PROXY: http://127.0.0.1:8787
       E2E_GPU_TIER: "0"
       SHOW_ROUTER_LOGS: "1"
     steps:

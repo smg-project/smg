@@ -1,4 +1,4 @@
-"""The Codex review workflow runs from main, admits writers only, and keeps the keys out of reach."""
+"""The Codex review workflow admits writers only, keeps the keys out of reach, and posts what it ran."""
 
 import json
 from pathlib import Path
@@ -20,21 +20,24 @@ def step(job, prefix):
     return next(s for s in job["steps"] if str(s.get("uses", "")).startswith(prefix))
 
 
-def test_every_trigger_runs_the_workflow_from_the_default_branch(workflow):
+def test_the_triggers_are_the_pull_request_events_and_the_comment_events(workflow):
     triggers = workflow[True]  # PyYAML reads the `on` key as a boolean
     assert set(triggers) == {
-        "pull_request_target",
+        "pull_request",
         "issue_comment",
         "pull_request_review_comment",
         "pull_request_review",
     }
-    assert "pull_request" not in triggers
-    assert triggers["pull_request_target"]["types"] == [
-        "opened",
-        "synchronize",
-        "reopened",
-        "ready_for_review",
-    ]
+    # pull_request, not pull_request_target: Claude's App-token exchange rejects the latter's OIDC token
+    assert "pull_request_target" not in triggers
+    assert triggers["pull_request"]["types"] == ["opened", "synchronize", "reopened"]
+
+
+def test_the_artifact_upload_includes_the_dot_prefixed_review_directory(workflow):
+    codex = workflow["jobs"]["codex"]
+    upload = step(codex, "actions/upload-artifact@")
+    assert upload["with"]["path"] == "pr/.codex-review/"
+    assert upload["with"]["include-hidden-files"] is True
 
 
 def test_forks_and_bots_are_refused_before_any_job_starts(workflow):
@@ -83,7 +86,8 @@ def test_the_post_job_runs_only_after_a_successful_review_from_the_default_branc
     post = workflow["jobs"]["post"]
     assert post["needs"] == "codex"
     assert "needs.codex.result == 'success'" in post["if"]
-    assert post["permissions"] == {"contents": "read", "pull-requests": "write"}
+    # the App token posts, not the job token; id-token lets the job prove itself to the sidecar
+    assert post["permissions"] == {"contents": "read", "id-token": "write"}
     checkout = step(post, "actions/checkout@")
     assert "ref" not in checkout.get("with", {})  # the default ref of a main-defined run is main
 
@@ -122,3 +126,65 @@ def test_the_acl_package_is_installed_before_codex_drops_sudo(workflow):
     )
     assert acl < run
     assert "setfacl" in codex["steps"][acl]["run"]
+
+
+def test_the_post_job_posts_as_the_codex_app_with_a_token_the_sidecar_mints(workflow):
+    import sys
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import codex_review_post
+
+    assert workflow["env"]["CODEX_BOT"] == codex_review_post.BOT == "smg-codex-review[bot]"
+    post = workflow["jobs"]["post"]
+    steps = post["steps"]
+    mint = next(s for s in steps if s.get("id") == "app-token")
+    assert mint["uses"] == "./.github/actions/codex-posting-token"
+    # the codex job, where the model runs, has no id-token permission and so cannot prove
+    # itself to the sidecar
+    assert "id-token" not in workflow["jobs"]["codex"]["permissions"]
+    posting = next(s for s in steps if "codex_review_post.py post" in str(s.get("run", "")))
+    assert steps.index(mint) < steps.index(posting)
+    assert posting["env"]["GITHUB_TOKEN"] == "${{ steps.app-token.outputs.token }}"
+    text = WORKFLOW.read_text()
+    assert "github-actions[bot]" not in text  # the verify prompt names the App's login via env
+    assert "${{ env.CODEX_BOT }}" in text
+
+
+def test_the_posting_token_action_proves_the_job_with_its_oidc_token_and_masks_the_result():
+    action = yaml.safe_load((ROOT / ".github/actions/codex-posting-token/action.yml").read_text())
+    assert action["runs"]["using"] == "composite"
+    run = " ".join(str(s.get("run", "")) for s in action["runs"]["steps"])
+    assert "ACTIONS_ID_TOKEN_REQUEST_URL" in run and "audience=ai-key-proxy" in run
+    assert "Authorization: Bearer" in run and "/github/app-token" in run
+    assert "::add-mask::" in run
+    assert "2>/dev/null || true" in run  # a non-JSON reply still reaches the error line
+    assert "token" in action["outputs"]
+
+
+def test_codex_announces_itself_before_reviewing_and_reports_the_outcome(workflow):
+    jobs = workflow["jobs"]
+    announce = jobs["announce"]
+    assert "needs" not in announce  # beside the review, not after it
+    assert announce["permissions"] == {"contents": "read", "id-token": "write"}
+    assert announce["runs-on"] == jobs["codex"]["runs-on"]
+    assert "github.event_name == 'pull_request'" in announce["if"]
+    assert "@codex review" in announce["if"]
+    assert "pull_request_review_comment" not in announce["if"]  # a thread reply gets no note
+    runs = " ".join(str(s.get("run", "")) for s in announce["steps"])
+    assert "codex_review_post.py announce --state reviewing" in runs
+    failed = jobs["finish-status"]
+    assert failed["needs"] == "codex"
+    assert "always()" in failed["if"] and "needs.codex.result == 'failure'" in failed["if"]
+    assert "needs.codex.outputs.mode == 'review'" in failed["if"]
+    runs = " ".join(str(s.get("run", "")) for s in failed["steps"])
+    assert "codex_review_post.py announce --state failed" in runs
+    for name in ("announce", "post", "finish-status"):
+        mint = next(
+            s
+            for s in jobs[name]["steps"]
+            if str(s.get("uses", "")).startswith("./.github/actions/codex-posting-token")
+        )
+        posting = next(
+            s for s in jobs[name]["steps"] if "codex_review_post.py" in str(s.get("run", ""))
+        )
+        assert posting["env"]["GITHUB_TOKEN"] == "${{ steps." + mint["id"] + ".outputs.token }}"
