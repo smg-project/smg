@@ -707,6 +707,128 @@ impl Picker for PowerOfTwo {
     }
 }
 
+/// `a` before `b` in the count-first order: fewer requests in flight on
+/// the host, then the higher score (compared exactly, as the policies'
+/// expected-wait tie-break is), equal on both.
+fn count_first_order(
+    candidates: &[Candidate],
+    kept: &[u32],
+    scores: &[f32],
+    a: usize,
+    b: usize,
+) -> std::cmp::Ordering {
+    let count_a = candidates[kept[a] as usize].in_flight;
+    let count_b = candidates[kept[b] as usize].in_flight;
+    count_a
+        .cmp(&count_b)
+        .then_with(|| scores[b].total_cmp(&scores[a]))
+}
+
+/// The fewest requests in flight on the host first, the profile's score
+/// among equal counts, the decision's seed among exact ties; the next by
+/// the same order as alternates. No weight or band stands between the two
+/// stages: a strictly lower count wins whatever the scores.
+#[derive(Debug)]
+pub struct CountFirst;
+
+impl Lifecycle for CountFirst {}
+
+impl Picker for CountFirst {
+    fn name(&self) -> &'static str {
+        "count-first"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        _: TieBand,
+        out: &mut Targets,
+    ) {
+        let mut draw = Draw::new(facts.seed);
+        let mut taken = [usize::MAX; MAX_TARGETS];
+        for slot in 0..MAX_TARGETS.min(kept.len()) {
+            let mut best: Option<usize> = None;
+            let mut tied = 0u32;
+            for i in 0..kept.len() {
+                if taken[..slot].contains(&i) {
+                    continue;
+                }
+                let Some(b) = best else {
+                    best = Some(i);
+                    tied = 1;
+                    continue;
+                };
+                match count_first_order(candidates, kept, scores, i, b) {
+                    std::cmp::Ordering::Less => {
+                        best = Some(i);
+                        tied = 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        tied += 1;
+                        if draw.below(tied as usize) == 0 {
+                            best = Some(i);
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {}
+                }
+            }
+            let Some(b) = best else {
+                break;
+            };
+            taken[slot] = b;
+            out.push(target_of(&candidates[kept[b] as usize]));
+        }
+    }
+}
+
+/// Two uniform draws, the one with fewer requests in flight taken and the
+/// profile's score deciding equal counts; the other is the alternate.
+#[derive(Debug)]
+pub struct PowerOfTwoCountFirst;
+
+impl Lifecycle for PowerOfTwoCountFirst {}
+
+impl Picker for PowerOfTwoCountFirst {
+    fn name(&self) -> &'static str {
+        "power-of-two-count-first"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        _: TieBand,
+        out: &mut Targets,
+    ) {
+        if kept.is_empty() {
+            return;
+        }
+        let mut draw = Draw::new(facts.seed);
+        let a = draw.below(kept.len());
+        if kept.len() == 1 {
+            out.push(target_of(&candidates[kept[a] as usize]));
+            return;
+        }
+        let mut b = draw.below(kept.len() - 1);
+        if b >= a {
+            b += 1;
+        }
+        let (first, second) =
+            if count_first_order(candidates, kept, scores, b, a) == std::cmp::Ordering::Less {
+                (b, a)
+            } else {
+                (a, b)
+            };
+        out.push(target_of(&candidates[kept[first] as usize]));
+        out.push(target_of(&candidates[kept[second] as usize]));
+    }
+}
+
 /// A rotation per survivor set, keyed by the set's rows (id and DP rank) in
 /// order; a set seen first starts from a shared advancing position. The table
 /// holds 4096 sets and is cleared when full, so no decision walks
@@ -1198,6 +1320,83 @@ mod tests {
         }
         // Worker 2 is drawn in two of three pairs and wins each time.
         assert!((50..=85).contains(&hits), "{hits}");
+    }
+
+    /// The review's case: counts 0, 1 and 2000 with the idle worker's wait
+    /// the worst of the three. The count decides before any score: the idle
+    /// worker leads, the next by count follows; a drawn pair is led by its
+    /// fewer in flight, so the busiest worker never leads one.
+    #[test]
+    fn count_first_takes_the_fewest_in_flight_before_any_score() {
+        let pool = [candidate(0, 0), candidate(1, 1), candidate(2, 2000)];
+        let scores = [0.0f32, 1.0, 0.49];
+        for seed in 0..20u64 {
+            let facts = RequestFacts {
+                seed,
+                ..RequestFacts::default()
+            };
+            let mut out = Targets::new();
+            CountFirst.pick(
+                &facts,
+                &pool,
+                &kept(3),
+                &scores,
+                TieBand::NORMALIZED,
+                &mut out,
+            );
+            let order: Vec<u32> = out.iter().map(|t| t.position).collect();
+            assert_eq!(order, [0, 1, 2], "seed {seed}");
+            let mut pair = Targets::new();
+            PowerOfTwoCountFirst.pick(
+                &facts,
+                &pool,
+                &kept(3),
+                &scores,
+                TieBand::NORMALIZED,
+                &mut pair,
+            );
+            let drawn: Vec<u32> = pair.iter().map(|t| t.position).collect();
+            assert_eq!(drawn.len(), 2, "seed {seed}");
+            assert!(
+                pool[drawn[0] as usize].in_flight <= pool[drawn[1] as usize].in_flight,
+                "seed {seed}: {drawn:?}"
+            );
+            assert_ne!(drawn[0], 2, "seed {seed}: the busiest worker never leads");
+        }
+    }
+
+    /// Equal counts fall to the score, compared exactly; an exact tie on
+    /// both is drawn from the seed; the alternates keep the order.
+    #[test]
+    fn count_first_breaks_equal_counts_by_the_score_and_exact_ties_by_the_seed() {
+        let pool = [
+            candidate(0, 3),
+            candidate(1, 3),
+            candidate(2, 3),
+            candidate(3, 7),
+        ];
+        let scores = [0.2f32, 0.9, 0.9, 1.0];
+        let mut firsts = std::collections::BTreeSet::new();
+        for seed in 0..40u64 {
+            let facts = RequestFacts {
+                seed,
+                ..RequestFacts::default()
+            };
+            let mut out = Targets::new();
+            CountFirst.pick(
+                &facts,
+                &pool,
+                &kept(4),
+                &scores,
+                TieBand::NORMALIZED,
+                &mut out,
+            );
+            let order: Vec<u32> = out.iter().map(|t| t.position).collect();
+            assert!(order[0] == 1 || order[0] == 2, "{order:?}");
+            assert_eq!((order[2], order[3]), (0, 3), "{order:?}");
+            firsts.insert(order[0]);
+        }
+        assert_eq!(firsts.len(), 2, "an exact tie is drawn from the seed");
     }
 
     #[test]
