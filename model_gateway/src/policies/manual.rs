@@ -420,7 +420,7 @@ mod tests {
     use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::policies::test_support::{headers_with_routing_key, make_workers};
+    use crate::policies::test_support::{headers_with_routing_key, make_workers, with_headers};
 
     #[test]
     fn test_manual_role_namespaces_sticky_entries() {
@@ -510,10 +510,7 @@ mod tests {
         let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let headers = headers_with_routing_key("user-123");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (first_result, branch) = policy.select_worker_impl(&workers, &info);
         let first_idx = first_result.unwrap();
@@ -538,10 +535,7 @@ mod tests {
         let mut distribution = HashMap::new();
         for i in 0..100 {
             let headers = headers_with_routing_key(&format!("user-{i}"));
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                ..Default::default()
-            };
+            let info = with_headers(&headers);
             let (result, branch) = policy.select_worker_impl(&workers, &info);
             assert_eq!(branch, ExecutionBranch::Vacant);
             *distribution.entry(result.unwrap()).or_insert(0) += 1;
@@ -579,10 +573,7 @@ mod tests {
         workers[0].set_status(WorkerStatus::NotReady);
 
         let headers = headers_with_routing_key("test-routing-id");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, Some(1), "Should only select healthy worker");
@@ -602,10 +593,7 @@ mod tests {
 
         workers[0].set_status(WorkerStatus::NotReady);
         let headers = headers_with_routing_key("test");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, None);
         assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
@@ -619,10 +607,7 @@ mod tests {
         let mut counts = HashMap::new();
         for _ in 0..100 {
             let headers = headers_with_routing_key("");
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                ..Default::default()
-            };
+            let info = with_headers(&headers);
             let (result, branch) = policy.select_worker_impl(&workers, &info);
             assert_eq!(branch, ExecutionBranch::NoRoutingId);
             if let Some(idx) = result {
@@ -643,10 +628,7 @@ mod tests {
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let headers = headers_with_routing_key("sticky-user");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (first_result, branch) = policy.select_worker_impl(&workers, &info);
         let first_idx = first_result.unwrap();
@@ -675,10 +657,7 @@ mod tests {
         let policy = ManualPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![];
         let headers = headers_with_routing_key("test");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, None);
         assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
@@ -690,10 +669,7 @@ mod tests {
         let workers = make_workers(&["http://w1:8000"]);
 
         let headers = headers_with_routing_key("single-test");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, Some(0));
@@ -712,10 +688,7 @@ mod tests {
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let headers = headers_with_routing_key("recovery-test");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (first_result, branch) = policy.select_worker_impl(&workers, &info);
         let first_idx = first_result.unwrap();
@@ -745,10 +718,7 @@ mod tests {
         let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let headers = headers_with_routing_key("eviction-test");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (first_result, branch) = policy.select_worker_impl(&workers, &info);
         let first_idx = first_result.unwrap();
@@ -886,10 +856,7 @@ mod tests {
         let policy = ManualPolicy::new();
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let headers = headers_with_routing_key("test-key");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
         let routing_id = RoutingId::new("test-key");
 
         // Vacant: first access
@@ -930,10 +897,7 @@ mod tests {
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let headers = headers_with_routing_key("key-0");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
         policy.select_worker_impl(&workers, &info);
 
         assert_eq!(policy.routing_map.len(), 1);
@@ -955,10 +919,7 @@ mod tests {
         for i in 0..9 {
             let routing_key = format!("key-{i}");
             let headers = headers_with_routing_key(&routing_key);
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                ..Default::default()
-            };
+            let info = with_headers(&headers);
 
             let (result, branch) = policy.select_worker_impl(&workers, &info);
             assert!(result.is_some());
@@ -1001,10 +962,7 @@ mod tests {
         assert_eq!(workers[2].routing_key_load(), 0);
 
         let headers = headers_with_routing_key("new-key");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
         let (result, _) = policy.select_worker_impl(&workers, &info);
         let selected_idx = result.unwrap();
 
@@ -1029,10 +987,7 @@ mod tests {
         assert_eq!(workers[2].load(), 0);
 
         let headers = headers_with_routing_key("new-key");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
         let (result, _) = policy.select_worker_impl(&workers, &info);
         let selected_idx = result.unwrap();
 
@@ -1053,10 +1008,7 @@ mod tests {
         workers[1].increment_routing_key_load("key-2");
 
         let headers = headers_with_routing_key("new-key");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (first_result, branch) = policy.select_worker_impl(&workers, &info);
         let first_idx = first_result.unwrap();
@@ -1155,10 +1107,7 @@ mod tests {
         let mut selected_worker_0 = false;
         for i in 0..50 {
             let headers = headers_with_routing_key(&format!("test-{i}"));
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                ..Default::default()
-            };
+            let info = with_headers(&headers);
             let (result, _) = policy.select_worker_impl(&workers, &info);
             if result == Some(0) {
                 selected_worker_0 = true;
