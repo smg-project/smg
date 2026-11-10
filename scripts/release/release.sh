@@ -940,7 +940,7 @@ publish_plan() { # <version> <ref>: the plan for v<version> as read at <ref> (th
     done < <(awk '$1 == "crate" { print $2, $3 }' "$list")
     [ "${REGISTRY:-1}" != 0 ] || say "     (the registries were not read: REGISTRY=0)"
   fi
-  say "$((n += 1)). Gateway image (Docker Hub lightseekorg/smg:$version and ghcr.io/smg-project/smg:$version $latest)"
+  say "$((n += 1)). Gateway image (Docker Hub lightseekorg/smg:$version and ghcr.io/smg-project/smg:$version $latest; the same tags with -slurm appended = the variant with the Slurm clients)"
   say "   gh workflow run release-docker.yml --ref $tagname"
   say "$((n += 1)). Helm chart (oci://ghcr.io/smg-project/charts/smg, version $version)"
   say "   gh workflow run release-helm.yml --ref $tagname"

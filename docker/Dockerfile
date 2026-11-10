@@ -170,7 +170,7 @@ RUN uv pip install maturin \
     && rm -rf /root/.cache
 
 ######################### ROUTER IMAGE #########################
-FROM base AS router-image
+FROM base AS router
 ARG TARGETARCH
 
 # libjpeg-turbo and libwebp for the media pipeline: the gateway loads
@@ -212,3 +212,23 @@ USER smg
 
 # Set the entrypoint to the main command
 ENTRYPOINT ["python3", "-m", "smg.launch_router"]
+
+######################### ROUTER IMAGE WITH THE SLURM CLIENTS #########################
+# The Slurm discovery provider runs `squeue` and `scontrol` in the router
+# container, so this stage adds Ubuntu's Slurm client package to the router
+# image; the workflows publish it beside the router image as the `-slurm` tag.
+# What the cluster's authentication needs, its slurm.conf and MUNGE key or
+# auth/jwt with SLURM_JWT, still comes from the deployment.
+FROM router AS router-slurm-image
+USER root
+RUN apt update -y \
+    && apt install -y --no-install-recommends slurm-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt clean \
+    && command -v squeue \
+    && command -v scontrol
+USER smg
+
+# The last stage is what a build that names no target makes: the router image
+# as before, without the Slurm clients.
+FROM router AS router-image

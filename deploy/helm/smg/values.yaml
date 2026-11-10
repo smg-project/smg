@@ -122,9 +122,10 @@ router:
       path: ""             # the manifest's path in the pod (default: the ConfigMap key under /etc/smg/discovery)
 
     # -- Workers on the nodes of running Slurm jobs, found with `squeue` and
-    #    `scontrol`. The published image has no Slurm client: this needs an
-    #    image with Slurm >= 23.11 clients and the cluster's configuration and
-    #    authentication (README, Worker Discovery).
+    #    `scontrol`. The published image has no Slurm client; its `-slurm`
+    #    variant (global.image.tag "<version>-slurm") carries the Slurm 23.11
+    #    clients. The cluster's configuration and authentication come from the
+    #    deployment (README, Worker Discovery).
     slurm:
       jobNames: []         # jobs whose nodes are regular workers
       encodeJobNames: []
