@@ -1066,11 +1066,12 @@ mod tests {
         let mut no_resize = config(MAX_IMAGE_TOKENS);
         no_resize.do_resize = Some(false);
         let unaligned = DynamicImage::ImageRgb8(RgbImage::from_pixel(30, 30, Rgb([1, 2, 3])));
-        let err = Glm53FlashProcessor::from_config_for(&no_resize, Modality::Image)
-            .unwrap()
-            .preprocess(&[&unaligned])
-            .unwrap_err();
+        let no_resize = Glm53FlashProcessor::from_config_for(&no_resize, Modality::Image).unwrap();
+        let err = no_resize.preprocess(&[&unaligned]).unwrap_err();
         assert!(err.to_string().contains("not aligned"), "{err}");
+        // The size-only count takes the same source canvas as the encode.
+        assert_eq!(no_resize.calculate_num_tokens(56, 56).unwrap(), 4);
+        assert!(no_resize.calculate_num_tokens(30, 30).is_err());
     }
 
     #[test]

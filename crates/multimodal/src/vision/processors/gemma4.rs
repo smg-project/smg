@@ -1049,6 +1049,9 @@ mod tests {
         assert!(no_resize.preprocess(&[&solid(100, 100, [0; 3])]).is_err());
         let aligned = no_resize.preprocess(&[&solid(96, 48, [0; 3])]).unwrap();
         assert_eq!(aligned.feature_token_counts, vec![2]);
+        // The size-only count takes the same source size as the encode.
+        assert_eq!(no_resize.calculate_num_tokens(96, 48).unwrap(), 2);
+        assert!(no_resize.calculate_num_tokens(100, 100).is_err());
         // Aligned but over the budget of 2520 patches (180 x 60 = 10,800).
         assert!(no_resize
             .preprocess(&[&solid(48 * 60, 48 * 20, [0; 3])])
