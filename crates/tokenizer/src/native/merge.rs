@@ -103,8 +103,9 @@ const PAIR_FILTER_MULTIPLIER: u64 = 0xD6E8_FEB8_6659_FD93;
 /// loaded vocabulary.
 const HOT_SIDE_BITS: u32 = 9;
 const HOT_SIDE: u32 = 1 << HOT_SIDE_BITS;
-/// The window base of a table without the grid: no id reaches its window.
-const NO_HOT_BASE: u32 = 1 << 31;
+/// The window base of a table without the grid: past every 32-bit id, so
+/// that no pair reaches the window (the base is 64 bits for it).
+const NO_HOT_BASE: u64 = 1 << 32;
 /// An empty entry of the pair table; no pair of ids has this key.
 const EMPTY_KEY: u64 = u64::MAX;
 /// No neighbour, in the linked list of a long piece.
@@ -182,7 +183,7 @@ pub(super) enum ByteTokens {
     Alphabet,
     /// Sentencepiece's `<0xHH>` tokens (a piece of such a vocabulary starts
     /// from character symbols instead, see [`MergeTable::merge_symbols`];
-    /// the table carries no byte-pair grid).
+    /// the table carries no hot grid).
     Hex,
 }
 
@@ -202,22 +203,24 @@ pub(super) struct MergeTable {
     /// hash and the bucket line. Counted on first-sight text, a quarter to
     /// two fifths of a merge's pair lookups fall in the window (more on
     /// short texts and on vocabularies whose first merges cover more of the
-    /// text); the cold pass runs 1.6-2.3 % fewer instructions per token from
-    /// 256 B to 32 KB for it, the fills level, the warm pass untouched (it
-    /// merges nothing). Before this grid a 256 x 256 grid by byte answered
+    /// text); the cold pass runs 0.8-2.6 % fewer instructions per token by
+    /// cell (1.6-2.3 % by size-class median) from 256 B to 32 KB over four
+    /// vocabularies for it, its cache fills unchanged, the warm pass
+    /// untouched (it merges nothing). Before this grid a 256 x 256 grid by byte answered
     /// the first round's byte pairs alone, the same pairs recorded in the
     /// buckets too. Empty for a table whose pieces start from character
     /// symbols ([`ByteTokens::Hex`]): their first round reads the bucket
     /// table ([`Self::merge_symbols`]), and the grid's 2 MiB per loaded
     /// vocabulary stay unspent.
     hot: Box<[Merge]>,
-    /// The first id of the hot grid's window; [`NO_HOT_BASE`] for a table
-    /// without the grid.
-    hot_base: u32,
+    /// The first id of the hot grid's window, the least byte token's id;
+    /// [`NO_HOT_BASE`] for a table without the grid.
+    hot_base: u64,
     /// The pairs outside the hot grid's window, open-addressed by bucket with
-    /// linear probing over whole buckets: a pair's key hashes to a bucket of [`BUCKET`] entries, and a
-    /// lookup reads the bucket whole (one compare per entry, no branch) and
-    /// goes on to the next bucket only when none matched and none was empty.
+    /// linear probing over whole buckets: a pair's key hashes to a bucket of
+    /// [`BUCKET`] entries, and a lookup reads the bucket whole (one compare
+    /// per entry, no branch) and goes on to the next bucket only when none
+    /// matched and none was empty.
     buckets: Box<[Bucket]>,
     /// Bits a key's hash is shifted right by to give its first bucket; the
     /// table holds `1 << (64 - shift)` buckets.
@@ -305,7 +308,7 @@ impl MergeTable {
         );
         table.byte_ids = byte_ids;
         if tokens == ByteTokens::Alphabet {
-            table.hot_base = byte_ids.iter().copied().min().unwrap_or(0);
+            table.hot_base = u64::from(byte_ids.iter().copied().min().unwrap_or(0));
         }
         let mut token = String::new();
         let mut pairs = Vec::with_capacity(merges.len());
@@ -413,7 +416,7 @@ impl MergeTable {
         }
         let mut table = Self::with_capacity(splits.len(), false, true);
         table.byte_ids = byte_ids;
-        table.hot_base = byte_ids.iter().copied().min().unwrap_or(0);
+        table.hot_base = u64::from(byte_ids.iter().copied().min().unwrap_or(0));
         for &(left, right, rank) in &splits {
             table.insert(left, right, Merge::new(rank, rank));
         }
@@ -540,11 +543,15 @@ impl MergeTable {
     }
 
     /// The index of the pair `(a, b)` in the hot grid when both ids are in
-    /// its window (one compare: the side is a power of two).
+    /// its window (one compare: the side is a power of two, and the base of
+    /// a table without the grid is past every id).
     #[inline(always)]
     fn hot_index(&self, a: u32, b: u32) -> Option<usize> {
-        let (x, y) = (a.wrapping_sub(self.hot_base), b.wrapping_sub(self.hot_base));
-        ((x | y) < HOT_SIDE).then_some((x as usize) << HOT_SIDE_BITS | y as usize)
+        let (x, y) = (
+            u64::from(a).wrapping_sub(self.hot_base),
+            u64::from(b).wrapping_sub(self.hot_base),
+        );
+        ((x | y) < u64::from(HOT_SIDE)).then_some((x as usize) << HOT_SIDE_BITS | y as usize)
     }
 
     /// Records `(a, b)` as `merge`; a pair recorded twice keeps the later
@@ -802,8 +809,15 @@ impl MergeTable {
 
     /// The merge of `n` (`1..=SHORT_PIECE_SYMBOLS`) initial `symbols` as a
     /// [`ShortMerge`] on stack arrays, the smaller ones for a piece that fits
-    /// them.
-    fn merge_short(&self, symbols: impl Iterator<Item = u32>, n: usize, ids: &mut Vec<u32>) {
+    /// them. `n` is the iterator's length, passed by the caller: taken from
+    /// the iterator it cost one to two instructions per token on cold text.
+    fn merge_short(
+        &self,
+        symbols: impl ExactSizeIterator<Item = u32>,
+        n: usize,
+        ids: &mut Vec<u32>,
+    ) {
+        debug_assert_eq!(symbols.len(), n);
         if n <= SHORT_PIECE_TINY {
             ShortMerge::<SHORT_PIECE_TINY>::of(symbols, n).run(self, ids);
         } else if n <= SHORT_PIECE_SMALL {

@@ -866,11 +866,11 @@ fn the_merges_read_are_the_models_merges_with_a_gap_in_the_ids_too() {
     }
 }
 
-/// The byte-pair grid answers as the bucket table does on a vocabulary
+/// The hot grid, indexed by id, answers as the model does on a vocabulary
 /// that gives two byte characters one id: the model merges the pair by id
-/// for either byte, and so does the table's first round. (The merge's
-/// product is in the vocabulary under both spellings, on one id too: the
-/// model names a merge by either byte when it serializes its merges.)
+/// for either byte, and so does the table's first round from the grid. (The
+/// merge's product is in the vocabulary under both spellings, on one id too:
+/// the model names a merge by either byte when it serializes its merges.)
 #[test]
 fn two_byte_characters_on_one_id_merge_as_the_model_does() {
     let (mut vocab, table) = alphabet_vocab();
@@ -928,9 +928,19 @@ fn the_tables_bytes_are_the_grid_the_filter_and_its_buckets_at_half_load_or_less
 /// filter (a filter that admitted them all would save no bucket line).
 #[test]
 fn every_merge_passes_the_pair_filter_and_a_pair_that_is_none_mostly_does_not() {
-    let bpe = model_with(&merges(), false);
+    // Filler tokens push the merge products past the hot grid's window, so
+    // that the merges among products reach the filter and its buckets.
+    let fillers: Vec<String> = (0..HOT_SIDE).map(|i| format!("filler{i}")).collect();
+    let fillers: Vec<&str> = fillers.iter().map(String::as_str).collect();
+    let bpe = model_with_tokens(&merges(), &fillers);
     let table = table_of(&bpe);
     let id = |token: &str| bpe.token_to_id(token).expect("a token of the model");
+    assert!(
+        merges()
+            .iter()
+            .any(|&(a, b)| table.hot_index(id(a), id(b)).is_none()),
+        "some merge must fall outside the hot window, or the filter goes untested"
+    );
     for (a, b) in merges() {
         assert!(
             table.merge_of(id(a), id(b)) != Merge::NONE,
@@ -952,7 +962,7 @@ fn every_merge_passes_the_pair_filter_and_a_pair_that_is_none_mostly_does_not() 
     let (mut none, mut admitted) = (0, 0);
     while none < 20_000 {
         let (a, b) = ((next() % ids) as u32, (next() % ids) as u32);
-        if table.merge_of(a, b) != Merge::NONE {
+        if table.hot_index(a, b).is_some() || table.merge_of(a, b) != Merge::NONE {
             continue;
         }
         none += 1;
@@ -962,6 +972,36 @@ fn every_merge_passes_the_pair_filter_and_a_pair_that_is_none_mostly_does_not() 
         admitted * 20 < none,
         "{admitted} of {none} pairs that are no merge pass the filter"
     );
+}
+
+/// A byte-fallback vocabulary may number its tokens anywhere in the id
+/// space, and its table has no hot grid: no pair is answered from the grid
+/// whatever the ids, so operands at 2^31 load and merge through the
+/// buckets (a window base chosen as a sentinel would have indexed the
+/// absent grid at load).
+#[test]
+fn a_table_without_the_hot_grid_answers_no_pair_from_it_whatever_the_ids() {
+    let mut vocab = Vocab::default();
+    vocab.insert("<unk>".to_owned(), 0);
+    for byte in 0..=255u8 {
+        vocab.insert(format!("<0x{byte:02X}>"), 1 + u32::from(byte));
+    }
+    let (a, b, ab) = (1 << 31, (1 << 31) + 1, (1 << 31) + 2);
+    vocab.insert("a".to_owned(), a);
+    vocab.insert("b".to_owned(), b);
+    vocab.insert("ab".to_owned(), ab);
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, vec![("a".to_owned(), "b".to_owned())])
+        .byte_fallback(true)
+        .unk_token("<unk>".to_owned())
+        .build()
+        .expect("a byte-fallback BPE");
+    let table = MergeTable::from_model(&ModelWrapper::BPE(bpe), ByteTokens::Hex)
+        .expect("the table loads with ids at 2^31");
+    assert!(table.hot.is_empty());
+    assert_eq!(table.hot_index(a, b), None);
+    assert_eq!(table.merge_of(a, b), Merge::new(0, ab));
+    assert_eq!(table.merge_of(a, a), Merge::NONE);
 }
 
 /// At a vocabulary's size and the tightest rounding of the filter (131,072
