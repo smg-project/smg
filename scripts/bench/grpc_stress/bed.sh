@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# The CPU-only stress bed for the gateway's gRPC request path: one release
-# gateway in front of a fleet of `mock-worker --engine realistic` gRPC engines
-# (KV events on), or in front of a prefill fleet and a decode fleet on the
-# gateway's prefill-decode path. No GPU, no engine: the whole bed is this
-# repository.
+# The CPU-only stress bed for the gateway's request path: one release gateway
+# in front of a fleet of `mock-worker --engine realistic` gRPC engines (KV
+# events on), in front of a prefill fleet and a decode fleet on the gateway's
+# prefill-decode path, or in front of the same fleet on the mock's HTTP wire
+# behind the gateway's HTTP regular path. No GPU, no engine: the whole bed is
+# this repository.
 #
 #   bed.sh up      start the fleet(s) and the gateway, register the workers, wait until a probe answers
 #   bed.sh down    stop them (pids from the bed's own pid files only)
@@ -13,8 +14,9 @@
 #   GS_DIR       run directory for logs, pids and cells [target/grpc-stress]
 #   SMG_BIN      gateway binary [target/release/smg]      MOCK_BIN  [target/release/mock-worker]
 #   GW_PORT      [29600]  PROM_PORT [29601]  ADMIN_PORT [29609]  MOCK_BASE [29610]  WORKERS [12]
-#   FLEET        grpc | prefill-decode: one fleet of regular gRPC engines, or a prefill fleet and a decode fleet
-#                registered with their roles, so the gateway serves the model on its prefill-decode path [grpc]
+#   FLEET        grpc | prefill-decode | http: one fleet of regular gRPC engines; a prefill fleet and a decode fleet
+#                registered with their roles, so the gateway serves the model on its prefill-decode path; or one
+#                fleet of regular HTTP engines, so the gateway serves it on its HTTP regular path [grpc]
 #   MODEL        served model id [mock-model]   TOKENIZER  tokenizer directory or hub id (required)
 #   BLOCK        KV block size [16]
 #   GW_CORES     cpu list the gateway is pinned to (taskset) [none]   GW_THREADS  tokio worker threads [8]
@@ -68,10 +70,10 @@ GW=http://127.0.0.1:$GW_PORT
 ts() { date -u +%FT%TZ; }
 die() { echo "$(ts) bed: $*" >&2; exit 1; }
 case "$FLEET" in
-  grpc) ;;
+  grpc|http) ;;
   prefill-decode)
     [ "$PREFILL_WORKERS" -ge 1 ] 2>/dev/null || die "PREFILL_WORKERS=$PREFILL_WORKERS: one prefill engine or more" ;;
-  *) die "FLEET=$FLEET: grpc or prefill-decode" ;;
+  *) die "FLEET=$FLEET: grpc, prefill-decode or http" ;;
 esac
 # The prefix that runs a command in a transient systemd user scope of its own (memory accounting on), so the bed's
 # processes are not throttled by the memory controller of the shell's cgroup and the gateway's memory can be read
@@ -108,18 +110,18 @@ stop_all() {
 # A failed start leaves no process and no port behind.
 bail() { stop_all; die "$@"; }
 
-# start_fleet <name> <first port> <count> <admin port> <engine flags...>: one mock-worker process of <count> gRPC
-# engines on <first port>.. with its admin API on <admin port>, in a scope of its own, pinned to MOCK_CORES;
-# its log and pid file are <name>.log and <name>.pid under the bed. Returns 1 when a worker could not bind its
-# port (a worker whose port another process holds exits quietly, and the gateway would route a share of the
-# traffic into that stranger) or the fleet did not come up whole.
+# start_fleet <name> <wire> <first port> <count> <admin port> <engine flags...>: one mock-worker process of <count>
+# engines of the <wire> (grpc or http) on <first port>.. with its admin API on <admin port>, in a scope of its own,
+# pinned to MOCK_CORES; its log and pid file are <name>.log and <name>.pid under the bed. Returns 1 when a worker
+# could not bind its port (a worker whose port another process holds exits quietly, and the gateway would route a
+# share of the traffic into that stranger) or the fleet did not come up whole.
 start_fleet() {
-  local name=$1 base=$2 count=$3 admin=$4; shift 4
+  local name=$1 wire=$2 base=$3 count=$4 admin=$5; shift 5
   local prefix pid child fleet scope
   prefix=$(scope_prefix "grpc-stress-$name-$base-$stamp") || return 1
   read -r -a scope <<< "$prefix"
   # shellcheck disable=SC2206
-  local mock_cmd=("${scope[@]}" ${MOCK_CORES:+taskset -c $MOCK_CORES} "$MOCK_BIN" --grpc-base-port "$base" --grpc-count "$count" \
+  local mock_cmd=("${scope[@]}" ${MOCK_CORES:+taskset -c $MOCK_CORES} "$MOCK_BIN" "--$wire-base-port" "$base" "--$wire-count" "$count" \
     --model "$MODEL" --tokenizer "$TOKENIZER" --block-size "$BLOCK" --admin-port "$admin" "$@")
   echo "$(ts) bed: $name fleet: ${mock_cmd[*]}"
   "${mock_cmd[@]}" > "$BED/$name.log" 2>&1 &
@@ -139,12 +141,15 @@ start_fleet() {
   [ "${fleet:-0}" = "$count" ] || { echo "$(ts) bed: the $name fleet has ${fleet:-0} workers, not $count (see $BED/$name.log)" >&2; return 1; }
 }
 
-# register <port> <extra labels> <extra fields>: one gRPC worker of the model at the gateway's worker API; the
-# answer is kept as register-<port>.json. The extra labels and fields are JSON fragments, each starting with a comma.
+# register <wire> <port> <extra labels> <extra fields>: one worker of the model on the wire (grpc or http) at the
+# gateway's worker API; the answer is kept as register-<port>.json. The extra labels and fields are JSON fragments,
+# each starting with a comma. A gRPC engine names the scheduler wire it speaks; an HTTP engine's runtime is read at
+# registration.
 register() {
-  local p=$1 labels=$2 extra=$3 code
+  local wire=$1 p=$2 labels=$3 extra=$4 code runtime=""
+  [ "$wire" = grpc ] && runtime=",\"runtime\":\"tokenspeed\""
   code=$(curl -s -o "$BED/register-$p.json" -w '%{http_code}' --max-time 30 -X POST "$GW/workers" -H 'content-type: application/json' \
-    -d "{\"url\":\"grpc://127.0.0.1:$p\",\"connection_mode\":\"grpc\",\"runtime\":\"tokenspeed\",\"models\":[{\"id\":\"$MODEL\"}],\"labels\":{\"tokenizer_path\":\"$TOKENIZER\"$labels},\"kv_block_size\":$BLOCK,\"health\":{\"disable_health_check\":true}$extra}")
+    -d "{\"url\":\"$wire://127.0.0.1:$p\",\"connection_mode\":\"$wire\"$runtime,\"models\":[{\"id\":\"$MODEL\"}],\"labels\":{\"tokenizer_path\":\"$TOKENIZER\"$labels},\"kv_block_size\":$BLOCK,\"health\":{\"disable_health_check\":true}$extra}")
   case "$code" in 2*) ;; *) cat "$BED/register-$p.json" >&2; bail "registering worker $p: HTTP $code" ;; esac
 }
 
@@ -179,13 +184,14 @@ case "$cmd" in
     gw_prefix=$(scope_prefix "grpc-stress-gw-$GW_PORT-$stamp") || exit 1
     read -r -a gw_scope <<< "$gw_prefix"
     gw_flags=()
+    wire=grpc; [ "$FLEET" = http ] && wire=http
     if [ "$FLEET" = prefill-decode ]; then
       # shellcheck disable=SC2086
-      start_fleet prefill "$PREFILL_BASE" "$PREFILL_WORKERS" "$PREFILL_ADMIN_PORT" --worker-type prefill --bootstrap-base-port "$BOOTSTRAP_BASE" $PREFILL_ENGINE_ARGS \
+      start_fleet prefill grpc "$PREFILL_BASE" "$PREFILL_WORKERS" "$PREFILL_ADMIN_PORT" --worker-type prefill --bootstrap-base-port "$BOOTSTRAP_BASE" $PREFILL_ENGINE_ARGS \
         || bail "the prefill fleet did not come up"
       # The decode engines run the regular engine flags with the window the gateway's rooms are told of.
       # shellcheck disable=SC2086
-      start_fleet mock "$MOCK_BASE" "$WORKERS" "$ADMIN_PORT" --worker-type decode $ENGINE_ARGS --max-running "$DECODE_WINDOW" \
+      start_fleet mock grpc "$MOCK_BASE" "$WORKERS" "$ADMIN_PORT" --worker-type decode $ENGINE_ARGS --max-running "$DECODE_WINDOW" \
         || bail "the decode fleet did not come up"
       # The multi-router gateway serves the roles on its prefill-decode router by itself; the mode flag is what
       # admits the prefill in-flight bound (and the per-role policies), with no static worker list.
@@ -193,7 +199,7 @@ case "$cmd" in
       [ "$PREFILL_WINDOW" -gt 0 ] && gw_flags+=(--prefill-max-inflight-requests-per-worker "$PREFILL_WINDOW")
     else
       # shellcheck disable=SC2086
-      start_fleet mock "$MOCK_BASE" "$WORKERS" "$ADMIN_PORT" $ENGINE_ARGS || bail "the fleet did not come up"
+      start_fleet mock "$wire" "$MOCK_BASE" "$WORKERS" "$ADMIN_PORT" $ENGINE_ARGS || bail "the fleet did not come up"
     fi
 
     # shellcheck disable=SC2206
@@ -216,14 +222,14 @@ case "$cmd" in
       # The roles the gateway pairs on: a prefill worker with the bootstrap port its engine bound (the gateway
       # probes it), a decode worker with the running window its rooms are claimed against.
       for i in $(seq 0 $((PREFILL_WORKERS - 1))); do
-        register $((PREFILL_BASE + i)) "" ",\"worker_type\":\"prefill\",\"bootstrap_port\":$((BOOTSTRAP_BASE + i))"
+        register grpc $((PREFILL_BASE + i)) "" ",\"worker_type\":\"prefill\",\"bootstrap_port\":$((BOOTSTRAP_BASE + i))"
       done
       for i in $(seq 0 $((WORKERS - 1))); do
-        register $((MOCK_BASE + i)) ",\"max_running_requests\":\"$DECODE_WINDOW\"" ",\"worker_type\":\"decode\""
+        register grpc $((MOCK_BASE + i)) ",\"max_running_requests\":\"$DECODE_WINDOW\"" ",\"worker_type\":\"decode\""
       done
     else
       for i in $(seq 0 $((WORKERS - 1))); do
-        register $((MOCK_BASE + i)) "" ""
+        register "$wire" $((MOCK_BASE + i)) "" ""
       done
     fi
     # A probe through the whole path (tokenizer loaded, a worker serving) before the bed is declared up.
