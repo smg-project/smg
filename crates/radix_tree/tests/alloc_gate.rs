@@ -48,21 +48,23 @@ fn fresh_single_holder_stores_amortize_to_map_growth() {
     run_chain();
 }
 
-fn run_flat() {
-    let mut tree = FlatTree::new(Config::default());
-    let h = tree.create_holder("h");
-    // Warm: one chain so first-touch allocations (scratch, maps) are
-    // out of the measured window.
-    let warm: Vec<(u64, u64)> = (1..=64u64).map(|i| (i, i ^ 0xABCD)).collect();
-    tree.store(h, None, &warm).expect("warm");
-
+/// The gate's measure over one core, `what`: `store` writes fresh single-holder
+/// batches of eight blocks in chains of 512 after `first_key` until 100,000 are
+/// stored, and the heap allocations per block stay under 0.5: generous headroom
+/// over the core's amortized structure growth (named at each caller) while still
+/// failing any per-block heap regression (a heap set per block would cost >= 1.0).
+fn stores_amortize(what: &str, first_key: u64, mut store: impl FnMut(Option<u64>, &[(u64, u64)])) {
     // Many realistic-length chains (512 blocks), fresh single-holder
     // blocks throughout — never near max_chain_len.
     const BLOCKS: u64 = 100_000;
     const CHAIN_LEN: u64 = 512;
     let mut batch = Vec::with_capacity(8);
+    // Warm: one chain so first-touch allocations (scratch, maps) are
+    // out of the measured window.
+    let warm: Vec<(u64, u64)> = (1..=64u64).map(|i| (i, i ^ 0xABCD)).collect();
+    store(None, &warm);
     let before = ALLOCS.load(Ordering::Relaxed);
-    let mut key = 1000u64;
+    let mut key = first_key;
     let mut stored = 0u64;
     'outer: loop {
         let mut parent = None;
@@ -73,7 +75,7 @@ fn run_flat() {
                 key += 1;
                 batch.push((key, key.wrapping_mul(0x9E3779B97F4A7C15) | 1));
             }
-            tree.store(h, parent, &batch).expect("store");
+            store(parent, &batch);
             parent = Some(key);
             stored += 8;
             in_chain += 8;
@@ -84,16 +86,21 @@ fn run_flat() {
     }
     let allocs = ALLOCS.load(Ordering::Relaxed) - before;
     let per_block = allocs as f64 / stored as f64;
-    println!("{allocs} allocations for {stored} single-holder blocks = {per_block:.4}/block");
-    // Membership::One is inline (zero per-block); what remains is
-    // amortized structure growth: BTreeSet nodes (~1 per 11 inserts)
-    // and hash-map doublings. 0.5/block is generous headroom over
-    // that floor while still failing any per-block heap regression
-    // (a heap set per block would cost >= 1.0).
+    println!("{what}: {allocs} allocations for {stored} blocks = {per_block:.4}/block");
     assert!(
         per_block < 0.5,
-        "flat allocation regression: {per_block:.4} allocs/block (gate: < 0.5)"
+        "{what} allocation regression: {per_block:.4} allocs/block (gate: < 0.5)"
     );
+}
+
+/// The flat core's floor: `Membership::One` is inline (zero per-block); what
+/// remains is the doublings of the entries map and the holder's registry map.
+fn run_flat() {
+    let mut tree = FlatTree::new(Config::default());
+    let h = tree.create_holder("h");
+    stores_amortize("flat", 1000, |parent, batch| {
+        tree.store(h, parent, batch).expect("store");
+    });
 }
 
 /// Same gate for the chain-native core: contents-Vec growth and span
@@ -101,39 +108,9 @@ fn run_flat() {
 fn run_chain() {
     let mut tree = RadixTree::new(Config::default());
     let h = tree.create_holder("h");
-    let warm: Vec<(u64, u64)> = (1..=64u64).map(|i| (i, i ^ 0xABCD)).collect();
-    tree.store(h, None, &warm).expect("warm");
-    const BLOCKS: u64 = 100_000;
-    const CHAIN_LEN: u64 = 512;
-    let mut batch = Vec::with_capacity(8);
-    let before = ALLOCS.load(Ordering::Relaxed);
-    let mut key = 10_000_000u64;
-    let mut stored = 0u64;
-    'outer: loop {
-        let mut parent = None;
-        let mut in_chain = 0u64;
-        while in_chain < CHAIN_LEN {
-            batch.clear();
-            for _ in 0..8 {
-                key += 1;
-                batch.push((key, key.wrapping_mul(0x9E3779B97F4A7C15) | 1));
-            }
-            tree.store(h, parent, &batch).expect("store");
-            parent = Some(key);
-            stored += 8;
-            in_chain += 8;
-            if stored >= BLOCKS {
-                break 'outer;
-            }
-        }
-    }
-    let allocs = ALLOCS.load(Ordering::Relaxed) - before;
-    let per_block = allocs as f64 / stored as f64;
-    println!("chain core: {allocs} allocations for {stored} blocks = {per_block:.4}/block");
-    assert!(
-        per_block < 0.5,
-        "chain allocation regression: {per_block:.4} allocs/block (gate: < 0.5)"
-    );
+    stores_amortize("chain", 10_000_000, |parent, batch| {
+        tree.store(h, parent, batch).expect("store");
+    });
 }
 
 /// Read-path gate: with a caller-owned scratch reused across queries, an
