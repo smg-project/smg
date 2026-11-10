@@ -18,7 +18,8 @@ Standard library only: the check step runs before the test dependencies land.
 One deadline bounds the whole handshake: a process timer that interrupts
 whatever call is blocking when it falls, so a peer that trickles its
 headers, a line or a body a byte at a time inside the socket timeout still
-meets it and the probe prints its own line; the deadline is also checked
+meets it and the probe prints its own line naming the step; the deadline
+is also checked
 before every request and read and honoured by the session's close. The
 per-request timeout bounds one idle socket operation. An event stream is
 read event by event and left the moment the answer arrives, never to its end.
@@ -56,11 +57,13 @@ class Deadline:
     def __init__(self, seconds: float) -> None:
         self.seconds = seconds
         self.end = time.monotonic() + seconds
+        self.step = "the connection"  # the last step that checked in, for the timer's line
 
     def left(self) -> float:
         return self.end - time.monotonic()
 
     def remaining(self, step: str) -> float:
+        self.step = step
         left = self.left()
         if left <= 0:
             raise HandshakeError(f"the deadline of {self.seconds:g} s passed during {step}")
@@ -219,9 +222,8 @@ def _close_session(url: str, session: str, timeout: float, deadline: Deadline) -
         pass  # the deadline falling during the close changes nothing either
 
 
-def list_tools(url: str, timeout: float, deadline_seconds: float) -> list[str]:
-    """Run the handshake and return the advertised tool names."""
-    deadline = Deadline(deadline_seconds)
+def list_tools(url: str, timeout: float, deadline: Deadline) -> list[str]:
+    """Run the handshake under the deadline and return the advertised tool names."""
     init = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -276,16 +278,18 @@ def main() -> int:
     args = parser.parse_args()
 
     def _expired(_signum, _frame):
-        raise HandshakeError(f"the deadline of {args.deadline:g} s passed")
+        raise HandshakeError(f"the deadline of {args.deadline:g} s passed during {deadline.step}")
 
     # A process timer interrupts whatever call is blocking when the deadline
     # falls (an exception raised by a signal handler ends a blocked recv), so
     # a peer trickling its headers or a line a byte at a time inside the
-    # socket timeout still meets it and the probe prints its own line.
+    # socket timeout still meets it; its line names the step the handshake
+    # was in, the last one that checked the deadline.
+    deadline = Deadline(args.deadline)
     previous = signal.signal(signal.SIGALRM, _expired)
     signal.setitimer(signal.ITIMER_REAL, args.deadline)
     try:
-        names = list_tools(args.url, args.timeout, args.deadline)
+        names = list_tools(args.url, args.timeout, deadline)
     except HandshakeError as exc:
         print(f"MCP handshake with {args.url} failed: {exc}")
         return 2

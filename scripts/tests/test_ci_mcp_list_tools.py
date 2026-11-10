@@ -278,7 +278,7 @@ def test_a_json_answer_that_trickles_in_meets_the_deadline(server, monkeypatch, 
         monkeypatch, capsys, server("json-slow").url, "--timeout", "10", "--deadline", "1"
     )
     assert code == 2
-    assert "failed: the deadline of 1 s passed" in out
+    assert "failed: the deadline of 1 s passed during the answer to tools/list" in out
     assert time.monotonic() - started < 5
 
 
@@ -288,7 +288,7 @@ def test_headers_that_trickle_in_meet_the_deadline(server, monkeypatch, capsys):
         monkeypatch, capsys, server("headers-slow").url, "--timeout", "10", "--deadline", "1"
     )
     assert code == 2
-    assert "failed: the deadline of 1 s passed" in out
+    assert "failed: the deadline of 1 s passed during tools/list" in out
     assert time.monotonic() - started < 5
 
 
@@ -298,7 +298,7 @@ def test_an_event_line_that_trickles_in_meets_the_deadline(server, monkeypatch, 
         monkeypatch, capsys, server("sse-slow-line").url, "--timeout", "10", "--deadline", "1"
     )
     assert code == 2
-    assert "failed: the deadline of 1 s passed" in out
+    assert "failed: the deadline of 1 s passed during the event stream of tools/list" in out
     assert time.monotonic() - started < 5
 
 
@@ -332,7 +332,7 @@ def test_a_stream_that_never_answers_meets_the_deadline(server, monkeypatch, cap
         monkeypatch, capsys, server("sse-silent").url, "--timeout", "10", "--deadline", "1"
     )
     assert code == 2
-    assert "failed: the deadline of 1 s passed" in out
+    assert "failed: the deadline of 1 s passed during the event stream of tools/list" in out
     assert time.monotonic() - started < 5
 
 
