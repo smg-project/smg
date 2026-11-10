@@ -4,10 +4,11 @@ use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     messages::CreateMessageRequest, responses::ResponsesRequest,
 };
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::{debug, warn};
 
 use crate::{
+    channel::Channel,
     request_fields::{
         body_format, completion_constraint, plain_constraint, stop_strings, ConstraintKind,
         OutputConstraint, PlainSampling,
@@ -720,7 +721,11 @@ mod tests {
         .expect("a completion request");
         let client = TrtllmServiceClient {
             client: proto::trtllm_service_client::TrtllmServiceClient::new(
-                Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+                Channel::unconnected(
+                    "http://127.0.0.1:1",
+                    crate::channel::DEFAULT_CONNECT_TIMEOUT,
+                )
+                .expect("a channel to nowhere"),
             ),
             trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
         };
@@ -1044,7 +1049,11 @@ mod tests {
         // runtime a channel needs): the builders dial nothing.
         let client = TrtllmServiceClient {
             client: proto::trtllm_service_client::TrtllmServiceClient::new(
-                Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+                Channel::unconnected(
+                    "http://127.0.0.1:1",
+                    crate::channel::DEFAULT_CONNECT_TIMEOUT,
+                )
+                .expect("a channel to nowhere"),
             ),
             trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
         };

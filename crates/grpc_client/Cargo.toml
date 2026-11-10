@@ -20,7 +20,7 @@ name = "smg_grpc_client"
 openai-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tracing.workspace = true
 
 # gRPC dependencies
@@ -32,14 +32,13 @@ prost-types.workspace = true
 # Async/concurrency
 futures.workspace = true
 
-# The HTTP/2 layer under tonic: the type of the transport fault a
-# `tonic::Status` made of one carries in its source chain
-# (`channel::is_transport_failure`); also the raw peer of the channel tests.
+# The HTTP/2 layer the channel runs on (`channel`): the connection, its
+# streams and pings; also the type of the transport fault a `tonic::Status`
+# made of one carries in its source chain (`channel::is_transport_failure`),
+# and the raw peer of the channel tests.
 h2 = "0.4.19"
-# The HTTP layer under tonic's channel: the type of the I/O failure under a
-# call (the socket reset or closed) a `tonic::Status` carries in its source
-# chain, without an `h2::Error` (`channel::is_transport_failure`).
-hyper = { version = "1", default-features = false }
+# The HTTP body frame the channel hands tonic for a response.
+http-body = "1"
 
 # Archive validation
 sha2 = "0.11"
@@ -50,12 +49,9 @@ tempfile = "3.27"
 tonic-prost-build = "0.14.6"
 
 [dev-dependencies]
-# The in-memory IO of the channel tests' raw HTTP/2 peer.
-hyper-util = { version = "0.1", features = ["tokio"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 # Mock-server harness for the abort-on-drop behavioral tests.
 tokio-stream = { version = "0.1", features = ["net"] }
-tower = { version = "0.5", default-features = false }
 
 [lints]
 workspace = true
