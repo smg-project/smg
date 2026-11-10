@@ -10,7 +10,10 @@ use tokio::sync::Semaphore;
 use super::*;
 use crate::{
     middleware::scheduler,
-    policies::{cost as selection_cost, engine_host::preset_name},
+    policies::{
+        cost as selection_cost,
+        engine_host::{preset_name, Decider},
+    },
     worker::endpoint::Endpoint,
 };
 
@@ -417,17 +420,16 @@ pub(crate) struct ConfigValidator;
 impl ConfigValidator {
     /// Under `--policy-engine engine` every policy that decides (the default
     /// and the two pair sides) is one whose stages the engine carries in
-    /// this build.
+    /// this build, and the engine itself accepts the configuration: the
+    /// decider is built once here, so a tunable the engine refuses fails
+    /// the start instead of falling back to the legacy path.
     fn validate_policy_engine(config: &RouterConfig) -> ConfigResult<()> {
         if config.policy_engine != PolicyEngineMode::Engine {
             return Ok(());
         }
-        let policies = [
-            &config.policy,
-            config.mode.get_prefill_policy(&config.policy),
-            config.mode.get_decode_policy(&config.policy),
-        ];
-        for policy in policies {
+        let prefill = config.mode.get_prefill_policy(&config.policy);
+        let decode = config.mode.get_decode_policy(&config.policy);
+        for policy in [&config.policy, prefill, decode] {
             if preset_name(policy).is_none() {
                 return Err(ConfigError::invalid_value(
                     "policy_engine",
@@ -437,6 +439,15 @@ impl ConfigValidator {
                 ));
             }
         }
+        Decider::from_configs(&config.policy, prefill, decode).map_err(|error| {
+            let mut names = vec![config.policy.name()];
+            for policy in [prefill, decode] {
+                if !names.contains(&policy.name()) {
+                    names.push(policy.name());
+                }
+            }
+            ConfigError::invalid_value("policy_engine", names.join("/"), error.to_string())
+        })?;
         Ok(())
     }
 
@@ -2622,6 +2633,32 @@ mod tests {
             ConfigValidator::validate(&config),
             Err(ConfigError::InvalidValue { ref field, .. }) if field == "cache_boundaries"
         ));
+    }
+
+    /// A tunable the engine refuses (a default throughput that overflows the
+    /// engine's single-precision parameter) fails the start under the
+    /// switch instead of falling back; the legacy path takes it.
+    #[test]
+    fn the_engine_switch_refuses_a_tunable_the_engine_cannot_carry() {
+        let config = RouterConfig {
+            policy_engine: PolicyEngineMode::Engine,
+            policy: PolicyConfig::LeastLoad {
+                kv_pressure_weight: 0.15,
+                mean_prefill_tokens: 1024,
+                default_throughput: 1e40,
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, ref value, ref reason })
+                if field == "policy_engine" && value == "least_load" && reason.contains("default_throughput")
+        ));
+        let legacy = RouterConfig {
+            policy_engine: PolicyEngineMode::Legacy,
+            ..config
+        };
+        assert!(ConfigValidator::validate(&legacy).is_ok());
     }
 
     /// Under `engine` a policy the engine does not carry is refused at start

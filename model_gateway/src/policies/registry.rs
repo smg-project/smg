@@ -9,7 +9,7 @@ use std::{
 use dashmap::DashMap;
 use http::{header::HeaderName, HeaderMap};
 use parking_lot::{Mutex, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Policy Registry for managing model-to-policy mappings
 ///
@@ -284,9 +284,10 @@ impl PolicyRegistry {
 
     /// Select the implementation that decides (`--policy-engine`): under
     /// `engine` the policy engine is built from the default policy and the
-    /// two pair-side policies. The validator refuses a configuration the
-    /// engine cannot serve at start; a direct construction that reaches here
-    /// with one keeps the legacy path and says so.
+    /// two pair-side policies. The validator builds the same decider at
+    /// start and refuses what the engine refuses, so a refusal here is a
+    /// construction that skipped validation; it keeps the legacy path and
+    /// says so at error level.
     #[must_use]
     pub fn with_policy_engine(
         mut self,
@@ -305,7 +306,7 @@ impl PolicyRegistry {
                     self.decider = Some(Arc::new(decider));
                 }
                 Err(error) => {
-                    warn!(%error, "The policy engine cannot serve this configuration; the legacy policies decide");
+                    error!(%error, "The policy engine refused a configuration the validator did not see; the legacy policies decide");
                 }
             }
         }

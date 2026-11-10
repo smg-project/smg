@@ -124,16 +124,48 @@ fn tune(profile: &mut ProfileSpec, config: &PolicyConfig) {
         PolicyConfig::PowerOfTwo {
             load_metric: PowerOfTwoLoadMetric::Requests,
         } => {
-            profile.score = vec![ScoreSpec::Name("least-requests".into())];
+            profile.score = count_then_wait();
         }
         PolicyConfig::PowerOfTwo {
             load_metric: PowerOfTwoLoadMetric::LeastRequests,
         } => {
-            profile.score = vec![ScoreSpec::Name("least-requests".into())];
+            profile.score = count_then_wait();
             profile.pick = "best".into();
         }
         _ => {}
     }
+}
+
+/// The weight of the in-flight count against the expected wait in the two
+/// in-flight metrics' score: the engine combines normalized scores by
+/// weight, so this ratio reads as the policies' two stages, the fewest in
+/// flight first and the expected wait among them. Two bounds follow from
+/// the normalization: the count order is exact while the pool's in-flight
+/// span stays below the weight, and under the `best` picker equal counts
+/// whose waits differ by less than the weight times the picker's band (one
+/// millionth of the wait span per unit, a thousandth of it here) draw by
+/// the seed, where the policies tie at a microsecond. An exact two-stage
+/// form is a fewest-in-flight stage in the engine, a later step's.
+const COUNT_FIRST_WEIGHT: f32 = 1000.0;
+
+/// The score chain of `power_of_two` under its `requests` and
+/// `least_requests` metrics: the host's in-flight count, then the
+/// expected wait on equal counts (see [`COUNT_FIRST_WEIGHT`]).
+fn count_then_wait() -> Vec<ScoreSpec> {
+    let mut count = std::collections::BTreeMap::new();
+    count.insert(
+        "least-requests".to_string(),
+        ScoreParams {
+            weight: COUNT_FIRST_WEIGHT,
+            kv_pressure_weight: None,
+            mean_prefill_tokens: None,
+            default_throughput: None,
+        },
+    );
+    vec![
+        ScoreSpec::Named(count),
+        ScoreSpec::Name("least-load".into()),
+    ]
 }
 
 /// The stable id of a worker in the view: its registration key (the URL)
@@ -417,8 +449,9 @@ impl Decider {
     /// (with `has_capacity` as the admission window reads it now), the
     /// decode profile over the partners of the chosen prefill. `partners(i)`
     /// lists the open partners of `prefills[i]`; the decode rows of each
-    /// prefill form its pair class. The returned workers are the decode
-    /// rows in position order, for the target's decode side.
+    /// prefill form its pair class. The request's tried URLs and `excluded`
+    /// reach both sides. The returned workers are the decode rows in
+    /// position order, for the target's decode side.
     pub fn decide_pair(
         &self,
         request: &HostRequest<'_>,
@@ -458,7 +491,11 @@ impl Decider {
                 candidates.push(candidate);
                 for decode in partners(i) {
                     let position = decode_workers.len() as u32;
-                    decodes.push(self.candidate(&build, position, &decode, true, class));
+                    let row = self.candidate(&build, position, &decode, true, class);
+                    if request.tried.iter().any(|url| url == decode.base_url()) {
+                        tried.push(row.id);
+                    }
+                    decodes.push(row);
                     decode_workers.push(decode);
                 }
             }
@@ -485,6 +522,7 @@ impl Decider {
                 ..Constraints::default()
             };
             let decode_cx = Constraints {
+                excluded,
                 overload_lifted: lift_decode,
                 ..Constraints::default()
             };
@@ -554,8 +592,11 @@ impl Decider {
 
 /// One worker's load row from its report, in one pass over the ranks: the
 /// request and token counts summed, the KV ratios averaged, the drain rate
-/// as the policies read it today (a prefill's measured prefill throughput;
-/// otherwise the generation rate of the ranks with a request running).
+/// as the policies read it today. A prefill's drain is its measured input
+/// capacity, which only a complete report with every rank's rate states: a
+/// partial report or a rank without a rate leaves it unknown (zero), and
+/// the scorer prices the worker at the fleet's nominal rate. Any other
+/// role's drain is the generation rate of the ranks with a request running.
 fn load_row(
     report: &WorkerLoadResponse,
     worker_type: WorkerType,
@@ -569,6 +610,9 @@ fn load_row(
     let mut kv_usage = 0.0f64;
     let mut active_kv = 0.0f64;
     let mut live_rate = 0.0f64;
+    let complete = !report.loads.is_empty()
+        && report.loads.len() >= usize::try_from(report.dp_rank_count).unwrap_or(0);
+    let mut prefill_rate: Option<f64> = complete.then_some(0.0);
     let mut resident: Option<i64> = Some(0);
     for rank in &report.loads {
         running += i64::from(rank.num_running_reqs);
@@ -577,15 +621,22 @@ fn load_row(
         max_running += i64::from(rank.max_running_requests);
         kv_usage += rank.token_usage;
         active_kv += rank.active_token_usage.unwrap_or(rank.token_usage);
-        live_rate += match worker_type {
-            WorkerType::Prefill => rank
-                .prefill_throughput
-                .filter(|rate| rate.is_finite() && *rate > 0.0)
-                .unwrap_or(0.0),
-            _ if rank.num_running_reqs > 0 => rank.gen_throughput,
-            _ => 0.0,
-        };
+        match worker_type {
+            WorkerType::Prefill => {
+                prefill_rate = prefill_rate
+                    .zip(
+                        rank.prefill_throughput
+                            .filter(|rate| rate.is_finite() && *rate > 0.0),
+                    )
+                    .map(|(sum, rate)| sum + rate);
+            }
+            _ if rank.num_running_reqs > 0 => live_rate += rank.gen_throughput,
+            _ => {}
+        }
         resident = resident.zip(rank.num_resident_tokens).map(|(a, b)| a + b);
+    }
+    if matches!(worker_type, WorkerType::Prefill) {
+        live_rate = prefill_rate.unwrap_or(0.0);
     }
     let ranks = report.loads.len().max(1) as f64;
     LoadRow {
@@ -744,7 +795,9 @@ mod tests {
         let taken = decider
             .commit(&lease, &first, Side::Single, |_| true)
             .expect("a target");
-        for _ in 0..3 {
+        // Twenty decisions: without the booking the two workers tie and the
+        // picker draws the tie from the seed.
+        for _ in 0..20 {
             let (second, _) = decider.decide(&request, &workers, &[]);
             let next = second.pick().expect("a pick").targets.first().copied();
             assert_eq!(
@@ -950,6 +1003,190 @@ mod tests {
         let row = load_row(&report, WorkerType::Regular, now, now);
         assert_eq!((row.kv_usage_permille, row.active_kv_permille), (500, 300));
         assert_eq!((row.running, row.live_rate), (2, 4000));
+    }
+
+    /// A prefill's drain is unknown unless the report is complete and every
+    /// rank states a rate: one rateless rank or a partial report reads zero
+    /// (the fleet's nominal rate at the scorer), as the policies read it.
+    #[test]
+    fn a_partial_or_rateless_prefill_report_leaves_the_drain_unknown() {
+        let now = Instant::now();
+        let mut report = one_rank_load(0, 0.1, 2000.0);
+        report.loads[0].prefill_throughput = Some(5000.0);
+        let mut second = report.loads[0].clone();
+        second.dp_rank = 1;
+        second.prefill_throughput = None;
+        report.loads.push(second);
+        report.dp_rank_count = 2;
+        assert_eq!(
+            load_row(&report, WorkerType::Prefill, now, now).live_rate,
+            0
+        );
+        report.loads[1].prefill_throughput = Some(3000.0);
+        assert_eq!(
+            load_row(&report, WorkerType::Prefill, now, now).live_rate,
+            8000
+        );
+        report.dp_rank_count = 4;
+        assert_eq!(
+            load_row(&report, WorkerType::Prefill, now, now).live_rate,
+            0
+        );
+        assert_eq!(
+            load_row(&report, WorkerType::Regular, now, now).live_rate,
+            4000,
+            "a regular worker's drain is its ranks' generation rate"
+        );
+    }
+
+    /// The two in-flight metrics keep the policies' two stages: the fewest
+    /// in flight first, the expected wait among equal counts. Equal counts
+    /// over a busy and an idle report take the idle worker on every seed;
+    /// a lower count beats a lighter load.
+    #[test]
+    fn equal_counts_fall_to_the_expected_wait_and_a_lower_count_wins_over_load() {
+        let workers = pool(2);
+        let (_tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(vec![
+            (
+                workers[0].url().to_string(),
+                one_rank_load(4096, 0.5, 2000.0),
+            ),
+            (workers[1].url().to_string(), one_rank_load(0, 0.1, 2000.0)),
+        ]));
+        let request = HostRequest {
+            prompt_tokens: 512,
+            ..request()
+        };
+        for metric in [
+            PowerOfTwoLoadMetric::Requests,
+            PowerOfTwoLoadMetric::LeastRequests,
+        ] {
+            let decider = decider(&PolicyConfig::PowerOfTwo {
+                load_metric: metric,
+            });
+            decider.set_load_receiver(Some(rx.clone()));
+            for _ in 0..20 {
+                let (decision, _) = decider.decide(&request, &workers, &[]);
+                let first = decision.pick().expect("a pick").targets.first().copied();
+                assert_eq!(
+                    first.map(|t| t.position),
+                    Some(1),
+                    "{metric:?}: equal counts, the idle report wins"
+                );
+            }
+        }
+        // The idle worker now carries the higher count: the count decides.
+        workers[1].increment_load();
+        workers[1].increment_load();
+        let decider = decider(&PolicyConfig::PowerOfTwo {
+            load_metric: PowerOfTwoLoadMetric::LeastRequests,
+        });
+        decider.set_load_receiver(Some(rx));
+        for _ in 0..20 {
+            let (decision, _) = decider.decide(&request, &workers, &[]);
+            let first = decision.pick().expect("a pick").targets.first().copied();
+            assert_eq!(
+                first.map(|t| t.position),
+                Some(0),
+                "the lower count beats the lighter load"
+            );
+        }
+    }
+
+    /// Three workers at equal counts with waits far apart: the pool's wait
+    /// span normalizes the two lighter waits close together, and the
+    /// composition still takes the idle worker on every seed under
+    /// `least_requests`; `requests` never takes the heaviest.
+    #[test]
+    fn equal_counts_over_three_workers_still_take_the_idle_one() {
+        let workers = pool(3);
+        let (_tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(vec![
+            (workers[0].url().to_string(), one_rank_load(0, 0.1, 2000.0)),
+            (
+                workers[1].url().to_string(),
+                one_rank_load(1000, 0.1, 2000.0),
+            ),
+            (
+                workers[2].url().to_string(),
+                one_rank_load(20_000, 0.1, 2000.0),
+            ),
+        ]));
+        let request = HostRequest {
+            prompt_tokens: 512,
+            ..request()
+        };
+        let least = decider(&PolicyConfig::PowerOfTwo {
+            load_metric: PowerOfTwoLoadMetric::LeastRequests,
+        });
+        least.set_load_receiver(Some(rx.clone()));
+        let sampled = decider(&PolicyConfig::PowerOfTwo {
+            load_metric: PowerOfTwoLoadMetric::Requests,
+        });
+        sampled.set_load_receiver(Some(rx));
+        for _ in 0..20 {
+            let (decision, _) = least.decide(&request, &workers, &[]);
+            let first = decision.pick().expect("a pick").targets.first().copied();
+            assert_eq!(
+                first.map(|t| t.position),
+                Some(0),
+                "the idle worker at five percent of the span: {decision:?}"
+            );
+            let (decision, _) = sampled.decide(&request, &workers, &[]);
+            let first = decision.pick().expect("a pick").targets.first().copied();
+            assert_ne!(first.map(|t| t.position), Some(2), "{decision:?}");
+        }
+    }
+
+    /// The decode side reads the request's tried URLs and the exclusions as
+    /// the prefill side does: a tried or excluded decode is passed over
+    /// while a partner remains.
+    #[test]
+    fn a_pair_decision_passes_over_a_tried_or_excluded_decode() {
+        let decider = decider(&PolicyConfig::RoundRobin);
+        let prefills = vec![worker_of("http://p0:8000", WorkerType::Prefill)];
+        let decodes = [
+            worker_of("http://d0:8000", WorkerType::Decode),
+            worker_of("http://d1:8000", WorkerType::Decode),
+        ];
+        let partners = |_: usize| -> Vec<Arc<dyn Worker>> { decodes.to_vec() };
+        let tried = [decodes[0].base_url().to_string()];
+        let after_d0 = HostRequest {
+            phase: Phase::Prefill,
+            tried: &tried,
+            ..request()
+        };
+        let decode_of = |decision: &Decision| {
+            decision
+                .pick()
+                .expect("a pair")
+                .targets
+                .first()
+                .and_then(|t| t.pair)
+                .map(|p| p.decode_position)
+        };
+        for _ in 0..20 {
+            let (decision, _, _) =
+                decider.decide_pair(&after_d0, &prefills, &|_| true, &partners, false, &[]);
+            assert_eq!(
+                decode_of(&decision),
+                Some(1),
+                "the tried decode: {decision:?}"
+            );
+        }
+        let excluded = [worker_id(decodes[0].as_ref())];
+        let fresh = HostRequest {
+            phase: Phase::Prefill,
+            ..request()
+        };
+        for _ in 0..20 {
+            let (decision, _, _) =
+                decider.decide_pair(&fresh, &prefills, &|_| true, &partners, false, &excluded);
+            assert_eq!(
+                decode_of(&decision),
+                Some(1),
+                "the excluded decode: {decision:?}"
+            );
+        }
     }
 
     #[test]
