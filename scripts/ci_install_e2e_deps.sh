@@ -55,9 +55,9 @@ fi
 # `import grpc_health.v1.health_pb2`, and the sglang gRPC server at
 # `grpc_reflection/v1alpha/reflection.proto`. The 1.81.x line caps protobuf<7 and
 # ships the 6.x gencode, so it stays compatible. This runs last to override
-# whatever engine/extra-dep installs selected. (grpcio core has no generated
-# protobuf, so it is left at the engine-selected version.) Drop the cap once the
-# stack moves to a protobuf 7 runtime.
+# whatever engine/extra-dep installs selected. Their requirements can upgrade
+# grpcio core too; a lane retaining image-selected gRPC must set the companion
+# override below. Drop the cap once the stack moves to a protobuf 7 runtime.
 # ROCm image setup can retain its installed companions for this Actions job.
 SMG_CI_GRPC_COMPANION_VERSION="${SMG_CI_GRPC_COMPANION_VERSION:-1.81.*}"
 $RETRY 3 10 python3 -m pip install \

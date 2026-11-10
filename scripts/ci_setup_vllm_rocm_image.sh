@@ -3,8 +3,7 @@
 #
 # The image already ships vLLM with its ROCm stack, NIXL, UCX and MoRI, so this
 # builds a venv on top of the image's packages instead of installing an engine.
-# The venv exists because smg-grpc-servicer needs grpcio >= 1.81.1 and the
-# image's vLLM pins 1.78.0; in vLLM only the gRPC launcher imports grpc.
+# Job-specific packages live in a venv; the engine keeps its image version.
 
 set -euo pipefail
 
