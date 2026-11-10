@@ -37,7 +37,7 @@ use openai_protocol::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
         RealtimeTranscriptionSessionCreateRequest,
     },
-    rerank::{RerankRequest, RerankResponse, RerankResult},
+    rerank::{RerankRequest, RerankResponse, RerankWorkerResponse},
     responses::ResponsesRequest,
     systemone::SystemOneRequest,
     transcription::{AudioFile, TranscriptionRequest},
@@ -1642,6 +1642,14 @@ impl Router {
     /// client addressed the model by an alias; reporting the alias would make
     /// this route disagree with every other one about which model ran.
     ///
+    /// The worker's body is read as a [`RerankWorkerResponse`]: the bare
+    /// result list or the Cohere-style `results` object, in either's spelling
+    /// of the score and the document, so a worker of any of the rerank
+    /// contracts answers in the gateway's one shape. The results keep the
+    /// worker's order (every contract sorts them, highest score first);
+    /// `top_k` and `return_documents` are applied here, whatever the worker
+    /// made of them.
+    ///
     /// The worker body read is capped at `max_body_bytes`; a larger body is a
     /// misbehaving worker and yields a 502.
     async fn build_rerank_response(
@@ -1674,8 +1682,8 @@ impl Router {
                 );
             }
         };
-        let rerank_results = match serde_json::from_slice::<Vec<RerankResult>>(&body_bytes) {
-            Ok(results) => results,
+        let rerank_results = match serde_json::from_slice::<RerankWorkerResponse>(&body_bytes) {
+            Ok(response) => response.into_results(),
             Err(e) => {
                 error!("Failed to build rerank response: {e}");
                 return error::internal_error(
@@ -1686,7 +1694,8 @@ impl Router {
         };
         let model = canonical_model.map_or(req.model, ToOwned::to_owned);
         let mut rerank_response = RerankResponse::new(rerank_results, model, req.rid);
-        // Sorting is handled by Python worker (serving_rerank.py)
+        // The worker's order stands: every rerank contract answers sorted,
+        // highest score first.
         if let Some(top_k) = req.top_k {
             rerank_response.apply_top_k(top_k);
         }
@@ -2869,6 +2878,7 @@ mod tests {
     };
 
     use axum::http::header::{CONTENT_LENGTH, RETRY_AFTER};
+    use openai_protocol::rerank::RerankResult;
     use serde_json::{json, Value};
 
     use super::*;
@@ -3599,6 +3609,123 @@ mod tests {
             },
         ])
         .unwrap()
+    }
+
+    /// The gateway's response to a worker that answered `body`, with every
+    /// document asked for and no `top_k`.
+    async fn rerank_response_of(body: &str) -> RerankResponse {
+        let req = RerankRequest {
+            top_k: None,
+            return_documents: true,
+            ..rerank_request()
+        };
+        let upstream = Response::new(Body::from(body.to_string()));
+        let response = Router::build_rerank_response(
+            RerankResponseSpec::from(&req),
+            None,
+            upstream,
+            usize::MAX,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the body is read: {body}"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_results_object_with_relevance_scores_is_answered_in_the_gateway_shape() {
+        // The Cohere-style object: no document echoed, the object's own
+        // fields beside `results` unread.
+        let rerank = rerank_response_of(
+            r#"{"model": "test-model", "object": "list",
+                "usage": {"prompt_tokens": 12, "total_tokens": 12},
+                "results": [{"index": 1, "relevance_score": 0.93},
+                            {"index": 0, "relevance_score": 0.07}]}"#,
+        )
+        .await;
+        assert_eq!(rerank.model, "test-model");
+        let (first, second) = (&rerank.results[0], &rerank.results[1]);
+        assert_eq!((first.index, first.score), (1, 0.93));
+        assert_eq!((second.index, second.score), (0, 0.07));
+        assert_eq!(
+            first.document, None,
+            "a worker that echoes no document yields none"
+        );
+        assert!(rerank.usage.is_none(), "the worker's usage is not read");
+    }
+
+    #[tokio::test]
+    async fn a_document_object_and_the_text_spelling_read_as_the_document() {
+        let rerank = rerank_response_of(
+            r#"{"id": "r1", "model": "test-model", "usage": {"total_tokens": 9},
+                "results": [{"index": 0, "document": {"text": "d1"}, "relevance_score": 0.8}]}"#,
+        )
+        .await;
+        assert_eq!(rerank.results[0].document.as_deref(), Some("d1"));
+
+        let rerank = rerank_response_of(
+            r#"[{"index": 1, "score": 0.6, "text": "d2"}, {"index": 0, "score": 0.4}]"#,
+        )
+        .await;
+        assert_eq!(rerank.results[0].document.as_deref(), Some("d2"));
+        assert_eq!(rerank.results[1].document, None);
+        assert_eq!((rerank.results[1].index, rerank.results[1].score), (0, 0.4));
+    }
+
+    #[tokio::test]
+    async fn top_k_and_return_documents_apply_to_a_results_object_as_to_the_native_list() {
+        // `rerank_request` asks for one result and no documents.
+        let req = rerank_request();
+        let body = r#"{"results": [{"index": 0, "document": {"text": "d1"}, "relevance_score": 0.9},
+                                   {"index": 1, "document": {"text": "d2"}, "relevance_score": 0.5}]}"#;
+        let response = Router::build_rerank_response(
+            RerankResponseSpec::from(&req),
+            None,
+            Response::new(Body::from(body)),
+            usize::MAX,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rerank: RerankResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(rerank.results.len(), 1, "top_k truncates the worker's list");
+        assert_eq!(
+            rerank.results[0].document, None,
+            "return_documents false drops the echoed document"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_in_no_rerank_shape_is_a_build_failure_not_a_pass_through() {
+        for body in [
+            r#"{"error": {"message": "no reranker loaded"}}"#,
+            r#"[{"index": 0}]"#,
+            "not json",
+        ] {
+            let req = rerank_request();
+            let response = Router::build_rerank_response(
+                RerankResponseSpec::from(&req),
+                None,
+                Response::new(Body::from(body)),
+                usize::MAX,
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{body}"
+            );
+            assert_eq!(
+                extract_error_code_from_response(&response),
+                "rerank_response_build_failed",
+                "{body}"
+            );
+        }
     }
 
     #[tokio::test]
