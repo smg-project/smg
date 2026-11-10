@@ -13,12 +13,18 @@ categories = ["algorithms"]
 # controller, a binding).
 parking_lot = { workspace = true }
 rustc-hash = "2"
+# The spec's JSON schema is generated from its types; serde_json renders it
+# as the committed artifact.
+schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.8"
-serde_json = { workspace = true }
+# The corpus test reads YAML documents; the gateway reads its spec file with
+# the same crate.
+serde_yaml = "0.9"
 
 [[bench]]
 name = "decision"
