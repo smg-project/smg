@@ -101,8 +101,8 @@ use openai_protocol::{
 
 use super::*;
 use crate::worker::{
-    circuit_breaker::CircuitState, BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker,
-    WorkerError, WorkerRegistry, WorkerType,
+    circuit_breaker::CircuitState, test_support::RefusedAddress, BasicWorkerBuilder,
+    ConnectionMode, RuntimeType, Worker, WorkerError, WorkerRegistry, WorkerType,
 };
 
 fn make_worker(url: &str, success_threshold: u32, failure_threshold: u32) -> Arc<dyn Worker> {
@@ -1476,13 +1476,9 @@ async fn engine_metrics_tries_the_next_registration_when_stale_credentials_get_a
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn engine_metrics_logs_a_failed_scrape_without_its_credentials() {
-    // A port nothing listens on: bound to learn its number, then released.
-    let closed = {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a port to release");
-        listener.local_addr().expect("the port").port()
-    };
+    // The down engine's port: held and refused for the whole case.
+    let down = RefusedAddress::reserve();
+    let closed = down.port();
     let registry = WorkerRegistry::new();
     registry
         .register(make_worker(
@@ -1519,13 +1515,10 @@ async fn engine_metrics_logs_a_failed_scrape_without_its_credentials() {
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn engine_metrics_closes_an_address_on_a_transport_error() {
-    // A port nothing listens on: bound to learn its number, then released.
-    let closed = {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind a port to release");
-        listener.local_addr().expect("the port").port()
-    };
+    // The down engine's port: held and refused for the whole case, so no
+    // later bind, the healthy stub's included, can draw it.
+    let down = RefusedAddress::reserve();
+    let closed = down.port();
     let healthy_hits = Arc::new(AtomicUsize::new(0));
     let healthy = start_metrics_stub(healthy_hits.clone()).await;
 

@@ -48,7 +48,7 @@ use tonic::{
     codegen::{
         http::{
             header::{HeaderValue, USER_AGENT},
-            uri::Uri,
+            uri::{Authority, Uri},
             Request, Response, Version,
         },
         Body as _, Bytes, Service,
@@ -156,9 +156,10 @@ impl Service<Request<tonic::body::Body>> for Channel {
 /// [`DEFAULT_CONNECT_TIMEOUT`].
 ///
 /// The endpoint may use `http://` or `grpc://`; the gRPC scheme is
-/// normalised to its HTTP equivalent before the URI is parsed. TLS endpoints
-/// are refused (see [`normalize_grpc_endpoint`] for the scheme rewrite and
-/// the config validator for the refusal at start-up).
+/// normalised to its HTTP equivalent before the URI is parsed. A userinfo in
+/// the endpoint is not forwarded: every call's `:authority` is the host and
+/// port. TLS endpoints are refused (see [`normalize_grpc_endpoint`] for the
+/// scheme rewrite and the config validator for the refusal at start-up).
 pub async fn connect_channel(
     endpoint: &str,
 ) -> Result<Channel, Box<dyn std::error::Error + Send + Sync>> {
@@ -266,7 +267,15 @@ impl Channel {
 }
 
 /// `endpoint` as the origin of a channel's calls: a plain `http://` URI with
-/// a host, the gRPC scheme normalised first.
+/// a host, the gRPC scheme normalised first, its authority the host and port
+/// alone.
+///
+/// A userinfo written into a worker URL (`user:secret@host:port`) stays out
+/// of the origin: `http` keeps it in the URI's authority and h2 writes that
+/// authority whole into every request's `:authority`, a pseudo-header that
+/// names the host and port and nothing else, so it is cut here, once, as the
+/// origin is built. The host and port stay as the endpoint wrote them (an
+/// IPv6 literal's brackets, a port left to the default).
 ///
 /// `https://` (`grpcs://`) is refused: the channel speaks plain HTTP/2 over
 /// TCP. tonic's channel carried its TLS code into the gateway binary (a
@@ -284,10 +293,16 @@ fn origin_of(endpoint: &str) -> Result<Uri, BoxError> {
         )
         .into());
     }
-    if origin.host().is_none() {
-        return Err("the endpoint names no host".into());
-    }
-    Ok(origin)
+    // The authority as the calls write it: what follows the userinfo, when
+    // the endpoint carries one.
+    let host_port = match origin.authority().map(|a| a.as_str().rsplit_once('@')) {
+        None => return Err("the endpoint names no host".into()),
+        Some(None) => return Ok(origin),
+        Some(Some((_userinfo, host_port))) => host_port.parse::<Authority>()?,
+    };
+    let mut parts = origin.into_parts();
+    parts.authority = Some(host_port);
+    Ok(Uri::from_parts(parts)?)
 }
 
 /// What the diagnostics call `origin`'s peer: host and port, never the

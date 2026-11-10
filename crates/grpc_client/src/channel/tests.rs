@@ -54,6 +54,31 @@ fn an_endpoint_without_a_plain_http_origin_is_refused_before_any_dial() {
     );
 }
 
+/// The origin's authority, the `:authority` of every call, is the host and
+/// port as the endpoint wrote them (an IPv6 literal's brackets, a port left
+/// to the default), never the userinfo in front of them.
+#[test]
+fn the_origin_authority_is_the_host_and_port_without_the_userinfo() {
+    for (endpoint, authority) in [
+        ("grpc://user:secret@worker:8080", "worker:8080"),
+        // A raw `@` inside the userinfo: the host follows the last one.
+        ("grpc://user:p@ss@worker:8080", "worker:8080"),
+        ("http://token@10.0.0.5:8000", "10.0.0.5:8000"),
+        ("grpc://user:secret@[::1]:8080", "[::1]:8080"),
+        ("grpc://user:secret@worker", "worker"),
+        ("grpc://worker:8080", "worker:8080"),
+        ("http://[::1]:8080", "[::1]:8080"),
+        ("http://worker", "worker"),
+    ] {
+        let channel = Channel::unconnected(endpoint, DEFAULT_CONNECT_TIMEOUT).expect(endpoint);
+        assert_eq!(
+            channel.shared.origin.authority().map(|a| a.as_str()),
+            Some(authority),
+            "{endpoint}"
+        );
+    }
+}
+
 #[test]
 fn normalize_grpc_to_http() {
     assert_eq!(
@@ -215,12 +240,12 @@ impl http_body::Body for OneFrame {
 }
 
 /// Serve `io` as a gRPC peer that answers every request with an OK
-/// status and one empty message, over h2's server API; `on_request` runs
-/// as each request arrives. Ends with the connection.
-async fn serve_grpc_ok(io: TcpStream, on_request: impl Fn()) {
+/// status and one empty message, over h2's server API; `on_request` reads
+/// each request as it arrives. Ends with the connection.
+async fn serve_grpc_ok(io: TcpStream, on_request: impl Fn(&http::Request<h2::RecvStream>)) {
     let mut connection = h2::server::handshake(io).await.expect("h2 handshake");
     while let Some(Ok((request, mut respond))) = connection.accept().await {
-        on_request();
+        on_request(&request);
         let response = http::Response::builder()
             .status(200)
             .header("content-type", "application/grpc")
@@ -243,13 +268,16 @@ async fn serve_grpc_ok(io: TcpStream, on_request: impl Fn()) {
 
 /// A loopback gRPC peer that answers OK on every connection until it is
 /// stopped; counts its connections and its requests, and records the
-/// runtime's live task count at each request.
+/// runtime's live task count and the `:authority` at each request.
 struct OkPeer {
     url: String,
     /// One task per accepted connection: their count is the peer's connection count.
     connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     requests: Arc<AtomicUsize>,
     tasks_at_request: Arc<AtomicUsize>,
+    /// Each request's `:authority`, as the peer decoded it from the HEADERS
+    /// frame (h2's server rebuilds the request's URI from the pseudo-headers).
+    authorities: Arc<Mutex<Vec<String>>>,
     serving: tokio::task::JoinHandle<()>,
 }
 
@@ -263,10 +291,12 @@ impl OkPeer {
         let connections = Arc::new(Mutex::new(Vec::new()));
         let requests = Arc::new(AtomicUsize::new(0));
         let tasks_at_request = Arc::new(AtomicUsize::new(0));
-        let (kept, served, tasks) = (
+        let authorities = Arc::new(Mutex::new(Vec::new()));
+        let (kept, served, tasks, seen) = (
             Arc::clone(&connections),
             Arc::clone(&requests),
             Arc::clone(&tasks_at_request),
+            Arc::clone(&authorities),
         );
         #[expect(
             clippy::disallowed_methods,
@@ -275,15 +305,23 @@ impl OkPeer {
         let serving = tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.expect("accept");
-                let (served, tasks) = (Arc::clone(&served), Arc::clone(&tasks));
+                let (served, tasks, seen) =
+                    (Arc::clone(&served), Arc::clone(&tasks), Arc::clone(&seen));
                 #[expect(clippy::disallowed_methods, reason = "test-only peer connection")]
-                let connection = tokio::spawn(serve_grpc_ok(stream, move || {
+                let connection = tokio::spawn(serve_grpc_ok(stream, move |request| {
                     served.fetch_add(1, Ordering::SeqCst);
                     tasks.store(
                         tokio::runtime::Handle::current()
                             .metrics()
                             .num_alive_tasks(),
                         Ordering::SeqCst,
+                    );
+                    seen.lock().expect("the peer's authorities").push(
+                        request
+                            .uri()
+                            .authority()
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
                     );
                 }));
                 kept.lock()
@@ -296,6 +334,7 @@ impl OkPeer {
             connections,
             requests,
             tasks_at_request,
+            authorities,
             serving,
         }
     }
@@ -305,6 +344,14 @@ impl OkPeer {
             .lock()
             .expect("the peer's connections")
             .len()
+    }
+
+    /// The `:authority` of each request so far, in order.
+    fn authorities(&self) -> Vec<String> {
+        self.authorities
+            .lock()
+            .expect("the peer's authorities")
+            .clone()
     }
 
     /// The peer stops listening and closes its connections; done once the
@@ -376,6 +423,28 @@ async fn a_bracketed_ipv6_origin_dials_the_address_inside_the_brackets() {
         .expect("the peer on the IPv6 loopback accepts the dial");
     client.health_check().await.expect("the peer answers OK");
     assert_eq!(peer.requests.load(Ordering::SeqCst), 1);
+    // The brackets stay on the wire, as the origin wrote them.
+    assert_eq!(peer.authorities(), [peer.url.trim_start_matches("http://")]);
+    peer.stop().await;
+}
+
+/// The `:authority` of every call is the origin's host and port: a worker
+/// URL's userinfo (`grpc://user:secret@host:port`) reaches the wire in no
+/// header. The peer reads the authority of each request as h2's server
+/// rebuilt it from the HEADERS frame, so what it records is what was sent.
+#[tokio::test]
+async fn the_authority_on_the_wire_is_the_host_and_port_without_the_userinfo() {
+    let peer = OkPeer::start("127.0.0.1:0").await;
+    let host_port = peer.url.trim_start_matches("http://").to_owned();
+    let client = TokenSpeedSchedulerClient::connect(&format!("grpc://user:secret@{host_port}"))
+        .await
+        .expect("the peer accepts the dial");
+    client.health_check().await.expect("the peer answers OK");
+    let plain = TokenSpeedSchedulerClient::connect(&peer.url)
+        .await
+        .expect("the peer accepts the dial");
+    plain.health_check().await.expect("the peer answers OK");
+    assert_eq!(peer.authorities(), [host_port.clone(), host_port]);
     peer.stop().await;
 }
 

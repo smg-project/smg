@@ -694,10 +694,13 @@ mod tests {
         )
         .expect("a file source");
 
-        write(dir.path(), "tenants", "no-tenant-separator\n");
+        // The line parses and breaks a start rule: the refusal is the last
+        // gate before the swap, so the pin covers every earlier place the
+        // record's write could move to.
+        write(dir.path(), "tenants", "acme:flag-key\n");
         reloader
             .reload()
-            .expect_err("a tenant line without its separator is refused");
+            .expect_err("the flag's shared key repeated by a tenant is refused");
         assert_eq!(
             reloader.keys_in_force(),
             KeysInForce::of(Some("flag-key"), &start, None),

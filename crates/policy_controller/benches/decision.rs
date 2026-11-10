@@ -1,8 +1,9 @@
 //! The engine's cost per decision: the view build and the decision at 8, 64
-//! and 512 candidates, per preset, and the least-load decision with a credit
-//! held per row. Ids: `policy_engine/view_build/<n>`,
-//! `policy_engine/decide/<preset>/<n>` and
-//! `policy_engine/decide/least_load_credited/<n>`. The view is built from a
+//! and 512 candidates, per preset, the least-load decision with a credit
+//! held per row, and the spec's parse-and-validate time at apply. Ids:
+//! `policy_engine/view_build/<n>`, `policy_engine/decide/<preset>/<n>`,
+//! `policy_engine/decide/least_load_credited/<n>` and
+//! `policy_engine/spec/parse_validate`. The view is built from a
 //! synthetic per-worker state the way a host reads its routing state; the
 //! decision runs with a fresh seed per iteration so the drawing pickers draw.
 #![expect(
@@ -182,5 +183,39 @@ fn decide(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, view_build, decide);
+/// A full document of this build's stages, the size of the largest
+/// acceptance-corpus item: the view, two index entries, three profiles,
+/// the plan rules and two bindings with their overload defaults.
+const SPEC_DOCUMENT: &str = r#"{
+  "apiVersion": "smg.policy/v1",
+  "generation": 4,
+  "view": { "headers": ["x-session-id", "x-smg-routing-key"], "block_size": 128, "boundaries": [256, 1024, 4096], "max_block_hashes": 256 },
+  "index": { "*": { "kind": "hash", "ttl_s": 300, "max_size": 67108864, "sweep_s": 120 }, "chat-*": { "max_size": 1048576 } },
+  "profiles": {
+    "prefill": { "filter": ["healthy", "not-overloaded", "has-capacity", "not-tried"], "score": [{ "least-load": { "kv_pressure_weight": 0.3, "mean_prefill_tokens": 2048, "default_throughput": 1500 } }, "session-affinity"], "pick": "best" },
+    "decode": { "filter": ["healthy", "not-overloaded", "has-room", "not-tried"], "score": ["least-load"], "pick": "power-of-two" },
+    "default": { "filter": ["healthy", "not-overloaded", "not-tried"], "score": [{ "least-load": { "weight": 0.3 } }, { "least-requests": { "weight": 0.7 } }, "prefix-affinity"], "pick": "best" }
+  },
+  "plans": { "pd-pair": { "pairing": "strict" } },
+  "bindings": [
+    { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "decode" },
+      "overload": { "enabled": true, "waiting_requests": 32, "token_usage": 0.9, "shed_when_all_vetoed": true } },
+    { "match": { "model": "*" }, "profile": "default", "overload": { "enabled": false }, "admission": { "enabled": false } }
+  ]
+}"#;
+
+fn spec_parse_validate(c: &mut Criterion) {
+    let mut group = c.benchmark_group("policy_engine/spec");
+    group.throughput(Throughput::Bytes(SPEC_DOCUMENT.len() as u64));
+    group.bench_function("parse_validate", |b| {
+        b.iter(|| {
+            let spec: PolicySpec =
+                serde_json::from_str(black_box(SPEC_DOCUMENT)).expect("the document parses");
+            spec.validate().expect("the document validates")
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, view_build, decide, spec_parse_validate);
 criterion_main!(benches);
