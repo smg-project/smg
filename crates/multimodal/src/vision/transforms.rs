@@ -1002,20 +1002,6 @@ pub(super) fn per_sample_reference_channels<const C: usize>(
     out
 }
 
-/// [`per_sample_reference_channels`] for RGB.
-#[cfg(test)]
-pub(super) fn per_sample_reference(
-    data: &[u8],
-    in_w: usize,
-    in_h: usize,
-    out_w: usize,
-    out_h: usize,
-    filter: PilResizeFilter,
-    quantization: KernelQuantization,
-) -> Vec<u8> {
-    per_sample_reference_channels::<3>(data, in_w, in_h, out_w, out_h, filter, quantization)
-}
-
 /// Number of threads to split an elementwise or row-banded preprocessing pass
 /// across. Each output row/element is independent, so banding work over threads
 /// yields BIT-IDENTICAL output: no shared accumulation and no inner-loop order
@@ -2643,6 +2629,47 @@ fn resize_pil_bytes<const C: usize>(
     }
 }
 
+/// `data` (`in_w` x `in_h` interleaved RGB) resampled to `out_w` x `out_h`
+/// with `filter`'s kernel in the torch `uint8` quantization, on the passes of
+/// this target: on x86-64 the banded Pillow-exact passes of
+/// [`resize_bicubic_pil_rgb`] take the torch taps (their AVX-512 and AVX2 arms,
+/// or the portable rows), elsewhere the rows of `torch_resample` run them
+/// (NEON on AArch64, the plain loops otherwise). One per-sample definition on
+/// every route, `clip8((half + Σ pixel · tap) >> precision)`, the width pass
+/// rounded to bytes before the height pass, so the bytes are the same.
+fn resize_torch_uint8_rgb(
+    data: &[u8],
+    in_w: u32,
+    in_h: u32,
+    out_w: u32,
+    out_h: u32,
+    filter: PilResizeFilter,
+) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        resize_pil_bytes::<3>(
+            data,
+            in_w,
+            in_h,
+            out_w,
+            out_h,
+            filter,
+            KernelQuantization::TorchUint8,
+        )
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        super::torch_resample::resize_rgb(
+            data,
+            in_w as usize,
+            in_h as usize,
+            out_w as usize,
+            out_h as usize,
+            filter,
+        )
+    }
+}
+
 /// PyTorch's antialiased BICUBIC resize of `uint8` RGB pixels: what
 /// `torch.nn.functional.interpolate(mode="bicubic", antialias=True)` computes
 /// on a CPU `uint8` tensor, which is where torchvision's `resize` sends a
@@ -2655,8 +2682,9 @@ fn resize_pil_bytes<const C: usize>(
 /// keeps the largest weight below 2^15, not at a fixed 22 bits
 /// (`KernelQuantization::TorchUint8`). The two differ by up to two levels on
 /// a fraction of the pixels, which an engine fed by such a processor sees.
-/// The passes run in `super::torch_resample`: 16-bit taps, 32-bit sums, on
-/// the vector unit where there is one.
+/// The passes are `resize_torch_uint8_rgb`'s: the width pass rounded to bytes
+/// before the height pass, `clip8((half + Σ pixel · tap) >> precision)` per
+/// sample.
 pub fn resize_bicubic_torch_aa_rgb(
     data: &[u8],
     width: u32,
@@ -2677,14 +2705,8 @@ pub fn resize_bicubic_torch_aa_rgb(
             "torch bicubic RGB resize {width}x{height} -> {out_w}x{out_h} must be non-empty"
         )));
     }
-    let output = super::torch_resample::resize_rgb(
-        data,
-        in_w,
-        in_h,
-        out_w as usize,
-        out_h as usize,
-        PilResizeFilter::Bicubic,
-    );
+    let output =
+        resize_torch_uint8_rgb(data, width, height, out_w, out_h, PilResizeFilter::Bicubic);
     RgbImage::from_raw(out_w, out_h, output).ok_or_else(|| {
         TransformError::ShapeError(format!(
             "failed to build torch bicubic RGB image for {out_w}x{out_h}"
@@ -2717,12 +2739,12 @@ pub fn resize_lanczos_torch_aa_rgb_bytes(
             "torch lanczos RGB resize {width}x{height} -> {out_w}x{out_h} must be non-empty"
         )));
     }
-    Ok(super::torch_resample::resize_rgb(
+    Ok(resize_torch_uint8_rgb(
         data,
-        in_w,
-        in_h,
-        out_w as usize,
-        out_h as usize,
+        width,
+        height,
+        out_w,
+        out_h,
         PilResizeFilter::Lanczos,
     ))
 }
@@ -2731,12 +2753,12 @@ pub fn resize_lanczos_torch_aa_rgb_bytes(
 /// for a decoded image.
 pub fn resize_bicubic_torch_aa(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
     let (in_w, in_h, data) = rgb_bytes(image);
-    let output = super::torch_resample::resize_rgb(
+    let output = resize_torch_uint8_rgb(
         &data,
-        in_w,
-        in_h,
-        out_w as usize,
-        out_h as usize,
+        in_w as u32,
+        in_h as u32,
+        out_w,
+        out_h,
         PilResizeFilter::Bicubic,
     );
     #[expect(
@@ -4108,6 +4130,11 @@ mod tests {
         );
     }
 
+    /// Both tap quantizations the passes run: Pillow's fixed 22 bits and the
+    /// torch `uint8` resampler's 16-bit taps.
+    const QUANTIZATIONS: [KernelQuantization; 2] =
+        [KernelQuantization::Pillow, KernelQuantization::TorchUint8];
+
     /// The passes' parity cases: up- and downscales, identity axes, extreme
     /// aspects, row lengths that leave vector tails, odd row counts (the
     /// vector width pass's lone last row), a large image, and the vector
@@ -4149,14 +4176,15 @@ mod tests {
     }
 
     /// Every byte of the 32-bit passes, three and four channels, bicubic and
-    /// Lanczos, over [`PIL_PASS_CASES`], equals the per-sample `i64`
-    /// computation.
+    /// Lanczos, both tap quantizations, over [`PIL_PASS_CASES`], equals the
+    /// per-sample `i64` computation.
     #[test]
     fn pil_passes_equal_the_per_sample_i64_reference() {
         fn check<const C: usize>(
             data: &[u8],
             (in_w, in_h, out_w, out_h): (usize, usize, usize, usize),
             filter: PilResizeFilter,
+            quantization: KernelQuantization,
             what: &str,
         ) {
             let actual = resize_pil_bytes::<C>(
@@ -4166,7 +4194,7 @@ mod tests {
                 out_w as u32,
                 out_h as u32,
                 filter,
-                KernelQuantization::Pillow,
+                quantization,
             );
             let expected = per_sample_reference_channels::<C>(
                 data,
@@ -4175,42 +4203,105 @@ mod tests {
                 out_w,
                 out_h,
                 filter,
-                KernelQuantization::Pillow,
+                quantization,
             );
             assert_same_bytes(&actual, &expected, &format!("{C} channels, {what}"));
         }
-        for (f, filter) in [
-            PilResizeFilter::Bicubic,
-            PilResizeFilter::Lanczos,
-            PilResizeFilter::Bilinear,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            for (seed, &case) in PIL_PASS_CASES.iter().enumerate() {
-                let (in_w, in_h, out_w, out_h) = case;
-                let seed = seed * 13 + f * 101;
-                let what = format!("filter {f}: {in_w}x{in_h} -> {out_w}x{out_h}");
-                check::<3>(&gradient_rgb(in_w, in_h, seed), case, filter, &what);
-                check::<4>(&gradient_rgba(in_w, in_h, seed), case, filter, &what);
+        for quantization in QUANTIZATIONS {
+            for (f, filter) in [
+                PilResizeFilter::Bicubic,
+                PilResizeFilter::Lanczos,
+                PilResizeFilter::Bilinear,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for (seed, &case) in PIL_PASS_CASES.iter().enumerate() {
+                    let (in_w, in_h, out_w, out_h) = case;
+                    let seed = seed * 13 + f * 101;
+                    let what = format!(
+                        "{quantization:?} taps, filter {f}: {in_w}x{in_h} -> {out_w}x{out_h}"
+                    );
+                    check::<3>(
+                        &gradient_rgb(in_w, in_h, seed),
+                        case,
+                        filter,
+                        quantization,
+                        &what,
+                    );
+                    check::<4>(
+                        &gradient_rgba(in_w, in_h, seed),
+                        case,
+                        filter,
+                        quantization,
+                        &what,
+                    );
+                }
             }
+        }
+    }
+
+    /// The torch `uint8` entry points carry the per-sample bytes of the torch
+    /// taps on every case, whichever rows this target runs them on (the
+    /// Pillow-exact passes on x86-64, the torch module's rows elsewhere), and
+    /// the decoded-image form equals the byte form.
+    #[test]
+    fn torch_uint8_entry_points_carry_the_per_sample_bytes() {
+        for (seed, &(in_w, in_h, out_w, out_h)) in PIL_PASS_CASES.iter().enumerate() {
+            let data = gradient_rgb(in_w, in_h, seed * 19 + 7);
+            let (w, h, ow, oh) = (in_w as u32, in_h as u32, out_w as u32, out_h as u32);
+            let what = format!("{in_w}x{in_h} -> {out_w}x{out_h}");
+            let bicubic = resize_bicubic_torch_aa_rgb(&data, w, h, ow, oh).unwrap();
+            assert_same_bytes(
+                bicubic.as_raw(),
+                &per_sample_reference_channels::<3>(
+                    &data,
+                    in_w,
+                    in_h,
+                    out_w,
+                    out_h,
+                    PilResizeFilter::Bicubic,
+                    KernelQuantization::TorchUint8,
+                ),
+                &format!("torch bicubic, {what}"),
+            );
+            let image = DynamicImage::ImageRgb8(RgbImage::from_raw(w, h, data.clone()).unwrap());
+            assert_same_bytes(
+                resize_bicubic_torch_aa(&image, ow, oh).to_rgb8().as_raw(),
+                bicubic.as_raw(),
+                &format!("torch bicubic of the decoded image, {what}"),
+            );
+            assert_same_bytes(
+                &resize_lanczos_torch_aa_rgb_bytes(&data, w, h, ow, oh).unwrap(),
+                &per_sample_reference_channels::<3>(
+                    &data,
+                    in_w,
+                    in_h,
+                    out_w,
+                    out_h,
+                    PilResizeFilter::Lanczos,
+                    KernelQuantization::TorchUint8,
+                ),
+                &format!("torch lanczos, {what}"),
+            );
         }
     }
 
     /// The portable arm and every vector arm the host can build (the
     /// detected one, and on x86-64 each of AVX2 and AVX-512 the processor
-    /// reports) write the same bytes on every case, three and four channels
-    /// (on a processor without a vector unit every arm is the portable
-    /// loop).
+    /// reports) write the same bytes on every case, three and four channels,
+    /// both tap quantizations (on a processor without a vector unit every arm
+    /// is the portable loop).
     #[test]
     fn pil_pass_arms_agree() {
         fn check<const C: usize>(
             data: &[u8],
             (in_w, in_h, out_w, out_h): (usize, usize, usize, usize),
             filter: PilResizeFilter,
+            quantization: KernelQuantization,
             what: &str,
         ) {
-            let kernel = FixedKernel::new(in_w, out_w, filter, KernelQuantization::Pillow);
+            let kernel = FixedKernel::new(in_w, out_w, filter, quantization);
             let mut portable = vec![0_u8; in_h * out_w * C];
             WidthPass::Portable.rows::<C>(data, &kernel, in_w, out_w, 0, &mut portable);
             #[cfg_attr(
@@ -4239,7 +4330,7 @@ mod tests {
                     &format!("width pass {name}, {C} channels, {what}"),
                 );
             }
-            let kernel = FixedKernel::new(in_h, out_h, filter, KernelQuantization::Pillow);
+            let kernel = FixedKernel::new(in_h, out_h, filter, quantization);
             let mut portable_rows = vec![0_u8; out_h * out_w * C];
             HeightPass::Portable.rows(&portable, 0, &kernel, out_w * C, 0, &mut portable_rows);
             #[cfg_attr(
@@ -4266,19 +4357,35 @@ mod tests {
                 );
             }
         }
-        for (f, filter) in [
-            PilResizeFilter::Bicubic,
-            PilResizeFilter::Lanczos,
-            PilResizeFilter::Bilinear,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            for (seed, &case) in PIL_PASS_CASES.iter().enumerate() {
-                let (in_w, in_h, out_w, out_h) = case;
-                let what = format!("filter {f}: {in_w}x{in_h} -> {out_w}x{out_h}");
-                check::<3>(&gradient_rgb(in_w, in_h, seed), case, filter, &what);
-                check::<4>(&gradient_rgba(in_w, in_h, seed), case, filter, &what);
+        for quantization in QUANTIZATIONS {
+            for (f, filter) in [
+                PilResizeFilter::Bicubic,
+                PilResizeFilter::Lanczos,
+                PilResizeFilter::Bilinear,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for (seed, &case) in PIL_PASS_CASES.iter().enumerate() {
+                    let (in_w, in_h, out_w, out_h) = case;
+                    let what = format!(
+                        "{quantization:?} taps, filter {f}: {in_w}x{in_h} -> {out_w}x{out_h}"
+                    );
+                    check::<3>(
+                        &gradient_rgb(in_w, in_h, seed),
+                        case,
+                        filter,
+                        quantization,
+                        &what,
+                    );
+                    check::<4>(
+                        &gradient_rgba(in_w, in_h, seed),
+                        case,
+                        filter,
+                        quantization,
+                        &what,
+                    );
+                }
             }
         }
     }
@@ -4294,10 +4401,11 @@ mod tests {
             data: &[u8],
             (in_w, in_h, out_w, out_h): (usize, usize, usize, usize),
             filter: PilResizeFilter,
+            quantization: KernelQuantization,
             what: &str,
         ) {
-            let width = FixedKernel::new(in_w, out_w, filter, KernelQuantization::Pillow);
-            let height = FixedKernel::new(in_h, out_h, filter, KernelQuantization::Pillow);
+            let width = FixedKernel::new(in_w, out_w, filter, quantization);
+            let height = FixedKernel::new(in_h, out_h, filter, quantization);
             let expected = per_sample_reference_channels::<C>(
                 data,
                 in_w,
@@ -4305,7 +4413,7 @@ mod tests {
                 out_w,
                 out_h,
                 filter,
-                KernelQuantization::Pillow,
+                quantization,
             );
             let row_len = out_w * C;
             for band_bytes in [
@@ -4331,23 +4439,39 @@ mod tests {
                 );
             }
         }
-        for (f, filter) in [
-            PilResizeFilter::Bicubic,
-            PilResizeFilter::Lanczos,
-            PilResizeFilter::Bilinear,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            for (seed, &case) in PIL_PASS_CASES.iter().enumerate() {
-                let (in_w, in_h, out_w, out_h) = case;
-                if in_w == out_w || in_h == out_h {
-                    continue;
+        for quantization in QUANTIZATIONS {
+            for (f, filter) in [
+                PilResizeFilter::Bicubic,
+                PilResizeFilter::Lanczos,
+                PilResizeFilter::Bilinear,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for (seed, &case) in PIL_PASS_CASES.iter().enumerate() {
+                    let (in_w, in_h, out_w, out_h) = case;
+                    if in_w == out_w || in_h == out_h {
+                        continue;
+                    }
+                    let seed = seed * 17 + f * 103;
+                    let what = format!(
+                        "{quantization:?} taps, filter {f}: {in_w}x{in_h} -> {out_w}x{out_h}"
+                    );
+                    check::<3>(
+                        &gradient_rgb(in_w, in_h, seed),
+                        case,
+                        filter,
+                        quantization,
+                        &what,
+                    );
+                    check::<4>(
+                        &gradient_rgba(in_w, in_h, seed),
+                        case,
+                        filter,
+                        quantization,
+                        &what,
+                    );
                 }
-                let seed = seed * 17 + f * 103;
-                let what = format!("filter {f}: {in_w}x{in_h} -> {out_w}x{out_h}");
-                check::<3>(&gradient_rgb(in_w, in_h, seed), case, filter, &what);
-                check::<4>(&gradient_rgba(in_w, in_h, seed), case, filter, &what);
             }
         }
     }
