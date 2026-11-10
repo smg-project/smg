@@ -326,8 +326,9 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         self.inner.preprocess(images)
     }
 
-    /// Write BF16 image batches in one pass. Single images retain neutral
-    /// pixels, including their existing pixel-cache representation.
+    /// Write BF16 image batches in one pass; only BF16 was benchmarked here.
+    /// Single images retain neutral U8 pixels to preserve pixel-cache entry
+    /// sizes. This guard also applies when no cache is present.
     fn preprocess_wire(
         &self,
         images: &[&DynamicImage],
