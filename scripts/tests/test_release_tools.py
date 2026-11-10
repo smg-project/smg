@@ -383,6 +383,7 @@ class Sandbox:
         )
         self.put("grpc_servicer/servicer.py", "x = 1\n")
         self.put("bindings/golang/Cargo.toml", versioned("smg-golang", "1.13.0"))
+        self.put("bindings/golang/go.mod", f"module {GO_MODULE}\n\ngo 1.24.0\n")
         self.put("bindings/python/Cargo.toml", versioned("smg-python", "1.13.0"))
         self.put("bindings/python/pyproject.toml", '[project]\nname = "smg"\nversion = "1.13.0"\n')
         self.put("bindings/python/src/smg/version.py", '__version__ = "1.13.0"\n')
@@ -2137,6 +2138,9 @@ def test_notes_refresh_reads_every_body_again_and_a_cut_cache_file_is_read_again
 # --- publish-plan ----------------------------------------------------------------------------
 
 
+GO_MODULE = "github.com/smg-project/smg/bindings/golang"  # what bindings/golang/go.mod declares
+
+
 def plan_items(out: str) -> list[int]:
     """The numbers of a publishing plan's items, in the order printed."""
     return [int(line.split(".", 1)[0]) for line in out.splitlines() if re.match(r"\d+\. ", line)]
@@ -2166,7 +2170,7 @@ def test_publish_plan_prints_the_dispatches_and_runs_nothing(repo: Sandbox) -> N
         "a crate with publish = [] is never published either: not in the plan"
     )
     assert "publish = false or publish = [] is never published and not listed" in out
-    assert plan_items(out) == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert plan_items(out) == [1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 
 def test_publish_plan_leaves_pypi_and_crates_io_out_of_a_candidate(repo: Sandbox) -> None:
@@ -2185,7 +2189,29 @@ def test_publish_plan_leaves_pypi_and_crates_io_out_of_a_candidate(repo: Sandbox
     assert "A candidate is never published to PyPI or crates.io" in out
     assert "smg==" not in out and "tool-parser" not in out
     assert repo.curl_calls() == [], "no registry is read for a plan that publishes to none"
-    assert plan_items(out) == [1, 2, 3, 4, 5]
+    assert plan_items(out) == [1, 2, 3, 4, 5, 6]
+
+
+def test_publish_plan_leaves_the_bindings_tag_out_where_the_module_path_is_old(
+    repo: Sandbox,
+) -> None:
+    """A patch of a line whose bindings/golang/go.mod still declares another module path: the plan prints no
+    `bindings/golang/v<version>` tag item (the tag would name a go.mod that go get refuses) and says why; the
+    other items count without a gap."""
+    finished_release(repo)
+    repo.tool("bump", "1.14.1")
+    repo.put("bindings/golang/go.mod", "module github.com/lightseek/smg/go-grpc-sdk\n\ngo 1.24.0\n")
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "chore: the older line keeps its module path")
+    repo.land_on_release()
+    out = repo.tool("publish-plan", "1.14.1").stdout
+    assert "git tag bindings/golang/v1.14.1" not in out
+    assert (
+        "no Go bindings module tag: bindings/golang/go.mod at origin/release/1.14 does not declare "
+        f"{GO_MODULE}, so a tag there would not resolve" in out
+    )
+    assert "gh workflow run release-go.yml --ref v1.14.1 -f version=1.14.1" in out
+    assert plan_items(out) == [1, 2, 3, 4, 5, 6, 7, 8]
 
 
 def test_publish_plan_prints_one_engine_dispatch_per_release_base(repo: Sandbox) -> None:
@@ -2248,7 +2274,7 @@ def test_check_reports_that_a_candidate_never_reaches_the_registries(repo: Sandb
     assert (
         "[note] publish: a candidate is never published to PyPI or crates.io (release-pypi,"
         " release-crates and release-grpc refuse a ref named -rc.; release.sh publish-plan 1.14.0-rc.1"
-        " leaves them out): its artifacts are the images, the chart, the Go module tag and the GitHub"
+        " leaves them out): its artifacts are the images, the chart, the two Go module tags and the GitHub"
         " pre-release" in out
     )
     repo.tool("bump", "1.14.0")
