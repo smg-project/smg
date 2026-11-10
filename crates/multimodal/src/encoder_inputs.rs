@@ -1428,11 +1428,42 @@ impl PreprocessedEncoderInputs {
             .map(|part| &part.encoder_input)
             .collect::<Vec<_>>();
         let encoder_input = EncoderInput::concat(&inputs)?;
-        Self::concat_refs_with_input(parts, layouts, encoder_input)
+        Self::join_batch_metadata(parts, layouts, encoder_input)
     }
 
     /// Join metadata for parts already written in order into one encoder input.
     pub fn concat_refs_with_input(
+        parts: &[&Self],
+        layouts: &HashMap<String, FieldLayout>,
+        encoder_input: EncoderInput,
+    ) -> AnyhowResult<Self> {
+        let (rows, tail) = encoder_input
+            .shape()
+            .split_first()
+            .context("joined encoder input has no row axis")?;
+        let part_rows = parts.iter().try_fold(0usize, |total, part| {
+            let (rows, part_tail) = part
+                .encoder_input
+                .shape()
+                .split_first()
+                .context("batch part has no row axis")?;
+            anyhow::ensure!(
+                part_tail == tail,
+                "joined encoder input has incompatible features"
+            );
+            total
+                .checked_add(*rows)
+                .context("joined encoder row count overflows usize")
+        })?;
+        anyhow::ensure!(
+            *rows == part_rows,
+            "joined encoder row count does not match its batch parts"
+        );
+        Self::join_batch_metadata(parts, layouts, encoder_input)
+    }
+
+    /// Join metadata after the encoder inputs have been assembled and validated.
+    fn join_batch_metadata(
         parts: &[&Self],
         layouts: &HashMap<String, FieldLayout>,
         encoder_input: EncoderInput,
@@ -1706,6 +1737,22 @@ mod tests {
         }
         assert!(first.encoder_input_flat().iter().all(|&v| v == 16.0));
         assert!(PreprocessedEncoderInputs::concat_refs(&[], &HashMap::new()).is_err());
+    }
+
+    /// A caller-supplied tensor must describe the same rows and features as its parts.
+    #[test]
+    fn concat_with_supplied_input_rejects_incompatible_shapes() {
+        let first = clip(16, 1, 1.0);
+        let second = clip(32, 2, 0.5);
+        for shape in [[47, 3], [48, 2]] {
+            let input = EncoderInput::F32(ArrayD::zeros(IxDyn(&shape)));
+            assert!(PreprocessedEncoderInputs::concat_refs_with_input(
+                &[&first, &second],
+                &video_layouts(),
+                input,
+            )
+            .is_err());
+        }
     }
 
     #[test]
