@@ -432,3 +432,29 @@ pub fn create_test_tools() -> Vec<Tool> {
         },
     ]
 }
+
+/// One tool, `update_task(taskId: string, subject: string)`: the string-typed arguments whose
+/// values look numeric (the MiniMax M2 report, issue #1743, and the M3 copy of it).
+#[allow(
+    dead_code,
+    reason = "shared test utility not used by all test binaries"
+)]
+pub fn update_task_tools() -> Vec<Tool> {
+    vec![Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "update_task".to_string(),
+            description: None,
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {
+                    "taskId":  {"type": "string"},
+                    "subject": {"type": "string"}
+                },
+                "required": ["taskId", "subject"]
+            })),
+            strict: None,
+            extra: Default::default(),
+        },
+    }]
+}
