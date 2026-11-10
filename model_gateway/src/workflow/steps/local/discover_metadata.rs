@@ -445,8 +445,21 @@ async fn fetch_vllm_http_metadata_checked(
     api_key: Option<&str>,
     strict: bool,
 ) -> Result<HashMap<String, String>, String> {
-    let base = http_base_url(url);
     let mut labels = HashMap::new();
+    fetch_vllm_http_metadata_into(client, url, api_key, strict, &mut labels).await?;
+    Ok(labels)
+}
+
+// Retain validated model/protocol facts if registration's optional version
+// request exhausts its budget. Refresh still requires the whole checked read.
+async fn fetch_vllm_http_metadata_into(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+    strict: bool,
+    labels: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    let base = http_base_url(url);
 
     // /v1/models — vLLM uses `root` as model_path, `id` as served_model_name
     match http_get_vllm_models_classified(client, &format!("{base}/v1/models"), api_key).await {
@@ -489,7 +502,7 @@ async fn fetch_vllm_http_metadata_checked(
         Err(_) => {}
     }
 
-    Ok(labels)
+    Ok(())
 }
 
 /// Re-read the KV transfer engine id a gRPC engine reports, for a PD worker
@@ -725,75 +738,100 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
             config.url, connection_mode
         );
 
-        let (discovered_labels, detected_runtime) = match connection_mode {
-            ConnectionMode::Http => {
-                let runtime = context
-                    .data
-                    .detected_runtime_type
-                    .as_deref()
-                    .unwrap_or_else(|| {
-                        warn!(
-                            "No detected_runtime_type for {}, defaulting to sglang",
-                            config.url
-                        );
-                        "sglang"
-                    });
-                let client = context.data.http_client("discover_metadata")?;
-                let metadata = discover_engine_labels(
-                    &client,
-                    &config.url,
-                    ConnectionMode::Http,
-                    runtime,
-                    config.api_key.as_deref(),
-                    false,
-                )
-                .await;
-                if runtime == "vllm" {
-                    // Only explicit extension failures escape this tolerant read.
-                    let metadata = metadata.map_err(|message| WorkflowError::StepFailed {
-                        step_id: wfaas::StepId::new("discover_metadata"),
-                        message,
-                    })?;
-                    Ok(metadata)
-                } else {
-                    metadata
+        // Optional discovery must finish inside the workflow's 10s step timeout.
+        // Keep validated facts outside the cancelled future so a slow optional
+        // endpoint cannot erase an already validated pairing contract.
+        let mut partial_labels = HashMap::new();
+        let discovery = async {
+            let metadata = match connection_mode {
+                ConnectionMode::Http => {
+                    let runtime = context
+                        .data
+                        .detected_runtime_type
+                        .as_deref()
+                        .unwrap_or_else(|| {
+                            warn!(
+                                "No detected_runtime_type for {}, defaulting to sglang",
+                                config.url
+                            );
+                            "sglang"
+                        });
+                    let client = context.data.http_client("discover_metadata")?;
+                    if runtime == "vllm" {
+                        fetch_vllm_http_metadata_into(
+                            &client,
+                            &config.url,
+                            config.api_key.as_deref(),
+                            false,
+                            &mut partial_labels,
+                        )
+                        .await
+                        .map_err(|message| WorkflowError::StepFailed {
+                            step_id: wfaas::StepId::new("discover_metadata"),
+                            message,
+                        })?;
+                        Ok((partial_labels.clone(), None))
+                    } else {
+                        discover_engine_labels(
+                            &client,
+                            &config.url,
+                            ConnectionMode::Http,
+                            runtime,
+                            config.api_key.as_deref(),
+                            false,
+                        )
+                        .await
+                    }
+                }
+                ConnectionMode::Grpc => {
+                    let config_runtime = config.runtime_type.to_string();
+                    let runtime_type = context
+                        .data
+                        .detected_runtime_type
+                        .as_deref()
+                        .unwrap_or(&config_runtime);
+                    fetch_grpc_metadata(&config.url, runtime_type, false)
+                        .await
+                        .map(|(labels, rt)| (labels, Some(rt)))
+                }
+                // A ZMQ engine reports its geometry at the handshake, which runs
+                // after this step; the facts worth having earlier are the
+                // model's own sampling defaults, read from the model the gateway
+                // was started with (a local directory, or a Hub id through the
+                // HF cache), for a worker that serves that model (one registered
+                // for another model, by spec or label, must not inherit them),
+                // and where the gateway's own link starts a grammar, which is
+                // the link's rule and needs no engine. The runtime stays `None`:
+                // the handshake is shared across engines, so it cannot be probed
+                // here and the configured or detected runtime is preserved.
+                ConnectionMode::Zmq => {
+                    let router_model = context
+                        .data
+                        .app_context
+                        .as_ref()
+                        .and_then(|app| app.router_config.model_path.clone());
+                    let model = zmq_model(router_model, resolve_model_id(config, &config.labels));
+                    Ok((zmq_worker_labels(model.as_deref()).await, None))
                 }
             }
-            ConnectionMode::Grpc => {
-                let config_runtime = config.runtime_type.to_string();
-                let runtime_type = context
-                    .data
-                    .detected_runtime_type
-                    .as_deref()
-                    .unwrap_or(&config_runtime);
-                fetch_grpc_metadata(&config.url, runtime_type, false)
-                    .await
-                    .map(|(labels, rt)| (labels, Some(rt)))
-            }
-            // A ZMQ engine reports its geometry at the handshake, which runs
-            // after this step; the facts worth having earlier are the
-            // model's own sampling defaults, read from the model the gateway
-            // was started with (a local directory, or a Hub id through the
-            // HF cache), for a worker that serves that model (one registered
-            // for another model, by spec or label, must not inherit them),
-            // and where the gateway's own link starts a grammar, which is
-            // the link's rule and needs no engine. The runtime stays `None`:
-            // the handshake is shared across engines, so it cannot be probed
-            // here and the configured or detected runtime is preserved.
-            ConnectionMode::Zmq => {
-                let router_model = context
-                    .data
-                    .app_context
-                    .as_ref()
-                    .and_then(|app| app.router_config.model_path.clone());
-                let model = zmq_model(router_model, resolve_model_id(config, &config.labels));
-                Ok((zmq_worker_labels(model.as_deref()).await, None))
-            }
-        }
-        .unwrap_or_else(|e| {
-            warn!("Failed to fetch metadata for {}: {}", config.url, e);
-            (HashMap::new(), None)
-        });
+            .unwrap_or_else(|e| {
+                warn!("Failed to fetch metadata for {}: {}", config.url, e);
+                (HashMap::new(), None)
+            });
+
+            Ok::<_, WorkflowError>(metadata)
+        };
+        let (discovered_labels, detected_runtime) =
+            match tokio::time::timeout(Duration::from_secs(9), discovery).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    warn!(
+                        "Optional registration metadata budget expired for {}",
+                        config.url
+                    );
+                    (partial_labels, None)
+                }
+            };
 
         debug!(
             "Discovered {} labels for {}",
@@ -1081,6 +1119,39 @@ mod tests {
     /// The vLLM HTTP read takes the model's identity and window from
     /// `/v1/models` and the build from `/version`; a `/version` the engine
     /// does not offer leaves no label and fails no read.
+    #[tokio::test]
+    async fn strict_vllm_refresh_still_rejects_optional_version_failure() {
+        use crate::workflow::steps::local::test_support::serve_json_routes;
+
+        let base = serve_json_routes(vec![
+            (
+                "/v1/models",
+                http::StatusCode::OK,
+                serde_json::json!({"data": [{"id": "model"}], "pairing_protocol": "kv-v1"}),
+            ),
+            (
+                "/version",
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({}),
+            ),
+        ])
+        .await;
+        let client = crate::server::http_client();
+        let (labels, _) =
+            discover_engine_labels(&client, &base, ConnectionMode::Http, "vllm", None, false)
+                .await
+                .unwrap();
+        assert_eq!(
+            labels.get("pairing_protocol").map(String::as_str),
+            Some("kv-v1")
+        );
+        let error =
+            discover_engine_labels(&client, &base, ConnectionMode::Http, "vllm", None, true)
+                .await
+                .unwrap_err();
+        assert!(error.starts_with("/version: status 503"), "{error}");
+    }
+
     #[tokio::test]
     async fn the_vllm_http_read_takes_the_model_list_and_the_version() {
         use http::StatusCode;
