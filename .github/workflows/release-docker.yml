@@ -197,6 +197,12 @@ jobs:
           LATEST_IMAGE="lightseekorg/smg:latest"
           GHCR_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:${VERSION}"
           GHCR_LATEST="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:latest"
+          # The variant counts as published only with a digest: in mirror mode a variant missing
+          # from Docker Hub is skipped with a warning and leaves the step's outcome at success.
+          SLURM_PUBLISHED="false"
+          if [[ "${SLURM_OUTCOME}" == "success" && -n "${SLURM_DIGEST}" ]]; then
+            SLURM_PUBLISHED="true"
+          fi
           if [[ "${PUBLISH_OUTCOME}" == "success" && "${PUSH}" == "true" ]]; then
             {
               echo "### ✅ Release images available"
@@ -209,7 +215,7 @@ jobs:
                 echo "| Docker Hub | \`latest\` | \`${LATEST_IMAGE}\` |"
                 echo "| GHCR | \`latest\` | \`${GHCR_LATEST}\` |"
               fi
-              if [[ "${SLURM_OUTCOME}" == "success" ]]; then
+              if [[ "${SLURM_PUBLISHED}" == "true" ]]; then
                 echo "| Docker Hub | \`${VERSION}-slurm\` | \`${IMAGE}-slurm\` |"
                 echo "| GHCR | \`${VERSION}-slurm\` | \`${GHCR_IMAGE}-slurm\` |"
                 if [[ "${LATEST}" == "true" ]]; then
@@ -221,17 +227,16 @@ jobs:
                 echo ""
                 echo "Digest: \`${DIGEST}\`"
               fi
-              if [[ -n "${SLURM_DIGEST}" ]]; then
+              if [[ "${SLURM_PUBLISHED}" == "true" ]]; then
                 echo ""
                 echo "Digest of the \`-slurm\` variant: \`${SLURM_DIGEST}\`"
-              fi
-              if [[ "${SLURM_OUTCOME}" != "success" ]]; then
+              else
                 echo ""
-                echo "The \`-slurm\` variant was **not** published (outcome: \`${SLURM_OUTCOME}\`)."
+                echo "The \`-slurm\` variant was **not** published (outcome: \`${SLURM_OUTCOME}\`, digest: \`${SLURM_DIGEST:-none}\`)."
               fi
             } >> "$GITHUB_STEP_SUMMARY"
-            if [[ "${SLURM_OUTCOME}" != "success" ]]; then
-              echo "::warning::The -slurm variant of ${IMAGE} was not published (outcome: ${SLURM_OUTCOME})."
+            if [[ "${SLURM_PUBLISHED}" != "true" ]]; then
+              echo "::warning::The -slurm variant of ${IMAGE} was not published (outcome: ${SLURM_OUTCOME}, digest: ${SLURM_DIGEST:-none})."
             fi
           elif [[ "${PUBLISH_OUTCOME}" == "success" ]]; then
             {
