@@ -1670,9 +1670,9 @@ dependencies = [
  "cfg-if",
  "crossbeam-utils",
  "hashbrown 0.14.5",
- "lock_api",
+ "lock_api 0.4.14",
  "once_cell",
- "parking_lot_core",
+ "parking_lot_core 0.9.12",
 ]
 
 [[package]]
@@ -1685,7 +1685,7 @@ dependencies = [
  "deadpool-postgres",
  "deadpool-redis",
  "oracle",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rand 0.10.2",
  "redis",
  "serde",
@@ -2182,7 +2182,7 @@ dependencies = [
  "futures",
  "half",
  "memchr",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rmp-serde",
  "rmpv",
  "serde",
@@ -3792,7 +3792,7 @@ dependencies = [
  "json-patch",
  "k8s-openapi",
  "kube-client",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pin-project",
  "serde",
  "serde_json",
@@ -3817,7 +3817,7 @@ dependencies = [
  "libc",
  "mimalloc",
  "once_cell",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rand 0.10.2",
  "rustc-hash 2.1.3",
  "serde",
@@ -3879,9 +3879,9 @@ checksum = "34b357333733e8260735ba5894eb928c02ecc69c78715f01a8019e7fa7f2db4c"
 
 [[package]]
 name = "libc"
-version = "0.2.190"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libfuzzer-sys"
@@ -4029,6 +4029,15 @@ name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
+name = "lock_api"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65d91b22da179613dcf4d6ec8349563f52a363f6849e03b00dd0a185ec4a59af"
 dependencies = [
  "scopeguard",
 ]
@@ -5387,8 +5396,18 @@ version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
- "lock_api",
- "parking_lot_core",
+ "lock_api 0.4.14",
+ "parking_lot_core 0.9.12",
+]
+
+[[package]]
+name = "parking_lot"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9cf937ca4e1d0b7578784559063422fc39ae7c5a00f02471f2614d5486fd226"
+dependencies = [
+ "lock_api 0.5.0",
+ "parking_lot_core 0.10.0",
 ]
 
 [[package]]
@@ -5399,7 +5418,19 @@ checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
  "cfg-if",
  "libc",
- "redox_syscall",
+ "redox_syscall 0.5.18",
+ "smallvec",
+ "windows-link",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cfff060068cc18aa7815010fcaf80c68c7fb9e85fc7f5c0f9bf142c21d19826"
+dependencies = [
+ "libc",
+ "redox_syscall 0.9.5",
  "smallvec",
  "windows-link",
 ]
@@ -6467,7 +6498,7 @@ dependencies = [
 name = "reasoning-parser"
 version = "1.11.0"
 dependencies = [
- "parking_lot",
+ "parking_lot 0.13.0",
  "regex",
  "thiserror 2.0.21",
 ]
@@ -6513,6 +6544,15 @@ name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
+dependencies = [
+ "bitflags 2.13.2",
+]
+
+[[package]]
+name = "redox_syscall"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "580c875845b41ecb1564ad1ae4703044cef774145e3d7a94dc2b3fa7c97868fd"
 dependencies = [
  "bitflags 2.13.2",
 ]
@@ -7434,7 +7474,7 @@ dependencies = [
  "futures-util",
  "log",
  "once_cell",
- "parking_lot",
+ "parking_lot 0.12.5",
  "serial_test_derive",
 ]
 
@@ -7664,7 +7704,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-proto 0.33.0",
  "opentelemetry_sdk 0.32.1",
- "parking_lot",
+ "parking_lot 0.13.0",
  "pin-project-lite",
  "portpicker",
  "prost",
@@ -7741,7 +7781,7 @@ dependencies = [
  "http",
  "jsonwebtoken",
  "lru",
- "parking_lot",
+ "parking_lot 0.13.0",
  "reqwest 0.13.4",
  "rsa",
  "rustls",
@@ -7868,7 +7908,7 @@ dependencies = [
  "dashmap",
  "futures",
  "lru",
- "parking_lot",
+ "parking_lot 0.13.0",
  "regex",
  "reqwest 0.13.4",
  "rmcp",
@@ -7902,7 +7942,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "openssl",
- "parking_lot",
+ "parking_lot 0.13.0",
  "prost",
  "rand 0.10.2",
  "rustls",
@@ -7925,7 +7965,7 @@ version = "0.1.1"
 dependencies = [
  "dashmap",
  "nixl-sys",
- "parking_lot",
+ "parking_lot 0.13.0",
  "tracing",
 ]
 
@@ -7934,7 +7974,7 @@ name = "smg-policy-controller"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rustc-hash 2.1.3",
  "schemars 1.2.2",
  "serde",
@@ -8854,7 +8894,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
@@ -8896,7 +8936,7 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "log",
- "parking_lot",
+ "parking_lot 0.12.5",
  "percent-encoding",
  "phf 0.13.1",
  "pin-project-lite",
@@ -9116,7 +9156,7 @@ dependencies = [
  "async-trait",
  "num-traits",
  "openai-protocol",
- "parking_lot",
+ "parking_lot 0.13.0",
  "regex",
  "rustpython-parser",
  "serde",
@@ -10219,7 +10259,7 @@ dependencies = [
  "async-trait",
  "backoff",
  "chrono",
- "parking_lot",
+ "parking_lot 0.13.0",
  "serde",
  "thiserror 2.0.21",
  "tokio",
@@ -10807,7 +10847,7 @@ dependencies = [
  "futures",
  "futures-channel",
  "log",
- "parking_lot",
+ "parking_lot 0.12.5",
  "rand 0.10.2",
  "regex",
  "scc",
