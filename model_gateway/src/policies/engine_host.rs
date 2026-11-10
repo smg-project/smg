@@ -3931,6 +3931,52 @@ mod tests {
         ));
     }
 
+    /// The configured block size reaches the view: a held prefix is priced
+    /// by it. At 64 tokens a block with a margin price of 8 tokens, a
+    /// one-block holder seven requests deep stays under its margin of 8
+    /// (64 / 8) and keeps the prompt; at the view's default of 16 the same
+    /// block would price at 2, the margin would fall to 4 and the holder
+    /// would spill.
+    #[test]
+    fn the_cache_aware_block_size_reaches_the_view_through_the_prefix_price() {
+        let mut config = cache_aware_config(64);
+        if let PolicyConfig::CacheAware {
+            balance_prefix_margin_tokens,
+            ..
+        } = &mut config
+        {
+            *balance_prefix_margin_tokens = 8;
+        }
+        let decider = decider(&config);
+        let policy = cache_aware_policy(64);
+        let workers = pool(3);
+        policy.init_workers(&workers);
+        let tokens: Vec<u32> = (1..=64).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..SelectWorkerInfo::default()
+        };
+        let request = HostRequest {
+            prompt_tokens: 64,
+            affinity: Some(Affinity {
+                policy: &policy,
+                info: &info,
+            }),
+            ..request()
+        };
+        policy.record_route(&workers, 0, &info);
+        for _ in 0..7 {
+            workers[0].increment_load();
+        }
+        for _ in 0..20 {
+            assert_eq!(
+                leader(&decider, &request, &workers),
+                0,
+                "the priced prefix keeps its holder under the gate"
+            );
+        }
+    }
+
     /// A tokenized request on a model with an event index reads the index's
     /// overlap: the holder of the request's blocks leads every decision, a
     /// novel prompt is a miss both idle workers take across the seeds.

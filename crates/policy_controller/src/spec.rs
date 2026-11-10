@@ -3848,4 +3848,54 @@ mod tests {
         let text = serde_json::to_string(&spec).expect("serializes");
         assert!(!text.contains("kind"), "{text}");
     }
+
+    /// The spill parameters of a prefix-affinity entry reach the gates the
+    /// profile's stages share: under a relative threshold of four a holder
+    /// three times as loaded as the mean keeps its request; under the
+    /// default (1.5, plus the margin) it spills.
+    #[test]
+    fn the_spill_parameters_of_the_spec_reach_the_profiles_gates() {
+        use crate::{Candidate, Constraints, Health, PoolFacts, RequestFacts, Scratch, WorkerId};
+        let hashes = [0u64; 16];
+        let facts = RequestFacts {
+            model: "m",
+            block_hashes: &hashes,
+            prompt_tokens: 256,
+            seed: 7,
+            ..RequestFacts::default()
+        };
+        let row = |position: u32, in_flight: u32, overlap_blocks: u32| Candidate {
+            position,
+            id: WorkerId(100 + u64::from(position)),
+            health: Health {
+                healthy: true,
+                ..Health::default()
+            },
+            in_flight,
+            overlap_blocks,
+            ..Candidate::default()
+        };
+        let pool = [row(0, 20, 16), row(1, 0, 0), row(2, 0, 0)];
+        let leader = |score: &str| {
+            let engine = spec_with_score(score).validate().expect("a valid profile");
+            let decision = engine.decide(
+                &facts,
+                &PoolFacts::default(),
+                &pool,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            );
+            decision.pick().expect("a pick").targets.as_slice()[0].position
+        };
+        assert_eq!(
+            leader(r#"{"prefix-affinity":{"spill":{"rel":4.0}}}"#),
+            0,
+            "a holder under the configured gate keeps its request"
+        );
+        assert_ne!(
+            leader(r#"{"prefix-affinity":{}}"#),
+            0,
+            "under the default gate the loaded holder spills"
+        );
+    }
 }

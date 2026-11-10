@@ -855,6 +855,36 @@ mod tests {
         assert_eq!(slice.misses.load(Ordering::Relaxed), 8);
     }
 
+    /// A few-block hit on a long request is a miss for the slice: at most
+    /// four blocks held that cover less than half the request. A fifth
+    /// block, or half the request, is a hit the slice leaves alone.
+    #[test]
+    fn a_few_block_hit_on_a_long_request_is_sliced_as_a_miss() {
+        let params = WarmupSliceParams {
+            share: Some(1.0),
+            divert_every: Some(0),
+            blocks: Some(8),
+            miss_share: Some(0.0),
+            ..WarmupSliceParams::default()
+        };
+        let slice = WarmupSlice::new(&params, Gates::of(None, None, Some(16)));
+        let held = |blocks: u32| {
+            [
+                sized(0, 3, blocks, 64),
+                sized(1, 2, 0, 64),
+                sized(2, 5, 0, 0),
+            ]
+        };
+        // Three of sixteen blocks: a miss, the thin worker takes it.
+        assert_eq!(scores(&slice, &facts(16), &held(3)), vec![0.0, 0.0, 1.0]);
+        // Five blocks: over the few-block bound, a hit.
+        assert_eq!(scores(&slice, &facts(16), &held(5)), vec![1.0, 1.0, 1.0]);
+        // Four of eight blocks cover half the request: a hit; three of
+        // eight do not: a miss.
+        assert_eq!(scores(&slice, &facts(8), &held(4)), vec![1.0, 1.0, 1.0]);
+        assert_eq!(scores(&slice, &facts(8), &held(3)), vec![0.0, 0.0, 1.0]);
+    }
+
     #[test]
     fn a_young_fleet_slices_nothing_and_a_young_worker_among_warm_ones_takes_its_share() {
         let slice = warmup(1.0, 0);
