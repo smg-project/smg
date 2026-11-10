@@ -70,9 +70,10 @@ pub use overload::OverloadThresholds;
 pub(crate) use pd_pair_index::{PdPairIndex, PdWire};
 pub use pd_pairing::{PairingMismatch, PdPairing, PdPairingMode};
 pub use prefill_admission::{
-    acquire_prefill, AdmittedPrefill, PrefillAcquireError, PrefillAdmission,
-    PrefillAdmissionAttempt, PrefillAdmissionRejection, PrefillCandidateError, PrefillLoadGuard,
-    PrefillReservation, PrefillSelection, PrefillSelectionContext,
+    acquire_prefill, acquire_prefill_decided, AdmittedPrefill, CapacityWindow, PrefillAcquireError,
+    PrefillAdmission, PrefillAdmissionAttempt, PrefillAdmissionRejection, PrefillCandidateError,
+    PrefillLoadGuard, PrefillProposal, PrefillReservation, PrefillSelection,
+    PrefillSelectionContext,
 };
 pub(crate) use registry::{ModelWorkerSnapshot, RoutingPool};
 pub use registry::{WorkerOrigin, WorkerRegistry};
