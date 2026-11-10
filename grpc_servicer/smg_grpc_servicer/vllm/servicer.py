@@ -556,6 +556,17 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     "ec_transfer_params": ec_transfer_params,
                 }
             tokenization_kwargs = self._tokenization_kwargs_from_proto(request.sampling_params)
+            # The parser must start in the same thinking mode as the rendered prompt.
+            generate_kwargs = {}
+            if hasattr(request, "chat_template_kwargs_json") and request.HasField(
+                "chat_template_kwargs_json"
+            ):
+                template_kwargs = json.loads(request.chat_template_kwargs_json)
+                if not isinstance(template_kwargs, dict):
+                    raise ValueError("chat_template_kwargs_json must contain a JSON object")
+                generate_kwargs["reasoning_parser_kwargs"] = {
+                    "chat_template_kwargs": template_kwargs
+                }
 
             # Extract logprobs configuration
             num_logprobs = sampling_params.logprobs
@@ -605,6 +616,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 tokenization_kwargs=tokenization_kwargs,
                 trace_headers=trace_headers(context.invocation_metadata()),
                 data_parallel_rank=pinned_rank,
+                **generate_kwargs,
             ):
                 # ECCPU may evict an encoding before completion and return
                 # metadata without a fetch address. P has no pixels to
