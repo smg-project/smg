@@ -95,8 +95,9 @@ package outright for a retry). The Go bindings module, `github.com/smg-project/s
 is published by the tag `bindings/golang/v<version>` at the release commit: the plan prints the
 `git tag` and `git push` for it, run by a maintainer with tag rights beside `v<version>` until
 `release-go` pushes it too (`make release-ship` dispatches workflows only, so it is run by hand
-either way); a tag at a release made before the module path matched the repository would name a
-`go.mod` that `go get` refuses, so the first one is the release after that change. A release candidate is never published to PyPI or crates.io:
+either way). The plan prints that item only where `bindings/golang/go.mod` at the ref declares that
+path: a tag at an older release would name a `go.mod` that `go get` refuses, so a plan for an older
+line leaves it out and says why; the first such tag is 1.16.0's. A release candidate is never published to PyPI or crates.io:
 `release-pypi`, `release-crates` and `release-grpc` refuse a ref whose name carries `-rc.` (the
 job is skipped, and its first step says why when it is reached anyway),
 `make release-publish-plan VERSION=1.14.0-rc.1` leaves the three out and says so,

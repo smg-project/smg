@@ -956,8 +956,14 @@ publish_plan() { # <version> <ref>: the plan for v<version> as read at <ref> (th
   fi
   say "$((n += 1)). Go module tag (crates/grpc_client/go/v$version)"
   say "   gh workflow run release-go.yml --ref $tagname -f version=$version"
-  say "$((n += 1)). Go bindings module tag (bindings/golang/v$version at the release commit; by hand until release-go.yml pushes it)"
-  say "   git tag bindings/golang/v$version $tagname^{commit} && git push $REMOTE refs/tags/bindings/golang/v$version"
+  # The bindings module resolves through its tag only where its go.mod declares the path it lives at (the releases from that
+  # change on); at an older ref the tag would name a go.mod that go get refuses, so the plan prints the item only where it holds.
+  if [ "$(git show "$ref:bindings/golang/go.mod" 2>/dev/null | sed -n 's/^module //p')" = github.com/smg-project/smg/bindings/golang ]; then
+    say "$((n += 1)). Go bindings module tag (bindings/golang/v$version at the release commit; by hand until release-go.yml pushes it)"
+    say "   git tag bindings/golang/v$version $tagname^{commit} && git push $REMOTE refs/tags/bindings/golang/v$version"
+  else
+    say "   (no Go bindings module tag: bindings/golang/go.mod at $ref does not declare github.com/smg-project/smg/bindings/golang, so a tag there would not resolve)"
+  fi
   say "$((n += 1)). The GitHub release: release.sh notes $version > notes.md, then the gh release create line it prints."
   say ""
   say "Watch a dispatch: gh run list --workflow <file> --branch $tagname"
