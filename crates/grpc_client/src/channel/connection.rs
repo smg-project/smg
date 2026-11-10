@@ -196,8 +196,10 @@ async fn connect_tcp(host: &str, port: u16, within: Duration) -> io::Result<TcpS
         socket.set_nodelay(true)?;
         Ok(socket)
     }
-    let addresses: Vec<std::net::SocketAddr> =
-        tokio::net::lookup_host((host, port)).await?.collect();
+    let addresses: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| io::Error::new(e.kind(), format!("{host}:{port}: {e}")))?
+        .collect();
     let each = within / u32::try_from(addresses.len()).unwrap_or(u32::MAX).max(1);
     let mut last = io::Error::new(
         io::ErrorKind::NotFound,

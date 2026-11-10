@@ -1006,14 +1006,7 @@ async fn a_status_made_of_the_socket_failing_under_the_call_is_a_transport_failu
         assert!(is_transport_failure(&status), "{end:?}: {status:?}");
     }
 
-    let refused = testing::refused_endpoint();
-    let channel = Channel::unconnected(&refused.url, DEFAULT_CONNECT_TIMEOUT).expect("a channel");
-    let mut client =
-        tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient::new(channel);
-    let status = client
-        .health_check(tonic::Request::new(tokenspeed_proto::HealthCheckRequest {}))
-        .await
-        .expect_err("nothing listens");
+    let (_, status) = a_refused_dial().await;
     assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
     assert_eq!(
         io_error_kind_in(&status),
@@ -1023,11 +1016,9 @@ async fn a_status_made_of_the_socket_failing_under_the_call_is_a_transport_failu
     assert!(!is_transport_failure(&status), "{status:?}");
 }
 
-/// A dial that is refused names the peer in its error, as the dial that
-/// runs into its timeout does: the log line of a failed call on a gateway
-/// with many workers says which one refused.
-#[tokio::test]
-async fn a_refused_dial_names_the_peer_in_its_error() {
+/// A call over a channel to a reserved loopback port that nothing listens
+/// on: the status the refused dial produces, and the peer dialled as host:port.
+async fn a_refused_dial() -> (String, tonic::Status) {
     let refused = testing::refused_endpoint();
     let peer = refused.url.trim_start_matches("grpc://").to_owned();
     let channel = Channel::unconnected(&refused.url, DEFAULT_CONNECT_TIMEOUT).expect("a channel");
@@ -1037,6 +1028,15 @@ async fn a_refused_dial_names_the_peer_in_its_error() {
         .health_check(tonic::Request::new(tokenspeed_proto::HealthCheckRequest {}))
         .await
         .expect_err("nothing listens");
+    (peer, status)
+}
+
+/// A dial that is refused names the peer in its error, as the dial that
+/// runs into its timeout does: the log line of a failed call on a gateway
+/// with many workers says which one refused.
+#[tokio::test]
+async fn a_refused_dial_names_the_peer_in_its_error() {
+    let (peer, status) = a_refused_dial().await;
     assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
     assert!(
         status.message().contains(&peer),
