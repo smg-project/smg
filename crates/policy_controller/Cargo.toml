@@ -25,6 +25,12 @@ criterion = "0.8"
 # The corpus test reads YAML documents; the gateway reads its spec file with
 # the same crate.
 serde_yaml = { workspace = true }
+# The contract tests (tests/contracts.rs) compile the protocol to a
+# descriptor set through protoc and resolve the WebAssembly world; no code
+# is generated and nothing at run time reads the files.
+prost-build = { version = "0.14.4", default-features = false }
+prost-types = { workspace = true }
+wit-parser = { version = "0.258.3", default-features = false, features = ["std"] }
 
 [[bench]]
 name = "decision"
