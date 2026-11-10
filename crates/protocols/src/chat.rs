@@ -9,9 +9,9 @@ use super::{
         default_true, deserialize_null_as_empty_vec, deserialize_null_as_false,
         deserialize_null_as_true, invalid, invalid_at, is_false, is_true, on_field,
         validate_json_schema_shape, validate_logit_bias, validate_stop, CachePartition,
-        ChatLogProbs, ContentPart, Function, FunctionCall, FunctionChoice, GenerationRequest,
-        ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice,
-        ToolChoiceValue, ToolReference, Usage,
+        ChatLogProbs, ContentPart, Function, FunctionCall, FunctionCallResponse, FunctionChoice,
+        GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall,
+        ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -47,11 +47,18 @@ pub enum ChatMessage {
         #[schemars(skip)]
         ext: KimiUserExt,
     },
+    /// An earlier model turn, replayed by the client. The refusal, the audio
+    /// reference and the deprecated function call are carried as the client
+    /// sent them, for an upstream that reads them; the gRPC chat template
+    /// never sees them, as the engines' own chat utils leave them out.
     #[serde(rename = "assistant")]
     Assistant {
         content: Option<MessageContent>,
+        refusal: Option<String>,
         name: Option<String>,
+        audio: Option<ChatAssistantAudio>,
         tool_calls: Option<Vec<ToolCall>>,
+        function_call: Option<FunctionCallResponse>,
         /// Reasoning content for O1-style models (an engine extension), read
         /// from `reasoning_content` or `reasoning`; see [`AssistantReasoning`].
         #[serde(flatten)]
@@ -90,6 +97,13 @@ pub enum ChatMessage {
         content: MessageContent,
         name: Option<String>,
     },
+}
+
+/// The audio answer of an earlier assistant turn, referred to by its id: the
+/// history carries the reference, not the audio.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ChatAssistantAudio {
+    pub id: String,
 }
 
 /// The reasoning text of an assistant message on input. It is read from

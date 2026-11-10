@@ -35,6 +35,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- An assistant message in the chat history keeps its `refusal`, `audio` and `function_call` when
+  the request is written back for an upstream, as the HTTP router and the provider routers write
+  it. The crate dropped all three while reading the message, so a replayed refused turn reached a
+  provider as a bare `{"role": "assistant"}`. The gRPC chat template still gets the turn without
+  them, as the engines' own chat utils build it. Breaking: `ChatMessage::Assistant` gains the
+  fields `refusal: Option<String>`, `audio: Option<ChatAssistantAudio>` and
+  `function_call: Option<FunctionCallResponse>`.
 - A GLM-5.3 request with a `minimal`, `medium` or `xhigh` effort is served. The profile reads the
   name as `low`, `high` or `max`, as z.ai does, in `reasoning_effort` and in `thinking.effort`.
   Since 1.11.0 the profile refused those names with `reasoning_effort_not_allowed`, and `medium`

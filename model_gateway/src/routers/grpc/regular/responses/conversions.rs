@@ -185,6 +185,9 @@ fn push_item(
                 let assistant = ChatMessage::Assistant {
                     content: None,
                     name: None,
+                    refusal: None,
+                    audio: None,
+                    function_call: None,
                     tool_calls: None,
                     reasoning: AssistantReasoning {
                         text: Some(reasoning_text),
@@ -514,6 +517,9 @@ fn assistant_tool_call(
     ChatMessage::Assistant {
         content: None,
         name: None,
+        refusal: None,
+        audio: None,
+        function_call: None,
         tool_calls: Some(vec![ToolCall {
             id: call_id.to_string(),
             tool_type: "function".to_string(),
@@ -604,6 +610,9 @@ fn role_to_chat_message(role: &str, content: MessageContent) -> ChatMessage {
         "assistant" => ChatMessage::Assistant {
             content: Some(content),
             name: None,
+            refusal: None,
+            audio: None,
+            function_call: None,
             tool_calls: None,
             reasoning: Default::default(),
             ext: Default::default(),
