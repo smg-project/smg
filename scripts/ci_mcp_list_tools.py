@@ -15,11 +15,12 @@ among them, 1 when the list is empty or an expected name is missing, 2 when
 the handshake fails (connection, HTTP status, malformed answer, the deadline).
 Standard library only: the check step runs before the test dependencies land.
 
-One deadline bounds the whole handshake, checked before every request and
-every read (JSON bodies and event streams alike) and honoured by the
-session's close. The per-request timeout only bounds one socket operation,
-so a peer that stalls can hold the probe one socket timeout past the
-deadline; the check step's outer timeout allows for that. An event stream is
+One deadline bounds the whole handshake: a process timer that interrupts
+whatever call is blocking when it falls, so a peer that trickles its
+headers, a line or a body a byte at a time inside the socket timeout still
+meets it and the probe prints its own line; the deadline is also checked
+before every request and read and honoured by the session's close. The
+per-request timeout bounds one idle socket operation. An event stream is
 read event by event and left the moment the answer arrives, never to its end.
 """
 
@@ -28,6 +29,7 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import signal
 import sys
 import time
 import urllib.error
@@ -204,7 +206,7 @@ def _close_session(url: str, session: str, timeout: float, deadline: Deadline) -
     skipped once the deadline has passed.
     """
     left = deadline.left()
-    if left <= 0:
+    if left < 0.5:
         return
     request = urllib.request.Request(
         url,
@@ -213,8 +215,8 @@ def _close_session(url: str, session: str, timeout: float, deadline: Deadline) -
     )
     try:
         urllib.request.urlopen(request, timeout=min(timeout, 5.0, left)).close()
-    except NETWORK_ERRORS:
-        pass
+    except NETWORK_ERRORS + (HandshakeError,):
+        pass  # the deadline falling during the close changes nothing either
 
 
 def list_tools(url: str, timeout: float, deadline_seconds: float) -> list[str]:
@@ -272,11 +274,24 @@ def main() -> int:
         "--deadline", type=float, default=30.0, help="seconds for the whole handshake"
     )
     args = parser.parse_args()
+
+    def _expired(_signum, _frame):
+        raise HandshakeError(f"the deadline of {args.deadline:g} s passed")
+
+    # A process timer interrupts whatever call is blocking when the deadline
+    # falls (an exception raised by a signal handler ends a blocked recv), so
+    # a peer trickling its headers or a line a byte at a time inside the
+    # socket timeout still meets it and the probe prints its own line.
+    previous = signal.signal(signal.SIGALRM, _expired)
+    signal.setitimer(signal.ITIMER_REAL, args.deadline)
     try:
         names = list_tools(args.url, args.timeout, args.deadline)
     except HandshakeError as exc:
         print(f"MCP handshake with {args.url} failed: {exc}")
         return 2
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
     expected = [name for name in args.expect.split(",") if name]
     missing = [name for name in expected if name not in names]
     print(f"{args.url} lists {len(names)} tool(s): {', '.join(names) or '(none)'}")

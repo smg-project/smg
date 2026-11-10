@@ -3,8 +3,8 @@
 Every verdict runs against a throwaway MCP server on a loopback port here, one
 shape per test: JSON or SSE answers, an empty list, a missing tool, a failing
 initialize, a null result, a stream kept open with keepalives after the answer,
-a stream that never answers, a chunked HTTP/1.1 stream split mid-line, a JSON answer that
-trickles in, a truncated error body, a closed port. Nothing here reaches a real server.
+a stream that never answers, a chunked HTTP/1.1 stream split mid-line, a JSON answer, a header
+block or an event line that trickle in, a truncated error body, a closed port. Nothing here reaches a real server.
 """
 
 from __future__ import annotations
@@ -89,6 +89,16 @@ class _Handler(BaseHTTPRequestHandler):
         tools = {"empty": [], "missing": [{"name": "other_tool"}]}.get(mode, TWO_TOOLS)
         result = None if mode == "null-result" else {"tools": tools}
         answer = {"jsonrpc": "2.0", "id": payload["id"], "result": result}
+        if mode == "headers-slow":
+            raw = b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n"
+            self._slow_raw(raw + json.dumps(answer).encode())
+            return
+        if mode == "sse-slow-line":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self._slow_raw(f"data: {json.dumps(answer)}\n\n".encode())
+            return
         if mode.startswith("sse"):
             self._event_stream(answer, mode)
         elif mode == "json-slow":
@@ -107,6 +117,17 @@ class _Handler(BaseHTTPRequestHandler):
                 if self.server.stop.wait(0.2):
                     return
                 self.wfile.write(body[i : i + 1])
+                self.wfile.flush()
+        except OSError:
+            return
+
+    def _slow_raw(self, raw):
+        """Raw bytes a byte per 200 ms: a peer trickling its headers or a line inside a socket timeout."""
+        try:
+            for i in range(len(raw)):
+                if self.server.stop.wait(0.2):
+                    return
+                self.wfile.write(raw[i : i + 1])
                 self.wfile.flush()
         except OSError:
             return
@@ -257,7 +278,27 @@ def test_a_json_answer_that_trickles_in_meets_the_deadline(server, monkeypatch, 
         monkeypatch, capsys, server("json-slow").url, "--timeout", "10", "--deadline", "1"
     )
     assert code == 2
-    assert "the deadline of 1 s passed during the answer to tools/list" in out
+    assert "failed: the deadline of 1 s passed" in out
+    assert time.monotonic() - started < 5
+
+
+def test_headers_that_trickle_in_meet_the_deadline(server, monkeypatch, capsys):
+    started = time.monotonic()
+    code, out = _verdict(
+        monkeypatch, capsys, server("headers-slow").url, "--timeout", "10", "--deadline", "1"
+    )
+    assert code == 2
+    assert "failed: the deadline of 1 s passed" in out
+    assert time.monotonic() - started < 5
+
+
+def test_an_event_line_that_trickles_in_meets_the_deadline(server, monkeypatch, capsys):
+    started = time.monotonic()
+    code, out = _verdict(
+        monkeypatch, capsys, server("sse-slow-line").url, "--timeout", "10", "--deadline", "1"
+    )
+    assert code == 2
+    assert "failed: the deadline of 1 s passed" in out
     assert time.monotonic() - started < 5
 
 
@@ -291,7 +332,7 @@ def test_a_stream_that_never_answers_meets_the_deadline(server, monkeypatch, cap
         monkeypatch, capsys, server("sse-silent").url, "--timeout", "10", "--deadline", "1"
     )
     assert code == 2
-    assert "the deadline of 1 s passed during the event stream of tools/list" in out
+    assert "failed: the deadline of 1 s passed" in out
     assert time.monotonic() - started < 5
 
 
