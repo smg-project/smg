@@ -179,47 +179,38 @@ fn has_byte_level_member(decoder: &DecoderWrapper) -> bool {
 /// The byte each `<0xHH>` token of a ByteFallback vocabulary stands for,
 /// indexed by id: the streaming step reads it per token, so it is a table
 /// rather than a vocabulary lookup and a parse. Empty for other vocabularies.
-/// Read id by id from the pipeline's own tables (the model's, then the
-/// added tokens, whose ids may sit past the model's size): the loader keeps
-/// no copy of the vocabulary.
+/// Found by asking the pipeline for every spelling the `ByteFallback`
+/// decoder reads (`<0x`, two characters it parses as a byte, `>`) rather
+/// than by walking the vocabulary: the loader keeps no copy of it, and the
+/// table reaches the last byte token's id wherever the file put it (past a
+/// gap in the ids, or among the added tokens past the model's size).
 fn byte_fallback_values(tokenizer: &HfTokenizer, has_byte_fallback: bool) -> Vec<Option<u8>> {
     if !has_byte_fallback {
         return Vec::new();
     }
-    let len = tokenizer
-        .get_added_vocabulary()
-        .get_added_tokens_decoder()
-        .keys()
-        .filter_map(|&id| usize::try_from(id).ok())
-        .map(|id| id + 1)
-        .max()
-        .unwrap_or(0)
-        .max(tokenizer.get_vocab_size(false));
-    let mut values = vec![None; len];
-    for (index, value) in values.iter_mut().enumerate() {
-        let Ok(id) = TokenIdType::try_from(index) else {
-            break;
-        };
-        *value = tokenizer
-            .id_to_token(id)
-            .and_then(|token| byte_fallback_byte(&token));
+    // The characters `from_str_radix` reads in a byte's two places: a hex
+    // digit of either case, and a leading sign.
+    const PLACES: &[u8] = b"0123456789abcdefABCDEF+";
+    let mut values = Vec::new();
+    for &high in PLACES {
+        for &low in PLACES {
+            let text = format!("<0x{}{}>", char::from(high), char::from(low));
+            let Some(byte) = crate::byte_fallback::byte_token(&text) else {
+                continue;
+            };
+            let Some(index) = tokenizer
+                .token_to_id(&text)
+                .and_then(|id| usize::try_from(id).ok())
+            else {
+                continue;
+            };
+            if values.len() <= index {
+                values.resize(index + 1, None);
+            }
+            values[index] = Some(byte);
+        }
     }
     values
-}
-
-/// The byte a ByteFallback byte token (`<0xHH>`) stands for; `None` for any
-/// other token.
-fn byte_fallback_byte(token: &str) -> Option<u8> {
-    let bytes = token.as_bytes();
-    let byte_token = bytes.len() == 6
-        && bytes.starts_with(b"<0x")
-        && bytes[5] == b'>'
-        && bytes[3].is_ascii_hexdigit()
-        && bytes[4].is_ascii_hexdigit();
-    if !byte_token {
-        return None;
-    }
-    u8::from_str_radix(&token[3..5], 16).ok()
 }
 
 pub(crate) const QWEN2_PRETOKENIZE_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -1012,7 +1003,7 @@ impl HuggingFaceTokenizer {
             if skip_special_tokens && self.special_added_token(id) {
                 continue;
             }
-            if let Some(token) = self.core.tokenizer.id_to_token(id) {
+            if let Some(token) = self.token_text(id) {
                 push_token_bytes(&token, &mut bytes);
             }
         }
@@ -1049,6 +1040,20 @@ impl HuggingFaceTokenizer {
             .get_added_tokens_decoder()
             .get(&id)
             .is_some_and(|token| token.special)
+    }
+
+    /// The text of `id` as the file spells it: an added token's content
+    /// (the pipeline's own lookup answers a normalized added token in the
+    /// normalizer's spelling, which `token_to_id` does not map back), else
+    /// the model's piece.
+    fn token_text(&self, id: TokenIdType) -> Option<String> {
+        self.core
+            .tokenizer
+            .get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .get(&id)
+            .map(|token| token.content.clone())
+            .or_else(|| self.core.tokenizer.get_model().id_to_token(id))
     }
 
     /// Encodes a Llama-class checkpoint as its reference class does.
@@ -2359,8 +2364,10 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         self.core.tokenizer.token_to_id(token)
     }
 
+    /// The file's spelling of the id's token (an added token's content, else
+    /// the model's piece), which `token_to_id` maps back to the id.
     fn id_to_token(&self, id: TokenIdType) -> Option<String> {
-        self.core.tokenizer.id_to_token(id)
+        self.token_text(id)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

@@ -179,7 +179,7 @@ impl PieceTable {
 
 /// The byte a `<0xHH>` token stands for, exactly as the `ByteFallback`
 /// decoder reads it.
-fn byte_token(token: &str) -> Option<u8> {
+pub(crate) fn byte_token(token: &str) -> Option<u8> {
     (token.len() == 6 && token.starts_with("<0x") && token.ends_with('>'))
         .then(|| u8::from_str_radix(&token[3..5], 16).ok())
         .flatten()

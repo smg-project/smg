@@ -98,6 +98,45 @@ fn byte_fallback_run_streams_each_complete_character() {
     assert_eq!(recoveries, 0);
 }
 
+/// A ByteFallback vocabulary whose ids have a gap, the byte tokens past it
+/// (more ids than entries): the byte table reaches them, so the stream holds
+/// back a character its end cut short instead of rendering its bytes as
+/// replacement characters.
+#[test]
+fn byte_fallback_byte_tokens_past_a_gap_in_the_ids_are_known_to_the_stream() {
+    let definition = serde_json::json!({
+        "version": "1.0", "added_tokens": [],
+        "model": {"type": "WordLevel", "unk_token": "[UNK]", "vocab": {
+            "[UNK]": 0, "x": 1, "<0xE2>": 70, "<0x82>": 71, "<0xAC>": 72
+        }},
+        "decoder": {"type": "Sequence", "decoders": [
+            {"type": "ByteFallback"}, {"type": "Fuse"}
+        ]}
+    });
+    let native =
+        tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&definition).unwrap()).unwrap();
+    let tokenizer: Arc<dyn crate::TokenizerTrait> =
+        Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(native));
+    let (deltas, batch, recoveries) = stream_all(
+        &tokenizer,
+        &[1, 70, 71, 72],
+        crate::StopSequenceConfig::default(),
+        true,
+    );
+    assert_eq!(deltas, vec!["x", "€"]);
+    assert_eq!(batch, "x€");
+    assert_eq!(recoveries, 0);
+    let (deltas, batch, recoveries) = stream_all(
+        &tokenizer,
+        &[1, 70, 71],
+        crate::StopSequenceConfig::default(),
+        true,
+    );
+    assert_eq!(deltas, vec!["x"]);
+    assert_eq!(batch, format!("x{}", "\u{FFFD}".repeat(2)));
+    assert_eq!(recoveries, 0);
+}
+
 #[test]
 fn byte_fallback_invalid_byte_keeps_streamed_text_and_counts_the_recovery() {
     let tokenizer = byte_fallback_full_tokenizer(Vec::new());
