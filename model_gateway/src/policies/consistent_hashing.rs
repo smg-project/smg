@@ -252,7 +252,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        policies::test_support::{headers_with_routing_key, make_workers},
+        policies::test_support::{headers_with_routing_key, make_workers, with_headers},
         worker::HashRing,
     };
 
@@ -260,14 +260,6 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert("x-smg-target-worker", idx.to_string().parse().unwrap());
         headers
-    }
-
-    /// The selection info of a request carrying `headers` and nothing else.
-    fn with_headers(headers: &http::HeaderMap) -> SelectWorkerInfo<'_> {
-        SelectWorkerInfo {
-            headers: Some(headers),
-            ..Default::default()
-        }
     }
 
     /// The selection info of a request carrying `headers`, routed over `ring`.

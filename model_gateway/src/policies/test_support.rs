@@ -1,9 +1,9 @@
-//! What the policy tests line their workers up with, and the routing-key
-//! header they send.
+//! What the policy tests line their workers up with, the routing-key
+//! header they send and the selection info that carries it.
 
 use std::sync::Arc;
 
-use super::LoadBalancingPolicy;
+use super::{LoadBalancingPolicy, SelectWorkerInfo};
 use crate::worker::{load_state::TestFeed, test_support::worker_of, Worker, WorkerType};
 
 /// A healthy worker (health checks disabled) at `url`.
@@ -21,6 +21,14 @@ pub(crate) fn headers_with_routing_key(key: &str) -> http::HeaderMap {
     let mut headers = http::HeaderMap::new();
     headers.insert("x-smg-routing-key", key.parse().unwrap());
     headers
+}
+
+/// The selection info of a request carrying `headers` and nothing else.
+pub(crate) fn with_headers(headers: &http::HeaderMap) -> SelectWorkerInfo<'_> {
+    SelectWorkerInfo {
+        headers: Some(headers),
+        ..Default::default()
+    }
 }
 
 /// The `a`/`b` worker pair under `policy` with a test feed attached; the
