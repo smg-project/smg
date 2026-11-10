@@ -30,8 +30,8 @@ use super::{
 };
 use crate::observability::metrics::Metrics;
 
-#[path = "minimax_image_cache.rs"]
-mod minimax_image_cache;
+#[path = "batch_image_cache.rs"]
+mod batch_image_cache;
 
 struct PreparedMultimodalPart {
     preprocessed: PreprocessedEncoderInputs,
@@ -568,8 +568,8 @@ async fn preprocess_modality(
     preprocess_batch(media, ctx).await
 }
 
-/// M3 batches its cache misses. Other models retain the per-image cache
-/// for one image or small independent batches.
+/// Batch misses for processors that support slicing the result into cache
+/// entries. Use the per-image path for other eligible requests.
 async fn cached_images(
     media: &MediaBatch,
     ctx: &PlanContext<'_>,
@@ -580,11 +580,14 @@ async fn cached_images(
     let Some(cache) = &ctx.components.pixel_cache else {
         return Ok(None);
     };
-    let independent = ctx
-        .vision_processors
-        .image()
+    let processor = ctx.vision_processors.image();
+    let independent = processor
+        .as_ref()
         .is_ok_and(|processor| processor.supports_per_image_preprocessing());
-    let batch_cache = independent && !images.is_empty() && ctx.spec.name() == "minimax_m3";
+    let batch_cache = independent
+        && !images.is_empty()
+        && processor
+            .is_ok_and(|processor| processor.supports_batch_image_cache(ctx.image_wire_dtype));
     if !(batch_cache || images.len() == 1 || (images.len() < 32 && independent)) {
         return Ok(None);
     }
@@ -598,7 +601,7 @@ async fn cached_images(
     });
     let fingerprint = config_fingerprint(ctx.tokenizer_id, &config, &ctx.model_config.config)?;
     if batch_cache {
-        return minimax_image_cache::preprocess(images, cache, ctx, fingerprint)
+        return batch_image_cache::preprocess(images, cache, ctx, fingerprint)
             .await
             .map(Some);
     }

@@ -794,6 +794,100 @@ async fn the_policy_is_part_of_the_pixel_cache_key() {
     );
 }
 
+/// Batch a cold 32-image fill, then reuse those images in a new order with an append.
+#[tokio::test]
+async fn bf16_batch_cache_reuses_large_batches_for_qwen_and_gemma() {
+    let frame = |id| {
+        Arc::new(ImageFrame::new(
+            image::RgbImage::from_pixel(112, 112, image::Rgb([id, 21, 203])).into(),
+            Default::default(),
+            Default::default(),
+            ImageSource::InlineBytes,
+            id.to_string(),
+        ))
+    };
+    let cold = (0..32).map(frame).collect::<Vec<_>>();
+    let appended = frame(32);
+    for model_type in ["qwen3_vl", "gemma4"] {
+        let config = MultimodalModelConfig::new(
+            serde_json::json!({"model_type": model_type, "image_token_id": 100}),
+            PreProcessorConfig::default(),
+            None,
+        );
+        let mut components = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &MultimodalSettings::default(),
+        )
+        .unwrap();
+        components.pixel_cache = Some(Arc::new(PixelCache::new(512 * 1024 * 1024)));
+        let spec = components
+            .model_registry
+            .lookup(&ModelMetadata {
+                model_id: model_type,
+                tokenizer: &NoTokenizer,
+                config: &config.config,
+            })
+            .unwrap();
+        let ctx = PlanContext {
+            components: &components,
+            model_id: model_type,
+            model_type: Some(model_type),
+            spec,
+            tokenizer_id: model_type,
+            model_config: &config,
+            vision_processors: config.vision_processors(spec),
+            image_wire_dtype: Some(EncoderDtype::BFloat16),
+            transparency: TransparencyPolicy::KeepAlpha,
+            encoder_budget: None,
+        };
+        let first = MediaBatch::Images(cold.clone());
+        let result = preprocess_modality(&first, &ctx).await.unwrap();
+        let uncached = preprocess_batch(&first, &ctx).await.unwrap();
+        assert_eq!(result.encoder_input, uncached.encoder_input);
+
+        // Invalid encoded bytes make an accidental cache miss visible.
+        let mut cached = cold
+            .iter()
+            .rev()
+            .map(|image| {
+                Arc::new(ImageFrame::encoded(
+                    bytes::Bytes::from_static(b"not an image"),
+                    ImageDetail::Auto,
+                    ImageSource::InlineBytes,
+                    image.hash.clone(),
+                    ImageSize::new(112, 112),
+                    None,
+                ))
+            })
+            .collect::<Vec<_>>();
+        cached.push(Arc::clone(&appended));
+        let expected = cold
+            .iter()
+            .rev()
+            .chain(std::iter::once(&appended))
+            .cloned()
+            .collect();
+        let result = preprocess_modality(&MediaBatch::Images(cached), &ctx)
+            .await
+            .unwrap();
+        let expected = preprocess_batch(&MediaBatch::Images(expected), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(result.encoder_input, expected.encoder_input);
+        assert_eq!(result.feature_token_counts, expected.feature_token_counts);
+        assert_eq!(result.item_sizes, expected.item_sizes);
+        assert_eq!(result.model_specific.len(), expected.model_specific.len());
+        for (key, value) in expected.model_specific {
+            assert_eq!(
+                format!("{:?}", result.model_specific[&key]),
+                format!("{value:?}")
+            );
+        }
+    }
+}
+
 /// Reuse previously cached images across turns and preserve wire bytes and order.
 #[tokio::test]
 async fn minimax_batch_cache_reuses_single_and_batch_misses_in_request_order() {

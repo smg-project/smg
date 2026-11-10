@@ -289,6 +289,11 @@ impl VisionPreProcessor for Qwen3VLProcessor {
         true
     }
 
+    /// BF16 patch rows and their metadata are independent between images.
+    fn supports_batch_image_cache(&self, wire_dtype: Option<EncoderDtype>) -> bool {
+        wire_dtype == Some(EncoderDtype::BFloat16)
+    }
+
     fn emits_pixel_bytes(&self) -> bool {
         true
     }
@@ -316,6 +321,17 @@ impl VisionPreProcessor for Qwen3VLProcessor {
         self.inner.preprocess_wire(images, dtype)
     }
 
+    /// Fill independently owned misses while the writer still has their rows.
+    fn preprocess_cached_wire(
+        &self,
+        prefix: &[&crate::EncoderInput],
+        images: &[&DynamicImage],
+        dtype: EncoderDtype,
+    ) -> Option<Result<(crate::EncoderInput, Vec<PreprocessedEncoderInputs>), TransformError>> {
+        (dtype == EncoderDtype::BFloat16 && images.len() > 1)
+            .then(|| self.inner.preprocess_cached_wire(prefix, images, dtype))
+    }
+
     fn preprocess_video(
         &self,
         frames: &[DynamicImage],
@@ -334,6 +350,11 @@ impl VisionPreProcessor for Qwen3VLProcessor {
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         self.inner.calculate_num_tokens(width, height)
+    }
+
+    /// Number of stored patch elements for one image.
+    fn image_input_elements(&self, width: u32, height: u32) -> Option<usize> {
+        self.inner.image_input_elements(width, height)
     }
 
     fn model_name(&self) -> &'static str {

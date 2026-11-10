@@ -121,6 +121,12 @@ pub trait VisionPreProcessor: Send + Sync {
         false
     }
 
+    /// Whether this processor can slice a batched cache fill into independent
+    /// entries whose representation matches a cached single image.
+    fn supports_batch_image_cache(&self, _wire_dtype: Option<EncoderDtype>) -> bool {
+        false
+    }
+
     /// Whether this processor produces the image's own bytes
     /// ([`EncoderInput::U8`](crate::encoder_inputs::EncoderInput::U8)), so
     /// a destination that normalizes on device can be served raw pixels

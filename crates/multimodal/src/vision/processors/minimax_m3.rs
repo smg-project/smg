@@ -315,6 +315,11 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         true
     }
 
+    /// M3's patch rows and image metadata can be sliced for both cache forms.
+    fn supports_batch_image_cache(&self, _wire_dtype: Option<EncoderDtype>) -> bool {
+        true
+    }
+
     fn emits_pixel_bytes(&self) -> bool {
         true
     }
@@ -347,7 +352,7 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         self.inner.preprocess_wire(images, dtype)
     }
 
-    /// Assemble a BF16 request with a small cached prefix in the fused batch writer.
+    /// Assemble a BF16 request with an optional cached prefix in the fused batch writer.
     fn preprocess_cached_wire(
         &self,
         prefix: &[&EncoderInput],
@@ -446,14 +451,7 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
 
     /// M3's patches cover the resized RGB image once per temporal copy.
     fn image_input_elements(&self, width: u32, height: u32) -> Option<usize> {
-        let (height, width) = self
-            .inner
-            .smart_resize(height as usize, width as usize)
-            .ok()?;
-        height
-            .checked_mul(width)?
-            .checked_mul(3)?
-            .checked_mul(self.inner.temporal_patch_size())
+        self.inner.image_input_elements(width, height)
     }
 
     fn model_name(&self) -> &'static str {

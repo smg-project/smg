@@ -1,4 +1,4 @@
-//! Cache MiniMax M3 images independently while preprocessing misses as a batch.
+//! Cache images independently while preprocessing misses as a batch.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -95,11 +95,11 @@ pub(super) async fn preprocess(
                 .map_while(Option::as_deref)
                 .map(|entry| &entry.preprocessed)
                 .collect::<Vec<_>>();
-            // Leave larger hits in the parallel join. For a small prefix,
-            // filling its bands inline avoids a separate copy of every miss.
+            // Use the fused writer for distinct cold batches and small
+            // cached prefixes. Each worker retains its image before moving
+            // on, so admission needs no second pass over the batch.
             const MAX_FUSED_PREFIX_BYTES: usize = 4 * 1024 * 1024;
-            let fused = if !prefix.is_empty()
-                && parts.len() == images.len()
+            let fused = if parts.len() == images.len()
                 && prefix.len() + misses.len() == images.len()
                 && prefix
                     .iter()
@@ -142,7 +142,7 @@ pub(super) async fn preprocess(
                     let shape = input.shape().to_vec();
                     let norm = input
                         .pixel_norm()
-                        .context("M3 image input has no pixel normalization")?;
+                        .context("image input has no pixel normalization")?;
                     let bytes = input
                         .into_bytes_as(EncoderDtype::BFloat16)
                         .map_err(anyhow::Error::msg)?;
@@ -164,7 +164,7 @@ pub(super) async fn preprocess(
                     && items
                         .iter()
                         .all(|item| item.batch_size() == 1 && item.feature_token_counts.len() == 1),
-                "M3 image preprocessing returned an unexpected item count"
+                "image preprocessing returned an unexpected item count"
             );
             let admit = items
                 .iter()
@@ -190,7 +190,7 @@ pub(super) async fn preprocess(
                     parts[index]
                         .as_ref()
                         .map(|entry| &entry.preprocessed)
-                        .context("missing M3 image cache output")
+                        .context("missing image cache output")
                 })
                 .collect::<Result<Vec<_>>>()?;
             PreprocessedEncoderInputs::concat_refs(&ordered, &layouts.model_specific)?
@@ -202,7 +202,7 @@ pub(super) async fn preprocess(
         Ok(output)
     })
     .await
-    .context("M3 image preprocessing task panicked")?
+    .context("batch image preprocessing task panicked")?
 }
 
 /// Own each image's patches and metadata so the LRU can evict images independently.
@@ -211,19 +211,19 @@ fn split_batch(
     layouts: &EncoderFieldLayouts,
     image_count: usize,
 ) -> Result<Vec<PreprocessedEncoderInputs>> {
-    let FieldLayout::Flat { sizes_key } = &layouts.encoder_input else {
-        anyhow::bail!("expected a flat M3 image encoder input");
+    let sizes = match &layouts.encoder_input {
+        FieldLayout::Batched => vec![1; image_count],
+        FieldLayout::Flat { sizes_key } => batch
+            .model_specific
+            .get(sizes_key)
+            .context("missing image patch counts")?
+            .as_flat_sizes()?,
     };
-    let sizes = batch
-        .model_specific
-        .get(sizes_key)
-        .context("missing M3 image patch counts")?
-        .as_flat_sizes()?;
     anyhow::ensure!(
         sizes.len() == image_count
             && batch.item_sizes.len() == image_count
             && batch.feature_token_counts.len() == image_count,
-        "M3 image preprocessing returned an unexpected item count"
+        "image preprocessing returned an unexpected item count"
     );
     let inputs = batch.encoder_input.split_axis0(&sizes)?;
     let mut items = Vec::with_capacity(image_count);
@@ -235,7 +235,7 @@ fn split_batch(
                 let value = match layouts.model_specific.get(key) {
                     Some(FieldLayout::Batched) => value.slice_first_dim(index, 1)?,
                     Some(FieldLayout::Flat { .. }) => {
-                        anyhow::bail!("unexpected flat M3 image metadata {key}")
+                        anyhow::bail!("unexpected flat image cache metadata {key}")
                     }
                     None => value.clone(),
                 };

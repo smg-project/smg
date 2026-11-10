@@ -696,6 +696,17 @@ impl VisionPreProcessor for Gemma4Processor {
         true
     }
 
+    /// The BF16 wire has one independently padded slice per image.
+    fn supports_batch_image_cache(&self, wire_dtype: Option<EncoderDtype>) -> bool {
+        wire_dtype == Some(EncoderDtype::BFloat16) && self.pixels.one_table()
+    }
+
+    /// Every cache entry includes the full padded patch dimension.
+    fn image_input_elements(&self, _width: u32, _height: u32) -> Option<usize> {
+        let params = self.params_for(Modality::Image).ok()?;
+        params.max_patches().checked_mul(params.patch_pixels())
+    }
+
     fn default_mean(&self) -> [f64; 3] {
         [0.0, 0.0, 0.0]
     }
