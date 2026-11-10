@@ -13,7 +13,7 @@
 use serde_json::{json, Map, Value};
 use smg_data_connector::redacted_url;
 
-use super::RouterConfig;
+use super::{RouterConfig, TenantApiKeyEntry};
 use crate::{
     middleware::key_fingerprint,
     server::posture::{SecretSource, SecretSources},
@@ -148,16 +148,52 @@ const REDACTED: &[&str] = &[
     "ca_certificates",
 ];
 
-/// The view: the build identity, where this start read its secrets, and the
-/// configuration with its secrets redacted.
+/// The keys in force, as the view names them: the shared key by its
+/// fingerprint, each tenant key by its tenant and fingerprint, and how many
+/// control-plane entries are in force. The start's configuration gives the
+/// first record ([`KeysInForce::of`]); a reload of the key files gives each
+/// later one ([`crate::secrets::SecretReloader::keys_in_force`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct KeysInForce {
+    /// The shared serving key's fingerprint, if one is in force.
+    pub api_key: Option<String>,
+    /// Each tenant key in force: the tenant and the key's fingerprint.
+    pub tenant_api_keys: Vec<(String, String)>,
+    /// The control-plane entries in force, `None` when no set is held.
+    pub control_plane_entries: Option<usize>,
+}
+
+impl KeysInForce {
+    /// The record of `api_key`, `tenant_api_keys` and a control-plane set
+    /// of `control_plane_entries` entries.
+    pub(crate) fn of(
+        api_key: Option<&str>,
+        tenant_api_keys: &[TenantApiKeyEntry],
+        control_plane_entries: Option<usize>,
+    ) -> Self {
+        Self {
+            api_key: api_key.map(key_fingerprint),
+            tenant_api_keys: tenant_api_keys
+                .iter()
+                .map(|entry| (entry.tenant_id.clone(), key_fingerprint(&entry.key)))
+                .collect(),
+            control_plane_entries,
+        }
+    }
+}
+
+/// The view: the build identity, where this start read its secrets with the
+/// entries in force, and the configuration with its secrets redacted and
+/// its keys named by the record in force.
 pub(crate) fn effective(
     config: &RouterConfig,
     sources: &SecretSources,
+    keys: &KeysInForce,
 ) -> serde_json::Result<Value> {
     Ok(json!({
         "build": build_identity(),
-        "secret_sources": secret_sources(sources),
-        "config": redacted(config)?,
+        "secret_sources": secret_sources(sources, keys),
+        "config": redacted(config, keys)?,
     }))
 }
 
@@ -176,24 +212,27 @@ fn build_identity() -> Value {
 }
 
 /// The sources record in the words of the start-up line: `flag`, `env` or
-/// `file` per secret, `null` for a secret that was not given.
-fn secret_sources(sources: &SecretSources) -> Value {
+/// `file` per secret, `null` for a secret that was not given. The entry
+/// counts are the sets in force, which a reload of the key files moves.
+fn secret_sources(sources: &SecretSources, keys: &KeysInForce) -> Value {
     json!({
         "api_key": sources.api_key.map(SecretSource::as_str),
-        "tenant_api_keys": sources
-            .tenant_api_keys
-            .map(|(source, entries)| json!({ "source": source.as_str(), "entries": entries })),
-        "control_plane_api_keys": sources
-            .control_plane_api_keys
-            .map(|(source, entries)| json!({ "source": source.as_str(), "entries": entries })),
+        "tenant_api_keys": sources.tenant_api_keys.map(|(source, _)| {
+            json!({ "source": source.as_str(), "entries": keys.tenant_api_keys.len() })
+        }),
+        "control_plane_api_keys": sources.control_plane_api_keys.map(|(source, entries)| {
+            let entries = keys.control_plane_entries.unwrap_or(entries);
+            json!({ "source": source.as_str(), "entries": entries })
+        }),
         "postgres_db_url": sources.postgres_db_url.map(SecretSource::as_str),
         "redis_url": sources.redis_url.map(SecretSource::as_str),
     })
 }
 
 /// The configuration's serialized fields: the plain ones as they are, the
-/// secret-bearing ones rewritten, an unclassified one left out.
-pub(crate) fn redacted(config: &RouterConfig) -> serde_json::Result<Value> {
+/// secret-bearing ones rewritten (the keys by the record in force), an
+/// unclassified one left out.
+pub(crate) fn redacted(config: &RouterConfig, keys: &KeysInForce) -> serde_json::Result<Value> {
     let Value::Object(fields) = serde_json::to_value(config)? else {
         // A struct serializes to an object; nothing else carries a field.
         return Ok(Value::Null);
@@ -201,16 +240,12 @@ pub(crate) fn redacted(config: &RouterConfig) -> serde_json::Result<Value> {
     let mut view = Map::with_capacity(fields.len());
     for (field, value) in fields {
         let value = match field.as_str() {
-            "api_key" => json!(config.api_key.as_deref().map(key_fingerprint)),
+            "api_key" => json!(keys.api_key),
             "tenant_api_keys" => Value::Array(
-                config
-                    .tenant_api_keys
+                keys.tenant_api_keys
                     .iter()
-                    .map(|entry| {
-                        json!({
-                            "tenant_id": entry.tenant_id,
-                            "fingerprint": key_fingerprint(&entry.key),
-                        })
+                    .map(|(tenant_id, fingerprint)| {
+                        json!({ "tenant_id": tenant_id, "fingerprint": fingerprint })
                     })
                     .collect(),
             ),
@@ -357,7 +392,8 @@ mod tests {
     fn the_view_carries_none_of_the_secrets_and_names_each_by_its_mask() {
         let config = configuration_with_every_secret();
 
-        let view = redacted(&config).expect("the view serializes");
+        let keys = KeysInForce::of(config.api_key.as_deref(), &config.tenant_api_keys, None);
+        let view = redacted(&config, &keys).expect("the view serializes");
         let text = view.to_string();
 
         for secret in [
@@ -411,7 +447,7 @@ mod tests {
             ..RouterConfig::default()
         };
 
-        let view = redacted(&config).expect("the view serializes");
+        let view = redacted(&config, &KeysInForce::default()).expect("the view serializes");
 
         assert_eq!(view["host"], json!("0.0.0.0"));
         assert_eq!(view["port"], json!(30123));
@@ -437,8 +473,16 @@ mod tests {
             redis_url: Some(SecretSource::Flag),
         };
 
+        let keys = KeysInForce {
+            tenant_api_keys: vec![
+                ("team-red".to_string(), "0".repeat(16)),
+                ("team-blue".to_string(), "1".repeat(16)),
+            ],
+            ..KeysInForce::default()
+        };
+
         assert_eq!(
-            secret_sources(&sources),
+            secret_sources(&sources, &keys),
             json!({
                 "api_key": "file",
                 "tenant_api_keys": { "source": "env", "entries": 2 },
@@ -451,11 +495,69 @@ mod tests {
 
     #[test]
     fn the_effective_view_has_its_three_parts() {
-        let view = effective(&RouterConfig::default(), &SecretSources::default())
-            .expect("the view serializes");
+        let view = effective(
+            &RouterConfig::default(),
+            &SecretSources::default(),
+            &KeysInForce::default(),
+        )
+        .expect("the view serializes");
 
         assert_eq!(view["build"]["version"], json!(version::VERSION));
         assert!(view["secret_sources"].is_object(), "{view}");
         assert_eq!(view["config"]["port"], json!(RouterConfig::default().port));
+    }
+
+    #[test]
+    fn the_view_names_the_keys_in_force_over_the_configuration() {
+        let config = RouterConfig {
+            api_key: Some("start-key".to_string()),
+            ..RouterConfig::default()
+        };
+        let sources = SecretSources {
+            api_key: Some(SecretSource::File),
+            tenant_api_keys: Some((SecretSource::File, 1)),
+            control_plane_api_keys: Some((SecretSource::File, 1)),
+            ..SecretSources::default()
+        };
+        let keys = KeysInForce::of(
+            Some("rotated-key"),
+            &[
+                TenantApiKeyEntry {
+                    tenant_id: "team-red".to_string(),
+                    key: "red-secret".to_string(),
+                },
+                TenantApiKeyEntry {
+                    tenant_id: "team-blue".to_string(),
+                    key: "blue-secret".to_string(),
+                },
+            ],
+            Some(3),
+        );
+
+        let view = effective(&config, &sources, &keys).expect("the view serializes");
+
+        assert_eq!(
+            view["config"]["api_key"],
+            json!(key_fingerprint("rotated-key"))
+        );
+        assert_eq!(
+            view["config"]["tenant_api_keys"],
+            json!([
+                { "tenant_id": "team-red", "fingerprint": key_fingerprint("red-secret") },
+                { "tenant_id": "team-blue", "fingerprint": key_fingerprint("blue-secret") },
+            ])
+        );
+        assert_eq!(
+            view["secret_sources"]["tenant_api_keys"]["entries"],
+            json!(2)
+        );
+        assert_eq!(
+            view["secret_sources"]["control_plane_api_keys"]["entries"],
+            json!(3)
+        );
+        assert!(
+            !view.to_string().contains(&key_fingerprint("start-key")),
+            "the start's key is gone from the view: {view}"
+        );
     }
 }
