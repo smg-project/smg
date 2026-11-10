@@ -1682,38 +1682,42 @@ mod tests {
         assert!(assign(ParserChoice::Legacy, &ling, &unknown, None, PROMPT).is_none());
     }
 
+    /// The table Symphony reads `request`'s model with, under the default names and no templates.
+    fn table_of(request: &ChatCompletionRequest) -> Arc<Format> {
+        reads(
+            ParserChoice::Symphony,
+            &ModelNames::default(),
+            &request.model,
+            &templates(),
+        )
+        .expect("read")
+        .expect("a table")
+    }
+
+    /// The table assigned to `request`'s response, under the default names and no templates.
+    fn assigned_format(request: &ChatCompletionRequest) -> Arc<Format> {
+        assign(
+            ParserChoice::Symphony,
+            &ModelNames::default(),
+            request,
+            None,
+            PROMPT,
+        )
+        .expect("assigned")
+        .format
+    }
+
     #[test]
     fn the_requests_asks_take_a_variant_of_the_table_and_do_not_switch_the_reader() {
         // A request that keeps the thought in the content, or asks for no calls, is read by the
         // same table without its thought or its calls; the constraint is the full table's.
-        let table = |request: &ChatCompletionRequest| {
-            reads(
-                ParserChoice::Symphony,
-                &ModelNames::default(),
-                &request.model,
-                &templates(),
-            )
-            .expect("read")
-            .expect("a table")
-        };
-        let assigned = |request: &ChatCompletionRequest| {
-            assign(
-                ParserChoice::Symphony,
-                &ModelNames::default(),
-                request,
-                None,
-                PROMPT,
-            )
-            .expect("assigned")
-            .format
-        };
         let declared = serde_json::to_value(tools()).expect("tools");
         let kept = request(
             json!({"tools": declared, "tool_choice": "required", "separate_reasoning": false}),
         );
         assert_eq!(
-            *assigned(&kept),
-            Arc::unwrap_or_clone(table(&kept)).without_reasoning()
+            *assigned_format(&kept),
+            Arc::unwrap_or_clone(table_of(&kept)).without_reasoning()
         );
         assert!(constraint(
             ParserChoice::Symphony,
@@ -1725,8 +1729,8 @@ mod tests {
         .is_some());
         let no_calls = request(json!({"tool_choice": "none"}));
         assert_eq!(
-            *assigned(&no_calls),
-            Arc::unwrap_or_clone(table(&no_calls)).without_calls()
+            *assigned_format(&no_calls),
+            Arc::unwrap_or_clone(table_of(&no_calls)).without_calls()
         );
         assert!(constraint(
             ParserChoice::Symphony,
@@ -1738,13 +1742,13 @@ mod tests {
         .is_none());
         let neither = request(json!({"separate_reasoning": false}));
         assert_eq!(
-            *assigned(&neither),
-            Arc::unwrap_or_clone(table(&neither))
+            *assigned_format(&neither),
+            Arc::unwrap_or_clone(table_of(&neither))
                 .without_calls()
                 .without_reasoning()
         );
         let both = request(json!({"tools": declared}));
-        assert_eq!(assigned(&both), table(&both));
+        assert_eq!(assigned_format(&both), table_of(&both));
     }
 
     #[test]
@@ -1753,35 +1757,14 @@ mod tests {
         // list included, or when the model's provider reads calls without any; the table keeps
         // its calls exactly then, so a call the conversation established comes back as a call
         // under either parser, and a `tool_choice` of `none` keeps them for the reader to drop.
-        let table = |request: &ChatCompletionRequest| {
-            reads(
-                ParserChoice::Symphony,
-                &ModelNames::default(),
-                &request.model,
-                &templates(),
-            )
-            .expect("read")
-            .expect("a table")
-        };
-        let assigned = |request: &ChatCompletionRequest| {
-            assign(
-                ParserChoice::Symphony,
-                &ModelNames::default(),
-                request,
-                None,
-                PROMPT,
-            )
-            .expect("assigned")
-            .format
-        };
         let retry = request(json!({"model": "MiniMax-M3", "messages": retry_messages()}));
         assert!(scans_for_tool_calls_for(
             &retry,
             ProviderProfile::for_model(&retry.model)
         ));
         assert_eq!(
-            assigned(&retry),
-            table(&retry),
+            assigned_format(&retry),
+            table_of(&retry),
             "the provider reads calls without tools"
         );
         let refused = request(json!({
@@ -1797,7 +1780,7 @@ mod tests {
         .expect("assigned");
         assert_eq!(
             forbidden.format,
-            table(&refused),
+            table_of(&refused),
             "none keeps the calls the provider reads; the reader drops them"
         );
         assert!(forbidden.forbids_calls);
@@ -1807,8 +1790,8 @@ mod tests {
             ProviderProfile::for_model(&declared_none.model)
         ));
         assert_eq!(
-            assigned(&declared_none),
-            table(&declared_none),
+            assigned_format(&declared_none),
+            table_of(&declared_none),
             "an empty list is a declaration"
         );
         let undeclared = request(json!({"messages": retry_messages()}));
@@ -1817,8 +1800,8 @@ mod tests {
             ProviderProfile::for_model(&undeclared.model)
         ));
         assert_eq!(
-            *assigned(&undeclared),
-            Arc::unwrap_or_clone(table(&undeclared)).without_calls(),
+            *assigned_format(&undeclared),
+            Arc::unwrap_or_clone(table_of(&undeclared)).without_calls(),
             "a provider that reads calls only with tools"
         );
         // A Messages request: declared tools, an empty list included, keep the calls; none
