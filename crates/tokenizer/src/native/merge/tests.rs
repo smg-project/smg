@@ -89,7 +89,7 @@ fn model_ids(bpe: &BPE, table: &[char; 256], piece: &[u8]) -> Vec<u32> {
 }
 
 fn table_of(bpe: &BPE) -> MergeTable {
-    MergeTable::from_model(&ModelWrapper::BPE(bpe.clone()), ByteTokens::Alphabet)
+    MergeTable::from_model(&ModelWrapper::BPE(bpe.clone()), ByteTokens::Alphabet, None)
         .expect("the table loads")
 }
 
@@ -668,7 +668,7 @@ fn a_vocabulary_without_merges_leaves_the_bytes() {
 #[test]
 fn models_the_table_cannot_stand_in_for_decline() {
     let declined = |bpe: BPE| {
-        MergeTable::from_model(&ModelWrapper::BPE(bpe), ByteTokens::Alphabet)
+        MergeTable::from_model(&ModelWrapper::BPE(bpe), ByteTokens::Alphabet, None)
             .err()
             .expect("declined")
             .to_string()
@@ -721,7 +721,7 @@ fn models_the_table_cannot_stand_in_for_decline() {
     // Not BPE at all.
     let word_level = ModelWrapper::WordLevel(WordLevel::default());
     assert_eq!(
-        MergeTable::from_model(&word_level, ByteTokens::Alphabet)
+        MergeTable::from_model(&word_level, ByteTokens::Alphabet, None)
             .err()
             .expect("declined")
             .to_string(),
@@ -772,7 +772,7 @@ fn a_byte_fallback_vocabulary_merges_its_symbols_as_the_model_does() {
         .unk_token("<unk>".to_owned())
         .build()
         .expect("a byte-fallback BPE");
-    let table = MergeTable::from_model(&ModelWrapper::BPE(bpe.clone()), ByteTokens::Hex)
+    let table = MergeTable::from_model(&ModelWrapper::BPE(bpe.clone()), ByteTokens::Hex, None)
         .expect("the table loads with hex byte tokens");
     assert_eq!(table.merges(), merges.len());
     // No merge of such a table starts from bytes: the hot grid is not built
@@ -1038,7 +1038,7 @@ fn a_table_without_the_hot_grid_answers_no_pair_from_it_whatever_the_ids() {
         .unk_token("<unk>".to_owned())
         .build()
         .expect("a byte-fallback BPE");
-    let table = MergeTable::from_model(&ModelWrapper::BPE(bpe), ByteTokens::Hex)
+    let table = MergeTable::from_model(&ModelWrapper::BPE(bpe), ByteTokens::Hex, None)
         .expect("the table loads with ids at 2^31");
     assert!(table.hot.is_empty());
     assert_eq!(table.hot_index(a, b), None);

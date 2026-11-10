@@ -876,6 +876,7 @@ impl HuggingFaceTokenizer {
         // The bound rides on the file's model into the built tokenizer: no
         // copy of the model (see `word_cache`).
         tokenizer.get_model().bound(encoders.bpe_words_cached());
+        let model_max_id = tokenizer.get_model().read().and_then(|read| read.max_id);
         let tokenizer = HfTokenizer::from(tokenizer);
         encoders.seed_native(tokenizer.get_model());
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
@@ -901,8 +902,8 @@ impl HuggingFaceTokenizer {
             .and_then(deepseek_v31::Checkpoint::load);
         let tools_block =
             deepseek_v31.is_some() && deepseek_v31::Checkpoint::renders_tools_block(&chat_template);
-        let byte_level = ByteLevelTable::build(&tokenizer);
-        let pieces = PieceTable::build(&tokenizer);
+        let byte_level = ByteLevelTable::build_with_max_id(&tokenizer, model_max_id);
+        let pieces = PieceTable::build_with_max_id(&tokenizer, model_max_id);
         let token_texts = TokenTextTable::build(&tokenizer);
         log_decode_path(
             &tokenizer,

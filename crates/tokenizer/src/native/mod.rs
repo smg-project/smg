@@ -888,6 +888,7 @@ impl NativeEncoder {
         let merges = match MergeTable::from_model(
             tokenizer.get_model().wrapper(),
             ByteTokens::Alphabet,
+            tokenizer.get_model().read(),
         ) {
             Ok(table) => {
                 tracing::debug!(
@@ -956,7 +957,11 @@ impl NativeEncoder {
                  normalizer that holds a space or the word marker",
             ));
         }
-        let chars = CharSymbols::from_model(tokenizer.get_model().wrapper(), marker)?;
+        let chars = CharSymbols::from_model(
+            tokenizer.get_model().wrapper(),
+            marker,
+            tokenizer.get_model().read(),
+        )?;
         tracing::debug!(
             merges = chars.merges(),
             bytes = chars.bytes(),

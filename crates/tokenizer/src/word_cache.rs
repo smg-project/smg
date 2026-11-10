@@ -58,6 +58,12 @@ pub(crate) type LoadingTokenizer = TokenizerOf<LateBoundModel>;
 /// The `tokenizers` model behind a tokenizer's model type, built or loading.
 pub(crate) trait ModelView {
     fn wrapper(&self) -> &ModelWrapper;
+
+    /// What the one-pass read of the file saw of a BPE section, while the
+    /// model is loading; nothing once it is built.
+    fn read(&self) -> Option<&ReadBpe> {
+        None
+    }
 }
 
 impl ModelView for ModelWrapper {
@@ -76,6 +82,51 @@ pub(crate) struct LateBoundModel {
     /// Words the BPE model caches per thread once built: the general bound
     /// until the load decides otherwise.
     words: AtomicUsize,
+    /// What the one-pass read of a BPE section saw, for the loader's own
+    /// tables; `None` for a model built in memory or read by the crate.
+    read: Option<ReadBpe>,
+}
+
+/// What the one-pass read of a BPE section saw that the loader's own tables
+/// are built from, so none of it is read back from the built model: the
+/// merges as ids (left, right, product; the rank is the index), when every
+/// merge names tokens of the vocabulary, and the vocabulary's largest id.
+/// Dropped with the loading model when it moves into the built tokenizer.
+pub(crate) struct ReadBpe {
+    pub(crate) pairs: Option<Box<[[u32; 3]]>>,
+    pub(crate) max_id: Option<u32>,
+}
+
+impl ReadBpe {
+    fn of(vocab: &Vocab, merges: &[(String, String)]) -> Self {
+        let max_id = vocab.values().copied().max();
+        let mut token = String::new();
+        let mut pairs = Vec::with_capacity(merges.len());
+        for (left, right) in merges {
+            token.clear();
+            token.push_str(left);
+            token.push_str(right);
+            match (
+                vocab.get(left.as_str()),
+                vocab.get(right.as_str()),
+                vocab.get(token.as_str()),
+            ) {
+                (Some(&a), Some(&b), Some(&product)) => pairs.push([a, b, product]),
+                // A merge naming a token outside the vocabulary: the table
+                // built from the model declines it with the reason.
+                _ => {
+                    return Self {
+                        pairs: None,
+                        max_id,
+                    }
+                }
+            }
+        }
+        Self {
+            pairs: Some(pairs.into_boxed_slice()),
+            max_id,
+        }
+    }
 }
 
 impl LateBoundModel {
@@ -90,6 +141,10 @@ impl ModelView for LateBoundModel {
     fn wrapper(&self) -> &ModelWrapper {
         &self.model
     }
+
+    fn read(&self) -> Option<&ReadBpe> {
+        self.read.as_ref()
+    }
 }
 
 impl From<ModelWrapper> for LateBoundModel {
@@ -97,6 +152,7 @@ impl From<ModelWrapper> for LateBoundModel {
         Self {
             model,
             words: AtomicUsize::new(HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD),
+            read: None,
         }
     }
 }
@@ -104,7 +160,11 @@ impl From<ModelWrapper> for LateBoundModel {
 impl From<LateBoundModel> for ModelWrapper {
     /// The model moves into the built tokenizer with its bound applied.
     fn from(late: LateBoundModel) -> Self {
-        let LateBoundModel { mut model, words } = late;
+        let LateBoundModel {
+            mut model,
+            words,
+            read: _,
+        } = late;
         if let ModelWrapper::BPE(bpe) = &mut model {
             bpe.resize_cache(words.into_inner());
         }
@@ -115,7 +175,7 @@ impl From<LateBoundModel> for ModelWrapper {
 impl<'de> Deserialize<'de> for LateBoundModel {
     /// The file's model section, read in one pass (see [`ModelSection`]).
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_map(ModelSection).map(Self::from)
+        deserializer.deserialize_map(ModelSection)
     }
 }
 
@@ -142,13 +202,13 @@ impl<'de> Deserialize<'de> for LateBoundModel {
 struct ModelSection;
 
 impl<'de> Visitor<'de> for ModelSection {
-    type Value = ModelWrapper;
+    type Value = LateBoundModel;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a tokenizer model section")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<ModelWrapper, A::Error> {
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<LateBoundModel, A::Error> {
         let mut replay = Replay {
             key: None,
             value: None,
@@ -158,7 +218,7 @@ impl<'de> Visitor<'de> for ModelSection {
             let value = if key == "type" {
                 let kind: String = replay.rest.next_value()?;
                 if kind == "BPE" {
-                    return bpe_section(replay.rest).map(ModelWrapper::BPE);
+                    return bpe_section(replay.rest);
                 }
                 Value::String(kind)
             } else {
@@ -168,6 +228,7 @@ impl<'de> Visitor<'de> for ModelSection {
             replay.value = Some(value);
         }
         ModelWrapper::deserialize(de::value::MapAccessDeserializer::new(replay))
+            .map(LateBoundModel::from)
     }
 }
 
@@ -204,8 +265,10 @@ impl<'de, A: MapAccess<'de>> MapAccess<'de> for Replay<A> {
 
 /// The rest of a BPE section after its `type`, fed to the crate's builder
 /// field by field: the fields, their defaults and the skipping of unknown
-/// ones are the crate's own (`tokenizers::models::bpe::serialization`).
-fn bpe_section<'de, A: MapAccess<'de>>(mut map: A) -> Result<BPE, A::Error> {
+/// ones are the crate's own (`tokenizers::models::bpe::serialization`). What
+/// the loader's own tables need of the section rides on the loading model
+/// (`ReadBpe`), read here once.
+fn bpe_section<'de, A: MapAccess<'de>>(mut map: A) -> Result<LateBoundModel, A::Error> {
     let mut builder = BPE::builder();
     let mut vocab: Option<Vocab> = None;
     let mut merges: Option<Vec<(String, String)>> = None;
@@ -267,10 +330,16 @@ fn bpe_section<'de, A: MapAccess<'de>>(mut map: A) -> Result<BPE, A::Error> {
     let (Some(vocab), Some(merges)) = (vocab, merges) else {
         return Err(A::Error::custom("Missing vocab/merges"));
     };
-    builder
+    let read = ReadBpe::of(&vocab, &merges);
+    let model = builder
         .vocab_and_merges(vocab, merges)
         .build()
-        .map_err(A::Error::custom)
+        .map_err(A::Error::custom)?;
+    Ok(LateBoundModel {
+        model: ModelWrapper::BPE(model),
+        words: AtomicUsize::new(HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD),
+        read: Some(read),
+    })
 }
 
 /// The merge list of a BPE section: each merge a pair `["a", "b"]`, or in

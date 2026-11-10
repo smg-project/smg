@@ -19,13 +19,13 @@
 //! time is written in the vocabulary's form for the merge alone.
 
 use rustc_hash::FxHashMap;
-use tokenizers::models::ModelWrapper;
+use tokenizers::{models::ModelWrapper, Model};
 
 use super::{
     merge::{ByteTokens, MergeTable},
     short_pieces::ShortPieceKey,
 };
-use crate::encode_path::Declined;
+use crate::{encode_path::Declined, word_cache::ReadBpe};
 
 /// The word marker of a sentencepiece vocabulary.
 pub(super) const WORD_MARKER: char = '\u{2581}';
@@ -79,7 +79,16 @@ impl CharSymbols {
     /// stand in for (the table's own declines, with the `<0xHH>` spelling of
     /// the byte tokens), a token that spells a byte token inside it (a merge
     /// could then cross a cut).
-    pub(super) fn from_model(model: &ModelWrapper, marker: Marker) -> Result<Self, Declined> {
+    ///
+    /// `read` is what the file's one-pass read saw of the model: the merge
+    /// table takes the merges from it and the entries are read by id,
+    /// nothing through a clone of the vocabulary; `None` for a model built
+    /// in memory.
+    pub(super) fn from_model(
+        model: &ModelWrapper,
+        marker: Marker,
+        read: Option<&ReadBpe>,
+    ) -> Result<Self, Declined> {
         let ModelWrapper::BPE(bpe) = model else {
             return Err(Declined::from("the model is not BPE"));
         };
@@ -88,7 +97,7 @@ impl CharSymbols {
                 "a byte-fallback vocabulary with ignore_merges (the whole text is looked up)",
             ));
         }
-        let merges = MergeTable::from_model(model, ByteTokens::Hex)?;
+        let merges = MergeTable::from_model(model, ByteTokens::Hex, read)?;
         let mut symbols = Self {
             ascii: [NO_ID; 128],
             beyond: FxHashMap::default(),
@@ -96,8 +105,19 @@ impl CharSymbols {
             marker,
             merges,
         };
-        for (token, id) in bpe.get_vocab() {
-            symbols.read_token(&token, id)?;
+        match read.and_then(|read| read.max_id) {
+            Some(max_id) => {
+                for id in 0..=max_id {
+                    if let Some(token) = bpe.id_to_token(id) {
+                        symbols.read_token(&token, id)?;
+                    }
+                }
+            }
+            None => {
+                for (token, id) in bpe.get_vocab() {
+                    symbols.read_token(&token, id)?;
+                }
+            }
         }
         symbols.bridge_raw_text();
         Ok(symbols)
