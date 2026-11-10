@@ -506,6 +506,7 @@ struct Router {
     admin_max_connections: usize,
     admin_port: Option<u16>,
     api_key: Option<String>,
+    api_key_file: Option<String>,
     assignment_mode: Option<String>,
     backend: Option<BackendType>,
     balance_abs_threshold: usize,
@@ -528,6 +529,7 @@ struct Router {
     chat_template: Option<String>,
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
+    control_plane_api_keys_file: Option<String>,
     control_plane_auth: Option<PyControlPlaneAuthConfig>,
     cors_allowed_origins: Vec<String>,
     decode_expected_workers: Option<usize>,
@@ -672,6 +674,7 @@ struct Router {
     routing_key_override: bool,
     runtime_worker_threads: Option<usize>,
     schema_config: Option<String>,
+    secrets_auto_reload: bool,
     selection_accounting_ttl_ms: u64,
     selection_policy: String,
     selection_temperature: f32,
@@ -690,6 +693,7 @@ struct Router {
     /// Per-tenant data-plane keys as `(tenant_id, key)` pairs; each resolves
     /// to its own tenant identity (`auth:<tenant_id>`) on top of `api_key`.
     tenant_api_keys: Vec<(String, String)>,
+    tenant_api_keys_file: Option<String>,
     tenant_header_name: String,
     tenant_rate_limit_config: Option<String>,
     tenant_rate_limit_enabled: bool,
@@ -800,6 +804,86 @@ impl Router {
             server_key_path: key.into(),
             ..smg_mesh::MTLSConfig::default()
         }))
+    }
+
+    /// The files the launcher read the keys from, where a file was the
+    /// source: the targets of the key reload. A key given as a value came
+    /// from the launcher's flag or environment, which the binding does not
+    /// see, so it has no file.
+    fn secret_files(
+        api_key_file: Option<&str>,
+        tenant_api_keys_file: Option<&str>,
+        control_plane_api_keys_file: Option<&str>,
+    ) -> secrets::SecretFiles {
+        let path = |file: Option<&str>| file.map(std::path::PathBuf::from);
+        secrets::SecretFiles {
+            api_key: path(api_key_file),
+            tenant_api_keys: path(tenant_api_keys_file),
+            control_plane_api_keys: path(control_plane_api_keys_file),
+        }
+    }
+
+    /// The sources record: each file with the entries the launcher read
+    /// from it; a key given as a value, or the selected history backend's
+    /// store URL, is the launcher's, from its flag or its environment, which
+    /// the binding does not tell apart; a secret neither given nor filed is
+    /// unnamed.
+    fn secret_sources(
+        files: &secrets::SecretFiles,
+        api_key_given: bool,
+        tenant_entries: usize,
+        control_plane_entries: usize,
+        postgres_db_url_given: bool,
+        redis_url_given: bool,
+    ) -> server::posture::SecretSources {
+        use smg::server::posture::SecretSource;
+        let source = |file: Option<&std::path::PathBuf>, given: bool| match (file, given) {
+            (Some(_), _) => Some(SecretSource::File),
+            (None, true) => Some(SecretSource::Launcher),
+            (None, false) => None,
+        };
+        server::posture::SecretSources {
+            api_key: source(files.api_key.as_ref(), api_key_given),
+            tenant_api_keys: source(files.tenant_api_keys.as_ref(), tenant_entries > 0)
+                .map(|source| (source, tenant_entries)),
+            control_plane_api_keys: source(
+                files.control_plane_api_keys.as_ref(),
+                control_plane_entries > 0,
+            )
+            .map(|source| (source, control_plane_entries)),
+            postgres_db_url: postgres_db_url_given.then_some(SecretSource::Launcher),
+            redis_url: redis_url_given.then_some(SecretSource::Launcher),
+        }
+    }
+
+    /// A key file keyword names the file the launcher's parser read the key
+    /// from, beside the value it read: the reload's target, not a source the
+    /// binding reads itself. A path without its value would start the
+    /// gateway without that key, with the serving auth layer never built
+    /// (its presence is fixed at start) while the record named the file, so
+    /// it is refused by name. The parser and the CLI both refuse an empty
+    /// key file, so a file read by either comes with a value.
+    fn key_file_without_its_value(
+        api_key: Option<&str>,
+        api_key_file: Option<&str>,
+        tenant_api_keys: usize,
+        tenant_api_keys_file: Option<&str>,
+        control_plane_api_keys: usize,
+        control_plane_api_keys_file: Option<&str>,
+    ) -> Option<&'static str> {
+        [
+            (api_key_file.is_some() && api_key.is_none(), "api_key_file"),
+            (
+                tenant_api_keys_file.is_some() && tenant_api_keys == 0,
+                "tenant_api_keys_file",
+            ),
+            (
+                control_plane_api_keys_file.is_some() && control_plane_api_keys == 0,
+                "control_plane_api_keys_file",
+            ),
+        ]
+        .into_iter()
+        .find_map(|(without_value, name)| without_value.then_some(name))
     }
 
     /// The join peers of `mesh_peer_urls`, each an `ip:port`. The binary's
@@ -1417,6 +1501,7 @@ impl Router {
         admin_max_connections = 0,
         admin_port = None,
         api_key = None,
+        api_key_file = None,
         assignment_mode = None,
         backend = None,
         balance_abs_threshold = 64,
@@ -1439,6 +1524,7 @@ impl Router {
         chat_template = None,
         client_cert_path = None,
         client_key_path = None,
+        control_plane_api_keys_file = None,
         control_plane_auth = None,
         cors_allowed_origins = vec![],
         decode_expected_workers = None,
@@ -1576,6 +1662,7 @@ impl Router {
         routing_key_override = false,
         runtime_worker_threads = None,
         schema_config = None,
+        secrets_auto_reload = false,
         selection_accounting_ttl_ms = 0,
         selection_policy = String::from("cache-aware-default"),
         selection_temperature = 0.0,
@@ -1592,6 +1679,7 @@ impl Router {
         storage_hook_wasm_path = None,
         stream_body_stall_timeout_secs = 300,
         tenant_api_keys = vec![],
+        tenant_api_keys_file = None,
         tenant_header_name = String::from("x-smg-tenant-id"),
         tenant_rate_limit_config = None,
         tenant_rate_limit_enabled = false,
@@ -1639,6 +1727,7 @@ impl Router {
         admin_max_connections: usize,
         admin_port: Option<u16>,
         api_key: Option<String>,
+        api_key_file: Option<String>,
         assignment_mode: Option<String>,
         backend: Option<BackendType>,
         balance_abs_threshold: usize,
@@ -1661,6 +1750,7 @@ impl Router {
         chat_template: Option<String>,
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
+        control_plane_api_keys_file: Option<String>,
         control_plane_auth: Option<PyControlPlaneAuthConfig>,
         cors_allowed_origins: Vec<String>,
         decode_expected_workers: Option<usize>,
@@ -1798,6 +1888,7 @@ impl Router {
         routing_key_override: bool,
         runtime_worker_threads: Option<usize>,
         schema_config: Option<String>,
+        secrets_auto_reload: bool,
         selection_accounting_ttl_ms: u64,
         selection_policy: String,
         selection_temperature: f32,
@@ -1814,6 +1905,7 @@ impl Router {
         storage_hook_wasm_path: Option<String>,
         stream_body_stall_timeout_secs: u64,
         tenant_api_keys: Vec<(String, String)>,
+        tenant_api_keys_file: Option<String>,
         tenant_header_name: String,
         tenant_rate_limit_config: Option<String>,
         tenant_rate_limit_enabled: bool,
@@ -1861,6 +1953,22 @@ impl Router {
                  a discovery mapping takes check_interval_secs",
             ));
         }
+        if let Some(name) = Self::key_file_without_its_value(
+            api_key.as_deref(),
+            api_key_file.as_deref(),
+            tenant_api_keys.len(),
+            tenant_api_keys_file.as_deref(),
+            control_plane_auth
+                .as_ref()
+                .map_or(0, |auth| auth.api_keys.len()),
+            control_plane_api_keys_file.as_deref(),
+        ) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "{name} names a key file without the key read from it: \
+                 RouterArgs.from_cli_args reads the file and passes both, \
+                 a direct RouterArgs passes the value beside the file"
+            )));
+        }
         let discovery = discovery
             .as_ref()
             .map(parse_discovery)
@@ -1897,6 +2005,7 @@ impl Router {
             admin_max_connections,
             admin_port,
             api_key,
+            api_key_file,
             assignment_mode,
             backend,
             balance_abs_threshold,
@@ -1919,6 +2028,7 @@ impl Router {
             chat_template,
             client_cert_path,
             client_key_path,
+            control_plane_api_keys_file,
             control_plane_auth,
             cors_allowed_origins,
             decode_expected_workers,
@@ -2056,6 +2166,7 @@ impl Router {
             routing_key_override,
             runtime_worker_threads,
             schema_config,
+            secrets_auto_reload,
             selection_accounting_ttl_ms,
             selection_policy,
             selection_temperature,
@@ -2072,6 +2183,7 @@ impl Router {
             storage_hook_wasm_path,
             stream_body_stall_timeout_secs,
             tenant_api_keys,
+            tenant_api_keys_file,
             tenant_header_name,
             tenant_rate_limit_config,
             tenant_rate_limit_enabled,
@@ -2179,6 +2291,14 @@ impl Router {
         // Release the GIL while the server runs so Python threads can make progress.
         py.detach(|| {
             runtime.block_on(async move {
+            // The launcher resolved the secrets' sources in Python and hands
+            // over the files it read the keys from: the record names those,
+            // and the reload reads them again.
+            let secret_files = Self::secret_files(
+                self.api_key_file.as_deref(),
+                self.tenant_api_keys_file.as_deref(),
+                self.control_plane_api_keys_file.as_deref(),
+            );
             Box::pin(server::startup(server::ServerConfig {
                 router_config,
                 log_dir: self.log_dir.clone(),
@@ -2249,13 +2369,23 @@ impl Router {
                 },
                 webrtc_bind_addr,
                 webrtc_stun_server: self.webrtc_stun_server.clone(),
-                // The launcher resolved the secrets' sources in Python; the
-                // record is the CLI's.
-                secret_sources: Default::default(),
-                secret_files: Default::default(),
-                // No file path reaches the binding yet, so there is nothing
-                // to watch; the flag follows with the paths.
-                secrets_auto_reload: false,
+                secret_sources: Self::secret_sources(
+                    &secret_files,
+                    self.api_key.is_some(),
+                    self.tenant_api_keys.len(),
+                    self.control_plane_auth
+                        .as_ref()
+                        .map_or(0, |auth| auth.api_keys.len()),
+                    matches!(self.history_backend, HistoryBackendType::Postgres)
+                        && self
+                            .postgres_config
+                            .as_ref()
+                            .is_some_and(|config| config.db_url.is_some()),
+                    matches!(self.history_backend, HistoryBackendType::Redis)
+                        && self.redis_config.is_some(),
+                ),
+                secret_files,
+                secrets_auto_reload: self.secrets_auto_reload,
             }))
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
@@ -2430,6 +2560,100 @@ mod tests {
         ] {
             assert_eq!(unpinned.startup_worker_runtime(), None, "{unpinned:?}");
         }
+    }
+
+    /// Each key file the launcher read reaches the gateway under its own
+    /// name, and a key given as a value has no file.
+    #[test]
+    fn secret_files_keep_each_file_under_its_own_name() {
+        let files = Router::secret_files(Some("/run/keys/api"), None, Some("/run/keys/control"));
+        assert_eq!(
+            files.api_key.as_deref(),
+            Some(std::path::Path::new("/run/keys/api"))
+        );
+        assert!(files.tenant_api_keys.is_none(), "given as a value: no file");
+        assert_eq!(
+            files.control_plane_api_keys.as_deref(),
+            Some(std::path::Path::new("/run/keys/control"))
+        );
+        let none = Router::secret_files(None, None, None);
+        assert_eq!(none, secrets::SecretFiles::default());
+    }
+
+    /// The sources record names a file for each key a file gave, with the
+    /// entries read from it; a count without a file or a value names nothing.
+    #[test]
+    fn secret_sources_name_the_files_with_their_own_entry_counts() {
+        use smg::server::posture::SecretSource;
+        let files =
+            Router::secret_files(None, Some("/run/keys/tenants"), Some("/run/keys/control"));
+        let sources = Router::secret_sources(&files, false, 3, 2, false, false);
+        assert!(
+            sources.api_key.is_none(),
+            "neither given nor filed: unnamed"
+        );
+        assert_eq!(sources.tenant_api_keys, Some((SecretSource::File, 3)));
+        assert_eq!(
+            sources.control_plane_api_keys,
+            Some((SecretSource::File, 2))
+        );
+        assert!(sources.postgres_db_url.is_none() && sources.redis_url.is_none());
+
+        let serving_only = Router::secret_files(Some("/run/keys/api"), None, None);
+        let sources = Router::secret_sources(&serving_only, true, 0, 0, false, false);
+        assert_eq!(sources.api_key, Some(SecretSource::File));
+        assert!(
+            sources.tenant_api_keys.is_none(),
+            "neither given nor filed names nothing"
+        );
+        assert!(sources.control_plane_api_keys.is_none());
+    }
+
+    /// A key given as a value and no file is the launcher's in the record,
+    /// with its entry count, and so is the selected backend's store URL; the
+    /// binding does not tell flag from environment.
+    #[test]
+    fn secret_sources_name_a_value_given_key_as_the_launchers() {
+        use smg::server::posture::SecretSource;
+        let none = Router::secret_files(None, None, None);
+        let sources = Router::secret_sources(&none, true, 3, 2, true, false);
+        assert_eq!(sources.api_key, Some(SecretSource::Launcher));
+        assert_eq!(sources.postgres_db_url, Some(SecretSource::Launcher));
+        assert!(
+            sources.redis_url.is_none(),
+            "the other backend's URL is not given"
+        );
+        assert_eq!(sources.tenant_api_keys, Some((SecretSource::Launcher, 3)));
+        assert_eq!(
+            sources.control_plane_api_keys,
+            Some((SecretSource::Launcher, 2))
+        );
+        assert!(Router::secret_sources(&none, false, 0, 0, false, false)
+            .api_key
+            .is_none());
+    }
+
+    /// A key file keyword without the value read from it is named for the
+    /// refusal; with its value, or without the file, nothing is.
+    #[test]
+    fn a_key_file_without_its_value_is_named() {
+        let without = Router::key_file_without_its_value;
+        assert_eq!(
+            without(None, Some("/k"), 0, None, 0, None),
+            Some("api_key_file")
+        );
+        assert_eq!(without(Some("k"), Some("/k"), 0, None, 0, None), None);
+        assert_eq!(
+            without(None, None, 0, Some("/t"), 0, None),
+            Some("tenant_api_keys_file")
+        );
+        assert_eq!(without(None, None, 2, Some("/t"), 0, None), None);
+        assert_eq!(
+            without(None, None, 0, None, 0, Some("/c")),
+            Some("control_plane_api_keys_file")
+        );
+        assert_eq!(without(None, None, 0, None, 1, Some("/c")), None);
+        assert_eq!(without(None, None, 0, None, 0, None), None);
     }
 
     /// The join peers parse the same from a comma list and from separate
