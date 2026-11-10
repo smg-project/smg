@@ -118,9 +118,9 @@ pub trait VisionPreProcessor: Send + Sync {
         false
     }
 
-    /// Whether this processor can slice a batched cache fill into independent
-    /// entries whose representation matches a cached single image.
-    fn supports_batch_image_cache(&self, _wire_dtype: Option<EncoderDtype>) -> bool {
+    /// Whether this processor can split a BF16 batch into independently
+    /// preprocessed images with their metadata.
+    fn supports_bf16_batch_cache(&self) -> bool {
         false
     }
 
@@ -190,14 +190,6 @@ pub trait VisionPreProcessor: Send + Sync {
         _images: &[&DynamicImage],
         _dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
-        None
-    }
-
-    /// Preprocess images into independently owned neutral cache entries.
-    fn preprocess_image_items(
-        &self,
-        _images: &[&DynamicImage],
-    ) -> Option<Result<Vec<PreprocessedEncoderInputs>, TransformError>> {
         None
     }
 

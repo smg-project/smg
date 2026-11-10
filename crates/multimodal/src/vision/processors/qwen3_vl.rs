@@ -290,8 +290,8 @@ impl VisionPreProcessor for Qwen3VLProcessor {
     }
 
     /// BF16 patch rows and their metadata are independent between images.
-    fn supports_batch_image_cache(&self, wire_dtype: Option<EncoderDtype>) -> bool {
-        wire_dtype == Some(EncoderDtype::BFloat16)
+    fn supports_bf16_batch_cache(&self) -> bool {
+        true
     }
 
     fn emits_pixel_bytes(&self) -> bool {

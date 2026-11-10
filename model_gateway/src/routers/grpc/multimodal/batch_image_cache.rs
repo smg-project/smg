@@ -7,11 +7,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use llm_multimodal::{
-    EncoderDtype, EncoderFieldLayouts, EncoderInput, FieldLayout, ImageFrame, Modality,
-    PreprocessedEncoderInputs,
+    buffer_pool, EncoderDtype, EncoderFieldLayouts, EncoderInput, FieldLayout, ImageFrame,
+    Modality, PreprocessedEncoderInputs,
 };
 
-use super::{image_cache_fingerprint, on_pool, preprocess_images, PlanContext, VisionProcessors};
+use super::{image_cache_fingerprint, on_pool, preprocess_image_frames, PlanContext};
 use crate::{
     observability::metrics::Metrics,
     routers::grpc::multimodal::pixel_cache::{CachedPreprocessedItem, PixelCache, PixelCacheKey},
@@ -22,12 +22,12 @@ pub(super) async fn preprocess(
     images: &[Arc<ImageFrame>],
     cache: &Arc<PixelCache>,
     ctx: &PlanContext<'_>,
+    newly_cacheable: bool,
 ) -> Result<Option<PreprocessedEncoderInputs>> {
     let model_id = Metrics::interned_model_label(ctx.model_id);
-    let wire_dtype = ctx.image_wire_dtype;
-    let bf16 = wire_dtype == Some(EncoderDtype::BFloat16);
+    let wire_dtype = Some(EncoderDtype::BFloat16);
     let budget = cache.max_bytes();
-    let width = if bf16 { 2 } else { 1 };
+    let width = EncoderDtype::BFloat16.element_size();
     let processor = ctx.vision_processors.image()?;
     let remaining = images
         .iter()
@@ -49,6 +49,7 @@ pub(super) async fn preprocess(
     }
     let fingerprint = image_cache_fingerprint(ctx)?;
     let working_bytes = remaining.map_or(0, |remaining| (budget / width - remaining) * width);
+    let working_capacity = buffer_pool::allocation_capacity(working_bytes);
     let images = images.to_vec();
     let cache = Arc::clone(cache);
     let processors = Arc::clone(&ctx.vision_processors);
@@ -90,65 +91,64 @@ pub(super) async fn preprocess(
         let mut direct_output = None;
         if has_misses {
             let direct = misses.len() == images.len();
+            // Large cold fills can hold the buffers that the next wave would
+            // reuse. Leave those buffers in the pool until images recur.
+            let large_pooled = 8 * 1024 * 1024..=buffer_pool::LARGEST;
+            if direct
+                && newly_cacheable
+                && large_pooled.contains(&working_bytes)
+                && !cache.admit_repeated(misses.iter().map(|(_, key)| key), working_capacity)
+            {
+                return preprocess_image_frames(&images, &processors, wire_dtype).map(Some);
+            }
             // For a large, mostly new request, keep one contiguous output.
             // Recompute the small set of hits rather than gather a second
             // full tensor. Keep the hit-assisted path if decoding fails.
             const MIN_RECOMPUTE_BYTES: usize = 8 * 1024 * 1024;
-            if bf16
-                && distinct
+            if distinct
                 && !direct
                 && misses.len() >= images.len() - misses.len()
                 && working_bytes >= MIN_RECOMPUTE_BYTES
+                && working_capacity < budget
             {
                 if let Ok(mut batch) = preprocess_image_frames(&images, &processors, wire_dtype) {
-                    if admit_shared_batch(
-                        &mut batch,
-                        &images,
-                        &layouts,
-                        &cache,
-                        budget,
-                        fingerprint,
-                    )? {
-                        return Ok(Some(batch));
+                    admit_shared_batch(&mut batch, &images, &layouts, &cache, fingerprint)?;
+                    return Ok(Some(batch));
+                }
+            }
+            let mut batch = preprocess_image_frames(&miss_images, &processors, wire_dtype)?;
+            // MiniMax M3 uses neutral pixels for a single image. Store the
+            // BF16 form so the entry can join a multi-image wire batch.
+            if !matches!(batch.encoder_input, EncoderInput::Wire { .. }) {
+                let input = batch.encoder_input;
+                let shape = input.shape().to_vec();
+                let norm = input
+                    .pixel_norm()
+                    .context("image input has no pixel normalization")?;
+                let bytes = input
+                    .into_bytes_as(EncoderDtype::BFloat16)
+                    .map_err(anyhow::Error::msg)?;
+                batch.encoder_input =
+                    EncoderInput::wire(bytes, EncoderDtype::BFloat16, shape, norm)
+                        .map_err(anyhow::Error::msg)?;
+            }
+            if direct && batch.encoder_input.nbytes() > budget {
+                return Ok(Some(batch));
+            }
+            batch.encoder_input.share_wire(budget);
+            let mut items = split_batch(&batch, &layouts, misses.len())?;
+            // When pooled capacity leaves insufficient room for metadata,
+            // compact the cache entries while retaining the request output.
+            if let Some((_, capacity)) = batch.encoder_input.shared_allocation() {
+                if !cache.shared_batch_fits(capacity, items.iter()) {
+                    for item in &mut items {
+                        item.encoder_input = item.encoder_input.view().to_owned();
                     }
                 }
             }
-            let processor = processors.image()?;
-            let decoded = decode_image_frames(&miss_images)?;
-            let items = if let Some(items) = (!direct && !bf16)
-                .then(|| processor.preprocess_image_items(&decoded))
-                .flatten()
-            {
-                items?
-            } else {
-                let mut batch = preprocess_images(processor.as_ref(), &decoded, wire_dtype)?;
-                // The fused batch processor emits neutral pixels for a lone
-                // image. Match the representation of multi-image entries.
-                if bf16 && !matches!(batch.encoder_input, EncoderInput::Wire { .. }) {
-                    let input = batch.encoder_input;
-                    let shape = input.shape().to_vec();
-                    let norm = input
-                        .pixel_norm()
-                        .context("image input has no pixel normalization")?;
-                    let bytes = input
-                        .into_bytes_as(EncoderDtype::BFloat16)
-                        .map_err(anyhow::Error::msg)?;
-                    batch.encoder_input =
-                        EncoderInput::wire(bytes, EncoderDtype::BFloat16, shape, norm)
-                            .map_err(anyhow::Error::msg)?;
-                }
-                if direct && batch.encoder_input.nbytes() > budget {
-                    return Ok(Some(batch));
-                }
-                if bf16 {
-                    batch.encoder_input.share_wire(budget);
-                }
-                let items = split_batch(&batch, &layouts, misses.len())?;
-                if direct {
-                    direct_output = Some(batch);
-                }
-                items
-            };
+            if direct {
+                direct_output = Some(batch);
+            }
             anyhow::ensure!(
                 items.len() == misses.len()
                     && items
@@ -187,10 +187,9 @@ pub(super) async fn preprocess(
                 PreprocessedEncoderInputs::concat_refs(&ordered, &layouts.model_specific)?;
             // Repoint the entries of a growing request to its assembled output
             // so its next replay can reuse it and old backing groups can leave.
-            if bf16
-                && distinct
+            if distinct
                 && has_misses
-                && admit_shared_batch(&mut output, &images, &layouts, &cache, budget, fingerprint)?
+                && admit_shared_batch(&mut output, &images, &layouts, &cache, fingerprint)?
             {
                 return Ok(Some(output));
             }
@@ -206,52 +205,34 @@ pub(super) async fn preprocess(
     .context("batch image preprocessing task panicked")?
 }
 
-/// Decode and preprocess an image batch.
-fn preprocess_image_frames(
-    images: &[Arc<ImageFrame>],
-    vision_processors: &VisionProcessors,
-    image_wire_dtype: Option<EncoderDtype>,
-) -> Result<PreprocessedEncoderInputs> {
-    let decoded = decode_image_frames(images)?;
-    let processor = vision_processors.image()?;
-    preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
-}
-
-/// Decode the frames in parallel and borrow them for the processor.
-fn decode_image_frames(images: &[Arc<ImageFrame>]) -> Result<Vec<&image::DynamicImage>> {
-    ImageFrame::decode_all(images).map_err(llm_multimodal::MultiModalError::Media)?;
-    images
-        .iter()
-        .map(|frame| {
-            frame
-                .image()
-                .map_err(llm_multimodal::MultiModalError::Media)
-                .map_err(anyhow::Error::from)
-        })
-        .collect()
-}
-
 /// Admit a distinct batch's image views without making a second pixel allocation.
 fn admit_shared_batch(
     batch: &mut PreprocessedEncoderInputs,
     images: &[Arc<ImageFrame>],
     layouts: &EncoderFieldLayouts,
     cache: &PixelCache,
-    budget: usize,
     fingerprint: u64,
 ) -> Result<bool> {
-    if !batch.encoder_input.share_wire(budget) {
+    if !batch.encoder_input.share_wire(cache.max_bytes()) {
         return Ok(false);
     }
+    let (_, capacity) = batch
+        .encoder_input
+        .shared_allocation()
+        .context("missing shared wire capacity")?;
     let items = split_batch(batch, layouts, images.len())?;
-    cache.insert_batch(images.iter().zip(items).map(|(image, preprocessed)| {
-        let key = PixelCacheKey {
-            image_hash: image.hash.clone(),
-            config_fingerprint: fingerprint,
-        };
-        (key, Arc::new(CachedPreprocessedItem { preprocessed }))
-    }));
-    Ok(true)
+    let entries = images
+        .iter()
+        .zip(items)
+        .map(|(image, preprocessed)| {
+            let key = PixelCacheKey {
+                image_hash: image.hash.clone(),
+                config_fingerprint: fingerprint,
+            };
+            (key, Arc::new(CachedPreprocessedItem { preprocessed }))
+        })
+        .collect();
+    Ok(cache.insert_shared_batch(entries, capacity))
 }
 
 /// Slice each image's patches and metadata, sharing already immutable wire data.

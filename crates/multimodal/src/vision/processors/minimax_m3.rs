@@ -47,14 +47,11 @@ use image::DynamicImage;
 
 use super::{
     qwen2_vl::{CLIP_MEAN, CLIP_STD},
-    qwen_vl_base::{
-        image_work, weighted_runs, QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode,
-    },
+    qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode},
 };
 use crate::{
     types::RgbFrameRef,
     vision::{
-        execution,
         preprocessor_config::PreProcessorConfig,
         processor::{PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor},
         transforms::TransformError,
@@ -310,13 +307,8 @@ impl Deref for MiniMaxM3VisionProcessor {
 }
 
 impl VisionPreProcessor for MiniMaxM3VisionProcessor {
-    /// Image geometry and patchification are independent across the batch.
-    fn supports_per_image_preprocessing(&self) -> bool {
-        true
-    }
-
-    /// M3's patch rows and image metadata can be sliced for both cache forms.
-    fn supports_batch_image_cache(&self, _wire_dtype: Option<EncoderDtype>) -> bool {
+    /// Each image contributes independent BF16 patch rows and metadata.
+    fn supports_bf16_batch_cache(&self) -> bool {
         true
     }
 
@@ -339,8 +331,9 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         self.inner.preprocess(images)
     }
 
-    /// Write multi-image BF16 batches in one pass. A single image uses the
-    /// neutral path, which the gateway can convert to match cached BF16 entries.
+    /// Write BF16 image batches in one pass; only BF16 was benchmarked here.
+    /// Single images retain neutral U8 pixels to preserve pixel-cache entry
+    /// sizes. This guard also applies when no cache is present.
     fn preprocess_wire(
         &self,
         images: &[&DynamicImage],
@@ -350,54 +343,6 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
             return None;
         }
         self.inner.preprocess_wire(images, dtype)
-    }
-
-    /// Produce cache entries directly when they will be assembled with hits
-    /// or duplicated in the request. Balance work by pixels and keep results
-    /// in request order.
-    fn preprocess_image_items(
-        &self,
-        images: &[&DynamicImage],
-    ) -> Option<Result<Vec<PreprocessedEncoderInputs>, TransformError>> {
-        let preprocess = |image: &&DynamicImage| self.inner.preprocess_owned_image(image);
-        let source_bytes = images.iter().map(|image| image.as_bytes().len()).sum();
-        let tasks = execution::task_count(source_bytes, images.len(), 1);
-        if tasks <= 1 {
-            return Some(images.iter().map(preprocess).collect());
-        }
-        let weights: Vec<_> = images
-            .iter()
-            .map(|image| {
-                let (height, width) = (image.height() as usize, image.width() as usize);
-                let (target_h, target_w) = self
-                    .inner
-                    .smart_resize(height, width)
-                    .unwrap_or((height, width));
-                image_work(image, target_w as u32, target_h as u32)
-            })
-            .collect();
-        let mut results: Vec<_> = images.iter().map(|_| None).collect();
-        let items = images.iter().zip(&mut results).collect();
-        execution::scope(|scope| {
-            for run in weighted_runs(items, &weights, tasks) {
-                let preprocess = &preprocess;
-                scope.spawn(move |_| {
-                    for (image, result) in run {
-                        *result = Some(preprocess(image));
-                    }
-                });
-            }
-        });
-        Some(
-            results
-                .into_iter()
-                .map(|result| {
-                    result.unwrap_or_else(|| {
-                        Err(TransformError::ShapeError("missing M3 image result".into()))
-                    })
-                })
-                .collect(),
-        )
     }
 
     fn preprocess_video(
@@ -435,7 +380,7 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         self.inner.calculate_num_tokens(width, height)
     }
 
-    /// M3's patches cover the resized RGB image once per temporal copy.
+    /// The rows cover each resized RGB image once per temporal copy.
     fn image_input_elements(&self, width: u32, height: u32) -> Option<usize> {
         self.inner.image_input_elements(width, height)
     }
@@ -475,55 +420,6 @@ mod tests {
             }"#,
         )
         .expect("checkpoint preprocessor config parses")
-    }
-
-    /// Cache entries must hold only the bytes the pixel budget charges.
-    #[test]
-    fn owned_cache_items_have_no_spare_pixel_capacity() {
-        use crate::EncoderInput;
-        let processor = MiniMaxM3VisionProcessor::new();
-        let image = DynamicImage::new_rgb8(560, 560);
-        let item = processor
-            .preprocess_image_items(&[&image])
-            .unwrap()
-            .unwrap()
-            .pop()
-            .unwrap();
-        let pixels = item.encoder_input.nbytes();
-        let EncoderInput::U8 { patches, .. } = item.encoder_input else {
-            panic!("expected owned neutral pixels");
-        };
-        let buffer = patches.into_raw_vec_and_offset().0;
-        assert!((1 << 20..64 << 20).contains(&pixels));
-        assert!(!pixels.is_power_of_two());
-        assert_eq!(buffer.capacity(), pixels);
-    }
-
-    /// Work can run out of order while cache entries retain the image order.
-    #[test]
-    fn owned_cache_items_keep_request_order() {
-        let processor = MiniMaxM3VisionProcessor::new();
-        let sizes = [
-            (112, 112),
-            (672, 560),
-            (140, 112),
-            (560, 560),
-            (112, 140),
-            (560, 672),
-            (168, 112),
-            (112, 168),
-            (196, 112),
-        ];
-        let images = sizes.map(|(width, height)| DynamicImage::new_rgb8(width, height));
-        let refs = images.iter().collect::<Vec<_>>();
-        let items = processor.preprocess_image_items(&refs).unwrap().unwrap();
-        assert_eq!(
-            items
-                .iter()
-                .flat_map(|item| item.item_sizes.iter().copied())
-                .collect::<Vec<_>>(),
-            sizes,
-        );
     }
 
     /// The fused BF16 path preserves pixels, geometry, and metadata under
@@ -601,7 +497,10 @@ mod tests {
                     .preprocess_wire(&[&images[0], &images[1]], dtype)
                     .is_none());
             }
-            assert!(processor.supports_per_image_preprocessing());
+            assert!(
+                !processor.supports_per_image_preprocessing(),
+                "this change does not enable the multi-image cache"
+            );
         }
     }
 

@@ -650,7 +650,8 @@ impl EncoderInput {
                     })
                     .collect::<AnyhowResult<Vec<_>>>()?;
                 Ok(Self::U8 {
-                    patches: concat_pixel_arrays(&views)?,
+                    patches: ndarray::concatenate(Axis(0), &views)
+                        .context("encoder inputs of the batch parts do not stack")?,
                     norm: *norm,
                 })
             }
@@ -675,36 +676,6 @@ impl EncoderInput {
             _ => None,
         }
     }
-}
-
-/// Copy contiguous pixel arrays directly, retaining ndarray's strided path.
-fn concat_pixel_arrays(views: &[ArrayViewD<'_, u8>]) -> AnyhowResult<ArrayD<u8>> {
-    let shape = views[0].shape();
-    let slices = views
-        .iter()
-        .map(|part| part.as_slice())
-        .collect::<Option<Vec<_>>>();
-    let (Some((_, tail)), Some(slices)) = (shape.split_first(), slices) else {
-        return ndarray::concatenate(Axis(0), views)
-            .context("encoder inputs of the batch parts do not stack");
-    };
-    let mut joined = shape.to_vec();
-    joined[0] = 0;
-    let mut len = 0usize;
-    for (part, slice) in views.iter().zip(&slices) {
-        anyhow::ensure!(
-            part.shape().get(1..) == Some(tail),
-            "encoder inputs of the batch parts do not stack"
-        );
-        joined[0] = joined[0]
-            .checked_add(part.shape()[0])
-            .context("joined row count overflows usize")?;
-        len = len
-            .checked_add(slice.len())
-            .context("joined pixel count overflows usize")?;
-    }
-    ArrayD::from_shape_vec(IxDyn(&joined), concat_byte_slices(&slices, len))
-        .context("encoder inputs of the batch parts do not stack")
 }
 
 /// Copy large byte batches into disjoint output bands on the shared pool.

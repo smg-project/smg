@@ -1252,7 +1252,7 @@ impl QwenVLProcessorBase {
 /// by: the source pixels (a resize reads every source row, so a large image
 /// shrunk to the budget costs its source, not its target) plus the target
 /// pixels (the patch layout and the write).
-pub(super) fn image_work(image: &DynamicImage, target_width: u32, target_height: u32) -> usize {
+fn image_work(image: &DynamicImage, target_width: u32, target_height: u32) -> usize {
     let source = image.width() as usize * image.height() as usize;
     let target = target_width as usize * target_height as usize;
     source + target
@@ -1262,7 +1262,7 @@ pub(super) fn image_work(image: &DynamicImage, target_width: u32, target_height:
 /// first, each to the lightest run so far, so the runs hold about equal
 /// shares of the work and no run is empty; at most `tasks` runs, at most one
 /// per item. Within a run the items keep their order.
-pub(super) fn weighted_runs<T>(items: Vec<T>, weights: &[usize], tasks: usize) -> Vec<Vec<T>> {
+fn weighted_runs<T>(items: Vec<T>, weights: &[usize], tasks: usize) -> Vec<Vec<T>> {
     let tasks = tasks.clamp(1, items.len().max(1));
     let mut order: Vec<usize> = (0..items.len()).collect();
     order.sort_by_key(|&index| std::cmp::Reverse(weights[index]));
@@ -1631,20 +1631,22 @@ impl QwenVLProcessorBase {
     }
 }
 
-impl QwenVLProcessorBase {
-    /// Allocate exactly the pixels retained by an independently cached image.
-    pub(super) fn preprocess_owned_image(
-        &self,
-        image: &DynamicImage,
-    ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        self.preprocess_pixels(&[image], |len| vec![0; len])
+impl VisionPreProcessor for QwenVLProcessorBase {
+    fn emits_pixel_bytes(&self) -> bool {
+        true
     }
 
-    /// Write neutral patches into a caller-selected allocation.
-    fn preprocess_pixels(
+    fn default_mean(&self) -> [f64; 3] {
+        self.config.mean
+    }
+
+    fn default_std(&self) -> [f64; 3] {
+        self.config.std
+    }
+
+    fn preprocess(
         &self,
         images: &[&DynamicImage],
-        allocate: fn(usize) -> Vec<u8>,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let batch = self.plan_image_batch(images)?;
         let ImageBatchPlan {
@@ -1658,8 +1660,10 @@ impl QwenVLProcessorBase {
         let image_plans = &batch.plans;
 
         // Each image owns a disjoint band of the patch buffer, so the images
-        // resize and patchify in parallel. The bands cover the allocation.
-        let mut all_patches = allocate(total_patch_values);
+        // resize and patchify in parallel. A pooled buffer: its bytes are a
+        // previous request's until the bands, which cover it exactly, are
+        // written.
+        let mut all_patches: Vec<u8> = buffer_pool::take(total_patch_values);
         let mut bands = Vec::with_capacity(images.len());
         let mut remaining = all_patches.as_mut_slice();
         for plan in image_plans {
@@ -1747,27 +1751,6 @@ impl QwenVLProcessorBase {
                 ))
             })?;
         Ok(batch.result(EncoderInput::bytes(encoder_input, norm)))
-    }
-}
-
-impl VisionPreProcessor for QwenVLProcessorBase {
-    fn emits_pixel_bytes(&self) -> bool {
-        true
-    }
-
-    fn default_mean(&self) -> [f64; 3] {
-        self.config.mean
-    }
-
-    fn default_std(&self) -> [f64; 3] {
-        self.config.std
-    }
-
-    fn preprocess(
-        &self,
-        images: &[&DynamicImage],
-    ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        self.preprocess_pixels(images, buffer_pool::take)
     }
 
     fn preprocess_wire(
