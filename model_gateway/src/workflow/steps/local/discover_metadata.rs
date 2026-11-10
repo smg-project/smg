@@ -1116,9 +1116,6 @@ mod tests {
         );
     }
 
-    /// The vLLM HTTP read takes the model's identity and window from
-    /// `/v1/models` and the build from `/version`; a `/version` the engine
-    /// does not offer leaves no label and fails no read.
     #[tokio::test]
     async fn strict_vllm_refresh_still_rejects_optional_version_failure() {
         use crate::workflow::steps::local::test_support::serve_json_routes;
@@ -1152,6 +1149,9 @@ mod tests {
         assert!(error.starts_with("/version: status 503"), "{error}");
     }
 
+    /// The vLLM HTTP read takes the model's identity and window from
+    /// `/v1/models` and the build from `/version`; a `/version` the engine
+    /// does not offer leaves no label and fails no read.
     #[tokio::test]
     async fn the_vllm_http_read_takes_the_model_list_and_the_version() {
         use http::StatusCode;
