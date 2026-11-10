@@ -631,6 +631,7 @@ struct Router {
     pd_admission_wait_secs: u64,
     pd_disaggregation: bool,
     pd_pairing_mode: String,
+    policy_engine: String,
     postgres_config: Option<PyPostgresConfig>,
     power_of_two_load_metric: String,
     prefill_expected_workers: Option<usize>,
@@ -945,6 +946,19 @@ impl Router {
                 field: "pd_pairing_mode".to_string(),
                 value: self.pd_pairing_mode.clone(),
                 reason: "expected 'off', 'lenient', or 'strict'".to_string(),
+            }
+        })
+    }
+
+    /// The deciding implementation by its CLI spelling (`legacy`, `engine`;
+    /// any case, trimmed); anything else is refused by name, as the CLI's
+    /// choices refuse it.
+    fn parse_policy_engine(&self) -> Result<config::PolicyEngineMode, config::ConfigError> {
+        config::PolicyEngineMode::parse(&self.policy_engine).ok_or_else(|| {
+            config::ConfigError::InvalidValue {
+                field: "policy_engine".to_string(),
+                value: self.policy_engine.clone(),
+                reason: "expected 'legacy' or 'engine'".to_string(),
             }
         })
     }
@@ -1295,6 +1309,7 @@ impl Router {
             };
 
         let pd_pairing_mode = self.parse_pd_pairing_mode()?;
+        let policy_engine = self.parse_policy_engine()?;
 
         config::RouterConfig::builder()
             .mode(mode)
@@ -1430,6 +1445,7 @@ impl Router {
             .dp_aware(self.dp_aware)
             .engine_metrics(self.engine_metrics)
             .pd_pairing_mode(pd_pairing_mode)
+            .policy_engine(policy_engine)
             .runtime_worker_threads(self.runtime_worker_threads)
             .upstream_http2(self.upstream_http2)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
@@ -1619,6 +1635,7 @@ impl Router {
         pd_admission_wait_secs = 30,
         pd_disaggregation = false,
         pd_pairing_mode = String::from("lenient"),
+        policy_engine = String::from("legacy"),
         postgres_config = None,
         power_of_two_load_metric = String::from("expected_wait"),
         prefill_expected_workers = None,
@@ -1845,6 +1862,7 @@ impl Router {
         pd_admission_wait_secs: u64,
         pd_disaggregation: bool,
         pd_pairing_mode: String,
+        policy_engine: String,
         postgres_config: Option<PyPostgresConfig>,
         power_of_two_load_metric: String,
         prefill_expected_workers: Option<usize>,
@@ -2123,6 +2141,7 @@ impl Router {
             pd_admission_wait_secs,
             pd_disaggregation,
             pd_pairing_mode,
+            policy_engine,
             postgres_config,
             power_of_two_load_metric,
             prefill_expected_workers,
