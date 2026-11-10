@@ -7,8 +7,8 @@ use smg_mcp::McpConfig;
 use super::{
     AccessLogField, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
     HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig, MetricsConfig,
-    OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig, PostgresConfig,
-    RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+    OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig, PolicyEngineMode,
+    PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
     TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
@@ -750,6 +750,11 @@ impl RouterConfigBuilder {
 
     pub fn pd_pairing_mode(mut self, mode: PdPairingMode) -> Self {
         self.config.pd_pairing_mode = mode;
+        self
+    }
+
+    pub fn policy_engine(mut self, mode: PolicyEngineMode) -> Self {
+        self.config.policy_engine = mode;
         self
     }
 

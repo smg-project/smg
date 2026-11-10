@@ -28,8 +28,9 @@ use serde::{
 
 use crate::{
     builtins::{
-        Best, HasCapacity, HasRoom, Healthy, LeastLoad, LeastRequests, NotOverloaded, NotTried,
-        Passthrough, PowerOfTwo, PrefixAffinity, Random, RoundRobin, SessionAffinity,
+        Best, CountFirst, HasCapacity, HasRoom, Healthy, LeastLoad, LeastRequests, NotOverloaded,
+        NotTried, Passthrough, PowerOfTwo, PowerOfTwoCountFirst, PrefixAffinity, Random,
+        RoundRobin, SessionAffinity,
     },
     framework::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, Weighted},
     view::Phase,
@@ -1676,10 +1677,8 @@ fn picker_of(
             "round-robin" => built_picker(RoundRobin::new()),
             "random" => built_picker(Random),
             "power-of-two" => built_picker(PowerOfTwo),
-            "count-first" => Resolved::NotInBuild("the count-first picker"),
-            "power-of-two-count-first" => {
-                Resolved::NotInBuild("the power-of-two-count-first picker")
-            }
+            "count-first" => built_picker(CountFirst),
+            "power-of-two-count-first" => built_picker(PowerOfTwoCountFirst),
             "passthrough" => built_picker(Passthrough),
             "manual" => Resolved::NotInBuild("the manual picker"),
             "best-with-temperature" => {
@@ -2982,11 +2981,6 @@ mod tests {
             not_in_build(&spec_with_pick(r#""manual""#)),
             ("profiles.p.pick".to_string(), "the manual picker")
         );
-        for name in ["count-first", "power-of-two-count-first"] {
-            let (path, what) = not_in_build(&spec_with_pick(&format!("{name:?}")));
-            assert_eq!(path, "profiles.p.pick");
-            assert_eq!(what, format!("the {name} picker"));
-        }
         assert_eq!(
             bad_field(&spec_with_pick(r#""best-with-temperature""#)),
             "profiles.p.pick"
@@ -3015,6 +3009,8 @@ mod tests {
             "round-robin",
             "random",
             "power-of-two",
+            "count-first",
+            "power-of-two-count-first",
             "passthrough",
         ] {
             assert!(
