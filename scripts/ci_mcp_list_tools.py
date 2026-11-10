@@ -15,10 +15,12 @@ among them, 1 when the list is empty or an expected name is missing, 2 when
 the handshake fails (connection, HTTP status, malformed answer, the deadline).
 Standard library only: the check step runs before the test dependencies land.
 
-One deadline bounds the whole handshake. The per-request timeout only bounds
-a socket operation, and a server that keeps an event stream open with
-keepalive comments never trips it; the stream is read event by event and
-left the moment the answer arrives, never to its end.
+One deadline bounds the whole handshake, checked before every request and
+every read (JSON bodies and event streams alike) and honoured by the
+session's close. The per-request timeout only bounds one socket operation,
+so a peer that stalls can hold the probe one socket timeout past the
+deadline; the check step's outer timeout allows for that. An event stream is
+read event by event and left the moment the answer arrives, never to its end.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ CLIENT_INFO = {"name": "smg-ci-service-check", "version": "1"}
 # list is a few kilobytes, a stream that passes this without the answer is
 # not going to deliver it.
 MAX_ANSWER_BYTES = 1024 * 1024
+READ_CHUNK = 64 * 1024
 
 NETWORK_ERRORS = (urllib.error.URLError, http.client.HTTPException, OSError)
 
@@ -46,14 +49,17 @@ class HandshakeError(Exception):
 
 
 class Deadline:
-    """One total bound over the handshake: every request, read and the session's close."""
+    """One total bound over the handshake, checked before every request, read and the session's close."""
 
     def __init__(self, seconds: float) -> None:
         self.seconds = seconds
         self.end = time.monotonic() + seconds
 
+    def left(self) -> float:
+        return self.end - time.monotonic()
+
     def remaining(self, step: str) -> float:
-        left = self.end - time.monotonic()
+        left = self.left()
         if left <= 0:
             raise HandshakeError(f"the deadline of {self.seconds:g} s passed during {step}")
         return left
@@ -69,12 +75,30 @@ def _checked(message: dict) -> dict:
     return message
 
 
-def _read_json(response: http.client.HTTPResponse, wanted_id: int, method: str) -> dict:
-    """Return the JSON-RPC message with the wanted id from a JSON body (an object or a batch)."""
-    try:
-        body = response.read(MAX_ANSWER_BYTES + 1).decode("utf-8", errors="replace")
-    except NETWORK_ERRORS as exc:
-        raise HandshakeError(f"reading the answer to {method} failed: {exc}") from exc
+def _read_json(
+    response: http.client.HTTPResponse, wanted_id: int, method: str, deadline: Deadline
+) -> dict:
+    """Return the JSON-RPC message with the wanted id from a JSON body (an object or a batch).
+
+    The body is read in the pieces that have arrived, the deadline checked
+    before each, so a peer that trickles bytes inside the socket timeout
+    cannot run past it any more than a stream of keepalives can.
+    """
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        deadline.remaining(f"the answer to {method}")
+        try:
+            chunk = response.read1(READ_CHUNK)
+        except NETWORK_ERRORS as exc:
+            raise HandshakeError(f"reading the answer to {method} failed: {exc}") from exc
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > MAX_ANSWER_BYTES:
+            raise HandshakeError(f"the answer to {method} passed {MAX_ANSWER_BYTES} bytes")
+    body = b"".join(chunks).decode("utf-8", errors="replace")
     if not body.strip():
         raise HandshakeError(f"{method} answered HTTP {response.status} with no body")
     try:
@@ -147,7 +171,15 @@ def _post(
     try:
         response = urllib.request.urlopen(request, timeout=min(timeout, deadline.remaining(method)))
     except urllib.error.HTTPError as exc:
-        raise HandshakeError(f"HTTP {exc.code} on {method}: {exc.read()[:200]!r}") from exc
+        # A sized read returns what arrived instead of raising on a truncated
+        # error body, and the guard keeps a stalled one from escaping this
+        # handler as a traceback (an exception raised inside one except
+        # clause is not caught by its siblings).
+        try:
+            detail = exc.read(200)
+        except NETWORK_ERRORS:
+            detail = b"(the error body could not be read)"
+        raise HandshakeError(f"HTTP {exc.code} on {method}: {detail!r}") from exc
     except NETWORK_ERRORS as exc:
         raise HandshakeError(f"{method} failed: {exc}") from exc
     with response:
@@ -159,23 +191,28 @@ def _post(
             raise HandshakeError(f"{method} answered HTTP 202 with no body")
         if response.headers.get("Content-Type", "").startswith("text/event-stream"):
             return _read_event(response, payload["id"], method, deadline), new_session
-        return _read_json(response, payload["id"], method), new_session
+        return _read_json(response, payload["id"], method, deadline), new_session
 
 
-def _close_session(url: str, session: str, timeout: float) -> None:
+def _close_session(url: str, session: str, timeout: float, deadline: Deadline) -> None:
     """Tell a stateful server the session is over (the protocol's DELETE), best effort.
 
     A stateless server answers 405 and a dead one nothing; neither changes the
     verdict, the tool list is already in hand. Without this every probe would
-    leave a session in the shared server's memory until its pod restarts.
+    leave a session in the shared server's memory until its pod restarts. The
+    close gets what is left of the deadline, at most a few seconds, and is
+    skipped once the deadline has passed.
     """
+    left = deadline.left()
+    if left <= 0:
+        return
     request = urllib.request.Request(
         url,
         method="DELETE",
         headers={"Mcp-Session-Id": session, "MCP-Protocol-Version": PROTOCOL_VERSION},
     )
     try:
-        urllib.request.urlopen(request, timeout=timeout).close()
+        urllib.request.urlopen(request, timeout=min(timeout, 5.0, left)).close()
     except NETWORK_ERRORS:
         pass
 
@@ -212,7 +249,7 @@ def list_tools(url: str, timeout: float, deadline_seconds: float) -> list[str]:
         )
     finally:
         if session:
-            _close_session(url, session, min(timeout, 5.0))
+            _close_session(url, session, timeout, deadline)
     result = (answer or {}).get("result")
     tools = result.get("tools") if isinstance(result, dict) else None
     if not isinstance(tools, list):

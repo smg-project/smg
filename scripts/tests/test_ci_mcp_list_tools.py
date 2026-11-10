@@ -3,7 +3,8 @@
 Every verdict runs against a throwaway MCP server on a loopback port here, one
 shape per test: JSON or SSE answers, an empty list, a missing tool, a failing
 initialize, a null result, a stream kept open with keepalives after the answer,
-a stream that never answers, a closed port. Nothing here reaches a real server.
+a stream that never answers, a chunked HTTP/1.1 stream split mid-line, a JSON answer that
+trickles in, a truncated error body, a closed port. Nothing here reaches a real server.
 """
 
 from __future__ import annotations
@@ -68,6 +69,15 @@ class _Handler(BaseHTTPRequestHandler):
             if mode == "init-500":
                 self._send(500, b"boom", "text/plain")
                 return
+            if mode == "init-502-truncated":
+                # A proxy in front of a restarting pod: the status, a
+                # Content-Length of 100, eleven bytes, then the close.
+                self.send_response(502)
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                self.wfile.write(b"bad gateway")
+                self.wfile.flush()
+                return
             result = {
                 "protocolVersion": PROBE.PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
@@ -81,10 +91,52 @@ class _Handler(BaseHTTPRequestHandler):
         answer = {"jsonrpc": "2.0", "id": payload["id"], "result": result}
         if mode.startswith("sse"):
             self._event_stream(answer, mode)
+        elif mode == "json-slow":
+            self._trickle(json.dumps(answer).encode())
         else:
             self._send(200, json.dumps(answer).encode())
 
+    def _trickle(self, body):
+        """A JSON answer at a few bytes per second, each inside a socket timeout."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            for i in range(len(body)):
+                if self.server.stop.wait(0.2):
+                    return
+                self.wfile.write(body[i : i + 1])
+                self.wfile.flush()
+        except OSError:
+            return
+
+    def _chunk(self, data):
+        self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+        self.wfile.flush()
+
+    def _chunked_event_stream(self, answer):
+        """The real server's shape: HTTP/1.1, Transfer-Encoding chunked, the answer split mid-line."""
+        self.protocol_version = "HTTP/1.1"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        event = f"event: message\ndata: {json.dumps(answer)}\n\n".encode()
+        half = len(event) // 2
+        try:
+            self._chunk(b": a greeting comment\n\n")
+            self._chunk(event[:half])
+            self._chunk(event[half:])
+            while not self.server.stop.wait(0.05):
+                self._chunk(b": ping\n\n")
+        except OSError:
+            return
+
     def _event_stream(self, answer, mode):
+        if mode == "sse-chunked":
+            self._chunked_event_stream(answer)
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -193,6 +245,32 @@ def test_a_closed_port_is_exit_2(monkeypatch, capsys):
     assert "failed: initialize failed" in out
 
 
+def test_a_truncated_error_body_is_the_named_line_not_a_traceback(server, monkeypatch, capsys):
+    code, out = _verdict(monkeypatch, capsys, server("init-502-truncated").url)
+    assert code == 2
+    assert "failed: HTTP 502 on initialize: b'bad gateway'" in out
+
+
+def test_a_json_answer_that_trickles_in_meets_the_deadline(server, monkeypatch, capsys):
+    started = time.monotonic()
+    code, out = _verdict(
+        monkeypatch, capsys, server("json-slow").url, "--timeout", "10", "--deadline", "1"
+    )
+    assert code == 2
+    assert "the deadline of 1 s passed during the answer to tools/list" in out
+    assert time.monotonic() - started < 5
+
+
+def test_a_chunked_stream_split_mid_line_is_read_to_the_answer(server, monkeypatch, capsys):
+    started = time.monotonic()
+    code, out = _verdict(
+        monkeypatch, capsys, server("sse-chunked").url, "--expect", "brave_web_search"
+    )
+    assert code == 0
+    assert "lists 2 tool(s)" in out
+    assert time.monotonic() - started < 5
+
+
 def test_a_null_result_is_exit_2_with_the_named_line_not_a_traceback(server, monkeypatch, capsys):
     code, out = _verdict(monkeypatch, capsys, server("null-result").url)
     assert code == 2
@@ -220,6 +298,6 @@ def test_a_stream_that_never_answers_meets_the_deadline(server, monkeypatch, cap
 def test_the_check_step_bounds_each_attempt_and_passes_the_deadline():
     text = CHECK.read_text()
     assert (
-        'timeout 45 python3 "$probe" "$url" --expect "$expected" --timeout 10 --deadline 30' in text
+        'timeout 60 python3 "$probe" "$url" --expect "$expected" --timeout 10 --deadline 30' in text
     )
     assert 'check_mcp_tools "Brave Search MCP" "http://$host:8080/mcp" "brave_web_search"' in text
