@@ -68,7 +68,29 @@ pub(crate) fn known_spec_drafted(counts: impl Iterator<Item = (u32, u32)>) -> Op
     }
 }
 
+/// Every requested choice must have its own terminal frame. Arrival count
+/// alone cannot distinguish a missing choice from a repeated terminal index.
+/// Some legacy workers send only index zero for n>1; those frames cannot prove
+/// complete membership either, so their rejections remain unavailable.
+pub(crate) fn all_choices_completed(
+    responses: &[ProtoGenerateComplete],
+    expected_choices: u32,
+) -> bool {
+    responses.len() >= expected_choices as usize
+        && (0..expected_choices).all(|index| responses.iter().any(|r| r.index() == index))
+}
+
 impl TokenCounts {
+    /// Collected counters retain partial answers, but only certify rejections
+    /// once every choice requested by the client supplied terminal counters.
+    pub(crate) fn of_collected(responses: &[ProtoGenerateComplete], expected_choices: u32) -> Self {
+        let mut counts = Self::of(responses);
+        if !all_choices_completed(responses, expected_choices) {
+            counts.spec_drafted = None;
+        }
+        counts
+    }
+
     /// The counters of the `Complete` frames of one request.
     pub(crate) fn of(responses: &[ProtoGenerateComplete]) -> Self {
         Self {
