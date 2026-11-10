@@ -679,7 +679,6 @@ jobs:
       E2E_AMD_REQUIRE_PASSING_CALL: '1'
       E2E_STARTUP_TIMEOUT: '900'
       ROUTER_LOCAL_MODEL_PATH: /models
-      GPU_TYPE: MI300
       BENCH_ENFORCE_THRESHOLDS: '0'
       E2E_LOG_DIR: benchmark-logs-amd
     steps:
@@ -2232,6 +2231,8 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
     env:
       E2E_VENDOR: ${{ matrix.vendor }}
+      # Pod-local sidecar owns the real keys. Never map provider secrets here.
+      E2E_AI_KEY_PROXY: http://127.0.0.1:8787
       E2E_GPU_TIER: "0"
       SHOW_ROUTER_LOGS: "1"
     steps:
