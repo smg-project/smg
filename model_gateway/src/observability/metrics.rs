@@ -1550,6 +1550,10 @@ pub(crate) fn init_metrics() {
         "smg_responses_not_stored_total",
         "Responses with store: true whose record or conversation linking was not written, by mode (foreground: the request was answered with the failure; background: the record keeps what it had) and step (record: nothing is stored; linking: the record is stored, its items are not in the conversation)"
     );
+    describe_counter!(
+        "smg_messages_thread_turns_total",
+        "Message-thread turns on the Messages route, by op (create, continue) and outcome (stored: the answer is kept under its id; reissued: kept under a fresh id, the answer's id being a stored turn's; unstored: answered, not kept; not_found, mismatch: a continue refused before the model ran)"
+    );
 
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
     super::runtime_metrics::describe();
@@ -2276,6 +2280,21 @@ impl Metrics {
             "smg_responses_not_stored_total",
             "mode" => mode,
             "step" => step
+        )
+        .increment(1);
+    }
+
+    /// A message-thread turn, by `op` (create, continue) and `outcome`:
+    /// `stored` (the answer is kept under its id), `reissued` (the answer's
+    /// id was a stored turn's: kept under a fresh id, in the answer too),
+    /// `unstored` (answered and not kept: a streamed answer, an error, an
+    /// answer the gateway could not read, a write the store refused),
+    /// `not_found` and `mismatch` (a continue refused before the model ran).
+    pub fn record_message_thread_turn(op: &'static str, outcome: &'static str) {
+        counter!(
+            "smg_messages_thread_turns_total",
+            "op" => op,
+            "outcome" => outcome
         )
         .increment(1);
     }

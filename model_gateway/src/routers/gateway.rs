@@ -44,9 +44,11 @@ use crate::{
         error as route_error,
         factory::{router_ids, RouterId},
         grpc::regular::stages::decisions::supports_worker as supports_decisions_worker,
+        message_threads::MessageThreads,
         BodyPolicy, RouterFactory, RouterTrait,
     },
     server::ServerConfig,
+    tenant::storage_tenant,
     worker::{ConnectionMode, ProviderType, RoutingPool, WorkerRegistry},
 };
 
@@ -107,6 +109,9 @@ pub struct Gateway {
     routers: ArcSwap<HashMap<RouterId, Arc<dyn RouterTrait>>>,
     default_router: ArcSwapOption<RouterId>,
     enable_igw: bool,
+    /// The message threads of the Messages route: resolved before the
+    /// family routers see a request, stored after one answers.
+    threads: MessageThreads,
 }
 
 /// The answer when no router serves a request: the JSON error object, a 404
@@ -122,6 +127,7 @@ impl Gateway {
             routers: ArcSwap::from_pointee(HashMap::new()),
             default_router: ArcSwapOption::empty(),
             enable_igw: false,
+            threads: MessageThreads::new(),
         }
     }
 
@@ -472,6 +478,53 @@ impl Gateway {
             None => miss(),
         }
     }
+
+    /// The router of a Messages request: in IGW mode an empty message (a
+    /// `max_tokens` of 0) may go to a router that answers it without an
+    /// engine.
+    fn select_messages_router(
+        &self,
+        body: &CreateMessageRequest,
+        model_id: &str,
+    ) -> Option<Arc<dyn RouterTrait>> {
+        if self.enable_igw && body.max_tokens == 0 {
+            self.select_router_for_empty_message(model_id)
+        } else {
+            self.select_router_for_request(Some(model_id))
+        }
+    }
+
+    /// A thread turn: resolved before the router sees it (a create as it
+    /// came, a continue as the rebuilt conversation), stored after the
+    /// router answers.
+    async fn route_messages_thread(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        body: CreateMessageRequest,
+        model_id: &str,
+    ) -> Response {
+        let (body, turn) = match self
+            .threads
+            .resolve(body, storage_tenant(tenant_meta))
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(refused) => return refused,
+        };
+        let response = match self.select_messages_router(&body, model_id) {
+            Some(router) => {
+                router
+                    .route_messages(headers, tenant_meta, body, model_id)
+                    .await
+            }
+            None => no_router(),
+        };
+        match turn {
+            Some(turn) => self.threads.stored(turn, response).await,
+            None => response,
+        }
+    }
 }
 
 #[async_trait]
@@ -581,12 +634,14 @@ impl RouterTrait for Gateway {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        let router = if self.enable_igw && body.max_tokens == 0 {
-            self.select_router_for_empty_message(model_id)
-        } else {
-            self.select_router_for_request(Some(model_id))
-        };
-        match router {
+        // A thread turn runs as its own boxed future: its locals (the chain
+        // walk, the rebuild, the answer read back) would otherwise size every
+        // plain request's task.
+        if body.thread.is_some() {
+            return Box::pin(self.route_messages_thread(headers, tenant_meta, body, model_id))
+                .await;
+        }
+        match self.select_messages_router(&body, model_id) {
             Some(router) => {
                 router
                     .route_messages(headers, tenant_meta, body, model_id)
