@@ -333,6 +333,26 @@ def test_evidence_identity_retains_opt_in_or_failure_boundary():
     )
 
 
+def _artifact_output_value(public, artifact_id, outcome="success"):
+    job = _document()["jobs"]["run"]
+    expression = job["outputs"][public]
+    planned = {"complete_artifact": "planned-complete", "worker_artifact": "planned-worker"}
+    direct = re.fullmatch(r"\$\{\{ steps\.evidence-identity\.outputs\.([a-z_]+) \}\}", expression)
+    if direct:
+        return planned[direct[1]]
+    gated = re.fullmatch(
+        r"\$\{\{ steps\.([a-z-]+)\.outputs\.artifact-id != '' && "
+        r"steps\.evidence-identity\.outputs\.([a-z_]+) \|\| '' \}\}",
+        expression,
+    )
+    assert gated, "Only the actual direct or artifact-ID-gated expression is supported"
+    upload = next(step for step in job["steps"] if step.get("id") == gated[1])
+    assert upload["uses"].startswith("actions/upload-artifact@")
+    assert upload["with"]["name"] == "${{ steps.evidence-identity.outputs." + gated[2] + " }}"
+    # Outcome is deliberately NOT evidence of an upload: warn/ignore-no-files can succeed.
+    return planned[gated[2]] if artifact_id != "" else ""
+
+
 @pytest.mark.parametrize("engine", ["sglang", "tokenspeed", "trtllm"])
 def test_evidence_non_vllm_defaults_do_not_claim_nixl(tmp_path, engine):
     inputs = {"engine": engine, "gpu_tier": "1", "test_dirs": "e2e_test/chat_completions"}
@@ -371,6 +391,21 @@ def test_evidence_readable_label_keeps_moriio_mode_and_vendor(tmp_path, mode, ve
         },
     )[0]
     assert "-moriio-" + mode + "-" + vendor + "-" in contract
+
+
+@pytest.mark.parametrize("public", ["complete_evidence_artifact", "worker_log_artifact"])
+@pytest.mark.parametrize(
+    "outcome,artifact_id", [("success", ""), ("skipped", ""), ("failure", ""), ("success", "12345")]
+)
+def test_evidence_output_requires_real_uploaded_artifact_id(public, outcome, artifact_id):
+    actual = _artifact_output_value(public, artifact_id, outcome)
+    expected = "planned-complete" if public == "complete_evidence_artifact" else "planned-worker"
+    assert actual == (expected if artifact_id else "")
+
+
+def test_evidence_success_without_artifact_id_has_empty_output():
+    assert _artifact_output_value("complete_evidence_artifact", "", "success") == ""
+    assert _artifact_output_value("worker_log_artifact", "", "success") == ""
 
 
 def test_evidence_empty_moriio_mode_uses_declared_read_default(tmp_path):
