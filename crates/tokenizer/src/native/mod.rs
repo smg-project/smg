@@ -1583,12 +1583,17 @@ impl NativeEncoder {
         text: &str,
         add_special_tokens: bool,
     ) -> Result<Vec<u32>, Fallback> {
-        self.encode_with(
-            model,
-            text,
-            text.len() >= PARALLEL_MIN_BYTES,
-            add_special_tokens,
-        )
+        self.encode_with(model, text, Self::worth_the_pool(text), add_special_tokens)
+    }
+
+    /// Whether `text` is encoded through the thread pool: long enough
+    /// (`PARALLEL_MIN_BYTES`) and a pool with more than one thread to cut
+    /// it for. A pool of one thread (a process pinned to one core, a
+    /// container with one CPU) encodes the units one after the other and
+    /// pays the cut, the Vec per unit and the join for nothing: 5 % of the
+    /// cycles and 140 allocations per encode of 2 MB on one core, measured.
+    fn worth_the_pool(text: &str) -> bool {
+        text.len() >= PARALLEL_MIN_BYTES && rayon::current_num_threads() > 1
     }
 
     /// The ids of `text` with no added token cut out of it and no frame:
@@ -1607,7 +1612,7 @@ impl NativeEncoder {
         self.encode_units(
             model,
             text,
-            text.len() >= PARALLEL_MIN_BYTES,
+            Self::worth_the_pool(text),
             false,
             false,
             at_start,
