@@ -257,7 +257,14 @@ fn measure(
         window_seconds(settings.requests, rate)
     });
     if let Some(spec) = spec {
-        enqueue(bed, &answers(spec, (rate * seconds as f64) as usize + 256))?;
+        enqueue(
+            bed,
+            &answers(
+                spec,
+                (rate * seconds as f64) as usize + 256,
+                settings.bed.fleet.wire(),
+            ),
+        )?;
     }
     thread::sleep(Duration::from_secs(2));
     let s0 = snapshot(bed)?;
@@ -827,7 +834,14 @@ fn soak_windows(
     for w in 1..=windows {
         let wdir = cdir.join(format!("window-{w}"));
         fs::create_dir_all(&wdir)?;
-        enqueue(bed, &answers(spec, (rate * seconds as f64) as usize + 256))?;
+        enqueue(
+            bed,
+            &answers(
+                spec,
+                (rate * seconds as f64) as usize + 256,
+                settings.bed.fleet.wire(),
+            ),
+        )?;
         summaries.push(run_client(
             settings,
             bed,
@@ -851,7 +865,11 @@ fn soak_windows(
     fs::create_dir_all(&bdir)?;
     enqueue(
         bed,
-        &answers(spec, (rate * burst * seconds as f64) as usize + 256),
+        &answers(
+            spec,
+            (rate * burst * seconds as f64) as usize + 256,
+            settings.bed.fleet.wire(),
+        ),
     )?;
     summaries.push(run_client(
         settings,
@@ -1032,7 +1050,7 @@ fn smoke_paths(settings: &Settings, bed: &Bed, paths: &[PathSpec]) -> Result<i32
     for spec in paths {
         let sdir = settings.out.join("smoke").join(spec.name);
         fs::create_dir_all(&sdir)?;
-        enqueue(bed, &answers(spec, 16))?;
+        enqueue(bed, &answers(spec, 16, settings.bed.fleet.wire()))?;
         let summary = run_client(
             settings,
             bed,
@@ -1425,6 +1443,11 @@ pub(crate) mod tests {
         assert_eq!(
             setup_text(&settings, "cpu"),
             "cpu: 10,000 requests per cell at the path's rate x 0.5, 64-word prompts, 128 distinct, 1 prefill and 4 decode scripted mock engines on the prefill-decode path, 8 runtime threads; gateway pinned to cores 0-7"
+        );
+        settings.bed.fleet = crate::bed::Fleet::Http;
+        assert_eq!(
+            setup_text(&settings, "cpu"),
+            "cpu: 10,000 requests per cell at the path's rate x 0.5, 64-word prompts, 128 distinct, 4 scripted mock engines on the HTTP wire, 8 runtime threads; gateway pinned to cores 0-7"
         );
     }
 }
