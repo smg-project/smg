@@ -162,9 +162,15 @@ jobs:
             echo "::error::Mirror mode only supports the current release (${CURRENT_VERSION})."
             exit 1
           fi
-          # The router image and its -slurm variant, each from its Docker Hub tag.
+          # The router image and its -slurm variant, each from its Docker Hub tag. The router
+          # image must be there; a variant that is not (its build failed after the router
+          # image was pushed) is reported and skipped, so the mirror of the rest stands.
           for VARIANT in "" "-slurm"; do
             SOURCE="lightseekorg/smg:${VERSION}${VARIANT}"
+            if [[ -n "${VARIANT}" ]] && ! docker buildx imagetools inspect "${SOURCE}" > /dev/null 2>&1; then
+              echo "::warning::${SOURCE} is not on Docker Hub; the ${VARIANT} variant was not mirrored."
+              continue
+            fi
             GHCR_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:${VERSION}${VARIANT}"
             GHCR_LATEST="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:latest${VARIANT}"
             TAG_ARGS=(--tag "${GHCR_IMAGE}")
