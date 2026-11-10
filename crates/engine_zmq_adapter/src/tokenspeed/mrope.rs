@@ -1307,6 +1307,11 @@ pub(crate) mod tests {
     /// (`--ignored --nocapture`, a release build, the core pinned): the
     /// shapes the gateway's media pipeline builds, from one small image to a
     /// prompt that fills a window with a large image, for each rule.
+    /// `SMG_MROPE_SPEED_ITERATIONS` sets the repetitions (2000 by default) and
+    /// `SMG_MROPE_SPEED_SHAPE` keeps one shape by its index and
+    /// `SMG_MROPE_SPEED_RULE` one rule by its name, so a counter run (`perf
+    /// stat` on this binary) reads one cell, and two runs at different
+    /// repetition counts separate the rule's cost from the process's.
     #[test]
     #[ignore = "a timing table, run alone on a pinned core"]
     #[expect(clippy::print_stdout)]
@@ -1373,13 +1378,27 @@ pub(crate) mod tests {
                 64,
             ),
         ];
+        let iterations: u32 = std::env::var("SMG_MROPE_SPEED_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2000);
+        let only: Option<usize> = std::env::var("SMG_MROPE_SPEED_SHAPE")
+            .ok()
+            .and_then(|value| value.parse().ok());
+        let only_rule = std::env::var("SMG_MROPE_SPEED_RULE").ok();
         println!("| rule | shape | prompt tokens | per request |");
         println!("|---|---|---|---|");
         for (rule_name, rule) in [
             ("Qwen3.5", PositionRule::Qwen35(LAYOUT)),
             ("Qwen3-Omni", PositionRule::Qwen3Omni(OMNI)),
         ] {
-            for (name, lead, specs, tail) in &shapes {
+            if only_rule.as_deref().is_some_and(|keep| keep != rule_name) {
+                continue;
+            }
+            for (index, (name, lead, specs, tail)) in shapes.iter().enumerate() {
+                if only.is_some_and(|keep| keep != index) {
+                    continue;
+                }
                 let omni = rule.reads_video_timing();
                 let mut ids: Vec<u32> = (0..*lead as u32).map(|i| 1000 + i).collect();
                 let mut items: Vec<ShapeItem> = Vec::new();
@@ -1443,7 +1462,6 @@ pub(crate) mod tests {
                         audio_in_video: false,
                     })
                     .collect();
-                let iterations = 2000;
                 let started = std::time::Instant::now();
                 for _ in 0..iterations {
                     let table = rule.positions(&ids, &grid_items).unwrap();
