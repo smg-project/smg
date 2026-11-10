@@ -80,8 +80,6 @@ pub struct HuggingFaceTokenizer {
     /// deferred encode of a prompt rendered by segments.
     core: Arc<EncoderCore>,
     special_tokens: SpecialTokens,
-    vocab: HashMap<String, TokenIdType>,
-    reverse_vocab: HashMap<TokenIdType, String>,
     chat_template: ChatTemplateState,
     /// Raw `response_template` from the sibling tokenizer_config.json.
     response_template: Option<serde_json::Value>,
@@ -181,27 +179,35 @@ fn has_byte_level_member(decoder: &DecoderWrapper) -> bool {
 /// The byte each `<0xHH>` token of a ByteFallback vocabulary stands for,
 /// indexed by id: the streaming step reads it per token, so it is a table
 /// rather than a vocabulary lookup and a parse. Empty for other vocabularies.
-fn byte_fallback_values(
-    reverse_vocab: &HashMap<TokenIdType, String>,
-    has_byte_fallback: bool,
-) -> Vec<Option<u8>> {
+/// Found by asking the pipeline for every spelling the `ByteFallback`
+/// decoder reads (`<0x`, two characters it parses as a byte, `>`) rather
+/// than by walking the vocabulary: the loader keeps no copy of it, and the
+/// table reaches the last byte token's id wherever the file put it (past a
+/// gap in the ids, or among the added tokens past the model's size).
+fn byte_fallback_values(tokenizer: &HfTokenizer, has_byte_fallback: bool) -> Vec<Option<u8>> {
     if !has_byte_fallback {
         return Vec::new();
     }
-    let len = reverse_vocab
-        .keys()
-        .filter_map(|&id| usize::try_from(id).ok())
-        .map(|id| id + 1)
-        .max()
-        .unwrap_or(0);
-    let mut values = vec![None; len];
-    for (&id, token) in reverse_vocab {
-        if token.len() == 6 && token.starts_with("<0x") && token.ends_with('>') {
-            if let (Ok(index), Ok(byte)) =
-                (usize::try_from(id), u8::from_str_radix(&token[3..5], 16))
-            {
-                values[index] = Some(byte);
+    // The characters `from_str_radix` reads in a byte's two places: a hex
+    // digit of either case, and a leading sign.
+    const PLACES: &[u8] = b"0123456789abcdefABCDEF+";
+    let mut values = Vec::new();
+    for &high in PLACES {
+        for &low in PLACES {
+            let text = format!("<0x{}{}>", char::from(high), char::from(low));
+            let Some(byte) = crate::byte_fallback::byte_token(&text) else {
+                continue;
+            };
+            let Some(index) = tokenizer
+                .token_to_id(&text)
+                .and_then(|id| usize::try_from(id).ok())
+            else {
+                continue;
+            };
+            if values.len() <= index {
+                values.resize(index + 1, None);
             }
+            values[index] = Some(byte);
         }
     }
     values
@@ -792,12 +798,6 @@ impl HuggingFaceTokenizer {
             ))
         })?;
         tokenizer.with_padding(None);
-        // Build vocab mappings (include special tokens to get added_tokens like <|im_start|>)
-        let vocab = tokenizer.get_vocab(true); // true = include special tokens and added_tokens
-        let reverse_vocab: HashMap<TokenIdType, String> = vocab
-            .iter()
-            .map(|(token, &id)| (id, token.clone()))
-            .collect();
 
         // Load tokenizer_config.json once for chat template, add_bos/eos, and special tokens
         let config_result = Self::load_chat_template_and_config(&tokenizer_path.to_string_lossy());
@@ -850,7 +850,7 @@ impl HuggingFaceTokenizer {
 
         if needs_bos || needs_eos {
             if let Some(post_processor) =
-                Self::build_post_processor(needs_bos, needs_eos, &special_tokens, &vocab)
+                Self::build_post_processor(needs_bos, needs_eos, &special_tokens, &tokenizer)
             {
                 debug!(needs_bos, needs_eos, "Configured post_processor");
                 tokenizer.with_post_processor(Some(post_processor));
@@ -867,7 +867,7 @@ impl HuggingFaceTokenizer {
             special_tokens
                 .eos_token
                 .as_deref()
-                .and_then(|token| vocab.get(token).copied()),
+                .and_then(|token| tokenizer.token_to_id(token)),
         );
 
         // Detect a custom Python-encoder model from config.json::architectures.
@@ -883,7 +883,7 @@ impl HuggingFaceTokenizer {
         let tokenizer = HfTokenizer::from(tokenizer);
         encoders.seed_native(tokenizer.get_model());
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
-        let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
+        let byte_fallback_values = byte_fallback_values(&tokenizer, has_byte_fallback);
         let glm = tokenizer_path.parent().and_then(glm::Checkpoint::load);
         let renderer = glm
             .as_ref()
@@ -929,8 +929,6 @@ impl HuggingFaceTokenizer {
             v1: encoders.v1,
             core,
             special_tokens,
-            vocab,
-            reverse_vocab,
             chat_template,
             glm,
             media_handling,
@@ -1000,14 +998,13 @@ impl HuggingFaceTokenizer {
     /// bytes (the byte-level characters mapped back, a skipped special token
     /// left out) end in the start of a character and nothing more.
     fn byte_level_window_ends_cut(&self, held: &[TokenIdType], skip_special_tokens: bool) -> bool {
-        let added = self.core.tokenizer.get_added_vocabulary();
         let mut bytes = Vec::new();
         for &id in held {
-            if let Some(token) = self.reverse_vocab.get(&id) {
-                if skip_special_tokens && added.is_special_token(token) {
-                    continue;
-                }
-                push_token_bytes(token, &mut bytes);
+            if skip_special_tokens && self.special_added_token(id) {
+                continue;
+            }
+            if let Some(token) = self.token_text(id) {
+                push_token_bytes(&token, &mut bytes);
             }
         }
         cut_start(&bytes) < bytes.len()
@@ -1027,20 +1024,36 @@ impl HuggingFaceTokenizer {
             && self.byte_fallback_value(ids[prefix_index - 1]).is_some()
     }
 
+    /// Whether an id is a byte token (`<0xHH>`, read from the id-indexed
+    /// table) or, when special tokens are skipped, an added token the file
+    /// marks special: the ids a byte run's window holds besides its text.
     fn byte_fallback_piece(&self, token_id: TokenIdType, skip_special_tokens: bool) -> bool {
-        self.reverse_vocab.get(&token_id).is_some_and(|token| {
-            let byte_token = token.len() == 6
-                && token.starts_with("<0x")
-                && token.ends_with('>')
-                && token.as_bytes()[3..5].iter().all(u8::is_ascii_hexdigit);
-            byte_token
-                || (skip_special_tokens
-                    && self
-                        .core
-                        .tokenizer
-                        .get_added_vocabulary()
-                        .is_special_token(token))
-        })
+        self.byte_fallback_value(token_id).is_some()
+            || (skip_special_tokens && self.special_added_token(token_id))
+    }
+
+    /// Whether `id` is an added token the file marks special.
+    fn special_added_token(&self, id: TokenIdType) -> bool {
+        self.core
+            .tokenizer
+            .get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .get(&id)
+            .is_some_and(|token| token.special)
+    }
+
+    /// The text of `id` as the file spells it: an added token's content
+    /// (the pipeline's own lookup answers a normalized added token in the
+    /// normalizer's spelling, which `token_to_id` does not map back), else
+    /// the model's piece.
+    fn token_text(&self, id: TokenIdType) -> Option<String> {
+        self.core
+            .tokenizer
+            .get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .get(&id)
+            .map(|token| token.content.clone())
+            .or_else(|| self.core.tokenizer.get_model().id_to_token(id))
     }
 
     /// Encodes a Llama-class checkpoint as its reference class does.
@@ -1147,11 +1160,11 @@ impl HuggingFaceTokenizer {
 
     /// Build a TemplateProcessing post_processor (matches Python transformers' update_post_processor)
     /// Template format: "{bos}:0 $A:0 {eos}:0" with optional BOS/EOS based on config
-    fn build_post_processor(
+    fn build_post_processor<M: Model>(
         add_bos_token: bool,
         add_eos_token: bool,
         special_tokens: &SpecialTokens,
-        vocab: &HashMap<String, TokenIdType>,
+        tokenizer: &TokenizerOf<M>,
     ) -> Option<TemplateProcessing> {
         // Build template string exactly like Python:
         // single = f"{(bos + ':0 ') if add_bos_token else ''}$A:0{(' ' + eos + ':0') if add_eos_token else ''}"
@@ -1160,7 +1173,7 @@ impl HuggingFaceTokenizer {
 
         if add_bos_token {
             let bos = special_tokens.bos_token.as_ref()?;
-            let bos_id = vocab.get(bos).copied()?;
+            let bos_id = tokenizer.token_to_id(bos)?;
             template.push_str(bos);
             template.push_str(":0 ");
             tokens.push((bos.clone(), bos_id));
@@ -1170,7 +1183,7 @@ impl HuggingFaceTokenizer {
 
         if add_eos_token {
             let eos = special_tokens.eos_token.as_ref()?;
-            let eos_id = vocab.get(eos).copied()?;
+            let eos_id = tokenizer.token_to_id(eos)?;
             template.push(' ');
             template.push_str(eos);
             template.push_str(":0");
@@ -1222,14 +1235,8 @@ impl HuggingFaceTokenizer {
         Self::bound_bpe_cache(&mut tokenizer, encoders.bpe_words_cached());
         encoders.seed_native(tokenizer.get_model());
         let special_tokens = Self::extract_special_tokens(&tokenizer, &ConfigTokens::default());
-        let vocab = tokenizer.get_vocab(true); // true = include special tokens and added_tokens
-        let reverse_vocab: HashMap<TokenIdType, String> = vocab
-            .iter()
-            .map(|(token, &id)| (id, token.clone()))
-            .collect();
-
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
-        let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
+        let byte_fallback_values = byte_fallback_values(&tokenizer, has_byte_fallback);
         let byte_level = ByteLevelTable::build(&tokenizer);
         let byte_level_chain =
             byte_level.is_none() && tokenizer.get_decoder().is_some_and(has_byte_level_member);
@@ -1242,8 +1249,6 @@ impl HuggingFaceTokenizer {
             v1: encoders.v1,
             core: Arc::new(EncoderCore::new(tokenizer, encoders.native)),
             special_tokens,
-            vocab,
-            reverse_vocab,
             chat_template: ChatTemplateState::empty(),
             response_template: None,
             eos_token_ids: Vec::new(), // No directory path in from_tokenizer
@@ -2353,12 +2358,16 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         &self.special_tokens
     }
 
+    /// The pipeline's own tables answer (the added vocabulary, then the
+    /// model); the loader keeps no copy of the vocabulary.
     fn token_to_id(&self, token: &str) -> Option<TokenIdType> {
-        self.vocab.get(token).copied()
+        self.core.tokenizer.token_to_id(token)
     }
 
+    /// The file's spelling of the id's token (an added token's content, else
+    /// the model's piece), which `token_to_id` maps back to the id.
     fn id_to_token(&self, id: TokenIdType) -> Option<String> {
-        self.reverse_vocab.get(&id).cloned()
+        self.token_text(id)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

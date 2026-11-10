@@ -438,6 +438,12 @@ fn other_checkpoints_keep_their_file_pipeline() {
     fs::write(&path, LLAMA_STYLE_TOKENIZER_JSON).unwrap();
     let no_configuration = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
     assert_eq!(ids_of(&no_configuration, "<|im_start|>a"), [3, 6, 7]);
+    // Under the file's `Prepend` normalizer the normalized `</think>` sits in
+    // the pipeline's added vocabulary as `▁</think>`; the lookups answer the
+    // file's spelling both ways.
+    assert_eq!(no_configuration.id_to_token(5).as_deref(), Some("</think>"));
+    assert_eq!(no_configuration.token_to_id("</think>"), Some(5));
+    assert_eq!(no_configuration.token_to_id("▁</think>"), None);
 }
 
 /// The table the gate reads is searched by `binary_search`, so it stays
