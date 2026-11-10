@@ -112,7 +112,7 @@ engine-zmq-adapter.workspace = true
 # External dependencies (not in workspace)
 bincode = "1.3"
 clap = { version = "4", features = ["derive", "env"] }
-axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.9.0", default-features = false, features = ["tls-rustls-no-provider"] }
 ndarray = "0.17"
 memmap2 = "0.9"
 rayon = "1.12"
