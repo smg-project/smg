@@ -3072,6 +3072,9 @@ impl ResponseUsage {
             prompt_tokens_details: Some(PromptTokenUsageInfo {
                 cached_tokens: self.input_tokens_details.cached_tokens,
                 audio_tokens: None,
+                text_tokens: None,
+                image_tokens: None,
+                cache_write_tokens: None,
             }),
         }
     }
