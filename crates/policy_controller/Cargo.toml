@@ -1,0 +1,27 @@
+[package]
+name = "smg-policy-controller"
+version = "0.1.0"
+edition = "2021"
+description = "The policy controller: the routing policy engine (a bounded view, a typed decision, a lifecycle, a filter, score and pick framework under one versioned spec) and, in later steps, the standalone controller's store, ingestion, API and election"
+license = "Apache-2.0"
+repository = "https://github.com/smg-project/smg"
+keywords = ["routing", "policy", "load-balancing", "llm"]
+categories = ["algorithms"]
+
+[dependencies]
+# No workspace crate: the engine knows nothing about its host (a gateway, a
+# controller, a binding).
+parking_lot = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.8"
+serde_json = { workspace = true }
+
+[[bench]]
+name = "decision"
+harness = false
+
+[lints]
+workspace = true
