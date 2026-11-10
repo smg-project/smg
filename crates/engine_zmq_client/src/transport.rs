@@ -586,6 +586,7 @@ mod tests {
         codec::encode_msgpack,
         mock_engine::{
             connect_to_frontend, default_ready_response, hello, hello_in_group, IpcNamespace,
+            MockEngine,
         },
         protocol::vllm::{
             output::{
@@ -597,6 +598,30 @@ mod tests {
     };
 
     const TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// A frontend whose handshake with one mock engine (index 0) is done, that
+    /// engine, and the namespace whose paths the sockets live on.
+    async fn connected_frontend() -> (ConnectedTransport, MockEngine, IpcNamespace) {
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        let (transport, engine) = tokio::join!(
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        (
+            transport.expect("frontend handshake"),
+            engine.expect("mock engine connect"),
+            ns,
+        )
+    }
 
     #[tokio::test]
     async fn bind_local_sockets_supports_ipc() {
@@ -611,24 +636,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_then_request_and_output_roundtrip() {
-        let ns = IpcNamespace::new().unwrap();
-        let (handshake, input, output) = (
-            ns.handshake_endpoint(),
-            ns.input_endpoint(),
-            ns.output_endpoint(),
-        );
-
-        // Frontend binds + drives handshake; mock engine (index 0) connects in.
-        let (transport, engine) = tokio::join!(
-            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let transport = transport.expect("frontend handshake");
-        let mut engine = engine.expect("mock engine connect");
+        let (transport, mut engine, _ns) = connected_frontend().await;
 
         // Registration surfaced the engine + its post-init config.
         assert_eq!(transport.engines.len(), 1);
@@ -710,23 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn dead_sentinel_surfaces_engine_core_dead() {
-        let ns = IpcNamespace::new().unwrap();
-        let (handshake, input, output) = (
-            ns.handshake_endpoint(),
-            ns.input_endpoint(),
-            ns.output_endpoint(),
-        );
-
-        let (transport, engine) = tokio::join!(
-            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let transport = transport.expect("frontend handshake");
-        let mut engine = engine.expect("mock engine connect");
+        let (transport, mut engine, _ns) = connected_frontend().await;
 
         let (out_tx, mut out_rx) = mpsc::channel(4);
         #[expect(
