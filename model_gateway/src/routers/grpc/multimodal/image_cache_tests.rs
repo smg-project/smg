@@ -479,27 +479,46 @@ async fn the_produced_count_is_held_to_the_budget_after_the_size_was() {
 /// the budget on its header size: one token over is refused before any
 /// decode (the frame's bytes are empty, so a decode would fail rather than
 /// count), and at the budget a small image goes through the family's own
-/// preprocessing, which produces the count its size gave.
+/// preprocessing, which produces the count its size gave. The two families
+/// whose encode takes the source grid under `do_resize: false` are counted
+/// in that mode too, on sizes their encode accepts as they are (multiples of
+/// Gemma 4's pooled patch of 48 and of GLM's factor of 28).
 #[tokio::test]
 async fn every_image_family_is_held_to_the_budget_on_its_header_size() {
-    for model_type in [
-        "qwen2_vl",
-        "qwen3_vl",
-        "step3_vl",
-        "deepseek_v41",
-        "llava",
-        "llava_next",
-        "phi3_v",
-        "llama4",
-        "kimi_k25",
-        "kimi_k3",
-        "inkling",
-        "muse_spark",
-    ] {
+    let defaults = PreProcessorConfig::default;
+    let no_resize = || PreProcessorConfig {
+        do_resize: Some(false),
+        ..PreProcessorConfig::default()
+    };
+    // (model type, preprocessor config, a header size, a small size)
+    let families = [
+        ("qwen2_vl", defaults(), (1600, 1200), (64, 64)),
+        ("qwen3_vl", defaults(), (1600, 1200), (64, 64)),
+        ("step3_vl", defaults(), (1600, 1200), (64, 64)),
+        ("deepseek_v41", defaults(), (1600, 1200), (64, 64)),
+        ("llava", defaults(), (1600, 1200), (64, 64)),
+        ("llava_next", defaults(), (1600, 1200), (64, 64)),
+        ("phi3_v", defaults(), (1600, 1200), (64, 64)),
+        ("llama4", defaults(), (1600, 1200), (64, 64)),
+        ("kimi_k25", defaults(), (1600, 1200), (64, 64)),
+        ("kimi_k3", defaults(), (1600, 1200), (64, 64)),
+        ("inkling", defaults(), (1600, 1200), (64, 64)),
+        ("muse_spark", defaults(), (1600, 1200), (64, 64)),
+        ("gemma4", defaults(), (1600, 1200), (64, 64)),
+        ("glm53_flash", defaults(), (1600, 1200), (64, 64)),
+        ("gemma4", no_resize(), (960, 480), (96, 48)),
+        ("glm53_flash", no_resize(), (1120, 560), (56, 56)),
+    ];
+    for (model_type, preprocessor_config, header, small) in families {
+        let mode = if preprocessor_config.do_resize == Some(false) {
+            " (do_resize: false)"
+        } else {
+            ""
+        };
         let (components, _, _) = setup(true, false);
         let config = MultimodalModelConfig::new(
             serde_json::json!({"model_type": model_type}),
-            PreProcessorConfig::default(),
+            preprocessor_config,
             None,
         );
         let metadata = ModelMetadata {
@@ -510,14 +529,14 @@ async fn every_image_family_is_held_to_the_budget_on_its_header_size() {
         let spec = components
             .model_registry
             .lookup(&metadata)
-            .unwrap_or_else(|| panic!("{model_type}: no spec"));
+            .unwrap_or_else(|| panic!("{model_type}{mode}: no spec"));
         let processors = config.vision_processors(spec);
         let processor = processors
             .image()
-            .unwrap_or_else(|error| panic!("{model_type}: {error:#}"));
+            .unwrap_or_else(|error| panic!("{model_type}{mode}: {error:#}"));
         let ctx = |budget| context(&components, &config, spec, model_type, "tok", None, budget);
 
-        let (width, height) = (1600, 1200);
+        let (width, height) = header;
         let count = processor.calculate_num_tokens(width, height).unwrap();
         let header_only = MediaBatch::Images(vec![Arc::new(ImageFrame::encoded(
             Default::default(),
@@ -540,22 +559,26 @@ async fn every_image_family_is_held_to_the_budget_on_its_header_size() {
                 sampled_frames: None,
                 budget: count - 1,
             }),
-            "{model_type}: {error:#}"
+            "{model_type}{mode}: {error:#}"
         );
 
-        let (width, height) = (64, 64);
+        let (width, height) = small;
         let count = processor.calculate_num_tokens(width, height).unwrap();
         let small = MediaBatch::Images(vec![Arc::new(ImageFrame::new(
             image::DynamicImage::new_rgb8(width, height),
             Default::default(),
             Default::default(),
             ImageSource::InlineBytes,
-            format!("{model_type}-small"),
+            format!("{model_type}{mode}-small"),
         ))]);
         let result = preprocess_modality(&small, &ctx(Some(count)))
             .await
-            .unwrap_or_else(|error| panic!("{model_type}: {error:#}"));
-        assert_eq!(result.feature_token_counts, [count], "{model_type}");
+            .unwrap_or_else(|error| panic!("{model_type}{mode}: {error:#}"));
+        assert_eq!(
+            result.feature_token_counts,
+            [count],
+            "{model_type}{mode}: the produced count is the size-only count"
+        );
     }
 }
 

@@ -546,13 +546,11 @@ fn intermediate_of(
 
 /// Preprocess one modality's batch: a small image batch through the pixel
 /// cache, image by image, when the cache is on and the processor allows it;
-/// every other batch whole, on the blocking pool.
-/// One batch preprocessed: through the pixel cache's per-image path when the
-/// batch takes it, as a whole otherwise. An image the engine can never place
-/// is refused first, on the size its header gave and the processor's own
-/// size-to-count rule, before any of the batch is decoded or any tensor
-/// built; the counts the preprocessing produces are held to the same budget
-/// in [`prepared_part`].
+/// every other batch whole, on the blocking pool. An image the engine can
+/// never place is refused first, on the size its header gave and the
+/// processor's own size-to-count rule, before any of the batch is decoded
+/// or any tensor built; the counts the preprocessing produces are held to
+/// the same budget in [`prepared_part`].
 async fn preprocess_modality(
     media: &MediaBatch,
     ctx: &PlanContext<'_>,
