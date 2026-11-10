@@ -230,40 +230,6 @@ impl Scorer for FewestSessions {
     }
 }
 
-/// Prefix overlap in blocks over the request's blocks.
-#[derive(Debug)]
-pub struct PrefixAffinity;
-
-impl Lifecycle for PrefixAffinity {}
-
-impl Scorer for PrefixAffinity {
-    fn name(&self) -> &'static str {
-        "prefix-affinity"
-    }
-
-    fn score(
-        &self,
-        facts: &RequestFacts<'_>,
-        candidates: &[Candidate],
-        kept: &[u32],
-        out: &mut [f32],
-    ) -> TieBand {
-        let blocks = facts.block_hashes.len().max(1) as f32;
-        for (o, &i) in out.iter_mut().zip(kept) {
-            *o = (candidates[i as usize].overlap_blocks as f32 / blocks).clamp(0.0, 1.0);
-        }
-        TieBand::NORMALIZED
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            token_hashes: true,
-            events: true,
-            ..Needs::default()
-        }
-    }
-}
-
 /// Dispatches to one rank row no report reflects yet, oldest first within
 /// each lane. What a decision reads (the held token-work and requests) rides
 /// one atomic word, so deciding threads read a row without a lock. The
@@ -2616,14 +2582,10 @@ mod tests {
             ..RequestFacts::default()
         };
         let mut pool = [candidate(0, 0), candidate(1, 0)];
-        pool[0].overlap_blocks = 2;
         pool[1].session_hit = true;
         let mut scores = [0.0f32; 2];
-        PrefixAffinity.score(&facts, &pool, &kept(2), &mut scores);
-        assert_eq!(scores, [0.5, 0.0]);
         SessionAffinity.score(&facts, &pool, &kept(2), &mut scores);
         assert_eq!(scores, [0.0, 1.0]);
-        assert!(PrefixAffinity.needs().token_hashes && PrefixAffinity.needs().events);
         assert!(SessionAffinity.needs().headers);
         assert!(LeastLoad::new(0.15, 1024, 2000.0).needs().loads);
     }

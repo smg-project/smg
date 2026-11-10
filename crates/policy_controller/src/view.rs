@@ -309,6 +309,9 @@ pub struct Candidate {
     pub admitted_age_ms: u32,
     /// Blocks the index learned about the worker since admission.
     pub indexed_growth: u32,
+    /// Blocks the index holds for the worker: what a warm-up stage reads
+    /// thinness from, against the fleet's level.
+    pub indexed_blocks: u32,
     /// The zone, as a position into the spec's declared list; `0` when
     /// unzoned.
     pub zone: u16,
