@@ -39,6 +39,15 @@ pub(super) struct NfcQuick {
     marked: Box<[u64]>,
 }
 
+/// Where the quick check stopped: `at`, the start of the character its
+/// tables could not place, and `cut`, the start of the last ASCII character
+/// before it or 0 (see [`NfcQuick::check`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Unplaced {
+    pub(super) cut: usize,
+    pub(super) at: usize,
+}
+
 impl NfcQuick {
     /// The tables, read from the library's functions for every character of
     /// the plane.
@@ -70,30 +79,33 @@ impl NfcQuick {
         }
     }
 
-    /// Whether `text` is in NFC: the quick check, and the library's own
-    /// stretch-wise check from the cut before the character the quick check
-    /// could not place.
+    /// Whether `text` is in NFC: the quick check's walk, the library's
+    /// check on the one stretch that holds a character the walk cannot
+    /// place, and the walk again after that stretch.
     pub(super) fn is_nfc(&self, text: &str) -> bool {
         let mut from = 0;
         loop {
             match self.check(&text[from..]) {
                 Ok(in_nfc) => return in_nfc,
-                Err(cut) => {
-                    // The library reads the one stretch the quick check
-                    // could not settle (`super::stretches`: the character at
-                    // the cut and the run after it; a settled stretch before
-                    // it is skipped), then the walk resumes where the next
-                    // stretch starts, an ASCII character or an ideograph,
-                    // where the library's own walk starts afresh too: no
-                    // composition or mark order crosses such a boundary.
+                Err(Unplaced { cut, at }) => {
+                    // The library reads the stretch that holds the character
+                    // (`super::stretches` from the cut: the ASCII character
+                    // there with the run after it, or the run the text
+                    // starts with; a stretch before it, settled or walked by
+                    // the quick check, is placed already), then the walk
+                    // resumes where the next stretch starts, an ASCII
+                    // character or an ideograph, where the library's own
+                    // walk starts afresh too: no composition or mark order
+                    // crosses such a boundary. Each step walks the text once
+                    // and the library reads each such stretch once.
                     let rest = &text[from + cut..];
-                    let Some((start, stretch)) = super::stretches(rest)
-                        .find(|(_, _, settled)| !settled)
-                        .map(|(start, stretch, _)| (start, stretch))
+                    let held = at - cut;
+                    let Some((start, stretch, settled)) = super::stretches(rest)
+                        .find(|(start, stretch, _)| start + stretch.len() > held)
                     else {
                         return true;
                     };
-                    if !unicode_normalization_alignments::is_nfc(stretch) {
+                    if !settled && !unicode_normalization_alignments::is_nfc(stretch) {
                         return false;
                     }
                     from += cut + start + stretch.len();
@@ -103,17 +115,17 @@ impl NfcQuick {
     }
 
     /// The quick check of `text`: `Ok(true)` when it is in NFC, `Ok(false)`
-    /// when it is not, `Err(cut)` when it cannot tell, as the library's
+    /// when it is not, `Err(Unplaced)` when it cannot tell, as the library's
     /// answers Yes, No and Maybe. The walk is the library's: a character
     /// whose combining class is below the one before it and not zero makes
     /// the text not NFC; the first character that is not Yes stops the walk
     /// (a Maybe, which the library settles by normalizing; its No would be
-    /// No here too). `cut` is the start of the last ASCII character before
-    /// it, or 0: the text before the cut is Yes with combining class 0
-    /// throughout, an ASCII character is the second element of no
-    /// composition and reorders with nothing, so the text is in NFC exactly
-    /// when the text from the cut on is, and the library reads that alone.
-    pub(super) fn check(&self, text: &str) -> Result<bool, usize> {
+    /// No here too) and is reported with its start, `at`, and `cut`, the
+    /// start of the last ASCII character before it, or 0: the text before
+    /// the cut is Yes with combining class 0 throughout, an ASCII character
+    /// is the second element of no composition and reorders with nothing,
+    /// so the text is in NFC exactly when the text from the cut on is.
+    pub(super) fn check(&self, text: &str) -> Result<bool, Unplaced> {
         let bytes = text.as_bytes();
         let mut at = 0;
         let mut cut = 0;
@@ -124,7 +136,8 @@ impl NfcQuick {
                 // it: a byte, then whole words of it.
                 at += 1;
                 while let Some(word) = bytes.get(at..at + 8) {
-                    if u64::from_ne_bytes(word.try_into().map_err(|_| cut)?) & NON_ASCII != 0 {
+                    let word = word.try_into().map_err(|_| Unplaced { cut, at })?;
+                    if u64::from_ne_bytes(word) & NON_ASCII != 0 {
                         break;
                     }
                     at += 8;
@@ -148,7 +161,7 @@ impl NfcQuick {
                 last = 0;
                 continue;
             }
-            let ch = char::from_u32(code as u32).ok_or(cut)?;
+            let ch = char::from_u32(code as u32).ok_or(Unplaced { cut, at: at - len })?;
             let (yes, marked) = if code < PLANE {
                 (Self::bit(&self.yes, code), Self::bit(&self.marked, code))
             } else {
@@ -166,7 +179,7 @@ impl NfcQuick {
                 return Ok(false);
             }
             if !yes {
-                return Err(cut);
+                return Err(Unplaced { cut, at: at - len });
             }
             last = class;
         }
@@ -185,7 +198,7 @@ mod tests {
         char::canonical_combining_class, is_nfc as library_is_nfc, is_nfc_quick, IsNormalized,
     };
 
-    use super::NfcQuick;
+    use super::{NfcQuick, Unplaced};
 
     #[test]
     fn the_tables_are_the_librarys_answers_for_every_character_of_the_plane() {
@@ -234,6 +247,16 @@ mod tests {
             "\u{1100}\u{1161} abc \u{1100}\u{1161}".to_string(),
             format!("ก\u{E38}\u{E48}{plain}ก\u{E48}\u{E38}"),
             format!("{plain}x\u{301}"),
+            // No ASCII at all: ideographs and kana by turns (settled and
+            // unsettled stretches), the one character the tables cannot
+            // place at the end; the library reads that stretch alone.
+            format!("{}か\u{3099}", "漢字かな".repeat(300)),
+            format!("{}\u{301}", "かな漢字".repeat(300)),
+            format!(
+                "{}\u{1100}\u{1161}{}",
+                "漢字".repeat(200),
+                "かな".repeat(200)
+            ),
         ] {
             assert_eq!(quick.is_nfc(&text), library_is_nfc(&text), "{text:?}");
         }
@@ -302,13 +325,13 @@ mod tests {
             ("🙂 and 🇫🇷", Ok(true)),
             // A mark after a letter: the library's Maybe, read from the last
             // ASCII character before it.
-            ("x\u{301}", Err(0)),
-            ("e\u{301}", Err(0)),
-            ("abc d\u{301}", Err(4)),
-            ("漢字 e\u{301}", Err(7)),
-            ("\u{1100}\u{1161}", Err(0)),
-            ("中文\u{1100}\u{1161}", Err(0)),
-            ("a\u{301}\u{323}", Err(0)),
+            ("x\u{301}", Err(Unplaced { cut: 0, at: 1 })),
+            ("e\u{301}", Err(Unplaced { cut: 0, at: 1 })),
+            ("abc d\u{301}", Err(Unplaced { cut: 4, at: 5 })),
+            ("漢字 e\u{301}", Err(Unplaced { cut: 7, at: 8 })),
+            ("\u{1100}\u{1161}", Err(Unplaced { cut: 0, at: 3 })),
+            ("中文\u{1100}\u{1161}", Err(Unplaced { cut: 0, at: 9 })),
+            ("a\u{301}\u{323}", Err(Unplaced { cut: 0, at: 1 })),
             // Marks out of canonical order: the library's No.
             ("ก\u{E48}\u{E38}", Ok(false)),
             ("1234567ก\u{E48}\u{E38}", Ok(false)),
