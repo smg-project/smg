@@ -88,8 +88,8 @@ struct BedArgs {
     /// Output directory [target/gateway-perf/<stamp>]
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Mock engines behind the gateway (the decode engines of the prefill-decode fleet)
-    #[arg(long, default_value_t = 4)]
+    /// Mock engines behind the gateway (the decode engines of the prefill-decode fleet), one or more
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
     workers: u16,
     /// The fleet behind the gateway: regular gRPC engines, a prefill fleet and a decode fleet on the prefill-decode path, or regular HTTP engines
     #[arg(long, value_enum, default_value_t = Fleet::Grpc)]
@@ -693,6 +693,9 @@ mod tests {
             "0",
         ])
         .is_err());
+        assert!(
+            Cli::try_parse_from(["gateway-perf", "cpu", "--base", "/b", "--workers", "0"]).is_err()
+        );
         let cli = Cli::try_parse_from([
             "gateway-perf",
             "bed",

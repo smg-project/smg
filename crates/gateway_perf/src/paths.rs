@@ -365,7 +365,8 @@ pub fn parse_paths(text: &str) -> Result<Vec<PathSpec>> {
 }
 
 /// The paths of a run on `fleet`: the named ones, or the fleet's default list, each
-/// one the fleet serves (the HTTP fleet refuses the Messages paths by name and reason).
+/// one the fleet serves (the HTTP fleet refuses the Messages and generate paths by name
+/// and reason).
 pub fn fleet_paths(fleet: Fleet, text: Option<&str>) -> Result<Vec<PathSpec>> {
     let paths = parse_paths(text.unwrap_or_else(|| fleet.default_paths()))?;
     if let Some(unserved) = paths.iter().find(|p| !fleet.serves(p.name)) {
