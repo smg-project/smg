@@ -772,6 +772,28 @@ fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
 /// 8 threads. Messages of 32 MiB and more (float32 tensors of 1080p-class
 /// grids and larger) keep the default behaviour.
 ///
+/// The threshold keeps a tokenizer's load-time transients in the dirty cache
+/// as well, and the vocabulary's hash tables land inside them: for a
+/// vocabulary of 115k-229k tokens each table is 8.25 MiB in the 10 MiB class,
+/// its last 1.75 MiB a tail nothing writes (a 256k vocabulary's 16.5 MiB
+/// table sits in the 20 MiB class with a 3.5 MiB tail), and a tail that lands
+/// on a recycled extent an earlier transient wrote end to end stays resident
+/// for the life of the process. That is about 5 MB per loaded tokenizer on
+/// every text path, present before the first request and invisible in
+/// jemalloc's own resident count, which counts a live table's whole class
+/// whether its tail was written or not (RSS at idle after 10,000 chat
+/// requests on one binary: 129 MB under the default threshold, 134 MB at
+/// 32 MiB). No entry of this string separates the tables from the image
+/// buffers: a 1024x768 encode buffer is the same 10 MiB class in the same
+/// kind of arena. A shorter `dirty_decay_ms` leaves a live table's pages
+/// alone and purges an image buffer between requests; a threshold between
+/// the two values gives up the classes above it (a 1920x1080 image in
+/// bfloat16 is a 28 MiB-class message); an exact-class fit of dirty extents
+/// clears the tails and hands the image path fresh pages again (jemalloc
+/// merges freed large extents eagerly, and the merged run no longer fits its
+/// class). A deployment that serves text alone takes the default back with
+/// `_RJEM_MALLOC_CONF=oversize_threshold:8388608` and loses nothing.
+///
 /// This is jemalloc's application-provided `malloc_conf` string under the
 /// vendored build's `_rjem_` prefix; the `_RJEM_MALLOC_CONF` environment
 /// variable is read after it and overrides it entry by entry.
