@@ -352,8 +352,10 @@ pub enum GridTensors {
 impl GridTensors {
     /// From the facts a TokenSpeed engine declares at its handshake (a subset
     /// of the facts a launcher hands the Rust servicer: the three layout
-    /// facts, none of the Omni clock); an engine that declares nothing keeps
-    /// the conservative reading ([`Self::Positions`]).
+    /// facts, none of the Omni clock, so a Qwen3-Omni engine's items are
+    /// refused by name on this path until the handshake carries the clock);
+    /// an engine that declares nothing keeps the conservative reading
+    /// ([`Self::Positions`]).
     pub fn declared(ready: &EngineCoreReadyResponse) -> Self {
         Self::for_model(
             &ready.architectures,
@@ -817,7 +819,19 @@ pub(crate) fn translate_tokenspeed_multimodal(
         // video's clock, off the same tensors the engine reads them from,
         // before they join the wire payload.
         let grid = match rule {
-            Some(_) => GridKind::KEYS
+            // The Omni rule reads the modality's own grid, as the engine's
+            // `_omni_media_segments` does (an image item's `video_grid_thw`
+            // is not its grid); the Qwen3.5 rule the first key an item
+            // carries, image before video, as the engine's fast path does.
+            Some(PositionRule::Qwen3Omni(_)) => match GridKind::of_modality(modality) {
+                Some(kind) => item
+                    .model_specific_tensors
+                    .get(kind.key())
+                    .map(|tensor| grid_rows(kind.key(), tensor).map(|rows| (kind, rows)))
+                    .transpose()?,
+                None => None,
+            },
+            Some(PositionRule::Qwen35(_)) => GridKind::KEYS
                 .iter()
                 .find_map(|(key, kind)| {
                     item.model_specific_tensors
@@ -2376,8 +2390,8 @@ mod tests {
         spatial_merge_size: Some(2),
         image_token_id: None,
         video_token_id: None,
-        position_id_per_seconds: None,
-        seconds_per_chunk: None,
+        position_id_per_seconds: Some(13.0),
+        seconds_per_chunk: Some(2.0),
     };
     const OMNI_ARCHITECTURE: &str = "Qwen3OmniMoeForConditionalGeneration";
 
@@ -2445,9 +2459,10 @@ mod tests {
         patches.architectures = vec!["Llama4ForConditionalGeneration".to_string()];
         patches.mrope_positions = Some(false);
         assert_eq!(GridTensors::declared(&patches), GridTensors::PatchLayout);
-        // A Qwen3-Omni engine: its rule needs the merge size, which the
-        // handshake declares when the engine reads it at the thinker level;
-        // the clock is the engine's default either way.
+        // A Qwen3-Omni engine: the handshake carries no clock (and, at the
+        // pinned engine, no merge size for a thinker checkpoint), so this
+        // path refuses the family's items by name rather than run its rule
+        // on a guessed clock, with or without the merge size declared.
         let mut omni = default_ready_response();
         omni.model_type = Some("qwen3_omni_moe".to_string());
         omni.architectures = vec![OMNI_ARCHITECTURE.to_string()];
@@ -2458,11 +2473,7 @@ mod tests {
         omni.spatial_merge_size = Some(2);
         assert_eq!(
             GridTensors::declared(&omni),
-            GridTensors::Computed(PositionRule::Qwen3Omni(OmniLayout {
-                spatial_merge_size: 2,
-                position_id_per_seconds: OmniLayout::DEFAULT_POSITION_ID_PER_SECONDS,
-                seconds_per_chunk: OmniLayout::DEFAULT_SECONDS_PER_CHUNK,
-            }))
+            GridTensors::Unavailable(RuleFamily::Qwen3Omni)
         );
     }
 
@@ -2682,6 +2693,31 @@ mod tests {
             err.contains("thinker_config.vision_config.spatial_merge_size"),
             "{err}"
         );
+
+        // The grid is the modality's own: a video item carrying only an
+        // `image_grid_thw` has no grid to the Omni rule (the engine refuses
+        // it naming the missing key), and one carrying both is laid out over
+        // its video rows, not the image rows a first-key reading would take.
+        let mut mislabelled = video.clone();
+        let rows = mislabelled
+            .model_specific_tensors
+            .remove("video_grid_thw")
+            .expect("the video grid");
+        mislabelled
+            .model_specific_tensors
+            .insert("image_grid_thw".to_string(), rows.clone());
+        let err = translate_for(request(vec![mislabelled.clone()]), rule).unwrap_err();
+        assert!(err.contains("carries no video_grid_thw"), "{err}");
+        mislabelled
+            .model_specific_tensors
+            .insert("image_grid_thw".to_string(), grid(&[[1, 8, 8]]));
+        mislabelled
+            .model_specific_tensors
+            .insert("video_grid_thw".to_string(), rows);
+        let wire = translate_for(request(vec![mislabelled]), rule).expect("the video rows");
+        let mm = wire.multimodal_inputs.expect("mm payload");
+        let values = i64_values(&mm.mrope_positions.expect("the table"));
+        assert_eq!(&values[15..23], &[15, 15, 15, 15, 28, 28, 28, 28]);
 
         // A video that asks for its audio interleaved: the engine's refusal.
         video.model_specific_tensors.insert(

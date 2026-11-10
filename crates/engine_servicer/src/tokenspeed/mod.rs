@@ -87,12 +87,14 @@ pub struct TokenSpeedModelInfo {
     /// The checkpoint's video placeholder token id (`video_token_id`).
     pub video_token_id: Option<u32>,
     /// The Qwen3-Omni rule's clock (`thinker_config.position_id_per_seconds`):
-    /// the positions one second of media spans on the time axis; `None` when
-    /// the checkpoint says nothing (the rule takes the engine's default).
+    /// the positions one second of media spans on the time axis. The launcher
+    /// reads it as the engine does, the engine's default for a thinker that
+    /// leaves it unsaid; `None` (no thinker, or not a number) refuses the
+    /// family's items by the fact's name.
     pub position_id_per_seconds: Option<f64>,
     /// The seconds one temporal grid of a video spans for that rule when the
-    /// item carries no `video_second_per_grid` (`thinker_config.seconds_per_chunk`);
-    /// `None` when the checkpoint says nothing (the engine's default).
+    /// item carries no `video_second_per_grid` (`thinker_config.seconds_per_chunk`),
+    /// read the same way.
     pub seconds_per_chunk: Option<f64>,
     pub model_dtype: String,
     pub multimodal_encoder_dtype: String,

@@ -227,21 +227,19 @@ def mrope_positions(hf_config: Any, hf_text_config: Any = None) -> bool | None:
 
     With the engine's own text config (``ModelConfig.hf_text_config``, which
     looks below a Qwen Omni wrapper's ``thinker_config`` as the engine does),
-    the reading is the engine executor's: its rope parameters
-    (``rope_parameters``, else ``rope_scaling``) carry an ``mrope_section`` or a
-    rope type named ``mrope``, and a text model without one, or without any
-    rope config (a recurrent hybrid), runs 1-D positions. Without it the
+    the reading is the engine executor's, exactly: ``"mrope_section" in
+    get_rope_parameters(hf_text_config)``, the ``rope_parameters`` mapping or
+    an empty one, so ``rope_scaling`` and a rope type's name do not count, and
+    a text model without the section, or without any rope config (a recurrent
+    hybrid), runs 1-D positions. Without it the
     checkpoint's own sections are read, ``text_config`` and the top level,
     either declaration meaning MRoPE (a config class may fill a plain rope
     default on one while the checkpoint declares its section on the other);
     ``None`` then says the config carries no rope section at all, which the
     servicer reads conservatively."""
     if hf_text_config is not None:
-        return any(
-            _rope_declares_mrope(rope)
-            for key in ("rope_parameters", "rope_scaling")
-            if (rope := _config_section(hf_text_config, key)) is not None
-        )
+        rope = _config_section(hf_text_config, "rope_parameters")
+        return rope is not None and _config_section(rope, "mrope_section") is not None
     if hf_config is None:
         return None
     sections = [hf_config]
@@ -293,17 +291,24 @@ def mrope_layout(hf_config: Any) -> dict[str, int | float | None]:
     (patches per position along each axis), the ``image_token_id`` /
     ``video_token_id`` the Qwen3.5 rule checks each placeholder span against,
     and the Qwen3-Omni rule's clock, ``position_id_per_seconds`` and
-    ``seconds_per_chunk`` (its defaults are the Rust rule's when absent). Each
-    is ``None`` when the checkpoint has none; a rule refuses the item without
-    the facts it needs."""
+    ``seconds_per_chunk``, read as the engine reads them,
+    ``getattr(thinker_config, name, default)``: the engine's defaults (13, 2.0)
+    for a thinker that leaves them unsaid, ``None`` for a checkpoint without a
+    thinker. The root is the only root: a thinker's missing fact is never taken
+    from the wrapper's top level, which the engine does not read. Each other
+    fact is ``None`` when the checkpoint has none; a rule refuses the item
+    without the facts it needs."""
     root = _facts_root(hf_config)
     vision = _config_section(root, "vision_config") if root is not None else None
 
     def fact(name: str) -> Any:
-        value = _config_section(root, name) if root is not None else None
-        if value is None and root is not hf_config:
-            value = _config_section(hf_config, name)
-        return value
+        return _config_section(root, name) if root is not None else None
+
+    def clock(name: str, default: float) -> float | None:
+        if root is None or root is hf_config:
+            return None
+        value = fact(name)
+        return default if value is None else _optional_number(value)
 
     return {
         "spatial_merge_size": _optional_int(
@@ -311,8 +316,8 @@ def mrope_layout(hf_config: Any) -> dict[str, int | float | None]:
         ),
         "image_token_id": _optional_int(fact("image_token_id")),
         "video_token_id": _optional_int(fact("video_token_id")),
-        "position_id_per_seconds": _optional_number(fact("position_id_per_seconds")),
-        "seconds_per_chunk": _optional_number(fact("seconds_per_chunk")),
+        "position_id_per_seconds": clock("position_id_per_seconds", 13.0),
+        "seconds_per_chunk": clock("seconds_per_chunk", 2.0),
     }
 
 

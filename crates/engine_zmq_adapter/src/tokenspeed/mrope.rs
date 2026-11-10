@@ -33,23 +33,19 @@ pub struct MropeLayout {
 
 /// The checkpoint facts the Qwen3-Omni rule needs besides the request, which
 /// its checkpoint keeps under `thinker_config`: the vision tower's spatial
-/// merge and the model's clock.
+/// merge and the model's clock. The clock is read where the engine reads it
+/// (`getattr(thinker_config, ..., default)`: the launcher ships the engine's
+/// defaults, 13 and 2.0, for a thinker that leaves them unsaid); the rule
+/// itself defaults nothing, so a source that carries no clock gets no rule.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OmniLayout {
     pub spatial_merge_size: u32,
     /// `position_id_per_seconds`: the positions one second of media spans on
-    /// the time axis ([`Self::DEFAULT_POSITION_ID_PER_SECONDS`] when the
-    /// checkpoint says nothing, as the engine defaults it).
+    /// the time axis.
     pub position_id_per_seconds: f64,
     /// `seconds_per_chunk`: the seconds one temporal grid of a video spans
-    /// when its item carries no `video_second_per_grid`
-    /// ([`Self::DEFAULT_SECONDS_PER_CHUNK`] when the checkpoint says nothing).
+    /// when its item carries no `video_second_per_grid`.
     pub seconds_per_chunk: f64,
-}
-
-impl OmniLayout {
-    pub const DEFAULT_POSITION_ID_PER_SECONDS: f64 = 13.0;
-    pub const DEFAULT_SECONDS_PER_CHUNK: f64 = 2.0;
 }
 
 /// The checkpoint facts a launcher, or the engine's handshake, ships for the
@@ -104,8 +100,9 @@ impl RuleFamily {
 
     /// The family's rule with the facts it reads, `None` when a fact it needs
     /// is missing: the Qwen3.5 rule reads the merge size and both placeholder
-    /// ids, the Omni rule the merge size, with the engine's defaults for a
-    /// clock the checkpoint leaves unsaid.
+    /// ids, the Omni rule the merge size and both clock facts (a source that
+    /// does not carry the clock, such as the engine's handshake today, gets no
+    /// rule rather than a guessed clock).
     pub fn rule(self, facts: PositionFacts) -> Option<PositionRule> {
         match self {
             Self::Qwen35 => match (
@@ -122,17 +119,22 @@ impl RuleFamily {
                 }
                 _ => None,
             },
-            Self::Qwen3Omni => facts.spatial_merge_size.map(|spatial_merge_size| {
-                PositionRule::Qwen3Omni(OmniLayout {
+            Self::Qwen3Omni => match (
+                facts.spatial_merge_size,
+                facts.position_id_per_seconds,
+                facts.seconds_per_chunk,
+            ) {
+                (
+                    Some(spatial_merge_size),
+                    Some(position_id_per_seconds),
+                    Some(seconds_per_chunk),
+                ) => Some(PositionRule::Qwen3Omni(OmniLayout {
                     spatial_merge_size,
-                    position_id_per_seconds: facts
-                        .position_id_per_seconds
-                        .unwrap_or(OmniLayout::DEFAULT_POSITION_ID_PER_SECONDS),
-                    seconds_per_chunk: facts
-                        .seconds_per_chunk
-                        .unwrap_or(OmniLayout::DEFAULT_SECONDS_PER_CHUNK),
-                })
-            }),
+                    position_id_per_seconds,
+                    seconds_per_chunk,
+                })),
+                _ => None,
+            },
         }
     }
 
@@ -141,7 +143,10 @@ impl RuleFamily {
     pub fn needs(self) -> &'static str {
         match self {
             Self::Qwen35 => "spatial_merge_size, image_token_id, video_token_id",
-            Self::Qwen3Omni => "thinker_config.vision_config.spatial_merge_size",
+            Self::Qwen3Omni => {
+                "thinker_config.vision_config.spatial_merge_size, \
+                 thinker_config.position_id_per_seconds, thinker_config.seconds_per_chunk"
+            }
         }
     }
 }
@@ -180,7 +185,9 @@ impl PositionRule {
     }
 }
 
-/// Which grid an item carries, by the key the engine looks for first.
+/// Which grid an item carries: the Qwen3.5 rule takes the first key an item
+/// carries, image before video, as the engine's fast path does; the Omni rule
+/// the modality's own key, as the engine's `_omni_media_segments` does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GridKind {
     Image,
@@ -192,7 +199,32 @@ impl GridKind {
         ("image_grid_thw", GridKind::Image),
         ("video_grid_thw", GridKind::Video),
     ];
+
+    /// The grid a modality owns (`{modality}_grid_thw`); audio has none.
+    pub(crate) fn of_modality(modality: TokenSpeedWireModality) -> Option<Self> {
+        match modality {
+            TokenSpeedWireModality::Image => Some(Self::Image),
+            TokenSpeedWireModality::Video => Some(Self::Video),
+            TokenSpeedWireModality::Audio => None,
+        }
+    }
+
+    /// The tensor key the grid rides under.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Image => "image_grid_thw",
+            Self::Video => "video_grid_thw",
+        }
+    }
 }
+
+/// The refusal for a running position no `i64` holds: never a wrapped table.
+const POSITIONS_OVERFLOW: &str =
+    "the position table overflows: a multimodal item's time axis climbs past what a position holds";
+
+/// Below 2^62 a float32 time product casts to an `i64` without saturating;
+/// the checked additions decide the rest.
+const TIME_POSITION_LIMIT: f32 = (1u64 << 62) as f32;
 
 /// One item's inputs to the rules: its modality, its grid rows `(t, h, w)`
 /// as the tensor carries them (`None` for an item without a grid, which
@@ -485,15 +517,26 @@ fn span_in(index: usize, start: u64, end: u64, seq_len: usize) -> Result<(usize,
     Ok((start as usize, end as usize))
 }
 
-/// A text run: the same linear positions on all three axes.
-fn fill_text(axes: &mut [&mut [i64]; 3], from: usize, to: usize, next_pos: &mut i64) {
+/// A text run: the same linear positions on all three axes; a running
+/// position that cannot take the run (a time axis the Omni rule let climb
+/// that far) is a refusal, never a wrap.
+fn fill_text(
+    axes: &mut [&mut [i64]; 3],
+    from: usize,
+    to: usize,
+    next_pos: &mut i64,
+) -> Result<(), String> {
+    let after = next_pos
+        .checked_add((to - from) as i64)
+        .ok_or_else(|| POSITIONS_OVERFLOW.to_string())?;
     for pos in from..to {
         let value = *next_pos + (pos - from) as i64;
         for axis in axes.iter_mut() {
             axis[pos] = value;
         }
     }
-    *next_pos += (to - from) as i64;
+    *next_pos = after;
+    Ok(())
 }
 
 /// The three axes of a table over `seq_len` tokens, and the table they make.
@@ -523,7 +566,7 @@ fn build_table(seq_len: usize, segments: &[Segment]) -> Result<MropeTable, Strin
         let mut cursor = 0usize;
         for segment in segments {
             if cursor < segment.start {
-                fill_text(axes, cursor, segment.start, &mut next_pos);
+                fill_text(axes, cursor, segment.start, &mut next_pos)?;
             }
             let (h, w) = (segment.h as usize, segment.w as usize);
             for (offset, pos) in (segment.start..=segment.end).enumerate() {
@@ -535,7 +578,7 @@ fn build_table(seq_len: usize, segments: &[Segment]) -> Result<MropeTable, Strin
             cursor = segment.end + 1;
         }
         if cursor < seq_len {
-            fill_text(axes, cursor, seq_len, &mut next_pos);
+            fill_text(axes, cursor, seq_len, &mut next_pos)?;
         }
         Ok(next_pos)
     })
@@ -607,9 +650,10 @@ pub(crate) fn qwen3_omni_positions(
             continue;
         }
         let Some((_, rows)) = &item.grid else {
+            let key = GridKind::of_modality(modality).map_or("grid", GridKind::key);
             return Err(format!(
-                "multimodal item {index} ({modality:?}) carries no grid; the rule lays its span \
-                 out over one"
+                "multimodal item {index} ({modality:?}) carries no {key}, which the engine's \
+                 rule lays its span out over"
             ));
         };
         if modality == TokenSpeedWireModality::Video && item.audio_in_video {
@@ -635,6 +679,16 @@ pub(crate) fn qwen3_omni_positions(
         // A video's seconds per grid: the item's one value for every row, or
         // one per row, else the checkpoint's; an image ticks the bare clock.
         let seconds: Vec<Option<f64>> = if modality == TokenSpeedWireModality::Video {
+            if let Some(bad) = item
+                .seconds_per_grid
+                .as_deref()
+                .and_then(|values| values.iter().find(|v| !v.is_finite() || **v < 0.0))
+            {
+                return Err(format!(
+                    "multimodal item {index} video_second_per_grid {bad} is not a finite, \
+                     non-negative number of seconds"
+                ));
+            }
             match &item.seconds_per_grid {
                 Some(values) if values.len() == 1 => vec![Some(f64::from(values[0])); rows.len()],
                 Some(values) if values.len() == rows.len() => {
@@ -678,9 +732,9 @@ pub(crate) fn qwen3_omni_positions(
             if segment.start < cursor {
                 return Err("multimodal placeholder spans overlap".to_string());
             }
-            fill_text(axes, cursor, segment.start, &mut next_pos);
+            fill_text(axes, cursor, segment.start, &mut next_pos)?;
             match segment.media {
-                OmniMedia::Audio => fill_text(axes, segment.start, segment.end + 1, &mut next_pos),
+                OmniMedia::Audio => fill_text(axes, segment.start, segment.end + 1, &mut next_pos)?,
                 OmniMedia::Vision { t, h, w, clock } => {
                     let index = segment.item;
                     if h % merge != 0 || w % merge != 0 {
@@ -706,12 +760,29 @@ pub(crate) fn qwen3_omni_positions(
                     }
                     // One time position per temporal step, as the engine's
                     // float32 `arange * clock` truncated; the span check above
-                    // bounds `t` by the prompt.
-                    let steps: Vec<i64> = (0..t).map(|step| (step as f32 * clock) as i64).collect();
+                    // bounds `t` by the prompt. A product the request's
+                    // seconds push past what a position holds is refused
+                    // (the engine's cast would wrap it into a garbage table),
+                    // and the running position takes each step checked.
+                    let steps = (0..t)
+                        .map(|step| {
+                            let product = step as f32 * clock;
+                            (product.is_finite() && (0.0..TIME_POSITION_LIMIT).contains(&product))
+                                .then_some(product as i64)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "multimodal item {index} video_second_per_grid puts time \
+                                         step {step} at {product}, past what a position holds"
+                                    )
+                                })
+                        })
+                        .collect::<Result<Vec<i64>, String>>()?;
                     let (lh, lw) = (lh as usize, lw as usize);
                     for (offset, pos) in (segment.start..=segment.end).enumerate() {
                         let (step, cell) = (offset / (lh * lw), offset % (lh * lw));
-                        axes[0][pos] = next_pos + steps[step];
+                        axes[0][pos] = next_pos
+                            .checked_add(steps[step])
+                            .ok_or_else(|| POSITIONS_OVERFLOW.to_string())?;
                         axes[1][pos] = next_pos + (cell / lw) as i64;
                         axes[2][pos] = next_pos + (cell % lw) as i64;
                     }
@@ -722,12 +793,15 @@ pub(crate) fn qwen3_omni_positions(
                         .unwrap_or(0)
                         .max(lh as i64 - 1)
                         .max(lw as i64 - 1);
-                    next_pos += top + 1;
+                    next_pos = top
+                        .checked_add(1)
+                        .and_then(|advance| next_pos.checked_add(advance))
+                        .ok_or_else(|| POSITIONS_OVERFLOW.to_string())?;
                 }
             }
             cursor = segment.end + 1;
         }
-        fill_text(axes, cursor, seq_len, &mut next_pos);
+        fill_text(axes, cursor, seq_len, &mut next_pos)?;
         Ok(next_pos)
     })
 }
@@ -1117,19 +1191,28 @@ pub(crate) mod tests {
             }),
             None
         );
+        // The Omni rule reads the merge size and both clock facts; a source
+        // without the clock (the engine's handshake today) gets no rule, not
+        // the engine's defaults guessed in.
         let merge_only = PositionFacts {
             spatial_merge_size: Some(2),
             ..PositionFacts::default()
         };
+        assert_eq!(RuleFamily::Qwen3Omni.rule(merge_only), None);
+        let omni = PositionFacts {
+            position_id_per_seconds: Some(13.0),
+            seconds_per_chunk: Some(2.0),
+            ..merge_only
+        };
         assert_eq!(
-            RuleFamily::Qwen3Omni.rule(merge_only),
+            RuleFamily::Qwen3Omni.rule(omni),
             Some(PositionRule::Qwen3Omni(OMNI))
         );
         assert_eq!(
             RuleFamily::Qwen3Omni.rule(PositionFacts {
                 position_id_per_seconds: Some(25.0),
                 seconds_per_chunk: Some(0.5),
-                ..merge_only
+                ..omni
             }),
             Some(PositionRule::Qwen3Omni(OmniLayout {
                 spatial_merge_size: 2,
@@ -1137,8 +1220,22 @@ pub(crate) mod tests {
                 seconds_per_chunk: 0.5,
             }))
         );
+        assert_eq!(
+            RuleFamily::Qwen3Omni.rule(PositionFacts {
+                seconds_per_chunk: None,
+                ..omni
+            }),
+            None
+        );
         assert_eq!(RuleFamily::Qwen3Omni.rule(PositionFacts::default()), None);
-        assert!(RuleFamily::Qwen3Omni.needs().contains("thinker_config"));
+        let needs = RuleFamily::Qwen3Omni.needs();
+        for fact in [
+            "spatial_merge_size",
+            "position_id_per_seconds",
+            "seconds_per_chunk",
+        ] {
+            assert!(needs.contains(fact), "{needs}");
+        }
     }
 
     /// An Omni item: its modality, its spans, its grid rows and a video's
@@ -1260,9 +1357,36 @@ pub(crate) mod tests {
         let table = omni_table(10, &[omni_video(&[[2, 4, 4]], &[(1, 8)], None)]).unwrap();
         assert_eq!(&rows_of(&table)[0][1..9], &[1, 1, 1, 1, 27, 27, 27, 27]);
         assert_eq!(delta_of(&table), 28 + 1 - 10);
-        // One value per grid row is read per row.
+        // One value for one row is the broadcast arm again.
         let table = omni_table(10, &[omni_video(&[[2, 4, 4]], &[(1, 8)], Some(&[0.5]))]).unwrap();
         assert_eq!(&rows_of(&table)[0][1..9], &[1, 1, 1, 1, 7, 7, 7, 7]);
+        // One value per grid row: each row ticks its own clock (the engine's
+        // table for two rows at 0.5 and 1.5 seconds per grid: the second row
+        // starts where the first's top left off, at 8, and its second step
+        // is 1.5 * 13 = 19.5 positions on, truncated).
+        let table = omni_table(
+            18,
+            &[omni_video(
+                &[[2, 4, 4], [2, 4, 4]],
+                &[(1, 8), (9, 16)],
+                Some(&[0.5, 1.5]),
+            )],
+        )
+        .unwrap();
+        let rows = rows_of(&table);
+        assert_eq!(
+            rows[0],
+            vec![0, 1, 1, 1, 1, 7, 7, 7, 7, 8, 8, 8, 8, 27, 27, 27, 27, 28]
+        );
+        assert_eq!(
+            rows[1],
+            vec![0, 1, 1, 2, 2, 1, 1, 2, 2, 8, 8, 9, 9, 8, 8, 9, 9, 28]
+        );
+        assert_eq!(
+            rows[2],
+            vec![0, 1, 2, 1, 2, 1, 2, 1, 2, 8, 9, 8, 9, 8, 9, 8, 9, 28]
+        );
+        assert_eq!(delta_of(&table), 11);
     }
 
     /// Every precondition the engine's Omni rule raises on is a refusal
@@ -1275,7 +1399,7 @@ pub(crate) mod tests {
         interleaved.audio_in_video = true;
         assert!(err(6, &[interleaved]).contains("use_audio_in_video"));
         assert!(err(5, &[omni_image(&[[1, 4, 4]], &[(1, 3)])]).contains("needs 4"));
-        assert!(err(6, &[omni_image(&[], &[(1, 4)])]).contains("carries no grid"));
+        assert!(err(6, &[omni_image(&[], &[(1, 4)])]).contains("carries no image_grid_thw"));
         assert!(err(6, &[omni_image(&[[1, 4, 4], [1, 4, 4]], &[(1, 4)])])
             .contains("2 grid row(s) for 1"));
         assert!(err(6, &[omni_image(&[[1, 0, 4]], &[(1, 4)])]).contains("is not positive"));
@@ -1296,6 +1420,35 @@ pub(crate) mod tests {
         )
         .contains("2 video_second_per_grid value(s) for 1"));
         assert!(err(0, &[]).contains("non-empty prompt"));
+        // The clock side refuses what the engine's cast would wrap into a
+        // garbage table: a non-finite or negative seconds value, a step whose
+        // product leaves the range a position holds (the engine serves
+        // `[2, 2, 2]` at 1e18 seconds per grid with i64::MIN + 1 in its
+        // table), and a running position no `i64` takes.
+        assert!(err(
+            4,
+            &[omni_video(&[[2, 2, 2]], &[(1, 2)], Some(&[f32::INFINITY]))]
+        )
+        .contains("video_second_per_grid inf is not a finite"));
+        assert!(
+            err(4, &[omni_video(&[[2, 2, 2]], &[(1, 2)], Some(&[-1.0]))])
+                .contains("video_second_per_grid -1 is not a finite")
+        );
+        assert!(
+            err(4, &[omni_video(&[[2, 2, 2]], &[(1, 2)], Some(&[1e18]))])
+                .contains("past what a position holds")
+        );
+        // Three such videos: each advances the running position by 3.9e18,
+        // and the third's step no longer fits beside it.
+        assert!(err(
+            10,
+            &[
+                omni_video(&[[2, 2, 2]], &[(1, 2)], Some(&[3e17])),
+                omni_video(&[[2, 2, 2]], &[(4, 5)], Some(&[3e17])),
+                omni_video(&[[2, 2, 2]], &[(7, 8)], Some(&[3e17]))
+            ]
+        )
+        .contains("overflows"));
         // An item without spans contributes nothing, as the engine skips it;
         // a prompt of audio alone is linear with a zero delta.
         let table = omni_table(4, &[omni_audio(&[(1, 2)]), omni_image(&[[1, 4, 4]], &[])]).unwrap();
@@ -1497,12 +1650,10 @@ pub(crate) mod tests {
         let rule = match config["rule"].as_str().unwrap_or("qwen3_5") {
             "qwen3_omni" => PositionRule::Qwen3Omni(OmniLayout {
                 spatial_merge_size: merge,
-                position_id_per_seconds: config["position_id_per_seconds"]
-                    .as_f64()
-                    .unwrap_or(OmniLayout::DEFAULT_POSITION_ID_PER_SECONDS),
-                seconds_per_chunk: config["seconds_per_chunk"]
-                    .as_f64()
-                    .unwrap_or(OmniLayout::DEFAULT_SECONDS_PER_CHUNK),
+                // The engine's `getattr` defaults, which the launcher ships
+                // for a thinker that leaves them unsaid.
+                position_id_per_seconds: config["position_id_per_seconds"].as_f64().unwrap_or(13.0),
+                seconds_per_chunk: config["seconds_per_chunk"].as_f64().unwrap_or(2.0),
             }),
             _ => PositionRule::Qwen35(MropeLayout {
                 spatial_merge_size: merge,

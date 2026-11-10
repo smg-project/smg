@@ -1855,11 +1855,27 @@ def test_mrope_layout_facts_are_read_as_the_engines_input_processor_reads_them()
         "position_id_per_seconds": 13.0,
         "seconds_per_chunk": 2.0,
     }
-    # A clock the checkpoint leaves unsaid is None (the rule's defaults are
-    # the engine's); a value that is not a number is None too.
+    # A clock the thinker leaves unsaid is the engine's default, read as the
+    # engine reads it (getattr(thinker_config, name, default)), never the
+    # wrapper's top-level value, which the engine does not read; a value that
+    # is not a number is None (the rule then refuses by name). The top-level
+    # placeholder ids do not leak into the thinker's facts either.
     assert rust.mrope_layout(
-        {"thinker_config": {"vision_config": {"spatial_merge_size": 2}, "seconds_per_chunk": "2"}}
-    ) == {**none, "spatial_merge_size": 2}
+        {
+            "thinker_config": {
+                "vision_config": {"spatial_merge_size": 2},
+                "seconds_per_chunk": "2",
+            },
+            "position_id_per_seconds": 25,
+            "image_token_id": 7,
+        }
+    ) == {**none, "spatial_merge_size": 2, "position_id_per_seconds": 13.0}
+    assert rust.mrope_layout({"thinker_config": {"vision_config": {"spatial_merge_size": 2}}}) == {
+        **none,
+        "spatial_merge_size": 2,
+        "position_id_per_seconds": 13.0,
+        "seconds_per_chunk": 2.0,
+    }
 
 
 def test_mrope_positions_are_read_as_the_engines_executor_reads_them():
@@ -1876,8 +1892,18 @@ def test_mrope_positions_are_read_as_the_engines_executor_reads_them():
     plain_text = SimpleNamespace(rope_parameters={"rope_type": "default", "rope_theta": 1e6})
     assert rust.mrope_positions(SimpleNamespace(), plain_text) is False
     assert rust.mrope_positions(SimpleNamespace(), SimpleNamespace(hidden_size=8)) is False
-    # The older rope_scaling spelling reads the same on the engine's config.
-    assert rust.mrope_positions(SimpleNamespace(), {"rope_scaling": {"type": "mrope"}}) is True
+    # The executor reads rope_parameters only: a rope_scaling spelling, or a
+    # rope type named mrope without a section, is 1-D to it (the engine's
+    # config class fills rope_parameters at load for a checkpoint that spells
+    # it the old way).
+    assert (
+        rust.mrope_positions(SimpleNamespace(), {"rope_scaling": {"mrope_section": [1, 1, 1]}})
+        is False
+    )
+    assert (
+        rust.mrope_positions(SimpleNamespace(), {"rope_parameters": {"rope_type": "mrope"}})
+        is False
+    )
     # Without the engine's text config the Omni wrapper's nesting is out of
     # reach and the reading is None: the launcher passes the engine's.
     assert rust.mrope_positions(SimpleNamespace(thinker_config=object())) is None
