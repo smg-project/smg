@@ -1265,6 +1265,30 @@ mod tests {
         assert!(cache_aware.kv_event_monitor_is_set_for_test());
     }
 
+    /// The switch reaches the policy registry of a built context: `engine`
+    /// with a carried policy exposes the decider, `legacy` none.
+    #[tokio::test]
+    async fn a_context_under_the_engine_switch_exposes_the_decider_and_legacy_none() {
+        use crate::config::PolicyEngineMode;
+
+        let build = |mode: PolicyEngineMode| {
+            let mut config = RouterConfig::builder()
+                .round_robin_policy()
+                .policy_engine(mode)
+                .build_unchecked();
+            config.health_check.disable_health_check = true;
+            config
+        };
+        let engine = AppContext::from_config(build(PolicyEngineMode::Engine), 30, None, None)
+            .await
+            .expect("a context under engine");
+        assert!(engine.policy_registry.decider().is_some());
+        let legacy = AppContext::from_config(build(PolicyEngineMode::Legacy), 30, None, None)
+            .await
+            .expect("a context under legacy");
+        assert!(legacy.policy_registry.decider().is_none());
+    }
+
     #[test]
     fn maybe_rate_limit_manager_disabled_is_ok_none() {
         let config = RouterConfig::default();

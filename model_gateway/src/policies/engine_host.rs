@@ -674,6 +674,11 @@ mod tests {
         let mut seen = Vec::new();
         for _ in 0..4 {
             let (decision, lease) = decider.decide(&request(), &workers, &[]);
+            let targets = &decision.pick().expect("a pick").targets;
+            assert!(
+                targets.iter().all(|t| t.position != 1),
+                "the view's healthy bit keeps the not-ready worker out of the decision: {targets:?}"
+            );
             let target = decider
                 .commit(&lease, &decision, Side::Single, |t| {
                     workers[t.position as usize].is_available()
@@ -790,6 +795,67 @@ mod tests {
         }
     }
 
+    /// The request's tried URLs reach the engine as the not-tried filter's
+    /// ids: a worker an earlier attempt dispatched to is passed over while
+    /// another remains, and the filter steps aside once every worker was
+    /// tried.
+    #[test]
+    fn a_tried_worker_is_passed_over_while_another_remains() {
+        let decider = decider(&PolicyConfig::RoundRobin);
+        let workers = pool(2);
+        let tried = [workers[0].base_url().to_string()];
+        let once_tried = HostRequest {
+            tried: &tried,
+            ..request()
+        };
+        for _ in 0..20 {
+            let (decision, _) = decider.decide(&once_tried, &workers, &[]);
+            let first = decision.pick().expect("a pick").targets.first().copied();
+            assert_eq!(first.map(|t| t.position), Some(1), "{decision:?}");
+        }
+        let both = [
+            workers[0].base_url().to_string(),
+            workers[1].base_url().to_string(),
+        ];
+        let all_tried = HostRequest {
+            tried: &both,
+            ..request()
+        };
+        let (decision, _) = decider.decide(&all_tried, &workers, &[]);
+        assert!(
+            decision.pick().is_some(),
+            "the not-tried filter is soft: {decision:?}"
+        );
+    }
+
+    /// Three workers tell the two in-flight metrics apart: `least_requests`
+    /// takes the emptiest worker for every seed, `requests` samples two and
+    /// never takes the fullest.
+    #[test]
+    fn least_requests_takes_the_emptiest_of_three_and_requests_never_the_fullest() {
+        let workers = pool(3);
+        for _ in 0..5 {
+            workers[0].increment_load();
+        }
+        for _ in 0..3 {
+            workers[1].increment_load();
+        }
+        let least = decider(&PolicyConfig::PowerOfTwo {
+            load_metric: PowerOfTwoLoadMetric::LeastRequests,
+        });
+        let sampled = decider(&PolicyConfig::PowerOfTwo {
+            load_metric: PowerOfTwoLoadMetric::Requests,
+        });
+        for _ in 0..20 {
+            let (decision, _) = least.decide(&request(), &workers, &[]);
+            let first = decision.pick().expect("a pick").targets.first().copied();
+            assert_eq!(first.map(|t| t.position), Some(2), "{decision:?}");
+            let (decision, _) = sampled.decide(&request(), &workers, &[]);
+            let first = decision.pick().expect("a pick").targets.first().copied();
+            assert_ne!(first.map(|t| t.position), Some(0), "{decision:?}");
+        }
+    }
+
     #[test]
     fn a_same_url_replacement_gets_a_new_id() {
         let a: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w:8000").build());
@@ -846,6 +912,46 @@ mod tests {
         }
     }
 
+    /// A rank with no running request contributes no generation rate (its
+    /// gauge is stale); a prefill reads its prefill throughput whatever runs.
+    #[test]
+    fn an_idle_rank_contributes_no_live_rate_until_a_request_runs() {
+        let now = Instant::now();
+        let mut report = one_rank_load(0, 0.1, 2000.0);
+        report.loads[0].num_running_reqs = 0;
+        assert_eq!(
+            load_row(&report, WorkerType::Regular, now, now).live_rate,
+            0
+        );
+        report.loads[0].num_running_reqs = 1;
+        assert_eq!(
+            load_row(&report, WorkerType::Regular, now, now).live_rate,
+            2000
+        );
+        report.loads[0].num_running_reqs = 0;
+        report.loads[0].prefill_throughput = Some(1500.0);
+        assert_eq!(
+            load_row(&report, WorkerType::Prefill, now, now).live_rate,
+            1500
+        );
+    }
+
+    /// The counts sum over the ranks; the KV fields average over them, the
+    /// active share falling back to the token usage of a rank without one.
+    #[test]
+    fn the_counts_sum_and_the_kv_fields_average_over_the_ranks() {
+        let now = Instant::now();
+        let mut report = one_rank_load(0, 0.2, 2000.0);
+        let mut second = report.loads[0].clone();
+        second.dp_rank = 1;
+        second.token_usage = 0.8;
+        second.active_token_usage = Some(0.4);
+        report.loads.push(second);
+        let row = load_row(&report, WorkerType::Regular, now, now);
+        assert_eq!((row.kv_usage_permille, row.active_kv_permille), (500, 300));
+        assert_eq!((row.running, row.live_rate), (2, 4000));
+    }
+
     #[test]
     fn a_pair_decision_pairs_a_prefill_with_one_of_its_partners_and_books_both_sides() {
         let decider = decider(&PolicyConfig::RoundRobin);
@@ -884,6 +990,59 @@ mod tests {
                 "the decode is a partner of the chosen prefill"
             );
             assert_eq!(pair.decode_id, worker_id(decode.as_ref()));
+        }
+    }
+
+    /// A pair commit books the decode side too: under least-load on both
+    /// sides with equal partner reports, the next pair takes the other decode.
+    #[test]
+    fn a_pair_commit_books_the_decode_side_so_the_next_pair_takes_the_other_decode() {
+        let decider = decider(&PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        });
+        let prefills = vec![worker_of("http://p0:8000", WorkerType::Prefill)];
+        let decodes = [
+            worker_of("http://d0:8000", WorkerType::Decode),
+            worker_of("http://d1:8000", WorkerType::Decode),
+        ];
+        let idle = || one_rank_load(0, 0.1, 2000.0);
+        let (_tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(vec![
+            (prefills[0].url().to_string(), idle()),
+            (decodes[0].url().to_string(), idle()),
+            (decodes[1].url().to_string(), idle()),
+        ]));
+        decider.set_load_receiver(Some(rx));
+        let partners = |_: usize| -> Vec<Arc<dyn Worker>> { decodes.to_vec() };
+        let request = HostRequest {
+            phase: Phase::Prefill,
+            prompt_tokens: 512,
+            ..request()
+        };
+        let (first, lease, _) =
+            decider.decide_pair(&request, &prefills, &|_| true, &partners, false, &[]);
+        let taken = decider
+            .commit(&lease, &first, Side::Prefill, |_| true)
+            .expect("a pair");
+        let booked = taken.pair.expect("the decode side").decode_position;
+        // Twenty decisions: without the booking the two decodes tie and the
+        // picker draws the tie from the seed, so one or three decisions
+        // could agree by chance.
+        for _ in 0..20 {
+            let (next, _, _) =
+                decider.decide_pair(&request, &prefills, &|_| true, &partners, false, &[]);
+            let pair = next
+                .pick()
+                .expect("a pair")
+                .targets
+                .first()
+                .and_then(|t| t.pair);
+            assert_eq!(
+                pair.map(|p| p.decode_position),
+                Some(1 - booked),
+                "the booked decode carries the credit: {next:?}"
+            );
         }
     }
 

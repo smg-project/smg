@@ -1206,8 +1206,9 @@ mod tests {
     }
 
     /// The load feed handed to the registry reaches the engine whether the
-    /// decider exists before or after the hand-off: a least-load decision
-    /// then reads the reports and takes the idle worker.
+    /// decider exists before or after the hand-off. Worker 1 carries two
+    /// in-flight requests, so a dark pool (no feed) takes worker 0 by the
+    /// host count and only the reports flip the pick to the idle worker 1.
     #[test]
     fn the_load_feed_hand_off_reaches_the_decider() {
         let least_load = PolicyConfig::LeastLoad {
@@ -1219,6 +1220,8 @@ mod tests {
             ready_worker("http://w0:8000", "m"),
             ready_worker("http://w1:8000", "m"),
         ];
+        workers[1].increment_load();
+        workers[1].increment_load();
         let (_tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(vec![
             (
                 workers[0].url().to_string(),
@@ -1226,7 +1229,7 @@ mod tests {
             ),
             (workers[1].url().to_string(), one_rank_load(0, 0.1, 2000.0)),
         ]));
-        let idle_wins = |registry: &PolicyRegistry| {
+        let pick = |registry: &PolicyRegistry| {
             let decider = registry.decider().expect("the engine");
             let request = HostRequest {
                 model: "m",
@@ -1234,8 +1237,22 @@ mod tests {
             };
             let (decision, _) = decider.decide(&request, &workers, &[]);
             let first = decision.pick().expect("a pick").targets.first().copied();
-            assert_eq!(first.map(|t| t.position), Some(1), "{decision:?}");
+            first.map(|t| t.position)
         };
+        let idle_wins = |registry: &PolicyRegistry| {
+            assert_eq!(pick(registry), Some(1), "the reports flip the pick");
+        };
+
+        let dark = PolicyRegistry::new(least_load.clone()).with_policy_engine(
+            PolicyEngineMode::Engine,
+            &least_load,
+            &least_load,
+        );
+        assert_eq!(
+            pick(&dark),
+            Some(0),
+            "without the feed the host count decides"
+        );
 
         let handed_first = PolicyRegistry::new(least_load.clone());
         handed_first.set_load_receiver(Some(rx.clone()));
