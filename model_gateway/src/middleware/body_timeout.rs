@@ -230,7 +230,12 @@ struct TimedBody {
     stall: Option<Duration>,
     /// Armed on the first pending poll of a wait, cleared on progress.
     stall_timer: Option<Pin<Box<Sleep>>>,
-    deadline: Pin<Box<Sleep>>,
+    /// When the request timeout ends, read once at the wrap; the timer that
+    /// waits for it is built on the first poll that has to wait, as the stall
+    /// timer is: a body that arrives whole never waits, and a timer boxed at
+    /// the wrap was one allocation per request for nothing.
+    deadline_at: tokio::time::Instant,
+    deadline: Option<Pin<Box<Sleep>>>,
     outcome: Arc<AtomicU8>,
     ended: bool,
 }
@@ -241,7 +246,8 @@ impl TimedBody {
             inner,
             stall: timeouts.stall,
             stall_timer: None,
-            deadline: Box::pin(tokio::time::sleep(timeouts.total)),
+            deadline_at: tokio::time::Instant::now() + timeouts.total,
+            deadline: None,
             outcome,
             ended: false,
         }
@@ -282,7 +288,11 @@ impl http_body::Body for TimedBody {
                 return Poll::Ready(frame);
             }
         }
-        if this.deadline.as_mut().poll(cx).is_ready() {
+        let deadline_at = this.deadline_at;
+        let deadline = this
+            .deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline_at)));
+        if deadline.as_mut().poll(cx).is_ready() {
             return this.end(
                 TIMED_OUT,
                 "request body still incomplete at the request timeout",
