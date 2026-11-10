@@ -150,6 +150,40 @@ impl Params {
     fn soft_tokens(self, target: (usize, usize)) -> usize {
         (target.0 / self.patch) * (target.1 / self.patch) / (self.pool * self.pool)
     }
+
+    /// The `(height, width)` the encode works on for a `source_h` x
+    /// `source_w` input: the reference's resize target when `do_resize` is
+    /// on, the source itself otherwise, refused as the encode refuses it (a
+    /// side that is zero or not a multiple of the pooled patch, a grid above
+    /// the patch budget). The count and the encode take their size from here,
+    /// so they agree in both modes.
+    fn input_size(
+        self,
+        do_resize: bool,
+        source_h: usize,
+        source_w: usize,
+    ) -> Result<(usize, usize), TransformError> {
+        let (height, width) = if do_resize {
+            self.target_size(source_h, source_w)?
+        } else {
+            (source_h, source_w)
+        };
+        let side = self.side_mult();
+        if height == 0 || width == 0 || !height.is_multiple_of(side) || !width.is_multiple_of(side)
+        {
+            return Err(shape(format!(
+                "Gemma 4 input {width}x{height} is not a multiple of {side} pixels"
+            )));
+        }
+        let num_patches = (height / self.patch) * (width / self.patch);
+        if num_patches > self.max_patches() {
+            return Err(shape(format!(
+                "Gemma 4 input {width}x{height} has {num_patches} patches, above the budget of {}",
+                self.max_patches()
+            )));
+        }
+        Ok((height, width))
+    }
 }
 
 /// The pixel transform in the crate's form: `rescale_factor` times the byte,
@@ -307,26 +341,8 @@ impl Layout {
         params: Params,
         pixels: &Pixels,
     ) -> Result<Self, TransformError> {
-        let (height, width) = if pixels.do_resize {
-            params.target_size(source_h, source_w)?
-        } else {
-            (source_h, source_w)
-        };
-        let side = params.side_mult();
-        if height == 0 || width == 0 || !height.is_multiple_of(side) || !width.is_multiple_of(side)
-        {
-            return Err(shape(format!(
-                "Gemma 4 input {width}x{height} is not a multiple of {side} pixels"
-            )));
-        }
+        let (height, width) = params.input_size(pixels.do_resize, source_h, source_w)?;
         let (grid_h, grid_w) = (height / params.patch, width / params.patch);
-        if grid_h * grid_w > params.max_patches() {
-            return Err(shape(format!(
-                "Gemma 4 input {width}x{height} has {} patches, above the budget of {}",
-                grid_h * grid_w,
-                params.max_patches()
-            )));
-        }
         Ok(Self {
             height,
             width,
@@ -742,12 +758,13 @@ impl VisionPreProcessor for Gemma4Processor {
         preprocess_video_frames(frames, self.params_for(Modality::Video)?, &self.pixels)
     }
 
-    /// Soft tokens for an image of this size; the preprocessing error for a
-    /// size the reference rule cannot resize.
+    /// Soft tokens for an image of this size, counted on the size the encode
+    /// works on (the resize target, or the source itself under
+    /// `do_resize: false`); the preprocessing error for a size it refuses.
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         let params = self.params_for(Modality::Image)?;
-        let target = params.target_size(height as usize, width as usize)?;
-        Ok(params.soft_tokens(target))
+        let input = params.input_size(self.pixels.do_resize, height as usize, width as usize)?;
+        Ok(params.soft_tokens(input))
     }
 
     fn model_name(&self) -> &'static str {
@@ -1032,6 +1049,9 @@ mod tests {
         assert!(no_resize.preprocess(&[&solid(100, 100, [0; 3])]).is_err());
         let aligned = no_resize.preprocess(&[&solid(96, 48, [0; 3])]).unwrap();
         assert_eq!(aligned.feature_token_counts, vec![2]);
+        // The size-only count takes the same source size as the encode.
+        assert_eq!(no_resize.calculate_num_tokens(96, 48).unwrap(), 2);
+        assert!(no_resize.calculate_num_tokens(100, 100).is_err());
         // Aligned but over the budget of 2520 patches (180 x 60 = 10,800).
         assert!(no_resize
             .preprocess(&[&solid(48 * 60, 48 * 20, [0; 3])])
