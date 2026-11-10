@@ -30,6 +30,9 @@ use super::{
 };
 use crate::observability::metrics::Metrics;
 
+#[path = "minimax_image_cache.rs"]
+mod minimax_image_cache;
+
 struct PreparedMultimodalPart {
     preprocessed: PreprocessedEncoderInputs,
     media: MediaBatch,
@@ -563,15 +566,12 @@ async fn cached_images(
     let Some(cache) = &ctx.components.pixel_cache else {
         return Ok(None);
     };
-    let batch_cache = ctx.spec.name() == "minimax_m3" && !images.is_empty();
-    if !(batch_cache
-        || images.len() == 1
-        || (images.len() < 32
-            && ctx
-                .vision_processors
-                .image()
-                .is_ok_and(|p| p.supports_per_image_preprocessing())))
-    {
+    let independent = ctx
+        .vision_processors
+        .image()
+        .is_ok_and(|processor| processor.supports_per_image_preprocessing());
+    let batch_cache = independent && !images.is_empty() && ctx.spec.name() == "minimax_m3";
+    if !(batch_cache || images.len() == 1 || (images.len() < 32 && independent)) {
         return Ok(None);
     }
     let config = serde_json::json!({
@@ -890,7 +890,7 @@ async fn preprocess_image_batch(
     .map_err(|e| anyhow::Error::new(e).context("Preprocessing task panicked"))?
 }
 
-/// Decode cache misses in parallel and borrow the decoded frames for the processor.
+/// Decode the frames in parallel and borrow them for the processor.
 fn preprocess_image_frames(
     images: &[Arc<ImageFrame>],
     vision_processors: &VisionProcessors,
@@ -1948,6 +1948,3 @@ mod tests {
 #[cfg(test)]
 #[path = "image_cache_tests.rs"]
 mod image_cache_tests;
-
-#[path = "minimax_image_cache.rs"]
-mod minimax_image_cache;

@@ -30,26 +30,55 @@ pub(super) async fn preprocess(
     on_pool(ctx.model_id, move || {
         let mut indices = HashMap::new();
         let mut order = Vec::with_capacity(images.len());
-        let mut parts = Vec::new();
-        let mut misses = Vec::new();
-        let mut miss_images = Vec::new();
+        let mut unique = Vec::new();
         for image in &images {
-            let next = parts.len();
+            let next = unique.len();
             let index = *indices.entry(image.hash.as_str()).or_insert(next);
             order.push(index);
             if index == next {
-                let key = PixelCacheKey {
-                    image_hash: image.hash.clone(),
-                    config_fingerprint: fingerprint,
-                };
-                let entry = cache.get(&key);
-                Metrics::record_mm_pixel_cache_lookup(&model_id, entry.is_some());
-                if entry.is_none() {
-                    misses.push((index, key));
-                    miss_images.push(Arc::clone(image));
-                }
-                parts.push(entry);
+                unique.push(image);
             }
+        }
+
+        let budget = cache.max_bytes();
+        let storage_width = if wire_dtype == Some(EncoderDtype::BFloat16) {
+            2
+        } else {
+            1
+        };
+        // An oversized batch of distinct images cannot fill the cache. Keep
+        // the contiguous batch path before looking up or splitting any items.
+        // Repeated images can still benefit from request-local deduplication.
+        if unique.len() == images.len() {
+            let processor = processors.image()?;
+            let over_budget = unique
+                .iter()
+                .filter_map(|image| {
+                    let size = image.size();
+                    processor.image_input_elements(size.width, size.height)
+                })
+                .try_fold(budget / storage_width, usize::checked_sub)
+                .is_none();
+            if over_budget {
+                return preprocess_image_frames(&images, &processors, wire_dtype);
+            }
+        }
+
+        let mut parts = Vec::new();
+        let mut misses = Vec::new();
+        let mut miss_images = Vec::new();
+        for (index, image) in unique.into_iter().enumerate() {
+            let key = PixelCacheKey {
+                image_hash: image.hash.clone(),
+                config_fingerprint: fingerprint,
+            };
+            let entry = cache.get(&key);
+            Metrics::record_mm_pixel_cache_lookup(&model_id, entry.is_some());
+            if entry.is_none() {
+                misses.push((index, key));
+                miss_images.push(Arc::clone(image));
+            }
+            parts.push(entry);
         }
 
         let mut inserts = Vec::new();
@@ -82,7 +111,7 @@ pub(super) async fn preprocess(
                     .map(|p| p.preprocessed.encoder_input.nbytes())
                     .sum(),
             );
-            let admit = working_bytes <= cache.max_bytes();
+            let admit = working_bytes <= budget;
             if direct && !admit {
                 return Ok(batch);
             }

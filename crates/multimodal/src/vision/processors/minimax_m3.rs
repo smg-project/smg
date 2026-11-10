@@ -307,6 +307,11 @@ impl Deref for MiniMaxM3VisionProcessor {
 }
 
 impl VisionPreProcessor for MiniMaxM3VisionProcessor {
+    /// Image geometry and patchification are independent across the batch.
+    fn supports_per_image_preprocessing(&self) -> bool {
+        true
+    }
+
     fn emits_pixel_bytes(&self) -> bool {
         true
     }
@@ -326,9 +331,8 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         self.inner.preprocess(images)
     }
 
-    /// Write BF16 image batches in one pass; only BF16 was benchmarked here.
-    /// Single images retain neutral U8 pixels to preserve pixel-cache entry
-    /// sizes. This guard also applies when no cache is present.
+    /// Write multi-image BF16 batches in one pass. A single image uses the
+    /// neutral path, which the gateway can convert to match cached BF16 entries.
     fn preprocess_wire(
         &self,
         images: &[&DynamicImage],
@@ -373,6 +377,18 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         self.inner.calculate_num_tokens(width, height)
+    }
+
+    /// M3's patches cover the resized RGB image once per temporal copy.
+    fn image_input_elements(&self, width: u32, height: u32) -> Option<usize> {
+        let (height, width) = self
+            .inner
+            .smart_resize(height as usize, width as usize)
+            .ok()?;
+        height
+            .checked_mul(width)?
+            .checked_mul(3)?
+            .checked_mul(self.inner.temporal_patch_size())
     }
 
     fn model_name(&self) -> &'static str {
@@ -440,6 +456,15 @@ mod tests {
                 vec![&images[2], &images[0], &images[1], &images[2]],
             ] {
                 let neutral = processor.preprocess(&refs).unwrap();
+                let elements: usize = refs
+                    .iter()
+                    .map(|image| {
+                        processor
+                            .image_input_elements(image.width(), image.height())
+                            .unwrap()
+                    })
+                    .sum();
+                assert_eq!(elements, neutral.encoder_input.len());
                 let wire = processor
                     .preprocess_wire(&refs, EncoderDtype::BFloat16)
                     .unwrap()
@@ -478,10 +503,7 @@ mod tests {
                     .preprocess_wire(&[&images[0], &images[1]], dtype)
                     .is_none());
             }
-            assert!(
-                !processor.supports_per_image_preprocessing(),
-                "this change does not enable the multi-image cache"
-            );
+            assert!(processor.supports_per_image_preprocessing());
         }
     }
 

@@ -625,5 +625,38 @@ async fn minimax_batch_cache_reuses_single_and_batch_misses_in_request_order() {
                 );
             }
         }
+
+        let mut small_components = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &MultimodalSettings::default(),
+        )
+        .unwrap();
+        small_components.pixel_cache = Some(Arc::new(PixelCache::new(200 * 1024)));
+        let small = PlanContext {
+            components: &small_components,
+            ..ctx
+        };
+        preprocess_modality(&batch(&[&first]), &small)
+            .await
+            .unwrap();
+        // A single image fits and is cached. The distinct three-image
+        // working set exceeds the budget even in the neutral form.
+        preprocess_modality(&batch(&[&first_hit]), &small)
+            .await
+            .unwrap();
+        assert!(
+            preprocess_modality(&batch(&[&first_hit, &second, &third]), &small)
+                .await
+                .is_err()
+        );
+        let oversized = batch(&[&first, &second, &third]);
+        let expected = preprocess_batch(&oversized, &small).await.unwrap();
+        let actual = preprocess_modality(&oversized, &small).await.unwrap();
+        assert_eq!(
+            actual.encoder_input.write_as(EncoderDtype::BFloat16),
+            expected.encoder_input.write_as(EncoderDtype::BFloat16)
+        );
     }
 }

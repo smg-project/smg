@@ -230,6 +230,12 @@ pub trait VisionPreProcessor: Send + Sync {
     /// * `height` - Image height after preprocessing
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError>;
 
+    /// Estimate the number of image tensor elements from the decoded dimensions.
+    /// A processor without an estimate leaves admission to the actual output.
+    fn image_input_elements(&self, _width: u32, _height: u32) -> Option<usize> {
+        None
+    }
+
     /// Get the model family name for identification.
     fn model_name(&self) -> &'static str;
 
