@@ -827,7 +827,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                 Err(_) => {
                     warn!(
                         "Optional registration metadata budget expired for {}",
-                        config.url
+                        Endpoint::redacted_str(&config.url)
                     );
                     (partial_labels, None)
                 }
