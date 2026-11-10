@@ -131,7 +131,7 @@ pub(super) async fn generate(
         .sampling_params
         .as_ref()
         .map_or((None, 1), |params| (params.max_new_tokens, params.n));
-    // A language-side worker hands a request's image references to the
+    // A language-side worker hands a request's media references to the
     // encoders before the submit (the dispatcher the lifecycle owner
     // supplied); every other worker refuses such a request there.
     let subs = client

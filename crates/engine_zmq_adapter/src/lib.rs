@@ -59,7 +59,8 @@ pub use eos::{fold_tokenizer_eos_backstop, EosTokenIds};
 pub use sglang::{to_sglang_response, SglangGenerateStream, SglangProfileStart};
 pub use sglang_encode::{
     EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
-    EncodeRelease, EncoderDispatchErrorReq, SglangEncodeDispatcher,
+    EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq,
+    SglangEncodeDispatcher,
 };
 pub use sglang_mm_hash::SglangCpuMmHasher;
 pub use sockets::{zmq_handshake_address, Handshake};
