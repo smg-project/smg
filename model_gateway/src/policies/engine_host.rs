@@ -101,7 +101,9 @@ fn profile_of(config: &PolicyConfig) -> Result<ProfileSpec, EngineHostError> {
 
 /// Carry a configuration's tunables into its preset profile (see
 /// [`profile_of`]); a profile built by the crate's pair presets takes the
-/// same adjustment.
+/// same adjustment. The two in-flight metrics of `power_of_two` keep the
+/// policies' two stages through the engine's count-first pickers: the
+/// fewest in flight, the expected wait among equal counts.
 fn tune(profile: &mut ProfileSpec, config: &PolicyConfig) {
     match config {
         PolicyConfig::LeastLoad {
@@ -124,48 +126,17 @@ fn tune(profile: &mut ProfileSpec, config: &PolicyConfig) {
         PolicyConfig::PowerOfTwo {
             load_metric: PowerOfTwoLoadMetric::Requests,
         } => {
-            profile.score = count_then_wait();
+            profile.score = vec![ScoreSpec::Name("least-load".into())];
+            profile.pick = "power-of-two-count-first".into();
         }
         PolicyConfig::PowerOfTwo {
             load_metric: PowerOfTwoLoadMetric::LeastRequests,
         } => {
-            profile.score = count_then_wait();
-            profile.pick = "best".into();
+            profile.score = vec![ScoreSpec::Name("least-load".into())];
+            profile.pick = "count-first".into();
         }
         _ => {}
     }
-}
-
-/// The weight of the in-flight count against the expected wait in the two
-/// in-flight metrics' score: the engine combines normalized scores by
-/// weight, so this ratio reads as the policies' two stages, the fewest in
-/// flight first and the expected wait among them. Two bounds follow from
-/// the normalization: the count order is exact while the pool's in-flight
-/// span stays below the weight, and under the `best` picker equal counts
-/// whose waits differ by less than the weight times the picker's band (one
-/// millionth of the wait span per unit, a thousandth of it here) draw by
-/// the seed, where the policies tie at a microsecond. An exact two-stage
-/// form is a fewest-in-flight stage in the engine, a later step's.
-const COUNT_FIRST_WEIGHT: f32 = 1000.0;
-
-/// The score chain of `power_of_two` under its `requests` and
-/// `least_requests` metrics: the host's in-flight count, then the
-/// expected wait on equal counts (see [`COUNT_FIRST_WEIGHT`]).
-fn count_then_wait() -> Vec<ScoreSpec> {
-    let mut count = std::collections::BTreeMap::new();
-    count.insert(
-        "least-requests".to_string(),
-        ScoreParams {
-            weight: COUNT_FIRST_WEIGHT,
-            kv_pressure_weight: None,
-            mean_prefill_tokens: None,
-            default_throughput: None,
-        },
-    );
-    vec![
-        ScoreSpec::Named(count),
-        ScoreSpec::Name("least-load".into()),
-    ]
 }
 
 /// The stable id of a worker in the view: its registration key (the URL)
@@ -1093,9 +1064,8 @@ mod tests {
         }
     }
 
-    /// Three workers at equal counts with waits far apart: the pool's wait
-    /// span normalizes the two lighter waits close together, and the
-    /// composition still takes the idle worker on every seed under
+    /// Three workers at equal counts with waits far apart: the count-first
+    /// pick falls to the wait and takes the idle worker on every seed under
     /// `least_requests`; `requests` never takes the heaviest.
     #[test]
     fn equal_counts_over_three_workers_still_take_the_idle_one() {
@@ -1130,6 +1100,54 @@ mod tests {
                 first.map(|t| t.position),
                 Some(0),
                 "the idle worker at five percent of the span: {decision:?}"
+            );
+            let (decision, _) = sampled.decide(&request, &workers, &[]);
+            let first = decision.pick().expect("a pick").targets.first().copied();
+            assert_ne!(first.map(|t| t.position), Some(2), "{decision:?}");
+        }
+    }
+
+    /// The review's wide spread: counts 0, 1 and 2000 with the idle worker's
+    /// wait the worst. The count decides before any wait: `least_requests`
+    /// takes the idle worker on every seed, `requests` never leads a pair
+    /// with the busiest worker.
+    #[test]
+    fn a_strictly_lower_count_wins_whatever_the_wait_span() {
+        let workers = pool(3);
+        workers[1].increment_load();
+        for _ in 0..2000 {
+            workers[2].increment_load();
+        }
+        let (_tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(vec![
+            (
+                workers[0].url().to_string(),
+                one_rank_load(40_000, 0.1, 2000.0),
+            ),
+            (workers[1].url().to_string(), one_rank_load(0, 0.1, 2000.0)),
+            (
+                workers[2].url().to_string(),
+                one_rank_load(20_000, 0.1, 2000.0),
+            ),
+        ]));
+        let request = HostRequest {
+            prompt_tokens: 512,
+            ..request()
+        };
+        let least = decider(&PolicyConfig::PowerOfTwo {
+            load_metric: PowerOfTwoLoadMetric::LeastRequests,
+        });
+        least.set_load_receiver(Some(rx.clone()));
+        let sampled = decider(&PolicyConfig::PowerOfTwo {
+            load_metric: PowerOfTwoLoadMetric::Requests,
+        });
+        sampled.set_load_receiver(Some(rx));
+        for _ in 0..20 {
+            let (decision, _) = least.decide(&request, &workers, &[]);
+            let first = decision.pick().expect("a pick").targets.first().copied();
+            assert_eq!(
+                first.map(|t| t.position),
+                Some(0),
+                "the idle count beats the lightest wait: {decision:?}"
             );
             let (decision, _) = sampled.decide(&request, &workers, &[]);
             let first = decision.pick().expect("a pick").targets.first().copied();
