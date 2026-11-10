@@ -206,21 +206,21 @@ pub(super) struct MergeTable {
     /// text); the cold pass runs 0.8-2.6 % fewer instructions per token by
     /// cell (1.6-2.3 % by size-class median) from 256 B to 32 KB over four
     /// vocabularies for it, its cache fills unchanged, the warm pass
-    /// untouched (it merges nothing). Before this grid a 256 x 256 grid by byte answered
-    /// the first round's byte pairs alone, the same pairs recorded in the
-    /// buckets too. Empty for a table whose pieces start from character
-    /// symbols ([`ByteTokens::Hex`]): their first round reads the bucket
-    /// table ([`Self::merge_symbols`]), and the grid's 2 MiB per loaded
-    /// vocabulary stay unspent.
+    /// untouched (it merges nothing). Before this grid a 256 x 256 grid by
+    /// byte answered the first round's byte pairs alone, the same pairs
+    /// recorded in the buckets too. Empty for a table whose pieces start
+    /// from character symbols ([`ByteTokens::Hex`]): their first round reads
+    /// the bucket table ([`Self::merge_symbols`]), and the grid's 2 MiB per
+    /// loaded vocabulary stay unspent.
     hot: Box<[Merge]>,
     /// The first id of the hot grid's window, the least byte token's id;
     /// [`NO_HOT_BASE`] for a table without the grid.
     hot_base: u64,
     /// The pairs outside the hot grid's window, open-addressed by bucket with
     /// linear probing over whole buckets: a pair's key hashes to a bucket of
-    /// [`BUCKET`] entries, and a lookup reads the bucket whole (one compare
-    /// per entry, no branch) and goes on to the next bucket only when none
-    /// matched and none was empty.
+    /// [`BUCKET`] entries on one cache line, and a lookup walks it to the key
+    /// or the first empty entry, going on to the next bucket only when every
+    /// entry holds another pair (see [`Self::merge_of`]).
     buckets: Box<[Bucket]>,
     /// Bits a key's hash is shifted right by to give its first bucket; the
     /// table holds `1 << (64 - shift)` buckets.
@@ -555,7 +555,9 @@ impl MergeTable {
     }
 
     /// Records `(a, b)` as `merge`; a pair recorded twice keeps the later
-    /// merge, as the model's merge map does.
+    /// merge, as the model's merge map does. The only writer of the grid and
+    /// the buckets: it fills a bucket from its first entry and nothing removes
+    /// an entry, which the lookup's walk ([`Self::merge_of`]) rests on.
     fn insert(&mut self, a: u32, b: u32, merge: Merge) {
         if let Some(at) = self.hot_index(a, b) {
             self.hot[at] = merge;
@@ -610,8 +612,11 @@ impl MergeTable {
     /// The merge of the pair `(a, b)`, [`Merge::NONE`] when it is none: the
     /// hot grid by index when both ids are in its window, else the pair's
     /// filter word (a pair never inserted is answered there), then the
-    /// bucket the key hashes to, read whole, and the buckets after it while
-    /// a bucket is full of other pairs.
+    /// bucket the key hashes to, entry by entry up to the key or the first
+    /// empty entry, and the buckets after it while a bucket is full of other
+    /// pairs. The walk rests on [`Self::insert`] filling a bucket from its
+    /// first entry and on no entry ever being removed: no bucket holds an
+    /// empty entry before a live one.
     #[inline(always)]
     fn merge_of(&self, a: u32, b: u32) -> Merge {
         match self.hot_index(a, b) {
@@ -632,16 +637,15 @@ impl MergeTable {
         let mask = buckets.len() - 1;
         let mut bucket = self.first_bucket(key);
         loop {
-            let mut found = Merge::NONE;
-            let mut empty = false;
+            // Most lookups end after one or two compares of the one line
+            // (a bucket holds two or fewer at the table's load).
             for entry in &buckets[bucket].0 {
                 if entry.key == key {
-                    found = entry.merge;
+                    return entry.merge;
                 }
-                empty |= entry.key == EMPTY_KEY;
-            }
-            if found != Merge::NONE || empty {
-                return found;
+                if entry.key == EMPTY_KEY {
+                    return Merge::NONE;
+                }
             }
             bucket = (bucket + 1) & mask;
         }
