@@ -747,7 +747,7 @@ mod tests {
         assert_eq!(cfg.prefill_engines(), 2);
         // The block's layout, not a probe of the host's ports: the fixed-base probe went
         // red whenever another process held a port of the block.
-        cfg.ports = Some(Ports::block(29950, 4, 2).0);
+        cfg.ports = Some(Ports::block(29950, cfg.workers, cfg.prefill_engines()).0);
         let bed = Bed::new(&cfg, Path::new("/h"), Path::new("/run"), true);
         let env: BTreeMap<String, String> = bed.env().into_iter().collect();
         assert_eq!(env["FLEET"], "prefill-decode");
@@ -766,6 +766,41 @@ mod tests {
         assert_eq!(grpc.prefill_engines(), 0);
         assert_eq!(grpc.engines_text(), "4 scripted mock engines");
         assert_eq!(Fleet::Grpc.as_str(), "grpc");
+    }
+
+    #[test]
+    fn choose_ports_scans_for_a_block_that_holds_the_prefill_engines_too() {
+        // No ports and no base: the scan, handed the config's own counts. A block laid
+        // out for the decode engines alone leaves the prefill bases at zero, and only
+        // the script would notice at start.
+        let mut cfg = config();
+        cfg.fleet = Fleet::PrefillDecode;
+        cfg.prefill_workers = 2;
+        cfg.ports = None;
+        cfg.choose_ports().unwrap();
+        let ports = cfg.ports();
+        assert!((29700..=29999).contains(&ports.gateway), "{ports:?}");
+        assert_eq!(ports.prefill_admin, ports.gateway + 8);
+        assert_eq!(ports.mock_base, ports.gateway + 10);
+        assert_eq!(ports.prefill_base, ports.mock_base + cfg.workers);
+        assert_eq!(
+            ports.bootstrap_base,
+            ports.prefill_base + cfg.prefill_engines()
+        );
+        // The gRPC fleet's scan reserves no prefill ports.
+        let mut grpc = config();
+        grpc.ports = None;
+        grpc.choose_ports().unwrap();
+        let ports = grpc.ports();
+        assert_eq!(ports.mock_base, ports.gateway + 10);
+        assert_eq!(
+            (
+                ports.prefill_admin,
+                ports.prefill_base,
+                ports.bootstrap_base
+            ),
+            (0, 0, 0)
+        );
     }
 
     #[test]
