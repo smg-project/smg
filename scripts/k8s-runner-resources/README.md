@@ -47,13 +47,29 @@ that reaches a runner. The keys the automated reviews and the scheduled Claude w
 the Kubernetes secrets (`openai-api-key`, `anthropic-api-key`) and are mounted only into the
 `ai-key-proxy` sidecar of `runner-values-cpu.yaml`: an nginx container that listens on
 `127.0.0.1:8787`, pod-local, and puts the real key on each request it forwards to
-`api.anthropic.com` or `api.openai.com`. The workflows point Claude (`ANTHROPIC_BASE_URL`) and the
+`api.anthropic.com`, `api.openai.com`, or `api.x.ai`. The workflows point Claude (`ANTHROPIC_BASE_URL`) and the
 Codex action (`responses-api-endpoint`) at it with placeholder keys. A separate container's
 environment and memory are unreadable from the runner container, so nothing a job runs can print a
 key; what a job can do is spend through the proxy, which the keys' spend caps bound. Rotating a key is
 `kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -` on the secret and a roll of the
 runner pods. A live set whose runner container carries a key, or runs privileged (only the `dind`
 sidecar may), has drifted from these values; `helm upgrade` from the files here removes both.
+
+Vendor E2E uses the same pod-local proxy with public placeholder keys. Its gateway worker roots are
+`http://127.0.0.1:8787/openai`, `/anthropic`, or `/xai` without a trailing slash or `/v1`;
+an OpenAI SDK that calls the provider directly uses `/openai/v1` (or `/xai/v1`). The OpenAI
+location forwards WebSocket Upgrade/Connection for Realtime as well as HTTP and SSE. These URLs
+apply only inside a CPU runner pod with this sidecar; bare-metal/GPU Docker jobs do not acquire
+access to this loopback endpoint by setting an environment variable.
+
+The proposed xAI route reads only `XAI_API_KEY` from the optional sidecar Secret reference
+`xai-api-key`. This does not assert that the Secret exists in a cluster. If it is unavailable, the
+proxy still starts for the existing providers and `/xai/` returns 503 without contacting xAI;
+the required xAI tests remain failing. An authorized deployment must confirm or bind the approved
+credential in `actions-runner-system`, apply the reviewed CPU values, roll affected runner pods in
+an approved window, and verify HTTP/SSE and a Realtime WebSocket handshake through the deployed
+sidecar. Source changes or `/healthz` alone do not prove that rollout, credential availability,
+provider quality, or successful paid tests. No raw key belongs in workflow/job environment values.
 
 The same sidecar holds the private key of the **SMG Codex Review** GitHub App (secret
 `codex-github-app` with `app-id`, `installation-id` and `private-key`, the key in PKCS#8 form:

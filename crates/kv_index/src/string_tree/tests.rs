@@ -2512,3 +2512,71 @@ fn the_scans_count_whole_characters_around_the_word_edges() {
         }
     }
 }
+
+#[test]
+fn the_match_counts_the_input_on_every_way_a_walk_stops() {
+    // The input's character count is what the walk advanced past plus the
+    // remainder, on every way a match stops: a hit through several nodes
+    // (the remainder empty), a stop inside a node's text, an input that runs
+    // past a leaf, a miss at the root and a miss below a full match, the
+    // empty input; in one-, two-, three- and four-byte characters. The
+    // oracle is the input's own count and, for the matched count, the longest
+    // common prefix with any inserted text.
+    let tree = Tree::new();
+    let texts = [
+        "hello world",
+        "hello there",
+        "help me",
+        "héllo wörld",
+        "héllo wörlds",
+        "你好世界呀",
+        "你好世界吗",
+        "😀😀😁 face",
+        "😀😀😂 face",
+    ];
+    for (i, text) in texts.iter().enumerate() {
+        tree.insert_text(text, &format!("tenant-{i}"));
+    }
+    let probes = [
+        "hello world",
+        "hello",
+        "hel",
+        "hello worlds and more",
+        "goodbye",
+        "hello worse",
+        "héllo wörld",
+        "héllo wö",
+        "héllo wörldly",
+        "héllo w0rld",
+        "h",
+        "",
+        "你好世界呀",
+        "你好",
+        "你好世界呀呀",
+        "你好世",
+        "你不好",
+        "😀😀😁 face",
+        "😀😀",
+        "😀😀😁 faces",
+        "😀😀🙂",
+        "😀",
+    ];
+    for probe in probes {
+        let result = tree.match_prefix_with_counts(probe);
+        let longest_common_prefix = texts
+            .iter()
+            .map(|text| {
+                text.chars()
+                    .zip(probe.chars())
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            })
+            .max()
+            .unwrap();
+        assert_eq!(result.input_char_count, probe.chars().count(), "{probe:?}");
+        assert_eq!(
+            result.matched_char_count, longest_common_prefix,
+            "{probe:?}"
+        );
+    }
+}
