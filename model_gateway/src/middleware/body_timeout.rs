@@ -439,6 +439,27 @@ mod tests {
         );
     }
 
+    /// The request timeout counts from the wrap, where this layer is
+    /// reached, not from the first read of the body: a handler that reads
+    /// late is cut at the timeout the wrap started.
+    #[tokio::test(start_paused = true)]
+    async fn the_request_timeout_counts_from_the_wrap_not_from_the_first_read() {
+        let wrapped_at = Instant::now();
+        let (request, outcome) = timed(
+            echo_request(trickle(usize::MAX, Duration::from_secs(1))),
+            timeouts(0, 5),
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let read = to_bytes(request.into_body(), usize::MAX).await;
+        assert!(read.is_err(), "the body ends with the timeout's error");
+        assert_eq!(outcome.load(Ordering::Acquire), TIMED_OUT);
+        let waited = wrapped_at.elapsed();
+        assert!(
+            waited >= Duration::from_secs(5) && waited < Duration::from_secs(6),
+            "cut {waited:?} after the wrap: the 5 s timeout counted from the wrap, not from the first read at 3 s"
+        );
+    }
+
     /// Progress inside the stall window resets the watchdog: a slow but
     /// moving upload that completes before the request timeout is served.
     #[tokio::test(start_paused = true)]

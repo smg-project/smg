@@ -84,7 +84,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_token_never_fires_so_inner_response_passes_through() {
+    async fn without_an_admission_token_the_inner_response_passes_through() {
         // Legacy mode: the extractor yields no token, and the guard runs the
         // work as it is; it must never short-circuit to Preempted.
         let guard = PreemptionGuard::default();
@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn from_extensions_reads_the_admission_token_or_defaults_to_one_that_never_fires() {
+    async fn from_extensions_reads_the_admission_token_or_holds_none() {
         let mut extensions = Extensions::new();
         let resp = PreemptionGuard::from_extensions(&extensions)
             .guard(async { StatusCode::OK.into_response() })
