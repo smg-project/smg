@@ -744,10 +744,10 @@ mod tests {
         let mut cfg = config();
         cfg.fleet = Fleet::PrefillDecode;
         cfg.prefill_workers = 2;
-        cfg.ports = None;
-        cfg.port_base = 29950;
         assert_eq!(cfg.prefill_engines(), 2);
-        cfg.choose_ports().unwrap();
+        // The block's layout, not a probe of the host's ports: the fixed-base probe went
+        // red whenever another process held a port of the block.
+        cfg.ports = Some(Ports::block(29950, 4, 2).0);
         let bed = Bed::new(&cfg, Path::new("/h"), Path::new("/run"), true);
         let env: BTreeMap<String, String> = bed.env().into_iter().collect();
         assert_eq!(env["FLEET"], "prefill-decode");
