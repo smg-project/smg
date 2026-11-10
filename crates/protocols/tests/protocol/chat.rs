@@ -339,3 +339,33 @@ fn the_schema_carries_the_assistant_turns_refusal_audio_and_function_call() {
         assert!(properties.contains_key(key), "{key}: {properties:?}");
     }
 }
+
+/// A `json_schema` response format keeps its description when the request is
+/// written back for an upstream; the crate dropped it while reading the
+/// format. Without one, the format is written as before.
+#[test]
+fn a_json_schema_response_formats_description_is_written_back() {
+    let with = json!({"type": "json_schema", "json_schema": {
+        "name": "city", "description": "A city and its country.",
+        "schema": {"type": "object"}, "strict": true
+    }});
+    let mut without = with.clone();
+    without["json_schema"]
+        .as_object_mut()
+        .unwrap()
+        .remove("description");
+    for format in [with, without] {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Name a city."}],
+            "response_format": format.clone()
+        }))
+        .unwrap();
+        request.validate().unwrap();
+        assert!(!request.other.contains_key("response_format"));
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["response_format"],
+            format
+        );
+    }
+}

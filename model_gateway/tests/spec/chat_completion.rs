@@ -560,6 +560,7 @@ fn test_validate_response_format_json_schema_schema_not_object() {
             }],
             response_format: Some(ResponseFormat::JsonSchema {
                 json_schema: JsonSchemaFormat {
+                    description: None,
                     name: name.to_string(),
                     schema,
                     strict: None,

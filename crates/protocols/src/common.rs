@@ -730,6 +730,11 @@ pub struct JsonSchemaFormat {
     pub schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
+    /// What the format is for, as the client describes it to the model.
+    /// Declared last and defaulted, so the derive's positional form keeps
+    /// reading `[name, schema, strict]` as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// A `json_schema` object that arrived before the kind, kept for the end of
@@ -2726,6 +2731,7 @@ mod tests {
             ResponseFormat::JsonObject,
             ResponseFormat::JsonSchema {
                 json_schema: JsonSchemaFormat {
+                    description: None,
                     name: "answer".to_owned(),
                     schema: json!({"type": "object"}),
                     strict: None,
