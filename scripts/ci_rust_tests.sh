@@ -78,7 +78,7 @@ packages_of() {
         agentic)    echo data-connector smg-mcp smg-wasm wfaas ;;
         protocols)  echo openai-protocol smg-external-router smg-auth smg-rl smg-client openapi-gen ;;
         engine)     echo smg-grpc-client engine-zmq-client engine-zmq-adapter engine-servicer mock-worker gateway-perf ;;
-        kv)         echo kv-index smg-mesh smg-mm-rdma smg-radix-tree ;;
+        kv)         echo kv-index smg-mesh smg-mm-rdma smg-policy-controller smg-radix-tree ;;
         radix-fuzz) echo smg-radix-tree ;;
         *) shard_row "$1" >/dev/null ;;
     esac
@@ -178,7 +178,7 @@ commands_of() {
             echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine" ;;
         kv)
             local selectors
-            echo "-p kv-index -p smg-mesh -p smg-mm-rdma"
+            echo "-p kv-index -p smg-mesh -p smg-mm-rdma -p smg-policy-controller"
             # The radix tree without its fuzz binary (the radix-fuzz shard); --doc cannot share an invocation with --test.
             selectors=$(test_selectors_except smg-radix-tree fuzz_differential)
             echo "-p smg-radix-tree --lib$selectors"
