@@ -762,8 +762,7 @@ pub(crate) fn qwen3_omni_positions(
                     // float32 `arange * clock` truncated; the span check above
                     // bounds `t` by the prompt. A product the request's
                     // seconds push past what a position holds is refused
-                    // (the engine's cast would wrap it into a garbage table),
-                    // and the running position takes each step checked.
+                    // (the engine's cast would wrap it into a garbage table).
                     let steps = (0..t)
                         .map(|step| {
                             let product = step as f32 * clock;
@@ -778,14 +777,9 @@ pub(crate) fn qwen3_omni_positions(
                         })
                         .collect::<Result<Vec<i64>, String>>()?;
                     let (lh, lw) = (lh as usize, lw as usize);
-                    for (offset, pos) in (segment.start..=segment.end).enumerate() {
-                        let (step, cell) = (offset / (lh * lw), offset % (lh * lw));
-                        axes[0][pos] = next_pos
-                            .checked_add(steps[step])
-                            .ok_or_else(|| POSITIONS_OVERFLOW.to_string())?;
-                        axes[1][pos] = next_pos + (cell / lw) as i64;
-                        axes[2][pos] = next_pos + (cell % lw) as i64;
-                    }
+                    // Every position the span writes is at most `next_pos +
+                    // top`, so the one checked advance bounds all three axes
+                    // before a cell is written; the fills stay plain.
                     let top = steps
                         .iter()
                         .copied()
@@ -793,10 +787,17 @@ pub(crate) fn qwen3_omni_positions(
                         .unwrap_or(0)
                         .max(lh as i64 - 1)
                         .max(lw as i64 - 1);
-                    next_pos = top
+                    let after = top
                         .checked_add(1)
                         .and_then(|advance| next_pos.checked_add(advance))
                         .ok_or_else(|| POSITIONS_OVERFLOW.to_string())?;
+                    for (offset, pos) in (segment.start..=segment.end).enumerate() {
+                        let (step, cell) = (offset / (lh * lw), offset % (lh * lw));
+                        axes[0][pos] = next_pos + steps[step];
+                        axes[1][pos] = next_pos + (cell / lw) as i64;
+                        axes[2][pos] = next_pos + (cell % lw) as i64;
+                    }
+                    next_pos = after;
                 }
             }
             cursor = segment.end + 1;
