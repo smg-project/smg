@@ -52,6 +52,32 @@ fn stateless_function_history_validates_without_new_user_message() {
     request.validate().unwrap();
 }
 
+/// The follow-up of a `store: false` agent turn replays the reasoning without
+/// its id; the request validates and goes on to the worker without one.
+#[test]
+fn stateless_reasoning_replay_without_id_validates_and_forwards_without_id() {
+    let reasoning = json!({
+        "type": "reasoning",
+        "summary": [{"type": "summary_text", "text": "Call the clock."}],
+        "encrypted_content": "sglang-reasoning-v1.eJxzTszJUSjJSFVIzslPztYDACnFBTg="
+    });
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model", "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "input": [
+            {"role": "user", "content": "What time is it?"},
+            reasoning,
+            {"type": "function_call", "call_id": "call_clock", "name": "clock", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_clock", "output": "12:00"}
+        ]
+    }))
+    .unwrap();
+    request.validate().unwrap();
+
+    let forwarded = to_value_exact(&request).unwrap();
+    assert_eq!(forwarded["input"][1], reasoning);
+}
+
 #[test]
 fn tool_continuation_keeps_other_input_and_cross_field_validation() {
     for input in [
@@ -917,6 +943,77 @@ fn function_call_items_accept_missing_optional_id() {
         serde_json::to_value(&function_output_item).expect("serialize input function_call_output"),
         function_output_payload
     );
+}
+
+/// A `store: false` client replays its reasoning without the id, whatever the
+/// item carries the reasoning in; the item serializes back without an id.
+#[test]
+fn reasoning_input_items_accept_missing_optional_id() {
+    for payload in [
+        json!({
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "Call the clock."}],
+            "encrypted_content": "sglang-reasoning-v1.eJxzTszJUSjJSFVIzslPztYDACnFBTg="
+        }),
+        json!({"type": "reasoning", "summary": [], "encrypted_content": "opaque"}),
+        json!({
+            "type": "reasoning",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": "Call the clock."}]
+        }),
+    ] {
+        let item: ResponseInputOutputItem =
+            serde_json::from_value(payload.clone()).unwrap_or_else(|e| panic!("{payload}: {e}"));
+        match &item {
+            ResponseInputOutputItem::Reasoning { id, .. } => assert!(id.is_none(), "{payload}"),
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_value(&item).expect("serialize input reasoning"),
+            payload
+        );
+    }
+
+    // No summary either: the item still reads, and still goes out without an id.
+    let bare: ResponseInputOutputItem =
+        serde_json::from_value(json!({"type": "reasoning", "encrypted_content": "opaque"}))
+            .expect("reasoning with only encrypted_content should deserialize");
+    let serialized = serde_json::to_value(&bare).expect("serialize bare reasoning");
+    assert!(serialized.get("id").is_none(), "{serialized}");
+    assert_eq!(serialized["encrypted_content"], "opaque");
+
+    // A null id reads as no id.
+    let null_id: ResponseInputOutputItem =
+        serde_json::from_value(json!({"type": "reasoning", "id": null, "summary": []}))
+            .expect("reasoning with a null id should deserialize");
+    assert_eq!(
+        serde_json::to_value(&null_id).expect("serialize null-id reasoning"),
+        json!({"type": "reasoning", "summary": []})
+    );
+
+    // An id is kept as before.
+    let with_id = json!({"type": "reasoning", "id": "rs_1", "summary": []});
+    let item: ResponseInputOutputItem =
+        serde_json::from_value(with_id.clone()).expect("reasoning with an id should deserialize");
+    match &item {
+        ResponseInputOutputItem::Reasoning { id, .. } => assert_eq!(id.as_deref(), Some("rs_1")),
+        other => panic!("expected Reasoning, got {other:?}"),
+    }
+    assert_eq!(
+        serde_json::to_value(&item).expect("serialize reasoning"),
+        with_id
+    );
+    let built = ResponseInputOutputItem::new_reasoning("rs_2".to_string(), vec![], vec![], None);
+    assert_eq!(
+        serde_json::to_value(&built).expect("serialize built reasoning"),
+        json!({"type": "reasoning", "id": "rs_2", "summary": []})
+    );
+
+    // The output item is the server's own and keeps its required id.
+    assert!(serde_json::from_value::<ResponseOutputItem>(
+        json!({"type": "reasoning", "summary": [], "content": []})
+    )
+    .is_err());
 }
 
 #[test]

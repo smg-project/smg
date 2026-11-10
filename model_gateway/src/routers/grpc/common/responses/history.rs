@@ -480,7 +480,6 @@ async fn resolve_item_references(
 fn input_item_id(item: &ResponseInputOutputItem) -> Option<&str> {
     match item {
         ResponseInputOutputItem::Message { id, .. }
-        | ResponseInputOutputItem::Reasoning { id, .. }
         | ResponseInputOutputItem::McpApprovalRequest { id, .. }
         | ResponseInputOutputItem::ImageGenerationCall { id, .. }
         | ResponseInputOutputItem::ComputerCall { id, .. }
@@ -488,7 +487,8 @@ fn input_item_id(item: &ResponseInputOutputItem) -> Option<&str> {
         | ResponseInputOutputItem::LocalShellCallOutput { id, .. }
         | ResponseInputOutputItem::McpCall { id, .. }
         | ResponseInputOutputItem::McpListTools { id, .. } => Some(id.as_str()),
-        ResponseInputOutputItem::FunctionToolCall { id, .. }
+        ResponseInputOutputItem::Reasoning { id, .. }
+        | ResponseInputOutputItem::FunctionToolCall { id, .. }
         | ResponseInputOutputItem::FunctionCallOutput { id, .. }
         | ResponseInputOutputItem::McpApprovalResponse { id, .. }
         | ResponseInputOutputItem::Compaction { id, .. }
@@ -1103,7 +1103,7 @@ pub(crate) mod tests {
         assert!(matches!(
             reasoning,
             ResponseInputOutputItem::Reasoning { ref id, ref content, .. }
-                if id == "reasoning_1" && content.len() == 1
+                if id.as_deref() == Some("reasoning_1") && content.len() == 1
         ));
 
         // a row with no input form is left out, not an error
@@ -1236,6 +1236,31 @@ pub(crate) mod tests {
 
         assert_eq!(resolved.len(), 2);
         assert_eq!(input_item_id(&resolved[1]), Some("ctc_1"));
+    }
+
+    /// A reasoning item replayed without its id carries none, so a reference
+    /// passes it by and finds the reasoning item that has the id.
+    #[tokio::test]
+    async fn item_reference_finds_a_loaded_reasoning_item_by_its_id() {
+        let storage = MemoryResponseStorage::new();
+        let without_id: ResponseInputOutputItem = serde_json::from_value(json!({
+            "type": "reasoning", "summary": [], "encrypted_content": "opaque"
+        }))
+        .unwrap();
+        let with_id: ResponseInputOutputItem = serde_json::from_value(json!({
+            "type": "reasoning", "id": "rs_1", "summary": [],
+            "content": [{"type": "reasoning_text", "text": "thinking"}]
+        }))
+        .unwrap();
+        assert_eq!(input_item_id(&without_id), None);
+
+        let resolved =
+            resolve_item_references(&storage, vec![without_id, with_id, reference("rs_1")], None)
+                .await
+                .expect("an item already in the list resolves without storage");
+
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(input_item_id(&resolved[2]), Some("rs_1"));
     }
 
     /// An output item of another tenant's response is as unknown as a missing
