@@ -61,6 +61,8 @@ fn an_endpoint_without_a_plain_http_origin_is_refused_before_any_dial() {
 fn the_origin_authority_is_the_host_and_port_without_the_userinfo() {
     for (endpoint, authority) in [
         ("grpc://user:secret@worker:8080", "worker:8080"),
+        // A raw `@` inside the userinfo: the host follows the last one.
+        ("grpc://user:p@ss@worker:8080", "worker:8080"),
         ("http://token@10.0.0.5:8000", "10.0.0.5:8000"),
         ("grpc://user:secret@[::1]:8080", "[::1]:8080"),
         ("grpc://user:secret@worker", "worker"),
