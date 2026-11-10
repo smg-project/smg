@@ -201,6 +201,17 @@ const PARALLEL_MIN_BYTES: usize = 64 << 10;
 /// The size a long text unit is cut into for the pool, at the first stable
 /// boundary past each multiple of it.
 const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
+/// Threads of the pool the vocabulary seed is read on at load. The pool is
+/// built for that read and joined before the load returns: on rayon's
+/// global pool the first load would build that pool at the machine's
+/// parallelism (a CPU quota of sixty-four, sixty-four threads) and keep its
+/// threads, idle, for the life of the process. Four read a 151k-entry
+/// vocabulary in about 70 ms against about 250 on one thread (see
+/// `vocabulary_seed`); more threads gain tens of milliseconds on a load
+/// that costs over half a second in the vocabulary file and the model. A
+/// load that runs on a worker of a rayon pool already (the Python binding
+/// loads on its own, sized by its host) reads on that pool instead.
+const SEED_THREADS: usize = 4;
 /// Text on each side of a candidate cut that every stage's pattern is run
 /// over to confirm a piece starts there (widened to the spaces around it).
 const CUT_CHECK_WINDOW: usize = 512;
@@ -1240,7 +1251,9 @@ impl NativeEncoder {
     /// byte-level piece; one the model declines, or whose ids the table
     /// cannot hold, is left to the miss path. A model with merge dropout
     /// tokenizes at random and gets no seed. The entries are read by id, on
-    /// the thread pool, without a copy of the vocabulary.
+    /// the caller's rayon pool when the load runs on one, else on a pool of
+    /// `SEED_THREADS` threads that is gone when the read is; without a copy
+    /// of the vocabulary either way.
     ///
     /// Called once the model's word cache is bounded (see `word_cache`): the
     /// words the seed merges would otherwise fill that cache on every thread
@@ -1272,52 +1285,82 @@ impl NativeEncoder {
         for (byte, &c) in alphabet.iter().enumerate() {
             byte_of[c as usize] = Some(byte as u8);
         }
-        // One slot per id that is an entry: the seeded piece, the bytes of a
-        // long byte-level piece, or `None` for an entry that is no
-        // byte-level piece.
-        let entries: Vec<Option<Seeded>> = (0..bpe.get_vocab_size() as u32)
-            .into_par_iter()
-            .with_min_len(2048)
-            .filter_map(|id| {
-                let entry = bpe.id_to_token(id)?;
-                let seeded = (|| {
-                    let ids_of = |entry: &str| {
-                        let mut ids = SeededIds::default();
-                        for token in &model.tokenize(entry).ok()? {
-                            ids.push(token.id)?;
+        // One id's read: `None` for an id that is no entry, else the seeded
+        // piece, the bytes of a long byte-level piece, or `None` inside for
+        // an entry that is no byte-level piece.
+        let read = |id: u32| -> Option<Option<Seeded>> {
+            let entry = bpe.id_to_token(id)?;
+            let seeded = (|| {
+                let ids_of = |entry: &str| {
+                    let mut ids = SeededIds::default();
+                    for token in &model.tokenize(entry).ok()? {
+                        ids.push(token.id)?;
+                    }
+                    Some(ids)
+                };
+                if chars {
+                    let key = CharSymbols::entry_key(&entry)?;
+                    return Some(Seeded::Short(key, ids_of(entry.as_str())?));
+                }
+                let mut piece = [0u8; SHORT_PIECE_MAX_BYTES];
+                let mut len = 0;
+                // The bytes of an entry past the key's length, with the
+                // key's bytes in front: a long entry for the filter.
+                let mut long = Vec::new();
+                for c in entry.chars() {
+                    let byte = byte_of.get(c as usize).copied().flatten()?;
+                    if len < SHORT_PIECE_MAX_BYTES {
+                        piece[len] = byte;
+                        len += 1;
+                    } else {
+                        if long.is_empty() {
+                            long.extend_from_slice(&piece);
                         }
-                        Some(ids)
-                    };
-                    if chars {
-                        let key = CharSymbols::entry_key(&entry)?;
-                        return Some(Seeded::Short(key, ids_of(entry.as_str())?));
+                        long.push(byte);
                     }
-                    let mut piece = [0u8; SHORT_PIECE_MAX_BYTES];
-                    let mut len = 0;
-                    // The bytes of an entry past the key's length, with the
-                    // key's bytes in front: a long entry for the filter.
-                    let mut long = Vec::new();
-                    for c in entry.chars() {
-                        let byte = byte_of.get(c as usize).copied().flatten()?;
-                        if len < SHORT_PIECE_MAX_BYTES {
-                            piece[len] = byte;
-                            len += 1;
-                        } else {
-                            if long.is_empty() {
-                                long.extend_from_slice(&piece);
-                            }
-                            long.push(byte);
-                        }
-                    }
-                    if !long.is_empty() {
-                        return Some(Seeded::Long(long.into_boxed_slice()));
-                    }
-                    let key = ShortPieceKey::of(&piece[..len])?;
-                    Some(Seeded::Short(key, ids_of(entry.as_str())?))
-                })();
-                Some(seeded)
-            })
-            .collect();
+                }
+                if !long.is_empty() {
+                    return Some(Seeded::Long(long.into_boxed_slice()));
+                }
+                let key = ShortPieceKey::of(&piece[..len])?;
+                Some(Seeded::Short(key, ids_of(entry.as_str())?))
+            })();
+            Some(seeded)
+        };
+        let ids = 0..bpe.get_vocab_size() as u32;
+        // One slot per id.
+        let read_all = || {
+            ids.clone()
+                .into_par_iter()
+                .with_min_len(2048)
+                .filter_map(&read)
+                .collect::<Vec<Option<Seeded>>>()
+        };
+        // A caller that is a worker of a rayon pool already (the Python
+        // binding loads on its own, sized by its host) reads on that pool,
+        // which never builds the global one. Any other caller reads on this
+        // load's own pool: its threads start here and are joined before the
+        // entries are returned, so the load leaves no pool behind; a process
+        // that cannot spawn them reads on the calling thread and says so.
+        // (The name fits the fifteen bytes a thread's name keeps.)
+        let (entries, threads) = if rayon::current_thread_index().is_some() {
+            (read_all(), rayon::current_num_threads())
+        } else {
+            let pooled = rayon::ThreadPoolBuilder::new()
+                .num_threads(SEED_THREADS)
+                .thread_name(|index| format!("vocab-seed-{index}"))
+                .build_scoped(|thread| thread.run(), |pool| pool.install(read_all));
+            match pooled {
+                Ok(entries) => (entries, SEED_THREADS),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "could not build the vocabulary seed's pool; reading on the calling thread"
+                    );
+                    (ids.filter_map(&read).collect::<Vec<_>>(), 1)
+                }
+            }
+        };
         let covers = entries.len() == bpe.get_vocab_size();
         let short = entries
             .iter()
@@ -1342,6 +1385,7 @@ impl NativeEncoder {
             long_entries = long,
             long_entry_bytes = filter.as_ref().map_or(0, LongEntryFilter::bytes),
             covers_short_entries = covers,
+            threads,
             ms = started.elapsed().as_millis() as u64,
             "the native encoder's vocabulary pieces"
         );
