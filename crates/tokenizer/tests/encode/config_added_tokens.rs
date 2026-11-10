@@ -1,0 +1,166 @@
+//! The added tokens `tokenizer_config.json` declares beyond `tokenizer.json`.
+//! `transformers` and the engines' tokenizers read the configuration's
+//! `added_tokens_decoder` on top of the file's added tokens, so a token only
+//! the configuration names is a token of the model: it encodes to its id,
+//! its id decodes to its text, and the id is known to the gateway's bound.
+//! A token both files name is held once; a declared id the pipeline cannot
+//! place is refused at load, as on the vocab.json + merges.txt path.
+
+#![expect(clippy::expect_used, reason = "a test that stops on a broken setup")]
+
+use llm_tokenizer::{
+    traits::{Decoder as _, Encoder as _, Tokenizer as _},
+    HuggingFaceTokenizer,
+};
+use serde_json::{json, Map, Value};
+use tempfile::TempDir;
+
+/// A `tokenizer.json` whose model vocabulary holds `plain` as ordinary pieces
+/// and whose added tokens mark `special` as special tokens, in order after
+/// the vocabulary.
+fn tokenizer_json(plain: &[&str], special: &[&str]) -> String {
+    let mut vocab = Map::new();
+    for (id, piece) in ["hello", "Hi"].iter().chain(plain).enumerate() {
+        vocab.insert((*piece).to_string(), json!(id));
+    }
+    let added_tokens: Vec<Value> = special
+        .iter()
+        .enumerate()
+        .map(|(offset, token)| {
+            json!({
+                "id": vocab.len() + offset,
+                "content": token,
+                "single_word": false,
+                "lstrip": false,
+                "rstrip": false,
+                "normalized": false,
+                "special": true,
+            })
+        })
+        .collect();
+    json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": added_tokens,
+        "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"},
+        "post_processor": null,
+        "decoder": null,
+        "model": {"type": "BPE", "vocab": vocab, "merges": []},
+    })
+    .to_string()
+}
+
+/// A `tokenizer_config.json` whose `added_tokens_decoder` declares `tokens`
+/// at the ids given.
+fn config(tokens: &[(u32, &str)]) -> Value {
+    let mut decoder = Map::new();
+    for (id, token) in tokens {
+        decoder.insert(
+            id.to_string(),
+            json!({
+                "content": token,
+                "single_word": false,
+                "lstrip": false,
+                "rstrip": false,
+                "normalized": false,
+                "special": true,
+            }),
+        );
+    }
+    json!({"added_tokens_decoder": decoder})
+}
+
+/// The directory holding `tokenizer_json` and `config`, loaded.
+fn load(
+    dir: &TempDir,
+    tokenizer_json: &str,
+    config: Value,
+) -> anyhow::Result<HuggingFaceTokenizer> {
+    let path = dir.path().join("tokenizer.json");
+    std::fs::write(&path, tokenizer_json).expect("tokenizer.json written");
+    std::fs::write(dir.path().join("tokenizer_config.json"), config.to_string())
+        .expect("tokenizer_config.json written");
+    HuggingFaceTokenizer::from_file(path.to_str().expect("a UTF-8 path"))
+}
+
+/// Two plain pieces (ids 0, 1), one special token in the file (id 2).
+const FILE_TOKENS: [&str; 1] = ["<|im_start|>"];
+
+#[test]
+fn a_token_only_the_configuration_declares_is_a_token_of_the_model() {
+    let dir = TempDir::new().expect("a temp dir");
+    let tokenizer = load(
+        &dir,
+        &tokenizer_json(&[], &FILE_TOKENS),
+        config(&[(2, "<|im_start|>"), (3, "<|audio_start|>")]),
+    )
+    .expect("the tokenizer loads");
+
+    assert_eq!(tokenizer.token_to_id("<|audio_start|>"), Some(3));
+    assert_eq!(tokenizer.id_to_token(3).as_deref(), Some("<|audio_start|>"));
+    let encoding = tokenizer
+        .encode("<|audio_start|>", false)
+        .expect("the control encodes");
+    assert_eq!(encoding.token_ids(), &[3]);
+    assert_eq!(
+        tokenizer.decode(&[3], false).expect("the id decodes"),
+        "<|audio_start|>"
+    );
+    // The model's table is unchanged; the count with the added tokens grew by the one token.
+    assert_eq!(tokenizer.vocab_size(), 2);
+    assert_eq!(tokenizer.tokenizers_pipeline().get_vocab_size(true), 4);
+}
+
+#[test]
+fn a_token_both_files_declare_is_held_once_on_its_id() {
+    let dir = TempDir::new().expect("a temp dir");
+    let tokenizer = load(
+        &dir,
+        &tokenizer_json(&[], &FILE_TOKENS),
+        config(&[(2, "<|im_start|>")]),
+    )
+    .expect("the tokenizer loads");
+
+    assert_eq!(tokenizer.token_to_id("<|im_start|>"), Some(2));
+    assert_eq!(tokenizer.tokenizers_pipeline().get_vocab_size(true), 3);
+    assert_eq!(
+        tokenizer
+            .encode("<|im_start|>", false)
+            .expect("the token encodes")
+            .token_ids(),
+        &[2]
+    );
+}
+
+#[test]
+fn a_declared_id_the_pipeline_cannot_place_refuses_the_load() {
+    let dir = TempDir::new().expect("a temp dir");
+    let error = match load(
+        &dir,
+        &tokenizer_json(&[], &FILE_TOKENS),
+        config(&[(2, "<|im_start|>"), (7, "<|audio_start|>")]),
+    ) {
+        Ok(_) => panic!("an id past the next free one must refuse the load"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("'<|audio_start|>' expected ID 7, got Some(3)"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn a_configuration_without_the_block_changes_nothing() {
+    let dir = TempDir::new().expect("a temp dir");
+    let tokenizer = load(
+        &dir,
+        &tokenizer_json(&[], &FILE_TOKENS),
+        json!({"add_bos_token": false}),
+    )
+    .expect("the tokenizer loads");
+
+    assert_eq!(tokenizer.tokenizers_pipeline().get_vocab_size(true), 3);
+    assert_eq!(tokenizer.token_to_id("<|im_start|>"), Some(2));
+}
