@@ -2084,6 +2084,83 @@ mod tests {
         }
     }
 
+    /// The run sites name the word scans their roles carry on the real
+    /// templates: the template's letter run is the letters, the cased
+    /// template's upper and lower runs are the upper-case and the lower-case
+    /// letters, and the white-space runs of both are the white space; the
+    /// digit, punctuation and line-break roles run byte by byte. A class
+    /// change that dropped a scan would keep the ids and lose the gain; it
+    /// fails here instead.
+    #[test]
+    fn the_run_sites_name_the_scans_their_roles_carry() {
+        for pattern in [CL100K, QWEN2, QWEN35, TWO_DIGITS, ANY_DIGITS] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            let Matcher::Template(scanner) = &parsed.matcher else {
+                panic!("the template takes its scanner: {pattern}");
+            };
+            let roles = &scanner.roles;
+            assert_eq!(
+                roles.scan_of(Role::Word.bit()),
+                WordScan::LETTERS,
+                "{pattern}"
+            );
+            for role in [Role::TrailSpace, Role::Space] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::SPACES,
+                    "{pattern} {role:?}"
+                );
+            }
+            for role in [Role::Digit, Role::Punct, Role::PunctBreak, Role::Break] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::NONE,
+                    "{pattern} {role:?}"
+                );
+            }
+        }
+        for pattern in [CASED, TEKKEN, CASED_ONE_DIGIT] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            let Matcher::Cased(scanner) = &parsed.matcher else {
+                panic!("the cased template takes its scanner: {pattern}");
+            };
+            let roles = scanner.roles();
+            for role in [cased::Role::Upper1, cased::Role::Upper2] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::UPPER,
+                    "{pattern} {role:?}"
+                );
+            }
+            for role in [cased::Role::Lower1, cased::Role::Lower2] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::LOWER,
+                    "{pattern} {role:?}"
+                );
+            }
+            for role in [cased::Role::TrailSpace, cased::Role::Space] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::SPACES,
+                    "{pattern} {role:?}"
+                );
+            }
+            for role in [
+                cased::Role::Digit,
+                cased::Role::Punct,
+                cased::Role::PunctBreak,
+                cased::Role::Break,
+            ] {
+                assert_eq!(
+                    roles.scan_of(role.bit()),
+                    WordScan::NONE,
+                    "{pattern} {role:?}"
+                );
+            }
+        }
+    }
+
     /// The cased-letter template with the clitic group, without it and with
     /// one digit at a time, and no other shape: the group in one letter
     /// alternative only, the letter alternatives the other way round, a

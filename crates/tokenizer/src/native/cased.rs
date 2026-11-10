@@ -55,7 +55,7 @@ use super::{
 /// role bits.
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
-enum Role {
+pub(super) enum Role {
     /// The optional lead-in of the first letter alternative.
     Lead1,
     /// The upper run of the first letter alternative (`*`).
@@ -110,7 +110,7 @@ const ROLES: [Role; 15] = [
 
 impl Role {
     #[inline(always)]
-    const fn bit(self) -> Bits {
+    pub(super) const fn bit(self) -> Bits {
         1 << (self as u32)
     }
 }
@@ -257,6 +257,12 @@ impl Scanner {
     #[cfg(test)]
     pub(super) fn digit_cap(&self) -> u32 {
         self.digit_cap
+    }
+
+    /// The role tables; for the tests that pin the templates' scans.
+    #[cfg(test)]
+    pub(super) fn roles(&self) -> &Roles {
+        &self.roles
     }
 
     /// The number of clitic alternatives of a letter alternative.

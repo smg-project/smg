@@ -322,6 +322,14 @@ impl Roles {
         }
     }
 
+    /// The word scan of the role of `bit` (`WordScan::NONE` when it runs byte
+    /// by byte); for the tests that pin the templates' scans.
+    #[cfg(test)]
+    pub(super) fn scan_of(&self, bit: Bits) -> u8 {
+        debug_assert_eq!(bit.count_ones(), 1, "one role's bit");
+        self.scans[bit.trailing_zeros() as usize]
+    }
+
     /// The end of the run of characters holding `bit` that starts at `pos`.
     #[inline(always)]
     pub(super) fn run_end(&self, text: &str, mut pos: usize, bit: Bits) -> usize {
@@ -458,7 +466,8 @@ mod tests {
             WordScan::LETTERS => WordScan::outside::<{ WordScan::LETTERS }>(word),
             WordScan::LOWER => WordScan::outside::<{ WordScan::LOWER }>(word),
             WordScan::UPPER => WordScan::outside::<{ WordScan::UPPER }>(word),
-            _ => WordScan::outside::<{ WordScan::SPACES }>(word),
+            WordScan::SPACES => WordScan::outside::<{ WordScan::SPACES }>(word),
+            other => panic!("no word scan {other}"),
         };
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
         for slot in 0..4 {
