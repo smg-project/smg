@@ -1445,7 +1445,8 @@ const REASONING_PROBE: KnownDifference = KnownDifference {
     id: "parse/reasoning-with-marker-text",
     reason: "the reasoning holds a `</think>`; the parser ends the reasoning there, as every \
              marker parser does, and the reference keeps the marker as reasoning text \
-             (bellwether #16)",
+             (bellwether #16); the vendor library reads the split the same way and drops the \
+             stray marker where the parser keeps it as text (bellwether #298)",
     calls: 0,
     finish: "stop",
 };
@@ -1474,6 +1475,31 @@ const KNOWN_REASONING_PROBE: &[KnownDifference] = &[REASONING_PROBE];
 /// markers are dropped; the reference keeps the fence as content. The reasoning probe's `</think>`
 /// is not this family's marker, so it stays reasoning text, as the reference says.
 const KNOWN_M3_DIFFERENCES: &[KnownDifference] = &[FENCE_PROBE];
+
+/// A case a library witness reads wrongly where the reference and the parser agree, recorded in
+/// bellwether's `waivers/library_defects.toml` with the library's version: the library's reading is
+/// reported beside the parser's and not held against it. An entry is stale when the library reads
+/// the case as the parser does again, and the run says so. `id` keeps the slug: a library's defect
+/// is one model's.
+struct LibraryDefect {
+    library: &'static str,
+    id: &'static str,
+    reason: &'static str,
+}
+
+const LIBRARY_DEFECTS: &[LibraryDefect] = &[LibraryDefect {
+    library: "deepseek-recipe",
+    id: "deepseek-v4.1-flash/parse/tau2-o4-mini-2025-04-16-telecom-workflow-default-150-10",
+    reason: "the library cuts a quoted parameter name at its first space and hands arguments that \
+             are no longer JSON; the parser and the reference keep the whole name (bellwether \
+             waivers/library_defects.toml, deepseek-recipe 0.2.0)",
+}];
+
+fn library_defect(library: &str, id: &str) -> Option<&'static LibraryDefect> {
+    LIBRARY_DEFECTS
+        .iter()
+        .find(|defect| defect.library == library && defect.id == id)
+}
 
 /// The case's id after its slug: what [`KnownDifference::id`] names.
 fn after_slug(id: &str) -> &str {
@@ -2318,9 +2344,26 @@ fn parity(
                             ""
                         ));
                     }
+                    if library_defect(library, &fixture.id).is_some() {
+                        failures.push(format!(
+                            "{}: recorded as a wrong reading of {library} but read as the parser \
+                             now; remove it from LIBRARY_DEFECTS and from bellwether's \
+                             waivers/library_defects.toml",
+                            fixture.id
+                        ));
+                    }
                 }
                 Some(read) => {
                     tally.differently += 1;
+                    if let Some(defect) = library_defect(library, &fixture.id) {
+                        // The library's own wrong reading, recorded with its version: reported
+                        // beside the parser's reading, never held against the parser.
+                        out.push_str(&format!(
+                            "  {:34} {library} reads it wrongly, as recorded: {}\n",
+                            "", defect.reason
+                        ));
+                        continue;
+                    }
                     out.push_str(&format!(
                         "  {:34} {library} reads it differently: {read:?}\n",
                         ""
