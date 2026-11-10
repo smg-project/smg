@@ -562,6 +562,11 @@ async fn minimax_batch_cache_reuses_single_and_batch_misses_in_request_order() {
     let second_hit = cached_only(&second);
     let third_hit = cached_only(&third);
     let fourth = image(4, 168, 140);
+    let fifth = image(5, 140, 168);
+    let sixth = image(6, 168, 112);
+    let seventh = image(7, 112, 140);
+    let sixth_hit = cached_only(&sixth);
+    let seventh_hit = cached_only(&seventh);
 
     for image_wire_dtype in [None, Some(EncoderDtype::BFloat16)] {
         let mut components = MultimodalComponents::new(
@@ -596,7 +601,12 @@ async fn minimax_batch_cache_reuses_single_and_batch_misses_in_request_order() {
             MediaBatch::Images(images.iter().map(|image| Arc::clone(image)).collect())
         };
         let turns = [
-            (vec![&first], vec![&first]),
+            (vec![&first, &fifth], vec![&first, &fifth]),
+            (
+                vec![&first_hit, &sixth, &seventh],
+                vec![&first, &sixth, &seventh],
+            ),
+            (vec![&sixth_hit, &seventh_hit], vec![&sixth, &seventh]),
             (
                 vec![&second, &first_hit, &second],
                 vec![&second, &first, &second],

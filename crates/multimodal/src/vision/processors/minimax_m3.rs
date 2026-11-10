@@ -59,7 +59,7 @@ use crate::{
         processor::{PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor},
         transforms::TransformError,
     },
-    EncoderDtype,
+    EncoderDtype, EncoderInput,
 };
 
 /// Default patch size.
@@ -347,6 +347,17 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         self.inner.preprocess_wire(images, dtype)
     }
 
+    /// Assemble a BF16 request with a small cached prefix in the fused batch writer.
+    fn preprocess_cached_wire(
+        &self,
+        prefix: &[&EncoderInput],
+        images: &[&DynamicImage],
+        dtype: EncoderDtype,
+    ) -> Option<Result<(EncoderInput, Vec<PreprocessedEncoderInputs>), TransformError>> {
+        (dtype == EncoderDtype::BFloat16 && images.len() > 1)
+            .then(|| self.inner.preprocess_cached_wire(prefix, images, dtype))
+    }
+
     /// Produce cache entries directly when they will be assembled with hits
     /// or duplicated in the request. Balance work by pixels and keep results
     /// in request order.
@@ -496,9 +507,9 @@ mod tests {
                 .unwrap();
             let pixels = item.encoder_input.nbytes();
             let buffer = match item.encoder_input {
-                crate::EncoderInput::U8 { patches, .. } => patches.into_raw_vec_and_offset().0,
-                crate::EncoderInput::Wire { bytes, .. } => bytes,
-                crate::EncoderInput::F32(_) => panic!("expected owned pixel bytes"),
+                EncoderInput::U8 { patches, .. } => patches.into_raw_vec_and_offset().0,
+                EncoderInput::Wire { bytes, .. } => bytes,
+                EncoderInput::F32(_) => panic!("expected owned pixel bytes"),
             };
             assert!((1 << 20..64 << 20).contains(&pixels));
             assert!(!pixels.is_power_of_two());

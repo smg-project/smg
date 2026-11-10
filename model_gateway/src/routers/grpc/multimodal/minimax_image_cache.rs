@@ -85,12 +85,48 @@ pub(super) async fn preprocess(
         }
 
         let mut inserts = Vec::new();
-        let mut cold_batch = None;
+        let mut direct_output = None;
         if !misses.is_empty() {
             let direct = misses.len() == images.len();
             let processor = processors.image()?;
             let decoded = decode_image_frames(&miss_images)?;
-            let items = if let Some(items) = (!direct)
+            let prefix = parts
+                .iter()
+                .map_while(Option::as_deref)
+                .map(|entry| &entry.preprocessed)
+                .collect::<Vec<_>>();
+            // Leave larger hits in the parallel join. For a small prefix,
+            // filling its bands inline avoids a separate copy of every miss.
+            const MAX_FUSED_PREFIX_BYTES: usize = 4 * 1024 * 1024;
+            let fused = if !prefix.is_empty()
+                && parts.len() == images.len()
+                && prefix.len() + misses.len() == images.len()
+                && prefix
+                    .iter()
+                    .map(|item| item.encoder_input.nbytes())
+                    .sum::<usize>()
+                    <= MAX_FUSED_PREFIX_BYTES
+            {
+                wire_dtype.and_then(|dtype| {
+                    let inputs = prefix
+                        .iter()
+                        .map(|item| &item.encoder_input)
+                        .collect::<Vec<_>>();
+                    processor.preprocess_cached_wire(&inputs, &decoded, dtype)
+                })
+            } else {
+                None
+            };
+            let items = if let Some(result) = fused {
+                let (input, items) = result?;
+                let ordered = prefix.into_iter().chain(items.iter()).collect::<Vec<_>>();
+                direct_output = Some(PreprocessedEncoderInputs::concat_refs_with_input(
+                    &ordered,
+                    &layouts.model_specific,
+                    input,
+                )?);
+                items
+            } else if let Some(items) = (!direct)
                 .then(|| processor.preprocess_image_items(&decoded, wire_dtype))
                 .flatten()
             {
@@ -119,7 +155,7 @@ pub(super) async fn preprocess(
                 }
                 let items = split_batch(&batch, &layouts, misses.len())?;
                 if direct {
-                    cold_batch = Some(batch);
+                    direct_output = Some(batch);
                 }
                 items
             };
@@ -145,7 +181,7 @@ pub(super) async fn preprocess(
             }
         }
 
-        let output = if let Some(batch) = cold_batch {
+        let output = if let Some(batch) = direct_output {
             batch
         } else {
             let ordered = order

@@ -1428,8 +1428,17 @@ impl PreprocessedEncoderInputs {
             .map(|part| &part.encoder_input)
             .collect::<Vec<_>>();
         let encoder_input = EncoderInput::concat(&inputs)?;
+        Self::concat_refs_with_input(parts, layouts, encoder_input)
+    }
 
-        let keys = parts[0].model_specific.keys().cloned().collect::<Vec<_>>();
+    /// Join metadata for parts already written in order into one encoder input.
+    pub fn concat_refs_with_input(
+        parts: &[&Self],
+        layouts: &HashMap<String, FieldLayout>,
+        encoder_input: EncoderInput,
+    ) -> AnyhowResult<Self> {
+        let first = parts.first().context("cannot join zero batches")?;
+        let keys = first.model_specific.keys().cloned().collect::<Vec<_>>();
         let mut model_specific = HashMap::with_capacity(keys.len());
         for key in keys {
             let values = parts

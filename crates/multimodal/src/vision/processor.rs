@@ -7,7 +7,10 @@ use image::DynamicImage;
 
 use super::transforms::TransformError;
 pub use crate::encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs};
-use crate::{encoder_inputs::EncoderDtype, types::RgbFrameRef};
+use crate::{
+    encoder_inputs::{EncoderDtype, EncoderInput},
+    types::RgbFrameRef,
+};
 
 /// Helper to extract a dimension from encoder_input given an ndim-dependent axis index.
 /// Returns `Err` if the ndim is not 4 or 5.
@@ -194,6 +197,17 @@ pub trait VisionPreProcessor: Send + Sync {
         _images: &[&DynamicImage],
         _wire_dtype: Option<EncoderDtype>,
     ) -> Option<Result<Vec<PreprocessedEncoderInputs>, TransformError>> {
+        None
+    }
+
+    /// Write a cached prefix and new images into the wire batch. Return
+    /// independently owned entries for the new images in their input order.
+    fn preprocess_cached_wire(
+        &self,
+        _prefix: &[&EncoderInput],
+        _images: &[&DynamicImage],
+        _dtype: EncoderDtype,
+    ) -> Option<Result<(EncoderInput, Vec<PreprocessedEncoderInputs>), TransformError>> {
         None
     }
 
