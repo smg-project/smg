@@ -686,7 +686,7 @@ impl Tree {
             Done,
             Continue {
                 next_prev: NodeRef,
-                advance_chars: usize,
+                advance_bytes: usize,
             },
         }
 
@@ -728,7 +728,8 @@ impl Tree {
                     let matched_node_text_str = matched_node_text.as_str();
 
                     // Use slice-based comparison - no allocation
-                    let shared_count = shared_prefix_count(remaining, matched_node_text_str);
+                    let (shared_count, shared_bytes) =
+                        shared_prefix_len(remaining, matched_node_text_str);
 
                     if shared_count < matched_node_text_count {
                         // Split the matched node
@@ -787,7 +788,7 @@ impl Tree {
 
                         InsertStep::Continue {
                             next_prev: new_node,
-                            advance_chars: shared_count,
+                            advance_bytes: shared_bytes,
                         }
                     } else {
                         // Full match - move to next node (intermediate - no timestamp update)
@@ -802,7 +803,7 @@ impl Tree {
 
                         InsertStep::Continue {
                             next_prev: matched_node,
-                            advance_chars: shared_count,
+                            advance_bytes: shared_bytes,
                         }
                     }
                 }
@@ -813,10 +814,10 @@ impl Tree {
                 InsertStep::Done => return, // New leaf created with timestamp, we're done
                 InsertStep::Continue {
                     next_prev,
-                    advance_chars,
+                    advance_bytes,
                 } => {
                     prev = next_prev;
-                    remaining = advance_by_chars(remaining, advance_chars);
+                    remaining = &remaining[advance_bytes..];
                 }
             }
         }
@@ -858,14 +859,15 @@ impl Tree {
                 let matched_node_text_count = matched_text_guard.char_count();
 
                 // Use slice-based comparison - no allocation
-                let shared_count = shared_prefix_count(remaining, matched_text_guard.as_str());
+                let (shared_count, shared_bytes) =
+                    shared_prefix_len(remaining, matched_text_guard.as_str());
                 drop(matched_text_guard);
 
                 if shared_count == matched_node_text_count {
                     // Full match with current node's text, continue to next node
                     matched_chars += shared_count;
                     consumed_chars += shared_count;
-                    remaining = advance_by_chars(remaining, shared_count);
+                    remaining = &remaining[shared_bytes..];
                     prev = matched_node;
                 } else {
                     // Partial match - still use this node for tenant selection
@@ -1277,13 +1279,14 @@ impl Tree {
                 let matched_node_text_count = matched_text_guard.char_count();
 
                 // Use slice-based comparison - no allocation
-                let shared_count = shared_prefix_count(remaining, matched_text_guard.as_str());
+                let (shared_count, shared_bytes) =
+                    shared_prefix_len(remaining, matched_text_guard.as_str());
                 drop(matched_text_guard);
 
                 if shared_count == matched_node_text_count {
                     // Full match with current node's text, continue to next node
                     matched_chars += shared_count;
-                    remaining = advance_by_chars(remaining, shared_count);
+                    remaining = &remaining[shared_bytes..];
                     prev = matched_node;
                 } else {
                     // Partial match - still use this node for timestamp update
