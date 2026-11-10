@@ -45,6 +45,9 @@ const MODEL: &str = "restart-test-model";
 
 /// The probes' cadence: a demotion or a promotion is one probe away.
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+/// A probe's bound, and the gap the schedule puts between a demoted worker's
+/// passing probe and its next read.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Far longer than the test: the breaker's own timeout must play no part.
 const BREAKER_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long after the restart a request must have succeeded: a few probe
@@ -200,7 +203,7 @@ async fn build_router_with(
             .runtime_type(RuntimeType::TokenSpeed)
             .model(ModelCard::new(MODEL))
             .health_config(HealthCheckConfig {
-                timeout_secs: 1,
+                timeout_secs: PROBE_TIMEOUT.as_secs(),
                 check_interval_secs: probe_interval.as_secs(),
                 success_threshold,
                 failure_threshold: 1,
@@ -305,9 +308,13 @@ async fn a_restarted_worker_is_routable_when_its_probes_pass_again() {
 /// restart plus a probe timeout, not two intervals: the probe that passes
 /// short of the threshold brings the next one to a timeout from now. Nothing
 /// contacts the worker while it is out (round robin opens no stream and a
-/// demoted worker is not load-polled), so its probes alone see the return;
-/// the engine comes back right after the probe that demoted the worker, so
-/// the first passing probe is a whole interval away.
+/// demoted worker is not load-polled), so its probes alone see the return,
+/// and every contact the worker records after the restart is a passing
+/// probe: the test reads the probes off the worker's contact clock and
+/// measures the rule between the two reads it is about, so a probe the host
+/// loses or a stall before the pair moves the pair, not the verdict. The
+/// engine comes back right after the probe that demoted the worker, so the
+/// first passing probe is a whole interval away.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_kept_worker_returns_within_one_interval_under_a_success_threshold_of_two() {
     const INTERVAL: Duration = Duration::from_secs(3);
@@ -332,28 +339,59 @@ async fn a_kept_worker_returns_within_one_interval_under_a_success_threshold_of_
     let restarted = Instant::now();
     let engine = MockEngine::start(port).await;
 
-    let mut first_success = None;
-    while restarted.elapsed() < RECOVERY_BOUND {
-        if request_status(router.as_ref()).await == 200 {
-            first_success = Some(restarted.elapsed());
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let first_success = first_success.unwrap_or_else(|| {
-        panic!(
-            "no request succeeded within {RECOVERY_BOUND:?} of the restart (worker {:?})",
+    // The passing probes since the restart as offsets from it, the promoting
+    // one last, stamped by the worker's contact clock (a contact older than
+    // the restart is the engine's first life). The status is read first: a
+    // probe stamps its contact before it promotes, so a read of Ready orders
+    // the contact read after the promoting pass. The contact is read between
+    // two reads of the restart's clock: a poll descheduled between them reads
+    // the pass early by as long as it was out, so a reading whose clock reads
+    // are more than a tenth of a timeout apart is skipped and taken again on
+    // the next poll. A reading within a fifth of a timeout of the last one is
+    // the same pass again (the two clocks round to different milliseconds);
+    // the later reading is kept.
+    let mut passes: Vec<Duration> = Vec::new();
+    common::wait_until("the worker's promotion", RECOVERY_BOUND, || {
+        assert!(
+            restarted.elapsed() < RECOVERY_BOUND,
+            "no promotion within {RECOVERY_BOUND:?} of the restart (worker {:?}): {passes:?}",
             worker.status()
-        )
-    });
+        );
+        let ready = worker.status() == WorkerStatus::Ready;
+        let from = restarted.elapsed();
+        let age = worker.contact_age();
+        if restarted.elapsed() - from > PROBE_TIMEOUT / 10 {
+            return false;
+        }
+        if let Some(at) = from.checked_sub(age) {
+            match passes.last_mut() {
+                Some(last) if at < *last + PROBE_TIMEOUT / 5 => *last = (*last).max(at),
+                _ => passes.push(at),
+            }
+        }
+        ready
+    })
+    .await;
+    assert_eq!(request_status(router.as_ref()).await, 200);
+
+    let &[.., before, promoting] = passes.as_slice() else {
+        panic!("the promotion took one read, not the threshold's two: {passes:?}")
+    };
     assert!(
-        first_success >= INTERVAL - Duration::from_millis(500),
-        "the first passing probe is the scheduled one, an interval after the demotion: {first_success:?}"
+        promoting >= INTERVAL - Duration::from_millis(500),
+        "the first passing probe is the scheduled one, an interval after the probe that demoted \
+         the worker, so the promotion comes no sooner than that: {passes:?}"
+    );
+    let gap = promoting - before;
+    assert!(
+        gap >= PROBE_TIMEOUT / 2,
+        "two passing probes closer than the probe timeout: something other than the probes \
+         contacts the worker: {passes:?}"
     );
     assert!(
-        first_success < INTERVAL + Duration::from_secs(2),
-        "the second read follows the first a probe timeout (one second) later, not an interval \
-         later: {first_success:?}"
+        gap < PROBE_TIMEOUT + Duration::from_secs(1),
+        "the promoting read follows the passing read before it a probe timeout later, not an \
+         interval later: {passes:?}"
     );
 
     engine.kill().await;
