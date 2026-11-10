@@ -36,6 +36,13 @@
 //! lease (a fresh key is claimed at its decision). The in-flight cap reads
 //! the host's per-key count on each worker, the one the load guard keeps
 //! under the raw key.
+//!
+//! A cache-aware decision reads its affinity through the legacy policy that
+//! holds the model's event index and approximate trees ([`Affinity`]): the
+//! host fills the rows' overlap and warm-up facts and the request's block
+//! hashes from them before the decision, and the seam records the route in
+//! the tree after the commit, so the index stays where it is until the
+//! controller's store takes it over.
 
 use std::{
     cell::RefCell,
@@ -52,8 +59,8 @@ use parking_lot::{Mutex, RwLock};
 use smg_policy_controller::{
     fingerprint,
     spec::{
-        BindingSpec, LeastLoadParams, PlanName, ProfileSpec, ScoreSpec, ScoreStage,
-        MANUAL_SESSION_HEADER,
+        BindingSpec, KvPressureParams, LeastLoadParams, PlanName, PrefixAffinityParams,
+        ProfileSpec, ScoreSpec, ScoreStage, SpillParams, WarmupSliceParams, MANUAL_SESSION_HEADER,
     },
     store::{identity, identity_of},
     Assignment, Candidate, Constraints, Decision, Engine, Health, Identity, Lease, LeaseId,
@@ -65,11 +72,20 @@ use tracing::debug;
 
 use super::registry::STICKY_INFLIGHT_CAP;
 use crate::{
-    config::{ManualAssignmentMode, PolicyConfig, PowerOfTwoLoadMetric, RoutingKeyOverrideConfig},
-    policies::{host_stores::HostStores, normalize_model_key},
+    config::{
+        CacheIndexKind, ManualAssignmentMode, PolicyConfig, PowerOfTwoLoadMetric,
+        RoutingKeyOverrideConfig,
+    },
+    policies::{
+        cache_aware::{AffinityRow, AffinityRows},
+        cost,
+        host_stores::HostStores,
+        normalize_model_key, CacheAwarePolicy, SelectWorkerInfo,
+    },
     routers::common::pd_admission,
     worker::{
         expected_wait::DEFAULT_MEAN_PREFILL_TOKENS,
+        liveness,
         load_state::{LoadReceiver, LoadSnapshot},
         Worker, WorkerType,
     },
@@ -107,6 +123,9 @@ pub fn preset_name(config: &PolicyConfig) -> Option<&'static str> {
         } => return None,
         PolicyConfig::PowerOfTwo { .. } => "power_of_two",
         PolicyConfig::LeastLoad { .. } => "least_load",
+        PolicyConfig::CacheAware { .. } if cache_aware_unsupported(config).is_none() => {
+            "cache_aware"
+        }
         PolicyConfig::Manual { .. } => "manual",
         _ => return None,
     })
@@ -127,20 +146,67 @@ pub fn encode_preset_name(config: &PolicyConfig) -> Option<&'static str> {
     })
 }
 
-/// The name of what the engine does not carry in `config`, for the error.
-fn unsupported(config: &PolicyConfig) -> EngineHostError {
-    EngineHostError::Unsupported(match config {
+/// The form of a cache-aware configuration the engine does not carry yet,
+/// for the error: the hash index (its placement map is the controller
+/// store's), a selection policy other than the default, a selection
+/// temperature, the overlap decay, the optimistic accounting and the
+/// uncached credit, each a stage parameter the crate refuses as not in this
+/// build. `None` for the default form, which the engine serves.
+fn cache_aware_unsupported(config: &PolicyConfig) -> Option<&'static str> {
+    let PolicyConfig::CacheAware {
+        cache_index,
+        selection_policy,
+        selection_temperature,
+        overlap_decay,
+        selection_accounting_ttl_ms,
+        balance_uncached_credit,
+        ..
+    } = config
+    else {
+        return None;
+    };
+    Some(if *cache_index == CacheIndexKind::Hash {
+        "cache_aware with a hash index"
+    } else if selection_policy
+        .as_deref()
+        .is_some_and(|name| name != cost::DEFAULT_POLICY)
+    {
+        "cache_aware with a selection policy"
+    } else if *selection_temperature > 0.0 {
+        "cache_aware with a selection temperature"
+    } else if *overlap_decay > 0.0 {
+        "cache_aware with overlap decay"
+    } else if *selection_accounting_ttl_ms > 0 {
+        "cache_aware with selection accounting"
+    } else if *balance_uncached_credit {
+        "cache_aware with the uncached credit"
+    } else {
+        return None;
+    })
+}
+
+/// The name of what the engine does not carry in `config`: the policy, or
+/// the form of it (`power_of_two with resident_tokens`, `cache_aware with a
+/// hash index`), for the start-up refusal and the host's error.
+pub(crate) fn unsupported_form(config: &PolicyConfig) -> &'static str {
+    match config {
         PolicyConfig::PowerOfTwo {
             load_metric: PowerOfTwoLoadMetric::ResidentTokens { .. },
         } => "power_of_two with resident_tokens",
+        PolicyConfig::CacheAware { .. } => cache_aware_unsupported(config).unwrap_or("cache_aware"),
         other => other.name(),
-    })
+    }
+}
+
+fn unsupported(config: &PolicyConfig) -> EngineHostError {
+    EngineHostError::Unsupported(unsupported_form(config))
 }
 
 /// The preset profile of one policy configuration with its tunables carried
 /// over: the least-load parameters, and the stages the power-of-two metrics
 /// name (`requests` draws two and compares in-flight counts, `least_requests`
-/// takes the fewest in flight over every candidate).
+/// takes the fewest in flight over every candidate), and the cache-aware
+/// thresholds, gates and warm-up budgets.
 fn profile_of(config: &PolicyConfig) -> Result<ProfileSpec, EngineHostError> {
     let name = preset_name(config).ok_or_else(|| unsupported(config))?;
     let mut profile = PolicySpec::preset(name)?
@@ -220,6 +286,48 @@ fn tune(profile: &mut ProfileSpec, config: &PolicyConfig) {
                 profile.pick = "best".into();
             }
         },
+        // The preset's stages with the configuration's values: the match
+        // threshold, the spill gate and the KV gates as the policy applies
+        // them, the warm-up slice at the process's liveness budgets.
+        PolicyConfig::CacheAware {
+            cache_threshold,
+            balance_abs_threshold,
+            balance_rel_threshold,
+            balance_prefix_margin_tokens,
+            balance_token_usage_threshold,
+            overload_token_usage_threshold,
+            ..
+        } => {
+            let warmup = liveness::budgets();
+            profile.score = vec![
+                ScoreSpec::Params(ScoreStage::WarmupSlice(WarmupSliceParams {
+                    weight: 8.0,
+                    secs: Some(warmup.warmup_secs.as_secs()),
+                    share: Some(warmup.warmup_share),
+                    blocks: Some(u64::try_from(warmup.warmup_blocks).unwrap_or(u64::MAX)),
+                    thin_ratio: Some(warmup.warmup_thin_ratio),
+                    divert_every: Some(warmup.warmup_divert_every),
+                    miss_share: Some(*cache_threshold),
+                })),
+                ScoreSpec::Params(ScoreStage::PrefixAffinity(PrefixAffinityParams {
+                    weight: 4.0,
+                    threshold: Some(*cache_threshold),
+                    spill: Some(SpillParams {
+                        abs: Some(u32::try_from(*balance_abs_threshold).unwrap_or(u32::MAX)),
+                        rel: Some(*balance_rel_threshold),
+                        prefix_margin_tokens: Some(*balance_prefix_margin_tokens),
+                        uncached_credit: None,
+                    }),
+                    ..PrefixAffinityParams::default()
+                })),
+                ScoreSpec::Params(ScoreStage::KvPressure(KvPressureParams {
+                    weight: 1.0,
+                    spread: Some(*balance_token_usage_threshold),
+                    ceiling: Some(*overload_token_usage_threshold),
+                })),
+                ScoreSpec::Name(LEAST_LOAD.into()),
+            ];
+        }
         _ => {}
     }
 }
@@ -367,6 +475,8 @@ struct View {
     /// each for the bar.
     open_partners: Vec<OpenPartner>,
     scratch: Scratch,
+    /// The affinity rows and block hashes of a cache-aware decision.
+    affinity: AffinityRows,
 }
 
 /// The decode side of a pair decision as the host hands it to
@@ -442,6 +552,20 @@ pub struct HostRequest<'a> {
     /// retired after the draw is booked by neither commit. `None` numbers
     /// the lease when its view is built.
     pub sequence: Option<LeaseId>,
+    /// The index source of a cache-aware decision: the legacy policy's
+    /// event index and approximate trees, read into the view's affinity
+    /// rows and block hashes. `None` for every other policy.
+    pub affinity: Option<Affinity<'a>>,
+}
+
+/// What a cache-aware decision reads its affinity from: the policy that
+/// holds the model's index and trees, and the request as the host read it
+/// (its tokens or text, its cache namespace). The seam records the route
+/// through the same pair after the commit.
+#[derive(Clone, Copy)]
+pub struct Affinity<'a> {
+    pub policy: &'a CacheAwarePolicy,
+    pub info: &'a SelectWorkerInfo<'a>,
 }
 
 /// What the encode items of one request share, as the host holds it: the
@@ -569,6 +693,16 @@ impl Decider {
         }
         spec.profiles
             .insert("default".to_string(), profile_of(default)?);
+        // The block size a held prefix is priced by and a hashless request
+        // is sized by: the cache-aware configuration's.
+        spec.view.block_size = [default, prefill, decode]
+            .iter()
+            .find_map(|config| match config {
+                PolicyConfig::CacheAware { block_size, .. } => {
+                    Some(u32::try_from(*block_size).unwrap_or(u32::MAX).max(1))
+                }
+                _ => None,
+            });
         // The plan's binding covers its phases (the pair's two, the encode
         // phase too under `epd`); every other phase resolves to the default
         // profile.
@@ -737,6 +871,7 @@ impl Decider {
         worker: &Arc<dyn Worker>,
         has_capacity: bool,
         pair_class: u32,
+        affinity: Option<&AffinityRow>,
     ) -> Candidate {
         let ViewBuild {
             snapshot,
@@ -800,6 +935,11 @@ impl Decider {
             pair_class,
             has_capacity,
             has_room: role != Role::Decode || pd_admission::has_free_room(worker.as_ref()),
+            overlap_blocks: affinity.map_or(0, |row| row.overlap_blocks),
+            predicted_blocks: affinity.map_or(0, |row| row.predicted_blocks),
+            admitted_age_ms: affinity.map_or(0, |row| row.admitted_age_ms),
+            indexed_growth: affinity.map_or(0, |row| row.indexed_growth),
+            indexed_blocks: affinity.map_or(0, |row| row.indexed_blocks),
             ..Candidate::default()
         }
     }
@@ -850,10 +990,15 @@ impl Decider {
                 candidates,
                 tried,
                 scratch,
+                affinity,
                 ..
             } = &mut *view;
             candidates.clear();
             tried.clear();
+            match request.affinity {
+                Some(source) => source.policy.fill_affinity(workers, source.info, affinity),
+                None => affinity.clear(),
+            }
             for (position, worker) in workers.iter().enumerate() {
                 let candidate = self.candidate(
                     &build,
@@ -861,6 +1006,7 @@ impl Decider {
                     worker,
                     request.has_capacity.is_none_or(|has| has(worker)),
                     0,
+                    affinity.rows.get(position),
                 );
                 if request.tried.iter().any(|url| url == worker.base_url()) {
                     tried.push(candidate.id);
@@ -870,7 +1016,10 @@ impl Decider {
             let now_micros = self.micros_since_origin(now);
             let facts = RequestFacts {
                 model: request.model,
+                namespace_seed: affinity.namespace_seed,
                 prompt_tokens: request.prompt_tokens,
+                block_hashes: &affinity.hashes,
+                hash_kind: affinity.hash_kind,
                 session_key,
                 phase: request.phase,
                 attempt: u8::try_from(request.tried.len()).unwrap_or(u8::MAX),
@@ -933,7 +1082,7 @@ impl Decider {
             } = &mut *view;
             candidates.clear();
             for (position, worker) in encoders.iter().enumerate() {
-                let mut row = self.candidate(&build, position as u32, worker, true, 0);
+                let mut row = self.candidate(&build, position as u32, worker, true, 0, None);
                 row.ec_compatible = (request.pairs_with_prefill)(worker);
                 row.vision = (request.vision_capable)(worker);
                 candidates.push(row);
@@ -1012,6 +1161,7 @@ impl Decider {
                 lists,
                 open_partners,
                 scratch,
+                ..
             } = &mut *view;
             candidates.clear();
             decodes.clear();
@@ -1031,7 +1181,7 @@ impl Decider {
                         let class = lists.len() as u32;
                         let mut emit = |decode: &Arc<dyn Worker>| {
                             let position = decode_workers.len() as u32;
-                            let row = self.candidate(&build, position, decode, true, class);
+                            let row = self.candidate(&build, position, decode, true, class, None);
                             if request.tried.iter().any(|url| url == decode.base_url()) {
                                 tried.push(row.id);
                             }
@@ -1063,8 +1213,14 @@ impl Decider {
                         class
                     }
                 };
-                let candidate =
-                    self.candidate(&build, i as u32, prefill, has_capacity(prefill), class);
+                let candidate = self.candidate(
+                    &build,
+                    i as u32,
+                    prefill,
+                    has_capacity(prefill),
+                    class,
+                    None,
+                );
                 if request.tried.iter().any(|url| url == prefill.base_url()) {
                     tried.push(candidate.id);
                 }
@@ -1353,17 +1509,18 @@ fn permille(ratio: f64) -> u16 {
 mod tests {
     use std::sync::{mpsc, Arc};
 
+    use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
     use openai_protocol::worker::WorkerStatus;
     use tokio::sync::watch;
 
     use super::*;
     use crate::{
         config::types::ManualAssignmentMode,
-        policies::{test_support, PolicyFactory},
+        policies::{test_support, CacheAwareConfig, PolicyFactory},
         worker::{
             load_state::{one_rank_load, LoadSnapshot},
             test_support::{no_health_check, worker_of},
-            BasicWorkerBuilder, Worker,
+            BasicWorkerBuilder, KvEventMonitor, KvIndex, Worker, WorkerBlocks,
         },
     };
 
@@ -1520,7 +1677,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(carried, 8, "the six presets, power_of_two in three forms");
+        assert_eq!(carried, 9, "the seven presets, power_of_two in three forms");
     }
 
     /// A removed worker's rows leave the engine's accounting with it: work
@@ -1853,7 +2010,7 @@ mod tests {
             session_key: None,
         };
         let row = decider
-            .candidate(&build, 0, &workers[0], true, 0)
+            .candidate(&build, 0, &workers[0], true, 0, None)
             .load
             .expect("a row for a reported worker");
         assert_eq!(
@@ -3444,7 +3601,7 @@ mod tests {
                 session_key: Some("s1"),
             };
             decider
-                .candidate(&build, 0, &workers[0], true, 0)
+                .candidate(&build, 0, &workers[0], true, 0, None)
                 .session_in_flight
         };
         assert_eq!(row(&decider(&manual(ManualAssignmentMode::Random))), 0);
@@ -3686,5 +3843,157 @@ mod tests {
         );
         assert_eq!(decider.prefill_prompt_tokens(None), 100);
         assert_eq!(decider.prefill_prompt_tokens(Some(&[1, 2, 3])), 3);
+    }
+
+    fn cache_aware_config(block_size: usize) -> PolicyConfig {
+        let mut config = PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096);
+        if let PolicyConfig::CacheAware {
+            block_size: size, ..
+        } = &mut config
+        {
+            *size = block_size;
+        }
+        config
+    }
+
+    /// The legacy policy that holds the trees and the index, as the registry
+    /// builds it for the configuration.
+    fn cache_aware_policy(block_size: usize) -> CacheAwarePolicy {
+        CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            block_size,
+            ..CacheAwareConfig::default()
+        })
+    }
+
+    fn leader(decider: &Decider, request: &HostRequest<'_>, workers: &[Arc<dyn Worker>]) -> u32 {
+        let (decision, _) = decider.decide(request, workers, &[]);
+        decision.pick().expect("a pick").targets.as_slice()[0].position
+    }
+
+    /// A text request reads the approximate tree: the first decision is a
+    /// miss placed by load, its route is recorded for the taken worker, and
+    /// every later decision for the prompt keeps that holder whatever the
+    /// seed; the forms the engine does not carry are refused by name.
+    #[test]
+    fn a_cache_aware_decision_reads_the_tree_match_into_the_view_and_keeps_the_holder() {
+        let decider = decider(&cache_aware_config(16));
+        let policy = cache_aware_policy(16);
+        let workers = pool(2);
+        policy.init_workers(&workers);
+        let text = "the one prompt whose prefix lives on a single worker after the first request";
+        let info = SelectWorkerInfo {
+            request_text: Some(text),
+            ..SelectWorkerInfo::default()
+        };
+        let request = HostRequest {
+            prompt_tokens: decider.prompt_tokens(None),
+            affinity: Some(Affinity {
+                policy: &policy,
+                info: &info,
+            }),
+            ..request()
+        };
+        let (decision, lease) = decider.decide(&request, &workers, &[]);
+        let holder = decider
+            .commit(&lease, &decision, Side::Single, |_| true)
+            .expect("placed")
+            .position;
+        policy.record_route(&workers, holder as usize, &info);
+        let mut rows = AffinityRows::default();
+        policy.fill_affinity(&workers, &info, &mut rows);
+        let overlap: Vec<u32> = rows.rows.iter().map(|row| row.overlap_blocks).collect();
+        assert_eq!(overlap[holder as usize], 5, "74 characters at 16 a block");
+        assert_eq!(overlap[1 - holder as usize], 0, "the route alone holds it");
+        assert_eq!(rows.hashes.len(), 4, "the whole windows of the text");
+        for _ in 0..20 {
+            assert_eq!(
+                leader(&decider, &request, &workers),
+                holder,
+                "the prefix pins the prompt to its holder"
+            );
+        }
+        let mut hashed = cache_aware_config(16);
+        if let PolicyConfig::CacheAware { cache_index, .. } = &mut hashed {
+            *cache_index = CacheIndexKind::Hash;
+        }
+        assert_eq!(preset_name(&hashed), None);
+        assert!(matches!(
+            Decider::from_configs(
+                &hashed,
+                &hashed,
+                &hashed,
+                &RoutingKeyOverrideConfig::default()
+            ),
+            Err(EngineHostError::Unsupported(
+                "cache_aware with a hash index"
+            ))
+        ));
+    }
+
+    /// A tokenized request on a model with an event index reads the index's
+    /// overlap: the holder of the request's blocks leads every decision, a
+    /// novel prompt is a miss both idle workers take across the seeds.
+    #[test]
+    fn a_cache_aware_decision_reads_the_event_index_overlap_into_the_view() {
+        let decider = decider(&cache_aware_config(4));
+        let policy = cache_aware_policy(4);
+        let workers = pool(2);
+        policy.init_workers(&workers);
+        let indexer = Arc::new(KvIndex::chain());
+        let holder = indexer.intern_worker(workers[1].url()).expect("interned");
+        let blocks: Vec<StoredBlock> = [[1u32, 2, 3, 4], [5, 6, 7, 8]]
+            .iter()
+            .enumerate()
+            .map(|(i, tokens)| StoredBlock {
+                seq_hash: SequenceHash(i as u64 + 1),
+                content_hash: compute_content_hash(tokens),
+            })
+            .collect();
+        indexer
+            .apply_stored(holder, &blocks, None, &mut WorkerBlocks::default())
+            .expect("applied");
+        let monitor = Arc::new(KvEventMonitor::new());
+        monitor.indexers.insert(
+            normalize_model_key(workers[0].model_id()).to_string(),
+            indexer,
+        );
+        policy.set_kv_event_monitor(Some(monitor));
+        let cached = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let info = SelectWorkerInfo {
+            tokens: Some(&cached),
+            ..SelectWorkerInfo::default()
+        };
+        let request = HostRequest {
+            prompt_tokens: decider.prompt_tokens(Some(&cached)),
+            affinity: Some(Affinity {
+                policy: &policy,
+                info: &info,
+            }),
+            ..request()
+        };
+        for _ in 0..20 {
+            assert_eq!(
+                leader(&decider, &request, &workers),
+                1,
+                "the holder of both blocks leads"
+            );
+        }
+        let novel = [101u32, 102, 103, 104, 105, 106, 107, 108];
+        let info = SelectWorkerInfo {
+            tokens: Some(&novel),
+            ..SelectWorkerInfo::default()
+        };
+        let request = HostRequest {
+            affinity: Some(Affinity {
+                policy: &policy,
+                info: &info,
+            }),
+            ..request
+        };
+        let seen: std::collections::HashSet<u32> = (0..32)
+            .map(|_| leader(&decider, &request, &workers))
+            .collect();
+        assert_eq!(seen.len(), 2, "a miss is placed by load, both idle");
     }
 }

@@ -109,6 +109,7 @@ use kv_index::{
 use parking_lot::RwLock;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
+use smg_policy_controller::HashKind;
 use tracing::{debug, error, warn};
 
 use super::{
@@ -3459,6 +3460,288 @@ impl CacheAwarePolicy {
             );
         }
         Some(idx)
+    }
+}
+
+/// What the policy engine's view reads from this policy's indexes for one
+/// request, when the engine serves `cache_aware` (the ingestion stays here
+/// until the controller's store): per worker position the request's prefix
+/// in blocks by the event index (`overlap_blocks`) or by the approximate
+/// tree (`predicted_blocks`, a match above the threshold) and the warm-up
+/// facts, the request's block hashes with their kind, and the namespace
+/// seed. One buffer per deciding thread, reused.
+#[derive(Debug, Default)]
+pub(crate) struct AffinityRows {
+    /// The request's blocks: the event index's content hashes for a
+    /// tokenized request on a model with an event index, fixed character
+    /// windows of the block size for a text request, none for a tokenized
+    /// request on the approximate token tree (its size is its token count).
+    pub hashes: Vec<u64>,
+    pub hash_kind: HashKind,
+    /// The cache namespace's hash seed; `0` unpartitioned.
+    pub namespace_seed: u64,
+    /// One row per worker position.
+    pub rows: Vec<AffinityRow>,
+}
+
+/// One worker's affinity facts for the view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AffinityRow {
+    pub overlap_blocks: u32,
+    pub predicted_blocks: u32,
+    /// Milliseconds since the worker was admitted; `u32::MAX` (never young)
+    /// while the pool has no warming worker, so the engine's slice costs a
+    /// settled fleet one pass.
+    pub admitted_age_ms: u32,
+    pub indexed_growth: u32,
+    pub indexed_blocks: u32,
+}
+
+impl Default for AffinityRow {
+    fn default() -> Self {
+        Self {
+            overlap_blocks: 0,
+            predicted_blocks: 0,
+            admitted_age_ms: u32::MAX,
+            indexed_growth: 0,
+            indexed_blocks: 0,
+        }
+    }
+}
+
+impl AffinityRows {
+    /// Empty, for a decision without an affinity source.
+    pub(crate) fn clear(&mut self) {
+        self.hashes.clear();
+        self.rows.clear();
+        self.hash_kind = HashKind::Token;
+        self.namespace_seed = 0;
+    }
+}
+
+/// A count as the view's narrow field.
+fn narrow_usize(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+/// Fixed character windows of `block_size` characters over `text`, each
+/// hashed, into `out`: the text-window hash form of a request on a host
+/// without a tokenizer (design 4.1, `hash_kind: text`); a tail shorter than a
+/// window is not a block, as the trees count a request's blocks.
+fn text_windows(text: &str, block_size: usize, out: &mut Vec<u64>) {
+    let block_size = block_size.max(1);
+    let mut start = 0;
+    let mut chars = 0;
+    for (i, c) in text.char_indices() {
+        chars += 1;
+        if chars == block_size {
+            let end = i + c.len_utf8();
+            out.push(xxhash_rust::xxh3::xxh3_64(&text.as_bytes()[start..end]));
+            start = end;
+            chars = 0;
+        }
+    }
+}
+
+// The index source of the policy engine's cache-aware decisions.
+impl CacheAwarePolicy {
+    /// Read the request's affinity over `workers` into `out`: the event
+    /// index's overlap per holder (capped by the holder's cache groups) and
+    /// the warm-up facts when the pool table has a warming worker; else the
+    /// approximate tree's match above the threshold, placed on its tenants
+    /// and rounded up to whole blocks, so the share the engine compares
+    /// against the threshold never falls under the ratio this read cleared;
+    /// the request's block hashes beside them. Nothing is inserted: the
+    /// route is recorded at the commit ([`Self::record_route`]).
+    pub(crate) fn fill_affinity(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        out: &mut AffinityRows,
+    ) {
+        out.clear();
+        out.rows.resize(workers.len(), AffinityRow::default());
+        out.namespace_seed = info.cache_namespace.map_or(0, CacheNamespace::event_seed);
+        let Some(first) = workers.first() else {
+            return;
+        };
+        let model_id = normalize_model_key(first.model_id());
+        if let Some(tokens) = info.tokens {
+            if let Some(index) = self.event_index_for(model_id) {
+                self.fill_event_overlap(workers, info, tokens, &index, out);
+                return;
+            }
+            let tree = tree_for_model(&self.token_trees, model_id, || self.new_token_tree());
+            let (keyed, marker_len) = self.keyed_tokens(info, tokens);
+            let result = tree.match_prefix_with_counts(&keyed);
+            self.place_match(
+                workers,
+                &result.matched_tenants,
+                result.matched_token_count.saturating_sub(marker_len),
+                result.input_token_count.saturating_sub(marker_len),
+                out,
+            );
+            return;
+        }
+        let text = info.request_text.unwrap_or("");
+        out.hash_kind = HashKind::Text;
+        let tree = tree_for_model(&self.string_trees, model_id, Tree::new);
+        let (keyed, marker_len) = Self::keyed_text(info, text);
+        let result = tree.match_prefix_with_counts(&keyed);
+        self.place_match(
+            workers,
+            &result.matched_tenants,
+            result.matched_char_count.saturating_sub(marker_len),
+            result.input_char_count.saturating_sub(marker_len),
+            out,
+        );
+        text_windows(
+            CacheNamespace::unpartitioned_text(text),
+            self.config.block_size,
+            &mut out.hashes,
+        );
+    }
+
+    /// The event index's overlap per holder and, when the pool table has a
+    /// warming worker, every row's warm-up facts; the request's content
+    /// hashes into the buffer.
+    fn fill_event_overlap(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        tokens: &[u32],
+        index: &EventIndex<'_>,
+        out: &mut AffinityRows,
+    ) {
+        let hashes = Self::event_content_hashes(info, tokens, index.block_size);
+        out.hashes.extend(hashes.iter().map(|hash| hash.0));
+        let table = self.pool_table(workers, &index.indexer, liveness::now_ms());
+        if !hashes.is_empty() {
+            let started = Instant::now();
+            let mut overlap = index.indexer.find_matches(&hashes, false);
+            Metrics::record_kv_index_lookup(index.indexer.name(), started.elapsed().as_secs_f64());
+            if !overlap.scores.is_empty() {
+                index
+                    .indexer
+                    .cap_by_groups(&hashes, index.block_size, &mut overlap);
+            }
+            for (&id, &score) in &overlap.scores {
+                if score == 0 {
+                    continue;
+                }
+                if let Some(position) = table.position(id, workers) {
+                    out.rows[position].overlap_blocks = score;
+                }
+            }
+        }
+        // A settled fleet pays nothing here: its rows read "never young,
+        // nothing indexed" and the engine's slice returns on one pass.
+        if table.warming.is_empty() && table.thin.is_empty() {
+            return;
+        }
+        for (position, worker) in workers.iter().enumerate() {
+            let indexed = table
+                .id_at
+                .get(position)
+                .copied()
+                .flatten()
+                .map(|id| index.indexer.worker_block_count(id));
+            let row = &mut out.rows[position];
+            row.admitted_age_ms =
+                u32::try_from(worker.admitted_age().as_millis()).unwrap_or(u32::MAX);
+            row.indexed_growth =
+                indexed.map_or(0, |indexed| narrow_usize(worker.warmup_growth(indexed)));
+            row.indexed_blocks = indexed.map_or(0, narrow_usize);
+        }
+    }
+
+    /// The approximate tree's match on its tenants as the index's overlap
+    /// (the tree is the policy's index in the tree modes), when its share of
+    /// the request clears the threshold (the rule the tree paths route by).
+    fn place_match(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        matched_tenants: &[TenantId],
+        matched: usize,
+        input: usize,
+        out: &mut AffinityRows,
+    ) {
+        if input == 0 || matched as f32 / input as f32 <= self.config.cache_threshold {
+            return;
+        }
+        let blocks = narrow_usize(matched.div_ceil(self.config.block_size.max(1)).max(1));
+        for (position, worker) in workers.iter().enumerate() {
+            if matched_tenants
+                .iter()
+                .any(|tenant| tenant.as_ref() == worker.url())
+            {
+                out.rows[position].overlap_blocks = blocks;
+            }
+        }
+    }
+
+    /// Record a route the engine decided over [`Self::fill_affinity`]'s
+    /// rows, as the legacy selection records its own: the request's path
+    /// inserted for the chosen worker in the approximate tree (with its hash
+    /// and a delta while the mesh is attached); nothing on the event-driven
+    /// path, whose index the engines feed.
+    pub(crate) fn record_route(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        position: usize,
+        info: &SelectWorkerInfo,
+    ) {
+        let Some(worker) = workers.get(position) else {
+            return;
+        };
+        let model_id = normalize_model_key(worker.model_id());
+        let worker_url = worker.url();
+        if let Some(tokens) = info.tokens {
+            if self.event_index_for(model_id).is_some() {
+                return;
+            }
+            let tree = tree_for_model(&self.token_trees, model_id, || self.new_token_tree());
+            let (keyed, _marker_len) = self.keyed_tokens(info, tokens);
+            let keyed: &[u32] = &keyed;
+            let aligned = tree.aligned_len(keyed.len());
+            match (self.mesh_attached() && aligned > 0)
+                .then(|| kv_index::hash_token_path(&keyed[..aligned]))
+            {
+                Some(node_hash) => {
+                    tree.insert_tokens_with_hash(keyed, worker_url, node_hash);
+                    self.sync_local_insert(
+                        model_id,
+                        TreeDelta {
+                            tree_kind: TreeKind::Token,
+                            node_hash,
+                            worker_url: worker_url.to_string(),
+                            epoch: 0,
+                        },
+                    );
+                }
+                None => tree.insert_tokens(keyed, worker_url),
+            }
+            return;
+        }
+        let text = info.request_text.unwrap_or("");
+        let tree = tree_for_model(&self.string_trees, model_id, Tree::new);
+        let (keyed, _marker_len) = Self::keyed_text(info, text);
+        let keyed: &str = &keyed;
+        match (self.mesh_attached() && !keyed.is_empty()).then(|| kv_index::hash_node_path(keyed)) {
+            Some(node_hash) => {
+                tree.insert_text_with_hash(keyed, worker_url, node_hash);
+                self.sync_local_insert(
+                    model_id,
+                    TreeDelta {
+                        tree_kind: TreeKind::String,
+                        node_hash,
+                        worker_url: worker_url.to_string(),
+                        epoch: 0,
+                    },
+                );
+            }
+            None => tree.insert_text(keyed, worker_url),
+        }
     }
 }
 
