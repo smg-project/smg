@@ -1,5 +1,6 @@
 """The committed runner values keep API keys in the key-proxy sidecar only, and privilege in dind only."""
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -173,5 +174,23 @@ def test_vendor_job_cannot_restore_real_keys_into_the_runner_environment():
     job = yaml.safe_load(workflow.read_text())["jobs"]["e2e-vendor"]
     for env in [job.get("env", {})] + [step.get("env", {}) for step in job["steps"]]:
         for name, value in env.items():
-            if "API_KEY" in name:
-                assert "secrets." not in str(value), f"vendor job exports a real credential: {name}"
+            assert "secrets." not in str(value), f"vendor job exports a real credential: {name}"
+
+
+@pytest.mark.parametrize("scope", ["job", "step"])
+def test_vendor_secret_alias_is_rejected(tmp_path, monkeypatch, scope):
+    workflow = RESOURCES.parents[1] / ".github/workflows/pr-test-rust.yml"
+    document = yaml.safe_load(workflow.read_text())
+    job = document["jobs"]["e2e-vendor"]
+    target = job if scope == "job" else job["steps"][0]
+    target.setdefault("env", {})["OPENAI_TOKEN"] = "${{ secrets.OPENAI_API_KEY }}"
+    fixture = tmp_path / ".github/workflows/pr-test-rust.yml"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text(yaml.safe_dump(document))
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "RESOURCES",
+        tmp_path / "scripts/k8s-runner-resources",
+    )
+    with pytest.raises(AssertionError, match="vendor job exports a real credential: OPENAI_TOKEN"):
+        test_vendor_job_cannot_restore_real_keys_into_the_runner_environment()
