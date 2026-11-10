@@ -213,19 +213,37 @@ def _config_section(config: Any, name: str) -> Any:
     return getattr(config, name, None)
 
 
-def mrope_positions(hf_config: Any) -> bool | None:
-    """Whether the language model's rotary positions are MRoPE, read off the
-    checkpoint's text rope config: ``rope_scaling`` / ``rope_parameters`` (on the
-    text config when the checkpoint nests one, and the top level) with an
-    ``mrope_section``, or a rope type named ``mrope``. A checkpoint whose rope
-    config is plain (``rope_type: default`` with no section) uses 1-D positions,
-    so its vision grid tensors only lay out the patches. ``None`` when the
-    config carries no rope section at all."""
+def _rope_declares_mrope(rope: Any) -> bool:
+    """Whether a rope config declares MRoPE: an ``mrope_section``, or a rope
+    type named ``mrope``."""
+    if _config_section(rope, "mrope_section") is not None:
+        return True
+    kind = _config_section(rope, "rope_type") or _config_section(rope, "type")
+    return isinstance(kind, str) and "mrope" in kind
+
+
+def mrope_positions(hf_config: Any, hf_text_config: Any = None) -> bool | None:
+    """Whether the language model's rotary positions are MRoPE.
+
+    With the engine's own text config (``ModelConfig.hf_text_config``, which
+    looks below a Qwen Omni wrapper's ``thinker_config`` as the engine does),
+    the reading is the engine executor's: its rope parameters
+    (``rope_parameters``, else ``rope_scaling``) carry an ``mrope_section`` or a
+    rope type named ``mrope``, and a text model without one, or without any
+    rope config (a recurrent hybrid), runs 1-D positions. Without it the
+    checkpoint's own sections are read, ``text_config`` and the top level,
+    either declaration meaning MRoPE (a config class may fill a plain rope
+    default on one while the checkpoint declares its section on the other);
+    ``None`` then says the config carries no rope section at all, which the
+    servicer reads conservatively."""
+    if hf_text_config is not None:
+        return any(
+            _rope_declares_mrope(rope)
+            for key in ("rope_parameters", "rope_scaling")
+            if (rope := _config_section(hf_text_config, key)) is not None
+        )
     if hf_config is None:
         return None
-    # Both the nested text config and the top level are read: a config class
-    # may fill a plain rope default on one while the checkpoint declares its
-    # MRoPE section on the other, and either declaration means MRoPE.
     sections = [hf_config]
     text = _config_section(hf_config, "text_config")
     if text is not None:
@@ -237,10 +255,7 @@ def mrope_positions(hf_config: Any) -> bool | None:
             if rope is None:
                 continue
             found = True
-            if _config_section(rope, "mrope_section") is not None:
-                return True
-            kind = _config_section(rope, "rope_type") or _config_section(rope, "type")
-            if isinstance(kind, str) and "mrope" in kind:
+            if _rope_declares_mrope(rope):
                 return True
     return False if found else None
 
@@ -252,24 +267,52 @@ def _optional_int(value: Any) -> int | None:
     return int(value)
 
 
-def mrope_layout(hf_config: Any) -> dict[str, int | None]:
-    """The checkpoint facts the Rust servicer's MRoPE position rule reads
-    besides the request, as the engine's own input processor reads them:
-    ``vision_config.spatial_merge_size`` (patches per position along each
-    axis) and the top-level ``image_token_id`` / ``video_token_id`` every
-    placeholder span is checked against. Each is ``None`` when the checkpoint
-    has none; the rule needs all three and refuses the item otherwise."""
-    vision = _config_section(hf_config, "vision_config") if hf_config is not None else None
+def _optional_number(value: Any) -> float | None:
+    """``float(value)`` for an integer or float config scalar, ``None`` when
+    absent or neither."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _facts_root(hf_config: Any) -> Any:
+    """The config that carries a multimodal checkpoint's placeholder ids,
+    vision config and clock: a Qwen Omni wrapper keeps them below
+    ``thinker_config`` (where the engine's own position rule reads them),
+    every other checkpoint at the top level."""
+    if hf_config is None:
+        return None
+    thinker = _config_section(hf_config, "thinker_config")
+    return hf_config if thinker is None else thinker
+
+
+def mrope_layout(hf_config: Any) -> dict[str, int | float | None]:
+    """The checkpoint facts the Rust servicer's MRoPE position rules read
+    besides the request, as the engine's own input processor reads them, off
+    the facts root (:func:`_facts_root`): ``vision_config.spatial_merge_size``
+    (patches per position along each axis), the ``image_token_id`` /
+    ``video_token_id`` the Qwen3.5 rule checks each placeholder span against,
+    and the Qwen3-Omni rule's clock, ``position_id_per_seconds`` and
+    ``seconds_per_chunk`` (its defaults are the Rust rule's when absent). Each
+    is ``None`` when the checkpoint has none; a rule refuses the item without
+    the facts it needs."""
+    root = _facts_root(hf_config)
+    vision = _config_section(root, "vision_config") if root is not None else None
+
+    def fact(name: str) -> Any:
+        value = _config_section(root, name) if root is not None else None
+        if value is None and root is not hf_config:
+            value = _config_section(hf_config, name)
+        return value
+
     return {
         "spatial_merge_size": _optional_int(
             _config_section(vision, "spatial_merge_size") if vision is not None else None
         ),
-        "image_token_id": _optional_int(
-            _config_section(hf_config, "image_token_id") if hf_config is not None else None
-        ),
-        "video_token_id": _optional_int(
-            _config_section(hf_config, "video_token_id") if hf_config is not None else None
-        ),
+        "image_token_id": _optional_int(fact("image_token_id")),
+        "video_token_id": _optional_int(fact("video_token_id")),
+        "position_id_per_seconds": _optional_number(fact("position_id_per_seconds")),
+        "seconds_per_chunk": _optional_number(fact("seconds_per_chunk")),
     }
 
 
@@ -303,7 +346,7 @@ def model_facts(server_args: Any, model_config: Any | None = None) -> dict[str, 
         "supports_vision": any(modality in (1, 3) for modality in supported_modalities),
         "supports_multimodal": bool(supported_modalities),
         "supported_modalities": [int(modality) for modality in supported_modalities],
-        "mrope_positions": mrope_positions(model.hf_config),
+        "mrope_positions": mrope_positions(model.hf_config, model.hf_text_config),
         **mrope_layout(model.hf_config),
         "model_dtype": dtype,
         "multimodal_encoder_dtype": dtype,

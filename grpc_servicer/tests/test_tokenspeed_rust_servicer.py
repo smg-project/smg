@@ -379,6 +379,8 @@ def test_model_facts_mirror_the_python_servicer(monkeypatch):
         "spatial_merge_size": None,
         "image_token_id": None,
         "video_token_id": None,
+        "position_id_per_seconds": None,
+        "seconds_per_chunk": None,
         "model_dtype": "bfloat16",
         "multimodal_encoder_dtype": "bfloat16",
         "constrained_decoding": "",
@@ -1811,7 +1813,15 @@ def test_mrope_layout_facts_are_read_as_the_engines_input_processor_reads_them()
         image_token_id=248056,
         video_token_id=248057,
     )
+    none = {
+        "spatial_merge_size": None,
+        "image_token_id": None,
+        "video_token_id": None,
+        "position_id_per_seconds": None,
+        "seconds_per_chunk": None,
+    }
     assert rust.mrope_layout(qwen35) == {
+        **none,
         "spatial_merge_size": 2,
         "image_token_id": 248056,
         "video_token_id": 248057,
@@ -1820,20 +1830,57 @@ def test_mrope_layout_facts_are_read_as_the_engines_input_processor_reads_them()
     # config or the ids ships None for each (the Rust rule then refuses the
     # item instead of guessing).
     assert rust.mrope_layout({"vision_config": {"spatial_merge_size": 2}, "image_token_id": 5}) == {
+        **none,
         "spatial_merge_size": 2,
         "image_token_id": 5,
-        "video_token_id": None,
     }
-    assert rust.mrope_layout(SimpleNamespace(image_token_id="x")) == {
-        "spatial_merge_size": None,
-        "image_token_id": None,
-        "video_token_id": None,
+    assert rust.mrope_layout(SimpleNamespace(image_token_id="x")) == none
+    assert rust.mrope_layout(None) == none
+    # A Qwen Omni wrapper keeps the facts below thinker_config, where the
+    # engine's own Omni rule reads them, with the rule's clock beside them
+    # (an integer in the checkpoint, a number to the rule).
+    omni = SimpleNamespace(
+        thinker_config=SimpleNamespace(
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+            image_token_id=151655,
+            video_token_id=151656,
+            position_id_per_seconds=13,
+            seconds_per_chunk=2,
+        ),
+    )
+    assert rust.mrope_layout(omni) == {
+        "spatial_merge_size": 2,
+        "image_token_id": 151655,
+        "video_token_id": 151656,
+        "position_id_per_seconds": 13.0,
+        "seconds_per_chunk": 2.0,
     }
-    assert rust.mrope_layout(None) == {
-        "spatial_merge_size": None,
-        "image_token_id": None,
-        "video_token_id": None,
-    }
+    # A clock the checkpoint leaves unsaid is None (the rule's defaults are
+    # the engine's); a value that is not a number is None too.
+    assert rust.mrope_layout(
+        {"thinker_config": {"vision_config": {"spatial_merge_size": 2}, "seconds_per_chunk": "2"}}
+    ) == {**none, "spatial_merge_size": 2}
+
+
+def test_mrope_positions_are_read_as_the_engines_executor_reads_them():
+    # With the engine's own text config (ModelConfig.hf_text_config, the
+    # nested text config below a Qwen Omni wrapper's thinker_config as the
+    # engine resolves it), the reading is the executor's: an mrope_section in
+    # its rope parameters.
+    omni_text = SimpleNamespace(
+        rope_parameters={"rope_type": "default", "mrope_section": [24, 20, 20]},
+    )
+    assert rust.mrope_positions(SimpleNamespace(thinker_config=object()), omni_text) is True
+    # A text model with a plain rope, or without any rope config (a recurrent
+    # hybrid), runs 1-D positions: False, not the conservative None.
+    plain_text = SimpleNamespace(rope_parameters={"rope_type": "default", "rope_theta": 1e6})
+    assert rust.mrope_positions(SimpleNamespace(), plain_text) is False
+    assert rust.mrope_positions(SimpleNamespace(), SimpleNamespace(hidden_size=8)) is False
+    # The older rope_scaling spelling reads the same on the engine's config.
+    assert rust.mrope_positions(SimpleNamespace(), {"rope_scaling": {"type": "mrope"}}) is True
+    # Without the engine's text config the Omni wrapper's nesting is out of
+    # reach and the reading is None: the launcher passes the engine's.
+    assert rust.mrope_positions(SimpleNamespace(thinker_config=object())) is None
 
 
 def test_mrope_positions_are_read_off_the_text_rope_config():
