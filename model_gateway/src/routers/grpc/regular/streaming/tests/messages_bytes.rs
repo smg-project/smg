@@ -122,6 +122,10 @@ async fn stream_bytes(scenario: &MessagesScenario) -> Vec<u8> {
     };
     let spec = MessagesResponseSpec {
         prompt_tokens: 0,
+        // The `length` scenario's one token is its whole budget: the recorded
+        // bytes say `max_tokens`.
+        max_tokens: 1,
+        context_window: None,
         thinking_requested: scenario.thinking,
         thinking_text_returned: true,
         reasoning_in_prefill: false,

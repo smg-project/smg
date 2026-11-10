@@ -1,7 +1,9 @@
 //! GLM-5.3 media reminders through the normal gRPC pipelines.
 
 use super::*;
-use crate::worker::test_support::no_health_check;
+use crate::{
+    routers::grpc::common::stages::selection_context_length, worker::test_support::no_health_check,
+};
 
 /// Build a checkpoint-backed tokenizer without any multimodal components.
 async fn glm53_components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponents> {
@@ -138,6 +140,8 @@ async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
     };
     // A transport listener is enough: construction never calls an engine RPC.
     let port = spawn_stub(GatedScheduler::default()).await;
+    // The window the fixture's prefill and decode workers advertise.
+    const WINDOW: u32 = 8_192;
     for endpoint in [Endpoint::Chat, Endpoint::Messages] {
         let registry = Arc::new(WorkerRegistry::new());
         for (url, worker_type) in [
@@ -148,7 +152,7 @@ async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
                 .worker_type(worker_type)
                 .connection_mode(ConnectionMode::Grpc)
                 .runtime_type(RuntimeType::Sglang)
-                .model(ModelCard::new(MODEL))
+                .model(ModelCard::new(MODEL).with_context_length(WINDOW))
                 .label(SUPPORTS_VISION_LABEL, "false")
                 .health_config(no_health_check())
                 .build();
@@ -274,6 +278,15 @@ async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
                 spec.prompt_tokens as usize,
                 token_ids.len(),
                 "the Messages spec carries the rendered prompt's count"
+            );
+            let window = selection_context_length(
+                ctx.state.workers.as_ref().expect("selected workers"),
+                &ctx.input.model_id,
+            );
+            assert_eq!(window, Some(WINDOW), "the pair advertises its window");
+            assert_eq!(
+                spec.context_window, window,
+                "the Messages spec carries the selected workers' window"
             );
         }
         for request in built.plan.generate_requests_mut() {

@@ -609,6 +609,10 @@ impl RequestPipeline {
             );
             let retained = plan.as_mut().ok_or_else(consumed)?;
             helpers::restamp_plan_for_attempt(retained, stamp, workers, &self.tool_parser_factory)?;
+            // The new workers' window, for the stop reason of a `length` finish.
+            if let Some(ResponseSpec::Messages(messages)) = spec.as_mut() {
+                messages.context_window = selection_context_length(workers, &dctx.model_id);
+            }
             if let Some(decoder) = dctx.response.stop_decoder.as_mut() {
                 decoder.reset();
             }
