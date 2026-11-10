@@ -1365,6 +1365,138 @@ mod tests {
         assert_eq!(mapped.stop_token_ids, None);
     }
 
+    /// The sampling values the engine takes from this wire are the ones the
+    /// engine's in-process path derived for the same gateway request: the
+    /// servicer there forwarded the proto's set fields and the engine's
+    /// `SamplingParams.__post_init__` derived the rest (`0 <= temperature <
+    /// 1e-6` is greedy: temperature 1.0 and top_k 1; top_k 1 pins the seed to
+    /// 0; top_k -1 becomes the disabled sentinel; the stop ids are a set or
+    /// None; a negative temperature stays for the range check to refuse).
+    /// `engine_derivation` transcribes that path and every case compares the
+    /// whole wire struct against it. String stops are no sampling field: the
+    /// servicer matches them itself, so no case carries one.
+    #[test]
+    fn tokenspeed_sampling_equals_the_engine_derivation_of_the_in_process_path() {
+        use engine_zmq_client::protocol::tokenspeed::sampling::TOP_K_DISABLED;
+
+        fn engine_derivation(sp: &tokenspeed_proto::SamplingParams) -> TokenSpeedSamplingParams {
+            // The set fields as forwarded, the class defaults for the rest.
+            let mut params = TokenSpeedSamplingParams {
+                max_new_tokens: sp.max_new_tokens,
+                temperature: sp.temperature.map_or(1.0, f64::from),
+                top_p: sp.top_p.map_or(1.0, f64::from),
+                top_k: sp.top_k.unwrap_or(-1),
+                min_p: sp.min_p.map_or(0.0, f64::from),
+                frequency_penalty: sp.frequency_penalty.map_or(0.0, f64::from),
+                presence_penalty: sp.presence_penalty.map_or(0.0, f64::from),
+                repetition_penalty: sp.repetition_penalty.map_or(1.0, f64::from),
+                min_new_tokens: sp.min_new_tokens,
+                ignore_eos: sp.ignore_eos,
+                skip_special_tokens: sp.skip_special_tokens,
+                spaces_between_special_tokens: sp.spaces_between_special_tokens,
+                no_stop_trim: sp.no_stop_trim,
+                seed: sp.sampling_seed,
+                n: if sp.n == 0 { 1 } else { sp.n },
+                logit_bias: (!sp.logit_bias.is_empty()).then(|| {
+                    sp.logit_bias
+                        .iter()
+                        .map(|(token, bias)| (token.clone(), f64::from(*bias)))
+                        .collect()
+                }),
+                ..TokenSpeedSamplingParams::default()
+            };
+            // `__post_init__`.
+            let mut ids = sp.stop_token_ids.clone();
+            ids.sort_unstable();
+            ids.dedup();
+            params.stop_token_ids = (!ids.is_empty()).then_some(ids);
+            if (0.0..1e-6).contains(&params.temperature) {
+                params.temperature = 1.0;
+                params.top_k = 1;
+            }
+            if params.top_k == 1 {
+                params.seed = Some(0);
+            }
+            if params.top_k == -1 {
+                params.top_k = TOP_K_DISABLED;
+            }
+            // `normalize()`: no stop strings, so an empty list.
+            params.stop_strs = Vec::new();
+            params.stop_str_max_len = 0;
+            params.is_normalized = true;
+            params
+        }
+
+        let set = |temperature: Option<f32>, top_k: Option<i32>, seed: Option<u64>| {
+            tokenspeed_proto::SamplingParams {
+                temperature,
+                top_p: Some(1.0),
+                top_k,
+                min_p: Some(0.0),
+                frequency_penalty: Some(0.0),
+                presence_penalty: Some(0.0),
+                repetition_penalty: Some(1.0),
+                max_new_tokens: Some(64),
+                skip_special_tokens: true,
+                spaces_between_special_tokens: true,
+                sampling_seed: seed,
+                n: 1,
+                ..Default::default()
+            }
+        };
+        let cases = [
+            ("greedy by temperature 0", set(Some(0.0), Some(-1), None)),
+            (
+                "greedy by temperature 0 with a request seed",
+                set(Some(0.0), Some(-1), Some(1_234)),
+            ),
+            (
+                "greedy by a temperature under the threshold",
+                set(Some(5e-7), Some(-1), Some(9)),
+            ),
+            (
+                "greedy by temperature 0 over an explicit top_k",
+                set(Some(0.0), Some(40), None),
+            ),
+            ("greedy by top_k 1", set(Some(0.7), Some(1), Some(3))),
+            ("sampled without a seed", set(Some(0.7), Some(-1), None)),
+            ("sampled with a seed", set(Some(0.7), Some(40), Some(7))),
+            (
+                "a negative temperature, for the engine to refuse",
+                set(Some(-0.5), Some(-1), Some(7)),
+            ),
+            (
+                "the proto's unset scalars",
+                tokenspeed_proto::SamplingParams::default(),
+            ),
+            (
+                "penalties, min_p, a bias, duplicated stop ids, a minimum",
+                tokenspeed_proto::SamplingParams {
+                    min_p: Some(0.05),
+                    frequency_penalty: Some(0.5),
+                    presence_penalty: Some(0.3),
+                    repetition_penalty: Some(1.1),
+                    min_new_tokens: 2,
+                    stop_token_ids: vec![13, 7, 13],
+                    ignore_eos: true,
+                    no_stop_trim: true,
+                    logit_bias: [("42".to_string(), -100.0f32)].into(),
+                    ..set(Some(0.9), Some(-1), None)
+                },
+            ),
+        ];
+        for (name, sp) in cases {
+            let mut wire = translate_sampling_tokenspeed(sp.clone());
+            // The wire sends the stop ids as the gateway did; the engine
+            // reads them as a set, which is what the derivation holds.
+            if let Some(ids) = wire.stop_token_ids.as_mut() {
+                ids.sort_unstable();
+                ids.dedup();
+            }
+            assert_eq!(wire, engine_derivation(&sp), "{name}");
+        }
+    }
+
     fn ts_tokenized_req(
         sampling: tokenspeed_proto::SamplingParams,
     ) -> tokenspeed_proto::GenerateRequest {
