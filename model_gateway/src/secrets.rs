@@ -11,7 +11,7 @@
 
 use std::{collections::BTreeMap, ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use smg_auth::ApiKeySet;
 use tokio::{sync::mpsc, task, time};
@@ -19,6 +19,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     config::{
+        redacted::KeysInForce,
         secrets::{
             parse_control_plane_api_key, parse_tenant_api_key, API_KEY_FILE,
             CONTROL_PLANE_API_KEYS_FILE, TENANT_API_KEYS_FILE,
@@ -138,6 +139,10 @@ pub struct SecretReloader {
     /// The tenant entries when no file gave them: every reload keeps them.
     fixed_tenants: Vec<TenantApiKeyEntry>,
     control_plane: Option<ApiKeySet>,
+    /// The keys in force as the configuration view names them: the start's
+    /// until a reload is accepted, then the last accepted reload's; a refused
+    /// reload leaves it as it was.
+    in_force: RwLock<KeysInForce>,
     /// One reload at a time: two callers would interleave their reads and
     /// swaps.
     turn: Mutex<()>,
@@ -181,12 +186,18 @@ impl SecretReloader {
             &[]
         };
         let control_plane = control_plane.filter(|_| files.control_plane_api_keys.is_some());
+        let in_force = KeysInForce::of(
+            api_key,
+            tenant_api_keys,
+            control_plane.as_ref().map(ApiKeySet::len),
+        );
         Some(Self {
             files,
             serving,
             fixed_api_key,
             fixed_tenants: fixed_tenants.to_vec(),
             control_plane,
+            in_force: RwLock::new(in_force),
             turn: Mutex::new(()),
         })
     }
@@ -194,6 +205,13 @@ impl SecretReloader {
     /// The files a reload reads.
     pub fn files(&self) -> &SecretFiles {
         &self.files
+    }
+
+    /// The keys in force as the configuration view names them: the start's
+    /// until a reload is accepted, then the last accepted reload's; a refused
+    /// reload leaves it as it was.
+    pub(crate) fn keys_in_force(&self) -> KeysInForce {
+        self.in_force.read().clone()
     }
 
     /// Read every file, check the serving set that would be in force by the
@@ -260,6 +278,7 @@ impl SecretReloader {
         // files' part and the fixed part together, passes the start's rules
         // before any swap: a tenant file the start would refuse, or a key a
         // file repeats from the fixed part, puts nothing in force.
+        let mut served = None;
         if api_key.is_some() || tenants.is_some() {
             let api_key = api_key.or_else(|| self.fixed_api_key.clone());
             let tenants = tenants.as_deref().unwrap_or(&self.fixed_tenants);
@@ -271,6 +290,7 @@ impl SecretReloader {
                 };
                 return Err(BadFile(file.bad_file(path, &entry_refusal(error))));
             }
+            served = Some(KeysInForce::of(api_key.as_deref(), tenants, None));
             let keys = AuthConfig::key_map(api_key, tenants);
             let previous = self.serving.replace(keys.clone());
             report.serving_changed = *previous != keys;
@@ -278,6 +298,16 @@ impl SecretReloader {
         if let Some((set, entries)) = control_plane {
             report.control_plane_changed = set.load().as_slice() != entries.as_slice();
             set.replace(entries);
+        }
+        // The view's record follows the sets: the serving half when a
+        // serving file was read, the control-plane count when its set is held.
+        let mut in_force = self.in_force.write();
+        if let Some(served) = served {
+            in_force.api_key = served.api_key;
+            in_force.tenant_api_keys = served.tenant_api_keys;
+        }
+        if let Some(set) = &self.control_plane {
+            in_force.control_plane_entries = Some(set.len());
         }
         Ok(report)
     }
@@ -563,6 +593,116 @@ mod tests {
         let BadFile(error) = reloader.reload().expect_err("an empty file is refused");
         assert!(error.to_string().contains("holds no entry"), "{error}");
         assert!(set.find("cp-one").is_some());
+    }
+
+    #[test]
+    fn a_reload_moves_the_keys_the_view_names() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let file = write(dir.path(), "key", "k-one\n");
+        let cp = write(dir.path(), "cp", "ops:Ops:admin:cp-one\n");
+        let set = ApiKeySet::new(vec![ApiKeyEntry::new("ops", "Ops", "cp-one", Role::Admin)]);
+        let reloader = SecretReloader::new(
+            SecretFiles {
+                api_key: Some(file),
+                control_plane_api_keys: Some(cp),
+                ..SecretFiles::default()
+            },
+            &sources(SecretSource::File, None),
+            Some("k-one"),
+            &[],
+            AuthConfig::new(Some("k-one".into())),
+            Some(set),
+        )
+        .expect("file sources");
+        assert_eq!(
+            reloader.keys_in_force(),
+            KeysInForce::of(Some("k-one"), &[], Some(1)),
+            "the start's record"
+        );
+
+        write(dir.path(), "key", "k-two\n");
+        write(
+            dir.path(),
+            "cp",
+            "ops:Ops:admin:cp-one\nsre:Sre:admin:cp-two\n",
+        );
+        reloader.reload().expect("reloaded");
+        assert_eq!(
+            reloader.keys_in_force(),
+            KeysInForce::of(Some("k-two"), &[], Some(2)),
+            "the reload's record"
+        );
+    }
+
+    #[test]
+    fn a_reload_moves_the_tenant_keys_the_view_names() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let tenants = write(dir.path(), "tenants", "acme:t-one\n");
+        let start = [TenantApiKeyEntry {
+            tenant_id: "acme".into(),
+            key: "t-one".into(),
+        }];
+        let reloader = SecretReloader::new(
+            SecretFiles {
+                tenant_api_keys: Some(tenants),
+                ..SecretFiles::default()
+            },
+            &sources(SecretSource::Flag, Some(SecretSource::File)),
+            Some("flag-key"),
+            &start,
+            AuthConfig::with_tenant_keys(Some("flag-key".into()), &start),
+            None,
+        )
+        .expect("a file source");
+        assert_eq!(
+            reloader.keys_in_force(),
+            KeysInForce::of(Some("flag-key"), &start, None),
+            "the start's record"
+        );
+
+        write(dir.path(), "tenants", "beta:t-two\n");
+        reloader.reload().expect("reloaded");
+        let rotated = [TenantApiKeyEntry {
+            tenant_id: "beta".into(),
+            key: "t-two".into(),
+        }];
+        assert_eq!(
+            reloader.keys_in_force(),
+            KeysInForce::of(Some("flag-key"), &rotated, None),
+            "the file's tenant is in the record, the start's is gone, the flag's key is kept"
+        );
+    }
+
+    #[test]
+    fn a_refused_reload_leaves_the_record() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let tenants = write(dir.path(), "tenants", "acme:t-one\n");
+        let start = [TenantApiKeyEntry {
+            tenant_id: "acme".into(),
+            key: "t-one".into(),
+        }];
+        let reloader = SecretReloader::new(
+            SecretFiles {
+                tenant_api_keys: Some(tenants),
+                ..SecretFiles::default()
+            },
+            &sources(SecretSource::Flag, Some(SecretSource::File)),
+            Some("flag-key"),
+            &start,
+            AuthConfig::with_tenant_keys(Some("flag-key".into()), &start),
+            None,
+        )
+        .expect("a file source");
+
+        write(dir.path(), "tenants", "no-tenant-separator\n");
+        reloader
+            .reload()
+            .expect_err("a tenant line without its separator is refused");
+        assert_eq!(
+            reloader.keys_in_force(),
+            KeysInForce::of(Some("flag-key"), &start, None),
+            "a refused reload leaves the record as it was"
+        );
     }
 
     #[test]

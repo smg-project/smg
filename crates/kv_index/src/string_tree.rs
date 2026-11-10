@@ -857,6 +857,9 @@ impl Tree {
     pub fn match_prefix_with_counts(&self, text: &str) -> PrefixMatchResult {
         let mut remaining = text;
         let mut matched_chars = 0;
+        // The characters the walk advanced past (its full matches), so the
+        // input's count is theirs plus the remainder's: the fused walk's shape.
+        let mut consumed_chars = 0usize;
         let mut prev = Arc::clone(&self.root);
 
         while let Some(first_char) = remaining.chars().next() {
@@ -884,6 +887,7 @@ impl Tree {
                 if shared_count == matched_node_text_count {
                     // Full match with current node's text, continue to next node
                     matched_chars += shared_count;
+                    consumed_chars += shared_count;
                     remaining = advance_by_chars(remaining, shared_count);
                     prev = matched_node;
                 } else {
@@ -900,10 +904,9 @@ impl Tree {
 
         let curr = prev;
 
-        // Compute input char count directly from input text.
-        // This is equivalent to matched_chars + remaining.chars().count() but avoids
-        // needing to track remaining precisely through the traversal.
-        let input_char_count = text.chars().count();
+        // Only the remainder is counted here: nothing on a hit, the whole
+        // input only on a miss at the root.
+        let input_char_count = consumed_chars + remaining.chars().count();
 
         // The tenant pick (the `last_tenant` cache first, the tenant map on a
         // miss), its cache populate on that slow path, the probabilistic

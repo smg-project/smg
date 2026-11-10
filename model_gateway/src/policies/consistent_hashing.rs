@@ -281,6 +281,34 @@ mod tests {
         }
     }
 
+    /// The policy over four workers and their hash ring, the bed of the routing-key-hint tests.
+    fn ring_of_four() -> (ConsistentHashingPolicy, Vec<Arc<dyn Worker>>, Arc<HashRing>) {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = make_workers(&[
+            "http://w1:8000",
+            "http://w2:8000",
+            "http://w3:8000",
+            "http://w4:8000",
+        ]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+        (policy, workers, ring)
+    }
+
+    /// The worker `key` lands on as the request's routing-key hint, with no other key present.
+    fn placed_by_hint(
+        policy: &ConsistentHashingPolicy,
+        workers: &[Arc<dyn Worker>],
+        ring: &Arc<HashRing>,
+        key: &str,
+    ) -> usize {
+        let info = SelectWorkerInfo {
+            routing_key: Some(key),
+            hash_ring: Some(Arc::clone(ring)),
+            ..Default::default()
+        };
+        policy.select_worker_impl(workers, &info).0.unwrap()
+    }
+
     /// Every consistent-hashing entry point gathers on
     /// `is_healthy_and_eligible()`, so a vetoed worker must drop out of the
     /// ring, out of an explicit target-worker probe, and out of the random
@@ -693,23 +721,8 @@ mod tests {
 
     #[test]
     fn test_routing_key_hint_wins_over_raw_header() {
-        let policy = ConsistentHashingPolicy::new();
-        let workers = make_workers(&[
-            "http://w1:8000",
-            "http://w2:8000",
-            "http://w3:8000",
-            "http://w4:8000",
-        ]);
-        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
-
-        let select_by_key = |key: &str| {
-            let info = SelectWorkerInfo {
-                routing_key: Some(key),
-                hash_ring: Some(ring.clone()),
-                ..Default::default()
-            };
-            policy.select_worker_impl(&workers, &info).0.unwrap()
-        };
+        let (policy, workers, ring) = ring_of_four();
+        let select_by_key = |key: &str| placed_by_hint(&policy, &workers, &ring, key);
 
         // Find two keys that land on different workers.
         let base_idx = select_by_key("key-0");
@@ -732,23 +745,8 @@ mod tests {
 
     #[test]
     fn test_routing_key_hint_outranks_rid_key() {
-        let policy = ConsistentHashingPolicy::new();
-        let workers = make_workers(&[
-            "http://w1:8000",
-            "http://w2:8000",
-            "http://w3:8000",
-            "http://w4:8000",
-        ]);
-        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
-
-        let select_by_key = |key: &str| {
-            let info = SelectWorkerInfo {
-                routing_key: Some(key),
-                hash_ring: Some(ring.clone()),
-                ..Default::default()
-            };
-            policy.select_worker_impl(&workers, &info).0.unwrap()
-        };
+        let (policy, workers, ring) = ring_of_four();
+        let select_by_key = |key: &str| placed_by_hint(&policy, &workers, &ring, key);
 
         // Find a header key that lands on a different worker than the rid.
         let rid_idx = select_by_key("conv");

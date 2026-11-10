@@ -881,10 +881,18 @@ async fn inflight_requests(State(state): State<Arc<AppState>>) -> Response {
 pub const ADMIN_ONLY_READS: &[&str] = &["/config"];
 
 /// `GET /config`: the effective configuration with every secret
-/// redacted. The `admin` role alone reads it ([`ADMIN_ONLY_READS`]): the
-/// view names the store addresses, which the `user` role's reads do not.
+/// redacted and the keys in force named by fingerprint. The `admin` role
+/// alone reads it ([`ADMIN_ONLY_READS`]): the view names the store
+/// addresses, which the `user` role's reads do not.
 async fn admin_config(State(state): State<Arc<AppState>>) -> Response {
-    match redacted::effective(&state.context.router_config, &state.secret_sources) {
+    let config = &state.context.router_config;
+    // The keys the view names: the sets in force, which a reload of the key
+    // files moves; without a reloader nothing moves them after the start.
+    let keys = match &state.secrets {
+        Some(secrets) => secrets.keys_in_force(),
+        None => redacted::KeysInForce::of(config.api_key.as_deref(), &config.tenant_api_keys, None),
+    };
+    match redacted::effective(config, &state.secret_sources, &keys) {
         Ok(view) => Json(view).into_response(),
         Err(error) => {
             error!("the configuration view did not serialize: {error}");
