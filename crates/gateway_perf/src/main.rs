@@ -94,8 +94,8 @@ struct BedArgs {
     /// The fleet behind the gateway: regular gRPC engines, or a prefill fleet and a decode fleet on the prefill-decode path
     #[arg(long, value_enum, default_value_t = Fleet::Grpc)]
     fleet: Fleet,
-    /// Prefill engines of the prefill-decode fleet
-    #[arg(long, default_value_t = 1)]
+    /// Prefill engines of the prefill-decode fleet (one or more)
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
     prefill_workers: u16,
     /// First port of the bed's block (gateway; +1 metrics, +9 admin, +10.. workers, then the prefill engines and their bootstrap ports) [a free block from 29700]
     #[arg(long, default_value_t = 0)]
@@ -681,6 +681,17 @@ mod tests {
         };
         assert_eq!(pd.bed.fleet, Fleet::PrefillDecode);
         assert_eq!(pd.bed.prefill_workers, 2);
+        assert!(Cli::try_parse_from([
+            "gateway-perf",
+            "cpu",
+            "--base",
+            "/b",
+            "--fleet",
+            "prefill-decode",
+            "--prefill-workers",
+            "0",
+        ])
+        .is_err());
         assert!(
             Cli::try_parse_from(["gateway-perf", "cpu", "--base", "/b", "--fleet", "pd"]).is_err()
         );
