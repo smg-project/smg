@@ -1,6 +1,6 @@
 [package]
 name = "smg"
-version = "1.15.0-dev"
+version = "1.16.0-dev"
 edition = "2021"
 rust-version.workspace = true
 description = "High-performance model-routing gateway for large-scale LLM deployments"
