@@ -218,9 +218,9 @@ pub(super) struct MergeTable {
     hot_base: u64,
     /// The pairs outside the hot grid's window, open-addressed by bucket with
     /// linear probing over whole buckets: a pair's key hashes to a bucket of
-    /// [`BUCKET`] entries, and a lookup reads the bucket whole (one compare
-    /// per entry, no branch) and goes on to the next bucket only when none
-    /// matched and none was empty.
+    /// [`BUCKET`] entries on one cache line, and a lookup walks it to the key
+    /// or the first empty entry, going on to the next bucket only when every
+    /// entry holds another pair (see [`Self::merge_of`]).
     buckets: Box<[Bucket]>,
     /// Bits a key's hash is shifted right by to give its first bucket; the
     /// table holds `1 << (64 - shift)` buckets.
