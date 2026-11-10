@@ -12,7 +12,6 @@
 //! frame of its own: `generate_bytes` pins their bytes.
 
 use std::{
-    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -20,7 +19,7 @@ use std::{
     task::Poll,
 };
 
-use futures::{Stream, StreamExt as _};
+use futures::StreamExt as _;
 use llm_tokenizer::traits::Tokenizer;
 use serde_json::Value;
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
@@ -28,7 +27,7 @@ use tokio::{sync::oneshot, task::JoinHandle};
 
 use super::{
     super::*,
-    eof::{chunk, complete, gated_stream, scripted_stream, CharacterTokenizer},
+    eof::{chunk, complete, gated_stream, pull, scripted_stream, CharacterTokenizer},
 };
 
 const MODEL: &str = "generate-frames-test";
@@ -104,11 +103,6 @@ fn driven_body_of(
         failure_flag.store(result.is_err(), Ordering::SeqCst);
     };
     (DrivenBody::new(Box::pin(reading), rx), failed, server)
-}
-
-/// The next pull on `body`, polled once.
-async fn pull(body: &mut DrivenBody) -> Poll<Option<Result<Bytes, std::io::Error>>> {
-    std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *body).poll_next(cx))).await
 }
 
 /// The first token's frame leaves alone and is pending to the connection
