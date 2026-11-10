@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use gateway_perf::{
     base::build_base,
-    bed::{Bed, BedConfig, Ports},
+    bed::{Bed, BedConfig, Fleet, Ports},
     cells::{self, Results, Settings},
     counters::perf_available,
     gate,
@@ -88,10 +88,16 @@ struct BedArgs {
     /// Output directory [target/gateway-perf/<stamp>]
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Mock engines behind the gateway
+    /// Mock engines behind the gateway (the decode engines of the prefill-decode fleet)
     #[arg(long, default_value_t = 4)]
     workers: u16,
-    /// First port of the bed's block (gateway; +1 metrics, +9 admin, +10.. workers) [a free block from 29700]
+    /// The fleet behind the gateway: regular gRPC engines, or a prefill fleet and a decode fleet on the prefill-decode path
+    #[arg(long, value_enum, default_value_t = Fleet::Grpc)]
+    fleet: Fleet,
+    /// Prefill engines of the prefill-decode fleet
+    #[arg(long, default_value_t = 1)]
+    prefill_workers: u16,
+    /// First port of the bed's block (gateway; +1 metrics, +9 admin, +10.. workers, then the prefill engines and their bootstrap ports) [a free block from 29700]
     #[arg(long, default_value_t = 0)]
     port_base: u16,
     /// cpu list the gateway is pinned to [$GW_CORES]
@@ -374,6 +380,8 @@ fn settings(
         &tokenizer,
     );
     cfg.workers = bed.workers;
+    cfg.fleet = bed.fleet;
+    cfg.prefill_workers = bed.prefill_workers;
     cfg.port_base = bed.port_base;
     cfg.gw_cores = or_env(&bed.gw_cores, "GW_CORES");
     cfg.mock_cores = or_env(&bed.mock_cores, "MOCK_CORES");
@@ -424,13 +432,22 @@ fn settings(
         settings.prompt_tokens = cell.prompt_tokens;
         settings.distinct = cell.distinct;
     }
+    let prefill_ports = if settings.bed.fleet == Fleet::PrefillDecode {
+        format!(
+            ", 'prefill_admin': {}, 'prefill_base': {}, 'bootstrap_base': {}",
+            ports.prefill_admin, ports.prefill_base, ports.bootstrap_base
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "out {}\nports {{'gateway': {}, 'metrics': {}, 'admin': {}, 'mock_base': {}}}\ntokenizer {tokenizer}\ncounters: {note}",
+        "out {}\nports {{'gateway': {}, 'metrics': {}, 'admin': {}, 'mock_base': {}{prefill_ports}}}\nfleet {}\ntokenizer {tokenizer}\ncounters: {note}",
         out.display(),
         ports.gateway,
         ports.metrics,
         ports.admin,
-        ports.mock_base
+        ports.mock_base,
+        settings.bed.engines_text()
     );
     Ok(settings)
 }
@@ -472,10 +489,10 @@ fn run_bed(cmd: &BedCmd) -> Result<i32> {
             let mut bed = cells::bed_for(&settings, true)?;
             let info = bed.up()?;
             println!(
-                "bed up: gateway pid {} at {}, {} workers, bed.json {}",
+                "bed up: gateway pid {} at {}, {}, bed.json {}",
                 info.gateway_pid,
                 info.gateway_url,
-                settings.bed.workers,
+                settings.bed.engines_text(),
                 settings
                     .out
                     .join("bed")
@@ -646,6 +663,27 @@ mod tests {
             panic!("not bed")
         };
         assert_eq!(bed.action, BedAction::Smoke);
+        assert_eq!(bed.bed.fleet, Fleet::Grpc);
+        assert_eq!(bed.bed.prefill_workers, 1);
+        let cli = Cli::try_parse_from([
+            "gateway-perf",
+            "cpu",
+            "--base",
+            "/b",
+            "--fleet",
+            "prefill-decode",
+            "--prefill-workers",
+            "2",
+        ])
+        .unwrap();
+        let Cmd::Cpu(pd) = cli.command else {
+            panic!("not cpu")
+        };
+        assert_eq!(pd.bed.fleet, Fleet::PrefillDecode);
+        assert_eq!(pd.bed.prefill_workers, 2);
+        assert!(
+            Cli::try_parse_from(["gateway-perf", "cpu", "--base", "/b", "--fleet", "pd"]).is_err()
+        );
         let cli = Cli::try_parse_from(["gateway-perf", "report", "--out", "/tmp/x"]).unwrap();
         let Cmd::Report(report) = cli.command else {
             panic!("not report")
@@ -683,6 +721,8 @@ mod tests {
             tokenizer: String::new(),
             out: None,
             workers: 4,
+            fleet: Fleet::Grpc,
+            prefill_workers: 1,
             port_base: 0,
             gw_cores: String::new(),
             mock_cores: String::new(),

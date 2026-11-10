@@ -932,7 +932,7 @@ pub(crate) fn init_metrics() {
     // first-token pair, none of these four.
     describe_histogram!(
         "smg_router_ttft_seconds",
-        "Time to first token of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline)"
+        "Time to first token of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline); the clock starts at the answering attempt's RPC dispatch (the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes), so a refused attempt's wait and its backoff are in smg_router_request_duration_seconds, the backoff alone in smg_worker_retry_backoff_seconds, and the refused attempt counted by smg_worker_retries_total, not here"
     );
     describe_histogram!(
         "smg_router_tpot_seconds",
@@ -940,7 +940,7 @@ pub(crate) fn init_metrics() {
     );
     describe_histogram!(
         TIME_TO_FIRST_TOKEN_SECONDS,
-        "Time to first token of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline): the observations of smg_router_ttft_seconds on buckets that resolve them (six per decade from 10 ms to 10 s; the request-duration bucket flag does not apply)"
+        "Time to first token of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline): the observations of smg_router_ttft_seconds on buckets that resolve them (six per decade from 10 ms to 10 s; the request-duration bucket flag does not apply), on the same clock from the answering attempt's RPC dispatch"
     );
     describe_histogram!(
         REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS,
@@ -952,7 +952,7 @@ pub(crate) fn init_metrics() {
     );
     describe_histogram!(
         "smg_router_generation_duration_seconds",
-        "Total generation time by router_type, backend_type, model, endpoint (gRPC only)"
+        "Total generation time by router_type, backend_type, model, endpoint (gRPC only): from the answering attempt's RPC dispatch (the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes) to the answer's end, so a refused attempt's wait and its backoff are in smg_router_request_duration_seconds, the backoff alone in smg_worker_retry_backoff_seconds, and the refused attempt counted by smg_worker_retries_total, not here"
     );
     describe_counter!(
         "smg_router_local_stop_aborts_total",

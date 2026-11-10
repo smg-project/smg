@@ -15,6 +15,7 @@ BASELINE = (
 )
 COMPONENTS = (
     ("e2e_test/infra/cloud_credentials.py", "e2e_test/infra/test_cloud_credentials.py"),
+    ("scripts/ci/validate_pr_benchmark.py", "scripts/ci/tests/test_validate_pr_benchmark.py"),
     ("e2e_test/router/test_pd_topologies.py", "e2e_test/infra/test_http_pd_pairing_protocol.py"),
     ("e2e_test/infra/http_pd_stream_fault.py", "e2e_test/infra/test_http_pd_stream_fault.py"),
     ("scripts/ci_responses_evidence.py", "scripts/tests/test_ci_responses_evidence.py"),
