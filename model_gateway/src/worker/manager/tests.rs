@@ -1911,9 +1911,9 @@ fn test_state_machine_success_resets_failure_counter() {
 
 #[tokio::test]
 async fn test_removal_candidate_strips_dp_rank_suffix() {
-    // Regression test: a DP-aware worker is registered under
+    // Regression test: a rank worker is registered under
     // "{base}@{rank}", but the removal workflow prefix-matches
-    // "{url}@" in dp_aware mode. Submitting the registered (suffixed)
+    // "{url}@" for a data-parallel group. Submitting the registered (suffixed)
     // URL made the prefix "{base}@{rank}@", which matched nothing, so
     // unhealthy DP workers were never removed.
     let registry = Arc::new(WorkerRegistry::new());

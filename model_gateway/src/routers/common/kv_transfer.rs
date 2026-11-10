@@ -529,8 +529,9 @@ fn effective_kv_engine_id(
 }
 
 /// The connector mode for a PD pair, read off the prefill worker's metadata.
-/// Discovered dp_size matters even without `--dp-aware` expansion: a DP>1
-/// engine behind an unexpanded worker must not be minted for.
+/// Discovered dp_size matters for an unexpanded worker too (a ZMQ grouped
+/// worker, or an engine whose registration-time read missed its rank count):
+/// a DP>1 engine behind one worker must not be minted for.
 pub(crate) fn connector_mode_for_worker(worker: &dyn Worker) -> KvConnectorMode {
     let meta = worker.metadata();
     let dp_label = meta.spec.labels.get("dp_size");

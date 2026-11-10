@@ -32,8 +32,8 @@ pub(super) struct WorkerStreamState {
     pub(super) index: WorkerIndexState,
     /// A relay snapshot whose chunks are still arriving on the stream.
     pub(super) snapshot: Option<SnapshotProgress>,
-    /// The data-parallel rank this worker stands for under `--dp-aware`,
-    /// `None` for a worker that stands for its whole engine. An engine's
+    /// The data-parallel rank this worker stands for, `None` for a worker
+    /// that stands for its whole engine. An engine's
     /// stream names every rank's batches: all of them move their rank's
     /// cursor and the snapshot bookkeeping, only this rank's (and the
     /// unranked, which are every rank's) enter the index or clear it.
@@ -88,7 +88,7 @@ impl WorkerStreamState {
     }
 
     /// The degraded cursors among the ranks this worker indexes: every rank
-    /// of an unpinned worker; under `--dp-aware` its own rank, plus rank 0's
+    /// of an unpinned worker; a rank worker's own rank, plus rank 0's
     /// cursor once a batch that names no rank (every rank's, indexed here)
     /// has ridden it. Another rank's unreplayed gap says nothing about this
     /// worker's index.
@@ -1526,7 +1526,7 @@ mod tests {
             .collect()
     }
 
-    /// Under `--dp-aware` an engine's stream names every rank's batches. A
+    /// A data-parallel engine's stream names every rank's batches. A
     /// rank worker runs them all through admission (each rank's cursor, so
     /// the resubscribe cursor and the gap detection are the unpinned
     /// worker's) and indexes its own rank's and the unranked ones only.
