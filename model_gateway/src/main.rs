@@ -574,7 +574,9 @@ struct RoutingArgs {
     #[arg(long, default_value = "expected_wait", value_parser = parse_power_of_two_load_metric, help_heading = "Routing Policy")]
     power_of_two_load_metric: PowerOfTwoLoadMetric,
 
-    /// Enable data parallelism aware scheduling
+    /// Deprecated and ignored: data-parallel ranks are discovered at every
+    /// registration (one worker per rank of a gRPC or SGLang HTTP engine; a ZMQ
+    /// engine stays one grouped worker). The flag is removed in release 1.17
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
 
@@ -631,9 +633,9 @@ struct RoutingArgs {
 
     /// Choose a data-parallel rank per request from the ranks' reported token
     /// loads: the HTTP prefill-decode router, for an engine registered as one
-    /// worker. Under --dp-aware the engine's ranks are workers and the policy's
-    /// pick among them is the rank choice, so this flag chooses nothing there
-    /// (warned at start-up)
+    /// worker. A data-parallel engine's ranks are workers (gRPC and HTTP alike)
+    /// and the policy's pick among them is the rank choice, so this flag chooses
+    /// nothing there (warned at the engine's registration)
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
 

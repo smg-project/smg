@@ -721,6 +721,10 @@ impl RouterConfigBuilder {
     // ==================== Boolean Setters ====================
     // Accept bool parameters to conditionally set flags without if statements
 
+    /// Deprecated and ignored: data-parallel ranks are discovered at every
+    /// registration (one worker per rank of a gRPC or SGLang HTTP engine; a ZMQ
+    /// engine stays one grouped worker); a set flag only draws the start-up
+    /// deprecation line. Removed in 1.17.
     pub fn dp_aware(mut self, enable: bool) -> Self {
         self.config.dp_aware = enable;
         self

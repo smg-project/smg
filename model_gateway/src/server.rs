@@ -2346,13 +2346,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     for warning in crate::config::unused_credentials_warnings(&config.router_config.mode) {
         tracing::warn!("{warning}");
     }
-    // A rank scheduler under rank expansion chooses nothing: the operator's
-    // configuration runs, with the word that one of its flags does nothing.
-    if let Some(warning) = crate::config::dp_minimum_tokens_scheduler_scope_warning(
-        config.router_config.dp_aware,
-        config.router_config.dp_minimum_tokens_scheduler,
-    ) {
-        tracing::warn!("{warning}");
+    // The flag that used to turn rank discovery on: discovery runs at every
+    // registration now, so the flag is accepted and ignored for one release,
+    // with the word that it does nothing.
+    if config.router_config.dp_aware {
+        tracing::warn!(
+            "--dp-aware is deprecated and ignored: data-parallel ranks are discovered at every \
+             registration; the flag is removed in release 1.17"
+        );
     }
 
     // Who else can read the private key files: checked here, once the

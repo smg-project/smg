@@ -671,11 +671,14 @@ impl WorkerService {
         validate_spec(&config)?;
         Self::require_provider_router(&config)?;
 
-        // A data-parallel router expands one spec into one worker per rank,
-        // each registered under a rank-suffixed URL. Re-running registration
-        // for a single ID cannot express that, so refuse here instead of
-        // answering 202 and failing in the background.
-        if self.router_config.dp_aware {
+        // A data-parallel engine registers as one worker per rank, each under
+        // a rank-suffixed URL, so one rank's ID cannot stand for a new
+        // registration of its engine: a PUT of a rank worker is refused here
+        // rather than answered 202 and failed in the background. (A PUT of a
+        // plain worker whose engine now reports several ranks passes this
+        // check and is refused by the register step's batch rule, which takes
+        // exactly one worker for one ID.)
+        if existing.is_dp_aware() {
             return Err(WorkerServiceError::BadRequest {
                 message: format!(
                     "Worker '{url}' belongs to a data-parallel group. \
@@ -787,6 +790,25 @@ impl WorkerService {
         }
 
         if let Some(worker_url) = self.worker_registry.get_url_by_id(&worker_id) {
+            // A data-parallel engine registered under this URL holds one row
+            // per rank, each under its own ID; the ID the POST answered with
+            // resolves to the group's first rank, so its Location can be
+            // followed to a registered worker (and its group size).
+            let mut ranks: Vec<Arc<dyn Worker>> = self
+                .worker_registry
+                .get_all()
+                .into_iter()
+                .filter(|worker| worker.is_dp_aware() && worker.base_url() == worker_url)
+                .collect();
+            ranks.sort_by_key(|worker| worker.dp_rank());
+            if let Some(first) = ranks.first() {
+                let mut worker_info = worker_to_info(first);
+                worker_info.id = worker_id.as_str().to_string();
+                if let Some(status) = job_queue.get_status(&worker_url) {
+                    worker_info.job_status = Some(status);
+                }
+                return Ok(GetWorkerResponse(worker_info));
+            }
             if let Some(status) = job_queue.get_status(&worker_url) {
                 return Ok(GetWorkerResponse(WorkerInfo::pending(
                     worker_id.as_str(),
@@ -952,6 +974,57 @@ mod tests {
 
     fn worker_spec(url: &str) -> WorkerSpec {
         serde_json::from_value(json!({ "url": url })).expect("worker spec")
+    }
+
+    /// A PUT of one rank worker of a data-parallel engine is refused up
+    /// front, whatever the configuration says: the engine's registration is
+    /// one worker per rank, which a replacement by one ID cannot express. A
+    /// plain worker's PUT passes the check and reaches the queue, under the
+    /// retired flag too.
+    #[tokio::test]
+    async fn put_of_a_rank_worker_is_refused_and_a_plain_workers_passes() {
+        for dp_aware in [false, true] {
+            let registry = Arc::new(WorkerRegistry::new());
+            let rank = BasicWorkerBuilder::new("grpc://10.0.0.12:8000")
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("m"))
+                .dp_config(1, 4)
+                .build();
+            let rank_url = rank.url().to_string();
+            registry.register(Arc::new(rank)).unwrap();
+            register_worker(&registry, "grpc://10.0.0.13:8000", Some("m"));
+            let rank_id = registry.reserve_id_for_url(&rank_url);
+            let plain_id = registry.reserve_id_for_url("grpc://10.0.0.13:8000");
+            let service = WorkerService::new(
+                Arc::clone(&registry),
+                Arc::new(std::sync::OnceLock::new()),
+                RouterConfig {
+                    dp_aware,
+                    ..RouterConfig::default()
+                },
+            );
+            let err = service
+                .replace_worker(rank_id.as_str(), worker_spec(&rank_url))
+                .await
+                .expect_err("a rank worker's PUT");
+            assert!(
+                matches!(&err, WorkerServiceError::BadRequest { message }
+                    if message.contains("data-parallel")),
+                "dp_aware {dp_aware}: {err}"
+            );
+            // Past the rank check: the queue is the next thing the plain
+            // worker's PUT meets, uninitialized in this harness.
+            assert!(
+                matches!(
+                    service
+                        .replace_worker(plain_id.as_str(), worker_spec("grpc://10.0.0.13:8000"))
+                        .await
+                        .expect_err("queue is uninitialized"),
+                    WorkerServiceError::QueueNotInitialized
+                ),
+                "dp_aware {dp_aware}"
+            );
+        }
     }
 
     #[tokio::test]

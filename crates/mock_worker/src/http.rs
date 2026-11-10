@@ -342,12 +342,17 @@ fn profile_answer(result: Result<String, String>) -> Response {
 }
 
 /// `GET /server_info` (and its older spelling `/get_server_info`): what the
-/// gateway's metadata read of an HTTP engine asks for. A disaggregated worker
+/// gateway's metadata read of an HTTP engine asks for; a data-parallel mock
+/// (`--http-dp-size` above 1) adds the rank count (`dp_size`) the gateway
+/// registers one row per rank from. A disaggregated worker
 /// reports its role and, on the prefill side, the port its partners
 /// rendezvous on, as the engines' server info carries them; the mock moves
 /// no KV cache and names the one transport the gateway pairs its workers on.
 async fn server_info(State(state): State<Arc<AppState>>) -> Response {
     let mut info = json!({ "model_path": state.cfg.model_id });
+    if state.cfg.http_dp_size > 1 {
+        info["dp_size"] = json!(state.cfg.http_dp_size);
+    }
     if let Some(role) = state.cfg.role {
         info["disaggregation_mode"] = json!(role.as_str());
         info["disaggregation_transfer_backend"] = json!(crate::grpc::KV_TRANSPORT);

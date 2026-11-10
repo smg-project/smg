@@ -1,14 +1,27 @@
-//! Data Parallel (DP) information discovery step.
-
+//! Data-parallel discovery: the rank count a registering engine reports.
+//!
+//! A data-parallel engine registers as one worker per rank, so the routing
+//! policy's pick among the rank workers is the rank choice and every rank
+//! carries its own load. The discovery runs on every registration; no
+//! configuration turns it on (`--dp-aware` is accepted and ignored for one
+//! release). The rank count is read from the labels the metadata discovery
+//! flattened: a gRPC engine's `GetServerInfo`, an SGLang HTTP engine's
+//! `/server_info` (the one HTTP source of a rank count; every other HTTP
+//! runtime registers as one worker). An engine that reports none registers
+//! as one worker; a rank count missing from an SGLang engine's labels is
+//! re-read strictly, so a failed read retries the registration instead of
+//! settling the engine on one worker. A gRPC rank worker's load is pushed by
+//! its servicer; an HTTP rank worker's comes from the gateway's polls, and
+//! each request to it carries its `data_parallel_rank`, as before. A ZMQ
+//! engine's data parallelism is the grouped worker (`dp_size` on the spec:
+//! one worker, one socket set, N engines dialing in), never an expansion.
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use openai_protocol::worker::WorkerSpec;
-use reqwest::Client;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::discover_metadata::get_server_info;
+use super::discover_metadata::server_info_labels;
 use crate::{
     worker::{endpoint::Endpoint, ConnectionMode, UNKNOWN_MODEL_ID},
     workflow::data::{WorkerKind, WorkerWorkflowData},
@@ -21,36 +34,11 @@ pub struct DpInfo {
     pub model_id: String,
 }
 
-/// Get DP info for a worker URL.
-pub async fn get_dp_info(
-    client: &Client,
-    url: &str,
-    api_key: Option<&str>,
-) -> Result<DpInfo, String> {
-    let info = get_server_info(client, url, api_key).await?;
-
-    let dp_size = routing_dp_size(info.dp_size, info.attn_dp_size).map_err(|error| {
-        format!(
-            "Invalid DP metadata from {}: {error}",
-            Endpoint::redacted_str(url)
-        )
-    })?;
-
-    let model_id = info
-        .model_id
-        .filter(|s| !s.is_empty())
-        .or_else(|| info.served_model_name.filter(|s| !s.is_empty()))
-        .or_else(|| {
-            info.model_path
-                .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
-        })
-        .unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string());
-
-    Ok(DpInfo { dp_size, model_id })
-}
-
-/// Build DP info from gRPC-discovered metadata labels, normalized by metadata discovery.
-pub fn dp_info_from_labels(labels: &HashMap<String, String>) -> Result<DpInfo, String> {
+/// The rank count and model of a registering engine, from the labels its
+/// metadata discovery flattened (a gRPC engine's `GetServerInfo`, an HTTP
+/// engine's `/server_info`): `Ok(None)` when the engine reports no width,
+/// `Err` for a width it reports wrongly (zero, unparsable, overflowing).
+pub fn dp_info_from_labels(labels: &HashMap<String, String>) -> Result<Option<DpInfo>, String> {
     let width = |name: &str| {
         labels
             .get(name)
@@ -61,28 +49,33 @@ pub fn dp_info_from_labels(labels: &HashMap<String, String>) -> Result<DpInfo, S
             })
             .transpose()
     };
-    let dp_size = routing_dp_size(width("dp_size")?, width("attn_dp_size")?)?;
+    let Some(dp_size) = routing_dp_size(width("dp_size")?, width("attn_dp_size")?)? else {
+        return Ok(None);
+    };
 
-    Ok(DpInfo {
+    Ok(Some(DpInfo {
         dp_size,
         model_id: model_id_from_labels(labels),
-    })
+    }))
 }
 
-fn routing_dp_size(dp_size: Option<usize>, attn_dp_size: Option<usize>) -> Result<usize, String> {
+fn routing_dp_size(
+    dp_size: Option<usize>,
+    attn_dp_size: Option<usize>,
+) -> Result<Option<usize>, String> {
     if dp_size.is_none() && attn_dp_size.is_none() {
-        return Err("no DP size in discovered metadata".to_string());
+        return Ok(None);
     }
-    // Newer SGLang separates model replicas from attention-DP groups; older
-    // servers report their routing width in dp_size alone.
+    // Newer engine releases separate model replicas from attention-DP groups;
+    // older servers report their routing width in dp_size alone.
     dp_size
         .unwrap_or(1)
         .checked_mul(attn_dp_size.unwrap_or(1))
         .filter(|&width| width > 0)
+        .map(Some)
         .ok_or_else(|| "DP sizes must be positive and their product must fit usize".to_string())
 }
 
-/// Best-effort model identity from discovered metadata labels.
 fn model_id_from_labels(labels: &HashMap<String, String>) -> String {
     labels
         .get("model_id")
@@ -98,19 +91,10 @@ fn model_id_from_labels(labels: &HashMap<String, String>) -> String {
         .unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string())
 }
 
-/// DP info for a ZMQ worker. There is nothing to discover — the engines dial
-/// in later and EngineCore serves no metadata endpoint — so the spec's own
-/// `dp_size` (a grouped worker: one socket set, N engines) is the answer.
-/// Reporting it keeps a ZMQ worker registrable under `--dp-aware`, where an
-/// absent `dp_info` used to fail create_worker with an internal error.
-fn zmq_dp_info(config: &WorkerSpec, labels: &HashMap<String, String>) -> DpInfo {
-    DpInfo {
-        dp_size: config.dp_size.unwrap_or(1).max(1),
-        model_id: model_id_from_labels(labels),
-    }
-}
-
-/// Step 2b: Discover DP (Data Parallel) information (only for DP-aware workers).
+/// Step 2b: the data-parallel rank count of a local worker, read from the
+/// labels metadata discovery flattened its handshake into. Set for a gRPC
+/// or HTTP engine that reports one; left unset for a ZMQ worker and for an
+/// engine that reports none, which register as one worker.
 pub struct DiscoverDPInfoStep;
 
 #[async_trait]
@@ -124,75 +108,77 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
         }
 
         let config = &context.data.config;
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
-
-        if !app_context.router_config.dp_aware {
-            debug!(
-                "Worker {} is not DP-aware, skipping DP discovery",
-                Endpoint::redacted_str(&config.url)
-            );
-            return Ok(StepResult::Success);
-        }
-
-        debug!(
-            "Discovering DP info for {} (DP-aware)",
-            Endpoint::redacted_str(&config.url)
-        );
-
+        let url = Endpoint::redacted_str(&config.url);
+        let labels = &context.data.discovered_labels;
+        let one_worker = |why: &str| debug!("{why} for {url}; registering as one worker");
         let dp_info = match context.data.connection_mode {
-            // gRPC workers report dp_size through GetServerInfo, already
-            // flattened into the discovered metadata labels. A missing label
-            // means the engine cannot honor a rank pin — degrade to a plain
-            // single worker instead of failing registration under --dp-aware.
-            Some(ConnectionMode::Grpc) => {
-                match dp_info_from_labels(&context.data.discovered_labels) {
-                    Ok(info) => info,
-                    Err(e) => {
-                        warn!(
-                            "No DP info for {} ({e}); registering as a single \
-                         non-DP worker",
-                            Endpoint::redacted_str(&config.url)
-                        );
-                        return Ok(StepResult::Success);
-                    }
-                }
+            // A ZMQ engine's data parallelism is the grouped worker (`dp_size`
+            // on the spec), never an expansion.
+            Some(ConnectionMode::Zmq) => {
+                one_worker("No rank expansion over ZMQ");
+                return Ok(StepResult::Success);
             }
-            // A ZMQ worker has no metadata endpoint to discover from: its DP
-            // shape is the spec's own `dp_size` (a grouped worker awaiting N
-            // engines on one socket set). Report it so create_worker can
-            // validate the shape instead of failing on a missing dp_info.
-            Some(ConnectionMode::Zmq) => zmq_dp_info(config, &context.data.discovered_labels),
-            _ => {
-                // HTTP DP discovery uses SGLang's /server_info which exposes
-                // dp_size — other runtimes don't expose DP info this way
-                let runtime = context.data.detected_runtime_type.as_deref();
-                if runtime != Some("sglang") {
-                    warn!(
-                        "DP discovery is not supported for {} HTTP workers ({}), skipping",
-                        runtime.unwrap_or("unknown"),
-                        Endpoint::redacted_str(&config.url)
-                    );
+            // A gRPC engine reports its rank count through GetServerInfo,
+            // flattened into the labels by the metadata discovery.
+            Some(ConnectionMode::Grpc) => match dp_info_from_labels(labels) {
+                Ok(Some(info)) => info,
+                Ok(None) => {
+                    one_worker("No DP size reported");
                     return Ok(StepResult::Success);
                 }
-                let client = context.data.http_client("discover_dp_info")?;
-                get_dp_info(&client, &config.url, config.api_key.as_deref())
-                    .await
-                    .map_err(|e| WorkflowError::StepFailed {
-                        step_id: StepId::new("discover_dp_info"),
-                        message: format!("Failed to get DP info: {e}"),
-                    })?
+                Err(e) => {
+                    warn!("Invalid DP info for {url} ({e}); registering as one worker");
+                    return Ok(StepResult::Success);
+                }
+            },
+            // Over HTTP the one source of a rank count is SGLang's
+            // /server_info; every other runtime (vLLM, TRT-LLM, MLX, a nested
+            // gateway registered as `generic`, whose /get_server_info is one
+            // of its engines') registers as one worker. The registration's
+            // tolerant metadata read leaves a gap where /server_info failed,
+            // so a rank count missing from the labels is re-read strictly: a
+            // failed read fails the step, which is retried, rather than
+            // settling the engine on one worker; an engine that answers
+            // without a rank count is one worker.
+            _ => {
+                if context.data.detected_runtime_type.as_deref() != Some("sglang") {
+                    one_worker("No rank discovery for this HTTP runtime");
+                    return Ok(StepResult::Success);
+                }
+                match dp_info_from_labels(labels) {
+                    Ok(Some(info)) => info,
+                    Err(e) => {
+                        warn!("Invalid DP info for {url} ({e}); registering as one worker");
+                        return Ok(StepResult::Success);
+                    }
+                    Ok(None) => {
+                        let client = context.data.http_client("discover_dp_info")?;
+                        let read =
+                            server_info_labels(&client, &config.url, config.api_key.as_deref())
+                                .await
+                                .map_err(|e| WorkflowError::StepFailed {
+                                    step_id: StepId::new("discover_dp_info"),
+                                    message: format!("Failed to read the rank count of {url}: {e}"),
+                                })?;
+                        match read.as_ref().map(dp_info_from_labels) {
+                            Some(Ok(Some(info))) => info,
+                            Some(Err(e)) => {
+                                warn!("Invalid DP info for {url} ({e}); registering as one worker");
+                                return Ok(StepResult::Success);
+                            }
+                            Some(Ok(None)) | None => {
+                                one_worker("No DP size in /server_info");
+                                return Ok(StepResult::Success);
+                            }
+                        }
+                    }
+                }
             }
         };
 
         debug!(
-            "Discovered DP size {} for {} (model: {})",
-            dp_info.dp_size,
-            Endpoint::redacted_str(&config.url),
-            dp_info.model_id
+            "Discovered DP size {} for {url} (model: {})",
+            dp_info.dp_size, dp_info.model_id
         );
 
         context.data.dp_info = Some(dp_info);
@@ -206,8 +192,21 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use openai_protocol::worker::WorkerSpec;
+    use wfaas::WorkflowInstanceId;
+
     use super::*;
-    use crate::workflow::steps::local::test_support::labels_of;
+    use crate::{
+        app_context::testing::app_context_for_tests,
+        config::RouterConfig,
+        worker::WorkerRegistry,
+        workflow::{
+            data::WorkerRegistrationMode,
+            steps::{create_worker_workflow_data, local::test_support::labels_of},
+        },
+    };
 
     #[test]
     fn dp_info_from_labels_reads_dp_size_and_model() {
@@ -219,7 +218,7 @@ mod tests {
         ] {
             let mut metadata = labels_of(&widths);
             metadata.insert("served_model_name".to_string(), "m".to_string());
-            let info = dp_info_from_labels(&metadata).unwrap();
+            let info = dp_info_from_labels(&metadata).unwrap().expect("a width");
             assert_eq!(info.dp_size, 4);
             assert_eq!(info.model_id, "m");
         }
@@ -228,40 +227,27 @@ mod tests {
     #[test]
     fn dp_info_from_labels_model_path_fallback() {
         let info = dp_info_from_labels(&labels_of(&[("dp_size", "2"), ("model_path", "org/repo")]))
-            .unwrap();
+            .unwrap()
+            .expect("a width");
         assert_eq!(info.model_id, "repo");
         let info =
             dp_info_from_labels(&labels_of(&[("dp_size", "2"), ("model_path", "org/repo/")]))
-                .unwrap();
+                .unwrap()
+                .expect("a width");
         assert_eq!(info.model_id, "repo");
     }
 
     #[test]
     fn dp_info_from_labels_unknown_model_when_absent() {
-        let info = dp_info_from_labels(&labels_of(&[("dp_size", "2")])).unwrap();
+        let info = dp_info_from_labels(&labels_of(&[("dp_size", "2")]))
+            .unwrap()
+            .expect("a width");
         assert_eq!(info.model_id, UNKNOWN_MODEL_ID);
     }
 
     #[test]
-    fn zmq_dp_info_uses_the_spec_dp_size() {
-        // Nothing to discover over ZMQ: an ungrouped worker is dp_size 1 and a
-        // grouped one reports its spec size, so create_worker gets a dp_info
-        // to validate under --dp-aware instead of an internal error.
-        let mut spec = WorkerSpec::new("ipc:///tmp/smg-zmq/engine.ipc");
-        let info = zmq_dp_info(&spec, &labels_of(&[("model_id", "m")]));
-        assert_eq!(info.dp_size, 1);
-        assert_eq!(info.model_id, "m");
-
-        spec.dp_size = Some(4);
-        assert_eq!(zmq_dp_info(&spec, &HashMap::new()).dp_size, 4);
-
-        spec.dp_size = Some(0);
-        assert_eq!(zmq_dp_info(&spec, &HashMap::new()).dp_size, 1);
-    }
-
-    #[test]
-    fn dp_info_from_labels_rejects_missing_or_zero_dp_size() {
-        assert!(dp_info_from_labels(&labels_of(&[])).is_err());
+    fn dp_info_from_labels_leaves_a_missing_width_and_rejects_a_wrong_one() {
+        assert!(dp_info_from_labels(&labels_of(&[])).unwrap().is_none());
         assert!(dp_info_from_labels(&labels_of(&[("dp_size", "0")])).is_err());
         assert!(dp_info_from_labels(&labels_of(&[("dp_size", "abc")])).is_err());
         assert!(
@@ -272,5 +258,146 @@ mod tests {
         );
         let overflow = labels_of(&[("dp_size", &usize::MAX.to_string()), ("attn_dp_size", "2")]);
         assert!(dp_info_from_labels(&overflow).is_err());
+    }
+
+    /// The step run over a local worker of `mode` at `url`, its runtime as
+    /// detected, whose metadata discovery left `labels`, under a
+    /// configuration with `dp_aware` as given: what it leaves for the create
+    /// step, or the step's error.
+    async fn discovered(
+        mode: ConnectionMode,
+        runtime: &str,
+        url: &str,
+        labels: &[(&str, &str)],
+        dp_aware: bool,
+    ) -> WorkflowResult<Option<DpInfo>> {
+        let router_config = RouterConfig {
+            dp_aware,
+            ..RouterConfig::default()
+        };
+        let mut data = create_worker_workflow_data(
+            WorkerSpec::new(url),
+            WorkerRegistrationMode::Upsert,
+            app_context_for_tests(router_config, Arc::new(WorkerRegistry::new()), None),
+        );
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(mode);
+        data.detected_runtime_type = Some(runtime.to_string());
+        data.discovered_labels = labels_of(labels);
+        let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
+        assert_eq!(
+            DiscoverDPInfoStep.execute(&mut ctx).await?,
+            StepResult::Success
+        );
+        Ok(ctx.data.dp_info)
+    }
+
+    const GRPC: (ConnectionMode, &str, &str) =
+        (ConnectionMode::Grpc, "tokenspeed", "grpc://worker:8000");
+    /// A closed port: an HTTP engine nothing answers for.
+    const HTTP: (ConnectionMode, &str, &str) =
+        (ConnectionMode::Http, "sglang", "http://127.0.0.1:1");
+
+    /// Discovery runs on every registration, whatever the retired flag says:
+    /// a gRPC or SGLang HTTP engine that reports four ranks leaves a four-rank
+    /// `dp_info` for the create step; one that reports a single rank leaves a
+    /// single-rank one; one that reports a wrong width, a gRPC engine that
+    /// reports none, an HTTP engine of another runtime and a ZMQ worker leave
+    /// none (one worker each).
+    #[tokio::test]
+    async fn ranks_are_discovered_for_grpc_and_http_engines_without_any_flag() {
+        let four = [("dp_size", "4"), ("model_id", "m")];
+        for dp_aware in [false, true] {
+            for (mode, runtime, url) in [GRPC, HTTP] {
+                let info = discovered(mode, runtime, url, &four, dp_aware)
+                    .await
+                    .unwrap()
+                    .expect("the engine's rank count is discovered");
+                assert_eq!(
+                    (info.dp_size, info.model_id.as_str()),
+                    (4, "m"),
+                    "{mode:?} dp_aware {dp_aware}"
+                );
+                let one = discovered(mode, runtime, url, &[("dp_size", "1")], dp_aware)
+                    .await
+                    .unwrap()
+                    .expect("a single rank is reported too");
+                assert_eq!(one.dp_size, 1, "{mode:?}");
+                assert!(
+                    discovered(mode, runtime, url, &[("dp_size", "0")], dp_aware)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "{mode:?}: a wrong width, one worker"
+                );
+            }
+            assert!(discovered(GRPC.0, GRPC.1, GRPC.2, &[], dp_aware)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(
+                discovered(ConnectionMode::Http, "generic", HTTP.2, &four, dp_aware)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "another HTTP runtime registers as one worker whatever its labels say"
+            );
+            assert!(discovered(
+                ConnectionMode::Zmq,
+                "tokenspeed",
+                "zmq://worker:8000",
+                &four,
+                dp_aware
+            )
+            .await
+            .unwrap()
+            .is_none());
+        }
+    }
+
+    /// An SGLang HTTP engine whose labels carry no rank count is re-read
+    /// strictly: a failed read fails the step (the registration retries), an
+    /// engine answering without a width is one worker, one answering a width
+    /// is expanded.
+    #[tokio::test]
+    async fn a_missing_http_rank_count_is_re_read_strictly() {
+        let failed = discovered(HTTP.0, HTTP.1, HTTP.2, &[], false).await;
+        assert!(failed.is_err(), "{failed:?}");
+        for (body, want) in [
+            (r#"{"model_path":"org/m"}"#, None),
+            (r#"{"model_path":"org/m","dp_size":4}"#, Some(4)),
+        ] {
+            let (url, server) = serve_json(body).await;
+            let info = discovered(ConnectionMode::Http, "sglang", &url, &[], false)
+                .await
+                .unwrap();
+            server.abort();
+            assert_eq!(info.as_ref().map(|info| info.dp_size), want, "{body}");
+            if let Some(info) = info {
+                assert_eq!(info.model_id, "m");
+            }
+        }
+    }
+
+    /// A local server answering `body` as JSON at every path.
+    async fn serve_json(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{http::header::CONTENT_TYPE, Router};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only server; the handle is aborted at the test's end"
+        )]
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .fallback(move || async move { ([(CONTENT_TYPE, "application/json")], body) }),
+            )
+            .await
+            .unwrap();
+        });
+        (format!("http://127.0.0.1:{port}"), server)
     }
 }

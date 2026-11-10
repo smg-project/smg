@@ -56,9 +56,9 @@ pub struct ServerInfo {
     pub max_running_requests: Option<usize>,
     /// Whether the engine splits `max_running_requests` across its
     /// attention-DP workers (`attn_dp_size` above carries that width as its
-    /// newer releases resolve it): under `--dp-aware` each rank worker then
-    /// gets its share of the window (`create_worker::labels_for_rank`), on
-    /// this path as on the gRPC one.
+    /// newer releases resolve it): each rank worker then gets its share of
+    /// the window (`create_worker::labels_for_rank`), on this path as on the
+    /// gRPC one.
     pub enable_dp_attention: Option<bool>,
     pub weight_version: Option<String>,
 }
@@ -121,17 +121,6 @@ impl std::fmt::Display for MetadataError {
 }
 
 /// GET JSON with optional bearer auth, with 404 fallback to `/get_<endpoint>`.
-async fn get_json_with_fallback<T: serde::de::DeserializeOwned>(
-    client: &Client,
-    base_url: &str,
-    endpoint: &str,
-    api_key: Option<&str>,
-) -> Result<T, String> {
-    get_json_with_fallback_classified(client, base_url, endpoint, api_key)
-        .await
-        .map_err(|e| e.to_string())
-}
-
 async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
     client: &Client,
     base_url: &str,
@@ -221,14 +210,6 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
         .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))
 }
 
-pub async fn get_server_info(
-    client: &Client,
-    url: &str,
-    api_key: Option<&str>,
-) -> Result<ServerInfo, String> {
-    get_json_with_fallback(client, &http_base_url(url), "server_info", api_key).await
-}
-
 /// The labels an engine reports about itself, read the way registration
 /// reads them: an HTTP engine's metadata endpoints (by runtime), or a gRPC
 /// engine's model and server info. Callable again for a worker that is
@@ -280,6 +261,30 @@ async fn fetch_sglang_http_metadata(
     fetch_sglang_http_metadata_checked(client, url, api_key, false)
         .await
         .unwrap_or_default()
+}
+
+/// An HTTP engine's `/server_info`, read strictly, as the labels the
+/// discovery step takes a rank count from: `Ok(Some(labels))` on an answer,
+/// `Ok(None)` for an engine that does not offer the endpoint (404 on every
+/// spelling), `Err` for a read that failed (transport, timeout, a non-2xx
+/// other than 404, an unparsable body), which the step retries.
+pub(super) async fn server_info_labels(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> Result<Option<HashMap<String, String>>, String> {
+    match get_json_with_fallback_classified::<ServerInfo>(
+        client,
+        &http_base_url(url),
+        "server_info",
+        api_key,
+    )
+    .await
+    {
+        Ok(info) => Ok(Some(flat_labels(&info))),
+        Err(MetadataError::NotOffered) => Ok(None),
+        Err(MetadataError::Failed(e)) => Err(e),
+    }
 }
 
 /// The SGLang HTTP metadata. Registration tolerates an endpoint that fails
@@ -1252,7 +1257,9 @@ mod tests {
                 labels.get("max_running_requests").map(String::as_str),
                 Some("256")
             );
-            let dp_info = super::super::discover_dp::dp_info_from_labels(&labels).unwrap();
+            let dp_info = super::super::discover_dp::dp_info_from_labels(&labels)
+                .unwrap()
+                .expect("a width");
             assert_eq!(dp_info.dp_size, 4);
         }
     }
@@ -1349,8 +1356,8 @@ mod tests {
 
     /// A credentialed worker that answers 401 (a wrong password): the error
     /// text names the address masked, never the secret. The status error is
-    /// the likeliest failure of such a worker, and it ends in the DP
-    /// discovery's warning and the step's failure message.
+    /// the likeliest failure of such a worker, and it ends in the step's
+    /// failure message and the strict refresh's error.
     #[tokio::test]
     async fn a_status_error_names_the_address_masked() {
         use axum::{http::StatusCode, Router};
@@ -1371,13 +1378,15 @@ mod tests {
             .unwrap();
         });
 
-        let err = get_server_info(
+        let err = get_json_with_fallback_classified::<ServerInfo>(
             &crate::server::http_client(),
-            &format!("http://user:secret@127.0.0.1:{port}"),
+            &http_base_url(&format!("http://user:secret@127.0.0.1:{port}")),
+            "server_info",
             None,
         )
         .await
-        .expect_err("401 is a failure");
+        .expect_err("401 is a failure")
+        .to_string();
         server.abort();
 
         assert!(!err.contains("secret"), "{err}");

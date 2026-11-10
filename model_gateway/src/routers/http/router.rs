@@ -1215,11 +1215,12 @@ impl Router {
 
     /// The worker of a transcription, or the refusal this router answers.
     /// Multipart transcription can't route through `worker.prepare_request`,
-    /// which is the hook that injects `data_parallel_rank` for DP-aware
-    /// workers: DP-aware workers are pre-filtered out of the candidate pool
-    /// so the policy can pick a non-DP worker when one exists, and the
-    /// request falls back to model_not_found / 400 only when the pool is
-    /// empty or every candidate is DP-aware. The verdict on a policy that
+    /// which is the hook that injects `data_parallel_rank` for a rank worker,
+    /// so a plain worker is preferred: rank workers leave the candidate pool
+    /// while a plain one exists. Where a model's workers are all rank rows,
+    /// one row per engine stands for it and the engine places the unpinned
+    /// request itself, as it did for the one worker it was before rank
+    /// discovery ran on every registration. The verdict on a policy that
     /// returns no worker is judged from the same pool.
     fn select_transcription_worker(
         &self,
@@ -1243,16 +1244,21 @@ impl Router {
                 error::model_not_found(model_id),
             ));
         }
-        let non_dp_workers: Vec<Arc<dyn Worker>> = all_workers
+        let mut non_dp_workers: Vec<Arc<dyn Worker>> = all_workers
             .iter()
             .filter(|w| !w.is_dp_aware())
             .cloned()
             .collect();
         if non_dp_workers.is_empty() {
-            return Err(error::bad_request(
-                "dp_aware_not_supported",
-                "/v1/audio/transcriptions does not yet support DP-aware workers",
-            ));
+            let mut rows: Vec<Arc<dyn Worker>> = all_workers.to_vec();
+            rows.sort_by_key(|w| w.dp_rank());
+            let mut engines: Vec<String> = Vec::new();
+            for row in rows {
+                if !engines.iter().any(|engine| engine == row.base_url()) {
+                    engines.push(row.base_url().to_string());
+                    non_dp_workers.push(row);
+                }
+            }
         }
         let Some(worker) = placement::select_from(
             &self.worker_registry,
@@ -1803,8 +1809,8 @@ struct RouteOutcome<'a> {
 
 impl RouteOutcome<'_> {
     /// Finalize router metrics for an early error that never reached an
-    /// upstream worker (model_not_found, dp_aware_not_supported, no
-    /// available workers, build failure). Without this, pre-send failures
+    /// upstream worker (model_not_found, no available workers, build
+    /// failure). Without this, pre-send failures
     /// silently disappear from router_upstream_responses / router_error.
     fn pre_send_error(&self, response: &Response) {
         let rstatus = response.status();
@@ -3243,6 +3249,71 @@ mod tests {
             !errors.iter().any(|line| line.contains(r#"model="m1""#)),
             "{errors:?}"
         );
+    }
+
+    /// A model whose workers are all rank rows (two engines of two ranks
+    /// each) still has a transcription worker: one row per engine stands in,
+    /// the engine's first rank, and the multipart request goes to the
+    /// engine's own address, unpinned. A model nobody serves stays
+    /// model_not_found.
+    #[test]
+    fn a_transcription_over_rank_rows_takes_one_row_per_engine() {
+        let router = create_test_regular_router();
+        for url in ["http://worker1:8080", "http://worker2:8080"] {
+            router.worker_registry.remove_by_url(url);
+        }
+        for (engine, rank) in [
+            ("http://engine-a:8000", 1),
+            ("http://engine-a:8000", 0),
+            ("http://engine-b:8000", 0),
+            ("http://engine-b:8000", 1),
+        ] {
+            let row = BasicWorkerBuilder::new(engine)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .dp_config(rank, 2)
+                .build();
+            router.worker_registry.register_or_replace(Arc::new(row));
+        }
+        let routing = RoutingDerivatives {
+            tokens: None,
+            text: None,
+            rid_key: None,
+            cache_namespace: None,
+        };
+        let mut engines = std::collections::BTreeSet::new();
+        for _ in 0..8 {
+            let worker = match router.select_transcription_worker(
+                None,
+                crate::worker::UNKNOWN_MODEL_ID,
+                &routing,
+            ) {
+                Ok(worker) => worker,
+                Err(refusal) => panic!(
+                    "a rank-row model has a transcription worker, got {}",
+                    refusal.status()
+                ),
+            };
+            assert!(worker.is_dp_aware(), "{}", worker.url());
+            assert_eq!(
+                worker.dp_rank(),
+                Some(0),
+                "the engine's first row: {}",
+                worker.url()
+            );
+            assert_eq!(
+                worker.endpoint_url("/v1/audio/transcriptions"),
+                format!("{}/v1/audio/transcriptions", worker.base_url()),
+                "unpinned, at the engine's own address"
+            );
+            engines.insert(worker.base_url().to_string());
+        }
+        assert!(!engines.is_empty());
+        let Err(refused) = router.select_transcription_worker(None, "nobody-serves-this", &routing)
+        else {
+            panic!("an unserved model is refused");
+        };
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
