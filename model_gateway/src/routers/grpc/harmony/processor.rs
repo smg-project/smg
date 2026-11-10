@@ -470,7 +470,7 @@ mod tests {
             cached: 0,
             reasoning,
             spec_accepted: 0,
-            spec_drafted: 0,
+            spec_drafted: Some(0),
         }
     }
 

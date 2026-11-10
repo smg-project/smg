@@ -1141,6 +1141,7 @@ impl ResponseProcessor {
         let mut total_reasoning = 0u32;
         let mut total_spec_accepted = 0u32;
         let mut total_spec_drafted = 0u32;
+        let mut has_unknown_spec_draft_tokens = false;
         let mut choices = Vec::new();
 
         for (prompt_index, all_responses) in collected.into_iter().enumerate() {
@@ -1172,6 +1173,8 @@ impl ResponseProcessor {
                 total_reasoning += complete.reasoning_tokens();
                 total_spec_accepted += complete.spec_accepted_tokens();
                 total_spec_drafted += complete.spec_draft_tokens();
+                has_unknown_spec_draft_tokens |= complete.spec_draft_tokens() == 0
+                    || complete.spec_draft_tokens() < complete.spec_accepted_tokens();
 
                 let finish_reason =
                     utils::completion_finish_reason(stopped, complete.finish_reason());
@@ -1253,7 +1256,13 @@ impl ResponseProcessor {
                     cached: total_cached,
                     reasoning: total_reasoning,
                     spec_accepted: total_spec_accepted,
-                    spec_drafted: total_spec_drafted,
+                    spec_drafted: if has_unknown_spec_draft_tokens
+                        && (total_spec_drafted > 0 || total_spec_accepted > 0)
+                    {
+                        None
+                    } else {
+                        Some(total_spec_drafted)
+                    },
                 }
                 .usage(),
             ),
