@@ -526,11 +526,18 @@ impl KvEventMonitor {
                 // stop retrying — this RPC will never succeed.
                 if e.code() == tonic::Code::Unimplemented {
                     match sub.role {
+                        // The one line an operator gets for a model that lost
+                        // cache-aware routing: it names the model and carries
+                        // the servicer's own reason (the publisher is off, or
+                        // the engine cannot serve this model's cache groups).
                         Role::Index { .. } => warn!(
                             worker_url = %Endpoint::redacted_str(worker_url),
+                            model_id = sub.model_id,
+                            reason = e.message(),
                             "Backend does not implement SubscribeKvEvents, \
                              disabling KV event subscription for this worker; \
-                             cache-aware routing sees nothing of its cache"
+                             cache tracking for the model falls back to the \
+                             approximate prefix tree"
                         ),
                         Role::Loads => info!(
                             worker_url = %Endpoint::redacted_str(worker_url),
@@ -793,7 +800,10 @@ mod tests {
 
     use futures::Stream;
     use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
-    use openai_protocol::worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType};
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType},
+    };
     use smg_grpc_client::{
         common_proto as common,
         tokenspeed_scheduler::tokenspeed_proto::{
@@ -802,6 +812,7 @@ mod tests {
         },
     };
     use tonic::{transport::Server, Request, Response, Status};
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::{
@@ -1717,8 +1728,10 @@ mod tests {
     }
 
     /// A backend that serves no KV events (an engine whose publisher is off)
-    /// left one WARN line as the only trace of a cache-aware router routing
-    /// blind: the worker carries a gauge from the answer until it leaves.
+    /// leaves one WARN line, which names the model that lost cache-aware
+    /// routing and carries the servicer's own reason; the worker carries a
+    /// gauge from the answer until it leaves.
+    #[traced_test]
     #[test]
     fn a_backend_without_kv_events_is_a_gauge_until_the_worker_leaves() {
         use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -1745,7 +1758,18 @@ mod tests {
             rt.block_on(async {
                 let (addr, server) = serve(Subscribe::Unimplemented).await;
 
-                let worker = grpc_worker(addr);
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://{addr}"))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::TokenSpeed)
+                        .model(ModelCard::new("hybrid-m"))
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                );
                 let monitor = KvEventMonitor::new();
                 monitor
                     .on_worker_added(&worker, SubscriptionKind::Events)
@@ -1761,6 +1785,14 @@ mod tests {
                     Some(1.0),
                     "the answer raises the gauge"
                 );
+                // The WARN says which model lost cache-aware routing, why the
+                // servicer refused, and where its cache tracking went.
+                assert!(logs_contain("hybrid-m"), "the model is named");
+                assert!(
+                    logs_contain("KV cache events not enabled"),
+                    "the servicer's reason rides the line"
+                );
+                assert!(logs_contain("approximate prefix tree"));
 
                 monitor.on_worker_removed(worker.url()).await;
                 assert_eq!(
