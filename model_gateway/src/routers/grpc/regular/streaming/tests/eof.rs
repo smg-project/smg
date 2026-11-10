@@ -1,10 +1,10 @@
 //! Test gateway parsers and SSE events with exact gRPC frames.
 
-use std::{sync::atomic::Ordering, time::Duration};
+use std::{pin::Pin, sync::atomic::Ordering, task::Poll, time::Duration};
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use bytes::BufMut;
-use futures::{stream, StreamExt as _};
+use futures::{stream, Stream, StreamExt as _};
 use http_body::Frame;
 use http_body_util::StreamBody;
 use openai_protocol::{
@@ -40,6 +40,11 @@ pub(super) fn runtime() -> tokio::runtime::Runtime {
         .enable_all()
         .build()
         .expect("a current-thread runtime")
+}
+
+/// The next pull on `body`, polled once.
+pub(super) async fn pull(body: &mut DrivenBody) -> Poll<Option<Result<Bytes, std::io::Error>>> {
+    std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *body).poll_next(cx))).await
 }
 
 pub(crate) fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
@@ -172,7 +177,7 @@ pub(super) fn trailers_frame(grpc_status: &'static str) -> Frame<Bytes> {
 pub(super) fn decoded_stream<M, S>(body: S) -> tonic::Streaming<M>
 where
     M: ProstMessage + Default + Send + 'static,
-    S: futures::Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
+    S: Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
 {
     let mut codec = tonic_prost::ProstCodec::<M, M>::default();
     tonic::Streaming::new_response(
@@ -188,7 +193,7 @@ where
 /// stream that was never dispatched (nothing to cancel on drop).
 fn response_stream<S>(body: S, client: VllmEngineClient) -> ProtoStream
 where
-    S: futures::Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
+    S: Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
 {
     let stream = AbortOnDropStream::new(decoded_stream(body), "eof-test".to_string(), client);
     // No generation was sent to the mock, so there is nothing to cancel.
