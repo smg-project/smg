@@ -1208,6 +1208,33 @@ mod tests {
         (work, dropped_rx)
     }
 
+    /// Delete `id`'s record while `run` works under the watch: the run ends
+    /// within five seconds, its work is dropped (`dropped_rx` fires), nothing
+    /// is written under the deleted id and `registry` holds nothing in flight.
+    async fn the_delete_ends_the_run(
+        storage: &Arc<dyn ResponseStorage>,
+        id: &str,
+        run: tokio::task::JoinHandle<()>,
+        dropped_rx: oneshot::Receiver<()>,
+        registry: &BackgroundResponses,
+    ) {
+        storage
+            .delete_response(&ResponseId::from(id))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the run ends once its record is gone")
+            .unwrap();
+        dropped_rx.await.expect("the work was dropped");
+        assert_eq!(
+            stored_raw(storage, id).await,
+            Value::Null,
+            "nothing is written under the deleted {id}"
+        );
+        assert_eq!(registry.in_flight(), 0);
+    }
+
     /// A memory store that counts its writes.
     struct CountingStorage {
         inner: MemoryResponseStorage,
@@ -1831,21 +1858,7 @@ mod tests {
             Duration::from_millis(10),
         ));
         wait_for_status(&storage, "resp_1", "in_progress").await;
-        storage
-            .delete_response(&ResponseId::from("resp_1"))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .expect("the run ends once its record is gone")
-            .unwrap();
-        dropped_rx.await.expect("the work was dropped");
-        assert_eq!(
-            stored_raw(&storage, "resp_1").await,
-            Value::Null,
-            "nothing is written under the deleted id"
-        );
-        assert_eq!(registry.in_flight(), 0);
+        the_delete_ends_the_run(&storage, "resp_1", task, dropped_rx, &registry).await;
     }
 
     /// A store that never shows the record (no history backend, or a record
@@ -1905,21 +1918,7 @@ mod tests {
             "the watch read the record: {} calls",
             flaky.calls()
         );
-        storage
-            .delete_response(&ResponseId::from("resp_1"))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .expect("the run ends once its record is gone")
-            .unwrap();
-        dropped_rx.await.expect("the work was dropped");
-        assert_eq!(
-            stored_raw(&storage, "resp_1").await,
-            Value::Null,
-            "nothing is written under the deleted id"
-        );
-        assert_eq!(registry.in_flight(), 0);
+        the_delete_ends_the_run(&storage, "resp_1", task, dropped_rx, &registry).await;
     }
 
     /// The guard of the terminal persist is the conditional write: an open

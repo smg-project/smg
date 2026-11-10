@@ -339,21 +339,33 @@ mod tests {
         ApprovalManager::new(policy_engine, audit_log)
     }
 
+    /// The approval parameters of the request `req-1` for `tool_name` on
+    /// `server` (the elicitation `elicit-1`), with `message` for the user,
+    /// under `hints` and `tenant`.
+    fn approval_params<'a>(
+        tool_name: &'a str,
+        message: &'a str,
+        hints: &'a ToolAnnotations,
+        tenant: &'a TenantContext,
+    ) -> ApprovalParams<'a> {
+        ApprovalParams {
+            request_id: "req-1",
+            server_key: "server",
+            elicitation_id: "elicit-1",
+            tool_name,
+            hints,
+            message,
+            tenant_ctx: tenant,
+        }
+    }
+
     #[tokio::test]
     async fn test_policy_only_mode() {
         let manager = test_manager();
         let tenant = TenantContext::new("test");
         let hints = ToolAnnotations::new().with_read_only(true);
 
-        let params = ApprovalParams {
-            request_id: "req-1",
-            server_key: "server",
-            elicitation_id: "elicit-1",
-            tool_name: "read_tool",
-            hints: &hints,
-            message: "Allow read?",
-            tenant_ctx: &tenant,
-        };
+        let params = approval_params("read_tool", "Allow read?", &hints, &tenant);
 
         let outcome = manager
             .handle_approval(ApprovalMode::PolicyOnly, params)
@@ -372,15 +384,7 @@ mod tests {
         let tenant = TenantContext::new("test");
         let hints = ToolAnnotations::new().with_destructive(true);
 
-        let params = ApprovalParams {
-            request_id: "req-1",
-            server_key: "server",
-            elicitation_id: "elicit-1",
-            tool_name: "delete_tool",
-            hints: &hints,
-            message: "Allow delete?",
-            tenant_ctx: &tenant,
-        };
+        let params = approval_params("delete_tool", "Allow delete?", &hints, &tenant);
 
         let outcome = manager
             .handle_approval(ApprovalMode::Interactive, params)
@@ -407,15 +411,7 @@ mod tests {
         let tenant = TenantContext::new("test");
         let hints = ToolAnnotations::new();
 
-        let params = ApprovalParams {
-            request_id: "req-1",
-            server_key: "server",
-            elicitation_id: "elicit-1",
-            tool_name: "tool",
-            hints: &hints,
-            message: "Allow?",
-            tenant_ctx: &tenant,
-        };
+        let params = approval_params("tool", "Allow?", &hints, &tenant);
 
         let outcome = manager
             .handle_approval(ApprovalMode::Interactive, params)
@@ -454,30 +450,14 @@ mod tests {
         let tenant = TenantContext::new("test");
         let hints = ToolAnnotations::new();
 
-        let params = ApprovalParams {
-            request_id: "req-1",
-            server_key: "server",
-            elicitation_id: "elicit-1",
-            tool_name: "tool",
-            hints: &hints,
-            message: "Allow?",
-            tenant_ctx: &tenant,
-        };
+        let params = approval_params("tool", "Allow?", &hints, &tenant);
 
         manager
             .handle_approval(ApprovalMode::Interactive, params)
             .await
             .unwrap();
 
-        let params2 = ApprovalParams {
-            request_id: "req-1",
-            server_key: "server",
-            elicitation_id: "elicit-1",
-            tool_name: "tool",
-            hints: &hints,
-            message: "Allow?",
-            tenant_ctx: &tenant,
-        };
+        let params2 = approval_params("tool", "Allow?", &hints, &tenant);
 
         let result = manager
             .handle_approval(ApprovalMode::Interactive, params2)

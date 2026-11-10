@@ -13,7 +13,7 @@
 # Environment (defaults in brackets):
 #   GS_DIR       run directory for logs, pids and cells [target/grpc-stress]
 #   SMG_BIN      gateway binary [target/release/smg]      MOCK_BIN  [target/release/mock-worker]
-#   GW_PORT      [29600]  PROM_PORT [29601]  ADMIN_PORT [29609]  MOCK_BASE [29610]  WORKERS [12]
+#   GW_PORT      [29600]  PROM_PORT [29601]  ADMIN_PORT [29609]  MOCK_BASE [29610]  WORKERS [12], one or more
 #   FLEET        grpc | prefill-decode | http: one fleet of regular gRPC engines; a prefill fleet and a decode fleet
 #                registered with their roles, so the gateway serves the model on its prefill-decode path; or one
 #                fleet of regular HTTP engines, so the gateway serves it on its HTTP regular path [grpc]
@@ -70,9 +70,7 @@ GW=http://127.0.0.1:$GW_PORT
 ts() { date -u +%FT%TZ; }
 die() { echo "$(ts) bed: $*" >&2; exit 1; }
 case "$FLEET" in
-  grpc|http) ;;
-  prefill-decode)
-    [ "$PREFILL_WORKERS" -ge 1 ] 2>/dev/null || die "PREFILL_WORKERS=$PREFILL_WORKERS: one prefill engine or more" ;;
+  grpc|http|prefill-decode) ;;
   *) die "FLEET=$FLEET: grpc, prefill-decode or http" ;;
 esac
 # The prefix that runs a command in a transient systemd user scope of its own (memory accounting on), so the bed's
@@ -138,7 +136,7 @@ start_fleet() {
     return 1
   fi
   fleet=$(curl -s "http://127.0.0.1:$admin/admin/fleet" | python3 -c 'import json,sys; d=json.load(sys.stdin); w=d["workers"] if isinstance(d,dict) else d; print(len(w))' 2>/dev/null)
-  [ "${fleet:-0}" = "$count" ] || { echo "$(ts) bed: the $name fleet has ${fleet:-0} workers, not $count (see $BED/$name.log)" >&2; return 1; }
+  [ -n "$fleet" ] && [ "$fleet" = "$count" ] || { echo "$(ts) bed: the $name fleet has ${fleet:-no readable list of} workers, not $count (see $BED/$name.log)" >&2; return 1; }
 }
 
 # register <wire> <port> <extra labels> <extra fields>: one worker of the model on the wire (grpc or http) at the
@@ -162,6 +160,8 @@ case "$cmd" in
     cat "$BED/bed.json" 2>/dev/null || die "no bed.json under $BED"
     ;;
   up)
+    [ "$WORKERS" -ge 1 ] 2>/dev/null || die "WORKERS=$WORKERS: one engine or more"
+    [ "$FLEET" != prefill-decode ] || [ "$PREFILL_WORKERS" -ge 1 ] 2>/dev/null || die "PREFILL_WORKERS=$PREFILL_WORKERS: one prefill engine or more"
     : "${TOKENIZER:?set TOKENIZER to a tokenizer directory or hub id}"
     [ -x "$SMG_BIN" ] || die "no gateway binary at $SMG_BIN"
     [ -x "$MOCK_BIN" ] || die "no mock-worker binary at $MOCK_BIN"
