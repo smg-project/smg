@@ -526,18 +526,24 @@ impl KvEventMonitor {
                 // stop retrying — this RPC will never succeed.
                 if e.code() == tonic::Code::Unimplemented {
                     match sub.role {
-                        // The one line an operator gets for a model that lost
-                        // cache-aware routing: it names the model and carries
-                        // the servicer's own reason (the publisher is off, or
-                        // the engine cannot serve this model's cache groups).
+                        // The one line an operator gets for a worker whose
+                        // cache the cache-aware policy cannot see: it names
+                        // the model and carries the servicer's own reason
+                        // (the publisher is off, or the engine cannot serve
+                        // this model's cache groups). The model itself stays
+                        // on its event index while any other worker of it
+                        // publishes; only when none does is it routed on the
+                        // approximate prefix tree.
                         Role::Index { .. } => warn!(
                             worker_url = %Endpoint::redacted_str(worker_url),
                             model_id = sub.model_id,
                             reason = e.message(),
                             "Backend does not implement SubscribeKvEvents, \
                              disabling KV event subscription for this worker; \
-                             cache tracking for the model falls back to the \
-                             approximate prefix tree"
+                             cache-aware routing sees nothing of this worker's \
+                             cache, and the model falls back to the approximate \
+                             prefix tree only when no worker of it publishes \
+                             events"
                         ),
                         Role::Loads => info!(
                             worker_url = %Endpoint::redacted_str(worker_url),
@@ -1728,9 +1734,10 @@ mod tests {
     }
 
     /// A backend that serves no KV events (an engine whose publisher is off)
-    /// leaves one WARN line, which names the model that lost cache-aware
-    /// routing and carries the servicer's own reason; the worker carries a
-    /// gauge from the answer until it leaves.
+    /// leaves one WARN line, which names the model, carries the servicer's
+    /// own reason and says that the model reaches the approximate tree only
+    /// when no worker of it publishes; the worker carries a gauge from the
+    /// answer until it leaves.
     #[traced_test]
     #[test]
     fn a_backend_without_kv_events_is_a_gauge_until_the_worker_leaves() {
@@ -1785,14 +1792,27 @@ mod tests {
                     Some(1.0),
                     "the answer raises the gauge"
                 );
-                // The WARN says which model lost cache-aware routing, why the
-                // servicer refused, and where its cache tracking went.
-                assert!(logs_contain("hybrid-m"), "the model is named");
-                assert!(
-                    logs_contain("KV cache events not enabled"),
-                    "the servicer's reason rides the line"
-                );
-                assert!(logs_contain("approximate prefix tree"));
+                // The WARN line itself names the model, carries the servicer's
+                // reason and says when the model reaches the tree; the
+                // subscription's start line names the model too, so the
+                // checks are scoped to the refusal's line.
+                logs_assert(|lines: &[&str]| {
+                    let line = lines
+                        .iter()
+                        .find(|line| line.contains("does not implement SubscribeKvEvents"))
+                        .ok_or_else(|| "no refusal line was logged".to_string())?;
+                    for wanted in [
+                        "WARN",
+                        "hybrid-m",
+                        "KV cache events not enabled",
+                        "approximate prefix tree only when no worker of it publishes events",
+                    ] {
+                        if !line.contains(wanted) {
+                            return Err(format!("the refusal line lacks {wanted:?}: {line}"));
+                        }
+                    }
+                    Ok(())
+                });
 
                 monitor.on_worker_removed(worker.url()).await;
                 assert_eq!(
