@@ -179,7 +179,9 @@ pub(super) async fn connect(
 /// left out: a worker's endpoint is one address). The socket gets nodelay
 /// and the TCP keep-alive flag (the idle time is the kernel's); an address
 /// whose socket the host cannot give (a family it lacks) is skipped for the
-/// next, as one that refuses the connection is.
+/// next, as one that refuses the connection is. The error kept for the
+/// caller names the address it came from, as the timeout's does: a gateway
+/// with many workers logs which one refused.
 async fn connect_tcp(host: &str, port: u16, within: Duration) -> io::Result<TcpStream> {
     // A socket of the address's family with the keep-alive flag alone (the
     // idle time stays the kernel's: setting it needs socket2, kept out of
@@ -194,8 +196,10 @@ async fn connect_tcp(host: &str, port: u16, within: Duration) -> io::Result<TcpS
         socket.set_nodelay(true)?;
         Ok(socket)
     }
-    let addresses: Vec<std::net::SocketAddr> =
-        tokio::net::lookup_host((host, port)).await?.collect();
+    let addresses: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| io::Error::new(e.kind(), format!("{host}:{port}: {e}")))?
+        .collect();
     let each = within / u32::try_from(addresses.len()).unwrap_or(u32::MAX).max(1);
     let mut last = io::Error::new(
         io::ErrorKind::NotFound,
@@ -207,13 +211,13 @@ async fn connect_tcp(host: &str, port: u16, within: Duration) -> io::Result<TcpS
         let socket = match socket_for(address) {
             Ok(socket) => socket,
             Err(e) => {
-                last = e;
+                last = io::Error::new(e.kind(), format!("{address}: {e}"));
                 continue;
             }
         };
         match tokio::time::timeout(each, socket.connect(address)).await {
             Ok(Ok(socket)) => return Ok(socket),
-            Ok(Err(e)) => last = e,
+            Ok(Err(e)) => last = io::Error::new(e.kind(), format!("{address}: {e}")),
             Err(_) => {
                 last = io::Error::new(
                     io::ErrorKind::TimedOut,
