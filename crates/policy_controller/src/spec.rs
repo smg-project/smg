@@ -47,6 +47,10 @@ pub const DENIED_HEADERS: [&str; 5] = [
     "x-api-key",
 ];
 
+/// The most headers `view.headers` may list: a view names an allow-listed
+/// header by its position in one byte.
+pub const MAX_HEADERS: usize = 256;
+
 /// The filters this build carries.
 pub const FILTERS: [&str; 5] = [
     "healthy",
@@ -70,13 +74,16 @@ pub const SCORERS: [&str; 9] = [
     "resident-work",
 ];
 
-/// The pickers of v1; `best-with-temperature` takes its temperature and is
-/// written in the parameter form.
-pub const PICKERS: [&str; 7] = [
+/// The pickers of v1; `count-first` and `power-of-two-count-first` compare
+/// the requests in flight before the score; `best-with-temperature` takes
+/// its temperature and is written in the parameter form.
+pub const PICKERS: [&str; 9] = [
     "best",
     "round-robin",
     "random",
     "power-of-two",
+    "count-first",
+    "power-of-two-count-first",
     "passthrough",
     "manual",
     "best-with-temperature",
@@ -84,7 +91,7 @@ pub const PICKERS: [&str; 7] = [
 
 /// A sampling picker compares its draws by the profile's scorers, so it
 /// needs at least one.
-const SAMPLING_PICKERS: [&str; 1] = ["power-of-two"];
+const SAMPLING_PICKERS: [&str; 2] = ["power-of-two", "power-of-two-count-first"];
 
 /// The side names a binding's `profiles` map may use.
 const SIDES: [&str; 4] = ["single", "prefill", "decode", "encode"];
@@ -138,7 +145,9 @@ pub struct ViewSpec {
     /// positions take on the wire. A name on the deny-list (`authorization`,
     /// `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, the host's
     /// tenant header) is refused. Every header a binding's `sessions`,
-    /// `canary` or `match.header` names must be listed here.
+    /// `canary` or `match.header` names must be listed here. At most 256: a
+    /// view names a header by its position in one byte.
+    #[schemars(length(max = 256))]
     pub headers: Vec<String>,
     /// The token block size the host hashes prefixes by when no engine has
     /// published one; absent, the host's own default. The block size of
@@ -1265,6 +1274,8 @@ pub enum SpecError {
     IndexOverlap { first: String, second: String },
     #[error("the document names {count} profiles; at most {max}")]
     TooManyProfiles { count: usize, max: u16 },
+    #[error("view.headers names {count} headers; at most {max}")]
+    TooManyHeaders { count: usize, max: usize },
     #[error("binding {index}: profiles names an unknown side {side:?}")]
     UnknownSide { index: usize, side: String },
     #[error("binding {index}: the {plan} plan has no {side:?} side")]
@@ -1428,6 +1439,12 @@ fn check_unique<'a>(
 
 fn check_view(view: &ViewSpec, denied: &[&str]) -> Result<(), SpecError> {
     let at = At::new("view");
+    if view.headers.len() > MAX_HEADERS {
+        return Err(SpecError::TooManyHeaders {
+            count: view.headers.len(),
+            max: MAX_HEADERS,
+        });
+    }
     for (i, header) in view.headers.iter().enumerate() {
         check_header_name(header, format!("view.headers[{i}]"), denied)?;
     }
@@ -1659,6 +1676,10 @@ fn picker_of(
             "round-robin" => built_picker(RoundRobin::new()),
             "random" => built_picker(Random),
             "power-of-two" => built_picker(PowerOfTwo),
+            "count-first" => Resolved::NotInBuild("the count-first picker"),
+            "power-of-two-count-first" => {
+                Resolved::NotInBuild("the power-of-two-count-first picker")
+            }
             "passthrough" => built_picker(Passthrough),
             "manual" => Resolved::NotInBuild("the manual picker"),
             "best-with-temperature" => {
@@ -2627,6 +2648,16 @@ mod tests {
                 picker: "power-of-two".into()
             })
         );
+        let count_first_form = doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"power-of-two-count-first"}}}"#,
+        );
+        assert_eq!(
+            count_first_form.validate().err(),
+            Some(SpecError::PickerNeedsScorer {
+                profile: "p".into(),
+                picker: "power-of-two-count-first".into()
+            })
+        );
         let requests_form = doc(r#"{ "apiVersion": "smg.policy/v1",
           "profiles": { "p2": { "score": ["least-requests"], "pick": "power-of-two" } } }"#);
         let engine = requests_form
@@ -2785,6 +2816,25 @@ mod tests {
     }
 
     #[test]
+    fn the_view_lists_at_most_256_headers() {
+        let with_headers = |count: usize| {
+            let names: Vec<String> = (0..count).map(|i| format!("\"x-h{i}\"")).collect();
+            spec_with_view(&format!(r#"{{"headers":[{}]}}"#, names.join(",")))
+        };
+        let engine = with_headers(MAX_HEADERS)
+            .validate()
+            .expect("256 headers fill the byte of positions");
+        assert!(engine.needs().headers);
+        assert_eq!(
+            with_headers(MAX_HEADERS + 1).validate().err(),
+            Some(SpecError::TooManyHeaders {
+                count: 257,
+                max: 256
+            })
+        );
+    }
+
+    #[test]
     fn the_view_checks_block_size_boundaries_and_the_hash_cap() {
         assert_eq!(
             bad_field(&spec_with_view(r#"{"block_size":0}"#)),
@@ -2932,6 +2982,11 @@ mod tests {
             not_in_build(&spec_with_pick(r#""manual""#)),
             ("profiles.p.pick".to_string(), "the manual picker")
         );
+        for name in ["count-first", "power-of-two-count-first"] {
+            let (path, what) = not_in_build(&spec_with_pick(&format!("{name:?}")));
+            assert_eq!(path, "profiles.p.pick");
+            assert_eq!(what, format!("the {name} picker"));
+        }
         assert_eq!(
             bad_field(&spec_with_pick(r#""best-with-temperature""#)),
             "profiles.p.pick"
