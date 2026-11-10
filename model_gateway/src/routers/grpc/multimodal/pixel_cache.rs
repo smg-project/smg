@@ -150,7 +150,7 @@ impl PixelCache {
     }
 
     /// Remember large cold fills without pinning their pixels. Admit when at
-    /// least half the images recurred within one cache budget of large fills.
+    /// least half the images recurred within one cache budget of intervening fills.
     pub(super) fn admit_repeated<'a>(
         &self,
         keys: impl ExactSizeIterator<Item = &'a PixelCacheKey>,
@@ -158,10 +158,11 @@ impl PixelCache {
     ) -> bool {
         let required = keys.len().div_ceil(2);
         let mut inner = self.inner.lock();
-        let epoch = inner.large_fill_bytes;
-        inner.large_fill_bytes = epoch.wrapping_add(capacity as u64);
-        keys.filter_map(|key| inner.recent_large_misses.put(key.clone(), epoch))
-            .filter(|previous| epoch.wrapping_sub(*previous) < self.max_bytes as u64)
+        let start = inner.large_fill_bytes;
+        let end = start.wrapping_add(capacity as u64);
+        inner.large_fill_bytes = end;
+        keys.filter_map(|key| inner.recent_large_misses.put(key.clone(), end))
+            .filter(|previous| start.wrapping_sub(*previous) < self.max_bytes as u64)
             .count()
             >= required
     }
@@ -528,6 +529,16 @@ mod tests {
         }
         assert!(!cache.admit_repeated(a.iter(), 100));
         assert_eq!(cache.current_bytes(), 0);
+    }
+
+    #[test]
+    fn immediate_reuse_excludes_the_previous_fill_capacity() {
+        let keys = ["a", "b"].map(pixel_cache_key);
+        for capacity in [400, 800] {
+            let cache = PixelCache::new(400);
+            assert!(!cache.admit_repeated(keys.iter(), capacity));
+            assert!(cache.admit_repeated(keys.iter(), capacity));
+        }
     }
 
     fn shared_pixel_entries(keys: [&str; 2]) -> Vec<(PixelCacheKey, Arc<CachedPreprocessedItem>)> {

@@ -899,6 +899,77 @@ async fn bf16_batch_cache_reuses_large_batches_for_qwen_and_gemma() {
     }
 }
 
+/// Keep newly computed images when an overlapping request cannot replace its old backing.
+#[tokio::test]
+async fn bf16_recompute_caches_misses_without_replacing_a_partial_backing() {
+    let (mut components, _, _) = setup(true, false);
+    let cache = Arc::new(PixelCache::new(512 * 1024 * 1024));
+    components.pixel_cache = Some(cache.clone());
+    let model = "qwen3_vl";
+    let config = MultimodalModelConfig::new(
+        serde_json::json!({"model_type": model, "image_token_id": 100}),
+        PreProcessorConfig::default(),
+        None,
+    );
+    let spec = components
+        .model_registry
+        .lookup(&ModelMetadata {
+            model_id: model,
+            tokenizer: &NoTokenizer,
+            config: &config.config,
+        })
+        .unwrap();
+    let ctx = context(
+        &components,
+        &config,
+        spec,
+        model,
+        model,
+        Some(EncoderDtype::BFloat16),
+        None,
+    );
+    let fingerprint = image_cache_fingerprint(&ctx).unwrap();
+    let key = |id: u8| PixelCacheKey {
+        image_hash: id.to_string(),
+        config_fingerprint: fingerprint,
+    };
+    let batch = |ids: [u8; 3]| {
+        MediaBatch::Images(
+            ids.into_iter()
+                .map(|id| {
+                    Arc::new(ImageFrame::new(
+                        image::RgbImage::from_pixel(640, 640, image::Rgb([id, 21, 203])).into(),
+                        Default::default(),
+                        Default::default(),
+                        ImageSource::InlineBytes,
+                        id.to_string(),
+                    ))
+                })
+                .collect(),
+        )
+    };
+    preprocess_modality(&batch([0, 1, 2]), &ctx).await.unwrap();
+    let prefix = cache.get(&key(0)).unwrap();
+    assert!(prefix
+        .preprocessed
+        .encoder_input
+        .shared_allocation()
+        .is_some());
+
+    // One hit and two misses above the recompute threshold. The other
+    // session still owns two slices of the original allocation.
+    preprocess_modality(&batch([0, 3, 4]), &ctx).await.unwrap();
+    assert!(Arc::ptr_eq(&prefix, &cache.get(&key(0)).unwrap()));
+    for id in [3, 4] {
+        let entry = cache.get(&key(id)).expect("recomputed miss must be cached");
+        assert!(entry
+            .preprocessed
+            .encoder_input
+            .shared_allocation()
+            .is_none());
+    }
+}
+
 /// Reuse previously cached images across turns and preserve wire bytes and order.
 #[tokio::test]
 async fn minimax_batch_cache_reuses_single_and_batch_misses_in_request_order() {

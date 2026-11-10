@@ -107,7 +107,25 @@ pub(super) async fn preprocess(
                 && working_capacity < budget
             {
                 if let Ok(mut batch) = preprocess_image_frames(&images, &processors, wire_dtype) {
-                    admit_shared_batch(&mut batch, &images, &layouts, &cache, fingerprint)?;
+                    if !admit_shared_batch(&mut batch, &images, &layouts, &cache, fingerprint)?
+                        && batch.encoder_input.nbytes() <= budget
+                        && batch.encoder_input.share_wire(usize::MAX)
+                    {
+                        // Keep the old owners. Copy only the recomputed misses
+                        // into compact entries so they do not pin the full batch.
+                        let mut misses = misses.into_iter().peekable();
+                        let inserts = split_batch(&batch, &layouts, images.len())?
+                            .into_iter()
+                            .enumerate()
+                            .filter_map(|(index, mut preprocessed)| {
+                                let (_, key) = misses.next_if(|(miss, _)| *miss == index)?;
+                                preprocessed.encoder_input =
+                                    preprocessed.encoder_input.view().to_owned();
+                                Some((key, Arc::new(CachedPreprocessedItem { preprocessed })))
+                            })
+                            .collect::<Vec<_>>();
+                        cache.insert_batch(inserts);
+                    }
                     return Ok(Some(batch));
                 }
             }
@@ -130,7 +148,9 @@ pub(super) async fn preprocess(
             if direct && batch.encoder_input.nbytes() > budget {
                 return Ok(Some(batch));
             }
-            batch.encoder_input.share_wire(budget);
+            // An allocation that fills the budget leaves no room for entries.
+            // Let the owned split copy those slices in parallel.
+            batch.encoder_input.share_wire(budget.saturating_sub(1));
             let mut items = split_batch(&batch, &layouts, misses.len())?;
             // When pooled capacity leaves insufficient room for metadata,
             // compact the cache entries while retaining the request output.
