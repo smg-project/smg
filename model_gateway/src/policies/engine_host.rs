@@ -26,7 +26,7 @@ use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
 use smg_policy_controller::{
     fingerprint,
-    spec::{BindingSpec, ProfileSpec, ScoreParams, ScoreSpec},
+    spec::{BindingSpec, LeastLoadParams, ProfileSpec, ScoreSpec, ScoreStage},
     Candidate, Constraints, Decision, Engine, Health, Identity, Lease, LeaseId, LeaseKind,
     Lifecycle, LoadRow, PairPools, Phase, PolicySpec, PoolFacts, RequestFacts, Role, Scratch, Side,
     SignalSource, SpecError, Target, WorkerId,
@@ -111,17 +111,12 @@ fn tune(profile: &mut ProfileSpec, config: &PolicyConfig) {
             mean_prefill_tokens,
             default_throughput,
         } => {
-            let mut params = std::collections::BTreeMap::new();
-            params.insert(
-                "least-load".to_string(),
-                ScoreParams {
-                    weight: 1.0,
-                    kv_pressure_weight: Some(*kv_pressure_weight as f32),
-                    mean_prefill_tokens: Some(*mean_prefill_tokens),
-                    default_throughput: Some(*default_throughput as f32),
-                },
-            );
-            profile.score = vec![ScoreSpec::Named(params)];
+            profile.score = vec![ScoreSpec::Params(ScoreStage::LeastLoad(LeastLoadParams {
+                weight: 1.0,
+                kv_pressure_weight: Some(*kv_pressure_weight as f32),
+                mean_prefill_tokens: Some(*mean_prefill_tokens),
+                default_throughput: Some(*default_throughput as f32),
+            }))];
         }
         PolicyConfig::PowerOfTwo {
             load_metric: PowerOfTwoLoadMetric::Requests,
