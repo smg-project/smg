@@ -956,6 +956,8 @@ publish_plan() { # <version> <ref>: the plan for v<version> as read at <ref> (th
   fi
   say "$((n += 1)). Go module tag (crates/grpc_client/go/v$version)"
   say "   gh workflow run release-go.yml --ref $tagname -f version=$version"
+  say "$((n += 1)). Go bindings module tag (bindings/golang/v$version at the release commit; by hand until release-go.yml pushes it)"
+  say "   git tag bindings/golang/v$version $tagname^{commit} && git push $REMOTE refs/tags/bindings/golang/v$version"
   say "$((n += 1)). The GitHub release: release.sh notes $version > notes.md, then the gh release create line it prints."
   say ""
   say "Watch a dispatch: gh run list --workflow <file> --branch $tagname"
@@ -1135,7 +1137,7 @@ verifier_rows() { # the provider verifiers: the release owner's lines, as the ga
 
 publish_rule() { # <version>: the gate's line on what the registries take: a candidate never, the final by its dispatches
   if is_candidate "$1"; then
-    say "[note] publish: a candidate is never published to PyPI or crates.io (release-pypi, release-crates and release-grpc refuse a ref named -rc.; release.sh publish-plan $1 leaves them out): its artifacts are the images, the chart, the Go module tag and the GitHub pre-release"
+    say "[note] publish: a candidate is never published to PyPI or crates.io (release-pypi, release-crates and release-grpc refuse a ref named -rc.; release.sh publish-plan $1 leaves them out): its artifacts are the images, the chart, the two Go module tags and the GitHub pre-release"
   else
     say "[note] publish: the final publishes to PyPI and crates.io by its dispatches (release.sh publish-plan $1 lists them; a candidate never does)"
   fi

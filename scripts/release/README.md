@@ -83,11 +83,7 @@ pushed, the read-only commands (`check`, `status`, `publish-plan`, `notes`) read
 
 Nothing, on its own. The `release-pypi`, `release-helm`, `release-crates`, `release-grpc`,
 `release-go` (the Go module tag `crates/grpc_client/go/v<version>`) and `release-engine-docker`
-workflows run on `workflow_dispatch` only (the Go bindings module,
-`github.com/smg-project/smg/bindings/golang`, is published by the tag `bindings/golang/v<version>`
-at the release commit, pushed by a maintainer with tag rights beside `v<version>` until `release-go`
-makes it too; a tag at a release before the module path matched the repository names a `go.mod`
-that `go get` refuses); `release-grpc` and `release-go` also refuse a dispatch
+workflows run on `workflow_dispatch` only; `release-grpc` and `release-go` also refuse a dispatch
 whose ref is not a tag (`release-go`: not the version's tag), since a branch can move between a
 dispatch and its retry; `release-docker` builds the image on a push to `main` or `release/**`
 that touches the Dockerfile and pushes it on a dispatch only. The release owner dispatches each
@@ -95,12 +91,17 @@ against the tag once the gate is green; `make release-publish-plan VERSION=<x.y.
 exact commands and the artifact names (the gateway image's `latest` moves only for a final; a
 crate publishes when its exact version is not on crates.io yet; a PyPI version that is complete,
 wheel and sdist, is skipped, and `-f packages=proto|servicer|both` on `release-grpc` names a
-package outright for a retry). A release candidate is never published to PyPI or crates.io:
+package outright for a retry). The Go bindings module, `github.com/smg-project/smg/bindings/golang`,
+is published by the tag `bindings/golang/v<version>` at the release commit: the plan prints the
+`git tag` and `git push` for it, run by a maintainer with tag rights beside `v<version>` until
+`release-go` pushes it too (`make release-ship` dispatches workflows only, so it is run by hand
+either way); a tag at a release made before the module path matched the repository would name a
+`go.mod` that `go get` refuses, so the first one is the release after that change. A release candidate is never published to PyPI or crates.io:
 `release-pypi`, `release-crates` and `release-grpc` refuse a ref whose name carries `-rc.` (the
 job is skipped, and its first step says why when it is reached anyway),
 `make release-publish-plan VERSION=1.14.0-rc.1` leaves the three out and says so,
-`make release-check` reports the rule, and the candidate ships as its images, its chart, its Go
-module tag and its GitHub pre-release. The nightly prerelease and the CI images are unchanged by
+`make release-check` reports the rule, and the candidate ships as its images, its chart, its two Go
+module tags and its GitHub pre-release. The nightly prerelease and the CI images are unchanged by
 this process.
 
 ## The gate

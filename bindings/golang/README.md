@@ -43,8 +43,16 @@ The module lives in a subdirectory of the repository, so each release publishes 
 go get github.com/smg-project/smg/bindings/golang@v<version>
 ```
 
-The package links the FFI library built from the same checkout (`make build` below), so a
-`go get` alone does not run: build the library at the tag you import.
+The package links `libsmg_go`, the FFI library built from the same checkout, and its cgo
+directives name no library directory, so `go get` alone does not give a program that builds.
+Build the library at the tag you import, then point cgo (and the loader) at it:
+
+```bash
+git clone --branch bindings/golang/v<version> https://github.com/smg-project/smg
+cd smg/bindings/golang && make build
+export CGO_LDFLAGS="-L$(pwd)/target/release"
+export LD_LIBRARY_PATH="$(pwd)/target/release:$LD_LIBRARY_PATH"   # DYLD_LIBRARY_PATH on macOS
+```
 
 ### Sync Dependencies
 

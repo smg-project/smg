@@ -2166,7 +2166,7 @@ def test_publish_plan_prints_the_dispatches_and_runs_nothing(repo: Sandbox) -> N
         "a crate with publish = [] is never published either: not in the plan"
     )
     assert "publish = false or publish = [] is never published and not listed" in out
-    assert plan_items(out) == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert plan_items(out) == [1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 
 def test_publish_plan_leaves_pypi_and_crates_io_out_of_a_candidate(repo: Sandbox) -> None:
@@ -2185,7 +2185,7 @@ def test_publish_plan_leaves_pypi_and_crates_io_out_of_a_candidate(repo: Sandbox
     assert "A candidate is never published to PyPI or crates.io" in out
     assert "smg==" not in out and "tool-parser" not in out
     assert repo.curl_calls() == [], "no registry is read for a plan that publishes to none"
-    assert plan_items(out) == [1, 2, 3, 4, 5]
+    assert plan_items(out) == [1, 2, 3, 4, 5, 6]
 
 
 def test_publish_plan_prints_one_engine_dispatch_per_release_base(repo: Sandbox) -> None:
@@ -2248,7 +2248,7 @@ def test_check_reports_that_a_candidate_never_reaches_the_registries(repo: Sandb
     assert (
         "[note] publish: a candidate is never published to PyPI or crates.io (release-pypi,"
         " release-crates and release-grpc refuse a ref named -rc.; release.sh publish-plan 1.14.0-rc.1"
-        " leaves them out): its artifacts are the images, the chart, the Go module tag and the GitHub"
+        " leaves them out): its artifacts are the images, the chart, the two Go module tags and the GitHub"
         " pre-release" in out
     )
     repo.tool("bump", "1.14.0")
