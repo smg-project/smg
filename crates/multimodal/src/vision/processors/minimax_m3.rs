@@ -59,7 +59,7 @@ use crate::{
         processor::{PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor},
         transforms::TransformError,
     },
-    EncoderDtype, EncoderInput,
+    EncoderDtype,
 };
 
 /// Default patch size.
@@ -352,28 +352,14 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         self.inner.preprocess_wire(images, dtype)
     }
 
-    /// Assemble a BF16 request with an optional cached prefix in the fused batch writer.
-    fn preprocess_cached_wire(
-        &self,
-        prefix: &[&EncoderInput],
-        images: &[&DynamicImage],
-        dtype: EncoderDtype,
-    ) -> Option<Result<(EncoderInput, Vec<PreprocessedEncoderInputs>), TransformError>> {
-        (dtype == EncoderDtype::BFloat16 && images.len() > 1)
-            .then(|| self.inner.preprocess_cached_wire(prefix, images, dtype))
-    }
-
     /// Produce cache entries directly when they will be assembled with hits
     /// or duplicated in the request. Balance work by pixels and keep results
     /// in request order.
     fn preprocess_image_items(
         &self,
         images: &[&DynamicImage],
-        wire_dtype: Option<EncoderDtype>,
     ) -> Option<Result<Vec<PreprocessedEncoderInputs>, TransformError>> {
-        let wire_dtype = wire_dtype.filter(|dtype| *dtype == EncoderDtype::BFloat16);
-        let preprocess =
-            |image: &&DynamicImage| self.inner.preprocess_owned_image(image, wire_dtype);
+        let preprocess = |image: &&DynamicImage| self.inner.preprocess_owned_image(image);
         let source_bytes = images.iter().map(|image| image.as_bytes().len()).sum();
         let tasks = execution::task_count(source_bytes, images.len(), 1);
         if tasks <= 1 {
@@ -494,25 +480,23 @@ mod tests {
     /// Cache entries must hold only the bytes the pixel budget charges.
     #[test]
     fn owned_cache_items_have_no_spare_pixel_capacity() {
+        use crate::EncoderInput;
         let processor = MiniMaxM3VisionProcessor::new();
         let image = DynamicImage::new_rgb8(560, 560);
-        for dtype in [None, Some(EncoderDtype::BFloat16)] {
-            let item = processor
-                .preprocess_image_items(&[&image], dtype)
-                .unwrap()
-                .unwrap()
-                .pop()
-                .unwrap();
-            let pixels = item.encoder_input.nbytes();
-            let buffer = match item.encoder_input {
-                EncoderInput::U8 { patches, .. } => patches.into_raw_vec_and_offset().0,
-                EncoderInput::Wire { bytes, .. } => bytes,
-                EncoderInput::F32(_) => panic!("expected owned pixel bytes"),
-            };
-            assert!((1 << 20..64 << 20).contains(&pixels));
-            assert!(!pixels.is_power_of_two());
-            assert_eq!(buffer.capacity(), pixels);
-        }
+        let item = processor
+            .preprocess_image_items(&[&image])
+            .unwrap()
+            .unwrap()
+            .pop()
+            .unwrap();
+        let pixels = item.encoder_input.nbytes();
+        let EncoderInput::U8 { patches, .. } = item.encoder_input else {
+            panic!("expected owned neutral pixels");
+        };
+        let buffer = patches.into_raw_vec_and_offset().0;
+        assert!((1 << 20..64 << 20).contains(&pixels));
+        assert!(!pixels.is_power_of_two());
+        assert_eq!(buffer.capacity(), pixels);
     }
 
     /// Work can run out of order while cache entries retain the image order.
@@ -532,10 +516,7 @@ mod tests {
         ];
         let images = sizes.map(|(width, height)| DynamicImage::new_rgb8(width, height));
         let refs = images.iter().collect::<Vec<_>>();
-        let items = processor
-            .preprocess_image_items(&refs, Some(EncoderDtype::BFloat16))
-            .unwrap()
-            .unwrap();
+        let items = processor.preprocess_image_items(&refs).unwrap().unwrap();
         assert_eq!(
             items
                 .iter()

@@ -845,7 +845,11 @@ async fn bf16_batch_cache_reuses_large_batches_for_qwen_and_gemma() {
         let first = MediaBatch::Images(cold.clone());
         let result = preprocess_modality(&first, &ctx).await.unwrap();
         let uncached = preprocess_batch(&first, &ctx).await.unwrap();
-        assert_eq!(result.encoder_input, uncached.encoder_input);
+        assert_eq!(result.encoder_input.shape(), uncached.encoder_input.shape());
+        assert_eq!(
+            result.encoder_input.write_as(EncoderDtype::BFloat16),
+            uncached.encoder_input.write_as(EncoderDtype::BFloat16),
+        );
 
         // Invalid encoded bytes make an accidental cache miss visible.
         let mut cached = cold
@@ -875,7 +879,11 @@ async fn bf16_batch_cache_reuses_large_batches_for_qwen_and_gemma() {
         let expected = preprocess_batch(&MediaBatch::Images(expected), &ctx)
             .await
             .unwrap();
-        assert_eq!(result.encoder_input, expected.encoder_input);
+        assert_eq!(result.encoder_input.shape(), expected.encoder_input.shape());
+        assert_eq!(
+            result.encoder_input.write_as(EncoderDtype::BFloat16),
+            expected.encoder_input.write_as(EncoderDtype::BFloat16),
+        );
         assert_eq!(result.feature_token_counts, expected.feature_token_counts);
         assert_eq!(result.item_sizes, expected.item_sizes);
         assert_eq!(result.model_specific.len(), expected.model_specific.len());

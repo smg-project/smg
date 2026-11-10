@@ -3,6 +3,7 @@
 //! `SMG_MM_PIXEL_CACHE_MB` unset or 0).
 
 use std::{
+    collections::{hash_map::Entry, HashMap},
     io::{self, BufWriter, Write},
     mem::size_of,
     sync::{Arc, OnceLock},
@@ -43,7 +44,10 @@ fn preprocessed_heap_bytes(preprocessed: &PreprocessedEncoderInputs) -> usize {
         .iter()
         .map(|(key, value)| key.len() + model_specific_value_heap_bytes(value))
         .sum();
-    preprocessed.encoder_input.nbytes()
+    preprocessed
+        .encoder_input
+        .shared_allocation()
+        .map_or_else(|| preprocessed.encoder_input.nbytes(), |_| 0)
         + preprocessed.encoder_input.ndim() * size_of::<usize>()
         + preprocessed.feature_token_counts.len() * size_of::<usize>()
         + preprocessed.item_sizes.len() * size_of::<(u32, u32)>()
@@ -75,12 +79,41 @@ const PIXEL_CACHE_KEY_OVERHEAD: usize = 128;
 
 struct PixelCacheInner {
     map: LruCache<PixelCacheKey, Arc<CachedPreprocessedItem>>,
+    allocations: HashMap<usize, usize>,
     cur_bytes: usize,
-    max_bytes: usize,
+}
+
+impl PixelCacheInner {
+    /// Charge a shared wire allocation when its first slice enters the cache.
+    fn charge(&mut self, value: &CachedPreprocessedItem) {
+        self.cur_bytes += value.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD;
+        if let Some((id, capacity)) = value.preprocessed.encoder_input.shared_allocation() {
+            let count = self.allocations.entry(id).or_default();
+            if *count == 0 {
+                self.cur_bytes += capacity;
+            }
+            *count += 1;
+        }
+    }
+
+    /// Release a shared allocation's charge when its last slice leaves.
+    fn uncharge(&mut self, value: &CachedPreprocessedItem) {
+        self.cur_bytes -= value.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD;
+        if let Some((id, capacity)) = value.preprocessed.encoder_input.shared_allocation() {
+            if let Entry::Occupied(mut count) = self.allocations.entry(id) {
+                *count.get_mut() -= 1;
+                if *count.get() == 0 {
+                    count.remove();
+                    self.cur_bytes -= capacity;
+                }
+            }
+        }
+    }
 }
 
 /// Thread-safe, byte-budgeted LRU of per-image vision processor outputs.
 pub(crate) struct PixelCache {
+    max_bytes: usize,
     inner: Mutex<PixelCacheInner>,
 }
 
@@ -90,17 +123,18 @@ impl PixelCache {
         // zero, rather than appearing with the first image.
         Metrics::init_mm_pixel_cache_series();
         Self {
+            max_bytes,
             inner: Mutex::new(PixelCacheInner {
                 map: LruCache::unbounded(),
+                allocations: HashMap::new(),
                 cur_bytes: 0,
-                max_bytes,
             }),
         }
     }
 
     /// Upper bound for the total size of resident entries.
     pub(super) fn max_bytes(&self) -> usize {
-        self.inner.lock().max_bytes
+        self.max_bytes
     }
 
     pub(crate) fn get(&self, key: &PixelCacheKey) -> Option<Arc<CachedPreprocessedItem>> {
@@ -109,34 +143,49 @@ impl PixelCache {
     }
 
     pub(crate) fn insert(&self, key: PixelCacheKey, value: Arc<CachedPreprocessedItem>) {
-        let entry_bytes = value.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD;
+        self.insert_batch([(key, value)]);
+    }
+
+    /// Insert a request's cache entries under one lock and report its evictions.
+    pub(super) fn insert_batch(
+        &self,
+        entries: impl IntoIterator<Item = (PixelCacheKey, Arc<CachedPreprocessedItem>)>,
+    ) {
         let mut inner = self.inner.lock();
-        if entry_bytes > inner.max_bytes {
-            return;
-        }
-        let PixelCacheInner {
-            map,
-            cur_bytes,
-            max_bytes,
-        } = &mut *inner;
-        if let Some(previous) = map.put(key, value) {
-            *cur_bytes = cur_bytes.saturating_sub(previous.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD);
-        }
-        *cur_bytes += entry_bytes;
+        let mut released = Vec::new();
         let mut evicted_entries = 0;
-        while *cur_bytes > *max_bytes {
-            match map.pop_lru() {
-                Some((_, evicted)) => {
-                    *cur_bytes =
-                        cur_bytes.saturating_sub(evicted.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD);
-                    evicted_entries += 1;
-                }
-                None => break,
+        let mut inserted = false;
+        for (key, value) in entries {
+            let capacity = value
+                .preprocessed
+                .encoder_input
+                .shared_allocation()
+                .map_or(0, |(_, bytes)| bytes);
+            if value.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD + capacity > self.max_bytes {
+                continue;
+            }
+            inserted = true;
+            inner.charge(&value);
+            if let Some(previous) = inner.map.put(key, value) {
+                inner.uncharge(&previous);
+                released.push(previous);
             }
         }
-        let (bytes, entries) = (*cur_bytes, map.len());
+        while inner.cur_bytes > self.max_bytes {
+            if let Some((_, evicted)) = inner.map.pop_lru() {
+                inner.uncharge(&evicted);
+                released.push(evicted);
+                evicted_entries += 1;
+            } else {
+                break;
+            }
+        }
+        let (bytes, entries) = (inner.cur_bytes, inner.map.len());
         drop(inner);
-        Metrics::record_mm_pixel_cache_insert(evicted_entries, bytes, entries);
+        drop(released);
+        if inserted {
+            Metrics::record_mm_pixel_cache_insert(evicted_entries, bytes, entries);
+        }
     }
 
     #[cfg(test)]
@@ -378,6 +427,58 @@ mod tests {
         assert_eq!(got.preprocessed.feature_token_counts, vec![10]);
         assert!(Arc::ptr_eq(&got, &value));
         assert!(cache.get(&pixel_cache_key("missing")).is_none());
+    }
+
+    /// Partial eviction retains the whole charge until the final slice leaves.
+    #[test]
+    fn pixel_cache_accounts_for_shared_wire_capacity_once() {
+        use llm_multimodal::{EncoderDtype, EncoderInput, PixelNorm};
+
+        let mut bytes = Vec::with_capacity(1024);
+        bytes.resize(128, 0);
+        let mut wire = EncoderInput::wire(
+            bytes,
+            EncoderDtype::BFloat16,
+            vec![2, 32],
+            PixelNorm {
+                scale: 1.0,
+                offset: [0.0; 3],
+                divisor: [1.0; 3],
+                channel_block: 1,
+            },
+        )
+        .unwrap();
+        assert!(wire.share_wire(1024));
+        let (_, capacity) = wire.shared_allocation().unwrap();
+        let parts = wire.split_axis0(&[1, 1]).unwrap();
+        let entries = ["a", "b"]
+            .into_iter()
+            .zip(parts)
+            .map(|(key, encoder_input)| {
+                (
+                    pixel_cache_key(key),
+                    Arc::new(CachedPreprocessedItem {
+                        preprocessed: PreprocessedEncoderInputs::new(
+                            encoder_input,
+                            vec![1],
+                            vec![(1, 1)],
+                        ),
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let meta = entries[0].1.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD;
+        let independent = pixel_cache_item(1, 8);
+        let other = independent.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD;
+        let cache = PixelCache::new(capacity + meta + other);
+        cache.insert_batch(entries);
+        assert_eq!(cache.current_bytes(), capacity + 2 * meta);
+        cache.insert(pixel_cache_key("c"), independent.clone());
+        assert!(cache.get(&pixel_cache_key("a")).is_none());
+        assert_eq!(cache.current_bytes(), capacity + meta + other);
+        cache.insert(pixel_cache_key("d"), independent);
+        assert!(cache.get(&pixel_cache_key("b")).is_none());
+        assert_eq!(cache.current_bytes(), 2 * other);
     }
 
     #[test]

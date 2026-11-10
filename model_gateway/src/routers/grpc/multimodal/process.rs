@@ -591,20 +591,10 @@ async fn cached_images(
     if !(batch_cache || images.len() == 1 || (images.len() < 32 && independent)) {
         return Ok(None);
     }
-    let config = serde_json::json!({
-        "model_id": ctx.model_id,
-        "model_type": ctx.model_type,
-        "preprocessor_config": preprocessor_config_for(ctx.model_config, Modality::Image),
-        // A one-pass result is only right for its own wire.
-        "image_wire_dtype": ctx.image_wire_dtype.map(|dtype| dtype.to_string()),
-        "transparency": ctx.transparency,
-    });
-    let fingerprint = config_fingerprint(ctx.tokenizer_id, &config, &ctx.model_config.config)?;
     if batch_cache {
-        return batch_image_cache::preprocess(images, cache, ctx, fingerprint)
-            .await
-            .map(Some);
+        return batch_image_cache::preprocess(images, cache, ctx).await;
     }
+    let fingerprint = image_cache_fingerprint(ctx)?;
     // Deduplicate within the request even if the result cannot fit
     // in the cache. Record every position before scheduling work.
     let mut unique = HashMap::new();
@@ -676,6 +666,23 @@ async fn cached_images(
     .context("Image batch assembly task panicked")?
     .context("Image batch assembly failed")
     .map(Some)
+}
+
+/// Identify the model, wire format and image policy in the pixel cache.
+fn image_cache_fingerprint(ctx: &PlanContext<'_>) -> Result<u64> {
+    let config = serde_json::json!({
+        "model_id": ctx.model_id,
+        "model_type": ctx.model_type,
+        "preprocessor_config": preprocessor_config_for(ctx.model_config, Modality::Image),
+        // A one-pass result is only right for its own wire.
+        "image_wire_dtype": ctx.image_wire_dtype.map(|dtype| dtype.to_string()),
+        "transparency": ctx.transparency,
+    });
+    Ok(config_fingerprint(
+        ctx.tokenizer_id,
+        &config,
+        &ctx.model_config.config,
+    )?)
 }
 
 /// `work` on the blocking pool, with the time its task waited in the pool's
@@ -752,7 +759,20 @@ async fn preprocess_batch(
 
     on_pool(ctx.model_id, move || match media_for_preprocess {
         MediaBatch::Images(images) => {
-            preprocess_image_frames(&images, &vision_processors, image_wire_dtype)
+            // Decode every frame first, in parallel on the preprocessing
+            // pool, rather than one photo after another on this thread.
+            ImageFrame::decode_all(&images)
+                .map_err(llm_multimodal::MultiModalError::Media)?;
+            let processor = vision_processors.image()?;
+            // The frames' own pixels, borrowed from the cells `decode_all`
+            // just filled: no processor owns, consumes or mutates its input,
+            // so the batch costs one pointer per image instead of a deep copy
+            // of every decoded image.
+            let decoded: Vec<&image::DynamicImage> = images
+                .iter()
+                .map(|frame| frame.image().map_err(llm_multimodal::MultiModalError::Media))
+                .collect::<Result<_, _>>()?;
+            preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
         }
         MediaBatch::Videos(videos) => {
             let processor = vision_processors.video()?;
@@ -892,7 +912,6 @@ async fn preprocess_image_cached(
     Ok(cached)
 }
 
-/// Run image preprocessing on the blocking pool.
 async fn preprocess_image_batch(
     model_id: &str,
     vision_processors: Arc<VisionProcessors>,
@@ -901,35 +920,20 @@ async fn preprocess_image_batch(
 ) -> Result<PreprocessedEncoderInputs> {
     let images = images.to_vec();
     on_pool(model_id, move || {
-        preprocess_image_frames(&images, &vision_processors, image_wire_dtype)
+        // Borrowed from the frames' own cells, as the batch path borrows them.
+        let decoded: Vec<&image::DynamicImage> = images
+            .iter()
+            .map(|frame| {
+                frame
+                    .image()
+                    .map_err(llm_multimodal::MultiModalError::Media)
+            })
+            .collect::<Result<_, _>>()?;
+        let processor = vision_processors.image()?;
+        preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
     })
     .await
     .map_err(|e| anyhow::Error::new(e).context("Preprocessing task panicked"))?
-}
-
-/// Decode and preprocess an image batch.
-fn preprocess_image_frames(
-    images: &[Arc<ImageFrame>],
-    vision_processors: &VisionProcessors,
-    image_wire_dtype: Option<EncoderDtype>,
-) -> Result<PreprocessedEncoderInputs> {
-    let decoded = decode_image_frames(images)?;
-    let processor = vision_processors.image()?;
-    preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
-}
-
-/// Decode the frames in parallel and borrow them for the processor.
-fn decode_image_frames(images: &[Arc<ImageFrame>]) -> Result<Vec<&image::DynamicImage>> {
-    ImageFrame::decode_all(images).map_err(llm_multimodal::MultiModalError::Media)?;
-    images
-        .iter()
-        .map(|frame| {
-            frame
-                .image()
-                .map_err(llm_multimodal::MultiModalError::Media)
-                .map_err(anyhow::Error::from)
-        })
-        .collect()
 }
 
 /// The images preprocessed: laid out in `wire_dtype` in one pass when the

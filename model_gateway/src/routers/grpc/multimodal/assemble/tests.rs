@@ -237,10 +237,15 @@ fn a_single_whole_wire_item_moves_its_own_bytes_into_the_payload() {
     match (&a.storage, &b.storage) {
         (TokenSpeedTensorStorage::Inline(x), TokenSpeedTensorStorage::Inline(y)) => {
             assert_eq!(
-                x, &wire_bytes,
+                x.as_slice(),
+                wire_bytes.as_slice(),
                 "the view-written item carries the wire's bytes"
             );
-            assert_eq!(y, &wire_bytes, "the moved item carries the wire's bytes");
+            assert_eq!(
+                y.as_slice(),
+                wire_bytes.as_slice(),
+                "the moved item carries the wire's bytes"
+            );
         }
         other => panic!("inline payloads expected, got {other:?}"),
     }

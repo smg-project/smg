@@ -1297,27 +1297,18 @@ impl ImageBatchPlan {
     /// The preprocessed batch around its encoder input: token counts, sizes,
     /// grids and patch counts per image.
     fn result(&self, encoder_input: EncoderInput) -> PreprocessedEncoderInputs {
-        Self::result_for(&self.plans, &self.item_sizes, encoder_input)
-    }
-
-    /// Build the metadata for a batch or one of its independently cached items.
-    fn result_for(
-        plans: &[QwenImagePlan],
-        item_sizes: &[(u32, u32)],
-        encoder_input: EncoderInput,
-    ) -> PreprocessedEncoderInputs {
-        let mut patches_per_image: Vec<i64> = Vec::with_capacity(plans.len());
-        let mut grid_thw_data = Vec::with_capacity(plans.len() * 3);
-        let mut feature_token_counts = Vec::with_capacity(plans.len());
-        for plan in plans {
+        let mut patches_per_image: Vec<i64> = Vec::with_capacity(self.plans.len());
+        let mut grid_thw_data = Vec::with_capacity(self.plans.len() * 3);
+        let mut feature_token_counts = Vec::with_capacity(self.plans.len());
+        for plan in &self.plans {
             grid_thw_data.extend([plan.grid_t as i64, plan.grid_h as i64, plan.grid_w as i64]);
             feature_token_counts.push(plan.tokens);
             patches_per_image.push(plan.num_patches as i64);
         }
-        PreprocessedEncoderInputs::new(encoder_input, feature_token_counts, item_sizes.to_vec())
+        PreprocessedEncoderInputs::new(encoder_input, feature_token_counts, self.item_sizes.clone())
             .with_extra(
                 "image_grid_thw",
-                ModelSpecificValue::int_2d(grid_thw_data, plans.len(), 3),
+                ModelSpecificValue::int_2d(grid_thw_data, self.plans.len(), 3),
             )
             .with_extra(
                 "patches_per_image",
@@ -1409,122 +1400,19 @@ impl QwenVLProcessorBase {
         &self,
         images: &[&DynamicImage],
         dtype: EncoderDtype,
-        allocate: fn(usize) -> Vec<u8>,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
         let batch = match self.plan_image_batch(images) {
             Ok(batch) => batch,
             Err(error) => return Some(Err(error)),
         };
         let writer = WireWriter::new(&batch.norm, dtype)?;
-        let wire_len = batch.total_patch_values * writer.element_size();
-        let mut wire = allocate(wire_len);
-        let result = self
-            .write_image_wire(images, &batch, &writer, &mut wire, |_| ())
-            .and_then(|_| {
-                EncoderInput::wire(
-                    wire,
-                    dtype,
-                    vec![batch.total_patches, batch.patch_features],
-                    batch.norm,
-                )
-                .map_err(TransformError::ShapeError)
-            })
-            .map(|encoder_input| batch.result(encoder_input));
-        Some(result)
-    }
-
-    /// Write each image directly into its final batch band, keeping an owned
-    /// copy of the new image while that worker still has its pixels.
-    pub(super) fn preprocess_cached_wire(
-        &self,
-        prefix: &[&EncoderInput],
-        images: &[&DynamicImage],
-        dtype: EncoderDtype,
-    ) -> Result<(EncoderInput, Vec<PreprocessedEncoderInputs>), TransformError> {
-        let batch = self.plan_image_batch(images)?;
-        let writer = WireWriter::new(&batch.norm, dtype)
-            .ok_or_else(|| TransformError::ShapeError("unsupported cached wire dtype".into()))?;
         let element_size = writer.element_size();
-        let shape_error = || TransformError::ShapeError("cached wire size overflow".into());
-        let row_bytes = batch
-            .patch_features
-            .checked_mul(element_size)
-            .ok_or_else(shape_error)?;
-        let mut rows = batch.total_patches;
-        let mut cached_bytes = Vec::with_capacity(prefix.len());
-        for input in prefix {
-            let EncoderInput::Wire {
-                bytes,
-                dtype: cached_dtype,
-                shape,
-                norm,
-            } = input
-            else {
-                return Err(TransformError::ShapeError(
-                    "expected cached wire pixels".into(),
-                ));
-            };
-            match shape.as_slice() {
-                [cached_rows, features]
-                    if *features == batch.patch_features
-                        && *cached_dtype == dtype
-                        && *norm == batch.norm
-                        && cached_rows.checked_mul(row_bytes) == Some(bytes.len()) =>
-                {
-                    rows = rows.checked_add(*cached_rows).ok_or_else(shape_error)?;
-                    cached_bytes.push(bytes.as_slice());
-                }
-                _ => {
-                    return Err(TransformError::ShapeError(
-                        "incompatible cached wire pixels".into(),
-                    ))
-                }
-            }
-        }
-        let mut wire = buffer_pool::take(rows.checked_mul(row_bytes).ok_or_else(shape_error)?);
-        let mut tail = wire.as_mut_slice();
-        for bytes in cached_bytes {
-            let (band, rest) = tail.split_at_mut(bytes.len());
-            band.copy_from_slice(bytes);
-            tail = rest;
-        }
-        let copies = self.write_image_wire(images, &batch, &writer, tail, <[u8]>::to_vec)?;
-        let entries = copies
-            .into_iter()
-            .zip(batch.plans.iter().zip(&batch.item_sizes))
-            .map(|(bytes, (plan, size))| {
-                let input = EncoderInput::wire(
-                    bytes,
-                    dtype,
-                    vec![plan.num_patches, batch.patch_features],
-                    batch.norm,
-                )
-                .map_err(TransformError::ShapeError)?;
-                Ok(ImageBatchPlan::result_for(
-                    std::slice::from_ref(plan),
-                    std::slice::from_ref(size),
-                    input,
-                ))
-            })
-            .collect::<Result<Vec<_>, TransformError>>()?;
-        let input = EncoderInput::wire(wire, dtype, vec![rows, batch.patch_features], batch.norm)
-            .map_err(TransformError::ShapeError)?;
-        Ok((input, entries))
-    }
-
-    /// Apply the fused writer and consume each completed image band in its worker.
-    fn write_image_wire<T: Send>(
-        &self,
-        images: &[&DynamicImage],
-        batch: &ImageBatchPlan,
-        writer: &WireWriter,
-        wire: &mut [u8],
-        finish: impl Fn(&[u8]) -> T + Sync,
-    ) -> Result<Vec<T>, TransformError> {
-        let element_size = writer.element_size();
-        let wire_len = wire.len();
+        let wire_len = batch.total_patch_values * element_size;
+        // A pooled buffer: its bytes are a previous request's until the
+        // bands below, which cover it exactly, are written.
+        let mut wire: Vec<u8> = buffer_pool::take(wire_len);
         let mut bands = Vec::with_capacity(images.len());
-        let mut remaining = wire;
+        let mut remaining = wire.as_mut_slice();
         for plan in &batch.plans {
             let (band, rest) = remaining.split_at_mut(plan.patch_values * element_size);
             bands.push(band);
@@ -1532,8 +1420,8 @@ impl QwenVLProcessorBase {
         }
         debug_assert!(remaining.is_empty(), "the image bands cover the wire");
         let filter = batch.filter;
-        let mut results: Vec<Option<Result<T, TransformError>>> =
-            (0..images.len()).map(|_| None).collect();
+        let writer = &writer;
+        let mut errors: Vec<Option<TransformError>> = (0..images.len()).map(|_| None).collect();
         // One image's resize and patch layout into its band: the work of one
         // task, whether it runs here or on the pool.
         let per_image = |image: &DynamicImage, plan: &QwenImagePlan, band: &mut [u8]| {
@@ -1549,19 +1437,19 @@ impl QwenVLProcessorBase {
                 image
             };
             self.patchify_image_rgb_wire_into(img_ref, plan.grid_h, plan.grid_w, band, writer)
-                .map(|()| finish(band))
+                .err()
         };
         let parallel_tasks = task_count(wire_len, images.len(), 1);
         if parallel_tasks <= 1 {
             // One image, the inline mode, or a pool busy with other
             // operations: on the calling thread, image after image.
-            for (((image, plan), band), result) in images
+            for (((image, plan), band), error_slot) in images
                 .iter()
                 .zip(&batch.plans)
                 .zip(bands)
-                .zip(results.iter_mut())
+                .zip(errors.iter_mut())
             {
-                *result = Some(per_image(image, plan, band));
+                *error_slot = per_image(image, plan, band);
             }
         } else {
             // Exactly as many tasks as the split allows (or as there are
@@ -1577,26 +1465,27 @@ impl QwenVLProcessorBase {
                 .iter()
                 .zip(&batch.plans)
                 .zip(bands)
-                .zip(results.iter_mut())
+                .zip(errors.iter_mut())
                 .collect();
             parallel_scope(|scope| {
                 for run in weighted_runs(items, &weights, parallel_tasks) {
                     scope.spawn(move |_| {
-                        for (((image, plan), band), result) in run {
-                            *result = Some(per_image(image, plan, band));
+                        for (((image, plan), band), error_slot) in run {
+                            *error_slot = per_image(image, plan, band);
                         }
                     });
                 }
             });
         }
-        results
-            .into_iter()
-            .map(|result| {
-                result.unwrap_or_else(|| {
-                    Err(TransformError::ShapeError("missing image wire band".into()))
-                })
-            })
-            .collect()
+        if let Some(error) = errors.into_iter().flatten().next() {
+            return Some(Err(error));
+        }
+        let shape = vec![batch.total_patches, batch.patch_features];
+        Some(
+            EncoderInput::wire(wire, dtype, shape, batch.norm)
+                .map(|encoder_input| batch.result(encoder_input))
+                .map_err(TransformError::ShapeError),
+        )
     }
 
     /// [`patchify_image_rgb_into`](Self::patchify_image_rgb_into) writing
@@ -1747,13 +1636,8 @@ impl QwenVLProcessorBase {
     pub(super) fn preprocess_owned_image(
         &self,
         image: &DynamicImage,
-        dtype: Option<EncoderDtype>,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        let images = &[image];
-        let allocate = |len| vec![0; len];
-        dtype
-            .and_then(|dtype| self.preprocess_into_wire(images, dtype, allocate))
-            .unwrap_or_else(|| self.preprocess_pixels(images, allocate))
+        self.preprocess_pixels(&[image], |len| vec![0; len])
     }
 
     /// Write neutral patches into a caller-selected allocation.
@@ -1891,7 +1775,7 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         images: &[&DynamicImage],
         dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
-        self.preprocess_into_wire(images, dtype, buffer_pool::take)
+        self.preprocess_into_wire(images, dtype)
     }
 
     fn preprocess_video(

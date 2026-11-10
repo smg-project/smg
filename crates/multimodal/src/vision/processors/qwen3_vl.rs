@@ -321,17 +321,6 @@ impl VisionPreProcessor for Qwen3VLProcessor {
         self.inner.preprocess_wire(images, dtype)
     }
 
-    /// Fill independently owned misses while the writer still has their rows.
-    fn preprocess_cached_wire(
-        &self,
-        prefix: &[&crate::EncoderInput],
-        images: &[&DynamicImage],
-        dtype: EncoderDtype,
-    ) -> Option<Result<(crate::EncoderInput, Vec<PreprocessedEncoderInputs>), TransformError>> {
-        (dtype == EncoderDtype::BFloat16 && images.len() > 1)
-            .then(|| self.inner.preprocess_cached_wire(prefix, images, dtype))
-    }
-
     fn preprocess_video(
         &self,
         frames: &[DynamicImage],
