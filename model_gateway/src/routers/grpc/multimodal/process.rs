@@ -1146,14 +1146,23 @@ mod tests {
     use crate::observability::metrics::test_support::global_recorder;
 
     /// The queue wait is measured on the pool thread before the work and
-    /// recorded there: a task behind the one held thread records a wait of
-    /// at least the hold, and a task whose awaiting future was dropped while
-    /// it queued records its wait all the same.
+    /// recorded there: a task behind the one held thread records at least
+    /// the time from its queueing to the hold's release, a task whose
+    /// awaiting future was dropped while it queued records its wait all the
+    /// same, and the record is taken before the work runs.
     #[test]
     fn the_pool_queue_wait_is_recorded_on_the_pool_thread() {
-        use std::{collections::BTreeMap, future::Future, task::Poll};
+        use std::{
+            collections::BTreeMap,
+            future::Future,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                mpsc as std_mpsc,
+            },
+            task::Poll,
+        };
 
-        use tokio::sync::mpsc;
+        use tokio::sync::{mpsc, oneshot};
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1161,16 +1170,24 @@ mod tests {
             .build()
             .expect("a runtime");
         runtime.block_on(async {
-            let (tx, mut rx) = mpsc::unbounded_channel::<(&'static str, f64)>();
-            let hold = tokio::task::spawn_blocking(|| {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+            // Each record: who, the wait, and whether the work had run.
+            let (tx, mut rx) = mpsc::unbounded_channel::<(&'static str, f64, bool)>();
+            // The hold takes the pool's one thread, says so, and keeps it
+            // until the test releases it once both tasks are queued behind.
+            let (taken_tx, taken_rx) = oneshot::channel();
+            let (release_tx, release_rx) = std_mpsc::channel::<()>();
+            let hold = tokio::task::spawn_blocking(move || {
+                let _ = taken_tx.send(());
+                let _ = release_rx.recv();
             });
+            taken_rx.await.expect("the hold took the thread");
+
             // Polled once, so its task is queued behind the hold, then dropped.
             let dropped_tx = tx.clone();
             let mut dropped = Box::pin(on_pool_recording(
                 || (),
                 move |waited| {
-                    let _ = dropped_tx.send(("dropped", waited));
+                    let _ = dropped_tx.send(("dropped", waited, false));
                 },
             ));
             std::future::poll_fn(|cx| {
@@ -1178,42 +1195,60 @@ mod tests {
                 Poll::Ready(())
             })
             .await;
+            // Stamped after the poll, so the task's own clock started first.
+            let dropped_queued = Instant::now();
             drop(dropped);
-            // Its work takes 300 ms: a wait read before the work stays near
-            // the 50 ms hold, one read after it would pass 300 ms.
+
+            // Queued behind both, then awaited; its work sets a flag the
+            // record closure reads, so the order of the two is recorded.
+            let worked = Arc::new(AtomicBool::new(false));
+            let worked_by_work = Arc::clone(&worked);
+            let worked_by_record = Arc::clone(&worked);
             let awaited_tx = tx.clone();
-            let value = on_pool_recording(
-                || {
-                    std::thread::sleep(std::time::Duration::from_millis(300));
+            let mut awaited = Box::pin(on_pool_recording(
+                move || {
+                    worked_by_work.store(true, Ordering::SeqCst);
                     7
                 },
                 move |waited| {
-                    let _ = awaited_tx.send(("awaited", waited));
+                    let _ = awaited_tx.send((
+                        "awaited",
+                        waited,
+                        worked_by_record.load(Ordering::SeqCst),
+                    ));
                 },
-            )
-            .await
-            .expect("the work ran");
+            ));
+            std::future::poll_fn(|cx| {
+                let _ = awaited.as_mut().poll(cx);
+                Poll::Ready(())
+            })
+            .await;
+            let awaited_queued = Instant::now();
+
+            // Stamped before the release, so no record can precede it.
+            let released = Instant::now();
+            release_tx.send(()).expect("the hold is waiting");
+            let value = awaited.await.expect("the work ran");
             assert_eq!(value, 7);
             hold.await.expect("the hold ran");
             drop(tx);
+
             let mut seen = BTreeMap::new();
-            while let Some((who, waited)) = rx.recv().await {
-                seen.insert(who, waited);
+            while let Some((who, waited, worked_first)) = rx.recv().await {
+                seen.insert(who, (waited, worked_first));
             }
-            for who in ["awaited", "dropped"] {
-                let waited = seen
+            for (who, queued) in [("dropped", dropped_queued), ("awaited", awaited_queued)] {
+                let (waited, _) = seen
                     .get(who)
                     .unwrap_or_else(|| panic!("{who}: no wait recorded"));
+                let held = released.duration_since(queued).as_secs_f64();
                 assert!(
-                    *waited >= 0.02,
-                    "{who}: waited {waited} s behind a 50 ms hold"
+                    *waited >= held,
+                    "{who}: waited {waited} s, queued {held} s before the release"
                 );
             }
-            let awaited = seen["awaited"];
-            assert!(
-                awaited < 0.25,
-                "the wait was read before the work, not after: {awaited} s"
-            );
+            let (_, worked_first) = seen["awaited"];
+            assert!(!worked_first, "the wait was recorded after the work ran");
         });
     }
 
