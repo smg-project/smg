@@ -26,6 +26,7 @@
 //! already passes, on a listener of their own.
 
 mod admin;
+mod choice;
 mod embed;
 pub mod engine_hash;
 mod engine_link;
