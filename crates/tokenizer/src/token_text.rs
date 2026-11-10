@@ -13,8 +13,10 @@
 //! decodes here; a step that adds a plain token to a window with nothing
 //! pending takes the token's text without a decode at all.
 //!
-//! The table is built on the first decode: a tokenizer that only encodes (the
-//! usual role of the vocabularies with these decoders) never pays for it.
+//! The table is built at load, where its cost sits beside the vocabulary's own
+//! parse and no request waits for it: about 3,000 instructions per id (25 ms
+//! for a vocabulary of 30 thousand ids, a few MB and a fraction of a second for
+//! one of 250 thousand). A tokenizer that only encodes carries it unused.
 
 use std::sync::Arc;
 
@@ -133,6 +135,7 @@ fn clean(text: &str, cleanup: bool) -> String {
 
 impl TokenTextTable {
     /// Whether [`Self::build`] takes the tokenizer's decoder.
+    #[cfg(test)]
     pub(crate) fn applies(tokenizer: &HfTokenizer) -> bool {
         tokenizer
             .get_decoder()

@@ -110,10 +110,10 @@ pub struct HuggingFaceTokenizer {
     pieces: Option<Arc<PieceTable>>,
     /// Text per id as a first and as a later token, when the decoder reads
     /// tokens one at a time (`WordPiece`, `Metaspace`; see `token_text`),
-    /// built on the first decode: full and window decodes read it instead
-    /// of running the `tokenizers` decode. `None` once built for another
-    /// decoder.
-    token_texts: OnceLock<Option<Arc<TokenTextTable>>>,
+    /// built at load so that no request pays for it: full and window decodes
+    /// read it instead of running the `tokenizers` decode. `None` for
+    /// another decoder.
+    token_texts: Option<Arc<TokenTextTable>>,
     /// The opt-in v1 pipeline, when the choice took it (then the core's
     /// `native` is `None`).
     #[cfg(feature = "tokenizers-v1")]
@@ -143,16 +143,15 @@ pub struct HuggingFaceTokenizer {
 
 /// Logs, once per load, which path a tokenizer's full decode takes: the
 /// byte-level table (a `ByteLevel` decoder), the piece table (byte fallback),
-/// the token-text table (a `WordPiece` or `Metaspace` decoder; built on the
-/// first decode), or `tokenizers` itself, with the decoder kind that kept the
-/// tables out.
+/// the token-text table (a `WordPiece` or `Metaspace` decoder), or
+/// `tokenizers` itself, with the decoder kind that kept the tables out.
 fn log_decode_path(tokenizer: &HfTokenizer, byte_level: bool, pieces: bool, token_texts: bool) {
     let path = if byte_level {
         "byte-level table"
     } else if pieces {
         "piece table"
     } else if token_texts {
-        "token-text table, built on the first decode"
+        "token-text table"
     } else {
         "tokenizers"
     };
@@ -921,11 +920,12 @@ impl HuggingFaceTokenizer {
         let byte_level_chain =
             byte_level.is_none() && tokenizer.get_decoder().is_some_and(has_byte_level_member);
         let pieces = PieceTable::build(&tokenizer);
+        let token_texts = TokenTextTable::build(&tokenizer);
         log_decode_path(
             &tokenizer,
             byte_level.is_some(),
             pieces.is_some(),
-            TokenTextTable::applies(&tokenizer),
+            token_texts.is_some(),
         );
         let core = Arc::new(EncoderCore::new(tokenizer, encoders.native));
         let structural_controls = tokenizer_path
@@ -942,7 +942,7 @@ impl HuggingFaceTokenizer {
         Ok(HuggingFaceTokenizer {
             byte_level,
             pieces,
-            token_texts: OnceLock::new(),
+            token_texts,
             #[cfg(feature = "tokenizers-v1")]
             v1: encoders.v1,
             core,
@@ -977,12 +977,10 @@ impl HuggingFaceTokenizer {
         self.decode(ids, skip_special_tokens)
     }
 
-    /// The token-text table, built by the first decode that asks (see
-    /// `token_text`); `None` for a decoder it does not read.
+    /// The token-text table (see `token_text`); `None` for a decoder it does
+    /// not read.
     fn token_texts(&self) -> Option<&Arc<TokenTextTable>> {
-        self.token_texts
-            .get_or_init(|| TokenTextTable::build(&self.core.tokenizer))
-            .as_ref()
+        self.token_texts.as_ref()
     }
 
     /// The byte a ByteFallback byte token (`<0xHH>`) stands for.
@@ -1271,16 +1269,17 @@ impl HuggingFaceTokenizer {
         let byte_level_chain =
             byte_level.is_none() && tokenizer.get_decoder().is_some_and(has_byte_level_member);
         let pieces = PieceTable::build(&tokenizer);
+        let token_texts = TokenTextTable::build(&tokenizer);
         log_decode_path(
             &tokenizer,
             byte_level.is_some(),
             pieces.is_some(),
-            TokenTextTable::applies(&tokenizer),
+            token_texts.is_some(),
         );
         HuggingFaceTokenizer {
             byte_level,
             pieces,
-            token_texts: OnceLock::new(),
+            token_texts,
             #[cfg(feature = "tokenizers-v1")]
             v1: encoders.v1,
             core: Arc::new(EncoderCore::new(tokenizer, encoders.native)),
@@ -2115,9 +2114,9 @@ impl Decoder for HuggingFaceTokenizer {
             return Ok(table.render(token_ids, skip_special_tokens));
         }
         // A vocabulary whose decoder reads tokens one at a time (WordPiece,
-        // Metaspace) decodes through its token-text table, built by the
-        // first decode: one pass over the ids in place of a string per token
-        // and the decoder's passes over each.
+        // Metaspace) decodes through its token-text table: one pass over the
+        // ids in place of a string per token and the decoder's passes over
+        // each.
         if let Some(table) = self.token_texts() {
             return Ok(table.render(token_ids, skip_special_tokens));
         }
