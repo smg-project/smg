@@ -25,15 +25,16 @@
 //!    through).
 //!
 //! The rule bounds nothing but the long side. The serving engine publishes
-//! 3164 feature tokens as its per-image maximum for the family (the count of
+//! 3164 prompt tokens as its per-image maximum for the family (the layout of
 //! a 3024 x 3024 image, the size it names as the one with the most features:
-//! 36 crops, five newlines, the view) and admits a larger item only under
+//! 36 crops, five newlines, the view; 3085 of those positions carry a
+//! feature) and admits a larger item only under
 //! its batched-token budget, a deployment flag (2048, 8192 or 16384 by the
 //! engine's memory size at the pin). A thin image (an aspect ratio past 4
 //! with a short side of 32 px or more, one under 32 px after the cap
 //! included) takes a window as small as its short side, with the crop count
 //! growing as the long side over it: a 2000 x 40 image plans 50 crops and
-//! 4321 tokens, a 96768 x 32 image 3024 one-pixel windows and 8.6 GiB of
+//! 4321 prompt tokens, a 96768 x 32 image 3024 one-pixel windows and 8.6 GiB of
 //! float32. A plan past the published maximum, like a side that caps to
 //! zero, is refused before any pixel moves, with the size, the crops, the
 //! count and the limit named: strips thinner than about 1:36 that an engine
