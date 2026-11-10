@@ -890,23 +890,29 @@ async fn preprocess_image_batch(
     .map_err(|e| anyhow::Error::new(e).context("Preprocessing task panicked"))?
 }
 
-/// Decode the frames in parallel and borrow them for the processor.
+/// Decode and preprocess an image batch.
 fn preprocess_image_frames(
     images: &[Arc<ImageFrame>],
     vision_processors: &VisionProcessors,
     image_wire_dtype: Option<EncoderDtype>,
 ) -> Result<PreprocessedEncoderInputs> {
-    ImageFrame::decode_all(images).map_err(llm_multimodal::MultiModalError::Media)?;
+    let decoded = decode_image_frames(images)?;
     let processor = vision_processors.image()?;
-    let decoded = images
+    preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
+}
+
+/// Decode the frames in parallel and borrow them for the processor.
+fn decode_image_frames(images: &[Arc<ImageFrame>]) -> Result<Vec<&image::DynamicImage>> {
+    ImageFrame::decode_all(images).map_err(llm_multimodal::MultiModalError::Media)?;
+    images
         .iter()
         .map(|frame| {
             frame
                 .image()
                 .map_err(llm_multimodal::MultiModalError::Media)
+                .map_err(anyhow::Error::from)
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
+        .collect()
 }
 
 /// The images preprocessed: laid out in `wire_dtype` in one pass when the

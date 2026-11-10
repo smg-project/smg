@@ -658,5 +658,20 @@ async fn minimax_batch_cache_reuses_single_and_batch_misses_in_request_order() {
             actual.encoder_input.write_as(EncoderDtype::BFloat16),
             expected.encoder_input.write_as(EncoderDtype::BFloat16)
         );
+
+        // Repeated images still share request-local work when the unique
+        // working set is too large to admit new entries.
+        let request = batch(&[&first_hit, &third, &second, &third]);
+        let reference = batch(&[&first, &third, &second, &third]);
+        let expected = preprocess_batch(&reference, &small).await.unwrap();
+        let actual = preprocess_modality(&request, &small).await.unwrap();
+        assert_eq!(actual.feature_token_counts, expected.feature_token_counts);
+        assert_eq!(
+            actual.encoder_input.write_as(EncoderDtype::BFloat16),
+            expected.encoder_input.write_as(EncoderDtype::BFloat16)
+        );
+        assert!(preprocess_modality(&batch(&[&second_hit]), &small)
+            .await
+            .is_err());
     }
 }

@@ -52,6 +52,7 @@ use super::{
 use crate::{
     types::RgbFrameRef,
     vision::{
+        execution,
         preprocessor_config::PreProcessorConfig,
         processor::{PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor},
         transforms::TransformError,
@@ -342,6 +343,38 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
             return None;
         }
         self.inner.preprocess_wire(images, dtype)
+    }
+
+    /// Produce cache entries directly when they will be assembled with hits
+    /// or duplicated in the request. Keep the shared executor's task limits.
+    fn preprocess_image_items(
+        &self,
+        images: &[&DynamicImage],
+        wire_dtype: Option<EncoderDtype>,
+    ) -> Option<Result<Vec<PreprocessedEncoderInputs>, TransformError>> {
+        let preprocess = |image: &&DynamicImage| {
+            let one = std::slice::from_ref(image);
+            wire_dtype
+                .filter(|dtype| *dtype == EncoderDtype::BFloat16)
+                .and_then(|dtype| self.inner.preprocess_wire(one, dtype))
+                .unwrap_or_else(|| self.inner.preprocess(one))
+        };
+        let source_bytes = images.iter().map(|image| image.as_bytes().len()).sum();
+        let tasks = execution::task_count(source_bytes, images.len(), 1);
+        if tasks <= 1 {
+            return Some(images.iter().map(preprocess).collect());
+        }
+        let chunk_size = images.len().div_ceil(tasks);
+        let mut results: Vec<_> = images.chunks(chunk_size).map(|_| Vec::new()).collect();
+        execution::scope(|scope| {
+            for (images, result) in images.chunks(chunk_size).zip(&mut results) {
+                let preprocess = &preprocess;
+                scope.spawn(move |_| {
+                    result.extend(images.iter().map(preprocess));
+                });
+            }
+        });
+        Some(results.into_iter().flatten().collect())
     }
 
     fn preprocess_video(

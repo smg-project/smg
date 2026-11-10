@@ -8,7 +8,9 @@ use llm_multimodal::{
     PreprocessedEncoderInputs,
 };
 
-use super::{on_pool, preprocess_image_frames, PlanContext};
+use super::{
+    decode_image_frames, on_pool, preprocess_image_frames, preprocess_images, PlanContext,
+};
 use crate::{
     observability::metrics::Metrics,
     routers::grpc::multimodal::pixel_cache::{CachedPreprocessedItem, PixelCache, PixelCacheKey},
@@ -84,52 +86,55 @@ pub(super) async fn preprocess(
         let mut inserts = Vec::new();
         let mut cold_batch = None;
         if !misses.is_empty() {
-            let mut batch = preprocess_image_frames(&miss_images, &processors, wire_dtype)?;
             let direct = misses.len() == images.len();
-            // The fused M3 preprocessor emits neutral bytes for a lone
-            // image. Match the format of cached BF16 batches before joining.
-            if wire_dtype == Some(EncoderDtype::BFloat16)
-                && !matches!(batch.encoder_input, EncoderInput::Wire { .. })
+            let processor = processors.image()?;
+            let decoded = decode_image_frames(&miss_images)?;
+            let items = if let Some(items) = (!direct)
+                .then(|| processor.preprocess_image_items(&decoded, wire_dtype))
+                .flatten()
             {
-                let input = batch.encoder_input;
-                let shape = input.shape().to_vec();
-                let norm = input
-                    .pixel_norm()
-                    .context("M3 image input has no pixel normalization")?;
-                let bytes = input
-                    .into_bytes_as(EncoderDtype::BFloat16)
-                    .map_err(anyhow::Error::msg)?;
-                batch.encoder_input =
-                    EncoderInput::wire(bytes, EncoderDtype::BFloat16, shape, norm)
-                        .map_err(anyhow::Error::msg)?;
-            }
-            // Skip admission when the pixels alone exceed the budget.
-            let working_bytes = batch.encoder_input.nbytes().saturating_add(
-                parts
-                    .iter()
-                    .flatten()
-                    .map(|p| p.preprocessed.encoder_input.nbytes())
-                    .sum(),
-            );
-            let admit = working_bytes <= budget;
-            if direct && !admit {
-                return Ok(batch);
-            }
-            // A lone miss in a mixed or repeated request already has the
-            // cache entry's layout. Move it instead of slicing a full copy.
-            let items = if !direct
-                && misses.len() == 1
-                && batch.batch_size() == 1
-                && batch.feature_token_counts.len() == 1
-            {
-                vec![batch]
+                items?
             } else {
+                let mut batch = preprocess_images(processor.as_ref(), &decoded, wire_dtype)?;
+                // The fused batch processor emits neutral pixels for a lone
+                // image. Match the representation of multi-image entries.
+                if wire_dtype == Some(EncoderDtype::BFloat16)
+                    && !matches!(batch.encoder_input, EncoderInput::Wire { .. })
+                {
+                    let input = batch.encoder_input;
+                    let shape = input.shape().to_vec();
+                    let norm = input
+                        .pixel_norm()
+                        .context("M3 image input has no pixel normalization")?;
+                    let bytes = input
+                        .into_bytes_as(EncoderDtype::BFloat16)
+                        .map_err(anyhow::Error::msg)?;
+                    batch.encoder_input =
+                        EncoderInput::wire(bytes, EncoderDtype::BFloat16, shape, norm)
+                            .map_err(anyhow::Error::msg)?;
+                }
+                if direct && batch.encoder_input.nbytes() > budget {
+                    return Ok(batch);
+                }
                 let items = split_batch(&batch, &layouts, misses.len())?;
                 if direct {
                     cold_batch = Some(batch);
                 }
                 items
             };
+            anyhow::ensure!(
+                items.len() == misses.len()
+                    && items
+                        .iter()
+                        .all(|item| item.batch_size() == 1 && item.feature_token_counts.len() == 1),
+                "M3 image preprocessing returned an unexpected item count"
+            );
+            let admit = items
+                .iter()
+                .chain(parts.iter().flatten().map(|part| &part.preprocessed))
+                .map(|item| item.encoder_input.nbytes())
+                .try_fold(budget, usize::checked_sub)
+                .is_some();
             for ((index, key), preprocessed) in misses.into_iter().zip(items) {
                 let entry = Arc::new(CachedPreprocessedItem { preprocessed });
                 if admit {

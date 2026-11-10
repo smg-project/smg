@@ -187,6 +187,16 @@ pub trait VisionPreProcessor: Send + Sync {
         None
     }
 
+    /// Preprocess images into independently owned cache entries. When supplied,
+    /// the wire dtype uses the same bytes as the corresponding batch.
+    fn preprocess_image_items(
+        &self,
+        _images: &[&DynamicImage],
+        _wire_dtype: Option<EncoderDtype>,
+    ) -> Option<Result<Vec<PreprocessedEncoderInputs>, TransformError>> {
+        None
+    }
+
     /// Preprocess one decoded video clip represented as sampled frames.
     ///
     /// Implementations that support video should emit the same primary
