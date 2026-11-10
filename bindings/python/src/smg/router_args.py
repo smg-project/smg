@@ -378,11 +378,15 @@ class RouterArgs:
     # The worker discovery provider. service_discovery=True is the legacy
     # spelling of discovery_provider="kubernetes"; set one or the other.
     discovery_provider: str | None = None
+    # Deprecated and ignored: data-parallel ranks are discovered at every
+    # registration (one worker per rank of a gRPC or SGLang HTTP engine; a ZMQ
+    # engine stays one grouped worker). Removed in 1.17.
     dp_aware: bool = False
     # Choose a data-parallel rank per request from the ranks' reported token
     # loads: the HTTP prefill-decode router, for an engine registered as one
-    # worker. Under dp_aware the ranks are workers and the policy's pick among
-    # them is the rank choice, so this chooses nothing there (warned at start-up)
+    # worker. A data-parallel engine's ranks are workers and the policy's
+    # pick among them is the rank choice, so this chooses nothing there (warned
+    # at the engine's registration)
     dp_minimum_tokens_scheduler: bool = False
     # Seconds a Ready worker is kept in Draining before it leaves the registry,
     # on every removal (a discovery deletion, an unhealthy worker's removal, the
@@ -1514,7 +1518,11 @@ class RouterArgs:
         routing_group.add_argument(
             f"--{prefix}dp-aware",
             action="store_true",
-            help="Enable data parallelism aware schedule",
+            help=(
+                "Deprecated and ignored: data-parallel ranks are discovered at every"
+                " registration (one worker per rank of a gRPC or SGLang HTTP engine; a ZMQ"
+                " engine stays one grouped worker). The flag is removed in release 1.17"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}routing-key-override",
@@ -1542,9 +1550,9 @@ class RouterArgs:
             help=(
                 "Choose a data-parallel rank per request from the ranks' reported token"
                 " loads: the HTTP prefill-decode router, for an engine registered as one"
-                " worker. Under --dp-aware the engine's ranks are workers and the policy's"
+                " worker. A data-parallel engine's ranks are workers and the policy's"
                 " pick among them is the rank choice, so this flag chooses nothing there"
-                " (warned at start-up)"
+                " (warned at the engine's registration)"
             ),
         )
         routing_group.add_argument(

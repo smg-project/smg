@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import warnings
 
 from smg.router_args import RouterArgs
 from smg.smg_rs import (
@@ -357,12 +358,14 @@ class Router:
             cache-aware routing (chars for HTTP, tokens for gRPC), shared across
             all workers; eviction keeps every tree at or under this bound.
             Default: 2^26
-        dp_aware: Enable data parallelism aware schedule. Default: False
+        dp_aware: Deprecated and ignored: data-parallel ranks are discovered at every
+            registration (one worker per rank of a gRPC or SGLang HTTP engine; a ZMQ
+            engine stays one grouped worker). Removed in 1.17. Default: False
         dp_minimum_tokens_scheduler: Choose a data-parallel rank per request from the
             ranks' reported token loads: the HTTP prefill-decode router, for an engine
-            registered as one worker. Under dp_aware the engine's ranks are workers and
-            the policy's pick among them is the rank choice, so this chooses nothing
-            there (warned at start-up). Default: False
+            registered as one worker. A data-parallel engine's ranks are workers
+            and the policy's pick among them is the rank choice, so this chooses
+            nothing there (warned at the engine's registration). Default: False
         upstream_http2: Speak HTTP/2 to workers via prior knowledge (h2c on
             cleartext), multiplexing every request to a worker over one
             connection. Negotiated per worker at registration: a worker that
@@ -370,8 +373,7 @@ class Router:
         enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When
             enabled, the router can manage multiple models simultaneously with per-model
             load balancing policies. Default: False
-        api_key: The api key used for the authorization with the worker. Useful when
-            the dp aware scheduling strategy is enabled. Default: None
+        api_key: The api key used for the authorization with the worker. Default: None
         log_dir: Directory to store log files. If None, logs are only output to
             console. Default: None
         log_level: Logging level. Options: 'debug', 'info', 'warn', 'error'.
@@ -488,6 +490,16 @@ class Router:
     def from_args(args: RouterArgs) -> Router:
         """Create a router from a RouterArgs instance."""
 
+        if args.dp_aware:
+            # Accepted for one release and ignored: the gateway discovers
+            # data-parallel ranks at every registration.
+            warnings.warn(
+                "dp_aware is deprecated and ignored: data-parallel ranks are discovered"
+                " at every registration (gRPC and SGLang HTTP engines; a ZMQ engine stays"
+                " one grouped worker); the argument is removed in 1.17",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         args_dict = vars(args).copy()
         provider = args.selected_discovery_provider()
         for field in _DISCOVERY_FIELDS:
