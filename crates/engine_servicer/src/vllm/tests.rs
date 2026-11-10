@@ -51,8 +51,8 @@ use super::*;
 use crate::{
     kv_events,
     testing::{
-        assert_bucket_edges, assert_golden, bound_port, captured_logs, http_get, servicer_config,
-        Bounded,
+        assert_bucket_edges, assert_golden, bound_port, captured_logs, http_get, next_batch,
+        servicer_config, Bounded,
     },
     tokenizer_bundle, ServicerError,
 };
@@ -2124,11 +2124,7 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
         .expect("subscribe")
         .into_inner();
     for expected in [0, 1] {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         assert_eq!(batch.sequence_number, expected);
     }
     assert_eq!(relay.counts().served_from_history, 1);
@@ -2644,11 +2640,7 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
         .expect("subscribe")
         .into_inner();
     for expected in 0..=3 {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         assert_eq!(batch.sequence_number, expected);
     }
     assert_eq!(relay.counts().served_from_history, 1);
@@ -3019,11 +3011,7 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
         .await
         .expect("publish");
     let second = loop {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         if batch.sequence_number != 0 {
             break batch;
         }

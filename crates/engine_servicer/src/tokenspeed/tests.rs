@@ -43,7 +43,8 @@ use super::*;
 use crate::{
     kv_events,
     testing::{
-        assert_bucket_edges, assert_golden, captured_logs, http_get, servicer_config, Bounded,
+        assert_bucket_edges, assert_golden, captured_logs, http_get, next_batch, servicer_config,
+        Bounded,
     },
     ServicerError,
 };
@@ -1654,11 +1655,7 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
         .expect("subscribe")
         .into_inner();
     for expected in [0, 1] {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         assert_eq!(batch.sequence_number, expected);
     }
     assert_eq!(relay.counts().served_from_history, 1);
@@ -1698,11 +1695,7 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
         .expect("subscribe")
         .into_inner();
     for expected in 0..=3 {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         assert_eq!(batch.sequence_number, expected);
     }
     assert_eq!(relay.counts().served_from_history, 1);
@@ -1909,11 +1902,7 @@ async fn every_rank_of_a_data_parallel_publisher_reaches_the_gateway() {
         .into_inner();
     let mut seen = Vec::new();
     for _ in 0..2 {
-        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-            .await
-            .expect("a batch in time")
-            .expect("stream open")
-            .expect("a batch");
+        let batch = next_batch(&mut stream).await;
         seen.push((batch.dp_rank, batch.sequence_number));
     }
     seen.sort_unstable();
@@ -1927,11 +1916,7 @@ async fn every_rank_of_a_data_parallel_publisher_reaches_the_gateway() {
         .send(golden::frame(b"kv", 1, &batch2))
         .await
         .expect("publish");
-    let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
-        .await
-        .expect("a batch in time")
-        .expect("stream open")
-        .expect("a batch");
+    let batch = next_batch(&mut stream).await;
     assert_eq!((batch.dp_rank, batch.sequence_number), (Some(1), 1));
     drop(stream);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
