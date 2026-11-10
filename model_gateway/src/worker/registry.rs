@@ -470,6 +470,37 @@ impl WorkerRegistry {
         self.worker_origins.get(worker_id).map(|entry| *entry)
     }
 
+    /// Whether a worker this node owns serves the canonical model
+    /// `model_id`. Mesh imports do not count: a model's policy is built from
+    /// a local registration's labels and lives as long as one does. An alias
+    /// does not count either: policies are keyed by canonical ids, which the
+    /// routers resolve every alias to first.
+    ///
+    /// The worker at each of the model's index entries counts while it lists
+    /// the model: a refresh of an endpoint's model list rewrites the worker's
+    /// models and leaves the model index as the registration wrote it. A
+    /// worker registered without model cards is indexed under its primary
+    /// model alone, and counts for that.
+    pub fn serves_model_locally(&self, model_id: &str) -> bool {
+        let Some(indexed) = self
+            .model_index
+            .get(model_id)
+            .map(|workers| Arc::clone(&workers.all))
+        else {
+            return false;
+        };
+        indexed.iter().any(|entry| {
+            self.get_id_by_url(entry.url()).is_some_and(|id| {
+                self.origin_of(&id) == Some(WorkerOrigin::Local)
+                    && self.get(&id).is_some_and(|worker| {
+                        worker.any_model(&mut |card| card.id == model_id)
+                            || (worker.metadata().spec.models.is_wildcard()
+                                && worker.model_id() == model_id)
+                    })
+            })
+        })
+    }
+
     /// Subscribe to the `WorkerEvent` broadcast stream.
     ///
     /// Returns a `broadcast::Receiver` that observes every future mutation
@@ -1994,6 +2025,27 @@ impl WorkerRegistry {
             model_ids.push(worker.model_id().to_string());
         }
 
+        model_ids
+    }
+
+    /// The models whose policy `worker` keeps: every model it serves
+    /// ([`Self::worker_model_ids`]), every model its registration listed,
+    /// which a refresh of its model list can leave out while the model
+    /// index keeps them, and its primary model, which names the policy its
+    /// registration built. A model's policy goes once no worker of this node
+    /// serves it (see [`Self::serves_model_locally`]), so a workflow that
+    /// takes `worker` away asks after each of them.
+    pub fn policy_model_ids(worker: &Arc<dyn Worker>) -> Vec<String> {
+        let mut model_ids = Self::worker_model_ids(worker);
+        let registered = worker.metadata().spec.models.all().iter();
+        for model_id in registered
+            .map(|card| card.id.as_str())
+            .chain([worker.model_id()])
+        {
+            if !model_ids.iter().any(|known| known == model_id) {
+                model_ids.push(model_id.to_string());
+            }
+        }
         model_ids
     }
 

@@ -255,6 +255,11 @@ pub struct WorkerRemovalWorkflowData {
     /// Actual worker objects to remove (transient, not serialized)
     #[serde(skip, default)]
     pub actual_workers_to_remove: Option<Vec<Arc<dyn Worker>>>,
+    /// The workers the registry step removed at those URLs, a same-URL
+    /// replacement that landed during the drain rather than the worker found
+    /// (transient, not serialized)
+    #[serde(skip, default)]
+    pub removed_workers: Vec<Arc<dyn Worker>>,
 }
 
 impl WorkflowData for WorkerRemovalWorkflowData {

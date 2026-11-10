@@ -382,6 +382,116 @@ fn origin_tracks_local_and_mesh_registrations() {
     assert_eq!(registry.origin_of(&mesh_id), Some(WorkerOrigin::Mesh));
 }
 
+#[test]
+fn a_model_is_served_locally_only_by_a_worker_this_node_owns() {
+    let registry = WorkerRegistry::new();
+    assert!(!registry.serves_model_locally("llama-3"));
+
+    registry.on_remote_worker_state(&remote_state("peer-w1", "http://remote:8080", true, vec![]));
+    assert!(!registry.serves_model_locally("llama-3"));
+
+    let local: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://local:8080")
+            .model(ModelCard::new("llama-3"))
+            .build(),
+    );
+    registry.register(local).unwrap();
+    assert!(registry.serves_model_locally("llama-3"));
+    registry.remove_by_url("http://local:8080");
+    assert!(!registry.serves_model_locally("llama-3"));
+}
+
+#[test]
+fn a_worker_serves_locally_the_models_it_lists_now() {
+    // A refresh of an endpoint's model list rewrites the worker's models and
+    // leaves the model index as the registration wrote it. Its primary model,
+    // the first card, counts no more than the others once left out.
+    let registry = WorkerRegistry::new();
+    let endpoint: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![ModelCard::new("qwen"), ModelCard::new("llama")])
+            .build(),
+    );
+    registry.register(Arc::clone(&endpoint)).unwrap();
+    assert!(registry.serves_model_locally("qwen"));
+    assert!(registry.serves_model_locally("llama"));
+
+    endpoint.set_models(vec![ModelCard::new("llama")]);
+    assert!(!registry.serves_model_locally("qwen"));
+    assert!(registry.serves_model_locally("llama"));
+}
+
+#[test]
+fn a_worker_registered_without_model_cards_serves_its_primary_model() {
+    // Indexed under its primary model alone, the `model_id` label or the
+    // wildcard id: a model list it discovers later leaves that out, and it
+    // still counts for it.
+    let registry = WorkerRegistry::new();
+    let labelled: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://labelled:8080")
+            .label("model_id", "llama")
+            .build(),
+    );
+    let unlabelled: Arc<dyn Worker> =
+        Arc::new(BasicWorkerBuilder::new("http://unlabelled:8080").build());
+    registry.register(Arc::clone(&labelled)).unwrap();
+    registry.register(Arc::clone(&unlabelled)).unwrap();
+    assert!(registry.serves_model_locally("llama"));
+    assert!(registry.serves_model_locally(unlabelled.model_id()));
+
+    labelled.set_models(vec![ModelCard::new("qwen")]);
+    unlabelled.set_models(vec![ModelCard::new("qwen")]);
+    assert!(registry.serves_model_locally("llama"));
+    assert!(registry.serves_model_locally(unlabelled.model_id()));
+}
+
+#[test]
+fn an_alias_is_not_a_model_served_locally() {
+    // Policies are keyed by canonical ids, which the routers resolve every
+    // alias to first.
+    let registry = WorkerRegistry::new();
+    registry
+        .register(worker_with_model_aliases(
+            "http://w1:8080",
+            "llama",
+            &["llama-latest"],
+            WorkerType::Regular,
+        ))
+        .unwrap();
+    assert!(registry.serves_model_locally("llama"));
+    assert!(!registry.serves_model_locally("llama-latest"));
+}
+
+#[test]
+fn a_worker_keeps_the_policy_of_every_model_it_serves_and_of_its_primary_model() {
+    let endpoint: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://endpoint:8080")
+            .models(vec![ModelCard::new("qwen"), ModelCard::new("llama")])
+            .build(),
+    );
+    assert_eq!(
+        WorkerRegistry::policy_model_ids(&endpoint),
+        ["qwen", "llama"]
+    );
+    // A refresh of its model list leaves llama in the model index, and its
+    // removal asks after llama all the same.
+    endpoint.set_models(vec![ModelCard::new("qwen"), ModelCard::new("mistral")]);
+    assert_eq!(
+        WorkerRegistry::policy_model_ids(&endpoint),
+        ["qwen", "mistral", "llama"]
+    );
+
+    // A worker registered before its models were known names its policy by
+    // its primary model, which the models it discovers later leave out.
+    let lazy: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://lazy:8080").build());
+    let primary = lazy.model_id().to_string();
+    lazy.set_models(vec![ModelCard::new("qwen")]);
+    assert_eq!(
+        WorkerRegistry::policy_model_ids(&lazy),
+        vec!["qwen".to_string(), primary]
+    );
+}
+
 /// The record a rebuild from a decoded spec is for.
 fn record(version: u64) -> ImportRecord {
     ImportRecord {
