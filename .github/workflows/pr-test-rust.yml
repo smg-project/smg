@@ -927,6 +927,7 @@ jobs:
               - 'crates/kv_index/**'
               - 'crates/mesh/**'
               - 'crates/mm_rdma/**'
+              - 'crates/policy_controller/**'
               - 'crates/radix_tree/**'
             rust-radix:
               - *rust-infra
@@ -1228,6 +1229,9 @@ jobs:
               ("crates/mock_worker/**",                          NONE),
               ("crates/gateway_perf/**",                         NONE),
               ("crates/radix_tree/**",                           NONE),
+              # the policy controller crate: linked by no binary yet (its gateway host is
+              # a later change, which moves this row to the core)
+              ("crates/policy_controller/**",                    NONE),
               ("crates/tokenizer/**",                            "go-bindings"),
               # Symphony and the response templates it compiles: the default
               # parser, read on every lane's chat, messages and responses path

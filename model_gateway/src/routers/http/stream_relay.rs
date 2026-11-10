@@ -20,7 +20,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
 
-use super::stream_failure::{mark_head_success_recorded, note_sent, RelaySource, UpstreamCut};
+use super::stream_failure::{
+    mark_head_success_recorded, note_sent, RelaySource, SentTail, UpstreamCut,
+};
 use crate::{
     routers::common::{
         sse::SSE_CHANNEL_BUFFER,
@@ -131,7 +133,7 @@ where
             // its last bytes, so the event that ends a cut SSE body is
             // written on a frame boundary.
             let mut relayed: u64 = 0;
-            let mut sent_tail: Vec<u8> = Vec::with_capacity(4);
+            let mut sent_tail = SentTail::default();
             // One timer, reset per chunk, instead of a fresh sleep per token.
             let idle = tokio::time::sleep(IDLE_FLUSH);
             tokio::pin!(idle);
@@ -202,7 +204,7 @@ where
                                         // On its own frame: a cut inside a frame leaves
                                         // a partial line the event must not merge into.
                                         let event =
-                                            source.error_event_on_its_own_frame(&cut, &sent_tail);
+                                            source.error_event_on_its_own_frame(&cut, sent_tail.as_slice());
                                         let _ = tx.send(Ok(event)).await;
                                         break;
                                     }

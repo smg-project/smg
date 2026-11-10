@@ -1,6 +1,6 @@
 [workspace]
 members = ["model_gateway", "model_gateway/test_harness", "crates/protocols", "crates/reasoning_parser", "crates/response_template", "crates/tool_parser", "crates/symphony", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp",
-    "crates/external_router", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "crates/engine_zmq_adapter", "crates/engine_servicer", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/gateway_perf", "crates/rl", "crates/radix_tree"]
+    "crates/external_router", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "crates/engine_zmq_adapter", "crates/engine_servicer", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/gateway_perf", "crates/rl", "crates/radix_tree", "crates/policy_controller"]
 resolver = "2"
 
 [workspace.package]
@@ -33,6 +33,7 @@ engine-zmq-client = { version = "0.5.0", path = "crates/engine_zmq_client" }
 engine-zmq-adapter = { version = "0.3.0", path = "crates/engine_zmq_adapter" }
 engine-servicer = { version = "0.4.0", path = "crates/engine_servicer" }
 smg-rl = { version = "0.3.1", path = "crates/rl" }
+smg-policy-controller = { version = "0.1.0", path = "crates/policy_controller" }
 
 # Shared dependencies
 anyhow = "1.0"

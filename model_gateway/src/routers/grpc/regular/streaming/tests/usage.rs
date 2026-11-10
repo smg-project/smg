@@ -1647,3 +1647,208 @@ fn continuous_spec_usage_terminal_coverage_controls() {
         }
     }
 }
+
+/// Clean EOF may return the completed subset, but cannot certify rejections
+/// for the requested choice that never supplied its terminal counters.
+#[tokio::test]
+async fn collected_chat_missing_choice_keeps_rejections_unknown() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "eof-test", "messages": [], "n": 2,
+        "separate_reasoning": false,
+    }))
+    .unwrap();
+    let counters = Counters {
+        prompt: 10,
+        cached: 4,
+        spec_accepted: 2,
+        spec_drafted: 2,
+    };
+    let (response, counts) = non_streamed_chat(
+        scheduler_stream(scheduler_choice_frames(0, &["ok"], counters, 3)).await,
+        &request,
+    )
+    .await;
+    assert_eq!(
+        response.choices.len(),
+        1,
+        "preserve the partial answer policy"
+    );
+    assert_eq!(
+        counts.settlement(),
+        UsageSettlement {
+            actual_input_tokens: 10,
+            completion_tokens: 2,
+            cached_input_tokens: 4,
+            reasoning_tokens: 3,
+        }
+    );
+    let usage = serde_json::to_value(response).unwrap()["usage"].clone();
+    assert_eq!(
+        usage["completion_tokens_details"]["accepted_prediction_tokens"],
+        2
+    );
+    assert!(
+        usage["completion_tokens_details"]
+            .get("rejected_prediction_tokens")
+            .is_none(),
+        "{usage}"
+    );
+}
+
+#[tokio::test]
+async fn collected_completion_missing_choice_in_one_prompt_keeps_rejections_unknown() {
+    for (first_indices, second_indices) in [
+        (&[1, 0][..], &[0][..]),
+        (&[1, 0][..], &[1, 0][..]),
+        (&[1, 0][..], &[0, 0][..]),
+        (&[0][..], &[1, 0][..]),
+    ] {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "eof-test", "prompt": ["first", "second"], "n": 2,
+        }))
+        .unwrap();
+        let counters = Counters {
+            prompt: 10,
+            cached: 4,
+            spec_accepted: 2,
+            spec_drafted: 2,
+        };
+        let first: Vec<_> = first_indices
+            .iter()
+            .flat_map(|&index| scheduler_choice_frames(index, &["ok"], counters, 3))
+            .collect();
+        let mut results = Vec::new();
+        let mut servers = Vec::new();
+        let second: Vec<_> = second_indices
+            .iter()
+            .flat_map(|&index| scheduler_choice_frames(index, &["ok"], counters, 3))
+            .collect();
+        for frames in [first, second] {
+            let (stream, server) = scheduler_stream(frames).await;
+            results.push(context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            });
+            servers.push(server);
+        }
+        let tokenizer = tokenizer();
+        let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+        let response = response_processor()
+            .process_non_streaming_completion_response(
+                context::ExecutionResult::Batch { results },
+                CompletionResponseSpec::new(&request, Vec::new()),
+                dispatch(),
+                &tokenizer,
+                &mut decoder,
+            )
+            .await
+            .unwrap_or_else(|response| panic!("{}", response.status()));
+        for server in servers {
+            server.abort();
+        }
+        let count = first_indices.len() + second_indices.len();
+        assert_eq!(
+            response.choices.iter().map(|c| c.index).collect::<Vec<_>>(),
+            (0..first_indices.len() as u32)
+                .chain((0..second_indices.len() as u32).map(|i| 2 + i))
+                .collect::<Vec<_>>()
+        );
+        let usage = serde_json::to_value(response).unwrap()["usage"].clone();
+        assert_eq!(usage["prompt_tokens"], 20);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 8);
+        assert_eq!(usage["completion_tokens"], 2 * count);
+        assert_eq!(
+            usage["completion_tokens_details"]["reasoning_tokens"],
+            3 * count
+        );
+        assert_eq!(
+            usage["completion_tokens_details"]["accepted_prediction_tokens"],
+            2 * count
+        );
+        let rejected = usage["completion_tokens_details"].get("rejected_prediction_tokens");
+        if first_indices == [1, 0] && second_indices == [1, 0] {
+            assert_eq!(rejected, Some(&json!(0)));
+        } else {
+            assert!(rejected.is_none(), "{usage}");
+        }
+    }
+}
+
+/// Compatibility controls drive both actual collected consumers, including
+/// ambiguous legacy duplicate indices and scalar zero proposal sentinels.
+#[tokio::test]
+async fn collected_regular_membership_and_proposal_controls() {
+    let cases = [
+        (Some(2), &[(0, 0, 0)][..], None),
+        (Some(2), &[(0, 0, 10)][..], None),
+        (Some(2), &[(0, 2, 2), (0, 2, 2)][..], None),
+        (Some(2), &[(0, 2, 2), (2, 2, 2)][..], None),
+        (Some(2), &[(1, 2, 2), (0, 2, 2)][..], Some(0)),
+        (Some(2), &[(1, 1, 4), (0, 2, 5)][..], Some(6)),
+        (Some(2), &[(0, 0, 0), (1, 0, 0)][..], Some(0)),
+        (Some(2), &[(0, 2, 0), (1, 1, 10)][..], None),
+        (Some(2), &[(0, 0, 0), (1, 0, 10)][..], None),
+        (Some(2), &[(0, 4, 2), (1, 0, 10)][..], None),
+        (Some(1), &[(0, 0, 5)][..], Some(5)),
+        (None, &[(0, 2, 2)][..], Some(0)),
+        (Some(0), &[(0, 2, 2)][..], Some(0)),
+    ];
+    for (n, entries, rejected) in cases {
+        let frames: Vec<_> = entries
+            .iter()
+            .flat_map(|&(index, accepted, drafted)| {
+                scheduler_choice_frames(
+                    index,
+                    &["ok"],
+                    Counters {
+                        prompt: 10,
+                        cached: 4,
+                        spec_accepted: accepted,
+                        spec_drafted: drafted,
+                    },
+                    3,
+                )
+            })
+            .collect();
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "eof-test", "messages": [], "n": n, "separate_reasoning": false,
+        }))
+        .unwrap();
+        let completion: CompletionRequest = serde_json::from_value(json!({
+            "model": "eof-test", "prompt": "hi", "n": n,
+        }))
+        .unwrap();
+        let chat_usage =
+            non_streamed_chat_usage(scheduler_stream(frames.clone()).await, &chat).await;
+        let completion_usage =
+            non_streamed_completion_usage(scheduler_stream(frames).await, &completion).await;
+        for (is_chat, usage) in [(true, chat_usage), (false, completion_usage)] {
+            assert_eq!(usage["prompt_tokens"], 10);
+            assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 4);
+            assert_eq!(usage["completion_tokens"], 2 * entries.len());
+            let details = &usage["completion_tokens_details"];
+            assert_eq!(details["reasoning_tokens"], 3 * entries.len());
+            if !is_chat && rejected == Some(0) && entries.iter().all(|e| e.1 == 0 && e.2 == 0) {
+                // Legacy completions do not add chat's all-zero schema defaults.
+                assert!(
+                    details.get("accepted_prediction_tokens").is_none(),
+                    "{usage}"
+                );
+                assert!(
+                    details.get("rejected_prediction_tokens").is_none(),
+                    "{usage}"
+                );
+            } else {
+                assert_eq!(
+                    details["accepted_prediction_tokens"],
+                    entries.iter().map(|e| e.1).sum::<u32>()
+                );
+                assert_eq!(
+                    details.get("rejected_prediction_tokens"),
+                    rejected.map(|v| json!(v)).as_ref(),
+                    "n={n:?}, {entries:?}: {usage}"
+                );
+            }
+        }
+    }
+}

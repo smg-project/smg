@@ -771,15 +771,29 @@ fn run_class(
     }))
 }
 
-/// Whether this host resizes through the crate's AVX2 rows (`vision/torch_resample.rs`).
-fn avx2_rows() -> bool {
+/// The arm of the Pillow-exact passes (`vision/transforms.rs`) this host
+/// resizes through, decided as the crate decides it: the AVX-512 arm needs
+/// the five features its `detected` reads, else the AVX2 arm, else the
+/// portable rows (the only ones off x86-64).
+fn resample_arm() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
-        std::arch::is_x86_feature_detected!("avx2")
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+            && std::arch::is_x86_feature_detected!("avx512vbmi")
+        {
+            "avx512"
+        } else if std::arch::is_x86_feature_detected!("avx2") {
+            "avx2"
+        } else {
+            "portable"
+        }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        false
+        "portable"
     }
 }
 
@@ -790,10 +804,12 @@ fn meta(options: &Options) -> Value {
     };
     let vector_kernels = if cfg!(target_arch = "aarch64") {
         "aarch64: the crate's vector paths (pixel conversion, resample, orientation, RGB runs, JPEG colour conversion)"
-    } else if avx2_rows() {
-        "x86-64: the crate's AVX2 rows of the uint8 antialiased resample and the AVX2 wire formula of the pixel conversion; orientation, RGB runs and the JPEG colour conversion run scalar"
     } else {
-        "scalar: the crate has no vector path for this architecture"
+        match resample_arm() {
+            "avx512" => "x86-64: the AVX-512 arm of the Pillow-exact passes for the uint8 antialiased resample and the AVX2 wire formula of the pixel conversion; orientation, RGB runs and the JPEG colour conversion run scalar",
+            "avx2" => "x86-64: the AVX2 arm of the Pillow-exact passes for the uint8 antialiased resample and the AVX2 wire formula of the pixel conversion; orientation, RGB runs and the JPEG colour conversion run scalar",
+            _ => "scalar: the crate has no vector path for this architecture",
+        }
     };
     json!({
         "kind": "meta",

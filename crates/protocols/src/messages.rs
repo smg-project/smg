@@ -1460,6 +1460,10 @@ pub enum StopReason {
     PauseTurn,
     /// Streaming classifiers intervened
     Refusal,
+    /// The response filled the model's context window before it reached
+    /// `max_tokens`: the client treats it as truncated and does not retry
+    /// with a larger budget
+    ModelContextWindowExceeded,
 }
 
 /// Billing and rate-limit usage.

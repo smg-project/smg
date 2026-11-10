@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     config::{MultimodalComponents, MultimodalModelConfig, VisionProcessors},
-    encoder_budget::check_item_feature_budget,
+    encoder_budget::{check_image_size_feature_budget, check_item_feature_budget},
     log_mm_timing_enabled,
     pixel_cache::{config_fingerprint, CachedPreprocessedItem, PixelCache, PixelCacheKey},
     plan::MediaPlan,
@@ -59,7 +59,9 @@ struct PlanContext<'a> {
     image_wire_dtype: Option<EncoderDtype>,
     transparency: TransparencyPolicy,
     /// The engine's per-item bound in feature tokens, when known (see
-    /// [`super::encoder_budget`]).
+    /// [`super::encoder_budget`]): held to on an image's header size before
+    /// anything is decoded, and on every item's produced count after its
+    /// preprocessing.
     encoder_budget: Option<usize>,
 }
 
@@ -166,8 +168,10 @@ impl Fetched {
 /// Process a protocol-independent, ordered media plan.
 ///
 /// `encoder_budget` is the engine's per-item bound in feature tokens, when
-/// known (see [`super::encoder_budget`]): an item above it is refused once
-/// its features are counted, before anything reaches the engine.
+/// known (see [`super::encoder_budget`]): an image above it on its header
+/// size alone is refused before any of its batch is decoded or any tensor
+/// built, and any item above it on its produced count is refused once its
+/// features are counted; nothing above it reaches the engine.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn process_multimodal_plan(
     plan: MediaPlan,
@@ -544,10 +548,20 @@ fn intermediate_of(
 }
 
 /// Preprocess one modality's batch, using the pixel cache for eligible images.
+/// An image the engine can
+/// never place is refused first, on the size its header gave and the
+/// processor's own size-to-count rule, before any of the batch is decoded
+/// or any tensor built; the counts the preprocessing produces are held to
+/// the same budget in [`prepared_part`].
 async fn preprocess_modality(
     media: &MediaBatch,
     ctx: &PlanContext<'_>,
 ) -> Result<PreprocessedEncoderInputs> {
+    if let MediaBatch::Images(images) = media {
+        if let Ok(processor) = ctx.vision_processors.image() {
+            check_image_size_feature_budget(processor.as_ref(), images, ctx.encoder_budget)?;
+        }
+    }
     if let Some(preprocessed) = cached_images(media, ctx).await? {
         return Ok(preprocessed);
     }

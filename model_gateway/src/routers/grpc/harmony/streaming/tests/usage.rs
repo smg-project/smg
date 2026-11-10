@@ -597,3 +597,69 @@ async fn spec_usage_regression_harmony_missing_choice_is_unknown() {
         );
     }
 }
+
+#[tokio::test]
+async fn collected_harmony_missing_choice_keeps_rejections_unknown() {
+    let counters = Counters {
+        prompt: 10,
+        cached: 4,
+        spec_accepted: 2,
+        spec_drafted: 2,
+    };
+    let tokens = harmony_tokens(None, "ok");
+    let (usage, settlement) = non_streamed_chat(choice_frames(0, &tokens, counters), 2).await;
+    assert_eq!(settlement.actual_input_tokens, 10);
+    assert_eq!(settlement.cached_input_tokens, 4);
+    assert_eq!(
+        usage["completion_tokens_details"]["accepted_prediction_tokens"],
+        2
+    );
+    assert!(
+        usage["completion_tokens_details"]
+            .get("rejected_prediction_tokens")
+            .is_none(),
+        "{usage}"
+    );
+}
+
+#[tokio::test]
+async fn collected_harmony_membership_and_proposal_controls() {
+    let tokens = harmony_tokens(None, "ok");
+    for (n, entries, rejected) in [
+        (2, &[(0, 2, 2), (0, 2, 2)][..], None),
+        (2, &[(1, 2, 2), (0, 2, 2)][..], Some(0)),
+        (2, &[(0, 0, 0), (1, 0, 0)][..], Some(0)),
+        (2, &[(0, 0, 0), (1, 0, 10)][..], None),
+        (1, &[(0, 0, 5)][..], Some(5)),
+        (0, &[(0, 2, 2)][..], Some(0)),
+    ] {
+        let frames = entries
+            .iter()
+            .flat_map(|&(index, accepted, drafted)| {
+                choice_frames(
+                    index,
+                    &tokens,
+                    Counters {
+                        prompt: 10,
+                        cached: 4,
+                        spec_accepted: accepted,
+                        spec_drafted: drafted,
+                    },
+                )
+            })
+            .collect();
+        let usage = non_streamed_chat_usage(frames, n).await;
+        assert_eq!(usage["prompt_tokens"], 10);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 4);
+        let details = &usage["completion_tokens_details"];
+        assert_eq!(
+            details["accepted_prediction_tokens"],
+            entries.iter().map(|e| e.1).sum::<u32>()
+        );
+        assert_eq!(
+            details.get("rejected_prediction_tokens"),
+            rejected.map(|v| json!(v)).as_ref(),
+            "n={n}, {entries:?}: {usage}"
+        );
+    }
+}

@@ -199,23 +199,49 @@ pub(crate) fn resolve_request_id_stamp(
             let stamp = IdStamp::Suffixed {
                 base: rid.to_string(),
             };
-            (format!("{rid}-{}", request_stamp_uuid(tenant_meta)), stamp)
+            (suffixed_id(rid, request_stamp_uuid(tenant_meta)), stamp)
         } else {
             (rid.to_string(), IdStamp::Exact)
         };
     }
     match middleware_request_id(tenant_meta) {
         Some(request_id) => (
-            format!("{request_id}-{}", request_stamp_uuid(tenant_meta)),
+            suffixed_id(request_id, request_stamp_uuid(tenant_meta)),
             IdStamp::Suffixed {
                 base: request_id.to_string(),
             },
         ),
         None => (
-            format!("{prefix}{}", request_stamp_uuid(tenant_meta)),
+            minted_id(prefix, request_stamp_uuid(tenant_meta)),
             IdStamp::Minted { prefix },
         ),
     }
+}
+
+/// `{base}-{uuid}`, written into one `String` of its exact size: a `format!`
+/// of these pieces starts its buffer empty and grows it twice on the way
+/// (three allocations per id on every gRPC request, measured on the mock
+/// bed), where the length is known before the first byte is written.
+fn suffixed_id(base: &str, uuid: uuid::Uuid) -> String {
+    let mut id = String::with_capacity(base.len() + 1 + uuid::fmt::Hyphenated::LENGTH);
+    id.push_str(base);
+    id.push('-');
+    push_hyphenated(&mut id, uuid);
+    id
+}
+
+/// `{prefix}{uuid}`, written into one `String` of its exact size (see
+/// `suffixed_id`).
+fn minted_id(prefix: &str, uuid: uuid::Uuid) -> String {
+    let mut id = String::with_capacity(prefix.len() + uuid::fmt::Hyphenated::LENGTH);
+    id.push_str(prefix);
+    push_hyphenated(&mut id, uuid);
+    id
+}
+
+fn push_hyphenated(id: &mut String, uuid: uuid::Uuid) {
+    let mut text = [0u8; uuid::fmt::Hyphenated::LENGTH];
+    id.push_str(uuid.hyphenated().encode_lower(&mut text));
 }
 
 /// Shared id + stamp for the batched completion fan-out. The shared id
@@ -232,11 +258,7 @@ pub(crate) fn resolve_batch_id_stamp(
         Some(rid) => (rid.to_string(), Some(rid.to_string()), disaggregated),
         None => match middleware_request_id(tenant_meta) {
             Some(request_id) => (request_id.to_string(), Some(request_id.to_string()), true),
-            None => (
-                format!("{prefix}{}", uuid::Uuid::now_v7()),
-                None,
-                disaggregated,
-            ),
+            None => (minted_id(prefix, uuid::Uuid::now_v7()), None, disaggregated),
         },
     };
     (
@@ -281,12 +303,8 @@ impl IdStamp {
     pub(crate) fn restamp(&self, plan: &mut ExecutionPlan) -> Result<(), Response> {
         match self {
             Self::Exact => Ok(()),
-            Self::Suffixed { base } => {
-                plan.set_request_id(format!("{base}-{}", uuid::Uuid::now_v7()))
-            }
-            Self::Minted { prefix } => {
-                plan.set_request_id(format!("{prefix}{}", uuid::Uuid::now_v7()))
-            }
+            Self::Suffixed { base } => plan.set_request_id(suffixed_id(base, uuid::Uuid::now_v7())),
+            Self::Minted { prefix } => plan.set_request_id(minted_id(prefix, uuid::Uuid::now_v7())),
             Self::Batch(batch) => {
                 let ExecutionPlan::Batch {
                     shared_request_id,
@@ -306,7 +324,7 @@ impl IdStamp {
                 let shared = batch
                     .stable_shared
                     .clone()
-                    .unwrap_or_else(|| format!("{}{}", batch.prefix, uuid::Uuid::now_v7()));
+                    .unwrap_or_else(|| minted_id(batch.prefix, uuid::Uuid::now_v7()));
                 for (i, request) in requests.iter_mut().enumerate() {
                     request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
                 }

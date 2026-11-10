@@ -2455,17 +2455,23 @@ fn the_block_scan_counts_the_bytes_the_byte_wise_scan_counted() {
     // other, and a difference at every byte of every such pair: the difference
     // falls on each side of every word edge and inside the tail under one word.
     let text: Vec<u8> = (0..40u8).map(|i| b'a' + i % 26).collect();
-    for len_a in 0..=text.len() {
-        for len_b in 0..=text.len() {
-            let a = &text[..len_a];
-            let b = &text[..len_b];
+    assert_scan_is_byte_wise(&text, 0..=text.len());
+}
+
+/// Every pair of the lengths, equal and one a prefix of the other, counts as
+/// the byte-wise scan counts, and a difference written at every byte of every
+/// such pair is found there, in both orders.
+fn assert_scan_is_byte_wise(text: &[u8], lengths: impl Iterator<Item = usize> + Clone) {
+    for len_a in lengths.clone() {
+        for len_b in lengths.clone() {
+            let (a, b) = (&text[..len_a], &text[..len_b]);
             assert_eq!(
                 common_byte_prefix(a, b),
                 byte_wise_prefix(a, b),
                 "{len_a} {len_b}"
             );
             for at in 0..len_a.min(len_b) {
-                let mut b = text[..len_b].to_vec();
+                let mut b = b.to_vec();
                 b[at] = b'#';
                 assert_eq!(common_byte_prefix(a, &b), at, "{len_a} {len_b} {at}");
                 assert_eq!(common_byte_prefix(&b, a), at, "{len_a} {len_b} {at}");
@@ -2656,4 +2662,19 @@ fn the_walks_advance_to_the_character_boundary_the_scan_found() {
             }
         }
     }
+}
+
+#[test]
+fn the_block_scan_skips_whole_chunks_and_finds_the_byte_after_them() {
+    // Lengths at and beyond the 32- and 64-byte edges (both operands, equal and
+    // one a prefix of the other) and a difference at every byte of every such
+    // pair: the difference falls inside the first chunk, exactly on a chunk
+    // edge, after whole chunks, and in the words and the tail after the last
+    // chunk. The count is the byte-wise scan's, in both orders.
+    let text: Vec<u8> = (0..200u8).map(|i| b'a' + i % 26).collect();
+    let lengths = [
+        0, 1, 7, 8, 9, 31, 32, 33, 40, 63, 64, 65, 72, 95, 96, 97, 127, 128, 129, 136, 191, 192,
+        193, 200,
+    ];
+    assert_scan_is_byte_wise(&text, lengths.into_iter());
 }
