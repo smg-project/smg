@@ -165,6 +165,16 @@ def is_tokenspeed() -> bool:
     return get_runtime() == "tokenspeed"
 
 
+def zmq_backend(engine: str) -> str:
+    """The backend the gateway is pinned to for a ZMQ engine.
+
+    The gateway cannot probe a ZMQ engine's runtime from its ``ipc://`` URL,
+    so the harness names it: the engine itself, or the vLLM wire for the mock
+    worker, whose ZMQ ranks speak it.
+    """
+    return Runtime.VLLM.value if engine == Runtime.MOCK.value else engine
+
+
 def get_connection_mode_override() -> "ConnectionMode | None":
     """Per-lane wire-protocol override for local backends.
 
@@ -814,6 +824,13 @@ ENGINE_START_SECS = 300
 SERVICER_WARMUP_BUDGET_SECS = 300  # smg_grpc_servicer.warmup.DEFAULT_BUDGET_SECS, pinned by a test
 DEFAULT_STARTUP_TIMEOUT = ENGINE_START_SECS + SERVICER_WARMUP_BUDGET_SECS
 DEFAULT_ROUTER_TIMEOUT = 60
+# A cloud gateway's budget for one call to its provider (--request-timeout-secs).
+# A provider call that never answers ends here as a gateway error the SDK
+# clients retry on their own, so a stalled call costs this long instead of the
+# ten minutes the openai and anthropic clients wait before their retry: twice
+# in one job, that reaches the job's cap with every test green. The slowest
+# passing cloud test takes about 70 s for all of its calls together.
+CLOUD_REQUEST_TIMEOUT_SECS = 180
 HEALTH_CHECK_INTERVAL = 2  # Check every 2s (was 5s)
 
 # Model loading configuration

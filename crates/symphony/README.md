@@ -57,7 +57,7 @@ the scanner and the token ledger are the engine's own.
 | `formats::for_model`, `formats::Table` | The registry: the table that reads a model id's output, with the model's own turn opener, for every checkpoint in the models table below with a table; `Table::named` the table an operator names (`Table::name`: the gateway's `--tool-call-parser` and `--reasoning-parser`, or a worker's labels, take one in place of a legacy parser's name). |
 | `Event`, `Events`, `Text` | The output: `Content`, `ReasoningStart`/`Reasoning`/`ReasoningEnd`, `ToolCallStart`/`ToolCallArguments`/`ToolCallEnd`, `Dropped`, `Malformed`, `Finish`. `Text` carries the bytes and the engine tokens they cost. |
 | `DropReason`, `MalformedReason`, `FinishReason` | Why bytes were dropped, why a region could not be parsed, and the refined finish (`tool_calls` when calls were made). |
-| `ParseError` | Buffer overflow, lifecycle misuse, or a defect in a parser; what was pushed before the error is final. |
+| `ParseError` | Lifecycle misuse, the one error: a step fed out of order. A parser never fails on the output's bytes; what was pushed before the error is final. |
 | `Format`, `Emits`, `CallSyntax` | A model family's table: terminals (the marker strings), states (what the text in them is: content, reasoning, a call's arguments, wrapping), rows (`state + terminal = state`), the call syntax inside the arguments state, and the turn opener. The call syntax is a family's, or a call given as data (`CallSyntax::Shaped`, a `shape::CallShape`) as a response template writes it. A table read from a response template has the rows its fields need as well: turn anchors, the state a turn starts in, framing whose text is dropped, stays trimmed as the template's fields are, a stop that closes a call, and the terminals that are stop tokens. A table whose template opens the turn after a user message only names the state a turn the prompt leaves unopened starts in (DeepSeek V4: the thought). Built with a small builder and checked by `Format::validate`. `Format::turn_opener` names the opener, `Format::replay` cuts the prompt to the part the engine replays, and `Format::reasoning_open` says whether that replay leaves the model inside its thought; `Format::thinks_first` says the template writes the thought before every call and answer. |
 | `Engine` | The one parser that runs any table: `Engine::new(format, declared)`. |
 | `ValueRead`, `Inferred`, `Format::reads_values_with` | How a shaped call's values read: a tagged value's text by the template's parser (`shape::ValueParser`), typed by its parameter's schema; a member of JSON arguments held and typed where the reader says; a key written twice. A table names its reader; `Inferred`, the default, reads as the tagged tables do, and a crate that implements a template library's semantics gives its own. |
@@ -200,9 +200,10 @@ A group is **ready** when its table is on main, bellwether's `main` holds the gr
 benchmark-scale set (the count in **bellwether set**), and a run of the fixture test
 (`tests/bellwether_parse_fixtures.rs`) on main's code has replayed every case of that set at every
 chunking with no difference. That run is local, and the pull request that marked the group ready
-records it: SMG's CI runs the fixture test on every change to the crate against the bellwether
-commit pinned in `.github/versions/bellwether.ref`, which holds the hand-written sets only, so CI
-guards a ready group's set once the pin moves to a commit that holds it. **Replaying the set**
+records it: SMG's CI runs the fixture test on every change to the crate against the tree its
+fixture job unpacks from the bellwether commit pinned in `.github/versions/bellwether.ref` (every
+hand-written set, and one compressed set in 3,500 of bellwether's), every case of it: of a ready
+group's benchmark-scale sets, CI guards the ones that sample picks, not the whole count. **Replaying the set**
 means the table is on main and bellwether's `main` holds the set, and that run has not finished.
 A group bellwether recorded under another checkpoint's slug, because that checkpoint shares its
 tokenizer, template and generation config (the group's manifest names it), replays that recording

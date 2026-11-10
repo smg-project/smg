@@ -23,6 +23,7 @@
 //! - **LLaMA 4 Vision** (`llama4_vision`): Tile-based processing with 336x336 tiles and global tile
 //! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
 //! - **Nemotron-H Omni** (`nemotron_omni`): C-RADIO dynamic resolution, an even 16px patch grid with CLIP normalization
+//! - **Step3-VL** (`step3_vl`): a 728px global view and 504px sliding-window crops with CLIP normalization
 
 pub mod deepseek_v41;
 pub mod gemma4;
@@ -43,6 +44,7 @@ pub mod qwen2_vl;
 pub mod qwen3_omni_vision;
 pub mod qwen3_vl;
 pub mod qwen_vl_base;
+pub mod step3_vl;
 
 pub use deepseek_v41::DeepseekV41Processor;
 pub use gemma4::Gemma4Processor;
@@ -61,3 +63,4 @@ pub use pixtral::PixtralProcessor;
 pub use qwen2_vl::Qwen2VLProcessor;
 pub use qwen3_omni_vision::Qwen3OmniVisionProcessor;
 pub use qwen3_vl::Qwen3VLProcessor;
+pub use step3_vl::Step3VLProcessor;

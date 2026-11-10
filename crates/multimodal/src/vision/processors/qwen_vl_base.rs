@@ -28,6 +28,7 @@ use image::{imageops::FilterType, DynamicImage, GenericImageView};
 use ndarray::{Array2, Array3};
 
 use crate::{
+    buffer_pool,
     encoder_inputs::{EncoderDtype, EncoderInput, PixelNorm},
     pixel_convert::WireWriter,
     types::RgbFrameRef,
@@ -86,6 +87,19 @@ impl QwenVLConfig {
 pub enum QwenVideoResizeMode {
     TotalVolume,
     PerFrame,
+}
+
+/// What a clip's `video_second_per_grid`, the time one temporal patch spans
+/// in the position ids, divides the temporal patch size by.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QwenVideoTiming {
+    /// The rate the clip was sampled at, which the Qwen2-VL line's
+    /// processors read from the video metadata.
+    SampledRate,
+    /// A rate the processor fixes on its own, whatever the clip was sampled
+    /// at: the Qwen3-Omni processor divides by its `fps` argument, 1.0
+    /// unless a caller passes one.
+    FixedRate(f64),
 }
 
 #[derive(Clone)]
@@ -177,6 +191,10 @@ pub(super) fn pixel_norm(
         channel_block,
     }
 }
+
+/// The planar scratch of one sub-patch on the stack: three channel planes of
+/// a patch of up to 32 pixels a side (3 KiB).
+const PLANES_SCRATCH: usize = 3 * 32 * 32;
 
 fn dispatch_patch_blocks<T: Send + Sync>(
     region: &mut [T],
@@ -326,8 +344,10 @@ fn resize_dynamic_frame_to_raw(
     } else {
         resize(frame, target_width, target_height, filter)
     };
-    let (width, height, data) = rgb_bytes(&resized);
-    (width, height, data.into_owned())
+    let (width, height) = (resized.width() as usize, resized.height() as usize);
+    // Both resizers hand the frame back as RGB8, whose buffer moves out; a resize
+    // that kept another layout (a source with alpha) converts once.
+    (width, height, resized.into_rgb8().into_raw())
 }
 
 /// Generic Qwen VL image processor.
@@ -340,6 +360,7 @@ pub struct QwenVLProcessorBase {
     config: QwenVLConfig,
     allow_video_dimensions_below_factor: bool,
     raise_rounded_sides_to_factor: bool,
+    video_timing: QwenVideoTiming,
     transforms: QwenTransforms,
 }
 
@@ -388,6 +409,7 @@ impl QwenVLProcessorBase {
             config,
             allow_video_dimensions_below_factor: false,
             raise_rounded_sides_to_factor: false,
+            video_timing: QwenVideoTiming::SampledRate,
         }
     }
 
@@ -407,11 +429,6 @@ impl QwenVLProcessorBase {
     /// Whether frames are resized to the planned grid (`do_resize`).
     pub(super) fn resizes(&self) -> bool {
         self.transforms.do_resize
-    }
-
-    /// The resize filter the preprocessor config selected.
-    pub(super) fn filter(&self) -> FilterType {
-        self.transforms.filter
     }
 
     /// Preserve an already aligned native-loader video grid and its pixel bytes.
@@ -485,6 +502,13 @@ impl QwenVLProcessorBase {
         self.config.temporal_patch_size
     }
 
+    /// Divide a clip's temporal patch size by `timing`'s rate for its
+    /// `video_second_per_grid`, rather than by the rate it was sampled at.
+    pub fn with_video_timing(mut self, timing: QwenVideoTiming) -> Self {
+        self.video_timing = timing;
+        self
+    }
+
     fn plan_video(
         &self,
         frame_count: usize,
@@ -513,11 +537,21 @@ impl QwenVLProcessorBase {
                 "Qwen video patch buffer size overflow: patches={num_patches}, features={patch_features}"
             ))
         })?;
-        // The rate the clip was sampled at sets the time each temporal patch spans.
+        // The rate the clip was sampled at sets the time each temporal patch
+        // spans, unless the processor fixes a rate of its own.
         let sample_fps = clip.sample_fps;
         if !sample_fps.is_finite() || sample_fps <= 0.0 {
             return Err(TransformError::ShapeError(format!(
                 "Qwen video fps must be finite and positive, got {sample_fps}"
+            )));
+        }
+        let timing_rate = match self.video_timing {
+            QwenVideoTiming::SampledRate => sample_fps,
+            QwenVideoTiming::FixedRate(rate) => rate,
+        };
+        if !timing_rate.is_finite() || timing_rate <= 0.0 {
+            return Err(TransformError::ShapeError(format!(
+                "Qwen video timing rate must be finite and positive, got {timing_rate}"
             )));
         }
 
@@ -532,7 +566,7 @@ impl QwenVLProcessorBase {
             num_patches,
             output_values,
             tokens: self.calculate_tokens_from_grid(grid_t, grid_h, grid_w),
-            second_per_grid: (temporal_patch_size as f64 / sample_fps) as f32,
+            second_per_grid: (temporal_patch_size as f64 / timing_rate) as f32,
             filter: self.transforms.filter,
             do_resize: self.transforms.do_resize,
             norm: self.transforms.norm,
@@ -1365,7 +1399,9 @@ impl QwenVLProcessorBase {
         let writer = WireWriter::new(&batch.norm, dtype)?;
         let element_size = writer.element_size();
         let wire_len = batch.total_patch_values * element_size;
-        let mut wire: Vec<u8> = vec![0u8; wire_len];
+        // A pooled buffer: its bytes are a previous request's until the
+        // bands below, which cover it exactly, are written.
+        let mut wire: Vec<u8> = buffer_pool::take(wire_len);
         let mut bands = Vec::with_capacity(images.len());
         let mut remaining = wire.as_mut_slice();
         for plan in &batch.plans {
@@ -1373,6 +1409,7 @@ impl QwenVLProcessorBase {
             bands.push(band);
             remaining = rest;
         }
+        debug_assert!(remaining.is_empty(), "the image bands cover the wire");
         let filter = batch.filter;
         let writer = &writer;
         let mut errors: Vec<Option<TransformError>> = (0..images.len()).map(|_| None).collect();
@@ -1536,8 +1573,16 @@ impl QwenVLProcessorBase {
         // rows split into their channel runs with the vector loads of the
         // byte layout, then each plane converted in one run (not a row's
         // worth at a time) into its first temporal copy, which the other
-        // copies repeat.
-        let mut planes = vec![0u8; 3 * plane];
+        // copies repeat. The scratch lives on the stack (three planes of a
+        // patch of up to 32 pixels a side); a wider patch allocates it.
+        let mut planes_on_stack = [0u8; PLANES_SCRATCH];
+        let mut planes_on_heap = Vec::new();
+        let planes: &mut [u8] = if 3 * plane <= PLANES_SCRATCH {
+            &mut planes_on_stack[..3 * plane]
+        } else {
+            planes_on_heap.resize(3 * plane, 0);
+            &mut planes_on_heap
+        };
         for (bi, chunk) in band.chunks_mut(block_bytes).enumerate() {
             let blk = block_start + bi;
             let pr = blk / pc_blocks;
@@ -1606,8 +1651,10 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         let image_plans = &batch.plans;
 
         // Each image owns a disjoint band of the patch buffer, so the images
-        // resize and patchify in parallel.
-        let mut all_patches: Vec<u8> = vec![0u8; total_patch_values];
+        // resize and patchify in parallel. A pooled buffer: its bytes are a
+        // previous request's until the bands, which cover it exactly, are
+        // written.
+        let mut all_patches: Vec<u8> = buffer_pool::take(total_patch_values);
         let mut bands = Vec::with_capacity(images.len());
         let mut remaining = all_patches.as_mut_slice();
         for plan in image_plans {
@@ -1615,6 +1662,10 @@ impl VisionPreProcessor for QwenVLProcessorBase {
             bands.push(band);
             remaining = rest;
         }
+        debug_assert!(
+            remaining.is_empty(),
+            "the image bands cover the patch buffer"
+        );
         let mut errors: Vec<Option<TransformError>> = (0..images.len()).map(|_| None).collect();
         // One image's resize and patch layout into its band: the work of one
         // task, whether it runs here or on the pool.
@@ -1713,7 +1764,8 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         let (width, height) = frames[0].dimensions();
         let plan = self.plan_video(frames.len(), width, height, clip)?;
         let temporal_patch_size = self.config.temporal_patch_size;
-        let mut all_patches = vec![0u8; plan.output_values];
+        // A pooled buffer, written end to end by the chunks below.
+        let mut all_patches = buffer_pool::take(plan.output_values);
         let mut out_idx = 0;
         let mut frame_rgbs = Vec::with_capacity(temporal_patch_size);
         for gt in 0..plan.grid_t {
@@ -1773,7 +1825,8 @@ impl VisionPreProcessor for QwenVLProcessorBase {
 
         let plan = self.plan_video(frames.len(), frames[0].width, frames[0].height, clip)?;
         let temporal_patch_size = self.config.temporal_patch_size;
-        let mut all_patches = vec![0u8; plan.output_values];
+        // A pooled buffer, written end to end by the bands below.
+        let mut all_patches = buffer_pool::take(plan.output_values);
         for frame in frames {
             let expected_len = (frame.width as usize)
                 .checked_mul(frame.height as usize)
@@ -2015,7 +2068,7 @@ mod tests {
         }
     }
 
-    fn create_test_config() -> QwenVLConfig {
+    pub(super) fn create_test_config() -> QwenVLConfig {
         QwenVLConfig {
             patch_size: 14,
             merge_size: 2,
@@ -2122,6 +2175,39 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// `frames` through the borrowed-RGB video path and through the dynamic
+    /// one: the two encoder inputs agree in shape and, bit for bit, in every
+    /// value (`what` names the case in the messages). Returns the two results
+    /// for what a test reads beyond that.
+    fn rgb_video_path_matches_dynamic(
+        processor: &QwenVLProcessorBase,
+        frames: &[DynamicImage],
+        what: &str,
+    ) -> (PreprocessedEncoderInputs, PreprocessedEncoderInputs) {
+        let rgb_frames = rgb_views(frames);
+        let dynamic = processor
+            .preprocess_video(frames, &VideoClipOptions::sampled_at(2.0))
+            .unwrap();
+        let rgb = processor
+            .preprocess_video_rgb(&rgb_frames, &VideoClipOptions::sampled_at(2.0))
+            .unwrap();
+        assert_eq!(
+            dynamic.encoder_input.shape(),
+            rgb.encoder_input.shape(),
+            "{what}: the encoder input shapes differ"
+        );
+        let dynamic_values = dynamic.encoder_input.flat_f32().into_owned();
+        let rgb_values = rgb.encoder_input.flat_f32().into_owned();
+        for (idx, (&got, &want)) in rgb_values.iter().zip(dynamic_values.iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{what}: the RGB video path diverges at index {idx}: got {got}, want {want}"
+            );
+        }
+        (dynamic, rgb)
     }
 
     fn create_sized_pattern_frame(w: u32, h: u32, seed: u8) -> DynamicImage {
@@ -2318,29 +2404,7 @@ mod tests {
             "test must force a resize; target {target_w}x{target_h} should differ from 7x9"
         );
 
-        let rgb_frames = rgb_views(&frames);
-
-        let dynamic = processor
-            .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
-            .unwrap();
-        let rgb = processor
-            .preprocess_video_rgb(&rgb_frames, &VideoClipOptions::sampled_at(2.0))
-            .unwrap();
-
-        let a = dynamic.encoder_input.flat_f32().into_owned();
-        let b = rgb.encoder_input.flat_f32().into_owned();
-        assert_eq!(
-            a.len(),
-            b.len(),
-            "resized video encoder input length differs"
-        );
-        for (idx, (&got, &want)) in a.iter().zip(b.iter()).enumerate() {
-            assert_eq!(
-                got.to_bits(),
-                want.to_bits(),
-                "resized video path diverges at index {idx}: dynamic {got} vs rgb {want}"
-            );
-        }
+        rgb_video_path_matches_dynamic(&processor, &frames, "resized video");
     }
 
     #[test]
@@ -2368,25 +2432,7 @@ mod tests {
             "test must force a resize; target {target_w}x{target_h} should differ from 7x9"
         );
 
-        let rgb_frames = rgb_views(&frames);
-
-        let dynamic = processor
-            .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
-            .unwrap();
-        let rgb = processor
-            .preprocess_video_rgb(&rgb_frames, &VideoClipOptions::sampled_at(2.0))
-            .unwrap();
-
-        let a = dynamic.encoder_input.flat_f32().into_owned();
-        let b = rgb.encoder_input.flat_f32().into_owned();
-        assert_eq!(a.len(), b.len());
-        for (idx, (&got, &want)) in a.iter().zip(b.iter()).enumerate() {
-            assert_eq!(
-                got.to_bits(),
-                want.to_bits(),
-                "resized padded video path diverges at index {idx}: dynamic {got} vs rgb {want}"
-            );
-        }
+        rgb_video_path_matches_dynamic(&processor, &frames, "resized padded video");
     }
 
     #[test]
@@ -2503,6 +2549,25 @@ mod tests {
         assert_eq!(tokens, (32 * 32) / 4);
     }
 
+    /// A processor that fixes its own timing rate is refused one that cannot
+    /// divide the temporal patch size, as a clip sampled at such a rate is:
+    /// the guard covers the rate the plan divides by, whichever it is.
+    #[test]
+    fn fixed_timing_rate_must_be_finite_and_positive() {
+        let frames = vec![create_pattern_frame(3), create_pattern_frame(101)];
+        for rate in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let processor = QwenVLProcessorBase::new(create_video_test_config())
+                .with_video_timing(QwenVideoTiming::FixedRate(rate));
+            match processor.preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0)) {
+                Err(TransformError::ShapeError(message)) => {
+                    assert!(message.contains("timing rate"), "rate {rate}: {message}");
+                }
+                Err(other) => panic!("rate {rate}: {other}"),
+                Ok(_) => panic!("rate {rate} was accepted"),
+            }
+        }
+    }
+
     #[test]
     fn test_preprocess_video_matches_tensor_patchify() {
         let processor = QwenVLProcessorBase::new(create_video_test_config());
@@ -2556,34 +2621,13 @@ mod tests {
             create_pattern_frame(177),
         ];
 
-        let rgb_frames = rgb_views(&frames);
-
-        let dynamic_result = processor
-            .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
-            .unwrap();
-        let rgb_result = processor
-            .preprocess_video_rgb(&rgb_frames, &VideoClipOptions::sampled_at(2.0))
-            .unwrap();
-
-        assert_eq!(
-            dynamic_result.encoder_input.shape(),
-            rgb_result.encoder_input.shape()
-        );
+        let (dynamic_result, rgb_result) =
+            rgb_video_path_matches_dynamic(&processor, &frames, "video");
         let mut dynamic_keys = dynamic_result.model_specific.keys().collect::<Vec<_>>();
         let mut rgb_keys = rgb_result.model_specific.keys().collect::<Vec<_>>();
         dynamic_keys.sort();
         rgb_keys.sort();
         assert_eq!(dynamic_keys, rgb_keys);
-
-        let dynamic_values = dynamic_result.encoder_input.flat_f32().into_owned();
-        let rgb_values = rgb_result.encoder_input.flat_f32().into_owned();
-        for (idx, (&got, &want)) in rgb_values.iter().zip(dynamic_values.iter()).enumerate() {
-            assert_eq!(
-                got.to_bits(),
-                want.to_bits(),
-                "RGB video patch value differs at index {idx}: got {got}, want {want}"
-            );
-        }
     }
 
     #[test]
@@ -2600,28 +2644,7 @@ mod tests {
             create_sized_pattern_frame(280, 280, 101),
         ];
 
-        let rgb_frames = rgb_views(&frames);
-
-        let dynamic_result = processor
-            .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
-            .unwrap();
-        let rgb_result = processor
-            .preprocess_video_rgb(&rgb_frames, &VideoClipOptions::sampled_at(2.0))
-            .unwrap();
-
-        assert_eq!(
-            dynamic_result.encoder_input.shape(),
-            rgb_result.encoder_input.shape()
-        );
-        let dynamic_values = dynamic_result.encoder_input.flat_f32().into_owned();
-        let rgb_values = rgb_result.encoder_input.flat_f32().into_owned();
-        for (idx, (&got, &want)) in rgb_values.iter().zip(dynamic_values.iter()).enumerate() {
-            assert_eq!(
-                got.to_bits(),
-                want.to_bits(),
-                "parallel RGB video patch value differs at index {idx}: got {got}, want {want}"
-            );
-        }
+        rgb_video_path_matches_dynamic(&processor, &frames, "parallel-block video");
     }
 }
 
@@ -2632,7 +2655,7 @@ mod wire_tests {
     use super::*;
     use crate::{encoder_inputs::EncoderDtype, vision::processors::Qwen3VLProcessor};
 
-    fn gradient(w: u32, h: u32, seed: u32) -> DynamicImage {
+    pub(super) fn gradient(w: u32, h: u32, seed: u32) -> DynamicImage {
         DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
             image::Rgb([
                 ((seed + x * 7 + y * 3) % 256) as u8,
@@ -2707,5 +2730,107 @@ mod wire_tests {
                     .is_none());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod buffer_pool_tests {
+    use super::{tests::create_test_config, wire_tests::gradient, *};
+    use crate::{
+        buffer_pool::{self, BufferPool, SENTINEL},
+        encoder_inputs::EncoderDtype,
+    };
+
+    /// A pooled buffer holds a previous request's bytes, so the band writers
+    /// must write every byte they are given: a band primed with the sentinel
+    /// ends up equal to a zeroed one, on the wire path in both float widths
+    /// and on the patch-bytes path.
+    #[test]
+    fn the_band_writers_write_every_byte_of_their_band() {
+        let processor = QwenVLProcessorBase::new(create_test_config());
+        // 448x448 is the smallest size the rule accepts: no resize.
+        let image = gradient(448, 448, 3);
+        let batch = processor.plan_image_batch(&[&image]).expect("planned");
+        let plan = &batch.plans[0];
+        assert!(!plan.needs_resize);
+        for dtype in [EncoderDtype::Float32, EncoderDtype::BFloat16] {
+            let writer = WireWriter::new(&batch.norm, dtype).expect("a float writer");
+            let len = plan.patch_values * writer.element_size();
+            let mut zeroed = vec![0u8; len];
+            let mut primed = vec![SENTINEL; len];
+            for band in [&mut zeroed, &mut primed] {
+                processor
+                    .patchify_image_rgb_wire_into(&image, plan.grid_h, plan.grid_w, band, &writer)
+                    .expect("written");
+            }
+            assert!(
+                zeroed == primed,
+                "{dtype}: a byte of the wire band was left unwritten"
+            );
+        }
+        let mut zeroed = vec![0u8; plan.patch_values];
+        let mut primed = vec![SENTINEL; plan.patch_values];
+        for band in [&mut zeroed, &mut primed] {
+            let mut written = 0;
+            processor
+                .patchify_image_rgb_into(&image, plan.grid_h, plan.grid_w, band, &mut written)
+                .expect("written");
+            assert_eq!(written, plan.patch_values);
+        }
+        assert!(
+            zeroed == primed,
+            "a byte of the patch band was left unwritten"
+        );
+    }
+
+    /// The whole preprocess on a pooled buffer: the second run takes the
+    /// buffer the first one returned and writes the same bytes into it.
+    #[test]
+    fn a_preprocess_reuses_the_returned_buffer_and_writes_the_same_bytes() {
+        static MINE: BufferPool = BufferPool::new();
+        buffer_pool::with_pool(&MINE, || {
+            let processor = QwenVLProcessorBase::new(create_test_config());
+            let image = gradient(448, 448, 5);
+            let wire = |processor: &QwenVLProcessorBase| {
+                processor
+                    .preprocess_wire(&[&image], EncoderDtype::Float32)
+                    .expect("one-pass")
+                    .expect("preprocessed")
+                    .encoder_input
+                    .into_bytes_as(EncoderDtype::Float32)
+                    .expect("the wire moves out")
+            };
+            let first = wire(&processor);
+            let address = first.as_ptr();
+            let reference = first.clone();
+            buffer_pool::recycle(first);
+            let second = wire(&processor);
+            assert_eq!(
+                second.as_ptr(),
+                address,
+                "the second run took the first run's buffer"
+            );
+            assert!(second == reference, "the bytes differ on the reused buffer");
+            let patches = |processor: &QwenVLProcessorBase| {
+                processor
+                    .preprocess(&[&image])
+                    .expect("preprocessed")
+                    .encoder_input
+                    .into_bytes_as(EncoderDtype::Uint8)
+                    .expect("the patch bytes")
+            };
+            let first = patches(&processor);
+            let held = MINE.held();
+            assert!(held > 0, "the patch buffer came back to the pool");
+            let reference = first.clone();
+            buffer_pool::recycle(first);
+            let second = patches(&processor);
+            assert_eq!(
+                MINE.held(),
+                held,
+                "the second run took and returned pooled buffers"
+            );
+            assert!(second == reference, "the bytes differ on the reused buffer");
+        });
     }
 }

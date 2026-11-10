@@ -1,6 +1,6 @@
 [package]
 name = "llm-multimodal"
-version = "1.15.0"
+version = "1.16.0"
 edition = "2021"
 description = "Multimodal processing for vision and other modalities"
 license = "Apache-2.0"
@@ -32,6 +32,9 @@ base64 = "0.23"
 hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "rustls-tls"], optional = true }
 bytes = { workspace = true, features = ["serde"] }
 fast_image_resize = { version = "6.0.0", features = ["image"] }
+# The image containers the crate decodes. AVIF is not among them: its decoder
+# is a native library, and such a file is refused with a typed error that
+# names the format.
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp"] }
 libloading = "0.8"
 ndarray = "0.17"
@@ -53,6 +56,13 @@ futures.workspace = true
 # Workspace crates
 anyhow.workspace = true
 blake3.workspace = true
+
+# The x86-64 vector paths: `multiversion` dispatches a function to its
+# feature-specific clone from safe code, and `bytemuck` moves vector words in
+# and out of byte arrays without pointers, so the kernels carry no `unsafe`.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+bytemuck = { version = "1.25", features = ["must_cast"] }
+multiversion = "0.9"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

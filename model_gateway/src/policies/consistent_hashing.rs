@@ -1,7 +1,12 @@
 //! Consistent hashing routing policy with header-based routing support
 //!
 //! Supports two routing mechanisms via HTTP headers:
-//! - `X-SMG-Target-Worker`: Direct routing by worker index (0-based), returns None if unavailable
+//! - `X-SMG-Target-Worker`: Direct routing by worker index (0-based) into the
+//!   workers the caller hands the policy. Placement hands it the workers
+//!   available when the request arrives, so the index counts those and an
+//!   index past them is a miss, not another worker. The one exception is a
+//!   pool with every worker vetoed, which placement's all-vetoed fallback
+//!   serves without reading the header.
 //! - `X-SMG-Routing-Key`: Consistent hash routing for session affinity
 //!
 //! ## Consistent Hashing
@@ -14,9 +19,12 @@
 //! The ring is built once when workers are added/removed, not per-request.
 //! This ensures O(log n) lookup performance.
 //!
-//! Complexity: O(log n) binary search + O(k) walk where k = consecutive unhealthy workers.
+//! Complexity per request: O(log n) binary search + O(k) walk where k =
+//! consecutive unhealthy workers, each probed node read for eligibility and
+//! found in the pool by one scan of its URLs; nothing is allocated for the
+//! translation.
 
-use std::sync::Arc;
+use std::{cell::Cell, sync::Arc};
 
 use rand::RngExt as _;
 
@@ -66,42 +74,52 @@ impl ConsistentHashingPolicy {
     /// The ring returns a worker URL, which we then map to an index in the workers array.
     /// This correctly handles filtered worker arrays since we match by URL, not by index.
     ///
-    /// Complexity: O(n) to build healthy URL map + O(log n) ring lookup + O(k) walk
+    /// Complexity: O(log n) ring lookup + O(k) walk, each probed node read for
+    /// eligibility and found in the pool by a scan of its URLs (the last
+    /// eligible worker at that URL, as the map this replaced answered).
     fn find_by_consistent_hash(
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo,
         key: &str,
     ) -> Option<usize> {
-        // Build URL→index map for healthy workers: O(n) once, O(1) lookups
         // A lifted overload veto keeps an owner over the thresholds.
-        let healthy_url_to_idx: std::collections::HashMap<&str, usize> = workers
-            .iter()
-            .enumerate()
-            .filter(|(_, w)| {
-                if info.overload_lifted {
-                    w.routing_state().eligible_ignoring_overload()
-                } else {
-                    w.is_healthy_and_eligible()
-                }
-            })
-            .map(|(i, w)| (w.url(), i))
-            .collect();
-
-        if healthy_url_to_idx.is_empty() {
-            return None;
-        }
+        let eligible = |worker: &Arc<dyn Worker>| {
+            if info.overload_lifted {
+                worker.routing_state().eligible_ignoring_overload()
+            } else {
+                worker.is_healthy_and_eligible()
+            }
+        };
 
         // Use pre-computed ring if available
         if let Some(ref ring) = info.hash_ring {
-            // O(1) lookup per URL checked instead of O(n)
-            let url = ring.find_healthy_url(key, |url| healthy_url_to_idx.contains_key(url))?;
-            return healthy_url_to_idx.get(url).copied();
+            let eligible_at = |url: &str| {
+                workers
+                    .iter()
+                    .rposition(|worker| worker.url() == url && eligible(worker))
+            };
+            // The probe that accepts the ring's answer keeps the position it
+            // found: one scan and one eligibility read per probed node, and
+            // the answer cannot disagree with the probe that admitted it.
+            let found = Cell::new(None);
+            ring.find_healthy_url(key, |url| {
+                found.set(eligible_at(url));
+                found.get().is_some()
+            })?;
+            return found.get();
         }
 
         // Fallback: no ring provided, use simple modulo (less optimal but functional)
         // This shouldn't happen in normal operation as WorkerSelectionStage provides the ring
-        let mut healthy_indices: Vec<usize> = healthy_url_to_idx.values().copied().collect();
-        healthy_indices.sort_unstable(); // Ensure deterministic order
+        let healthy_indices: Vec<usize> = workers
+            .iter()
+            .enumerate()
+            .filter(|(_, worker)| eligible(worker))
+            .map(|(idx, _)| idx)
+            .collect();
+        if healthy_indices.is_empty() {
+            return None;
+        }
 
         // Use blake3 for consistent hashing in fallback too
         let hash = blake3::hash(key.as_bytes());
@@ -233,26 +251,15 @@ mod tests {
     use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::{policies::test_support::make_workers, worker::HashRing};
-
-    fn headers_with_routing_key(key: &str) -> http::HeaderMap {
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-smg-routing-key", key.parse().unwrap());
-        headers
-    }
+    use crate::{
+        policies::test_support::{headers_with_routing_key, make_workers, with_headers},
+        worker::HashRing,
+    };
 
     fn headers_with_target_worker(idx: usize) -> http::HeaderMap {
         let mut headers = http::HeaderMap::new();
         headers.insert("x-smg-target-worker", idx.to_string().parse().unwrap());
         headers
-    }
-
-    /// The selection info of a request carrying `headers` and nothing else.
-    fn with_headers(headers: &http::HeaderMap) -> SelectWorkerInfo<'_> {
-        SelectWorkerInfo {
-            headers: Some(headers),
-            ..Default::default()
-        }
     }
 
     /// The selection info of a request carrying `headers`, routed over `ring`.
@@ -264,6 +271,34 @@ mod tests {
             hash_ring: Some(Arc::clone(ring)),
             ..with_headers(headers)
         }
+    }
+
+    /// The policy over four workers and their hash ring, the bed of the routing-key-hint tests.
+    fn ring_of_four() -> (ConsistentHashingPolicy, Vec<Arc<dyn Worker>>, Arc<HashRing>) {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = make_workers(&[
+            "http://w1:8000",
+            "http://w2:8000",
+            "http://w3:8000",
+            "http://w4:8000",
+        ]);
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+        (policy, workers, ring)
+    }
+
+    /// The worker `key` lands on as the request's routing-key hint, with no other key present.
+    fn placed_by_hint(
+        policy: &ConsistentHashingPolicy,
+        workers: &[Arc<dyn Worker>],
+        ring: &Arc<HashRing>,
+        key: &str,
+    ) -> usize {
+        let info = SelectWorkerInfo {
+            routing_key: Some(key),
+            hash_ring: Some(Arc::clone(ring)),
+            ..Default::default()
+        };
+        policy.select_worker_impl(workers, &info).0.unwrap()
     }
 
     /// Every consistent-hashing entry point gathers on
@@ -678,23 +713,8 @@ mod tests {
 
     #[test]
     fn test_routing_key_hint_wins_over_raw_header() {
-        let policy = ConsistentHashingPolicy::new();
-        let workers = make_workers(&[
-            "http://w1:8000",
-            "http://w2:8000",
-            "http://w3:8000",
-            "http://w4:8000",
-        ]);
-        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
-
-        let select_by_key = |key: &str| {
-            let info = SelectWorkerInfo {
-                routing_key: Some(key),
-                hash_ring: Some(ring.clone()),
-                ..Default::default()
-            };
-            policy.select_worker_impl(&workers, &info).0.unwrap()
-        };
+        let (policy, workers, ring) = ring_of_four();
+        let select_by_key = |key: &str| placed_by_hint(&policy, &workers, &ring, key);
 
         // Find two keys that land on different workers.
         let base_idx = select_by_key("key-0");
@@ -717,23 +737,8 @@ mod tests {
 
     #[test]
     fn test_routing_key_hint_outranks_rid_key() {
-        let policy = ConsistentHashingPolicy::new();
-        let workers = make_workers(&[
-            "http://w1:8000",
-            "http://w2:8000",
-            "http://w3:8000",
-            "http://w4:8000",
-        ]);
-        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
-
-        let select_by_key = |key: &str| {
-            let info = SelectWorkerInfo {
-                routing_key: Some(key),
-                hash_ring: Some(ring.clone()),
-                ..Default::default()
-            };
-            policy.select_worker_impl(&workers, &info).0.unwrap()
-        };
+        let (policy, workers, ring) = ring_of_four();
+        let select_by_key = |key: &str| placed_by_hint(&policy, &workers, &ring, key);
 
         // Find a header key that lands on a different worker than the rid.
         let rid_idx = select_by_key("conv");
@@ -789,5 +794,59 @@ mod tests {
     fn test_policy_name() {
         let policy = ConsistentHashingPolicy::new();
         assert_eq!(policy.name(), "consistent_hashing");
+    }
+
+    /// Sixteen workers on a ring and forty-eight session keys: every key lands
+    /// where it did when a per-request URL map translated the ring's answer,
+    /// with every worker eligible and with three of them not ready (their keys
+    /// move to the next eligible owner clockwise, the rest stay). The
+    /// placement is the ring's; the translation must not move it.
+    #[test]
+    fn the_recorded_key_set_lands_where_the_ring_placed_it() {
+        const RECORDED_ALL_ELIGIBLE: [usize; 48] = [
+            7, 4, 2, 15, 13, 12, 9, 12, 5, 12, 11, 0, 3, 0, 2, 8, 4, 6, 6, 4, 2, 13, 12, 6, 14, 8,
+            5, 4, 14, 6, 6, 5, 2, 3, 1, 7, 15, 11, 11, 13, 8, 6, 2, 3, 0, 10, 10, 13,
+        ];
+        const RECORDED_THREE_NOT_READY: [usize; 48] = [
+            4, 4, 2, 15, 13, 12, 9, 12, 5, 12, 5, 0, 10, 0, 2, 8, 4, 6, 6, 4, 2, 13, 12, 6, 14, 8,
+            5, 4, 14, 6, 6, 5, 2, 6, 1, 5, 15, 6, 4, 13, 8, 6, 2, 6, 0, 10, 10, 13,
+        ];
+        let policy = ConsistentHashingPolicy::new();
+        let urls: Vec<String> = (0..16).map(|i| format!("http://w{i:02}:8000")).collect();
+        let workers = make_workers(&urls.iter().map(String::as_str).collect::<Vec<_>>());
+        let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
+        let keys: Vec<String> = (0..48).map(|i| format!("session-{i}")).collect();
+        let placements = |workers: &[Arc<dyn Worker>]| -> Vec<usize> {
+            keys.iter()
+                .map(|key| {
+                    let info = SelectWorkerInfo {
+                        routing_key: Some(key),
+                        hash_ring: Some(ring.clone()),
+                        ..Default::default()
+                    };
+                    let (result, branch) = policy.select_worker_impl(workers, &info);
+                    assert_eq!(branch, Branch::RoutingKeyHit, "key {key}");
+                    result.expect("an eligible owner exists")
+                })
+                .collect()
+        };
+        assert_eq!(
+            placements(&workers),
+            RECORDED_ALL_ELIGIBLE,
+            "with every worker eligible the keys placed {:?}",
+            placements(&workers)
+        );
+        for not_ready in [3, 7, 11] {
+            workers[not_ready].set_status(WorkerStatus::NotReady);
+        }
+        let moved = placements(&workers);
+        assert!(
+            !moved.contains(&3) && !moved.contains(&7) && !moved.contains(&11),
+            "a not-ready worker owns a key: {moved:?}"
+        );
+        assert_eq!(
+            moved, RECORDED_THREE_NOT_READY,
+            "with three workers not ready the keys placed {moved:?}"
+        );
     }
 }

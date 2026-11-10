@@ -19,7 +19,7 @@ use super::{
     process::preprocessor_config_for,
     settings::MultimodalSettings,
 };
-use crate::worker::http_client::build_with;
+use crate::{observability::metrics::Metrics, worker::http_client::build_with};
 
 /// Cached model configuration files loaded from the tokenizer directory.
 #[derive(Debug)]
@@ -470,7 +470,7 @@ impl MultimodalComponents {
             "media fetch policy for router-side processing"
         );
         let media_connector = build_with(
-            || crate::clients::http_client_builder().timeout(std::time::Duration::from_secs(30)),
+            || crate::server::http_client_builder().timeout(std::time::Duration::from_secs(30)),
             false,
             "media HTTP client",
             |client| MediaConnector::new(client, connector_config.clone()),
@@ -498,6 +498,7 @@ impl MultimodalComponents {
             "multimodal one-pass wire write"
         );
 
+        Metrics::init_mm_inflight_series();
         let inflight = max_inflight_bytes
             .map(|bytes| {
                 let inflight = MultimodalInflight::new(bytes);

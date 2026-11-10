@@ -123,6 +123,9 @@ message EngineLoad {
   optional uint32 prefill_pending_tokens = 21;
   // Computed input tokens per active prefill second; absent if unknown or stale.
   optional double prefill_throughput = 22;
+  // Context tokens (prompt plus committed output) of every request the rank
+  // holds. Part of the routing core: sent on every record when reported.
+  optional uint64 num_resident_tokens = 23;
 }
 
 // The sections below mirror the SGLang scheduler's GetLoads messages field
@@ -243,6 +246,10 @@ message KvBlocksStored {
   // computed under. Consumers fold them into their own content hashes.
   optional string lora_name = 11;
   optional string cache_salt = 12;
+  // The cache groups that hold the blocks after this store, bit i for the
+  // engine's group i, from a publisher that reports a boundary once for
+  // every group; group_idx then names the lowest group the store is about.
+  optional uint64 group_mask = 13;
 }
 
 // One entry of vLLM's per-block `extra_keys`: the inputs beyond token ids
@@ -279,6 +286,9 @@ message KvBlocksRemoved {
   optional uint32 group_idx = 5;
   optional KvCacheLocality locality = 6;
   optional string ownership = 7;
+  // The cache groups that dropped the blocks, bit i for the engine's group
+  // i, from a publisher that reports a boundary once for every group.
+  optional uint64 group_mask = 8;
 }
 
 message KvCacheCleared {

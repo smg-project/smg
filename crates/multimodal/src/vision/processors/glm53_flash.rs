@@ -13,8 +13,8 @@ use crate::{
         preprocessor_config::PreProcessorConfig,
         processor::{PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor},
         transforms::{
-            pil_to_filter, resize_bicubic_pil_rgb, resize_rgb_bytes, rgb_bytes, round_half_to_even,
-            TransformError,
+            pil_to_filter, resize_bicubic_torch_aa_rgb, resize_rgb_bytes, rgb_bytes,
+            round_half_to_even, TransformError,
         },
     },
 };
@@ -166,6 +166,36 @@ impl Params {
         })
     }
 
+    /// The geometry the encode works on for `frames` frames of `height` x
+    /// `width`: the budget search's target when `do_resize` is on, the source
+    /// itself otherwise, refused as the encode refuses it (a zero side, a
+    /// canvas off the factor). The count and the encode take their canvas
+    /// from here, so they agree in both modes.
+    fn input_geometry(
+        self,
+        do_resize: bool,
+        frames: usize,
+        height: usize,
+        width: usize,
+    ) -> Result<Geometry, TransformError> {
+        let geometry = if do_resize {
+            self.geometry(frames, height, width)?
+        } else {
+            if height == 0 || width == 0 {
+                return Err(shape("GLM dimensions must be positive"));
+            }
+            Geometry {
+                target: (height, width),
+                content: (height, width),
+            }
+        };
+        let (target_h, target_w) = geometry.target;
+        if !target_h.is_multiple_of(self.factor) || !target_w.is_multiple_of(self.factor) {
+            return Err(shape("GLM canvas is not aligned to the configured factor"));
+        }
+        Ok(geometry)
+    }
+
     fn geometry(
         self,
         frames: usize,
@@ -315,6 +345,12 @@ impl Pixels {
     }
 }
 
+/// One frame's bytes as the reference lays them out: resized to the content
+/// size, then zero-padded to the target canvas. The reference image and video
+/// processors resize with the torchvision antialiased kernel on the bytes
+/// (a bicubic `resample` takes that kernel's uint8 form, which parts from
+/// Pillow's quantization by up to two levels at the scale extremes: tiny
+/// upscales and 4K-8K downscales), so a bicubic resize takes the same kernel here.
 fn prepare<'a, F: RgbSource>(
     frame: &'a F,
     geometry: Geometry,
@@ -335,7 +371,7 @@ fn prepare<'a, F: RgbSource>(
         raw.into_owned()
     } else {
         let resized = if filter == FilterType::CatmullRom {
-            resize_bicubic_pil_rgb(
+            resize_bicubic_torch_aa_rgb(
                 raw.as_ref(),
                 source_w,
                 source_h,
@@ -378,22 +414,13 @@ fn encode<F: RgbSource>(
         return Err(shape("GLM video frames must have identical dimensions"));
     }
     let do_resize = pixels.do_resize;
-    let geometry = if do_resize {
-        params.geometry(
-            budget_frames,
-            source_size.1 as usize,
-            source_size.0 as usize,
-        )?
-    } else {
-        Geometry {
-            target: (source_size.1 as usize, source_size.0 as usize),
-            content: (source_size.1 as usize, source_size.0 as usize),
-        }
-    };
+    let geometry = params.input_geometry(
+        do_resize,
+        budget_frames,
+        source_size.1 as usize,
+        source_size.0 as usize,
+    )?;
     let (height, width) = geometry.target;
-    if !height.is_multiple_of(params.factor) || !width.is_multiple_of(params.factor) {
-        return Err(shape("GLM canvas is not aligned to the configured factor"));
-    }
     let (grid_h, grid_w) = (height / params.patch, width / params.patch);
     let grid_t = frames.len().div_ceil(params.temporal);
     let count = product(&[grid_t, grid_h, grid_w], "GLM patch count")?;
@@ -679,9 +706,17 @@ impl VisionPreProcessor for Glm53FlashProcessor {
         )
     }
 
+    /// The tokens of one image, counted on the canvas the encode works on
+    /// (the budget search's target, or the source itself under
+    /// `do_resize: false`); the preprocessing error for a size it refuses.
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         let params = self.params_for(Modality::Image)?;
-        let geometry = params.geometry(params.temporal, height as usize, width as usize)?;
+        let geometry = params.input_geometry(
+            self.pixels.do_resize,
+            params.temporal,
+            height as usize,
+            width as usize,
+        )?;
         Ok(
             geometry.target.0 / params.patch * (geometry.target.1 / params.patch)
                 / (params.merge * params.merge),
@@ -1031,11 +1066,12 @@ mod tests {
         let mut no_resize = config(MAX_IMAGE_TOKENS);
         no_resize.do_resize = Some(false);
         let unaligned = DynamicImage::ImageRgb8(RgbImage::from_pixel(30, 30, Rgb([1, 2, 3])));
-        let err = Glm53FlashProcessor::from_config_for(&no_resize, Modality::Image)
-            .unwrap()
-            .preprocess(&[&unaligned])
-            .unwrap_err();
+        let no_resize = Glm53FlashProcessor::from_config_for(&no_resize, Modality::Image).unwrap();
+        let err = no_resize.preprocess(&[&unaligned]).unwrap_err();
         assert!(err.to_string().contains("not aligned"), "{err}");
+        // The size-only count takes the same source canvas as the encode.
+        assert_eq!(no_resize.calculate_num_tokens(56, 56).unwrap(), 4);
+        assert!(no_resize.calculate_num_tokens(30, 30).is_err());
     }
 
     #[test]
@@ -1060,5 +1096,105 @@ mod tests {
             rows,
             "patch rows must equal the summed grid volumes"
         );
+    }
+
+    /// A bicubic resize takes the reference's kernel, torchvision's
+    /// antialiased bicubic on the bytes, which its CPU path runs natively on
+    /// `u8`. Pillow's bicubic agrees with it at ordinary ratios and parts by
+    /// one or two 8-bit levels at the scale extremes, so the pins are two extreme
+    /// upscales: the digest of the reference's bytes (torchvision 0.28.0 on
+    /// the seeded input) and the positions where Pillow's bytes differ.
+    #[test]
+    fn prepare_resizes_with_the_reference_kernel_at_extreme_ratios() {
+        use sha2::{Digest, Sha256};
+
+        struct Case {
+            width: u32,
+            height: u32,
+            seed: u32,
+            // SHA-256 of the reference's 28x28 bytes.
+            digest: &'static str,
+            // (index, Pillow's byte, the reference's byte) where the two kernels part.
+            differing: &'static [(usize, u8, u8)],
+        }
+        fn lcg_bytes(count: usize, seed: u32) -> Vec<u8> {
+            let mut state = seed;
+            (0..count)
+                .map(|_| {
+                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
+                    ((state >> 16) & 0xff) as u8
+                })
+                .collect()
+        }
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+
+        let cases = [
+            Case {
+                width: 2,
+                height: 2,
+                seed: 11,
+                digest: "58b97a38d107b21c7635038b616e5fd0593204b93b82bdca5ddf413f20c7866d",
+                differing: &[
+                    (597, 132, 133),
+                    (600, 132, 133),
+                    (626, 123, 122),
+                    (653, 152, 153),
+                    (660, 172, 171),
+                    (902, 163, 164),
+                    (1040, 97, 98),
+                    (1292, 85, 84),
+                    (1490, 205, 204),
+                    (1689, 253, 252),
+                    (1692, 253, 252),
+                    (1718, 98, 99),
+                    (1745, 225, 224),
+                    (1752, 3, 4),
+                ],
+            },
+            Case {
+                width: 7,
+                height: 5,
+                seed: 13,
+                digest: "aaf8d4df4d527fe8ad579d91011a959e53427463ffcdf8331683256ac2838e7b",
+                differing: &[
+                    (662, 205, 206),
+                    (1157, 155, 154),
+                    (1260, 24, 25),
+                    (1315, 33, 34),
+                    (1702, 89, 90),
+                ],
+            },
+        ];
+        for case in cases {
+            let Case {
+                width,
+                height,
+                seed,
+                digest,
+                differing,
+            } = case;
+            let data = lcg_bytes((width * height * 3) as usize, seed);
+            let image = DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, data).unwrap());
+            // Content and target both 28x28: the resized bytes are the whole canvas.
+            let geometry = Geometry {
+                target: (28, 28),
+                content: (28, 28),
+            };
+            let bytes = prepare(&image, geometry, FilterType::CatmullRom, true).unwrap();
+            assert_eq!(bytes.len(), 28 * 28 * 3);
+            for &(index, pillow, reference) in differing {
+                assert_eq!(
+                    bytes[index], reference,
+                    "{width}x{height} -> 28x28 byte {index} (Pillow gives {pillow})"
+                );
+            }
+            assert_eq!(
+                hex(&Sha256::digest(bytes.as_ref())),
+                digest,
+                "{width}x{height} -> 28x28"
+            );
+        }
     }
 }

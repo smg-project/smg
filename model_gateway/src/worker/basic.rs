@@ -34,7 +34,9 @@ use super::{
     event::WorkerConnected,
     http_client::LazyHttpClient,
     pd_pairing::PdPairing,
-    runtime::{routing_state_series, CIRCUIT_OPEN_CODE, ROUTING_STATE_SERIES},
+    runtime::{
+        routing_state_series, AVAILABLE_CODE, CIRCUIT_OPEN_CODE, ROUTING_STATE_SERIES, STALE_BIT,
+    },
     CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult,
 };
 pub use super::{
@@ -179,6 +181,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         0
     }
 
+    /// Raise the revision to at least `floor`, for a worker that keeps one
+    /// (nothing happens for a worker whose revision is always `0`): the
+    /// registry raises a claimed mesh import's revision past the version
+    /// its peers hold for the key, so the claim's publication outranks it.
+    fn raise_revision_to(&self, _floor: u64) {}
+
     /// Epochs reported during metadata discovery, invalidated after a health
     /// failure. These are observations, not proof against an undetected restart.
     fn cache_trace_epochs(&self) -> Vec<String> {
@@ -293,6 +301,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Rooms currently claimed on this worker.
     fn pd_admitted(&self) -> usize {
+        0
+    }
+
+    /// Rooms the places waiting in this worker's admission queue need
+    /// ([`Worker::pd_enqueue`]), so a selection can tell a free room from one
+    /// a waiter is already in line for. The default never queues, so zero.
+    fn pd_waiting_rooms(&self) -> usize {
         0
     }
 
@@ -468,6 +483,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Record a token or a completion from the worker.
     fn note_token_progress(&self) {}
 
+    /// [`Self::note_token_progress`] at `now_ms` on the gateway clock
+    /// (`liveness::now_ms`): a stamp the caller read once for every note of
+    /// the same message.
+    fn note_token_progress_at(&self, _now_ms: u64) {
+        self.note_token_progress();
+    }
+
     /// Record a transport failure (a poll, probe or stream that failed on the
     /// connection); cleared by the next contact.
     fn note_transport_failure(&self) {}
@@ -624,12 +646,24 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// backlog only.
     fn note_prefill_started(&self, _tokens: u64, _timed: bool) {}
 
+    /// [`Self::note_prefill_started`] at `now_ms` on the gateway clock: the
+    /// dispatch's one stamp.
+    fn note_prefill_started_at(&self, tokens: u64, timed: bool, _now_ms: u64) {
+        self.note_prefill_started(tokens, timed);
+    }
+
     /// The request's first token came back, with `cached` of its prompt
     /// tokens reported served from the engine's prefix cache (`Some`; zero
     /// when the engine reports no count), or its stream ended or was dropped
     /// before one (`None`): its prompt is no longer pending prefill. `timed`
     /// as at its start.
     fn note_prefill_ended(&self, _tokens: u64, _timed: bool, _cached: Option<u64>) {}
+
+    /// [`Self::note_prefill_ended`] at `now_ms` on the gateway clock: the
+    /// first response's one stamp.
+    fn note_prefill_ended_at(&self, tokens: u64, timed: bool, cached: Option<u64>, _now_ms: u64) {
+        self.note_prefill_ended(tokens, timed, cached);
+    }
 
     /// How long the engine may still need before the first token of its
     /// in-flight work is due: the prompt tokens dispatched and not yet
@@ -964,7 +998,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// superseded by a replacement. `BasicWorker` aborts the detached ZMQ
     /// handshake driver: it holds the handshake and data-plane socket binds
     /// until it lands, so an orphaned driver would keep them for up to the
-    /// connect timeout and collide with a same-URL re-registration.
+    /// connect timeout and collide with a same-URL re-registration. It also
+    /// stops asserting the shared state code, which a replacement reads: a
+    /// fact the retired instance still writes marks the code stale instead.
     fn abort_background_tasks(&self) {}
     async fn grpc_health_check(&self) -> WorkerResult<bool>;
     /// Liveness check for a ZMQ worker. Unlike gRPC there is no health RPC on
@@ -1148,6 +1184,14 @@ pub struct BasicWorker {
     /// releases the sockets the in-flight handshake has bound instead of
     /// leaving them held until it times out. `None` until a driver is spawned.
     pub zmq_connect_abort: Arc<ArcSwapOption<AbortHandle>>,
+    /// Set when the registry retires this instance (a removal, or a same-URL
+    /// replacement that took over the shared runtime). A retired instance
+    /// asserts no shared state code: the replacement's routing reads answer
+    /// from that code, and a replacement built with another breaker config
+    /// keeps a breaker of its own. A fact the retired instance still writes
+    /// (a trip of a shared breaker behind a request in flight, a stall) marks
+    /// the code stale, and the replacement's next read publishes it again.
+    pub superseded: AtomicBool,
     /// Wakes the manager the instant the ZMQ handshake completes so it can
     /// promote the worker without waiting for the next health poll. Set only
     /// for ZMQ workers built through the registration path; `None` elsewhere
@@ -1191,6 +1235,7 @@ impl Clone for BasicWorker {
             kv_engine_id_unconfirmed: Arc::new(AtomicBool::new(
                 self.kv_engine_id_unconfirmed.load(Ordering::Relaxed),
             )),
+            superseded: AtomicBool::new(self.superseded.load(Ordering::Relaxed)),
             http_client: Arc::clone(&self.http_client),
             resilience: self.resilience.clone(),
         }
@@ -1327,9 +1372,18 @@ impl BasicWorker {
     /// called, so the last publish in lock order reads every fact that
     /// moved, and the series end on the pair the facts give. The breaker is
     /// read as stored: its timeout's move belongs to the routing decision's
-    /// read ([`Self::breaker_allows`]), which publishes it.
+    /// read ([`Self::breaker_allows`]), which publishes it. An instance the
+    /// registry retired asserts no pair: its replacement may keep a breaker
+    /// of its own, or share this one, so the fact that moved is real. It
+    /// marks the code stale under the same lock, and the replacement's next
+    /// routing read publishes from the facts, after or before this whole
+    /// publish, never inside it.
     fn publish_state_under(&self, rt: &WorkerRuntime, forget_previous: bool) {
         let _publish = rt.publish_lock();
+        if self.superseded.load(Ordering::Acquire) {
+            rt.mark_published_stale();
+            return;
+        }
         if forget_previous {
             rt.swap_published_state(0);
         }
@@ -1340,7 +1394,7 @@ impl BasicWorker {
             self.circuit_breaker.load().peek_state() == super::circuit_breaker::CircuitState::Open,
         );
         let code = index as u8 + 1;
-        let previous = rt.swap_published_state(code);
+        let previous = rt.swap_published_state(code) & !STALE_BIT;
         if previous == code {
             return;
         }
@@ -1473,6 +1527,10 @@ impl Worker for BasicWorker {
         self.runtime.load().revision()
     }
 
+    fn raise_revision_to(&self, floor: u64) {
+        self.runtime.load().raise_revision_to(floor);
+    }
+
     fn cache_trace_epochs(&self) -> Vec<String> {
         if !self.runtime.load().cache_trace_epochs_valid() {
             return Vec::new();
@@ -1587,6 +1645,10 @@ impl Worker for BasicWorker {
         self.runtime.load().pd_admitted()
     }
 
+    fn pd_waiting_rooms(&self) -> usize {
+        self.runtime.load().pd_waiting_rooms()
+    }
+
     fn pd_enqueue(&self, rooms: usize) -> u64 {
         self.runtime.load().pd_enqueue(rooms)
     }
@@ -1669,6 +1731,10 @@ impl Worker for BasicWorker {
 
     fn note_token_progress(&self) {
         self.runtime.load().note_token_progress();
+    }
+
+    fn note_token_progress_at(&self, now_ms: u64) {
+        self.runtime.load().note_token_progress_at(now_ms);
     }
 
     fn note_transport_failure(&self) {
@@ -1765,10 +1831,23 @@ impl Worker for BasicWorker {
         self.runtime.load().note_prefill_started(tokens, timed);
     }
 
+    fn note_prefill_started_at(&self, tokens: u64, timed: bool, now_ms: u64) {
+        // 0 is the runtime's unset stamp, as the plain note guards too.
+        self.runtime
+            .load()
+            .note_prefill_started_at(tokens, timed, now_ms.max(1));
+    }
+
     fn note_prefill_ended(&self, tokens: u64, timed: bool, cached: Option<u64>) {
         self.runtime
             .load()
             .note_prefill_ended(tokens, timed, cached);
+    }
+
+    fn note_prefill_ended_at(&self, tokens: u64, timed: bool, cached: Option<u64>, now_ms: u64) {
+        self.runtime
+            .load()
+            .note_prefill_ended_at(tokens, timed, cached, now_ms.max(1));
     }
 
     fn prefill_backlog(&self) -> Duration {
@@ -1824,9 +1903,17 @@ impl Worker for BasicWorker {
     }
 
     fn is_available(&self) -> bool {
-        // Same two guards the pre-veto version took (`is_healthy` +
-        // `circuit_breaker_can_execute`): the vetoes ride the runtime guard.
+        // The published code answers `available` under the runtime guard
+        // alone (see `routing_state`); any other code reads the vetoes, which
+        // ride that guard, and the breaker under its own.
         let rt = self.runtime.load();
+        let code = rt.published_state();
+        if code == AVAILABLE_CODE {
+            return true;
+        }
+        if code & STALE_BIT != 0 {
+            self.publish_state_under(&rt, false);
+        }
         rt.status() == WorkerStatus::Ready
             && !rt.is_overloaded()
             && rt.stall_reason().is_none()
@@ -1857,6 +1944,28 @@ impl Worker for BasicWorker {
         // (all live in `self.runtime`); the circuit breaker is a separate
         // ArcSwap, so it needs its own guard.
         let rt = self.runtime.load();
+        // The published `smg_worker_state` code summarises the four vetoes as
+        // of the last publish, and every writer of a veto publishes: a status
+        // change, an overload or liveness edge, a breaker move (the timeout's
+        // move to half-open is published by the read that makes it, below).
+        // `available` says none holds, so the common case answers from the
+        // code and never takes the breaker's guard. Any other code (a veto
+        // in force, or no publish yet) reads the facts; a code a retired
+        // instance marked stale is published again first, from these facts.
+        let code = rt.published_state();
+        if code == AVAILABLE_CODE {
+            return RoutingState {
+                healthy: true,
+                can_execute: true,
+                load: rt.load(),
+                processed: rt.processed_requests(),
+                overloaded: false,
+                stalled: false,
+            };
+        }
+        if code & STALE_BIT != 0 {
+            self.publish_state_under(&rt, false);
+        }
         RoutingState {
             healthy: rt.status() == WorkerStatus::Ready,
             can_execute: self.breaker_allows(&rt),
@@ -2104,6 +2213,7 @@ impl Worker for BasicWorker {
     }
 
     fn abort_background_tasks(&self) {
+        self.superseded.store(true, Ordering::Release);
         if let Some(handle) = self.zmq_connect_abort.swap(None) {
             handle.abort();
             // The bound sockets are released with the cancelled future; reset

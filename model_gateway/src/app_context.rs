@@ -680,7 +680,7 @@ impl AppContextBuilder {
         }
 
         let make_builder = || {
-            let mut client_builder = crate::clients::http_client_builder()
+            let mut client_builder = crate::server::http_client_builder()
                 .pool_idle_timeout(pool_idle_timeout)
                 .pool_max_idle_per_host(500)
                 .timeout(Duration::from_secs(timeout_secs))
@@ -979,12 +979,15 @@ fn mcp_bootstrap_config(file: Option<&smg_mcp::McpConfig>) -> smg_mcp::McpConfig
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::WorkerStatus;
 
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        worker::{BasicWorkerBuilder, PrefillAdmissionAttempt, Worker, WorkerType},
+        worker::{
+            test_support::{select_worker, worker_of},
+            BasicWorkerBuilder, PrefillAdmissionAttempt, Worker, WorkerType,
+        },
     };
 
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
@@ -1182,7 +1185,7 @@ mod tests {
     /// cache-aware deployments get waiting-prefill and KV-usage data.
     #[test]
     fn worker_monitor_wires_load_receiver_into_policies() {
-        use crate::policies::CacheAwarePolicy;
+        use crate::policies::as_cache_aware;
 
         let config = config_with_policy(PolicyConfig::CacheAware {
             cache_threshold: 0.5,
@@ -1216,10 +1219,7 @@ mod tests {
             .as_ref()
             .expect("policy registry set")
             .get_default_policy();
-        let cache_aware = policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .expect("default policy is cache-aware");
+        let cache_aware = as_cache_aware(policy.as_ref()).expect("default policy is cache-aware");
         assert!(cache_aware.has_load_receiver_for_test());
     }
 
@@ -1243,7 +1243,7 @@ mod tests {
     /// workers get the event-driven index rather than the approximate tree.
     #[test]
     fn a_cache_aware_policy_from_a_worker_label_gets_the_kv_event_monitor() {
-        use crate::policies::CacheAwarePolicy;
+        use crate::policies::as_cache_aware;
 
         let config = config_with_policy(PolicyConfig::Random);
         let builder = AppContextBuilder::new()
@@ -1255,10 +1255,8 @@ mod tests {
             .as_ref()
             .expect("policy registry set");
         let policy = registry.on_worker_added("affine", Some("cache_aware"));
-        let cache_aware = policy
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
-            .expect("the label's policy is cache-aware");
+        let cache_aware =
+            as_cache_aware(policy.as_ref()).expect("the label's policy is cache-aware");
         assert!(cache_aware.kv_event_monitor_is_set_for_test());
     }
 
@@ -1353,33 +1351,15 @@ policy:
         );
     }
 
-    fn prefill_worker(url: &str) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Prefill)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .build(),
-        )
-    }
-
     #[tokio::test]
     async fn worker_status_change_wakes_prefill_admission() {
         let registry = Arc::new(WorkerRegistry::new());
         let admission = Arc::new(PrefillAdmission::new(1, 1, Duration::from_secs(1)));
         start_prefill_admission_notifier(&registry, &admission).unwrap();
 
-        let first = prefill_worker("http://prefill-1:8000");
+        let first = worker_of("http://prefill-1:8000", WorkerType::Prefill);
         registry.register(Arc::clone(&first)).unwrap();
-        let occupied = admission
-            .admit(None, {
-                let first = Arc::clone(&first);
-                move |capacity| capacity.select(Arc::clone(&first), ())
-            })
-            .await
-            .unwrap();
+        let occupied = admission.admit(None, select_worker(&first)).await.unwrap();
 
         let attempts = Arc::new(AtomicUsize::new(0));
         #[expect(
@@ -1497,7 +1477,7 @@ pub(crate) mod testing {
 
         Arc::new(AppContext {
             gateway_auth: AuthConfig::new(None),
-            client: crate::clients::http_client(),
+            client: crate::server::http_client(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,

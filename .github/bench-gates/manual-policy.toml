@@ -20,8 +20,28 @@
 # medians of both sides, and the hosted runner's own spread, read from those, is the number to
 # tighten this to.
 
+#
+# Placement. The workflow's benchmark job builds its binaries, the gate's pair and the summary
+# run's, with every function on a 64-byte boundary (RUSTFLAGS:
+# `-C llvm-args=-align-all-functions=6`, beside the outliner flag of .cargo/config.toml).
+# symphony.toml records why: identical code sits in one of two speed states chosen by where its
+# unchanged hot functions land modulo 64, and a pull request's code size alone moved them. Under the
+# flags this gate's null read (the same bytes twice, three interleaved runs a side on one core, 16
+# ids) read 0 failed, 0 suspect with a largest change of medians of +6.1 %, so the thresholds stand.
+# An inserted regression on the path the rows run (100 dependent multiply-adds plus 12 per worker on
+# every selection) is caught: 13 of 16 failed, fast path +27 to +30 %, no routing key +31 to +45 %,
+# cache size +26 to +28 % at 100 to 10000 keys. Under the 25 % threshold: the 100000-key cache row
+# (+21 %) and the vacant slow path at 4 and 16 workers (+17 and +21 %, where the vacant path's own
+# cost dominates), its 64- and 256-worker rows at +29 and +31 %.
+
 repeats = 3
 filter = "^manual_policy/(fast_path|slow_path_vacant|no_routing_key|cache_size)/"
+
+# The files that feed this binary beyond the measured crate: the base side is built with them as the
+# pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
+# gated rows through the binary's inlining (symphony.toml records the case). A new row goes to a
+# bench target of its own.
+sources = ["model_gateway/benches/manual_policy_benchmark.rs"]
 
 [[gate]]
 pattern = "^manual_policy/"

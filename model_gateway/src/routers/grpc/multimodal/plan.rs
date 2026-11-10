@@ -418,7 +418,7 @@ fn url_source(url: &str) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use llm_multimodal::PreProcessorConfig;
@@ -434,13 +434,79 @@ mod tests {
     };
     use crate::worker::{RuntimeType, WorkerRegistry};
 
-    fn image_urls(count: usize) -> MediaPlan {
+    /// The tokens a spec resolves for a modality, as `(text, id)` pairs, the
+    /// anchor first.
+    type Tokens = &'static [(&'static str, u32)];
+
+    /// `count` image parts, each at its own URL.
+    pub(crate) fn image_urls(count: usize) -> MediaPlan {
         MediaPlan::new((0..count).map(|i| MediaContentPart::ImageUrl {
             url: format!("https://example.com/{i}.png"),
             detail: None,
             uuid: None,
             max_long_side_pixel: None,
         }))
+    }
+
+    /// `count` fetchable parts of `modality`.
+    fn media_urls(modality: Modality, count: usize) -> MediaPlan {
+        match modality {
+            Modality::Video => MediaPlan::new((0..count).map(|i| MediaContentPart::VideoUrl {
+                url: format!("https://example.com/{i}.mp4"),
+                uuid: None,
+                fps: None,
+                max_long_side_pixel: None,
+            })),
+            Modality::Audio => MediaPlan::new((0..count).map(|i| MediaContentPart::AudioUrl {
+                url: format!("https://example.com/{i}.wav"),
+                uuid: None,
+            })),
+            Modality::Image | Modality::ImageEmbeds => image_urls(count),
+        }
+    }
+
+    /// A three-modality checkpoint's config, its token ids nested as the
+    /// family's checkpoints nest them.
+    fn omni_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "qwen3_omni_moe",
+            "thinker_config": {
+                "audio_token_id": 151675,
+                "image_token_id": 151655,
+                "video_token_id": 151656
+            }
+        })
+    }
+
+    /// A Gemma 4 checkpoint's config: the image anchor with its begin and end
+    /// markers, and the video anchor.
+    fn gemma4_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "gemma4",
+            "image_token_id": 258880,
+            "boi_token_id": 255999,
+            "eoi_token_id": 258882,
+            "video_token_id": 258884
+        })
+    }
+
+    /// A Nemotron Omni checkpoint's config: the geometry the family's
+    /// processors implement and the sound encoder's parameters.
+    fn nemotron_omni_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "NemotronH_Nano_Omni_Reasoning_V3",
+            "patch_size": 16,
+            "downsample_ratio": 0.5,
+            "norm_mean": [0.48145466, 0.4578275, 0.40821073],
+            "norm_std": [0.26862954, 0.26130258, 0.27577711],
+            "vision_config": {
+                "args": {"min_num_patches": 1024, "max_num_patches": 13312},
+                "video_target_num_patches": 1024,
+                "video_temporal_patch_size": 2,
+                "video_maintain_aspect_ratio": true
+            },
+            "sound_config": {"sampling_rate": 16000, "num_mel_bins": 128, "subsampling_factor": 8}
+        })
     }
 
     /// The limit the model's workers advertise for their engine refuses a plan
@@ -514,49 +580,74 @@ mod tests {
 
     /// The specs that declare images without a count of their own leave the
     /// bound to the engine's advertised limit and the router's knobs: for
-    /// each family, with neither a request above the ten the specs used to
-    /// copy goes through, and the flag and the engine's limit still refuse
-    /// it, each naming itself.
+    /// each family, with neither a request above the count the spec used to
+    /// declare goes through, and the flag and the engine's limit still refuse
+    /// it, each naming itself. A row's tokens are the ones the spec resolves
+    /// for images, the anchor first.
     #[tokio::test]
     async fn the_specs_without_an_image_count_of_their_own_leave_the_bound_to_the_engine_and_the_knobs(
     ) {
-        let families = [
+        let families: [(&str, Tokens, serde_json::Value, usize); 9] = [
             (
                 "org/qwen3-vl",
-                "<|image_pad|>",
-                151655,
+                &[("<|image_pad|>", 151655)],
                 serde_json::json!({"model_type": "qwen3_vl", "image_token_id": 151655}),
+                10,
             ),
             (
                 "org/qwen2-vl",
-                "<|image_pad|>",
-                151655,
+                &[("<|image_pad|>", 151655)],
                 serde_json::json!({"model_type": "qwen2_vl", "image_token_id": 151655}),
+                10,
             ),
             (
                 "org/inkling",
-                "<|unused_200054|>",
-                200054,
+                &[("<|unused_200054|>", 200054)],
                 serde_json::json!({
                     "model_type": "inkling_mm_model",
                     "vision_config": {"decoder_dmodel": 6144}
                 }),
+                10,
             ),
             (
                 "org/muse-spark",
-                "<|patch|>",
-                200092,
+                &[("<|patch|>", 200092)],
                 serde_json::json!({"model_type": "muse_spark", "image_token_id": 200092}),
+                10,
             ),
             (
                 "org/kimi-k3",
-                "<|media_pad|>",
-                163605,
+                &[("<|media_pad|>", 163605)],
                 serde_json::json!({"model_type": "kimi_k3", "media_placeholder_token_id": 163605}),
+                10,
+            ),
+            (
+                "org/qwen3-omni",
+                &[("<|image_pad|>", 151655)],
+                omni_config(),
+                10,
+            ),
+            (
+                "org/gemma-4",
+                &[("<|image|>", 258880)],
+                gemma4_config(),
+                128,
+            ),
+            (
+                "org/nemotron-omni",
+                &[("<image>", 18), ("<img>", 19), ("</img>", 20)],
+                nemotron_omni_config(),
+                16,
+            ),
+            (
+                "org/deepseek-v4.1",
+                &[("<｜deepseek_image｜>", 129264)],
+                serde_json::json!({"model_type": "deepseek_v41", "image_token_id": 129264}),
+                128,
             ),
         ];
-        let plan = image_urls(11);
-        for (model_id, placeholder, token_id, config) in families {
+        for (model_id, tokens, config, cap) in families {
+            let (anchor, _) = tokens[0];
             let registry = Arc::new(MultimodalConfigRegistry::new());
             registry.insert(
                 "tok".to_string(),
@@ -566,7 +657,8 @@ mod tests {
                     None,
                 )),
             );
-            let tokenizer = MockTokenizer::new().with_tokens(&[(placeholder, token_id)]);
+            let tokenizer = MockTokenizer::new().with_tokens(tokens);
+            let plan = image_urls(cap + 1);
             let prepare = |image_limit, engine: HashMap<Modality, EngineItemLimit>| {
                 let components = MultimodalComponents::new(
                     registry.clone(),
@@ -598,17 +690,17 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{model_id}: no engine limit and no knob: {error}"));
             assert_eq!(
                 placeholders.get(Modality::Image),
-                Some(placeholder),
+                Some(anchor),
                 "{model_id}"
             );
 
-            let error = prepare(Some(10), HashMap::new())
+            let error = prepare(Some(cap), HashMap::new())
                 .await
                 .unwrap_err()
                 .to_string();
             assert!(
-                error.contains("11 image items")
-                    && error.contains("limit of 10")
+                error.contains(&format!("{} image items", cap + 1))
+                    && error.contains(&format!("limit of {cap}"))
                     && error.contains("(--mm-per-request-image-limit)"),
                 "{model_id}: {error}"
             );
@@ -624,6 +716,205 @@ mod tests {
             assert!(
                 error.contains("limit of 8") && error.contains("the engine's"),
                 "{model_id}: {error}"
+            );
+        }
+    }
+
+    /// The specs that declare video or audio without a count of their own
+    /// leave the bound to the engine's advertised limit and the router's
+    /// environment override: for each family and modality, with neither a
+    /// request above the count the spec used to declare goes through and
+    /// resolves the family's placeholder, and the override and the engine's
+    /// limit still refuse it, each naming itself. A row's tokens are the ones
+    /// the spec resolves for the modality, the anchor first.
+    #[tokio::test]
+    async fn the_specs_without_a_video_or_audio_count_of_their_own_leave_the_bound_to_the_engine_and_the_env(
+    ) {
+        let rows: [(&str, Modality, Tokens, serde_json::Value, usize); 11] = [
+            (
+                "org/qwen3-vl",
+                Modality::Video,
+                &[("<|video_pad|>", 151656)],
+                serde_json::json!({
+                    "model_type": "qwen3_vl",
+                    "image_token_id": 151655,
+                    "video_token_id": 151656
+                }),
+                1,
+            ),
+            (
+                "org/qwen2.5-vl",
+                Modality::Video,
+                &[("<|video_pad|>", 151656)],
+                serde_json::json!({
+                    "model_type": "qwen2_5_vl",
+                    "image_token_id": 151655,
+                    "video_token_id": 151656
+                }),
+                1,
+            ),
+            (
+                "org/muse-spark",
+                Modality::Video,
+                &[("<|video|>", 200091)],
+                serde_json::json!({
+                    "model_type": "muse_spark",
+                    "image_token_id": 200092,
+                    "video_token_id": 200091
+                }),
+                1,
+            ),
+            (
+                "org/muse-spark",
+                Modality::Audio,
+                &[("<|audio|>", 200038)],
+                serde_json::json!({
+                    "model_type": "muse_spark",
+                    "image_token_id": 200092,
+                    "audio_token_id": 200038,
+                    "audio_config": {"model_type": "muse_spark_audio", "patch_sizes": [16, 6, 5, 4]}
+                }),
+                10,
+            ),
+            (
+                "org/inkling",
+                Modality::Audio,
+                &[("<|unused_200053|>", 200053)],
+                serde_json::json!({
+                    "model_type": "inkling_mm_model",
+                    "audio_config": {"decoder_dmodel": 6144}
+                }),
+                10,
+            ),
+            (
+                "org/qwen3-omni",
+                Modality::Video,
+                &[("<|video_pad|>", 151656)],
+                omni_config(),
+                1,
+            ),
+            (
+                "org/qwen3-omni",
+                Modality::Audio,
+                &[("<|audio_pad|>", 151675)],
+                omni_config(),
+                10,
+            ),
+            (
+                "org/qwen3-asr",
+                Modality::Audio,
+                &[("<|audio_pad|>", 151676)],
+                serde_json::json!({
+                    "model_type": "qwen3_asr",
+                    "thinker_config": {"audio_token_id": 151676}
+                }),
+                10,
+            ),
+            (
+                "org/gemma-4",
+                Modality::Video,
+                &[("<|video|>", 258884)],
+                gemma4_config(),
+                8,
+            ),
+            (
+                "org/nemotron-omni",
+                Modality::Video,
+                &[
+                    ("<SPECIAL_30>", 30),
+                    ("<image>", 18),
+                    ("<img>", 19),
+                    ("</img>", 20),
+                ],
+                nemotron_omni_config(),
+                2,
+            ),
+            (
+                "org/nemotron-omni",
+                Modality::Audio,
+                &[("<so_embedding>", 27), ("<so_start>", 28), ("<so_end>", 29)],
+                nemotron_omni_config(),
+                4,
+            ),
+        ];
+        for (model_id, modality, tokens, config, cap) in rows {
+            let (anchor, _) = tokens[0];
+            let registry = Arc::new(MultimodalConfigRegistry::new());
+            registry.insert(
+                "tok".to_string(),
+                Arc::new(MultimodalModelConfig::new(
+                    config,
+                    PreProcessorConfig::default(),
+                    None,
+                )),
+            );
+            let tokenizer = MockTokenizer::new().with_tokens(tokens);
+            let components =
+                MultimodalComponents::new(registry, None, None, &MultimodalSettings::default())
+                    .unwrap();
+            let plan = media_urls(modality, cap + 1);
+            // `env` stands in for the modality's `SMG_<MODALITY>_MAX_COUNT`.
+            let prepare = |env: Option<usize>, engine: HashMap<Modality, EngineItemLimit>| {
+                let plan = &plan;
+                let tokenizer = &tokenizer;
+                let components = &components;
+                async move {
+                    prepare_placeholder_tokens_with_env(
+                        plan,
+                        model_id,
+                        tokenizer,
+                        components,
+                        "tok",
+                        "unused",
+                        &engine,
+                        |_| true,
+                        move |requested| if requested == modality { env } else { None },
+                    )
+                    .await
+                }
+            };
+
+            let placeholders = prepare(None, HashMap::new()).await.unwrap_or_else(|error| {
+                panic!("{model_id} {modality}: no engine limit and no override: {error}")
+            });
+            assert_eq!(
+                placeholders.get(modality),
+                Some(anchor),
+                "{model_id} {modality}"
+            );
+
+            let error = prepare(Some(cap), HashMap::new())
+                .await
+                .unwrap_err()
+                .to_string();
+            let variable = format!(
+                "SMG_{}_MAX_COUNT",
+                modality.to_string().to_ascii_uppercase()
+            );
+            assert!(
+                error.contains(&format!("{} {modality} items", cap + 1))
+                    && error.contains(&format!("limit of {cap}"))
+                    && error.contains(&variable),
+                "{model_id} {modality}: {error}"
+            );
+
+            // The engine whose servicer advertises this modality's limit.
+            let runtime = if modality == Modality::Audio {
+                RuntimeType::Sglang
+            } else {
+                RuntimeType::Vllm
+            };
+            let engine = HashMap::from([(
+                modality,
+                EngineItemLimit {
+                    limit: cap,
+                    runtime,
+                },
+            )]);
+            let error = prepare(None, engine).await.unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("limit of {cap}")) && error.contains("the engine's"),
+                "{model_id} {modality}: {error}"
             );
         }
     }

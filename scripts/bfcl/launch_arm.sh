@@ -69,19 +69,90 @@ VLLM_BIN="${VLLM_BIN:-vllm}"                      # `vllm serve` console script
 VLLM_PYTHON="${VLLM_PYTHON:-python}"             # python that can `-m vllm.entrypoints.grpc_server`
 SMG_LAUNCH="${SMG_LAUNCH:-smg launch}"           # SMG launcher (binary subcmd or `python -m smg.launch_router`)
 
+PROBE_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/arm_probe.py"
+case "$ARM" in
+  a|b)
+    # Validate before either engine starts. Scoring keeps RUN_TIMEOUT verbatim;
+    # only the observer maps uncapped/long runs to its existing finite bound.
+    PROBE_DURATION=$(python3 "$PROBE_SCRIPT" \
+      --bounded-duration-for-run-timeout="${RUN_TIMEOUT:-14400}")
+    echo "[launch_arm] RUN_TIMEOUT validated; arm B observer bound: ${PROBE_DURATION}s (scoring RUN_TIMEOUT unchanged)" >&2
+    ;;
+esac
+
 mkdir -p "$RUN_DIR"
 
-# start <name> <logfile> <command...> — detached, pidfile-tracked.
+# Only this invocation's direct startup children belong to this private owner.
+# Coprocess transport FDs are close-on-exec; no engine inherits the control pipe.
+if [[ "$ARM" == a || "$ARM" == b ]]; then
+  coproc BFCL_OWNER { python3 "$(dirname "${BASH_SOURCE[0]}")/startup_owner.py"; }
+  OWNER_PID=$BFCL_OWNER_PID
+  OWNER_READ=${BFCL_OWNER[0]}
+  OWNER_WRITE=${BFCL_OWNER[1]}
+  STARTUP_COMMITTED=0
+  STARTED_PIDFILES=()
+  STARTED_PIDS=()
+  startup_exit() {
+    local status="$1" index saved_pid
+    trap - EXIT INT TERM
+    if [[ "$STARTUP_COMMITTED" != 1 ]]; then
+      if owner_request abort >/dev/null 2>/dev/null && [[ "$OWNER_HANDLE" == ok ]]; then
+        # These groups were reaped. A later legacy stop must not signal their
+        # recycled numeric PIDs. Leave unrelated or replaced pidfiles alone.
+        for index in "${!STARTED_PIDFILES[@]}"; do
+          if IFS= read -r saved_pid <"${STARTED_PIDFILES[index]}" \
+            && [[ "$saved_pid" == "${STARTED_PIDS[index]}" ]]; then
+            rm -f -- "${STARTED_PIDFILES[index]}" || true
+          fi
+        done
+      fi
+    fi
+    exec {OWNER_WRITE}>&- || true
+    exec {OWNER_READ}<&- || true
+    wait "$OWNER_PID" || true
+    exit "$status"
+  }
+  trap 'startup_exit $?' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+fi
+
+owner_request() {
+  local status=0
+  trap '' PIPE
+  printf '%s\0' "$@" >&"$OWNER_WRITE" || status=$?
+  trap - PIPE
+  [[ "$status" == 0 ]] || return "$status"
+  IFS=' ' read -r OWNER_HANDLE OWNER_CHILD_PID <&"$OWNER_READ"
+}
+
+commit_startup() {
+  owner_request commit
+  [[ "$OWNER_HANDLE" == ok ]]
+  STARTUP_COMMITTED=1
+}
+
+# Commands are passed as argv, never through a shell or a persisted pidfile.
 start() {
   local name="$1" log="$2"; shift 2
-  setsid env "$@" >"$log" 2>&1 </dev/null &
-  echo $! >"$RUN_DIR/$name.pid"
-  echo "[launch_arm] started $name (pid $(cat "$RUN_DIR/$name.pid")) -> $log" >&2
+  owner_request start "$log" "$(($# + 1))" env "$@"
+  echo "$OWNER_CHILD_PID" >"$RUN_DIR/$name.pid"
+  STARTED_PIDFILES+=("$RUN_DIR/$name.pid")
+  STARTED_PIDS+=("$OWNER_CHILD_PID")
+  echo "[launch_arm] started $name (pid $OWNER_CHILD_PID) -> $log" >&2
 }
 
 # Tail a logfile to stderr (streams live in CI; stdout is reserved for the
-# base_url). Prints the tail pid so the caller can stop it once healthy.
-stream_log() { tail -n +1 -F "$1" >&2 & echo $!; }
+# base_url). Call directly, not via $(...): LOG_TAIL_HANDLE is kept for stop_log.
+stream_log() {
+  owner_request start - 5 tail -n +1 -F "$1"
+  LOG_TAIL_HANDLE=$OWNER_HANDLE
+}
+
+stop_log() {
+  owner_request stop "$LOG_TAIL_HANDLE"
+  [[ "$OWNER_HANDLE" == ok ]]
+}
 
 wait_http() {  # wait_http <url> <timeout_s>
   local url="$1" timeout="${2:-300}" waited=0
@@ -120,9 +191,10 @@ case "$ARM" in
     # shellcheck disable=SC2206  # intentional word-split of optional extra flags
     [ -n "$VLLM_EXTRA" ] && cmd+=($VLLM_EXTRA)
     start arm_a "$RUN_DIR/arm_a_vllm.log" "${cmd[@]}"
-    log_tail=$(stream_log "$RUN_DIR/arm_a_vllm.log")
+    stream_log "$RUN_DIR/arm_a_vllm.log"
     wait_http "http://127.0.0.1:$ARM_A_PORT/health" "${BFCL_STARTUP_TIMEOUT:-420}"
-    kill "$log_tail" 2>/dev/null || true
+    stop_log
+    commit_startup
     echo "http://127.0.0.1:$ARM_A_PORT"
     ;;
 
@@ -142,9 +214,9 @@ case "$ARM" in
     # shellcheck disable=SC2206  # intentional word-split of optional extra flags
     [ -n "$VLLM_EXTRA" ] && wcmd+=($VLLM_EXTRA)
     start arm_b_worker "$RUN_DIR/arm_b_worker.log" "${wcmd[@]}"
-    log_tail=$(stream_log "$RUN_DIR/arm_b_worker.log")
+    stream_log "$RUN_DIR/arm_b_worker.log"
     wait_grpc "$ARM_B_GRPC_PORT" "${BFCL_STARTUP_TIMEOUT:-420}"
-    kill "$log_tail" 2>/dev/null || true
+    stop_log
     # 2) SMG gateway in front, exposing the OpenAI API.
     # shellcheck disable=SC2206  # intentional word-split of SMG_LAUNCH
     declare -a smg_cmd=(
@@ -160,9 +232,21 @@ case "$ARM" in
     [ -n "$SMG_TOOL_PARSER" ] && smg_cmd+=(--tool-call-parser "$SMG_TOOL_PARSER")
     [ -n "$SMG_REASONING_PARSER" ] && smg_cmd+=(--reasoning-parser "$SMG_REASONING_PARSER")
     start arm_b_gateway "$RUN_DIR/arm_b_gateway.log" "${smg_cmd[@]}"
-    log_tail=$(stream_log "$RUN_DIR/arm_b_gateway.log")
-    wait_http "http://127.0.0.1:$ARM_B_GW_PORT/health" "${BFCL_STARTUP_TIMEOUT:-420}"
-    kill "$log_tail" 2>/dev/null || true
+    stream_log "$RUN_DIR/arm_b_gateway.log"
+    # /health is process liveness, including while workers/tokenizers are not
+    # ready. Require this model's readiness before handing BFCL the base URL.
+    # Retain bounded state through inference too: startup success cannot explain
+    # a worker that becomes unavailable several minutes into the full suite.
+    python3 "$PROBE_SCRIPT" --base-url "http://127.0.0.1:$ARM_B_GW_PORT" \
+      --model "$MODEL" --run-dir "$RUN_DIR" \
+      --wait-ready "${BFCL_STARTUP_TIMEOUT:-420}"
+    stop_log
+    start arm_b_probe "$RUN_DIR/arm_b_probe.log" python3 "$PROBE_SCRIPT" \
+      --base-url "http://127.0.0.1:$ARM_B_GW_PORT" --model "$MODEL" \
+      --run-dir "$RUN_DIR" --duration "$PROBE_DURATION" \
+      --metrics-url "http://127.0.0.1:$ARM_B_METRICS_PORT" \
+      --worker-port "$ARM_B_GRPC_PORT"
+    commit_startup
     echo "http://127.0.0.1:$ARM_B_GW_PORT"
     ;;
 

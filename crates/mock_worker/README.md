@@ -6,9 +6,9 @@ stand-ins for vLLM/SGLang engines.
 
 Two modes:
 
-- **canned** (default) — every response is fixed (no model); a single optional
-  `--gen-ms` delay. Cheap enough to run thousands of idle workers for measuring
-  the gateway's own CPU/registration/routing cost.
+- **canned** (default) — every response is fixed (no model), in the shape of
+  its route; a single optional `--gen-ms` delay. Cheap enough to run thousands
+  of idle workers for measuring the gateway's own CPU/registration/routing cost.
 - **realistic** (`--engine realistic`) — each worker runs a continuous-batching
   **engine simulator** that behaves like a real LLM engine on CPU, so the whole
   gateway (including load- and cache-aware routing) can be exercised without
@@ -22,22 +22,65 @@ Two modes:
 - `POST /v1/chat/completions` · `/v1/completions` · `/generate` — non-stream JSON
   or SSE (`data: {chunk}\n\n … data: [DONE]\n\n`)
 - `GET /v1/loads?include=core` → `WorkerLoadResponse` (load-aware policies)
+- `POST /flush_cache` · `/start_profile` · `/stop_profile` — the gateway's admin
+  fan-out: the flush clears the engine's cache (a canned worker has none) and
+  answers 200; a profiling run starts with the body's options and ends with one
+  trace file in its output directory (a run already in progress, or a stop with
+  none, is a 409)
 
-**gRPC** (TokenSpeed scheduler — the gateway tokenizes, the worker speaks token
-ids): `HealthCheck`, `GetModelInfo`, `GetServerInfo`, `Generate` (streamed
-chunks + complete), `GetLoads`, `Abort`, and (realistic mode only)
-`SubscribeKvEvents`; other admin RPCs return `unimplemented`. Beside the
-scheduler service the server hosts the standard `grpc.health.v1` service
-(`Check`, `Watch`): the empty name and the scheduler service are SERVING
-exactly when `HealthCheck` answers healthy (`POST /admin/serving/{port}` flips
-both), any other name is unknown.
+**gRPC** (one engine's scheduler service, `--grpc-wire tokenspeed|vllm|sglang`,
+TokenSpeed by default — the gateway tokenizes, the worker speaks token ids):
+`HealthCheck`, `GetModelInfo`, `GetServerInfo`, `Generate` (streamed chunks +
+complete), `GetLoads`, `Abort`, and (realistic mode only) `SubscribeKvEvents`, and
+the admin fan-out's `FlushCache` (every rank's cache cleared at once,
+`success: true`), `StartProfile` and `StopProfile` (a run in progress refused
+with `success: false`, the trace file written at the stop), the same on each
+wire; the other RPCs (`GetTokenizer`, embeddings, LoRA) return `unimplemented`. The canned
+and scripted answers, the realistic engine, the data-parallel ranks and the
+prefill/decode roles are the same behind each wire; each shapes its own
+messages (a role is `disaggregation_mode` in the server args on the TokenSpeed
+and SGLang wires, with `disaggregation_transfer_backend` mooncake, and
+`kv_role` behind `kv_connector` MooncakeConnector on the vLLM one, whose info
+is a struct of named fields the admin API's info patch sets by name: the mock
+moves no KV cache and names Mooncake as its transport on every wire). The
+encode role (`--worker-type encode`) is the vLLM wire's alone: the worker
+advertises `ec_role` ec_producer behind `ec_connector` ECCPUConnector (a prefill
+worker on that wire advertises the consumer side), reads as vision-capable with
+a worker-side media processor (`mm_processor` mock, so the gateway forwards
+media references to it), and answers every `Generate` that carries
+`ec_transfer_params_json` with the encoder's token-less completion, the media
+identity (the prompt ids as sent, one hash per media item) and one pull handle
+per hash naming its own address; the TokenSpeed encoder is a separate service
+the mock does not serve, and the SGLang wire has no encode role.
+`--capture` records the TokenSpeed wire's requests only. Beside the scheduler
+service the server hosts the standard `grpc.health.v1` service (`Check`,
+`Watch`): the empty name and the served scheduler service are SERVING exactly
+when `HealthCheck` answers healthy (`POST /admin/serving/{port}` flips both),
+any other name is unknown; the gateway detects a worker's runtime by the
+scheduler service that answers its health check, so a worker serves one.
 
 **ZMQ** (`--zmq-handshake <ipc://…> --zmq-count N [--zmq-start-index I]`):
 mock vLLM `EngineCore` ranks on the `engine-zmq-client` wire. Unlike the HTTP
 and gRPC workers, which bind and are dialed, each rank dials the frontend's
 handshake address, registers, takes `EngineCoreRequest`s and pushes
 `EngineCoreOutputs` with the engine's load as `scheduler_stats`; the admin API
-sees it as worker `zmq:<index>`.
+sees it as worker `zmq:<index>`. `--zmq-step-ms <ms>` has the ranks send an
+engine's steps: one message per period carrying the next token of every
+running request (a request that produced faster than the period waits its
+turn, one output per step), instead of one message per token;
+`GET /admin/zmq/zmq:<index>` reads what the rank pushed since it connected,
+the messages that carried request outputs and the outputs in them
+(cumulative; a reset does not clear them). A rank waits for the frontend to
+bind its handshake endpoint in three rounds of 30 s, each round it misses
+logged (a gateway binds the handshake of a worker it was started with at that
+worker's first health probe, up to one check interval after its own start),
+then gives up.
+
+A worker that stops on its own (a port already in use, a rank whose frontend
+never bound) is logged and the others keep serving; when the last one stops
+the process exits with status 1, so a launcher sees a fleet that serves
+nothing as the failed start it is instead of waiting on it. The admin API is
+not a worker: it neither counts nor keeps the process up alone.
 
 ## Run (canned)
 
@@ -128,6 +171,7 @@ experiments against it transfer to engines:
 | `--admin-port` | off | process-wide admin API (below) |
 | `--drain-timeout-secs` | 5 | on SIGTERM or SIGINT: stop accepting, let the requests in flight finish for this long, then exit 0 either way |
 | `--kv-events-zmq-base-port` | off | ZMQ KV-event publishers on vLLM's or SGLang's wire (below) |
+| `--kv-cache-groups` | `full_attention` | the KV cache groups a realistic engine publishes, `kind[:window],...`, one to eight of `full_attention`, `mla_attention`, `sink_full_attention`, `sliding_window:<tokens>`, `sliding_window_mla:<tokens>` and `mamba` (at most one of them one of the three main-attention kinds, at any index, and a model without one starts with a window kind; a window kind with its window, the others without): every group's events carry its index, kind and window, a window group stores only the window tail ending at the prompt's aligned replay boundary and a Mamba group the one state block there (vLLM 0.31.0's default retention), a sparse store's `token_ids` on the vLLM wire spanning the whole step as the engine writes it, and an eviction is published once per group, every group's in one batch from the mock's one pool where the engine's per-group pools may stagger them; one group only on the SGLang wire. The gRPC stream carries every group's events unfiltered (a servicer's relay forwards every group, a sparse group's store as its hashes; the gateway indexes the main group and keeps the other groups' blocks in a per-worker view that bounds its overlap the way the engine does), and the mock's own prefix hit and `cached_tokens` are the engine's fixed point over its groups (a window group's tail ending at the hit or its leading run, a Mamba group's rightmost state block, iterated until nothing moves) |
 
 ```bash
 cargo run --release -p mock-worker -- \
@@ -175,8 +219,12 @@ then ZMQ ranks) publishes on `base + 2i` and answers replay on `base + 2i + 1`.
 - Payload: vLLM's `EventBatch`, `[ts, events, data_parallel_rank]`; events are
   tagged maps in vLLM's field order with its `omit_defaults`: `BlockStored`
   (`type`, `block_hashes`, `parent_block_hash`, `token_ids`, `block_size`,
-  `lora_id`, `medium: "GPU"`, `lora_name`, `group_idx: 0`,
-  `kv_cache_spec_kind: "full_attention"`), `BlockRemoved` (`type`,
+  `lora_id`, `medium: "GPU"`, `lora_name`, `group_idx`,
+  `kv_cache_spec_kind` and, for a window group, `kv_cache_spec_sliding_window`;
+  one store per cache group of `--kv-cache-groups`, a sparse group's store
+  carrying the step's whole `token_ids` span while its `block_hashes` name
+  only the blocks the group retains, as the engine's `cache_full_blocks`
+  writes a masked group), `BlockRemoved` (`type`,
   `block_hashes`, `medium`, `group_idx`), `AllBlocksCleared` (`type`). Block
   hashes are unsigned 64-bit integers (vLLM's int form of the same bits the
   gRPC stream carries signed).
@@ -214,6 +262,9 @@ engines do not expose:
   worker, the requests the `fail` hook answered before admission (they left no
   record) and the streams it cut;
 - `GET /admin/cache/{worker}` — the worker's cached block keys;
+- `GET /admin/ops/{worker}` — what the gateway's admin fan-out reached on the
+  worker: `flushes`, `profiles_started`, `profiles_stopped`, whether a run is
+  `profiling`, the `last_trace` written (`all`: every worker);
 - `POST /admin/reset[/{worker}]` — clear caches and publish `AllBlocksCleared`
   (an engine restart, to the index).
 
@@ -255,6 +306,7 @@ path has no engine to hook.
 |----------|--------|
 | `POST /admin/truth/{worker}` with `{"token_ids": [...]}` | what the worker would serve from cache for that prompt right now: `cached_tokens`, `cached_blocks`, `block_size` (the engine's own prefix match, last-block rule included) |
 | `GET /admin/truth` | per worker, over every admitted request: `requests`, `prompt_tokens`, `cached_tokens`, `oracle_tokens`, so a gateway's hit-rate claim can be checked against what the engines actually served; `injected_failures` and `cut_streams` count what the `fail` hook refused before admission and cut after output |
+| `GET /admin/zmq/{worker}` | a ZMQ rank's output counts since it connected: `batch_messages`, the messages that carried request outputs, and `outputs`, the outputs in them (one per message without a step period, several with one; a utility reply is neither); cumulative, `POST /admin/reset` does not clear them; a rank name, not `all` |
 
 A circuit-breaker or retry drill arms `fail` on one worker (`status=503&count=N`
 for exactly N failures inside the breaker's window, `secs=T` for a worker that
@@ -268,16 +320,20 @@ the request arrives); an HTTP worker answers the bare 499.
 
 ## Prefill/decode roles
 
-`--worker-type prefill|decode` gives the gRPC workers a role in a
-disaggregated fleet, so a gateway in PD mode (`--prefill <url> <bootstrap
-port> --decode <url>`) runs with no engine behind it. The gateway detects
-the mock by the scheduler service it serves and runs that wire's PD
-protocol: both sides get the same request, with the rendezvous the gateway
-mints (`kv_bootstrap_info`), and the client reads the decode side's output.
+`--worker-type prefill|decode` gives the HTTP or the gRPC workers of a
+process a role in a disaggregated fleet, so a gateway in PD mode (`--prefill
+<url> <bootstrap port> --decode <url>`) runs with no engine behind it. The
+gateway detects the mock by the scheduler service it serves (or, on the HTTP
+wire, by its model list) and runs that wire's PD protocol: both sides get the
+same request, with the rendezvous the gateway mints (`kv_bootstrap_info` on
+the gRPC wires; `bootstrap_host`, `bootstrap_port` and `bootstrap_room` in
+the request body on the HTTP wire, whose PD router is its own code path), and
+the client reads the decode side's output.
 
 - A **prefill** worker answers every request with the prompt side's
   completion alone (`prompt_tokens`, no output, `stop`), ahead of the script
-  and of either engine mode, and advertises `disaggregation_mode: prefill`.
+  and of either engine mode, and advertises `disaggregation_mode: prefill`
+  (in its server args on the gRPC wires, in `/server_info` on the HTTP wire).
   With `--bootstrap-base-port <port>`, worker `i` also binds `port + i`,
   where a decode partner's engine would rendezvous for the KV handoff: it
   accepts and closes each connection (the gateway probes the port once the
@@ -287,15 +343,26 @@ mints (`kv_bootstrap_info`), and the client reads the decode side's output.
   scripted: the answers a test states go to the decode side) and advertises
   `disaggregation_mode: decode`.
 
-No KV moves between the two: the decode side has the prompt. HTTP and ZMQ
-workers take no role.
+- On the HTTP wire either side refuses a request that carries no
+  `bootstrap_room` (a 400, as the engines' disaggregated servers answer one),
+  and a prefill worker one whose `bootstrap_port` is not the port it bound:
+  its decode partner would rendezvous elsewhere for the handoff this mock
+  stands in for. A missing or null `bootstrap_port` reads as the engines'
+  default, 8998 (what the gateway sends for a prefill worker registered
+  without a port): the worker on that port takes it, one on another
+  refuses it.
+
+No KV moves between the two: the decode side has the prompt. ZMQ workers
+take no role, and one process gives the role to one wire's workers (worker
+`i` of either wire would bind the same bootstrap port); the encode role is
+the vLLM gRPC wire's alone.
 
 Every gRPC worker advertises the pairing protocol its environment names
 (`SMG_PAIRING_PROTOCOL`) as `pairing_protocol`, as the engine servicers do:
 a prefill and a decode that name the same one pair; name different ones for
 the two to see the gateway refuse the pair.
 
-In realistic mode (`--engine realistic`) a prefill worker honors the
+In realistic mode (`--engine realistic`) a prefill worker, on either wire, honors the
 [fault hooks](#fault-hooks) as any request: the stall, a status before
 admission (`fail?status=S`, counted under `failed_total`), the admission
 delay and rate (`pause` freezes the passes, which the prompt side never
@@ -338,7 +405,11 @@ gRPC, ZMQ), ahead of either engine mode. Two sources feed one store:
   optional: `finish_reason` defaults to `stop`; `matched_stop` is a token id
   or a string; `prompt_tokens` defaults to the request's own count;
   `logprobs` holds the sampled token's logprob per output token and is sent
-  when the request asks for logprobs; `delay_ms` is the pause before every
+  when the request asks for logprobs; `token_id_logprobs` holds the logprob
+  of each token id a scoring request asks for (`token_ids_logprob` on the
+  SGLang wire), in the request's order, on an answer of no tokens
+  (`"output_text": ""`), for a request that asks for logprobs, as the engine
+  computes the row only then; `delay_ms` is the pause before every
   frame but the first; `chunk_tokens` the tokens per frame (1 by default).
 - `POST /admin/script/{worker}` on the admin API, with one such answer or an
   array of them: the answers the worker's next requests get, in order

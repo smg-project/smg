@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock},
+    sync::{atomic::AtomicBool, Arc, LazyLock},
 };
 
 use llm_tokenizer::stop::StopSequenceDecoder;
@@ -13,7 +13,7 @@ use symphony::{
     Declared, DropReason, Engine, EngineFinish, Event, Events, Format, Input, Parser as _, Text,
     TokenSpan,
 };
-use tracing::debug;
+use tracing::{debug, Span};
 
 use super::{
     constraint::Asks,
@@ -43,6 +43,15 @@ pub(crate) struct Assignment {
     /// the reader reads and delivers like the rest, and a marker of the table kept as text in it
     /// is no failure of the table's reading ([`Tally::new`]).
     pub past_the_end: bool,
+    /// The request's span, current where the assignment is made ([`assignment`]), for the record
+    /// a reading that was not clean leaves on it ([`Reader::end`], [`Reader::failed`]). A streamed
+    /// response's reading runs outside the span (the response body drives it), so the span
+    /// travels with the assignment rather than being looked up where the output ends.
+    pub span: Span,
+    /// Set by the first reading of the request that marks the span ([`Tally::mark`],
+    /// [`telemetry::mark_failed`]): one reading stands on the span, the first that was not clean,
+    /// and a later choice's reading or a later failure of the same request leaves it.
+    pub marked: Arc<AtomicBool>,
 }
 
 impl Assignment {
@@ -52,7 +61,8 @@ impl Assignment {
     }
 }
 
-/// The assignment of `format` to a response, with the part of `prompt` the engine replays.
+/// The assignment of `format` to a response, with the part of `prompt` the engine replays,
+/// under the span current here: the request's.
 pub(super) fn assignment(
     format: Arc<Format>,
     model: &str,
@@ -67,6 +77,8 @@ pub(super) fn assignment(
         prompt,
         forbids_calls,
         past_the_end,
+        span: Span::current(),
+        marked: Arc::default(),
     }
 }
 
@@ -337,6 +349,11 @@ pub(crate) struct Reader {
     /// request's isolation is driven end to end. `None` in every other process: one branch per
     /// step.
     trap: Option<&'static str>,
+    /// The request's span ([`Assignment::span`]): an output that ends other than clean leaves its
+    /// reading on it ([`Tally::mark`]).
+    span: Span,
+    /// The request's mark ([`Assignment::marked`]): set by the first reading that is not clean.
+    marked: Arc<AtomicBool>,
 }
 
 impl Reader {
@@ -365,6 +382,8 @@ impl Reader {
             framing: Vec::new(),
             framing_text: String::new(),
             trap: isolation::test_trap(),
+            span: assignment.span.clone(),
+            marked: Arc::clone(&assignment.marked),
         };
         // The prompt's events carry no text of the prompt (a thought it opens or closes), so they
         // move from the replay's own buffer into the caller's one by one, whatever delta that one
@@ -403,6 +422,15 @@ impl Reader {
         out: &mut Events<'d>,
     ) -> Result<bool, SymphonyError> {
         delta.clear();
+        // The step's tokens, reserved before the first push: a whole output read in one step
+        // (the request that does not stream) grew both vectors by doubling from empty, eight
+        // regrows and 3.3 KiB moved for an answer of forty tokens. A step of one token skips
+        // the reserve: its push grows an empty vector the same way, and a stream's delta keeps
+        // its capacity from the step before, so the check found the room there on every step.
+        if token_ids.len() > 1 {
+            delta.spans.reserve(token_ids.len());
+            delta.tokens.reserve(token_ids.len());
+        }
         let mut stopped = false;
         for &token_id in token_ids {
             let start = delta.text.len();
@@ -479,7 +507,8 @@ impl Reader {
     /// ends where the call should be; the whitespace before the first opener and after the last
     /// refused byte stays the template's, and the table's rule keeps debris out of an answer
     /// that went on past the block: a block that text or a call follows stays dropped. The
-    /// output is recorded here, under `who`: its counters, and the line when it was not clean
+    /// output is recorded here, under `who`: the request span's mark when it was not clean
+    /// ([`Tally::mark`]), then its counters and its line, written inside the span
     /// ([`Tally::report`]); an output of whitespace alone counts as `empty`, one with refused
     /// blocks as `malformed`, whether or not bytes were released, and the line says how many
     /// were.
@@ -503,7 +532,12 @@ impl Reader {
             self.tally.released(released.len());
             release_before_the_finish(released, out);
         }
-        self.tally.report(self.table, who);
+        self.tally
+            .mark(&self.span, &self.marked, self.table, who.choice);
+        // The line is written inside the request's span, after the mark: a streamed response's
+        // reading runs outside the span, and only from within does the line carry the span's
+        // request id and the fields just marked.
+        self.span.in_scope(|| self.tally.report(self.table, who));
         Ok(())
     }
 
@@ -514,11 +548,12 @@ impl Reader {
 
     /// The error of an output the reader could not read whole, which the request fails with:
     /// the decoder refused a token or the text it held, or the table refused the output
-    /// ([`Self::feed`]). The output is recorded as failed for the table and is over: its end
-    /// counts nothing more.
+    /// ([`Self::feed`]). The output is recorded as failed for the table, left on the request's
+    /// span with the bytes read so far, and is over: its end counts nothing more.
     pub(crate) fn failed(&mut self, why: String) -> SymphonyError {
         self.ended = true;
         telemetry::record_failed(self.table);
+        telemetry::mark_failed(&self.span, &self.marked, self.table, self.read);
         SymphonyError::Read(why)
     }
 
@@ -602,7 +637,7 @@ impl Reader {
                         text,
                         why: DropReason::Whitespace,
                     } => {
-                        self.unshown.push_str(&text.text);
+                        hold_text(&mut self.unshown, &text.text);
                     }
                     Event::Content(_)
                     | Event::Reasoning(_)
@@ -635,7 +670,10 @@ impl Reader {
     /// marker and it follows it, so a run of whitespace is one entry however it arrived.
     fn hold_framing(&mut self, text: &str, at: usize, marker: bool) {
         let start = self.framing_text.len();
-        self.framing_text.push_str(text);
+        hold_text(&mut self.framing_text, text);
+        if self.framing.capacity() == 0 {
+            self.framing.reserve(HELD_RUNS_FLOOR);
+        }
         match self.framing.last_mut() {
             Some(last) if !marker && !last.marker && last.at + last.text.len() == at => {
                 last.text.end = self.framing_text.len();
@@ -664,10 +702,10 @@ impl Reader {
             0
         };
         for run in self.framing.drain(from..) {
-            self.refused.push_str(&self.framing_text[run.text]);
+            hold_text(&mut self.refused, &self.framing_text[run.text]);
         }
         self.clear_framing();
-        self.refused.push_str(text);
+        hold_text(&mut self.refused, text);
     }
 
     /// The held runs go, their one buffer kept for the next.
@@ -683,6 +721,23 @@ impl Reader {
         self.refused.clear();
         self.clear_framing();
     }
+}
+
+/// The capacity a held buffer takes on its first push: the runs a turn of a few calls drops (its
+/// markers, the whitespace between its blocks) and a refused block fit without a regrow, where the
+/// buffers grew by doubling from empty (the tool-call path's allocation census: eight regrows and
+/// 3.3 KiB moved per request). Nothing is reserved before the first push, so an output that holds
+/// nothing allocates nothing here.
+const HELD_BYTES_FLOOR: usize = 256;
+/// The runs `framing` holds before its first regrow.
+const HELD_RUNS_FLOOR: usize = 8;
+
+/// `text` onto `held`, the buffer reserved to the floor on its first push.
+fn hold_text(held: &mut String, text: &str) {
+    if held.capacity() == 0 {
+        held.reserve(HELD_BYTES_FLOOR.max(text.len()));
+    }
+    held.push_str(text);
 }
 
 /// A run the table dropped, held until what follows says whose it is: a refused block's opener
@@ -766,6 +821,8 @@ mod tests {
             prompt: prompt.to_string(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
+            marked: Arc::default(),
         };
         // A step's events borrow its delta, as a stream's do: each piece is a step of its own,
         // its events taken owned before the next.
@@ -1625,38 +1682,42 @@ mod tests {
         assert!(assign(ParserChoice::Legacy, &ling, &unknown, None, PROMPT).is_none());
     }
 
+    /// The table Symphony reads `request`'s model with, under the default names and no templates.
+    fn table_of(request: &ChatCompletionRequest) -> Arc<Format> {
+        reads(
+            ParserChoice::Symphony,
+            &ModelNames::default(),
+            &request.model,
+            &templates(),
+        )
+        .expect("read")
+        .expect("a table")
+    }
+
+    /// The table assigned to `request`'s response, under the default names and no templates.
+    fn assigned_format(request: &ChatCompletionRequest) -> Arc<Format> {
+        assign(
+            ParserChoice::Symphony,
+            &ModelNames::default(),
+            request,
+            None,
+            PROMPT,
+        )
+        .expect("assigned")
+        .format
+    }
+
     #[test]
     fn the_requests_asks_take_a_variant_of_the_table_and_do_not_switch_the_reader() {
         // A request that keeps the thought in the content, or asks for no calls, is read by the
         // same table without its thought or its calls; the constraint is the full table's.
-        let table = |request: &ChatCompletionRequest| {
-            reads(
-                ParserChoice::Symphony,
-                &ModelNames::default(),
-                &request.model,
-                &templates(),
-            )
-            .expect("read")
-            .expect("a table")
-        };
-        let assigned = |request: &ChatCompletionRequest| {
-            assign(
-                ParserChoice::Symphony,
-                &ModelNames::default(),
-                request,
-                None,
-                PROMPT,
-            )
-            .expect("assigned")
-            .format
-        };
         let declared = serde_json::to_value(tools()).expect("tools");
         let kept = request(
             json!({"tools": declared, "tool_choice": "required", "separate_reasoning": false}),
         );
         assert_eq!(
-            *assigned(&kept),
-            Arc::unwrap_or_clone(table(&kept)).without_reasoning()
+            *assigned_format(&kept),
+            Arc::unwrap_or_clone(table_of(&kept)).without_reasoning()
         );
         assert!(constraint(
             ParserChoice::Symphony,
@@ -1668,8 +1729,8 @@ mod tests {
         .is_some());
         let no_calls = request(json!({"tool_choice": "none"}));
         assert_eq!(
-            *assigned(&no_calls),
-            Arc::unwrap_or_clone(table(&no_calls)).without_calls()
+            *assigned_format(&no_calls),
+            Arc::unwrap_or_clone(table_of(&no_calls)).without_calls()
         );
         assert!(constraint(
             ParserChoice::Symphony,
@@ -1681,13 +1742,13 @@ mod tests {
         .is_none());
         let neither = request(json!({"separate_reasoning": false}));
         assert_eq!(
-            *assigned(&neither),
-            Arc::unwrap_or_clone(table(&neither))
+            *assigned_format(&neither),
+            Arc::unwrap_or_clone(table_of(&neither))
                 .without_calls()
                 .without_reasoning()
         );
         let both = request(json!({"tools": declared}));
-        assert_eq!(assigned(&both), table(&both));
+        assert_eq!(assigned_format(&both), table_of(&both));
     }
 
     #[test]
@@ -1696,35 +1757,14 @@ mod tests {
         // list included, or when the model's provider reads calls without any; the table keeps
         // its calls exactly then, so a call the conversation established comes back as a call
         // under either parser, and a `tool_choice` of `none` keeps them for the reader to drop.
-        let table = |request: &ChatCompletionRequest| {
-            reads(
-                ParserChoice::Symphony,
-                &ModelNames::default(),
-                &request.model,
-                &templates(),
-            )
-            .expect("read")
-            .expect("a table")
-        };
-        let assigned = |request: &ChatCompletionRequest| {
-            assign(
-                ParserChoice::Symphony,
-                &ModelNames::default(),
-                request,
-                None,
-                PROMPT,
-            )
-            .expect("assigned")
-            .format
-        };
         let retry = request(json!({"model": "MiniMax-M3", "messages": retry_messages()}));
         assert!(scans_for_tool_calls_for(
             &retry,
             ProviderProfile::for_model(&retry.model)
         ));
         assert_eq!(
-            assigned(&retry),
-            table(&retry),
+            assigned_format(&retry),
+            table_of(&retry),
             "the provider reads calls without tools"
         );
         let refused = request(json!({
@@ -1740,7 +1780,7 @@ mod tests {
         .expect("assigned");
         assert_eq!(
             forbidden.format,
-            table(&refused),
+            table_of(&refused),
             "none keeps the calls the provider reads; the reader drops them"
         );
         assert!(forbidden.forbids_calls);
@@ -1750,8 +1790,8 @@ mod tests {
             ProviderProfile::for_model(&declared_none.model)
         ));
         assert_eq!(
-            assigned(&declared_none),
-            table(&declared_none),
+            assigned_format(&declared_none),
+            table_of(&declared_none),
             "an empty list is a declaration"
         );
         let undeclared = request(json!({"messages": retry_messages()}));
@@ -1760,8 +1800,8 @@ mod tests {
             ProviderProfile::for_model(&undeclared.model)
         ));
         assert_eq!(
-            *assigned(&undeclared),
-            Arc::unwrap_or_clone(table(&undeclared)).without_calls(),
+            *assigned_format(&undeclared),
+            Arc::unwrap_or_clone(table_of(&undeclared)).without_calls(),
             "a provider that reads calls only with tools"
         );
         // A Messages request: declared tools, an empty list included, keep the calls; none
@@ -1895,6 +1935,8 @@ mod tests {
             prompt: "<|message_model|>".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
+            marked: Arc::default(),
         };
         let json = "{\"city\": \"Oslo\", \"country\": \"Norway\"}";
         let thought = "<|content_thinking|>plan<|end_message|><|message_model|><|content_text|>";
@@ -1967,6 +2009,8 @@ mod tests {
             prompt: GLM4_PROMPT.to_string(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
+            marked: Arc::default(),
         };
         let pieces = [
             "\n<think></think>\n<tool_call>answer_string\n<arg_key>answer</arg_key>\n<arg_value>",
@@ -2024,6 +2068,8 @@ mod tests {
             prompt: String::new(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
+            marked: Arc::default(),
         };
         let mut events = Events::new();
         let mut reader = Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
@@ -2041,12 +2087,128 @@ mod tests {
     }
 
     #[test]
+    fn an_assignment_carries_the_span_current_where_it_is_made_and_a_failed_output_marks_it() {
+        let lines = json_lines(|| {
+            let span = request_span();
+            assert!(span.id().is_some(), "the subscriber takes the span");
+            let assignment = span.in_scope(|| {
+                assignment(
+                    Arc::new(qwen3(CallSyntax::Json)),
+                    "Qwen/Qwen3-8B",
+                    PROMPT,
+                    false,
+                    false,
+                )
+            });
+            assert_eq!(assignment.span.id(), span.id());
+            let tokenizer: Arc<dyn Tokenizer> = Arc::new(Refusing::default());
+            let mut decoder = StopSequenceDecoder::new(
+                tokenizer,
+                llm_tokenizer::StopSequenceConfig::default(),
+                false,
+            );
+            let mut events = Events::new();
+            let mut reader =
+                Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
+            // One byte read whole, then the token no character carries: the output fails after
+            // one byte, outside the span, as a stream's reading runs.
+            let mut delta = Delta::default();
+            reader
+                .read(&mut decoder, &[u32::from('H')], &mut delta, &mut events)
+                .expect("a byte");
+            let mut failing = Delta::default();
+            let mut after = Events::new();
+            reader
+                .read(&mut decoder, &[Refusing::REFUSED], &mut failing, &mut after)
+                .expect_err("the token no character carries");
+            let _entered = span.enter();
+            tracing::info!(target: "smg::response", "finished processing request");
+        });
+        let span = &lines.last().expect("the access log line")["span"];
+        assert_eq!(span["name"], "http_request");
+        assert_eq!(span["symphony.outcome"], "failed");
+        assert_eq!(span["symphony.table"], "qwen3");
+        assert_eq!(span["symphony.bytes"], 1);
+        assert!(span.get("symphony.finish").is_none(), "{span}");
+    }
+
+    #[test]
+    fn one_assignment_marks_the_span_once_and_writes_its_line_inside_the_span() {
+        // The streamed order: the access line goes out first, then two choices' readers built
+        // from one assignment end outside the span, the first with an unterminated call and the
+        // second with nothing. The first output's line is written inside the request span with
+        // the fields just marked, and the second reading leaves the first's mark. The table is
+        // one no other test of this binary reads, so its line buckets hold both lines, and each
+        // line is found by its own fields: a suppressed line fails the test instead of passing it.
+        let lines = json_lines(|| {
+            let span = request_span();
+            let assignment = span.in_scope(|| {
+                assignment(
+                    Arc::new(symphony::formats::qwen2_5()),
+                    "Qwen/Qwen2.5-7B-Instruct",
+                    "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
+                    false,
+                    false,
+                )
+            });
+            span.in_scope(
+                || tracing::info!(target: "smg::response", "finished processing request"),
+            );
+            let mut events = Events::new();
+            let mut unterminated =
+                Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
+            let mut delta = Delta::default();
+            unterminated
+                .tail(
+                    "Hi <tool_call>\n{\"name\": \"get_weather\"".to_string(),
+                    &mut delta,
+                    &mut events,
+                )
+                .expect("read");
+            unterminated
+                .end(EngineFinish::Length, who(), &mut events)
+                .expect("ended");
+            let mut events = Events::new();
+            let mut nothing =
+                Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
+            nothing
+                .end(EngineFinish::Stop, Who { choice: 1, ..who() }, &mut events)
+                .expect("ended");
+        });
+        let position = |field: &str, value: &str| {
+            lines
+                .iter()
+                .position(|line| line[field] == value)
+                .unwrap_or_else(|| panic!("no line with {field} {value}: {lines:#?}"))
+        };
+        let access = position("message", "finished processing request");
+        let first = position("outcome", "malformed");
+        let second = position("outcome", "empty");
+        assert!(access < first && first < second, "{lines:#?}");
+        let span = &lines[access]["span"];
+        assert_eq!(span["name"], "http_request");
+        assert!(span.get("symphony.outcome").is_none(), "{span}");
+        let line = &lines[first];
+        assert_eq!(line["choice"], 0);
+        assert_eq!(line["span"]["name"], "http_request");
+        assert_eq!(line["span"]["symphony.outcome"], "malformed");
+        assert_eq!(line["span"]["symphony.reason"], "unterminated_region");
+        assert_eq!(line["span"]["symphony.choice"], 0);
+        let line = &lines[second];
+        assert_eq!(line["choice"], 1);
+        assert_eq!(line["span"]["symphony.outcome"], "malformed", "{line}");
+        assert_eq!(line["span"]["symphony.choice"], 0, "{line}");
+    }
+
+    #[test]
     fn a_token_the_decoder_refuses_fails_the_output_and_counts_it_once() {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
+            marked: Arc::default(),
         };
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(Refusing::default());
         let mut decoder = StopSequenceDecoder::new(
@@ -2172,6 +2334,8 @@ mod tests {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
+            marked: Arc::default(),
         };
         let calls = |first_only: bool| {
             let mut events = Events::new();
@@ -2203,6 +2367,8 @@ mod tests {
             prompt: String::new(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
+            marked: Arc::default(),
         };
         let first_run_at = |steps: &[&str]| -> (Option<usize>, usize) {
             let mut events = Events::new();
@@ -2251,6 +2417,8 @@ mod tests {
             prompt: String::new(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
+            marked: Arc::default(),
         };
         let mut events = Events::new();
         let mut reader = Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
@@ -2285,6 +2453,8 @@ mod tests {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: true,
             past_the_end: false,
+            span: Span::none(),
+            marked: Arc::default(),
         };
         let mut events = Vec::new();
         let scrape = rendered(|| {
@@ -2335,6 +2505,8 @@ mod tests {
         let allowed = Assignment {
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
+            marked: Arc::default(),
             ..assignment
         };
         let mut out = Events::new();
@@ -2529,6 +2701,8 @@ mod tests {
                 prompt: prompt.to_string(),
                 forbids_calls: false,
                 past_the_end: false,
+                span: Span::none(),
+                marked: Arc::default(),
             };
             let mut replayed = Events::new();
             let mut reader =

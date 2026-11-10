@@ -137,6 +137,22 @@ the ConfigMap's key under /etc/smg/discovery, where the router pod mounts it.
 {{- end -}}
 {{- end }}
 
+{{- /*
+Admission config validation -- the values the gateway would refuse at
+start-up or ignore with a warning: the tenant rate limit enabled without its
+YAML (the gateway requires --tenant-rate-limit-config with the flag), and a
+scheduler ConfigMap without the scheduler enabled (--priority-scheduler-config
+is ignored without --priority-scheduler-enabled). Renders nothing.
+*/}}
+{{- define "smg.validateAdmission" -}}
+{{- if and .Values.router.tenantRateLimit.enabled (not .Values.router.tenantRateLimit.configMap.name) -}}
+{{- fail "router.tenantRateLimit.enabled needs router.tenantRateLimit.configMap.name: the gateway requires --tenant-rate-limit-config with --tenant-rate-limit-enabled" -}}
+{{- end -}}
+{{- if and .Values.router.priorityScheduler.configMap.name (not .Values.router.priorityScheduler.enabled) -}}
+{{- fail "router.priorityScheduler.configMap.name without router.priorityScheduler.enabled: the gateway ignores --priority-scheduler-config without --priority-scheduler-enabled" -}}
+{{- end -}}
+{{- end -}}
+
 {{/*
 Discovery validation -- refuses at render time what the gateway would refuse
 at start-up, or run without telling: two spellings of the worker provider,
@@ -221,8 +237,63 @@ Called from the router Deployment template.
 - "0.0.0.0"
 - "--port"
 - {{ .Values.router.port | quote }}
+{{- if .Values.router.adminPort }}
+- "--admin-port"
+- {{ .Values.router.adminPort | quote }}
+{{- with .Values.router.adminHost }}
+- "--admin-host"
+- {{ . | quote }}
+{{- end }}
+{{- end }}
 - "--policy"
 - {{ .Values.router.policy | quote }}
+{{- with .Values.router.disaggregation }}
+{{- $mode := .mode | default "" }}
+{{- /* The role flags of disaggregated serving, typed: a role given without
+     its mode would be ignored by the gateway with a warning, so the chart
+     refuses it at render; the encode role exists only under epd. */}}
+{{- if and (not $mode) (or .prefillPolicy .decodePolicy .encodePolicy .prefill .decode .encode) -}}
+{{- fail "router.disaggregation names a role (a policy or workers) without router.disaggregation.mode: set mode to pd or epd" -}}
+{{- end }}
+{{- if and (ne $mode "epd") (or .encodePolicy .encode) -}}
+{{- fail (printf "router.disaggregation.encodePolicy and router.disaggregation.encode need router.disaggregation.mode=epd (mode is %q)" $mode) -}}
+{{- end }}
+{{- if eq $mode "pd" }}
+- "--pd-disaggregation"
+{{- else if eq $mode "epd" }}
+- "--epd-disaggregation"
+{{- end }}
+{{- if .prefillPolicy }}
+- "--prefill-policy"
+- {{ .prefillPolicy | quote }}
+{{- end }}
+{{- if .decodePolicy }}
+- "--decode-policy"
+- {{ .decodePolicy | quote }}
+{{- end }}
+{{- if .encodePolicy }}
+- "--encode-policy"
+- {{ .encodePolicy | quote }}
+{{- end }}
+{{- range .prefill }}
+- "--prefill"
+- {{ .url | quote }}
+{{- if .bootstrapPort }}
+- {{ .bootstrapPort | quote }}
+{{- end }}
+{{- end }}
+{{- range .decode }}
+- "--decode"
+- {{ .url | quote }}
+{{- end }}
+{{- range .encode }}
+- "--encode"
+- {{ .url | quote }}
+{{- if .bootstrapPort }}
+- {{ .bootstrapPort | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- if .Values.router.enableIgw }}
 - "--enable-igw"
 {{- end }}
@@ -269,12 +340,25 @@ Called from the router Deployment template.
 {{- end }}
 {{- end }}
 {{- end }}
+{{- $disaggregationMode := .Values.router.disaggregation.mode | default "" }}
+{{- $roleWorkers := or .Values.router.disaggregation.prefill .Values.router.disaggregation.decode .Values.router.disaggregation.encode }}
+{{- $chartWorkersAreRegular := and .Values.workers (not (include "smg.discoveryProvider" .)) (not (include "smg.meshRouterDiscovery" .)) }}
+{{- /* A disaggregated gateway reads only its role workers and drops regular
+     worker URLs without a word, so the chart refuses them under a mode and
+     passes its own workers only when the roles or a discovery provider
+     address them. */}}
+{{- if and $disaggregationMode .Values.router.workerUrls -}}
+{{- fail "router.workerUrls names regular workers under router.disaggregation.mode: a disaggregated gateway reads only its role workers (router.disaggregation.prefill, decode and encode, or the discovery role selectors)" -}}
+{{- end }}
+{{- if and $disaggregationMode $chartWorkersAreRegular (not $roleWorkers) -}}
+{{- fail "workers deploys engines that router.disaggregation.mode gives no role: list their services under router.disaggregation.prefill, decode or encode, or find them by a discovery role selector" -}}
+{{- end }}
 {{- if .Values.router.workerUrls }}
 - "--worker-urls"
 {{- range .Values.router.workerUrls }}
 - {{ . | quote }}
 {{- end }}
-{{- else if and .Values.workers (not (include "smg.discoveryProvider" .)) (not (include "smg.meshRouterDiscovery" .)) }}
+{{- else if and $chartWorkersAreRegular (not $disaggregationMode) }}
 - "--worker-urls"
 {{- range $i, $worker := .Values.workers }}
 {{- $defaults := index $.Values.engineDefaults $worker.engine }}
@@ -314,6 +398,25 @@ Called from the router Deployment template.
 - "--selector"
 - {{ .selector | quote }}
 {{- end }}
+{{- $mode := $.Values.router.disaggregation.mode | default "" }}
+{{- if and (not $mode) (or .prefillSelector .decodeSelector .encodeSelector) -}}
+{{- fail "router.discovery.kubernetes names a role selector (prefillSelector, decodeSelector or encodeSelector) without router.disaggregation.mode: set mode to pd or epd" -}}
+{{- end }}
+{{- if and (ne $mode "epd") .encodeSelector -}}
+{{- fail (printf "router.discovery.kubernetes.encodeSelector needs router.disaggregation.mode=epd (mode is %q)" $mode) -}}
+{{- end }}
+{{- if .prefillSelector }}
+- "--prefill-selector"
+- {{ .prefillSelector | quote }}
+{{- end }}
+{{- if .decodeSelector }}
+- "--decode-selector"
+- {{ .decodeSelector | quote }}
+{{- end }}
+{{- if .encodeSelector }}
+- "--encode-selector"
+- {{ .encodeSelector | quote }}
+{{- end }}
 - "--service-discovery-port"
 - {{ .port | quote }}
 {{- if not .clusterWide }}
@@ -330,6 +433,16 @@ Called from the router Deployment template.
 - {{ include "smg.discoveryFilePath" $ | quote }}
 {{- else if eq .provider "slurm" }}
 {{- with .slurm }}
+{{- $mode := $.Values.router.disaggregation.mode | default "" }}
+{{- if and (not $mode) (or .prefillJobNames .decodeJobNames .encodeJobNames) -}}
+{{- fail "router.discovery.slurm names a role job (prefillJobNames, decodeJobNames or encodeJobNames) without router.disaggregation.mode: set mode to pd or epd" -}}
+{{- end }}
+{{- if and (ne $mode "epd") .encodeJobNames -}}
+{{- fail (printf "router.discovery.slurm.encodeJobNames needs router.disaggregation.mode=epd (mode is %q)" $mode) -}}
+{{- end }}
+{{- if and $mode .jobNames -}}
+{{- fail (printf "router.discovery.slurm.jobNames names regular jobs under router.disaggregation.mode=%s: a disaggregated gateway reads only its role jobs (prefillJobNames, decodeJobNames and, under epd, encodeJobNames)" $mode) -}}
+{{- end }}
 {{- range .jobNames }}
 - "--slurm-job-name"
 - {{ . | quote }}
@@ -416,6 +529,8 @@ Called from the router Deployment template.
 - {{ int .Values.router.maxPayloadSize | quote }}
 - "--request-timeout-secs"
 - {{ .Values.router.requestTimeoutSecs | quote }}
+- "--mm-turbojpeg"
+- {{ .Values.router.mmTurbojpeg | quote }}
 {{- if .Values.router.grpcRequestTimeoutSecs }}
 - "--grpc-request-timeout-secs"
 - {{ .Values.router.grpcRequestTimeoutSecs | quote }}
@@ -535,6 +650,24 @@ Called from the router Deployment template.
 - "--api-key-file"
 - {{ printf "/etc/smg/auth/%s" (include "smg.authSecretKey" .) | quote }}
 {{- end }}
+{{- if include "smg.controlPlaneSecretName" . }}
+- "--control-plane-api-keys-file"
+- {{ printf "/etc/smg/control-plane/%s" (include "smg.controlPlaneSecretKey" .) | quote }}
+{{- end }}
+{{- if .Values.router.tenantRateLimit.enabled }}
+- "--tenant-rate-limit-enabled"
+{{- end }}
+{{- if .Values.router.tenantRateLimit.configMap.name }}
+- "--tenant-rate-limit-config"
+- {{ printf "/etc/smg/rate-limit/%s" .Values.router.tenantRateLimit.configMap.key | quote }}
+{{- end }}
+{{- if .Values.router.priorityScheduler.enabled }}
+- "--priority-scheduler-enabled"
+{{- end }}
+{{- if .Values.router.priorityScheduler.configMap.name }}
+- "--priority-scheduler-config"
+- {{ printf "/etc/smg/scheduler/%s" .Values.router.priorityScheduler.configMap.key | quote }}
+{{- end }}
 {{- range .Values.router.extraArgs }}
 - {{ . | quote }}
 {{- end }}
@@ -560,6 +693,28 @@ Auth secret key -- the key within the auth Secret that holds the API key.
 */}}
 {{- define "smg.authSecretKey" -}}
 {{- .Values.auth.apiKeySecretKey | default "api-key" -}}
+{{- end }}
+
+{{/*
+Control-plane secret -- the Secret holding the control-plane API keys file,
+mounted into the router pod and read with --control-plane-api-keys-file;
+the keys are never in the pod's arguments. `auth.controlPlane.existingSecret`
+names a Secret the operator manages; otherwise `auth.controlPlane.apiKeys`,
+when set, is written into a chart-managed Secret. Empty when neither is set.
+*/}}
+{{- define "smg.controlPlaneSecretName" -}}
+{{- if .Values.auth.controlPlane.existingSecret -}}
+{{- .Values.auth.controlPlane.existingSecret -}}
+{{- else if .Values.auth.controlPlane.apiKeys -}}
+{{- printf "%s-control-plane" (include "smg.fullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Control-plane secret key -- the key within that Secret holding the file.
+*/}}
+{{- define "smg.controlPlaneSecretKey" -}}
+{{- .Values.auth.controlPlane.secretKey | default "control-plane-api-keys" -}}
 {{- end }}
 
 {{/*

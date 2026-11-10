@@ -39,6 +39,7 @@ pub fn kimi_k3() -> Format {
         .state("call", Emits::Arguments)
         .transition("message", "think_open", "reasoning")
         .transition("reasoning", "think_close", "message")
+        .recovery_transition("reasoning", "response_close", "message")
         .transition("reasoning", "response_open", "content")
         .transition("reasoning", "tools_open", "tools")
         .transition("reasoning", "message_close", "message")
@@ -66,7 +67,10 @@ mod tests {
     use super::*;
     use crate::{
         ids::CallIds,
-        testing::{arguments_of, bytes, content, drive, drive_to, dropped, reasoning},
+        testing::{
+            arguments_of, bytes, content, drive, drive_to, dropped, malformed, reasoning,
+            the_same_at_every_cut,
+        },
     };
 
     fn ids() -> CallIds {
@@ -74,7 +78,7 @@ mod tests {
     }
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, MalformedReason, Text},
+        event::{DropReason, Event, FinishReason, MalformedReason, Text},
         input::EngineFinish,
         Declared,
     };
@@ -797,5 +801,57 @@ mod tests {
                 "{pieces:?}"
             );
         }
+    }
+
+    /// The reply written straight into the prefilled thought and the turn closed by the answer's
+    /// closer, never by the thought's (seen on about 1 % of very long turns): the closer ends the
+    /// thought as the end-of-turn tag would and is dropped as wrapping, whole and at every cut
+    /// alike, so no marker reaches the client; the reply stays the thought's text, every byte of
+    /// the output in one event. Before the row the closer was the thought's text, by the engine's
+    /// rule for a terminal no row leads out on. The end-of-turn tag alone, the shape's other
+    /// variant, ends the thought the same way.
+    #[test]
+    fn a_thought_closed_by_the_answers_closer_ends_there_and_the_closer_is_dropped() {
+        for closers in [
+            "<|close|>response<|sep|><|close|>message<|sep|>",
+            "<|close|>message<|sep|>",
+        ] {
+            let output = format!("The answer is 42.{closers}");
+            let said = the_same_at_every_cut(|pieces| run(PROMPT, pieces), &output);
+            assert_eq!(said.reasoning, "The answer is 42.", "{closers}");
+            assert_eq!(said.content, "", "{closers}");
+            assert!(said.calls.is_empty(), "{closers}: {said:?}");
+            assert_eq!(said.finish, Some((FinishReason::Stop, 0)), "{closers}");
+            let events = run(PROMPT, &[&output]);
+            assert_eq!(bytes(&events), output, "{closers}");
+            assert!(malformed(&events).is_empty(), "{closers}: {events:?}");
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    Event::Reasoning(text) | Event::Content(text) if text.text.contains("<|close|>")
+                )),
+                "a marker in the text, closed by {closers}: {events:?}"
+            );
+        }
+        // The answer's closer, event by event: the thought the prompt opened, the reply, the
+        // closer dropped, the thought ended, the turn's end dropped.
+        let events = run(
+            PROMPT,
+            &["The answer is 42.<|close|>response<|sep|><|close|>message<|sep|>"],
+        );
+        assert_eq!(events[0], Event::ReasoningStart, "{events:?}");
+        assert!(
+            matches!(&events[1], Event::Reasoning(text) if text.text == "The answer is 42."),
+            "{events:?}"
+        );
+        assert_eq!(
+            events[2..5],
+            [
+                dropped("<|close|>response<|sep|>"),
+                Event::ReasoningEnd,
+                dropped("<|close|>message<|sep|>"),
+            ],
+            "{events:?}"
+        );
     }
 }

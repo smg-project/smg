@@ -1,6 +1,11 @@
 //! Shared test fixtures for the discovery modules.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
+
+use k8s_openapi::{
+    api::core::v1::{Pod, PodCondition, PodSpec, PodStatus},
+    apimachinery::pkg::apis::meta::v1::ObjectMeta,
+};
 
 use crate::app_context::AppContext;
 
@@ -59,7 +64,7 @@ pub(crate) fn live_app_context() -> Arc<AppContext> {
     let context = Arc::new(
         AppContext::builder()
             .router_config(config.clone())
-            .client(crate::clients::http_client())
+            .client(crate::server::http_client())
             .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
             .worker_registry(Arc::new(WorkerRegistry::new()))
             .policy_registry(Arc::new(PolicyRegistry::new(config.policy.clone())))
@@ -84,4 +89,36 @@ pub(crate) fn live_app_context() -> Arc<AppContext> {
         .set(WorkflowEngines::new(&context.router_config))
         .ok();
     context
+}
+
+/// A running, ready pod named `name` at `ip`, carrying `labels`: the shape
+/// the Kubernetes watchers' tests feed to their label selectors.
+pub(crate) fn make_labeled_pod(name: &str, ip: &str, labels: &[(&str, &str)]) -> Pod {
+    let mut label_map = BTreeMap::new();
+    for &(k, v) in labels {
+        label_map.insert(k.to_string(), v.to_string());
+    }
+    Pod {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            uid: Some(format!("uid-{name}")),
+            labels: Some(label_map),
+            ..Default::default()
+        },
+        spec: Some(PodSpec::default()),
+        status: Some(PodStatus {
+            pod_ip: Some(ip.to_string()),
+            phase: Some("Running".to_string()),
+            conditions: Some(vec![PodCondition {
+                type_: "Ready".to_string(),
+                status: "True".to_string(),
+                last_probe_time: None,
+                last_transition_time: None,
+                message: None,
+                reason: None,
+                observed_generation: None,
+            }]),
+            ..Default::default()
+        }),
+    }
 }

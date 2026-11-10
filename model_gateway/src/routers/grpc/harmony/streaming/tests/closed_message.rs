@@ -61,7 +61,10 @@ async fn streamed(frames: Vec<proto::GenerateResponse>) -> (Value, Value) {
     let drain = async { while rx.recv().await.is_some() {} };
     let iteration = async {
         let result = HarmonyStreamingProcessor::process_responses_iteration_stream(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
             &mut emitter,
             &tx,
             None,

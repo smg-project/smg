@@ -14,6 +14,7 @@ pub mod qwen3_asr;
 mod qwen3_omni;
 mod qwen3_vl;
 mod qwen_vl;
+mod step3_vl;
 mod traits;
 pub mod transcription;
 
@@ -35,6 +36,7 @@ use qwen3_asr::Qwen3AsrSpec;
 use qwen3_omni::Qwen3OmniSpec;
 use qwen3_vl::Qwen3VLVisionSpec;
 use qwen_vl::QwenVLVisionSpec;
+use step3_vl::Step3VLVisionSpec;
 // Re-export public API from traits.
 pub use traits::{
     modality_limit_override, EncoderInputFormat, MediaItemInfo, MediaPartOrder, ModalityHooks,
@@ -75,6 +77,8 @@ impl ModelRegistry {
                 LazySpec::new(|| Box::new(Qwen3VLVisionSpec)),
                 LazySpec::new(|| Box::new(QwenVLVisionSpec)),
                 LazySpec::new(|| Box::new(Phi3VisionSpec)),
+                // Step3-VL matches its own model types only.
+                LazySpec::new(|| Box::new(Step3VLVisionSpec)),
             ],
         }
     }

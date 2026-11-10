@@ -201,6 +201,20 @@ pub(crate) struct MessagesResponseSpec {
     /// Whether the prompt ends inside the model's thinking block, decided by
     /// request building from the rendered prompt.
     pub reasoning_in_prefill: bool,
+    /// The rendered prompt's whole token count, set by request building:
+    /// what the stream's `message_start` reports as `input_tokens` before
+    /// the engine has said anything. The final `message_delta` carries the
+    /// engine's count, split on a prefix-cache hit into `input_tokens`
+    /// outside the cache and `cache_read_input_tokens`, which this count
+    /// includes.
+    pub prompt_tokens: u32,
+    /// The request's `max_tokens`: the budget an engine `length` finish is
+    /// read against (see [`Self::length_stop_reason`]).
+    pub max_tokens: u32,
+    /// The context window the selected worker advertises for the model, set
+    /// by request building and again when a retry selects another worker;
+    /// `None` when the worker advertises none.
+    pub context_window: Option<u32>,
     pub tool_choice: Option<messages::ToolChoice>,
     pub has_tools: bool,
     pub history_tool_calls_count: usize,
@@ -231,6 +245,9 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
                 .thinking_display()
                 .is_none_or(messages::ThinkingDisplay::returns_text),
             reasoning_in_prefill: false,
+            prompt_tokens: 0,
+            max_tokens: request.max_tokens,
+            context_window: None,
             tool_choice: request.tool_choice.clone(),
             has_tools: request.tools.is_some(),
             history_tool_calls_count: request.history_tool_calls_count(),
@@ -243,13 +260,43 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
     }
 }
 
+impl MessagesResponseSpec {
+    /// The stop reason of an engine `length` finish, which the engines report
+    /// alike for the request's budget and for the model's window:
+    /// `max_tokens` when the generation used the whole budget, else
+    /// `model_context_window_exceeded`. A generation that stopped short of
+    /// the budget ran out of window (an engine that clamps the budget to the
+    /// window finishes this way); so did one whose prompt and output together
+    /// reached the worker's advertised window. `prompt_tokens` is the
+    /// engine's count of the prompt it held, as the finish reports it: media
+    /// expanded on the worker makes it larger than the rendered count this
+    /// spec carries.
+    pub fn length_stop_reason(
+        &self,
+        prompt_tokens: u32,
+        output_tokens: u32,
+    ) -> messages::StopReason {
+        let short_of_budget = output_tokens < self.max_tokens;
+        let window_filled = self
+            .context_window
+            .is_some_and(|window| prompt_tokens.saturating_add(output_tokens) >= window);
+        if short_of_budget || window_filled {
+            messages::StopReason::ModelContextWindowExceeded
+        } else {
+            messages::StopReason::MaxTokens
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct CompletionResponseSpec {
     /// `n`, normalized.
     pub choices_per_prompt: u32,
     pub echo: bool,
     pub suffix: Option<String>,
-    pub logprobs: bool,
+    /// `logprobs`: how many alternatives per generated token the request
+    /// asked for; `None` when it asked for no logprobs.
+    pub logprobs: Option<u32>,
     pub include_usage: bool,
     /// Populated only when `echo` (choices prepend their prompt text).
     pub prompt_texts: Vec<String>,
@@ -260,21 +307,16 @@ pub(crate) struct CompletionResponseSpec {
     pub ignore_eos: bool,
 }
 
-impl From<&CompletionRequest> for CompletionResponseSpec {
-    fn from(request: &CompletionRequest) -> Self {
-        let prompt_texts = if request.echo {
-            match &request.prompt {
-                StringOrArray::String(text) => vec![text.clone()],
-                StringOrArray::Array(texts) => texts.clone(),
-            }
-        } else {
-            Vec::new()
-        };
+impl CompletionResponseSpec {
+    /// `prompt_texts` are the prepared prompts' texts, one per prompt (a text
+    /// prompt as sent, a token prompt decoded); only an `echo` reads them, so
+    /// a builder passes none when the request asks for no echo.
+    pub(crate) fn new(request: &CompletionRequest, prompt_texts: Vec<String>) -> Self {
         Self {
             choices_per_prompt: request.choices(),
             echo: request.echo,
             suffix: request.suffix.clone(),
-            logprobs: request.logprobs.is_some(),
+            logprobs: request.logprobs,
             include_usage: request
                 .stream_options
                 .as_ref()
@@ -304,16 +346,10 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
+    use crate::routers::grpc::testing::tool;
 
     fn chat_request(value: Value) -> ChatCompletionRequest {
         serde_json::from_value(value).expect("request deserializes")
-    }
-
-    fn tool(name: &str) -> Value {
-        json!({
-            "type": "function",
-            "function": {"name": name, "parameters": {"type": "object", "properties": {}}}
-        })
     }
 
     fn tool_names(spec: &ChatResponseSpec) -> Vec<String> {
@@ -449,6 +485,63 @@ mod tests {
         assert_eq!(
             ChatResponseSpec::from(&request).tools.as_deref(),
             Some(&[][..])
+        );
+    }
+
+    /// The Messages spec carries the request's budget; the window waits for
+    /// request building.
+    #[test]
+    fn messages_spec_takes_the_budget_from_the_request() {
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("request deserializes");
+
+        let spec = MessagesResponseSpec::from(&request);
+
+        assert_eq!(spec.max_tokens, 64);
+        assert_eq!(spec.context_window, None);
+    }
+
+    /// An engine `length` finish is `max_tokens` when the budget was used
+    /// whole and `model_context_window_exceeded` when the generation stopped
+    /// short of it or the prompt and the output together filled the window.
+    #[test]
+    fn a_length_finish_reads_the_budget_against_the_window() {
+        use messages::StopReason::{MaxTokens, ModelContextWindowExceeded};
+
+        let mut spec = MessagesResponseSpec::from(
+            &serde_json::from_value::<CreateMessageRequest>(json!({
+                "model": "m", "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .expect("request deserializes"),
+        );
+        spec.prompt_tokens = 100;
+
+        // No window known: the budget alone decides.
+        assert_eq!(spec.length_stop_reason(100, 64), MaxTokens);
+        assert_eq!(spec.length_stop_reason(100, 3), ModelContextWindowExceeded);
+        assert_eq!(spec.length_stop_reason(100, 0), ModelContextWindowExceeded);
+
+        // A window the whole budget stays inside: still the budget.
+        spec.context_window = Some(165);
+        assert_eq!(spec.length_stop_reason(100, 64), MaxTokens);
+        // The prompt and the output together reach the window.
+        spec.context_window = Some(164);
+        assert_eq!(spec.length_stop_reason(100, 64), ModelContextWindowExceeded);
+        // Short of the budget, whatever the window.
+        assert_eq!(spec.length_stop_reason(100, 3), ModelContextWindowExceeded);
+        // The engine's count decides, not the rendered one the spec carries:
+        // media expanded on the worker fills the window the spec would miss.
+        spec.context_window = Some(170);
+        assert_eq!(spec.length_stop_reason(100, 64), MaxTokens);
+        assert_eq!(spec.length_stop_reason(110, 64), ModelContextWindowExceeded);
+        // A synthetic count never overflows the sum.
+        assert_eq!(
+            spec.length_stop_reason(u32::MAX, 64),
+            ModelContextWindowExceeded
         );
     }
 }

@@ -19,7 +19,10 @@ use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 use crate::{
     codec::{
         dtype::decode_error,
-        tensor::{decode_tensor_f32, resolve_array_bytes, DecodedFloatTensor, WireTensor},
+        tensor::{
+            decode_tensor_f32, lies_within, resolve_array_bytes, DecodedFloatTensor, WireArrayData,
+            WireTensor,
+        },
     },
     error::Result,
 };
@@ -145,8 +148,9 @@ impl PoolingParams {
 
 /// The pooled tensor a finished pooling request carries in `pooling_output`,
 /// as it came off the wire: dtype and shape as the engine wrote them, with an
-/// aux-frame payload already resolved to its bytes (shared with the frame,
-/// not copied).
+/// aux-frame payload already resolved to its bytes (shared with that frame,
+/// not copied) and an inline payload in bytes of its own, so the tensor never
+/// pins the step's primary frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PoolingOutput {
     tensor: WireTensor,
@@ -158,10 +162,22 @@ impl PoolingOutput {
         Self { tensor }
     }
 
-    /// Resolve a wire tensor against the message's aux `frames`.
+    /// Resolve a wire tensor against the message's aux `frames`. An inline
+    /// payload decoded as a slice of the primary frame (`frames[0]`) is
+    /// copied out: the frame holds every output of the step, and a pooled
+    /// tensor outlives its decode.
     pub(crate) fn resolve(tensor: WireTensor, frames: &[Bytes]) -> Result<Self> {
         let WireTensor { dtype, shape, data } = tensor;
-        let bytes = resolve_array_bytes(data, "pooling_output", frames)?;
+        let bytes = match data {
+            WireArrayData::RawView(view)
+                if frames
+                    .first()
+                    .is_some_and(|frame| lies_within(frame, &view)) =>
+            {
+                Bytes::copy_from_slice(&view)
+            }
+            data => resolve_array_bytes(data, "pooling_output", frames)?,
+        };
         Ok(Self {
             tensor: WireTensor::from_raw_bytes(dtype, shape, bytes),
         })
@@ -206,7 +222,7 @@ mod tests {
     use rmpv::Value;
 
     use super::*;
-    use crate::codec::{decode_msgpack, decode_value, encode_msgpack, unhex};
+    use crate::codec::{decode_msgpack, decode_value, encode_msgpack, hex};
 
     /// `msgspec.msgpack.encode(PoolingParams(task="embed", use_activation=True,
     /// skip_reading_prefix_cache=False))` on vLLM 0.30.1rc1: the form the
@@ -220,15 +236,15 @@ mod tests {
     fn embed_params_encode_byte_for_byte_like_vllm() {
         assert_eq!(
             encode_msgpack(&PoolingParams::embed()).unwrap(),
-            unhex(VLLM_EMBED_PARAMS)
+            hex(VLLM_EMBED_PARAMS)
         );
         let raw = PoolingParams {
             task: Some(PoolingTask::Embed),
             ..PoolingParams::default()
         };
-        assert_eq!(encode_msgpack(&raw).unwrap(), unhex(VLLM_RAW_EMBED_PARAMS));
+        assert_eq!(encode_msgpack(&raw).unwrap(), hex(VLLM_RAW_EMBED_PARAMS));
         // Spot-check the positions against the Python field order.
-        let Value::Array(array) = decode_value(&unhex(VLLM_EMBED_PARAMS)).unwrap() else {
+        let Value::Array(array) = decode_value(&hex(VLLM_EMBED_PARAMS)).unwrap() else {
             panic!("expected array");
         };
         assert_eq!(array.len(), 10);
@@ -267,7 +283,7 @@ mod tests {
     #[test]
     fn pooling_params_decode_full_and_truncated_arrays() {
         assert_eq!(
-            decode_msgpack::<PoolingParams>(&unhex(VLLM_EMBED_PARAMS)).unwrap(),
+            decode_msgpack::<PoolingParams>(&hex(VLLM_EMBED_PARAMS)).unwrap(),
             PoolingParams::embed()
         );
         // A shorter array (older encoder) falls back to the Python defaults.

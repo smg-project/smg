@@ -27,12 +27,12 @@ What a user of PD mode hits, in the order they hit it:
 TokenSpeed runs Qwen3.5-9B, the model its disaggregation path is proven on;
 SGLang and vLLM run Llama-3.1-8B.
 
-On the mock engine (``E2E_RUNTIME=mock``) the gRPC topologies run on scripted
-mock workers in the prefill and decode roles: the gateway's pairing, dual
-dispatch, placement, streaming and failure handling with no KV moving (the
-decode side has the prompt). A test that reads the answer states it with the
-prompt it is for (``mock_answers``, filed on every decode worker); the HTTP PD
-wire, the asymmetric-tp pairs and the engine-death case stay on the engines.
+On the mock engine (``E2E_RUNTIME=mock``) the gRPC and HTTP topologies run on
+scripted mock workers in the prefill and decode roles: the gateway's pairing,
+dual dispatch, placement, streaming and failure handling with no KV moving
+(the decode side has the prompt). A test that reads the answer states it with
+the prompt it is for (``mock_answers``, filed on every decode worker); the
+asymmetric-tp pairs and the engine-death case stay on the engines.
 
 A MoRI-IO lane (``E2E_VLLM_KV_BACKEND=moriio``, ``E2E_VLLM_MORIIO_MODE`` read
 or write) runs every topology on SMG's HTTP PD router, the one that speaks the
@@ -166,13 +166,17 @@ _NIXL_HELD_MEMORY = (
 )
 
 
+# The gateway refreshes the load reports it serves on /loads once per
+# load-monitor interval; the idle checks below wait for a report taken after
+# the clients left before they judge, so the sweep pins the interval it reads.
+_LOAD_MONITOR_INTERVAL_S = 2
 _GATEWAY_ARGS = [
     "--prefill-policy",
     "round_robin",
     "--decode-policy",
     "round_robin",
     "--load-monitor-interval",
-    "2",
+    str(_LOAD_MONITOR_INTERVAL_S),
     *_HEALTH_ARGS,
 ]
 _TOPOLOGIES = (
@@ -202,18 +206,16 @@ _TOPOLOGIES = (
         # URL carries no kv_connector, so the router passes the request
         # through and decode recomputes the prompt; vLLM's handoff is covered
         # by the gRPC rows, where the worker reports its connector. The
-        # TokenSpeed e2e worker has no HTTP frontend.
+        # TokenSpeed e2e worker has no HTTP frontend. On the mock engine the
+        # HTTP workers take the roles: the router's injected bootstrap
+        # fields, its bootstrap probe and its server-info read are answered,
+        # and no KV moves.
         pytest.param(
             ("pd_http", (p, d)),
             id=f"{p}p{d}d-http",
-            marks=[
-                pytest.mark.skip_for_runtime(
-                    "tokenspeed", reason="the TokenSpeed e2e worker has no HTTP frontend"
-                ),
-                pytest.mark.skip_for_runtime(
-                    "mock", reason="the mock engine's prefill and decode roles are gRPC workers"
-                ),
-            ],
+            marks=pytest.mark.skip_for_runtime(
+                "tokenspeed", reason="the TokenSpeed e2e worker has no HTTP frontend"
+            ),
         )
         for p, d in [(1, 1), (2, 2)]
     ]
@@ -543,22 +545,53 @@ def _fleet_idle(gateway: Gateway) -> tuple[bool, list[dict]]:
 def _require_load_reports(backend: str) -> None:
     """The idle check reads /loads; HTTP SGLang workers report none without metrics.
 
-    A MoRI-IO lane reads its engines' own metrics instead (see ``_fleet_idle``).
+    A MoRI-IO lane reads its engines' own metrics instead (see ``_fleet_idle``);
+    the mock's HTTP workers report their loads as its gRPC workers do.
     """
-    if backend == "pd_http" and not _moriio_lane():
+    if backend == "pd_http" and not _moriio_lane() and get_runtime() != "mock":
         pytest.skip("load reports need gRPC workers")
 
 
+# How long a tick's report can take to reach /loads: the gateway gives a
+# group's poll LOAD_POLL_DEADLINE (worker/monitor.rs, 3 s) before it publishes
+# the tick, and an engine that answers between scheduler steps can use it. A
+# poll that misses the deadline is not published late: the tick prunes the
+# worker from /loads, which the check reads as not idle.
+_LOAD_POLL_DEADLINE_S = 3.0
+
+# How long after the clients left the first report taken after they left can
+# take to reach /loads. The poll under way at that moment may run to its
+# deadline and publish samples that predate their requests; the next tick
+# starts no later than one interval after that poll ends (the loop's timer
+# fires a missed tick at once, which is sooner); and its own poll may run to
+# the deadline again. /loads carries no sample time, so the check waits this
+# long instead of asking a report when it was taken.
+_FRESH_LOAD_REPORT_S = _LOAD_MONITOR_INTERVAL_S + 2 * _LOAD_POLL_DEADLINE_S
+
+
 def _assert_fleet_idle_within(gateway: Gateway, timeout: float) -> None:
+    """Every worker reads idle on a load report taken after the clients left, within ``timeout``.
+
+    ``/loads`` serves the gateway's latest load report and says nothing about
+    when it was taken: read the moment the clients left, it can be the report
+    taken before their requests arrived, and say idle about engines that still
+    hold the abandoned work. The first read therefore waits until the first
+    report taken after the clients left has reached ``/loads`` at the latest
+    (``_FRESH_LOAD_REPORT_S``); the deadline still counts from the moment they
+    left. The MoRI-IO lane reads the engines' own metrics, which are live, so
+    it does not wait.
+    """
     started = time.monotonic()
     deadline = started + timeout
+    if not _moriio_lane():
+        time.sleep(_FRESH_LOAD_REPORT_S)
     idle, loads = _fleet_idle(gateway)
     while not idle and time.monotonic() < deadline:
         time.sleep(1.0)
         idle, loads = _fleet_idle(gateway)
     # A floor on how long the engines kept working after the clients left:
-    # the clock starts once the callers joined their threads, and /loads is
-    # a 2 s-interval report, so only differences well above that mean much.
+    # the clock starts once the callers joined their threads and the first
+    # read waits for a fresh report, so only differences well above that mean much.
     if idle:
         logger.info("fleet idle within %.1fs of the clients leaving", time.monotonic() - started)
     assert idle, f"engines still hold work after {timeout:.0f}s: {loads}"
@@ -957,9 +990,12 @@ class TestPDTopology:
         choices = resp.json().get("choices", [])
         assert len(choices) == 4, f"expected 4 choices, got {len(choices)}"
         assert all(c.get("text", "").strip() for c in choices), f"empty choice in {choices}"
-        if get_runtime() == "mock":
+        if get_runtime() == "mock" and mode != "pd_http":
             # The fan-out itself: one single-sample child per choice under
-            # the one selected pair, each with its own room.
+            # the one selected pair, each with its own room. The HTTP PD
+            # router dispatches the request once instead (one room for every
+            # sample, the shape above); the mock's decode side has the
+            # prompt and serves the four choices itself.
             _wait_for_fanout(resp.json()["id"], 4)
 
     # -- failure -----------------------------------------------------------

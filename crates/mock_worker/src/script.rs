@@ -84,6 +84,16 @@ pub struct Answer {
     /// The sampled token's logprob per output token, sent when the request
     /// asks for logprobs.
     pub logprobs: Option<Vec<f32>>,
+    /// `"logprobs": "sampled"`: the logprobs are made up, one per output id,
+    /// once the ids are known (the encode of a text answer), so a scripted
+    /// text can answer a request that asks for logprobs on a token wire.
+    pub sampled_logprobs: bool,
+    /// The logprob of each token id the request asks a score for
+    /// (`token_ids_logprob` on the SGLang wire), in the request's order: the
+    /// answer of a prefill-only scoring request, whose output is empty. The
+    /// request asks for logprobs too, as the engine computes the row only
+    /// then; one that does not is refused.
+    pub token_id_logprobs: Option<Vec<f32>>,
     /// The pause before every frame but the first.
     pub delay: Duration,
     /// Tokens per frame.
@@ -163,7 +173,7 @@ impl Answer {
     ///  "output_ids": [...], "output_text": "..." | ["piece", ...],
     ///  "finish_reason": "stop", "matched_stop": 2 | "</s>",
     ///  "cached_tokens": 0, "prompt_tokens": 12, "logprobs": [-0.1, ...],
-    ///  "delay_ms": 0, "chunk_tokens": 1}
+    ///  "token_id_logprobs": [-0.2, ...], "delay_ms": 0, "chunk_tokens": 1}
     /// ```
     ///
     /// Everything is optional but one of `output_ids` and `output_text`;
@@ -174,6 +184,8 @@ impl Answer {
     /// `output_text` without `output_ids` is an answer of no tokens: the
     /// completion alone, as an engine answers a request it may not generate
     /// for. Beside ids, an empty string is one whole-text piece like any other.
+    /// `token_id_logprobs` scores the token ids a request asks for, in the
+    /// request's order: the answer of a prefill-only scoring request.
     pub fn parse(value: &Value) -> Result<Scripted, String> {
         let object = value.as_object().ok_or("an answer is a JSON object")?;
         let known = [
@@ -187,6 +199,7 @@ impl Answer {
             "cached_tokens",
             "prompt_tokens",
             "logprobs",
+            "token_id_logprobs",
             "delay_ms",
             "chunk_tokens",
         ];
@@ -303,8 +316,13 @@ impl Answer {
         let prompt_tokens = count("prompt_tokens")?
             .map(|n| to_u32("prompt_tokens", n))
             .transpose()?;
+        let mut sampled_logprobs = false;
         let logprobs = match object.get("logprobs") {
             None | Some(Value::Null) => None,
+            Some(Value::String(mode)) if mode == "sampled" => {
+                sampled_logprobs = true;
+                None
+            }
             Some(Value::Array(values)) => {
                 let logprobs = values
                     .iter()
@@ -328,7 +346,28 @@ impl Answer {
                 }
                 Some(logprobs)
             }
-            Some(other) => return Err(format!("logprobs: expected an array, got {other}")),
+            Some(other) => {
+                return Err(format!(
+                    "logprobs: expected an array or \"sampled\", got {other}"
+                ))
+            }
+        };
+        let token_id_logprobs = match object.get("token_id_logprobs") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(values)) => Some(
+                values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_f64()
+                            .map(|v| v as f32)
+                            .ok_or_else(|| format!("token_id_logprobs: {value} is not a number"))
+                    })
+                    .collect::<Result<Vec<f32>, String>>()?,
+            ),
+            Some(other) => {
+                return Err(format!("token_id_logprobs: expected an array, got {other}"))
+            }
         };
         let delay = Duration::from_millis(count("delay_ms")?.unwrap_or(0));
         let chunk_tokens = match count("chunk_tokens")? {
@@ -349,6 +388,8 @@ impl Answer {
                 cached_tokens,
                 prompt_tokens,
                 logprobs,
+                sampled_logprobs,
+                token_id_logprobs,
                 delay,
                 chunk_tokens,
             },
@@ -361,6 +402,7 @@ impl Answer {
     /// answer with ids, or without text, is returned as it is.
     pub fn encoded_with(mut self, tokenizer: &dyn Tokenizer) -> Result<Self, String> {
         if !self.output_ids.is_empty() {
+            self.synthesize_logprobs();
             return Ok(self);
         }
         let Some(pieces) = &self.output_text else {
@@ -371,6 +413,7 @@ impl Answer {
             .encode(&text, false)
             .map_err(|e| format!("encoding the scripted text: {e}"))?;
         self.output_ids = encoding.token_ids().to_vec();
+        self.synthesize_logprobs();
         // Per-piece logprobs align with the ids only when the pieces were
         // tokens, which the encode does not promise: an answer that wants
         // logprobs on a token wire gives ids.
@@ -436,6 +479,19 @@ impl Answer {
             self.output_ids.len()
         };
         u32::try_from(units).unwrap_or(u32::MAX)
+    }
+
+    /// The made-up logprobs of a `"logprobs": "sampled"` answer, one per
+    /// output id: eight values from -0.125 to -1.0, repeating, so a top-`k`
+    /// reading finds alternatives among the answer's tokens.
+    fn synthesize_logprobs(&mut self) {
+        if self.sampled_logprobs && self.logprobs.is_none() {
+            self.logprobs = Some(
+                (0..self.output_ids.len())
+                    .map(|i| -0.125 * ((i % 8) as f32 + 1.0))
+                    .collect(),
+            );
+        }
     }
 
     /// The whole output text, for a non-streaming HTTP answer.
@@ -894,9 +950,12 @@ pub fn take_ids(cfg: &Config, worker: &str, prompt_ids: &[u32]) -> Result<Option
 }
 
 /// `answer` with its ids for a token wire: a text-only answer encoded with
-/// the worker's tokenizer, any other as it is.
-fn encode_for_wire(cfg: &Config, worker: &str, answer: Answer) -> Result<Answer, String> {
-    if !answer.output_ids.is_empty() || answer.output_text.is_none() {
+/// the worker's tokenizer, any other as it is (an answer of no tokens, a
+/// scoring answer's, needs none), its sampled logprobs made up once the ids
+/// are known either way.
+fn encode_for_wire(cfg: &Config, worker: &str, mut answer: Answer) -> Result<Answer, String> {
+    if !answer.output_ids.is_empty() || answer.output_text.as_ref().is_none_or(Vec::is_empty) {
+        answer.synthesize_logprobs();
         return Ok(answer);
     }
     tokenizer(cfg)
@@ -1362,6 +1421,48 @@ mod tests {
             .load(&path)
             .expect_err("a script line is keyed by its prompt, never by a text")
             .contains("needs key or input_ids"));
+    }
+
+    #[test]
+    fn sampled_logprobs_are_made_up_once_the_ids_are_known() {
+        use llm_tokenizer::MockTokenizer;
+        let tokenizer = MockTokenizer::new();
+        let answer = parse(r#"{"output_text": "hello world", "logprobs": "sampled"}"#)
+            .expect("answer")
+            .answer;
+        assert_eq!(answer.logprobs, None, "nothing before the encode");
+        let encoded = answer.encoded_with(&tokenizer).expect("encoded");
+        let logprobs = encoded.logprobs.expect("one logprob per id");
+        assert_eq!(logprobs.len(), encoded.output_ids.len());
+        assert!(logprobs.iter().all(|lp| *lp < 0.0));
+        let with_ids = parse(r#"{"output_ids": [4, 5], "logprobs": "sampled"}"#)
+            .expect("answer")
+            .answer
+            .encoded_with(&tokenizer)
+            .expect("encoded");
+        assert_eq!(with_ids.logprobs, Some(vec![-0.125, -0.25]));
+        assert_eq!(with_ids.token_frames().len(), 2, "one logprob per frame");
+        assert!(parse(r#"{"output_text": "x", "logprobs": "random"}"#).is_err());
+    }
+
+    #[test]
+    fn an_answer_scripted_with_ids_gets_its_sampled_logprobs_on_the_wire() {
+        // Through `take_ids`, the token wires' path: an answer that carries
+        // ids skips the encode, and its sampled logprobs are made up all the
+        // same, so a request that asks for logprobs is answered with them.
+        let worker = "zmq:sampled-logprobs";
+        register(worker);
+        let scripted = parse(
+            r#"{"input_ids": [4101, 4102, 4103], "output_ids": [4, 5], "logprobs": "sampled"}"#,
+        )
+        .expect("answer");
+        assert!(enqueue(worker, vec![scripted]).is_some());
+        let answer = take_ids(&Config::default(), worker, &[4101, 4102, 4103])
+            .expect("nothing to encode, so no tokenizer is needed")
+            .expect("the scripted answer");
+        assert_eq!(answer.output_ids, vec![4, 5]);
+        assert_eq!(answer.logprobs, Some(vec![-0.125, -0.25]));
+        assert_eq!(answer.token_frames().len(), 2, "one logprob per frame");
     }
 
     #[test]

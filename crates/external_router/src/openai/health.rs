@@ -63,7 +63,7 @@ mod tests {
 
     use super::{get_server_info, health_generate};
     use crate::test_support::{
-        StubWorker, StubWorkers, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL,
+        text_of, StubWorker, StubWorkers, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL,
     };
 
     /// The health answer names an unhealthy worker by its address masked:
@@ -75,10 +75,7 @@ mod tests {
         let response = health_generate(&source);
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("a body");
-        let text = std::str::from_utf8(&body).expect("utf-8");
+        let text = text_of(response).await;
         assert!(!text.contains("secret"), "{text}");
         assert!(text.contains(&format!("m ({MASKED_WORKER_URL})")), "{text}");
     }

@@ -559,6 +559,28 @@ mod tests {
         assert_eq!(body, serialize_json_sized(&req, None).unwrap());
     }
 
+    /// A prompt of token ids rides the completion body to the engine as
+    /// sent, in both of its shapes.
+    #[test]
+    fn a_token_prompt_rides_the_completion_body_as_sent() {
+        let worker = worker();
+        for prompt in [json!([11, 12, 13]), json!([[11, 12], [13]])] {
+            let req: openai_protocol::completion::CompletionRequest =
+                serde_json::from_value(json!({
+                    "model": "alias-model",
+                    "prompt": prompt,
+                    "max_tokens": 4
+                }))
+                .unwrap();
+
+            let body = serialize_request_body(&req, None, &worker, None).unwrap();
+
+            assert_eq!(body, value_path_bytes(&req, None, &worker));
+            let parsed: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["prompt"], prompt);
+        }
+    }
+
     #[test]
     fn non_object_body_falls_back_to_the_value_pipeline() {
         let worker = worker();

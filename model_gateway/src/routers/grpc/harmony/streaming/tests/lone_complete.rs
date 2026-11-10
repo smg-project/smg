@@ -19,21 +19,10 @@ use crate::{
     routers::grpc::{
         context,
         harmony::try_harmony_encoding,
-        regular::streaming::tests::eof::{choice_trail, scripted_stream},
+        regular::streaming::tests::eof::{choice_trail, chunk_of_ids, scripted_stream},
         utils,
     },
 };
-
-fn chunk(index: u32, token_ids: Vec<u32>) -> proto::GenerateResponse {
-    proto::GenerateResponse {
-        response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
-            index,
-            completion_tokens: token_ids.len() as u32,
-            token_ids,
-            ..Default::default()
-        })),
-    }
-}
 
 fn complete(index: u32, output_ids: Vec<u32>) -> proto::GenerateResponse {
     complete_with(index, output_ids, "stop")
@@ -55,7 +44,7 @@ fn complete_with(index: u32, output_ids: Vec<u32>, finish_reason: &str) -> proto
 /// The frames of a choice that answers "Hi" on the final channel.
 fn answering_choice(index: u32) -> Vec<proto::GenerateResponse> {
     let tokens = harmony_tokens(None, "Hi");
-    vec![chunk(index, tokens.clone()), complete(index, tokens)]
+    vec![chunk_of_ids(index, tokens.clone()), complete(index, tokens)]
 }
 
 /// The `data:` events of the streamed chat completion for `frames`, `[DONE]`
@@ -75,7 +64,10 @@ async fn streamed_events(frames: Vec<proto::GenerateResponse>, choices: u32) -> 
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
     let response = Arc::new(HarmonyStreamingProcessor::new())
         .process_streaming_chat_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
             Arc::new(request),
             dispatch,
             Vec::new(),
@@ -169,7 +161,7 @@ async fn harmony_choice_of_header_tokens_only_opens_before_its_finish() {
         ("an empty final message", harmony_tokens(None, ""), "stop"),
     ] {
         let frames = vec![
-            chunk(0, tokens.clone()),
+            chunk_of_ids(0, tokens.clone()),
             complete_with(0, tokens, finish_reason),
         ];
         let events = streamed_events(frames, 1).await;

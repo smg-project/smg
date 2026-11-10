@@ -156,27 +156,36 @@ else
                 echo "::error::Unable to query GPU memory on node '$NODE_INFO'."
                 exit 1
             fi
+            READ_AT=$SECONDS
             DIRTY_GPUS=$(echo "$USED" | awk -F', ' '$2 > 100 {print "GPU " $1 ": " $2 " MiB used"}')
             if [ -z "$DIRTY_GPUS" ]; then
                 if [ -n "$REPORTED_AT" ]; then
-                    echo "gpu guard: every GPU clean after ${SECONDS}s"
+                    echo "gpu guard: every GPU clean after ${READ_AT}s"
                 fi
                 break
             fi
-            echo "gpu guard: ${SECONDS}s: $(echo "$DIRTY_GPUS" | paste -sd ';' - | sed 's/;/; /g')"
+            echo "gpu guard: ${READ_AT}s: $(echo "$DIRTY_GPUS" | paste -sd ';' - | sed 's/;/; /g')"
             if [ -z "$REPORTED_AT" ]; then
                 gpu_holders
-                REPORTED_AT=$SECONDS
+                REPORTED_AT=$READ_AT
             fi
-            if [ "$SECONDS" -ge "$WAIT_SECS" ]; then
-                if [ "$SECONDS" -gt "$REPORTED_AT" ]; then
+            if [ "$READ_AT" -ge "$WAIT_SECS" ]; then
+                if [ "$READ_AT" -gt "$REPORTED_AT" ]; then
                     gpu_holders
                 fi
-                echo "::error::GPU not clean on node '$NODE_INFO' after ${SECONDS}s, held by $GPU_HOLDERS:"
+                echo "::error::GPU not clean on node '$NODE_INFO' after ${READ_AT}s, held by $GPU_HOLDERS:"
                 echo "$DIRTY_GPUS"
                 exit 1
             fi
-            sleep "$POLL_SECS"
+            REMAINING=$((10#$WAIT_SECS - SECONDS))
+            if [ "$REMAINING" -le 0 ]; then
+                continue
+            fi
+            if [ "$POLL_SECS" -gt "$REMAINING" ]; then
+                sleep "$REMAINING"
+            else
+                sleep "$POLL_SECS"
+            fi
         done
     fi
 fi

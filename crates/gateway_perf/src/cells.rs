@@ -126,6 +126,9 @@ pub struct CellRecord {
     pub ok: u64,
     pub failed: u64,
     pub skipped: u64,
+    /// Requests still open when the client's drain ran out, cut off before their
+    /// last frame: a warning, as failed requests are.
+    pub unfinished: u64,
     pub statuses: Value,
     pub errors: Value,
     pub achieved_rps: Option<f64>,
@@ -254,7 +257,14 @@ fn measure(
         window_seconds(settings.requests, rate)
     });
     if let Some(spec) = spec {
-        enqueue(bed, &answers(spec, (rate * seconds as f64) as usize + 256))?;
+        enqueue(
+            bed,
+            &answers(
+                spec,
+                (rate * seconds as f64) as usize + 256,
+                settings.bed.fleet.wire(),
+            ),
+        )?;
     }
     thread::sleep(Duration::from_secs(2));
     let s0 = snapshot(bed)?;
@@ -352,14 +362,16 @@ pub fn cell(
 }
 
 /// The record's fields from what was measured, and its warnings: failed requests,
-/// script misses (answers served by the engine simulator), unreadable script counters
-/// and a lost allocator print mean the cell did not measure what it should.
+/// requests the client's drain cut off, script misses (answers served by the engine
+/// simulator), unreadable script counters and a lost allocator print mean the cell did
+/// not measure what it should.
 fn fill_record(record: &mut CellRecord, loaded: bool, m: &Measured, gateway_log: &str) {
     let s = &m.summary;
     record.sent = count(s, "sent");
     record.ok = count(s, "ok");
     record.failed = count(s, "failed");
     record.skipped = count(s, "skipped");
+    record.unfinished = count(s, "unfinished");
     record.statuses = s.get("statuses").cloned().unwrap_or_else(|| json!({}));
     record.errors = s.get("errors").cloned().unwrap_or_else(|| json!({}));
     record.achieved_rps = number(s, &["achieved_rps"]);
@@ -382,6 +394,12 @@ fn fill_record(record: &mut CellRecord, loaded: bool, m: &Measured, gateway_log:
     let mut bad = Vec::new();
     if loaded && record.failed > 0 {
         bad.push(format!("{} failed requests", record.failed));
+    }
+    if loaded && record.unfinished > 0 {
+        bad.push(format!(
+            "{} requests cut off at the client's drain",
+            record.unfinished
+        ));
     }
     if let Some(script) = &m.script {
         if loaded && script.misses > 0 {
@@ -537,10 +555,10 @@ pub fn setup_text(settings: &Settings, mode: &str) -> String {
         prompt.push_str(&format!(", {} distinct", settings.distinct));
     }
     format!(
-        "{mode}: {} requests per cell at the path's rate x {}, {prompt}, {} scripted mock engines, {} runtime threads{cores}",
+        "{mode}: {} requests per cell at the path's rate x {}, {prompt}, {}, {} runtime threads{cores}",
         thousands(settings.requests as f64, 0, false),
         py_g(settings.rate_scale, 6),
-        settings.bed.workers,
+        settings.bed.engines_text(),
         settings.bed.gw_threads
     )
 }
@@ -704,6 +722,9 @@ pub struct SoakRecord {
     pub sent: u64,
     pub ok: u64,
     pub failed: u64,
+    /// Requests still open when the client's drain ran out, summed over the windows.
+    #[serde(default)]
+    pub unfinished: u64,
     pub client_rc: i64,
     pub script: ScriptCounts,
     pub warnings: Vec<String>,
@@ -712,7 +733,7 @@ pub struct SoakRecord {
 /// The soak's record from its rows and its client summaries: RSS after the first and
 /// the last window, the growth per 10,000 requests, the peak after the burst and the
 /// allocator's live bytes; the request counts and the warnings as a cell's, so a soak
-/// with failed requests or script misses fails the run.
+/// with failed requests, requests cut off at the drain or script misses fails the run.
 pub fn soak_record(
     side: &str,
     spec: &PathSpec,
@@ -745,9 +766,15 @@ pub fn soak_record(
         (key("allocator_live_mb_after_last_window"), last.live_mb()),
     ]);
     let failed: u64 = summaries.iter().map(|s| count(s, "failed")).sum();
+    let unfinished: u64 = summaries.iter().map(|s| count(s, "unfinished")).sum();
     let mut bad = Vec::new();
     if failed > 0 {
         bad.push(format!("{failed} failed requests"));
+    }
+    if unfinished > 0 {
+        bad.push(format!(
+            "{unfinished} requests cut off at the client's drain"
+        ));
     }
     if script.misses > 0 {
         bad.push(format!(
@@ -773,6 +800,7 @@ pub fn soak_record(
         sent: summaries.iter().map(|s| count(s, "sent")).sum(),
         ok: summaries.iter().map(|s| count(s, "ok")).sum(),
         failed,
+        unfinished,
         client_rc: summaries
             .iter()
             .map(|s| s.get("client_rc").and_then(Value::as_i64).unwrap_or(0))
@@ -806,7 +834,14 @@ fn soak_windows(
     for w in 1..=windows {
         let wdir = cdir.join(format!("window-{w}"));
         fs::create_dir_all(&wdir)?;
-        enqueue(bed, &answers(spec, (rate * seconds as f64) as usize + 256))?;
+        enqueue(
+            bed,
+            &answers(
+                spec,
+                (rate * seconds as f64) as usize + 256,
+                settings.bed.fleet.wire(),
+            ),
+        )?;
         summaries.push(run_client(
             settings,
             bed,
@@ -830,7 +865,11 @@ fn soak_windows(
     fs::create_dir_all(&bdir)?;
     enqueue(
         bed,
-        &answers(spec, (rate * burst * seconds as f64) as usize + 256),
+        &answers(
+            spec,
+            (rate * burst * seconds as f64) as usize + 256,
+            settings.bed.fleet.wire(),
+        ),
     )?;
     summaries.push(run_client(
         settings,
@@ -965,10 +1004,10 @@ pub fn run_mem(
         unit: Some(String::new()),
     };
     let setup = format!(
-        "mem: {windows} windows of {} requests on one gateway, then a burst at x{}; {} scripted mock engines",
+        "mem: {windows} windows of {} requests on one gateway, then a burst at x{}; {}",
         thousands(settings.requests as f64, 0, false),
         py_g(burst, 6),
-        settings.bed.workers
+        settings.bed.engines_text()
     );
     let values: Vec<Value> = records
         .iter()
@@ -988,10 +1027,10 @@ pub fn smoke(settings: &Settings, paths: &[PathSpec]) -> Result<i32> {
     );
     let info = bed.up()?.clone();
     println!(
-        "bed up: gateway pid {} at {}, {} workers, bed.json {}",
+        "bed up: gateway pid {} at {}, {}, bed.json {}",
         info.gateway_pid,
         info.gateway_url,
-        settings.bed.workers,
+        settings.bed.engines_text(),
         settings
             .out
             .join("bed")
@@ -1011,7 +1050,7 @@ fn smoke_paths(settings: &Settings, bed: &Bed, paths: &[PathSpec]) -> Result<i32
     for spec in paths {
         let sdir = settings.out.join("smoke").join(spec.name);
         fs::create_dir_all(&sdir)?;
-        enqueue(bed, &answers(spec, 16))?;
+        enqueue(bed, &answers(spec, 16, settings.bed.fleet.wire()))?;
         let summary = run_client(
             settings,
             bed,
@@ -1276,6 +1315,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_cell_whose_requests_the_drain_cut_off_warns_like_one_with_failed_requests() {
+        let measured = |summary: Value| Measured {
+            summary,
+            s0: Snapshot::default(),
+            s1: Snapshot::default(),
+            counters: BTreeMap::new(),
+            script: None,
+        };
+        let drain_warning = "2 requests cut off at the client's drain".to_string();
+        let mut cut = CellRecord::default();
+        fill_record(
+            &mut cut,
+            true,
+            &measured(json!({"sent": 10, "ok": 8, "failed": 0, "unfinished": 2})),
+            "",
+        );
+        assert_eq!(
+            (cut.sent, cut.ok, cut.failed, cut.unfinished),
+            (10, 8, 0, 2)
+        );
+        assert!(cut.warnings.contains(&drain_warning), "{:?}", cut.warnings);
+        let mut whole = CellRecord::default();
+        fill_record(
+            &mut whole,
+            true,
+            &measured(json!({"sent": 10, "ok": 10, "failed": 0, "unfinished": 0})),
+            "",
+        );
+        assert_eq!(whole.unfinished, 0);
+        assert!(
+            !whole.warnings.contains(&drain_warning),
+            "{:?}",
+            whole.warnings
+        );
+        let mut idle = CellRecord::default();
+        fill_record(&mut idle, false, &measured(json!({"unfinished": 2})), "");
+        assert!(
+            !idle.warnings.contains(&drain_warning),
+            "an idle cell sends nothing: {:?}",
+            idle.warnings
+        );
+    }
+
+    #[test]
     fn mem_soak_record_warns_on_failed_requests_and_script_misses() {
         let snap = |rss: u64| Snapshot {
             status: BTreeMap::from([("VmRSS".to_string(), rss), ("VmHWM".to_string(), 2048)]),
@@ -1307,7 +1390,7 @@ pub(crate) mod tests {
         };
         let summaries = [
             json!({"sent": 10, "ok": 9, "failed": 1}),
-            json!({"sent": 10, "ok": 8, "failed": 2}),
+            json!({"sent": 10, "ok": 7, "failed": 2, "unfinished": 1}),
         ];
         let spec = crate::paths::path_named("stream").unwrap();
         let measured = SoakMeasured {
@@ -1318,11 +1401,13 @@ pub(crate) mod tests {
         let record = soak_record("pr", spec, "r1", Path::new("/d"), measured, 1, 10).unwrap();
         assert_eq!(record.sent, 20);
         assert_eq!(record.failed, 3);
+        assert_eq!(record.unfinished, 1);
         assert_eq!(record.script, counts);
         assert_eq!(
             record.warnings,
             [
                 "3 failed requests",
+                "1 requests cut off at the client's drain",
                 "2 script misses (answers served by the engine simulator)",
                 "1 script counters unreadable (misses unknown)",
             ]
@@ -1336,6 +1421,7 @@ pub(crate) mod tests {
         let value = serde_json::to_value(&record).unwrap();
         assert_eq!(value["rows"][0]["after"], "start");
         assert_eq!(value["rows"][0]["status"]["VmRSS"], 1024);
+        assert_eq!(value["unfinished"], 1);
     }
 
     #[test]
@@ -1352,6 +1438,16 @@ pub(crate) mod tests {
         assert_eq!(
             setup_text(&settings, "alloc"),
             "alloc: 10,000 requests per cell at the path's rate x 0.5, 64-word prompts, 128 distinct, 4 scripted mock engines, 8 runtime threads; gateway pinned to cores 0-7"
+        );
+        settings.bed.fleet = crate::bed::Fleet::PrefillDecode;
+        assert_eq!(
+            setup_text(&settings, "cpu"),
+            "cpu: 10,000 requests per cell at the path's rate x 0.5, 64-word prompts, 128 distinct, 1 prefill and 4 decode scripted mock engines on the prefill-decode path, 8 runtime threads; gateway pinned to cores 0-7"
+        );
+        settings.bed.fleet = crate::bed::Fleet::Http;
+        assert_eq!(
+            setup_text(&settings, "cpu"),
+            "cpu: 10,000 requests per cell at the path's rate x 0.5, 64-word prompts, 128 distinct, 4 scripted mock engines on the HTTP wire, 8 runtime threads; gateway pinned to cores 0-7"
         );
     }
 }

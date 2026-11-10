@@ -39,7 +39,6 @@ use crate::{
         error,
         grpc::{context::LoadGuards, harmony::responses::ToolResult, regular::symphony},
     },
-    worker::GuardedStream,
 };
 
 /// Item-id-prefix discriminator for non-format kinds. Format-driven items
@@ -1657,17 +1656,6 @@ pub(crate) fn body_guards(
         load_guards,
         reservation.map(|handle| ReservationAttachment::new(Arc::clone(handle))),
     )
-}
-
-/// [`build_sse_response`] whose body owns `guards` for as long as it lives:
-/// they ride in the body's own stream ([`GuardedStream`]) and are dropped
-/// with it, with no wrapper over the body (a wrapper is a boxed
-/// `poll_frame` more on every frame out).
-pub(crate) fn build_sse_response_guarded<G>(rx: SseReceiver, guards: G) -> Response
-where
-    G: Send + Unpin + 'static,
-{
-    build_sse_response_from_stream(GuardedStream::new(ReceiverStream::new(rx), guards))
 }
 
 /// Attach `server_label` to an MCP tool-call JSON item.

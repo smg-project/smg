@@ -728,7 +728,7 @@ async fn the_poll_decision_follows_the_receipt_of_pushed_records() {
 /// the other rank's heartbeats keep the stream alive, and the tick
 /// falls back to the poll for the worker. The poll's figure for the
 /// quiet rank replaces its entry in the pushed report: a heartbeat
-/// naming the busy rank no longer rebuilds the report from the quiet
+/// naming the busy rank no longer publishes a report with the quiet
 /// rank's last pushed record, the rank follows the poll from then on,
 /// a rank whose own record arrived since the poll began keeps it, and
 /// the poll decision is unchanged (the worker stays polled until the
@@ -789,8 +789,10 @@ async fn a_quiet_ranks_figures_follow_the_poll_rather_than_its_last_pushed_recor
         polled_at + Duration::from_millis(1),
     );
     monitor.apply_polled_load(url, &poll(0.91), polled_at);
-    // The next heartbeat names rank 0 only: the report it rebuilds and
-    // the gauges carry rank 1 at the poll's figure, rank 0 at its own.
+    // The next heartbeat names rank 0 only: the report it publishes carries
+    // rank 1 at the poll's figure and rank 0 at its own, and the record sets
+    // its own rank's gauges alone (rank 1's took the poll's figure from the
+    // poll itself, as every polled rank's do).
     let rendered = render_with_recorder(|| {
         monitor.apply_pushed_load(
             &worker,
@@ -804,16 +806,22 @@ async fn a_quiet_ranks_figures_follow_the_poll_rather_than_its_last_pushed_recor
     let report = snapshot.get(url).expect("published");
     assert_eq!(report.version, "pushed");
     assert_eq!(ranks_of(report), vec![(0, 5, 0.5), (1, 8, 0.91)]);
-    let rank1_hit_rate = rendered
-        .lines()
-        .find(|l| {
-            l.starts_with("smg_engine_cache_hit_rate{")
-                && l.contains("worker=\"grpc://w1:9000\"")
-                && l.contains("dp_rank=\"1\"")
-        })
-        .map(|l| l.rsplit(' ').next().unwrap_or("").to_string())
-        .unwrap_or_else(|| panic!("rank 1's hit rate gauge missing:\n{rendered}"));
-    assert_eq!(rank1_hit_rate, "0.91");
+    let hit_rate_of = |rank: &str| {
+        rendered
+            .lines()
+            .find(|l| {
+                l.starts_with("smg_engine_cache_hit_rate{")
+                    && l.contains("worker=\"grpc://w1:9000\"")
+                    && l.contains(&format!("dp_rank=\"{rank}\""))
+            })
+            .map(|l| l.rsplit(' ').next().unwrap_or("").to_string())
+    };
+    assert_eq!(hit_rate_of("0").as_deref(), Some("0.5"), "{rendered}");
+    assert_eq!(
+        hit_rate_of("1"),
+        None,
+        "a record touches no other rank's series:\n{rendered}"
+    );
 
     // The receipts are the stream's: rank 1 is still quiet, the worker
     // stays polled, and each poll's figure replaces the last. A rank
@@ -861,17 +869,17 @@ async fn a_quiet_ranks_figures_follow_the_poll_rather_than_its_last_pushed_recor
     };
     monitor.apply_polled_load(url, &rollup, next + Duration::from_millis(2));
     let rank0 = monitor
-        .pushed_ranks
+        .pushed_reports
         .lock()
         .get(url)
-        .and_then(|ranks| ranks.get(&0).cloned())
+        .and_then(|report| report.loads.iter().find(|load| load.dp_rank == 0).cloned())
         .expect("rank 0 on file");
     assert_eq!(
         (rank0.num_running_reqs, rank0.cache_hit_rate, rank0.worker),
         (6, 0.5, None)
     );
     // Rank 1's own record, once it pushes again, is the newer figure
-    // and suppresses the poll again; the report it rebuilds carries
+    // and suppresses the poll again; the report it publishes carries
     // rank 0 as the stream left it.
     monitor.apply_pushed_load(&worker, 1, &record(7, 0.7), next + Duration::from_millis(3));
     monitor.flush_pushed();
@@ -891,7 +899,11 @@ async fn a_quiet_ranks_figures_follow_the_poll_rather_than_its_last_pushed_recor
     let other = ready_worker("grpc://w2:9000", "llama-3");
     registry.register(Arc::clone(&other)).unwrap();
     monitor.apply_polled_load("grpc://w2:9000", &poll(0.1), t0);
-    assert!(monitor.pushed_ranks.lock().get("grpc://w2:9000").is_none());
+    assert!(monitor
+        .pushed_reports
+        .lock()
+        .get("grpc://w2:9000")
+        .is_none());
     assert_eq!(
         monitor.poll_mode("grpc://w2:9000", t0, interval),
         PollMode::Poll
@@ -968,4 +980,58 @@ fn a_tick_skips_a_worker_whose_stream_pushed_within_the_interval() {
                 && l.ends_with(" 1")),
         "{rendered}"
     );
+}
+
+/// The quarter-second sweep visits the registry's membership as it stands at
+/// each tick: a worker registered after the loop started is swept on the next
+/// tick, a removed one no longer. A sweep is observed through the load sample
+/// it stores on the worker (`swap_load_sample`), which every sweep writes
+/// before it judges anything.
+#[tokio::test(start_paused = true)]
+async fn the_liveness_sweep_follows_the_registrys_membership_tick_by_tick() {
+    let (registry, monitor) = build_monitor();
+    // The sleeps end just after a tick's deadline, so the paused clock fires
+    // the tick before the assertion runs.
+    let past_a_tick = liveness::SWEEP_INTERVAL + Duration::from_millis(1);
+
+    let first = ready_worker("http://w1:8000", "m");
+    first.note_tracked_started();
+    registry.register(Arc::clone(&first)).unwrap();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test aborts the loop before it returns"
+    )]
+    let sweep = tokio::spawn(liveness_sweep_loop(Arc::downgrade(&monitor)));
+    tokio::time::sleep(past_a_tick).await;
+    assert_eq!(
+        first.swap_load_sample(0),
+        1,
+        "a worker registered before the loop started is swept"
+    );
+
+    let late = ready_worker("http://w2:8000", "m");
+    late.note_tracked_started();
+    late.note_tracked_started();
+    let late_id = registry.register(Arc::clone(&late)).unwrap();
+    tokio::time::sleep(past_a_tick).await;
+    assert_eq!(
+        late.swap_load_sample(0),
+        2,
+        "a worker registered after the loop started is swept on the next tick"
+    );
+    assert_eq!(
+        first.swap_load_sample(0),
+        1,
+        "the first worker is swept on the same tick"
+    );
+
+    registry.remove(&late_id).unwrap();
+    tokio::time::sleep(past_a_tick).await;
+    assert_eq!(late.swap_load_sample(0), 0, "a removed worker is not swept");
+    assert_eq!(
+        first.swap_load_sample(0),
+        1,
+        "the worker that stays is swept on the tick after the removal"
+    );
+    sweep.abort();
 }

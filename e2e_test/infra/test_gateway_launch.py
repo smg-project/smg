@@ -18,7 +18,12 @@ import time
 from pathlib import Path
 
 import pytest
-from infra.constants import ENV_SHOW_ROUTER_LOGS, ENV_SHOW_WORKER_LOGS, ConnectionMode
+from infra.constants import (
+    CLOUD_REQUEST_TIMEOUT_SECS,
+    ENV_SHOW_ROUTER_LOGS,
+    ENV_SHOW_WORKER_LOGS,
+    ConnectionMode,
+)
 from infra.gateway import Gateway
 from infra.process_utils import ProcessExitedError, wait_for_health, wait_for_workers_ready
 from infra.worker import Worker
@@ -344,3 +349,14 @@ def test_the_readiness_wait_stops_when_a_launched_worker_exits(tmp_path, monkeyp
         if worker._log_file is not None:
             worker._log_file.close()
     assert time.perf_counter() - started < 10
+
+
+def test_a_cloud_gateway_gets_a_budget_for_each_call_to_its_provider(monkeypatch):
+    """A provider call that never answers ends at the budget as a gateway error
+    the SDK clients retry on their own, instead of holding the test for the ten
+    minutes of the SDK's own timeout (twice in one job: the job's cap)."""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    args = Gateway()._build_cloud_args("openai", "memory")
+
+    assert args[args.index("--request-timeout-secs") + 1] == str(CLOUD_REQUEST_TIMEOUT_SECS)

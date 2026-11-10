@@ -30,12 +30,14 @@
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 
+use std::borrow::Cow;
+
 use crate::{
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
     ids::CallIds,
     markers::{Piece, Scanner},
     tagged::{
-        end_cut_call, held_text,
+        end_cut_call, held_text, take_owned,
         value::{json, Kind, NULL_WORDS},
     },
     Declared,
@@ -112,6 +114,9 @@ pub struct Assembler {
     /// get, so it is no whole call, and nothing is made up for its close
     /// ([`Self::close_object_if_whole`]).
     refused: bool,
+    /// The buffer the events of a piece the scanner held fill before they go out owned
+    /// (`take_owned`): kept between pieces with its room.
+    scratch: Events<'static>,
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +168,7 @@ impl Assembler {
             scanner: Scanner::new(TAGS),
             carried: String::new(),
             stage: Stage::Opening,
+            scratch: Events::new(),
             function: None,
             written: 0,
             ended: false,
@@ -180,9 +186,9 @@ impl Assembler {
     /// Append the next bytes of the block, push the events they complete, and return how many of
     /// the bytes were taken: all of them, since the block's calls follow one another and its
     /// closing marker is the format's to read.
-    pub fn feed(&mut self, bytes: &str, declared: &Declared, out: &mut Events) -> usize {
+    pub fn feed<'d>(&mut self, bytes: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize {
         let scanned = self.scanner.feed(bytes);
-        for piece in scanned.pieces() {
+        for piece in scanned.pieces_of_delta() {
             self.take(piece, declared, out);
         }
         self.scanner.reclaim(scanned);
@@ -333,7 +339,7 @@ impl Assembler {
         }
         let held = self.scanner.set_aside();
         if !held.is_empty() {
-            self.stream(&held, out);
+            self.stream(Cow::Owned(held), out);
         }
         super::left_open(why, out);
         let source = Text::uncounted(std::mem::take(&mut self.carried));
@@ -444,9 +450,17 @@ impl Assembler {
         crate::event::drop_carried(std::mem::take(&mut self.carried), out);
     }
 
-    fn take(&mut self, piece: Piece<'_>, declared: &Declared, out: &mut Events) {
+    fn take<'d>(&mut self, piece: Piece<'d>, declared: &Declared, out: &mut Events<'d>) {
         match piece {
-            Piece::Text(text) => self.text(&text, declared, out),
+            Piece::Text(Cow::Borrowed(text)) => self.text(text, declared, out),
+            // The join's part after a hold is a copy, nobody's delta: its events go out owned.
+            Piece::Text(Cow::Owned(text)) => {
+                let mut scratch = std::mem::take(&mut self.scratch);
+                take_owned(&text, &mut scratch, out, |text, out| {
+                    self.text(text, declared, out);
+                });
+                self.scratch = scratch;
+            }
             Piece::Marker(tag) => self.tag(tag, declared, out),
         }
     }
@@ -514,7 +528,7 @@ impl Assembler {
         }
     }
 
-    fn text(&mut self, text: &str, declared: &Declared, out: &mut Events) {
+    fn text<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) {
         match self.stage {
             Stage::Opening | Stage::Between => {
                 self.text_between(text, MalformedReason::TextBetweenTags, out);
@@ -652,7 +666,7 @@ impl Assembler {
         self.written += 1;
     }
 
-    fn value_text(&mut self, text: &str, out: &mut Events) {
+    fn value_text<'d>(&mut self, text: &'d str, out: &mut Events<'d>) {
         let Stage::Value(value) = &mut self.stage else {
             return;
         };
@@ -675,7 +689,7 @@ impl Assembler {
             return;
         }
         match value.mode {
-            Mode::Streaming { .. } => self.stream(text, out),
+            Mode::Streaming { .. } => self.stream(Cow::Borrowed(text), out),
             Mode::Whole { .. } => self.carried.push_str(text),
             Mode::Undecided { start } => {
                 self.carried.push_str(text);
@@ -699,14 +713,17 @@ impl Assembler {
             wrote: false,
         };
         self.open_string_fragment(&key, out);
-        self.stream(&arrived, out);
+        self.stream(Cow::Owned(arrived), out);
     }
 
     /// A piece of a streamed string. Under a template that writes a newline before the closing
     /// tag, a newline the piece ends with is held, since it may be the template's, and a newline
     /// held before it turns out to be the value's; under one that writes none, every byte is
-    /// the value's and goes out at once.
-    fn stream(&mut self, text: &str, out: &mut Events) {
+    /// the value's and goes out at once. A piece of the delta with nothing carried before it
+    /// reaches its fragment borrowed, as the JSON syntax's fragments do, its text and its source
+    /// alike (the text escaped into a copy where a character needs it); one after carried bytes,
+    /// or one the assembler holds (`Cow::Owned`), is written with them as its own.
+    fn stream<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
         let own_line = self.placement == Placement::OwnLine;
         let Stage::Value(ValueState {
             mode:
@@ -720,9 +737,18 @@ impl Assembler {
             return;
         };
         let had_newline = *held_newline;
-        let (body, ends_with_newline) = match text.strip_suffix('\n') {
-            Some(body) if own_line => (body, true),
-            _ => (text, false),
+        let (body, ends_with_newline) = match text {
+            Cow::Borrowed(text) => match text.strip_suffix('\n') {
+                Some(body) if own_line => (Cow::Borrowed(body), true),
+                _ => (Cow::Borrowed(text), false),
+            },
+            Cow::Owned(mut text) => {
+                let ends_with_newline = own_line && text.ends_with('\n');
+                if ends_with_newline {
+                    text.pop();
+                }
+                (Cow::Owned(text), ends_with_newline)
+            }
         };
         *held_newline = ends_with_newline;
         if body.is_empty() && !had_newline {
@@ -731,19 +757,28 @@ impl Assembler {
             return;
         }
         *wrote = true;
-        let mut json = String::with_capacity(body.len() + 2);
-        if had_newline {
-            json.push_str("\\n");
-        }
-        push_escaped(&mut json, body);
-        // The source: the carried bytes (the template's newline after the tag, or the newline that
-        // was held and is now the value's) and the piece, less the newline held in its turn.
-        let mut source = std::mem::take(&mut self.carried);
-        source.push_str(body);
+        let (json, source) = match body {
+            Cow::Borrowed(body) if !had_newline && self.carried.is_empty() => {
+                (escaped(body), Text::uncounted(body))
+            }
+            body => {
+                let mut json = String::with_capacity(body.len() + 2);
+                if had_newline {
+                    json.push_str("\\n");
+                }
+                push_escaped(&mut json, &body);
+                // The source: the carried bytes (the template's newline after the tag, or the
+                // newline that was held and is now the value's) and the piece, less the newline
+                // held in its turn.
+                let mut source = std::mem::take(&mut self.carried);
+                source.push_str(&body);
+                (Cow::Owned(json), Text::uncounted(source))
+            }
+        };
         if ends_with_newline {
             self.carried.push('\n');
         }
-        self.push_fragment(json, Text::uncounted(source), out);
+        self.push_fragment(json, source, out);
     }
 
     /// `</parameter>`: a streamed string gets its closing quote, any other value is written whole.
@@ -811,7 +846,12 @@ impl Assembler {
         self.push_fragment(closing.to_string(), source, out);
     }
 
-    fn push_fragment<'d>(&self, json: String, source: Text<'d>, out: &mut Events<'d>) {
+    fn push_fragment<'d>(
+        &self,
+        json: impl Into<Cow<'d, str>>,
+        source: Text<'d>,
+        out: &mut Events<'d>,
+    ) {
         out.push(Event::ToolCallArguments {
             index: self.index,
             json: json.into(),
@@ -825,6 +865,23 @@ pub(crate) fn push_quoted(out: &mut String, text: &str) {
     out.push('"');
     push_escaped(out, text);
     out.push('"');
+}
+
+/// `text` as the inside of a JSON string: itself where no character of it needs an escape, so
+/// that a fragment of the model's own bytes borrows them; its escaped copy otherwise.
+pub(crate) fn escaped(text: &str) -> Cow<'_, str> {
+    match text
+        .bytes()
+        .position(|byte| matches!(byte, b'"' | b'\\') || byte < b' ')
+    {
+        None => Cow::Borrowed(text),
+        Some(at) => {
+            let mut out = String::with_capacity(text.len() + 2);
+            out.push_str(&text[..at]);
+            push_escaped(&mut out, &text[at..]);
+            Cow::Owned(out)
+        }
+    }
 }
 
 /// Appends `text` as the inside of a JSON string, escaped as `serde_json` escapes it: the quote,
@@ -917,16 +974,16 @@ mod tests {
 
     /// Feeds the pieces to an assembler reading values at `placement`, then the ending asked
     /// for, and returns the events with how many bytes each feed took.
-    fn run(
-        pieces: &[&str],
+    fn run<'p>(
+        pieces: &[&'p str],
         placement: Placement,
         ending: fn(Assembler, &mut Events),
-    ) -> (Vec<Event<'static>>, Vec<usize>) {
+    ) -> (Vec<Event<'p>>, Vec<usize>) {
         let declared = declared();
         let mut assembler = Assembler::new(0, ids(), placement);
         let mut out = Events::new();
         let mut taken = Vec::new();
-        for piece in pieces {
+        for &piece in pieces {
             taken.push(assembler.feed(piece, &declared, &mut out));
         }
         ending(assembler, &mut out);
@@ -934,16 +991,16 @@ mod tests {
     }
 
     /// The values on a line of their own, Qwen 3.5's way, and the stream cut at the end.
-    fn finished(pieces: &[&str]) -> Vec<Event<'static>> {
+    fn finished<'p>(pieces: &[&'p str]) -> Vec<Event<'p>> {
         run(pieces, Placement::OwnLine, Assembler::finish).0
     }
 
     /// The values between the tags directly, Seed-OSS's and MiMo's way, and the stream cut.
-    fn finished_direct(pieces: &[&str]) -> Vec<Event<'static>> {
+    fn finished_direct<'p>(pieces: &[&'p str]) -> Vec<Event<'p>> {
         run(pieces, Placement::Direct, Assembler::finish).0
     }
 
-    fn closed(pieces: &[&str]) -> Vec<Event<'static>> {
+    fn closed<'p>(pieces: &[&'p str]) -> Vec<Event<'p>> {
         run(pieces, Placement::OwnLine, Assembler::close).0
     }
 
@@ -2090,11 +2147,11 @@ mod tests {
     }
 
     /// Feeds the pieces at `placement`, then the stream's stop under a table with no stop row.
-    fn stopped(pieces: &[&str], placement: Placement) -> Vec<Event<'static>> {
+    fn stopped<'p>(pieces: &[&'p str], placement: Placement) -> Vec<Event<'p>> {
         let declared = declared();
         let mut assembler = Assembler::new(0, ids(), placement);
         let mut out = Events::new();
-        for piece in pieces {
+        for &piece in pieces {
             assembler.feed(piece, &declared, &mut out);
         }
         assembler.stop(false, &mut out);

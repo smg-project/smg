@@ -367,7 +367,7 @@ fn build_pool() -> Result<ThreadPool, Failure> {
             usize::from(parallelism_off)
         }
     };
-    ThreadPoolBuilder::new()
+    let pool = ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(|index| format!("smg-tokenizer-{index}"))
         .build()
@@ -376,7 +376,12 @@ fn build_pool() -> Result<ThreadPool, Failure> {
                 "starting the tokenizer's thread pool: {error} (SMG_TOKENIZER_THREADS sets its \
                  size)"
             ))
-        })
+        })?;
+    // A worker names its thread when it first runs, so right after `build`
+    // a reader of the process's threads can find a worker still under its
+    // parent's name. One broadcast returns once every worker has run.
+    pool.broadcast(|_| ());
+    Ok(pool)
 }
 
 /// Run `work` on the process's pool, where its rayon calls stay.
@@ -813,7 +818,9 @@ fn refuse_media(messages: &[ChatMessage]) -> Result<(), Failure> {
                 ContentPart::AudioUrl { .. } => "audio_url",
                 ContentPart::InputAudio { .. } => "input_audio",
                 ContentPart::VideoUrl { .. } => "video_url",
-                ContentPart::Text { .. } | ContentPart::Unknown(_) => continue,
+                ContentPart::Text { .. }
+                | ContentPart::Refusal { .. }
+                | ContentPart::Unknown(_) => continue,
             };
             return Err(Failure::Input(format!(
                 "messages[{index}] has {kind} content; SMG expands media into the model's own \

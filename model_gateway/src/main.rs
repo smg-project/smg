@@ -21,7 +21,7 @@ use smg::observability::metrics::SERVER_MALLOC_CONF;
     reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
 )]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8; 72] = SERVER_MALLOC_CONF;
+pub static MALLOC_CONF: &[u8; 100] = SERVER_MALLOC_CONF;
 
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg::{
@@ -29,6 +29,7 @@ use smg::{
         AccessLogField, PowerOfTwoLoadMetric, TurboJpegPolicy, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     observability::metrics::register_jemalloc_as_global_allocator,
+    secrets::SecretFiles,
     server::{self, posture::SecretSources, ServerConfig},
     version,
 };
@@ -395,7 +396,7 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 5, help_heading = "Routing Policy")]
     bucket_adjust_interval_secs: usize,
 
-    /// Abandon cache affinity for shortest-queue when the KV-usage spread
+    /// Abandon cache affinity for expected-wait routing when the KV-usage spread
     /// (hottest minus coldest backend, 0.0-1.0) exceeds this — catches
     /// long-context KV imbalance that request counts miss. Backend must
     /// report token_usage. Finite and > 0.0; >= 1.0 disables it.
@@ -469,10 +470,10 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
     selection_temperature: f32,
 
-    /// Worker selection policy for cache_aware, run over the per-worker
-    /// inputs the router gathers (prefix overlap, in-flight requests,
-    /// backend load reports); cache-aware-default, the affinity-group
-    /// decision, is the one policy
+    /// Worker selection policy for cache_aware, run over each worker's
+    /// prefix overlap and decayed affinity score and the fleet's mean
+    /// in-flight count; cache-aware-default, the affinity-group decision,
+    /// is the one policy
     #[arg(
         long,
         default_value = "cache-aware-default",
@@ -568,7 +569,8 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
     least_load_mean_prefill_tokens: u32,
 
-    /// What power_of_two compares: expected_wait (default), requests or least_requests
+    /// What power_of_two compares: expected_wait (default), requests, least_requests or
+    /// resident_tokens:<request_tokens> (resident context tokens plus that many per request)
     #[arg(long, default_value = "expected_wait", value_parser = parse_power_of_two_load_metric, help_heading = "Routing Policy")]
     power_of_two_load_metric: PowerOfTwoLoadMetric,
 
@@ -680,7 +682,7 @@ struct WorkerArgs {
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
     pd_disaggregation: bool,
 
-    /// Enable EPD (Encode-Prefill-Decode) disaggregated mode (gRPC + TokenSpeed only).
+    /// Enable EPD (Encode-Prefill-Decode) disaggregated mode (gRPC vLLM or TokenSpeed).
     /// Encode workers run the vision tower and ship embeddings to prefill over Mooncake;
     /// prefill/decode reuse the PD path. Encode urls are given via `--encode <url> [bootstrap_port]`.
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
@@ -1241,6 +1243,16 @@ struct ServingArgs {
     #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
     max_connections: usize,
 
+    /// Most client connections the admin listener (--admin-port) holds open
+    /// at once, the bound --max-connections puts on the data listener: a
+    /// connection beyond it is closed at accept, unanswered, and counted in
+    /// smg_http_connections_rejected_total. 0 = no bound. The bound is the
+    /// admin listener's own, so the control plane stays reachable while the
+    /// data plane is saturated, and a client that reaches the admin listener
+    /// cannot hold it open without limit
+    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
+    admin_max_connections: usize,
+
     /// Origins a browser may call the gateway from (exact origins,
     /// space-separated), or `*` alone for any origin. Without this flag the
     /// gateway makes no cross-origin allowance
@@ -1317,7 +1329,8 @@ struct ServingArgs {
     tenant_rate_limit_config: Option<String>,
 
     // ==================== Retry Configuration ====================
-    /// Maximum number of retry attempts
+    /// Default attempts per request in all, the first one included (1 disables retries).
+    /// A worker's per-model retry override takes precedence.
     #[arg(long, default_value_t = 5, help_heading = "Retry Configuration")]
     retry_max_retries: u32,
 
@@ -1747,11 +1760,19 @@ struct IntegrationArgs {
     jwt_role_mapping: Vec<String>,
 
     /// API keys for control plane access (format: id:name:role:key; role `admin` reaches every
-    /// control plane route, `user` the read-only GET/HEAD routes)
-    #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS", hide_env_values = true, help_heading = "Control Plane Authentication")]
+    /// control plane route, `user` the read-only GET/HEAD routes). Also read from the environment
+    /// (CONTROL_PLANE_API_KEYS, entries separated by ',' or a newline) or a file
+    /// (--control-plane-api-keys-file); the flag beats the environment, and entries together
+    /// with a file are refused
+    #[arg(long = "control-plane-api-keys", action = ArgAction::Append, help_heading = "Control Plane Authentication")]
     control_plane_api_keys: Vec<String>,
 
-    /// Disable audit logging for control plane operations
+    /// File holding the control-plane API keys, one id:name:role:key per line (blank lines and
+    /// lines starting with # are skipped), such as a mounted secret (env: CONTROL_PLANE_API_KEYS_FILE)
+    #[arg(long, help_heading = "Control Plane Authentication")]
+    control_plane_api_keys_file: Option<PathBuf>,
+
+    /// Disable the control-plane audit lines (the admission line and the mutation outcome line)
     #[arg(
         long,
         default_value_t = false,
@@ -1783,10 +1804,35 @@ struct IntegrationArgs {
     #[arg(skip)]
     secret_sources: SecretSources,
 
+    /// The files the keys above were read from, where a file was the
+    /// source, filled by `resolve_secret_sources` for the reload route; not
+    /// a flag.
+    #[arg(skip)]
+    secret_files: SecretFiles,
+
+    /// Watch the key files (`--api-key-file`, `--tenant-api-keys-file`,
+    /// `--control-plane-api-keys-file`) and put a changed file's keys in
+    /// force, as `POST /secrets/reload` does: a mounted secret rotated in
+    /// place takes effect without a restart. Off by default; a start with no
+    /// key file has nothing to watch and says so.
+    #[arg(
+        long,
+        default_value_t = false,
+        help_heading = "Control Plane Authentication"
+    )]
+    secrets_auto_reload: bool,
+
     // ==================== Mesh Server ====================
+    /// Start the mesh: several gateways find each other, keep one membership
+    /// table and replicate the workers each of them registered locally.
     #[arg(long, default_value_t = false)]
     enable_mesh: bool,
 
+    /// This node's name in the mesh: the owner stamped on the worker keys it
+    /// publishes, the `peer` of its metrics and log lines. Give it a name
+    /// that survives restarts (the chart passes the pod's); the default,
+    /// `Mesh_` and four random characters, does not, and the old name stays
+    /// in the members' tables.
     #[arg(long)]
     mesh_server_name: Option<String>,
 
@@ -1800,10 +1846,17 @@ struct IntegrationArgs {
     #[arg(long)]
     mesh_advertise_host: Option<String>,
 
+    /// The mesh listener's port, advertised with `--mesh-advertise-host`;
+    /// must differ from the other listeners' ports and cannot be 0.
     #[arg(long, default_value_t = 39527)]
     mesh_port: u16,
 
-    #[arg(long, num_args = 0..)]
+    /// Where to join, as `ip:port` of other members' mesh listeners,
+    /// space- or comma-separated: while the membership table holds nobody
+    /// else, the entries are dialed in turn under the retry backoff until
+    /// one answers, and the rest of the mesh is learned from that member. On
+    /// Kubernetes `--router-selector` finds the members instead.
+    #[arg(long, num_args = 0.., value_delimiter = ',')]
     mesh_peer_urls: Vec<String>,
 
     /// The CA certificate (PEM) the mesh peers' certificates chain to. With
@@ -2179,6 +2232,14 @@ mod tests {
                 vec!["--storage-context-headers", "noeq"],
                 "storage_context_headers",
             ),
+            (vec!["--selector", "app=engine", "tier"], "selector"),
+            (vec!["--selector", "=engine"], "selector"),
+            (vec!["--selector", "app=engine tier"], "selector"),
+            (vec!["--selector", " "], "selector"),
+            (vec!["--encode-selector", "noeq"], "encode_selector"),
+            (vec!["--prefill-selector", "noeq"], "prefill_selector"),
+            (vec!["--decode-selector", "noeq"], "decode_selector"),
+            (vec!["--router-selector", "noeq"], "router_selector"),
             (
                 vec!["--request-id-headers", "bad header"],
                 "request_id_headers",
@@ -2211,6 +2272,13 @@ mod tests {
             "1",
             "--storage-context-headers",
             "x-tenant=tenant",
+            "--selector",
+            "app=engine",
+            "tier=prod",
+            "--prefill-selector",
+            "app=engine role=prefill",
+            "--router-selector",
+            "role=router",
             "--request-id-headers",
             "x-request-id",
             "--api-key",
@@ -2480,6 +2548,80 @@ mod tests {
                 other => panic!("expected {value} refused by name, got {other:?}"),
             }
         }
+    }
+
+    /// Every `--mesh-peer-urls` entry is a join peer, in the order given; an
+    /// entry that is no socket address is refused by name, whatever its
+    /// position.
+    #[test]
+    fn every_mesh_peer_url_is_a_join_peer_and_a_bad_one_is_refused_by_name() {
+        let mesh = cli_args_from(&[
+            "--enable-mesh",
+            "--mesh-host",
+            "127.0.0.1",
+            "--mesh-peer-urls",
+            "10.0.0.2:39527",
+            "10.0.0.3:39527",
+        ])
+        .build_mesh_server_config()
+        .expect("a valid mesh configuration")
+        .expect("the mesh is on");
+        let expected: Vec<std::net::SocketAddr> = vec![
+            "10.0.0.2:39527".parse().unwrap(),
+            "10.0.0.3:39527".parse().unwrap(),
+        ];
+        assert_eq!(mesh.init_peers, expected, "every entry, in order");
+
+        let err = cli_args_from(&[
+            "--enable-mesh",
+            "--mesh-host",
+            "127.0.0.1",
+            "--mesh-peer-urls",
+            "10.0.0.2:39527",
+            "not-an-address",
+        ])
+        .build_mesh_server_config()
+        .err()
+        .expect("a second entry that is no socket address must be refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("mesh_peer_urls") && text.contains("not-an-address"),
+            "the refusal names the field and the value: {text}"
+        );
+    }
+
+    /// The peer URLs may stand as separate values or as one comma-separated
+    /// list; both read as the same join peers, in the order given.
+    #[test]
+    fn mesh_peer_urls_parse_the_same_comma_separated_and_as_separate_values() {
+        let init_peers = |peer_args: &[&str]| {
+            let mut args = vec![
+                "--enable-mesh",
+                "--mesh-host",
+                "127.0.0.1",
+                "--mesh-peer-urls",
+            ];
+            args.extend_from_slice(peer_args);
+            cli_args_from(&args)
+                .build_mesh_server_config()
+                .expect("a valid mesh configuration")
+                .expect("the mesh is on")
+                .init_peers
+        };
+        let expected: Vec<std::net::SocketAddr> = vec![
+            "10.0.0.2:39527".parse().unwrap(),
+            "10.0.0.3:39527".parse().unwrap(),
+        ];
+        assert_eq!(
+            init_peers(&["10.0.0.2:39527", "10.0.0.3:39527"]),
+            expected,
+            "separate values, in order"
+        );
+        assert_eq!(
+            init_peers(&["10.0.0.2:39527,10.0.0.3:39527"]),
+            expected,
+            "one comma-separated list reads as the same join peers"
+        );
     }
 
     /// Mesh bind and advertise hosts go through the shared bind-host rule, so
@@ -2989,6 +3131,19 @@ mod tests {
         assert_eq!(defaults.max_connections, 0);
     }
 
+    /// `--admin-max-connections` is the admin listener's own bound and must
+    /// flow into `RouterConfig`; without the flag there is no bound.
+    #[test]
+    fn admin_max_connections_flag_flows_into_router_config() {
+        let bounded = cli_args_from(&["--admin-max-connections", "64"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert_eq!(bounded.admin_max_connections, 64);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.admin_max_connections, 0);
+    }
+
     /// The SSE keep-alive interval is a router-only setting and must flow
     /// into `RouterConfig`; it is on by default.
     #[test]
@@ -3138,6 +3293,46 @@ mod tests {
         let server = cli.to_server_config(router).unwrap();
         assert!(server.service_discovery_config.is_some());
         assert!(server.mesh_discovery_config.is_none());
+    }
+
+    /// One selector argument may carry several `key=value` pairs separated
+    /// by whitespace, the form a quoted chart value passes; the CLI reads
+    /// them as the launcher does, into one map.
+    #[test]
+    fn service_discovery_selector_reads_several_pairs_in_one_argument() {
+        let cli = cli_args_from(&[
+            "--service-discovery",
+            "--selector",
+            "app=engine role=prefill",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        let server = cli.to_server_config(router).unwrap();
+        let RuntimeDiscoveryConfig::Kubernetes(discovery) = server
+            .service_discovery_config
+            .expect("service discovery config")
+        else {
+            panic!("the selector configures Kubernetes discovery");
+        };
+        assert_eq!(
+            discovery.selector.get("app").map(String::as_str),
+            Some("engine")
+        );
+        assert_eq!(
+            discovery.selector.get("role").map(String::as_str),
+            Some("prefill")
+        );
+    }
+
+    /// The refusal names the offending token, the text the launcher prints
+    /// for the same line.
+    #[test]
+    fn a_bad_selector_token_is_named_in_the_refusal() {
+        let error = cli_args_from(&["--selector", "app=engine tier"])
+            .to_router_config(vec![], vec![])
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("tier - expected 'key=value'"), "{text}");
+        assert!(!text.contains("app=engine tier -"), "{text}");
     }
 
     /// The router selector reaches the new independent mesh task unchanged.
@@ -4510,6 +4705,10 @@ mod tests {
                 "SMG_REDIS_URL",
                 "redis://:env-redis-pass@cache.example:6379/0",
             ),
+            (
+                "CONTROL_PLANE_API_KEYS",
+                "ops:Ops:admin:env-ops-key, ro:Read:user:env-ro-key",
+            ),
         ];
 
         let cli = resolved(&["--history-backend", "postgres"], &vars).expect("resolves");
@@ -4517,6 +4716,10 @@ mod tests {
         assert_eq!(
             cli.integrations.tenant_api_keys,
             vec!["red:env-red", "blue:env-blue", "green:env-green"]
+        );
+        assert_eq!(
+            cli.integrations.control_plane_api_keys,
+            vec!["ops:Ops:admin:env-ops-key", "ro:Read:user:env-ro-key"]
         );
         assert_eq!(
             cli.integrations.postgres_db_url.as_deref(),
@@ -4527,9 +4730,21 @@ mod tests {
             SecretSources {
                 api_key: Some(SecretSource::Environment),
                 tenant_api_keys: Some((SecretSource::Environment, 3)),
+                control_plane_api_keys: Some((SecretSource::Environment, 2)),
                 postgres_db_url: Some(SecretSource::Environment),
                 redis_url: None,
             }
+        );
+        let control_plane = cli
+            .build_control_plane_auth_config()
+            .expect("the resolved entries build the control-plane configuration");
+        assert_eq!(
+            control_plane
+                .api_keys
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ops", "ro"]
         );
         let config = cli
             .to_router_config(vec![], vec![])
@@ -4640,6 +4855,7 @@ mod tests {
         let vars = [
             ("SMG_API_KEY", "env-shared-key"),
             ("SMG_TENANT_API_KEYS", "red:env-red"),
+            ("CONTROL_PLANE_API_KEYS", "ops:Ops:admin:env-ops-key"),
             (
                 "SMG_POSTGRES_DB_URL",
                 "postgresql://u:env@db.example:5432/smg",
@@ -4651,6 +4867,8 @@ mod tests {
                 "flag-shared-key",
                 "--tenant-api-key",
                 "blue:flag-blue",
+                "--control-plane-api-keys",
+                "ci:CI:admin:flag-ci-key",
                 "--history-backend",
                 "postgres",
                 "--postgres-db-url",
@@ -4663,6 +4881,10 @@ mod tests {
         assert_eq!(cli.integrations.api_key.as_deref(), Some("flag-shared-key"));
         assert_eq!(cli.integrations.tenant_api_keys, vec!["blue:flag-blue"]);
         assert_eq!(
+            cli.integrations.control_plane_api_keys,
+            vec!["ci:CI:admin:flag-ci-key"]
+        );
+        assert_eq!(
             cli.integrations.postgres_db_url.as_deref(),
             Some("postgresql://u:flag@db.example:5432/smg")
         );
@@ -4671,6 +4893,7 @@ mod tests {
             SecretSources {
                 api_key: Some(SecretSource::Flag),
                 tenant_api_keys: Some((SecretSource::Flag, 1)),
+                control_plane_api_keys: Some((SecretSource::Flag, 1)),
                 postgres_db_url: Some(SecretSource::Flag),
                 redis_url: None,
             }
@@ -4684,6 +4907,7 @@ mod tests {
 
         assert_eq!(cli.integrations.api_key, None);
         assert!(cli.integrations.tenant_api_keys.is_empty());
+        assert!(cli.integrations.control_plane_api_keys.is_empty());
         assert_eq!(cli.integrations.postgres_db_url, None);
         assert_eq!(cli.integrations.redis_url, None);
         assert_eq!(cli.integrations.secret_sources, SecretSources::default());
@@ -4701,7 +4925,13 @@ mod tests {
         let tenants = dir.path().join("tenants");
         let pg = dir.path().join("pg-url");
         let redis = dir.path().join("redis-url");
+        let operators = dir.path().join("control-plane-keys");
         std::fs::write(&api_key, "file-shared-key\n").unwrap();
+        std::fs::write(
+            &operators,
+            "# the operators\n\nops:Ops:admin:file-ops-key\r\n  ro:Read:user:file-ro-key  \n",
+        )
+        .unwrap();
         std::fs::write(
             &tenants,
             "# the tenants\r\n\nred:file-red\r\n  blue : file-blue  \n\n# trailing comment\n",
@@ -4709,11 +4939,12 @@ mod tests {
         .unwrap();
         std::fs::write(&pg, "postgresql://u:file-pg@db.example:5432/smg").unwrap();
         std::fs::write(&redis, "  redis://:file-redis@cache.example:6379/1\n\n").unwrap();
-        let (api_key, tenants, pg, redis) = (
+        let (api_key, tenants, pg, redis, operators) = (
             api_key.to_str().unwrap(),
             tenants.to_str().unwrap(),
             pg.to_str().unwrap(),
             redis.to_str().unwrap(),
+            operators.to_str().unwrap(),
         );
 
         let by_flag = resolved(
@@ -4722,6 +4953,8 @@ mod tests {
                 api_key,
                 "--tenant-api-keys-file",
                 tenants,
+                "--control-plane-api-keys-file",
+                operators,
                 "--history-backend",
                 "postgres",
                 "--postgres-db-url-file",
@@ -4739,6 +4972,10 @@ mod tests {
             vec!["red:file-red", "blue : file-blue"]
         );
         assert_eq!(
+            by_flag.integrations.control_plane_api_keys,
+            vec!["ops:Ops:admin:file-ops-key", "ro:Read:user:file-ro-key"]
+        );
+        assert_eq!(
             by_flag.integrations.postgres_db_url.as_deref(),
             Some("postgresql://u:file-pg@db.example:5432/smg")
         );
@@ -4747,10 +4984,16 @@ mod tests {
             SecretSources {
                 api_key: Some(SecretSource::File),
                 tenant_api_keys: Some((SecretSource::File, 2)),
+                control_plane_api_keys: Some((SecretSource::File, 2)),
                 postgres_db_url: Some(SecretSource::File),
                 redis_url: None,
             }
         );
+        let control_plane = by_flag
+            .build_control_plane_auth_config()
+            .expect("the file's entries build the control-plane configuration");
+        assert_eq!(control_plane.api_keys.len(), 2);
+        assert_eq!(control_plane.api_keys[1].id, "ro");
         let config = by_flag.to_router_config(vec![], vec![]).expect("builds");
         assert_eq!(
             config
@@ -4766,6 +5009,7 @@ mod tests {
             &[
                 ("SMG_API_KEY_FILE", api_key),
                 ("SMG_TENANT_API_KEYS_FILE", tenants),
+                ("CONTROL_PLANE_API_KEYS_FILE", operators),
                 ("SMG_REDIS_URL_FILE", redis),
             ],
         )
@@ -4775,6 +5019,7 @@ mod tests {
             Some("file-shared-key")
         );
         assert_eq!(by_env.integrations.tenant_api_keys.len(), 2);
+        assert_eq!(by_env.integrations.control_plane_api_keys.len(), 2);
         assert_eq!(
             by_env.integrations.redis_url.as_deref(),
             Some("redis://:file-redis@cache.example:6379/1")
@@ -4784,6 +5029,7 @@ mod tests {
             SecretSources {
                 api_key: Some(SecretSource::File),
                 tenant_api_keys: Some((SecretSource::File, 2)),
+                control_plane_api_keys: Some((SecretSource::File, 2)),
                 postgres_db_url: None,
                 redis_url: Some(SecretSource::File),
             }
@@ -4840,6 +5086,21 @@ mod tests {
             ),
             (
                 vec![
+                    "--control-plane-api-keys",
+                    "ci:CI:admin:flag-secret",
+                    "--control-plane-api-keys-file",
+                    file,
+                ],
+                vec![],
+                "--control-plane-api-keys",
+            ),
+            (
+                vec!["--control-plane-api-keys-file", file],
+                vec![("CONTROL_PLANE_API_KEYS", "ci:CI:admin:env-secret")],
+                "--control-plane-api-keys",
+            ),
+            (
+                vec![
                     "--history-backend",
                     "postgres",
                     "--postgres-db-url",
@@ -4877,7 +5138,10 @@ mod tests {
                     "{args:?}: {named} missing from {text}"
                 );
             }
-            assert!(text.contains("SMG_"), "{args:?}: {text}");
+            assert!(
+                text.contains("SMG_") || text.contains("CONTROL_PLANE_API_KEYS"),
+                "{args:?}: {text}"
+            );
             for secret in ["flag-secret", "env-secret", "file-secret"] {
                 assert!(!text.contains(secret), "{args:?}: {text}");
             }
@@ -4923,6 +5187,16 @@ mod tests {
             (
                 vec!["--tenant-api-keys-file".into(), path(&missing)],
                 "tenant-api-keys-file",
+                "cannot be read",
+            ),
+            (
+                vec!["--control-plane-api-keys-file".into(), path(&comments_only)],
+                "control-plane-api-keys-file",
+                "holds no entry",
+            ),
+            (
+                vec!["--control-plane-api-keys-file".into(), path(&missing)],
+                "control-plane-api-keys-file",
                 "cannot be read",
             ),
             (
@@ -5034,6 +5308,7 @@ mod tests {
             SecretSources {
                 api_key: Some(SecretSource::File),
                 tenant_api_keys: Some((SecretSource::Environment, 1)),
+                control_plane_api_keys: None,
                 postgres_db_url: None,
                 redis_url: None,
             }
@@ -5054,16 +5329,15 @@ mod tests {
         use clap::CommandFactory;
 
         let mut command = Cli::command();
-        for id in ["oracle_password", "control_plane_api_keys"] {
-            let arg = command
-                .get_arguments()
-                .find(|arg| arg.get_id().as_str() == id)
-                .unwrap_or_else(|| panic!("{id} is an argument"));
-            assert!(
-                arg.is_hide_env_values_set(),
-                "{id} would show its environment value in the help"
-            );
-        }
+        let id = "oracle_password";
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id().as_str() == id)
+            .unwrap_or_else(|| panic!("{id} is an argument"));
+        assert!(
+            arg.is_hide_env_values_set(),
+            "{id} would show its environment value in the help"
+        );
         let help = command.render_long_help().to_string();
 
         for named in [
@@ -5077,7 +5351,9 @@ mod tests {
             "SMG_REDIS_URL",
             "--redis-url-file",
             "[env: ATP_PASSWORD]",
-            "[env: CONTROL_PLANE_API_KEYS]",
+            "CONTROL_PLANE_API_KEYS",
+            "--control-plane-api-keys-file",
+            "CONTROL_PLANE_API_KEYS_FILE",
         ] {
             assert!(help.contains(named), "{named} missing from the help");
         }

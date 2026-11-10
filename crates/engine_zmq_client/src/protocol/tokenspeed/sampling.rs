@@ -75,8 +75,8 @@ pub struct SamplingParams {
     pub custom_params: Option<OpaqueValue>,
     /// Streaming flush interval override. Not set by SMG.
     pub stream_interval: Option<u32>,
-    /// Per-token logit bias, keyed by stringified token id. SMG rejects
-    /// logit_bias upstream (no support on this backend).
+    /// Per-token logit bias, keyed by stringified token id, as the chat and
+    /// completion requests carry it (validated to -100..=100 at the gateway).
     pub logit_bias: Option<HashMap<String, f64>>,
     /// Random seed. `None` lets the engine derive one from the rid so all
     /// TP/DP ranks agree.

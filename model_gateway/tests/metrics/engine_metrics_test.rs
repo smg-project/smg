@@ -39,7 +39,7 @@ async fn engine_pd_gauge_appears_on_metrics_endpoint() {
     };
     Metrics::record_engine_load(WORKER, "test-model", &response);
 
-    let body = smg::clients::http_client()
+    let body = smg::server::http_client()
         .get(format!("http://{addr}/metrics"))
         .send()
         .await

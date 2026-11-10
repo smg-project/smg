@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::grpc_harness::{grpc_router_config, grpc_test_context, grpc_worker};
+use common::grpc_harness::{free_port, grpc_router_config, grpc_test_context, grpc_worker};
 use openai_protocol::{completion::CompletionRequest, model_card::ModelCard, worker::WorkerStatus};
 use smg::{
     app_context::AppContext,
@@ -108,7 +108,7 @@ impl MockEngine {
                 let _ = admin_stopped.await;
             },
         ));
-        let client = smg::clients::http_client_builder()
+        let client = smg::server::http_client_builder()
             .no_proxy()
             .build()
             .expect("test client");
@@ -158,28 +158,6 @@ impl MockEngine {
             let _ = served.await;
             let _ = admin.await;
         }
-    }
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test helper: a port the OS cannot hand out fails the fixture"
-)]
-async fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("ephemeral port address")
-        .port()
-}
-
-/// Wait for `done`, within `bound`.
-async fn wait_until(what: &str, bound: Duration, mut done: impl FnMut() -> bool) {
-    let started = Instant::now();
-    while !done() {
-        assert!(started.elapsed() < bound, "{what}: not within {bound:?}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -324,7 +302,7 @@ async fn a_kernel_built_for_a_new_shape_is_not_a_wedge() {
     let (router, worker) = (bed.router.as_ref(), &bed.worker);
 
     assert_eq!(request_status(router, SHORT_PROMPT).await, 200);
-    wait_until(
+    common::wait_until(
         "the worker's stream pushes load records",
         Duration::from_secs(10),
         || worker.pushes_load_records(),
@@ -380,7 +358,7 @@ async fn a_frozen_engine_on_a_shape_shown_is_still_vetoed_within_the_budget() {
     let (router, worker) = (bed.router.as_ref(), &bed.worker);
 
     assert_eq!(request_status(router, LONG_PROMPT).await, 200);
-    wait_until(
+    common::wait_until(
         "the worker's stream pushes load records",
         Duration::from_secs(10),
         || worker.pushes_load_records(),
@@ -419,7 +397,7 @@ async fn a_frozen_engine_on_a_shape_shown_is_still_vetoed_within_the_budget() {
         at >= WEDGE && at <= VERDICT_BOUND,
         "vetoed {at:?} after the dispatch: the budget is {WEDGE:?}"
     );
-    wait_until("the re-admission", SERVED_BOUND, || {
+    common::wait_until("the re-admission", SERVED_BOUND, || {
         worker.stall_reason().is_none()
     })
     .await;

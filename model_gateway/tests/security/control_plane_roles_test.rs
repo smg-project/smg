@@ -1,5 +1,7 @@
 //! Control-plane role matrix on the production route table: `admin` reaches
-//! every route, `user` the read-only ones, and no or an unknown key none.
+//! every route, `user` the read-only ones, and no or an unknown key none;
+//! the gated routes, mounted only behind control-plane authentication, are
+//! the server's own list and `admin` alone reaches them.
 
 use axum::{
     body::Body,
@@ -10,6 +12,7 @@ use axum::{
     },
     Router,
 };
+use smg::server::GATED_ROUTES;
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, ControlPlaneAuthState, Role};
 use tower::ServiceExt;
 
@@ -18,7 +21,7 @@ use crate::common::{
     TestWorkerConfig,
 };
 
-const ADMIN_KEY: &str = "matrix-admin-key";
+pub(super) const ADMIN_KEY: &str = "matrix-admin-key";
 const USER_KEY: &str = "matrix-user-key";
 
 /// Read-only control-plane routes: the `user` role reaches them.
@@ -40,7 +43,7 @@ const WRITE_ROUTES: &[(&str, &str)] = &[
     ("POST", "/heap_profile"),
 ];
 
-fn control_plane_auth() -> ControlPlaneAuthState {
+pub(super) fn control_plane_auth() -> ControlPlaneAuthState {
     ControlPlaneAuthState::new(
         ControlPlaneAuthConfig {
             jwt: None,
@@ -58,7 +61,12 @@ fn control_plane_auth() -> ControlPlaneAuthState {
     clippy::unwrap_used,
     reason = "test helper: a malformed request is a test bug"
 )]
-async fn status(app: &Router, method: &str, path: &str, key: Option<&str>) -> StatusCode {
+pub(super) async fn status(
+    app: &Router,
+    method: &str,
+    path: &str,
+    key: Option<&str>,
+) -> StatusCode {
     let mut request = Request::builder()
         .method(method)
         .uri(path)
@@ -123,6 +131,40 @@ async fn control_plane_role_matrix() {
             status(&app, method, path, Some(USER_KEY)).await,
             StatusCode::FORBIDDEN,
             "{method} {path} with the user key"
+        );
+    }
+
+    // The gated routes: the server's own list, mounted here because
+    // control-plane authentication is configured; `admin` alone reads them.
+    assert!(!GATED_ROUTES.is_empty(), "the gated group has a member");
+    for (method, path) in GATED_ROUTES {
+        assert_eq!(
+            status(&app, method, path, None).await,
+            StatusCode::UNAUTHORIZED,
+            "{method} {path} without a key"
+        );
+        assert_eq!(
+            status(&app, method, path, Some("not-a-configured-key")).await,
+            StatusCode::UNAUTHORIZED,
+            "{method} {path} with an unknown key"
+        );
+        assert_eq!(
+            status(&app, method, path, Some(USER_KEY)).await,
+            StatusCode::FORBIDDEN,
+            "{method} {path} with the user key"
+        );
+        // The gate passed, the route answers for itself (a reload with no
+        // file configured is a 409 here; its own test has the 200).
+        let admin = status(&app, method, path, Some(ADMIN_KEY)).await;
+        assert!(
+            !matches!(
+                admin,
+                StatusCode::UNAUTHORIZED
+                    | StatusCode::FORBIDDEN
+                    | StatusCode::NOT_FOUND
+                    | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "{method} {path} with the admin key passes the gate: {admin}"
         );
     }
 

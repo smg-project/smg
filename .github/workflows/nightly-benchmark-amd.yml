@@ -103,7 +103,10 @@ jobs:
     container:
       image: ${{ matrix.variant.image }}
       options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
-    timeout-minutes: 1440
+    # Three retained Sunday runs peaked at 4h09m11s per GPU job. Bound the
+    # job to six hours; host admission must also budget preparation/cleanup
+    # and wait if the whole occupancy would cross Router's 05:00 UTC start.
+    timeout-minutes: 360
     env:
       # Each job starts in a fresh container, so an engine's first start
       # compiles its kernels: SGLang's first Qwen3-30B-A3B worker takes about
@@ -223,7 +226,10 @@ jobs:
     container:
       image: ${{ matrix.variant.image }}
       options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
-    timeout-minutes: 1440
+    # Three retained Sunday runs peaked at 4h09m11s per GPU job. Bound the
+    # job to six hours; host admission must also budget preparation/cleanup
+    # and wait if the whole occupancy would cross Router's 05:00 UTC start.
+    timeout-minutes: 360
     env:
       E2E_STARTUP_TIMEOUT: "900" # as in single-worker
     strategy:

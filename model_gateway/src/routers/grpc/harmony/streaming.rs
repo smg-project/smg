@@ -34,17 +34,18 @@ use crate::{
     routers::{
         common::{
             openai_bridge::{self, descriptor, FormatRegistry, ResponseFormat},
-            sse::{sse_channel, SseEncoder, SseSender},
+            sse::{SseEncoder, SseSender},
         },
         grpc::{
             common::{
                 response_collection::drain_prefill,
-                response_formatting::{CompletionTokenTracker, TokenCounts},
+                response_formatting::{known_spec_drafted, CompletionTokenTracker, TokenCounts},
                 responses::{
-                    body_guards, build_sse_response_guarded,
+                    body_guards, build_sse_response_driven, driven_channel,
                     streaming::{
                         attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter,
                     },
+                    Reading,
                 },
             },
             context,
@@ -52,6 +53,7 @@ use crate::{
                 ProtoGenerateComplete, ProtoGenerateResponse, ProtoGenerateStreamChunk,
                 ProtoResponseVariant, ProtoStream,
             },
+            regular::streaming::ChatChunkWithUsage,
             utils,
         },
     },
@@ -131,11 +133,11 @@ impl HarmonyStreamingProcessor {
     /// The `load_guards` (and the reservation's safety net) ride in the
     /// response body, released when it is dropped: at the stream's end or
     /// the client's disconnect.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "streaming tasks are fire-and-forget by design; client disconnect terminates them"
-    )]
     #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::unused_async,
+        reason = "async for API consistency with the collected-response entry points: the stages await either"
+    )]
     /// `router_stop_strings` is non-empty only when the router must enforce
     /// string `stop` sequences itself (direct-ZMQ backends: the engine sees
     /// token ids only).
@@ -151,90 +153,101 @@ impl HarmonyStreamingProcessor {
     ) -> Response {
         let source = source.with_backend(metrics_labels::BACKEND_HARMONY);
         let guards = body_guards(load_guards, reservation.as_ref());
-        // Create SSE channel
-        let (tx, rx) = sse_channel();
+        // The body's channel (see `driven_channel`).
+        let (tx, rx) = driven_channel();
         // Read for this client: the moment the response body is dropped, the
         // request is aborted on the engine (see `ProtoStream::until_client_gone`).
         let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
-        // Spawn background task based on execution mode
-        match execution_result {
-            context::ExecutionResult::Single { stream } => {
-                tokio::spawn(async move {
-                    let result = Self::process_single_stream(
-                        stream,
-                        dispatch,
-                        chat_request,
-                        &tx,
-                        router_stop_strings,
-                        reservation,
-                    )
-                    .await;
+        // The reading of the engine's answer, by execution mode; the response
+        // body drives it (see `DrivenBody`).
+        let reading: Reading = match execution_result {
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start,
+            } => Box::pin(async move {
+                // The request's reading, isolated: a panic in it ends this
+                // response with an error event and `[DONE]`, not the task
+                // polling the body (see `utils::isolation`).
+                let result = utils::isolation::isolated(Self::process_single_stream(
+                    dispatch_start,
+                    stream,
+                    dispatch,
+                    chat_request,
+                    &tx,
+                    router_stop_strings,
+                    reservation,
+                ))
+                .await
+                .unwrap_or_else(|panicked| Err(panicked.into()));
 
-                    if let Err(failure) = result {
-                        utils::send_stream_failure(&tx, &failure, &source).await;
-                    }
+                if let Err(failure) = result {
+                    utils::send_stream_failure(&tx, &failure, &source).await;
+                }
 
-                    let _ = tx.send(Ok(SseEncoder::done())).await;
-                });
-            }
+                let _ = tx.send(Ok(SseEncoder::done())).await;
+            }),
             context::ExecutionResult::PrefillDecode {
                 prefill,
                 decode,
                 prefill_guards,
                 pd_timing,
                 ..
-            } => {
-                tokio::spawn(async move {
-                    let result = Self::process_prefill_decode_stream(
-                        prefill,
-                        *decode,
-                        dispatch,
-                        chat_request,
-                        &tx,
-                        router_stop_strings,
-                        pd_timing,
-                        prefill_guards,
-                        reservation,
-                    )
-                    .await;
+            } => Box::pin(async move {
+                let result = utils::isolation::isolated(Self::process_prefill_decode_stream(
+                    prefill,
+                    *decode,
+                    dispatch,
+                    chat_request,
+                    &tx,
+                    router_stop_strings,
+                    pd_timing,
+                    prefill_guards,
+                    reservation,
+                ))
+                .await
+                .unwrap_or_else(|panicked| Err(panicked.into()));
 
-                    if let Err(failure) = result {
-                        utils::send_stream_failure(&tx, &failure, &source).await;
-                    }
+                if let Err(failure) = result {
+                    utils::send_stream_failure(&tx, &failure, &source).await;
+                }
 
-                    let _ = tx.send(Ok(SseEncoder::done())).await;
-                });
-            }
+                let _ = tx.send(Ok(SseEncoder::done())).await;
+            }),
             context::ExecutionResult::Embedding { .. } => {
                 error!("Harmony streaming not supported for embeddings");
-                utils::send_error_sse(
-                    &tx,
-                    "Embeddings not supported in Harmony streaming",
-                    "invalid_request_error",
-                )
-                .await;
-                let _ = tx.send(Ok(SseEncoder::done())).await;
+                Box::pin(async move {
+                    utils::send_error_sse(
+                        &tx,
+                        "Embeddings not supported in Harmony streaming",
+                        "invalid_request_error",
+                    )
+                    .await;
+                    let _ = tx.send(Ok(SseEncoder::done())).await;
+                })
             }
             // Batch results exist only on the completions pipeline.
             context::ExecutionResult::Batch { .. } => {
                 error!("Harmony streaming not supported for batched results");
-                utils::send_error_sse(
-                    &tx,
-                    "Batched results not supported in Harmony streaming",
-                    "invalid_request_error",
-                )
-                .await;
-                let _ = tx.send(Ok(SseEncoder::done())).await;
+                Box::pin(async move {
+                    utils::send_error_sse(
+                        &tx,
+                        "Batched results not supported in Harmony streaming",
+                        "invalid_request_error",
+                    )
+                    .await;
+                    let _ = tx.send(Ok(SseEncoder::done())).await;
+                })
             }
-        }
+        };
 
         // Return SSE response
-        build_sse_response_guarded(rx, guards)
+        build_sse_response_driven(reading, rx, guards)
     }
 
     /// Process streaming chunks from a single stream
     async fn process_single_stream(
+        start_time: Instant,
         grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
@@ -245,6 +258,7 @@ impl HarmonyStreamingProcessor {
         let mut prompt_tokens = HashMap::new();
         let mut cached_tokens = HashMap::new();
         Self::process_chat_decode_stream(
+            start_time,
             grpc_stream,
             &dispatch,
             &original_request,
@@ -288,6 +302,7 @@ impl HarmonyStreamingProcessor {
         // Phase 2: Decode (shared helper). Pass pd_timing so the first decode
         // token yields honest PD TTFT.
         Self::process_chat_decode_stream(
+            pd_timing.prefill_start,
             decode_stream,
             &dispatch,
             &original_request,
@@ -317,6 +332,7 @@ impl HarmonyStreamingProcessor {
     /// yields honest PD TTFT (prefill start to first decode token).
     #[expect(clippy::too_many_arguments)]
     async fn process_chat_decode_stream(
+        start_time: Instant,
         mut decode_stream: ProtoStream,
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
@@ -327,7 +343,7 @@ impl HarmonyStreamingProcessor {
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
-        let mut decode = ChatDecode::new(pd_timing);
+        let mut decode = ChatDecode::new(start_time, pd_timing);
         while let Some(result) = decode_stream.next().await {
             let response = result.map_err(|e| {
                 utils::StreamFailure::upstream(e, decode.completion_tokens.delivered())
@@ -435,7 +451,10 @@ impl HarmonyStreamingProcessor {
                 .build();
 
         let sse_data = encoder
-            .encode_data(&chunk)
+            .encode_data(&ChatChunkWithUsage::new(
+                &chunk,
+                placeholder_usage(original_request),
+            ))
             .map_err(|e| format!("JSON serialization error: {e}"))?;
 
         tx.send(Ok(sse_data))
@@ -462,7 +481,10 @@ impl HarmonyStreamingProcessor {
                 .build();
 
         let sse_data = encoder
-            .encode_data(&role_chunk)
+            .encode_data(&ChatChunkWithUsage::new(
+                &role_chunk,
+                placeholder_usage(original_request),
+            ))
             .map_err(|e| format!("JSON serialization error: {e}"))?;
 
         tx.send(Ok(sse_data))
@@ -490,7 +512,10 @@ impl HarmonyStreamingProcessor {
                 .build();
 
         let sse_data = encoder
-            .encode_data(&chunk)
+            .encode_data(&ChatChunkWithUsage::new(
+                &chunk,
+                placeholder_usage(original_request),
+            ))
             .map_err(|e| format!("JSON serialization error: {e}"))?;
 
         tx.send(Ok(sse_data))
@@ -552,7 +577,7 @@ impl HarmonyStreamingProcessor {
         router_stop_strings: &[String],
     ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
         match execution_result {
-            context::ExecutionResult::Single { stream } => {
+            context::ExecutionResult::Single { stream, .. } => {
                 debug!("Processing Responses API single stream mode");
                 Self::process_decode_stream(
                     stream,
@@ -1288,7 +1313,10 @@ impl ResponsesDecode {
             cached: self.cached_tokens,
             reasoning: self.engine_reasoning_tokens,
             spec_accepted: self.spec_accepted,
-            spec_drafted: self.spec_drafted,
+            spec_drafted: known_spec_drafted(std::iter::once((
+                self.spec_accepted,
+                self.spec_drafted,
+            ))),
         }
     }
 
@@ -1393,9 +1421,9 @@ struct ChatDecode {
 }
 
 impl ChatDecode {
-    fn new(pd_timing: Option<context::PdTiming>) -> Self {
+    fn new(start_time: Instant, pd_timing: Option<context::PdTiming>) -> Self {
         Self {
-            start_time: Instant::now(),
+            start_time,
             first_token_time: None,
             pd_timing,
             parsers: HashMap::new(),
@@ -1520,12 +1548,13 @@ impl ChatDecode {
 
         self.completion_tokens.record_chunk(chunk);
 
-        // Convert logprobs if present and requested
+        // Convert logprobs if present and requested, with the candidates the
+        // request's `top_logprobs` asked for.
         let chunk_logprobs = if original_request.logprobs {
             let encoding = try_harmony_encoding()?;
             chunk
                 .output_logprobs()
-                .map(|lp| convert_harmony_logprobs(encoding, lp))
+                .map(|lp| convert_harmony_logprobs(encoding, lp, original_request.top_logprobs))
         } else {
             None
         };
@@ -1790,7 +1819,22 @@ impl ChatDecode {
             cached: cached_tokens.values().copied().max().unwrap_or(0),
             reasoning: self.reasoning_tokens.values().sum(),
             spec_accepted: self.spec_accepted.values().sum(),
-            spec_drafted: self.spec_drafted.values().sum(),
+            spec_drafted: known_spec_drafted(
+                // Include requested and observed choices, not only those with a Complete.
+                // A chunk-only/missing terminal choice has unknown proposal accounting.
+                (0..original_request.choices())
+                    .chain(self.parsers.keys().copied())
+                    .chain(self.spec_accepted.keys().copied())
+                    .chain(self.spec_drafted.keys().copied())
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .map(|index| {
+                        (
+                            self.spec_accepted.get(&index).copied().unwrap_or(0),
+                            self.spec_drafted.get(&index).copied().unwrap_or(0),
+                        )
+                    }),
+            ),
         };
 
         if let Some(handle) = reservation {
@@ -1833,16 +1877,9 @@ impl ChatDecode {
             .await?;
         }
 
-        // In PD mode this task only starts once the decode stream exists -- for sequential PD
-        // that is after prefill completes, with the first decode chunk already buffered -- so
-        // `start_time` would report a near-zero TTFT. Anchor at the prefill dispatch instant
-        // instead, as the chat stream does; generation duration must share the base or TPOT
-        // underflows.
-        let stream_base = self
-            .pd_timing
-            .as_ref()
-            .map(|timing| timing.prefill_start)
-            .unwrap_or(self.start_time);
+        // Headers may arrive with the first chunk. Both clocks start at the
+        // dispatch carried in `start_time` (the prefill dispatch for PD).
+        let stream_base = self.start_time;
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: metrics_labels::BACKEND_HARMONY,
@@ -1863,6 +1900,16 @@ impl Default for HarmonyStreamingProcessor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether the chunks before the usage-only one carry the `usage: null`
+/// placeholder the public API writes under `stream_options.include_usage`
+/// (the regular chat stream's rule, applied to this pipeline's chunks).
+fn placeholder_usage(request: &ChatCompletionRequest) -> bool {
+    request
+        .stream_options
+        .as_ref()
+        .is_some_and(|opts| opts.include_usage.unwrap_or(false))
 }
 
 #[cfg(test)]

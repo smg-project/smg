@@ -147,10 +147,15 @@ class TestRouterArgs:
         assert result == {}
 
     def test_parse_selector_invalid(self):
-        """Test parsing invalid selector arguments."""
-        # Test malformed selector (no equals sign)
-        result = RouterArgs._parse_selector(["app"])
-        assert result == {}
+        """An entry without '=' or without a key is refused by the field's name;
+        the first '=' splits a value that holds another."""
+        refusal = "Invalid value for field 'selector': app - expected 'key=value'"
+        with pytest.raises(ValueError, match=re.escape(refusal)):
+            RouterArgs._parse_selector(["app"])
+
+        refusal = "Invalid value for field 'prefill_selector': =prefill - expected 'key=value'"
+        with pytest.raises(ValueError, match=re.escape(refusal)):
+            RouterArgs._parse_selector(["=prefill"], "prefill_selector")
 
         # Test multiple equals signs (should use first one)
         result = RouterArgs._parse_selector(["app=worker=extra"])
@@ -611,6 +616,14 @@ class TestBackendChoices:
     def test_every_cli_backend_parses_and_converts(self, name):
         assert parse_router_args(["--backend", name]).backend == name
         assert backend_from_str(name) == getattr(BackendType, name.capitalize())
+
+    def test_no_backend_is_the_default_and_pins_no_wire(self):
+        """Without ``--backend`` the launcher names no engine, as the Rust CLI: a ZMQ
+        worker's wire is left to the gateway's detection step (it used to be pinned
+        to SGLang here and to vLLM EngineCore by the binary)."""
+        assert RouterArgs().backend is None
+        assert parse_router_args([]).backend is None
+        assert backend_from_str(None) is None
 
 
 class TestParseRouterArgs:
@@ -1947,6 +1960,21 @@ class TestMaxConnections:
             parse_router_args(["--max-connections", "-1"])
 
 
+class TestAdminMaxConnections:
+    """The admin listener's own connection bound: no bound by default, a
+    bound parses, a negative count is refused by the parser."""
+
+    def test_default_is_no_bound(self):
+        assert parse_router_args([]).admin_max_connections == 0
+
+    def test_flag_parses(self):
+        assert parse_router_args(["--admin-max-connections", "64"]).admin_max_connections == 64
+
+    def test_negative_is_refused(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--admin-max-connections", "-1"])
+
+
 class TestPrometheusHostDefault:
     """--prometheus-host is unset by default: the router derives the metrics
     bind address from --host's family (:: for an IPv6 host, 0.0.0.0 otherwise)
@@ -2108,12 +2136,52 @@ class TestStorageContextHeadersEntries:
         )
         assert router_args.storage_context_headers == {"x-tenant": "tenant_id", "x-user": "user=v2"}
 
-    def test_label_selectors_keep_skipping_a_bare_token(self):
-        # The Rust CLI skips a selector token without '=' too; only the header
-        # mapping is refused by it.
-        assert parse_router_args(["--selector", "app", "tier=engine"]).selector == {
-            "tier": "engine"
-        }
+
+class TestDiscoverySelectorEntries:
+    """A discovery selector entry without '=' is refused with the Rust CLI's
+    message, where it used to be skipped and the selector that remained matched
+    more pods than the line said."""
+
+    SELECTOR_FLAGS = [
+        "--selector",
+        "--encode-selector",
+        "--prefill-selector",
+        "--decode-selector",
+        "--router-selector",
+    ]
+
+    @pytest.mark.parametrize("flag", SELECTOR_FLAGS)
+    def test_entry_without_equals_is_refused(self, flag):
+        field = flag.lstrip("-").replace("-", "_")
+        refusal = f"Invalid value for field '{field}': tier - expected 'key=value'"
+        with pytest.raises(ValueError, match=re.escape(refusal)):
+            parse_router_args([flag, "app=engine", "tier"])
+
+    def test_entry_without_a_key_is_refused(self):
+        refusal = "Invalid value for field 'selector': =engine - expected 'key=value'"
+        with pytest.raises(ValueError, match=re.escape(refusal)):
+            parse_router_args(["--selector", "=engine"])
+
+    def test_router_prefixed_spelling_is_refused_too(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(["--router-prefill-selector", "app=engine tier"])
+        refusal = "Invalid value for field 'prefill_selector': tier - expected 'key=value'"
+        with pytest.raises(ValueError, match=re.escape(refusal)):
+            RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+
+    def test_well_formed_entries_keep_the_space_split_allowance(self):
+        router_args = parse_router_args(["--selector", "app=engine tier=prod", "zone=a=b"])
+        assert router_args.selector == {"app": "engine", "tier": "prod", "zone": "a=b"}
+
+    @pytest.mark.parametrize("blank", ["", " "])
+    def test_blank_entry_is_refused(self, blank):
+        """A blank item, an unset shell variable in ``--selector "$SELECTOR"``,
+        is refused like the CLI refuses it instead of reading as no selector."""
+        with pytest.raises(
+            ValueError, match=re.escape("Invalid value for field 'router_selector':")
+        ):
+            RouterArgs._parse_selector([blank], "router_selector")
 
 
 class TestRustCliSecondSpellings:
@@ -2147,6 +2215,8 @@ SECRET_ENV_NAMES = (
     "SMG_API_KEY_FILE",
     "SMG_TENANT_API_KEYS",
     "SMG_TENANT_API_KEYS_FILE",
+    "CONTROL_PLANE_API_KEYS",
+    "CONTROL_PLANE_API_KEYS_FILE",
     "SMG_POSTGRES_DB_URL",
     "SMG_POSTGRES_DB_URL_FILE",
     "POSTGRES_DB_URL",
@@ -2174,6 +2244,9 @@ class TestSecretSources:
         monkeypatch.setenv("SMG_POSTGRES_DB_URL", "postgresql://u:env-pg@db.example:5432/smg")
         monkeypatch.setenv("SMG_REDIS_URL", "redis://:env-redis@cache.example:6379/0")
         monkeypatch.setenv("ATP_PASSWORD", "env-oracle-password")
+        monkeypatch.setenv(
+            "CONTROL_PLANE_API_KEYS", "ops:Ops:admin:env-ops-key, ro:Read:user:env-ro-key"
+        )
 
         args = parse_router_args(["--history-backend", "postgres"])
 
@@ -2182,6 +2255,10 @@ class TestSecretSources:
             ("red", "env-red"),
             ("blue", "env-blue"),
             ("green", "env-green"),
+        ]
+        assert args.control_plane_api_keys == [
+            ("ops", "Ops", "env-ops-key", "admin"),
+            ("ro", "Read", "env-ro-key", "user"),
         ]
         assert args.postgres_db_url == "postgresql://u:env-pg@db.example:5432/smg"
         assert args.redis_url == "redis://:env-redis@cache.example:6379/0"
@@ -2201,6 +2278,7 @@ class TestSecretSources:
     def test_the_command_line_beats_the_environment(self, monkeypatch):
         monkeypatch.setenv("SMG_API_KEY", "env-shared-key")
         monkeypatch.setenv("SMG_TENANT_API_KEYS", "red:env-red")
+        monkeypatch.setenv("CONTROL_PLANE_API_KEYS", "ops:Ops:admin:env-ops-key")
         monkeypatch.setenv("SMG_POSTGRES_DB_URL", "postgresql://u:env@db.example:5432/smg")
         monkeypatch.setenv("ATP_PASSWORD", "env-oracle-password")
 
@@ -2210,6 +2288,8 @@ class TestSecretSources:
                 "flag-shared-key",
                 "--tenant-api-key",
                 "blue:flag-blue",
+                "--control-plane-api-keys",
+                "ci:CI:admin:flag-ci-key",
                 "--postgres-db-url",
                 "postgresql://u:flag@db.example:5432/smg",
                 "--oracle-password",
@@ -2219,6 +2299,7 @@ class TestSecretSources:
 
         assert args.api_key == "flag-shared-key"
         assert args.tenant_api_keys == [("blue", "flag-blue")]
+        assert args.control_plane_api_keys == [("ci", "CI", "flag-ci-key", "admin")]
         assert args.postgres_db_url == "postgresql://u:flag@db.example:5432/smg"
         assert args.oracle_password == "flag-oracle-password"
 
@@ -2227,6 +2308,7 @@ class TestSecretSources:
 
         assert args.api_key is None
         assert args.tenant_api_keys == []
+        assert args.control_plane_api_keys == []
         assert args.postgres_db_url is None
         assert args.redis_url is None
         assert args.oracle_password is None
@@ -2246,6 +2328,67 @@ class TestSecretSources:
         assert args.postgres_db_url == "postgresql://u:new@db.example:5432/smg"
         assert args.redis_url == "redis://new.example:6379"
 
+    def test_the_key_files_reach_the_arguments_as_paths(self, tmp_path, monkeypatch):
+        """A key read from a file leaves the file's path on the arguments beside
+        the value, by the flag or the environment: the target of the key
+        reload. A key given as a value leaves no path."""
+        api_key = tmp_path / "api-key"
+        api_key.write_text("file-shared-key\n")
+        tenants = tmp_path / "tenants"
+        tenants.write_text("red:file-red\n")
+        operators = tmp_path / "control-plane-keys"
+        operators.write_text("ops:Ops:admin:file-ops-key\n")
+
+        by_flag = parse_router_args(
+            [
+                "--api-key-file",
+                str(api_key),
+                "--tenant-api-keys-file",
+                str(tenants),
+                "--control-plane-api-keys-file",
+                str(operators),
+            ]
+        )
+        assert by_flag.api_key_file == str(api_key)
+        assert by_flag.tenant_api_keys_file == str(tenants)
+        assert by_flag.control_plane_api_keys_file == str(operators)
+        assert by_flag.api_key == "file-shared-key"
+
+        monkeypatch.setenv("SMG_API_KEY_FILE", str(api_key))
+        by_env = parse_router_args([])
+        assert by_env.api_key_file == str(api_key)
+        assert by_env.api_key == "file-shared-key"
+        monkeypatch.delenv("SMG_API_KEY_FILE")
+
+        by_value = parse_router_args(["--api-key", "flag-key", "--tenant-api-key", "red:flag-red"])
+        assert by_value.api_key_file is None
+        assert by_value.tenant_api_keys_file is None
+        assert by_value.control_plane_api_keys_file is None
+
+    def test_a_key_file_without_its_value_is_refused_by_the_binding(self, tmp_path):
+        """A direct RouterArgs naming a key file without the key read from it
+        would start the gateway without that key while the record named the
+        file: the binding refuses it by name. With the value beside the file,
+        as from_cli_args passes them, it is taken."""
+        key_file = tmp_path / "api-key"
+        key_file.write_text("file-shared-key\n")
+        worker_urls = ["http://localhost:8000"]
+        with pytest.raises(ValueError, match=r"^api_key_file names a key file without the key"):
+            Router.from_args(RouterArgs(worker_urls=worker_urls, api_key_file=str(key_file)))
+        with pytest.raises(ValueError, match=r"^tenant_api_keys_file names a key file"):
+            Router.from_args(
+                RouterArgs(worker_urls=worker_urls, tenant_api_keys_file=str(key_file))
+            )
+        Router.from_args(
+            RouterArgs(
+                worker_urls=worker_urls, api_key="file-shared-key", api_key_file=str(key_file)
+            )
+        )
+
+    def test_the_key_files_are_watched_only_when_asked(self):
+        assert parse_router_args([]).secrets_auto_reload is False
+        assert parse_router_args(["--secrets-auto-reload"]).secrets_auto_reload is True
+
     def test_secrets_are_read_from_files(self, tmp_path, monkeypatch):
         """A secret file is read whole with its trailing newline dropped, a
         tenant key file one entry per line with blank and comment lines
@@ -2260,6 +2403,10 @@ class TestSecretSources:
         pg.write_text("postgresql://u:file-pg@db.example:5432/smg")
         redis = tmp_path / "redis-url"
         redis.write_text("  redis://:file-redis@cache.example:6379/1\n\n")
+        operators = tmp_path / "control-plane-keys"
+        operators.write_text(
+            "# the operators\n\nops:Ops:admin:file-ops-key\r\n  ro:Read:user:file-ro-key  \n"
+        )
 
         by_flag = parse_router_args(
             [
@@ -2267,6 +2414,8 @@ class TestSecretSources:
                 str(api_key),
                 "--tenant-api-keys-file",
                 str(tenants),
+                "--control-plane-api-keys-file",
+                str(operators),
                 "--history-backend",
                 "postgres",
                 "--postgres-db-url-file",
@@ -2275,14 +2424,20 @@ class TestSecretSources:
         )
         assert by_flag.api_key == "file-shared-key"
         assert by_flag.tenant_api_keys == [("red", "file-red"), ("blue", "file-blue")]
+        assert by_flag.control_plane_api_keys == [
+            ("ops", "Ops", "file-ops-key", "admin"),
+            ("ro", "Read", "file-ro-key", "user"),
+        ]
         assert by_flag.postgres_db_url == "postgresql://u:file-pg@db.example:5432/smg"
 
         monkeypatch.setenv("SMG_API_KEY_FILE", str(api_key))
         monkeypatch.setenv("SMG_TENANT_API_KEYS_FILE", str(tenants))
+        monkeypatch.setenv("CONTROL_PLANE_API_KEYS_FILE", str(operators))
         monkeypatch.setenv("SMG_REDIS_URL_FILE", str(redis))
         by_env = parse_router_args(["--history-backend", "redis"])
         assert by_env.api_key == "file-shared-key"
         assert by_env.tenant_api_keys == [("red", "file-red"), ("blue", "file-blue")]
+        assert len(by_env.control_plane_api_keys) == 2
         assert by_env.redis_url == "redis://:file-redis@cache.example:6379/1"
 
     @pytest.mark.parametrize(
@@ -2301,6 +2456,21 @@ class TestSecretSources:
                 ["--tenant-api-keys-file", "FILE"],
                 {"SMG_TENANT_API_KEYS": "red:env-secret"},
                 "--tenant-api-key",
+            ),
+            (
+                [
+                    "--control-plane-api-keys",
+                    "ci:CI:admin:flag-secret",
+                    "--control-plane-api-keys-file",
+                    "FILE",
+                ],
+                {},
+                "--control-plane-api-keys",
+            ),
+            (
+                ["--control-plane-api-keys-file", "FILE"],
+                {"CONTROL_PLANE_API_KEYS": "ci:CI:admin:env-secret"},
+                "--control-plane-api-keys",
             ),
             (
                 [
@@ -2341,7 +2511,8 @@ class TestSecretSources:
 
         text = str(excinfo.value)
         file_flag = "--tenant-api-keys-file" if flag == "--tenant-api-key" else f"{flag}-file"
-        assert flag in text and file_flag in text and "SMG_" in text, text
+        assert flag in text and file_flag in text, text
+        assert "SMG_" in text or "CONTROL_PLANE_API_KEYS" in text, text
         for secret in ("flag-secret", "env-secret", "file-secret"):
             assert secret not in text
 
@@ -2364,6 +2535,16 @@ class TestSecretSources:
                 "holds no entry",
             ),
             (["--tenant-api-keys-file", str(missing)], "--tenant-api-keys-file", "cannot be read"),
+            (
+                ["--control-plane-api-keys-file", str(comments_only)],
+                "--control-plane-api-keys-file",
+                "holds no entry",
+            ),
+            (
+                ["--control-plane-api-keys-file", str(missing)],
+                "--control-plane-api-keys-file",
+                "cannot be read",
+            ),
             (
                 ["--history-backend", "postgres", "--postgres-db-url-file", str(two_lines)],
                 "--postgres-db-url-file",
@@ -2443,6 +2624,9 @@ class TestSecretSources:
             "--api-key-file",
             "SMG_TENANT_API_KEYS",
             "--tenant-api-keys-file",
+            "CONTROL_PLANE_API_KEYS",
+            "--control-plane-api-keys-file",
+            "CONTROL_PLANE_API_KEYS_FILE",
             "SMG_POSTGRES_DB_URL",
             "--postgres-db-url-file",
             "SMG_REDIS_URL",
@@ -2503,6 +2687,19 @@ class TestPdPairingMode:
 
     def test_reaches_the_rust_router(self):
         assert _rust_router_kwargs(pd_pairing_mode="strict")["pd_pairing_mode"] == "strict"
+
+
+class TestPowerOfTwoLoadMetric:
+    """--power-of-two-load-metric takes resident_tokens:<request_tokens> besides the
+    metric names, and refuses it without a non-negative cost at parse time."""
+
+    def test_resident_tokens_parses(self):
+        args = parse_router_args(["--power-of-two-load-metric", "resident_tokens:62500"])
+        assert args.power_of_two_load_metric == "resident_tokens:62500"
+
+    def test_resident_tokens_without_a_cost_is_refused(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--power-of-two-load-metric", "resident_tokens"])
 
 
 class TestRuntimeWorkerThreads:

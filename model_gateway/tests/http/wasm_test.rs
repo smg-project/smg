@@ -14,6 +14,7 @@ use axum::{
     http::{header::CONTENT_TYPE, StatusCode},
 };
 use llm_tokenizer::TokenizerRegistry;
+use openai_protocol::worker::WorkerErrorResponse;
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
@@ -48,7 +49,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
     let wasm_manager = Arc::new(WasmModuleManager::with_default_config());
 
     // Create AppContext with wasm_manager from the start
-    let client = smg::clients::http_client();
+    let client = smg::server::http_client();
 
     let tokenizer_registry = Arc::new(TokenizerRegistry::new());
     let worker_registry = Arc::new(WorkerRegistry::new());
@@ -195,6 +196,8 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
         gateway: None,
         mesh_handler: None,
         mesh_adapters: None,
+        secret_sources: Default::default(),
+        secrets: None,
     });
 
     let request_id_headers = vec!["x-request-id".to_string(), "x-correlation-id".to_string()];
@@ -315,11 +318,8 @@ async fn test_wasm_api_add_module_invalid_file() {
         .await
         .unwrap();
 
-    // Should return error status
-    assert!(
-        response.status() == StatusCode::BAD_REQUEST
-            || response.status() == StatusCode::INTERNAL_SERVER_ERROR
-    );
+    // A module that failed to load: 400 with the per-module result.
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let response_json: WasmModuleAddResponse = serde_json::from_slice(&body).unwrap();
@@ -370,11 +370,8 @@ async fn test_wasm_api_add_module_invalid_wasm() {
         .await
         .unwrap();
 
-    // Should return error status
-    assert!(
-        response.status() == StatusCode::BAD_REQUEST
-            || response.status() == StatusCode::INTERNAL_SERVER_ERROR
-    );
+    // A module that failed to load: 400 with the per-module result.
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let response_json: WasmModuleAddResponse = serde_json::from_slice(&body).unwrap();
@@ -422,10 +419,8 @@ async fn test_wasm_api_list_modules() {
         .await
         .unwrap();
 
+    // The add route answers once its job has run: the module is registered.
     assert_eq!(add_response.status(), StatusCode::OK);
-
-    // Wait a bit for the job to complete
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Now list modules
     let list_response = app
@@ -497,9 +492,6 @@ async fn test_wasm_api_remove_module() {
         .unwrap();
     let response_json: WasmModuleAddResponse = serde_json::from_slice(&body).unwrap();
 
-    // Wait for job to complete
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     // Get the module UUID
     let module_uuid =
         if let Some(WasmModuleAddResult::Success(uuid)) = &response_json.modules[0].add_result {
@@ -537,9 +529,7 @@ async fn test_wasm_api_remove_module() {
         "Expected OK status for remove but got {remove_status:?}"
     );
 
-    // Wait for removal to complete
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
+    // The remove route answers once its job has run.
     // Verify module is removed
     if let Some(wasm_manager) = app_context.wasm_manager.as_ref() {
         let module = wasm_manager
@@ -566,11 +556,147 @@ async fn test_wasm_api_remove_module_not_found() {
         .await
         .unwrap();
 
-    // Should return error status
+    assert_eq!(remove_response.status(), StatusCode::NOT_FOUND);
+    let refusal = envelope(remove_response).await;
+    assert_eq!(refusal.code, "WASM_MODULE_NOT_FOUND");
     assert!(
-        remove_response.status() == StatusCode::BAD_REQUEST
-            || remove_response.status() == StatusCode::NOT_FOUND
+        refusal.error.contains(&fake_uuid.to_string()),
+        "{}",
+        refusal.error
     );
+}
+
+/// A second valid component whose bytes differ from the first's: the same
+/// empty module twice, so its sha256 is its own.
+#[expect(clippy::expect_used, clippy::unwrap_used)]
+async fn create_second_test_wasm_component(temp_dir: &TempDir) -> String {
+    use wasm_encoder::{Component, Module};
+
+    let mut module = Module::new();
+    module.section(&wasm_encoder::TypeSection::new());
+    let mut component = Component::new();
+    component.section(&wasm_encoder::ModuleSection(&module));
+    component.section(&wasm_encoder::ModuleSection(&module));
+    let component_path = temp_dir.path().join("second_module.component.wasm");
+    fs::write(&component_path, component.as_slice())
+        .await
+        .expect("Failed to write the second WASM component file");
+    component_path
+        .canonicalize()
+        .expect("Failed to canonicalize path")
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Two modules of one name loaded in one request each get the uuid the
+/// job registered them under, and the manager holds both.
+#[tokio::test]
+async fn test_wasm_api_add_two_modules_of_one_name_get_their_own_uuids() {
+    let (app, app_context, temp_dir) = create_test_app_with_wasm().await;
+    let descriptor = |file_path: String| WasmModuleDescriptor {
+        name: "twin".to_string(),
+        file_path,
+        module_type: WasmModuleType::Middleware,
+        attach_points: vec![WasmModuleAttachPoint::Middleware(
+            MiddlewareAttachPoint::OnRequest,
+        )],
+        add_result: None,
+    };
+    let add_request = WasmModuleAddRequest {
+        modules: vec![
+            descriptor(create_test_wasm_component(&temp_dir).await),
+            descriptor(create_second_test_wasm_component(&temp_dir).await),
+        ],
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/wasm")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_string(&add_request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let response_json: WasmModuleAddResponse = serde_json::from_slice(&body).unwrap();
+    let uuids: Vec<Uuid> = response_json
+        .modules
+        .iter()
+        .map(|module| match &module.add_result {
+            Some(WasmModuleAddResult::Success(uuid)) => *uuid,
+            other => panic!("expected a success result, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(uuids.len(), 2);
+    assert_ne!(uuids[0], uuids[1], "two modules of one name share a uuid");
+
+    let wasm_manager = app_context.wasm_manager.as_ref().unwrap();
+    for uuid in uuids {
+        let module = wasm_manager.get_module(uuid).unwrap();
+        assert_eq!(
+            module.map(|m| m.module_meta.name),
+            Some("twin".to_string()),
+            "{uuid} is not the registered module"
+        );
+    }
+}
+
+/// The control plane's envelope of a refusal.
+#[expect(clippy::expect_used)]
+async fn envelope(response: axum::response::Response) -> WorkerErrorResponse {
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    serde_json::from_slice(&body).expect("the control plane's envelope")
+}
+
+#[tokio::test]
+async fn test_wasm_api_remove_module_malformed_uuid_is_a_400_in_the_envelope() {
+    let (app, _app_context, _temp_dir) = create_test_app_with_wasm().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/wasm/not-a-uuid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let refusal = envelope(response).await;
+    assert_eq!(refusal.code, "BAD_REQUEST");
+    assert!(refusal.error.contains("not-a-uuid"), "{}", refusal.error);
+}
+
+#[tokio::test]
+async fn test_wasm_api_add_module_body_the_type_does_not_take_is_a_400_in_the_envelope() {
+    let (app, _app_context, _temp_dir) = create_test_app_with_wasm().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/wasm")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"modules":[{"name":"m"}]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let refusal = envelope(response).await;
+    assert_eq!(refusal.code, "BAD_REQUEST");
+    assert!(refusal.error.contains("file_path"), "{}", refusal.error);
 }
 
 // ============================================================================
@@ -610,9 +736,6 @@ async fn test_wasm_module_duplicate_sha256() {
 
     assert_eq!(response1.status(), StatusCode::OK);
 
-    // Wait for first job to complete
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
     // Try to add the same file again (should fail due to duplicate SHA256)
     let add_request2 = WasmModuleAddRequest {
         modules: vec![WasmModuleDescriptor {
@@ -639,10 +762,7 @@ async fn test_wasm_module_duplicate_sha256() {
         .unwrap();
 
     // Should return error status for duplicate
-    assert!(
-        response2.status() == StatusCode::BAD_REQUEST
-            || response2.status() == StatusCode::INTERNAL_SERVER_ERROR
-    );
+    assert_eq!(response2.status(), StatusCode::BAD_REQUEST);
 
     let body = to_bytes(response2.into_body(), usize::MAX).await.unwrap();
     let response_json: WasmModuleAddResponse = serde_json::from_slice(&body).unwrap();
@@ -693,7 +813,7 @@ async fn test_wasm_module_execution() {
         add_result: None,
     };
 
-    let config_request = WasmModuleConfigRequest { descriptor };
+    let config_request = WasmModuleConfigRequest::new(descriptor, Uuid::now_v7());
     let workflow_data = WasmRegistrationWorkflowData {
         config: config_request,
         wasm_bytes: None,

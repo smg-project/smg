@@ -8,7 +8,9 @@
 
 use std::{
     convert::Infallible,
-    task::{Context, Poll},
+    future::Future,
+    pin::Pin,
+    task::{ready, Context, Poll},
 };
 
 use axum::{
@@ -22,6 +24,7 @@ use axum::{
 };
 use futures_util::future::{BoxFuture, Either};
 use openai_protocol::messages::{ErrorEnvelope, ErrorResponse};
+use pin_project_lite::pin_project;
 use serde_json::Value;
 use tower::{Layer, Service};
 
@@ -95,11 +98,10 @@ pub struct MessagesErrorEnvelope<S> {
 impl<S> Service<Request> for MessagesErrorEnvelope<S>
 where
     S: Service<Request, Response = Response, Error = Infallible>,
-    S::Future: Send + 'static,
 {
     type Response = Response;
     type Error = Infallible;
-    type Future = Either<S::Future, BoxFuture<'static, Result<Response, Infallible>>>;
+    type Future = Either<S::Future, EnvelopeFuture<S::Future>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -110,14 +112,47 @@ where
             return Either::Left(self.inner.call(request));
         }
         let request_id = request_id_of(&request);
-        let response = self.inner.call(request);
-        Either::Right(Box::pin(async move {
-            let Ok(response) = response.await;
-            if !(response.status().is_client_error() || response.status().is_server_error()) {
-                return Ok(response);
-            }
-            Ok(into_messages_envelope(response, request_id).await)
-        }))
+        Either::Right(EnvelopeFuture {
+            inner: self.inner.call(request),
+            request_id: Some(request_id),
+            envelope: None,
+        })
+    }
+}
+
+pin_project! {
+    /// A Messages route's response, its error answers rewritten into the
+    /// API's envelope: the inner future runs in place, and only an error
+    /// answer boxes the rewrite (an `async` block boxed for every Messages
+    /// request was one allocation per request for the rare case).
+    pub struct EnvelopeFuture<F> {
+        #[pin]
+        inner: F,
+        request_id: Option<String>,
+        envelope: Option<BoxFuture<'static, Response>>,
+    }
+}
+
+impl<F> Future for EnvelopeFuture<F>
+where
+    F: Future<Output = Result<Response, Infallible>>,
+{
+    type Output = Result<Response, Infallible>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        if let Some(envelope) = this.envelope.as_mut() {
+            return envelope.as_mut().poll(cx).map(Ok);
+        }
+        let Ok(response) = ready!(this.inner.poll(cx));
+        if !(response.status().is_client_error() || response.status().is_server_error()) {
+            return Poll::Ready(Ok(response));
+        }
+        let request_id = this.request_id.take().unwrap_or_default();
+        let envelope = this
+            .envelope
+            .insert(Box::pin(into_messages_envelope(response, request_id)));
+        envelope.as_mut().poll(cx).map(Ok)
     }
 }
 

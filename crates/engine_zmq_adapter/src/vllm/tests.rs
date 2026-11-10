@@ -32,7 +32,7 @@ fn batch(
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: request_id.to_string(),
+            request_id: request_id.into(),
             new_token_ids: vec![token],
             new_logprobs,
             finish_reason: finish,
@@ -61,6 +61,14 @@ async fn generate_e2e_translates_and_streams_vllm_proto() {
             other => panic!("expected Add, got {other:?}"),
         };
         assert_eq!(request.request_id, "r1");
+        assert_eq!(
+            request
+                .reasoning_parser_kwargs
+                .as_ref()
+                .unwrap()
+                .chat_template_kwargs["thinking_mode"],
+            "enabled"
+        );
         assert_eq!(request.prompt_token_ids, Some(vec![1, 2, 3]));
         assert_eq!(request.sampling_params.as_ref().unwrap().max_tokens, 2);
         output
@@ -93,6 +101,7 @@ async fn generate_e2e_translates_and_streams_vllm_proto() {
             logprobs: Some(1),
             ..Default::default()
         }),
+        chat_template_kwargs_json: Some(r#"{"thinking_mode":"enabled"}"#.into()),
         stream: true,
         ..Default::default()
     };
@@ -202,7 +211,7 @@ async fn generate_shapes_top_logprobs_to_requested_count() {
     let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: "r1".to_string(),
+            request_id: "r1".into(),
             new_token_ids: vec![10],
             new_logprobs: Some(Logprobs {
                 positions: vec![position],
@@ -314,7 +323,7 @@ async fn generate_streams_prompt_logprobs() {
     let prefill = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: "r1".to_string(),
+            request_id: "r1".into(),
             new_token_ids: vec![10],
             new_prompt_logprobs_tensors: Some(prompt_tensors),
             ..Default::default()
@@ -324,7 +333,7 @@ async fn generate_streams_prompt_logprobs() {
     let decode = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: "r1".to_string(),
+            request_id: "r1".into(),
             new_token_ids: vec![11],
             finish_reason: Some(EngineCoreFinishReason::Length),
             ..Default::default()
@@ -1563,5 +1572,49 @@ async fn prefill_samples_require_timing_and_skip_preemption_and_errors() {
             })
             .unwrap();
         assert_eq!(stream.take_prefill_sample(), None);
+    }
+}
+
+/// Parser kwargs survive translation without changing the grammar-start override.
+#[test]
+fn thinking_mode_reaches_engine_reasoning_parser_with_a_constraint() {
+    for mode in [None, Some("enabled"), Some("disabled"), Some("adaptive")] {
+        for first_token in [false, true] {
+            let mut req = tokenized_req(vllm::SamplingParams {
+                constraint: Some(vllm::sampling_params::Constraint::JsonObject(true)),
+                grammar_from_first_token: first_token,
+                ..Default::default()
+            });
+            req.chat_template_kwargs_json =
+                mode.map(|mode| serde_json::json!({"thinking_mode": mode}).to_string());
+            let translated =
+                translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
+                    .unwrap();
+            assert_eq!(translated.reasoning_ended, first_token.then_some(true));
+            assert_eq!(
+                translated
+                    .reasoning_parser_kwargs
+                    .map(|kwargs| kwargs.chat_template_kwargs),
+                mode.map(|mode| HashMap::from([(
+                    "thinking_mode".to_string(),
+                    serde_json::json!(mode)
+                )]))
+            );
+        }
+    }
+}
+
+/// Refuse malformed or non-object parser kwargs before submitting engine work.
+#[test]
+fn malformed_reasoning_template_kwargs_are_rejected() {
+    for json in ["{", "[]", "null", "true"] {
+        let mut req = tokenized_req(vllm::SamplingParams::default());
+        req.chat_template_kwargs_json = Some(json.to_string());
+        let error = translate_request(req, 4096, ModelDtype::BFloat16, &EosTokenIds::default())
+            .unwrap_err();
+        assert!(
+            error.starts_with("invalid chat_template_kwargs_json:"),
+            "{error}"
+        );
     }
 }

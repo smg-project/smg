@@ -60,14 +60,14 @@ pub(crate) mod encode;
 pub(crate) mod helpers;
 pub(crate) mod pd_protocol;
 mod rate_limit;
-mod request_execution;
+pub(crate) mod request_execution;
 mod worker_selection;
 
 // Export stage implementations
 pub(crate) use client_acquisition::acquire_clients;
 pub(crate) use context_length::{
     context_length_exceeded, enforce_context_length, enforce_decisions_context_length,
-    enforce_output_budget, smallest_context_length, ContextRequirements,
+    enforce_output_budget, selection_context_length, smallest_context_length, ContextRequirements,
 };
 pub(crate) use dispatch_metadata::prepare_dispatch_metadata;
 pub(crate) use encode::EncodeStage;

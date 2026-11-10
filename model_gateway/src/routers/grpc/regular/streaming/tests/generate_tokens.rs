@@ -10,7 +10,9 @@ use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as 
 
 use super::{
     super::*,
-    eof::{chunk, collect_events, complete_with_prompt, scripted_stream, CharacterTokenizer},
+    eof::{
+        chunk, collect_events, complete_with_prompt, runtime, scripted_stream, CharacterTokenizer,
+    },
 };
 use crate::{
     observability::metrics::test_support::render_with_recorder,
@@ -44,13 +46,6 @@ fn tokens(rendered: &str, token_type: &str) -> Option<f64> {
                 && line.contains(&token_type)
         })
         .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
-}
-
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a current-thread runtime")
 }
 
 /// The scrape after a two-choice generate stream of one chunk per choice,
@@ -144,7 +139,10 @@ fn a_collected_generate_answer_counts_its_prompt_and_cache_hit_once_per_request(
                 utils::ParserResolver::with_flags(Arc::new(WorkerRegistry::new()), None, None),
             )
             .process_non_streaming_generate_response(
-                context::ExecutionResult::Single { stream },
+                context::ExecutionResult::Single {
+                    stream,
+                    dispatch_start: Instant::now(),
+                },
                 dispatch,
                 &mut decoder,
                 false,

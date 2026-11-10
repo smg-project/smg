@@ -357,7 +357,7 @@ impl ConsulProviderConfig {
                 format!("CONSUL_CLIENT_CERT and CONSUL_CLIENT_KEY do not parse: {error}")
             })?;
         let make_builder = || {
-            let mut builder = crate::clients::http_client_builder()
+            let mut builder = crate::server::http_client_builder()
                 .connect_timeout(Duration::from_secs(10))
                 .redirect(reqwest::redirect::Policy::none());
             if https {
@@ -937,27 +937,13 @@ mod tests {
 
     use super::*;
     use crate::{
+        config::test_support::{pd_routing_mode, regular_routing_mode},
         service_discovery::testing::{create_test_app_context, live_app_context},
-        test_support::RefusedAddress,
+        worker::test_support::RefusedAddress,
     };
 
     const PASSING_2_0_4: &str = include_str!("testdata/consul/health-passing-2.0.4.json");
     const PASSING_1_22_7: &str = include_str!("testdata/consul/health-passing-1.22.7.json");
-
-    fn regular() -> RoutingMode {
-        RoutingMode::Regular {
-            worker_urls: vec![],
-        }
-    }
-
-    fn pd() -> RoutingMode {
-        RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: None,
-        }
-    }
 
     fn discovery(service: &str, address: Option<&str>) -> ConsulDiscoveryConfig {
         ConsulDiscoveryConfig {
@@ -983,9 +969,11 @@ mod tests {
             .iter()
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect();
-        ConsulProviderConfig::with_env(&discovery(service, address), &regular(), |name| {
-            env.get(name).cloned()
-        })
+        ConsulProviderConfig::with_env(
+            &discovery(service, address),
+            &regular_routing_mode(),
+            |name| env.get(name).cloned(),
+        )
     }
 
     fn config_in(mode: &RoutingMode) -> ConsulProviderConfig {
@@ -1051,7 +1039,7 @@ mod tests {
     #[test]
     fn recorded_answers_read_into_workers() {
         for recorded in [PASSING_2_0_4, PASSING_1_22_7] {
-            let outcome = read(answer(recorded), &config_in(&pd())).unwrap();
+            let outcome = read(answer(recorded), &config_in(&pd_routing_mode())).unwrap();
             let mut workers: Vec<(&str, String, WorkerType)> = outcome
                 .workers
                 .iter()
@@ -1115,7 +1103,7 @@ mod tests {
     /// typed ones are left out, each saying why.
     #[test]
     fn regular_routing_takes_the_untyped_instance_alone() {
-        let outcome = read(answer(PASSING_2_0_4), &config_in(&regular())).unwrap();
+        let outcome = read(answer(PASSING_2_0_4), &config_in(&regular_routing_mode())).unwrap();
         assert_eq!(ids(&outcome), ["dc1/gpu-09/worker-b"]);
         assert_eq!(outcome.workers[0].worker_type, WorkerType::Regular);
         assert_eq!(outcome.skipped.len(), 4, "{:?}", outcome.skipped);
@@ -1219,7 +1207,7 @@ mod tests {
     /// lower id keeps it.
     #[test]
     fn an_address_two_instances_claim_stays_with_the_first_registered() {
-        let config = config_in(&pd());
+        let config = config_in(&pd_routing_mode());
         let answer_of = |entries: Vec<Entry>| Answer {
             index: 1,
             entries,
@@ -1262,7 +1250,7 @@ mod tests {
     /// applied, an empty one as an empty fleet.
     #[test]
     fn an_answer_consul_says_it_filtered_is_rejected() {
-        let config = config_in(&pd());
+        let config = config_in(&pd_routing_mode());
         let empty = |filtered, default_deny| Answer {
             index: 3,
             entries: vec![],
@@ -1296,7 +1284,7 @@ mod tests {
     /// left, and the warning about a missing token stands while it lasts.
     #[tokio::test]
     async fn the_last_instance_leaves_a_default_deny_consul_read_with_no_token() {
-        let config = config_in(&pd());
+        let config = config_in(&pd_routing_mode());
         let client = config.client().unwrap();
         let mut discovery = ConsulDiscovery::new(config, create_test_app_context(), client);
         let deny = |mut answer: Answer| {
@@ -1732,7 +1720,7 @@ mod tests {
             .with("X-Consul-Default-Acl-Policy", "deny")
             .with("X-Consul-Results-Filtered-By-Acls", "true")])
         .await;
-        let config = consul.config(&pd());
+        let config = consul.config(&pd_routing_mode());
         let answer = query(config.request(&config.client().unwrap(), 0))
             .await
             .unwrap();
@@ -1752,7 +1740,7 @@ mod tests {
             Reply::ok(3, "not json"),
         ])
         .await;
-        let config = consul.config(&pd());
+        let config = consul.config(&pd_routing_mode());
         let client = config.client().unwrap();
         let mut errors = Vec::new();
         for _ in 0..4 {
@@ -1793,7 +1781,7 @@ mod tests {
         let closed = RefusedAddress::reserve();
         let config = ConsulProviderConfig::with_env(
             &discovery("smg-worker", Some(&closed.http_url())),
-            &pd(),
+            &pd_routing_mode(),
             |_| None,
         )
         .unwrap();
@@ -1834,7 +1822,7 @@ mod tests {
             Reply::ok(0, "[]"),
         ])
         .await;
-        let config = consul.config(&pd());
+        let config = consul.config(&pd_routing_mode());
         let client = config.client().unwrap();
         let mut discovery = ConsulDiscovery::new(config, create_test_app_context(), client);
 
@@ -1875,7 +1863,7 @@ mod tests {
     /// resets the wait.
     #[tokio::test]
     async fn failures_back_off_and_an_answer_resets_the_backoff() {
-        let config = config_in(&pd());
+        let config = config_in(&pd_routing_mode());
         let client = config.client().unwrap();
         let mut discovery = ConsulDiscovery::new(config, create_test_app_context(), client);
         let failure = || {
@@ -1901,7 +1889,7 @@ mod tests {
             Reply::ok(11, "[]").held(Duration::from_millis(2000)),
         ])
         .await;
-        let mut config = consul.config(&pd());
+        let mut config = consul.config(&pd_routing_mode());
         config.check_interval = Duration::from_millis(50);
         let client = config.client().unwrap();
         #[expect(
@@ -1991,7 +1979,7 @@ mod tests {
             Reply::ok(20, &only_a).held(Duration::from_millis(250)),
         ])
         .await;
-        let mut config = consul.config(&regular());
+        let mut config = consul.config(&regular_routing_mode());
         config.check_interval = Duration::from_secs(4);
         let client = config.client().unwrap();
         let app_context = live_app_context();

@@ -5,9 +5,10 @@ use serde_json::Value;
 use crate::{
     audio::{AudioPreProcessor, Qwen3AudioProcessor},
     encoder_inputs::PreprocessedEncoderInputs,
+    media::FrameSampling,
     registry::{
-        qwen_vl::IMAGE_PAD_TOKEN, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
-        RegistryResult,
+        qwen_vl::{loader_frame_sampling, IMAGE_PAD_TOKEN},
+        ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
     types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
     vision::{PreProcessorConfig, Qwen3OmniVisionProcessor, VisionPreProcessor},
@@ -124,14 +125,36 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
         }
     }
 
+    /// The family sets no per-request media count of its own for any of its
+    /// three modalities: its serving engines read all three as unlimited (the
+    /// family's processing info declares `audio: None`, `image: None`,
+    /// `video: None`), the checkpoint's processor config bounds an image's
+    /// pixels, a clip's frames and a recording's length, not how many of
+    /// each, and the context length is the practical bound. The three stay
+    /// declared (an undeclared modality is refused as unsupported) without a
+    /// bound of the spec's, so the effective limit per modality is the
+    /// engine's advertised one, else the deployment's
+    /// `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`,
+    /// `SMG_VIDEO_MAX_COUNT` or `SMG_AUDIO_MAX_COUNT`.
+    ///
+    /// What still bounds such a request, and where it lives. Before any
+    /// fetch: the per-request limit the model's workers advertise for their
+    /// engine, which caps the router's own limit in the gateway's limit
+    /// resolution, and the deployment's `SMG_IMAGE_MAX_COUNT` /
+    /// `SMG_VIDEO_MAX_COUNT` / `SMG_AUDIO_MAX_COUNT` (and
+    /// `--mm-per-request-image-limit` for images), read in the same
+    /// resolution. At or after the fetch: the gateway's cap on media bytes
+    /// in flight (`multimodal_max_inflight_bytes`), the engine's advertised
+    /// encoder budget and the context length. A number of the spec's own
+    /// would be a declared default again, not a bound of the family's.
     fn modality_limits(
         &self,
         _metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
         Ok(HashMap::from([
-            (Modality::Image, 10),
-            (Modality::Video, 1),
-            (Modality::Audio, 10),
+            (Modality::Image, usize::MAX),
+            (Modality::Video, usize::MAX),
+            (Modality::Audio, usize::MAX),
         ]))
     }
 
@@ -161,6 +184,15 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
             model_config,
             preprocessor_config,
         ))))
+    }
+
+    /// The family's video loader is the Qwen2-VL line's: a clip is sampled
+    /// before its processor sees it, `total / fps x 2` frames in whole
+    /// temporal groups of two, at most 768 ([`FrameSampling::SteppedGroups`]),
+    /// so a 5-frame clip at 1 fps is four frames, two temporal groups,
+    /// whatever the processor config states.
+    fn video_frame_sampling(&self) -> FrameSampling {
+        loader_frame_sampling()
     }
 
     fn prompt_replacements(
@@ -320,6 +352,63 @@ mod tests {
         }
     }
 
+    /// The family bounds its media by context, not by count: the spec
+    /// declares its three modalities without a limit of its own (the ten, one
+    /// and ten it carried were declared defaults, never counts of the
+    /// family's), so a deployment knob or the engine's advertised limit is the
+    /// only router-side bound for each.
+    #[test]
+    fn omni_declares_its_media_without_a_count_of_its_own() {
+        let tokenizer = omni_tokenizer();
+        let config = json!({
+            "model_type": "qwen3_omni_moe",
+            "thinker_config": {
+                "audio_token_id": 151675,
+                "image_token_id": 151655,
+                "video_token_id": 151656
+            }
+        });
+        let metadata = ModelMetadata {
+            model_id: "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let spec = Qwen3OmniSpec;
+
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap(),
+            HashMap::from([
+                (Modality::Image, usize::MAX),
+                (Modality::Video, usize::MAX),
+                (Modality::Audio, usize::MAX),
+            ])
+        );
+        // Above the old declared defaults each modality passes the spec's
+        // own validation; a deployment's cap (the flag or the environment
+        // override, or the engine's advertised limit the gateway passes in)
+        // still binds.
+        for (modality, cap) in [
+            (Modality::Image, 10),
+            (Modality::Video, 1),
+            (Modality::Audio, 10),
+        ] {
+            for count in [cap + 1, 1_000] {
+                spec.validate_media_request(&metadata, &[(modality, count)])
+                    .unwrap_or_else(|error| panic!("{count} {modality} items: {error}"));
+            }
+            let capped = HashMap::from([(modality, cap)]);
+            assert_eq!(
+                spec.validate_media_request_with_limits(&metadata, &[(modality, cap + 1)], &capped),
+                Err(ModelRegistryError::ModalityLimitExceeded {
+                    spec: "qwen3_omni",
+                    modality,
+                    limit: cap,
+                    requested: cap + 1,
+                })
+            );
+        }
+    }
+
     /// Every modality's anchor is the one token the serving engine expands,
     /// so images, video and audio may all be forwarded to a worker that
     /// processes media itself.
@@ -329,6 +418,47 @@ mod tests {
             assert!(Qwen3OmniSpec.worker_expandable(modality), "{modality}");
         }
         assert!(!Qwen3OmniSpec.worker_expandable(Modality::ImageEmbeds));
+    }
+
+    /// A clip is sampled the way the family's own video loader samples it:
+    /// a 5-frame clip at 1 fps is its first four frames (two temporal groups),
+    /// not ten frames at the nominal 2 fps with every frame doubled; the
+    /// temporal group is the loader's own, not the processor config's; a
+    /// one-frame clip, shorter than one temporal group, gets no frame, as on
+    /// the engine's own server.
+    #[test]
+    fn omni_video_frames_follow_the_qwen2_vl_loader_rule() {
+        use crate::media::{sampled_frame_indices, VideoFetchConfig};
+
+        let spec = Qwen3OmniSpec;
+        assert_eq!(
+            spec.video_frame_sampling(),
+            FrameSampling::SteppedGroups {
+                temporal_patch_size: 2,
+                max_frames: 768,
+            }
+        );
+        let config = PreProcessorConfig {
+            temporal_patch_size: Some(4),
+            ..PreProcessorConfig::default()
+        };
+        assert_eq!(
+            spec.video_frame_sampling_with(&config),
+            FrameSampling::SteppedGroups {
+                temporal_patch_size: 2,
+                max_frames: 768,
+            }
+        );
+        let fetch = VideoFetchConfig {
+            sampling: spec.video_frame_sampling(),
+            ..VideoFetchConfig::default()
+        };
+        assert_eq!(sampled_frame_indices(5, 1.0, fetch), vec![0, 1, 2, 3]);
+        assert_eq!(
+            sampled_frame_indices(150, 30.0, fetch),
+            (0..10).map(|group| group * 15).collect::<Vec<_>>()
+        );
+        assert!(sampled_frame_indices(1, 30.0, fetch).is_empty());
     }
 
     #[test]

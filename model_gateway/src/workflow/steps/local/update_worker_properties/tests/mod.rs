@@ -32,6 +32,7 @@ use crate::{
         registry::WorkerId,
         BasicWorker, ConnectionMode, RuntimeType,
     },
+    workflow::steps::local::test_support::labels_of,
 };
 
 fn make_app_context(workers: &[Arc<dyn Worker>]) -> Arc<AppContext> {
@@ -123,13 +124,7 @@ async fn a_constrained_decoding_label_update_must_name_a_policy() {
         Arc::clone(&worker),
         HashMap::from([("constrained_decoding".to_string(), "always".to_string())]),
     );
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut always)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut always).await);
 }
 
 fn make_refresh_context(
@@ -163,11 +158,10 @@ fn make_refresh_context(
     WorkflowContext::new(WorkflowInstanceId::new(), data)
 }
 
-fn labels_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-        .collect()
+/// Prove the step's `result` is a success; a failure names the caller's line.
+#[track_caller]
+fn step_succeeds(result: WorkflowResult<StepResult>) {
+    assert_eq!(result.unwrap(), StepResult::Success);
 }
 
 /// A gRPC decode worker over `labels`, with `discovered` on record as the
@@ -216,13 +210,7 @@ async fn a_rank_whose_dp_flag_only_the_operator_set_follows_the_engines_window()
     // The engine restarts with a window of 512, still naming no DP label.
     let fresh = labels_of(&[("max_running_requests", "512")]);
     let mut refresh = make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&worker), fresh);
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut refresh)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut refresh).await);
     let rebuilt = app_ctx
         .worker_registry
         .get_by_url(worker.url())
@@ -269,13 +257,7 @@ async fn a_label_refresh_follows_the_engine_and_keeps_the_operators_labels() {
     ]);
     let mut refresh =
         make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&worker), fresh.clone());
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut refresh)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut refresh).await);
     let rebuilt = app_ctx
         .worker_registry
         .get_by_url("grpc://decode:8000")
@@ -305,13 +287,7 @@ async fn a_label_refresh_follows_the_engine_and_keeps_the_operators_labels() {
     // The same report again changes nothing: no rebuild, no updated worker.
     let revision = rebuilt.revision();
     let mut again = make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&rebuilt), fresh);
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut again)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut again).await);
     assert_eq!(
         app_ctx
             .worker_registry
@@ -353,13 +329,7 @@ async fn a_label_refresh_keeps_the_engines_kv_metadata_out_of_the_labels_and_in_
         ("kv_engine_id", "engine-late"),
     ]);
     let mut refresh = make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&worker), fresh);
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut refresh)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut refresh).await);
     let rebuilt = app_ctx
         .worker_registry
         .get_by_url("grpc://decode:8000")
@@ -394,13 +364,7 @@ async fn a_label_refresh_keeps_the_engines_kv_metadata_out_of_the_labels_and_in_
     let revision = rebuilt.revision();
     let fresh = labels_of(&[("max_num_seqs", "8"), ("kv_engine_id", "engine-restarted")]);
     let mut again = make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&rebuilt), fresh);
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut again)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut again).await);
     let current = app_ctx
         .worker_registry
         .get_by_url("grpc://decode:8000")
@@ -461,13 +425,7 @@ async fn a_label_set_by_an_update_stays_the_operators_through_a_refresh() {
         Arc::clone(&worker),
         HashMap::from([("max_num_seqs".to_string(), "256".to_string())]),
     );
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut update)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut update).await);
     let updated = app_ctx
         .worker_registry
         .get_by_url("grpc://decode:8000")
@@ -487,13 +445,7 @@ async fn a_label_set_by_an_update_stays_the_operators_through_a_refresh() {
         Arc::clone(&updated),
         labels_of(&[("max_num_seqs", "256"), ("page_size", "1152")]),
     );
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut rebuild)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut rebuild).await);
     let rebuilt = app_ctx
         .worker_registry
         .get_by_url("grpc://decode:8000")
@@ -521,13 +473,7 @@ async fn a_label_set_by_an_update_stays_the_operators_through_a_refresh() {
         Arc::clone(&rebuilt),
         labels_of(&[("max_num_seqs", "8"), ("page_size", "1152")]),
     );
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut refresh)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut refresh).await);
     let refreshed = app_ctx
         .worker_registry
         .get_by_url("grpc://decode:8000")
@@ -583,13 +529,7 @@ async fn a_rank_workers_window_follows_the_engine_in_rank_space() {
     for rank in [&worker, &pinned] {
         let mut refresh =
             make_refresh_context(Arc::clone(&app_ctx), Arc::clone(rank), fresh.clone());
-        assert_eq!(
-            UpdateWorkerPropertiesStep
-                .execute(&mut refresh)
-                .await
-                .unwrap(),
-            StepResult::Success
-        );
+        step_succeeds(UpdateWorkerPropertiesStep.execute(&mut refresh).await);
     }
     let rebuilt = app_ctx
         .worker_registry
@@ -646,13 +586,7 @@ async fn a_rank_registered_from_a_provisional_read_takes_its_share_on_refresh() 
 
     let fresh = labels_of(&[("max_running_requests", "256"), ("attn_dp_size", "8")]);
     let mut refresh = make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&worker), fresh);
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut refresh)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut refresh).await);
     let rebuilt = app_ctx
         .worker_registry
         .get_by_url(worker.url())
@@ -706,13 +640,7 @@ async fn a_label_refresh_is_dropped_when_the_worker_changed_or_left_during_the_r
             .clone(),
     );
     assert!(app_ctx.worker_registry.replace(&id, patched));
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut refresh)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut refresh).await);
     assert_eq!(
         app_ctx
             .worker_registry
@@ -745,13 +673,7 @@ async fn a_label_refresh_is_dropped_when_the_worker_changed_or_left_during_the_r
             .build(),
     );
     app_ctx.worker_registry.register(replacement).unwrap();
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut refresh)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut refresh).await);
     assert_eq!(
         app_ctx
             .worker_registry
@@ -791,13 +713,7 @@ async fn the_label_cap_holds_over_the_labels_the_step_merges() {
         Arc::clone(&worker),
         HashMap::from([("k0".to_string(), "w".to_string())]),
     );
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut rewrite)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut rewrite).await);
 }
 
 /// A worker a provider registered after its update was accepted keeps
@@ -829,13 +745,7 @@ async fn an_update_of_labels_is_refused_for_a_worker_discovered_since_it_was_acc
     let mut priority = make_context(Arc::clone(&app_ctx), Arc::clone(&worker), HashMap::new());
     priority.data.config.labels = None;
     priority.data.config.priority = Some(3);
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut priority)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut priority).await);
     let updated = priority.data.updated_workers.expect("the updated worker");
     assert_eq!(updated[0].priority(), 3);
 }
@@ -957,10 +867,7 @@ async fn pd_update_preserves_connector_and_pair_descriptor() {
             ..Default::default()
         });
 
-        assert_eq!(
-            UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap(),
-            StepResult::Success
-        );
+        step_succeeds(UpdateWorkerPropertiesStep.execute(&mut ctx).await);
 
         let updated = app_ctx
             .worker_registry
@@ -1135,8 +1042,7 @@ async fn zmq_update_preserves_transport_state_and_the_live_client() {
         HashMap::from([("tier".to_string(), "gold".to_string())]),
     );
 
-    let result = UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap();
-    assert_eq!(result, StepResult::Success);
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut ctx).await);
 
     let updated = ctx.data.updated_workers.as_ref().expect("updated workers");
     assert_eq!(updated.len(), 1);
@@ -1190,7 +1096,7 @@ async fn zmq_update_preserves_transport_state_and_the_live_client() {
 /// entry the old worker was keeping alive.
 #[tokio::test]
 async fn http_update_adopts_the_materialized_shared_client() {
-    let client = Arc::new(crate::clients::http_client());
+    let client = Arc::new(crate::server::http_client());
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://w:8080")
             .http_client(Arc::clone(&client))
@@ -1200,8 +1106,7 @@ async fn http_update_adopts_the_materialized_shared_client() {
     let app_ctx = make_app_context(std::slice::from_ref(&worker));
     let mut ctx = make_context(app_ctx, Arc::clone(&worker), HashMap::new());
 
-    let result = UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap();
-    assert_eq!(result, StepResult::Success);
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut ctx).await);
 
     let updated = &ctx.data.updated_workers.as_ref().expect("updated workers")[0];
     let adopted = updated
@@ -1216,7 +1121,7 @@ async fn http_update_adopts_the_materialized_shared_client() {
 async fn http_update_preserves_http2() {
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://w:8080")
-            .http_client(Arc::new(crate::clients::http_client()))
+            .http_client(Arc::new(crate::server::http_client()))
             .http2(true)
             .status(WorkerStatus::Ready)
             .build(),
@@ -1244,25 +1149,13 @@ async fn a_worker_over_the_cap_takes_updates_that_add_no_key() {
     let mut priority = make_context(Arc::clone(&app_ctx), Arc::clone(&worker), HashMap::new());
     priority.data.config.labels = None;
     priority.data.config.priority = Some(7);
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut priority)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut priority).await);
     let mut rewrite = make_context(
         Arc::clone(&app_ctx),
         Arc::clone(&worker),
         HashMap::from([("k3".to_string(), "w".to_string())]),
     );
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut rewrite)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut rewrite).await);
     let mut adds = make_context(
         Arc::clone(&app_ctx),
         Arc::clone(&worker),
@@ -1329,13 +1222,6 @@ async fn a_refused_rank_leaves_no_partial_update_behind() {
     );
 }
 
-fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect()
-}
-
 /// A worker as registration builds it: its card derived from the spec and
 /// the labels, the labels on the worker.
 fn registered(spec: WorkerSpec, labels: HashMap<String, String>) -> Arc<dyn Worker> {
@@ -1376,7 +1262,7 @@ fn registered_worker(
 async fn a_label_refresh_re_derives_the_model_card_from_the_engines_labels() {
     let worker = discovered(
         WorkerSpec::new("http://w:8000"),
-        labels(&[("served_model_name", "m"), ("max_model_len", "4096")]),
+        labels_of(&[("served_model_name", "m"), ("max_model_len", "4096")]),
     );
     assert_eq!(
         worker.context_length("m"),
@@ -1386,20 +1272,14 @@ async fn a_label_refresh_re_derives_the_model_card_from_the_engines_labels() {
     assert!(!worker.models().remove(0).model_type.supports_vision());
     let app_ctx = make_app_context(std::slice::from_ref(&worker));
 
-    let fresh = labels(&[
+    let fresh = labels_of(&[
         ("served_model_name", "m"),
         ("max_model_len", "32768"),
         ("supports_vision", "true"),
     ]);
     let mut refresh =
         make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&worker), fresh.clone());
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut refresh)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut refresh).await);
 
     let rebuilt = app_ctx
         .worker_registry
@@ -1429,7 +1309,7 @@ async fn a_label_refresh_re_derives_the_model_card_from_the_engines_labels() {
 async fn the_model_card_follows_a_label_update() {
     let worker = registered(
         WorkerSpec::new("http://w:8000"),
-        labels(&[
+        labels_of(&[
             ("served_model_name", "m"),
             ("max_model_len", "4096"),
             ("model_type", "llama"),
@@ -1441,7 +1321,7 @@ async fn the_model_card_follows_a_label_update() {
     let mut ctx = make_context(
         Arc::clone(&app_ctx),
         Arc::clone(&worker),
-        labels(&[
+        labels_of(&[
             ("served_model_name", "other"),
             ("max_model_len", "8192"),
             ("model_type", "qwen3"),
@@ -1450,10 +1330,7 @@ async fn the_model_card_follows_a_label_update() {
             ("tokenizer_path", "/models/m"),
         ]),
     );
-    assert_eq!(
-        UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut ctx).await);
 
     let updated = app_ctx
         .worker_registry
@@ -1481,18 +1358,15 @@ async fn the_model_card_follows_a_label_update() {
 async fn a_card_value_set_by_hand_stands_over_a_label_update() {
     let mut spec = WorkerSpec::new("http://w:8000");
     spec.models = WorkerModels::Single(Box::new(ModelCard::new("m").with_context_length(2048)));
-    let worker = registered(spec, labels(&[("max_model_len", "4096")]));
+    let worker = registered(spec, labels_of(&[("max_model_len", "4096")]));
     assert_eq!(worker.context_length("m"), Some(2048), "as registered");
     let app_ctx = make_app_context(std::slice::from_ref(&worker));
     let mut ctx = make_context(
         Arc::clone(&app_ctx),
         Arc::clone(&worker),
-        labels(&[("max_model_len", "8192")]),
+        labels_of(&[("max_model_len", "8192")]),
     );
-    assert_eq!(
-        UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut ctx).await);
 
     let updated = app_ctx
         .worker_registry
@@ -1509,7 +1383,7 @@ async fn a_card_value_set_by_hand_stands_over_a_label_update() {
 async fn a_parser_override_from_a_label_update_must_be_known() {
     let worker = registered(
         WorkerSpec::new("http://w:8000"),
-        labels(&[("served_model_name", "m")]),
+        labels_of(&[("served_model_name", "m")]),
     );
     let app_ctx = make_app_context_with(
         std::slice::from_ref(&worker),
@@ -1518,7 +1392,7 @@ async fn a_parser_override_from_a_label_update_must_be_known() {
     let mut unknown = make_context(
         Arc::clone(&app_ctx),
         Arc::clone(&worker),
-        labels(&[("tool_parser", "definitely-not-a-parser")]),
+        labels_of(&[("tool_parser", "definitely-not-a-parser")]),
     );
     let err = UpdateWorkerPropertiesStep
         .execute(&mut unknown)
@@ -1534,15 +1408,9 @@ async fn a_parser_override_from_a_label_update_must_be_known() {
     let mut known = make_context(
         Arc::clone(&app_ctx),
         Arc::clone(&worker),
-        labels(&[("tool_parser", "json")]),
+        labels_of(&[("tool_parser", "json")]),
     );
-    assert_eq!(
-        UpdateWorkerPropertiesStep
-            .execute(&mut known)
-            .await
-            .unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut known).await);
     let updated = app_ctx
         .worker_registry
         .get_by_url("http://w:8000")
@@ -1573,16 +1441,13 @@ async fn an_external_workers_cards_are_left_as_they_are() {
         let mut ctx = make_context(
             Arc::clone(&app_ctx),
             Arc::clone(&worker),
-            labels(&[
+            labels_of(&[
                 ("is_embedding", "true"),
                 ("model_type", "chat"),
                 ("max_model_len", "8192"),
             ]),
         );
-        assert_eq!(
-            UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap(),
-            StepResult::Success
-        );
+        step_succeeds(UpdateWorkerPropertiesStep.execute(&mut ctx).await);
 
         let updated = app_ctx
             .worker_registry
@@ -1607,11 +1472,11 @@ async fn an_external_workers_cards_are_left_as_they_are() {
 async fn a_conflicting_parser_override_from_a_label_update_is_warned_about() {
     let peer = registered(
         WorkerSpec::new("http://peer:8000"),
-        labels(&[("served_model_name", "m"), ("tool_parser", "json")]),
+        labels_of(&[("served_model_name", "m"), ("tool_parser", "json")]),
     );
     let worker = registered(
         WorkerSpec::new("http://w:8000"),
-        labels(&[("served_model_name", "m"), ("tool_parser", "json")]),
+        labels_of(&[("served_model_name", "m"), ("tool_parser", "json")]),
     );
     let app_ctx = make_app_context_with(
         &[Arc::clone(&peer), Arc::clone(&worker)],
@@ -1620,12 +1485,9 @@ async fn a_conflicting_parser_override_from_a_label_update_is_warned_about() {
     let mut ctx = make_context(
         Arc::clone(&app_ctx),
         Arc::clone(&worker),
-        labels(&[("tool_parser", "pythonic")]),
+        labels_of(&[("tool_parser", "pythonic")]),
     );
-    assert_eq!(
-        UpdateWorkerPropertiesStep.execute(&mut ctx).await.unwrap(),
-        StepResult::Success
-    );
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut ctx).await);
     assert!(logs_contain("conflicting parser overrides"));
     assert!(logs_contain("existing_worker=\"http://peer:8000\""));
     assert!(!logs_contain("existing_worker=\"http://w:8000\""));

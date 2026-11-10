@@ -1,6 +1,6 @@
 //! Harmony response processor for non-streaming responses
 
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
 use axum::response::Response;
 use openai_protocol::{
@@ -29,6 +29,7 @@ use crate::{
                 responses::utils::{generation_failure_error, response_status},
             },
             context::{DispatchMetadata, ExecutionResult},
+            regular::processor::generation_start,
         },
     },
 };
@@ -124,7 +125,7 @@ impl HarmonyResponseProcessor {
         dispatch: DispatchMetadata,
         router_stop_strings: &[String],
     ) -> Result<(ChatCompletionResponse, response_formatting::TokenCounts), Response> {
-        let started = Instant::now();
+        let started = generation_start(&execution_result);
         let request_logprobs = chat_request.logprobs;
 
         // Collect all completed responses (one per choice)
@@ -172,14 +173,14 @@ impl HarmonyResponseProcessor {
                     )
                 })?;
 
-            // Convert output logprobs if present: the engine's, one entry per
-            // generated token, as the engine's own server returns them.
+            // Convert output logprobs if present: one entry per generated
+            // token, with the candidates the request's `top_logprobs` asked for.
             let logprobs: Option<ChatLogProbs> = if request_logprobs {
                 let encoding = try_harmony_encoding()
                     .map_err(|e| error::internal_error("harmony_encoding_unavailable", e))?;
                 complete
                     .output_logprobs()
-                    .map(|lp| convert_harmony_logprobs(encoding, lp))
+                    .map(|lp| convert_harmony_logprobs(encoding, lp, chat_request.top_logprobs))
             } else {
                 None
             };
@@ -217,7 +218,8 @@ impl HarmonyResponseProcessor {
         // The usage from the engine's counters, built as the streamed answer
         // builds its usage chunk: with the reasoning tokens the parser
         // counted and every detail counter present as the OpenAI API sends it.
-        let counts = response_formatting::TokenCounts::of(&all_responses);
+        let counts =
+            response_formatting::TokenCounts::of_collected(&all_responses, chat_request.choices());
         let usage = chat_usage(counts, total_reasoning_tokens);
 
         // Final ChatCompletionResponse
@@ -469,7 +471,7 @@ mod tests {
             cached: 0,
             reasoning,
             spec_accepted: 0,
-            spec_drafted: 0,
+            spec_drafted: Some(0),
         }
     }
 

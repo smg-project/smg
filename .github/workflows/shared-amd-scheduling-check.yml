@@ -1,0 +1,33 @@
+name: Shared AMD scheduling configuration
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/nightly-pd.yml
+      - .github/workflows/nightly-benchmark-amd.yml
+      - .github/workflows/shared-amd-scheduling-check.yml
+      - scripts/ci/amd_ci_hold_host_lease.sh
+      - scripts/ci/tests/test_amd_ci_host_lease.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  effective-configuration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Report effective AMD gates without allocating a GPU
+        env:
+          AMD_LEGS_ENABLED: ${{ vars.SMG_RUN_AMD_LEGS == 'true' }}
+          AMD_PRS_ENABLED: ${{ vars.SMG_RUN_AMD_ON_PRS == 'true' }}
+          AMD_PR_BENCHMARK_ENABLED: ${{ vars.SMG_RUN_AMD_PR_BENCHMARK == 'true' }}
+        run: |
+          echo "SMG_RUN_AMD_LEGS effective true: $AMD_LEGS_ENABLED"
+          echo "SMG_RUN_AMD_ON_PRS effective true: $AMD_PRS_ENABLED"
+          echo "SMG_RUN_AMD_PR_BENCHMARK effective true: $AMD_PR_BENCHMARK_ENABLED"
+          echo "Host admission must enforce Router 05:00-06:30 UTC for every AMD event."
+      - uses: actions/checkout@v7
+      - name: Exercise lease holder using isolated temporary locks
+        run: python3 -B scripts/ci/tests/test_amd_ci_host_lease.py

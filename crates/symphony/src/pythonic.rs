@@ -2321,6 +2321,17 @@ mod tests {
                 "",
                 Found::Open,
             ),
+            // The fuzz campaign's `empty-arguments` class on this syntax: a call of no
+            // arguments at its `)`, at its list's `]`, and before a second call the ending
+            // cuts; a second name cut before its parenthesis.
+            ("[get_weather()", "", Found::Whole),
+            ("[get_weather()]", "]", Found::Wrapping),
+            ("[get_weather(), get_stock_price(", "", Found::Open),
+            (
+                "[get_weather(city='Paris'), get_stock_price",
+                "get_stock_price",
+                Found::Name,
+            ),
         ];
         for ending in [Ending::Close, Ending::Stream] {
             for (text, held, found) in cuts {
@@ -2396,14 +2407,18 @@ mod tests {
                             assert_eq!(said(&events), [*held], "{place}: the name");
                         }
                     }
-                    if *found != Found::Open {
-                        assert!(
-                            calls(&events)
-                                .iter()
-                                .all(|(_, _, arguments)| arguments.ends_with('}')),
-                            "{place}: every call is whole"
-                        );
-                    }
+                    // Every call before the cut is whole; where nothing is cut, every call.
+                    let made = calls(&events);
+                    let before_the_cut = match found {
+                        Found::Open => &made[..made.len() - 1],
+                        _ => &made[..],
+                    };
+                    assert!(
+                        before_the_cut
+                            .iter()
+                            .all(|(_, _, arguments)| arguments.ends_with('}')),
+                        "{place}: every call before the cut is whole"
+                    );
                 }
             }
         }

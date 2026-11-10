@@ -1,17 +1,216 @@
-//! Shared `tonic::Channel` builder for SMG gRPC clients.
+//! The engine clients' HTTP/2 channel: one connection per engine, every call
+//! run over h2 from the task that makes it.
 //!
 //! Each gRPC client of this crate (`vllm_engine`, `sglang_scheduler`,
 //! `tokenspeed_scheduler`, `trtllm_service`, `mlx_engine`, and the EPD
 //! encode client `tokenspeed_encoder`) connects to its backend the same
-//! way: accept either an `http(s)://` or a `grpc(s)://` endpoint, convert
-//! the gRPC schemes to tonic-compatible HTTP(S) ones, and build a `Channel`
-//! with the same keep-alive / window-size profile. This module centralises
-//! that pipeline so adding a new engine — or tuning the transport profile —
-//! touches one file instead of one per client.
+//! way: accept either an `http://` or a `grpc://` endpoint, convert the
+//! gRPC scheme to its HTTP equivalent, dial under a connect timeout, and
+//! run every call over a [`Channel`] with the same keep-alive and window
+//! profile. This module centralises that pipeline so adding a new engine,
+//! or tuning the transport profile, touches one place instead of one per
+//! client.
+//!
+//! The channel is this crate's own `tower::Service` over h2's client
+//! handle rather than tonic's `Channel`. tonic's fronts hyper's HTTP/2
+//! client with a `tower::buffer::Buffer` (one worker task per connection,
+//! an mpsc send and a oneshot per call), and hyper relays every request
+//! through its dispatch task and a task spawned per request for the
+//! response: five tasks and seven hand-offs per call, paid in instructions
+//! and allocations on every engine call (not in context switches: the
+//! hand-offs run in the runtime worker's LIFO slot). Here a call opens its
+//! stream on the connection from the calling task, writes its body under
+//! the stream's send window and awaits the response head; the connection's
+//! one task (the socket, with the keep-alive pings, in `connection`)
+//! wakes the call for the head and for every frame of the response body.
+//! No task is spawned per call and nothing relays the answer, as the h2
+//! crate is built to be used.
 
-use std::time::Duration;
+mod connection;
+#[cfg(test)]
+mod tests;
 
-use tonic::transport::{Channel, Endpoint};
+use std::{
+    fmt,
+    future::{poll_fn, Future},
+    pin::{pin, Pin},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, PoisonError,
+    },
+    task::{ready, Context, Poll, Waker},
+    time::Duration,
+};
+
+use h2::{client, Reason, RecvStream, SendStream};
+use http_body::Frame;
+use tonic::{
+    codegen::{
+        http::{
+            header::{HeaderValue, USER_AGENT},
+            uri::Uri,
+            Request, Response, Version,
+        },
+        Body as _, Bytes, Service,
+    },
+    ConnectError,
+};
+use tracing::{debug, info};
+
+use self::connection::{Connection, End};
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Default ceiling on a single TCP connect attempt.
+///
+/// Without a bound of its own, a dial to a black-holing peer (SYN dropped
+/// rather than refused, a pod IP whose container is not listening yet) sits
+/// in `SYN_SENT` until the kernel gives up: `net.ipv4.tcp_syn_retries`
+/// defaults to 6, i.e. ~127s. Bounding the attempt here keeps those sockets
+/// from accumulating faster than they drain. Matches the upstream HTTP
+/// client's connect timeout in `AppContext`.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The `user-agent` of every call, in place of the one tonic's channel
+/// wrote: engines log it with the request.
+const USER_AGENT_VALUE: &str = concat!("smg-grpc-client/", env!("CARGO_PKG_VERSION"));
+
+/// One HTTP/2 connection to an engine, shared by every clone of the channel.
+///
+/// A call opens its stream on the connection from the task that makes it,
+/// writes the request body under the stream's send window (a one-message
+/// body, which every call of this crate has, is one DATA frame that ends the
+/// stream) and awaits the response head; the connection's task wakes it for
+/// the head and the body hands tonic every frame as the socket task reads
+/// it. No task is spawned per call and nothing relays the answer.
+///
+/// A connection that died (the peer went away, a GOAWAY, a keep-alive ping
+/// unanswered) fails the calls in flight on it and is re-dialled under the
+/// next call: one dial at a time, and the callers that find the connection
+/// dead meanwhile wait for that dial and share its connection, or its
+/// failure, so N callers on a dead engine cost one dial, not N, and one
+/// connect timeout, not N, when the engine black-holes. The gateway caches
+/// a worker's client once, so this is the client's only recovery.
+#[derive(Clone)]
+pub struct Channel {
+    shared: Arc<Shared>,
+}
+
+/// The response's body: h2's receive stream as an HTTP body, each data
+/// frame's bytes released back to the stream's window as it is read, the
+/// trailers last. A request still being written when the response head
+/// arrived (a peer that answers before it has read the whole request and
+/// keeps reading) is written from here, as the body is read: no task for
+/// that either.
+#[derive(Debug)]
+pub struct RecvBody {
+    stream: RecvStream,
+    write: Option<BodyWrite>,
+    end: Arc<End>,
+}
+
+impl Service<Request<tonic::body::Body>> for Channel {
+    type Response = Response<RecvBody>;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    /// Always ready: whether the connection takes a stream is asked under
+    /// the call, where a dead connection is re-dialled, because tonic's
+    /// generated clients report a readiness error as an `Unknown` status
+    /// without its source, which would lose the fault's nature.
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<tonic::body::Body>) -> Self::Future {
+        let (mut parts, body) = request.into_parts();
+        // The origin in front of the call's own path (what tonic's AddOrigin
+        // layer wrote).
+        let mut uri = self.shared.origin.clone().into_parts();
+        uri.path_and_query = parts.uri.path_and_query().cloned();
+        parts.uri = match Uri::from_parts(uri) {
+            Ok(uri) => uri,
+            Err(e) => return Box::pin(std::future::ready(Err(e.into()))),
+        };
+        parts.version = Version::HTTP_2;
+        parts
+            .headers
+            .entry(USER_AGENT)
+            .or_insert(HeaderValue::from_static(USER_AGENT_VALUE));
+        let request = Request::from_parts(parts, ());
+        let ended = body.is_end_stream();
+        let shared = Arc::clone(&self.shared);
+        Box::pin(async move {
+            let mut connection = shared.ready().await?;
+            let (response, stream) = connection
+                .requests
+                .send_request(request, ended)
+                .map_err(|e| connection.end.failure(e))?;
+            exchange(response, stream, body, connection.end, ended).await
+        })
+    }
+}
+
+/// Connect a [`Channel`] to the given endpoint with the SMG-standard
+/// keep-alive and HTTP/2 window profile applied, using
+/// [`DEFAULT_CONNECT_TIMEOUT`].
+///
+/// The endpoint may use `http://` or `grpc://`; the gRPC scheme is
+/// normalised to its HTTP equivalent before the URI is parsed. TLS endpoints
+/// are refused (see [`normalize_grpc_endpoint`] for the scheme rewrite and
+/// the config validator for the refusal at start-up).
+pub async fn connect_channel(
+    endpoint: &str,
+) -> Result<Channel, Box<dyn std::error::Error + Send + Sync>> {
+    connect_channel_with_timeout(endpoint, DEFAULT_CONNECT_TIMEOUT).await
+}
+
+/// Same as [`connect_channel`], but with an explicit connect timeout.
+///
+/// Callers that already bound the dial with their own deadline (health and
+/// reachability probes) should pass that deadline through, so the socket of
+/// a dial that runs past it is closed with the attempt rather than left to
+/// the outer future being dropped.
+pub async fn connect_channel_with_timeout(
+    endpoint: &str,
+    connect_timeout: Duration,
+) -> Result<Channel, Box<dyn std::error::Error + Send + Sync>> {
+    let channel = Channel::unconnected(endpoint, connect_timeout)?;
+    channel.shared.dial().await?;
+    Ok(channel)
+}
+
+/// Whether `status` is what tonic makes of a failure in the HTTP/2 layer
+/// under a call, rather than an answer the worker gave: the connection went
+/// away (a GOAWAY of either side, the one this client issues once too many
+/// of its locally-reset streams received late frames included; the socket
+/// failing or closed with the call in flight), the peer reset the stream
+/// below gRPC, a protocol fault. tonic picks such a status's code from the
+/// frame's reason (`ENHANCE_YOUR_CALM` reads as `RESOURCE_EXHAUSTED`, the
+/// code of a worker's own capacity pushback; `PROTOCOL_ERROR` as `INTERNAL`,
+/// the code of its own failure on a request; an I/O failure, which h2
+/// reports with no reason, as `UNKNOWN`), so the code cannot tell the two
+/// apart: the `h2::Error` in the status's source chain can. A status the
+/// worker answered with (its trailers) carries no such source. Neither does
+/// a dial the peer refuses or that times out (the channel's `UNAVAILABLE`
+/// over the connect error, before any call was in flight), nor the
+/// `UNAVAILABLE` "keep-alive timed out" of a connection this side dropped
+/// for a pong that never came, as tonic answered it.
+///
+/// The gateway's liveness asks a different question of the ends of its
+/// polls and streams, whether the peer is reachable for work, and answers
+/// it from the code alone (`worker::liveness::is_connection_code` in the
+/// gateway crate); the two are not interchangeable.
+pub fn is_transport_failure(status: &tonic::Status) -> bool {
+    let mut source = std::error::Error::source(status);
+    while let Some(error) = source {
+        if error.is::<h2::Error>() {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
 
 /// Convert a `grpc://` or `grpcs://` endpoint to a tonic-compatible
 /// `http://` or `https://` URI. Other schemes (or schemeless inputs) are
@@ -25,150 +224,360 @@ pub fn normalize_grpc_endpoint(endpoint: &str) -> String {
     }
 }
 
-/// Default ceiling on a single TCP/TLS connect attempt.
-///
-/// tonic applies no connect timeout of its own, so without this a dial to a
-/// black-holing peer (SYN dropped rather than refused — a pod IP whose
-/// container is not listening yet) sits in `SYN_SENT` until the kernel gives
-/// up: `net.ipv4.tcp_syn_retries` defaults to 6, i.e. ~127s. Bounding the
-/// attempt here keeps those sockets from accumulating faster than they drain.
-/// Matches the upstream HTTP client's connect timeout in `AppContext`.
-pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+// --- the channel's own machinery --------------------------------------------
 
-/// HTTP/2 keepalive: a ping every 30 seconds, answered within 10. The
-/// interval is bounded from below by the engines' gRPC servers, not by how
-/// fast a dead peer should be noticed: a grpc-core server (vLLM's and
-/// SGLang's native gRPC servers) answers a ping that arrives within its
-/// `min_ping_interval_without_data` (five minutes by default) of the previous
-/// one with a strike, and the second strike is a GOAWAY "too_many_pings"
-/// that fails every in-flight stream with `UNAVAILABLE`. A ping every second
-/// did exactly that whenever a prefill batch left the connection without
-/// data for two seconds. A peer that drops its connection still fails its
-/// streams at once; one that falls silent is noticed at the keepalive
-/// timeout or at the next poll's deadline, whichever comes first, and the
-/// gateway's liveness veto turns the failure into exclusion from routing.
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
-const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
-const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
-
-/// HTTP/2 receive window per stream (one in-flight RPC).
-///
-/// These windows only govern what the worker sends back; requests flow under
-/// the worker's own settings. The stream window caps how much of a response h2
-/// buffers while SMG is not reading it, e.g. while a slow SSE client keeps the
-/// bounded body channel full. Beyond that, flow control pauses the worker.
-///
-/// h2 charges every buffered DATA frame under 256 bytes against a single
-/// budget per *connection*, and a streamed token chunk is a few dozen bytes.
-/// Once the budget is gone the client sends
-/// `GOAWAY ENHANCE_YOUR_CALM too_many_data_frames`, failing every RPC on the
-/// connection. A 16 MiB stream window let one unread high-rate stream (an
-/// `n=128` request behind a slow client) do that in about 90 seconds.
-const STREAM_WINDOW: u32 = 256 * 1024;
-
-/// HTTP/2 receive window per connection.
-///
-/// Every stream is already capped at [`STREAM_WINDOW`], so this does not bound
-/// memory in practice. It sizes h2's small-DATA-frame budget, which is half of
-/// this window.
-const CONNECTION_WINDOW: u32 = 512 * 1024 * 1024;
-
-// A stream window packed with 1-byte DATA frames costs `STREAM_WINDOW * 255`
-// budget units. Require room for four of them, so a few stalled streams
-// cannot tear down the connection they share.
-const _: () = assert!((STREAM_WINDOW as usize) * 255 * 4 <= (CONNECTION_WINDOW as usize) / 2);
-
-/// Connect a `tonic::Channel` to the given endpoint with the SMG-standard
-/// keep-alive and HTTP/2 window profile applied, using
-/// [`DEFAULT_CONNECT_TIMEOUT`].
-///
-/// The endpoint may use any of `http://`, `https://`, `grpc://`, or
-/// `grpcs://` — gRPC schemes are normalised to their HTTP(S) equivalents
-/// before tonic parses them.
-pub async fn connect_channel(
-    endpoint: &str,
-) -> Result<Channel, Box<dyn std::error::Error + Send + Sync>> {
-    connect_channel_with_timeout(endpoint, DEFAULT_CONNECT_TIMEOUT).await
-}
-
-/// Same as [`connect_channel`], but with an explicit connect timeout.
-///
-/// Callers that already bound the dial with their own deadline (health and
-/// reachability probes) should pass that deadline through so tonic reaps the
-/// socket itself, rather than relying on the outer future being dropped.
-pub async fn connect_channel_with_timeout(
-    endpoint: &str,
+struct Shared {
+    /// The `http://` origin: the scheme and authority of every call's URI.
+    origin: Uri,
     connect_timeout: Duration,
-) -> Result<Channel, Box<dyn std::error::Error + Send + Sync>> {
-    let channel = configured_endpoint(endpoint, connect_timeout)?
-        .connect()
-        .await?;
-    Ok(channel)
+    /// The connection the clones share: the latest dial's, `None` before
+    /// the first.
+    live: Mutex<Option<Connection>>,
+    /// Held for the length of a dial, so a dead connection is re-dialled
+    /// once however many callers find it dead; the guard carries the text
+    /// of the failure the last dial ended in (`None` after a connection),
+    /// for the callers that queued behind that dial.
+    dial: tokio::sync::Mutex<Option<String>>,
+    /// Dials finished so far: a caller reads it before queuing for the
+    /// lock and knows, once it holds the lock, whether a dial ended while
+    /// it waited.
+    dials: AtomicU64,
 }
 
-fn configured_endpoint(
-    endpoint: &str,
-    connect_timeout: Duration,
-) -> Result<Endpoint, tonic::transport::Error> {
-    let http_endpoint = normalize_grpc_endpoint(endpoint);
-    Ok(Endpoint::from_shared(http_endpoint)?
-        .connect_timeout(connect_timeout)
-        .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
-        .keep_alive_timeout(KEEPALIVE_TIMEOUT)
-        .keep_alive_while_idle(true)
-        .tcp_keepalive(Some(TCP_KEEPALIVE))
-        .tcp_nodelay(true)
-        .http2_adaptive_window(false)
-        .initial_stream_window_size(Some(STREAM_WINDOW))
-        .initial_connection_window_size(Some(CONNECTION_WINDOW)))
-}
-
-/// Whether `status` is what tonic makes of a failure in the HTTP/2 layer
-/// under a call, rather than an answer the worker gave: the connection went
-/// away (a GOAWAY of either side, the one this client issues once too many
-/// of its locally-reset streams received late frames included), the peer
-/// reset the stream below gRPC, a protocol fault. tonic picks such a
-/// status's code from the frame's reason (`ENHANCE_YOUR_CALM` reads as
-/// `RESOURCE_EXHAUSTED`, the code of a worker's own capacity pushback;
-/// `PROTOCOL_ERROR` as `INTERNAL`, the code of its own failure on a
-/// request), so the code cannot tell the two apart: the `h2::Error` in the
-/// status's source chain can. A status the worker answered with (its
-/// trailers) carries no such source.
-///
-/// The socket under the call failing (the peer reset the connection, or
-/// closed it with the call in flight) is the same connection going away,
-/// seen below the framing: h2 reports it as an I/O failure, hyper unwraps
-/// that into an I/O error of its own, with the `io::Error` behind it and no
-/// `h2::Error` left in the chain, and tonic, which has no code for it,
-/// answers `Unknown` with the words "transport error". That `hyper::Error`
-/// over an `io::Error` is the second shape read here. A dial the peer
-/// resets during the HTTP/2 handshake, after the connect, ends the same
-/// way: the channel dials under the call, and tonic reports it with the
-/// same `Unknown` "transport error" over hyper's I/O error, so it reads as
-/// a transport failure too (a test below dials such a peer). A dial the
-/// peer refuses is tonic's own `UNAVAILABLE`, with an `io::Error` under
-/// its connect error and no `hyper::Error`: not a failure under a call.
-///
-/// The gateway's liveness asks a different question of the ends of its
-/// polls and streams, whether the peer is reachable for work, and answers
-/// it from the code alone (`worker::liveness::is_connection_code` in the
-/// gateway crate); the two are not interchangeable.
-pub fn is_transport_failure(status: &tonic::Status) -> bool {
-    let mut source = std::error::Error::source(status);
-    while let Some(error) = source {
-        if error.is::<h2::Error>() {
-            return true;
-        }
-        if error.is::<hyper::Error>()
-            && error
-                .source()
-                .is_some_and(|cause| cause.is::<std::io::Error>())
-        {
-            return true;
-        }
-        source = error.source();
+impl Channel {
+    /// A channel to `endpoint` that dials on its first call.
+    pub(crate) fn unconnected(endpoint: &str, connect_timeout: Duration) -> Result<Self, BoxError> {
+        let origin = origin_of(endpoint)?;
+        Ok(Self {
+            shared: Arc::new(Shared {
+                origin,
+                connect_timeout,
+                live: Mutex::new(None),
+                dial: tokio::sync::Mutex::new(None),
+                dials: AtomicU64::new(0),
+            }),
+        })
     }
-    false
+
+    /// The peer as the diagnostics name it: host and port.
+    pub(crate) fn peer(&self) -> String {
+        peer_of(&self.shared.origin)
+    }
+}
+
+/// `endpoint` as the origin of a channel's calls: a plain `http://` URI with
+/// a host, the gRPC scheme normalised first.
+///
+/// `https://` (`grpcs://`) is refused: the channel speaks plain HTTP/2 over
+/// TCP. tonic's channel carried its TLS code into the gateway binary (a
+/// feature another crate of the workspace enables) but no root store to
+/// validate an engine's certificate against, so no TLS endpoint ever
+/// completed a validated handshake; the config validator refuses the scheme
+/// at start-up now, and a TLS connector, when one is wanted, slots in under
+/// `connection::connect_io`, which takes any socket.
+fn origin_of(endpoint: &str) -> Result<Uri, BoxError> {
+    let origin: Uri = normalize_grpc_endpoint(endpoint).parse()?;
+    if origin.scheme_str() != Some("http") {
+        return Err(format!(
+            "{}: only plain http (grpc) endpoints are supported",
+            peer_of(&origin)
+        )
+        .into());
+    }
+    if origin.host().is_none() {
+        return Err("the endpoint names no host".into());
+    }
+    Ok(origin)
+}
+
+/// What the diagnostics call `origin`'s peer: host and port, never the
+/// origin whole (a worker URL may carry userinfo, which no log line or
+/// error gets).
+fn peer_of(origin: &Uri) -> String {
+    format!(
+        "{}:{}",
+        origin.host().unwrap_or_default(),
+        origin.port_u16().unwrap_or(80)
+    )
+}
+
+impl Shared {
+    /// The connection the clones share, if there is one.
+    fn live(&self) -> Option<Connection> {
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The shared connection, ready to take a stream: the live one once it
+    /// has room for a stream (h2 queues the call behind the peer's
+    /// concurrency limit here, no error), else the one a dial under the
+    /// call gives.
+    async fn ready(&self) -> Result<Connection, BoxError> {
+        if let Some(mut live) = self.live() {
+            if poll_fn(|cx| live.requests.poll_ready(cx)).await.is_ok() {
+                return Ok(live);
+            }
+        }
+        let mut connection = self.connected().await?;
+        poll_fn(|cx| connection.requests.poll_ready(cx))
+            .await
+            .map_err(|e| connection.end.failure(e))?;
+        Ok(connection)
+    }
+
+    /// A connection for a call that found none alive: the one another caller
+    /// dialled meanwhile, else this caller's own dial, under the dial lock so
+    /// a dead engine is dialled once however many callers queue. A dial that
+    /// fails is the call's `UNAVAILABLE`, as tonic reads its connect errors.
+    async fn connected(&self) -> Result<Connection, BoxError> {
+        let dials_before = self.dials.load(Ordering::Acquire);
+        let mut last_dial = self.dial.lock().await;
+        if let Some(mut live) = self.live() {
+            // Alive unless h2 says the connection is gone: a connection at
+            // the peer's concurrency limit is alive and queues the call.
+            let mut probe = Context::from_waker(Waker::noop());
+            if !matches!(live.requests.poll_ready(&mut probe), Poll::Ready(Err(_))) {
+                return Ok(live);
+            }
+        }
+        // A dial that ended in a failure while this caller waited for the
+        // lock is this caller's answer too: the callers behind a dial that
+        // times out pay one connect timeout between them, not one each.
+        let dialled_meanwhile = self.dials.load(Ordering::Acquire) != dials_before;
+        if let (true, Some(failure)) = (dialled_meanwhile, last_dial.as_deref()) {
+            return Err(ConnectError(std::io::Error::other(failure.to_owned()).into()).into());
+        }
+        let dialled = self.dial().await;
+        *last_dial = dialled.as_ref().err().map(ToString::to_string);
+        self.dials.fetch_add(1, Ordering::Release);
+        Ok(dialled.map_err(ConnectError)?)
+    }
+
+    /// Dials the origin and publishes the connection to the clones.
+    async fn dial(&self) -> Result<Connection, BoxError> {
+        let connection = connection::connect(&self.origin, self.connect_timeout).await?;
+        let previous = self
+            .live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(connection.clone());
+        if previous.is_some() {
+            info!(
+                "re-dialled {} after its connection ended",
+                peer_of(&self.origin)
+            );
+        }
+        Ok(connection)
+    }
+}
+
+/// The call once its stream is open: the request body written, the response
+/// head awaited, the response body handed over as it arrives. The write and
+/// the head are polled together, so a peer that answers before it has read
+/// the whole request is heard: an answer that ends the stream, or carries
+/// the gRPC status, is the call's whole answer and the rest of the body
+/// stays unwritten; any other early head hands the write to the response
+/// body, which finishes it as it is read.
+async fn exchange(
+    response: client::ResponseFuture,
+    stream: SendStream<Bytes>,
+    body: tonic::body::Body,
+    end: Arc<End>,
+    ended: bool,
+) -> Result<Response<RecvBody>, BoxError> {
+    let mut response = pin!(response);
+    let mut write = (!ended).then(|| BodyWrite::new(stream, body));
+    let head = poll_fn(|cx| {
+        if let Some(pending) = &mut write {
+            let written = Pin::new(pending).poll(cx);
+            match written {
+                Poll::Ready(Ok(()) | Err(Unwritten::Stream)) => write = None,
+                Poll::Ready(Err(Unwritten::Body(e))) => return Poll::Ready(Err(e)),
+                Poll::Pending => {}
+            }
+        }
+        response.as_mut().poll(cx).map(Ok)
+    })
+    .await?
+    .map_err(|e| end.failure(e))?;
+    let (parts, stream) = head.into_parts();
+    if stream.is_end_stream() || parts.headers.contains_key("grpc-status") {
+        write = None;
+    }
+    Ok(Response::from_parts(parts, RecvBody { stream, write, end }))
+}
+
+/// How a request body's write ended short of the stream's end.
+enum Unwritten {
+    /// The body itself failed (its encoder refused a message): the stream is
+    /// reset and the body's error is the call's.
+    Body(BoxError),
+    /// The stream ended under the write (the peer reset it, the connection
+    /// went away): the response says how.
+    Stream,
+}
+
+fn stream_ended(error: impl fmt::Display) -> Unwritten {
+    debug!("the request body was not written in full: {error}");
+    Unwritten::Stream
+}
+
+/// The request body's write to its stream, under the stream's send window:
+/// one DATA frame per message, the one the body ends with flagged as the
+/// stream's end (so a one-message body is one frame), the trailers last when
+/// the body has them. A future the call polls with the response head, and
+/// the response body after it when the head came first; it holds no
+/// reference, so it moves between the two.
+#[derive(Debug)]
+struct BodyWrite {
+    stream: SendStream<Bytes>,
+    body: tonic::body::Body,
+    /// The frame read ahead of the one being written, to learn whether that
+    /// one is the body's last (`Some(None)`: it is).
+    next: Option<Option<Result<Frame<Bytes>, tonic::Status>>>,
+    /// The data waiting for the window, and whether it ends the stream.
+    pending: Option<(Bytes, bool)>,
+}
+
+impl BodyWrite {
+    fn new(stream: SendStream<Bytes>, body: tonic::body::Body) -> Self {
+        Self {
+            stream,
+            body,
+            next: None,
+            pending: None,
+        }
+    }
+
+    /// The next frame of the body, read ahead or awaited.
+    fn poll_next_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, tonic::Status>>> {
+        match self.next.take() {
+            Some(frame) => Poll::Ready(frame),
+            None => Pin::new(&mut self.body).poll_frame(cx),
+        }
+    }
+}
+
+impl Future for BodyWrite {
+    type Output = Result<(), Unwritten>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        loop {
+            if let Some((data, end)) = &mut this.pending {
+                if data.is_empty() {
+                    this.stream
+                        .send_data(Bytes::new(), *end)
+                        .map_err(stream_ended)?;
+                } else {
+                    this.stream.reserve_capacity(data.len());
+                    let granted = match ready!(this.stream.poll_capacity(cx)) {
+                        Some(granted) => granted.map_err(stream_ended)?,
+                        // The send side closed under the write: the peer
+                        // reset the stream, or the connection failed. The
+                        // response says how.
+                        None => {
+                            return Poll::Ready(Err(match ready!(this.stream.poll_reset(cx)) {
+                                Ok(reason) => stream_ended(h2::Error::from(reason)),
+                                Err(e) => stream_ended(e),
+                            }));
+                        }
+                    };
+                    let piece = data.split_to(granted.min(data.len()));
+                    let finished = data.is_empty();
+                    this.stream
+                        .send_data(piece, *end && finished)
+                        .map_err(stream_ended)?;
+                    if !finished {
+                        continue;
+                    }
+                }
+                let ended = *end;
+                this.pending = None;
+                if ended {
+                    return Poll::Ready(Ok(()));
+                }
+            }
+            match ready!(this.poll_next_frame(cx)) {
+                // The body ended without a frame flagged as its last: an
+                // empty frame ends the stream.
+                None => this.pending = Some((Bytes::new(), true)),
+                // The body failed, not the stream: nothing of the peer's
+                // will end it, so the call does, and its error is the
+                // body's.
+                Some(Err(e)) => {
+                    this.stream.send_reset(Reason::CANCEL);
+                    return Poll::Ready(Err(Unwritten::Body(e.into())));
+                }
+                Some(Ok(frame)) => match frame.into_data() {
+                    Ok(data) => {
+                        // A look at what follows, without waiting for it: a
+                        // body that is already at its end makes this frame
+                        // the stream's last.
+                        let last = match Pin::new(&mut this.body).poll_frame(cx) {
+                            Poll::Ready(None) => true,
+                            Poll::Ready(following) => {
+                                this.next = Some(following);
+                                false
+                            }
+                            Poll::Pending => false,
+                        };
+                        this.pending = Some((data, last));
+                    }
+                    Err(frame) => {
+                        if let Ok(trailers) = frame.into_trailers() {
+                            this.stream.send_trailers(trailers).map_err(stream_ended)?;
+                            return Poll::Ready(Ok(()));
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+impl http_body::Body for RecvBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        if let Some(write) = &mut this.write {
+            let written = Pin::new(write).poll(cx);
+            match written {
+                Poll::Ready(Ok(()) | Err(Unwritten::Stream)) => this.write = None,
+                Poll::Ready(Err(Unwritten::Body(e))) => {
+                    this.write = None;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Pending => {}
+            }
+        }
+        if let Some(data) = ready!(this.stream.poll_data(cx)) {
+            let data = data.map_err(|e| this.end.failure(e))?;
+            this.stream
+                .flow_control()
+                .release_capacity(data.len())
+                .map_err(|e| this.end.failure(e))?;
+            return Poll::Ready(Some(Ok(Frame::data(data))));
+        }
+        match ready!(this.stream.poll_trailers(cx)).map_err(|e| this.end.failure(e))? {
+            Some(trailers) => Poll::Ready(Some(Ok(Frame::trailers(trailers)))),
+            None => Poll::Ready(None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.stream.is_end_stream()
+    }
 }
 
 /// For the tests that need a dial to fail.
@@ -201,792 +610,44 @@ pub(crate) mod testing {
             url: format!("grpc://127.0.0.1:{port}"),
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use std::{
-        future::{pending, Pending},
-        io,
-        task::{Context, Poll},
-        time::{Duration, Instant},
-    };
-
-    use hyper_util::rt::TokioIo;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
-        net::{TcpListener, TcpStream},
-    };
-    use tonic::{codegen::http::Uri, transport::Endpoint};
-    use tower::Service;
-
-    use super::{
-        configured_endpoint, is_transport_failure, normalize_grpc_endpoint, testing,
-        DEFAULT_CONNECT_TIMEOUT, STREAM_WINDOW,
-    };
-    use crate::{tokenspeed_proto, TokenSpeedSchedulerClient};
-
-    #[derive(Clone, Copy)]
-    struct PendingConnector;
-
-    impl Service<Uri> for PendingConnector {
-        type Response = TokioIo<DuplexStream>;
-        type Error = io::Error;
-        type Future = Pending<Result<Self::Response, Self::Error>>;
-
-        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, _request: Uri) -> Self::Future {
-            pending()
-        }
+    /// A loopback endpoint whose dials black-hole: a listener whose accept
+    /// queue is full drops the SYNs that follow (Linux), so a connect runs
+    /// into its timeout. The queued connections live as long as this value
+    /// and nothing leaves the host. Linux only, as its one test is.
+    #[cfg(target_os = "linux")]
+    pub(crate) struct BlackHoleEndpoint {
+        _listener: tokio::net::TcpListener,
+        _queued: Vec<tokio::net::TcpStream>,
+        pub(crate) url: String,
     }
 
-    #[test]
-    fn default_connect_timeout_is_below_the_kernel_syn_ceiling() {
-        // The point of the default is to beat the ~127s kernel SYN timeout
-        // (tcp_syn_retries=6); if it ever grows past that it stops doing its job.
-        assert!(DEFAULT_CONNECT_TIMEOUT < Duration::from_secs(127));
-    }
-
-    /// A connector that never completes must be bounded by the caller's
-    /// `connect_timeout`, preventing the kernel SYN retry ceiling described by
-    /// [`DEFAULT_CONNECT_TIMEOUT`] from governing a black-holed dial.
-    ///
-    /// The upper bound has to sit *below* [`DEFAULT_CONNECT_TIMEOUT`], otherwise
-    /// an implementation that silently ignored the argument and fell back to the
-    /// default would still pass. `PROBE_TIMEOUT` is generous enough to absorb
-    /// scheduler variance on a loaded CI box.
-    #[tokio::test]
-    async fn connect_timeout_bounds_a_pending_connector() {
-        const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
-        const LOWER_BOUND: Duration = Duration::from_millis(200);
-        const UPPER_BOUND: Duration = Duration::from_secs(2);
-
-        // Guards the discriminating power of the assertion below: if the
-        // default ever drops to within the bound, this test silently stops
-        // distinguishing "argument honored" from "default used".
-        assert!(
-            UPPER_BOUND < DEFAULT_CONNECT_TIMEOUT,
-            "UPPER_BOUND ({UPPER_BOUND:?}) must stay below DEFAULT_CONNECT_TIMEOUT \
-             ({DEFAULT_CONNECT_TIMEOUT:?}) for this test to prove the argument is used"
-        );
-
-        let start = Instant::now();
-        let result = configured_endpoint("grpc://unused.invalid", PROBE_TIMEOUT)
-            .expect("build test endpoint")
-            .connect_with_connector(PendingConnector)
-            .await;
-        let elapsed = start.elapsed();
-
-        assert!(result.is_err(), "pending connector should time out");
-        assert!(
-            elapsed >= LOWER_BOUND,
-            "dial failed in {elapsed:?}, before the {PROBE_TIMEOUT:?} timeout; \
-             the test did not exercise timeout handling"
-        );
-        assert!(
-            elapsed < UPPER_BOUND,
-            "dial took {elapsed:?}, over the {UPPER_BOUND:?} bound; \
-             the {PROBE_TIMEOUT:?} connect_timeout argument was not applied"
-        );
-    }
-
-    #[test]
-    fn normalize_grpc_to_http() {
-        assert_eq!(
-            normalize_grpc_endpoint("grpc://worker:8080"),
-            "http://worker:8080"
-        );
-    }
-
-    #[test]
-    fn normalize_grpcs_to_https() {
-        assert_eq!(
-            normalize_grpc_endpoint("grpcs://worker:8443"),
-            "https://worker:8443"
-        );
-    }
-
-    #[test]
-    fn normalize_passes_http_through() {
-        assert_eq!(
-            normalize_grpc_endpoint("http://worker:8080"),
-            "http://worker:8080"
-        );
-    }
-
-    #[test]
-    fn normalize_passes_https_through() {
-        assert_eq!(
-            normalize_grpc_endpoint("https://worker:8443"),
-            "https://worker:8443"
-        );
-    }
-
-    #[test]
-    fn normalize_passes_unknown_scheme_through() {
-        // Tonic will reject this, but normalize is not a validator —
-        // it only rewrites gRPC schemes.
-        assert_eq!(
-            normalize_grpc_endpoint("tcp://worker:9000"),
-            "tcp://worker:9000"
-        );
-    }
-
-    #[test]
-    fn normalize_passes_schemeless_through() {
-        assert_eq!(normalize_grpc_endpoint("worker:8080"), "worker:8080");
-    }
-
-    #[test]
-    fn normalize_handles_path_after_authority() {
-        assert_eq!(
-            normalize_grpc_endpoint("grpc://worker:8080/some/path"),
-            "http://worker:8080/some/path"
-        );
-    }
-
-    #[test]
-    fn normalize_is_case_sensitive_on_scheme() {
-        // Schemes are conventionally lowercase; tonic itself is case
-        // sensitive on the URI, so we don't rewrite uppercased gRPC.
-        assert_eq!(
-            normalize_grpc_endpoint("GRPC://worker:8080"),
-            "GRPC://worker:8080"
-        );
-    }
-
-    // --- HTTP/2 window on the wire ------------------------------------------
-    //
-    // tonic applies `http2_adaptive_window` after the window setters and hyper
-    // resets both windows to 65535 when it is enabled, so what reaches the
-    // peer can only be checked on the wire. h2 also sizes its budget for
-    // sub-256-byte DATA frames from that window (`max(window / 2, 25_600)`),
-    // which is what turns a backlog of streamed token frames into
-    // `GOAWAY ENHANCE_YOUR_CALM too_many_data_frames`.
-
-    /// Read `SETTINGS_INITIAL_WINDOW_SIZE` from the client's first frame.
-    /// `None` means the client omitted it, which h2 does at the 65535 default.
-    async fn advertised_initial_stream_window<F>(build: F) -> Option<u32>
-    where
-        F: FnOnce(String) -> Endpoint,
-    {
-        use tokio::io::AsyncReadExt as _;
-
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-        let endpoint = build(format!("http://{addr}"));
-
-        let read_settings = async {
-            let (mut sock, _) = listener.accept().await.expect("accept");
-            let mut preface = [0u8; 24];
-            sock.read_exact(&mut preface).await.expect("read preface");
-            assert_eq!(&preface[..16], b"PRI * HTTP/2.0\r\n");
-            let mut header = [0u8; 9];
-            sock.read_exact(&mut header)
-                .await
-                .expect("read frame header");
-            assert_eq!(header[3], 0x4, "first frame must be SETTINGS");
-            let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
-            let mut payload = vec![0u8; len];
-            sock.read_exact(&mut payload).await.expect("read SETTINGS");
-            payload
-        };
-        // `connect` resolves once the preface is flushed, so join rather
-        // than race the two.
-        let (payload, _connected) = tokio::join!(read_settings, endpoint.connect());
-
-        let (entries, _) = payload.as_chunks::<6>();
-        entries
-            .iter()
-            .find(|e| u16::from_be_bytes([e[0], e[1]]) == 0x4)
-            .map(|e| u32::from_be_bytes([e[2], e[3], e[4], e[5]]))
-    }
-
-    #[tokio::test]
-    async fn configured_endpoint_advertises_its_stream_window() {
-        let advertised = advertised_initial_stream_window(|uri| {
-            configured_endpoint(&uri, DEFAULT_CONNECT_TIMEOUT).expect("endpoint")
-        })
-        .await;
-        assert_eq!(advertised, Some(STREAM_WINDOW));
-    }
-
-    #[derive(Debug)]
-    enum BlastOutcome {
-        ClientGoAway(h2::Reason),
-        StillOpen,
-    }
-
-    /// Have an in-process h2 server push `frames` one-byte DATA frames onto a
-    /// stream whose body the client never polls, and report whether the client
-    /// tore the connection down.
-    async fn blast_unread_data_frames<F>(build: F, frames: usize) -> BlastOutcome
-    where
-        F: FnOnce(String) -> Endpoint,
-    {
-        use tonic::codegen::{http, Bytes};
-
-        // Keep the HTTP/2 exchange in memory: closing TCP with unread DATA
-        // can surface as a connection reset on macOS instead of the GOAWAY.
-        // Buffer the entire blast (including frame headers) so the peer can
-        // finish writing before reading the client's GOAWAY.
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let endpoint = build("http://unused.invalid".to_owned());
-
-        #[expect(clippy::disallowed_methods, reason = "test-only h2 peer, joined below")]
-        let server = tokio::spawn(async move {
-            let mut conn = h2::server::handshake(server_io)
-                .await
-                .expect("h2 handshake");
-            let (_request, mut respond) = conn
-                .accept()
-                .await
-                .expect("client opened a stream")
-                .expect("valid request");
-            let response = http::Response::builder()
-                .status(200)
-                .header("content-type", "application/grpc")
-                .body(())
-                .expect("response");
-            let mut send = respond
-                .send_response(response, false)
-                .expect("send headers");
-            send.reserve_capacity(frames);
-            for sent in 0..frames {
-                // Every frame must be queued; a short blast would let
-                // `StillOpen` below pass vacuously.
-                send.send_data(Bytes::from_static(b"x"), false)
-                    .unwrap_or_else(|err| panic!("send_data failed after {sent} frames: {err}"));
-            }
-            match tokio::time::timeout(Duration::from_secs(5), conn.accept()).await {
-                Ok(Some(Err(err))) if err.is_go_away() && err.is_remote() => {
-                    BlastOutcome::ClientGoAway(err.reason().expect("go_away reason"))
-                }
-                Ok(Some(Err(err))) => panic!("unexpected h2 error: {err}"),
-                Ok(Some(Ok(_))) => panic!("client opened a second stream"),
-                Ok(None) => panic!("client closed mid-blast"),
-                Err(_elapsed) => BlastOutcome::StillOpen,
-            }
-        });
-
-        let mut client_io = Some(client_io);
-        let mut channel = endpoint
-            .connect_with_connector(tower::service_fn(move |_uri: Uri| {
-                let io = client_io.take().map(TokioIo::new).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotConnected, "test connection already used")
-                });
-                std::future::ready(io)
-            }))
-            .await
-            .expect("connect");
-        std::future::poll_fn(|cx| channel.poll_ready(cx))
-            .await
-            .expect("channel ready");
-        let request = http::Request::post("/smg.test.Blast/Stream")
-            .header("content-type", "application/grpc")
-            .header("te", "trailers")
-            .body(tonic::body::Body::empty())
-            .expect("request");
-        let response = channel.call(request).await.expect("response headers");
-        let _unread_body = response.into_body();
-
-        server.await.expect("server task")
-    }
-
-    /// With adaptive windows the budget is 32_767, so ~130 unread token
-    /// frames make the client GOAWAY and kill every stream on the connection.
-    #[tokio::test]
-    async fn adaptive_window_goaways_on_unread_token_frames() {
-        let outcome = blast_unread_data_frames(
-            |uri| {
-                Endpoint::from_shared(uri)
-                    .expect("uri")
-                    .http2_adaptive_window(true)
-                    .initial_stream_window_size(Some(STREAM_WINDOW))
-                    .initial_connection_window_size(Some(2 * STREAM_WINDOW))
-            },
-            2_000,
-        )
-        .await;
-        assert!(
-            matches!(
-                outcome,
-                BlastOutcome::ClientGoAway(h2::Reason::ENHANCE_YOUR_CALM)
-            ),
-            "expected GOAWAY ENHANCE_YOUR_CALM, got {outcome:?}"
-        );
-    }
-
-    /// The previous profile (16 MiB stream / 32 MiB connection window) let a
-    /// single unread stream buffer enough token frames to exhaust the 16 MiB
-    /// budget (~66k one-byte frames), and the client GOAWAYed every stream on
-    /// the connection.
-    #[tokio::test]
-    async fn oversized_stream_window_goaways_on_unread_token_frames() {
-        const MIB: u32 = 1024 * 1024;
-        let outcome = blast_unread_data_frames(
-            |uri| {
-                Endpoint::from_shared(uri)
-                    .expect("uri")
-                    .http2_adaptive_window(false)
-                    .initial_stream_window_size(Some(16 * MIB))
-                    .initial_connection_window_size(Some(32 * MIB))
-            },
-            70_000,
-        )
-        .await;
-        assert!(
-            matches!(
-                outcome,
-                BlastOutcome::ClientGoAway(h2::Reason::ENHANCE_YOUR_CALM)
-            ),
-            "expected GOAWAY ENHANCE_YOUR_CALM, got {outcome:?}"
-        );
-    }
-
-    /// Flow control stops the peer once an unread stream holds `STREAM_WINDOW`
-    /// bytes, and a full window of 1-byte frames still fits in the budget. The
-    /// connection therefore survives no matter how much the peer tries to send.
-    #[tokio::test]
-    async fn configured_endpoint_survives_unread_token_frames() {
-        let outcome = blast_unread_data_frames(
-            |uri| configured_endpoint(&uri, DEFAULT_CONNECT_TIMEOUT).expect("endpoint"),
-            STREAM_WINDOW as usize + 1_024,
-        )
-        .await;
-        assert!(
-            matches!(outcome, BlastOutcome::StillOpen),
-            "expected the connection to survive, got {outcome:?}"
-        );
-    }
-
-    // --- transport faults under a call ---------------------------------------
-
-    /// tonic's status for an HTTP/2 fault carries the h2 error as its source,
-    /// whatever code it picked from the frame's reason; a status a worker
-    /// answers with, or one made of some other error, carries none.
-    #[test]
-    fn a_status_made_of_an_http2_fault_is_a_transport_failure() {
-        for (reason, code) in [
-            (
-                h2::Reason::ENHANCE_YOUR_CALM,
-                tonic::Code::ResourceExhausted,
-            ),
-            (h2::Reason::PROTOCOL_ERROR, tonic::Code::Internal),
-            (h2::Reason::REFUSED_STREAM, tonic::Code::Unavailable),
-            (h2::Reason::CANCEL, tonic::Code::Cancelled),
-        ] {
-            let status = tonic::Status::from_error(Box::new(h2::Error::from(reason)));
-            assert_eq!(status.code(), code, "tonic's own code for {reason:?}");
-            assert!(is_transport_failure(&status), "{reason:?}");
-        }
-        assert!(!is_transport_failure(&tonic::Status::resource_exhausted(
-            "busy"
-        )));
-        assert!(!is_transport_failure(&tonic::Status::internal("boom")));
-        // An I/O error with no HTTP layer's account over it is not one either.
-        let other = tonic::Status::from_error(Box::new(io::Error::other("not http/2")));
-        assert_eq!(other.code(), tonic::Code::Unknown);
-        assert!(!is_transport_failure(&other));
-    }
-
-    /// How a loopback peer ends the socket once the request has reached it.
-    #[derive(Clone, Copy, Debug)]
-    enum SocketEnd {
-        /// A close under a zero linger: a reset (RST) rather than FIN.
-        Reset,
-        /// A plain close with the call in flight: FIN.
-        Close,
-    }
-
-    /// Read `stream` until the client's request is in: the 24-byte
-    /// connection preface, then frames of a 9-byte header (a 24-bit length,
-    /// the type, the flags, the stream id) up to a complete HEADERS or DATA
-    /// frame that ends the stream. Nothing of the request is left unread, so
-    /// a plain close afterwards is a FIN, not the reset the kernel sends for
-    /// a close over unread data.
-    async fn read_the_request(stream: &mut TcpStream) {
-        const PREFACE: usize = 24;
-        const DATA: u8 = 0x0;
-        const HEADERS: u8 = 0x1;
-        const END_STREAM: u8 = 0x1;
-        let mut bytes = Vec::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            let read = stream.read(&mut chunk).await.expect("read the client");
-            assert!(read > 0, "the client closed first");
-            bytes.extend_from_slice(&chunk[..read]);
-            let mut at = PREFACE;
-            while bytes.len() >= at + 9 {
-                let length = usize::from(bytes[at]) << 16
-                    | usize::from(bytes[at + 1]) << 8
-                    | usize::from(bytes[at + 2]);
-                let (kind, flags) = (bytes[at + 3], bytes[at + 4]);
-                if bytes.len() < at + 9 + length {
-                    break;
-                }
-                if matches!(kind, DATA | HEADERS) && flags & END_STREAM != 0 {
-                    return;
-                }
-                at += 9 + length;
-            }
-        }
-    }
-
-    /// A loopback peer that takes a call as far as the socket goes: it
-    /// answers the connection preface with its own (an empty SETTINGS
-    /// frame, so the client's request goes out at once), reads the request
-    /// and ends the socket, on every connection. The call is answered by
-    /// the layers below gRPC alone.
-    async fn a_peer_that_ends_the_socket(end: SocketEnd) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn black_hole_endpoint() -> BlackHoleEndpoint {
+        let socket = TcpSocket::new_v4().expect("a TCP socket");
+        socket
+            .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .expect("a loopback port of the system's choice");
-        let url = format!(
-            "http://{}",
-            listener.local_addr().expect("the bound address")
-        );
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test-only peer; it ends with the test's runtime"
-        )]
-        tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = listener.accept().await.expect("accept");
-                stream
-                    .write_all(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0])
-                    .await
-                    .expect("the server preface");
-                read_the_request(&mut stream).await;
-                if let SocketEnd::Reset = end {
-                    stream.set_zero_linger().expect("a zero linger");
-                }
-                drop(stream);
-            }
-        });
-        url
-    }
-
-    /// The `io::Error` in `status`'s source chain, by kind.
-    fn io_error_kind_in(status: &tonic::Status) -> Option<io::ErrorKind> {
-        let mut source = std::error::Error::source(status);
-        while let Some(error) = source {
-            if let Some(io) = error.downcast_ref::<io::Error>() {
-                return Some(io.kind());
-            }
-            source = error.source();
-        }
-        None
-    }
-
-    /// The socket under a call failing (the peer reset the connection, or
-    /// closed it with the call in flight) reaches tonic as hyper's I/O
-    /// error, not as an `h2::Error`, and tonic has no code for it: `Unknown`
-    /// with the words "transport error". Which `io::Error` sits behind it
-    /// is the lower layers' choice (h2 closes the streams of a connection
-    /// whose socket ended with a broken pipe of its own, a read or a write
-    /// that failed carries the OS error); it is the worker's connection
-    /// going away under the call all the same: a transport failure, either
-    /// way the socket ends. A dial the peer refuses is tonic's own
-    /// `UNAVAILABLE`, with an `io::Error` under its connect error and no
-    /// HTTP layer's account over it: not a failure under a call.
-    #[tokio::test]
-    async fn a_status_made_of_the_socket_failing_under_the_call_is_a_transport_failure() {
-        for end in [SocketEnd::Reset, SocketEnd::Close] {
-            let url = a_peer_that_ends_the_socket(end).await;
-            let client = TokenSpeedSchedulerClient::connect(&url)
-                .await
-                .expect("the peer accepts the dial");
-            let status = tokio::time::timeout(Duration::from_secs(10), client.health_check())
-                .await
-                .expect("the call ends with the socket")
-                .expect_err("the peer answers no call");
-            assert_eq!(status.code(), tonic::Code::Unknown, "{end:?}: {status:?}");
-            assert_eq!(status.message(), "transport error", "{end:?}: {status:?}");
-            assert!(
-                matches!(
-                    io_error_kind_in(&status),
-                    Some(io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe)
-                ),
-                "{end:?}: {status:?}"
-            );
-            assert!(is_transport_failure(&status), "{end:?}: {status:?}");
-        }
-
-        let refused = testing::refused_endpoint();
-        let channel = configured_endpoint(&refused.url, DEFAULT_CONNECT_TIMEOUT)
-            .expect("endpoint")
-            .connect_lazy();
-        let mut client =
-            tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient::new(channel);
-        let status = client
-            .health_check(tonic::Request::new(tokenspeed_proto::HealthCheckRequest {}))
-            .await
-            .expect_err("nothing listens");
-        assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
-        assert_eq!(
-            io_error_kind_in(&status),
-            Some(io::ErrorKind::ConnectionRefused),
-            "{status:?}"
-        );
-        assert!(!is_transport_failure(&status), "{status:?}");
-    }
-
-    /// A loopback peer that accepts the connect, reads the client's
-    /// connection preface and resets the socket without answering it: the
-    /// TCP connect and the handshake's write complete, the handshake's read
-    /// fails. A dying engine whose accept queue is reset looks like this
-    /// from the client.
-    async fn a_peer_that_resets_the_handshake() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a loopback port of the system's choice");
-        let url = format!(
-            "http://{}",
-            listener.local_addr().expect("the bound address")
-        );
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test-only peer; it ends with the test's runtime"
-        )]
-        tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = listener.accept().await.expect("accept");
-                let mut preface = [0u8; 24];
-                stream
-                    .read_exact(&mut preface)
-                    .await
-                    .expect("the client's connection preface");
-                stream.set_zero_linger().expect("a zero linger");
-                drop(stream);
-            }
-        });
-        url
-    }
-
-    /// Whether a `hyper::Error` sits in `status`'s source chain.
-    fn hyper_error_in(status: &tonic::Status) -> bool {
-        let mut source = std::error::Error::source(status);
-        while let Some(error) = source {
-            if error.is::<hyper::Error>() {
-                return true;
-            }
-            source = error.source();
-        }
-        false
-    }
-
-    /// A dial the peer resets during the HTTP/2 handshake, after the connect,
-    /// is reported like the reset under a call: the channel dials under the
-    /// call, and tonic answers `Unknown` "transport error" with hyper's I/O
-    /// error as the source (the `hyper::Error` in the chain is asserted, so
-    /// the test pins that shape and not a reset at the TCP connect, which
-    /// tonic reports as `UNAVAILABLE` under its connect error). It is the
-    /// worker's connection going away under the call: a transport failure.
-    #[tokio::test]
-    async fn a_dial_the_peer_resets_during_the_handshake_is_a_transport_failure() {
-        let url = a_peer_that_resets_the_handshake().await;
-        let channel = configured_endpoint(&url, DEFAULT_CONNECT_TIMEOUT)
-            .expect("endpoint")
-            .connect_lazy();
-        let mut client =
-            tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient::new(channel);
-        let status = tokio::time::timeout(
-            Duration::from_secs(10),
-            client.health_check(tonic::Request::new(tokenspeed_proto::HealthCheckRequest {})),
+        let address = socket.local_addr().expect("the bound address");
+        let listener = socket.listen(1).expect("a listener");
+        let mut queued = Vec::new();
+        // The queue is full once a connect no longer completes.
+        while let Ok(Ok(stream)) = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            tokio::net::TcpStream::connect(address),
         )
         .await
-        .expect("the dial ends with the reset")
-        .expect_err("the peer answers no handshake");
-        assert_eq!(status.code(), tonic::Code::Unknown, "{status:?}");
-        assert_eq!(status.message(), "transport error", "{status:?}");
-        assert!(
-            hyper_error_in(&status),
-            "hyper's error in the chain: {status:?}"
-        );
-        assert!(
-            matches!(
-                io_error_kind_in(&status),
-                Some(io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe)
-            ),
-            "{status:?}"
-        );
-        assert!(is_transport_failure(&status), "{status:?}");
-    }
-
-    // --- late frames on forgotten streams ------------------------------------
-    //
-    // A stream the client reset (a dropped response body) is remembered for
-    // one second, fifty at a time; a frame the peer sends on it after that is
-    // a frame on an unknown stream, which h2 answers with a library reset
-    // that counts toward the connection's limit of 1024, and past the limit
-    // it tears the connection down: GOAWAY ENHANCE_YOUR_CALM
-    // "too_many_internal_resets", every call in flight failed. The status
-    // tonic makes of that failure is a transport fault.
-
-    /// Serve `io` at the frame level: answer every request's HEADERS with
-    /// response headers at once and one DATA frame `late` afterwards, whatever
-    /// RST_STREAM the client sent in between; report the client's GOAWAY as
-    /// its (error code, debug data).
-    async fn serve_late_frames(io: DuplexStream, late: Duration) -> (u32, Vec<u8>) {
-        use std::sync::Arc;
-
-        use tokio::{
-            io::{AsyncReadExt as _, AsyncWriteExt as _, WriteHalf},
-            sync::Mutex,
-        };
-
-        async fn write_frame(
-            writer: &Mutex<WriteHalf<DuplexStream>>,
-            kind: u8,
-            flags: u8,
-            stream_id: u32,
-            payload: &[u8],
-        ) {
-            let mut frame = Vec::with_capacity(9 + payload.len());
-            frame.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
-            frame.push(kind);
-            frame.push(flags);
-            frame.extend_from_slice(&stream_id.to_be_bytes());
-            frame.extend_from_slice(payload);
-            let mut writer = writer.lock().await;
-            // The client closes its side after its GOAWAY: late writes may fail.
-            let _ = writer.write_all(&frame).await;
-            let _ = writer.flush().await;
+        {
+            queued.push(stream);
+            assert!(
+                queued.len() < 16,
+                "the accept queue behind a backlog of one did not fill"
+            );
         }
-
-        let (mut reader, writer) = tokio::io::split(io);
-        let writer = Arc::new(Mutex::new(writer));
-        let mut preface = [0u8; 24];
-        reader
-            .read_exact(&mut preface)
-            .await
-            .expect("client preface");
-        assert_eq!(&preface[..16], b"PRI * HTTP/2.0\r\n");
-        write_frame(&writer, 0x4, 0, 0, &[]).await; // the server's SETTINGS
-        loop {
-            let mut header = [0u8; 9];
-            reader
-                .read_exact(&mut header)
-                .await
-                .expect("a frame header (the client left without a GOAWAY)");
-            let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
-            let (kind, flags) = (header[3], header[4]);
-            let stream_id =
-                u32::from_be_bytes([header[5], header[6], header[7], header[8]]) & 0x7fff_ffff;
-            let mut payload = vec![0u8; len];
-            reader
-                .read_exact(&mut payload)
-                .await
-                .expect("a frame payload");
-            match kind {
-                // SETTINGS and PING are acknowledged; everything else the
-                // client sends, RST_STREAM above all, is ignored.
-                0x4 if flags & 0x1 == 0 => write_frame(&writer, 0x4, 0x1, 0, &[]).await,
-                0x6 if flags & 0x1 == 0 => write_frame(&writer, 0x6, 0x1, 0, &payload).await,
-                0x1 => {
-                    // `:status: 200` (static table index 8), END_HEADERS.
-                    write_frame(&writer, 0x1, 0x4, stream_id, &[0x88]).await;
-                    let writer = Arc::clone(&writer);
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "test-only h2 peer; the task ends with its one frame"
-                    )]
-                    tokio::spawn(async move {
-                        tokio::time::sleep(late).await;
-                        write_frame(&writer, 0x0, 0, stream_id, b"x").await;
-                    });
-                }
-                0x7 => {
-                    let code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                    return (code, payload[8..].to_vec());
-                }
-                _ => {}
-            }
+        BlackHoleEndpoint {
+            _listener: listener,
+            _queued: queued,
+            url: format!("grpc://{address}"),
         }
-    }
-
-    /// The limit under the production profile, reached by late frames alone:
-    /// the connection goes away with "too_many_internal_resets", and the
-    /// status a call in flight fails with is a transport fault (tonic reads
-    /// the reason as RESOURCE_EXHAUSTED, which answered as a 429 would tell
-    /// the client of a rate limit it never hit).
-    #[tokio::test]
-    async fn late_frames_on_forgotten_streams_end_the_connection_with_a_transport_failure() {
-        use std::pin::Pin;
-
-        use tonic::codegen::{http, Body as _};
-
-        // Past h2's limit of 1024 local resets per connection.
-        const ABANDONED: usize = 1_100;
-        // Past the one second h2 remembers a reset stream for.
-        const LATE: Duration = Duration::from_millis(1_500);
-
-        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
-        #[expect(clippy::disallowed_methods, reason = "test-only h2 peer, joined below")]
-        let server = tokio::spawn(serve_late_frames(server_io, LATE));
-
-        let mut client_io = Some(client_io);
-        let mut channel = configured_endpoint("http://unused.invalid", DEFAULT_CONNECT_TIMEOUT)
-            .expect("endpoint")
-            .connect_with_connector(tower::service_fn(move |_uri: Uri| {
-                let io = client_io.take().map(TokioIo::new).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotConnected, "test connection already used")
-                });
-                std::future::ready(io)
-            }))
-            .await
-            .expect("connect");
-        let request = || {
-            http::Request::post("/smg.test.Late/Stream")
-                .header("content-type", "application/grpc")
-                .header("te", "trailers")
-                .body(tonic::body::Body::empty())
-                .expect("request")
-        };
-        // One call stays in flight, to read the connection's end from.
-        std::future::poll_fn(|cx| channel.poll_ready(cx))
-            .await
-            .expect("channel ready");
-        let mut probe = channel
-            .call(request())
-            .await
-            .expect("probe headers")
-            .into_body();
-        for _ in 0..ABANDONED {
-            std::future::poll_fn(|cx| channel.poll_ready(cx))
-                .await
-                .expect("channel ready");
-            let response = channel.call(request()).await.expect("response headers");
-            // The body goes with it: RST_STREAM CANCEL.
-            drop(response);
-        }
-
-        let (code, debug) = tokio::time::timeout(Duration::from_secs(20), server)
-            .await
-            .expect("the client went away within the deadline")
-            .expect("server task");
-        assert_eq!(h2::Reason::from(code), h2::Reason::ENHANCE_YOUR_CALM);
-        assert_eq!(debug, b"too_many_internal_resets");
-
-        // The probe's own late frame arrives before the connection's end.
-        let failure = loop {
-            match std::future::poll_fn(|cx| Pin::new(&mut probe).poll_frame(cx)).await {
-                Some(Ok(_frame)) => continue,
-                Some(Err(failure)) => break failure,
-                None => panic!("the probe ended cleanly, not with the connection"),
-            }
-        };
-        assert!(is_transport_failure(&failure), "{failure:?}");
-        assert_eq!(
-            failure.code(),
-            tonic::Code::ResourceExhausted,
-            "{failure:?}"
-        );
     }
 }

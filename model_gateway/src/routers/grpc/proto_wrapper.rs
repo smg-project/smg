@@ -1071,8 +1071,19 @@ impl PrefillTicket {
         prompt_tokens: u64,
         timed: bool,
     ) -> Option<Self> {
+        Self::book_as_at(worker, prompt_tokens, timed, liveness::now_ms())
+    }
+
+    /// [`Self::book_as`] at `now_ms` on the gateway clock (`liveness::now_ms`):
+    /// the dispatch's one stamp, shared with its deadline.
+    pub(crate) fn book_as_at(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        timed: bool,
+        now_ms: u64,
+    ) -> Option<Self> {
         (prompt_tokens > 0).then(|| {
-            worker.note_prefill_started(prompt_tokens, timed);
+            worker.note_prefill_started_at(prompt_tokens, timed, now_ms);
             Self {
                 worker: Arc::clone(worker),
                 tokens: prompt_tokens,
@@ -1082,13 +1093,14 @@ impl PrefillTicket {
         })
     }
 
-    /// The first response came back, reporting `cached` prompt tokens served
-    /// from the engine's prefix cache.
-    fn first_response(&mut self, cached: u64) {
+    /// The first response came back at `now_ms` on the gateway clock (the
+    /// stamp its reader took for the message), reporting `cached` prompt
+    /// tokens served from the engine's prefix cache.
+    fn first_response_at(&mut self, cached: u64, now_ms: u64) {
         if !self.released {
             self.released = true;
             self.worker
-                .note_prefill_ended(self.tokens, self.timed, Some(cached));
+                .note_prefill_ended_at(self.tokens, self.timed, Some(cached), now_ms);
         }
     }
 }
@@ -1115,6 +1127,18 @@ pub(crate) struct DispatchBooking {
 
 impl DispatchBooking {
     pub(crate) fn book(worker: &Arc<dyn Worker>, prompt_tokens: u64, streaming: bool) -> Self {
+        Self::book_at(worker, prompt_tokens, streaming, Instant::now())
+    }
+
+    /// [`Self::book`] for a request dispatched at `dispatched_at`: the one
+    /// instant the dispatch read, which its deadline runs from too, stamps
+    /// the prefill booking.
+    pub(crate) fn book_at(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        streaming: bool,
+        dispatched_at: Instant,
+    ) -> Self {
         let progress = streaming.then(|| {
             worker.note_tracked_started();
             ProgressTicket {
@@ -1122,7 +1146,12 @@ impl DispatchBooking {
             }
         });
         Self {
-            prefill: PrefillTicket::book_as(worker, prompt_tokens, streaming),
+            prefill: PrefillTicket::book_as_at(
+                worker,
+                prompt_tokens,
+                streaming,
+                liveness::ms_at(dispatched_at),
+            ),
             progress,
         }
     }
@@ -1841,7 +1870,10 @@ impl ProtoStream {
         };
         match &item {
             Some(Ok(response)) => {
-                liveness::on_token_progress(&tracked.worker);
+                // One stamp for the message: the worker's progress note and,
+                // on the first response, the end of the prompt's prefill.
+                let now_ms = liveness::now_ms();
+                liveness::on_token_progress_at(&tracked.worker, now_ms);
                 if std::mem::take(&mut tracked.samples_success) {
                     tracked.worker.record_outcome(200);
                 }
@@ -1849,7 +1881,7 @@ impl ProtoStream {
                     tracked.output = Some(OutputTicket::open(&tracked.worker));
                 }
                 if let Some(ticket) = tracked.prefill.as_mut() {
-                    ticket.first_response(u64::from(response.cached_tokens()));
+                    ticket.first_response_at(u64::from(response.cached_tokens()), now_ms);
                 }
                 tracked.prefill = None;
             }
@@ -2221,8 +2253,8 @@ mod fanout_tests {
     use crate::{
         routers::grpc::common::response_collection::drain_prefill,
         worker::{
-            BasicWorkerBuilder, PrefillAdmission, PrefillLoadGuard, Worker, WorkerLoadGuard,
-            WorkerType,
+            test_support::select_worker, BasicWorkerBuilder, PrefillAdmission, PrefillLoadGuard,
+            Worker, WorkerLoadGuard, WorkerType,
         },
     };
 
@@ -2347,10 +2379,7 @@ mod fanout_tests {
                 );
                 let admission = PrefillAdmission::new(1, 0, std::time::Duration::from_secs(1));
                 let guard = if bounded {
-                    let admitted = admission
-                        .admit(None, |capacity| capacity.select(Arc::clone(&worker), ()))
-                        .await
-                        .unwrap();
+                    let admitted = admission.admit(None, select_worker(&worker)).await.unwrap();
                     PrefillLoadGuard::Admission {
                         _reservation: Arc::new(admitted.reservation),
                     }

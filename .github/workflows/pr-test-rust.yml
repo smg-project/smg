@@ -241,6 +241,15 @@ jobs:
       - name: Install wheel
         run: pip install dist/*.whl
 
+      # The chart tests in bindings/python/tests/test_helm_chart_args.py render
+      # the chart and skip without helm. With helm here they run on every pull
+      # request, so a template edit that breaks one fails this job. The
+      # version is the chart workflow's (pr-helm.yml).
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.17.0
+
       - name: Run Python unit tests
         run: |
           cd bindings/python
@@ -641,6 +650,89 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # Initial advisory AMD PR performance slice: same regular HTTP/gRPC test,
+  # four TP1 workers and thresholds as NVIDIA. PD performance remains separate.
+  benchmarks-amd:
+    needs: [build-wheel, detect-changes]
+    if: >-
+      !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_ON_PRS == 'true'
+      && vars.SMG_RUN_AMD_PR_BENCHMARK == 'true'
+      && github.event_name == 'pull_request'
+      && needs.build-wheel.result == 'success'
+      && needs.detect-changes.result == 'success'
+      && needs.detect-changes.outputs.docs-only != 'true'
+      && needs.detect-changes.outputs.card-tier-from == ''
+    runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi300x' }}
+    container:
+      image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+      options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    continue-on-error: true
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      E2E_RUNTIME: sglang
+      E2E_MIN_SELECTED: '2'
+      GENAI_BENCH_TEST_TIMEOUT: '600'
+      E2E_AMD_REQUIRE_PASSING_CALL: '1'
+      E2E_STARTUP_TIMEOUT: '900'
+      ROUTER_LOCAL_MODEL_PATH: /models
+      BENCH_ENFORCE_THRESHOLDS: '0'
+      E2E_LOG_DIR: benchmark-logs-amd
+    steps:
+      - uses: actions/checkout@v7
+      - name: Mark owned processes
+        run: echo "E2E_JOB_MARKER=benchmark-amd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
+      - name: Setup SGLang in its ROCm image
+        run: bash scripts/ci_setup_sglang_rocm_image.sh
+      - uses: ./.github/actions/download-build-artifacts
+        with:
+          wasm-fixtures: 'true'
+          client-types: 'true'
+      - name: Install wheel and test dependencies
+        run: |
+          pip uninstall -y smg || true
+          pip install wheel/*.whl
+          bash scripts/ci_install_e2e_deps.sh
+      - name: Install genai-bench
+        run: |
+          python3 -m venv "$RUNNER_TEMP/genai-bench"
+          bash scripts/ci_retry.sh 3 10 "$RUNNER_TEMP/genai-bench/bin/pip" install 'genai-bench==0.0.4' 'truststore<0.10.5'
+          echo "GENAI_BENCH_BIN=$RUNNER_TEMP/genai-bench/bin/genai-bench" >> "$GITHUB_ENV"
+      - name: Record runtime versions
+        run: |
+          mkdir -p benchmark-logs-amd
+          python3 -m pip freeze > benchmark-logs-amd/runtime-versions.txt
+          "$RUNNER_TEMP/genai-bench/bin/pip" freeze > benchmark-logs-amd/benchmark-versions.txt
+          printf '%s\n' "head=$GITHUB_SHA" "runner=$RUNNER_NAME" 'workers=4 protocol=http,grpc engine=sglang gpu=MI300' > benchmark-logs-amd/context.txt
+      - name: Run regular HTTP and gRPC benchmarks
+        run: |
+          SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1 pytest e2e_test/benchmarks/test_regular_perf.py -s -vv --junitxml=benchmark-logs-amd/junit.xml
+      - name: Explain measurement scope
+        if: always()
+        run: echo 'AMD initial slice measures request throughput and latency for regular HTTP/gRPC. The existing NVML utilization sampler cannot measure AMD utilization; its utilization output is not acceptance evidence. PD performance remains a separate gap.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Qualify raw AMD benchmark measurements
+        id: qualify
+        if: always()
+        run: python3 scripts/ci/validate_pr_benchmark.py --output benchmark-logs-amd/qualification.json
+      - name: Summarize AMD results
+        if: always() && steps.qualify.outcome == 'success'
+        run: python3 e2e_test/benchmarks/summarize.py
+      - name: Reap owned processes
+        if: always() && env.E2E_JOB_MARKER != ''
+        run: python3 scripts/ci_reap_job_processes.py "$E2E_JOB_MARKER"
+      - name: Upload AMD performance results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: genai-bench-results-amd-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            benchmark_**/
+            benchmark-logs-amd/
+          retention-days: 30
+
   detect-changes:
     runs-on: ubuntu-latest
     permissions:
@@ -761,7 +853,8 @@ jobs:
               - 'scripts/ci_install_rust.sh'
               - 'scripts/ci_apt_mirror.sh'
             # The gateway and everything it links: every crate but the radix tree,
-            # plus the sources two gateway integration tests read from disk
+            # the OpenAPI generator (the gateway's control-plane route test reads
+            # its route list), plus the sources two gateway integration tests read from disk
             # (the metrics catalogue test walks model_gateway, crates, clients,
             # bindings and examples for recorder and family names, Rust sources
             # only; the dashboard test reads the Helm chart), which the previous
@@ -772,6 +865,7 @@ jobs:
               - 'model_gateway/**'
               - 'crates/**'
               - '!crates/radix_tree/**'
+              - 'clients/openapi-gen/**'
               - 'bindings/python/src/**/*.rs'
               - 'bindings/golang/src/**/*.rs'
               - 'clients/**/*.rs'
@@ -833,6 +927,7 @@ jobs:
               - 'crates/kv_index/**'
               - 'crates/mesh/**'
               - 'crates/mm_rdma/**'
+              - 'crates/policy_controller/**'
               - 'crates/radix_tree/**'
             rust-radix:
               - *rust-infra
@@ -1021,7 +1116,6 @@ jobs:
               (".github/actions/setup-trtllm/**",                TRTLLM),
               (".github/actions/setup-tokenspeed/**",            TOKENSPEED),
               (".github/actions/setup-gh/**",                    NONE),
-              (".github/actions/export-pod-api-key/**",          NONE),
               (".github/actions/publish-crate/**",               NONE),
               (".github/actions/**",                             FULL),
               (".github/versions/tokenspeed.ref",                TOKENSPEED),
@@ -1098,6 +1192,7 @@ jobs:
               # registration workflow, the server and the entry points every lane
               ("model_gateway/tests/**",                         NONE),
               ("model_gateway/test_harness/**",                  NONE),
+              ("model_gateway/src/routers/grpc/tokenizer_cache/**", NONE),
               ("model_gateway/benches/**",                       NONE),
               ("model_gateway/src/endpoints/responses/**",       "agentic vendor"),
               ("model_gateway/src/endpoints/conversations/**",   "agentic vendor"),
@@ -1134,6 +1229,9 @@ jobs:
               ("crates/mock_worker/**",                          NONE),
               ("crates/gateway_perf/**",                         NONE),
               ("crates/radix_tree/**",                           NONE),
+              # the policy controller crate: linked by no binary yet (its gateway host is
+              # a later change, which moves this row to the core)
+              ("crates/policy_controller/**",                    NONE),
               ("crates/tokenizer/**",                            "go-bindings"),
               # Symphony and the response templates it compiles: the default
               # parser, read on every lane's chat, messages and responses path
@@ -1608,6 +1706,82 @@ jobs:
       connection_mode: "zmq"
       zmq_engine_count: "2"
       startup_profile: "vllm-zmq-dp2-chat"
+    secrets: inherit
+
+  # Independent opt-in; ordinary AMD chat does not enable this API lane.
+  e2e-1gpu-completions-vllm-amd:
+    name: e2e-1gpu-completions-vllm-amd (vllm)
+    needs:
+    - build-wheel
+    - detect-changes
+    if: always() && !cancelled() && vars.SMG_RUN_AMD_LEGS == 'true' && vars.SMG_RUN_AMD_VLLM_COMPLETIONS == 'true'
+      && needs.build-wheel.result == 'success' && (github.event_name != 'pull_request' || (vars.SMG_RUN_AMD_ON_PRS
+      == 'true' && needs.detect-changes.result == 'success')) && needs.detect-changes.outputs.skip-completions !=
+      'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: '1'
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      timeout: 60
+      test_timeout: 45
+      test_dirs: e2e_test/completions
+      min_selected: 15
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video
+        --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
+  # Independent opt-in; ordinary AMD chat does not enable this API lane.
+  e2e-1gpu-embeddings-vllm-amd:
+    name: e2e-1gpu-embeddings-vllm-amd (vllm)
+    needs:
+    - build-wheel
+    - detect-changes
+    if: always() && !cancelled() && vars.SMG_RUN_AMD_LEGS == 'true' && vars.SMG_RUN_AMD_VLLM_EMBEDDINGS == 'true'
+      && needs.build-wheel.result == 'success' && (github.event_name != 'pull_request' || (vars.SMG_RUN_AMD_ON_PRS
+      == 'true' && needs.detect-changes.result == 'success')) && needs.detect-changes.outputs.skip-embeddings != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: '1'
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      timeout: 60
+      test_timeout: 45
+      test_dirs: e2e_test/embeddings
+      min_selected: 20
+      extra_deps: sentence-transformers
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video
+        --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
+  # Independent opt-in; ordinary AMD chat does not enable this API lane.
+  e2e-1gpu-gateway-vllm-amd:
+    name: e2e-1gpu-gateway-vllm-amd (vllm)
+    needs:
+    - build-wheel
+    - detect-changes
+    if: always() && !cancelled() && vars.SMG_RUN_AMD_LEGS == 'true' && vars.SMG_RUN_AMD_VLLM_GATEWAY == 'true' &&
+      needs.build-wheel.result == 'success' && (github.event_name != 'pull_request' || (vars.SMG_RUN_AMD_ON_PRS ==
+      'true' && needs.detect-changes.result == 'success')) && needs.detect-changes.outputs.skip-chat-one-engine !=
+      'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: '1'
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      timeout: 60
+      test_timeout: 45
+      test_dirs: e2e_test/router
+      min_selected: 3
+      enabled: ${{ needs.detect-changes.outputs.skip-chat-completions != 'true' }}
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video
+        --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
     secrets: inherit
 
   e2e-1gpu-completions:
@@ -2092,7 +2266,10 @@ jobs:
           # smoke of SGLang over NIXL (its venv gets NIXL only on this row,
           # #2498). The peer-restart test stays out of the NIXL smoke: the
           # SGLang prefill segfaults when its decode comes back on the same
-          # address (#2503). The full sweeps run in nightly-pd.
+          # address (#2503). The smoke carries the 1p1d-http row too: the
+          # HTTP PD router is its own code path (pairing, error answers and
+          # the KV handoff on SGLang), and this is its one pull-request
+          # signal. The other HTTP rows and the full sweeps run in nightly-pd.
           - engine: vllm
             kv_backend: mooncake
             timeout: 50
@@ -2101,8 +2278,8 @@ jobs:
             kv_backend: nixl
             timeout: 60
             test_timeout: 50
-            test_filter: -k "1p1d and not http and not sole_leg_outage"
-            min_selected: 11
+            test_filter: -k "1p1d and not sole_leg_outage"
+            min_selected: 24
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -2119,7 +2296,8 @@ jobs:
       test_filter: ${{ matrix.test_filter || '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport or MismatchedProtocol"' }}
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
       # floor ≈ 93% of the slice: 15 cases on sglang/tokenspeed, 17 on vllm
-      # (its two transport classes); the 1p1d smoke selects 13, floor 11
+      # (its two transport classes); the 1p1d smoke selects 26 with its HTTP
+      # row (run 42508847810), floor 24
       min_selected: ${{ matrix.min_selected || 14 }}
       kv_backend: ${{ matrix.kv_backend || '' }}
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
@@ -2211,6 +2389,7 @@ jobs:
         deepseek-ai/DeepSeek-R1-Distill-Qwen-7B@916b56a44061fd5cd7d6a8fb632557ed4f724f60
         Qwen/Qwen2.5-14B-Instruct@cf98f3b3bbb457ad9e2bb7baf9a0125b6b88caa8
         openai/gpt-oss-20b@6cee5e81ee83917806bbde320786a8fb61efebee
+        Qwen/Qwen3-VL-8B-Instruct@0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
       SHOW_ROUTER_LOGS: "1"
     steps:
       - name: Checkout code
@@ -2289,23 +2468,31 @@ jobs:
         env:
           SHOW_WORKER_LOGS: "0"
           E2E_LOG_DIR: e2e-logs
-          # floor ≈ 95% of the 487 cases the mock marker selects: the chat
+          # floor ≈ 95% of the 539 cases the mock marker selects: the chat
           # completion, request-id, concurrency, reasoning-content, EOS
           # stripping, function-calling, tool-choice (three models),
           # multi-turn and sampling-defaults classes, the constraint-failure
           # and the reader-panic classes, the completions classes, the
           # context-length and load-report classes (the disaggregated ones
-          # included), the disaggregated topology, pairing-protocol,
-          # runtime-assembled fleet, Messages and Responses classes on mock
-          # prefill and decode workers, the Responses local
+          # included), the disaggregated topology (its gRPC rows, and its
+          # HTTP rows on the mock's HTTP prefill and decode workers),
+          # pairing-protocol, runtime-assembled fleet, Messages and
+          # Responses classes on mock prefill and decode workers, the
+          # Responses local
           # classes (state, background, streaming events, sampling
           # parameters, item references, the object shape), and the gpt-oss
           # classes of chat and Responses on the Harmony token stream (the
           # mock's tokenizer turns a scripted answer's channel markers into
-          # the special tokens), and the scheduler-wire classes (a chat, a
+          # the special tokens), the scheduler-wire classes (a chat, a
           # streamed and a tool-call turn through the gateway on each of the
-          # three gRPC protos the mock serves)
-          E2E_MIN_SELECTED: "462"
+          # three gRPC protos the mock serves), the disaggregated
+          # scheduler-wire classes (a chat and a streamed turn on a prefill
+          # and a decode worker on the sglang and the vllm wires), the
+          # encode-prefill-decode scheduler-wire class (a text and an image
+          # turn on an encode, a prefill and a decode worker on the vllm
+          # wire), and the worker API classes (the list routes, IGW mode,
+          # disable-health-check, the REST semantics)
+          E2E_MIN_SELECTED: "512"
           MOCK_WORKER_BIN: ${{ github.workspace }}/target/debug/mock-worker
           ROUTER_LOCAL_MODEL_PATH: ${{ runner.temp }}/models
           TIKTOKEN_ENCODINGS_BASE: ${{ runner.temp }}/models/tiktoken
@@ -2373,6 +2560,8 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
     env:
       E2E_VENDOR: ${{ matrix.vendor }}
+      # Pod-local sidecar owns the real keys. Never map provider secrets here.
+      E2E_AI_KEY_PROXY: http://127.0.0.1:8787
       E2E_GPU_TIER: "0"
       SHOW_ROUTER_LOGS: "1"
     steps:
@@ -2706,7 +2895,7 @@ jobs:
     secrets: inherit
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-sglang-amd, e2e-2gpu-chat-zmq-dp-vllm-amd, e2e-4gpu-chat-vllm-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-1gpu-responses-memory-core-amd, e2e-2gpu-pd-vllm-nixl-amd, e2e-2gpu-pd-vllm-mooncake-amd, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-4gpu-pd-vllm-nixl-amd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e, e2e-1gpu-chat-legacy-vllm-amd, e2e-1gpu-chat-symphony-sglang-amd, e2e-1gpu-chat-symphony-vllm-amd]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-sglang-amd, e2e-2gpu-chat-zmq-dp-vllm-amd, e2e-4gpu-chat-vllm-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-1gpu-responses-memory-core-amd, e2e-2gpu-pd-vllm-nixl-amd, e2e-2gpu-pd-vllm-mooncake-amd, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-4gpu-pd-vllm-nixl-amd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e, e2e-1gpu-chat-legacy-vllm-amd, e2e-1gpu-chat-symphony-sglang-amd, e2e-1gpu-chat-symphony-vllm-amd, e2e-1gpu-completions-vllm-amd, e2e-1gpu-embeddings-vllm-amd, e2e-1gpu-gateway-vllm-amd]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -2800,6 +2989,9 @@ jobs:
                 "${{ needs.rust-aarch64.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-completions-vllm-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-embeddings-vllm-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-gateway-vllm-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-legacy-vllm-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-symphony-sglang-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-symphony-vllm-amd.result }}" =~ $bad || \

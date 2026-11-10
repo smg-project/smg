@@ -14,16 +14,17 @@
 
 use std::collections::BTreeMap;
 
-use llm_tokenizer::{create_tokenizer, EncodePath, HuggingFaceTokenizer};
+use llm_tokenizer::{create_tokenizer, EncodePath, HuggingFaceTokenizer, TiktokenTokenizer};
 
 const DIRS_ENV: &str = "SMG_ENCODE_PATH_TOKENIZER_DIRS";
 
 /// What a fixture model's encodes go through: a Hugging Face tokenizer's
-/// path, or a tokenizer outside that wrapper (a tiktoken vocabulary).
+/// path, or, for a tiktoken vocabulary, whether the crate's direct encoder
+/// takes it (`native`) or the file's own encoder keeps it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Expected {
     Hf(EncodePath),
-    Tiktoken,
+    Tiktoken { native: bool },
 }
 
 use Expected::{Hf, Tiktoken};
@@ -62,11 +63,7 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
         Hf(EncodePath::Tokenizers),
         Hf(EncodePath::V1),
     ),
-    (
-        "gemma-4-e4b-it",
-        Hf(EncodePath::Tokenizers),
-        Hf(EncodePath::V1),
-    ),
+    ("gemma-4-e4b-it", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     ("glm-4.6", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     ("glm-4.7-flash", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     ("glm-5.3-flash", Hf(EncodePath::Native), Hf(EncodePath::V1)),
@@ -90,7 +87,11 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
         Hf(EncodePath::Tokenizers),
         Hf(EncodePath::Tokenizers),
     ),
-    ("kimi-k3", Tiktoken, Tiktoken),
+    (
+        "kimi-k3",
+        Tiktoken { native: true },
+        Tiktoken { native: true },
+    ),
     (
         "laguna-xs.2",
         Hf(EncodePath::Tokenizers),
@@ -127,7 +128,7 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
     ("minimax-m3", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     (
         "mistral-7b-instruct-v0.3",
-        Hf(EncodePath::Tokenizers),
+        Hf(EncodePath::Native),
         Hf(EncodePath::V1),
     ),
     (
@@ -135,11 +136,7 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
         Hf(EncodePath::Native),
         Hf(EncodePath::V1),
     ),
-    (
-        "nanbeige4.2-3b",
-        Hf(EncodePath::Tokenizers),
-        Hf(EncodePath::V1),
-    ),
+    ("nanbeige4.2-3b", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     (
         "nvidia-nemotron-3-nano-30b-a3b-bf16",
         Hf(EncodePath::Native),
@@ -319,7 +316,7 @@ const EXPECTED: &[(&str, Expected, Expected)] = &[
     ("step3", Hf(EncodePath::Native), Hf(EncodePath::V1)),
     (
         "tinyllama-1.1b-chat-v1.0",
-        Hf(EncodePath::Tokenizers),
+        Hf(EncodePath::Native),
         Hf(EncodePath::V1),
     ),
     (
@@ -350,10 +347,18 @@ fn every_fixture_model_takes_the_path_of_its_row() {
             .unwrap_or_else(|| panic!("{slug} is not a row of EXPECTED"));
         let expected = if feature_on { on } else { off };
         let tokenizer = create_tokenizer(dir).unwrap_or_else(|e| panic!("{slug}: {e}"));
-        let actual = tokenizer
-            .as_any()
-            .downcast_ref::<HuggingFaceTokenizer>()
-            .map_or(Tiktoken, |hf| Hf(hf.encode_path()));
+        let actual = match tokenizer.as_any().downcast_ref::<HuggingFaceTokenizer>() {
+            Some(hf) => Hf(hf.encode_path()),
+            None => Tiktoken {
+                native: tokenizer
+                    .as_any()
+                    .downcast_ref::<TiktokenTokenizer>()
+                    .unwrap_or_else(|| {
+                        panic!("{slug}: neither a Hugging Face nor a tiktoken tokenizer")
+                    })
+                    .uses_native_encoder(),
+            },
+        };
         checked += 1;
         *counts.entry(format!("{actual:?}")).or_default() += 1;
         if actual != expected {

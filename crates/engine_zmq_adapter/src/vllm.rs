@@ -17,7 +17,7 @@ use engine_zmq_client::{
             EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput, SpecDecodeMetrics,
             StopReason,
         },
-        request::{EngineCoreRequest, MmFeaturesPayload},
+        request::{EngineCoreRequest, MmFeaturesPayload, ReasoningParserKwargs},
         sampling::EngineCoreSamplingParams,
         structured_outputs::{StructuredOutputBackend, StructuredOutputsParams},
     },
@@ -372,6 +372,11 @@ impl MappedGenerateStream for VllmGenerateStream {
             &mut self.pending,
             output.kv_transfer_params.map(|params| *params),
         );
+        attach_ec_transfer_params(
+            &mut response,
+            &mut self.pending,
+            output.ec_transfer_params.map(|params| *params),
+        );
         attach_spec_decode_counts(
             &mut response,
             &mut self.pending,
@@ -444,6 +449,23 @@ fn attach_kv_transfer_params(
             remote_port,
         });
     complete.kv_transfer_params_json = Some(params.to_string());
+}
+
+/// Put the connector's returned encoder-cache transfer params (the encoder's
+/// handles an encode-prefill-decode prefill side pulls by) on the terminal
+/// `Complete`, direct or parked behind this tick's chunk: the JSON field
+/// verbatim, as the Python servicer reports them.
+fn attach_ec_transfer_params(
+    response: &mut vllm::GenerateResponse,
+    pending: &mut Option<vllm::GenerateResponse>,
+    params: Option<serde_json::Value>,
+) {
+    let Some(params) = params else {
+        return;
+    };
+    if let Some(complete) = complete_of(response, pending) {
+        complete.ec_transfer_params_json = Some(params.to_string());
+    }
 }
 
 impl Stream for VllmGenerateStream {
@@ -606,12 +628,15 @@ fn translate_batches_for(
     if batches.is_empty() {
         return Ok(TranslatedMedia::default());
     }
-    let has_kv_transfer = kv_transfer_params(req)?.is_some();
+    // A pixel-less batch is a remote leg's: a PD decode side's (remote KV) or
+    // an encoder-cache consumer's (the encoder's handles).
+    let has_remote_transfer =
+        kv_transfer_params(req)?.is_some() || ec_transfer_params(req)?.is_some();
     let (mm_features, cache_salt) = multimodal::translate_batches(
         batches,
         prompt_token_ids(req)?,
         model_dtype,
-        has_kv_transfer,
+        has_remote_transfer,
     )?;
     Ok(TranslatedMedia {
         mm_features: mm_features.map(MmFeaturesPayload::Typed),
@@ -699,9 +724,21 @@ pub(crate) fn translate_request_with_media(
     eos: &EosTokenIds,
     support: StructuredOutputsSupport,
 ) -> Result<EngineCoreRequest, String> {
+    let reasoning_parser_kwargs = req
+        .chat_template_kwargs_json
+        .as_deref()
+        .map(|json| {
+            serde_json::from_str(json)
+                .map(|chat_template_kwargs| ReasoningParserKwargs {
+                    chat_template_kwargs,
+                })
+                .map_err(|error| format!("invalid chat_template_kwargs_json: {error}"))
+        })
+        .transpose()?;
     // Connector params ride `SamplingParams.extra_args`, where vLLM's own
     // frontend puts them, so a request carrying them always gets params.
     let kv_transfer_params = kv_transfer_params(&req)?;
+    let ec_transfer_params = ec_transfer_params(&req)?;
     // vLLM's frontend defaults an unset `max_tokens` to the remaining context
     // (`max_model_len - prompt_len`).
     let default_max_tokens = admit_prompt(prompt_token_ids(&req)?.len(), max_model_len)?;
@@ -732,13 +769,15 @@ pub(crate) fn translate_request_with_media(
         .sampling_params
         .as_ref()
         .is_some_and(|sp| sp.grammar_from_first_token && sp.constraint.is_some());
-    let sampling_params = match (req.sampling_params, kv_transfer_params.is_some()) {
+    let has_connector_params = kv_transfer_params.is_some() || ec_transfer_params.is_some();
+    let sampling_params = match (req.sampling_params, has_connector_params) {
         (None, false) => None,
         (sp, _) => Some(translate_sampling(
             sp.unwrap_or_default(),
             default_max_tokens,
             eos,
             kv_transfer_params,
+            ec_transfer_params,
             support.backend,
         )),
     };
@@ -751,6 +790,7 @@ pub(crate) fn translate_request_with_media(
         data_parallel_rank,
         cache_salt,
         reasoning_ended: grammar_from_first_token.then_some(true),
+        reasoning_parser_kwargs,
         ..EngineCoreRequest::default()
     })
 }
@@ -786,11 +826,52 @@ pub(crate) fn kv_transfer_params(
     Ok(None)
 }
 
+/// Connector encoder-cache transfer params for encode-prefill-decode
+/// disaggregation, read as the Python servicer reads them: the JSON field
+/// verbatim (the encoder's request names the consumer's destination, the
+/// prefill side's the encoder's handles), which has to be a JSON object; the
+/// engine's connector interprets it. An empty field is no parameters.
+pub(crate) fn ec_transfer_params(
+    req: &vllm::GenerateRequest,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(json) = req
+        .ec_transfer_params_json
+        .as_deref()
+        .filter(|json| !json.is_empty())
+    else {
+        return Ok(None);
+    };
+    let params: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| format!("invalid ec_transfer_params_json: {error}"))?;
+    if !params.is_object() {
+        return Err("ec_transfer_params_json must be a JSON object".to_string());
+    }
+    Ok(Some(params))
+}
+
+/// The connector params as `SamplingParams.extra_args`, where vLLM's own
+/// frontend puts them: a PD leg's KV-transfer params, an encode-prefill-decode
+/// leg's encoder-cache params, either or both; `None` without any.
+fn connector_extra_args(
+    kv_transfer_params: Option<serde_json::Value>,
+    ec_transfer_params: Option<serde_json::Value>,
+) -> Option<HashMap<String, serde_json::Value>> {
+    let extra: HashMap<String, serde_json::Value> = [
+        ("kv_transfer_params", kv_transfer_params),
+        ("ec_transfer_params", ec_transfer_params),
+    ]
+    .into_iter()
+    .filter_map(|(key, params)| params.map(|params| (key.to_string(), params)))
+    .collect();
+    (!extra.is_empty()).then_some(extra)
+}
+
 pub(crate) fn translate_sampling(
     sp: vllm::SamplingParams,
     default_max_tokens: u32,
     eos: &EosTokenIds,
     kv_transfer_params: Option<serde_json::Value>,
+    ec_transfer_params: Option<serde_json::Value>,
     structured_backend: StructuredOutputsBackendConfig,
 ) -> EngineCoreSamplingParams {
     // Stopping at EOS is the frontend's duty here: the primary id rides
@@ -851,8 +932,7 @@ pub(crate) fn translate_sampling(
             .constraint
             .and_then(translate_constraint)
             .map(|params| params.with_backend(structured_backend.backend())),
-        extra_args: kv_transfer_params
-            .map(|params| HashMap::from([("kv_transfer_params".to_string(), params)])),
+        extra_args: connector_extra_args(kv_transfer_params, ec_transfer_params),
         ..EngineCoreSamplingParams::default()
     }
 }

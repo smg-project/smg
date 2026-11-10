@@ -75,6 +75,159 @@ fn model_info() -> VllmModelInfo {
     }
 }
 
+/// The model info of an engine with an encoder-cache connector in the given
+/// role (a Mooncake consumer's address per rank included, as the launcher
+/// reports them).
+fn ec_model_info(role: &str) -> VllmModelInfo {
+    VllmModelInfo {
+        supports_ec_transfer: true,
+        ec_connector: "ECMooncakeConnector".to_string(),
+        ec_role: role.to_string(),
+        ec_zmq_addrs: vec!["tcp://10.0.0.9:14579".to_string()],
+        ..model_info()
+    }
+}
+
+/// The model info of an engine with a CPU encoder-cache connector in the
+/// given role.
+fn ec_cpu_model_info(role: &str) -> VllmModelInfo {
+    VllmModelInfo {
+        ec_connector: "ECCPUConnector".to_string(),
+        ec_zmq_addrs: Vec::new(),
+        ..ec_model_info(role)
+    }
+}
+
+/// A pixel-less batch naming its media by hash alone: a consumer's leg.
+fn pixel_less_batch(hashes: &[&str]) -> vllm::MultimodalInputs {
+    vllm::MultimodalInputs {
+        mm_hashes: hashes.iter().map(|hash| hash.to_string()).collect(),
+        mm_placeholders: vec![vllm::PlaceholderRange {
+            offset: 1,
+            length: 3,
+        }],
+        modality: common::Modality::Image as i32,
+        ..Default::default()
+    }
+}
+
+/// A prefill side's realistic payload: the grid tensor of two items and their
+/// hashes, no pixels (the encoder ran elsewhere).
+fn grid_only_batch(hashes: &[&str]) -> vllm::MultimodalInputs {
+    let grid: Vec<u8> = [1i64, 2, 2, 1, 2, 2]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    vllm::MultimodalInputs {
+        mm_hashes: hashes.iter().map(|hash| hash.to_string()).collect(),
+        mm_placeholders: vec![
+            vllm::PlaceholderRange {
+                offset: 1,
+                length: 3,
+            },
+            vllm::PlaceholderRange {
+                offset: 6,
+                length: 3,
+            },
+        ],
+        model_specific_tensors: [(
+            "image_grid_thw".to_string(),
+            vllm::TensorData {
+                shape: vec![2, 3],
+                dtype: "int64".to_string(),
+                payload: Some(vllm::tensor_data::Payload::Inline(grid.into())),
+            },
+        )]
+        .into(),
+        batched_keys: vec!["image_grid_thw".to_string()],
+        modality: common::Modality::Image as i32,
+        ..Default::default()
+    }
+}
+
+/// A router-preprocessed image batch of two items whose pixels sit in a fresh
+/// `/dev/shm` file (read and unlinked once by the servicer).
+#[cfg(target_os = "linux")]
+fn shm_pixel_batch(tag: &str) -> vllm::MultimodalInputs {
+    let name = format!(
+        "smg-servicer-test-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let payload: Vec<u8> = (0..8).flat_map(|v| (v as f32).to_le_bytes()).collect();
+    fs::write(std::path::Path::new("/dev/shm").join(&name), &payload).expect("write shm file");
+    vllm::MultimodalInputs {
+        pixel_values: Some(vllm::TensorData {
+            shape: vec![2, 4],
+            dtype: "float32".to_string(),
+            payload: Some(vllm::tensor_data::Payload::Shm(common::ShmHandle {
+                name,
+                offset: 0,
+                nbytes: payload.len() as u64,
+                owner_id: "smg:test".to_string(),
+            })),
+        }),
+        mm_placeholders: vec![
+            vllm::PlaceholderRange {
+                offset: 1,
+                length: 3,
+            },
+            vllm::PlaceholderRange {
+                offset: 6,
+                length: 3,
+            },
+        ],
+        mm_hashes: vec!["h0".to_string(), "h1".to_string()],
+        batched_keys: vec!["pixel_values".to_string()],
+        modality: common::Modality::Image as i32,
+        ..Default::default()
+    }
+}
+
+/// An int64 tensor with its bytes on the wire.
+fn inline_i64_tensor(shape: Vec<u32>, values: &[i64]) -> vllm::TensorData {
+    vllm::TensorData {
+        shape,
+        dtype: "int64".to_string(),
+        payload: Some(vllm::tensor_data::Payload::Inline(
+            values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>()
+                .into(),
+        )),
+    }
+}
+
+/// An int64 tensor whose bytes sit in a fresh `/dev/shm` file (read and
+/// unlinked once by the servicer).
+#[cfg(target_os = "linux")]
+fn shm_i64_tensor(tag: &str, shape: Vec<u32>, values: &[i64]) -> vllm::TensorData {
+    let name = format!(
+        "smg-servicer-test-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let payload: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    fs::write(std::path::Path::new("/dev/shm").join(&name), &payload).expect("write shm file");
+    vllm::TensorData {
+        shape,
+        dtype: "int64".to_string(),
+        payload: Some(vllm::tensor_data::Payload::Shm(common::ShmHandle {
+            name,
+            offset: 0,
+            nbytes: payload.len() as u64,
+            owner_id: "smg:test".to_string(),
+        })),
+    }
+}
+
 fn config(dir: &std::path::Path, handshake: &str, model: VllmModelInfo) -> VllmServicerConfig {
     VllmServicerConfig {
         servicer: servicer_config(dir, handshake),
@@ -218,7 +371,7 @@ fn batch(
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
         outputs: vec![EngineCoreOutput {
-            request_id: request_id.to_string(),
+            request_id: request_id.into(),
             new_token_ids: tokens,
             finish_reason: finish,
             ..Default::default()
@@ -1147,6 +1300,355 @@ async fn media_refs_are_refused_and_extra_batches_translated() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// An encode-prefill-decode leg carries encoder-cache transfer parameters:
+/// the encoder's request (a pull connector's empty object, or a push
+/// connector's consumer destination and transfer ids), or the prefill side's
+/// with the encoder's handles. This servicer runs no encoder-cache connector
+/// and advertises none, so each is refused before the engine sees it, naming
+/// the label the Router reads; an empty field is no parameters and the
+/// request goes through.
+#[tokio::test]
+async fn encoder_cache_transfer_parameters_are_refused_before_the_engine() {
+    let mut h = harness(model_info(), None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest::default())
+        .await
+        .expect("server info")
+        .into_inner();
+    assert!(
+        !info.supports_ec_transfer
+            && info.ec_connector.is_empty()
+            && info.ec_role.is_empty()
+            && info.ec_zmq_addrs.is_empty(),
+        "no encoder-cache capability is advertised: {info:?}"
+    );
+    for (id, params) in [
+        (
+            "ec-encode",
+            r#"{"consumer_zmq":"tcp://10.0.0.2:5700","ec_items":[{"transfer_id":"t1"}]}"#,
+        ),
+        (
+            "ec-prefill",
+            r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600,"size_bytes":128}}"#,
+        ),
+        // The encoder leg of a pull connector: an empty object, the payload
+        // the Router sends most often, is parameters all the same.
+        ("ec-encode-pull", "{}"),
+    ] {
+        let mut request = generate_request(id, false, Vec::new());
+        request.ec_transfer_params_json = Some(params.to_string());
+        let status = h.client.generate(request).await.expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument, "{id}");
+        assert_eq!(
+            status.message(),
+            "ec_transfer_params_json sent but this worker runs no encoder-cache connector; \
+             check this worker's supports_ec_transfer label",
+            "{id}"
+        );
+    }
+    assert_engine_idle(&mut h.engine_in).await;
+
+    let mut request = generate_request("ec-empty", false, Vec::new());
+    request.ec_transfer_params_json = Some(String::new());
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("an empty field is a plain request")
+        .into_inner();
+    assert_eq!(recv_add(&mut h.engine_in).await.request_id, "ec-empty");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// With an encoder-cache connector in the engine, the four info fields are
+/// advertised as the launcher reports them, a leg's transfer parameters go
+/// to the engine as the connector's extra argument (a pull connector's empty
+/// object included, beside no KV params) and the connector's answer comes
+/// back on the `Complete`, as the Python servicer carries them.
+#[tokio::test]
+async fn encoder_cache_transfer_parameters_pass_through_both_ways() {
+    let mut h = harness(ec_model_info("ec_consumer"), None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest::default())
+        .await
+        .expect("server info")
+        .into_inner();
+    assert!(info.supports_ec_transfer, "{info:?}");
+    assert_eq!(
+        (info.ec_connector.as_str(), info.ec_role.as_str()),
+        ("ECMooncakeConnector", "ec_consumer")
+    );
+    assert_eq!(info.ec_zmq_addrs, vec!["tcp://10.0.0.9:14579"]);
+    for (id, params) in [
+        (
+            "ec-prefill",
+            r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600,"size_bytes":128}}"#,
+        ),
+        ("ec-encode-pull", "{}"),
+    ] {
+        let mut request = generate_request(id, false, Vec::new());
+        request.ec_transfer_params_json = Some(params.to_string());
+        let mut stream = h
+            .client
+            .generate(request)
+            .await
+            .expect("admitted on an engine with a connector")
+            .into_inner();
+        let engine_request = recv_add(&mut h.engine_in).await;
+        assert_eq!(engine_request.request_id, id);
+        let extra = engine_request
+            .sampling_params
+            .as_ref()
+            .and_then(|sp| sp.extra_args.as_ref())
+            .expect("extra_args carry the connector params");
+        let sent: serde_json::Value = serde_json::from_str(params).unwrap();
+        assert_eq!(extra.get("ec_transfer_params"), Some(&sent), "{id}");
+        assert!(extra.get("kv_transfer_params").is_none(), "{id}");
+
+        let mut outputs = batch(id, vec![7], Some(EngineCoreFinishReason::Length), None);
+        if let EngineCoreOutputs::RequestBatch(batch) = &mut outputs {
+            batch.outputs[0].ec_transfer_params = Some(Box::new(serde_json::json!({
+                "h1": {"peer_host": "10.0.0.2", "peer_port": 5700, "size_bytes": 128},
+            })));
+        }
+        h.engine_out.send_outputs(&outputs).await.unwrap();
+        let finished = complete(stream.message().bounded().await.unwrap().unwrap());
+        assert_eq!(finished.finish_reason, "length", "{id}");
+        let returned: serde_json::Value = serde_json::from_str(
+            finished
+                .ec_transfer_params_json
+                .as_deref()
+                .expect("json params"),
+        )
+        .unwrap();
+        assert_eq!(returned["h1"]["peer_port"], 5700, "{id}");
+        assert!(finished.kv_transfer_params_json.is_none(), "{id}");
+        assert!(stream.message().bounded().await.unwrap().is_none());
+    }
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A consumer's leg (the prefill side of an encode-prefill-decode fleet)
+/// brings pixel-less batches: the engine fetches their encodings by the
+/// handles in the transfer parameters, so a leg whose handles do not cover
+/// every item is refused before the engine, in the Python servicer's words
+/// (an empty object, a CPU handle without an address, a Mooncake transfer
+/// id short of one occurrence); one whose handles cover them goes through.
+#[tokio::test]
+async fn encoder_cache_consumer_needs_a_handle_for_every_pixel_less_item() {
+    let mut h = harness(ec_cpu_model_info("ec_consumer"), None).await;
+    let refused = [
+        ("ec-c-empty", "{}"),
+        (
+            "ec-c-short",
+            r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600}}"#,
+        ),
+        (
+            "ec-c-no-port",
+            r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600},"h2":{"peer_host":"10.0.0.1"}}"#,
+        ),
+    ];
+    for (id, params) in refused {
+        let mut request = generate_request(id, false, Vec::new());
+        request.mm_inputs = Some(pixel_less_batch(&["h1", "h2"]));
+        request.ec_transfer_params_json = Some(params.to_string());
+        let status = h.client.generate(request).await.expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument, "{id}");
+        assert!(
+            status
+                .message()
+                .contains("not usable for every pixel-less media item"),
+            "{id}: {}",
+            status.message()
+        );
+    }
+    assert_engine_idle(&mut h.engine_in).await;
+    let mut request = generate_request("ec-c-ok", false, Vec::new());
+    request.mm_inputs = Some(pixel_less_batch(&["h1", "h2"]));
+    request.ec_transfer_params_json = Some(
+        r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600},"h2":{"peer_host":"10.0.0.1","peer_port":5601}}"#
+            .to_string(),
+    );
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("covered handles go through")
+        .into_inner();
+    let engine_request = recv_add(&mut h.engine_in).await;
+    assert_eq!(engine_request.request_id, "ec-c-ok");
+    assert!(
+        engine_request.mm_features.is_none(),
+        "a pixel-less leg carries no features"
+    );
+
+    // The prefill side's realistic payload, grid tensors and hashes without
+    // pixels: admitted on the encoder-cache parameters alone (no KV
+    // parameters), as the Python servicer admits it, the grid riding to the
+    // engine as the items' features.
+    let mut request = generate_request("ec-c-grid", false, Vec::new());
+    request.input = Some(vllm::generate_request::Input::Tokenized(
+        vllm::TokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![1; 9],
+        },
+    ));
+    request.mm_inputs = Some(grid_only_batch(&["h1", "h2"]));
+    request.ec_transfer_params_json = Some(
+        r#"{"h1":{"peer_host":"10.0.0.1","peer_port":5600},"h2":{"peer_host":"10.0.0.1","peer_port":5601}}"#
+            .to_string(),
+    );
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("a grid-only batch on an encoder-cache leg goes through")
+        .into_inner();
+    let engine_request = recv_add(&mut h.engine_in).await;
+    assert_eq!(engine_request.request_id, "ec-c-grid");
+    assert!(
+        engine_request.mm_features.is_some(),
+        "the grid rides as the items' features"
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    // Mooncake consumes one transfer id per occurrence of a hash.
+    let mut h = harness(ec_model_info("ec_consumer"), None).await;
+    let mut request = generate_request("ec-m-short", false, Vec::new());
+    request.mm_inputs = Some(pixel_less_batch(&["h1", "h1"]));
+    request.ec_transfer_params_json =
+        Some(r#"{"ec_items":[{"mm_hash":"h1","transfer_id":"t1"}]}"#.to_string());
+    let status = h
+        .client
+        .generate(request)
+        .await
+        .expect_err("one id for two");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    let mut request = generate_request("ec-m-ok", false, Vec::new());
+    request.mm_inputs = Some(pixel_less_batch(&["h1", "h1"]));
+    request.ec_transfer_params_json = Some(
+        r#"{"ec_items":[{"mm_hash":"h1","transfer_id":"t1"},{"mm_hash":"h1","transfer_id":"t2"}]}"#
+            .to_string(),
+    );
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("one id per occurrence goes through")
+        .into_inner();
+    assert_eq!(recv_add(&mut h.engine_in).await.request_id, "ec-m-ok");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// An encoder's leg with router-preprocessed pixels: its `Complete` carries
+/// the media identity (the prompt's ids, the batch without its pixels) beside
+/// the connector's handles, and on a CPU connector a completion short of a
+/// handle for one of the items is refused instead of becoming a handoff.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn encoder_cache_producer_completion_carries_the_identity_and_the_cpu_handles() {
+    let mut h = harness(ec_cpu_model_info("ec_producer"), None).await;
+    let handles = |short: bool| {
+        let mut handles = serde_json::json!({
+            "h0": {"peer_host": "10.0.0.2", "peer_port": 5700, "size_bytes": 64},
+            "h1": {"peer_host": "10.0.0.2", "peer_port": 5700, "size_bytes": 64},
+        });
+        if short {
+            handles["h1"] = serde_json::json!({"size_bytes": 64});
+        }
+        handles
+    };
+    for (id, short) in [("ec-p-full", false), ("ec-p-short", true)] {
+        let mut request = generate_request(id, false, Vec::new());
+        request.input = Some(vllm::generate_request::Input::Tokenized(
+            vllm::TokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![0; 9],
+            },
+        ));
+        // Beside the pixels: a grid inline (kept by the identity), a grid in
+        // shared memory (dropped: unlinked once read) and a non-grid tensor
+        // (dropped: not part of the identity), all batched one row per item.
+        let mut mm = shm_pixel_batch(id);
+        mm.model_specific_tensors.insert(
+            "image_grid_thw".to_string(),
+            inline_i64_tensor(vec![2, 3], &[1, 2, 2, 1, 2, 2]),
+        );
+        mm.model_specific_tensors.insert(
+            "video_grid_thw".to_string(),
+            shm_i64_tensor(&format!("{id}-grid"), vec![2, 3], &[1, 2, 2, 1, 2, 2]),
+        );
+        mm.model_specific_tensors.insert(
+            "patches_per_image".to_string(),
+            inline_i64_tensor(vec![2], &[4, 4]),
+        );
+        mm.batched_keys.extend(
+            ["image_grid_thw", "video_grid_thw", "patches_per_image"]
+                .iter()
+                .map(|key| key.to_string()),
+        );
+        request.mm_inputs = Some(mm);
+        request.ec_transfer_params_json = Some("{}".to_string());
+        let mut stream = h
+            .client
+            .generate(request)
+            .await
+            .expect("an encoder's leg is admitted")
+            .into_inner();
+        let engine_request = recv_add(&mut h.engine_in).await;
+        assert_eq!(engine_request.request_id, id);
+        assert!(
+            engine_request.mm_features.is_some(),
+            "the pixels reach the engine"
+        );
+        let mut outputs = batch(id, vec![7], Some(EngineCoreFinishReason::Length), None);
+        if let EngineCoreOutputs::RequestBatch(batch) = &mut outputs {
+            batch.outputs[0].ec_transfer_params = Some(Box::new(handles(short)));
+        }
+        h.engine_out.send_outputs(&outputs).await.unwrap();
+        let item = stream.message().bounded().await;
+        if short {
+            let status = item.expect_err("a handle short of an address is refused");
+            assert_eq!(status.code(), Code::Internal, "{id}");
+            assert!(
+                status
+                    .message()
+                    .contains("incomplete ECCPU transfer handle"),
+                "{id}: {}",
+                status.message()
+            );
+            continue;
+        }
+        let finished = complete(item.unwrap().expect("the encoder's completion"));
+        let identity = finished.media_identity.expect("the encoder's identity");
+        assert_eq!(identity.prompt_token_ids, vec![0; 9]);
+        let batch = identity.mm_inputs.expect("the batch");
+        assert_eq!(batch.mm_hashes, vec!["h0", "h1"]);
+        assert!(
+            batch.pixel_values.is_none(),
+            "the identity carries no pixels"
+        );
+        assert_eq!(batch.mm_placeholders.len(), 2);
+        let mut kept: Vec<&String> = batch.model_specific_tensors.keys().collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            ["image_grid_thw"],
+            "the identity keeps the inline grid alone: not the grid in shared memory, not a \
+             non-grid tensor"
+        );
+        assert_eq!(batch.batched_keys, vec!["image_grid_thw"]);
+        assert!(batch.flat_keys.is_empty() && batch.keep_on_cpu_keys.is_empty());
+        let returned: serde_json::Value =
+            serde_json::from_str(finished.ec_transfer_params_json.as_deref().unwrap()).unwrap();
+        assert_eq!(returned["h1"]["peer_port"], 5700);
+        assert!(stream.message().bounded().await.unwrap().is_none());
+    }
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// vLLM checks string stops only once the output exceeds `min_tokens`, and
 /// the text up to that point never matches: the early "Hello world" is
 /// ignored, the later one ends the choice.
@@ -1696,6 +2198,55 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// `GetLoads` with a rank named answers that rank's entry alone, as the
+/// other three wires and the Python servicer answer it; without one, every
+/// rank's; a rank this servicer does not serve answers no entry (the shape
+/// of the three filtering wires).
+#[tokio::test]
+async fn get_loads_answers_the_named_rank_alone() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let (mut h, _rank1_in, _rank1_out) = two_rank_harness(model).await;
+    let ranks_of = |response: &vllm::GetLoadsResponse| {
+        response
+            .loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>()
+    };
+    let every = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((every.dp_rank_count, ranks_of(&every)), (2, vec![0, 1]));
+    let one = h
+        .client
+        .get_loads(vllm::GetLoadsRequest {
+            dp_rank: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((one.dp_rank_count, ranks_of(&one)), (1, vec![1]), "{one:?}");
+    let unserved = h
+        .client
+        .get_loads(vllm::GetLoadsRequest {
+            dp_rank: Some(7),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (unserved.dp_rank_count, ranks_of(&unserved)),
+        (0, Vec::new()),
+        "{unserved:?}"
+    );
+}
+
 /// Two ranks behind one servicer: the request the second rank serves is
 /// credited to that rank's hit rate and throughput, on the poll and on the
 /// pushed record, and the first rank reads idle rather than carrying the
@@ -1723,7 +2274,7 @@ async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
         .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 1,
             outputs: vec![EngineCoreOutput {
-                request_id: "r1".to_string(),
+                request_id: "r1".into(),
                 new_token_ids: vec![10, 11, 12, 13],
                 prefill_stats: Some(PrefillStats {
                     num_prompt_tokens: 3,
@@ -1869,7 +2420,7 @@ async fn the_entries_before_the_first_snapshot_carry_the_servicers_own_figures()
         .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
             outputs: vec![EngineCoreOutput {
-                request_id: "r1".to_string(),
+                request_id: "r1".into(),
                 new_token_ids: vec![10, 11, 12, 13],
                 prefill_stats: Some(PrefillStats {
                     num_prompt_tokens: 3,
@@ -1949,7 +2500,7 @@ async fn prefill_capacity_reaches_grpc_and_push_per_rank() {
                 engine_index: 1,
                 timestamp: start + 0.5,
                 outputs: vec![EngineCoreOutput {
-                    request_id: id.to_string(),
+                    request_id: id.into(),
                     new_token_ids: vec![10],
                     finish_reason: Some(EngineCoreFinishReason::Length),
                     events: Some(vec![
@@ -2788,7 +3339,7 @@ fn pooling_model_info() -> VllmModelInfo {
 fn pooled_batch(request_id: &str, values: Vec<f32>) -> EngineCoreOutputs {
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         outputs: vec![EngineCoreOutput {
-            request_id: request_id.to_string(),
+            request_id: request_id.into(),
             pooling_output: Some(Box::new(PoolingOutput::new(
                 WireTensor::from_f32(vec![values.len()], values).unwrap(),
             ))),
@@ -4041,7 +4592,7 @@ async fn concurrent_streams_keep_their_own_chunk_sequences() {
         let last = step + 1 == STEPS;
         let outputs = (0..STREAMS)
             .map(|i| EngineCoreOutput {
-                request_id: format!("c{i}"),
+                request_id: format!("c{i}").into(),
                 new_token_ids: vec![token(i, step)],
                 finish_reason: last.then_some(EngineCoreFinishReason::Length),
                 ..Default::default()
@@ -5387,4 +5938,59 @@ async fn server_info_and_the_zero_filled_loads_count_the_connected_ranks() {
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
+}
+
+/// 256 engine-timed prefills that share one scheduled-to-first-output
+/// interval read the capacity of the whole batch: 256 x 2 computed tokens
+/// over the half second they share, counted once (the reference for the
+/// wires that measure on the servicer's clock; a ring of per-request
+/// samples read the newest 64 of them over the same half second).
+#[tokio::test]
+async fn a_burst_of_overlapping_prefills_reads_the_capacity_of_the_whole_batch() {
+    use engine_zmq_client::protocol::vllm::output::{EngineCoreEvent, EngineCoreEventType};
+    let mut h = harness(model_info(), None).await;
+    for index in 0..256 {
+        let id = format!("b{index}");
+        let mut stream = h
+            .client
+            .generate(generate_request(&id, true, vec![]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(recv_add(&mut h.engine_in).await.request_id, id);
+        h.engine_out
+            .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+                engine_index: 0,
+                timestamp: 10.5,
+                outputs: vec![EngineCoreOutput {
+                    request_id: id.clone().into(),
+                    new_token_ids: vec![10],
+                    finish_reason: Some(EngineCoreFinishReason::Length),
+                    events: Some(vec![EngineCoreEvent {
+                        r#type: EngineCoreEventType::Scheduled,
+                        timestamp: 10.0,
+                    }]),
+                    prefill_stats: Some(PrefillStats {
+                        num_prompt_tokens: 3,
+                        num_cached_tokens: 1,
+                        num_computed_tokens: 2,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                scheduler_stats: Some(SchedulerStats::default()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.loads[0].prefill_throughput, Some(1_024.0));
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

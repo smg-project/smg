@@ -6,6 +6,7 @@ use tracing::debug;
 use crate::{
     hub::download_tokenizer_from_hf,
     huggingface::HuggingFaceTokenizer,
+    tekken,
     tiktoken::{has_tiktoken_file, is_tiktoken_file, TiktokenTokenizer},
     traits,
 };
@@ -23,6 +24,7 @@ pub enum TokenizerType {
 /// The file extension is used to determine the tokenizer type.
 /// Supported file types are:
 /// - json: HuggingFace tokenizer
+/// - tekken.json: a tekken vocabulary, through the tiktoken backend
 /// - For testing: can return mock tokenizer
 pub fn create_tokenizer_from_file(file_path: &str) -> Result<Arc<dyn traits::Tokenizer>> {
     create_tokenizer_with_chat_template(file_path, None)
@@ -47,6 +49,23 @@ pub fn create_tokenizer_with_chat_template(
 
     // If path is a directory, search for tokenizer files
     if path.is_dir() {
+        // A tekken.json vocabulary outranks the tokenizer.json a checkpoint
+        // may ship beside it: the file is what the family's reference reads
+        // (BOS on request, every special id by its spelling), and the
+        // conversion carries no frame. The loader reads tokenizer_config.json
+        // beside the file; the chat template resolves as it does for the
+        // conversion (the caller's path, else the directory's).
+        if tekken::has_tekken_file(path) {
+            let final_chat_template =
+                resolve_and_log_chat_template(chat_template_path, path, file_path);
+            return Ok(Arc::new(
+                TiktokenTokenizer::from_tekken_file_with_chat_template(
+                    &path.join(tekken::FILE_NAME),
+                    final_chat_template.as_deref(),
+                )?,
+            ));
+        }
+
         let tokenizer_json = path.join("tokenizer.json");
         if tokenizer_json.exists() {
             // Resolve chat template: provided path takes precedence over auto-discovery
@@ -104,7 +123,7 @@ pub fn create_tokenizer_with_chat_template(
         }
 
         return Err(Error::msg(format!(
-            "Directory '{file_path}' does not contain a valid tokenizer file (tokenizer.json, tiktoken.model, *.tiktoken, or vocab.json)"
+            "Directory '{file_path}' does not contain a valid tokenizer file (tekken.json, tokenizer.json, tiktoken.model, *.tiktoken, or vocab.json)"
         )));
     }
 
@@ -115,6 +134,9 @@ pub fn create_tokenizer_with_chat_template(
         .map(|s| s.to_lowercase());
 
     let result = match extension.as_deref() {
+        Some("json") if tekken::is_tekken_file(path) => Ok(Arc::new(
+            TiktokenTokenizer::from_tekken_file_with_chat_template(path, chat_template_path)?,
+        ) as Arc<dyn traits::Tokenizer>),
         Some("json") => {
             let tokenizer =
                 HuggingFaceTokenizer::from_file_with_chat_template(file_path, chat_template_path)?;
@@ -289,6 +311,36 @@ pub fn discover_processor_chat_template_in_dir(dir: &Path) -> Option<String> {
         .flatten()
 }
 
+/// The processor's legacy template file beside the tokenizer files, for the
+/// requests without tools the engine's server renders through it (see
+/// `ChatTemplateState::from_checkpoint`): read when the template in use is
+/// the checkpoint's own (the configuration's, or the sibling
+/// `chat_template.jinja` the discovery prefers); a template file given from
+/// elsewhere is the operator's and stands alone, as the request's own
+/// template outranks the processor's in the engine's server. A file that
+/// does not parse is no processor template: the engine's processor does not
+/// load then, and its server falls back to the tokenizer's template. One
+/// read for both backends.
+pub(crate) fn processor_chat_template(
+    dir: Option<&Path>,
+    chat_template_path: Option<&str>,
+) -> Option<String> {
+    let checkpoints_own_template = chat_template_path.is_none_or(|path| {
+        dir.is_some_and(|dir| Path::new(path) == dir.join("chat_template.jinja"))
+    });
+    dir.filter(|_| checkpoints_own_template)
+        .and_then(discover_processor_chat_template_in_dir)
+        .and_then(
+            |path| match crate::chat_template::load_chat_template_from_file(&path) {
+                Ok(template) => template,
+                Err(e) => {
+                    debug!("the processor's chat template at {path} does not load: {e}");
+                    None
+                }
+            },
+        )
+}
+
 /// Whether `tokenizer_config.json` in `dir` carries a `chat_template` the
 /// loaders read: a string, or a list of named templates (see
 /// `ConfigChatTemplates`). The file fallbacks serve a config without one.
@@ -436,13 +488,25 @@ pub async fn create_tokenizer_async_with_chat_template(
 }
 
 /// The tokenizer of a checkpoint downloaded from the Hub, from the files in
-/// its cache directory: `tokenizer.json`, else a tiktoken vocabulary, else the
-/// layouts the directory loader knows (`vocab.json` + `merges.txt`).
+/// its cache directory: `tekken.json`, else `tokenizer.json`, else a tiktoken
+/// vocabulary, else the layouts the directory loader knows (`vocab.json` +
+/// `merges.txt`).
 fn create_tokenizer_from_downloaded_dir(
     cache_dir: &Path,
     model_name_or_path: &str,
     chat_template_path: Option<&str>,
 ) -> Result<Arc<dyn traits::Tokenizer>> {
+    if tekken::has_tekken_file(cache_dir) {
+        // The chat template resolves as it does for the conversion below.
+        let final_chat_template =
+            resolve_and_log_chat_template(chat_template_path, cache_dir, model_name_or_path);
+        return Ok(Arc::new(
+            TiktokenTokenizer::from_tekken_file_with_chat_template(
+                &cache_dir.join(tekken::FILE_NAME),
+                final_chat_template.as_deref(),
+            )?,
+        ));
+    }
     // Look for tokenizer.json in the cache directory
     let tokenizer_path = cache_dir.join("tokenizer.json");
     if tokenizer_path.exists() {
@@ -537,6 +601,9 @@ pub fn get_tokenizer_info(file_path: &str) -> Result<TokenizerType> {
         .map(|s| s.to_lowercase());
 
     match extension.as_deref() {
+        Some("json") if tekken::is_tekken_file(path) => {
+            Ok(TokenizerType::Tiktoken(file_path.to_string()))
+        }
         Some("json") => Ok(TokenizerType::HuggingFace(file_path.to_string())),
         _ => {
             // Try auto-detection
@@ -566,8 +633,168 @@ mod tests {
 
     use super::{
         create_tokenizer, create_tokenizer_async, create_tokenizer_from_downloaded_dir,
-        create_tokenizer_from_file, is_likely_json, is_likely_openai_model,
+        create_tokenizer_from_file, get_tokenizer_info, is_likely_json, is_likely_openai_model,
+        TokenizerType,
     };
+
+    /// A checkpoint that ships `tekken.json` loads it ahead of the
+    /// `tokenizer.json` conversion beside it, from a directory, from a Hub
+    /// download and as the file itself; the file alone loads too.
+    #[test]
+    fn a_checkpoint_that_ships_tekken_json_loads_it_ahead_of_tokenizer_json() {
+        use crate::{tekken::testing, tiktoken::TiktokenTokenizer};
+        let dir = testing::dir_with(&testing::minimal());
+        let path = dir.path();
+        let alone = create_tokenizer(path.to_str().unwrap())
+            .unwrap_or_else(|e| panic!("tekken.json alone does not load: {e:#}"));
+        assert_eq!(alone.encode("hello", true).unwrap().token_ids(), [1, 262]);
+
+        // The conversion beside it: a word-level file whose `hello` is id 0.
+        std::fs::write(
+            path.join("tokenizer.json"),
+            r#"{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+                "normalizer": null, "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null,
+                "decoder": null, "model": {"type": "WordLevel", "vocab": {"hello": 0, "<unk>": 1},
+                "unk_token": "<unk>"}}"#,
+        )
+        .unwrap();
+        let conversion = create_tokenizer(path.join("tokenizer.json").to_str().unwrap()).unwrap();
+        assert_eq!(conversion.encode("hello", false).unwrap().token_ids(), [0]);
+        for loaded in [
+            create_tokenizer(path.to_str().unwrap()).unwrap(),
+            create_tokenizer_from_downloaded_dir(path, "org/model", None).unwrap(),
+            create_tokenizer_from_file(path.join("tekken.json").to_str().unwrap()).unwrap(),
+        ] {
+            assert!(loaded
+                .as_any()
+                .downcast_ref::<TiktokenTokenizer>()
+                .is_some());
+            assert_eq!(loaded.encode("hello", false).unwrap().token_ids(), [262]);
+            assert_eq!(loaded.encode("hello", true).unwrap().token_ids(), [1, 262]);
+        }
+        assert!(matches!(
+            get_tokenizer_info(path.join("tekken.json").to_str().unwrap()).unwrap(),
+            TokenizerType::Tiktoken(_)
+        ));
+        assert!(matches!(
+            get_tokenizer_info(path.join("tokenizer.json").to_str().unwrap()).unwrap(),
+            TokenizerType::HuggingFace(_)
+        ));
+    }
+
+    /// A checkpoint that ships both files renders the chat template the
+    /// conversion beside it would: the caller's template path first, else
+    /// the one the directory holds, resolved the same way by every arm
+    /// (the directory and the Hub download). The directory also names a
+    /// template in `tokenizer_config.json`: an arm that hands the loader no
+    /// path lets the loader take that one and renders `config` here, the
+    /// resolving arms render the `.jinja` beside it as the conversion does.
+    #[test]
+    fn a_checkpoint_that_ships_both_files_resolves_its_chat_template_like_the_conversion() {
+        use std::sync::Arc;
+
+        use crate::{chat_template::ChatTemplateParams, tekken::testing, traits::Tokenizer};
+        let dir = testing::dir_with(&testing::minimal());
+        let path = dir.path();
+        std::fs::write(
+            path.join("tokenizer_config.json"),
+            r#"{"chat_template": "config"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            path.join("tokenizer.json"),
+            r#"{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+                "normalizer": null, "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null,
+                "decoder": null, "model": {"type": "WordLevel", "vocab": {"hello": 0, "<unk>": 1},
+                "unk_token": "<unk>"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            path.join("chat_template.jinja"),
+            "{% for message in messages %}[{{ message['role'] }}]{{ message['content'] }}{% endfor %}",
+        )
+        .unwrap();
+        let other = path.join("other.jinja");
+        std::fs::write(&other, "{{ messages[0]['content'] }}!").unwrap();
+        let messages = [json!({"role": "user", "content": "hello"})];
+        let render = |tokenizer: Arc<dyn Tokenizer>| {
+            tokenizer
+                .apply_chat_template(&messages, ChatTemplateParams::default())
+                .unwrap()
+        };
+        // The directory's template, from the directory and from a download.
+        for loaded in [
+            create_tokenizer(path.to_str().unwrap()).unwrap(),
+            create_tokenizer_from_downloaded_dir(path, "org/model", None).unwrap(),
+        ] {
+            assert_eq!(render(loaded), "[user]hello");
+        }
+        // The caller's path first, by both arms.
+        for loaded in [
+            super::create_tokenizer_with_chat_template(path.to_str().unwrap(), other.to_str())
+                .unwrap(),
+            create_tokenizer_from_downloaded_dir(path, "org/model", other.to_str()).unwrap(),
+        ] {
+            assert_eq!(render(loaded), "hello!");
+        }
+    }
+
+    /// A checkpoint that ships both files and a processor template
+    /// (`chat_template.json` beside a configuration template) renders a
+    /// request without tools through the processor's template, as the
+    /// conversion beside it does, and a request with tools through the
+    /// configuration's.
+    #[test]
+    fn a_checkpoint_that_ships_both_files_reads_the_processor_template_like_the_conversion() {
+        use crate::{
+            chat_template::ChatTemplateParams, huggingface::HuggingFaceTokenizer, tekken::testing,
+            traits::Tokenizer,
+        };
+        let dir = testing::dir_with(&testing::minimal());
+        let path = dir.path();
+        std::fs::write(
+            path.join("tokenizer_config.json"),
+            r#"{"chat_template": "config"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            path.join("chat_template.json"),
+            r#"{"chat_template": "processor"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            path.join("tokenizer.json"),
+            r#"{"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+                "normalizer": null, "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null,
+                "decoder": null, "model": {"type": "WordLevel", "vocab": {"hello": 0, "<unk>": 1},
+                "unk_token": "<unk>"}}"#,
+        )
+        .unwrap();
+        let messages = [json!({"role": "user", "content": "hello"})];
+        let tools = [json!({"type": "function", "function": {"name": "f", "parameters": {}}})];
+        let loader = create_tokenizer(path.to_str().unwrap()).unwrap();
+        let conversion = HuggingFaceTokenizer::from_file_with_chat_template(
+            path.join("tokenizer.json").to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let arms: [(&str, &dyn Tokenizer); 2] =
+            [("loader", loader.as_ref()), ("conversion", &conversion)];
+        for (arm, tokenizer) in arms {
+            let without_tools = tokenizer
+                .apply_chat_template(&messages, ChatTemplateParams::default())
+                .unwrap();
+            assert_eq!(without_tools, "processor", "{arm}");
+            let with_tools = ChatTemplateParams {
+                tools: Some(tools.as_slice()),
+                ..ChatTemplateParams::default()
+            };
+            let with_tools = tokenizer
+                .apply_chat_template(&messages, with_tools)
+                .unwrap();
+            assert_eq!(with_tools, "config", "{arm}");
+        }
+    }
 
     /// A downloaded checkpoint that ships `vocab.json` + `merges.txt` and no
     /// `tokenizer.json` (Qwen3-Omni) loads from its cache directory, and gives

@@ -1,6 +1,10 @@
 //! Common helper functions shared across stages
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::response::Response;
 use engine_zmq_adapter::stops::encode_single_token_stops;
@@ -22,8 +26,8 @@ use crate::{
         grpc::{
             backend_client::BackendClient,
             context::{
-                stage_output, AttemptStamp, ClientSelection, ExecutionPlan, RequestContext,
-                RequestType, WorkerSelection,
+                stage_output, AttemptStamp, ClientSelection, EncodeOutputs, ExecutionPlan,
+                RequestContext, RequestType, WorkerSelection,
             },
             multimodal::{
                 assemble_media_refs, assemble_multimodal_data,
@@ -120,6 +124,34 @@ pub(crate) fn middleware_request_id(tenant_meta: Option<&TenantRequestMeta>) -> 
         .map(|request_id| request_id.0.as_str())
 }
 
+/// The request's wall-clock time as `(seconds, subsecond nanos)` since the
+/// Unix epoch: the timestamp of its charge id, a version-7 uuid the edge
+/// minted when it took the request in, which is the request's one wall-clock
+/// read (the response's `created`, the engine request id's stamp and the
+/// charge id all tell the same second); read from the clock for a request
+/// that carries no meta.
+pub(crate) fn request_wall_clock(tenant_meta: Option<&TenantRequestMeta>) -> (u64, u32) {
+    tenant_meta
+        .and_then(|meta| meta.request_charge_id().get_timestamp())
+        .map_or_else(
+            || {
+                let since_epoch = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
+                (since_epoch.as_secs(), since_epoch.subsec_nanos())
+            },
+            |stamp| stamp.to_unix(),
+        )
+}
+
+/// A fresh version-7 uuid at the request's wall-clock time (see
+/// [`request_wall_clock`]): unique by its random bits, ordered by the
+/// request's time like one minted now, without a clock read of its own.
+fn request_stamp_uuid(tenant_meta: Option<&TenantRequestMeta>) -> uuid::Uuid {
+    let (seconds, nanos) = request_wall_clock(tenant_meta);
+    uuid::Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, seconds, nanos))
+}
+
 /// How each retry attempt re-mints the engine request id, captured at build
 /// so replays reproduce exactly what a fresh build would have minted.
 ///
@@ -154,7 +186,8 @@ pub(crate) struct BatchIdStamp {
 /// attempts re-mint it with.
 ///
 /// Priority: the protocol `rid`, else the middleware request id, else a fresh
-/// `{prefix}{uuid}` (see [`IdStamp`] for the uniqueness rules).
+/// `{prefix}{uuid}` (see [`IdStamp`] for the uniqueness rules). The uuid is
+/// stamped at the request's wall-clock time ([`request_stamp_uuid`]).
 pub(crate) fn resolve_request_id_stamp(
     request_type: &RequestType,
     tenant_meta: Option<&TenantRequestMeta>,
@@ -166,23 +199,49 @@ pub(crate) fn resolve_request_id_stamp(
             let stamp = IdStamp::Suffixed {
                 base: rid.to_string(),
             };
-            (format!("{rid}-{}", uuid::Uuid::now_v7()), stamp)
+            (suffixed_id(rid, request_stamp_uuid(tenant_meta)), stamp)
         } else {
             (rid.to_string(), IdStamp::Exact)
         };
     }
     match middleware_request_id(tenant_meta) {
         Some(request_id) => (
-            format!("{request_id}-{}", uuid::Uuid::now_v7()),
+            suffixed_id(request_id, request_stamp_uuid(tenant_meta)),
             IdStamp::Suffixed {
                 base: request_id.to_string(),
             },
         ),
         None => (
-            format!("{prefix}{}", uuid::Uuid::now_v7()),
+            minted_id(prefix, request_stamp_uuid(tenant_meta)),
             IdStamp::Minted { prefix },
         ),
     }
+}
+
+/// `{base}-{uuid}`, written into one `String` of its exact size: a `format!`
+/// of these pieces starts its buffer empty and grows it twice on the way
+/// (three allocations per id on every gRPC request, measured on the mock
+/// bed), where the length is known before the first byte is written.
+fn suffixed_id(base: &str, uuid: uuid::Uuid) -> String {
+    let mut id = String::with_capacity(base.len() + 1 + uuid::fmt::Hyphenated::LENGTH);
+    id.push_str(base);
+    id.push('-');
+    push_hyphenated(&mut id, uuid);
+    id
+}
+
+/// `{prefix}{uuid}`, written into one `String` of its exact size (see
+/// `suffixed_id`).
+fn minted_id(prefix: &str, uuid: uuid::Uuid) -> String {
+    let mut id = String::with_capacity(prefix.len() + uuid::fmt::Hyphenated::LENGTH);
+    id.push_str(prefix);
+    push_hyphenated(&mut id, uuid);
+    id
+}
+
+fn push_hyphenated(id: &mut String, uuid: uuid::Uuid) {
+    let mut text = [0u8; uuid::fmt::Hyphenated::LENGTH];
+    id.push_str(uuid.hyphenated().encode_lower(&mut text));
 }
 
 /// Shared id + stamp for the batched completion fan-out. The shared id
@@ -199,11 +258,7 @@ pub(crate) fn resolve_batch_id_stamp(
         Some(rid) => (rid.to_string(), Some(rid.to_string()), disaggregated),
         None => match middleware_request_id(tenant_meta) {
             Some(request_id) => (request_id.to_string(), Some(request_id.to_string()), true),
-            None => (
-                format!("{prefix}{}", uuid::Uuid::now_v7()),
-                None,
-                disaggregated,
-            ),
+            None => (minted_id(prefix, uuid::Uuid::now_v7()), None, disaggregated),
         },
     };
     (
@@ -248,12 +303,8 @@ impl IdStamp {
     pub(crate) fn restamp(&self, plan: &mut ExecutionPlan) -> Result<(), Response> {
         match self {
             Self::Exact => Ok(()),
-            Self::Suffixed { base } => {
-                plan.set_request_id(format!("{base}-{}", uuid::Uuid::now_v7()))
-            }
-            Self::Minted { prefix } => {
-                plan.set_request_id(format!("{prefix}{}", uuid::Uuid::now_v7()))
-            }
+            Self::Suffixed { base } => plan.set_request_id(suffixed_id(base, uuid::Uuid::now_v7())),
+            Self::Minted { prefix } => plan.set_request_id(minted_id(prefix, uuid::Uuid::now_v7())),
             Self::Batch(batch) => {
                 let ExecutionPlan::Batch {
                     shared_request_id,
@@ -273,7 +324,7 @@ impl IdStamp {
                 let shared = batch
                     .stable_shared
                     .clone()
-                    .unwrap_or_else(|| format!("{}{}", batch.prefix, uuid::Uuid::now_v7()));
+                    .unwrap_or_else(|| minted_id(batch.prefix, uuid::Uuid::now_v7()));
                 for (i, request) in requests.iter_mut().enumerate() {
                     request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
                 }
@@ -825,7 +876,8 @@ pub(crate) fn resolve_string_stops(
 /// Inject PD bootstrap metadata when the runtime's rendezvous travels as
 /// SGLang-style `DisaggregatedParams` (bootstrap host/port/room).
 ///
-/// vLLM kv_transfer_params are handled in the request_execution stage.
+/// `kv_transfer_params`, the connector forms' handoff, are built and relayed
+/// by the sequential dispatch (`routers::grpc::sequential_pd`).
 pub(crate) fn maybe_inject_pd_metadata(
     request: &mut ProtoGenerateRequest,
     workers: &WorkerSelection,
@@ -929,8 +981,12 @@ pub(crate) async fn assemble_prompt_media(
         return Ok(None);
     };
     let builder = builder_client(ctx.state.clients.as_ref(), function)?;
-    // `encode_outputs` set by EncodeStage selects the pixel-drop assembly path.
-    let assembled = if ctx.state.encode_outputs.is_some() {
+    // A rendezvous plan from EncodeStage selects the pixel-drop assembly path;
+    // a push plan keeps the pixels, its encoder takes the built prompt.
+    let assembled = if matches!(
+        ctx.state.encode_outputs,
+        Some(EncodeOutputs::Rendezvous { .. })
+    ) {
         assemble_multimodal_data_after_encode(intermediate, builder, ctx.state.workers.as_ref())
             .await
     } else {
@@ -976,8 +1032,10 @@ pub(crate) fn finish_generate_request(
         }
     }
 
-    if let Some(outputs) = ctx.state.encode_outputs.as_mut() {
-        proto_request.set_encode_bootstrap_info(std::mem::take(&mut outputs.bootstrap_info));
+    if let Some(EncodeOutputs::Rendezvous { bootstrap_info, .. }) =
+        ctx.state.encode_outputs.as_mut()
+    {
+        proto_request.set_encode_bootstrap_info(std::mem::take(bootstrap_info));
     }
 
     if let Some(workers) = ctx.state.workers.as_ref() {

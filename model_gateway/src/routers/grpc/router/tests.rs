@@ -10,7 +10,6 @@ use std::{
 use http::header::{HeaderValue, RETRY_AFTER};
 use llm_tokenizer::factory;
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
-use portpicker::pick_unused_port;
 use serde_json::json;
 use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts};
 use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
@@ -19,12 +18,16 @@ use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
 use super::*;
 use crate::{
-    config::{ParserChoice, RoutingMode},
+    config::{
+        test_support::{epd_routing_mode, pd_routing_mode, regular_routing_mode},
+        ParserChoice, RoutingMode,
+    },
     rate_limit::{
         RateLimitBackend, ReserveOutcome, ReserveRequest, SharedReservationHandle, UsageSettlement,
     },
     routers::grpc::{
         common::stages::RateLimitOutcome,
+        test_engine::serve_on_loopback,
         testing::{grpc_config, grpc_ctx, grpc_ctx_from, grpc_ctx_with_parsers, mcp_orchestrator},
     },
     tenant::TenantKey,
@@ -35,32 +38,6 @@ use crate::{
         WorkerWorkflowData, WorkflowEngines,
     },
 };
-
-fn regular_routing_mode() -> RoutingMode {
-    RoutingMode::Regular {
-        worker_urls: vec![],
-    }
-}
-
-fn pd_routing_mode() -> RoutingMode {
-    RoutingMode::PrefillDecode {
-        prefill_urls: vec![],
-        decode_urls: vec![],
-        prefill_policy: None,
-        decode_policy: None,
-    }
-}
-
-fn epd_routing_mode() -> RoutingMode {
-    RoutingMode::EncodePrefillDecode {
-        encode_urls: vec![],
-        prefill_urls: vec![],
-        decode_urls: vec![],
-        encode_policy: None,
-        prefill_policy: None,
-        decode_policy: None,
-    }
-}
 
 /// A mode that does not serve an endpoint refuses it with the JSON error
 /// object under the endpoint's code, as the router trait's default does.
@@ -1209,34 +1186,13 @@ impl TokenSpeedScheduler for ScriptedEngine {
     }
 }
 
-/// Serves a [`ScriptedEngine`] on a free loopback port and returns the port
-/// once it accepts connections.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "test helper; the engine's server lives for the test process"
-)]
+/// Serves a [`ScriptedEngine`] on a loopback port bound before it is handed
+/// out and returns the port.
 async fn spawn_engine(output_ids: Vec<u32>) -> u16 {
-    let port = pick_unused_port().expect("a free port for the scripted engine");
-    let addr = format!("127.0.0.1:{port}").parse().expect("engine address");
-    tokio::spawn(async move {
-        Server::builder()
-            .add_service(TokenSpeedSchedulerServer::new(ScriptedEngine {
-                output_ids,
-            }))
-            .serve(addr)
-            .await
-            .expect("scripted engine server");
-    });
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
-            return port;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("the scripted engine on port {port} never came up");
+    let router = Server::builder().add_service(TokenSpeedSchedulerServer::new(ScriptedEngine {
+        output_ids,
+    }));
+    serve_on_loopback(router).await.0.port()
 }
 
 /// A gRPC worker of `worker_type` serving `card`'s model at `url`.

@@ -25,6 +25,8 @@ METRICS = [
     "smg_worker_overload_shed_total",
     "smg_kv_index_blocks_live",
     "smg_kv_index_arena_bytes",
+    "smg_kv_index_arena_chunk_bytes",
+    "smg_kv_index_cap_refusals",
 ]
 FIELDS = [
     "t",

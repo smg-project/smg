@@ -94,23 +94,24 @@ impl StopSequenceConfig {
     }
 }
 
-/// Decoder that handles stop sequences
-pub struct StopSequenceDecoder {
-    /// Sequence for incremental decoding (replaces token_buffer + offsets)
-    sequence: Sequence,
-    config: StopSequenceConfig,
-    /// Aho-Corasick automaton for O(N) stop sequence matching
-    aho_corasick: Option<AhoCorasick>,
+/// What a request's stop parameters compile to: the string stops' automaton with the boundary
+/// between its hidden and visible patterns, the patterns the jail's partial-match check reads,
+/// and the stop token ids sorted for the check per token. Built once per request
+/// ([`StopRules::new`]) and copied into each of its choices' decoders
+/// ([`StopSequenceDecoder::with_rules`]): a copy allocates nothing, since the patterns and the
+/// automaton share their tables behind reference counts and the ids live inline or behind one
+/// more; the automaton's build and the ids' sort are paid once.
+#[derive(Clone, Debug)]
+pub struct StopRules {
+    /// The stop sequences the automaton was built from, hidden then visible; `None` without string
+    /// stops (an empty shared slice would still allocate its header). Shared by every copy of the
+    /// rules, as the automaton's tables are.
+    patterns: Option<Arc<[String]>>,
     /// Index boundary: patterns [0..visible_boundary_idx) are hidden,
     /// patterns [visible_boundary_idx..) are visible
     visible_boundary_idx: usize,
-    /// Buffer for partial matches (the "jail")
-    jail_buffer: String,
-    /// Whether we've stopped
-    stopped: bool,
-    /// The string stop sequence that triggered the stop, if any. Set only for
-    /// string-sequence matches; token-level stops leave this `None`.
-    matched_stop: Option<String>,
+    /// Aho-Corasick automaton for O(N) stop sequence matching
+    aho_corasick: Option<AhoCorasick>,
     /// True when there are no string stop sequences (only token-level stops).
     /// In this mode the jail buffer is bypassed entirely for lower overhead.
     token_only: bool,
@@ -121,6 +122,59 @@ pub struct StopSequenceDecoder {
     visible_stop_ids: StopIds,
 }
 
+impl StopRules {
+    /// The rules of `config`: the automaton over its non-empty stop sequences,
+    /// hidden first, and its stop token ids sorted.
+    pub fn new(config: StopSequenceConfig) -> Self {
+        let StopSequenceConfig {
+            stop_tokens,
+            stop_sequences,
+            visible_stop_tokens,
+            visible_stop_sequences,
+        } = config;
+        let mut patterns = stop_sequences;
+        patterns.retain(|s| !s.is_empty());
+        let visible_boundary_idx = patterns.len();
+        patterns.extend(visible_stop_sequences.into_iter().filter(|s| !s.is_empty()));
+
+        let aho_corasick = if patterns.is_empty() {
+            None
+        } else {
+            // AhoCorasick::new is infallible for non-empty, pre-filtered string patterns.
+            // Failure would indicate a bug in the Aho-Corasick library itself.
+            #[expect(
+                clippy::expect_used,
+                reason = "AhoCorasick::new with pre-filtered non-empty &str patterns is practically infallible"
+            )]
+            Some(AhoCorasick::new(&patterns).expect("Failed to build Aho-Corasick automaton"))
+        };
+
+        Self {
+            token_only: aho_corasick.is_none(),
+            patterns: (!patterns.is_empty()).then(|| patterns.into()),
+            visible_boundary_idx,
+            aho_corasick,
+            hidden_stop_ids: StopIds::new(&stop_tokens),
+            visible_stop_ids: StopIds::new(&visible_stop_tokens),
+        }
+    }
+}
+
+/// Decoder that handles stop sequences
+pub struct StopSequenceDecoder {
+    /// Sequence for incremental decoding (replaces token_buffer + offsets)
+    sequence: Sequence,
+    /// The request's stop rules, this decoder's own copy ([`Self::with_rules`]).
+    rules: StopRules,
+    /// Buffer for partial matches (the "jail")
+    jail_buffer: String,
+    /// Whether we've stopped
+    stopped: bool,
+    /// The string stop sequence that triggered the stop, if any. Set only for
+    /// string-sequence matches; token-level stops leave this `None`.
+    matched_stop: Option<String>,
+}
+
 impl StopSequenceDecoder {
     /// Create a new stop sequence decoder
     pub fn new(
@@ -128,9 +182,20 @@ impl StopSequenceDecoder {
         config: StopSequenceConfig,
         skip_special_tokens: bool,
     ) -> Self {
+        Self::with_rules(tokenizer, StopRules::new(config), skip_special_tokens)
+    }
+
+    /// A decoder over `rules` built once for the request: a choice's decoder
+    /// beside another choice's, with a decode state and a jail of its own and
+    /// the request's automaton and stop ids copied, not rebuilt.
+    pub fn with_rules(
+        tokenizer: Arc<dyn traits::Tokenizer>,
+        rules: StopRules,
+        skip_special_tokens: bool,
+    ) -> Self {
         Self::with_sequence(
             Sequence::new_with_options(tokenizer, skip_special_tokens),
-            config,
+            rules,
         )
     }
 
@@ -143,7 +208,7 @@ impl StopSequenceDecoder {
     ) -> Self {
         Self::with_sequence(
             Sequence::for_stop_matching(tokenizer, skip_special_tokens),
-            config,
+            StopRules::new(config),
         )
     }
 
@@ -165,51 +230,13 @@ impl StopSequenceDecoder {
         self.sequence.token_ids().len()
     }
 
-    fn with_sequence(sequence: Sequence, config: StopSequenceConfig) -> Self {
-        // Build Aho-Corasick automaton from all stop sequences
-        // Hidden sequences come first, then visible sequences
-        let mut patterns: Vec<&str> = config
-            .stop_sequences
-            .iter()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.as_str())
-            .collect();
-        let visible_boundary_idx = patterns.len();
-        patterns.extend(
-            config
-                .visible_stop_sequences
-                .iter()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.as_str()),
-        );
-
-        let aho_corasick = if patterns.is_empty() {
-            None
-        } else {
-            // AhoCorasick::new is infallible for non-empty, pre-filtered string patterns.
-            // Failure would indicate a bug in the Aho-Corasick library itself.
-            #[expect(
-                clippy::expect_used,
-                reason = "AhoCorasick::new with pre-filtered non-empty &str patterns is practically infallible"
-            )]
-            Some(AhoCorasick::new(patterns).expect("Failed to build Aho-Corasick automaton"))
-        };
-
-        let token_only = aho_corasick.is_none();
-        let hidden_stop_ids = StopIds::new(&config.stop_tokens);
-        let visible_stop_ids = StopIds::new(&config.visible_stop_tokens);
-
+    fn with_sequence(sequence: Sequence, rules: StopRules) -> Self {
         StopSequenceDecoder {
             sequence,
-            config,
-            aho_corasick,
-            visible_boundary_idx,
+            rules,
             jail_buffer: String::new(),
             stopped: false,
             matched_stop: None,
-            token_only,
-            hidden_stop_ids,
-            visible_stop_ids,
         }
     }
 
@@ -228,10 +255,10 @@ impl StopSequenceDecoder {
 
         let mut longest = 0;
         for pattern in self
-            .config
-            .stop_sequences
+            .rules
+            .patterns
             .iter()
-            .chain(&self.config.visible_stop_sequences)
+            .flat_map(|patterns| patterns.iter())
         {
             let pat = pattern.as_bytes();
             // Only proper prefixes count, and only ones longer than the best so far.
@@ -258,9 +285,9 @@ impl StopSequenceDecoder {
     /// to a buffer of the caller's instead.
     pub fn process_token(&mut self, token_id: TokenIdType) -> Result<SequenceDecoderOutput> {
         if !self.stopped
-            && self.token_only
-            && !self.hidden_stop_ids.contains(token_id)
-            && !self.visible_stop_ids.contains(token_id)
+            && self.rules.token_only
+            && !self.rules.hidden_stop_ids.contains(token_id)
+            && !self.rules.visible_stop_ids.contains(token_id)
         {
             // The common path of the appending form, in its owned shape: the
             // decoder's own string for the token (one exact allocation, as
@@ -295,9 +322,9 @@ impl StopSequenceDecoder {
             return Ok(SequenceDecoderStep::Stopped);
         }
 
-        let hidden_stop = self.hidden_stop_ids.contains(token_id);
-        let visible_stop = self.visible_stop_ids.contains(token_id);
-        if self.token_only && !hidden_stop && !visible_stop {
+        let hidden_stop = self.rules.hidden_stop_ids.contains(token_id);
+        let visible_stop = self.rules.visible_stop_ids.contains(token_id);
+        if self.rules.token_only && !hidden_stop && !visible_stop {
             // The common path: no string stops and not a stop token, so the
             // decoded text goes out as it is, with no jail to run.
             return Ok(if self.sequence.append_token_into(token_id, out)? {
@@ -307,10 +334,13 @@ impl StopSequenceDecoder {
             });
         }
         if hidden_stop || visible_stop {
-            // A stop token closes the byte run before it; it must not discard
-            // pending text, and a string stop within that text takes precedence.
-            // A visible stop's own text is decoded first: the steps that can
-            // fail run before anything is appended to `out`.
+            // A stop token ends the stream for the text held before it, which
+            // is released as the stream's end releases it (a character the
+            // stop cut short as nothing); a string stop within that text takes
+            // precedence. The stop token itself never goes through the
+            // decoder: a visible stop's own text is decoded on its own first
+            // (the steps that can fail run before anything is appended to
+            // `out`) and follows the held text.
             let stop_text = if visible_stop && !hidden_stop {
                 Some(
                     self.sequence
@@ -351,7 +381,7 @@ impl StopSequenceDecoder {
     /// longest suffix that is still a partial stop sequence.
     fn release(&mut self, out: &mut String) -> SequenceDecoderStep {
         // Token-only fast path: no string stops means no jail is needed.
-        if self.token_only {
+        if self.rules.token_only {
             if self.jail_buffer.is_empty() {
                 return SequenceDecoderStep::Held;
             }
@@ -363,11 +393,11 @@ impl StopSequenceDecoder {
         // Check for stop sequences using Aho-Corasick. The jail only ever retains a
         // proper prefix of some pattern, so the buffer is bounded by
         // `longest_pattern + one token of text` and scanning it whole is cheap.
-        if let Some(ac) = &self.aho_corasick {
+        if let Some(ac) = &self.rules.aho_corasick {
             if let Some(mat) = ac.find(Input::new(&self.jail_buffer)) {
                 self.stopped = true;
                 self.matched_stop = Some(self.jail_buffer[mat.start()..mat.end()].to_string());
-                let is_visible = mat.pattern().as_usize() >= self.visible_boundary_idx;
+                let is_visible = mat.pattern().as_usize() >= self.rules.visible_boundary_idx;
                 // A visible stop sequence is included in the output, a hidden
                 // one excluded.
                 let end = if is_visible { mat.end() } else { mat.start() };
@@ -501,13 +531,15 @@ impl StopSequenceDecoder {
 const INLINE_STOP_IDS: usize = 8;
 
 /// A set of token ids kept sorted, for a membership check per generated
-/// token without hashing; a handful of ids live inline, more on the heap.
+/// token without hashing; a handful of ids live inline, more behind a shared
+/// reference, so a copy of the set allocates nothing either way.
+#[derive(Clone, Debug)]
 enum StopIds {
     Inline {
         len: usize,
         ids: [TokenIdType; INLINE_STOP_IDS],
     },
-    Heap(Box<[TokenIdType]>),
+    Heap(Arc<[TokenIdType]>),
 }
 
 impl StopIds {
@@ -525,7 +557,7 @@ impl StopIds {
         } else {
             let mut sorted: Vec<TokenIdType> = ids.iter().copied().collect();
             sorted.sort_unstable();
-            Self::Heap(sorted.into_boxed_slice())
+            Self::Heap(sorted.into())
         }
     }
 

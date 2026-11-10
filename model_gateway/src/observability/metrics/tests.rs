@@ -285,6 +285,82 @@ fn record_engine_load_sets_pd_gauges_when_disagg_present() {
     );
 }
 
+/// The `smg_engine_*` set recorded through kept handles renders exactly as
+/// it does with a key built per record: the same series with the same
+/// values, a capacity or PD series only where a load carried the figure,
+/// and a rank's own record (the pushed shape) moving that rank's values
+/// alone.
+#[test]
+fn the_engine_load_set_renders_the_same_through_kept_handles() {
+    let report = |running: i32, hit_rate: f64| WorkerLoadResponse {
+        timestamp: "t".to_string(),
+        dp_rank_count: 2,
+        loads: vec![
+            SchedulerLoadSnapshot {
+                dp_rank: 0,
+                num_running_reqs: running,
+                num_waiting_reqs: 1,
+                token_usage: 0.5,
+                gen_throughput: 42.0,
+                cache_hit_rate: hit_rate,
+                max_total_num_tokens: 262_144,
+                disagg_mode: Some("prefill".to_string()),
+                kv_transfer_latency_ms: Some(3.5),
+                prefill_queue_reqs: Some(9),
+                ..Default::default()
+            },
+            SchedulerLoadSnapshot {
+                dp_rank: 1,
+                num_running_reqs: running + 1,
+                cache_hit_rate: hit_rate,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let records = || {
+        Metrics::record_engine_load("http://w:1", "m", &report(7, 0.25));
+        Metrics::record_engine_rank_load("http://w:1", "m", &report(8, 0.75).loads[0]);
+        Metrics::record_engine_load("http://w:2", "m2", &report(1, 0.5));
+    };
+    let built = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(false));
+        records();
+        handles::reset();
+    });
+    let kept = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(true));
+        records();
+        handles::reset();
+    });
+    assert_eq!(sorted_series(&kept), sorted_series(&built));
+    for expected in [
+        "smg_engine_running_requests{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\"} 8",
+        "smg_engine_running_requests{worker=\"http://w:1\",model=\"m\",dp_rank=\"1\"} 8",
+        "smg_engine_cache_hit_rate{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\"} 0.75",
+        "smg_engine_cache_hit_rate{worker=\"http://w:1\",model=\"m\",dp_rank=\"1\"} 0.25",
+        "smg_engine_kv_capacity_tokens{worker=\"http://w:1\",model=\"m\",dp_rank=\"0\"} 262144",
+        "smg_engine_pd_kv_transfer_latency_ms{worker=\"http://w:1\",role=\"prefill\",dp_rank=\"0\"} 3.5",
+        "smg_engine_pd_prefill_queue_reqs{worker=\"http://w:1\",role=\"prefill\",dp_rank=\"0\"} 9",
+        "smg_engine_running_requests{worker=\"http://w:2\",model=\"m2\",dp_rank=\"1\"} 2",
+    ] {
+        assert!(
+            kept.lines().any(|line| line == expected),
+            "missing {expected} in:\n{kept}"
+        );
+    }
+    assert!(
+        !kept.contains(
+            "smg_engine_kv_capacity_tokens{worker=\"http://w:1\",model=\"m\",dp_rank=\"1\""
+        ),
+        "a rank whose loads carry no capacity has no capacity series:\n{kept}"
+    );
+    assert!(
+        !kept.contains("smg_engine_pd_kv_transfer_speed_gb_s"),
+        "a figure no load carried has no series:\n{kept}"
+    );
+}
+
 #[test]
 fn cache_tree_setters_emit_per_model_gauges() {
     let rendered = render_with_recorder(|| {
@@ -933,6 +1009,60 @@ fn pd_phase_families_describe_what_they_measure() {
     );
 }
 
+/// The router's first-token and generation families say on `/metrics` where
+/// their clock starts: at the answering attempt's RPC dispatch (the prefill
+/// dispatch of a pair, after a pushed encode call), so a refused attempt's
+/// wait and its backoff are in the request duration (the backoff alone in the
+/// backoff histogram, the attempt in the retry count), not in them.
+#[test]
+fn router_stream_families_name_the_attempt_anchor() {
+    let (rendered, ()) = with_test_recorder(|| {
+        init_metrics();
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_REGULAR,
+            model_id: "m",
+            endpoint: "chat",
+            ttft: Some(Duration::from_millis(5)),
+            generation_duration: Duration::from_millis(9),
+            input_tokens: None,
+            cached_tokens: None,
+            output_tokens: 2,
+        });
+    });
+    let help = |family: &str| -> String {
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("# HELP {family} ")))
+            .unwrap_or_else(|| panic!("no # HELP for {family}; rendered:\n{rendered}"))
+            .to_owned()
+    };
+    for family in [
+        "smg_router_ttft_seconds",
+        TIME_TO_FIRST_TOKEN_SECONDS,
+        "smg_router_generation_duration_seconds",
+    ] {
+        let text = help(family);
+        assert!(
+            text.contains("answering attempt's RPC dispatch"),
+            "{family}: {text}"
+        );
+    }
+    for family in [
+        "smg_router_ttft_seconds",
+        "smg_router_generation_duration_seconds",
+    ] {
+        let text = help(family);
+        assert!(
+            text.contains("smg_router_request_duration_seconds")
+                && text.contains("after the encode call when encode pushes")
+                && text.contains("smg_worker_retry_backoff_seconds")
+                && text.contains("smg_worker_retries_total"),
+            "{family}: {text}"
+        );
+    }
+}
+
 #[test]
 fn test_record_pd_kv_connector_mode_counts_by_mode() {
     let (rendered, ()) = with_test_recorder(|| {
@@ -1475,6 +1605,10 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
         Metrics::record_worker_cache_aware_policy_branch("tree_match");
         Metrics::record_worker_cache_aware_policy_branch("tree_match");
         Metrics::record_worker_cache_aware_policy_branch("spill");
+        Metrics::record_worker_manual_policy_branch("occupied_hit");
+        Metrics::record_worker_manual_policy_branch("occupied_hit");
+        Metrics::record_worker_consistent_hashing_policy_branch("routing_key_hit");
+        Metrics::record_worker_prefix_hash_policy_branch("ring_hit");
         Metrics::record_cache_aware_match_ratio(0.25);
         Metrics::record_cache_aware_match_ratio(0.75);
         Metrics::record_routing_key_source("header");
@@ -1506,6 +1640,9 @@ fn the_per_request_records_render_the_same_through_kept_handles() {
         "smg_worker_selection_total{worker_type=\"prefill\",connection_mode=\"grpc\",model=\"m2\",policy=\"random\"} 1",
         "smg_cache_aware_policy_branch_total{branch=\"tree_match\"} 2",
         "smg_cache_aware_policy_branch_total{branch=\"spill\"} 1",
+        "smg_manual_policy_branch_total{branch=\"occupied_hit\"} 2",
+        "smg_consistent_hashing_policy_branch_total{branch=\"routing_key_hit\"} 1",
+        "smg_prefix_hash_policy_branch_total{branch=\"ring_hit\"} 1",
         "smg_cache_aware_match_ratio_count 2",
         "smg_routing_key_source_total{source=\"header\"} 1",
         "smg_admission_queue_depth 1",

@@ -69,6 +69,22 @@ fn inline_image(payload: &'static [u8], hash: &str) -> Arc<ImageFrame> {
     ))
 }
 
+/// Two items bound one after the other, each at its own prompt offset: a
+/// two-token structural span and one patch of the same span, the batch shape
+/// the assembly tests share.
+fn two_item_bindings(offsets: [usize; 2]) -> Vec<PromptBinding> {
+    offsets
+        .into_iter()
+        .enumerate()
+        .map(|(item, offset)| PromptBinding {
+            item_index: item,
+            prompt_ordinal: item,
+            structural: PlaceholderRange { offset, length: 2 },
+            patches: vec![PlaceholderRange { offset, length: 2 }],
+        })
+        .collect()
+}
+
 /// One image whose flat span is the whole encoder input: the tensor
 /// handed over by value moves into the item's payload, and the item is
 /// the same as the one written from a view of it. (Shared with the encode
@@ -272,32 +288,7 @@ fn two_image_intermediate() -> PrecomputedMultimodalIntermediate {
     PrecomputedMultimodalIntermediate {
         preprocessed,
         media: MediaBatch::Images(images),
-        bindings: vec![
-            PromptBinding {
-                item_index: 0,
-                prompt_ordinal: 0,
-                structural: PlaceholderRange {
-                    offset: 10,
-                    length: 2,
-                },
-                patches: vec![PlaceholderRange {
-                    offset: 10,
-                    length: 2,
-                }],
-            },
-            PromptBinding {
-                item_index: 1,
-                prompt_ordinal: 1,
-                structural: PlaceholderRange {
-                    offset: 20,
-                    length: 2,
-                },
-                patches: vec![PlaceholderRange {
-                    offset: 20,
-                    length: 2,
-                }],
-            },
-        ],
+        bindings: two_item_bindings([10, 20]),
         placeholder_token_id: Some(151655),
         field_layouts: EncoderFieldLayouts::new(
             FieldLayout::flat("patches_per_image"),
@@ -427,6 +418,62 @@ fn a_patched_item_may_span_a_wider_structural_range() {
     assert_eq!(assembled.items[0].mm_placeholders, vec![(11, 2)]);
 }
 
+/// One image in a layout with structural tokens around its feature runs:
+/// four crops of 81 image tokens between their start and end tokens, a
+/// newline after the first row, then the view's 169 between its own. The
+/// runs are the reservation (493 of the 504 positions); `features` is the
+/// count the item claims for them.
+fn one_image_in_a_structural_layout(features: usize) -> PrecomputedMultimodalIntermediate {
+    let mut offset = 10;
+    let mut patches = Vec::new();
+    for crop in 0..4 {
+        patches.push(PlaceholderRange {
+            offset: offset + 1,
+            length: 81,
+        });
+        offset += 83 + usize::from(crop == 1);
+    }
+    patches.push(PlaceholderRange {
+        offset: offset + 1,
+        length: 169,
+    });
+    let mut intermediate = one_image_intermediate(504, patches);
+    intermediate.preprocessed.feature_token_counts = vec![features];
+    intermediate
+}
+
+/// The structural tokens of a layout are prompt text, not reserved
+/// positions: an item fits when its feature count is the runs' length, and a
+/// count that took the structural tokens for features never fits.
+#[test]
+fn a_layouts_structural_tokens_are_not_reserved_positions() {
+    let fits = one_image_in_a_structural_layout(493);
+    assert!(validate_precomputed_batch(&fits).is_ok());
+    // The wire that picks the feature positions out of the structural range
+    // is sent the whole range; the wires that take the runs as they are get
+    // exactly as many positions as the item has features.
+    assert_eq!(
+        placeholders_for_bindings(&fits.bindings, false).unwrap(),
+        vec![(10, 504)]
+    );
+    let runs = placeholders_for_bindings(&fits.bindings, true).unwrap();
+    assert_eq!(runs.len(), 5);
+    assert_eq!(
+        runs.iter()
+            .map(|&(_, length)| length as usize)
+            .sum::<usize>(),
+        493
+    );
+
+    let error = validate_precomputed_batch(&one_image_in_a_structural_layout(504))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("reserves 493 prompt positions for 504 encoder features"),
+        "{error}"
+    );
+}
+
 #[test]
 fn assemble_tokenspeed_v41_layouts_stay_inline_when_shm_disabled() {
     use crate::routers::grpc::proto_wrapper::TokenSpeedTensorStorage;
@@ -487,32 +534,7 @@ fn assemble_tokenspeed_v41_layouts_stay_inline_when_shm_disabled() {
     let intermediate = PrecomputedMultimodalIntermediate {
         preprocessed,
         media: MediaBatch::Images(images),
-        bindings: vec![
-            PromptBinding {
-                item_index: 0,
-                prompt_ordinal: 0,
-                structural: PlaceholderRange {
-                    offset: 10,
-                    length: 2,
-                },
-                patches: vec![PlaceholderRange {
-                    offset: 10,
-                    length: 2,
-                }],
-            },
-            PromptBinding {
-                item_index: 1,
-                prompt_ordinal: 1,
-                structural: PlaceholderRange {
-                    offset: 20,
-                    length: 2,
-                },
-                patches: vec![PlaceholderRange {
-                    offset: 20,
-                    length: 2,
-                }],
-            },
-        ],
+        bindings: two_item_bindings([10, 20]),
         placeholder_token_id: Some(129264),
         field_layouts: EncoderFieldLayouts::new(
             FieldLayout::flat("patches_per_image"),
@@ -749,32 +771,7 @@ fn assemble_tokenspeed_splits_video_items() {
     let intermediate = PrecomputedMultimodalIntermediate {
         preprocessed,
         media: MediaBatch::Videos(videos),
-        bindings: vec![
-            PromptBinding {
-                item_index: 0,
-                prompt_ordinal: 0,
-                structural: PlaceholderRange {
-                    offset: 30,
-                    length: 2,
-                },
-                patches: vec![PlaceholderRange {
-                    offset: 30,
-                    length: 2,
-                }],
-            },
-            PromptBinding {
-                item_index: 1,
-                prompt_ordinal: 1,
-                structural: PlaceholderRange {
-                    offset: 40,
-                    length: 2,
-                },
-                patches: vec![PlaceholderRange {
-                    offset: 40,
-                    length: 2,
-                }],
-            },
-        ],
+        bindings: two_item_bindings([30, 40]),
         placeholder_token_id: Some(151656),
         field_layouts: EncoderFieldLayouts::new(
             FieldLayout::flat("patches_per_video"),
@@ -973,32 +970,7 @@ fn assemble_tokenspeed_splits_audio_items_as_bfloat16_by_default() {
     let intermediate = PrecomputedMultimodalIntermediate {
         preprocessed,
         media: MediaBatch::Audios(audios),
-        bindings: vec![
-            PromptBinding {
-                item_index: 0,
-                prompt_ordinal: 0,
-                structural: PlaceholderRange {
-                    offset: 30,
-                    length: 2,
-                },
-                patches: vec![PlaceholderRange {
-                    offset: 30,
-                    length: 2,
-                }],
-            },
-            PromptBinding {
-                item_index: 1,
-                prompt_ordinal: 1,
-                structural: PlaceholderRange {
-                    offset: 40,
-                    length: 2,
-                },
-                patches: vec![PlaceholderRange {
-                    offset: 40,
-                    length: 2,
-                }],
-            },
-        ],
+        bindings: two_item_bindings([30, 40]),
         placeholder_token_id: Some(42),
         field_layouts: EncoderFieldLayouts::new(
             FieldLayout::flat("row_lengths"),
@@ -1374,4 +1346,99 @@ async fn the_zmq_sglang_arm_assembles_the_grpc_paths_payload_and_the_wire_carrie
             .as_ref(),
         grid.data.as_slice()
     );
+}
+
+/// A batch of images of different sizes through the Pixtral processor is
+/// floats (the reference pads it after normalizing, with a value no byte
+/// maps to), which a worker that normalizes pixels on device cannot take:
+/// the request is refused with the typed error instead of written as floats
+/// the device would normalize again. A same-size batch reaches that worker
+/// as bytes, and the mixed-size batch reaches a worker that normalizes on
+/// host as floats.
+#[test]
+fn a_mixed_size_batch_is_refused_by_a_worker_that_normalizes_on_device() {
+    use llm_multimodal::{vision::PixtralProcessor, ImageSource, VisionPreProcessor};
+
+    let frame_of = |width: u32, height: u32, hash: String| {
+        let image =
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(width, height, |x, y| {
+                image::Rgb([x as u8 * 5, y as u8 * 5, 7])
+            }));
+        let frame = Arc::new(ImageFrame::new(
+            image.clone(),
+            bytes::Bytes::from_static(b"bytes"),
+            ImageDetail::Auto,
+            ImageSource::InlineBytes,
+            hash,
+        ));
+        (image, frame)
+    };
+    let processor = PixtralProcessor::new();
+    let intermediate = |sizes: [(u32, u32); 2]| {
+        let (images, frames): (Vec<_>, Vec<_>) = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, &(width, height))| frame_of(width, height, format!("hash-{index}")))
+            .unzip();
+        let preprocessed = processor
+            .preprocess(&images.iter().collect::<Vec<_>>())
+            .expect("Pixtral preprocess");
+        let bindings = preprocessed
+            .feature_token_counts
+            .iter()
+            .enumerate()
+            .map(|(item_index, &length)| PromptBinding {
+                item_index,
+                prompt_ordinal: item_index,
+                structural: PlaceholderRange {
+                    offset: 10 + 1000 * item_index,
+                    length,
+                },
+                patches: vec![],
+            })
+            .collect();
+        PrecomputedMultimodalIntermediate {
+            preprocessed,
+            media: MediaBatch::Images(frames),
+            bindings,
+            placeholder_token_id: Some(10),
+            field_layouts: EncoderFieldLayouts::new(
+                FieldLayout::Batched,
+                HashMap::from([("image_sizes".to_string(), FieldLayout::Batched)]),
+            ),
+            keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
+        }
+    };
+    let normalizes_on_device = VllmAssembly {
+        encoder_dtype: "bfloat16".to_string(),
+        device_normalizes: true,
+        shm_enabled: false,
+        shm_min_bytes: 0,
+    };
+    let normalizes_on_host = VllmAssembly {
+        device_normalizes: false,
+        ..normalizes_on_device.clone()
+    };
+
+    let error = assemble_vllm(intermediate([(32, 32), (48, 32)]), &normalizes_on_device)
+        .expect_err("a batch the processor pads after normalizing has no bytes for the worker");
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.is::<FloatsForDeviceNormalization>()),
+        "{error:#}"
+    );
+    assert!(
+        error.to_string().contains("mm_device_do_normalize"),
+        "{error:#}"
+    );
+
+    let bytes = assemble_vllm(intermediate([(32, 32), (32, 32)]), &normalizes_on_device)
+        .expect("a same-size batch is the pixels' own bytes");
+    assert_eq!(bytes.pixel_values_dtype, "uint8");
+
+    let floats = assemble_vllm(intermediate([(32, 32), (48, 32)]), &normalizes_on_host)
+        .expect("a worker that normalizes on host takes the floats");
+    assert_eq!(floats.pixel_values_dtype, "bfloat16");
 }

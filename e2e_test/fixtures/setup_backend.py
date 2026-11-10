@@ -43,8 +43,10 @@ from infra import (
     get_runtime,
     launch_cloud_gateway,
 )
-from infra.constants import vllm_kv_backend
+from infra.cloud_credentials import resolve_cloud_credentials
+from infra.constants import vllm_kv_backend, zmq_backend
 from infra.model_specs import get_model_spec
+from infra.process_utils import ProcessExitedError
 from infra.worker import stop_workers, validate_startup_profile_worker, worker_startup_timeout
 from infra.worker_pool import get_pool
 
@@ -93,11 +95,13 @@ _WORKER_DEFAULTS = {
 _worker_start_failures: dict[str, int] = {}  # engine -> count
 _MAX_WORKER_START_FAILURES = 3  # fail fast after this many failures (matches --reruns 2)
 
-# Engines that speak the direct-ZMQ backend wire in e2e. Pairing ZMQ with any
-# other engine can't work, so we reject it up front instead of timing out on a
-# worker that never becomes ready.
+# Engines that speak the direct-ZMQ backend wire in e2e: the three engines and
+# the mock worker, whose ZMQ ranks speak the vLLM wire (the gateway is pinned
+# to it, ``zmq_backend``). Pairing ZMQ with any other engine can't work, so we
+# reject it up front instead of timing out on a worker that never becomes
+# ready.
 ZMQ_CAPABLE_ENGINES = frozenset(
-    {Runtime.VLLM.value, Runtime.TOKENSPEED.value, Runtime.SGLANG.value}
+    {Runtime.VLLM.value, Runtime.TOKENSPEED.value, Runtime.SGLANG.value, Runtime.MOCK.value}
 )
 
 
@@ -409,6 +413,7 @@ def setup_backend(request: pytest.FixtureRequest):
                 engine,
                 connection_mode,
                 pool_counts,
+                workers_config,
                 gateway_config,
                 gateway,
                 log_dir,
@@ -541,14 +546,27 @@ def _setup_local(
     # the mock engine.
     set_class_workers(workers)
     try:
-        _start_gateway(
-            gateway,
-            gateway_config,
-            worker_urls=[w.base_url for w in workers],
-            workers=workers,
-            model_path=model_path,
-            backend=engine if is_zmq else None,
-        )
+        try:
+            _start_gateway(
+                gateway,
+                gateway_config,
+                worker_urls=[w.base_url for w in workers],
+                workers=workers,
+                model_path=model_path,
+                backend=zmq_backend(engine) if is_zmq else None,
+            )
+        except ProcessExitedError:
+            raise
+        except (TimeoutError, RuntimeError):
+            # A ZMQ engine's start-up wait is this gate (its spawn returned
+            # at once), so an engine that died in it, or that it waited out,
+            # failed to start. Counted as the pool counts a worker that fails
+            # its own gate, a death or the bound alike: the session stops
+            # after _MAX_WORKER_START_FAILURES such failures instead of
+            # running every later class of the engine into the same one.
+            if is_zmq:
+                _worker_start_failures[engine] = _worker_start_failures.get(engine, 0) + 1
+            raise
         logger.info("%s backend ready at %s", backend_name, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     finally:
@@ -829,6 +847,7 @@ def _setup_epd(
     engine,
     connection_mode,
     epd_counts,
+    workers_config,
     gateway_config,
     gateway,
     log_dir,
@@ -855,6 +874,9 @@ def _setup_epd(
         n_decode,
     )
 
+    # The class marker's engine flags (a scheduler wire, a context length)
+    # reach every pool, as they do for the prefill-decode pools.
+    extra_engine_args = workers_config.get("extra_engine_args")
     all_workers: list = []
     try:
         encode_workers = _start_workers_tracked(
@@ -866,6 +888,7 @@ def _setup_epd(
             log_dir=log_dir,
             gpu_offset=0,
             gpus=1,  # vision tower runs on one GPU regardless of LM tp
+            extra_engine_args=extra_engine_args,
         )
         all_workers.extend(encode_workers)
 
@@ -877,6 +900,7 @@ def _setup_epd(
             worker_type=WorkerType.PREFILL,
             log_dir=log_dir,
             gpu_offset=n_encode,
+            extra_engine_args=extra_engine_args,
         )
         all_workers.extend(prefill_workers)
 
@@ -888,9 +912,14 @@ def _setup_epd(
             worker_type=WorkerType.DECODE,
             log_dir=log_dir,
             gpu_offset=n_encode + n_prefill * tp,
+            extra_engine_args=extra_engine_args,
         )
         all_workers.extend(decode_workers)
 
+        # The class's workers, for the answers a test states on the mock
+        # engine (the fixture picks the decode side's) and for a test that
+        # reads one worker's own admin API.
+        set_class_workers(all_workers)
         _start_gateway(
             gateway,
             gateway_config,
@@ -898,9 +927,11 @@ def _setup_epd(
             prefill_workers=prefill_workers,
             decode_workers=decode_workers,
         )
+        _wait_for_serving(gateway, model_id, model_path)
         logger.info("%s EPD backend ready at %s", runtime_label, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     finally:
+        clear_class_workers()
         logger.info("Tearing down %s EPD backend", runtime_label)
         gateway.shutdown()
         stop_workers(all_workers)
@@ -914,10 +945,9 @@ def _setup_epd(
 def _setup_cloud(backend_name, request, gateway_config):
     """Launch cloud gateway (no local workers), yield result tuple, tear down."""
     cfg = THIRD_PARTY_MODELS[backend_name]
-    api_key_env = cfg.get("api_key_env")
-
-    if api_key_env and not os.environ.get(api_key_env):
-        pytest.fail(f"{api_key_env} not set for {backend_name} tests")
+    credentials = resolve_cloud_credentials(backend_name, require_key=False)
+    if not credentials.api_key:
+        pytest.fail(f"{credentials.api_key_env} not set for {backend_name} tests")
 
     storage_backend = get_marker_value(request, "storage", default="memory")
 
@@ -928,7 +958,7 @@ def _setup_cloud(backend_name, request, gateway_config):
         extra_args=gateway_config.get("extra_args"),
     )
 
-    api_key = os.environ.get(api_key_env) if api_key_env else "not-used"
+    api_key = credentials.api_key
     model_path = cfg["model"]
 
     client: openai.OpenAI | anthropic.Anthropic
@@ -990,7 +1020,7 @@ def backend_router(request: pytest.FixtureRequest):
             worker_urls=[w.base_url for w in workers],
             workers=workers,
             model_path=model_path,
-            backend=engine if is_zmq else None,
+            backend=zmq_backend(engine) if is_zmq else None,
             # ZMQ loads the model inside the gateway's readiness gate; cover it.
             timeout=gateway_timeout,
         )

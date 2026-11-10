@@ -15,7 +15,7 @@ use openai_protocol::{
 use serde_json::{json, Value};
 use smg_grpc_client::{tokenspeed_proto::GenerateComplete, vllm_engine::proto};
 use symphony::{
-    formats::{deepseek_v4, deepseek_v4_1, gemma4, glm, glm4, llama4, plain, qwen3},
+    formats::{deepseek_v4, deepseek_v4_1, gemma4, glm, glm4, kimi_k3, llama4, plain, qwen3},
     CallSyntax, Format,
 };
 
@@ -32,7 +32,12 @@ use crate::{
         proto_wrapper::ProtoGenerateComplete,
         regular::{
             processor::ResponseProcessor,
-            symphony::{assign, template::Templates, testing::Refusing, Asks, Assignment},
+            symphony::{
+                assign, telemetry,
+                template::Templates,
+                testing::{tools, Refusing},
+                Asks, Assignment,
+            },
         },
         utils::ModelNames,
     },
@@ -49,6 +54,8 @@ pub(super) fn assigned(
         prompt: prompt.to_string(),
         forbids_calls: false,
         past_the_end: false,
+        span: Span::none(),
+        marked: Arc::default(),
     });
     spec
 }
@@ -666,16 +673,6 @@ async fn malformed_call_text_is_content_and_keeps_its_logprobs() {
     assert_eq!(kept_logprob_tokens(&choice), output);
 }
 
-/// The `lookup` tool the outputs call.
-fn lookup_tools() -> Vec<Tool> {
-    serde_json::from_value(json!([{
-        "type": "function", "function": {
-            "name": "lookup", "parameters": {"type": "object", "properties": {}}
-        }
-    }]))
-    .expect("tools")
-}
-
 /// A Messages spec with Symphony assigned `format`, replaying `prompt`, with the `lookup` tool.
 pub(super) fn assigned_message(
     format: Format,
@@ -683,6 +680,9 @@ pub(super) fn assigned_message(
     thinking: bool,
 ) -> MessagesResponseSpec {
     MessagesResponseSpec {
+        prompt_tokens: 0,
+        max_tokens: 4096,
+        context_window: None,
         first_tool_call_only: false,
         thinking_requested: thinking,
         thinking_text_returned: true,
@@ -690,13 +690,15 @@ pub(super) fn assigned_message(
         tool_choice: None,
         has_tools: true,
         history_tool_calls_count: 0,
-        chat_tools: lookup_tools().into(),
+        chat_tools: tools().into(),
         stop_sequences: None,
         symphony: Some(Assignment {
             format: Arc::new(format),
             prompt: prompt.to_string(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
+            marked: Arc::default(),
         }),
         parser_names: None,
     }
@@ -879,13 +881,22 @@ async fn two_symphony_messages_never_share_a_tool_use_id() {
 
 #[tokio::test]
 async fn symphony_message_stop_reasons_follow_the_finish_and_the_matched_stop() {
-    // The token limit.
-    let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    // The token limit: the five tokens are the whole budget.
+    let mut spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    spec.max_tokens = 5;
     let (result, events) =
         message_events(vec![chunk(0, "Hello"), complete(0, "length")], spec, None).await;
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(message_blocks(&events)[0].2, "Hello");
     assert_eq!(message_stop_reason(&events), "max_tokens");
+    // The same cut short of the budget: the window was filled.
+    let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    let (_, events) =
+        message_events(vec![chunk(0, "Hello"), complete(0, "length")], spec, None).await;
+    assert_eq!(
+        message_stop_reason(&events),
+        "model_context_window_exceeded"
+    );
     // The turn's end.
     let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
     let (_, events) =
@@ -1027,7 +1038,10 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
             utils::ParserResolver::disabled(),
         )
         .process_non_streaming_messages_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             spec(),
             dispatch(),
             tokenizer,
@@ -1094,8 +1108,10 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
 }
 
 /// The scrape of a recorder of this test's own after `read` ran on this thread (the test
-/// runtime is single-threaded, so the local recorder sees every record of the future).
-pub(super) async fn scraped<F: std::future::Future>(read: F) -> (F::Output, String) {
+/// runtime is single-threaded, so the local recorder sees every record of the future), the
+/// Symphony series it read being this test's own too (`telemetry::own_series`).
+pub(super) async fn scraped<F: Future>(read: F) -> (F::Output, String) {
+    let _own = telemetry::own_series();
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     let guard = metrics::set_default_local_recorder(&recorder);
@@ -1268,7 +1284,10 @@ async fn a_messages_call_whose_arguments_are_not_json_carries_the_prefixes_value
             utils::ParserResolver::disabled(),
         )
         .process_non_streaming_messages_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             spec(),
             dispatch(),
             tokenizer,
@@ -1363,6 +1382,61 @@ async fn a_messages_call_whose_arguments_are_not_json_carries_the_prefixes_value
         arguments.starts_with(&partial),
         "{arguments:?} vs {partial:?}"
     );
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn scraped_takes_its_lines_from_series_of_its_own() {
+    // Forty malformed outputs read under one scrape drain the table's bucket; the output read
+    // under the next scrape still writes its line, and counts none of the flow's suppressed
+    // lines: the series are the scrape's own. The flow's written count is read after it, so the
+    // pin does not lean on the bucket's burst size.
+    let flow = 40;
+    let written = |lines: &[&str]| {
+        lines
+            .iter()
+            .filter(|line| line.contains("did not read the whole output"))
+            .count()
+    };
+    scraped(async {
+        for _ in 0..flow {
+            fold("Hello <tool_call>\nnot a call\n</tool_call>").await;
+        }
+    })
+    .await;
+    let after_the_flow = std::cell::Cell::new(0);
+    logs_assert(|lines: &[&str]| {
+        let count = written(lines);
+        after_the_flow.set(count);
+        if count < flow {
+            Ok(())
+        } else {
+            Err(format!(
+                "no line of the flow was suppressed: {count} written"
+            ))
+        }
+    });
+    scraped(fold("Hello <tool_call>\nnot a call\n</tool_call>")).await;
+    logs_assert(|lines: &[&str]| {
+        let count = written(lines);
+        let last = lines
+            .iter()
+            .rev()
+            .find(|line| line.contains("did not read the whole output"));
+        match last {
+            Some(line)
+                if count == after_the_flow.get() + 1 && line.contains("suppressed_lines=0") =>
+            {
+                Ok(())
+            }
+            Some(line) => Err(format!(
+                "the line after the flow is missing or counts the flow's suppressed lines \
+                 ({count} written after {}): {line}",
+                after_the_flow.get()
+            )),
+            None => Err("no line at all".to_string()),
+        }
+    });
 }
 
 #[tracing_test::traced_test]
@@ -1925,7 +1999,10 @@ async fn a_decoders_end_that_fails_counts_the_output_as_failed_on_the_messages_p
             utils::ParserResolver::disabled(),
         )
         .process_non_streaming_messages_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             spec(),
             dispatch(),
             tokenizer,
@@ -2208,4 +2285,134 @@ async fn a_whole_keyed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_
             "{output:?}"
         );
     }
+}
+
+/// The Kimi K3 generation prompt's tail with thinking on: the assistant's message opened and its
+/// thought.
+const KIMI_K3_THINKING_PROMPT: &str =
+    "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>";
+
+/// A Kimi K3 reply written straight into the prefilled thought and closed by the answer's closer
+/// and the end of the turn, never by the thought's closer (seen on about 1 % of very long turns),
+/// one marker a token as the engine streams them.
+const KIMI_K3_SKIPPED_THOUGHT: [&str; 8] = [
+    "The answer",
+    " is 42.",
+    "<|close|>",
+    "response",
+    "<|sep|>",
+    "<|close|>",
+    "message",
+    "<|sep|>",
+];
+
+/// Every text a client reads from `events`: a chat delta's content and reasoning, a Messages
+/// delta's text and thinking.
+fn client_text(events: &[Value]) -> String {
+    events
+        .iter()
+        .flat_map(|event| {
+            let delta = if event["choices"].is_array() {
+                &event["choices"][0]["delta"]
+            } else {
+                &event["delta"]
+            };
+            ["content", "reasoning_content", "text", "thinking"]
+                .into_iter()
+                .filter_map(move |field| delta[field].as_str())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_kimi_k3_thought_closed_by_the_answers_closer_reaches_the_client_once_without_the_marker()
+{
+    let output = KIMI_K3_SKIPPED_THOUGHT.concat();
+    let frames = || -> Vec<proto::GenerateResponse> {
+        let mut frames: Vec<_> = KIMI_K3_SKIPPED_THOUGHT
+            .iter()
+            .map(|token| chunk(0, token))
+            .collect();
+        frames.push(complete(0, "stop"));
+        frames
+    };
+
+    // The chat stream: the reply once, as the thought it was streamed as; no content, and the
+    // closer never in the text.
+    let spec = assigned(chat_spec(false), kimi_k3(), KIMI_K3_THINKING_PROMPT);
+    let (result, events) = stream_events(frames(), false, spec).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        chat_text(&events, 0, "reasoning_content"),
+        "The answer is 42.",
+        "{events:#?}"
+    );
+    assert_eq!(chat_text(&events, 0, "content"), "", "{events:#?}");
+    assert!(
+        !client_text(&events).contains("<|close|>"),
+        "a marker reached the client: {events:#?}"
+    );
+
+    // The whole chat message: the same reading.
+    let (choice, _) = fold_with(&output, kimi_k3(), KIMI_K3_THINKING_PROMPT).await;
+    assert_eq!(
+        choice.message.reasoning_content.as_deref(),
+        Some("The answer is 42."),
+        "{choice:?}"
+    );
+    assert_eq!(choice.message.content, None, "{choice:?}");
+    assert_eq!(choice.finish_reason.as_deref(), Some("stop"), "{choice:?}");
+
+    // The Messages stream: one thinking block with the reply, no text block, no marker.
+    let spec = || assigned_message(kimi_k3(), KIMI_K3_THINKING_PROMPT, true);
+    let (result, events) = message_events(frames(), spec(), None).await;
+    assert!(result.is_ok(), "{result:?}");
+    let blocks = message_blocks(&events);
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    assert_eq!(blocks[0].0, "thinking", "{blocks:?}");
+    assert_eq!(blocks[0].2, "The answer is 42.", "{blocks:?}");
+    assert_eq!(message_stop_reason(&events), "end_turn");
+    assert!(
+        !client_text(&events).contains("<|close|>"),
+        "a marker reached the client: {events:#?}"
+    );
+
+    // The whole Messages answer: the thinking block and nothing else.
+    let mut frame = complete(0, "stop");
+    if let Some(proto::generate_response::Response::Complete(complete)) = &mut frame.response {
+        complete.output_ids = output.chars().map(u32::from).collect();
+        complete.completion_tokens = complete.output_ids.len() as u32;
+    }
+    let (stream, server) = scripted_stream(vec![frame], "0").await;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
+    let result = ResponseProcessor::new(
+        ToolParserFactory::new(),
+        ReasoningParserFactory::new(),
+        utils::ParserResolver::disabled(),
+    )
+    .process_non_streaming_messages_response(
+        context::ExecutionResult::Single {
+            stream,
+            dispatch_start: Instant::now(),
+        },
+        spec(),
+        dispatch(),
+        tokenizer,
+        &mut decoder,
+    )
+    .await;
+    server.abort();
+    let (message, _) = match result {
+        Ok(message) => message,
+        Err(response) => panic!("the message was refused with {}", response.status()),
+    };
+    let blocks = serde_json::to_value(&message.content).expect("the blocks");
+    assert_eq!(blocks.as_array().map(Vec::len), Some(1), "{blocks}");
+    assert_eq!(blocks[0]["type"], "thinking", "{blocks}");
+    assert_eq!(blocks[0]["thinking"], "The answer is 42.", "{blocks}");
+    assert_eq!(
+        serde_json::to_value(message.stop_reason).expect("the stop reason"),
+        "end_turn"
+    );
 }

@@ -37,7 +37,7 @@ use tower::{Layer, Service};
 use super::edge_body::BodyDuties;
 use crate::{
     config::types::RouterConfig,
-    routers::http::stream_failure::{note_sent, on_frame_boundary},
+    routers::http::stream_failure::{note_sent, on_frame_boundary, SentTail},
 };
 
 /// The keep-alive of an OpenAI-shaped stream: an SSE comment, which every
@@ -193,37 +193,47 @@ pub async fn sse_keepalive_middleware(
 
 /// The keep-alive of one SSE body: `frame` after `interval` of silence, on a
 /// frame boundary. The edge's body wrapper tells it of every frame sent and
-/// polls it while the body is quiet. The timer is lazy: when it fires it is
-/// re-armed from the time of the last frame rather than reset on every
-/// frame, so a flowing stream costs one timer wake per interval, not one per
-/// token.
+/// polls it while the body is quiet. The clock is read when the body turns
+/// quiet after frames went out (the moment the last of them left, to the
+/// microsecond: the wrapper asks for the next frame as soon as it has taken
+/// one), not once per frame, so a stream of a thousand deltas stamps once
+/// per burst. The timer is lazy as well: when it fires it is re-armed from
+/// the time of the last frame rather than reset on every frame, so a flowing
+/// stream costs one timer wake per interval, not one per token.
 pub(crate) struct KeepAlive {
     interval: Duration,
     frame: Bytes,
-    /// When the headers, the last frame or the last keep-alive went out.
+    /// When the headers, the last burst of frames or the last keep-alive went
+    /// out.
     last_sent: Instant,
+    /// Frames went out since `last_sent` was stamped: the next quiet poll
+    /// stamps the moment they stopped.
+    sent_since: bool,
     /// The last bytes sent, to tell a frame boundary from the inside of a
     /// frame.
-    tail: Vec<u8>,
-    timer: Pin<Box<Sleep>>,
+    tail: SentTail,
+    /// Built on the first wait for silence, due one interval after the last
+    /// frame, which is when a timer built with the stream would have been
+    /// reset to anyway; a stream that is never quiet never builds it.
+    timer: Option<Pin<Box<Sleep>>>,
 }
 
 impl KeepAlive {
     fn new(interval: Duration, frame: Bytes) -> Self {
-        let now = Instant::now();
         Self {
             interval,
             frame,
-            last_sent: now,
-            tail: Vec::with_capacity(4),
-            timer: Box::pin(tokio::time::sleep_until(now + interval)),
+            last_sent: Instant::now(),
+            sent_since: false,
+            tail: SentTail::default(),
+            timer: None,
         }
     }
 
     /// A data frame of the body went out.
     pub(crate) fn frame_out(&mut self, data: &[u8]) {
         note_sent(&mut self.tail, data);
-        self.last_sent = Instant::now();
+        self.sent_since = true;
     }
 
     /// The body is quiet: the keep-alive frame once `interval` has passed
@@ -233,20 +243,28 @@ impl KeepAlive {
     /// then; fired inside a frame it is re-armed for another interval and
     /// nothing is written.
     pub(crate) fn poll_silence(&mut self, cx: &mut Context<'_>) -> Poll<Bytes> {
+        if std::mem::take(&mut self.sent_since) {
+            // The first quiet poll after a burst: its last frame just left.
+            self.last_sent = Instant::now();
+        }
+        let first_due = self.last_sent + self.interval;
+        let timer = self
+            .timer
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(first_due)));
         loop {
-            if self.timer.as_mut().poll(cx).is_pending() {
+            if timer.as_mut().poll(cx).is_pending() {
                 return Poll::Pending;
             }
             let now = Instant::now();
             let due = self.last_sent + self.interval;
             if now < due {
-                self.timer.as_mut().reset(due);
-            } else if on_frame_boundary(&self.tail) {
+                timer.as_mut().reset(due);
+            } else if on_frame_boundary(self.tail.as_slice()) {
                 self.last_sent = now;
-                self.timer.as_mut().reset(now + self.interval);
+                timer.as_mut().reset(now + self.interval);
                 return Poll::Ready(self.frame.clone());
             } else {
-                self.timer.as_mut().reset(now + self.interval);
+                timer.as_mut().reset(now + self.interval);
             }
         }
     }

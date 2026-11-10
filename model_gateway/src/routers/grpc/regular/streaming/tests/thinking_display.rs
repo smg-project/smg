@@ -2,6 +2,8 @@
 //! text, `summarized`, `updates` and no display return it, under the reasoning parser and under
 //! Symphony alike, in the stream and in the message; the usage is the same under every value.
 
+use std::sync::Arc;
+
 use openai_protocol::messages::CreateMessageRequest;
 use serde_json::{json, Value};
 use smg_grpc_client::vllm_engine::proto::generate_response::Response as GenerationEvent;
@@ -44,6 +46,8 @@ fn spec(display: Option<&str>, with_symphony: bool) -> MessagesResponseSpec {
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: false,
             past_the_end: false,
+            span: Span::none(),
+            marked: Arc::default(),
         });
     }
     spec
@@ -140,7 +144,10 @@ async fn the_thinking_text_is_in_the_message_unless_the_display_is_omitted() {
                     utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
                 let (message, _counts) = response_processor()
                     .process_non_streaming_messages_response(
-                        context::ExecutionResult::Single { stream },
+                        context::ExecutionResult::Single {
+                            stream,
+                            dispatch_start: Instant::now(),
+                        },
                         spec(display, with_symphony),
                         dispatch(),
                         tokenizer,

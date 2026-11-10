@@ -86,18 +86,26 @@ mod handles {
     };
 
     use metrics::{Counter, Gauge, Histogram};
+    use rustc_hash::FxHashMap;
     #[cfg(test)]
     pub(super) use smg_external_router::metrics::handles::force_on_this_thread;
     pub(super) use smg_external_router::metrics::handles::{
-        keep_handles, nested, recorder_installed, with_handle, with_model_handle, ByLabels,
+        keep_handles, kept, nested, recorder_installed, with_handle, with_model_handle, ByLabels,
     };
 
-    /// Handles by the matched path (the only label a request computes).
-    pub(super) type ByPath<H> = HashMap<String, H>;
+    use super::{intern_model_label, intern_string};
+
+    /// Handles by the matched path (the only label a request computes: the
+    /// route template, the gateway's own, so these maps hash with FxHash).
+    pub(super) type ByPath<H> = FxHashMap<String, H>;
     /// Handles by method, then matched path.
-    pub(super) type ByMethodAndPath<H> = HashMap<&'static str, ByPath<H>>;
+    pub(super) type ByMethodAndPath<H> = FxHashMap<&'static str, ByPath<H>>;
     /// Response counters by matched path, then status code, then error code.
-    pub(super) type ByPathStatusAndError = HashMap<String, HashMap<u16, ByPath<Counter>>>;
+    /// The error-code level keeps the standard hasher: a worker's own error
+    /// code can reach it through the response middleware, so that key is not
+    /// one the gateway controls.
+    pub(super) type ByPathStatusAndError =
+        FxHashMap<String, FxHashMap<u16, HashMap<String, Counter>>>;
 
     /// The static labels of the stream-timing set.
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -138,6 +146,167 @@ mod handles {
         pub(super) cached_tokens: OnceCell<Counter>,
     }
 
+    /// The `smg_engine_*` handles of one rank of a worker under one model
+    /// label, each built the first time a load has a figure for it, so the
+    /// series that exist are exactly the ones recorded to: the core gauges
+    /// with the rank's first load, the capacity gauge with the first that
+    /// carries the capacity, the PD gauges under the role the engine reports
+    /// with the first that carries a `disagg` section.
+    #[derive(Default)]
+    pub(super) struct EngineRankHandles {
+        pub(super) core: Option<EngineCoreHandles>,
+        /// `smg_engine_kv_capacity_tokens`.
+        pub(super) kv_capacity: Option<Gauge>,
+        /// The PD gauges, under the role label the engine last reported.
+        pd: Option<EnginePdHandles>,
+    }
+
+    /// The labels of one rank's core series, interned once per record that
+    /// builds a handle (a rank's first sight, or every record while handles
+    /// are not kept) and shared by the handles it builds; a record on the
+    /// kept path interns nothing.
+    pub(super) struct EngineLabels {
+        worker: Arc<str>,
+        model: Arc<str>,
+        dp_rank: Arc<str>,
+    }
+
+    impl EngineLabels {
+        fn new(worker_url: &str, model_id: &str, dp_rank: i32) -> Self {
+            Self {
+                worker: intern_string(worker_url),
+                model: intern_model_label(model_id),
+                dp_rank: intern_string(&dp_rank.to_string()),
+            }
+        }
+    }
+
+    /// The labels in `slot`, built on the first call of a record.
+    pub(super) fn engine_labels<'l>(
+        slot: &'l mut Option<EngineLabels>,
+        worker_url: &str,
+        model_id: &str,
+        dp_rank: i32,
+    ) -> &'l EngineLabels {
+        slot.get_or_insert_with(|| EngineLabels::new(worker_url, model_id, dp_rank))
+    }
+
+    /// The gauges every load sets for its rank.
+    pub(super) struct EngineCoreHandles {
+        /// `smg_engine_running_requests`.
+        pub(super) running: Gauge,
+        /// `smg_engine_waiting_requests`.
+        pub(super) waiting: Gauge,
+        /// `smg_engine_token_usage`.
+        pub(super) token_usage: Gauge,
+        /// `smg_engine_gen_throughput`.
+        pub(super) gen_throughput: Gauge,
+        /// `smg_engine_cache_hit_rate`.
+        pub(super) cache_hit_rate: Gauge,
+    }
+
+    /// The gauges of a rank's `disagg` section under one role label, each
+    /// built when a load first carries its figure.
+    pub(super) struct EnginePdHandles {
+        /// The role label the engine reported, interned once per role.
+        pub(super) role: Arc<str>,
+        /// `smg_engine_pd_kv_transfer_latency_ms`.
+        pub(super) kv_transfer_latency: Option<Gauge>,
+        /// `smg_engine_pd_kv_transfer_speed_gb_s`.
+        pub(super) kv_transfer_speed: Option<Gauge>,
+        /// `smg_engine_pd_prefill_queue_reqs`.
+        pub(super) prefill_queue: Option<Gauge>,
+        /// `smg_engine_pd_decode_queue_reqs`.
+        pub(super) decode_queue: Option<Gauge>,
+    }
+
+    impl EngineRankHandles {
+        /// The PD handles under `role`: the kept set while the engine keeps
+        /// reporting that role, a fresh set when it reports another (the
+        /// old role's series stay as they were, as they always have).
+        pub(super) fn pd(&mut self, role: &str) -> &mut EnginePdHandles {
+            let kept = self
+                .pd
+                .get_or_insert_with(|| EnginePdHandles::new(intern_string(role)));
+            if kept.role.as_ref() != role {
+                *kept = EnginePdHandles::new(intern_string(role));
+            }
+            kept
+        }
+    }
+
+    impl EngineCoreHandles {
+        /// The five core series of the rank `labels` name.
+        pub(super) fn new(labels: &EngineLabels) -> Self {
+            Self {
+                running: engine_gauge("smg_engine_running_requests", labels),
+                waiting: engine_gauge("smg_engine_waiting_requests", labels),
+                token_usage: engine_gauge("smg_engine_token_usage", labels),
+                gen_throughput: engine_gauge("smg_engine_gen_throughput", labels),
+                cache_hit_rate: engine_gauge("smg_engine_cache_hit_rate", labels),
+            }
+        }
+    }
+
+    impl EnginePdHandles {
+        fn new(role: Arc<str>) -> Self {
+            Self {
+                role,
+                kv_transfer_latency: None,
+                kv_transfer_speed: None,
+                prefill_queue: None,
+                decode_queue: None,
+            }
+        }
+    }
+
+    /// The series `name` of the rank `labels` name, by the key the
+    /// engine-load record has always built: the series is the same one
+    /// whether it is reached through a kept handle or a key built per call,
+    /// and the scrape reads the same.
+    pub(super) fn engine_gauge(name: &'static str, labels: &EngineLabels) -> Gauge {
+        metrics::gauge!(
+            name,
+            "worker" => Arc::clone(&labels.worker),
+            "model" => Arc::clone(&labels.model),
+            "dp_rank" => Arc::clone(&labels.dp_rank),
+        )
+    }
+
+    /// A PD series: labelled by the role the engine reported, not the model.
+    pub(super) fn engine_pd_gauge(
+        name: &'static str,
+        labels: &EngineLabels,
+        role: &Arc<str>,
+    ) -> Gauge {
+        metrics::gauge!(
+            name,
+            "worker" => Arc::clone(&labels.worker),
+            "role" => Arc::clone(role),
+            "dp_rank" => Arc::clone(&labels.dp_rank),
+        )
+    }
+
+    /// The kept handles of rank `dp_rank` under `model_id`'s label for one
+    /// worker, created on first sight: the model map's key is the interner's
+    /// own allocation, as the request counters' is, and a label the interner
+    /// refused (its sentinel) keeps nothing (`None`).
+    pub(super) fn engine_rank<'m>(
+        by_model: &'m mut HashMap<Arc<str>, FxHashMap<i32, EngineRankHandles>>,
+        model_id: &str,
+        dp_rank: i32,
+    ) -> Option<&'m mut EngineRankHandles> {
+        if !by_model.contains_key(model_id) {
+            let label = intern_model_label(model_id);
+            if !kept(by_model.len(), &label) {
+                return None;
+            }
+            by_model.insert(label, FxHashMap::default());
+        }
+        let ranks = by_model.get_mut(model_id)?;
+        Some(ranks.entry(dp_rank).or_default())
+    }
+
     /// Every registration or removal of a worker moves this on, and a
     /// thread whose kept per-worker handles are from an earlier state drops
     /// them at its next record: a removal drops the address's series from
@@ -157,14 +326,14 @@ mod handles {
     /// every family is here: the map is cleared when the generation moves.
     pub(super) struct ByWorker<V> {
         generation: u64,
-        by_worker: HashMap<String, V>,
+        by_worker: FxHashMap<String, V>,
     }
 
     impl<V> Default for ByWorker<V> {
         fn default() -> Self {
             Self {
                 generation: 0,
-                by_worker: HashMap::new(),
+                by_worker: FxHashMap::default(),
             }
         }
     }
@@ -172,7 +341,7 @@ mod handles {
     impl<V> ByWorker<V> {
         /// The handles by worker, after dropping every kept handle if the
         /// worker set changed since they were kept.
-        pub(super) fn current(&mut self) -> &mut HashMap<String, V> {
+        pub(super) fn current(&mut self) -> &mut FxHashMap<String, V> {
             let generation = WORKER_SET_GENERATION.load(Ordering::Acquire);
             if self.generation != generation {
                 self.by_worker.clear();
@@ -194,12 +363,16 @@ mod handles {
     pub(super) type WorkerRequests = ByWorker<HashMap<Arc<str>, Counter>>;
 
     /// `smg_worker_cb_outcomes_total`: by worker URL, then the outcome.
-    pub(super) type WorkerOutcomes = ByWorker<HashMap<&'static str, Counter>>;
+    pub(super) type WorkerOutcomes = ByWorker<FxHashMap<&'static str, Counter>>;
 
     /// A per-worker gauge set on every request (the active-request count,
     /// the circuit breaker's consecutive outcomes): set through its kept
     /// handle, not through a key built and looked up per call.
     pub(super) type WorkerGauges = ByWorker<Gauge>;
+
+    /// The `smg_engine_*` set: by worker URL, then the model label as the
+    /// interner gave it, then the DP rank.
+    pub(super) type EngineLoads = ByWorker<HashMap<Arc<str>, FxHashMap<i32, EngineRankHandles>>>;
 
     /// Uses the one handle of a series with no dynamic label: this thread's
     /// kept handle, built on first use, or a key built per call when handles
@@ -219,9 +392,10 @@ mod handles {
     /// Uses the handle under a static label (or a tuple of them): this
     /// thread's kept handle, built on the label's first sight, or a key
     /// built per call when handles are not kept. A static label set is
-    /// finite, so the map needs no cap.
+    /// finite, so the map needs no cap; its labels are the gateway's own
+    /// constants, so the map hashes with FxHash.
     pub(super) fn with_static<K: Copy + Eq + Hash, H>(
-        kept: &'static LocalKey<RefCell<HashMap<K, H>>>,
+        kept: &'static LocalKey<RefCell<FxHashMap<K, H>>>,
         label: K,
         build: impl FnOnce() -> H,
         use_handle: impl FnOnce(&H),
@@ -235,17 +409,17 @@ mod handles {
 
     thread_local! {
         /// `smg_http_requests_total`.
-        pub(super) static HTTP_REQUESTS: RefCell<ByMethodAndPath<Counter>> = RefCell::new(HashMap::new());
+        pub(super) static HTTP_REQUESTS: RefCell<ByMethodAndPath<Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_http_request_duration_seconds`.
-        pub(super) static HTTP_DURATIONS: RefCell<ByMethodAndPath<Histogram>> = RefCell::new(HashMap::new());
+        pub(super) static HTTP_DURATIONS: RefCell<ByMethodAndPath<Histogram>> = RefCell::new(FxHashMap::default());
         /// `smg_http_responses_total`.
-        pub(super) static HTTP_RESPONSES: RefCell<ByPathStatusAndError> = RefCell::new(HashMap::new());
+        pub(super) static HTTP_RESPONSES: RefCell<ByPathStatusAndError> = RefCell::new(FxHashMap::default());
         /// `smg_http_rate_limit_total` by result.
-        pub(super) static HTTP_RATE_LIMITS: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        pub(super) static HTTP_RATE_LIMITS: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_http_connections_active`: one series, a handle to it per worker.
         pub(super) static HTTP_CONNECTIONS_ACTIVE: RefCell<Option<Gauge>> = const { RefCell::new(None) };
         /// The stream-timing set by its static labels, then the model.
-        pub(super) static STREAMS: RefCell<ByLabels<StreamLabels, StreamHandles>> = RefCell::new(HashMap::new());
+        pub(super) static STREAMS: RefCell<ByLabels<StreamLabels, StreamHandles>> = RefCell::new(FxHashMap::default());
         /// `smg_worker_requests_total`.
         pub(super) static WORKER_REQUESTS: RefCell<WorkerRequests> = RefCell::new(WorkerRequests::default());
         /// `smg_worker_requests_active`.
@@ -256,20 +430,28 @@ mod handles {
         pub(super) static WORKER_CB_SUCCESSES: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
         /// `smg_worker_cb_outcomes_total`.
         pub(super) static WORKER_CB_OUTCOMES: RefCell<WorkerOutcomes> = RefCell::new(WorkerOutcomes::default());
+        /// The `smg_engine_*` set.
+        pub(super) static ENGINE_LOADS: RefCell<EngineLoads> = RefCell::new(EngineLoads::default());
         /// `smg_worker_selection_total` by its static labels, then the model.
-        pub(super) static WORKER_SELECTIONS: RefCell<ByLabels<SelectionLabels, Counter>> = RefCell::new(HashMap::new());
+        pub(super) static WORKER_SELECTIONS: RefCell<ByLabels<SelectionLabels, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_cache_aware_policy_branch_total` by branch.
-        pub(super) static CACHE_AWARE_BRANCHES: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        pub(super) static CACHE_AWARE_BRANCHES: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
+        /// `smg_manual_policy_branch_total` by branch.
+        pub(super) static MANUAL_BRANCHES: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
+        /// `smg_consistent_hashing_policy_branch_total` by branch.
+        pub(super) static CONSISTENT_HASHING_BRANCHES: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
+        /// `smg_prefix_hash_policy_branch_total` by branch.
+        pub(super) static PREFIX_HASH_BRANCHES: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_cache_aware_match_ratio`: one series.
         pub(super) static CACHE_AWARE_MATCH_RATIO: RefCell<Option<Histogram>> = const { RefCell::new(None) };
         /// `smg_routing_key_source_total` by source.
-        pub(super) static ROUTING_KEY_SOURCES: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        pub(super) static ROUTING_KEY_SOURCES: RefCell<FxHashMap<&'static str, Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_admission_queue_depth`: one series.
         pub(super) static ADMISSION_QUEUE_DEPTH: RefCell<Option<Gauge>> = const { RefCell::new(None) };
         /// `smg_admission_inflight`: one series.
         pub(super) static ADMISSION_INFLIGHT: RefCell<Option<Gauge>> = const { RefCell::new(None) };
         /// `smg_router_request_body_path_total` by path, then reason.
-        pub(super) static REQUEST_BODY_PATHS: RefCell<HashMap<(&'static str, &'static str), Counter>> = RefCell::new(HashMap::new());
+        pub(super) static REQUEST_BODY_PATHS: RefCell<FxHashMap<(&'static str, &'static str), Counter>> = RefCell::new(FxHashMap::default());
         /// `smg_router_request_buffers_released_early_bytes_total`: one series.
         pub(super) static REQUEST_BUFFERS_RELEASED_EARLY: RefCell<Option<Counter>> = const { RefCell::new(None) };
     }
@@ -288,8 +470,12 @@ mod handles {
         WORKER_CB_FAILURES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
         WORKER_CB_SUCCESSES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
         WORKER_CB_OUTCOMES.with_borrow_mut(|kept| *kept = WorkerOutcomes::default());
+        ENGINE_LOADS.with_borrow_mut(|kept| *kept = EngineLoads::default());
         WORKER_SELECTIONS.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_BRANCHES.with_borrow_mut(HashMap::clear);
+        MANUAL_BRANCHES.with_borrow_mut(HashMap::clear);
+        CONSISTENT_HASHING_BRANCHES.with_borrow_mut(HashMap::clear);
+        PREFIX_HASH_BRANCHES.with_borrow_mut(HashMap::clear);
         CACHE_AWARE_MATCH_RATIO.set(None);
         ROUTING_KEY_SOURCES.with_borrow_mut(HashMap::clear);
         ADMISSION_QUEUE_DEPTH.set(None);
@@ -314,6 +500,17 @@ mod handles {
             assert_eq!(counters.len(), 1);
             worker_set_changed();
             assert!(kept.for_worker("http://w1").is_empty());
+        }
+
+        #[test]
+        fn engine_rank_handles_are_made_once_per_model_and_rank() {
+            let mut by_model = HashMap::new();
+            for (model, rank) in [("m", 0), ("m", 1), ("m", 0), ("m2", 0), ("m", 1)] {
+                assert!(engine_rank(&mut by_model, model, rank).is_some());
+            }
+            assert_eq!(by_model.len(), 2, "one map per model label");
+            assert_eq!(by_model.get("m").map(HashMap::len), Some(2));
+            assert_eq!(by_model.get("m2").map(HashMap::len), Some(1));
         }
     }
 }
@@ -555,11 +752,53 @@ fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
 /// and cost 12 % CPU in arena contention. On a host with fewer than four CPUs
 /// the fixed count is more arenas than the default, a few mostly empty slabs.
 ///
+/// Allocations of `oversize_threshold` bytes or more bypass the arenas'
+/// dirty-page cache: jemalloc serves them from a dedicated arena and returns
+/// their pages to the OS the moment they are freed, so the next one is
+/// faulted in page by page and zeroed by the kernel. Its default is 8 MiB.
+/// An image request's pixel tensor rides in one gRPC message, which the
+/// codec encodes into one contiguous buffer per call: 9 MiB for a 1024x768
+/// image in bfloat16, 24 MiB for 1920x1080, twice that in float32. Under the
+/// default every such request faulted the whole encode buffer in again
+/// (~2,300 minor faults for 1024x768); with the threshold at 32 MiB those
+/// buffers recycle through the dirty cache like everything else. On its own
+/// the setting takes a 1024x768 request from ~5,200 minor faults to ~3,000
+/// and 15 % less CPU: the request's zero-filled decoded frame and wire
+/// buffers still fault, because jemalloc purges a recycled dirty extent
+/// before it hands it out zeroed, so only a buffer that is not allocated per
+/// request stops faulting. With those buffers pooled across requests the
+/// same request takes 77 faults, a further 25 % less CPU than the pool alone
+/// (40 % less than with neither), for ~30 MB more peak resident memory at
+/// 8 threads. Messages of 32 MiB and more (float32 tensors of 1080p-class
+/// grids and larger) keep the default behaviour.
+///
+/// The threshold keeps a tokenizer's load-time transients in the dirty cache
+/// as well, and the vocabulary's hash tables land inside them: for a
+/// vocabulary of 115k-229k tokens each table is 8.25 MiB in the 10 MiB class,
+/// its last 1.75 MiB a tail nothing writes (a 256k vocabulary's 16.5 MiB
+/// table sits in the 20 MiB class with a 3.5 MiB tail), and a tail that lands
+/// on a recycled extent an earlier transient wrote end to end stays resident
+/// for the life of the process. That is about 5 MB per loaded tokenizer on
+/// every text path, present before the first request and invisible in
+/// jemalloc's own resident count, which counts a live table's whole class
+/// whether its tail was written or not (RSS at idle after 10,000 chat
+/// requests on one binary: 129 MB under the default threshold, 134 MB at
+/// 32 MiB). No entry of this string separates the tables from the image
+/// buffers: a 1024x768 encode buffer is the same 10 MiB class in the same
+/// kind of arena. A shorter `dirty_decay_ms` leaves a live table's pages
+/// alone and purges an image buffer between requests; a threshold between
+/// the two values gives up the classes above it (a 1920x1080 image in
+/// bfloat16 is a 28 MiB-class message); an exact-class fit of dirty extents
+/// clears the tails and hands the image path fresh pages again (jemalloc
+/// merges freed large extents eagerly, and the merged run no longer fits its
+/// class). A deployment that serves text alone takes the default back with
+/// `_RJEM_MALLOC_CONF=oversize_threshold:8388608` and loses nothing.
+///
 /// This is jemalloc's application-provided `malloc_conf` string under the
 /// vendored build's `_rjem_` prefix; the `_RJEM_MALLOC_CONF` environment
 /// variable is read after it and overrides it entry by entry.
-pub const SERVER_MALLOC_CONF: &[u8; 72] =
-    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16\0";
+pub const SERVER_MALLOC_CONF: &[u8; 100] =
+    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432\0";
 
 /// Marks jemalloc as the final artifact's Rust global allocator.
 ///
@@ -708,22 +947,26 @@ pub(crate) fn init_metrics() {
         "Per-request body-path decisions by path (streamed/buffered) and dominant reason"
     );
 
-    // Layer 2: Router inference metrics (gRPC only)
+    // Layer 2: Router inference metrics (gRPC only). The first-token and
+    // per-token families hold streamed answers alone: a collected answer is
+    // built from the drained stream and sees no first token, and a streamed
+    // Responses answer on the Harmony pipeline records only the prefill-decode
+    // first-token pair, none of these four.
     describe_histogram!(
         "smg_router_ttft_seconds",
-        "Time to first token by router_type, backend_type, model, endpoint (gRPC only)"
+        "Time to first token of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline); the clock starts at the answering attempt's RPC dispatch (the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes), so a refused attempt's wait and its backoff are in smg_router_request_duration_seconds, the backoff alone in smg_worker_retry_backoff_seconds, and the refused attempt counted by smg_worker_retries_total, not here"
     );
     describe_histogram!(
         "smg_router_tpot_seconds",
-        "Time per output token by router_type, backend_type, model, endpoint (gRPC only)"
+        "Time per output token of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline, so no time per token)"
     );
     describe_histogram!(
         TIME_TO_FIRST_TOKEN_SECONDS,
-        "Time to first token by router_type, backend_type, model, endpoint (gRPC only): the observations of smg_router_ttft_seconds on buckets that resolve them (six per decade from 10 ms to 10 s; the request-duration bucket flag does not apply)"
+        "Time to first token of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline): the observations of smg_router_ttft_seconds on buckets that resolve them (six per decade from 10 ms to 10 s; the request-duration bucket flag does not apply), on the same clock from the answering attempt's RPC dispatch"
     );
     describe_histogram!(
         REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS,
-        "Per-request mean time per output token by router_type, backend_type, model, endpoint (gRPC only): the observations of smg_router_tpot_seconds on buckets that resolve them (six per decade from 1 ms to 1 s; the request-duration bucket flag does not apply); a per-request mean, as the servicer's request_time_per_output_token family, not the per-interval gap"
+        "Per-request mean time per output token of streamed answers by router_type, backend_type, model, endpoint (gRPC only; a collected answer records no first token, nor does a streamed Responses answer on the Harmony pipeline, so no time per token): the observations of smg_router_tpot_seconds on buckets that resolve them (six per decade from 1 ms to 1 s; the request-duration bucket flag does not apply); a per-request mean, as the servicer's request_time_per_output_token family, not the per-interval gap"
     );
     describe_counter!(
         "smg_router_tokens_total",
@@ -731,7 +974,7 @@ pub(crate) fn init_metrics() {
     );
     describe_histogram!(
         "smg_router_generation_duration_seconds",
-        "Total generation time by router_type, backend_type, model, endpoint (gRPC only)"
+        "Total generation time by router_type, backend_type, model, endpoint (gRPC only): from the answering attempt's RPC dispatch (the prefill dispatch of a prefill-decode pair, after the encode call when encode pushes) to the answer's end, so a refused attempt's wait and its backoff are in smg_router_request_duration_seconds, the backoff alone in smg_worker_retry_backoff_seconds, and the refused attempt counted by smg_worker_retries_total, not here"
     );
     describe_counter!(
         "smg_router_local_stop_aborts_total",
@@ -916,6 +1159,15 @@ pub(crate) fn init_metrics() {
         "Blocks of the sub-block stores, by worker"
     );
     describe_counter!(
+        "smg_kv_event_cap_refused_stores_total",
+        "Stores the KV index declined because a run's child table or hash array would outgrow \
+         an arena chunk (the fan-out and run-length caps), by worker"
+    );
+    describe_counter!(
+        "smg_kv_event_cap_refused_blocks_total",
+        "Blocks the declined stores left out of the index, by worker"
+    );
+    describe_counter!(
         "smg_kv_event_blocks_total",
         "Blocks named by applied KV events, by worker and op (stored, removed; snapshot: \
          the live set a relay state snapshot listed)"
@@ -966,6 +1218,11 @@ pub(crate) fn init_metrics() {
         "Bytes of the chain index's word arena sitting in free lists, by model"
     );
     describe_gauge!(
+        "smg_kv_index_arena_chunk_bytes",
+        "Bytes the chain index's word arena holds from the allocator: whole 8 MiB chunks, \
+         each kept once taken, by model"
+    );
+    describe_gauge!(
         "smg_kv_index_slab_bytes",
         "Bytes the chain index's run slab holds from the allocator, by model"
     );
@@ -978,6 +1235,11 @@ pub(crate) fn init_metrics() {
         "smg_kv_index_engine_conflicts",
         "Stored blocks whose engine hash differed from the one the chain index holds for \
          the block, a fleet whose engines do not name content alike (cumulative), by model"
+    );
+    describe_gauge!(
+        "smg_kv_index_cap_refusals",
+        "Stores the chain index declined because a run's child table or hash array would \
+         outgrow an arena chunk (the fan-out and run-length caps; cumulative), by model"
     );
     describe_gauge!(
         "smg_kv_index_blocks",
@@ -1253,12 +1515,16 @@ pub(crate) fn init_metrics() {
         "Bytes of preprocessed encoder inputs the pixel cache holds"
     );
     describe_gauge!("smg_mm_pixel_cache_entries", "Images the pixel cache holds");
+    describe_gauge!(
+        "smg_mm_inflight_bytes",
+        "Bytes of preprocessed media the gateway holds in flight for engines, summed over every router of the process (a gateway in IGW mode builds three, each with the configured budget, so the gauge may read up to three budgets)"
+    );
     // The media pipeline per request, from the clock reads and counts it
     // already makes: its stages' time, the items a request carries and its
     // fetches.
     describe_histogram!(
         "smg_mm_processing_seconds",
-        "Seconds a multimodal request spent in a processing stage (config_lookup, media_fetch_decode, preprocess, token_expand, total), by model"
+        "Seconds a multimodal request spent in a processing stage (config_lookup, media_fetch_decode, preprocess, token_expand, total), by model; pool_queue is one observation per blocking task, the wait for a pool thread, so its count is tasks, not requests"
     );
     describe_histogram!(
         "smg_mm_media_per_request",
@@ -1951,6 +2217,26 @@ impl Metrics {
         gauge!("smg_mm_pixel_cache_entries").set(0.0);
     }
 
+    /// The in-flight bytes gauge at zero: called when the media pipeline is
+    /// built, so it is on the first scrape.
+    pub fn init_mm_inflight_series() {
+        gauge!("smg_mm_inflight_bytes").set(0.0);
+    }
+
+    /// A request's preprocessed media bytes from their reservation to their
+    /// release: with a budget the bytes the budget counts, without one the
+    /// count alone. The gauge moves by the bytes, so concurrent requests add
+    /// up, across every router of the process: a gateway in IGW mode builds
+    /// three gRPC routers, each with its own budget of the configured size, so
+    /// the one series may read up to three budgets while no router refuses.
+    pub fn record_mm_inflight_reserved(bytes: usize) {
+        gauge!("smg_mm_inflight_bytes").increment(bytes as f64);
+    }
+
+    pub fn record_mm_inflight_released(bytes: usize) {
+        gauge!("smg_mm_inflight_bytes").decrement(bytes as f64);
+    }
+
     /// One pixel cache lookup for `model_id`: a hit served the image's
     /// preprocessed encoder input, a miss preprocessed it. Both series exist
     /// from the model's first lookup, so a hit rate reads from the start.
@@ -2014,7 +2300,9 @@ impl Metrics {
 
     /// One processing stage of a multimodal request: `seconds` spent in
     /// `stage` (`config_lookup`, `media_fetch_decode`, `preprocess`,
-    /// `token_expand`, `total`), the clock reads the timing log makes.
+    /// `token_expand`, `total`), the clock reads the timing log makes; and
+    /// `pool_queue`, one observation per blocking task, the time it waited
+    /// in the pool's queue before it ran.
     pub fn record_mm_processing_stage(model_id: &str, stage: &'static str, seconds: f64) {
         let model = intern_model_label(model_id);
         histogram!("smg_mm_processing_seconds", "model" => model, "stage" => stage).record(seconds);
@@ -2640,11 +2928,12 @@ impl Metrics {
 
     /// Record manual policy execution branch for routing decisions
     pub fn record_worker_manual_policy_branch(branch: &'static str) {
-        counter!(
-            "smg_manual_policy_branch_total",
-            "branch" => branch
-        )
-        .increment(1);
+        handles::with_static(
+            &handles::MANUAL_BRANCHES,
+            branch,
+            || counter!("smg_manual_policy_branch_total", "branch" => branch),
+            |count| count.increment(1),
+        );
     }
 
     /// Set manual policy cache entries count
@@ -2726,20 +3015,22 @@ impl Metrics {
 
     /// Record consistent hashing policy execution branch for routing decisions
     pub fn record_worker_consistent_hashing_policy_branch(branch: &'static str) {
-        counter!(
-            "smg_consistent_hashing_policy_branch_total",
-            "branch" => branch
-        )
-        .increment(1);
+        handles::with_static(
+            &handles::CONSISTENT_HASHING_BRANCHES,
+            branch,
+            || counter!("smg_consistent_hashing_policy_branch_total", "branch" => branch),
+            |count| count.increment(1),
+        );
     }
 
     /// Record prefix hash policy execution branch for routing decisions
     pub fn record_worker_prefix_hash_policy_branch(branch: &'static str) {
-        counter!(
-            "smg_prefix_hash_policy_branch_total",
-            "branch" => branch
-        )
-        .increment(1);
+        handles::with_static(
+            &handles::PREFIX_HASH_BRANCHES,
+            branch,
+            || counter!("smg_prefix_hash_policy_branch_total", "branch" => branch),
+            |count| count.increment(1),
+        );
     }
 
     /// A request dispatched to a worker (each attempt, each PD side), counted
@@ -2938,6 +3229,10 @@ impl Metrics {
             .increment(0);
         counter!("smg_kv_event_sub_block_blocks_total", "worker" => Arc::clone(&worker))
             .increment(0);
+        counter!("smg_kv_event_cap_refused_stores_total", "worker" => Arc::clone(&worker))
+            .increment(0);
+        counter!("smg_kv_event_cap_refused_blocks_total", "worker" => Arc::clone(&worker))
+            .increment(0);
         gauge!("smg_kv_event_degraded_ranks", "worker" => worker).set(0.0);
     }
 
@@ -3069,6 +3364,15 @@ impl Metrics {
         counter!("smg_kv_event_parentless_blocks_total", "worker" => worker).increment(blocks);
     }
 
+    /// Count the stores a batch had declined at an arena cap (a run's fan-out or
+    /// length) and the blocks they left out of the index.
+    pub fn record_kv_event_cap_refused(worker_url: &str, stores: u64, blocks: u64) {
+        let worker = intern_string(worker_url);
+        counter!("smg_kv_event_cap_refused_stores_total", "worker" => worker.clone())
+            .increment(stores);
+        counter!("smg_kv_event_cap_refused_blocks_total", "worker" => worker).increment(blocks);
+    }
+
     /// Count the stores a batch left out of the index as narrower than the
     /// worker's block of record, and the blocks they carried.
     pub fn record_kv_event_sub_block(worker_url: &str, stores: u64, blocks: u64) {
@@ -3127,11 +3431,14 @@ impl Metrics {
         gauge!("smg_kv_index_arena_bytes", "model" => model.clone()).set(stats.arena_bytes as f64);
         gauge!("smg_kv_index_arena_free_bytes", "model" => model.clone())
             .set(stats.arena_free_bytes as f64);
+        gauge!("smg_kv_index_arena_chunk_bytes", "model" => model.clone())
+            .set(stats.arena_chunk_bytes as f64);
         gauge!("smg_kv_index_slab_bytes", "model" => model.clone()).set(stats.slab_bytes as f64);
         gauge!("smg_kv_index_moved_hashes", "model" => model.clone())
             .set(stats.moved_hashes as f64);
-        gauge!("smg_kv_index_engine_conflicts", "model" => model)
+        gauge!("smg_kv_index_engine_conflicts", "model" => model.clone())
             .set(stats.engine_conflicts as f64);
+        gauge!("smg_kv_index_cap_refusals", "model" => model).set(stats.cap_refusals as f64);
     }
 
     // ========================================================================
@@ -3330,7 +3637,9 @@ impl Metrics {
     // Layer 3: Engine load re-export
     // ========================================================================
 
-    /// Re-export a worker's `GetLoads` snapshot as `smg_engine_*` gauges.
+    /// Re-export a worker's `GetLoads` snapshot as `smg_engine_*` gauges:
+    /// every rank the report carries, as a poll's does. A pushed record
+    /// names one rank and goes through [`Self::record_engine_rank_load`].
     ///
     /// Core gauges are per DP rank (`dp_rank` bounded by dp_size). PD gauges
     /// are emitted only for ranks that carry a `disagg` section, labeled by the
@@ -3340,102 +3649,129 @@ impl Metrics {
         model_id: &str,
         response: &openai_protocol::worker::WorkerLoadResponse,
     ) {
-        let worker = intern_string(worker_url);
-        let model = intern_model_label(model_id);
-
         for load in &response.loads {
-            let dp_rank = intern_string(&load.dp_rank.to_string());
+            Self::record_engine_rank_load(worker_url, model_id, load);
+        }
+    }
 
-            gauge!(
-                "smg_engine_running_requests",
-                "worker" => Arc::clone(&worker),
-                "model" => Arc::clone(&model),
-                "dp_rank" => Arc::clone(&dp_rank),
-            )
-            .set(load.num_running_reqs as f64);
-            gauge!(
-                "smg_engine_waiting_requests",
-                "worker" => Arc::clone(&worker),
-                "model" => Arc::clone(&model),
-                "dp_rank" => Arc::clone(&dp_rank),
-            )
-            .set(load.num_waiting_reqs as f64);
-            gauge!(
-                "smg_engine_token_usage",
-                "worker" => Arc::clone(&worker),
-                "model" => Arc::clone(&model),
-                "dp_rank" => Arc::clone(&dp_rank),
-            )
-            .set(load.token_usage);
-            gauge!(
-                "smg_engine_gen_throughput",
-                "worker" => Arc::clone(&worker),
-                "model" => Arc::clone(&model),
-                "dp_rank" => Arc::clone(&dp_rank),
-            )
-            .set(load.gen_throughput);
-            gauge!(
-                "smg_engine_cache_hit_rate",
-                "worker" => Arc::clone(&worker),
-                "model" => Arc::clone(&model),
-                "dp_rank" => Arc::clone(&dp_rank),
-            )
-            .set(load.cache_hit_rate);
-            // The capacity behind the usage ratio, when the engine reports
-            // it (a snapshot read off an HTTP metrics page carries the
-            // ratio alone and leaves it 0).
-            if load.max_total_num_tokens > 0 {
-                gauge!(
-                    "smg_engine_kv_capacity_tokens",
-                    "worker" => Arc::clone(&worker),
-                    "model" => Arc::clone(&model),
-                    "dp_rank" => Arc::clone(&dp_rank),
-                )
+    /// Re-export one rank's figures as its `smg_engine_*` gauges: through
+    /// this thread's kept handles for the worker, model and rank (built on
+    /// the rank's first sight, dropped when the worker set changes), or
+    /// through keys built per call when handles are not kept. A record
+    /// pushed at the engine's batch rate is then a few atomic stores, with
+    /// nothing built or allocated, and touches no other rank's series.
+    pub fn record_engine_rank_load(
+        worker_url: &str,
+        model_id: &str,
+        load: &openai_protocol::worker::SchedulerLoadSnapshot,
+    ) {
+        if handles::keep_handles() {
+            let recorded = handles::ENGINE_LOADS.with_borrow_mut(|kept| {
+                handles::engine_rank(kept.for_worker(worker_url), model_id, load.dp_rank)
+                    .map(|rank| Self::set_engine_rank_gauges(rank, worker_url, model_id, load))
+                    .is_some()
+            });
+            if recorded {
+                return;
+            }
+        }
+        // Nothing kept (no recorder installed yet, or a model label the
+        // interner refused): the keys are built for this call alone.
+        Self::set_engine_rank_gauges(
+            &mut handles::EngineRankHandles::default(),
+            worker_url,
+            model_id,
+            load,
+        );
+    }
+
+    /// Set a rank's gauges through `rank`'s handles, each built the first
+    /// time the rank has a figure for its series; the labels are interned
+    /// once per record that builds a handle and not at all otherwise.
+    fn set_engine_rank_gauges(
+        rank: &mut handles::EngineRankHandles,
+        worker_url: &str,
+        model_id: &str,
+        load: &openai_protocol::worker::SchedulerLoadSnapshot,
+    ) {
+        let dp_rank = load.dp_rank;
+        let mut labels = None;
+        let core = rank.core.get_or_insert_with(|| {
+            handles::EngineCoreHandles::new(handles::engine_labels(
+                &mut labels,
+                worker_url,
+                model_id,
+                dp_rank,
+            ))
+        });
+        core.running.set(load.num_running_reqs as f64);
+        core.waiting.set(load.num_waiting_reqs as f64);
+        core.token_usage.set(load.token_usage);
+        core.gen_throughput.set(load.gen_throughput);
+        core.cache_hit_rate.set(load.cache_hit_rate);
+        // The capacity behind the usage ratio, when the engine reports
+        // it (a snapshot read off an HTTP metrics page carries the
+        // ratio alone and leaves it 0).
+        if load.max_total_num_tokens > 0 {
+            rank.kv_capacity
+                .get_or_insert_with(|| {
+                    handles::engine_gauge(
+                        "smg_engine_kv_capacity_tokens",
+                        handles::engine_labels(&mut labels, worker_url, model_id, dp_rank),
+                    )
+                })
                 .set(f64::from(load.max_total_num_tokens));
-            }
+        }
 
-            // PD gauges only when the engine reported a disagg section. Labeled
-            // by dp_rank too, so DP ranks sharing a role don't overwrite.
-            let Some(role) = load.disagg_mode.as_deref() else {
-                continue;
-            };
-            let role = intern_string(role);
-            if let Some(latency) = load.kv_transfer_latency_ms {
-                gauge!(
-                    "smg_engine_pd_kv_transfer_latency_ms",
-                    "worker" => Arc::clone(&worker),
-                    "role" => Arc::clone(&role),
-                    "dp_rank" => Arc::clone(&dp_rank),
-                )
+        // PD gauges only when the engine reported a disagg section. Labeled
+        // by dp_rank too, so DP ranks sharing a role don't overwrite.
+        let Some(role) = load.disagg_mode.as_deref() else {
+            return;
+        };
+        let pd = rank.pd(role);
+        if let Some(latency) = load.kv_transfer_latency_ms {
+            pd.kv_transfer_latency
+                .get_or_insert_with(|| {
+                    handles::engine_pd_gauge(
+                        "smg_engine_pd_kv_transfer_latency_ms",
+                        handles::engine_labels(&mut labels, worker_url, model_id, dp_rank),
+                        &pd.role,
+                    )
+                })
                 .set(latency);
-            }
-            if let Some(speed) = load.kv_transfer_speed_gb_s {
-                gauge!(
-                    "smg_engine_pd_kv_transfer_speed_gb_s",
-                    "worker" => Arc::clone(&worker),
-                    "role" => Arc::clone(&role),
-                    "dp_rank" => Arc::clone(&dp_rank),
-                )
+        }
+        if let Some(speed) = load.kv_transfer_speed_gb_s {
+            pd.kv_transfer_speed
+                .get_or_insert_with(|| {
+                    handles::engine_pd_gauge(
+                        "smg_engine_pd_kv_transfer_speed_gb_s",
+                        handles::engine_labels(&mut labels, worker_url, model_id, dp_rank),
+                        &pd.role,
+                    )
+                })
                 .set(speed);
-            }
-            if let Some(reqs) = load.prefill_queue_reqs {
-                gauge!(
-                    "smg_engine_pd_prefill_queue_reqs",
-                    "worker" => Arc::clone(&worker),
-                    "role" => Arc::clone(&role),
-                    "dp_rank" => Arc::clone(&dp_rank),
-                )
+        }
+        if let Some(reqs) = load.prefill_queue_reqs {
+            pd.prefill_queue
+                .get_or_insert_with(|| {
+                    handles::engine_pd_gauge(
+                        "smg_engine_pd_prefill_queue_reqs",
+                        handles::engine_labels(&mut labels, worker_url, model_id, dp_rank),
+                        &pd.role,
+                    )
+                })
                 .set(reqs as f64);
-            }
-            if let Some(reqs) = load.decode_queue_reqs {
-                gauge!(
-                    "smg_engine_pd_decode_queue_reqs",
-                    "worker" => Arc::clone(&worker),
-                    "role" => role,
-                    "dp_rank" => dp_rank,
-                )
+        }
+        if let Some(reqs) = load.decode_queue_reqs {
+            pd.decode_queue
+                .get_or_insert_with(|| {
+                    handles::engine_pd_gauge(
+                        "smg_engine_pd_decode_queue_reqs",
+                        handles::engine_labels(&mut labels, worker_url, model_id, dp_rank),
+                        &pd.role,
+                    )
+                })
                 .set(reqs as f64);
-            }
         }
     }
 
@@ -3526,7 +3862,22 @@ impl Metrics {
 /// Metrics helpers for tests elsewhere in the crate.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use metrics_exporter_prometheus::PrometheusBuilder;
+    use std::sync::OnceLock;
+
+    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+    /// The lib test binary's one process-wide recorder, for records made on
+    /// threads no local recorder covers (the blocking pool). Installed once;
+    /// every other test keeps its own local recorder, which takes precedence
+    /// on its thread.
+    pub(crate) fn global_recorder() -> &'static PrometheusHandle {
+        static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+        HANDLE.get_or_init(|| {
+            PrometheusBuilder::new()
+                .install_recorder()
+                .expect("the lib test binary's one global recorder")
+        })
+    }
 
     /// Run `f` under a thread-local Prometheus recorder and return the
     /// rendered `/metrics` text — the same scrape output the :29000 endpoint

@@ -146,23 +146,25 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
 
             // Check for configuration conflicts between prefill and decode
             Self::check_worker_conflicts(&model_id, &all_workers);
-            let cache_aware = app_context
+            // The registry tests the policy's type itself and does nothing
+            // for a policy that is not cache-aware.
+            app_context
                 .policy_registry
-                .get_policy(&model_id)
-                .is_some_and(|policy| policy.name() == "cache_aware");
-            if cache_aware {
-                app_context
-                    .policy_registry
-                    .init_cache_aware_policy(&model_id, &all_workers);
-            }
+                .init_cache_aware_policy(&model_id, &all_workers);
 
-            // The worker's stream: its KV events into the model's index under
-            // a cache-aware policy, its load records alone otherwise, when
+            // The worker's stream follows the policy that places it, the
+            // role's policy for a prefill, decode or encode worker rather than
+            // the model's: its KV events into the model's index under a policy
+            // that reads the index, its load records alone otherwise, when
             // the worker monitor wants loads at all (always by default; see
             // `WorkerMonitor::loads_wanted`). Only gRPC workers stream.
+            let needs_kv_events = app_context
+                .policy_registry
+                .policy_for_worker(worker.as_ref())
+                .needs_kv_events();
             if *worker.connection_mode() == ConnectionMode::Grpc {
                 if let Some(ref monitor) = app_context.kv_event_monitor {
-                    let kind = if cache_aware {
+                    let kind = if needs_kv_events {
                         Some(SubscriptionKind::Events)
                     } else {
                         app_context
@@ -177,7 +179,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
                 }
             }
 
-            Self::warn_on_cache_aware_without_kv_events(&model_id, worker, cache_aware);
+            Self::warn_on_cache_aware_without_kv_events(&model_id, worker, needs_kv_events);
 
             if !updated_models.contains(&model_id) {
                 updated_models.push(model_id);
@@ -215,10 +217,18 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::worker::{HealthCheckConfig, RuntimeType, WorkerSpec, WorkerType};
     use tracing_test::traced_test;
+    use wfaas::WorkflowInstanceId;
 
     use super::*;
-    use crate::worker::BasicWorkerBuilder;
+    use crate::{
+        app_context::{testing::app_context_for_tests, AppContext},
+        config::{PolicyConfig, RouterConfig},
+        policies::{as_cache_aware, PolicyFactory},
+        worker::{BasicWorkerBuilder, KvEventMonitor, ModelCard, WorkerRegistry},
+        workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
+    };
 
     fn worker(url: &str, connection_mode: ConnectionMode) -> Arc<dyn Worker> {
         Arc::new(
@@ -226,6 +236,157 @@ mod tests {
                 .connection_mode(connection_mode)
                 .build(),
         )
+    }
+
+    const MODEL: &str = "qwen3";
+
+    /// A gRPC worker serving [`MODEL`] as `worker_type`, at a port that
+    /// refuses connections at once: a stream it is given reconnects in the
+    /// background with no engine involved.
+    fn grpc_worker(worker_type: WorkerType) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:1")
+                .worker_type(worker_type)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::TokenSpeed)
+                .model(ModelCard::new(MODEL))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    fn cache_aware() -> PolicyConfig {
+        PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096)
+    }
+
+    /// An app context over `policy` with a KV event monitor and no worker
+    /// monitor, so a worker gets a stream only for its KV events, and its
+    /// model an index with the first.
+    fn context_over(policy: PolicyConfig) -> (Arc<AppContext>, Arc<KvEventMonitor>) {
+        let config = RouterConfig::builder().policy(policy).build_unchecked();
+        let mut context = AppContext::clone(&app_context_for_tests(
+            config,
+            Arc::new(WorkerRegistry::new()),
+            None,
+        ));
+        let monitor = Arc::new(KvEventMonitor::new());
+        context
+            .policy_registry
+            .set_kv_event_monitor(Some(Arc::clone(&monitor)));
+        context.kv_event_monitor = Some(Arc::clone(&monitor));
+        (Arc::new(context), monitor)
+    }
+
+    /// Register `worker` with `labels` and run the step over it.
+    async fn register(
+        app_context: &Arc<AppContext>,
+        worker: Arc<dyn Worker>,
+        labels: &[(&str, &str)],
+    ) {
+        app_context
+            .worker_registry
+            .register(Arc::clone(&worker))
+            .unwrap();
+        let mut data = create_worker_workflow_data(
+            WorkerSpec::new(worker.url()),
+            WorkerRegistrationMode::Upsert,
+            Arc::clone(app_context),
+        );
+        data.final_labels = labels
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        data.actual_workers = Some(vec![worker]);
+        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+        UpdatePoliciesStep.execute(&mut context).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_prefill_worker_placed_by_cache_aware_streams_its_kv_events() {
+        // `--policy round_robin --prefill-policy cache_aware`: the model's
+        // policy is round_robin, but the prefill pool is placed by
+        // cache_aware, which routes on the model's index.
+        let (app_context, monitor) = context_over(PolicyConfig::RoundRobin);
+        app_context
+            .policy_registry
+            .set_prefill_policy(PolicyFactory::create_from_config(&cache_aware()));
+
+        register(&app_context, grpc_worker(WorkerType::Prefill), &[]).await;
+
+        assert!(monitor.get_indexer(MODEL).is_some());
+        monitor.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_policy_label_leaves_a_cache_aware_role_its_kv_events() {
+        // A `policy` label names the model's policy, which places no decode
+        // worker: the decode pool keeps the default cache_aware.
+        let (app_context, monitor) = context_over(cache_aware());
+
+        register(
+            &app_context,
+            grpc_worker(WorkerType::Decode),
+            &[("policy", "round_robin")],
+        )
+        .await;
+
+        assert!(monitor.get_indexer(MODEL).is_some());
+        monitor.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_prefill_worker_placed_by_round_robin_streams_no_kv_events() {
+        // A `policy=cache_aware` label makes the model's policy cache_aware,
+        // but the prefill pool is placed by the default round_robin, which
+        // reads no index: the worker's events would fill one nothing reads.
+        let (app_context, monitor) = context_over(PolicyConfig::RoundRobin);
+
+        register(
+            &app_context,
+            grpc_worker(WorkerType::Prefill),
+            &[("policy", "cache_aware")],
+        )
+        .await;
+
+        assert!(monitor.get_indexer(MODEL).is_none());
+        monitor.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_regular_worker_streams_what_its_models_policy_reads() {
+        let (app_context, monitor) = context_over(PolicyConfig::RoundRobin);
+
+        register(
+            &app_context,
+            grpc_worker(WorkerType::Regular),
+            &[("policy", "cache_aware")],
+        )
+        .await;
+
+        assert!(monitor.get_indexer(MODEL).is_some());
+        monitor.stop().await;
+    }
+
+    /// A worker registered under a cache-aware model policy is routed
+    /// through the model's tree by this step.
+    #[tokio::test]
+    async fn a_worker_under_a_cache_aware_policy_is_routed_through_the_models_tree() {
+        let (app_context, monitor) = context_over(cache_aware());
+
+        register(&app_context, grpc_worker(WorkerType::Regular), &[]).await;
+
+        let policy = app_context
+            .policy_registry
+            .get_policy(MODEL)
+            .expect("the model's policy");
+        let tenants = as_cache_aware(policy.as_ref())
+            .expect("a cache-aware policy")
+            .tree_tenants_for_test(MODEL);
+        assert_eq!(tenants, ["grpc://127.0.0.1:1"]);
+        monitor.stop().await;
     }
 
     #[traced_test]

@@ -5,17 +5,22 @@
 //! entry points stay there and drive it.
 
 use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Instant,
 };
 
 use bytes::BytesMut;
 use llm_tokenizer::{
-    stop::{SequenceDecoderOutput, StopSequenceDecoder},
+    stop::{SequenceDecoderOutput, StopRules, StopSequenceDecoder},
     traits::Tokenizer,
 };
-use openai_protocol::{common::StringOrArray, completion::CompletionStreamChoice};
+use openai_protocol::{
+    common::{LogProbs, StringOrArray},
+    completion::CompletionStreamChoice,
+};
 
 use super::{CompletionChunkFrame, StreamingProcessor};
 use crate::{
@@ -23,7 +28,7 @@ use crate::{
     routers::{
         common::sse::SseSender,
         grpc::{
-            common::response_formatting::CompletionTokenTracker,
+            common::response_formatting::{known_spec_drafted, CompletionTokenTracker},
             context,
             proto_wrapper::{
                 ProtoGenerateComplete, ProtoGenerateStreamChunk, ProtoResponseVariant, ProtoStream,
@@ -38,7 +43,10 @@ use crate::{
 /// One backend stream of a `/v1/completions` request. Batched requests fan
 /// out into several, each remapped by a prompt-major choice-index offset.
 pub(super) enum CompletionStreamUnit {
-    Single(ProtoStream),
+    Single {
+        stream: ProtoStream,
+        dispatch_start: Instant,
+    },
     PrefillDecode {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
@@ -50,12 +58,11 @@ pub(super) enum CompletionStreamUnit {
 }
 
 impl CompletionStreamUnit {
-    /// The prefill dispatch instant of a disaggregated unit: the base its
-    /// TTFT and generation duration are measured from.
-    pub(super) fn prefill_start(&self) -> Option<Instant> {
+    /// The dispatch instant both TTFT and generation duration start from.
+    pub(super) fn generation_start(&self) -> Instant {
         match self {
-            Self::Single(_) => None,
-            Self::PrefillDecode { pd_timing, .. } => Some(pd_timing.prefill_start),
+            Self::Single { dispatch_start, .. } => *dispatch_start,
+            Self::PrefillDecode { pd_timing, .. } => pd_timing.prefill_start,
         }
     }
 }
@@ -67,7 +74,7 @@ pub(super) struct CompletionStreamOutcome {
     pub(super) cached_tokens: u32,
     pub(super) reasoning_tokens: u32,
     pub(super) spec_accepted_tokens: u32,
-    pub(super) spec_draft_tokens: u32,
+    pub(super) spec_draft_tokens: Option<u32>,
     pub(super) completion_tokens: u32,
     pub(super) first_token_time: Option<Instant>,
     /// Whether *every* expected `n>1` choice in this unit received a
@@ -88,7 +95,9 @@ pub(super) struct CompletionStream<'a> {
     /// Dispatch metadata, for consistent response fields.
     dispatch: &'a context::DispatchMetadata,
     tokenizer: Arc<dyn Tokenizer>,
-    stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+    /// The request's stop rules, built once; each choice's decoder copies them.
+    stop_rules: StopRules,
+    skip_special_tokens: bool,
     spec: &'a CompletionResponseSpec,
     prompt_text: &'a str,
     index_offset: u32,
@@ -99,26 +108,21 @@ pub(super) struct CompletionStream<'a> {
     backend_type: &'static str,
 
     first_token_time: Option<Instant>,
+    /// Whether the frame carrying the first token has left: until it has,
+    /// the read flushes before every poll, so the first token waits for
+    /// nothing ([`StreamingProcessor::next_packed`]).
+    first_token_out: bool,
+    /// The body's first frame as this unit sees it ([`BodysFirstFrame`]): a
+    /// first-token frame that claimed it has its hand-off yield once, the
+    /// body's own yield after its first frame making the two; any later
+    /// first-token frame is not the body's first, so its hand-off yields
+    /// twice (as the Messages stream's), or the frame would reach the
+    /// connection behind the burst read after it.
+    first_frame: BodysFirstFrame<'a>,
 
-    // Per-choice state (per index, for n>1 support)
-    stop_decoders: HashMap<u32, StopSequenceDecoder>,
-    is_firsts: HashMap<u32, bool>,
-    /// Indices whose local stop decoder fired: "stop" is emitted even if the
-    /// backend's eventual Complete carries "length" (the local stop sequence
-    /// fired first), and later engine output for the index is ignored.
-    stopped_indices: HashSet<u32>,
-    /// Indices that received a `Complete` message -- tracked separately
-    /// from `reasoning_tokens` (which exists for a different purpose and
-    /// only incidentally gets exactly one insert per completed index
-    /// today) so the completeness gate doesn't silently break if that
-    /// insert behavior ever changes. A choice is closed by its Complete or
-    /// by its local stop (whose usage is as settled, see `read_chunk`).
-    completed_indices: HashSet<u32>,
-    /// Stopped indices the engine streamed a chunk for after their stop: it
-    /// is generating past the stop, which only a stop it cannot see does (an
-    /// engine that saw the stop ends the choice on that step and sends its
-    /// Complete next).
-    tailed_indices: HashSet<u32>,
+    /// The per-choice state, one entry per choice the request expects
+    /// (`spec.choices_per_prompt`), at the engine's index.
+    choices: Vec<ChoiceState>,
     /// The engine was streaming past a stop when every choice had closed:
     /// the loop stopped polling it, and the driver aborts it instead of
     /// marking it completed (see [`Self::release_engine`]).
@@ -138,10 +142,36 @@ pub(super) struct CompletionStream<'a> {
     /// messages rather than the sum (same prompt tokenized once, not per-choice).
     total_prompt: u32,
     total_cached: u32,
-    reasoning_tokens: HashMap<u32, u32>,
-    spec_accepted: HashMap<u32, u32>,
-    spec_drafted: HashMap<u32, u32>,
     total_completion: CompletionTokenTracker,
+}
+
+/// One choice of the unit: its decoder, made on its first chunk, and the
+/// flags and counts the loop keeps for it.
+#[derive(Default)]
+struct ChoiceState {
+    stop_decoder: Option<StopSequenceDecoder>,
+    /// The choice's first output went out (the echo goes in front of it).
+    started: bool,
+    /// The characters of the choice's tokens so far, where its next chunk's
+    /// logprobs offsets start (the echoed prompt's first); read only when
+    /// the request asked for logprobs.
+    text_offset: u32,
+    /// The local stop decoder fired: "stop" is emitted even if the backend's
+    /// eventual Complete carries "length" (the local stop sequence fired
+    /// first), and later engine output for the choice is ignored.
+    stopped: bool,
+    /// The engine's `Complete` came. A choice is closed by its Complete or
+    /// by its local stop (whose usage is as settled, see `read_chunk`); the
+    /// completeness gate counts the closed choices.
+    completed: bool,
+    /// The engine streamed a chunk for the choice after its stop: it is
+    /// generating past the stop, which only a stop it cannot see does (an
+    /// engine that saw the stop ends the choice on that step and sends its
+    /// Complete next).
+    tailed: bool,
+    reasoning_tokens: u32,
+    spec_accepted: u32,
+    spec_drafted: u32,
 }
 
 /// A completion chunk's choice: `text` at `index`, with its finish reason.
@@ -156,6 +186,28 @@ fn completion_choice(
         logprobs: None,
         finish_reason,
     }
+}
+
+/// The chunk's logprobs when the request asked for them: its positions in
+/// the legacy shape, their offsets continuing `text_offset`, the choice's
+/// count of characters so far; `None` for a chunk whose message scored no
+/// position (a wire may send the message empty), so a chunk without text
+/// goes out only with a position to carry.
+fn chunk_logprobs(
+    spec: &CompletionResponseSpec,
+    tokenizer: &Arc<dyn Tokenizer>,
+    text_offset: &mut u32,
+    chunk: &ProtoGenerateStreamChunk,
+) -> Option<LogProbs> {
+    let top_logprobs = spec.logprobs?;
+    let proto_logprobs = chunk.output_logprobs()?;
+    Some(utils::convert_proto_to_completion_logprobs(
+        proto_logprobs,
+        tokenizer,
+        top_logprobs,
+        text_offset,
+    ))
+    .filter(|logprobs| !logprobs.tokens.is_empty())
 }
 
 impl<'a> CompletionStream<'a> {
@@ -173,6 +225,7 @@ impl<'a> CompletionStream<'a> {
         tx: &'a SseSender,
         pd_timing: Option<context::PdTiming>,
         backend_type: &'static str,
+        first_frame: Option<&'a AtomicBool>,
     ) -> Self {
         let frame = CompletionChunkFrame::new(
             &dispatch.request_id,
@@ -180,10 +233,25 @@ impl<'a> CompletionStream<'a> {
             dispatch.created,
             dispatch.weight_version.as_deref(),
         );
+        // Where every choice's logprobs offsets start: after the echoed
+        // prompt, counted only for a request that asked for logprobs.
+        let text_offset = match spec.logprobs {
+            Some(_) if spec.echo => u32::try_from(prompt_text.chars().count()).unwrap_or(u32::MAX),
+            _ => 0,
+        };
+        let (stop, stop_token_ids, skip_special_tokens, no_stop_trim, ignore_eos) = stop_params;
+        let stop_rules = utils::stop_rules(
+            &tokenizer,
+            stop.as_ref(),
+            stop_token_ids.as_ref(),
+            no_stop_trim,
+            ignore_eos,
+        );
         Self {
             dispatch,
             tokenizer,
-            stop_params,
+            stop_rules,
+            skip_special_tokens,
             spec,
             prompt_text,
             index_offset,
@@ -191,39 +259,97 @@ impl<'a> CompletionStream<'a> {
             pd_timing,
             backend_type,
             first_token_time: None,
-            stop_decoders: HashMap::new(),
-            is_firsts: HashMap::new(),
-            stopped_indices: HashSet::new(),
-            completed_indices: HashSet::new(),
-            tailed_indices: HashSet::new(),
+            choices: (0..spec.choices_per_prompt)
+                .map(|_| ChoiceState {
+                    text_offset,
+                    ..Default::default()
+                })
+                .collect(),
+            first_token_out: false,
+            first_frame: BodysFirstFrame {
+                shared: first_frame,
+                frame_out: false,
+            },
             engine_outlived: false,
             tail_tokens: 0,
             frame,
             sse_buffer: BytesMut::with_capacity(4096),
             total_prompt: 0,
             total_cached: 0,
-            reasoning_tokens: HashMap::new(),
-            spec_accepted: HashMap::new(),
-            spec_drafted: HashMap::new(),
             total_completion: CompletionTokenTracker::new(),
         }
     }
 
-    /// The loop over the engine's messages, each reaching the client as its
-    /// own chunks as soon as it is processed.
+    /// The loop over the engine's messages: each is processed as soon as it
+    /// arrives and its chunks are written into the unit's buffer; the chunks
+    /// of the messages ready at one poll leave as one frame, the first
+    /// token's alone (the packed read, as the chat loop's). The first token's
+    /// frame has its hand-off yield once when it is the body's first frame
+    /// (this stream's, as the chat stream's) and twice when it is not: in a
+    /// batched request the body's first frame may be an earlier unit's, its
+    /// first token's, its finish with no token ahead of it, or the chunk
+    /// writer's own send of a first chunk past the flush size (see
+    /// [`Self::first_frame`]); a first-token frame the writer sent itself
+    /// pays its hand-off there ([`after_write`]). A failure inside the
+    /// processing of a message returns after the chunks written ahead of it
+    /// have left, as an upstream failure does.
     pub(super) async fn read_engine(
         &mut self,
         grpc_stream: &mut ProtoStream,
     ) -> Result<(), utils::StreamFailure> {
-        while let Some(response) = grpc_stream.next().await {
-            let gen_response = response.map_err(|e| {
-                utils::StreamFailure::upstream(e, self.total_completion.delivered())
-            })?;
+        loop {
+            // Until the first token's frame is out, the packed read flushes
+            // the buffer before the poll; that flush, when it is this unit's
+            // first frame, decides whether the frame is the body's first (a
+            // finish with no token ahead of it claims as much as a first
+            // token's frame); the hand-off yields once only for a first-token
+            // frame that is the body's first.
+            let first_frame_is_first_token = self.frame_leaves();
+            let next = StreamingProcessor::next_packed(
+                grpc_stream,
+                self.tx,
+                &mut self.sse_buffer,
+                &mut self.first_token_out,
+                self.first_token_time.is_some(),
+                first_frame_is_first_token,
+            )
+            .await?;
+            let Some(response) = next else {
+                if grpc_stream.client_left() {
+                    // As on the chat path: the departure ends the read before
+                    // held-back text is flushed to the closed sender.
+                    return Ok(());
+                }
+                break;
+            };
+            let gen_response = match response {
+                Ok(response) => response,
+                Err(e) => {
+                    // What was produced before the failure still goes out (a
+                    // first frame of any kind claims the body's first frame).
+                    self.frame_leaves();
+                    StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
+                    return Err(utils::StreamFailure::upstream(
+                        e,
+                        self.total_completion.delivered(),
+                    ));
+                }
+            };
 
-            match gen_response.into_response() {
-                ProtoResponseVariant::Chunk(chunk) => self.read_chunk(chunk).await?,
-                ProtoResponseVariant::Complete(complete) => self.read_complete(complete).await?,
+            // As on the chat path: the variant stays here, the readers borrow it.
+            let response = gen_response.into_response();
+            let read = match &response {
+                ProtoResponseVariant::Chunk(chunk) => self.read_chunk(chunk).await,
+                ProtoResponseVariant::Complete(complete) => self.read_complete(complete).await,
                 ProtoResponseVariant::None => continue,
+            };
+            if let Err(failure) = read {
+                // What was produced ahead of the failure (the chunks written
+                // since the last flush) still goes out, as it does ahead of
+                // an upstream failure; the failure's event follows it.
+                self.frame_leaves();
+                StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
+                return Err(failure);
             }
             // An engine that outlived the unit (every choice closed, a
             // locally stopped one streaming on past its stop) is not polled
@@ -233,15 +359,28 @@ impl<'a> CompletionStream<'a> {
                 break;
             }
         }
+        self.frame_leaves();
+        StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
         Ok(())
+    }
+
+    /// A flush of the buffer is due (the packed read's before a poll, a
+    /// failure's, the read's end, the finish of the open choices): whether the
+    /// frame about to leave is the body's first ([`BodysFirstFrame::leaves`]);
+    /// false when nothing is in the buffer (no frame leaves) and after this
+    /// unit's first frame.
+    fn frame_leaves(&mut self) -> bool {
+        !self.first_token_out && !self.sse_buffer.is_empty() && self.first_frame.leaves()
     }
 
     /// An engine chunk: the choice's tokens through its stop decoder (made on
     /// its first chunk), the prompt echoed in front of the first text, the
-    /// text out, and on a local stop the suffix and the "stop" finish.
+    /// text out, and on a local stop the suffix and the "stop" finish. A
+    /// chunk for a choice past the ones the request expects is a decoding
+    /// failure.
     async fn read_chunk(
         &mut self,
-        chunk: ProtoGenerateStreamChunk,
+        chunk: &ProtoGenerateStreamChunk,
     ) -> Result<(), utils::StreamFailure> {
         if self.first_token_time.is_none() {
             self.first_token_time = Some(Instant::now());
@@ -251,59 +390,69 @@ impl<'a> CompletionStream<'a> {
         }
 
         let index = self.index_offset + chunk.index();
+        let choice = utils::choice_mut(&mut self.choices, chunk.index())?;
 
         // A choice's engine chunk after its local stop is the tail the
         // engine generated for nobody (an engine that saw the stop sends
         // its Complete instead): counted, not read; the unit is aborted
         // once every choice has closed, until then another choice may
         // still be streaming.
-        if self.stopped_indices.contains(&index) {
+        if choice.stopped {
             self.tail_tokens += chunk.token_ids().len() as u64;
-            self.tailed_indices.insert(index);
+            choice.tailed = true;
             return Ok(());
         }
 
-        let is_first = self.is_firsts.entry(index).or_insert(true);
-        self.total_completion.record_chunk(&chunk);
+        self.total_completion.record_chunk(chunk);
 
-        let stop_decoder = self.stop_decoders.entry(index).or_insert_with(|| {
-            let (ref stop, ref stop_token_ids, skip_special_tokens, no_stop_trim, ignore_eos) =
-                self.stop_params;
-            utils::create_stop_decoder(
-                &self.tokenizer,
-                stop.as_ref(),
-                stop_token_ids.as_ref(),
-                skip_special_tokens,
-                no_stop_trim,
-                ignore_eos,
+        let stop_decoder = choice.stop_decoder.get_or_insert_with(|| {
+            StopSequenceDecoder::with_rules(
+                self.tokenizer.clone(),
+                self.stop_rules.clone(),
+                self.skip_special_tokens,
             )
         });
 
         let (mut text, stopped) =
             StreamingProcessor::process_chunk_tokens(stop_decoder, chunk.token_ids())?;
 
-        if *is_first {
+        if !choice.started {
             if self.spec.echo {
                 text.insert_str(0, self.prompt_text);
             }
-            *is_first = false;
+            choice.started = true;
         }
 
-        if !text.is_empty() {
-            StreamingProcessor::send_completion_chunk(
+        // The chunk's logprobs when the request asked for them: a chunk
+        // whose tokens made no text yet carries them all the same.
+        let logprobs = chunk_logprobs(self.spec, &self.tokenizer, &mut choice.text_offset, chunk);
+        if !text.is_empty() || logprobs.is_some() {
+            StreamingProcessor::write_completion_chunk(
                 self.tx,
                 &mut self.sse_buffer,
                 &self.frame,
-                &completion_choice(index, text, None),
+                &CompletionStreamChoice {
+                    text,
+                    index,
+                    logprobs,
+                    finish_reason: None,
+                },
             )
             .await?;
+            after_write(
+                &self.sse_buffer,
+                &mut self.first_frame,
+                self.first_token_time,
+                &mut self.first_token_out,
+            )
+            .await;
         }
 
         if stopped {
             // Stop-decoder match takes precedence: emit "stop" even if
             // the backend's eventual Complete carries "length". This is
             // intentional — the local stop sequence fired first.
-            self.stopped_indices.insert(index);
+            choice.stopped = true;
             // The choice closes here, as its Complete would close it: the
             // counts of the chunk the stop matched in are its counts (the
             // engine's own server counts a stopped request through that
@@ -312,29 +461,42 @@ impl<'a> CompletionStream<'a> {
             // the abort cuts, never the client's usage.
             self.total_prompt = self.total_prompt.max(chunk.prompt_tokens());
             self.total_cached = self.total_cached.max(chunk.cached_tokens());
-            self.reasoning_tokens
-                .insert(index, chunk.reasoning_tokens());
+            choice.reasoning_tokens = chunk.reasoning_tokens();
             // The tracker keys by the engine's own choice index, as its
             // chunks and Completes do; `index` is the client's.
             self.total_completion.record_local_stop(chunk.index());
 
             if let Some(sfx) = self.spec.suffix.as_deref() {
-                StreamingProcessor::send_completion_chunk(
+                StreamingProcessor::write_completion_chunk(
                     self.tx,
                     &mut self.sse_buffer,
                     &self.frame,
                     &completion_choice(index, sfx.to_string(), None),
                 )
                 .await?;
+                after_write(
+                    &self.sse_buffer,
+                    &mut self.first_frame,
+                    self.first_token_time,
+                    &mut self.first_token_out,
+                )
+                .await;
             }
 
-            StreamingProcessor::send_completion_chunk(
+            StreamingProcessor::write_completion_chunk(
                 self.tx,
                 &mut self.sse_buffer,
                 &self.frame,
                 &completion_choice(index, String::new(), Some("stop".to_string())),
             )
             .await?;
+            after_write(
+                &self.sse_buffer,
+                &mut self.first_frame,
+                self.first_token_time,
+                &mut self.first_token_out,
+            )
+            .await;
         }
         Ok(())
     }
@@ -346,103 +508,139 @@ impl<'a> CompletionStream<'a> {
     /// finish chunk.
     async fn read_complete(
         &mut self,
-        complete: ProtoGenerateComplete,
+        complete: &ProtoGenerateComplete,
     ) -> Result<(), utils::StreamFailure> {
         let index = self.index_offset + complete.index();
-        self.completed_indices.insert(index);
-        self.spec_accepted
-            .insert(index, complete.spec_accepted_tokens());
-        self.spec_drafted
-            .insert(index, complete.spec_draft_tokens());
+        let choice = utils::choice_mut(&mut self.choices, complete.index())?;
+        choice.completed = true;
+        choice.spec_accepted = complete.spec_accepted_tokens();
+        choice.spec_drafted = complete.spec_draft_tokens();
         // The Complete of a choice the engine generated past its local stop
         // (another choice of the unit kept the stream open) is the tail's
         // end: the choice closed at its stop with that step's counts, and
         // only the counts the stop could not know are taken from it.
-        if self.tailed_indices.contains(&index) {
+        if choice.tailed {
             return Ok(());
         }
         self.total_prompt = self.total_prompt.max(complete.prompt_tokens());
         self.total_cached = self.total_cached.max(complete.cached_tokens());
-        self.reasoning_tokens
-            .insert(index, complete.reasoning_tokens());
-        self.total_completion.record_complete(&complete);
+        choice.reasoning_tokens = complete.reasoning_tokens();
+        self.total_completion.record_complete(complete);
 
-        if self.stopped_indices.contains(&index) {
+        if choice.stopped {
             return Ok(());
         }
 
         // Handle echo when Complete arrives without any preceding Chunks
         // (e.g., max_tokens=0). The Chunk arm normally prepends prompt_text
         // on the first event, but if no Chunks arrive we must emit it here.
-        let is_first = self.is_firsts.entry(index).or_insert(true);
-        if *is_first && self.spec.echo && !self.prompt_text.is_empty() {
-            StreamingProcessor::send_completion_chunk(
+        if !choice.started && self.spec.echo && !self.prompt_text.is_empty() {
+            StreamingProcessor::write_completion_chunk(
                 self.tx,
                 &mut self.sse_buffer,
                 &self.frame,
                 &completion_choice(index, self.prompt_text.to_string(), None),
             )
             .await?;
-            *is_first = false;
+            after_write(
+                &self.sse_buffer,
+                &mut self.first_frame,
+                self.first_token_time,
+                &mut self.first_token_out,
+            )
+            .await;
+            choice.started = true;
         }
 
-        if let Some(decoder) = self.stop_decoders.get_mut(&index) {
+        if let Some(decoder) = choice.stop_decoder.as_mut() {
             let tail = decoder.finish().map_err(|e| e.to_string())?;
             utils::warn_detokenize_recoveries(&self.dispatch.request_id, index, decoder);
             if decoder.is_stopped() {
-                self.stopped_indices.insert(index);
+                choice.stopped = true;
             }
             if let SequenceDecoderOutput::Text(text)
             | SequenceDecoderOutput::StoppedWithText(text) = tail
             {
                 if !text.is_empty() {
-                    StreamingProcessor::send_completion_chunk(
+                    StreamingProcessor::write_completion_chunk(
                         self.tx,
                         &mut self.sse_buffer,
                         &self.frame,
                         &completion_choice(index, text, None),
                     )
                     .await?;
+                    after_write(
+                        &self.sse_buffer,
+                        &mut self.first_frame,
+                        self.first_token_time,
+                        &mut self.first_token_out,
+                    )
+                    .await;
                 }
             }
         }
 
         if let Some(sfx) = self.spec.suffix.as_deref() {
-            StreamingProcessor::send_completion_chunk(
+            StreamingProcessor::write_completion_chunk(
                 self.tx,
                 &mut self.sse_buffer,
                 &self.frame,
                 &completion_choice(index, sfx.to_string(), None),
             )
             .await?;
+            after_write(
+                &self.sse_buffer,
+                &mut self.first_frame,
+                self.first_token_time,
+                &mut self.first_token_out,
+            )
+            .await;
         }
 
-        let finish_reason = utils::completion_finish_reason(
-            self.stopped_indices.contains(&index),
-            complete.finish_reason(),
-        )
-        .to_string();
+        let finish_reason =
+            utils::completion_finish_reason(choice.stopped, complete.finish_reason()).to_string();
 
-        StreamingProcessor::send_completion_chunk(
+        StreamingProcessor::write_completion_chunk(
             self.tx,
             &mut self.sse_buffer,
             &self.frame,
             &completion_choice(index, String::new(), Some(finish_reason)),
         )
         .await?;
+        after_write(
+            &self.sse_buffer,
+            &mut self.first_frame,
+            self.first_token_time,
+            &mut self.first_token_out,
+        )
+        .await;
         Ok(())
     }
 
     /// After the engine's end: pending text and locally matched stops of
-    /// the choices no `Complete` closed go out, without inventing engine
-    /// usage. A local stop still honors the requested suffix.
+    /// the choices no `Complete` closed go out, in choice order, without
+    /// inventing engine usage. A local stop still honors the requested suffix.
     pub(super) async fn finish_open_choices(&mut self) -> Result<(), utils::StreamFailure> {
-        for (index, decoder) in &mut self.stop_decoders {
-            if self.completed_indices.contains(index) || self.stopped_indices.contains(index) {
+        for (at, choice) in self.choices.iter_mut().enumerate() {
+            if choice.completed || choice.stopped {
                 continue;
             }
-            let tail = decoder.finish().map_err(|e| e.to_string())?;
-            utils::warn_detokenize_recoveries(&self.dispatch.request_id, *index, decoder);
+            let Some(decoder) = choice.stop_decoder.as_mut() else {
+                continue;
+            };
+            let index = self.index_offset + at as u32;
+            // The third exit agrees with the read's two: an earlier choice's
+            // tail already in the buffer reaches the client ahead of this
+            // choice's failure.
+            let tail = match decoder.finish() {
+                Ok(tail) => tail,
+                Err(failure) => {
+                    self.frame_leaves();
+                    StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
+                    return Err(failure.to_string().into());
+                }
+            };
+            utils::warn_detokenize_recoveries(&self.dispatch.request_id, index, decoder);
             let stopped = decoder.is_stopped();
             let mut text = match tail {
                 SequenceDecoderOutput::Text(text)
@@ -457,24 +655,34 @@ impl<'a> CompletionStream<'a> {
             if text.is_empty() && !stopped {
                 continue;
             }
-            StreamingProcessor::send_completion_chunk(
+            StreamingProcessor::write_completion_chunk(
                 self.tx,
                 &mut self.sse_buffer,
                 &self.frame,
-                &completion_choice(*index, text, stopped.then(|| "stop".to_string())),
+                &completion_choice(index, text, stopped.then(|| "stop".to_string())),
             )
             .await?;
+            after_write(
+                &self.sse_buffer,
+                &mut self.first_frame,
+                self.first_token_time,
+                &mut self.first_token_out,
+            )
+            .await;
         }
+        // The finish of the open choices is written after the read's end
+        // flush: it leaves as its own frame.
+        self.frame_leaves();
+        StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
         Ok(())
     }
 
     /// Choices closed by their Complete or by their local stop.
     fn closed_choices(&self) -> u32 {
-        (self.completed_indices.len()
-            + self
-                .stopped_indices
-                .difference(&self.completed_indices)
-                .count()) as u32
+        self.choices
+            .iter()
+            .filter(|choice| choice.completed || choice.stopped)
+            .count() as u32
     }
 
     /// Whether the engine has outlived the unit: every expected choice is
@@ -485,16 +693,13 @@ impl<'a> CompletionStream<'a> {
     /// Complete is the next message, so nothing is aborted; a chunk instead
     /// is the tail. Nothing to look at while no stop has fired.
     fn engine_outlived_now(&self) -> bool {
-        if self.stopped_indices.is_empty() {
-            return false;
-        }
-        let mut open_stops = 0u32;
         let mut tailed = false;
-        for index in self.stopped_indices.difference(&self.completed_indices) {
-            open_stops += 1;
-            tailed |= self.tailed_indices.contains(index);
+        for choice in &self.choices {
+            if choice.stopped && !choice.completed {
+                tailed |= choice.tailed;
+            }
         }
-        tailed && self.completed_indices.len() as u32 + open_stops >= self.spec.choices_per_prompt
+        tailed && self.closed_choices() >= self.spec.choices_per_prompt
     }
 
     /// The engine stream, released before the unit's open choices are
@@ -518,22 +723,82 @@ impl<'a> CompletionStream<'a> {
         drop(grpc_stream);
     }
 
-    /// The unit's totals for the coordinator. `completed_indices` counts
-    /// distinct indices that finished cleanly via a `Complete` message. A
-    /// clean EOF partway through this unit's `n>1` choices (some completed,
-    /// others didn't) must not be treated as full usage.
+    /// The unit's totals for the coordinator. The closed choices are the
+    /// ones that finished cleanly via a `Complete` message or at their local
+    /// stop. A clean EOF partway through this unit's `n>1` choices (some
+    /// completed, others didn't) must not be treated as full usage.
     pub(super) fn outcome(self) -> CompletionStreamOutcome {
         let expected_choices = self.spec.choices_per_prompt;
         let saw_complete = self.closed_choices() >= expected_choices;
         CompletionStreamOutcome {
             prompt_tokens: self.total_prompt,
             cached_tokens: self.total_cached,
-            reasoning_tokens: self.reasoning_tokens.values().sum(),
-            spec_accepted_tokens: self.spec_accepted.values().sum(),
-            spec_draft_tokens: self.spec_drafted.values().sum(),
+            reasoning_tokens: self.choices.iter().map(|c| c.reasoning_tokens).sum(),
+            spec_accepted_tokens: self.choices.iter().map(|c| c.spec_accepted).sum(),
+            spec_draft_tokens: known_spec_drafted(
+                self.choices
+                    .iter()
+                    .map(|c| (c.spec_accepted, c.spec_drafted)),
+            ),
             completion_tokens: self.total_completion.total(),
             first_token_time: self.first_token_time,
             saw_complete,
         }
+    }
+}
+
+/// The body's first frame, as the units of one request see it: the first
+/// unit to send a frame of any kind (a first token's, a finish with no token
+/// ahead of it, the chunk writer's own send of a full buffer) claims it.
+struct BodysFirstFrame<'a> {
+    /// The flag shared by the units of one batched request (`None`: this
+    /// unit is the body's only one).
+    shared: Option<&'a AtomicBool>,
+    /// Whether a frame of this unit has left.
+    frame_out: bool,
+}
+
+impl BodysFirstFrame<'_> {
+    /// A frame of this unit leaves, or has just left: the first call claims
+    /// the body's first frame and answers whether this unit's frame is it;
+    /// every later call answers false. A claim with nothing behind it:
+    /// relaxed is enough.
+    fn leaves(&mut self) -> bool {
+        if self.frame_out {
+            return false;
+        }
+        self.frame_out = true;
+        self.shared
+            .is_none_or(|shared| !shared.swap(true, Ordering::Relaxed))
+    }
+}
+
+/// After a chunk write ([`StreamingProcessor::write_completion_chunk`]): a
+/// buffer left empty means the writer sent the full buffer itself (a first
+/// chunk past the flush size, the echo of a long prompt in front of the
+/// first token), so a frame of the unit is gone: it claims the body's first
+/// frame if it was the unit's first, and, the first token being among it,
+/// it is the first-token frame, whose hand-off the packed read's flush will
+/// not pay (the buffer is empty at the next poll): it is paid here, before
+/// the reading runs on into whatever the engine has ready behind the chunk,
+/// the one yield when the frame is the body's first and the two when it is
+/// not, as the read's flush pays it ([`StreamingProcessor::next_packed`]).
+async fn after_write(
+    buffer: &BytesMut,
+    first_frame: &mut BodysFirstFrame<'_>,
+    first_token_time: Option<Instant>,
+    first_token_out: &mut bool,
+) {
+    if !buffer.is_empty() {
+        return;
+    }
+    let bodys_first = first_frame.leaves();
+    if first_token_time.is_none() || *first_token_out {
+        return;
+    }
+    *first_token_out = true;
+    tokio::task::yield_now().await;
+    if !bodys_first {
+        tokio::task::yield_now().await;
     }
 }

@@ -331,6 +331,11 @@ impl ResponseProcessor {
             Some(messages::StopReason::EndTurn) if stop_sequence.is_some() => {
                 Some(messages::StopReason::StopSequence)
             }
+            // The reader's `max_tokens` is the engine's `length`: the budget
+            // or the window, told apart from the counts.
+            Some(messages::StopReason::MaxTokens) => Some(
+                request.length_stop_reason(complete.prompt_tokens(), complete.completion_tokens()),
+            ),
             stop_reason => stop_reason,
         };
         let stop_sequence = stop_sequence
@@ -373,7 +378,7 @@ impl ResponseProcessor {
         request_logprobs: bool,
     ) -> Result<(ChatCompletionResponse, response_formatting::TokenCounts), axum::response::Response>
     {
-        let started = generation_start(&execution_result, Instant::now());
+        let started = generation_start(&execution_result);
         let model = &dispatch.model;
         let reasoning_parser_name = self
             .parser_resolver
@@ -475,7 +480,10 @@ impl ResponseProcessor {
         // answer builds its usage chunk: with the reasoning tokens the
         // gateway's parser split off when it ran (zero included) and every
         // detail counter present as the OpenAI API sends it.
-        let counts = response_formatting::TokenCounts::of(&all_responses);
+        let counts = response_formatting::TokenCounts::of_collected(
+            &all_responses,
+            chat_request.expected_choices,
+        );
         let usage = response_formatting::chat_usage(
             counts.usage(),
             (reasoning_parser_available || chat_request.symphony.is_some())
@@ -676,7 +684,7 @@ impl ResponseProcessor {
         start_time: Instant,
         metrics_endpoint: &'static str,
     ) -> Result<Vec<GenerateResponse>, axum::response::Response> {
-        let started = generation_start(&execution_result, start_time);
+        let started = generation_start(&execution_result);
         // Collect all responses from the execution result
         let all_responses =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
@@ -774,7 +782,7 @@ impl ResponseProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<(Message, response_formatting::TokenCounts), axum::response::Response> {
-        let started = Instant::now();
+        let started = generation_start(&execution_result);
         let model = &dispatch.model;
         let reasoning_parser_name = self
             .parser_resolver
@@ -1057,9 +1065,14 @@ impl ResponseProcessor {
         let finish_reason_str = finish_after_local_stop(stopped, complete);
         let stop_sequence = matched_stop_string(stop_decoder, complete);
 
-        // Parsed calls do not override a truncation, as in Chat.
+        // Parsed calls do not override a truncation, as in Chat. The engines
+        // report the request's budget and the model's window alike as
+        // `length`; the spec tells them apart from the counts.
         let stop_reason = if finish_reason_str == "length" {
-            Some(messages::StopReason::MaxTokens)
+            Some(
+                messages_request
+                    .length_stop_reason(complete.prompt_tokens(), complete.completion_tokens()),
+            )
         } else if tool_calls.is_some() || finish_reason_str == "tool_calls" {
             Some(messages::StopReason::ToolUse)
         } else if stop_sequence.is_some() {
@@ -1105,18 +1118,20 @@ impl ResponseProcessor {
     /// Process non-streaming completion response
     ///
     /// Collects all responses (supports n>1 and batched prompts), decodes tokens
-    /// through the stop decoder, applies `echo` and `suffix`, and builds one
-    /// `CompletionResponse` with prompt-major global choice indices
-    /// (`prompt_index * n + choice_index`).
+    /// through the stop decoder, applies `echo` and `suffix`, lists each
+    /// choice's generated tokens' logprobs when the request asked for them,
+    /// and builds one `CompletionResponse` with prompt-major global choice
+    /// indices (`prompt_index * n + choice_index`).
     pub async fn process_non_streaming_completion_response(
         &self,
         execution_result: ExecutionResult,
         completion_req: CompletionResponseSpec,
         dispatch: DispatchMetadata,
+        tokenizer: &Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<CompletionResponse, axum::response::Response> {
-        let started = Instant::now();
-        let request_logprobs = completion_req.logprobs;
+        let started = generation_start(&execution_result);
+        let request_logprobs = completion_req.logprobs.is_some();
         let per_prompt_results = match execution_result {
             ExecutionResult::Batch { results } => results,
             other => vec![other],
@@ -1138,7 +1153,21 @@ impl ResponseProcessor {
         let mut total_cached = 0u32;
         let mut total_reasoning = 0u32;
         let mut total_spec_accepted = 0u32;
-        let mut total_spec_drafted = 0u32;
+        // Membership is per prompt: another prompt's choice cannot stand in
+        // for a missing terminal here. Borrow the collected frames so the
+        // shared proposal rule needs no intermediate allocation.
+        let spec_drafted =
+            response_formatting::known_spec_drafted(collected.iter().flatten().map(|complete| {
+                (
+                    complete.spec_accepted_tokens(),
+                    complete.spec_draft_tokens(),
+                )
+            }))
+            .filter(|_| {
+                collected.iter().all(|responses| {
+                    response_formatting::all_choices_completed(responses, choices_per_prompt)
+                })
+            });
         let mut choices = Vec::new();
 
         for (prompt_index, all_responses) in collected.into_iter().enumerate() {
@@ -1169,7 +1198,6 @@ impl ResponseProcessor {
                 total_completion += complete.completion_tokens();
                 total_reasoning += complete.reasoning_tokens();
                 total_spec_accepted += complete.spec_accepted_tokens();
-                total_spec_drafted += complete.spec_draft_tokens();
 
                 let finish_reason =
                     utils::completion_finish_reason(stopped, complete.finish_reason());
@@ -1191,10 +1219,29 @@ impl ResponseProcessor {
                     text.push_str(sfx);
                 }
 
+                // The generated tokens' logprobs when the request asked for
+                // them, as the engine reports them; their offsets count from
+                // the end of the echoed prompt.
+                let mut text_offset = if completion_req.echo {
+                    u32::try_from(prompt_text.chars().count()).unwrap_or(u32::MAX)
+                } else {
+                    0
+                };
+                let logprobs = completion_req.logprobs.and_then(|top_logprobs| {
+                    complete.output_logprobs().map(|proto_logprobs| {
+                        utils::convert_proto_to_completion_logprobs(
+                            proto_logprobs,
+                            tokenizer,
+                            top_logprobs,
+                            &mut text_offset,
+                        )
+                    })
+                });
+
                 choices.push(CompletionChoice {
                     text,
                     index: index_offset + i as u32,
-                    logprobs: None, // TODO: wire legacy LogProbs from backend token_logprobs
+                    logprobs,
                     finish_reason: Some(finish_reason.to_string()),
                     matched_stop,
                 });
@@ -1232,7 +1279,7 @@ impl ResponseProcessor {
                     cached: total_cached,
                     reasoning: total_reasoning,
                     spec_accepted: total_spec_accepted,
-                    spec_drafted: total_spec_drafted,
+                    spec_drafted,
                 }
                 .usage(),
             ),
@@ -1243,12 +1290,21 @@ impl ResponseProcessor {
 
 /// Where a collected answer's generation clock starts, as its streamed
 /// twin's does: at the prefill dispatch of a disaggregated pair (whose
-/// prefill may already have run when the answer is collected), else at
-/// `start`, the processor's entry or the stage's.
-fn generation_start(execution_result: &ExecutionResult, start: Instant) -> Instant {
+/// prefill may already have run when the answer is collected), or at the
+/// single RPC's dispatch. A batch uses its earliest member. The shapes
+/// that carry no dispatch instant (an embedding answer, an empty batch)
+/// read the clock here, so a generated answer reads it once, at the
+/// dispatch.
+pub(crate) fn generation_start(execution_result: &ExecutionResult) -> Instant {
     match execution_result {
+        ExecutionResult::Single { dispatch_start, .. } => *dispatch_start,
         ExecutionResult::PrefillDecode { pd_timing, .. } => pd_timing.prefill_start,
-        _ => start,
+        ExecutionResult::Batch { results } => results
+            .iter()
+            .map(generation_start)
+            .min()
+            .unwrap_or_else(Instant::now),
+        ExecutionResult::Embedding { .. } => Instant::now(),
     }
 }
 

@@ -1,6 +1,7 @@
 //! DeepSeek V4.1: reasoning between `<think>` and `</think>`, the calls of one turn between
 //! `<｜DSML｜ calls>` and `</｜DSML｜ calls>`, each call between `<｜DSML｜ invoke name="…">` and
-//! `</｜DSML｜ invoke>`, everything else content. The design's section 4 example, as recorded for
+//! `</｜DSML｜ invoke>`, an invoke written outside a block a call too, as the serving engines' own
+//! parsers read it, everything else content. The design's section 4 example, as recorded for
 //! `deepseek-ai/DeepSeek-V4.1-Flash`.
 //!
 //! The block's opener is spelled as the family's reference parser spells it: the blank line the
@@ -42,6 +43,17 @@ pub fn deepseek_v4_1() -> Format {
         .transition("content", "separated_calls_open", "calls")
         .transition("reasoning", "separated_calls_open", "calls")
         .transition("calls", "invoke_open", "invoke")
+        // An invoke the model writes outside a block is the call, as the serving engines' own
+        // parsers for the family read it (their machines start a call at the invoke's opener from
+        // the content as from the block); before this row the table kept such an invoke as
+        // content, its two tags counted as markers out of place, and the call was lost. The
+        // close leads into the block's wrapping state, as a block's invoke's does, so a second
+        // bare invoke is the next call and prose after a bare call is text between calls; a
+        // block opener met there is wrapping, as it is to the engines' machines, so a call the
+        // model writes bare and then again inside a block is two calls and no markup.
+        .transition("content", "invoke_open", "invoke")
+        .transition("calls", "calls_open", "calls")
+        .transition("calls", "separated_calls_open", "calls")
         .transition("invoke", "invoke_close", "calls")
         .transition("invoke", "invoke_open", "invoke")
         .transition("invoke", "calls_close", "content")
@@ -57,7 +69,10 @@ mod tests {
     use super::*;
     use crate::{
         ids::CallIds,
-        testing::{arguments_of, bytes, calls, content, dropped, reasoning},
+        testing::{
+            an_invoke_outside_a_block_reads_as_the_engines_do, arguments_of, bytes, calls, content,
+            dropped, reasoning, weather_tools,
+        },
     };
 
     fn ids() -> CallIds {
@@ -1035,5 +1050,52 @@ mod tests {
         // The reading and the writing agree on what the template puts before the block.
         let spelled = format!("{}<｜DSML｜ calls>", Tags::DSML.before_block);
         assert!(deepseek_v4_1().terminal_texts().any(|text| text == spelled));
+    }
+
+    /// Every shape of an invoke written outside a block (the shared
+    /// [`an_invoke_outside_a_block_reads_as_the_engines_do`] lists them) reads as the serving
+    /// engines' own parsers read it; the V4 table's notes say why.
+    #[test]
+    fn every_shape_of_an_invoke_written_outside_a_block_reads_as_the_engines_own_parsers_read_it() {
+        an_invoke_outside_a_block_reads_as_the_engines_do(
+            run,
+            concat!(
+                "<｜DSML｜ invoke name=\"add_integers\">\n",
+                "<｜DSML｜ parameter name=\"a\" string=\"false\">6</｜DSML｜ parameter>\n",
+                "<｜DSML｜ parameter name=\"b\" string=\"false\">8</｜DSML｜ parameter>\n",
+                "</｜DSML｜ invoke>"
+            ),
+            "<｜DSML｜ calls>",
+            "</｜DSML｜ calls>",
+            "<｜Assistant｜></think>",
+            "<｜Assistant｜><think>",
+        );
+    }
+
+    /// The rows from the content into an invoke change no forced-call tag: the grammar takes the
+    /// block from the wrapping state's row alone, so a forced call is still written as the block,
+    /// the block's opener with the template's blank line first, the invoke inside it, the block's
+    /// close last.
+    #[test]
+    fn a_forced_call_is_still_written_as_the_block() {
+        let payload = deepseek_v4_1()
+            .grammar(&weather_tools(), true, false)
+            .expect("a grammar")
+            .payload();
+        let elements = &payload["format"]["elements"];
+        assert_eq!(
+            elements[0],
+            serde_json::json!({"type": "const_string", "value": "\n\n<｜DSML｜ calls>\n"}),
+            "{payload}"
+        );
+        assert_eq!(
+            elements[1]["tags"][0]["begin"], "<｜DSML｜ invoke name=\"get_weather\">\n",
+            "{payload}"
+        );
+        assert_eq!(
+            elements[2],
+            serde_json::json!({"type": "const_string", "value": "</｜DSML｜ calls>"}),
+            "{payload}"
+        );
     }
 }

@@ -1,3 +1,5 @@
+use std::{future::Future, sync::mpsc};
+
 use llm_tokenizer::{chat_template::ChatTemplateContentFormat, traits::RendererCapabilities};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
@@ -71,6 +73,24 @@ fn process_chat_messages_rejects_unknown_content_parts() {
     assert!(error.contains("vendor_media"));
 }
 
+/// A refusal part is the assistant's: on any other role it is refused before
+/// the engine wire, as the unknown parts are, so no pipeline drops it.
+#[test]
+fn a_refusal_part_outside_an_assistant_turn_is_refused() {
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": [{"type": "refusal", "refusal": "I cannot."}]}
+    ]))
+    .unwrap();
+    let error = validate_chat_content_parts(&messages).unwrap_err();
+    assert!(error.contains("refusal"), "{error}");
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [{"type": "refusal", "refusal": "I cannot."}]}
+    ]))
+    .unwrap();
+    assert!(validate_chat_content_parts(&messages).is_ok());
+}
+
 #[test]
 fn known_chat_content_parts_are_accepted() {
     let messages: Vec<ChatMessage> = serde_json::from_value(json!([
@@ -83,10 +103,67 @@ fn known_chat_content_parts_are_accepted() {
             {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
         ]},
         {"role": "assistant", "content": null},
-        {"role": "function", "name": "lookup", "content": "result"}
+        {"role": "assistant", "content": [{"type": "refusal", "refusal": "I cannot."}]},
+        {"role": "function", "name": "lookup", "content": "result"},
+        {"role": "function", "name": "lookup", "content": null}
     ]))
     .unwrap();
     assert!(validate_chat_content_parts(&messages).is_ok());
+}
+
+/// A function result with `content: null` (the deprecated role's shape for a
+/// call that returned nothing) reaches the template as empty content in the
+/// template's own format, as a tool-call-only assistant turn does.
+#[test]
+fn a_function_result_without_content_reaches_the_template_as_empty_content() {
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "hi"},
+        {"role": "function", "name": "lookup", "content": null},
+        {"role": "function", "name": "lookup", "content": "found"}
+    ]))
+    .unwrap();
+    let as_string =
+        process_content_format(&messages, ChatTemplateContentFormat::String, None).unwrap();
+    assert_eq!(as_string[1]["content"], json!(""));
+    assert_eq!(as_string[2]["content"], json!("found"));
+    let as_parts =
+        process_content_format(&messages, ChatTemplateContentFormat::OpenAI, None).unwrap();
+    assert_eq!(as_parts[1]["content"], json!([]));
+    assert_eq!(as_parts[2]["content"], json!("found"));
+}
+
+/// A replayed assistant refusal part is the turn's text to the template, in
+/// the string format and in the parts format, as the engines' own servers
+/// hand it over; the text parts beside it keep their order.
+#[test]
+fn a_refusal_part_reaches_the_template_as_the_turns_text() {
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Sorry."},
+            {"type": "refusal", "refusal": "I cannot help with that."}
+        ]},
+        {"role": "user", "content": "ok"}
+    ]))
+    .unwrap();
+    let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
+    let as_string =
+        process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
+            .unwrap();
+    assert_eq!(
+        as_string[1]["content"],
+        json!("Sorry.\nI cannot help with that.")
+    );
+    let as_parts =
+        process_content_format(&messages, ChatTemplateContentFormat::OpenAI, Some(&tokens))
+            .unwrap();
+    assert_eq!(
+        as_parts[1]["content"],
+        json!([
+            {"type": "text", "text": "Sorry."},
+            {"type": "text", "text": "I cannot help with that."}
+        ])
+    );
 }
 
 #[test]
@@ -1305,7 +1382,7 @@ fn prefill_request() -> ChatCompletionRequest {
     .unwrap()
 }
 
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
+fn block_on<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1908,6 +1985,41 @@ fn deferred_renderer_gets_the_prefill_and_its_job_runs_in_the_tokenize_step() {
 }
 
 #[test]
+fn a_long_decode_takes_the_offload_path_and_a_short_one_runs_inline() {
+    use std::thread;
+
+    use crate::routers::grpc::testing::thread_recording_tokenizer;
+
+    // `block_on` polls on this thread, so an offloaded decode runs somewhere else.
+    let (tokenizer, ran_on) = thread_recording_tokenizer();
+    let hello = tokenizer.token_to_id("Hello").expect("mock vocab");
+    let decode = |ids: Vec<u32>| {
+        block_on(decode_ids_blocking(tokenizer.clone(), vec![ids], false))
+            .unwrap()
+            .remove(0)
+    };
+
+    let long = vec![hello; ENCODE_OFFLOAD_MIN_BYTES / size_of::<u32>()];
+    let expected = tokenizer.decode(&long, false).unwrap();
+    ran_on.lock().unwrap().clear();
+    assert_eq!(decode(long), expected);
+    let offloaded = ran_on.lock().unwrap().pop().expect("the decode ran");
+    assert_ne!(
+        offloaded,
+        thread::current().id(),
+        "a prompt of ids the size of a long text decodes off the worker thread"
+    );
+
+    assert_eq!(decode(vec![hello]), "Hello");
+    let inline = ran_on.lock().unwrap().pop().expect("the decode ran");
+    assert_eq!(
+        inline,
+        thread::current().id(),
+        "a short prompt of ids decodes inline"
+    );
+}
+
+#[test]
 fn deferred_encode_takes_the_offload_path_for_large_prompts() {
     use std::{
         sync::Mutex,
@@ -1956,6 +2068,175 @@ fn deferred_encode_takes_the_offload_path_for_large_prompts() {
         inline,
         thread::current().id(),
         "a small deferred encode runs inline"
+    );
+}
+
+#[test]
+fn a_conversation_of_a_few_kilobytes_is_encoded_on_the_request_thread() {
+    use std::{
+        sync::Mutex,
+        thread::{self, ThreadId},
+    };
+    // The job records the thread it ran on; `block_on` polls on this thread.
+    let ran_on: Arc<Mutex<Option<ThreadId>>> = Arc::new(Mutex::new(None));
+    let probe = {
+        let ran_on = ran_on.clone();
+        move || *ran_on.lock().unwrap() = Some(thread::current().id())
+    };
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+        llm_tokenizer::MockTokenizer::new()
+            .with_deferred_chat_ids(vec![1, 2])
+            .with_deferred_chat_probe(probe),
+    );
+    // A system prompt and two rounds of a conversation, about five kilobytes
+    // rendered: the shape of an ordinary multi-turn request, well above the
+    // old 512-byte threshold and below the one that protects the runtime.
+    let paragraph = |seed: usize| {
+        (0..350)
+            .map(|i| format!("w{}", (seed * 7 + i * 13) % 97))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "m",
+        "messages": [
+            {"role": "system", "content": paragraph(1)},
+            {"role": "user", "content": paragraph(2)},
+            {"role": "assistant", "content": paragraph(3)},
+            {"role": "user", "content": paragraph(4)}
+        ]
+    }))
+    .unwrap();
+    let (processed, encoding) =
+        process_with_derived_profile(&request, &*tokenizer, None, MediaPartOrder::MediaFirst)
+            .unwrap();
+    assert!(
+        processed.text.len() > 4 * 1024 && processed.text.len() < ENCODE_OFFLOAD_MIN_BYTES,
+        "the rendered conversation is a few kilobytes ({} bytes), under the threshold",
+        processed.text.len()
+    );
+    block_on(encode_prompt_blocking(
+        tokenizer.clone(),
+        &processed.text,
+        encoding,
+    ))
+    .unwrap();
+    let ran = ran_on.lock().unwrap().take().expect("the job ran");
+    assert_eq!(
+        ran,
+        thread::current().id(),
+        "a conversation of a few kilobytes is encoded on the thread that holds the request, \
+         not handed to the blocking pool"
+    );
+}
+
+#[test]
+fn a_batch_encodes_in_place_up_to_the_bound_and_the_rest_on_the_pool() {
+    use std::thread;
+
+    use crate::routers::grpc::testing::thread_recording_tokenizer;
+
+    // `block_on` polls on this thread, so an encode in place runs here and an
+    // offloaded one somewhere else.
+    let (tokenizer, ran_on) = thread_recording_tokenizer();
+    let here = thread::current().id();
+    let batch = |texts: Vec<String>| {
+        block_on(encode_texts_blocking(tokenizer.clone(), &texts, false)).unwrap();
+        std::mem::take(&mut *ran_on.lock().unwrap())
+    };
+
+    // Sixty-four prompts of twelve kibibytes, the shape of a completion batch:
+    // each alone is under the bound, the batch is forty times over it.
+    let long = "word ".repeat(12 * 1024 / 5);
+    assert!(long.len() < ENCODE_OFFLOAD_MIN_BYTES && 2 * long.len() > ENCODE_OFFLOAD_MIN_BYTES);
+    let threads = batch(vec![long; 64]);
+    assert_eq!(threads.len(), 64, "every prompt of the batch is encoded");
+    assert_eq!(
+        threads.iter().filter(|t| **t == here).count(),
+        1,
+        "one prompt of the batch fits the bound in place; the other sixty-three go to the pool"
+    );
+
+    // Sixty-four short prompts, under the bound in total, all stay in place.
+    let threads = batch(vec!["hello there".to_string(); 64]);
+    assert_eq!(threads.len(), 64);
+    assert!(
+        threads.iter().all(|t| *t == here),
+        "a batch under the bound in total is encoded on the thread that holds the request"
+    );
+}
+
+/// An input under the break-even size never takes the pool: once a call's
+/// share is spent it yields the worker and starts the next share, whether the
+/// call awaits its inputs one by one (a tokenize call of many short texts)
+/// or joins them, where the join runs about one share per poll pass.
+#[test]
+fn short_inputs_after_a_spent_share_stay_in_place_and_yield_instead() {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+        thread,
+    };
+
+    use crate::routers::grpc::testing::thread_recording_tokenizer;
+
+    /// The polls a future took to complete: one per yield of the call.
+    struct Polls<F>(Pin<Box<F>>, usize);
+    impl<F: Future> Future for Polls<F> {
+        type Output = (F::Output, usize);
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.1 += 1;
+            match self.0.as_mut().poll(cx) {
+                Poll::Ready(output) => Poll::Ready((output, self.1)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    let (tokenizer, ran_on) = thread_recording_tokenizer();
+    let here = thread::current().id();
+    let spends_the_share = "word ".repeat((ENCODE_OFFLOAD_MIN_BYTES - 512) / 5);
+    let short = "word ".repeat(20); // 100 bytes, under the break-even size
+    let texts = vec![short; 2_000]; // 200 KB in all: twelve shares and a bit
+
+    // One by one, as the tokenize loop awaits them.
+    let mut budget = InPlaceBudget::default();
+    block_on(async {
+        encode_blocking_in_batch(tokenizer.clone(), &spends_the_share, false, &mut budget)
+            .await
+            .unwrap();
+        for text in &texts {
+            encode_blocking_in_batch(tokenizer.clone(), text, false, &mut budget)
+                .await
+                .unwrap();
+        }
+    });
+    let threads = std::mem::take(&mut *ran_on.lock().unwrap());
+    assert_eq!(threads.len(), 2_001);
+    assert!(
+        threads.iter().all(|t| *t == here),
+        "a short input is never sent to the pool, spent share or not"
+    );
+
+    // As one call's batch, placed in one pass.
+    let ((), polls) = block_on(Polls(
+        Box::pin(async {
+            encode_texts_blocking(tokenizer.clone(), &texts, false)
+                .await
+                .unwrap();
+        }),
+        0,
+    ));
+    let threads = std::mem::take(&mut *ran_on.lock().unwrap());
+    assert_eq!(
+        threads.len(),
+        2_000,
+        "each input of the batch is encoded exactly once"
+    );
+    assert!(threads.iter().all(|t| *t == here));
+    assert!(
+        (12..=16).contains(&polls),
+        "the batch runs about one share of short inputs per pass and yields between passes: {polls} passes"
     );
 }
 
@@ -2163,4 +2444,144 @@ fn a_tool_declared_without_a_schema_reaches_the_template_with_a_null_schema() {
             "{pass} render"
         );
     }
+}
+
+/// A tokenizer that records, for every encode, the thread it ran on and the
+/// address of the text it was handed: the caller's own buffer, or a copy.
+struct RecordsEncodes {
+    inner: llm_tokenizer::MockTokenizer,
+    seen: parking_lot::Mutex<Vec<(std::thread::ThreadId, usize)>>,
+}
+
+impl RecordsEncodes {
+    fn new() -> Self {
+        Self {
+            inner: llm_tokenizer::MockTokenizer::new(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl llm_tokenizer::traits::Encoder for RecordsEncodes {
+    fn encode(&self, input: &str, add_special_tokens: bool) -> anyhow::Result<Encoding> {
+        self.seen
+            .lock()
+            .push((std::thread::current().id(), input.as_ptr() as usize));
+        self.inner.encode(input, add_special_tokens)
+    }
+
+    fn encode_batch(
+        &self,
+        inputs: &[&str],
+        add_special_tokens: bool,
+    ) -> anyhow::Result<Vec<Encoding>> {
+        self.inner.encode_batch(inputs, add_special_tokens)
+    }
+}
+
+impl llm_tokenizer::traits::Decoder for RecordsEncodes {
+    fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+        self.inner.decode(token_ids, skip_special_tokens)
+    }
+}
+
+impl Tokenizer for RecordsEncodes {
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    fn get_special_tokens(&self) -> &llm_tokenizer::traits::SpecialTokens {
+        self.inner.get_special_tokens()
+    }
+
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[test]
+fn a_prompt_below_the_offload_threshold_is_encoded_from_the_callers_own_text() {
+    let recorder = Arc::new(RecordsEncodes::new());
+    let tokenizer: Arc<dyn Tokenizer> = Arc::clone(&recorder) as Arc<dyn Tokenizer>;
+    let short = "a".repeat(ENCODE_OFFLOAD_MIN_BYTES - 1);
+    let long = "a".repeat(ENCODE_OFFLOAD_MIN_BYTES);
+    block_on(encode_prompt_blocking(
+        Arc::clone(&tokenizer),
+        &short,
+        PromptEncoding::FromText,
+    ))
+    .unwrap();
+    block_on(encode_prompt_blocking(
+        tokenizer,
+        &long,
+        PromptEncoding::FromText,
+    ))
+    .unwrap();
+    let seen = recorder.seen.lock();
+    let here = std::thread::current().id();
+    assert_eq!(
+        seen[0],
+        (here, short.as_ptr() as usize),
+        "a prompt below the threshold encodes in place, from the caller's own text, not a copy"
+    );
+    assert_ne!(
+        seen[1].0, here,
+        "a prompt at the threshold encodes on the blocking pool"
+    );
+    assert_ne!(
+        seen[1].1,
+        long.as_ptr() as usize,
+        "the blocking task reads a copy of its own, which outlives the caller's borrow"
+    );
+}
+
+/// A pool call dropped while its job runs keeps the job's permit until the
+/// blocking work ends: a pass ended by one input's error, or dropped by a
+/// client gone, still counts its running jobs against the bound. The bound is
+/// read after the drop and judged only once the job has been let go, so a
+/// regression fails the test instead of hanging the runtime's shutdown on the
+/// parked job.
+#[test]
+fn a_dropped_pool_call_holds_its_permit_until_the_blocking_work_ends() {
+    static PERMITS: Semaphore = Semaphore::const_new(1);
+    let (started, running) = mpsc::channel::<()>();
+    let (release, released) = mpsc::channel::<()>();
+    block_on(async {
+        {
+            let mut call = std::pin::pin!(pool_on(&PERMITS, move || {
+                started.send(()).ok();
+                released.recv_timeout(Duration::from_secs(10)).ok();
+                anyhow::Ok(())
+            }));
+            // One poll takes the permit and hands the job to the blocking pool.
+            assert!(futures::poll!(call.as_mut()).is_pending());
+            assert!(
+                running.recv_timeout(Duration::from_secs(10)).is_ok(),
+                "the job started"
+            );
+            assert_eq!(PERMITS.available_permits(), 0);
+        }
+        // The future is gone while the job still runs: read the bound, then let the job end.
+        let available_after_the_drop = PERMITS.available_permits();
+        release.send(()).ok();
+        for _ in 0..10_000 {
+            if PERMITS.available_permits() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(PERMITS.available_permits(), 1, "the permit never returned");
+        assert_eq!(
+            available_after_the_drop, 0,
+            "the permit returned before the work ended"
+        );
+    });
 }

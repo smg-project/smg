@@ -17,7 +17,7 @@ use smg_grpc_client::{
 use tonic::{Request, Response, Status};
 
 use super::{generate, info, State};
-use crate::{kv_events, rpc, BoxStream};
+use crate::{kv_events, rpc, servicer::RequestOrigin, BoxStream};
 
 #[derive(Clone)]
 pub(super) struct TokenSpeedService {
@@ -56,7 +56,8 @@ impl TokenSpeedScheduler for TokenSpeedService {
                 "Generate is unavailable on TokenSpeed encode workers",
             ));
         }
-        let stream = generate::generate(&self.state, request.into_inner()).await;
+        let stream =
+            generate::generate(&self.state, request.into_inner(), RequestOrigin::Client).await;
         rpc::generated(&self.state, stream)
     }
 
@@ -64,7 +65,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         _request: Request<ts::HealthCheckRequest>,
     ) -> Result<Response<ts::HealthCheckResponse>, Status> {
-        Ok(Response::new(info::health_check(&self.state)))
+        Ok(Response::new(info::health_check(&self.state).await))
     }
 
     async fn abort(
@@ -73,14 +74,23 @@ impl TokenSpeedScheduler for TokenSpeedService {
     ) -> Result<Response<ts::AbortResponse>, Status> {
         let request = request.into_inner();
         // The choices of an `n > 1` request live under the one registration,
-        // so aborting the parent id ends every choice.
-        self.state
+        // so aborting the parent id ends every choice. An unknown or finished
+        // id is reported as the Python servicer reports it.
+        let found = self
+            .state
             .shared
             .registry
             .abort(std::slice::from_ref(&request.request_id))?;
-        Ok(Response::new(ts::AbortResponse {
-            success: true,
-            message: format!("aborted {}", request.request_id),
+        Ok(Response::new(if found > 0 {
+            ts::AbortResponse {
+                success: true,
+                message: format!("aborted {}", request.request_id),
+            }
+        } else {
+            ts::AbortResponse {
+                success: false,
+                message: format!("Request {} not found", request.request_id),
+            }
         }))
     }
 

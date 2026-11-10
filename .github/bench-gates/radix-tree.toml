@@ -32,8 +32,45 @@
 # run is slower than every base run). Whether the insert rows should be gated at all, gated at the
 # rule's numbers, or run with more repeats is an open decision; this header records the numbers.
 
+#
+# Placement. The workflow's benchmark job builds its binaries, the gate's pair and the summary
+# run's, with every function and every hot loop on a 64-byte boundary (RUSTFLAGS:
+# `-C llvm-args=-align-all-functions=6 -C llvm-args=-align-loops=64`, beside the outliner flag
+# of .cargo/config.toml; LLVM's block placement aligns the loop blocks it marks hot and leaves
+# cold blocks and loops entered by a hot fall-through on its 16-byte default, so a short-trip
+# hot loop can still move between placement classes).
+# symphony.toml records why: identical code sits in one of two speed states chosen by where its
+# unchanged hot functions land modulo 64, and a pull request's code size alone moved them. Under the
+# function flag (#5371; the two reads of this paragraph were measured with functions aligned only
+# and predate the loop flag) this gate's null read (the same bytes twice, three interleaved runs a
+# side on one core, 72 ids) read 0 failed, 0 suspect with a largest change of medians of +14.6 %,
+# so the thresholds stand. An inserted regression on the path the rows run (one dependent
+# multiply-add per 12 input bytes in the string tree walks, per 4 tokens in the token tree walks
+# and 96 per chain-index key) is caught: 41 of 72 failed, string insert +53 to +95 %, string match
+# 8 of 9 at +30 to +35 %, token insert +45 to +61 %, token match +38 to +67 %, the 10-worker
+# chain-index lookups +29 to +51 %.
+# Under the 25 % threshold: string_match_10w_4096c at +24.8 %, the 100-worker lookups at +10 to +12
+# % and the 500-worker lookups at +2 to +3 % (their cost is the worker scoring), and the store rows
+# within 6 % (allocation and generation).
+# The loop flag came after the function flag, from a pull request whose token insert did main's
+# work (+10 instructions per 4,096-token re-insert by differencing, the same 7-instruction compare
+# loop under line tables) and read the six 1024/4096 token_insert ids +27.8 to +33.1 % on the
+# hosted runner: its smaller code in front of the 21-byte compare loop had moved the loop from
+# bytes 32-52 of a 64-byte line to across a line boundary, which the function flag does not govern
+# (LLVM places loops on 16 bytes). With both flags the same two sources read +2.9 to +10.0 % on
+# those ids (five interleaved runs a side on one core). The flag is this gate's, applied where it
+# is measured: symphony.toml records that aligning loops parks both arms of its scanner in the
+# slower state and hides an inserted regression there, and the other gates' regression reads were
+# taken with functions aligned only.
+
 repeats = 3
 filter = "^benchmark_summary/(indexer|string|token)_(match|insert|store)_"
+
+# The files that feed this binary beyond the measured crate: the base side is built with them as the
+# pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
+# gated rows through the binary's inlining (symphony.toml records the case). A new row goes to a
+# bench target of its own.
+sources = ["model_gateway/benches/radix_tree_benchmark.rs"]
 
 [[gate]]
 pattern = "^benchmark_summary/"

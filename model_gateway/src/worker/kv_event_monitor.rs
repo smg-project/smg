@@ -625,9 +625,7 @@ pub mod bench_support {
 
         /// Apply every event of `batch`, as an admitted batch is applied.
         pub fn apply(&mut self, index: &KvIndex, batch: &KvEventBatch) {
-            for event in &batch.events {
-                KvEventMonitor::apply_event(event, self.worker, index, &mut self.state);
-            }
+            KvEventMonitor::apply_events(&batch.events, self.worker, index, &mut self.state);
         }
 
         /// The worker leaves: its blocks go with it.
@@ -966,7 +964,15 @@ mod tests {
                 gauge(&handle, "smg_kv_index_engine_conflicts", "chain"),
                 Some(0.0)
             );
+            assert_eq!(
+                gauge(&handle, "smg_kv_index_cap_refusals", "chain"),
+                Some(0.0)
+            );
             assert!(gauge(&handle, "smg_kv_index_arena_bytes", "chain").is_some_and(|b| b > 0.0));
+            // The arena holds whole chunks: what it holds is at least what it handed out.
+            let handed_out = gauge(&handle, "smg_kv_index_arena_bytes", "chain").expect("arena");
+            assert!(gauge(&handle, "smg_kv_index_arena_chunk_bytes", "chain")
+                .is_some_and(|held| held >= handed_out));
             assert!(gauge(&handle, "smg_kv_index_slab_bytes", "chain").is_some_and(|b| b > 0.0));
         });
     }
@@ -1038,6 +1044,14 @@ mod tests {
                     ),
                     ("smg_kv_event_sub_block_stores_total", vec![("worker", url)]),
                     ("smg_kv_event_sub_block_blocks_total", vec![("worker", url)]),
+                    (
+                        "smg_kv_event_cap_refused_stores_total",
+                        vec![("worker", url)],
+                    ),
+                    (
+                        "smg_kv_event_cap_refused_blocks_total",
+                        vec![("worker", url)],
+                    ),
                     ("smg_kv_event_degraded_ranks", vec![("worker", url)]),
                     (
                         "smg_kv_index_moved_hashes",
@@ -1045,6 +1059,10 @@ mod tests {
                     ),
                     (
                         "smg_kv_index_engine_conflicts",
+                        vec![("model", UNKNOWN_MODEL_ID)],
+                    ),
+                    (
+                        "smg_kv_index_cap_refusals",
                         vec![("model", UNKNOWN_MODEL_ID)],
                     ),
                     (
@@ -1135,6 +1153,7 @@ mod tests {
                     "smg_kv_index_blocks_live",
                     "smg_kv_index_runs_live",
                     "smg_kv_index_arena_bytes",
+                    "smg_kv_index_arena_chunk_bytes",
                     "smg_kv_index_slab_bytes",
                     "smg_kv_block_size_tokens",
                 ] {

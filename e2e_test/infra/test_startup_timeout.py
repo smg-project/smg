@@ -414,7 +414,7 @@ def test_collection_finish_checks_actual_paths_and_declared_minimum(monkeypatch)
     reporter = config.pluginmanager.get_plugin("e2e_selection_reporter")
     chat = Path(__file__).resolve().parents[1] / "chat_completions"
     item = SimpleNamespace(path=chat / "test_chat.py", nodeid="chat::selected")
-    session = SimpleNamespace(config=config, items=[item] * 202)
+    session = SimpleNamespace(config=config, items=[item] * 202, testsfailed=0)
     reporter.pytest_collection_finish(session)
     session.items = [item] * 201
     with pytest.raises(pytest.exit.Exception, match="floor of 202"):

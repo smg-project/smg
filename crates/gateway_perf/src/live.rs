@@ -57,10 +57,13 @@ fn quantile(v: &Value, group: &str, q: &str) -> Option<f64> {
     v.get(group).and_then(|g| g.get(q)).and_then(Value::as_f64)
 }
 
-/// Whether a step holds the SLO, with the reasons it does not.
+/// Whether a step holds the SLO, with the reasons it does not. A request the client
+/// skipped or cut off at its drain counts as an error with the failed ones: it has no
+/// latency sample, so the quantiles alone would judge the step on the survivors.
 pub fn judge_step(summary: &Value, cpu_s: f64, offered: f64, slo: &Slo) -> Step {
     let sent = count(summary, "sent");
-    let failed = count(summary, "failed") + count(summary, "skipped");
+    let failed =
+        count(summary, "failed") + count(summary, "skipped") + count(summary, "unfinished");
     let ttft = quantile(summary, "ttft_ms", "p99");
     let e2e = quantile(summary, "e2e_ms", "p99");
     let achieved = summary
@@ -182,6 +185,7 @@ fn run_step(
         &answers(
             spec,
             (offered * (ramp.step_seconds + ramp.step_warmup + 2) as f64) as usize + 256,
+            settings.bed.fleet.wire(),
         ),
     )?;
     thread::sleep(Duration::from_secs(1));
@@ -426,6 +430,28 @@ mod tests {
                 .any(|r| r == "TTFT p99 None > 100.0 ms"),
             "{:?}",
             empty.reasons
+        );
+    }
+
+    #[test]
+    fn a_request_the_drain_cut_off_counts_as_an_error() {
+        let summary = json!({
+            "sent": 1_000,
+            "ok": 999,
+            "failed": 0,
+            "skipped": 0,
+            "unfinished": 1,
+            "achieved_rps": 400.0,
+            "ttft_ms": {"p50": 1.0, "p99": 5.0},
+            "e2e_ms": {"p50": 2.0, "p99": 10.0},
+        });
+        let cut = judge_step(&summary, 0.5, 400.0, &slo());
+        assert!(!cut.holds);
+        assert_eq!(cut.reasons.len(), 1, "{:?}", cut.reasons);
+        assert!(
+            cut.reasons[0].starts_with("errors 1/1000 > "),
+            "{:?}",
+            cut.reasons
         );
     }
 

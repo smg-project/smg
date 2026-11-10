@@ -12,6 +12,7 @@ This module handles:
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 from infra import (
@@ -452,9 +453,11 @@ def _enforce_selection_floor(selected_count: int) -> None:
         pytest.exit(
             f"e2e selection: only {selected_count} "
             f"{'test' if selected_count == 1 else 'tests'} selected, below the "
-            f"E2E_MIN_SELECTED floor of {floor}. The E2E_ENGINE/E2E_VENDOR/"
-            f"E2E_GPU_TIER env filter in e2e_test/fixtures/hooks.py is the "
-            f"likely cause (marker drift or a lane env-var typo).",
+            f"E2E_MIN_SELECTED floor of {floor}. The count is what runs after "
+            f"the E2E_ENGINE/E2E_VENDOR/E2E_GPU_TIER env filter in "
+            f"e2e_test/fixtures/hooks.py and the command line's -k/-m filter; "
+            f"a filter that matches too little (marker drift, a lane env-var "
+            f"typo, a renamed test id) is the likely cause.",
             returncode=1,
         )
 
@@ -485,7 +488,8 @@ def _format_selection_line(stats: dict) -> str:
 
 
 class _SelectionReporter:
-    """Report selection and enforce ``E2E_AMD_REQUIRE_PASSING_CALL`` at exit.
+    """Report selection, apply the ``E2E_MIN_SELECTED`` floor at collection
+    finish and enforce ``E2E_AMD_REQUIRE_PASSING_CALL`` at exit.
 
     Lives on the plugin manager (registered in ``pytest_configure``) because
     ``hooks.py`` is not a conftest, so a module-level
@@ -495,12 +499,6 @@ class _SelectionReporter:
     def __init__(self) -> None:
         self.require_passing_call = os.environ.get("E2E_AMD_REQUIRE_PASSING_CALL") == "1"
         self.passing_calls = 0
-
-    def pytest_collection_finish(self, session: pytest.Session) -> None:
-        if os.environ.get("E2E_STARTUP_PROFILE", "").strip():
-            validate_startup_profile_selection(session.config, session.items)
-            get_startup_profile()
-            _enforce_selection_floor(len(session.items))
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
         if report.when == "call" and report.passed:
@@ -527,6 +525,28 @@ class _SelectionReporter:
             return None
         return _format_selection_line(stats)
 
+    def pytest_collection_finish(self, session: pytest.Session) -> None:
+        """Apply the ``E2E_MIN_SELECTED`` floor to what will run.
+
+        ``session.items`` is the selection after every
+        ``pytest_collection_modifyitems`` hook, the env filter above and
+        pytest's own ``-k``/``-m`` deselection included. A count taken in
+        the env filter's hook saw the set before ``-k``: a lane whose filter
+        selects 26 of 133 compared its floor with 133.
+        """
+        if sys.exc_info()[0] is not None or session.testsfailed:
+            # pytest calls this hook from the ``finally`` of
+            # ``Session.perform_collect``, so it also runs while collection is
+            # unwinding from its own error (a missing path, a failing hook, an
+            # interrupt), and a module that fails to import is a recorded
+            # collection error that pytest reports after this hook. A floor
+            # exit here would replace that error's own message and exit code.
+            return
+        if os.environ.get("E2E_STARTUP_PROFILE", "").strip():
+            validate_startup_profile_selection(session.config, session.items)
+            get_startup_profile()
+        _enforce_selection_floor(len(session.items))
+
 
 def pytest_collection_modifyitems(
     config: pytest.Config,
@@ -541,8 +561,9 @@ def pytest_collection_modifyitems(
 
     Every dropped item is reported through ``pytest_deselected`` (so terminal
     output shows ``N deselected`` instead of silently running fewer tests than
-    collected) and tallied into the ``e2e selection:`` summary line. When
-    ``E2E_MIN_SELECTED`` is set, a final selection below it aborts the session.
+    collected) and tallied into the ``e2e selection:`` summary line. The
+    ``E2E_MIN_SELECTED`` floor is applied by ``_SelectionReporter`` at
+    collection finish, after pytest's own ``-k``/``-m`` deselection.
 
     Ordering: items are sorted by ``(backend, model)`` so consecutive
     classes that share a backend cluster together. This is what lets
@@ -625,7 +646,10 @@ def pytest_collection_modifyitems(
     config.stash[_SELECTION_STATS_KEY] = stats
 
     items.sort(key=_pool_sort_key)
-    _enforce_selection_floor(len(items))
+    # The E2E_MIN_SELECTED floor is applied by _SelectionReporter at
+    # collection finish, after pytest's own -k and -m deselection: this hook
+    # runs before the mark plugin's, so a count taken here would miss the
+    # filter a lane passes on its command line.
 
 
 def _pool_sort_key(item: pytest.Item) -> tuple:
