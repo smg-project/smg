@@ -338,10 +338,9 @@ impl StopSequenceDecoder {
             // is released as the stream's end releases it (a character the
             // stop cut short as `Sequence::finish` renders it); a string stop
             // within that text takes precedence. The stop token itself never
-            // goes through the
-            // decoder: a visible stop's own text is decoded on its own first
-            // (the steps that can fail run before anything is appended to
-            // `out`) and follows the held text.
+            // goes through the decoder: a visible stop's own text is decoded
+            // on its own first (the steps that can fail run before anything
+            // is appended to `out`) and follows the held text.
             let stop_text = if visible_stop && !hidden_stop {
                 Some(
                     self.sequence
