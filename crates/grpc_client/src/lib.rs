@@ -36,7 +36,7 @@ use std::sync::Arc;
 pub use abort_on_drop::{AbortOnDropClient, AbortOnDropStream};
 pub use channel::{
     connect_channel, connect_channel_with_timeout, is_transport_failure, normalize_grpc_endpoint,
-    DEFAULT_CONNECT_TIMEOUT,
+    Channel, DEFAULT_CONNECT_TIMEOUT,
 };
 pub use constraint_failure::{
     constraint_failed_status, is_constraint_failure, CONSTRAINT_FAILED_METADATA_KEY,
@@ -346,12 +346,14 @@ macro_rules! impl_engine_client_basics {
             endpoint: &str,
             trace_injector: $crate::BoxedTraceInjector,
         ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-            tracing::debug!(
-                "Connecting to {} gRPC server at {}",
-                $display_name,
-                endpoint
-            );
             let channel = $crate::channel::connect_channel(endpoint).await?;
+            // After the dial, so the line names the peer as the channel does
+            // (host and port): the endpoint as given may carry userinfo.
+            tracing::debug!(
+                "Connected to {} gRPC server at {}",
+                $display_name,
+                channel.peer()
+            );
             let client = <$proto_client>::new(channel);
             Ok(Self {
                 client,

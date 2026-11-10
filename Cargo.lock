@@ -7843,8 +7843,7 @@ version = "1.16.0"
 dependencies = [
  "futures",
  "h2",
- "hyper",
- "hyper-util",
+ "http-body",
  "openai-protocol",
  "prost",
  "prost-types",
@@ -7857,7 +7856,6 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
- "tower",
  "tracing",
  "zip",
 ]

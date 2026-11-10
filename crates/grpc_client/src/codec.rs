@@ -131,9 +131,8 @@ mod tests {
     };
 
     use futures::{future::ready, stream};
-    use hyper::body::Body;
     use prost::bytes::Bytes;
-    use tonic::codec::EncodeBody;
+    use tonic::{codec::EncodeBody, codegen::Body};
 
     use super::*;
     use crate::{

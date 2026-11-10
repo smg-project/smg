@@ -3,10 +3,11 @@ use openai_protocol::{
     messages::CreateMessageRequest, responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::debug;
 
 use crate::{
+    channel::Channel,
     request_fields::{logit_bias_by_token_id, OutputConstraint},
     BoxedTraceInjector,
 };
