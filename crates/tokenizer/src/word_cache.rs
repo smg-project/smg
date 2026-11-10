@@ -19,14 +19,22 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    de::{self, DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize, Serializer,
+};
+use serde_json::{Map, Value};
 use tokenizers::{
     decoders::DecoderWrapper,
-    models::{ModelWrapper, TrainerWrapper},
+    models::{
+        bpe::{Vocab, BPE},
+        ModelWrapper, TrainerWrapper,
+    },
     normalizers::NormalizerWrapper,
     pre_tokenizers::PreTokenizerWrapper,
     processors::PostProcessorWrapper,
@@ -105,8 +113,204 @@ impl From<LateBoundModel> for ModelWrapper {
 }
 
 impl<'de> Deserialize<'de> for LateBoundModel {
+    /// The file's model section, read in one pass (see [`ModelSection`]).
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        ModelWrapper::deserialize(deserializer).map(Self::from)
+        deserializer.deserialize_map(ModelSection).map(Self::from)
+    }
+}
+
+/// The model section of a tokenizer file, read in one pass.
+///
+/// The `tokenizers` crate reads the section through an untagged helper:
+/// serde buffers the whole section (the vocabulary map, the merge list) as
+/// its generic content, the helper copies that into a `serde_json::Value`
+/// tree and builds the model's tables from the tree, with the merge list
+/// buffered once more on the way. Four copies of a 150k-entry vocabulary
+/// are alive at once, 60-80 MB of transients for an 11 MB file, a third of
+/// the load's time; and they are freed into the allocator's dirty-page
+/// cache right before the model's own tables and the loader's are placed,
+/// which then sit on recycled pages with their size-class tails resident
+/// for the life of the process.
+///
+/// A BPE section, whose `type` key comes first in every file the crate
+/// writes, streams here: the vocabulary into its hash map, the merges into
+/// their list, both handed to the crate's own builder, so the model is the
+/// one the crate builds from the same file. Any other section (another
+/// model kind, a file without the `type` key or with it later) is collected
+/// and handed to the crate's own reader, as before.
+struct ModelSection;
+
+impl<'de> Visitor<'de> for ModelSection {
+    type Value = ModelWrapper;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a tokenizer model section")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ModelWrapper, A::Error> {
+        let mut collected = Map::new();
+        if let Some(key) = map.next_key::<String>()? {
+            if key == "type" {
+                let kind: String = map.next_value()?;
+                if kind == "BPE" {
+                    return bpe_section(map).map(ModelWrapper::BPE);
+                }
+                collected.insert(key, Value::String(kind));
+            } else {
+                let value: Value = map.next_value()?;
+                collected.insert(key, value);
+            }
+        }
+        while let Some((key, value)) = map.next_entry::<String, Value>()? {
+            collected.insert(key, value);
+        }
+        ModelWrapper::deserialize(Value::Object(collected)).map_err(A::Error::custom)
+    }
+}
+
+/// The rest of a BPE section after its `type`, fed to the crate's builder
+/// field by field: the fields, their defaults and the skipping of unknown
+/// ones are the crate's own (`tokenizers::models::bpe::serialization`).
+fn bpe_section<'de, A: MapAccess<'de>>(mut map: A) -> Result<BPE, A::Error> {
+    let mut builder = BPE::builder();
+    let mut vocab: Option<Vocab> = None;
+    let mut merges: Option<Vec<(String, String)>> = None;
+    while let Some(key) = map.next_key::<String>()? {
+        match key.as_str() {
+            "dropout" => {
+                if let Some(dropout) = map.next_value::<Option<f32>>()? {
+                    builder = builder.dropout(dropout);
+                }
+            }
+            "unk_token" => {
+                if let Some(token) = map.next_value::<Option<String>>()? {
+                    builder = builder.unk_token(token);
+                }
+            }
+            "continuing_subword_prefix" => {
+                if let Some(prefix) = map.next_value::<Option<String>>()? {
+                    builder = builder.continuing_subword_prefix(prefix);
+                }
+            }
+            "end_of_word_suffix" => {
+                if let Some(suffix) = map.next_value::<Option<String>>()? {
+                    builder = builder.end_of_word_suffix(suffix);
+                }
+            }
+            "fuse_unk" => {
+                if let Some(fuse) = map.next_value::<Option<bool>>()? {
+                    builder = builder.fuse_unk(fuse);
+                }
+            }
+            "byte_fallback" => {
+                if let Some(fallback) = map.next_value::<Option<bool>>()? {
+                    builder = builder.byte_fallback(fallback);
+                }
+            }
+            "ignore_merges" => {
+                if let Some(ignore) = map.next_value::<Option<bool>>()? {
+                    builder = builder.ignore_merges(ignore);
+                }
+            }
+            "vocab" => vocab = Some(map.next_value()?),
+            // The merge list is about the vocabulary's size, which the files
+            // write first: one allocation for the list, no growth copies.
+            "merges" => {
+                let about = vocab.as_ref().map_or(0, |vocab| vocab.len());
+                merges = Some(map.next_value_seed(MergeList { about })?);
+            }
+            "type" => {
+                let kind: String = map.next_value()?;
+                if kind != "BPE" {
+                    return Err(A::Error::invalid_value(de::Unexpected::Str(&kind), &"BPE"));
+                }
+            }
+            _ => {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+    }
+    let (Some(vocab), Some(merges)) = (vocab, merges) else {
+        return Err(A::Error::custom("Missing vocab/merges"));
+    };
+    builder
+        .vocab_and_merges(vocab, merges)
+        .build()
+        .map_err(A::Error::custom)
+}
+
+/// The merge list of a BPE section: each merge a pair `["a", "b"]`, or in
+/// the older files one line `"a b"` (a `#version` line among them is
+/// skipped, as the crate's reader of that form skips it).
+struct MergeList {
+    /// How many merges to expect when the list gives no count.
+    about: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for MergeList {
+    type Value = Vec<(String, String)>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for MergeList {
+    type Value = Vec<(String, String)>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a list of merges")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut merges = Vec::with_capacity(seq.size_hint().unwrap_or(self.about));
+        while let Some(Merge(merge)) = seq.next_element()? {
+            merges.extend(merge);
+        }
+        Ok(merges)
+    }
+}
+
+/// One merge as the file spells it; `None` for a `#version` line.
+struct Merge(Option<(String, String)>);
+
+impl<'de> Deserialize<'de> for Merge {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(MergeSpelling)
+    }
+}
+
+struct MergeSpelling;
+
+impl<'de> Visitor<'de> for MergeSpelling {
+    type Value = Merge;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a merge: a pair of pieces, or one string with a space between them")
+    }
+
+    fn visit_str<E: de::Error>(self, line: &str) -> Result<Merge, E> {
+        if line.starts_with("#version") {
+            return Ok(Merge(None));
+        }
+        let mut pieces = line.split(' ');
+        match (pieces.next(), pieces.next(), pieces.next()) {
+            (Some(a), Some(b), None) => Ok(Merge(Some((a.to_string(), b.to_string())))),
+            _ => Err(E::invalid_value(de::Unexpected::Str(line), &self)),
+        }
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Merge, A::Error> {
+        let a: String = seq
+            .next_element()?
+            .ok_or_else(|| A::Error::invalid_length(0, &self))?;
+        let b: String = seq
+            .next_element()?
+            .ok_or_else(|| A::Error::invalid_length(1, &self))?;
+        if seq.next_element::<IgnoredAny>()?.is_some() {
+            return Err(A::Error::invalid_length(3, &self));
+        }
+        Ok(Merge(Some((a, b))))
     }
 }
 
@@ -151,7 +355,12 @@ impl Model for LateBoundModel {
 #[cfg(test)]
 mod tests {
     use tokenizers::{
-        models::bpe::{Vocab, BPE},
+        models::{
+            bpe::{Vocab, BPE},
+            unigram::Unigram,
+            wordlevel::WordLevel,
+            wordpiece::WordPiece,
+        },
         pre_tokenizers::whitespace::Whitespace,
         AddedToken, Tokenizer,
     };
@@ -216,5 +425,143 @@ mod tests {
                 .expect("the rebuilt tokenizer serializes"),
             json
         );
+    }
+
+    /// The model as the file spells it, through the crate's own reader.
+    fn crate_reading(json: &str) -> String {
+        let model: ModelWrapper = serde_json::from_str(json).expect("the crate reads the section");
+        serde_json::to_string(&model).expect("the model serializes")
+    }
+
+    /// The model as the file spells it, through the loading model's reader.
+    fn loading_reading(json: &str) -> String {
+        let late: LateBoundModel =
+            serde_json::from_str(json).expect("the loading model reads the section");
+        serde_json::to_string(&late).expect("the model serializes")
+    }
+
+    /// A BPE with every field off its default: what the one-pass read must
+    /// carry through to the builder.
+    fn full_bpe_json() -> String {
+        let mut vocab = Vocab::default();
+        for (id, token) in ["<unk>", "a", "_b</w>", "ab</w>"].into_iter().enumerate() {
+            vocab.insert(token.to_string(), id as u32);
+        }
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, vec![("a".to_string(), "_b</w>".to_string())])
+            .dropout(0.25)
+            .unk_token("<unk>".to_string())
+            .continuing_subword_prefix("_".to_string())
+            .end_of_word_suffix("</w>".to_string())
+            .fuse_unk(true)
+            .byte_fallback(true)
+            .ignore_merges(true)
+            .build()
+            .expect("a BPE with every field set");
+        serde_json::to_string(&ModelWrapper::BPE(bpe)).expect("the model serializes")
+    }
+
+    #[test]
+    fn a_bpe_section_streams_into_the_model_the_crate_builds() {
+        let json = full_bpe_json();
+        assert!(json.starts_with(r#"{"type":"BPE","dropout":0.25,"unk_token":"<unk>""#));
+        assert_eq!(loading_reading(&json), json);
+        assert_eq!(crate_reading(&json), json);
+        let plain = serde_json::to_string(&ModelWrapper::BPE(letters())).expect("serializes");
+        assert_eq!(loading_reading(&plain), plain);
+    }
+
+    #[test]
+    fn the_older_merge_spelling_and_an_unknown_field_read_as_the_crate_reads_them() {
+        let json = full_bpe_json();
+        let older = json.replace(
+            r#""merges":[["a","_b</w>"]]"#,
+            r##""merges":["#version: 0.2","a _b</w>"]"##,
+        );
+        assert_ne!(
+            older, json,
+            "the merge list was rewritten in the older spelling"
+        );
+        assert_eq!(loading_reading(&older), json);
+        assert_eq!(crate_reading(&older), json);
+        let unknown = json.replace(
+            r#""dropout":0.25,"#,
+            r#""dropout":0.25,"future":{"x":[1,2]},"#,
+        );
+        assert_ne!(unknown, json);
+        assert_eq!(loading_reading(&unknown), json);
+        assert_eq!(crate_reading(&unknown), json);
+    }
+
+    #[test]
+    fn a_merge_that_is_not_two_pieces_is_refused() {
+        let json = full_bpe_json();
+        for merges in [r#"["a b c"]"#, r#"[["a","_b</w>","c"]]"#, r#"[["a"]]"#] {
+            let broken = json.replace(r#"[["a","_b</w>"]]"#, merges);
+            assert_ne!(broken, json);
+            assert!(
+                serde_json::from_str::<LateBoundModel>(&broken).is_err(),
+                "{merges} read as a merge list"
+            );
+        }
+    }
+
+    #[test]
+    fn another_model_kind_or_a_type_key_later_takes_the_crate_reader() {
+        let mut words = Vocab::default();
+        for (id, token) in ["[UNK]", "a", "b"].into_iter().enumerate() {
+            words.insert(token.to_string(), id as u32);
+        }
+        let word_level = WordLevel::builder()
+            .vocab(words.clone())
+            .unk_token("[UNK]".to_string())
+            .build()
+            .expect("a word-level model");
+        let word_piece = WordPiece::builder()
+            .vocab(words)
+            .unk_token("[UNK]".to_string())
+            .build()
+            .expect("a word-piece model");
+        let unigram = Unigram::from(
+            vec![("<unk>".to_string(), 0.0), ("a".to_string(), -1.0)],
+            Some(0),
+            false,
+        )
+        .expect("a unigram model");
+        for model in [
+            ModelWrapper::WordLevel(word_level),
+            ModelWrapper::WordPiece(word_piece),
+            ModelWrapper::Unigram(unigram),
+        ] {
+            let json = serde_json::to_string(&model).expect("the model serializes");
+            assert_eq!(loading_reading(&json), json);
+        }
+        // The `type` key after the fields, and a file without it (the
+        // crate's older files): the crate's reader decides, as before.
+        for json in [full_bpe_json(), {
+            let mut words = Vocab::default();
+            words.insert("[UNK]".to_string(), 0);
+            let model = WordPiece::builder()
+                .vocab(words)
+                .unk_token("[UNK]".to_string())
+                .build()
+                .expect("a word-piece model");
+            serde_json::to_string(&ModelWrapper::WordPiece(model)).expect("serializes")
+        }] {
+            let mut section: Map<String, Value> =
+                serde_json::from_str(&json).expect("the section is a map");
+            let kind = section
+                .shift_remove("type")
+                .expect("the section names its type");
+            let without_type = serde_json::to_string(&section).expect("serializes");
+            section.insert("type".to_string(), kind);
+            let type_last = serde_json::to_string(&section).expect("serializes");
+            assert!(
+                type_last.ends_with(r#""type":"BPE"}"#)
+                    || type_last.ends_with(r#""type":"WordPiece"}"#)
+            );
+            assert_eq!(loading_reading(&type_last), json);
+            assert_eq!(loading_reading(&without_type), crate_reading(&without_type));
+        }
     }
 }
