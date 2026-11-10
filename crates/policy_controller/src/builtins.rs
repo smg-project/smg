@@ -5,6 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
 
 use crate::{
     decision::{Target, Targets, MAX_TARGETS},
@@ -221,7 +222,7 @@ impl Scorer for PrefixAffinity {
     }
 }
 
-/// Dispatches to one worker no report reflects yet, oldest first.
+/// Dispatches to one rank row no report reflects yet, oldest first.
 #[derive(Debug, Default)]
 struct SinceReport {
     tokens: u64,
@@ -229,7 +230,7 @@ struct SinceReport {
     dispatches: VecDeque<(u64, u32)>,
 }
 
-/// Dispatches kept per worker between reports.
+/// Dispatches kept per rank row between reports.
 const SINCE_REPORT_KEPT: usize = 8_192;
 
 impl SinceReport {
@@ -261,15 +262,25 @@ impl SinceReport {
     }
 }
 
+/// A candidate row's identity in the tally: the worker and the DP rank. A row
+/// is one worker or one rank of a data-parallel worker, and a rank's report
+/// and credit are its own (design 4.1: a rank is a candidate), so two ranks of
+/// one worker never share an entry. The id is a fingerprint already, so the
+/// tally hashes the pair with the repository's fast hasher: the default
+/// hasher's second block over the two-word key cost the credited decision 3
+/// to 8 % at 64 and 512 rows.
+type RankKey = (WorkerId, u16);
+
 /// The expected wait: token-work over drain rate plus a convex KV-pressure
 /// barrier, the since-report dispatch credit water-filling arrivals between
-/// reports. The host's in-flight count floors the report.
+/// reports. The host's in-flight count floors the report. The credit tally is
+/// per rank row.
 #[derive(Debug)]
 pub struct LeastLoad {
     pub kv_pressure_weight: f32,
     pub mean_prefill_tokens: u32,
     pub default_throughput: f32,
-    tally: Mutex<HashMap<WorkerId, SinceReport>>,
+    tally: Mutex<FxHashMap<RankKey, SinceReport>>,
 }
 
 impl LeastLoad {
@@ -282,15 +293,26 @@ impl LeastLoad {
             } else {
                 1.0
             },
-            tally: Mutex::new(HashMap::new()),
+            tally: Mutex::new(FxHashMap::default()),
         }
     }
 
-    /// Dispatches no report reflects yet on `worker`, for tests and dumps.
+    /// Dispatches no report reflects yet on `worker`, over every rank of it,
+    /// for tests and dumps.
     pub fn held(&self, worker: WorkerId) -> usize {
         self.tally
             .lock()
-            .get(&worker)
+            .iter()
+            .filter(|((id, _), _)| *id == worker)
+            .map(|(_, d)| d.dispatches.len())
+            .sum()
+    }
+
+    /// Dispatches no report reflects yet on one rank of `worker`.
+    pub fn held_at(&self, worker: WorkerId, dp_rank: u16) -> usize {
+        self.tally
+            .lock()
+            .get(&(worker, dp_rank))
             .map_or(0, |d| d.dispatches.len())
     }
 
@@ -355,26 +377,34 @@ impl Lifecycle for LeastLoad {
         side: Side,
         since_decision_micros: u32,
     ) {
-        // The decode side of a pair target is the pair's decode worker; the
+        // The decode side of a pair target is the pair's decode rank; the
         // target itself is the prefill. The credit dates from the dispatch,
         // so a report sampled while a queue held the decision does not
         // release it.
-        let worker = match side {
-            Side::Decode => target.pair.map_or(target.id, |p| p.decode_id),
-            Side::Single | Side::Prefill | Side::Encode => target.id,
+        let rank: RankKey = match side {
+            Side::Decode => target.pair.map_or((target.id, target.dp_rank), |p| {
+                (p.decode_id, p.decode_dp_rank)
+            }),
+            Side::Single | Side::Prefill | Side::Encode => (target.id, target.dp_rank),
         };
         let dispatched_micros = lease.issued_micros + u64::from(since_decision_micros);
         let mut tally = self.tally.lock();
         tally
-            .entry(worker)
+            .entry(rank)
             .or_default()
             .record(dispatched_micros, lease.tokens);
     }
 
     fn on_membership(&self, change: &Membership<'_>) {
         match change {
-            Membership::Removed(id) | Membership::Replaced { old: id, .. } => {
-                self.tally.lock().remove(id);
+            // Every rank of the worker goes with it. A resized worker's ranks
+            // are a new set: what a vanished rank held would never release,
+            // and a kept rank's next report is one interval away. Rare, so a
+            // walk over the tally is cheaper than a second index per worker.
+            Membership::Removed(id)
+            | Membership::Replaced { old: id, .. }
+            | Membership::Resized(id) => {
+                self.tally.lock().retain(|(worker, _), _| worker != id);
             }
             // A snapshot (every worker of every pool, after a resync) stands
             // for removals that may never have arrived: only its ids keep a
@@ -384,9 +414,9 @@ impl Lifecycle for LeastLoad {
                 sorted.sort_unstable();
                 self.tally
                     .lock()
-                    .retain(|id, _| sorted.binary_search(&id.0).is_ok());
+                    .retain(|(worker, _), _| sorted.binary_search(&worker.0).is_ok());
             }
-            Membership::Added(_) | Membership::Relabelled(_) | Membership::Resized(_) => {}
+            Membership::Added(_) | Membership::Relabelled(_) => {}
         }
     }
 }
@@ -425,7 +455,7 @@ impl Scorer for LeastLoad {
                 let c = &candidates[i as usize];
                 *slot = match c.load {
                     Some(_) => {
-                        let (tokens, requests) = match tally.get_mut(&c.id) {
+                        let (tokens, requests) = match tally.get_mut(&(c.id, c.dp_rank)) {
                             Some(d) => {
                                 d.release_through(c.load_sampled_at_micros);
                                 (d.tokens, d.requests)
@@ -1181,6 +1211,76 @@ mod tests {
         };
         scorer.on_dispatched(&lease, &single, Side::Single, 0);
         assert_eq!(scorer.held(WorkerId(1)), 2);
+    }
+
+    #[test]
+    fn two_ranks_of_one_worker_are_credited_and_released_apart() {
+        let ll = LeastLoad::new(0.15, 1024, 2000.0);
+        let mut pool = [candidate(0, 0), candidate(1, 0)];
+        for (rank, c) in pool.iter_mut().enumerate() {
+            c.id = WorkerId(7);
+            c.dp_rank = rank as u16;
+            c.dp_size = 2;
+            c.load = Some(report(0, 0));
+            c.load_sampled_at_micros = 1_000;
+        }
+        let lease = Lease {
+            issued_micros: 2_000,
+            tokens: 8_192,
+            ..Lease::default()
+        };
+        // A dispatch to rank 0 is rank 0's credit alone.
+        ll.on_dispatched(&lease, &target_of(&pool[0]), Side::Single, 0);
+        assert_eq!(
+            (ll.held_at(WorkerId(7), 0), ll.held_at(WorkerId(7), 1)),
+            (1, 0)
+        );
+        assert_eq!(ll.held(WorkerId(7)), 1);
+        let mut scores = [0.0f32; 2];
+        ll.score(&RequestFacts::default(), &pool, &kept(2), &mut scores);
+        assert_eq!(
+            scores,
+            [0.0, 1.0],
+            "the credited rank costs more than its idle sibling"
+        );
+        // Rank 1's later report releases nothing of rank 0's.
+        pool[1].load_sampled_at_micros = 3_000;
+        ll.score(&RequestFacts::default(), &pool, &kept(2), &mut scores);
+        assert_eq!(
+            ll.held_at(WorkerId(7), 0),
+            1,
+            "a sibling rank's report is not this rank's"
+        );
+        assert_eq!(scores, [0.0, 1.0]);
+        // Rank 0's own report sampled after the dispatch does.
+        pool[0].load_sampled_at_micros = 3_000;
+        ll.score(&RequestFacts::default(), &pool, &kept(2), &mut scores);
+        assert_eq!(ll.held(WorkerId(7)), 0);
+        assert_eq!(scores, [1.0, 1.0]);
+        // The decode side of a pair credits the decode's own rank.
+        let pair = Target {
+            position: 0,
+            id: WorkerId(1),
+            dp_rank: 0,
+            pair: Some(crate::decision::Pair {
+                decode_position: 1,
+                decode_id: WorkerId(7),
+                decode_dp_rank: 1,
+            }),
+        };
+        ll.on_dispatched(&lease, &pair, Side::Decode, 0);
+        assert_eq!(
+            (ll.held_at(WorkerId(7), 0), ll.held_at(WorkerId(7), 1)),
+            (0, 1)
+        );
+        // A resize starts every rank of the worker over; a removal takes them.
+        ll.on_dispatched(&lease, &target_of(&pool[0]), Side::Single, 0);
+        ll.on_membership(&Membership::Resized(WorkerId(7)));
+        assert_eq!(ll.held(WorkerId(7)), 0);
+        ll.on_dispatched(&lease, &target_of(&pool[0]), Side::Single, 0);
+        ll.on_dispatched(&lease, &pair, Side::Decode, 0);
+        ll.on_membership(&Membership::Removed(WorkerId(7)));
+        assert_eq!(ll.held(WorkerId(7)), 0);
     }
 
     #[test]

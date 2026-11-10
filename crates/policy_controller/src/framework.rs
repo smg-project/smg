@@ -496,7 +496,10 @@ impl Engine {
     /// decode profile over the decodes of the chosen prefill's pair class. A
     /// prefill whose partners leave no decode is passed over for the next
     /// prefill target; the targets list carries the chosen pair first and the
-    /// alternate decodes of the same prefill after it.
+    /// alternate decodes of the same prefill after it. Pair class `0` is
+    /// outside any pairing on either side: such a decode partners nobody and
+    /// such a prefill is dropped at the `partnered` stage, so a host that
+    /// leaves the classes unset sheds instead of pairing all with all.
     pub fn decide_pair(
         &self,
         facts: &RequestFacts<'_>,
@@ -538,17 +541,19 @@ impl Engine {
         };
         // The prefill pool narrows to the prefills with a partner the decode
         // profile's hard filters keep, before the prefill picker truncates to
-        // its targets: a pair that exists is found.
+        // its targets: a pair that exists is found. A decode of class 0 is
+        // outside any pairing and partners nobody.
         scratch.classes.clear();
         scratch.classes.extend(
             decodes
                 .iter()
                 .filter(|d| {
-                    decode_profile
-                        .filters
-                        .iter()
-                        .filter(|f| !f.soft())
-                        .all(|f| f.keep(&decode_facts, d, decode_cx))
+                    d.pair_class != 0
+                        && decode_profile
+                            .filters
+                            .iter()
+                            .filter(|f| !f.soft())
+                            .all(|f| f.keep(&decode_facts, d, decode_cx))
                 })
                 .map(|d| d.pair_class),
         );
@@ -572,27 +577,29 @@ impl Engine {
             // own stages say about the partners of the prefills the prefill
             // filters keep (those were dropped by the partnered test alone):
             // a saturated decode fleet is saturation, not a missing endpoint,
-            // and a class with no decode at all is "partnered". When no
-            // prefill passes its own filters, the prefill side's stage is
-            // named instead. A picker's decline passes through.
+            // and a class with no decode at all is "partnered", as is a
+            // routable prefill of class 0. When no prefill passes its own
+            // filters, the prefill side's stage is named instead. A picker's
+            // decline passes through.
             if let Decision::Shed(prefill_shed) = &prefill {
                 if prefill_shed.reason != ShedReason::PolicyDeclined {
+                    let mut routable = 0usize;
                     scratch.classes.clear();
-                    scratch.classes.extend(
-                        prefills
+                    for c in prefills.iter().filter(|c| {
+                        prefill_profile
+                            .filters
                             .iter()
-                            .filter(|c| {
-                                prefill_profile
-                                    .filters
-                                    .iter()
-                                    .filter(|f| !f.soft())
-                                    .all(|f| f.keep(&prefill_facts, c, cx))
-                            })
-                            .map(|c| c.pair_class),
-                    );
+                            .filter(|f| !f.soft())
+                            .all(|f| f.keep(&prefill_facts, c, cx))
+                    }) {
+                        routable += 1;
+                        if c.pair_class != 0 {
+                            scratch.classes.push(c.pair_class);
+                        }
+                    }
                     scratch.classes.sort_unstable();
                     scratch.classes.dedup();
-                    if scratch.classes.is_empty() {
+                    if routable == 0 {
                         let stage = emptied_by(
                             prefill_profile,
                             &prefill_facts,
@@ -605,6 +612,9 @@ impl Engine {
                             },
                         );
                         return shed(reason_of(stage), stage, prefill_shed.trace);
+                    }
+                    if scratch.classes.is_empty() {
+                        return shed(ShedReason::NoEndpoints, "partnered", prefill_shed.trace);
                     }
                     let stage = emptied_by(
                         decode_profile,
@@ -1291,10 +1301,86 @@ mod tests {
         );
         let mut prefills = [candidate(0, 0)];
         prefills[0].position = 5;
-        let decodes = [candidate(0, 0)];
+        prefills[0].pair_class = 7;
+        let mut decodes = [candidate(0, 0)];
+        decodes[0].pair_class = 7;
         match decide_pair(&engine, &prefills, &decodes) {
             Decision::Shed(shed) => assert_eq!(shed.emptied_by, "partners"),
             other => panic!("a misplaced prefill answered {other:?}"),
+        }
+    }
+
+    #[test]
+    fn class_zero_is_outside_any_pairing_on_either_side() {
+        // A host that leaves the classes unset: a class-0 prefill over a
+        // healthy class-0 decode sheds at the partnered stage instead of
+        // pairing all with all.
+        let engine = Engine::new(
+            vec![strict_profile()],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        );
+        let prefills = [candidate(0, 0)];
+        let decodes = [candidate(0, 0)];
+        match decide_pair(&engine, &prefills, &decodes) {
+            Decision::Shed(shed) => {
+                assert_eq!(shed.emptied_by, "partnered");
+                assert_eq!(shed.reason, ShedReason::NoEndpoints);
+            }
+            other => panic!("two class-0 rows answered {other:?}"),
+        }
+        // A prefill of a class over decodes of class 0 alone: no partner.
+        let mut classed = [candidate(0, 0)];
+        classed[0].pair_class = 7;
+        match decide_pair(&engine, &classed, &decodes) {
+            Decision::Shed(shed) => assert_eq!(shed.emptied_by, "partnered"),
+            other => panic!("a class-0 decode partnered {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_class_zero_prefill_is_passed_over_for_a_classed_one() {
+        // A just-admitted prefill with no class yet beside a classed one
+        // whose decode is up: the pair is the classed one's, for every seed,
+        // and the class-0 decode is no alternate.
+        let engine = Engine::new(
+            vec![strict_profile()],
+            vec![pair_binding()],
+            1,
+            Needs::default(),
+        );
+        let mut prefills = [candidate(0, 0), candidate(1, 0)];
+        prefills[1].pair_class = 7;
+        let mut decodes = [candidate(0, 0), candidate(1, 0)];
+        decodes[1].pair_class = 7;
+        for seed in 0..20u64 {
+            let facts = RequestFacts {
+                model: "m",
+                seed,
+                ..RequestFacts::default()
+            };
+            let mut scratch = Scratch::new();
+            let decision = engine.decide_pair(
+                &facts,
+                &PoolFacts::default(),
+                PairPools {
+                    prefills: &prefills,
+                    decodes: &decodes,
+                },
+                &Constraints::default(),
+                &Constraints::default(),
+                &mut scratch,
+            );
+            let pick = decision.pick().expect("the classed prefill pairs");
+            let first = pick.targets.first().expect("a target");
+            assert_eq!(first.position, 1, "seed {seed}");
+            assert_eq!(
+                first.pair.map(|p| p.decode_position),
+                Some(1),
+                "seed {seed}"
+            );
+            assert_eq!(pick.targets.len(), 1, "the class-0 decode is no alternate");
         }
     }
 

@@ -12,6 +12,7 @@ categories = ["algorithms"]
 # No workspace crate: the engine knows nothing about its host (a gateway, a
 # controller, a binding).
 parking_lot = { workspace = true }
+rustc-hash = "2"
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 

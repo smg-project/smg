@@ -1,8 +1,10 @@
 //! The engine's cost per decision: the view build and the decision at 8, 64
-//! and 512 candidates, per preset. Ids: `policy_engine/view_build/<n>` and
-//! `policy_engine/decide/<preset>/<n>`. The view is built from a synthetic
-//! per-worker state the way a host reads its routing state; the decision
-//! runs with a fresh seed per iteration so the drawing pickers draw.
+//! and 512 candidates, per preset, and the least-load decision with a credit
+//! held per row. Ids: `policy_engine/view_build/<n>`,
+//! `policy_engine/decide/<preset>/<n>` and
+//! `policy_engine/decide/least_load_credited/<n>`. The view is built from a
+//! synthetic per-worker state the way a host reads its routing state; the
+//! decision runs with a fresh seed per iteration so the drawing pickers draw.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer; a preset that fails to validate is a bug the unit tests catch"
@@ -12,8 +14,8 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use smg_policy_controller::{
-    Candidate, Constraints, Engine, Health, LoadRow, PolicySpec, PoolFacts, RequestFacts, Scratch,
-    SignalSource, WorkerId, PRESETS,
+    Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow, PolicySpec, PoolFacts,
+    RequestFacts, Scratch, Side, SignalSource, Target, WorkerId, PRESETS,
 };
 
 /// What a host reads per worker before it writes a row.
@@ -131,6 +133,51 @@ fn decide(c: &mut Criterion) {
                 });
             });
         }
+    }
+    // The least-load decision with one dispatch credit per row in the tally,
+    // as between two reports under load: every decision reads and ages each
+    // reporting row's entry. The credits date after every sample instant, so
+    // no decision releases them.
+    let engine = engine_of("least_load");
+    for &n in &SIZES {
+        let fleet = fleet(n);
+        let mut view = Vec::with_capacity(n);
+        build_view(&fleet, &mut view);
+        let lease = Lease {
+            issued_micros: 1_000_000,
+            tokens: 512,
+            ..Lease::default()
+        };
+        for c in &view {
+            let target = Target {
+                position: c.position,
+                id: c.id,
+                dp_rank: c.dp_rank,
+                pair: None,
+            };
+            engine.on_dispatched(&lease, &target, Side::Single, 0);
+        }
+        let mut scratch = Scratch::new();
+        let pool = PoolFacts {
+            pool_size: n as u32,
+            generation: 1,
+            ..PoolFacts::default()
+        };
+        let cx = Constraints::default();
+        group.bench_with_input(BenchmarkId::new("least_load_credited", n), &n, |b, _| {
+            let mut seed = 0u64;
+            b.iter(|| {
+                seed += 1;
+                let facts = RequestFacts {
+                    model: "m",
+                    prompt_tokens: 512,
+                    seed,
+                    now_micros: 1_000_000,
+                    ..RequestFacts::default()
+                };
+                engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
+            });
+        });
     }
     group.finish();
 }
