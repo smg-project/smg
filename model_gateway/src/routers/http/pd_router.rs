@@ -976,8 +976,23 @@ impl PDRouter {
             serde_json::from_value::<openai_protocol::completion::CompletionResponse>(child.clone())
                 .is_ok()
         } else {
-            serde_json::from_value::<openai_protocol::chat::ChatCompletionResponse>(child.clone())
-                .is_ok()
+            // Engines may explicitly send null for this optional wire field.
+            // Apply the typed schema's default only to the validation copy;
+            // retain the original child (including null) in the aggregate.
+            let mut validation_child = child.clone();
+            if validation_child
+                .get("service_tier")
+                .is_some_and(Value::is_null)
+            {
+                validation_child
+                    .as_object_mut()
+                    .ok_or(())?
+                    .remove("service_tier");
+            }
+            serde_json::from_value::<openai_protocol::chat::ChatCompletionResponse>(
+                validation_child,
+            )
+            .is_ok()
         };
         if !valid_schema {
             return Err(());
@@ -5165,7 +5180,7 @@ mod tests {
             };
         }
         json!({
-            "id": body["request_id"], "created": 1, "model": "m",
+            "id": body["request_id"], "created": 1, "model": "m", "service_tier": null,
             "object": if route == "/v1/completions" { "text_completion" } else { "chat.completion" },
             "choices": [choice],
             "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7,
@@ -5208,6 +5223,7 @@ mod tests {
                         Some("index") => reply["choices"][0]["index"] = json!(1),
                         Some("finish") => reply["choices"][0]["finish_reason"] = Value::Null,
                         Some("model") => reply["model"] = json!("other-model"),
+                        Some("service_tier") => reply["service_tier"] = json!(42),
                         Some("schema") => {
                             reply["choices"][0]["message"] = json!({"role": "user", "content": 42});
                         }
@@ -5272,6 +5288,8 @@ mod tests {
                     .await
                     .unwrap();
                 let answer: Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(answer.as_object().unwrap().contains_key("service_tier"));
+                assert!(answer["service_tier"].is_null(), "preserve child wire null");
                 let choices = answer["choices"].as_array().unwrap();
                 assert_eq!(choices.len(), n);
                 for (index, choice) in choices.iter().enumerate() {
@@ -5328,6 +5346,7 @@ mod tests {
             "index",
             "finish",
             "model",
+            "service_tier",
             "schema",
             "count",
             "total",
