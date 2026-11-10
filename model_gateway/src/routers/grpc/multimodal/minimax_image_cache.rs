@@ -115,16 +115,27 @@ pub(super) async fn preprocess(
             if direct && !admit {
                 return Ok(batch);
             }
-            let items = split_batch(&batch, &layouts, misses.len())?;
+            // A lone miss in a mixed or repeated request already has the
+            // cache entry's layout. Move it instead of slicing a full copy.
+            let items = if !direct
+                && misses.len() == 1
+                && batch.batch_size() == 1
+                && batch.feature_token_counts.len() == 1
+            {
+                vec![batch]
+            } else {
+                let items = split_batch(&batch, &layouts, misses.len())?;
+                if direct {
+                    cold_batch = Some(batch);
+                }
+                items
+            };
             for ((index, key), preprocessed) in misses.into_iter().zip(items) {
                 let entry = Arc::new(CachedPreprocessedItem { preprocessed });
                 if admit {
                     inserts.push((key, Arc::clone(&entry)));
                 }
                 parts[index] = Some(entry);
-            }
-            if direct {
-                cold_batch = Some(batch);
             }
         }
 
