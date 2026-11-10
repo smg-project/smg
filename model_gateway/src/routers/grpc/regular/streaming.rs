@@ -29,7 +29,6 @@ use openai_protocol::{
         self, ContentBlock, ContentBlockDelta, Message, MessageDelta, MessageDeltaUsage,
         MessageStreamEvent,
     },
-    profile::ProviderProfile,
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
 use serde::Serialize;
@@ -73,6 +72,7 @@ use crate::{
             },
             utils,
             utils::{isolation::isolated, message_utils},
+            wire::StreamShape,
         },
     },
     worker::{GuardedStream, PrefillLoadGuard},
@@ -425,10 +425,10 @@ impl StreamingProcessor {
             chat_request.ignore_eos,
         );
 
-        // MiniMax's stream-QoS contract bounds per-event delta sizes. The HTTP
-        // relay re-slices the upstream body; here the gateway encodes the
-        // frames itself, so the channel is re-chunked on its way out.
-        let rechunk = chat_request.provider == ProviderProfile::Minimax;
+        // A wire that bounds its events' delta sizes (MiniMax's) has the
+        // channel re-chunked on its way out: the HTTP relay re-slices the
+        // upstream body, here the gateway encodes the frames itself.
+        let rechunk = chat_request.wire.rechunks_sse();
 
         // The body's channel: the reading parks on it until the body took
         // the frame before (see `driven_channel`).
@@ -3112,7 +3112,7 @@ impl StreamingProcessor {
     }
 }
 
-/// Add the provider's null placeholder without allocating a JSON value per
+/// Add the wire's null placeholder without allocating a JSON value per
 /// token or changing the shared Chat response type. A populated usage field
 /// is serialized only by `chunk`, so there is never a duplicate JSON key.
 #[derive(Serialize)]
@@ -3237,13 +3237,10 @@ struct ChatStream<'a> {
     start_time: Instant,
     first_token_time: Option<Instant>,
 
-    /// DeepSeek always reports aggregate usage on the final finish chunk;
-    /// the public dialect ends the stream with a usage-only chunk when
-    /// `include_usage` asks for one. Under `include_usage` every chunk that
-    /// carries no usage writes the `usage: null` placeholder, as the public
-    /// API does (`emit_usage_null`).
-    deepseek_usage: bool,
-    include_usage: bool,
+    /// The wire's rules for this stream, resolved once when it opened
+    /// (`Wire::stream`).
+    shape: StreamShape,
+    /// `shape.usage_null_placeholder`, read as every chunk is written.
     emit_usage_null: bool,
     continuous_usage: Option<ChatStreamUsage>,
 
@@ -3332,21 +3329,11 @@ impl<'a> ChatStream<'a> {
             ignore_eos,
         );
 
-        let deepseek_usage = spec.provider == ProviderProfile::DeepSeek;
-        let include_usage = spec
-            .stream_options
-            .as_ref()
-            .is_some_and(|opts| opts.include_usage.unwrap_or(false));
-        let emit_usage_null = include_usage;
-        let mut continuous_usage = spec
-            .stream_options
-            .as_ref()
-            .filter(|opts| {
-                !deepseek_usage
-                    && opts.include_usage.unwrap_or(false)
-                    && opts.continuous_usage_stats.unwrap_or(false)
-            })
-            .map(|_| ChatStreamUsage::new(spec.expected_choices));
+        // The wire's rules for this stream, decided once here.
+        let shape = spec.wire.stream(spec.stream_options.as_ref());
+        let mut continuous_usage = shape
+            .continuous_usage
+            .then(|| ChatStreamUsage::new(spec.expected_choices));
 
         let reasoning_parser_name = processor
             .parser_resolver
@@ -3424,9 +3411,8 @@ impl<'a> ChatStream<'a> {
             pd_timing,
             start_time,
             first_token_time: None,
-            deepseek_usage,
-            include_usage,
-            emit_usage_null,
+            shape,
+            emit_usage_null: shape.usage_null_placeholder,
             continuous_usage,
             reasoning_parser_name,
             tool_parser_name,
@@ -4490,11 +4476,11 @@ impl<'a> ChatStream<'a> {
         }
     }
 
-    /// The stream's usage when the client asked for one, from
-    /// [`Self::counts`]. Built by the non-streamed answer's builder: the
-    /// usage chunk carries the usage object that answer carries.
+    /// The stream's usage when its wire reports one, from [`Self::counts`].
+    /// Built by the non-streamed answer's builder: the usage chunk carries
+    /// the usage object that answer carries.
     fn final_usage(&self) -> Option<Usage> {
-        (self.deepseek_usage || self.include_usage).then(|| {
+        self.shape.reports_usage.then(|| {
             chat_usage(
                 self.counts().usage(),
                 (self.reasoning_parser_available || self.spec.symphony.is_some()).then(|| {
@@ -4542,11 +4528,14 @@ impl<'a> ChatStream<'a> {
 
             let matched_stop_value = choice.matched_stop.clone();
 
-            let finish_usage = if self.deepseek_usage && complete_usage && position == finished {
-                final_usage.cloned()
-            } else {
-                usage.cloned()
-            };
+            // The wire says which finish chunk carries the final usage
+            // (DeepSeek's last one).
+            let finish_usage =
+                if complete_usage && self.shape.final_usage_on.carries(position, finished) {
+                    final_usage.cloned()
+                } else {
+                    usage.cloned()
+                };
             let finish_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                 .created(created)
                 .add_choice_finish_reason(index, final_finish_reason, matched_stop_value)
@@ -4569,12 +4558,12 @@ impl<'a> ChatStream<'a> {
         Ok(())
     }
 
-    /// Phase 5: the OpenAI dialect keeps its opt-in, usage-only chunk.
+    /// Phase 5: the usage-only chunk of the wires that close with one.
     async fn send_usage_chunk(
         &mut self,
         final_usage: Option<Usage>,
     ) -> Result<(), utils::StreamFailure> {
-        if !self.deepseek_usage {
+        if self.shape.final_usage_on.sends_usage_chunk() {
             if let Some(final_usage) = final_usage {
                 let usage_chunk = ChatCompletionStreamResponse::builder(
                     &self.dispatch.request_id,

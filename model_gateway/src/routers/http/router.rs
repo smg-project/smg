@@ -32,7 +32,6 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::{CountMessageTokensRequest, CreateMessageRequest},
-    profile::ProviderProfile,
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
         RealtimeTranscriptionSessionCreateRequest,
@@ -85,9 +84,12 @@ use crate::{
         error::{self, extract_error_code_from_response},
         external::GatewayWorker,
         gateway::Gateway,
-        grpc::utils::{
-            error_reason_for_response, error_type_for_response, error_type_from_status,
-            route_to_endpoint,
+        grpc::{
+            utils::{
+                error_reason_for_response, error_type_for_response, error_type_from_status,
+                route_to_endpoint,
+            },
+            wire::Wire,
         },
         http::{
             request_body::{
@@ -878,9 +880,9 @@ impl Router {
     }
 
     /// How the attempt's answer is relayed: streamed or buffered, and
-    /// re-chunked to the provider's packet-size contract when the model the
-    /// client asked for has one (the profile follows the requested model, as
-    /// request validation selects it, not the alias-resolved id).
+    /// re-chunked when the wire of the model the client asked for re-slices
+    /// its stream ([`Wire::rechunks_sse`]; the wire follows the requested
+    /// model, as request validation selects it, not the alias-resolved id).
     fn relay_mode_for_attempt<T: GenerationRequest>(
         attempt: &TypedAttempt<'_, T>,
     ) -> StreamRelayMode {
@@ -888,9 +890,9 @@ impl Router {
         let rechunk = is_stream
             && attempt.route == "/v1/chat/completions"
             && attempt.lease.with_view(|view| {
-                view.request.get_model().is_some_and(|model| {
-                    ProviderProfile::for_model(model) == ProviderProfile::Minimax
-                })
+                view.request
+                    .get_model()
+                    .is_some_and(|model| Wire::for_model(model).rechunks_sse())
             });
         StreamRelayMode { is_stream, rechunk }
     }
@@ -1437,10 +1439,11 @@ impl Router {
     /// Relay a worker response to the client. A streaming response flows
     /// through a bounded channel with the load guard attached to the body; a
     /// buffered response is read capped at the ingress payload limit. With
-    /// `rechunk`, SSE delta payloads are re-sliced to the provider's
-    /// packet-size contract. A streamed body the worker ends with an error
-    /// after a successful head is accounted to `source` and, when it is SSE,
-    /// ended with the typed error event.
+    /// `rechunk`, SSE delta payloads are re-sliced to the bounds of the wire
+    /// of the model the client asked for ([`Wire::rechunks_sse`]). A streamed
+    /// body the worker ends with an error after a successful head is
+    /// accounted to `source` and, when it is SSE, ended with the typed error
+    /// event.
     async fn forward_worker_response(
         &self,
         res: reqwest::Response,
@@ -2878,7 +2881,7 @@ mod tests {
     };
 
     use axum::http::header::{CONTENT_LENGTH, RETRY_AFTER};
-    use openai_protocol::rerank::RerankResult;
+    use openai_protocol::{profile::ProviderProfile, rerank::RerankResult};
     use serde_json::{json, Value};
 
     use super::*;

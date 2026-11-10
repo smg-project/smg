@@ -24,6 +24,7 @@ use openai_protocol::{
 use crate::routers::grpc::{
     regular::{stages::decisions::scoring::DecisionScoring, symphony::Assignment},
     utils::Names,
+    wire::Wire,
 };
 
 /// Response-phase contract for one request, handed on by request building.
@@ -74,9 +75,9 @@ pub(crate) struct TranscriptionResponseSpec {
 
 #[derive(Clone)]
 pub(crate) struct ChatResponseSpec {
-    /// Provider dialect of the model the client asked for, as request
-    /// validation selects it; picks provider-specific response behaviour.
-    pub provider: ProviderProfile,
+    /// The wire the answer leaves in, selected by the profile of the model
+    /// the client asked for ([`Wire::of`]): the stream's shape follows it.
+    pub wire: Wire,
     pub separate_reasoning: bool,
     pub tool_choice: Option<ToolChoice>,
     /// The tools the response is read against, shared with the readers that
@@ -141,7 +142,7 @@ impl ChatResponseSpec {
     /// a request that carries none.
     pub(crate) fn for_request(request: &ChatCompletionRequest, provider: ProviderProfile) -> Self {
         Self {
-            provider,
+            wire: Wire::of(provider),
             separate_reasoning: request.separate_reasoning,
             tool_choice: request.tool_choice.clone(),
             // Every tool the model may call, dynamic tools declared on messages
@@ -454,25 +455,23 @@ mod tests {
         assert!(ChatResponseSpec::from(&request).tools.is_none());
     }
 
+    /// The wire follows the profile of the requested model, which the
+    /// stream's shape then reads off the spec.
     #[test]
-    fn chat_spec_provider_follows_the_requested_model() {
-        let minimax = chat_request(json!({
-            "model": "MiniMax-M3",
-            "messages": [{"role": "user", "content": "hi"}]
-        }));
-        let openai = chat_request(json!({
-            "model": "gpt-4o",
-            "messages": [{"role": "user", "content": "hi"}]
-        }));
+    fn chat_spec_wire_follows_the_requested_model() {
+        for (model, wire) in [
+            ("MiniMax-M3", Wire::Minimax),
+            ("deepseek-flash", Wire::DeepSeek),
+            ("gpt-4o", Wire::OpenAi),
+            ("self-hosted-model", Wire::OpenAi),
+        ] {
+            let request = chat_request(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}]
+            }));
 
-        assert_eq!(
-            ChatResponseSpec::from(&minimax).provider,
-            ProviderProfile::Minimax
-        );
-        assert_eq!(
-            ChatResponseSpec::from(&openai).provider,
-            ProviderProfile::OpenAi
-        );
+            assert_eq!(ChatResponseSpec::from(&request).wire, wire, "{model}");
+        }
     }
 
     #[test]

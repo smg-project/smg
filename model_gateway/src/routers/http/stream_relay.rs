@@ -5,9 +5,9 @@
 //! error after a successful head is accounted to its source and, when the
 //! head was SSE, ended with the typed error event on its own frame; the load
 //! guard rides in the body's own stream; a client that leaves ends the
-//! upstream read. The regular relay re-chunks SSE deltas when the provider
-//! profile asks; the decode relay reads each chunk through a hook (the
-//! prefill log-probability merge and the `[DONE]` cut).
+//! upstream read. The regular relay re-chunks SSE deltas when the wire of
+//! the model the client asked for asks; the decode relay reads each chunk
+//! through a hook (the prefill log-probability merge and the `[DONE]` cut).
 
 use axum::{
     body::Body,
@@ -39,7 +39,7 @@ pub(crate) struct ChunkStep {
 }
 
 /// How the relay reads each upstream chunk: as it is; through the SSE
-/// re-chunker the regular router's provider profile asks for; or through
+/// re-chunker the regular router's wire asks for; or through
 /// the decode side's hook (the prefill log-probability merge and the
 /// `[DONE]` cut). One of the three, so a re-chunker's held text can never be
 /// cut short by a hook that ends the relay.

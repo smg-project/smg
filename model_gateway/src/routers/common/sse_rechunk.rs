@@ -36,7 +36,8 @@
 //! came from there on), events carrying `logprobs` or other choice-level
 //! metadata, frames after `[DONE]` or larger than `MAX_FRAME_BYTES`, and
 //! malformed frames; and the relays build the stage only for the streams
-//! whose provider profile asks for re-slicing. The default, [`NoopObserver`],
+//! whose wire asks for re-slicing (`routers::grpc::wire::Wire::rechunks_sse`,
+//! the wire of the model the client asked for). The default, [`NoopObserver`],
 //! sees every slice and never objects.
 //! An observer that answers [`Verdict::Terminate`] ends the stream in its
 //! place: the slice and the text still buffered are dropped, the gateway's
