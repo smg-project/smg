@@ -137,8 +137,9 @@ class _SecretSources:
     file_env: str
     # The history backend a store URL belongs to; None for a key.
     backend: str | None = None
-    # The shape of one entry of a list-valued secret, named in its refusals.
-    entry: str = "tenant_id:key"
+    # The shape of one entry of a list-valued secret, named in its refusals;
+    # a single-valued secret has none.
+    entry: str = ""
 
 
 _API_KEY_SOURCES = _SecretSources(
@@ -150,6 +151,7 @@ _TENANT_API_KEYS_SOURCES = _SecretSources(
     "SMG_TENANT_API_KEYS",
     "--tenant-api-keys-file",
     "SMG_TENANT_API_KEYS_FILE",
+    entry="tenant_id:key",
 )
 _CONTROL_PLANE_API_KEYS_SOURCES = _SecretSources(
     "the control-plane API keys",
@@ -233,7 +235,7 @@ def _entries_of(text: str, separator: str) -> list[str]:
 def _entries_from_environment(sources: _SecretSources) -> list[str]:
     """The entries of a list-valued secret's environment variable, split at
     ',' and at line ends; a variable set but holding no entry is refused: it
-    was meant to close the serving routes."""
+    was meant to close the routes its keys guard."""
     text = os.environ.get(sources.env)
     if text is None:
         return []
@@ -313,8 +315,13 @@ class RouterArgs:
     # The admin listener (bind host and port) for the control-plane routes; None = the
     # control plane stays on the data listener
     admin_host: str | None = None
+    # Most client connections the admin listener holds open at once (0 = no bound)
+    admin_max_connections: int = 0
     admin_port: int | None = None
     api_key: str | None = None
+    # The file the shared API key was read from, when a file was its source:
+    # a target of the key reload, beside the key (a path alone is refused)
+    api_key_file: str | None = None
     # Routing-key assignment; defaults: random (manual policy), delegate (override)
     assignment_mode: str | None = None
     # None pins no wire: the gateway detects it, as it does for the CLI without --backend
@@ -357,6 +364,9 @@ class RouterArgs:
     consul_service: str | None = None
     # API keys for control plane auth (list of tuples: id, name, key, role)
     control_plane_api_keys: list[tuple] = dataclasses.field(default_factory=list)
+    # The file the control-plane keys were read from, when a file was their source,
+    # beside the keys (a path alone is refused)
+    control_plane_api_keys_file: str | None = None
     control_plane_audit_enabled: bool = False
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
     decode_expected_workers: int | None = None
@@ -612,6 +622,8 @@ class RouterArgs:
     # Threads of the async runtime, at least 1; None = the runtime's default
     runtime_worker_threads: int | None = None
     schema_config: str | None = None
+    # Watch the key files and put a rotated file's keys in force without a restart
+    secrets_auto_reload: bool = False
     # The optimistic accounting TTL (ms) of the cache-aware selection
     selection_accounting_ttl_ms: int = 0
     # The cache-aware selection policy
@@ -654,6 +666,9 @@ class RouterArgs:
     stream_body_stall_timeout_secs: int = 300
     # Per-tenant data-plane keys as (tenant_id, key) pairs (--tenant-api-key)
     tenant_api_keys: list[tuple] = dataclasses.field(default_factory=list)
+    # The file the tenant keys were read from, when a file was their source,
+    # beside the keys (a path alone is refused)
+    tenant_api_keys_file: str | None = None
     # The tenant header trust_tenant_header reads
     tenant_header_name: str = "x-smg-tenant-id"
     # Per-tenant token/request rate limiting
@@ -2213,6 +2228,20 @@ class RouterArgs:
             ),
         )
         request_group.add_argument(
+            f"--{prefix}admin-max-connections",
+            type=_non_negative_int,
+            default=RouterArgs.admin_max_connections,
+            help=(
+                "Most client connections the admin listener (--admin-port) holds open at"
+                " once, the bound --max-connections puts on the data listener: a connection"
+                " beyond it is closed at accept, unanswered, and counted in"
+                " smg_http_connections_rejected_total. 0 = no bound. The bound is the admin"
+                " listener's own, so the control plane stays reachable while the data plane"
+                " is saturated, and a client that reaches the admin listener cannot hold it"
+                " open without limit"
+            ),
+        )
+        request_group.add_argument(
             f"--{prefix}trust-tenant-header",
             action="store_true",
             default=False,
@@ -2971,6 +3000,15 @@ class RouterArgs:
                 " surrounding whitespace is dropped (env: SMG_API_KEY_FILE)."
             ),
         )
+        auth_group.add_argument(
+            f"--{prefix}secrets-auto-reload",
+            action="store_true",
+            help=(
+                "Watch the key files (--api-key-file, --tenant-api-keys-file,"
+                " --control-plane-api-keys-file) and put a changed file's keys in force"
+                " without a restart, as POST /secrets/reload does."
+            ),
+        )
         dp_auth_group.add_argument(
             f"--{prefix}tenant-api-key",
             type=str,
@@ -3293,6 +3331,7 @@ class RouterArgs:
             if args_dict.get("api_key") is not None:
                 raise _given_twice(_API_KEY_SOURCES)
             args_dict["api_key"] = _read_secret_file(api_key_file, _API_KEY_SOURCES.file_flag)
+            args_dict["api_key_file"] = api_key_file
 
         backend = args_dict.get("history_backend", cls.history_backend)
         for name, sources, older_env in (
@@ -3318,6 +3357,7 @@ class RouterArgs:
             if tenant_entries:
                 raise _given_twice(_TENANT_API_KEYS_SOURCES)
             tenant_entries = _read_entries_file(tenant_file, _TENANT_API_KEYS_SOURCES)
+            args_dict["tenant_api_keys_file"] = tenant_file
         args_dict["tenant_api_keys"] = cls._parse_tenant_api_keys(tenant_entries)
 
         # The control-plane keys under the same rule: the flag's entries, else
@@ -3332,6 +3372,7 @@ class RouterArgs:
             control_plane_entries = _read_entries_file(
                 control_plane_file, _CONTROL_PLANE_API_KEYS_SOURCES
             )
+            args_dict["control_plane_api_keys_file"] = control_plane_file
         args_dict["control_plane_api_keys"] = cls._parse_control_plane_api_keys(
             control_plane_entries
         )

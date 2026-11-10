@@ -29,6 +29,7 @@ use smg::{
         AccessLogField, PowerOfTwoLoadMetric, TurboJpegPolicy, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     observability::metrics::register_jemalloc_as_global_allocator,
+    secrets::SecretFiles,
     server::{self, posture::SecretSources, ServerConfig},
     version,
 };
@@ -1242,6 +1243,16 @@ struct ServingArgs {
     #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
     max_connections: usize,
 
+    /// Most client connections the admin listener (--admin-port) holds open
+    /// at once, the bound --max-connections puts on the data listener: a
+    /// connection beyond it is closed at accept, unanswered, and counted in
+    /// smg_http_connections_rejected_total. 0 = no bound. The bound is the
+    /// admin listener's own, so the control plane stays reachable while the
+    /// data plane is saturated, and a client that reaches the admin listener
+    /// cannot hold it open without limit
+    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
+    admin_max_connections: usize,
+
     /// Origins a browser may call the gateway from (exact origins,
     /// space-separated), or `*` alone for any origin. Without this flag the
     /// gateway makes no cross-origin allowance
@@ -1792,6 +1803,24 @@ struct IntegrationArgs {
     /// `resolve_secret_sources` for the start-up record; not a flag.
     #[arg(skip)]
     secret_sources: SecretSources,
+
+    /// The files the keys above were read from, where a file was the
+    /// source, filled by `resolve_secret_sources` for the reload route; not
+    /// a flag.
+    #[arg(skip)]
+    secret_files: SecretFiles,
+
+    /// Watch the key files (`--api-key-file`, `--tenant-api-keys-file`,
+    /// `--control-plane-api-keys-file`) and put a changed file's keys in
+    /// force, as `POST /secrets/reload` does: a mounted secret rotated in
+    /// place takes effect without a restart. Off by default; a start with no
+    /// key file has nothing to watch and says so.
+    #[arg(
+        long,
+        default_value_t = false,
+        help_heading = "Control Plane Authentication"
+    )]
+    secrets_auto_reload: bool,
 
     // ==================== Mesh Server ====================
     /// Start the mesh: several gateways find each other, keep one membership
@@ -3100,6 +3129,19 @@ mod tests {
 
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.max_connections, 0);
+    }
+
+    /// `--admin-max-connections` is the admin listener's own bound and must
+    /// flow into `RouterConfig`; without the flag there is no bound.
+    #[test]
+    fn admin_max_connections_flag_flows_into_router_config() {
+        let bounded = cli_args_from(&["--admin-max-connections", "64"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert_eq!(bounded.admin_max_connections, 64);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.admin_max_connections, 0);
     }
 
     /// The SSE keep-alive interval is a router-only setting and must flow

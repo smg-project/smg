@@ -87,15 +87,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Export API key from pod env
-        uses: ./.github/actions/export-pod-api-key
-
       - name: Install gh CLI
         uses: ./.github/actions/setup-gh
 
+      # No key in the job: the runner pod's key-proxy sidecar holds it (see
+      # scripts/k8s-runner-resources/runner-values-cpu.yaml); Claude gets a placeholder.
       - uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
+          anthropic_api_key: sk-ant-placeholder-the-sidecar-holds-the-key
           prompt: |
             REPO: ${{ github.repository }}
             PENDING ENGINE UPDATES (JSON): ${{ needs.detect.outputs.pending }}
@@ -137,4 +136,5 @@ jobs:
             --max-turns 40
             --allowedTools "Read,Glob,Grep,Bash,WebFetch,WebSearch,TaskCreate,TaskUpdate,TaskGet"
         env:
+          ANTHROPIC_BASE_URL: http://127.0.0.1:8787/anthropic
           GH_TOKEN: ${{ github.token }}

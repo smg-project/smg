@@ -132,6 +132,34 @@ fn request_for(request_id: &str, rank: u32) -> EngineCoreRequest {
     }
 }
 
+/// The unpinned add-request `request_id` submitted through `client` and read
+/// as its Add on `engine`, the rank the client's routing must choose for it;
+/// the request's stream comes back so the test keeps it in flight as long as
+/// it needs to.
+async fn unpinned_request_lands_on(
+    client: &EngineCoreClient,
+    engine: &mut MockEngine,
+    request_id: &str,
+) -> EngineCoreStream {
+    let next = client
+        .submit(EngineCoreRequest {
+            request_id: request_id.into(),
+            prompt_token_ids: Some(vec![1, 2, 3]),
+            ..EngineCoreRequest::default()
+        })
+        .await
+        .unwrap();
+    match tokio::time::timeout(TIMEOUT, engine.recv())
+        .await
+        .expect("the unpinned request should reach this engine")
+        .unwrap()
+    {
+        EngineInbound::Add(request) => assert_eq!(request.request_id, request_id),
+        other => panic!("expected the unpinned request's Add, got {other:?}"),
+    }
+    next
+}
+
 fn wave_control(engine_index: u32, control: DpControlMessage) -> Vec<Bytes> {
     let outputs = EngineCoreOutputs::DpControl(DpControlOutput {
         engine_index,
@@ -494,22 +522,7 @@ async fn unpinned_requests_prefer_the_least_loaded_engine() {
 
     // An unpinned request must now land on the idle engine 1, not
     // engines.first().
-    let _stream = client
-        .submit(EngineCoreRequest {
-            request_id: "cold".into(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            ..EngineCoreRequest::default()
-        })
-        .await
-        .unwrap();
-    let inbound = tokio::time::timeout(TIMEOUT, engines[1].recv())
-        .await
-        .expect("unpinned request should route to the least-loaded engine")
-        .unwrap();
-    match inbound {
-        EngineInbound::Add(request) => assert_eq!(request.request_id, "cold"),
-        other => panic!("expected Add on engine 1, got {other:?}"),
-    }
+    let _stream = unpinned_request_lands_on(&client, &mut engines[1], "cold").await;
 }
 
 #[tokio::test]
@@ -560,15 +573,7 @@ async fn failed_submit_releases_its_reservation() {
     // With counts (1, 0) the next request must land on engine 1. If the
     // failed attempt leaked its reservation the counts would read (1, 1)
     // and rotation could send this to engine 0.
-    let _next = client.submit(unpinned("after")).await.unwrap();
-    match tokio::time::timeout(TIMEOUT, engines[1].recv())
-        .await
-        .expect("request should route to the unloaded engine")
-        .unwrap()
-    {
-        EngineInbound::Add(request) => assert_eq!(request.request_id, "after"),
-        other => panic!("expected Add on engine 1, got {other:?}"),
-    }
+    let _next = unpinned_request_lands_on(&client, &mut engines[1], "after").await;
 }
 
 #[tokio::test]
@@ -607,22 +612,7 @@ async fn retiring_one_request_twice_frees_only_its_own_slot() {
     // Engine 0 still holds "held". An unpinned request must therefore go
     // to the idle engine 1 — it would go to 0 if the second retirement had
     // freed "held"'s slot too.
-    let _next = client
-        .submit(EngineCoreRequest {
-            request_id: "next".into(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            ..EngineCoreRequest::default()
-        })
-        .await
-        .unwrap();
-    match tokio::time::timeout(TIMEOUT, engines[1].recv())
-        .await
-        .expect("request should route to the idle engine")
-        .unwrap()
-    {
-        EngineInbound::Add(request) => assert_eq!(request.request_id, "next"),
-        other => panic!("expected Add on engine 1, got {other:?}"),
-    }
+    let _next = unpinned_request_lands_on(&client, &mut engines[1], "next").await;
 }
 
 #[tokio::test]
@@ -667,22 +657,7 @@ async fn an_emptied_rank_sheds_its_stale_queue_counts() {
     // it behind rank 1's real work.
     let _held = client.submit(request_for("held", 1)).await.unwrap();
     engines[1].recv().await.unwrap();
-    let _next = client
-        .submit(EngineCoreRequest {
-            request_id: "next".into(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            ..EngineCoreRequest::default()
-        })
-        .await
-        .unwrap();
-    match tokio::time::timeout(TIMEOUT, engines[0].recv())
-        .await
-        .expect("request should route to the emptied rank")
-        .unwrap()
-    {
-        EngineInbound::Add(request) => assert_eq!(request.request_id, "next"),
-        other => panic!("expected Add on engine 0, got {other:?}"),
-    }
+    let _next = unpinned_request_lands_on(&client, &mut engines[0], "next").await;
 }
 
 /// The step's finished set is the union of the out-of-band finished list
@@ -813,22 +788,7 @@ async fn a_finish_named_twice_or_for_a_stranger_retires_at_most_once() {
     // Engine 0 still holds "held": an unpinned request goes to the idle
     // engine 1. It would go to 0 if the second retirement, or the
     // stranger's, had freed a slot the step never finished.
-    let _next = client
-        .submit(EngineCoreRequest {
-            request_id: "next".into(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            ..EngineCoreRequest::default()
-        })
-        .await
-        .unwrap();
-    match tokio::time::timeout(TIMEOUT, engines[1].recv())
-        .await
-        .expect("request should route to the idle engine")
-        .unwrap()
-    {
-        EngineInbound::Add(request) => assert_eq!(request.request_id, "next"),
-        other => panic!("expected Add on engine 1, got {other:?}"),
-    }
+    let _next = unpinned_request_lands_on(&client, &mut engines[1], "next").await;
     let routing = client.inner.routing.lock();
     assert!(!routing.inflight.values().any(|ids| ids.contains("twice")));
     assert!(routing.inflight.values().any(|ids| ids.contains("held")));
@@ -975,24 +935,7 @@ async fn tokenspeed_client_submits_and_streams() {
         sampling::SamplingParams,
     };
 
-    let ns = IpcNamespace::new().unwrap();
-    let (handshake, input, output) = (
-        ns.handshake_endpoint(),
-        ns.input_endpoint(),
-        ns.output_endpoint(),
-    );
-    // Held for the test duration so the ipc files outlive the client.
-    let _ns = ns;
-    let (transport, engine) = tokio::join!(
-        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    let client = TokenSpeedClient::new(transport.unwrap());
-    let mut engine = engine.unwrap();
+    let (client, mut engine, _ns) = connect_wire::<TokenSpeedProtocol>().await;
 
     let request = TokenizedGenerateReqInput {
         rid: "ts-1".to_string(),
@@ -1096,23 +1039,7 @@ async fn a_request_reported_at_intervals_counts_no_silence() {
     use crate::protocol::tokenspeed::{
         output::BatchTokenIDOutSlim, request::TokenizedGenerateReqInput, sampling::SamplingParams,
     };
-    let ns = IpcNamespace::new().unwrap();
-    let (handshake, input, output) = (
-        ns.handshake_endpoint(),
-        ns.input_endpoint(),
-        ns.output_endpoint(),
-    );
-    let _ns = ns;
-    let (transport, engine) = tokio::join!(
-        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    let client = TokenSpeedClient::new(transport.unwrap());
-    let mut engine = engine.unwrap();
+    let (client, mut engine, _ns) = connect_wire::<TokenSpeedProtocol>().await;
     let request =
         |rid: &str, input_ids: Vec<u32>, stream: bool, stream_interval| TokenizedGenerateReqInput {
             rid: rid.to_string(),
@@ -1223,23 +1150,7 @@ async fn an_sglang_request_reported_at_intervals_counts_no_silence() {
         request::{SglangRequest, TokenizedEmbeddingReqInput, TokenizedGenerateReqInput},
         sampling::SamplingParams,
     };
-    let ns = IpcNamespace::new().unwrap();
-    let (handshake, input, output) = (
-        ns.handshake_endpoint(),
-        ns.input_endpoint(),
-        ns.output_endpoint(),
-    );
-    let _ns = ns;
-    let (transport, engine) = tokio::join!(
-        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    let client = SglangClient::new(transport.unwrap());
-    let mut engine = engine.unwrap();
+    let (client, mut engine, _ns) = connect_wire::<SglangProtocol>().await;
     let generate = |rid: &str, input_ids: Vec<u32>, stream: bool, stream_interval| {
         SglangRequest::Generate(TokenizedGenerateReqInput {
             rid: rid.to_string(),
@@ -3173,25 +3084,7 @@ use crate::protocol::tokenspeed::request::TokenizedGenerateReqInput as TaggedWir
 
 /// A client of that protocol over the same mock engine.
 async fn connect_tagged() -> (TokenSpeedClient, MockEngine, IpcNamespace) {
-    let ns = IpcNamespace::new().unwrap();
-    let (handshake, input, output) = (
-        ns.handshake_endpoint(),
-        ns.input_endpoint(),
-        ns.output_endpoint(),
-    );
-    let (transport, engine) = tokio::join!(
-        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    (
-        TokenSpeedClient::new(transport.unwrap()),
-        engine.unwrap(),
-        ns,
-    )
+    connect_wire::<TokenSpeedProtocol>().await
 }
 
 /// A request of that wire with a 64 MiB typed feature tensor.

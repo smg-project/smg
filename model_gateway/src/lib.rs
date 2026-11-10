@@ -24,6 +24,7 @@
 pub mod app_context;
 pub mod config;
 pub mod endpoints;
+pub(crate) mod fs_watch;
 pub mod health;
 pub mod mesh;
 pub mod middleware;
@@ -31,6 +32,7 @@ pub mod observability;
 pub mod policies;
 pub mod rate_limit;
 pub mod routers;
+pub mod secrets;
 pub mod server;
 pub mod service_discovery;
 pub mod tenant;

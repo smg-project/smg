@@ -1189,3 +1189,40 @@ fn derive_thinking_mode_reads_the_enable_thinking_alias() {
         ThinkingMode::Chat
     ));
 }
+
+/// A string-format template reads each content as the string it is, and
+/// the owned entry wraps nothing for it, as the borrowed one wraps nothing:
+/// the two render one prompt with the strings in it. A pre-wrap under every
+/// template would hand this one a part list in place of each string.
+#[test]
+fn an_owned_render_of_a_string_format_template_leaves_the_strings_alone() {
+    use crate::chat_template::ChatTemplateContentFormat;
+
+    let temp = TempDir::new().unwrap();
+    let tokenizer_path = temp.path().join("tokenizer.json");
+    fs::write(&tokenizer_path, MIN_TOKENIZER_JSON).unwrap();
+    let mut tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+    tokenizer
+        .set_chat_template(
+            "{% for message in messages %}{{ message['role'] }}:{{ message['content'] }}\n{% endfor %}"
+                .to_string(),
+        )
+        .unwrap();
+    assert_eq!(
+        tokenizer.chat_template_content_format(),
+        ChatTemplateContentFormat::String
+    );
+
+    let messages = vec![
+        json!({"role": "system", "content": "Be brief."}),
+        json!({"role": "user", "content": "Hi"}),
+    ];
+    let borrowed = tokenizer
+        .apply_chat_template_with_encoding(&messages, ChatTemplateParams::default(), None)
+        .unwrap();
+    let owned = tokenizer
+        .apply_chat_template_with_encoding_owned(messages, ChatTemplateParams::default(), None)
+        .unwrap();
+    assert_eq!(owned.text, borrowed.text, "the same prompt either way");
+    assert_eq!(borrowed.text, "system:Be brief.\nuser:Hi\n");
+}

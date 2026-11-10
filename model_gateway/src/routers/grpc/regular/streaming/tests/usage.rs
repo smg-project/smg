@@ -223,7 +223,10 @@ async fn non_streamed_chat(
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
     let answer = response_processor()
         .process_non_streaming_chat_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             ChatResponseSpec::from(request),
             dispatch(),
             tokenizer,
@@ -250,7 +253,10 @@ async fn streamed_completion_usage(
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_COMPLETIONS);
     let response = Arc::new(processor(false))
         .process_completion_streaming_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             CompletionResponseSpec::new(request, Vec::new()),
             dispatch,
             tokenizer(),
@@ -281,7 +287,10 @@ async fn non_streamed_completion(
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
     let response = response_processor()
         .process_non_streaming_completion_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             CompletionResponseSpec::new(request, Vec::new()),
             dispatch(),
             &tokenizer,
@@ -345,7 +354,10 @@ async fn non_streamed_generate(
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
     let responses = response_processor()
         .process_non_streaming_generate_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             dispatch(),
             &mut decoder,
             false,
@@ -393,7 +405,10 @@ async fn non_streamed_messages(
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
     let answer = response_processor()
         .process_non_streaming_messages_response(
-            context::ExecutionResult::Single { stream },
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: Instant::now(),
+            },
             spec,
             dispatch(),
             tokenizer,
@@ -1372,4 +1387,263 @@ async fn a_watched_completion_stream_whose_client_leaves_with_held_text_ends_at_
     let (result, ()) = tokio::join!(streamed, client);
     server.abort();
     assert!(result.is_ok(), "{:?}", result.err());
+}
+
+#[tokio::test]
+async fn spec_usage_regression_streamed_and_nonstreamed_formatting() {
+    for (first, second, rejected) in [
+        ((2, 0), (1, 10), None),
+        ((0, 0), (0, 10), None),
+        ((0, 7), (0, 0), None),
+        ((0, 7), (0, 10), Some(17)),
+        ((4, 2), (1, 10), None),
+        ((0, 0), (1, 10), None),
+        ((2, 3), (1, 10), Some(10)),
+        ((2, 2), (1, 1), Some(0)),
+        ((0, 0), (0, 0), Some(0)),
+    ] {
+        let counters = |(a, d)| Counters {
+            prompt: 10,
+            cached: 4,
+            spec_accepted: a,
+            spec_drafted: d,
+        };
+        let mut data = choice_frames(0, &["ok"], counters(first));
+        data.extend(choice_frames(1, &["ok"], counters(second)));
+        let chat = |stream| {
+            serde_json::from_value(json!({
+                "model": "eof-test", "messages": [], "n": 2, "stream": stream,
+                "stream_options": {"include_usage": true}
+            }))
+            .unwrap()
+        };
+        let completion = |stream| {
+            serde_json::from_value(json!({
+                "model": "eof-test", "prompt": "hi", "n": 2, "stream": stream,
+                "stream_options": {"include_usage": true}
+            }))
+            .unwrap()
+        };
+        let chat_stream =
+            streamed_chat_usage(engine_stream(data.clone()).await, &chat(true), None).await;
+        let chat_whole =
+            non_streamed_chat_usage(engine_stream(data.clone()).await, &chat(false)).await;
+        let completion_stream =
+            streamed_completion_usage(engine_stream(data.clone()).await, &completion(true), None)
+                .await;
+        let completion_whole =
+            non_streamed_completion_usage(engine_stream(data).await, &completion(false)).await;
+        assert_eq!(chat_stream, chat_whole);
+        assert_eq!(completion_stream, completion_whole);
+        for (usage, defaults) in [(chat_stream, true), (completion_stream, false)] {
+            let details = &usage["completion_tokens_details"];
+            if !defaults && first == (0, 0) && second == (0, 0) {
+                assert!(
+                    details.is_null(),
+                    "legacy completion has no speculative measurements: {usage}"
+                );
+            } else {
+                assert_eq!(details["accepted_prediction_tokens"], first.0 + second.0);
+                match rejected {
+                    Some(n) => assert_eq!(details["rejected_prediction_tokens"], n),
+                    None => assert!(
+                        details.get("rejected_prediction_tokens").is_none(),
+                        "{usage}"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mixed_stream_snapshot_preserves_unknown_rejected() {
+    let mut usage = ChatStreamUsage::default();
+    usage.choices.insert(
+        0,
+        ChatStreamTokenCounts {
+            spec_accepted: 2,
+            spec_drafted: 0,
+            ..Default::default()
+        },
+    );
+    usage.choices.insert(
+        1,
+        ChatStreamTokenCounts {
+            spec_accepted: 1,
+            spec_drafted: 10,
+            ..Default::default()
+        },
+    );
+    let json = serde_json::to_value(usage.snapshot(0)).unwrap();
+    assert_eq!(
+        json["completion_tokens_details"]["accepted_prediction_tokens"],
+        3
+    );
+    assert!(
+        json["completion_tokens_details"]
+            .get("rejected_prediction_tokens")
+            .is_none(),
+        "{json}"
+    );
+}
+
+#[tokio::test]
+async fn continuous_spec_usage_waits_for_unseen_choice() {
+    let counters = Counters {
+        prompt: 10,
+        cached: 4,
+        spec_accepted: 2,
+        spec_drafted: 2,
+    };
+    let mut data = choice_frames(0, &["ok"], counters);
+    data.extend(choice_frames(1, &["ok"], counters));
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "eof-test", "messages": [], "n": 2, "stream": true,
+        "stream_options": {"include_usage": true, "continuous_usage_stats": true}
+    }))
+    .unwrap();
+    let (stream, server) = engine_stream(data).await;
+    let (tx, rx) = sse_channel();
+    let result = processor(false)
+        .process_streaming_chunks(
+            stream,
+            dispatch(),
+            tokenizer(),
+            (
+                Some(StringOrArray::String("okay".to_string())),
+                None,
+                false,
+                false,
+                false,
+            ),
+            ChatResponseSpec::from(&request),
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    let intermediate: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["usage"]["completion_tokens_details"]["accepted_prediction_tokens"] == 2
+        })
+        .collect();
+    assert!(!intermediate.is_empty(), "{events:?}");
+    for event in intermediate {
+        let usage = &event["usage"];
+        assert_eq!(usage["prompt_tokens"], 10);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 4);
+        assert!(
+            usage["completion_tokens_details"]
+                .get("rejected_prediction_tokens")
+                .is_none(),
+            "unseen choice must remain unknown: {event}"
+        );
+    }
+    let final_usage = usage_chunk(&events);
+    assert_eq!(
+        final_usage["completion_tokens_details"]["accepted_prediction_tokens"],
+        4
+    );
+    assert_eq!(
+        final_usage["completion_tokens_details"]["rejected_prediction_tokens"],
+        0
+    );
+}
+
+#[test]
+fn continuous_spec_usage_terminal_coverage_controls() {
+    for (first, second, rejected) in [
+        ((0, 0), (0, 0), Some(0)),
+        ((2, 2), (1, 1), Some(0)),
+        ((2, 3), (1, 10), Some(10)),
+        ((2, 0), (1, 10), None),
+        ((0, 7), (0, 0), None),
+        ((4, 2), (1, 10), None),
+    ] {
+        let complete = |index, (accepted, drafted)| {
+            ProtoGenerateComplete::Vllm(Box::new(proto::GenerateComplete {
+                index,
+                prompt_tokens: 10,
+                cached_tokens: 4,
+                spec_accepted_tokens: accepted,
+                spec_draft_tokens: drafted,
+                ..Default::default()
+            }))
+        };
+        let snapshot =
+            |tracker: &ChatStreamUsage| serde_json::to_value(tracker.snapshot(3)).unwrap();
+        let mut tracker = ChatStreamUsage::new(2);
+        tracker.reasoning_parsed = true;
+        tracker.record_reasoning(0, 3);
+        tracker.record_complete(&complete(0, first));
+        // A duplicate terminal for choice 0 cannot stand in for choice 1.
+        tracker.record_complete(&complete(0, first));
+        let usage = snapshot(&tracker);
+        assert_eq!(usage["prompt_tokens"], 7);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 4);
+        assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 3);
+        assert_eq!(
+            usage["completion_tokens_details"]["accepted_prediction_tokens"],
+            first.0
+        );
+        if first == (0, 0) {
+            assert_eq!(
+                usage["completion_tokens_details"]["rejected_prediction_tokens"],
+                0
+            );
+        } else {
+            assert!(
+                usage["completion_tokens_details"]
+                    .get("rejected_prediction_tokens")
+                    .is_none(),
+                "{usage}"
+            );
+        }
+        tracker.record_chunk(&ProtoGenerateStreamChunk::Vllm(
+            proto::GenerateStreamChunk {
+                index: 1,
+                token_ids: vec![1, 2],
+                ..Default::default()
+            },
+        ));
+        let usage = snapshot(&tracker);
+        assert_eq!(usage["completion_tokens"], 2);
+        if first == (0, 0) {
+            assert_eq!(
+                usage["completion_tokens_details"]["rejected_prediction_tokens"],
+                0
+            );
+        } else {
+            assert!(
+                usage["completion_tokens_details"]
+                    .get("rejected_prediction_tokens")
+                    .is_none(),
+                "{usage}"
+            );
+        }
+        tracker.record_complete(&complete(1, second));
+        let usage = snapshot(&tracker);
+        assert_eq!(usage["completion_tokens"], 2);
+        assert_eq!(
+            usage["completion_tokens_details"]["accepted_prediction_tokens"],
+            first.0 + second.0
+        );
+        match rejected {
+            Some(value) => assert_eq!(
+                usage["completion_tokens_details"]["rejected_prediction_tokens"],
+                value
+            ),
+            None => assert!(
+                usage["completion_tokens_details"]
+                    .get("rejected_prediction_tokens")
+                    .is_none(),
+                "{usage}"
+            ),
+        }
+    }
 }

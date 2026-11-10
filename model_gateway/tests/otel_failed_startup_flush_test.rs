@@ -108,6 +108,8 @@ fn a_refused_startup_flushes_the_spans_the_exporter_holds() {
 
     let config = ServerConfig {
         secret_sources: Default::default(),
+        secret_files: Default::default(),
+        secrets_auto_reload: false,
         router_config: RouterConfig::builder()
             .regular_mode(vec![])
             .host("127.0.0.1")

@@ -4,14 +4,17 @@
 //! reads the prefill time away. Every streaming route therefore anchors its
 //! time to first token and its generation duration at the prefill dispatch,
 //! as the chat stream does, and records the PD first-token pair at the first
-//! decode token: the chat, Messages and completions streams (single and
-//! batched), and the openai-harmony pipeline's chat and Responses streams.
+//! decode token: the chat, Messages, completions (single and batched) and
+//! generate streams, and the openai-harmony pipeline's chat and Responses
+//! streams.
 //! Each case drives the route's `PrefillDecode` arm over scripted sides whose
 //! dispatch instants lie a known time before the stream, under a thread-local
 //! Prometheus recorder, and reads the rendered families.
 use std::{future::Future, time::Duration};
 
-use openai_protocol::{chat::ChatCompletionRequest, completion::CompletionRequest};
+use openai_protocol::{
+    chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+};
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
 use tokio::task::JoinHandle;
 
@@ -126,6 +129,14 @@ fn completion_spec(prompt: Value) -> CompletionResponseSpec {
     CompletionResponseSpec::new(&request, Vec::new())
 }
 
+/// A generate request over one text, streamed.
+fn generate_spec() -> GenerateResponseSpec {
+    let request: GenerateRequest =
+        serde_json::from_value(json!({"model": MODEL, "text": "test", "stream": true}))
+            .expect("generate request");
+    GenerateResponseSpec::from(&request)
+}
+
 fn source(endpoint: &'static str) -> utils::StreamSource {
     utils::StreamSource::new(None, &dispatch(), endpoint)
 }
@@ -182,8 +193,8 @@ fn sample(rendered: &str, family: &str, field: &str, label: &str) -> Option<f64>
         .and_then(|value| value.parse().ok())
 }
 
-/// The route's stream metrics anchor at the prefill dispatch: one record, a
-/// TTFT of at least the prefill offset (a clock the task started itself
+/// The route's stream metrics anchor at dispatch: one record, a
+/// TTFT of at least the dispatch offset (a clock the task started itself
 /// would read milliseconds) and a generation duration on the same base.
 fn assert_stream_anchor(rendered: &str, route: &str, endpoint: &'static str) {
     let label = format!("endpoint=\"{endpoint}\"");
@@ -206,7 +217,7 @@ fn assert_stream_anchor(rendered: &str, route: &str, endpoint: &'static str) {
     let floor = PREFILL_OFFSET.as_secs_f64();
     assert!(
         ttft >= floor,
-        "{endpoint}: TTFT {ttft} s anchors after the prefill dispatch ({floor} s before)"
+        "{endpoint}: TTFT {ttft} s anchors after dispatch ({floor} s before)"
     );
     assert!(
         generation >= ttft,
@@ -369,6 +380,32 @@ fn a_batched_pd_completion_stream_anchors_at_its_earliest_prefill_dispatch() {
     );
 }
 
+/// The generate stream of a pair (the one that carries the prefill side's
+/// input logprobs) derives its anchor from the pair's prefill dispatch once
+/// at its start; a stream anchored at its own start would read the
+/// prefill time away.
+#[test]
+fn a_pd_generate_stream_anchors_at_the_prefill_dispatch() {
+    let rendered = render_after(|| async {
+        let (result, servers) = pd_result(text_frames(), PREFILL_OFFSET).await;
+        let response = Arc::new(processor(false))
+            .process_streaming_generate(
+                result,
+                generate_spec(),
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                None,
+                None,
+                source(metrics_labels::ENDPOINT_GENERATE),
+            )
+            .await;
+        read_to_end(response).await;
+        servers
+    });
+    assert_stream_anchor(&rendered, "generate", metrics_labels::ENDPOINT_GENERATE);
+    assert_pd_pair(&rendered, "generate", 1.0, PREFILL_OFFSET);
+}
+
 /// The openai-harmony pipeline's chat stream.
 #[test]
 fn a_pd_harmony_chat_stream_anchors_at_the_prefill_dispatch() {
@@ -423,4 +460,72 @@ fn a_pd_harmony_responses_iteration_records_the_pd_pair_at_its_first_decode_fram
         servers
     });
     assert_pd_pair(&rendered, "harmony responses", 1.0, PREFILL_OFFSET);
+}
+
+/// A Single RPC can have its first chunk buffered when the stream starts.
+#[test]
+fn a_single_harmony_chat_stream_anchors_at_dispatch() {
+    let rendered = render_after(|| async {
+        let (stream, server) = scripted_stream(harmony_frames(), "0").await;
+        let response = Arc::new(HarmonyStreamingProcessor::new())
+            .process_streaming_chat_response(
+                ExecutionResult::Single {
+                    stream,
+                    dispatch_start: pd_timing(PREFILL_OFFSET).prefill_start,
+                },
+                Arc::new(chat_request()),
+                dispatch(),
+                Vec::new(),
+                None,
+                None,
+                source(metrics_labels::ENDPOINT_CHAT),
+            )
+            .await;
+        read_to_end(response).await;
+        vec![server]
+    });
+    assert_stream_anchor(
+        &rendered,
+        "single harmony chat",
+        metrics_labels::ENDPOINT_CHAT,
+    );
+}
+
+/// The earliest dispatch belongs to the second prompt, not the first one.
+#[test]
+fn a_batched_single_completion_stream_anchors_at_its_earliest_dispatch() {
+    let rendered = render_after(|| async {
+        let (first, first_server) = scripted_stream(text_frames(), "0").await;
+        let (second, second_server) = scripted_stream(text_frames(), "0").await;
+        let timing = pd_timing(PREFILL_OFFSET);
+        let response = Arc::new(processor(false))
+            .process_completion_streaming_response(
+                ExecutionResult::Batch {
+                    results: vec![
+                        ExecutionResult::Single {
+                            stream: first,
+                            dispatch_start: timing.decode_sent,
+                        },
+                        ExecutionResult::Single {
+                            stream: second,
+                            dispatch_start: timing.prefill_start,
+                        },
+                    ],
+                },
+                completion_spec(json!(["one", "two"])),
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                None,
+                None,
+                source(metrics_labels::ENDPOINT_COMPLETIONS),
+            )
+            .await;
+        read_to_end(response).await;
+        vec![first_server, second_server]
+    });
+    assert_stream_anchor(
+        &rendered,
+        "batched single completions",
+        metrics_labels::ENDPOINT_COMPLETIONS,
+    );
 }

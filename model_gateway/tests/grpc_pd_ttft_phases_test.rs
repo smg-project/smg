@@ -19,13 +19,13 @@
 use std::time::Duration;
 
 use common::{
-    decode_stream::produce_after,
-    engine_answers::{VllmAnswers, VllmGenerateStream},
+    decode_stream::HeldHeadersEngine,
+    engine_answers::VllmAnswers,
     grpc_harness::{
         build_grpc_router, grpc_router_config, grpc_workers, serve_canned_worker, serve_engine,
         Canned,
     },
-    metrics_capture::render_after,
+    metrics_capture::{self, render_after},
 };
 use smg::{
     middleware::TenantRequestMeta,
@@ -33,11 +33,7 @@ use smg::{
     tenant::TenantKey,
     worker::{RuntimeType, WorkerType},
 };
-use smg_grpc_client::vllm_proto as proto;
 use smg_test_harness as common;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status};
 
 const MODEL: &str = "pd-ttft-phases-test-model";
 /// Tokens every mock answers with; ids 1..=3 are in the mock tokenizer's vocabulary.
@@ -50,37 +46,12 @@ const DECODE_DELAY: Duration = Duration::from_millis(400);
 /// absorbed the other worker's delay fails its upper bound.
 const SLACK: Duration = Duration::from_millis(250);
 
-/// A sequential-dispatch mock engine: every generate call answers with
-/// `OUTPUT_TOKENS` chunks and a completion after `delay`. With `hold_headers`
-/// the call itself waits out the delay before it returns the stream, like an
-/// engine server that flushes its response headers with the first message;
-/// without it the stream is returned at once and the delay runs inside it.
-#[derive(Clone)]
-struct DelayedEngine {
-    delay: Duration,
-    hold_headers: bool,
-}
-
-#[tonic::async_trait]
-impl VllmAnswers for DelayedEngine {
-    async fn generate(
-        &self,
-        _request: Request<proto::GenerateRequest>,
-    ) -> Result<Response<VllmGenerateStream>, Status> {
-        let (tx, rx) = mpsc::channel(8);
-        let in_stream_delay = if self.hold_headers {
-            tokio::time::sleep(self.delay).await;
-            Duration::ZERO
-        } else {
-            self.delay
-        };
-        produce_after(tx, in_stream_delay, OUTPUT_TOKENS);
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
-    }
-}
-
-/// Serve a sequential-dispatch mock engine in-process; returns its port.
-async fn start_mock_engine(engine: DelayedEngine) -> u16 {
+/// Serve a sequential-dispatch mock engine in-process; returns its port. The
+/// engine answers every generate call with `OUTPUT_TOKENS` chunks and a
+/// completion after its delay: `HeldHeadersEngine::holding` waits it out
+/// before the call returns the stream, `HeldHeadersEngine::eager` returns the
+/// stream at once and the delay runs inside it.
+async fn start_mock_engine(engine: HeldHeadersEngine) -> u16 {
     serve_engine(engine.into_server()).await
 }
 
@@ -225,20 +196,10 @@ async fn one_streaming_chat(router: &dyn RouterTrait) -> String {
     one_streaming_request(router, Route::Chat).await
 }
 
-/// The `_sum` or `_count` sample of `family` whose labels contain `label`, if
-/// it was emitted.
-fn labelled(rendered: &str, family: &str, field: &str, label: &str) -> Option<f64> {
-    let prefix = format!("{family}_{field}{{");
-    rendered
-        .lines()
-        .find(|line| line.starts_with(&prefix) && line.contains(label))
-        .and_then(|line| line.rsplit(' ').next())
-        .and_then(|value| value.parse().ok())
-}
-
 /// The `_sum` or `_count` sample of `family` for `runtime`, if it was emitted.
 fn sample(rendered: &str, family: &str, field: &str, runtime: &str) -> Option<f64> {
-    labelled(rendered, family, field, &format!("runtime=\"{runtime}\""))
+    let runtime = format!("runtime=\"{runtime}\"");
+    metrics_capture::sample(rendered, family, field, &[runtime.as_str()])
 }
 
 /// The four PD TTFT families of one request, in seconds.
@@ -311,16 +272,9 @@ fn report(label: &str, phases: &Phases) {
 #[test]
 fn sequential_dispatch_phases_add_up_to_the_pd_ttft() {
     let rendered = render_after(|| async {
-        let prefill = start_mock_engine(DelayedEngine {
-            delay: PREFILL_DELAY,
-            hold_headers: false,
-        })
-        .await;
-        let decode = start_mock_engine(DelayedEngine {
-            delay: DECODE_DELAY,
-            hold_headers: false,
-        })
-        .await;
+        let prefill =
+            start_mock_engine(HeldHeadersEngine::eager(PREFILL_DELAY, OUTPUT_TOKENS)).await;
+        let decode = start_mock_engine(HeldHeadersEngine::eager(DECODE_DELAY, OUTPUT_TOKENS)).await;
         let router = build_pd_router(prefill, decode, RuntimeType::Vllm).await;
         let body = one_streaming_chat(router.as_ref()).await;
         let (deltas, completion_tokens) = chat_stream_counts(&body);
@@ -358,16 +312,10 @@ fn sequential_dispatch_phases_add_up_to_the_pd_ttft() {
 #[test]
 fn a_held_header_decode_side_stays_in_the_decode_phase() {
     let rendered = render_after(|| async {
-        let prefill = start_mock_engine(DelayedEngine {
-            delay: PREFILL_DELAY,
-            hold_headers: false,
-        })
-        .await;
-        let decode = start_mock_engine(DelayedEngine {
-            delay: DECODE_DELAY,
-            hold_headers: true,
-        })
-        .await;
+        let prefill =
+            start_mock_engine(HeldHeadersEngine::eager(PREFILL_DELAY, OUTPUT_TOKENS)).await;
+        let decode =
+            start_mock_engine(HeldHeadersEngine::holding(DECODE_DELAY, OUTPUT_TOKENS)).await;
         let router = build_pd_router(prefill, decode, RuntimeType::Vllm).await;
         one_streaming_chat(router.as_ref()).await;
     });
@@ -421,36 +369,37 @@ fn parallel_dispatch_reports_the_decode_phase_as_the_whole_ttft() {
 /// duration at the prefill dispatch: on the sequential pair the route's TTFT
 /// carries the prefill worker's delay and the decode worker's, and the PD
 /// first-token pair is recorded once. A stream clocked from its own start
-/// would read the time to the decode side's first buffered chunk alone.
+/// would read the time to the decode side's first buffered chunk alone. With
+/// `decode_holds` the decode worker holds its response headers through its
+/// delay, so the hold sits inside the RPC await and not inside the stream.
 #[expect(
     clippy::panic,
     reason = "test helper - panicking on failure is intentional"
 )]
-fn route_anchors_at_the_prefill_dispatch(route: Route) {
+fn route_anchors_at_the_prefill_dispatch(route: Route, decode_holds: bool) {
     let rendered = render_after(|| async {
-        let prefill = start_mock_engine(DelayedEngine {
-            delay: PREFILL_DELAY,
-            hold_headers: false,
-        })
-        .await;
-        let decode = start_mock_engine(DelayedEngine {
-            delay: DECODE_DELAY,
-            hold_headers: false,
-        })
-        .await;
+        let prefill =
+            start_mock_engine(HeldHeadersEngine::eager(PREFILL_DELAY, OUTPUT_TOKENS)).await;
+        let decode_engine = if decode_holds {
+            HeldHeadersEngine::holding(DECODE_DELAY, OUTPUT_TOKENS)
+        } else {
+            HeldHeadersEngine::eager(DECODE_DELAY, OUTPUT_TOKENS)
+        };
+        let decode = start_mock_engine(decode_engine).await;
         let router = build_pd_router(prefill, decode, RuntimeType::Vllm).await;
         one_streaming_request(router.as_ref(), route).await;
     });
     let endpoint = route.endpoint();
     let label = format!("endpoint=\"{endpoint}\"");
+    let labels = [label.as_str()];
     let (Some(count), Some(ttft), Some(generation)) = (
-        labelled(&rendered, "smg_router_ttft_seconds", "count", &label),
-        labelled(&rendered, "smg_router_ttft_seconds", "sum", &label),
-        labelled(
+        metrics_capture::sample(&rendered, "smg_router_ttft_seconds", "count", &labels),
+        metrics_capture::sample(&rendered, "smg_router_ttft_seconds", "sum", &labels),
+        metrics_capture::sample(
             &rendered,
             "smg_router_generation_duration_seconds",
             "sum",
-            &label,
+            &labels,
         ),
     ) else {
         panic!("{endpoint}: the stream metrics are missing:\n{rendered}");
@@ -480,19 +429,44 @@ fn route_anchors_at_the_prefill_dispatch(route: Route) {
         Some(1.0),
         "{endpoint}: the PD pair recorded once:\n{rendered}"
     );
+    let Some(tpot) = metrics_capture::sample(&rendered, "smg_router_tpot_seconds", "sum", &labels)
+    else {
+        panic!("{endpoint}: the TPOT record is missing:\n{rendered}");
+    };
+    let expected = (generation - ttft) / f64::from(OUTPUT_TOKENS - 1);
+    assert!(
+        (tpot - expected).abs() < 1e-6,
+        "{endpoint}: TPOT {tpot} != (generation {generation} - TTFT {ttft}) / {}",
+        OUTPUT_TOKENS - 1
+    );
 }
 
 #[test]
 fn the_chat_route_anchors_its_ttft_at_the_prefill_dispatch() {
-    route_anchors_at_the_prefill_dispatch(Route::Chat);
+    route_anchors_at_the_prefill_dispatch(Route::Chat, false);
 }
 
 #[test]
 fn the_messages_route_anchors_its_ttft_at_the_prefill_dispatch() {
-    route_anchors_at_the_prefill_dispatch(Route::Messages);
+    route_anchors_at_the_prefill_dispatch(Route::Messages, false);
 }
 
 #[test]
 fn the_completions_route_anchors_its_ttft_at_the_prefill_dispatch() {
-    route_anchors_at_the_prefill_dispatch(Route::Completions);
+    route_anchors_at_the_prefill_dispatch(Route::Completions, false);
+}
+
+#[test]
+fn the_chat_route_anchors_at_the_prefill_dispatch_under_held_headers() {
+    route_anchors_at_the_prefill_dispatch(Route::Chat, true);
+}
+
+#[test]
+fn the_messages_route_anchors_at_the_prefill_dispatch_under_held_headers() {
+    route_anchors_at_the_prefill_dispatch(Route::Messages, true);
+}
+
+#[test]
+fn the_completions_route_anchors_at_the_prefill_dispatch_under_held_headers() {
+    route_anchors_at_the_prefill_dispatch(Route::Completions, true);
 }

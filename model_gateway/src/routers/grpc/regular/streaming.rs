@@ -54,7 +54,8 @@ use crate::{
             common::{
                 response_collection::drain_prefill,
                 response_formatting::{
-                    chat_usage, effective_weight_version, CompletionTokenTracker, TokenCounts,
+                    chat_usage, effective_weight_version, known_spec_drafted,
+                    CompletionTokenTracker, TokenCounts,
                 },
                 responses::{
                     body_guards, build_sse_response_driven, build_sse_response_from_stream,
@@ -110,6 +111,15 @@ struct ChatStreamTokenCounts {
 }
 
 impl ChatStreamUsage {
+    fn new(expected_choices: u32) -> Self {
+        Self {
+            choices: (0..expected_choices)
+                .map(|index| (index, ChatStreamTokenCounts::default()))
+                .collect(),
+            reasoning_parsed: false,
+        }
+    }
+
     fn record_chunk(&mut self, chunk: &ProtoGenerateStreamChunk) {
         let counts = self.choices.entry(chunk.index()).or_default();
         counts.prompt = chunk.prompt_tokens();
@@ -150,7 +160,14 @@ impl ChatStreamUsage {
             cached: self.choices.values().map(|c| c.cached).max().unwrap_or(0),
             reasoning: self.choices.values().map(|c| c.reasoning).sum(),
             spec_accepted: self.choices.values().map(|c| c.spec_accepted).sum(),
-            spec_drafted: self.choices.values().map(|c| c.spec_drafted).sum(),
+            // Expected but unseen choices retain the proto's unknown zero
+            // sentinel: they invalidate a measured partial proposal sum while
+            // preserving legacy all-zero/no-speculation usage defaults.
+            spec_drafted: known_spec_drafted(
+                self.choices
+                    .values()
+                    .map(|c| (c.spec_accepted, c.spec_drafted)),
+            ),
         };
         chat_usage(
             counts.usage(),
@@ -212,7 +229,7 @@ impl GenerateStreamUsage {
             cached: self.cached,
             reasoning: self.reasoning.values().sum(),
             spec_accepted: 0,
-            spec_drafted: 0,
+            spec_drafted: Some(0),
         }
     }
 
@@ -424,7 +441,10 @@ impl StreamingProcessor {
         // body drives it (see `DrivenBody`), so its frames reach the
         // connection from the task that polls the body.
         let reading: Reading = match execution_result {
-            context::ExecutionResult::Single { stream } => {
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start,
+            } => {
                 let processor = self.clone();
                 let dispatch_clone = dispatch.clone();
                 let tokenizer_clone = tokenizer.clone();
@@ -436,13 +456,15 @@ impl StreamingProcessor {
                     // The request's reading, isolated: a panic in it ends
                     // this response with an error event and `[DONE]`, not
                     // the task polling the body (see `utils::isolation`).
-                    let result = isolated(processor.process_streaming_chunks(
+                    let result = isolated(processor.process_streaming_chunks_inner(
+                        dispatch_start,
                         stream,
                         dispatch_clone,
                         tokenizer_clone,
                         stop_params,
                         chat_request,
                         &tx,
+                        None,
                         reservation,
                     ))
                     .await
@@ -528,6 +550,7 @@ impl StreamingProcessor {
     }
 
     /// Process streaming chunks from a single stream (Regular mode)
+    #[cfg(any(test, feature = "test-util"))]
     #[expect(clippy::too_many_arguments)]
     pub async fn process_streaming_chunks(
         &self,
@@ -540,6 +563,7 @@ impl StreamingProcessor {
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
         self.process_streaming_chunks_inner(
+            Instant::now(),
             grpc_stream,
             dispatch,
             tokenizer,
@@ -562,6 +586,7 @@ impl StreamingProcessor {
     #[expect(clippy::too_many_arguments)]
     async fn process_streaming_chunks_inner(
         &self,
+        start_time: Instant,
         mut grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
@@ -579,6 +604,7 @@ impl StreamingProcessor {
             &original_request,
             tx,
             pd_timing,
+            start_time,
         );
         stream.read_engine(&mut grpc_stream).await?;
         // The stream's verdict, before the engine side is released.
@@ -639,6 +665,7 @@ impl StreamingProcessor {
         // Note: decode_stream will be marked completed inside process_streaming_chunks
         let result = self
             .process_streaming_chunks_inner(
+                pd_timing.prefill_start,
                 decode_stream,
                 dispatch,
                 tokenizer,
@@ -707,13 +734,17 @@ impl StreamingProcessor {
         // The reading of the engine's answer, by execution mode; the response
         // body drives it (see `DrivenBody`).
         let reading: Reading = match execution_result {
-            context::ExecutionResult::Single { stream } => {
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start,
+            } => {
                 let tokenizer = tokenizer.clone();
                 Box::pin(async move {
                     // The request's reading, isolated: a panic in it ends
                     // this response with an error event and `[DONE]`, not
                     // the task polling the body (see `utils::isolation`).
-                    let result = isolated(Self::process_generate_streaming(
+                    let result = isolated(Self::process_generate_streaming_at(
+                        dispatch_start,
                         tokenizer,
                         stream,
                         ctx,
@@ -788,7 +819,20 @@ impl StreamingProcessor {
 
     /// Process streaming chunks for generate endpoint (no tool/reasoning parsing)
     /// TODO: add streaming logprob support
+    #[cfg(any(test, feature = "test-util"))]
     async fn process_generate_streaming(
+        tokenizer: Arc<dyn Tokenizer>,
+        stream: ProtoStream,
+        ctx: GenerateStreamContext,
+        tx: &SseSender,
+        reservation: Option<Arc<SharedReservationHandle>>,
+    ) -> Result<(), utils::StreamFailure> {
+        Self::process_generate_streaming_at(Instant::now(), tokenizer, stream, ctx, tx, reservation)
+            .await
+    }
+
+    async fn process_generate_streaming_at(
+        dispatch_start: Instant,
         tokenizer: Arc<dyn Tokenizer>,
         mut stream: ProtoStream,
         ctx: GenerateStreamContext,
@@ -978,7 +1022,7 @@ impl StreamingProcessor {
         if stream.client_left() {
             return Ok(());
         }
-        Self::record_generate_metrics(start_time, first_token_time, counts, None, &ctx);
+        Self::record_generate_metrics(dispatch_start, first_token_time, counts, &ctx);
 
         Ok(())
     }
@@ -1059,6 +1103,12 @@ impl StreamingProcessor {
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
         let start_time = Instant::now();
+        // The stream's one anchor: the prefill dispatch of a disaggregated
+        // pair, else this read. `start_time` itself stays the response's
+        // e2e clock.
+        let stream_base = pd_timing
+            .as_ref()
+            .map_or(start_time, |timing| timing.prefill_start);
         let mut first_token_time: Option<Instant> = None;
 
         // Track state per index for n>1 case
@@ -1278,13 +1328,7 @@ impl StreamingProcessor {
         if stream.client_left() {
             return Ok(());
         }
-        Self::record_generate_metrics(
-            start_time,
-            first_token_time,
-            counts,
-            pd_timing.as_ref(),
-            &ctx,
-        );
+        Self::record_generate_metrics(stream_base, first_token_time, counts, &ctx);
 
         Ok(())
     }
@@ -1296,21 +1340,15 @@ impl StreamingProcessor {
     /// The token and latency records of a generate stream at its end, from
     /// the tally's `counts`: the prompt and its cache hit once per request
     /// (the tally's, shared by every index), the completion tokens of every
-    /// index.
+    /// index. `stream_base` is the stream's one anchor, the RPC dispatch its
+    /// caller handed in (the prefill dispatch for PD): headers may arrive
+    /// with the first chunk, so TTFT and the generation duration run from it.
     fn record_generate_metrics(
-        start_time: Instant,
+        stream_base: Instant,
         first_token_time: Option<Instant>,
         counts: TokenCounts,
-        pd_timing: Option<&context::PdTiming>,
         ctx: &GenerateStreamContext,
     ) {
-        // PD mode: the stream task starts after the prefill side was dispatched
-        // (sequential PD: after it completes, with the first decode chunk
-        // already buffered), so anchor TTFT at prefill dispatch. Generation
-        // duration shares the base or TPOT underflows.
-        let stream_base = pd_timing
-            .map(|timing| timing.prefill_start)
-            .unwrap_or(start_time);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: ctx.backend_type,
@@ -2291,7 +2329,10 @@ impl StreamingProcessor {
         // The reading of the engine's answer, by execution mode; the response
         // body drives it (see `DrivenBody`).
         let reading: Reading = match execution_result {
-            context::ExecutionResult::Single { stream } => {
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start,
+            } => {
                 let processor = self.clone();
                 let dispatch_clone = dispatch.clone();
                 let tokenizer_clone = tokenizer.clone();
@@ -2303,13 +2344,15 @@ impl StreamingProcessor {
                     // The request's reading, isolated: a panic in it ends
                     // this message with an error event, not the task polling
                     // the body (see `utils::isolation`).
-                    let result = isolated(processor.process_messages_streaming_chunks(
+                    let result = isolated(processor.process_messages_streaming_chunks_inner(
+                        dispatch_start,
                         stream,
                         dispatch_clone,
                         tokenizer_clone,
                         stop_params,
                         messages_request,
                         &tx,
+                        None,
                         reservation,
                     ))
                     .await
@@ -2406,6 +2449,7 @@ impl StreamingProcessor {
     /// Implements the Anthropic streaming protocol with content block
     /// state tracking. Always n=1 (no per-index HashMap). The phases are
     /// the methods of [`MessagesStream`], run in order.
+    #[cfg(any(test, feature = "test-util"))]
     #[expect(clippy::too_many_arguments)]
     pub async fn process_messages_streaming_chunks(
         &self,
@@ -2418,6 +2462,7 @@ impl StreamingProcessor {
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
         self.process_messages_streaming_chunks_inner(
+            Instant::now(),
             grpc_stream,
             dispatch,
             tokenizer,
@@ -2436,6 +2481,7 @@ impl StreamingProcessor {
     #[expect(clippy::too_many_arguments)]
     async fn process_messages_streaming_chunks_inner(
         &self,
+        start_time: Instant,
         mut grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
@@ -2453,6 +2499,7 @@ impl StreamingProcessor {
             &original_request,
             tx,
             pd_timing,
+            start_time,
         )?;
         stream.send_message_start().await?;
         stream.read_engine(&mut grpc_stream).await?;
@@ -2515,6 +2562,7 @@ impl StreamingProcessor {
 
         let result = self
             .process_messages_streaming_chunks_inner(
+                pd_timing.prefill_start,
                 decode_stream,
                 dispatch,
                 tokenizer,
@@ -2582,18 +2630,13 @@ impl StreamingProcessor {
         // The reading of the units' answers; the response body drives it
         // (see `DrivenBody`).
         let reading = async move {
-            let start_time = Instant::now();
-            // In PD mode this task only starts once the decode streams exist --
-            // for sequential PD that is after prefill completes, with the first
-            // decode chunk already buffered -- so `start_time` would report a
-            // near-zero TTFT. Anchor at the earliest prefill dispatch instead,
-            // as the chat stream does; generation duration must share the base
-            // or TPOT underflows.
+            // Headers may wait for the first chunk. Both clocks start at
+            // the earliest RPC dispatch (prefill dispatch for PD).
             let stream_base = units
                 .iter()
-                .filter_map(CompletionStreamUnit::prefill_start)
+                .map(CompletionStreamUnit::generation_start)
                 .min()
-                .unwrap_or(start_time);
+                .unwrap_or_else(Instant::now);
             let choices_per_prompt = completion_request.choices_per_prompt;
             let echo = completion_request.echo;
             let include_usage = completion_request.include_usage;
@@ -2639,7 +2682,7 @@ impl StreamingProcessor {
                     let body_first_frame = &body_first_frame;
                     async move {
                         match unit {
-                            CompletionStreamUnit::Single(stream) => {
+                            CompletionStreamUnit::Single { stream, .. } => {
                                 processor
                                     .process_completion_streaming_chunks(
                                         stream,
@@ -2694,6 +2737,8 @@ impl StreamingProcessor {
                     let mut total_reasoning = 0u32;
                     let mut total_spec_accepted = 0u32;
                     let mut total_spec_drafted = 0u32;
+                    let mut has_unknown_spec_draft_tokens = false;
+                    let mut has_unavailable_spec_draft_tokens = false;
                     let mut total_completion = 0u32;
                     let mut first_token_time: Option<Instant> = None;
                     let mut all_saw_complete = true;
@@ -2702,7 +2747,10 @@ impl StreamingProcessor {
                         total_cached += outcome.cached_tokens;
                         total_reasoning += outcome.reasoning_tokens;
                         total_spec_accepted += outcome.spec_accepted_tokens;
-                        total_spec_drafted += outcome.spec_draft_tokens;
+                        total_spec_drafted += outcome.spec_draft_tokens.unwrap_or(0);
+                        has_unavailable_spec_draft_tokens |= outcome.spec_draft_tokens.is_none();
+                        has_unknown_spec_draft_tokens |= outcome.spec_draft_tokens.is_none()
+                            || outcome.spec_draft_tokens == Some(0);
                         total_completion += outcome.completion_tokens;
                         all_saw_complete &= outcome.saw_complete;
                         first_token_time = match (first_token_time, outcome.first_token_time) {
@@ -2748,7 +2796,15 @@ impl StreamingProcessor {
                                     cached: total_cached,
                                     reasoning: total_reasoning,
                                     spec_accepted: total_spec_accepted,
-                                    spec_drafted: total_spec_drafted,
+                                    spec_drafted: if has_unknown_spec_draft_tokens
+                                        && (total_spec_drafted > 0
+                                            || total_spec_accepted > 0
+                                            || has_unavailable_spec_draft_tokens)
+                                    {
+                                        None
+                                    } else {
+                                        Some(total_spec_drafted)
+                                    },
                                 }
                                 .usage(),
                             ),
@@ -2789,9 +2845,13 @@ impl StreamingProcessor {
         execution_result: context::ExecutionResult,
     ) -> Result<Vec<CompletionStreamUnit>, &'static str> {
         match execution_result {
-            context::ExecutionResult::Single { stream } => {
-                Ok(vec![CompletionStreamUnit::Single(stream)])
-            }
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start,
+            } => Ok(vec![CompletionStreamUnit::Single {
+                stream,
+                dispatch_start,
+            }]),
             context::ExecutionResult::PrefillDecode {
                 prefill,
                 decode,
@@ -2807,9 +2867,13 @@ impl StreamingProcessor {
             context::ExecutionResult::Batch { results } => results
                 .into_iter()
                 .map(|result| match result {
-                    context::ExecutionResult::Single { stream } => {
-                        Ok(CompletionStreamUnit::Single(stream))
-                    }
+                    context::ExecutionResult::Single {
+                        stream,
+                        dispatch_start,
+                    } => Ok(CompletionStreamUnit::Single {
+                        stream,
+                        dispatch_start,
+                    }),
                     context::ExecutionResult::PrefillDecode {
                         prefill,
                         decode,
@@ -3247,6 +3311,7 @@ struct ChatStream<'a> {
 impl<'a> ChatStream<'a> {
     /// Phase 1: what the spec, the dispatch and the tokenizer decide for the
     /// whole stream, and the empty per-choice state.
+    #[expect(clippy::too_many_arguments)]
     fn open(
         processor: &'a StreamingProcessor,
         dispatch: &'a context::DispatchMetadata,
@@ -3255,8 +3320,8 @@ impl<'a> ChatStream<'a> {
         spec: &'a ChatResponseSpec,
         tx: &'a SseSender,
         pd_timing: Option<context::PdTiming>,
+        start_time: Instant,
     ) -> Self {
-        let start_time = Instant::now();
         let model = &dispatch.model;
         let (stop, stop_token_ids, skip_special_tokens, no_stop_trim, ignore_eos) = stop_params;
         let stop_rules = utils::stop_rules(
@@ -3281,7 +3346,7 @@ impl<'a> ChatStream<'a> {
                     && opts.include_usage.unwrap_or(false)
                     && opts.continuous_usage_stats.unwrap_or(false)
             })
-            .map(|_| ChatStreamUsage::default());
+            .map(|_| ChatStreamUsage::new(spec.expected_choices));
 
         let reasoning_parser_name = processor
             .parser_resolver
@@ -4417,7 +4482,11 @@ impl<'a> ChatStream<'a> {
                 .unwrap_or(0),
             reasoning: choices.iter().map(|choice| choice.reasoning_tokens).sum(),
             spec_accepted: choices.iter().map(|choice| choice.spec_accepted).sum(),
-            spec_drafted: choices.iter().map(|choice| choice.spec_drafted).sum(),
+            spec_drafted: known_spec_drafted(
+                choices
+                    .iter()
+                    .map(|choice| (choice.spec_accepted, choice.spec_drafted)),
+            ),
         }
     }
 
@@ -4558,16 +4627,9 @@ impl<'a> ChatStream<'a> {
         if client_left {
             return;
         }
-        // In PD mode this task only starts once the decode stream exists --
-        // for sequential PD that is after prefill completes, with the first
-        // decode chunk already buffered -- so `start_time` would report a
-        // near-zero TTFT. Anchor at the prefill dispatch instant instead;
-        // generation duration must share the base or TPOT underflows.
-        let stream_base = self
-            .pd_timing
-            .as_ref()
-            .map(|timing| timing.prefill_start)
-            .unwrap_or(self.start_time);
+        // Both clocks include the RPC's wait for response headers: they run
+        // from the dispatch carried in `start_time` (the prefill dispatch for PD).
+        let stream_base = self.start_time;
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.processor.backend_type,
@@ -4837,6 +4899,7 @@ impl<'a> MessagesStream<'a> {
     /// What the spec, the dispatch and the tokenizer decide for the whole
     /// stream, the stop decoder, the parsers (or Symphony's reader), and
     /// the empty counts.
+    #[expect(clippy::too_many_arguments)]
     fn open(
         processor: &'a StreamingProcessor,
         dispatch: &'a context::DispatchMetadata,
@@ -4845,8 +4908,8 @@ impl<'a> MessagesStream<'a> {
         spec: &'a MessagesResponseSpec,
         tx: &'a SseSender,
         pd_timing: Option<context::PdTiming>,
+        start_time: Instant,
     ) -> Result<Self, utils::StreamFailure> {
-        let start_time = Instant::now();
         let model = &dispatch.model;
         let has_tools = spec.has_tools;
 
@@ -5742,17 +5805,10 @@ impl<'a> MessagesStream<'a> {
         if client_left {
             return;
         }
-        // In PD mode this task only starts once the decode stream exists --
-        // for sequential PD that is after prefill completes, with the first
-        // decode chunk already buffered -- so `start_time` would report a
-        // near-zero TTFT. Anchor at the prefill dispatch instant instead, as
-        // the chat stream does; generation duration must share the base or
-        // TPOT underflows.
-        let stream_base = self
-            .pd_timing
-            .as_ref()
-            .map(|timing| timing.prefill_start)
-            .unwrap_or(self.start_time);
+        // Both clocks include the RPC's wait for response headers, as the
+        // chat stream's do: they run from the dispatch carried in `start_time`
+        // (the prefill dispatch for PD).
+        let stream_base = self.start_time;
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.processor.backend_type,

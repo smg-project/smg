@@ -625,9 +625,7 @@ pub mod bench_support {
 
         /// Apply every event of `batch`, as an admitted batch is applied.
         pub fn apply(&mut self, index: &KvIndex, batch: &KvEventBatch) {
-            for event in &batch.events {
-                KvEventMonitor::apply_event(event, self.worker, index, &mut self.state);
-            }
+            KvEventMonitor::apply_events(&batch.events, self.worker, index, &mut self.state);
         }
 
         /// The worker leaves: its blocks go with it.

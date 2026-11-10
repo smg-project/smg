@@ -310,6 +310,18 @@ fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
     assert_eq!(usage.completion_tokens, 10);
     let details = usage.completion_tokens_details.unwrap();
     assert_eq!(details.accepted_prediction_tokens, Some(2));
+    // Choice 1 has only chunks, so its draft count is not yet known.
+    assert_eq!(details.rejected_prediction_tokens, None);
+    tracker.record_complete(&ProtoGenerateComplete::Sglang(proto::GenerateComplete {
+        index: 1,
+        prompt_tokens: 10,
+        completion_tokens: 4,
+        spec_accepted_tokens: 1,
+        spec_draft_tokens: 1,
+        ..Default::default()
+    }));
+    let details = tracker.snapshot(0).completion_tokens_details.unwrap();
+    assert_eq!(details.accepted_prediction_tokens, Some(3));
     assert_eq!(details.rejected_prediction_tokens, Some(1));
 }
 

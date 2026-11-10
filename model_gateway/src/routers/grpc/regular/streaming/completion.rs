@@ -28,7 +28,7 @@ use crate::{
     routers::{
         common::sse::SseSender,
         grpc::{
-            common::response_formatting::CompletionTokenTracker,
+            common::response_formatting::{known_spec_drafted, CompletionTokenTracker},
             context,
             proto_wrapper::{
                 ProtoGenerateComplete, ProtoGenerateStreamChunk, ProtoResponseVariant, ProtoStream,
@@ -43,7 +43,10 @@ use crate::{
 /// One backend stream of a `/v1/completions` request. Batched requests fan
 /// out into several, each remapped by a prompt-major choice-index offset.
 pub(super) enum CompletionStreamUnit {
-    Single(ProtoStream),
+    Single {
+        stream: ProtoStream,
+        dispatch_start: Instant,
+    },
     PrefillDecode {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
@@ -55,12 +58,11 @@ pub(super) enum CompletionStreamUnit {
 }
 
 impl CompletionStreamUnit {
-    /// The prefill dispatch instant of a disaggregated unit: the base its
-    /// TTFT and generation duration are measured from.
-    pub(super) fn prefill_start(&self) -> Option<Instant> {
+    /// The dispatch instant both TTFT and generation duration start from.
+    pub(super) fn generation_start(&self) -> Instant {
         match self {
-            Self::Single(_) => None,
-            Self::PrefillDecode { pd_timing, .. } => Some(pd_timing.prefill_start),
+            Self::Single { dispatch_start, .. } => *dispatch_start,
+            Self::PrefillDecode { pd_timing, .. } => pd_timing.prefill_start,
         }
     }
 }
@@ -72,7 +74,7 @@ pub(super) struct CompletionStreamOutcome {
     pub(super) cached_tokens: u32,
     pub(super) reasoning_tokens: u32,
     pub(super) spec_accepted_tokens: u32,
-    pub(super) spec_draft_tokens: u32,
+    pub(super) spec_draft_tokens: Option<u32>,
     pub(super) completion_tokens: u32,
     pub(super) first_token_time: Option<Instant>,
     /// Whether *every* expected `n>1` choice in this unit received a
@@ -733,7 +735,11 @@ impl<'a> CompletionStream<'a> {
             cached_tokens: self.total_cached,
             reasoning_tokens: self.choices.iter().map(|c| c.reasoning_tokens).sum(),
             spec_accepted_tokens: self.choices.iter().map(|c| c.spec_accepted).sum(),
-            spec_draft_tokens: self.choices.iter().map(|c| c.spec_drafted).sum(),
+            spec_draft_tokens: known_spec_drafted(
+                self.choices
+                    .iter()
+                    .map(|c| (c.spec_accepted, c.spec_drafted)),
+            ),
             completion_tokens: self.total_completion.total(),
             first_token_time: self.first_token_time,
             saw_complete,

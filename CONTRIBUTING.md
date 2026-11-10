@@ -163,9 +163,10 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_AMD_GPU_1` | `1-gpu-mi300x` | AMD row of the 1-GPU chat e2e job (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 | `SMG_RUNNER_GPU_2` | `2-gpu-h100` | 2-GPU e2e jobs |
 | `SMG_RUNNER_GPU_4` | `4-gpu-h100` | 4-GPU e2e and benchmark jobs |
-| `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD nightly benchmark (off unless `SMG_RUN_AMD_LEGS` is `true`) |
+| `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD weekly and opt-in PR benchmarks (require `SMG_RUN_AMD_LEGS=true`) |
 | `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD BFCL and nightly PD runner; automatic AMD selection requires `SMG_RUN_AMD_LEGS=true` |
 | `SMG_RUN_AMD_BFCL` | `false` | Required for every AMD BFCL selection, including explicit dispatch; keep off until shared-host admission and owned teardown are qualified |
+| `SMG_RUN_AMD_PR_BENCHMARK` | `false` | Advisory AMD PR performance measurements; also requires `SMG_RUN_AMD_LEGS=true` and `SMG_RUN_AMD_ON_PRS=true`. Keep off until the native environment, performance budget and shared-host admission are qualified |
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.
@@ -215,6 +216,17 @@ if: github.repository == 'smg-project/smg' || vars.SMG_RUN_BENCHMARKS == 'true'
 They stay off in a fork until you set `SMG_RUN_BENCHMARKS` to `true`. Only
 `benchmark-radix-tree` runs on the self-hosted CPU pool, so it also needs
 `SMG_RUNNER_CPU`; the other four are on `ubuntu-latest` and need nothing else.
+
+A pull request's bench binary is gated against the base's by `scripts/bench_gate.py`,
+with the thresholds of `.github/bench-gates/*.toml`. A gated bench binary's sources, the
+bench file and what it includes (the gate file's `sources`), stay byte-identical unless
+the change is to what they measure: the bench profile links one codegen unit under thin
+LTO, so a row linked into the binary changes the inlining of the code the other rows
+time, and the gated rows move with the measured crate untouched. A new row goes to a
+bench target of its own, with a gate file of its own when it is to be gated. The gate
+builds the base's binary with the pull request's bench sources, so the rows compare the
+measured code alone, and its report names the case where those sources do not build on
+the base.
 
 The `release-*`, `nightly-*` and `stale` workflows are deliberately **not**
 opt-in — a fork should not publish artifacts or manage upstream's issues.

@@ -67,6 +67,12 @@ pub(super) struct WordArena {
     pub(super) free_arrays: Vec<SegQueue<u32>>,
     pub(super) free_tables: Vec<SegQueue<u32>>,
     pub(super) free_partials: Vec<SegQueue<u32>>,
+    /// Slots `table_take` probed and the scans it fell back to: a test shows an unlink lands on
+    /// its slot instead of walking the table.
+    #[cfg(test)]
+    pub(super) take_probes: AtomicUsize,
+    #[cfg(test)]
+    pub(super) take_scans: AtomicUsize,
 }
 
 impl WordArena {
@@ -78,6 +84,10 @@ impl WordArena {
             free_arrays: (0..ARRAY_CLASSES).map(|_| SegQueue::new()).collect(),
             free_tables: (0..TABLE_CLASSES).map(|_| SegQueue::new()).collect(),
             free_partials: (0..TABLE_CLASSES).map(|_| SegQueue::new()).collect(),
+            #[cfg(test)]
+            take_probes: AtomicUsize::new(0),
+            #[cfg(test)]
+            take_scans: AtomicUsize::new(0),
         }
     }
 
@@ -404,18 +414,43 @@ impl WordArena {
         }
     }
 
-    /// Tombstone the entry of `run`; returns the live count left.
-    pub(super) fn table_take(&self, table: u32, run: u32) -> u64 {
+    /// Tombstone the entry of `run`, keyed `key` (its offset under the run and its first content
+    /// hash, the key `table_find` probes by); returns the live count left. The probe meets the
+    /// entry within the slots between the key's home and it: none of them is empty while the
+    /// entry is live, and the table is only rebuilt under the lock the caller holds. The scan of
+    /// every slot behind it is a safety net for an entry the probe does not meet, not the path.
+    pub(super) fn table_take(&self, table: u32, key: u64, run: u32) -> u64 {
         let slots = self.table_slots(table);
         let words = self.words(table + 2, 2 * slots);
+        let mask = slots - 1;
+        let mut index = key as usize & mask;
+        for _ in 0..slots {
+            #[cfg(test)]
+            self.take_probes.fetch_add(1, Ordering::Relaxed);
+            let entry = words[2 * index + 1].load(Ordering::Relaxed);
+            if entry == 0 {
+                break;
+            }
+            if entry != TOMB && entry as u32 == run {
+                return self.table_tombstone(table, &words[2 * index + 1]);
+            }
+            index = (index + 1) & mask;
+        }
+        #[cfg(test)]
+        self.take_scans.fetch_add(1, Ordering::Relaxed);
         for index in 0..slots {
             let entry = words[2 * index + 1].load(Ordering::Relaxed);
             if entry != 0 && entry != TOMB && entry as u32 == run {
-                words[2 * index + 1].store(TOMB, Ordering::Release);
-                return self.word(table + 1).fetch_sub(1, Ordering::Relaxed) - 1;
+                return self.table_tombstone(table, &words[2 * index + 1]);
             }
         }
         self.word(table + 1).load(Ordering::Relaxed)
+    }
+
+    /// Tombstone one entry's run word; returns the live count left.
+    fn table_tombstone(&self, table: u32, run_word: &AtomicU64) -> u64 {
+        run_word.store(TOMB, Ordering::Release);
+        self.word(table + 1).fetch_sub(1, Ordering::Relaxed) - 1
     }
 
     /// Whether `table` can take one more live entry in a table that fits a chunk: false at the

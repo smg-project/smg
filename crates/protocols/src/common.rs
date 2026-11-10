@@ -1522,10 +1522,12 @@ impl Usage {
 
     /// Add speculative decoding details to this Usage.
     pub fn with_speculative_tokens(mut self, accepted: u32, drafted: u32) -> Self {
-        if drafted > 0 {
+        if accepted > 0 || drafted > 0 {
             let details = self.completion_tokens_details.get_or_insert_default();
             details.accepted_prediction_tokens = Some(accepted);
-            details.rejected_prediction_tokens = Some(drafted.saturating_sub(accepted));
+            // A zero draft count can mean unavailable, not zero proposals.
+            details.rejected_prediction_tokens =
+                (drafted > 0 && drafted >= accepted).then(|| drafted - accepted);
         }
         self
     }
@@ -1540,7 +1542,10 @@ impl Usage {
         self
     }
 
-    /// Every detail counter present, zero where nothing was counted: the
+    /// Default detail counters to zero, except unknown speculative rejections.
+    /// With explicit accepted tokens, unavailable/inconsistent drafts leave rejected
+    /// absent. Default zeros for non-speculative usage are schema defaults, not
+    /// measurements of speculative rejection. Otherwise this preserves the
     /// shape the OpenAI API sends on every chat completion
     /// (`prompt_tokens_details.{cached_tokens,audio_tokens}` and
     /// `completion_tokens_details.{reasoning_tokens,audio_tokens,
@@ -1557,8 +1562,14 @@ impl Usage {
         let completion = self.completion_tokens_details.get_or_insert_default();
         completion.reasoning_tokens.get_or_insert(0);
         completion.audio_tokens.get_or_insert(0);
+        // Explicit accepted (including measured zero) with absent rejected marks
+        // unavailable proposals. Preserve it before inserting legacy schema defaults.
+        let unknown_rejected = completion.accepted_prediction_tokens.is_some()
+            && completion.rejected_prediction_tokens.is_none();
         completion.accepted_prediction_tokens.get_or_insert(0);
-        completion.rejected_prediction_tokens.get_or_insert(0);
+        if !unknown_rejected {
+            completion.rejected_prediction_tokens.get_or_insert(0);
+        }
         self
     }
 }
@@ -2829,5 +2840,105 @@ mod tests {
             .expect("an unknown key twice is ignored"),
             ResponseFormat::JsonSchema { .. }
         ));
+    }
+
+    #[cfg(test)]
+    mod speculative_usage_regression {
+        use super::Usage;
+
+        #[test]
+        fn accepted_survives_unknown_drafted_count() {
+            let usage = Usage::from_counts(10, 5).with_speculative_tokens(2, 0);
+            let details = usage
+                .completion_tokens_details
+                .expect("accepted must not be discarded");
+            assert_eq!(details.accepted_prediction_tokens, Some(2));
+            assert_eq!(
+                details.rejected_prediction_tokens, None,
+                "unknown drafted is not measured rejection"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod speculative_complete_details_regression {
+        use super::Usage;
+
+        #[test]
+        fn complete_details_preserves_unknown_rejected() {
+            for drafted in [0, 1] {
+                let usage = Usage::from_counts(10, 5)
+                    .with_reasoning_tokens(3)
+                    .with_speculative_tokens(2, drafted)
+                    .with_complete_details();
+                let json = serde_json::to_value(&usage).unwrap();
+                let details = &json["completion_tokens_details"];
+                assert_eq!(details["accepted_prediction_tokens"], 2);
+                assert_eq!(details["reasoning_tokens"], 3);
+                assert!(
+                    details.get("rejected_prediction_tokens").is_none(),
+                    "unknown or inconsistent drafts must not be zero-filled: {json}"
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod speculative_usage_controls {
+        use super::Usage;
+        #[test]
+        fn known_drafts_keep_measured_rejected_including_zero() {
+            for (accepted, drafted, rejected) in [(2, 3, 1), (2, 2, 0), (0, 3, 3)] {
+                let usage = Usage::from_counts(10, 5)
+                    .with_speculative_tokens(accepted, drafted)
+                    .with_reasoning_tokens(3)
+                    .with_complete_details();
+                let details = usage.completion_tokens_details.unwrap();
+                assert_eq!(details.accepted_prediction_tokens, Some(accepted));
+                assert_eq!(details.rejected_prediction_tokens, Some(rejected));
+                assert_eq!(details.reasoning_tokens, Some(3));
+            }
+        }
+        #[test]
+        fn no_speculation_keeps_zero_schema_defaults() {
+            assert!(Usage::from_counts(10, 5)
+                .with_speculative_tokens(0, 0)
+                .completion_tokens_details
+                .is_none());
+            for usage in [
+                Usage::from_counts(10, 5),
+                Usage::from_counts(10, 5).with_speculative_tokens(0, 0),
+            ] {
+                let json = serde_json::to_value(usage.with_complete_details()).unwrap();
+                assert_eq!(
+                    json["completion_tokens_details"]["accepted_prediction_tokens"],
+                    0
+                );
+                assert_eq!(
+                    json["completion_tokens_details"]["rejected_prediction_tokens"],
+                    0
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod zero_accepted_unknown_rejections {
+        use super::Usage;
+
+        #[test]
+        fn complete_details_keeps_explicit_zero_accepted_unknown_rejected() {
+            let mut usage = Usage::from_counts(10, 5);
+            usage
+                .completion_tokens_details
+                .get_or_insert_default()
+                .accepted_prediction_tokens = Some(0);
+            let details = usage
+                .with_complete_details()
+                .completion_tokens_details
+                .unwrap();
+            assert_eq!(details.accepted_prediction_tokens, Some(0));
+            assert_eq!(details.rejected_prediction_tokens, None);
+        }
     }
 }

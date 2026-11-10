@@ -2439,3 +2439,155 @@ fn the_empty_text_names_nothing() {
     assert!(tree.insert_tenant_by_hash(named, "t2"));
     assert_hashes_name_live_nodes(&tree);
 }
+
+/// The byte-wise scan the block scan replaced: the oracle of the two tests
+/// below.
+fn byte_wise_prefix(a: &[u8], b: &[u8]) -> usize {
+    a.iter()
+        .zip(b)
+        .position(|(x, y)| x != y)
+        .unwrap_or_else(|| a.len().min(b.len()))
+}
+
+#[test]
+fn the_block_scan_counts_the_bytes_the_byte_wise_scan_counted() {
+    // Every pair of lengths up to five words, equal and one a prefix of the
+    // other, and a difference at every byte of every such pair: the difference
+    // falls on each side of every word edge and inside the tail under one word.
+    let text: Vec<u8> = (0..40u8).map(|i| b'a' + i % 26).collect();
+    for len_a in 0..=text.len() {
+        for len_b in 0..=text.len() {
+            let a = &text[..len_a];
+            let b = &text[..len_b];
+            assert_eq!(
+                common_byte_prefix(a, b),
+                byte_wise_prefix(a, b),
+                "{len_a} {len_b}"
+            );
+            for at in 0..len_a.min(len_b) {
+                let mut b = text[..len_b].to_vec();
+                b[at] = b'#';
+                assert_eq!(common_byte_prefix(a, &b), at, "{len_a} {len_b} {at}");
+                assert_eq!(common_byte_prefix(&b, a), at, "{len_a} {len_b} {at}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_scans_count_whole_characters_around_the_word_edges() {
+    // Two-, three- and four-byte characters after a lead of up to a word of
+    // ASCII, so one of them straddles each eight-byte edge; the other text
+    // differs at every character, by a character that shares its first bytes
+    // (the difference inside a character), by one of another width, or by
+    // ending there (a prefix). The character count and the byte offset are the
+    // character-wise walk's, in both argument orders.
+    // The near character differs in the last byte (the three first cases),
+    // in the second byte of a three- and a four-byte character, and in the
+    // third byte of a four-byte character: every byte position of a
+    // character where the scan can stop.
+    let cases: [(char, char, char); 6] = [
+        ('é', 'è', 'z'),
+        ('中', '丮', 'é'),
+        ('😀', '😁', '中'),
+        ('中', '乐', 'é'),
+        ('😀', '𐀀', '中'),
+        ('😀', '🙀', '中'),
+    ];
+    for (wide, near, other) in cases {
+        for lead in 0..=8 {
+            for count in 0..=12 {
+                let a: Vec<char> = std::iter::repeat_n('a', lead)
+                    .chain(std::iter::repeat_n(wide, count))
+                    .collect();
+                for at in 0..=a.len() {
+                    for replacement in [Some(near), Some(other), None] {
+                        let mut b = a.clone();
+                        match replacement {
+                            Some(c) if at < b.len() => b[at] = c,
+                            Some(_) => {}
+                            None => b.truncate(at),
+                        }
+                        let (a, b): (String, String) = (a.iter().collect(), b.iter().collect());
+                        let chars = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+                        let bytes: usize = a.chars().take(chars).map(char::len_utf8).sum();
+                        let case =
+                            format!("{wide:?} lead {lead} count {count} at {at} {replacement:?}");
+                        assert_eq!(shared_prefix_count(&a, &b), chars, "{case}");
+                        assert_eq!(shared_prefix_count(&b, &a), chars, "{case}");
+                        assert_eq!(shared_prefix_len(&a, &b), (chars, bytes), "{case}");
+                        assert_eq!(shared_prefix_len(&b, &a), (chars, bytes), "{case}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_match_counts_the_input_on_every_way_a_walk_stops() {
+    // The input's character count is what the walk advanced past plus the
+    // remainder, on every way a match stops: a hit through several nodes
+    // (the remainder empty), a stop inside a node's text, an input that runs
+    // past a leaf, a miss at the root and a miss below a full match, the
+    // empty input; in one-, two-, three- and four-byte characters. The
+    // oracle is the input's own count and, for the matched count, the longest
+    // common prefix with any inserted text.
+    let tree = Tree::new();
+    let texts = [
+        "hello world",
+        "hello there",
+        "help me",
+        "héllo wörld",
+        "héllo wörlds",
+        "你好世界呀",
+        "你好世界吗",
+        "😀😀😁 face",
+        "😀😀😂 face",
+    ];
+    for (i, text) in texts.iter().enumerate() {
+        tree.insert_text(text, &format!("tenant-{i}"));
+    }
+    let probes = [
+        "hello world",
+        "hello",
+        "hel",
+        "hello worlds and more",
+        "goodbye",
+        "hello worse",
+        "héllo wörld",
+        "héllo wö",
+        "héllo wörldly",
+        "héllo w0rld",
+        "h",
+        "",
+        "你好世界呀",
+        "你好",
+        "你好世界呀呀",
+        "你好世",
+        "你不好",
+        "😀😀😁 face",
+        "😀😀",
+        "😀😀😁 faces",
+        "😀😀🙂",
+        "😀",
+    ];
+    for probe in probes {
+        let result = tree.match_prefix_with_counts(probe);
+        let longest_common_prefix = texts
+            .iter()
+            .map(|text| {
+                text.chars()
+                    .zip(probe.chars())
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            })
+            .max()
+            .unwrap();
+        assert_eq!(result.input_char_count, probe.chars().count(), "{probe:?}");
+        assert_eq!(
+            result.matched_char_count, longest_common_prefix,
+            "{probe:?}"
+        );
+    }
+}

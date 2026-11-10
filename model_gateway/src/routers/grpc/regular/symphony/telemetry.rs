@@ -2921,6 +2921,57 @@ mod tests {
             .any(|label| label.key() == "table" && label.value() == OTHER_TABLE));
     }
 
+    #[test]
+    fn json_lines_take_their_lines_from_series_of_their_own() {
+        // The isolation `a_scrape_takes_its_lines_from_series_of_its_own` pins, through the
+        // log-line helper: a flow in one call's closure drains a table's bucket, the next call's
+        // one line is written and counts no suppressed line.
+        let flow: u32 = 40;
+        let drained = json_lines(|| {
+            for choice in 0..flow {
+                let mut tally = Tally::default();
+                tally.see(
+                    &malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
+                    false,
+                );
+                tally.see(&finished(FinishReason::Stop), false);
+                tally.report(
+                    "qwen3",
+                    Who {
+                        request_id: "req-flow-of-another-call",
+                        model: "m",
+                        choice,
+                    },
+                );
+            }
+        });
+        assert!(
+            drained.len() < flow as usize,
+            "no line of the flow was suppressed"
+        );
+        let after = json_lines(|| {
+            let mut tally = Tally::default();
+            tally.see(
+                &malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
+                false,
+            );
+            tally.see(&finished(FinishReason::Stop), false);
+            tally.report(
+                "qwen3",
+                Who {
+                    request_id: "req-after-another-call",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        let line = after
+            .iter()
+            .find(|line| line.to_string().contains("req-after-another-call"))
+            .expect("the line after the other call's flow");
+        assert_eq!(line["suppressed_lines"], 0, "{line}");
+    }
+
     /// A table's failure classes exist at zero from the moment the table is published, so an
     /// alert on `failed` or `malformed` reads 0 and not "no data" until the first such output,
     /// and the first output counts on the published series.

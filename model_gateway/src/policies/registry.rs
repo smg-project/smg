@@ -18,10 +18,10 @@ use tracing::{debug, info, warn};
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    as_cache_aware, get_healthy_worker_indices,
+    as_bucket, as_cache_aware, get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
-    normalize_model_key, BucketPolicy, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig,
-    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
+    normalize_model_key, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
+    PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
@@ -1085,15 +1085,13 @@ impl PolicyRegistry {
     pub fn init_pd_bucket_policies(&self, prefill_workers: &[Arc<dyn Worker>]) {
         // Initialize prefill policy if it's bucket (lock-free via OnceLock::get)
         if let Some(prefill_policy) = self.prefill_policy.get() {
-            if prefill_policy.name() == "bucket" {
-                if let Some(bucket) = prefill_policy.as_any().downcast_ref::<BucketPolicy>() {
-                    if !prefill_workers.is_empty() {
-                        debug!(
-                            "Initializing prefill bucket policy with {} workers",
-                            prefill_workers.len()
-                        );
-                        bucket.init_prefill_worker_urls(prefill_workers);
-                    }
+            if let Some(bucket) = as_bucket(prefill_policy.as_ref()) {
+                if !prefill_workers.is_empty() {
+                    debug!(
+                        "Initializing prefill bucket policy with {} workers",
+                        prefill_workers.len()
+                    );
+                    bucket.init_prefill_worker_urls(prefill_workers);
                 }
             }
         }
@@ -1122,12 +1120,13 @@ mod tests {
     use super::*;
     use crate::{
         policies::{
-            test_support::headers_with_routing_key, BucketConfig, CacheAwareConfig,
+            test_support::headers_with_routing_key, BucketConfig, BucketPolicy, CacheAwareConfig,
             CacheAwarePolicy, LeastLoadPolicy, SelectWorkerInfo,
         },
         worker::{
-            load_state::LoadSnapshot, test_support::worker_of, HashRing, Worker, WorkerLoadGuard,
-            WorkerType,
+            load_state::LoadSnapshot,
+            test_support::{ready_worker, worker_of},
+            HashRing, Worker, WorkerLoadGuard, WorkerType,
         },
     };
 
@@ -2517,6 +2516,76 @@ mod tests {
         registry.remove_worker_from_pd_cache_aware("http://decode-1:8000");
     }
 
+    /// The worker URLs a cache-aware policy's string tree routes to for `model`.
+    fn tree_of(policy: &Arc<dyn LoadBalancingPolicy>, model: &str) -> Vec<String> {
+        as_cache_aware(policy.as_ref())
+            .expect("a cache-aware policy")
+            .tree_tenants_for_test(model)
+    }
+
+    /// A registry whose policy for `llama-3` is cache-aware, and two of that
+    /// model's workers, routed by `init_cache_aware_policy`.
+    fn cache_aware_model() -> (
+        PolicyRegistry,
+        Arc<dyn LoadBalancingPolicy>,
+        Vec<Arc<dyn Worker>>,
+    ) {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let policy = registry.on_worker_added("llama-3", Some("cache_aware"));
+        let workers = vec![
+            ready_worker("http://w1:8000", "llama-3"),
+            ready_worker("http://w2:8000", "llama-3"),
+        ];
+        assert!(
+            tree_of(&policy, "llama-3").is_empty(),
+            "a fresh tree is empty"
+        );
+        registry.init_cache_aware_policy("llama-3", &workers);
+        (registry, policy, workers)
+    }
+
+    #[test]
+    fn init_cache_aware_policy_fills_the_models_tree() {
+        let (_registry, policy, _workers) = cache_aware_model();
+        assert_eq!(
+            tree_of(&policy, "llama-3"),
+            ["http://w1:8000", "http://w2:8000"]
+        );
+    }
+
+    #[test]
+    fn remove_worker_from_cache_aware_drops_the_worker_from_the_tree() {
+        let (registry, policy, _workers) = cache_aware_model();
+        registry.remove_worker_from_cache_aware("llama-3", "http://w1:8000");
+        assert_eq!(tree_of(&policy, "llama-3"), ["http://w2:8000"]);
+    }
+
+    #[test]
+    fn remove_workers_from_cache_aware_empties_the_models_tree() {
+        let (registry, policy, workers) = cache_aware_model();
+        let urls: HashSet<String> = workers.iter().map(|w| w.url().to_string()).collect();
+        registry.remove_workers_from_cache_aware("llama-3", &urls);
+        assert!(tree_of(&policy, "llama-3").is_empty());
+    }
+
+    #[test]
+    fn init_pd_cache_aware_policies_fills_both_role_trees() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry.set_prefill_policy(cache_aware_policy());
+        registry.set_decode_policy(cache_aware_policy());
+        let prefill = vec![worker_of("http://prefill-1:8000", WorkerType::Prefill)];
+        let decode = vec![worker_of("http://decode-1:8000", WorkerType::Decode)];
+        registry.init_pd_cache_aware_policies(&prefill, &decode);
+        assert_eq!(
+            tree_of(&registry.get_prefill_policy(), prefill[0].model_id()),
+            ["http://prefill-1:8000"]
+        );
+        assert_eq!(
+            tree_of(&registry.get_decode_policy(), decode[0].model_id()),
+            ["http://decode-1:8000"]
+        );
+    }
+
     /// A policy that remembers completions and reconciliation ticks.
     #[derive(Debug, Default)]
     struct CompletionRecorder {
@@ -2688,6 +2757,46 @@ mod tests {
             per_model.removed.lock().unwrap().as_slice(),
             ["http://w2:8000"]
         );
+    }
+
+    /// The PD bucket init reaches a bucket prefill policy by its type: the
+    /// partition exists after it, so the largest size is placed in the last
+    /// range and not by the no-partition fallback.
+    #[traced_test]
+    #[test]
+    fn init_pd_bucket_policies_reaches_the_bucket_policy() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry.set_prefill_policy(Arc::new(BucketPolicy::with_config(BucketConfig {
+            balance_abs_threshold: usize::MAX,
+            bucket_adjust_interval_secs: 3600,
+            ..Default::default()
+        })));
+        let prefill = vec![
+            worker_of("http://prefill-1:8000", WorkerType::Prefill),
+            worker_of("http://prefill-2:8000", WorkerType::Prefill),
+            worker_of("http://prefill-3:8000", WorkerType::Prefill),
+        ];
+
+        registry.init_pd_bucket_policies(&prefill);
+
+        assert!(logs_contain(
+            "Initializing prefill bucket policy with 3 workers"
+        ));
+        let text = "a".repeat(10_000);
+        let info = SelectWorkerInfo {
+            request_text: Some(&text),
+            ..Default::default()
+        };
+        let selected = registry
+            .get_prefill_policy()
+            .select_worker(&prefill, &info)
+            .unwrap_or_else(|| panic!("a request of 10000 chars selects no prefill worker"));
+        assert_eq!(
+            prefill[selected].url(),
+            "http://prefill-3:8000",
+            "the largest size falls in the last range of the even split"
+        );
+        assert!(!logs_contain("No bucket found for model"));
     }
 
     /// A prefill worker's removal reaches the bucket policy, which keeps the

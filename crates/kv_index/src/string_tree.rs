@@ -383,64 +383,63 @@ impl PartialEq for EvictionEntry {
 // Note that in rust, `.len()` or slice is operated on the "byte" level. It causes issues for UTF-8 characters because one character might use multiple bytes.
 // https://en.wikipedia.org/wiki/UTF-8
 
-/// Count matching prefix characters between two strings.
-/// Returns the number of characters that match from the start.
-/// Optimized: uses fast byte comparison for ASCII, falls back to char iteration for UTF-8.
+/// Count matching prefix characters between two strings: the character
+/// count of `shared_prefix_len`, one scan on the ASCII path and the
+/// multi-byte path alike.
 #[inline]
 fn shared_prefix_count(a: &str, b: &str) -> usize {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-
-    // Find common byte prefix length using iterator (potentially SIMD-optimized)
-    let common_byte_len = a_bytes
-        .iter()
-        .zip(b_bytes)
-        .position(|(&a_byte, &b_byte)| a_byte != b_byte)
-        .unwrap_or_else(|| a_bytes.len().min(b_bytes.len()));
-
-    // If the common byte prefix is all ASCII, byte count == char count
-    // Otherwise, fall back to char-by-char comparison for UTF-8 safety
-    if a_bytes[..common_byte_len].is_ascii() {
-        common_byte_len
-    } else {
-        shared_prefix_count_chars(a, b)
-    }
+    shared_prefix_len(a, b).0
 }
 
 /// Common prefix of `a` and `b` as (chars, bytes), so the caller can slice
-/// past it without a second walk over the matched text.
-#[inline]
+/// past it without a second walk over the matched text. Inlined into its
+/// callers explicitly: left to the inliner, the fused walk lost it once the
+/// helper had a second caller (a call per entry compared, measured).
+#[inline(always)]
 fn shared_prefix_len(a: &str, b: &str) -> (usize, usize) {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
-    let common_byte_len = a_bytes
-        .iter()
-        .zip(b_bytes)
-        .position(|(&a_byte, &b_byte)| a_byte != b_byte)
-        .unwrap_or_else(|| a_bytes.len().min(b_bytes.len()));
+    let common_byte_len = common_byte_prefix(a_bytes, b_bytes);
     if a_bytes[..common_byte_len].is_ascii() {
         return (common_byte_len, common_byte_len);
     }
-    // The byte-level prefix may end inside a character: count whole chars.
-    let mut chars = 0;
-    let mut bytes = 0;
-    for ((offset, a_char), b_char) in a.char_indices().zip(b.chars()) {
-        if a_char != b_char {
-            break;
-        }
-        chars += 1;
-        bytes = offset + a_char.len_utf8();
-    }
-    (chars, bytes)
+    // The byte position may sit inside a character: back it to that
+    // character's first byte (at most three bytes) and count the whole
+    // characters before it. The two strings agree byte for byte up to the
+    // position, so their character boundaries coincide there.
+    let bytes = a.floor_char_boundary(common_byte_len);
+    (a[..bytes].chars().count(), bytes)
 }
 
-/// Fallback char-by-char comparison for strings with non-ASCII characters.
+/// The bytes `a` and `b` share from the start. The span of the shorter run is
+/// compared as one slice first: on the tree's walks the input usually runs
+/// through a node's whole text, so one compare settles it. On a difference,
+/// the first unequal word of eight bytes names the byte by the lowest set bit
+/// of its xor (the lowest-addressed byte, read little-endian), and the bytes
+/// under one word at the end go one at a time: the count the byte-wise scan
+/// gave, for every pair.
 #[inline]
-fn shared_prefix_count_chars(a: &str, b: &str) -> usize {
-    a.chars()
-        .zip(b.chars())
-        .take_while(|(a_char, b_char)| a_char == b_char)
-        .count()
+fn common_byte_prefix(a: &[u8], b: &[u8]) -> usize {
+    const WORD: usize = 8;
+    let len = a.len().min(b.len());
+    let (a, b) = (&a[..len], &b[..len]);
+    if a == b {
+        return len;
+    }
+    let (a_words, a_tail) = a.as_chunks::<WORD>();
+    let (b_words, b_tail) = b.as_chunks::<WORD>();
+    for (i, (x, y)) in a_words.iter().zip(b_words).enumerate() {
+        let differing = u64::from_le_bytes(*x) ^ u64::from_le_bytes(*y);
+        if differing != 0 {
+            return i * WORD + differing.trailing_zeros() as usize / 8;
+        }
+    }
+    a_words.len() * WORD
+        + a_tail
+            .iter()
+            .zip(b_tail)
+            .position(|(x, y)| x != y)
+            .unwrap_or(a_tail.len())
 }
 
 impl Default for Tree {
@@ -835,6 +834,9 @@ impl Tree {
     pub fn match_prefix_with_counts(&self, text: &str) -> PrefixMatchResult {
         let mut remaining = text;
         let mut matched_chars = 0;
+        // The characters the walk advanced past (its full matches), so the
+        // input's count is theirs plus the remainder's: the fused walk's shape.
+        let mut consumed_chars = 0usize;
         let mut prev = Arc::clone(&self.root);
 
         while let Some(first_char) = remaining.chars().next() {
@@ -862,6 +864,7 @@ impl Tree {
                 if shared_count == matched_node_text_count {
                     // Full match with current node's text, continue to next node
                     matched_chars += shared_count;
+                    consumed_chars += shared_count;
                     remaining = advance_by_chars(remaining, shared_count);
                     prev = matched_node;
                 } else {
@@ -878,10 +881,9 @@ impl Tree {
 
         let curr = prev;
 
-        // Compute input char count directly from input text.
-        // This is equivalent to matched_chars + remaining.chars().count() but avoids
-        // needing to track remaining precisely through the traversal.
-        let input_char_count = text.chars().count();
+        // Only the remainder is counted here: nothing on a hit, the whole
+        // input only on a miss at the root.
+        let input_char_count = consumed_chars + remaining.chars().count();
 
         // The tenant pick (the `last_tenant` cache first, the tenant map on a
         // miss), its cache populate on that slow path, the probabilistic

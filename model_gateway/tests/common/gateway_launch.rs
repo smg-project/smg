@@ -18,8 +18,8 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
-    path::Path,
-    process::{Command, ExitStatus, Stdio},
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{Mutex, MutexGuard, PoisonError},
     thread,
     time::{Duration, Instant},
@@ -182,6 +182,121 @@ pub fn log_with_line(log_path: &Path, line: &str, timeout: Duration) -> Result<S
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// A gateway a test starts and keeps running until it drops it, for the
+/// tests that drive a serving gateway (a request to its control plane, a
+/// file it reads again) rather than read its start-up refusals.
+pub struct Gateway {
+    child: Child,
+    /// Its stdout and stderr, as a file: read with [`Gateway::log`] or
+    /// waited on with [`log_with_line`].
+    pub log: PathBuf,
+}
+
+impl Gateway {
+    /// Starts the gateway with `args` as its complete flag list and a bare
+    /// environment (`PATH` alone: a credential must come from the flags or
+    /// the files they name), its output in `log`, and waits until
+    /// `GET /health` answers 200 on `addr`. A gateway that exits first, or
+    /// does not serve within [`EXIT_TIMEOUT`], fails the test with its log.
+    /// The caller holds [`serial`] from the moment it picked the ports.
+    pub fn start(args: &[String], addr: SocketAddr, log: &Path) -> Self {
+        let file = File::create(log).expect("log file");
+        let child = Command::new(env!("CARGO_BIN_EXE_smg"))
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(file.try_clone().expect("log handle")))
+            .stderr(Stdio::from(file))
+            .spawn()
+            .expect("spawn the gateway");
+        let mut gateway = Self {
+            child,
+            log: log.to_path_buf(),
+        };
+        let deadline = Instant::now() + EXIT_TIMEOUT;
+        loop {
+            if let Some(status) = gateway.child.try_wait().expect("poll the gateway") {
+                panic!(
+                    "the gateway exited ({status}) before serving\n{}",
+                    gateway.log()
+                );
+            }
+            if request(addr, "GET", "/health", None, None).is_some_and(|(status, _)| status == 200)
+            {
+                return gateway;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the gateway did not serve within {EXIT_TIMEOUT:?}\n{}",
+                gateway.log()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The log as it stands.
+    pub fn log(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+impl Drop for Gateway {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Whether the serving layer accepts `key` on a keyed serving route: the
+/// layer alone answers 401, and the route behind it answers for itself (a
+/// body error, since the probe sends none).
+pub fn serving_accepts(addr: SocketAddr, key: Option<&str>) -> bool {
+    request(addr, "POST", "/v1/tokenize", key, None)
+        .expect("the gateway answers")
+        .0
+        != 401
+}
+
+/// One `method path` request to `addr` over a connection closed with the
+/// response, with `key` as the bearer and `body` as a JSON body when given:
+/// the status and the response body, or `None` when nothing answered.
+pub fn request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    key: Option<&str>,
+    body: Option<&str>,
+) -> Option<(u16, String)> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    let authorization = key.map_or(String::new(), |key| {
+        format!("Authorization: Bearer {key}\r\n")
+    });
+    let (content_type, body) = match body {
+        Some(body) => ("Content-Type: application/json\r\n", body),
+        None => ("", ""),
+    };
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{authorization}{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let response = String::from_utf8_lossy(&response);
+    let status = response
+        .strip_prefix("HTTP/1.1 ")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let body = response
+        .split_once("\r\n\r\n")
+        .map_or(String::new(), |(_, body)| body.to_string());
+    Some((status, body))
 }
 
 /// Whether the gateway answers `GET /health` with 200 over `stream`, a

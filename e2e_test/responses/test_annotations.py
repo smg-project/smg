@@ -30,12 +30,12 @@ from __future__ import annotations
 
 import io
 import logging
-import os
 import time
 from collections.abc import Iterable
 
 import openai
 import pytest
+from infra.cloud_credentials import resolve_cloud_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -206,17 +206,18 @@ def openai_direct_client():
     resulting ID through the gateway when calling ``responses.create`` with the
     ``file_search`` tool. This keeps the smg-under-test path exercised for the
     annotation round-trip while sidestepping a hard dependency on endpoint
-    coverage that is out of scope for E5. A missing ``OPENAI_API_KEY`` is a hard
+    coverage that is out of scope for E5. Proxy mode uses its explicit /openai/v1
+    SDK endpoint and placeholder; a missing direct-mode ``OPENAI_API_KEY`` is a hard
     misconfiguration for ``@pytest.mark.vendor("openai")`` tests — fail loudly
     rather than silently skipping the only coverage for ``file_citation``.
     """
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
+    credentials = resolve_cloud_credentials("openai", require_key=False)
+    if not credentials.api_key:
         pytest.fail(
             "OPENAI_API_KEY is required for TestFileCitationAnnotation "
             "(file_search setup needs direct /v1/files + /v1/vector_stores access)."
         )
-    client = openai.OpenAI(api_key=api_key)
+    client = openai.OpenAI(api_key=credentials.api_key, base_url=credentials.sdk_base_url)
     yield client
 
 

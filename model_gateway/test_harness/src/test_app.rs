@@ -111,6 +111,7 @@ pub fn create_test_app(
         mesh_handler: None,
         mesh_adapters: None,
         secret_sources: Default::default(),
+        secrets: None,
     });
 
     // Configure request ID headers (use defaults if not specified)
@@ -216,6 +217,7 @@ fn build_test_apps(
         mesh_handler: None,
         mesh_adapters: None,
         secret_sources: Default::default(),
+        secrets: None,
     });
 
     // Get config from the context

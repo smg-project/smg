@@ -118,6 +118,14 @@ pub struct RouterConfig {
     /// Bind host of the admin listener; `None` binds it on `host`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin_host: Option<String>,
+    /// Most client connections the admin listener (`admin_port`) holds open
+    /// at once, bounded as `max_connections` bounds the data listener and
+    /// counted in the same `smg_http_connections_rejected_total`. `0` is no
+    /// bound. The bound is the admin listener's own, so the control plane
+    /// stays reachable while the data plane is saturated, and a client that
+    /// reaches the admin listener cannot hold it open without limit.
+    #[serde(default)]
+    pub admin_max_connections: usize,
     /// Explicit async runtime worker-thread count. `None` uses tokio's default
     /// (`available_parallelism()`), which already honors the cgroup CPU quota on
     /// Rust 1.95+ and is therefore container-aware. `Some` pins a count from 1
@@ -2174,6 +2182,7 @@ impl Default for RouterConfig {
             header_read_timeout_secs: default_header_read_timeout_secs(),
             idle_connection_timeout_secs: default_idle_connection_timeout_secs(),
             max_connections: 0,
+            admin_max_connections: 0,
             request_timeout_secs: 1800, // 30 minutes
             grpc_request_timeout_secs: 0,
             sse_keepalive_secs: default_sse_keepalive_secs(),
@@ -2744,6 +2753,26 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.max_connections, 4096);
+    }
+
+    #[test]
+    fn test_admin_max_connections_serde_default_and_roundtrip() {
+        // Config files predating the field deserialize to no bound.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("admin_max_connections")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.admin_max_connections, 0);
+
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .admin_max_connections(64)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.admin_max_connections, 64);
     }
 
     #[test]

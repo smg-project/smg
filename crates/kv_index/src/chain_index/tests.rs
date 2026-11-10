@@ -624,6 +624,104 @@ fn many_children_grow_the_table_and_stay_findable() {
     assert_eq!(index.debug_blocks(), reference.blocks());
 }
 
+/// A run with thousands of children, every one of them unlinked in turn: each unlink lands on
+/// its child's slot by the child's key (its offset under the run and its first hash) in a few
+/// probes and never falls back to the scan of the whole table.
+#[test]
+fn a_child_unlink_probes_its_slot_instead_of_scanning_the_table() {
+    let index = ChainIndex::with_max_workers(8);
+    let w = index.intern_worker("w").expect("id");
+    let mut map = ChainBlockMap::default();
+    let parent = content(5, 0);
+    let chains: Vec<[ContentHash; 2]> = (0..3_000).map(|i| [parent, content(6, i)]).collect();
+    for chain in &chains {
+        index
+            .apply_stored(w, &blocks_of(chain), None, &mut map)
+            .expect("a child");
+    }
+    assert_eq!(
+        index.stats().child_entries,
+        2_999,
+        "the first chain's second block is the run's own, the rest hang off it"
+    );
+    let (probes, scans) = (
+        index.arena.take_probes.load(Ordering::Relaxed),
+        index.arena.take_scans.load(Ordering::Relaxed),
+    );
+    for chain in &chains[1..] {
+        index.apply_removed(w, &[blocks_of(chain)[1].seq_hash], &mut map);
+    }
+    let probes = index.arena.take_probes.load(Ordering::Relaxed) - probes;
+    let scans = index.arena.take_scans.load(Ordering::Relaxed) - scans;
+    assert_eq!(scans, 0, "no unlink fell back to the scan");
+    assert!(
+        probes <= 4 * 2_999,
+        "{probes} probes for 2,999 unlinks from a 4,096-slot table"
+    );
+    let stats = index.stats();
+    assert_eq!((stats.child_entries, stats.child_tombstones), (0, 0));
+    assert_eq!(scores(&index, &chains[0]), vec![(w, 2)]);
+    for chain in &chains[1..] {
+        assert_eq!(scores(&index, chain), vec![(w, 1)], "the shared block only");
+    }
+}
+
+/// The other derivation of a child's key: a split moves the children past its cut to the suffix,
+/// keyed by their offset under it. Unlinking them from the suffix lands by probe as well; a key
+/// the split and the unlink derived differently would show here as the scan being taken.
+#[test]
+fn a_child_moved_to_a_suffix_by_a_split_is_unlinked_by_probe_too() {
+    let index = ChainIndex::with_max_workers(8);
+    let w = index.intern_worker("w").expect("id");
+    let mut map = ChainBlockMap::default();
+    let prompt: Vec<ContentHash> = (0..4).map(|p| content(7, p)).collect();
+    index
+        .apply_stored(w, &blocks_of(&prompt), None, &mut map)
+        .expect("prompt");
+    // Children at offset 3 of the four-block run: chains that leave it after its third block.
+    let mut chains = Vec::new();
+    for branch in 0..200u64 {
+        let mut chain = prompt[..3].to_vec();
+        chain.push(content(700 + branch, 0));
+        index
+            .apply_stored(w, &blocks_of(&chain), None, &mut map)
+            .expect("branch");
+        chains.push(chain);
+    }
+    assert_eq!(index.stats().child_entries, 200);
+    // A hole at the second block splits the run at offset 2: the children hang off offset 1 of
+    // the suffix now, and the suffix is the prefix's one child.
+    index.apply_removed(w, &[blocks_of(&prompt)[1].seq_hash], &mut map);
+    let stats = index.stats();
+    assert_eq!(
+        (stats.splits_by_hole, stats.child_entries),
+        (1, 201),
+        "one split; the children moved to the suffix, the suffix under the prefix"
+    );
+    let (probes, scans) = (
+        index.arena.take_probes.load(Ordering::Relaxed),
+        index.arena.take_scans.load(Ordering::Relaxed),
+    );
+    for chain in &chains {
+        index.apply_removed(w, &[blocks_of(chain)[3].seq_hash], &mut map);
+    }
+    let probes = index.arena.take_probes.load(Ordering::Relaxed) - probes;
+    let scans = index.arena.take_scans.load(Ordering::Relaxed) - scans;
+    assert_eq!(scans, 0, "no unlink from the suffix fell back to the scan");
+    assert!(probes <= 4 * 200, "{probes} probes for 200 unlinks");
+    let stats = index.stats();
+    assert_eq!(
+        (stats.child_entries, stats.child_tombstones),
+        (1, 0),
+        "the suffix stays under the prefix; the children's table is gone"
+    );
+    assert_eq!(
+        scores(&index, &prompt),
+        vec![(w, 1)],
+        "the hole stops the match"
+    );
+}
+
 #[test]
 fn tail_evictions_and_regrowth_do_not_split() {
     let index = ChainIndex::with_max_workers(8);

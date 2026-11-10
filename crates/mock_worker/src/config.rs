@@ -693,8 +693,9 @@ fn parse_ids(raw: String, flag: &str) -> Result<Vec<u32>, String> {
 }
 
 /// `kind[:window],...`: the KV cache groups a realistic engine publishes,
-/// the first being its main-attention group (`full_attention` alone by
-/// default; a hybrid engine adds `sliding_window:<tokens>` or `mamba` groups).
+/// exactly one of them its main-attention group, at any index (`full_attention`
+/// alone by default; a hybrid engine adds `sliding_window:<tokens>` or `mamba`
+/// groups, and may publish its main group behind them).
 fn parse_kv_cache_groups(raw: String, flag: &str) -> Result<Vec<KvCacheGroup>, String> {
     let invalid = || format!("invalid value for {flag}: {raw}");
     let groups = raw
@@ -731,10 +732,22 @@ fn parse_kv_cache_groups(raw: String, flag: &str) -> Result<Vec<KvCacheGroup>, S
     if groups.is_empty() || groups.len() > 8 {
         return Err(format!("{flag} takes one to eight groups"));
     }
-    if !KvCacheGroup::MAIN_KINDS.contains(&groups[0].kind.as_str()) {
+    let main = groups
+        .iter()
+        .filter(|group| KvCacheGroup::MAIN_KINDS.contains(&group.kind.as_str()))
+        .count();
+    if main > 1 {
         return Err(format!(
-            "{flag}: the first group is the main-attention group (one of {}), not {}",
-            KvCacheGroup::MAIN_KINDS.join(", "),
+            "{flag}: at most one group is the main-attention group (one of {}), at any index; got {main}",
+            KvCacheGroup::MAIN_KINDS.join(", ")
+        ));
+    }
+    // A model without a main-attention group (every attention layer a
+    // sliding window) starts with its window group.
+    if main == 0 && !KvCacheGroup::WINDOW_KINDS.contains(&groups[0].kind.as_str()) {
+        return Err(format!(
+            "{flag}: a model without a main-attention group starts with a window group (one of {}), not {}",
+            KvCacheGroup::WINDOW_KINDS.join(", "),
             groups[0].kind
         ));
     }
@@ -817,9 +830,9 @@ pub fn usage() -> String {
        --kv-events-topic <s>    topic frame (default empty, as vLLM)\n\
        --kv-events-buffer-steps <n>  batches kept for replay (default 10000)\n\
        --kv-events-wire <vllm|sglang>  which engine's publisher to imitate (default vllm)\n\
-       --kv-cache-groups <kind[:window],...>  the KV cache groups a realistic engine publishes, the
-                                first one of the main-attention kinds (default full_attention), one
-                                to eight of full_attention, mla_attention, sink_full_attention,
+       --kv-cache-groups <kind[:window],...>  the KV cache groups a realistic engine publishes, exactly
+                                one of them a main-attention kind, at any index (default full_attention),
+                                one to eight of full_attention, mla_attention, sink_full_attention,
                                 sliding_window:<tokens>, sliding_window_mla:<tokens> and mamba: a
                                 window group's stores name the window tail and a Mamba group's the
                                 state block at the prompt's replay boundary, as vLLM 0.31.0 retains
@@ -927,8 +940,9 @@ mod tests {
         Config::parse(flags.iter().map(|flag| (*flag).to_string()))
     }
 
-    /// `--kv-cache-groups` names each group's kind and window in order; the
-    /// SGLang wire has no cache groups, so several are refused there.
+    /// `--kv-cache-groups` names each group's kind and window in order, the
+    /// main-attention group one of them at any index; the SGLang wire has no
+    /// cache groups, so several are refused there.
     #[test]
     fn the_kv_cache_groups_flag_names_each_group_and_stays_single_on_the_sglang_wire() {
         let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
@@ -970,6 +984,22 @@ mod tests {
             .is_ok(),
             "one group is the SGLang wire's shape"
         );
+        // A model without a main-attention group, and the main group at any
+        // index: behind a window group, or last.
+        for spec in [
+            "sliding_window:64",
+            "sliding_window:64,mamba",
+            "sliding_window:64,full_attention",
+            "mamba,full_attention",
+            "mamba,mla_attention,sliding_window:32",
+        ] {
+            let cfg = with(&["--kv-cache-groups", spec]).expect(spec);
+            assert_eq!(
+                cfg.engine.kv_cache_groups.len(),
+                spec.matches(',').count() + 1,
+                "{spec}"
+            );
+        }
         for (spec, reason) in [
             ("sliding_window", "needs its window"),
             ("full_attention,sliding_window_mla:0", "needs its window"),
@@ -977,14 +1007,11 @@ mod tests {
             ("full_attention:64", "has no window"),
             ("swa:128", "unknown cache group kind"),
             ("sliding-window:128", "unknown cache group kind"),
-            ("mamba", "the first group is the main-attention group"),
+            ("mamba", "starts with a window group"),
+            ("mamba,sliding_window:64", "starts with a window group"),
             (
-                "sliding_window:64,full_attention",
-                "the first group is the main-attention group",
-            ),
-            (
-                "mamba,full_attention",
-                "the first group is the main-attention group",
+                "full_attention,mla_attention",
+                "at most one group is the main-attention group",
             ),
         ] {
             let err = with(&["--kv-cache-groups", spec]).expect_err(spec);

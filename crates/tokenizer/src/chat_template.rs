@@ -2708,28 +2708,38 @@ impl RenderedLength {
 pub(crate) fn string_content_as_text_parts(
     messages: &[serde_json::Value],
 ) -> Option<Vec<serde_json::Value>> {
-    fn needs_wrap(message: &serde_json::Value) -> bool {
-        message
-            .get("content")
-            .is_some_and(serde_json::Value::is_string)
-            && message.get("role").and_then(serde_json::Value::as_str) != Some("tool")
-    }
-    if !messages.iter().any(needs_wrap) {
+    if !messages.iter().any(needs_text_part_wrap) {
         return None;
     }
-    let wrapped = messages
-        .iter()
-        .map(|message| {
-            if !needs_wrap(message) {
-                return message.clone();
-            }
-            let mut message = message.clone();
-            let text = message["content"].take();
-            message["content"] = serde_json::json!([{ "type": "text", "text": text }]);
-            message
-        })
-        .collect();
+    let mut wrapped = messages.to_vec();
+    wrap_string_content_in_place(&mut wrapped);
     Some(wrapped)
+}
+
+/// Whether the OpenAI-format render wraps `message`'s content: a string, on
+/// any message but a tool result (the engine joins a result's parts back
+/// into one string, so a string it stays).
+fn needs_text_part_wrap(message: &serde_json::Value) -> bool {
+    message
+        .get("content")
+        .is_some_and(serde_json::Value::is_string)
+        && message.get("role").and_then(serde_json::Value::as_str) != Some("tool")
+}
+
+/// [`string_content_as_text_parts`] on messages the caller owns: every
+/// string `content` of a non-tool message becomes a one-item text part list
+/// where it stands, and no message is copied.
+pub(crate) fn wrap_string_content_in_place(messages: &mut [serde_json::Value]) {
+    for message in messages.iter_mut() {
+        if !needs_text_part_wrap(message) {
+            continue;
+        }
+        let Some(content) = message.get_mut("content") else {
+            continue;
+        };
+        let text = content.take();
+        *content = serde_json::json!([{ "type": "text", "text": text }]);
+    }
 }
 
 /// Chat template processor using Jinja2 - simple wrapper like HuggingFace

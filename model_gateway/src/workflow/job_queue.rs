@@ -14,7 +14,7 @@ use openai_protocol::worker::{
     ConnectionMode, JobStatus, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
 };
 use smg_mcp::McpConfig;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
 use wfaas::WorkflowId;
 
@@ -128,7 +128,7 @@ impl Job {
             Job::InitializeWorkersFromConfig { .. } => "startup",
             Job::InitializeMcpServers { .. } => "startup",
             Job::RegisterMcpServer { config } => &config.name,
-            Job::AddWasmModule { config } => &config.descriptor.name,
+            Job::AddWasmModule { config } => &config.uuid_string,
             Job::RemoveWasmModule { request } => &request.uuid_string,
             Job::AddTokenizer { config } => &config.id,
             Job::RemoveTokenizer { request } => &request.id,
@@ -164,7 +164,36 @@ pub struct JobQueue {
     status_map: Arc<DashMap<String, JobStatus>>,
     /// Semaphore to limit concurrent job execution
     concurrency_limit: Arc<Semaphore>,
+    /// The waiters of [`Self::submit_and_wait`], by job key: a job's outcome
+    /// is handed to its waiter when the job ends.
+    outcomes: Outcomes,
 }
+
+/// The waiters for a job's outcome, by job key.
+type Outcomes = Arc<DashMap<String, oneshot::Sender<Result<String, String>>>>;
+
+/// Why [`JobQueue::submit_and_wait`] returned no success message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobOutcomeError {
+    /// The queue took no job: full, or shutting down.
+    NotQueued(String),
+    /// The job ran and failed, with its reason.
+    Failed(String),
+    /// The job did not end within the wait; it keeps running.
+    TimedOut(Duration),
+}
+
+impl std::fmt::Display for JobOutcomeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotQueued(reason) => write!(f, "Failed to submit job: {reason}"),
+            Self::Failed(reason) => f.write_str(reason),
+            Self::TimedOut(wait) => write!(f, "Job timeout after {}s", wait.as_secs()),
+        }
+    }
+}
+
+impl std::error::Error for JobOutcomeError {}
 
 impl std::fmt::Debug for JobQueue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -189,18 +218,21 @@ impl JobQueue {
 
         let status_map = Arc::new(DashMap::new());
         let concurrency_limit = Arc::new(Semaphore::new(config.max_concurrent_jobs));
+        let outcomes: Outcomes = Arc::new(DashMap::new());
 
         let queue = Arc::new(Self {
             tx,
             context: context.clone(),
             status_map: status_map.clone(),
             concurrency_limit: concurrency_limit.clone(),
+            outcomes: outcomes.clone(),
         });
 
         // Single dispatcher task
         let ctx = context.clone();
         let status = status_map.clone();
         let sem = concurrency_limit.clone();
+        let waiters = outcomes.clone();
 
         #[expect(
             clippy::disallowed_methods,
@@ -216,13 +248,14 @@ impl JobQueue {
 
                 let ctx_clone = ctx.clone();
                 let status_clone = status.clone();
+                let waiters_clone = waiters.clone();
 
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "Job processing task: bounded by the semaphore permit which is dropped when the task completes"
                 )]
                 tokio::spawn(async move {
-                    Self::process_job(job, ctx_clone, status_clone, permit).await;
+                    Self::process_job(job, ctx_clone, status_clone, waiters_clone, permit).await;
                 });
             }
 
@@ -390,6 +423,43 @@ impl JobQueue {
         Ok(())
     }
 
+    /// Submit `job` and wait for its outcome: the job's own success message
+    /// or its failure, as the status map records them, without a poll.
+    /// `timeout` bounds the wait; a job that outlives it keeps running and
+    /// its outcome is dropped.
+    pub async fn submit_and_wait(
+        &self,
+        job: Job,
+        timeout: Duration,
+    ) -> Result<String, JobOutcomeError> {
+        let key = job.worker_url().to_string();
+        let (tx, rx) = oneshot::channel();
+        self.outcomes.insert(key.clone(), tx);
+        if let Err(reason) = self.submit(job).await {
+            self.outcomes.remove(&key);
+            return Err(JobOutcomeError::NotQueued(reason));
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Ok(message))) => Ok(message),
+            Ok(Ok(Err(reason))) => Err(JobOutcomeError::Failed(reason)),
+            Ok(Err(_)) => Err(JobOutcomeError::Failed(
+                "the job ended without an outcome".to_string(),
+            )),
+            Err(_) => {
+                self.outcomes.remove(&key);
+                Err(JobOutcomeError::TimedOut(timeout))
+            }
+        }
+    }
+
+    /// Hands a finished job's outcome to the waiter under its key, if any;
+    /// a waiter that gave up (its receiver dropped) is a no-op.
+    fn deliver_outcome(outcomes: &Outcomes, key: &str, outcome: Result<String, String>) {
+        if let Some((_, waiter)) = outcomes.remove(key) {
+            let _ = waiter.send(outcome);
+        }
+    }
+
     /// Get job status by worker URL
     pub fn get_status(&self, worker_url: &str) -> Option<JobStatus> {
         self.status_map.get(worker_url).map(|entry| entry.clone())
@@ -405,6 +475,7 @@ impl JobQueue {
         job: Job,
         context: Weak<AppContext>,
         status_map: Arc<DashMap<String, JobStatus>>,
+        outcomes: Outcomes,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) {
         let job_type = job.job_type();
@@ -453,13 +524,15 @@ impl JobQueue {
                     ctx.worker_registry.release_reservation(&worker_url);
                 }
                 Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
+                Self::deliver_outcome(&outcomes, &worker_url, result);
             }
             None => {
                 let error_msg = "AppContext dropped".to_string();
                 status_map.insert(
                     worker_url.clone(),
-                    JobStatus::failed(job_type, &worker_url, error_msg),
+                    JobStatus::failed(job_type, &worker_url, error_msg.clone()),
                 );
+                Self::deliver_outcome(&outcomes, &worker_url, Err(error_msg));
                 error!(
                     "AppContext dropped, cannot process job: type={}, worker={}",
                     job_type,
@@ -1152,6 +1225,34 @@ mod tests {
         ] {
             assert_eq!(Job::shown_worker(job_type, name), name, "{job_type}");
         }
+    }
+
+    /// A finished job's outcome reaches the waiter under its key once, and
+    /// the waiter is gone; a key without a waiter is a no-op.
+    #[tokio::test]
+    async fn an_outcome_reaches_its_waiter_once() {
+        let outcomes: Outcomes = Arc::new(DashMap::new());
+        let (tx, rx) = oneshot::channel();
+        outcomes.insert("job-1".to_string(), tx);
+        JobQueue::deliver_outcome(&outcomes, "job-2", Ok("stray".to_string()));
+        JobQueue::deliver_outcome(&outcomes, "job-1", Ok("done".to_string()));
+        assert!(matches!(rx.await, Ok(Ok(ref message)) if message == "done"));
+        assert!(outcomes.is_empty());
+    }
+
+    /// A submission the queue refuses leaves no waiter behind and says why.
+    #[tokio::test]
+    async fn a_refused_submission_leaves_no_waiter() {
+        let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
+        let job = Job::RemoveWasmModule {
+            request: Box::new(WasmModuleRemovalRequest::new(uuid::Uuid::now_v7())),
+        };
+        let outcome = queue.submit_and_wait(job, Duration::from_secs(1)).await;
+        assert!(
+            matches!(outcome, Err(JobOutcomeError::NotQueued(ref reason)) if reason.contains("shutting down")),
+            "{outcome:?}"
+        );
+        assert!(queue.outcomes.is_empty());
     }
 
     fn spec_for(url: &str, router_config: &RouterConfig) -> WorkerSpec {
