@@ -12,7 +12,7 @@ use tokenizers::{
 };
 
 use super::{
-    super::bytes_char, ByteTokens, Merge, MergeTable, PAIR_FILTER_BITS_PER_MERGE,
+    super::bytes_char, ByteTokens, Merge, MergeTable, HOT_SIDE, PAIR_FILTER_BITS_PER_MERGE,
     SHORT_PIECE_SMALL, SHORT_PIECE_SYMBOLS, SHORT_PIECE_TINY,
 };
 
@@ -775,13 +775,13 @@ fn a_byte_fallback_vocabulary_merges_its_symbols_as_the_model_does() {
     let table = MergeTable::from_model(&ModelWrapper::BPE(bpe.clone()), ByteTokens::Hex)
         .expect("the table loads with hex byte tokens");
     assert_eq!(table.merges(), merges.len());
-    // No merge of such a table starts from bytes: the byte-pair grid is not
-    // built (512 KiB per loaded vocabulary otherwise).
+    // No merge of such a table starts from bytes: the hot grid is not built
+    // (2 MiB per loaded vocabulary otherwise).
     assert!(
-        table.byte_grid.is_empty(),
-        "a table built for character symbols carries no byte grid"
+        table.hot.is_empty(),
+        "a table built for character symbols carries no hot grid"
     );
-    assert!(table.bytes() < 256 * 256 * size_of::<u64>());
+    assert!(table.bytes() < (HOT_SIDE * HOT_SIDE) as usize * size_of::<u64>());
     // The symbols of a word as `merge_word` makes them: a character's token,
     // else its bytes' tokens.
     let symbols = |word: &str| -> Vec<u32> {
@@ -894,16 +894,16 @@ fn two_byte_characters_on_one_id_merge_as_the_model_does() {
     assert_eq!(table_ids(&merges, b"bc"), [ac]);
 }
 
-/// The table is the byte-pair grid (256 x 256 words) and its entries: a
-/// power of two of buckets, one cache line of four sixteen-byte entries
-/// each, at a load of one half or less, the pair filter, and the pre-formed
-/// character analysis counted apart.
+/// The table is the hot grid (`HOT_SIDE` x `HOT_SIDE` words) and its
+/// entries: a power of two of buckets, one cache line of four sixteen-byte
+/// entries each, at a load of one half or less, the pair filter, and the
+/// pre-formed character analysis counted apart.
 #[test]
 fn the_tables_bytes_are_the_grid_the_filter_and_its_buckets_at_half_load_or_less() {
     let bpe = model_with(&merges(), false);
     let table = table_of(&bpe);
     let merges = merges().len();
-    let grid = 256 * 256 * size_of::<u64>();
+    let grid = (HOT_SIDE * HOT_SIDE) as usize * size_of::<u64>();
     let filter = table.pair_filter_bytes();
     assert!(
         filter * 8 >= PAIR_FILTER_BITS_PER_MERGE * merges && filter.is_power_of_two(),
@@ -922,9 +922,10 @@ fn the_tables_bytes_are_the_grid_the_filter_and_its_buckets_at_half_load_or_less
     );
 }
 
-/// Every merge of the model passes the pair filter (a false negative would
-/// lose a merge), and pairs that are no merge mostly do not (a filter that
-/// admitted them all would save no bucket line).
+/// Every merge of the model is answered: a pair inside the hot grid's window
+/// by the grid, one outside it by the pair filter (a false negative would
+/// lose a merge) and its bucket; and pairs that are no merge mostly fail the
+/// filter (a filter that admitted them all would save no bucket line).
 #[test]
 fn every_merge_passes_the_pair_filter_and_a_pair_that_is_none_mostly_does_not() {
     let bpe = model_with(&merges(), false);
@@ -932,7 +933,11 @@ fn every_merge_passes_the_pair_filter_and_a_pair_that_is_none_mostly_does_not() 
     let id = |token: &str| bpe.token_to_id(token).expect("a token of the model");
     for (a, b) in merges() {
         assert!(
-            table.pair_filter_admits(id(a), id(b)),
+            table.merge_of(id(a), id(b)) != Merge::NONE,
+            "the merge ({a}, {b}) is not answered"
+        );
+        assert!(
+            table.hot_index(id(a), id(b)).is_some() || table.pair_filter_admits(id(a), id(b)),
             "the merge ({a}, {b}) fails the filter"
         );
     }
