@@ -1147,7 +1147,7 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_kv_event_resyncs_total",
         "KV event rank resyncs by worker and reason (out_of_range, data_loss, \
-         publisher_restart, gap_cleared, snapshot)"
+         publisher_restart, gap_cleared, snapshot, rank_joined)"
     );
     describe_histogram!(
         "smg_kv_event_lag_seconds",
@@ -3250,6 +3250,7 @@ impl Metrics {
             "publisher_restart",
             "gap_cleared",
             "snapshot",
+            "rank_joined",
         ] {
             counter!(
                 "smg_kv_event_resyncs_total",
