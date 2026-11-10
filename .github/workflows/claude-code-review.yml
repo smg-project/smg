@@ -51,8 +51,19 @@ jobs:
       )
     runs-on: ${{ vars.SMG_RUNNER_REVIEW || 'k8s-runner-cpu' }}
     timeout-minutes: 30
+    # One review at a time per pull request, the newest push winning. Only a review trigger may
+    # claim the group: a run started by any other comment on the pull request (the action's own
+    # tracking comment, Codex's status note, a human remark) gets a group of its own, or it would
+    # cancel the review in progress while its own job is skipped.
     concurrency:
-      group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      group: >-
+        claude-review-${{
+          (github.event_name == 'pull_request'
+            || (github.event_name == 'issue_comment'
+                && github.event.comment.user.type != 'Bot'
+                && contains(github.event.comment.body, '@claude review')))
+          && (github.event.pull_request.number || github.event.issue.number)
+          || format('noop-{0}', github.run_id) }}
       cancel-in-progress: true
     steps:
       # The default branch: this workflow's scripts. The pull request's head is checked
