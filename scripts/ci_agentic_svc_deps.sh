@@ -51,7 +51,11 @@ check_mcp_tools() {
     local i
     for ((i = 1; i <= attempts; i++)); do
         echo "Listing $name tools at $url (attempt $i/$attempts)..."
-        if python3 "$probe" "$url" --expect "$expected" --timeout 10; then
+        # The probe bounds the whole handshake itself (--deadline; a socket
+        # timeout alone never trips on a stream kept open with keepalives).
+        # The outer timeout is the backstop for anything else that could
+        # hang an attempt; its exit 124 is a failed attempt like any other.
+        if timeout 45 python3 "$probe" "$url" --expect "$expected" --timeout 10 --deadline 30; then
             return 0
         fi
         if [ "$i" -lt "$attempts" ]; then
