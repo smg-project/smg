@@ -389,9 +389,9 @@ fn has_pattern_and_length_bounds(obj: &serde_json::Map<String, Value>) -> bool {
         && (obj.contains_key("minLength") || obj.contains_key("maxLength"))
 }
 
-/// [`unsupported_in`] at every schema under `value`: a `json_schema` element
-/// (an object with `"type": "json_schema"`, its schema under `json_schema`)
-/// and, in the older spelling (`structures` with `triggers`), a structure's
+/// [`unsupported_in`] at every schema under `value`: a `json_schema` or a
+/// `qwen_xml_parameter` element (an object of that `type`, its schema under
+/// `json_schema`) and, in the older spelling (`structures` with `triggers`), a structure's
 /// `schema` beside its `begin` and `end`; the tag's other objects and arrays
 /// walked for them; `pointer` as there, and `openers` the `begin` of each tag
 /// on the way down (an object with one), taken back on the way up, so it
@@ -403,7 +403,10 @@ fn unsupported_in_tag(
 ) -> Option<Cow<'static, str>> {
     match value {
         Value::Object(obj) => {
-            if obj.get("type").and_then(Value::as_str) == Some("json_schema") {
+            if matches!(
+                obj.get("type").and_then(Value::as_str),
+                Some("json_schema" | "qwen_xml_parameter")
+            ) {
                 let schema = obj.get("json_schema")?;
                 push_segment(pointer, "json_schema");
                 return unsupported_in(schema, pointer);
@@ -1150,6 +1153,35 @@ mod tests {
         assert_eq!(
             xgrammar_unsupported_feature_in_structural_tag(&tag(
                 serde_json::json!({"type": "integer"})
+            )),
+            None
+        );
+    }
+
+    /// A `qwen_xml_parameter` element holds its schema under `json_schema`
+    /// too, and is checked there like a `json_schema` element, the tag around
+    /// it named; a schema that passes finds nothing.
+    #[test]
+    fn a_qwen_xml_parameter_element_is_checked_at_its_json_schema() {
+        let tag = |schema: Value| {
+            serde_json::json!({"type": "structural_tag", "format": {"type": "tag",
+                "begin": "<tool_call>", "end": "</tool_call>",
+                "content": {"type": "qwen_xml_parameter", "json_schema": schema}}})
+            .to_string()
+        };
+        assert_eq!(
+            xgrammar_unsupported_feature_in_structural_tag(&tag(serde_json::json!({
+                "type": "object", "properties": {"n": {"type": "integer", "multipleOf": 3}}
+            }))),
+            Some(XgrammarUnsupportedFeature {
+                keyword: "multipleOf".into(),
+                pointer: "/format/content/json_schema/properties/n".to_string(),
+                openers: vec!["<tool_call>".to_string()],
+            })
+        );
+        assert_eq!(
+            xgrammar_unsupported_feature_in_structural_tag(&tag(
+                serde_json::json!({"type": "object"})
             )),
             None
         );
