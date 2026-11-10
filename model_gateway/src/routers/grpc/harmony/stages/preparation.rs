@@ -463,3 +463,42 @@ fn build_text_format_structural_tag(schema: &serde_json::Value) -> Result<String
     serde_json::to_string(&structural_tag)
         .map_err(|e| format!("Failed to serialize structural tag for structured output: {e}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use super::*;
+
+    /// A `structural_tag` response format is the engine's constraint as the
+    /// client sent it, key for key, with no channel framing around it; a JSON
+    /// format takes the framing (`build_text_format_structural_tag`), and
+    /// `text` constrains nothing.
+    #[test]
+    fn a_structural_tag_response_format_is_the_constraint_as_sent() {
+        let constraint = |format: &ResponseFormat| {
+            HarmonyPreparationStage::generate_response_format_constraint(Some(format))
+                .expect("accepted")
+        };
+        let sent = json!({
+            "type": "structural_tag",
+            "format": {"type": "json_schema", "json_schema": {"type": "object"}}
+        });
+        let format: ResponseFormat = serde_json::from_value(sent.clone()).expect("a tag");
+        let (kind, tag) = constraint(&format).expect("a constraint");
+        assert_eq!(kind, "structural_tag");
+        assert_eq!(serde_json::from_str::<Value>(&tag).expect("the tag"), sent);
+        let (kind, tag) = constraint(&ResponseFormat::JsonObject).expect("a constraint");
+        assert_eq!(kind, "structural_tag");
+        let framed: Value = serde_json::from_str(&tag).expect("the tag");
+        assert_eq!(
+            framed["format"]["tags"][1]["begin"],
+            "<|channel|>final<|constrain|>json<|message|>"
+        );
+        assert_eq!(
+            framed["format"]["tags"][1]["content"]["json_schema"],
+            json!({"type": "object"})
+        );
+        assert_eq!(constraint(&ResponseFormat::Text), None);
+    }
+}

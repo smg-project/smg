@@ -389,12 +389,13 @@ fn has_pattern_and_length_bounds(obj: &serde_json::Map<String, Value>) -> bool {
         && (obj.contains_key("minLength") || obj.contains_key("maxLength"))
 }
 
-/// [`unsupported_in`] at every `json_schema` element under `value` (an object
-/// with `"type": "json_schema"`, its schema under `json_schema`), the tag's
-/// other objects and arrays walked for them; `pointer` as there, and
-/// `openers` the `begin` of each tag on the way down (an object with one),
-/// taken back on the way up, so it reads the tags around the hit when one
-/// returns.
+/// [`unsupported_in`] at every schema under `value`: a `json_schema` element
+/// (an object with `"type": "json_schema"`, its schema under `json_schema`)
+/// and, in the older spelling (`structures` with `triggers`), a structure's
+/// `schema` beside its `begin` and `end`; the tag's other objects and arrays
+/// walked for them; `pointer` as there, and `openers` the `begin` of each tag
+/// on the way down (an object with one), taken back on the way up, so it
+/// reads the tags around the hit when one returns.
 fn unsupported_in_tag(
     value: &Value,
     pointer: &mut String,
@@ -410,6 +411,16 @@ fn unsupported_in_tag(
             let opens = obj.get("begin").and_then(Value::as_str);
             if let Some(begin) = opens {
                 openers.push(begin.to_string());
+            }
+            // The older spelling's structure: its schema, checked as a
+            // `json_schema` element's is, its own `begin` among the openers.
+            if let Some(schema) = obj.get("schema") {
+                push_segment(pointer, "schema");
+                let found = unsupported_in(schema, pointer);
+                if found.is_none() && opens.is_some() {
+                    openers.pop();
+                }
+                return found;
             }
             for (key, nested) in obj {
                 let len = pointer.len();
@@ -1099,6 +1110,47 @@ mod tests {
         );
         assert_eq!(
             xgrammar_unsupported_feature_in_structural_tag("<not json>"),
+            None
+        );
+    }
+
+    /// The older spelling (`structures` with `triggers`) is checked at each
+    /// structure's `schema`, nested schemas included, the structure's `begin`
+    /// naming the tag around the hit; a tag whose schemas pass finds nothing.
+    #[test]
+    fn the_older_spelling_is_checked_at_each_structures_schema() {
+        let tag = |schema: Value| {
+            serde_json::json!({"type": "structural_tag", "structures": [
+                {"begin": "<w>", "schema": {"type": "object"}, "end": "</w>"},
+                {"begin": "<n>", "schema": schema, "end": "</n>"}],
+                "triggers": ["<w>", "<n>"]})
+            .to_string()
+        };
+        let found = |keyword: &str, pointer: &str| {
+            Some(XgrammarUnsupportedFeature {
+                keyword: keyword.to_string().into(),
+                pointer: pointer.to_string(),
+                openers: vec!["<n>".to_string()],
+            })
+        };
+        assert_eq!(
+            xgrammar_unsupported_feature_in_structural_tag(&tag(
+                serde_json::json!({"type": "integer", "multipleOf": 3})
+            )),
+            found("multipleOf", "/structures/1/schema")
+        );
+        assert_eq!(
+            xgrammar_unsupported_feature_in_structural_tag(&tag(serde_json::json!({
+                "type": "object",
+                "properties": {"days": {"type": "array", "items": {"type": "string"},
+                                        "uniqueItems": true}}
+            }))),
+            found("uniqueItems", "/structures/1/schema/properties/days")
+        );
+        assert_eq!(
+            xgrammar_unsupported_feature_in_structural_tag(&tag(
+                serde_json::json!({"type": "integer"})
+            )),
             None
         );
     }

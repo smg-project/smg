@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use axum::response::Response;
 use llm_tokenizer::chat_template::ThinkingKeyName;
-use openai_protocol::profile::ProviderProfile;
+use openai_protocol::{common::ResponseFormat, profile::ProviderProfile};
 use smg_grpc_client::FormatSetAside;
 use tracing::error;
 
@@ -195,6 +195,7 @@ pub(crate) fn build(
             tool_parser.as_deref(),
             first_token_tag,
             &proto_request,
+            own_format(&ctx.input.request_type, format_set_aside),
         ),
     };
     Ok((
@@ -207,6 +208,15 @@ pub(crate) fn build(
             tool_constraint,
         },
     ))
+}
+
+/// The body's own `response_format` as the builder read it: a chat body's,
+/// unless the constraint set it aside (`FormatSetAside::response_format`).
+fn own_format(request: &RequestType, set_aside: FormatSetAside) -> Option<&ResponseFormat> {
+    match request {
+        RequestType::Chat(chat) if !set_aside.response_format => chat.response_format.as_ref(),
+        _ => None,
+    }
 }
 
 /// Match the template's tri-state switch, including explicit kwargs precedence.

@@ -698,14 +698,22 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                             }
                         }
                         Field::JsonSchema if kind == Some(ResponseFormatKind::StructuralTag) => {
+                            // a repeat of one read before the kind: the last
+                            // value, in the first one's place
+                            schema_twice |= schema.is_some();
                             spec.insert("json_schema".to_owned(), map.next_value()?);
                         }
                         Field::JsonSchema => {
                             if schema.is_some() {
                                 // the derive reports the duplicate once the
-                                // object is read, whatever the second value
+                                // object is read, whatever the second value;
+                                // a tag keeps the last, in the first one's place
                                 schema_twice = true;
-                                map.next_value::<de::IgnoredAny>()?;
+                                if kind.is_none() {
+                                    spec.insert("json_schema".to_owned(), map.next_value()?);
+                                } else {
+                                    map.next_value::<de::IgnoredAny>()?;
+                                }
                                 continue;
                             }
                             schema = Some(match kind {
@@ -716,7 +724,12 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                                     map.next_value::<de::IgnoredAny>()?;
                                     Schema::Skipped
                                 }
-                                None => Schema::Kept(map.next_value()?),
+                                None => {
+                                    // the key's place, kept for a tag; the
+                                    // value fills it once the kind is read
+                                    spec.insert("json_schema".to_owned(), Value::Null);
+                                    Schema::Kept(map.next_value()?)
+                                }
                             });
                         }
                         Field::Other(name) => match kind {
@@ -734,7 +747,9 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                     ResponseFormatKind::Text => ResponseFormat::Text,
                     ResponseFormatKind::JsonObject => ResponseFormat::JsonObject,
                     ResponseFormatKind::StructuralTag => {
-                        if let Some(Schema::Kept(kept)) = schema {
+                        // the place kept before the kind takes its value; a
+                        // repeat of the key already took it
+                        if let Some(Schema::Kept(kept)) = schema.filter(|_| !schema_twice) {
                             spec.insert("json_schema".to_owned(), Value::from(kept));
                         }
                         ResponseFormat::StructuralTag { spec }
@@ -2772,8 +2787,11 @@ mod tests {
     /// the order they came, in whichever spelling the engine's grammar
     /// compiler takes (`structures` with `triggers`, or a `format`), unknown
     /// keys included, so the text written back is the text read. With `type`
-    /// last the keys before it are kept the same, a `json_schema` among them
-    /// as the value it was; the sequence form reads the kind, then the object.
+    /// last the keys before it are kept the same, in their places, a
+    /// `json_schema` among them as the value it was (the last one where the
+    /// key repeats, in the first one's place, before the kind as after it, as
+    /// the derive's flattened map keeps it); the sequence form reads the
+    /// kind, then the object.
     #[test]
     fn a_structural_tag_response_format_is_kept_as_it_arrived() {
         let read = |text: &str| serde_json::from_str::<ResponseFormat>(text).expect(text);
@@ -2813,6 +2831,28 @@ mod tests {
         assert_eq!(spec["structures"], json!([]));
         assert_eq!(spec["json_schema"], json!({"name": "m"}));
         assert_eq!(spec.len(), 3);
+        assert_eq!(
+            spec.keys().collect::<Vec<_>>(),
+            ["triggers", "json_schema", "structures"],
+            "the keys keep their places"
+        );
+        let ordered = r#"{"triggers":["<w>"],"json_schema":{"name":"m"},"structures":[],"type":"structural_tag"}"#;
+        assert_eq!(
+            serde_json::to_string(&read(ordered)).expect("writes"),
+            r#"{"type":"structural_tag","triggers":["<w>"],"json_schema":{"name":"m"},"structures":[]}"#
+        );
+        // a repeated `json_schema`: the last value, in the first one's place
+        for text in [
+            r#"{"json_schema":1,"triggers":[],"json_schema":2,"type":"structural_tag"}"#,
+            r#"{"type":"structural_tag","json_schema":1,"triggers":[],"json_schema":2}"#,
+            r#"{"json_schema":1,"type":"structural_tag","triggers":[],"json_schema":2}"#,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&read(text)).expect("writes"),
+                r#"{"type":"structural_tag","json_schema":2,"triggers":[]}"#,
+                "{text}"
+            );
+        }
         // inside a request: the field reads and writes back as sent
         let body = format!(
             r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"response_format":{structures}}}"#

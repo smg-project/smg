@@ -1372,3 +1372,59 @@ async fn a_structural_tag_response_format_is_the_engines_constraint_as_sent() {
     chat(&gateway, json!({"tools": tools(), "response_format": tag})).await;
     assert_eq!(sent_tag(&gateway), tag);
 }
+
+/// A `structural_tag` response format beside a forced call under the legacy parsers (no table sets
+/// the format aside), on an engine whose builder lets the body's format outrank the forced call's
+/// grammar (TokenSpeed's, as TensorRT-LLM's and SGLang's; vLLM's lets the call win): every worker
+/// receives the client's tag, on the first attempt and on the retries alike, never the grammar the
+/// builder dropped. Each worker refuses its first `Generate`, so the request crosses to the other
+/// worker and back: three attempts.
+#[tokio::test]
+async fn a_retry_keeps_the_clients_structural_tag_over_the_forced_calls() {
+    let tag = json!({
+        "type": "structural_tag",
+        "structures": [{"begin": "<w>", "schema": {"type": "object"}, "end": "</w>"}],
+        "triggers": ["<w>"]
+    });
+    let gateway = serve_engines(
+        Setup {
+            template: None,
+            chat_template: false,
+            parser: ParserChoice::Legacy,
+            reasoning_parser: None,
+            tool_parser: Some("kimik2"),
+            round_robin: true,
+            ..Setup::default()
+        },
+        vec![
+            Engine {
+                labels: vec![],
+                finish_reasons: vec!["unavailable", "stop"],
+            },
+            Engine {
+                labels: vec![],
+                finish_reasons: vec!["unavailable", "stop"],
+            },
+        ],
+    )
+    .await;
+    chat(
+        &gateway,
+        json!({"tools": tools(), "tool_choice": "required", "response_format": tag}),
+    )
+    .await;
+    let received: Vec<Value> = gateway
+        .requests
+        .iter()
+        .flat_map(|log| {
+            let log = log.lock().expect("the worker's log");
+            log.iter().map(constraint_of).collect::<Vec<_>>()
+        })
+        .map(|constraint| {
+            let (kind, text) = constraint.expect("a constraint");
+            assert_eq!(kind, "structural_tag");
+            serde_json::from_str(&text).expect("the tag as JSON")
+        })
+        .collect();
+    assert_eq!(received, vec![tag.clone(), tag.clone(), tag]);
+}
