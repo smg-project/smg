@@ -480,7 +480,10 @@ impl ResponseProcessor {
         // answer builds its usage chunk: with the reasoning tokens the
         // gateway's parser split off when it ran (zero included) and every
         // detail counter present as the OpenAI API sends it.
-        let counts = response_formatting::TokenCounts::of(&all_responses);
+        let counts = response_formatting::TokenCounts::of_collected(
+            &all_responses,
+            chat_request.expected_choices,
+        );
         let usage = response_formatting::chat_usage(
             counts.usage(),
             (reasoning_parser_available || chat_request.symphony.is_some())
@@ -1150,8 +1153,21 @@ impl ResponseProcessor {
         let mut total_cached = 0u32;
         let mut total_reasoning = 0u32;
         let mut total_spec_accepted = 0u32;
-        let mut total_spec_drafted = 0u32;
-        let mut has_unknown_spec_draft_tokens = false;
+        // Membership is per prompt: another prompt's choice cannot stand in
+        // for a missing terminal here. Borrow the collected frames so the
+        // shared proposal rule needs no intermediate allocation.
+        let spec_drafted =
+            response_formatting::known_spec_drafted(collected.iter().flatten().map(|complete| {
+                (
+                    complete.spec_accepted_tokens(),
+                    complete.spec_draft_tokens(),
+                )
+            }))
+            .filter(|_| {
+                collected.iter().all(|responses| {
+                    response_formatting::all_choices_completed(responses, choices_per_prompt)
+                })
+            });
         let mut choices = Vec::new();
 
         for (prompt_index, all_responses) in collected.into_iter().enumerate() {
@@ -1182,9 +1198,6 @@ impl ResponseProcessor {
                 total_completion += complete.completion_tokens();
                 total_reasoning += complete.reasoning_tokens();
                 total_spec_accepted += complete.spec_accepted_tokens();
-                total_spec_drafted += complete.spec_draft_tokens();
-                has_unknown_spec_draft_tokens |= complete.spec_draft_tokens() == 0
-                    || complete.spec_draft_tokens() < complete.spec_accepted_tokens();
 
                 let finish_reason =
                     utils::completion_finish_reason(stopped, complete.finish_reason());
@@ -1266,13 +1279,7 @@ impl ResponseProcessor {
                     cached: total_cached,
                     reasoning: total_reasoning,
                     spec_accepted: total_spec_accepted,
-                    spec_drafted: if has_unknown_spec_draft_tokens
-                        && (total_spec_drafted > 0 || total_spec_accepted > 0)
-                    {
-                        None
-                    } else {
-                        Some(total_spec_drafted)
-                    },
+                    spec_drafted,
                 }
                 .usage(),
             ),
