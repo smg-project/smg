@@ -47,7 +47,9 @@ use image::DynamicImage;
 
 use super::{
     qwen2_vl::{CLIP_MEAN, CLIP_STD},
-    qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode},
+    qwen_vl_base::{
+        image_work, weighted_runs, QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode,
+    },
 };
 use crate::{
     types::RgbFrameRef,
@@ -346,7 +348,8 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
     }
 
     /// Produce cache entries directly when they will be assembled with hits
-    /// or duplicated in the request. Keep the shared executor's task limits.
+    /// or duplicated in the request. Balance work by pixels and keep results
+    /// in request order.
     fn preprocess_image_items(
         &self,
         images: &[&DynamicImage],
@@ -360,17 +363,39 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         if tasks <= 1 {
             return Some(images.iter().map(preprocess).collect());
         }
-        let chunk_size = images.len().div_ceil(tasks);
-        let mut results: Vec<_> = images.chunks(chunk_size).map(|_| Vec::new()).collect();
+        let weights: Vec<_> = images
+            .iter()
+            .map(|image| {
+                let (height, width) = (image.height() as usize, image.width() as usize);
+                let (target_h, target_w) = self
+                    .inner
+                    .smart_resize(height, width)
+                    .unwrap_or((height, width));
+                image_work(image, target_w as u32, target_h as u32)
+            })
+            .collect();
+        let mut results: Vec<_> = images.iter().map(|_| None).collect();
+        let items = images.iter().zip(&mut results).collect();
         execution::scope(|scope| {
-            for (images, result) in images.chunks(chunk_size).zip(&mut results) {
+            for run in weighted_runs(items, &weights, tasks) {
                 let preprocess = &preprocess;
                 scope.spawn(move |_| {
-                    result.extend(images.iter().map(preprocess));
+                    for (image, result) in run {
+                        *result = Some(preprocess(image));
+                    }
                 });
             }
         });
-        Some(results.into_iter().flatten().collect())
+        Some(
+            results
+                .into_iter()
+                .map(|result| {
+                    result.unwrap_or_else(|| {
+                        Err(TransformError::ShapeError("missing M3 image result".into()))
+                    })
+                })
+                .collect(),
+        )
     }
 
     fn preprocess_video(
@@ -457,8 +482,6 @@ mod tests {
         .expect("checkpoint preprocessor config parses")
     }
 
-    /// The fused BF16 path preserves pixels, geometry, and metadata under
-    /// checkpoint/default settings and the gateway's decode-time resizing.
     /// Cache entries must hold only the bytes the pixel budget charges.
     #[test]
     fn owned_cache_items_have_no_spare_pixel_capacity() {
@@ -483,6 +506,38 @@ mod tests {
         }
     }
 
+    /// Work can run out of order while cache entries retain the image order.
+    #[test]
+    fn owned_cache_items_keep_request_order() {
+        let processor = MiniMaxM3VisionProcessor::new();
+        let sizes = [
+            (112, 112),
+            (672, 560),
+            (140, 112),
+            (560, 560),
+            (112, 140),
+            (560, 672),
+            (168, 112),
+            (112, 168),
+            (196, 112),
+        ];
+        let images = sizes.map(|(width, height)| DynamicImage::new_rgb8(width, height));
+        let refs = images.iter().collect::<Vec<_>>();
+        let items = processor
+            .preprocess_image_items(&refs, Some(EncoderDtype::BFloat16))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .flat_map(|item| item.item_sizes.iter().copied())
+                .collect::<Vec<_>>(),
+            sizes,
+        );
+    }
+
+    /// The fused BF16 path preserves pixels, geometry, and metadata under
+    /// checkpoint/default settings and the gateway's decode-time resizing.
     #[test]
     fn bf16_wire_matches_neutral_pixels() {
         let images = [(56, 84), (700, 672), (112, 56)].map(|(w, h)| {

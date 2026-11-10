@@ -1243,7 +1243,7 @@ impl QwenVLProcessorBase {
 /// by: the source pixels (a resize reads every source row, so a large image
 /// shrunk to the budget costs its source, not its target) plus the target
 /// pixels (the patch layout and the write).
-fn image_work(image: &DynamicImage, target_width: u32, target_height: u32) -> usize {
+pub(super) fn image_work(image: &DynamicImage, target_width: u32, target_height: u32) -> usize {
     let source = image.width() as usize * image.height() as usize;
     let target = target_width as usize * target_height as usize;
     source + target
@@ -1253,7 +1253,7 @@ fn image_work(image: &DynamicImage, target_width: u32, target_height: u32) -> us
 /// first, each to the lightest run so far, so the runs hold about equal
 /// shares of the work and no run is empty; at most `tasks` runs, at most one
 /// per item. Within a run the items keep their order.
-fn weighted_runs<T>(items: Vec<T>, weights: &[usize], tasks: usize) -> Vec<Vec<T>> {
+pub(super) fn weighted_runs<T>(items: Vec<T>, weights: &[usize], tasks: usize) -> Vec<Vec<T>> {
     let tasks = tasks.clamp(1, items.len().max(1));
     let mut order: Vec<usize> = (0..items.len()).collect();
     order.sort_by_key(|&index| std::cmp::Reverse(weights[index]));
