@@ -83,7 +83,11 @@ pushed, the read-only commands (`check`, `status`, `publish-plan`, `notes`) read
 
 Nothing, on its own. The `release-pypi`, `release-helm`, `release-crates`, `release-grpc`,
 `release-go` (the Go module tag `crates/grpc_client/go/v<version>`) and `release-engine-docker`
-workflows run on `workflow_dispatch` only; `release-grpc` and `release-go` also refuse a dispatch
+workflows run on `workflow_dispatch` only (the Go bindings module,
+`github.com/smg-project/smg/bindings/golang`, is published by the tag `bindings/golang/v<version>`
+at the release commit, pushed by a maintainer with tag rights beside `v<version>` until `release-go`
+makes it too; a tag at a release before the module path matched the repository names a `go.mod`
+that `go get` refuses); `release-grpc` and `release-go` also refuse a dispatch
 whose ref is not a tag (`release-go`: not the version's tag), since a branch can move between a
 dispatch and its retry; `release-docker` builds the image on a push to `main` or `release/**`
 that touches the Dockerfile and pushes it on a dispatch only. The release owner dispatches each

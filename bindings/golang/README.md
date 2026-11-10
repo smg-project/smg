@@ -36,9 +36,15 @@ A high-level Go SDK for interacting with Shepherd Model Gateway (SMG) gRPC API, 
 
 ## Installation
 
+The module lives in a subdirectory of the repository, so each release publishes it as the tag
+`bindings/golang/v<version>` at the release commit (from 1.16.0 on); name that version:
+
 ```bash
-go get github.com/lightseek/smg/go-grpc-sdk
+go get github.com/smg-project/smg/bindings/golang@v<version>
 ```
+
+The package links the FFI library built from the same checkout (`make build` below), so a
+`go get` alone does not run: build the library at the tag you import.
 
 ### Sync Dependencies
 
@@ -105,7 +111,7 @@ import (
     "fmt"
     "log"
 
-    "github.com/lightseek/smg/go-grpc-sdk"
+    smg "github.com/smg-project/smg/bindings/golang"
 )
 
 func main() {
@@ -150,7 +156,7 @@ import (
     "io"
     "log"
 
-    "github.com/lightseek/smg/go-grpc-sdk"
+    smg "github.com/smg-project/smg/bindings/golang"
 )
 
 func main() {
@@ -376,7 +382,7 @@ All public types and functions include comprehensive documentation with usage ex
 
 ```bash
 godoc -http=:6060
-# Visit: http://localhost:6060/pkg/github.com/lightseek/smg/go-grpc-sdk/
+# Visit: http://localhost:6060/pkg/github.com/smg-project/smg/bindings/golang/
 ```
 
 ## Development
