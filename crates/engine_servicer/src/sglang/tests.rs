@@ -2082,31 +2082,38 @@ async fn a_language_side_request_is_dispatched_to_the_encoders_before_its_rank()
 
 /// Media references a worker cannot have encoded are refused before the
 /// scheduler, by name: on a worker with no encode dispatch (not a
-/// language-side worker), on a language-side worker whose dispatch finds no
-/// encoder registered (the dispatcher is released even so), and when the
-/// dispatch itself fails; a failure reported for a request that never went
-/// out reaches no rank. The refused id is free again: a text request under
-/// it reaches the scheduler.
+/// language-side worker), whatever the modality named, on a language-side
+/// worker whose dispatch finds no encoder registered (the dispatcher is
+/// released even so), and when the dispatch itself fails; a failure reported
+/// for a request that never went out reaches no rank. The refused id is free
+/// again: a text request under it reaches the scheduler.
 #[tokio::test]
 async fn media_references_a_worker_cannot_encode_are_refused_before_the_scheduler() {
     let mut h = harness(vision_model(1)).await;
-    let status = h
-        .client
-        .generate(media_reference_request("refs", 1))
-        .await
-        .expect_err("no encode dispatch on this worker");
-    assert_eq!(
-        status.code(),
-        Code::FailedPrecondition,
-        "{}",
-        status.message()
-    );
-    assert!(
-        status.message().contains("runs no encode dispatch"),
-        "{}",
-        status.message()
-    );
-    assert_scheduler_idle(&mut h.engine_in).await;
+    for request in [
+        media_reference_request("refs", 1),
+        // Video and audio references get the same answer here: the
+        // translation no longer refuses them by name, this worker does.
+        every_modality_reference_request("refs-every"),
+    ] {
+        let status = h
+            .client
+            .generate(request)
+            .await
+            .expect_err("no encode dispatch on this worker");
+        assert_eq!(
+            status.code(),
+            Code::FailedPrecondition,
+            "{}",
+            status.message()
+        );
+        assert!(
+            status.message().contains("runs no encode dispatch"),
+            "{}",
+            status.message()
+        );
+        assert_scheduler_idle(&mut h.engine_in).await;
+    }
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 
     for (answer, code, needle) in [

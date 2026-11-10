@@ -457,7 +457,7 @@ pub(crate) fn translate_request_sglang(
     // embeddings arrive, as behind the engine's own frontend, which sends the
     // text it rendered. Preprocessed tensors take the processor-output path.
     let (mm_inputs, input_text) = match req.mm_inputs {
-        Some(mm) if encode_media_refs(&mm).is_some() => {
+        Some(mm) if names_encode_refs(&mm) => {
             if !req.extra_mm_inputs.is_empty() {
                 return Err("SGLang media references cannot carry extra tensor batches".into());
             }
@@ -529,25 +529,28 @@ pub(crate) fn translate_request_sglang(
     })
 }
 
-/// The media references a payload names for the encoders of an
-/// encode/prefill-disaggregated deployment, by modality, each list in prompt
-/// order: `Some` for a payload of references without preprocessed tensors
-/// (the encoders' input on a language-side worker, see
-/// [`crate::sglang_encode`]), `None` for one carrying tensors (the
-/// processor-output path, whatever references ride beside them: the engine's
-/// frontend processes such a request locally) or nothing at all. Whether the
-/// encoders take every modality named is the dispatch's question: it knows
-/// the transport.
+/// Whether a payload names media references for the encoders of an
+/// encode/prefill-disaggregated deployment: references of any modality
+/// without preprocessed tensors (the encoders' input on a language-side
+/// worker, see [`crate::sglang_encode`]). A payload carrying tensors takes the
+/// processor-output path whatever references ride beside them (the engine's
+/// frontend processes such a request locally); one naming nothing is not a
+/// dispatch. A borrowing test: the translation's guard, free of copies.
+pub(crate) fn names_encode_refs(mm: &sglang_proto::MultimodalInputs) -> bool {
+    mm.pixel_values.is_none()
+        && !(mm.image_urls.is_empty() && mm.video_urls.is_empty() && mm.audio_urls.is_empty())
+}
+
+/// The media references a payload names for the encoders, by modality, each
+/// list in prompt order ([`names_encode_refs`] says whether there are any):
+/// the dispatch's own copy, taken once per choice. Whether the encoders take
+/// every modality named is the dispatch's question: it knows the transport.
 pub(crate) fn encode_media_refs(mm: &sglang_proto::MultimodalInputs) -> Option<EncodeMediaRefs> {
-    if mm.pixel_values.is_some() {
-        return None;
-    }
-    let media = EncodeMediaRefs {
+    names_encode_refs(mm).then(|| EncodeMediaRefs {
         image_urls: mm.image_urls.clone(),
         video_urls: mm.video_urls.clone(),
         audio_urls: mm.audio_urls.clone(),
-    };
-    (!media.is_empty()).then_some(media)
+    })
 }
 
 /// Translate a single image or video batch to the scheduler's native
@@ -1280,6 +1283,7 @@ mod tests {
                 ..Default::default()
             })
         );
+        assert!(names_encode_refs(&references));
         let mut request = media_request(references.clone());
         request.tokenized.as_mut().unwrap().original_text =
             "<|vision_start|><|image_pad|><|vision_end|>What is this?".to_string();
@@ -1306,12 +1310,14 @@ mod tests {
         // Tensors win: references beside them are the frontend's own record.
         let mut both = media_payload();
         both.image_urls = vec!["http://example.test/a.png".to_string()];
+        assert!(!names_encode_refs(&both));
         assert_eq!(encode_media_refs(&both), None);
         let translated = translate(media_request(both)).unwrap();
         assert!(translated.mm_inputs.is_some() && translated.input_text.is_none());
         // Nothing at all is nothing to dispatch.
         let mut empty = media_payload();
         empty.pixel_values = None;
+        assert!(!names_encode_refs(&empty));
         assert_eq!(encode_media_refs(&empty), None);
         // Every modality by reference, each in its own list: the encoders'
         // input too, translated as the image is; the HTTP transport takes it
