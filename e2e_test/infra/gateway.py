@@ -14,6 +14,7 @@ from typing import IO, TYPE_CHECKING, Any
 
 import httpx
 
+from .cloud_credentials import PROXY_ENV, cloud_environment, resolve_cloud_credentials
 from .constants import (
     CLOUD_REQUEST_TIMEOUT_SECS,
     DEFAULT_HOST,
@@ -179,7 +180,11 @@ class Gateway:
         if self._started:
             raise RuntimeError("Gateway already started")
         if env:
-            self._env = {**os.environ, **env}
+            proxy = bool(cloud_backend and env.get(PROXY_ENV, os.environ.get(PROXY_ENV, "")))
+            self._env = {
+                **cloud_environment(os.environ, proxy=proxy),
+                **cloud_environment(env, proxy=proxy),
+            }
 
         is_epd_mode = encode_workers is not None
         is_pd_mode = (prefill_workers is not None or decode_workers is not None) and not is_epd_mode
@@ -531,21 +536,16 @@ class Gateway:
 
     def _build_cloud_args(self, cloud_backend: str, history_backend: str) -> list[str]:
         """Build CLI args and env for cloud mode."""
-        cloud_configs = {
-            "openai": ("https://api.openai.com", "OPENAI_API_KEY", "openai"),
-            "xai": ("https://api.x.ai", "XAI_API_KEY", "openai"),
-            "anthropic": ("https://api.anthropic.com", "ANTHROPIC_API_KEY", "anthropic"),
-        }
-        if cloud_backend not in cloud_configs:
-            raise ValueError(f"Unsupported cloud backend: {cloud_backend}")
-
-        worker_url, api_key_env, backend_type = cloud_configs[cloud_backend]
-        api_key = os.environ.get(api_key_env)
-        if not api_key:
-            raise ValueError(f"{api_key_env} environment variable required")
-
-        self._env = dict(self._env or os.environ)
-        self._env[api_key_env] = api_key
+        credentials = resolve_cloud_credentials(cloud_backend, environ=self._env)
+        worker_url, api_key_env, backend_type = (
+            credentials.worker_root,
+            credentials.api_key_env,
+            credentials.backend_type,
+        )
+        self._env = cloud_environment(
+            self._env if self._env is not None else os.environ, proxy=credentials.is_proxy
+        )
+        self._env[api_key_env] = credentials.api_key
 
         actual_history_backend = history_backend
         if history_backend == "oracle-custom":
