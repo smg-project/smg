@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use validator::Validate;
 
@@ -123,13 +123,21 @@ impl RerankRequest {
 }
 
 /// Individual rerank result
+///
+/// Written in the gateway's own spelling; read from a worker's answer in
+/// every spelling the rerank contracts write: `relevance_score` for the
+/// score and `text` for the document (the Cohere-style and the
+/// embeddings-server contracts), and a document given as the `{text}`
+/// object.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RerankResult {
     /// Relevance score for the document
+    #[serde(alias = "relevance_score")]
     pub score: f32,
 
     /// The document text (if return_documents was true)
+    #[serde(default, alias = "text", deserialize_with = "deserialize_document")]
     pub document: Option<String>,
 
     /// Original index of the document in the request
@@ -137,6 +145,50 @@ pub struct RerankResult {
 
     /// Additional metadata about the ranking
     pub meta_info: Option<HashMap<String, Value>>,
+}
+
+/// A result's document as the contracts write it: the text itself, the
+/// `{text}` object of the Cohere-style contract, or nothing.
+fn deserialize_document<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Document {
+        Text(String),
+        Object { text: Option<String> },
+    }
+    Ok(match Option::<Document>::deserialize(deserializer)? {
+        Some(Document::Text(text)) => Some(text),
+        Some(Document::Object { text }) => text,
+        None => None,
+    })
+}
+
+/// A rerank worker's answer: the ranked results as the bare list the gateway
+/// itself answers with (the embeddings-server contract writes the same list,
+/// `text` for the document), or under `results` as the Cohere-style object
+/// of the OpenAI-compatible rerank servers (`relevance_score`, the document
+/// as text or as `{text}`; the object's `id`, `model` and `usage` are not
+/// read). One `from_slice` reads every shape; the results keep the worker's
+/// order, which every contract sorts by score, highest first.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum RerankWorkerResponse {
+    /// The results as a bare list.
+    List(Vec<RerankResult>),
+    /// The results under `results`.
+    Object { results: Vec<RerankResult> },
+}
+
+impl RerankWorkerResponse {
+    /// The ranked results in the worker's order.
+    pub fn into_results(self) -> Vec<RerankResult> {
+        match self {
+            Self::List(results) | Self::Object { results } => results,
+        }
+    }
 }
 
 /// Rerank response containing sorted results
@@ -192,12 +244,30 @@ impl RerankResponse {
     }
 }
 
-/// V1 API compatibility format for rerank requests
-/// Matches Python's V1RerankReqInput
+/// The body of `/v1/rerank`: the request of the OpenAI-compatible rerank
+/// servers, `query` and `documents` with an optional `model`, `top_n` and
+/// `return_documents`. A body without `model` is routed as the unknown
+/// model, to any worker, the shape a single-model server's client sends;
+/// the native `/rerank` route takes [`RerankRequest`], whose `model` is
+/// required.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct V1RerankReqInput {
     pub query: String,
     pub documents: Vec<String>,
+
+    /// The model to rerank with, which selects the worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Maximum number of documents to return; absent and 0 mean all of them,
+    /// as the OpenAI-compatible servers read it. `top_k`, the native
+    /// spelling, is read as well.
+    #[serde(default, alias = "top_k", skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<usize>,
+
+    /// Whether the documents are returned with their scores (the default).
+    #[serde(default = "default_true")]
+    pub return_documents: bool,
 }
 
 /// Convert V1RerankReqInput to RerankRequest
@@ -206,9 +276,11 @@ impl From<V1RerankReqInput> for RerankRequest {
         RerankRequest {
             query: v1.query,
             documents: v1.documents,
-            model: super::UNKNOWN_MODEL_ID.to_string(),
-            top_k: None,
-            return_documents: true,
+            model: v1
+                .model
+                .unwrap_or_else(|| super::UNKNOWN_MODEL_ID.to_string()),
+            top_k: v1.top_n.filter(|n| *n > 0),
+            return_documents: v1.return_documents,
             rid: None,
             user: None,
         }

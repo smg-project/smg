@@ -236,7 +236,9 @@ pub trait RouterTrait: Send + Sync + Debug {
         )
     }
 
-    /// Route rerank requests
+    /// Route rerank requests. Regular HTTP workers serve them at their own
+    /// `/v1/rerank`; the default names that contract for the router kinds
+    /// that have no rerank path.
     async fn route_rerank(
         &self,
         _headers: Option<&HeaderMap>,
@@ -244,7 +246,11 @@ pub trait RouterTrait: Send + Sync + Debug {
         _body: RerankRequest,
         _model_id: &str,
     ) -> Response {
-        error::not_implemented("rerank_not_implemented", "Rerank not implemented")
+        error::not_implemented(
+            "rerank_not_implemented",
+            "Rerank is served by regular HTTP workers that answer POST /v1/rerank with ranked \
+             results; this router kind has no rerank path",
+        )
     }
 
     /// Route Anthropic Messages API requests (/v1/messages)
@@ -494,7 +500,8 @@ mod tests {
                     )
                     .await,
                 "rerank_not_implemented",
-                "Rerank not implemented",
+                "Rerank is served by regular HTTP workers that answer POST /v1/rerank with \
+                 ranked results; this router kind has no rerank path",
             ),
             (
                 router

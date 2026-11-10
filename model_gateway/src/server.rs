@@ -269,6 +269,13 @@ async fn v1_completions(
         .await
 }
 
+/// The native rerank route: `RerankRequest`, its `model` required and the
+/// body validated before dispatch. A regular HTTP worker serves it at its own
+/// `/v1/rerank`; the gateway reads the worker's answer in the bare-list and
+/// the `results`-object shapes of the rerank contracts and answers in its own
+/// shape (`results` of `score`, `document` and `index`, `top_k` and
+/// `return_documents` applied here). A router kind without a rerank path
+/// answers 501.
 async fn rerank(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -286,6 +293,10 @@ async fn rerank(
         .await
 }
 
+/// The OpenAI-compatible rerank route: `V1RerankReqInput` (`query`,
+/// `documents`, an optional `model`, `top_n` and `return_documents`), routed
+/// by `model` as `/v1/embeddings` is; a body without one goes to any worker,
+/// as a single-model server's client expects. The rest is the native route's.
 async fn v1_rerank(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

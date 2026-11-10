@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     extract::Request,
@@ -8,7 +10,10 @@ use smg::{config::RouterConfig, routers::RouterFactory};
 use tower::ServiceExt;
 
 use crate::common::{
-    mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
+    mock_worker::{
+        set_request_recorder, HealthStatus, MockWorker, MockWorkerConfig, RequestRecorder,
+        WorkerType,
+    },
     AppTestContext,
 };
 
@@ -2082,6 +2087,62 @@ mod rerank_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/rerank` routes by the body's `model`, as `/v1/embeddings` does:
+    /// the worker receives it, and `top_n` holds on the answer.
+    #[tokio::test]
+    async fn test_v1_rerank_carries_the_model_and_top_n() {
+        let recorder = RequestRecorder::new();
+        set_request_recorder(18113, Arc::clone(&recorder));
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18113,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "model": "mock-model",
+            "query": "machine learning algorithms",
+            "documents": [
+                "Introduction to machine learning concepts",
+                "Deep learning neural networks tutorial"
+            ],
+            "top_n": 1
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["model"], "mock-model");
+        assert_eq!(
+            body_json["results"].as_array().unwrap().len(),
+            1,
+            "top_n holds on the answer"
+        );
+        assert_eq!(
+            recorder.only_body()["model"],
+            "mock-model",
+            "the worker receives the body's model"
+        );
 
         ctx.shutdown().await;
     }
