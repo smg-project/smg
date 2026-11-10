@@ -28,7 +28,7 @@ use serde::{
     de::{self, DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer, Serialize, Serializer,
 };
-use serde_json::{Map, Value};
+use serde_json::Value;
 use tokenizers::{
     decoders::DecoderWrapper,
     models::{
@@ -136,8 +136,9 @@ impl<'de> Deserialize<'de> for LateBoundModel {
 /// writes, streams here: the vocabulary into its hash map, the merges into
 /// their list, both handed to the crate's own builder, so the model is the
 /// one the crate builds from the same file. Any other section (another
-/// model kind, a file without the `type` key or with it later) is collected
-/// and handed to the crate's own reader, as before.
+/// model kind, a file without the `type` key or with it later) goes to the
+/// crate's own reader, which streams it as before with the one entry
+/// already read put back in front.
 struct ModelSection;
 
 impl<'de> Visitor<'de> for ModelSection {
@@ -147,24 +148,57 @@ impl<'de> Visitor<'de> for ModelSection {
         f.write_str("a tokenizer model section")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ModelWrapper, A::Error> {
-        let mut collected = Map::new();
-        if let Some(key) = map.next_key::<String>()? {
-            if key == "type" {
-                let kind: String = map.next_value()?;
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<ModelWrapper, A::Error> {
+        let mut replay = Replay {
+            key: None,
+            value: None,
+            rest: map,
+        };
+        if let Some(key) = replay.rest.next_key::<String>()? {
+            let value = if key == "type" {
+                let kind: String = replay.rest.next_value()?;
                 if kind == "BPE" {
-                    return bpe_section(map).map(ModelWrapper::BPE);
+                    return bpe_section(replay.rest).map(ModelWrapper::BPE);
                 }
-                collected.insert(key, Value::String(kind));
+                Value::String(kind)
             } else {
-                let value: Value = map.next_value()?;
-                collected.insert(key, value);
-            }
+                replay.rest.next_value()?
+            };
+            replay.key = Some(key);
+            replay.value = Some(value);
         }
-        while let Some((key, value)) = map.next_entry::<String, Value>()? {
-            collected.insert(key, value);
+        ModelWrapper::deserialize(de::value::MapAccessDeserializer::new(replay))
+    }
+}
+
+/// The section's entries with the one already read put back in front: the
+/// crate's reader streams the section as it would have from the start.
+struct Replay<A> {
+    key: Option<String>,
+    value: Option<Value>,
+    rest: A,
+}
+
+impl<'de, A: MapAccess<'de>> MapAccess<'de> for Replay<A> {
+    type Error = A::Error;
+
+    fn next_key_seed<K: DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, A::Error> {
+        match self.key.take() {
+            Some(key) => seed
+                .deserialize(de::value::StringDeserializer::<A::Error>::new(key))
+                .map(Some),
+            None => self.rest.next_key_seed(seed),
         }
-        ModelWrapper::deserialize(Value::Object(collected)).map_err(A::Error::custom)
+    }
+
+    fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, A::Error> {
+        match self.value.take() {
+            Some(value) => seed.deserialize(value).map_err(A::Error::custom),
+            None => self.rest.next_value_seed(seed),
+        }
     }
 }
 
@@ -354,6 +388,7 @@ impl Model for LateBoundModel {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Map;
     use tokenizers::{
         models::{
             bpe::{Vocab, BPE},
@@ -459,6 +494,32 @@ mod tests {
             .build()
             .expect("a BPE with every field set");
         serde_json::to_string(&ModelWrapper::BPE(bpe)).expect("the model serializes")
+    }
+
+    /// The fields `bpe_section` reads are the crate's: a `tokenizers` bump
+    /// that adds or drops a BPE field fails here, where the one-pass read
+    /// would otherwise skip the new field quietly.
+    #[test]
+    fn the_one_pass_reader_knows_every_field_the_crate_writes() {
+        let section: Map<String, Value> =
+            serde_json::from_str(&full_bpe_json()).expect("the section is a map");
+        let keys: Vec<&str> = section.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "type",
+                "dropout",
+                "unk_token",
+                "continuing_subword_prefix",
+                "end_of_word_suffix",
+                "fuse_unk",
+                "byte_fallback",
+                "ignore_merges",
+                "vocab",
+                "merges",
+            ],
+            "the crate's BPE gained or lost a field: teach bpe_section to read it"
+        );
     }
 
     #[test]
