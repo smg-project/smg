@@ -261,3 +261,13 @@ SDK/send boundary, so the legacy hook cannot add another reservation or reject
 an otherwise approved guarded call. Both legacy startup/hook tests and the new
 pinned-SDK/result suites run in the same CPU workflow; this compatibility does
 not grant a policy, spending cap or execution permission.
+
+The source check resolves the actual imported `tau2` package, including the
+checkout used by `uv sync` editable installations, and verifies the same pinned
+request-path hashes in either installation mode. Distribution versions and SDK
+source fingerprints remain mandatory; an editable install does not waive them.
+
+A timeout or HTTP error from the exact uncharged loopback agent remains a
+simulation/quality failure, without halting the shared paid ledger. Unknown
+clients, redirects outside the fixed request contract, and paid request failures
+still halt it and make budget acceptance fail independently of quality tolerance.

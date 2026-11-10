@@ -6,6 +6,7 @@ import argparse
 import functools
 import hashlib
 import importlib.metadata
+import importlib.util
 import inspect
 import json
 import os
@@ -185,12 +186,17 @@ def verify_sources():
                 != digest
             ):
                 raise BudgetError("Unqualified SDK request source: " + package + "/" + name)
-    distribution = importlib.metadata.distribution("tau2")
+    # uv's editable install keeps metadata in site-packages but imports the
+    # package from the checkout. Check the actual import target in both modes.
+    spec = importlib.util.find_spec("tau2")
+    locations = tuple(spec.submodule_search_locations or ()) if spec else ()
+    if spec is None or spec.origin is None or len(locations) != 1:
+        raise BudgetError("Unknown tau2 package source")
+    root = Path(spec.origin).resolve().parent
+    if Path(spec.origin).name != "__init__.py" or root != Path(locations[0]).resolve():
+        raise BudgetError("Unknown tau2 package source")
     for name, digest in TAU2_SHA.items():
-        if (
-            hashlib.sha256(Path(distribution.locate_file("tau2/" + name)).read_bytes()).hexdigest()
-            != digest
-        ):
+        if hashlib.sha256((root / name).read_bytes()).hexdigest() != digest:
             raise BudgetError("Unqualified tau2 source: " + name)
 
 
@@ -448,12 +454,6 @@ class Guard:
             role = ROLE.get()
             model = str(kwargs.get("model", "")).removeprefix("openai/")
             base = str(kwargs.get("api_base", "")).rstrip("/")
-            if model == self.local_model and base == self.local_url + "/v1":
-                token = LOCAL.set(True)
-                try:
-                    return original_completion(*args, **kwargs)
-                finally:
-                    LOCAL.reset(token)
             if args or role not in MODELS or model != MODELS[role] or base:
                 self.deny("Unknown paid role/model/endpoint")
             forbidden = {
@@ -514,6 +514,14 @@ class Guard:
                     self.clients.remove(http_client)
 
         def completion(*args, **kwargs):
+            model = str(kwargs.get("model", "")).removeprefix("openai/")
+            base = str(kwargs.get("api_base", "")).rstrip("/")
+            if model == self.local_model and base == self.local_url + "/v1":
+                token = LOCAL.set(True)
+                try:
+                    return original_completion(*args, **kwargs)
+                finally:
+                    LOCAL.reset(token)
             try:
                 return protected_completion(*args, **kwargs)
             except Exception:
