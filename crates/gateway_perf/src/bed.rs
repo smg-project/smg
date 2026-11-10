@@ -608,6 +608,23 @@ mod tests {
     }
 
     #[test]
+    fn choose_ports_hands_the_scan_the_given_base_and_a_held_base_is_refused() {
+        // A base the test holds itself: the refusal is certain, and it is the scan's
+        // answer for the given base, not a block of the scan's own choice (a success on
+        // a fixed base is the probe that went red whenever another process held a port).
+        let holder = (29700..=29999)
+            .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+            .unwrap();
+        let held = holder.local_addr().unwrap().port();
+        let mut cfg = config();
+        cfg.ports = None;
+        cfg.port_base = held;
+        let err = cfg.choose_ports().unwrap_err().to_string();
+        assert!(err.contains(&format!("port(s) [{held}")), "{err}");
+        assert_eq!(cfg.ports(), Ports::default());
+    }
+
+    #[test]
     fn the_prefill_decode_block_adds_the_second_admin_the_prefill_engines_and_their_bootstrap_ports(
     ) {
         // The decode engines keep the regular fleet's places (+9 admin, +10..), so a
