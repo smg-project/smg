@@ -56,6 +56,7 @@ use crate::{
         processor::{PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor},
         transforms::TransformError,
     },
+    EncoderDtype,
 };
 
 /// Default patch size.
@@ -325,6 +326,19 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         self.inner.preprocess(images)
     }
 
+    /// Write BF16 image batches in one pass. Single images retain neutral
+    /// pixels, including their existing pixel-cache representation.
+    fn preprocess_wire(
+        &self,
+        images: &[&DynamicImage],
+        dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        if dtype != EncoderDtype::BFloat16 || images.len() < 2 {
+            return None;
+        }
+        self.inner.preprocess_wire(images, dtype)
+    }
+
     fn preprocess_video(
         &self,
         frames: &[DynamicImage],
@@ -395,6 +409,79 @@ mod tests {
             }"#,
         )
         .expect("checkpoint preprocessor config parses")
+    }
+
+    /// The fused BF16 path preserves pixels, geometry, and metadata under
+    /// checkpoint/default settings and the gateway's decode-time resizing.
+    #[test]
+    fn bf16_wire_matches_neutral_pixels() {
+        let images = [(56, 84), (700, 672), (112, 56)].map(|(w, h)| {
+            DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
+                image::Rgb([x as u8, y as u8, (x + y) as u8])
+            }))
+        });
+        let mut resized = m3_config();
+        resized.extra.insert(
+            crate::minimax_resize::RESIZED_KEY.to_owned(),
+            serde_json::json!(true),
+        );
+        let mut unnormalized = m3_config();
+        unnormalized.do_normalize = Some(false);
+        for config in [
+            PreProcessorConfig::default(),
+            m3_config(),
+            resized,
+            unnormalized,
+        ] {
+            let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
+            for refs in [
+                vec![&images[0], &images[1]],
+                vec![&images[2], &images[0], &images[1], &images[2]],
+            ] {
+                let neutral = processor.preprocess(&refs).unwrap();
+                let wire = processor
+                    .preprocess_wire(&refs, EncoderDtype::BFloat16)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(wire.encoder_input_shape(), neutral.encoder_input_shape());
+                assert_eq!(
+                    wire.encoder_input.write_as(EncoderDtype::BFloat16),
+                    neutral.encoder_input.write_as(EncoderDtype::BFloat16)
+                );
+                assert_eq!(wire.feature_token_counts, neutral.feature_token_counts);
+                assert_eq!(wire.item_sizes, neutral.item_sizes);
+                assert_eq!(wire.model_specific.len(), neutral.model_specific.len());
+                for (key, value) in &neutral.model_specific {
+                    assert_eq!(
+                        format!("{value:?}"),
+                        format!("{:?}", wire.model_specific[key])
+                    );
+                }
+            }
+            for refs in [vec![], vec![&images[0]]] {
+                assert!(processor
+                    .preprocess_wire(&refs, EncoderDtype::BFloat16)
+                    .is_none());
+            }
+            let invalid = DynamicImage::new_rgb8(0, 0);
+            assert!(processor
+                .preprocess_wire(&[&invalid, &images[0]], EncoderDtype::BFloat16)
+                .unwrap()
+                .is_err());
+            for dtype in [
+                EncoderDtype::Float32,
+                EncoderDtype::Float16,
+                EncoderDtype::Uint8,
+            ] {
+                assert!(processor
+                    .preprocess_wire(&[&images[0], &images[1]], dtype)
+                    .is_none());
+            }
+            assert!(
+                !processor.supports_per_image_preprocessing(),
+                "this change does not enable the multi-image cache"
+            );
+        }
     }
 
     #[test]
