@@ -73,6 +73,8 @@ struct SincePollDispatch {
 }
 
 impl SincePollDispatch {
+    /// Book one dispatch at `at`: its tokens and its request join the credit,
+    /// and its pick joins `picked`.
     fn record(&mut self, at: Instant, tokens: u64) {
         debug_assert!(
             self.dispatches.back().is_none_or(|&(last, _)| last <= at),
@@ -1522,12 +1524,12 @@ mod tests {
         );
     }
 
+    /// Eight picks on four idle workers that never report, all made before
+    /// the router takes any of their load guards: the live in-flight count
+    /// still reads zero everywhere, so each pick must count the ones
+    /// before it. Thirty bursts, as in the issue's reproduction.
     #[test]
     fn a_dark_burst_splits_evenly_before_the_router_takes_its_guards() {
-        // Eight picks on four idle workers that never report, all made before
-        // the router takes any of their load guards: the live in-flight count
-        // still reads zero everywhere, so each pick must count the ones
-        // before it. Thirty bursts, as in the issue's reproduction.
         for seed in 0..30 {
             let policy = LeastLoadPolicy::new().with_tie_break_seed(seed);
             let workers = make_workers(&[
@@ -1608,12 +1610,12 @@ mod tests {
         assert_ne!(picked, first.get());
     }
 
+    /// b holds one request. Every pick goes to a and is then dropped before
+    /// its guard is taken, as the router's overload re-check does, so it
+    /// never ends; the second poll that follows sets a back to the router's
+    /// zero.
     #[test]
     fn the_load_poll_releases_a_pick_the_router_never_dispatched() {
-        // b holds one request. Every pick goes to a and is then dropped before
-        // its guard is taken, as the router's overload re-check does, so it
-        // never ends; the second poll that follows sets a back to the router's
-        // zero.
         let policy = LeastLoadPolicy::new().with_tie_break_seed(7);
         let workers = make_workers(&["http://a:8000", "http://b:8000"]);
         workers[1].increment_load();
@@ -1691,12 +1693,12 @@ mod tests {
         }
     }
 
+    /// After one pick each, both ended, each worker takes a request this
+    /// policy did not pick (as one sent through the single-worker shortcut
+    /// is). Once the poll has set each count to the router's, two picks
+    /// made before their guards see each other.
     #[test]
     fn the_load_poll_counts_the_requests_the_policy_never_picked() {
-        // After one pick each, both ended, each worker takes a request this
-        // policy did not pick (as one sent through the single-worker shortcut
-        // is). Once the poll has set each count to the router's, two picks
-        // made before their guards see each other.
         for seed in 0..30 {
             let policy = LeastLoadPolicy::new().with_tie_break_seed(seed);
             let workers = make_workers(&["http://a:8000", "http://b:8000"]);
@@ -1714,12 +1716,12 @@ mod tests {
         }
     }
 
+    /// a holds three requests this policy did not pick and has never been
+    /// picked itself. Once the poll has counted them, each pick on a moves
+    /// its score, so seven picks made before their guards level the two
+    /// workers at five each.
     #[test]
     fn the_load_poll_counts_the_requests_on_a_worker_not_picked_yet() {
-        // a holds three requests this policy did not pick and has never been
-        // picked itself. Once the poll has counted them, each pick on a moves
-        // its score, so seven picks made before their guards level the two
-        // workers at five each.
         for seed in 0..30 {
             let policy = LeastLoadPolicy::new().with_tie_break_seed(seed);
             let workers = make_workers(&["http://a:8000", "http://b:8000"]);

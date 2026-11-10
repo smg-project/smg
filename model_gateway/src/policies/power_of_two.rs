@@ -149,10 +149,12 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         self.scorer.remove_worker(url);
     }
 
+    /// A request's end releases its pick on the scorer.
     fn on_request_complete(&self, worker_url: &str) {
         self.scorer.on_request_complete(worker_url);
     }
 
+    /// The load poll reaches the scorer's picks.
     fn reconcile_in_flight(&self, worker_url: &str, in_flight: usize) {
         self.scorer.reconcile_in_flight(worker_url, in_flight);
     }
@@ -342,10 +344,10 @@ mod tests {
         );
     }
 
+    /// b holds one request; each pick on a is dropped before its guard is
+    /// taken, and the second poll that follows sets a back to the router's zero.
     #[test]
     fn the_load_poll_releases_a_pick_the_router_never_dispatched() {
-        // b holds one request; each pick on a is dropped before its guard is
-        // taken, and the second poll that follows sets a back to the router's zero.
         let policy = PowerOfTwoPolicy::new();
         let a = make_worker("http://a:8000");
         let b = make_worker("http://b:8000");

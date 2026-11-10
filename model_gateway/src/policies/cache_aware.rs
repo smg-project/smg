@@ -1343,6 +1343,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         self.select_worker_scanned(workers, info)
     }
 
+    /// A request's end reaches the accounting, the load scorer and the
+    /// selection policy.
     fn on_request_complete(&self, worker_url: &str) {
         if let Some(accounting) = &self.accounting {
             accounting.release(worker_url);
@@ -1405,6 +1407,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         self.selection.on_worker_removed(url);
     }
 
+    /// The load poll reaches the accounting, the load scorer and the
+    /// selection policy.
     fn reconcile_in_flight(&self, worker_url: &str, in_flight: usize) {
         let released = self
             .accounting
