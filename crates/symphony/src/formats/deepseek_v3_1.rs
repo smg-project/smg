@@ -72,7 +72,7 @@ mod tests {
         grammar::{GrammarStart, Options},
         input::{EngineFinish, Input},
         parser::Parser,
-        testing::{bytes, calls, content, finish, reasoning, tool},
+        testing::{bytes, calls, content, finish, malformed_texts, reasoning, tool},
         Declared,
     };
 
@@ -114,16 +114,6 @@ mod tests {
             )
             .expect("end");
         out.into_owned().drain()
-    }
-
-    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(&*text.text),
-                _ => None,
-            })
-            .collect()
     }
 
     /// A turn as the checkpoint's chat template renders it (`chat_template` of
@@ -245,7 +235,7 @@ mod tests {
             .collect();
         assert_eq!(calls(events), expected, "{how}: {:?}", turn.output);
         assert_eq!(
-            malformed(events),
+            malformed_texts(events),
             Vec::<&str>::new(),
             "{how}: {:?}",
             turn.output
@@ -342,7 +332,7 @@ mod tests {
         assert_eq!(bytes(&whole), output);
         assert_eq!(calls(&whole), expected_calls);
         assert_eq!(content(&whole), "");
-        assert_eq!(malformed(&whole), ["and", " also", " this", " one"]);
+        assert_eq!(malformed_texts(&whole), ["and", " also", " this", " one"]);
         assert_eq!(shown(&whole).as_deref(), Some(prose));
         assert_eq!(streamed(&whole), prose);
         for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
@@ -573,7 +563,7 @@ mod tests {
     fn the_same_at_every_cut(tail: &str, output: &str) -> Said {
         let events = run(tail, &[output]);
         assert_eq!(bytes(&events), output);
-        assert_eq!(malformed(&events), Vec::<&str>::new(), "{output:?}");
+        assert_eq!(malformed_texts(&events), Vec::<&str>::new(), "{output:?}");
         let whole = said(&events);
         for (at, _) in output.char_indices().skip(1) {
             let (head, rest) = output.split_at(at);

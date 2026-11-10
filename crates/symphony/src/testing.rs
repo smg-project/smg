@@ -85,6 +85,18 @@ pub(crate) fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
         .collect()
 }
 
+/// The text of every malformed report, one entry per event, whatever its reason (a report of no
+/// bytes counts here, where the joined texts would not show it); the reasons are [`malformed`]'s.
+pub(crate) fn malformed_texts<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Malformed { text, .. } => Some(&*text.text),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The names of the calls, in order.
 pub(crate) fn names<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
     events
