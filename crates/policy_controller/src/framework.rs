@@ -10,6 +10,7 @@ use crate::{
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
     spec::Needs,
     view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts},
+    Draw,
 };
 
 /// Drops candidates before scoring. A `soft` filter steps aside when it would
@@ -535,8 +536,14 @@ impl Engine {
             phase: Phase::Prefill,
             ..*facts
         };
+        // The decode side draws its own sequence, derived from the request's
+        // seed: one seed on both sides made the decode picker replay the
+        // prefill picker's draws, so the decode chosen followed the prefill
+        // chosen (random over four prefills of four decodes each reached four
+        // of the sixteen). The decision still replays from the trace's seed.
         let decode_facts = RequestFacts {
             phase: Phase::Decode,
+            seed: Draw::new(facts.seed).next_u64(),
             ..*facts
         };
         // The prefill pool narrows to the prefills with a partner the decode
@@ -761,6 +768,7 @@ mod tests {
     use super::*;
     use crate::{
         builtins::{Best, Healthy, LeastRequests, NotTried},
+        spec::PolicySpec,
         view::{Health, WorkerId},
     };
 
@@ -1508,6 +1516,69 @@ mod tests {
         assert_eq!(
             pick.targets.as_slice()[1].pair.map(|p| p.decode_position),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn the_decode_picker_does_not_replay_the_prefill_pickers_draws() {
+        // Random on both sides, four prefills of four decodes each. With one
+        // seed on both sides the decode index inside the class followed the
+        // prefill index, and four of the sixteen decodes took every pair.
+        let engine = PolicySpec::pair_presets("random", "random")
+            .expect("the pair spec")
+            .validate()
+            .expect("the engine");
+        let mut prefills = [candidate(0, 0); 4];
+        for (i, p) in prefills.iter_mut().enumerate() {
+            p.position = i as u32;
+            p.id = WorkerId(100 + i as u64);
+            p.pair_class = i as u32 + 1;
+            p.has_capacity = true;
+        }
+        let mut decodes = [candidate(0, 0); 16];
+        for (i, d) in decodes.iter_mut().enumerate() {
+            d.position = i as u32;
+            d.id = WorkerId(200 + i as u64);
+            d.pair_class = i as u32 / 4 + 1;
+            d.has_room = true;
+        }
+        let mut picked = [0u32; 16];
+        for seed in 0..4096u64 {
+            let facts = RequestFacts {
+                model: "m",
+                seed,
+                ..RequestFacts::default()
+            };
+            let mut scratch = Scratch::new();
+            let decision = engine.decide_pair(
+                &facts,
+                &PoolFacts::default(),
+                PairPools {
+                    prefills: &prefills,
+                    decodes: &decodes,
+                },
+                &Constraints::default(),
+                &Constraints::default(),
+                &mut scratch,
+            );
+            let pick = decision.pick().expect("a pair");
+            let first = pick.targets.first().expect("a target");
+            let decode = first.pair.expect("a decode").decode_position as usize;
+            assert_eq!(
+                decodes[decode].pair_class, prefills[first.position as usize].pair_class,
+                "seed {seed}: the decode is of the prefill's class"
+            );
+            picked[decode] += 1;
+        }
+        let idle: Vec<usize> = picked
+            .iter()
+            .enumerate()
+            .filter(|(_, &n)| n == 0)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            idle.is_empty(),
+            "decodes never picked over 4096 seeds: {idle:?}"
         );
     }
 
