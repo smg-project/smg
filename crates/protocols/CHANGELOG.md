@@ -35,6 +35,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A Responses request that replays a reasoning item without its `id` is accepted. A `store: false`
+  client (hermes-agent) replays its reasoning that way, since the item was never stored; the item
+  always required an id, so the gateway refused the whole request as `input: data did not match
+  any variant of untagged enum ResponseInput` (#5612). The item reaches an HTTP worker without an
+  id, and is stored under a generated `rs_` one. Breaking: the `ResponseInputOutputItem::Reasoning`
+  field `id: String` is now `Option<String>`; `new_reasoning` and `new_reasoning_encrypted` still
+  take the id.
 - A GLM-5.3 request with a `minimal`, `medium` or `xhigh` effort is served. The profile reads the
   name as `low`, `high` or `max`, as z.ai does, in `reasoning_effort` and in `thinking.effort`.
   Since 1.11.0 the profile refused those names with `reasoning_effort_not_allowed`, and `medium`

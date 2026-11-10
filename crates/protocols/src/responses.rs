@@ -1722,7 +1722,10 @@ pub enum ResponseInputOutputItem {
     #[serde(rename = "reasoning")]
     #[non_exhaustive]
     Reasoning {
-        id: String,
+        /// Absent when a `store: false` client replays the item: the id names
+        /// a stored item, and this one was never stored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default)]
         summary: Vec<SummaryTextContent>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -4410,7 +4413,7 @@ impl ResponseInputOutputItem {
         status: Option<String>,
     ) -> Self {
         Self::Reasoning {
-            id,
+            id: Some(id),
             summary,
             content,
             encrypted_content: None,
@@ -4429,7 +4432,7 @@ impl ResponseInputOutputItem {
         status: Option<String>,
     ) -> Self {
         Self::Reasoning {
-            id,
+            id: Some(id),
             summary,
             content,
             encrypted_content: Some(encrypted_content),
@@ -4983,7 +4986,7 @@ mod tests {
                     phase: None,
                 },
                 ResponseInputOutputItem::Reasoning {
-                    id: "r1".to_string(),
+                    id: Some("r1".to_string()),
                     summary: vec![],
                     content: vec![ResponseReasoningContent::ReasoningText {
                         text: "five".to_string(),

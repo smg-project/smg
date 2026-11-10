@@ -559,7 +559,10 @@ mod tests {
     use validator::Validate;
 
     use super::*;
-    use crate::chat::{ChatCompletionRequest, ChatMessage};
+    use crate::{
+        chat::{ChatCompletionRequest, ChatMessage},
+        responses::{ResponseInput, ResponseInputOutputItem, ResponsesRequest},
+    };
 
     #[derive(Debug, Deserialize, Serialize, Validate)]
     struct TestRequest {
@@ -1521,15 +1524,18 @@ mod tests {
         .to_string()
     }
 
-    /// Reads a chat completion body through the extractor, as the gateway does.
-    async fn chat_request(body: &str) -> Result<ChatCompletionRequest, (StatusCode, Value)> {
+    /// Reads a body of type `T` through the extractor, as the gateway does.
+    async fn extracted<T>(body: &str) -> Result<T, (StatusCode, Value)>
+    where
+        T: DeserializeOwned + Validate + Normalizable + Send,
+    {
         let request = Request::builder()
             .method("POST")
             .uri("/")
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap_or_default();
-        match ValidatedJson::<ChatCompletionRequest>::from_request(request, &()).await {
+        match ValidatedJson::<T>::from_request(request, &()).await {
             Ok(ValidatedJson(body)) => Ok(body),
             Err(response) => {
                 let status = response.status();
@@ -1549,7 +1555,7 @@ mod tests {
     /// the message.
     #[tokio::test]
     async fn an_assistant_turn_spelling_its_reasoning_both_ways_is_a_request() {
-        let request = chat_request(&replayed_turn("I should run ls."))
+        let request = extracted::<ChatCompletionRequest>(&replayed_turn("I should run ls."))
             .await
             .unwrap();
         let ChatMessage::Assistant { reasoning, .. } = &request.messages[1] else {
@@ -1557,9 +1563,10 @@ mod tests {
         };
         assert_eq!(reasoning.text.as_deref(), Some("I should run ls."));
 
-        let (status, json) = chat_request(&replayed_turn("I should run pwd."))
-            .await
-            .unwrap_err();
+        let (status, json) =
+            extracted::<ChatCompletionRequest>(&replayed_turn("I should run pwd."))
+                .await
+                .unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["error"]["type"], "invalid_request_error", "{json}");
         assert_eq!(json["error"]["code"], "invalid_value", "{json}");
@@ -1570,5 +1577,62 @@ mod tests {
                 .is_some_and(|m| m.contains("`reasoning_content` and `reasoning` disagree")),
             "{json}"
         );
+    }
+
+    /// An agent client's second Responses request with `store: false`, with
+    /// `reasoning` replayed between the user's message and the tool call.
+    fn replayed_responses_turn(reasoning: Value) -> String {
+        json!({
+            "model": "zai-org/GLM-5.3-Flash",
+            "store": false,
+            "include": ["reasoning.encrypted_content"],
+            "input": [
+                {"role": "user", "content": "What time is it?"},
+                reasoning,
+                {"type": "function_call", "call_id": "call_1", "name": "clock", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "12:00"}
+            ],
+            "tools": [{"type": "function", "name": "clock", "parameters": {"type": "object", "properties": {}}}]
+        })
+        .to_string()
+    }
+
+    /// A reasoning item without its id makes a request and keeps its
+    /// reasoning; an id that is not a string is still refused, and the param
+    /// names the input.
+    #[tokio::test]
+    async fn a_reasoning_item_replayed_without_its_id_is_a_request() {
+        let request = extracted::<ResponsesRequest>(&replayed_responses_turn(json!({
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "Call the clock."}],
+            "encrypted_content": "sglang-reasoning-v1.eJxzTszJUSjJSFVIzslPztYDACnFBTg="
+        })))
+        .await
+        .unwrap();
+        let ResponseInput::Items(items) = &request.input else {
+            panic!("{:?}: not an item list", request.input);
+        };
+        let ResponseInputOutputItem::Reasoning {
+            id,
+            encrypted_content,
+            ..
+        } = &items[1]
+        else {
+            panic!("{:?}: not a reasoning item", items[1]);
+        };
+        assert!(id.is_none(), "{:?}", items[1]);
+        assert_eq!(
+            encrypted_content.as_deref(),
+            Some("sglang-reasoning-v1.eJxzTszJUSjJSFVIzslPztYDACnFBTg=")
+        );
+
+        let (status, json) = extracted::<ResponsesRequest>(&replayed_responses_turn(
+            json!({"type": "reasoning", "id": 7, "summary": []}),
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["type"], "invalid_request_error", "{json}");
+        assert_eq!(json["error"]["param"], "input", "{json}");
     }
 }

@@ -977,6 +977,29 @@ mod tests {
         );
     }
 
+    /// A `store: false` client replays its last turn's reasoning without the
+    /// item's id, carrying only the encrypted copy; the history hands the
+    /// model that reasoning back.
+    #[test]
+    fn a_reasoning_item_replayed_without_its_id_gives_back_its_encrypted_reasoning() {
+        let request = items_request(
+            "test-model",
+            serde_json::json!([
+                {"role": "user", "content": "What time is it?"},
+                {"type": "reasoning", "summary": [],
+                 "encrypted_content": encode_reasoning_content("Call the clock.")},
+                {"type": "function_call", "call_id": "call_1", "name": "clock", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "12:00"}
+            ]),
+        );
+
+        let chat = responses_to_chat(&request).expect("the history converts");
+        let ChatMessage::Assistant { reasoning, .. } = &chat.messages[1] else {
+            panic!("{:?}: not an assistant message", chat.messages[1]);
+        };
+        assert_eq!(reasoning.text.as_deref(), Some("Call the clock."));
+    }
+
     /// A Responses request for `model`, from its input items.
     fn items_request(model: &str, input: serde_json::Value) -> ResponsesRequest {
         serde_json::from_value(serde_json::json!({"model": model, "input": input}))

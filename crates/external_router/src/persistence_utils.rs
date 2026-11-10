@@ -323,6 +323,7 @@ pub fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> 
                                     let prefix = match item_type {
                                         "function_call" | "function_call_output" => "fc",
                                         "message" => "msg",
+                                        "reasoning" => "rs",
                                         _ => "item",
                                     };
                                     obj.insert("id".to_string(), json!(generate_id(prefix)));
@@ -863,6 +864,34 @@ mod tests {
         assert_eq!(
             new_item.content,
             json!([{"type": "input_text", "text": "hi"}])
+        );
+    }
+
+    /// A reasoning item replayed without its id is stored under a generated
+    /// one, with its reasoning kept verbatim.
+    #[test]
+    fn replayed_reasoning_input_item_without_id_is_stored_under_a_generated_id() {
+        let input: ResponseInput = serde_json::from_value(json!([{
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "Call the clock."}],
+            "encrypted_content": "opaque"
+        }]))
+        .unwrap();
+
+        let items = extract_input_items(&input).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0]["id"]
+                .as_str()
+                .is_some_and(|id| id.len() > "rs_".len() && id.starts_with("rs_")),
+            "{}",
+            items[0]
+        );
+        assert_eq!(items[0]["type"], "reasoning");
+        assert_eq!(items[0]["encrypted_content"], "opaque");
+        assert_eq!(
+            items[0]["summary"],
+            json!([{"type": "summary_text", "text": "Call the clock."}])
         );
     }
 
