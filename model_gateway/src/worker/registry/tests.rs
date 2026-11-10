@@ -1256,7 +1256,7 @@ fn remove_inner_aborts_when_origin_changed_before_lock() {
     // Models the post-promotion state: expecting Mesh, finding Local.
     assert!(
         registry
-            .remove_inner(&id, Some(WorkerOrigin::Mesh))
+            .remove_inner(&id, Some(WorkerOrigin::Mesh), None)
             .is_none(),
         "removal must abort when the origin no longer matches"
     );

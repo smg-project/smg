@@ -730,42 +730,120 @@ impl WorkerMonitor {
     /// ranks are fresh again; it stays out of the pushed report, and the
     /// poll's report stands for it while the worker is polled. A worker
     /// with no pushed record on file has no report to merge into; the
-    /// poll's report stands on its own, as always.
+    /// poll's report stands on its own, as always. Returns the rows on file
+    /// of the ranks that pushed since the poll began (the stream's, the
+    /// newer) and, when there are any, the report on file's sample instant,
+    /// for a publish that carries them over the poll's under their own
+    /// sample boundary.
     pub(crate) fn apply_polled_load(
         &self,
         url: &str,
         load: &WorkerLoadResponse,
         polled_at: Instant,
-    ) {
+    ) -> (Vec<SchedulerLoadSnapshot>, Option<Instant>) {
         // A rollup from a gateway registered as a worker is keyed by
         // downstream worker, not by rank: its entries all say rank 0 and
         // would collapse into one slot (the DP cache applies the same
         // guard).
         if !load.ranks_are_dp_ranks() {
-            return;
+            return (Vec::new(), None);
         }
         // Both tables held together so a record landing between the two
         // reads is not undone; pushes and retractions use the same lock order.
         let mut reports = self.pushed_reports.lock();
         let Some(report) = reports.get_mut(url) else {
-            return;
+            return (Vec::new(), None);
         };
         let pushed_at = self.pushed_at.lock();
         let receipts = pushed_at.get(url);
+        let mut newer = Vec::new();
         for entry in &load.loads {
+            let Ok(at) = report
+                .loads
+                .binary_search_by_key(&entry.dp_rank, |load| load.dp_rank)
+            else {
+                continue;
+            };
             let pushed_since = receipts
                 .and_then(|ranks| ranks.get(&entry.dp_rank))
                 .is_some_and(|&at| at >= polled_at);
             if pushed_since {
-                continue;
-            }
-            if let Ok(at) = report
-                .loads
-                .binary_search_by_key(&entry.dp_rank, |load| load.dp_rank)
-            {
+                newer.push(report.loads[at].clone());
+            } else {
                 report.loads[at].clone_from(entry);
             }
         }
+        let sampled_at = if newer.is_empty() {
+            None
+        } else {
+            report.sampled_at
+        };
+        (newer, sampled_at)
+    }
+
+    /// One worker's polled report through the poll loop's own steps: an
+    /// empty response's retraction, the merge over a pushed report, the
+    /// overload verdict, the queue-depth read, the DP cache and the publish
+    /// under the incarnation fence. The store ingress feeds polls here, so a
+    /// worker without a stream is published as the loop publishes it; a
+    /// rank whose record arrived since the poll began keeps the stream's
+    /// row in this publish too, as the pushed report keeps it, so a read
+    /// through the host sees the one arbitration the sink's contract names.
+    pub(crate) fn ingest_polled_report(
+        &self,
+        worker: &Arc<dyn Worker>,
+        mut load: WorkerLoadResponse,
+        polled_at: Instant,
+    ) {
+        let url = worker.url().to_string();
+        if load.loads.is_empty() {
+            self.apply_overload_verdict(worker, None, "poll");
+            self.retract_pushed_load(&url, worker.dp_rank(), polled_at);
+            if let Some(rank) = worker.dp_rank() {
+                self.worker_load_manager.remove_rank(&url, rank);
+            } else {
+                self.worker_load_manager.remove_worker(&url);
+            }
+            self.load_state
+                .publish_group(std::slice::from_ref(&url), Vec::new());
+            return;
+        }
+        let now = Instant::now();
+        let (newer, stream_sampled_at) = self.apply_polled_load(&url, &load, polled_at);
+        // One sample instant per report, the earlier of the two: the carried
+        // rows keep their stream's, so the scorer releases no dispatch they
+        // never saw; the poll's own rows cost their in-flight dispatches
+        // once more until the next report, the safe side.
+        load.sampled_at = Some(stream_sampled_at.map_or(now, |at| at.min(now)));
+        for newer in newer {
+            if let Some(entry) = load
+                .loads
+                .iter_mut()
+                .find(|entry| entry.dp_rank == newer.dp_rank)
+            {
+                *entry = newer;
+            }
+        }
+        // The verdict and everything below read the reconciled report.
+        self.apply_overload_verdict(worker, Some(&load), "poll");
+        let waiting: i64 = load
+            .loads
+            .iter()
+            .map(|rank| i64::from(rank.num_waiting_reqs))
+            .sum();
+        liveness::on_load_report(worker, waiting, None, false, None);
+        if load.has_absolute_token_data() && load.ranks_are_dp_ranks() {
+            self.worker_load_manager
+                .update_dp_loads(&HashMap::from([(url.clone(), load.dp_rank_loads())]));
+        } else {
+            self.worker_load_manager
+                .remove_workers(std::slice::from_ref(&url));
+        }
+        Metrics::record_engine_load(&url, worker.model_id(), &load);
+        self.load_state.publish_group(
+            std::slice::from_ref(&url),
+            vec![(Arc::clone(worker), Arc::new(load))],
+        );
     }
 
     /// Retract pre-poll pushed ranks after an authoritative empty response.
@@ -3096,6 +3174,62 @@ mod native_loads_tests {
         assert!(
             Arc::ptr_eq(&snapshot, &monitor.load_state.snapshot()),
             "no record since the publish: no rebuild"
+        );
+    }
+
+    /// A poll's publish that carries a stream row over the poll's keeps the
+    /// stream's sample instant: a dispatch between that sample and the poll
+    /// is still in flight for the scorer, so the report is not stamped with
+    /// the poll's later time.
+    #[tokio::test]
+    async fn a_reconciled_poll_publishes_the_carried_stream_rows_sample_instant() {
+        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
+        let worker = vllm_worker("http://w1:8000");
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        let t0 = Instant::now();
+        let record = |running: u32, age_ms: u32, sample: u64| EngineLoad {
+            running_requests: running,
+            age_ms,
+            sample,
+            ..Default::default()
+        };
+        // Both ranks on file from the stream; then a poll begins.
+        monitor.apply_pushed_load(&worker, 0, &record(2, 0, 1), t0);
+        monitor.apply_pushed_load(&worker, 1, &record(3, 0, 2), t0);
+        let polled_at = t0 + Duration::from_millis(10);
+        // Rank 0's record arrives after the poll began, sampled 100 ms before
+        // its receipt.
+        let received = polled_at + Duration::from_millis(5);
+        monitor.apply_pushed_load(&worker, 0, &record(4, 100, 3), received);
+        let stream_sample = received - Duration::from_millis(100) - PUSHED_ONE_WAY_MARGIN;
+        let poll = WorkerLoadResponse {
+            dp_rank_count: 2,
+            loads: (0..2)
+                .map(|dp_rank| SchedulerLoadSnapshot {
+                    dp_rank,
+                    num_running_reqs: 7,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        monitor.ingest_polled_report(&worker, poll, polled_at);
+        let snapshot = monitor.load_state.snapshot();
+        let (report, sampled_at) = snapshot.report(worker.url()).expect("published");
+        let ranks: Vec<(i32, i32)> = report
+            .loads
+            .iter()
+            .map(|rank| (rank.dp_rank, rank.num_running_reqs))
+            .collect();
+        assert_eq!(
+            ranks,
+            vec![(0, 4), (1, 7)],
+            "rank 0 keeps the stream's row, rank 1 takes the poll's"
+        );
+        assert_eq!(
+            sampled_at, stream_sample,
+            "the carried row's sample instant, not the poll's"
         );
     }
 
