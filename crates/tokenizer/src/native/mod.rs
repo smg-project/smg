@@ -195,8 +195,9 @@ const LONG_PIECE_BYTES_TOTAL: usize = 32 << 20;
 const LONG_PIECE_ENTRY_BYTES: usize = size_of::<(Box<[u8]>, Box<[u32]>)>();
 
 /// Inputs at least this long are encoded unit by unit on the thread pool (a
-/// text between added tokens, or a chunk of one cut at a stable boundary);
-/// shorter inputs would spend more on the hand-offs than they save.
+/// text between added tokens, or a chunk of one cut at a stable boundary)
+/// when the pool has more than one thread (see `worth_the_pool`); shorter
+/// inputs would spend more on the hand-offs than they save.
 const PARALLEL_MIN_BYTES: usize = 64 << 10;
 /// The size a long text unit is cut into for the pool, at the first stable
 /// boundary past each multiple of it.
@@ -1572,7 +1573,8 @@ impl NativeEncoder {
     /// declines, found after the pieces before it were tokenized, so that
     /// the error surfaces from the `tokenizers` encode. A long input is
     /// encoded on the thread pool, unit by unit (see [`Self::units`]), with
-    /// the same code per unit. `model` is the model behind the vocabulary,
+    /// the same code per unit, when the pool has more than one thread (see
+    /// [`Self::worth_the_pool`]). `model` is the model behind the vocabulary,
     /// read for the whole-piece lookup of `ignore_merges` and for the
     /// pieces of a model whose merge table declined; `None` for a
     /// vocabulary read from ranks ([`Self::from_ranks`]), whose table is
