@@ -226,6 +226,13 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Most client connections the admin listener holds open at once; `0`
+    /// is no bound.
+    pub fn admin_max_connections(mut self, admin_max_connections: usize) -> Self {
+        self.config.admin_max_connections = admin_max_connections;
+        self
+    }
+
     pub fn upstream_pool_idle_timeout_secs(mut self, secs: u64) -> Self {
         self.config.upstream_pool_idle_timeout_secs = secs;
         self

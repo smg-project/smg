@@ -1,19 +1,19 @@
-// The connector: the frontend-side request/response layer over a
-// [`ConnectedTransport`]. Adapted from the Apache-2.0 reference
-// `vllm-engine-core-client` (vllm-project/vllm) client, scoped to SMG's needs:
-//
-// - DP load balancing for unpinned requests: the connector picks the
-//   least-loaded engine from the piggybacked per-rank `scheduler_stats`
-//   (mirroring vLLM's frontend DP client). An SMG-stamped
-//   `data_parallel_rank` remains authoritative.
-// - No DP coordinator process: for a lockstep engine group the connector plays
-//   the wake role itself, over the input socket each rank already listens on.
-// - Utility RPCs (`call_utility`, vLLM only): one call to one rank, correlated
-//   by a call id this client issues. Pending calls live in the request
-//   registry, so the one dispatcher resolves their replies and fails them with
-//   the requests when the engine dies. Upstream's management wrappers (LoRA
-//   add/remove, sleep/wake, profiling, weight updates) stay unported; the
-//   prefix-cache reset is built on it by the adapter.
+//! The connector: the frontend-side request/response layer over a
+//! [`ConnectedTransport`]. Adapted from the Apache-2.0 reference
+//! `vllm-engine-core-client` (vllm-project/vllm) client, scoped to SMG's needs:
+//!
+//! - DP load balancing for unpinned requests: the connector picks the
+//!   least-loaded engine from the piggybacked per-rank `scheduler_stats`
+//!   (mirroring vLLM's frontend DP client). An SMG-stamped
+//!   `data_parallel_rank` remains authoritative.
+//! - No DP coordinator process: for a lockstep engine group the connector plays
+//!   the wake role itself, over the input socket each rank already listens on.
+//! - Utility RPCs (`call_utility`, vLLM only): one call to one rank, correlated
+//!   by a call id this client issues. Pending calls live in the request
+//!   registry, so the one dispatcher resolves their replies and fails them with
+//!   the requests when the engine dies. Upstream's management wrappers (LoRA
+//!   add/remove, sleep/wake, profiling, weight updates) stay unported; the
+//!   prefix-cache reset is built on it by the adapter.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -37,12 +37,12 @@ use tracing::{info, trace, warn};
 use zeromq::{RouterSendHalf, SocketRecv};
 
 use crate::{
-    codec::OpaqueValue,
+    codec::{FrameStr, OpaqueValue},
     error::{Error, Result},
     protocol::{
-        sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol, trtllm::TrtllmProtocol,
-        vllm::VllmProtocol, EngineBatch, EngineLoad, EngineOutput, EngineProtocol, UtilityReply,
-        WaveEvent,
+        kv_transfer::KvTransferStats, sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol,
+        trtllm::TrtllmProtocol, vllm::VllmProtocol, EngineBatch, EngineLoad, EngineOutput,
+        EngineProtocol, UtilityReply, WaveEvent,
     },
     transport::{run_output_loop, send_message, ConnectedEngine, ConnectedTransport, EngineId},
 };
@@ -70,8 +70,10 @@ pub type TrtllmStream = RequestStream<TrtllmProtocol>;
 /// other request on the transport — and backpressuring further, into the
 /// output PULL socket, would wedge the engine itself. Unboundedness is not
 /// unbounded memory: a request's queue is capped by its own generation
-/// (`max_tokens` outputs), a dropped stream auto-aborts it on the engine, and
-/// the buffer is freed with the stream.
+/// (`max_tokens` outputs), each output in it carries its request's own id
+/// rather than a view of the step frame it was decoded from
+/// ([`EngineOutput::own_request_id`]), a dropped stream auto-aborts it on the
+/// engine, and the buffer is freed with the stream.
 type OutputSender<O> = mpsc::UnboundedSender<Result<O>>;
 type OutputReceiver<O> = mpsc::UnboundedReceiver<Result<O>>;
 
@@ -135,9 +137,21 @@ struct RequestRegistry<O> {
 /// its first output, the prompt the engine still has to prefill for it.
 struct InFlight<O> {
     sender: OutputSender<O>,
+    /// The request's own id, copied once at registration and shared by
+    /// every output it is handed at dispatch in place of the step frame's
+    /// view (the first hand-over adds the shared header; a terminal output
+    /// takes the id itself).
+    id: FrameStr,
     prompt_tokens: u64,
     handed: bool,
     started: bool,
+    /// How many times a lockstep group that drained while this prompt was
+    /// still unanswered was woken again on its behalf
+    /// ([`RequestRegistry::take_rewake`]): [`DRAIN_REWAKES_PER_PROMPT`] at
+    /// most, so a holder whose add is late through more than one wave is
+    /// still served and a prompt the holder never schedules ends by the
+    /// silence watchdog instead of cycling waves.
+    rewakes: u8,
     every_step: bool,
 }
 
@@ -198,13 +212,18 @@ impl<O: EngineOutput> RequestRegistry<O> {
             self.in_flight_since = Some(now);
             self.busy_started.notify_one();
         }
+        // The request's own copy of its id, outside any frame: every output
+        // it is handed shares it in place of the step frame's view.
+        let id = FrameStr::from(request_id.as_str());
         self.requests.insert(
             request_id,
             InFlight {
                 sender,
+                id,
                 prompt_tokens,
                 handed: false,
                 started: false,
+                rewakes: 0,
                 every_step,
             },
         );
@@ -276,9 +295,10 @@ impl<O: EngineOutput> RequestRegistry<O> {
         Some(entry)
     }
 
-    /// The engine answered (an output of any kind): nothing in flight is
-    /// unanswered any more, and the busy period, if one is on, counts from
-    /// `now`. The work in hand is read again once the batch is routed
+    /// The engine answered (an output of any kind, or a sign of progress
+    /// noted outside its output wire): nothing in flight is unanswered any
+    /// more, and the busy period, if one is on, counts from `now`. The work
+    /// in hand is read again once the batch is routed, or at once for a note
     /// ([`Self::work_resumes`]).
     fn output_seen(&mut self, now: Instant) {
         self.unanswered_before = Duration::ZERO;
@@ -316,12 +336,14 @@ impl<O: EngineOutput> RequestRegistry<O> {
     ///
     /// The lookup key stays borrowed from the output, so the hot path — a
     /// non-terminal token batch — never allocates one.
-    fn route(&mut self, output: O) {
+    fn route(&mut self, mut output: O) {
         if output.finished() {
             // Terminal: retire the entry before handing the output over, while
             // its request id is still borrowable.
             match self.retire(output.request_id()) {
                 Some(entry) => {
+                    // The entry is owned here: its id moves, nothing is cloned.
+                    output.own_request_id(entry.id);
                     let _ = entry.sender.send(Ok(output));
                 }
                 None => trace!(
@@ -346,6 +368,8 @@ impl<O: EngineOutput> RequestRegistry<O> {
                 self.prefill_pending = self.prefill_pending.saturating_sub(entry.prompt_tokens);
             }
         }
+        // The queued output keeps the request's id, not the step frame.
+        output.own_request_id(entry.id.clone());
         // A failed send hands the output back, so the receiver-gone (stream
         // dropped) path retires the entry without an owned key either.
         if let Err(mpsc::error::SendError(Ok(undelivered))) = entry.sender.send(Ok(output)) {
@@ -354,7 +378,7 @@ impl<O: EngineOutput> RequestRegistry<O> {
     }
 
     /// Remove finished/aborted request ids reported out-of-band by the engine.
-    fn remove_all<'a>(&mut self, request_ids: impl IntoIterator<Item = &'a String>) {
+    fn remove_all<'a>(&mut self, request_ids: impl IntoIterator<Item = &'a str>) {
         for request_id in request_ids {
             self.retire(request_id);
         }
@@ -363,6 +387,23 @@ impl<O: EngineOutput> RequestRegistry<O> {
     /// Prompt tokens of the in-flight requests without a first output yet.
     fn prefill_pending_tokens(&self) -> u64 {
         self.prefill_pending
+    }
+
+    /// Whether a prompt the engine was handed is still unanswered with a
+    /// drain re-wake left to spend: a request whose add frame the engine
+    /// accepted, whose first output has not come, and on whose behalf fewer
+    /// than [`DRAIN_REWAKES_PER_PROMPT`] wakes went out after a drain. Every
+    /// such prompt spends one here, so one wake covers them all and a prompt
+    /// never answered buys that many re-wakes and no more.
+    fn take_rewake(&mut self) -> bool {
+        let mut due = false;
+        for entry in self.requests.values_mut() {
+            if entry.handed && !entry.started && entry.rewakes < DRAIN_REWAKES_PER_PROMPT {
+                entry.rewakes += 1;
+                due = true;
+            }
+        }
+        due
     }
 
     /// How long the engine may take to prefill `tokens` at the allowed rate
@@ -451,6 +492,11 @@ struct RoutingState {
     /// `select_engine` never mutates this map; its reservations live in
     /// `inflight`.
     load: HashMap<u32, EngineLoad>,
+    /// The KV-transfer samples each rank's connector reported since the last
+    /// [`Client::take_kv_transfer`], folded per engine index once a taker
+    /// asked for them ([`Client::keep_kv_transfer`]): the engine reports
+    /// them with its steps, the servicer logs them per interval.
+    kv_transfer: HashMap<u32, KvTransferStats>,
     /// This client's own unfinished request ids, per rank: a floor under the
     /// (possibly stale) reported load, so routing never trusts a snapshot that
     /// says an engine we just loaded is idle. Keyed by id rather than counted,
@@ -465,6 +511,7 @@ struct RoutingState {
 
 /// One frame queued for the engines' shared input socket.
 struct InputFrame {
+    retained: RetainedInput,
     engine_id: EngineId,
     request_type: Bytes,
     payload: Bytes,
@@ -475,6 +522,40 @@ struct InputFrame {
     /// The payload bytes the queue bound counts while the frame waits:
     /// `Some` for an add-request, `None` for a control frame.
     counted: Option<usize>,
+}
+
+/// Logical payload bytes held by queued frames and the active input writer.
+/// Shared allocations can count more than once. This excludes transport-owned
+/// references after local admission, codec/kernel buffers, and process RSS.
+struct RetainedInput {
+    total: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl RetainedInput {
+    /// Reserve atomically, rejecting both budget exhaustion and integer overflow.
+    fn reserve(total: &Arc<AtomicUsize>, bytes: usize, limit: usize) -> Result<Self> {
+        total
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(bytes).filter(|next| *next <= limit)
+            })
+            .map_err(|retained_bytes| Error::EngineInputBytesFull {
+                retained_bytes,
+                request_bytes: bytes,
+                limit_bytes: limit,
+            })?;
+        Ok(Self {
+            total: Arc::clone(total),
+            bytes,
+        })
+    }
+}
+
+impl Drop for RetainedInput {
+    /// Release on send completion, failure, or destruction of queued/active work.
+    fn drop(&mut self) {
+        self.total.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
 }
 
 /// The bound on add-request frames waiting behind a blocked input (see
@@ -557,6 +638,11 @@ struct ClientInner<P: EngineProtocol> {
     /// written) and their payload bytes, for the bound.
     waiting_adds: AtomicUsize,
     waiting_add_bytes: AtomicUsize,
+    /// Logical payload bytes held by queued frames and the active write.
+    retained_input_bytes: Arc<AtomicUsize>,
+    /// Data allowance: [`ENGINE_INPUT_RETAINED_BYTES`] unless
+    /// [`Client::set_input_byte_limit`] changed it. Controls bypass this limit.
+    input_byte_limit: AtomicUsize,
     /// When the input writer began the write it is in, if any: a write
     /// pending for a whole send window is the sign of a blocked input.
     writing_since: Mutex<Option<Instant>>,
@@ -583,16 +669,33 @@ struct ClientInner<P: EngineProtocol> {
     /// only: vLLM reserves negative ids for notices it sends unprompted.
     next_call_id: AtomicI64,
     /// The engine's last output of any kind (a token, a completion, a
-    /// stats-only step), in milliseconds on `output_clock`; reset at the
-    /// first submission the engine reports every step after a spell without
-    /// one, so the silence such a request sees counts from its own dispatch.
-    /// Read by [`Client::output_silence`].
+    /// stats-only step), in milliseconds on `output_clock`; 0 before the
+    /// first. Read by [`Client::last_output_at`] and, beside
+    /// `step_reports_since_ms` and `last_progress_ms`, by
+    /// [`Client::output_silence`].
     output_clock: Instant,
     last_output_ms: AtomicU64,
+    /// The engine's last sign of progress noted outside its output wire (a
+    /// live KV-event batch, [`Client::note_progress`]), in milliseconds on
+    /// `output_clock`; 0 before the first. Read beside `last_output_ms` by
+    /// [`Client::output_silence`], never by [`Client::last_output_at`]: a
+    /// probe that waits for the engine to speak on its wire is not answered
+    /// by a block it stored.
+    last_progress_ms: AtomicU64,
+    /// When the first request the engine reports every step was dispatched
+    /// after a spell without one, in milliseconds on `output_clock`: the
+    /// silence such a request sees counts from its own dispatch, not from an
+    /// output the engine gave before it had anything to say.
+    step_reports_since_ms: AtomicU64,
     /// The engine has sent a scheduler step without any token (a stats-only
     /// step report): its silence is then the scheduler's own, not a prefill
     /// in progress. Read by [`Client::reports_steps`].
     steps_reported: AtomicBool,
+    /// A taker wants the KV-transfer samples the engines report
+    /// ([`Client::keep_kv_transfer`]). Until one does, the dispatcher folds
+    /// none, so a client nobody drains (the gateway's direct lane) keeps no
+    /// growing series. Read by the dispatcher on every batch.
+    kv_transfer_wanted: AtomicBool,
 }
 
 impl<P: EngineProtocol> ClientInner<P> {
@@ -646,7 +749,7 @@ impl<P: EngineProtocol> ClientInner<P> {
                     });
                 }
                 let mut routing = self.routing.lock();
-                let RoutingState { load, inflight } = &mut *routing;
+                let RoutingState { load, inflight, .. } = &mut *routing;
                 let count = self.engines.len();
                 let start = self.scan_start.fetch_add(1, Ordering::Relaxed) % count;
                 let mut best: Option<(f64, usize)> = None;
@@ -681,10 +784,17 @@ impl<P: EngineProtocol> ClientInner<P> {
         }
     }
 
-    /// Stamp an output from the engine (or a dispatch onto an idle one) now.
+    /// Milliseconds on `output_clock` now.
+    fn clock_ms(&self) -> u64 {
+        u64::try_from(self.output_clock.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Stamp an output from the engine now: never 0, which
+    /// [`Client::last_output_at`] reads as no output yet, so a batch within
+    /// the clock's first millisecond reads as its first.
     fn note_output(&self) {
-        let millis = u64::try_from(self.output_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.last_output_ms.store(millis, Ordering::Relaxed);
+        self.last_output_ms
+            .store(self.clock_ms().max(1), Ordering::Relaxed);
     }
 
     /// Retire in-flight request ids from a rank. Idempotent: an id already
@@ -698,7 +808,7 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// every request, so an empty in-flight set is ground truth that the
     /// rank's queue is empty; the KV term is left as reported (cache pages
     /// outlive requests).
-    fn release<'a>(&self, engine_index: u32, request_ids: impl IntoIterator<Item = &'a String>) {
+    fn release<'a>(&self, engine_index: u32, request_ids: impl IntoIterator<Item = &'a str>) {
         let mut routing = self.routing.lock();
         let Some(ids) = routing.inflight.get_mut(&engine_index) else {
             return;
@@ -715,7 +825,7 @@ impl<P: EngineProtocol> ClientInner<P> {
     }
 
     /// Retire one request from the rank named by `engine_id`, if it has one.
-    fn release_one(&self, engine_id: &EngineId, request_id: &String) {
+    fn release_one(&self, engine_id: &EngineId, request_id: &str) {
         if let Some(index) = engine_id.engine_index() {
             self.release(index, [request_id]);
         }
@@ -774,7 +884,9 @@ impl<P: EngineProtocol> ClientInner<P> {
         payload: Vec<u8>,
         aux_frames: Vec<Bytes>,
     ) -> Result<()> {
-        let bytes = payload.len() + aux_frames.iter().map(Bytes::len).sum::<usize>();
+        let bytes = aux_frames.iter().fold(payload.len(), |total, frame| {
+            total.saturating_add(frame.len())
+        });
         self.admit_add(bytes)?;
         self.send_frame(engine_id, P::add_frame(), payload, aux_frames, Some(bytes))
             .await
@@ -792,7 +904,9 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// a whole window sooner than one that waits; the error names the
     /// request's size. The check is not synchronized with the
     /// queue, so a burst can overshoot the bound by a few frames; a burst to
-    /// an engine that reads is never refused, whatever its size.
+    /// an engine that reads is never refused by this check. Independently,
+    /// enqueueing enforces [`Client::set_input_byte_limit`] even on healthy
+    /// engines and can return [`Error::EngineInputBytesFull`].
     fn admit_add(&self, bytes: usize) -> Result<()> {
         let send_timeout = *self.send_timeout.lock();
         let blocked = self
@@ -896,7 +1010,9 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// Queue a frame for the input writer, behind every frame queued before
     /// it; `done`, if any, receives the result of the write, and `counted`
     /// bytes are held against the queue bound until the writer takes the
-    /// frame.
+    /// frame. Independently reserves payload bytes through the active write
+    /// against [`Client::set_input_byte_limit`]; `counted: None` controls bypass
+    /// that limit but still contribute to the retained total.
     fn queue_frame(
         &self,
         engine_id: &EngineId,
@@ -906,12 +1022,31 @@ impl<P: EngineProtocol> ClientInner<P> {
         done: Option<oneshot::Sender<Result<()>>>,
         counted: Option<usize>,
     ) -> Result<()> {
+        let bytes = aux_frames.iter().try_fold(payload.len(), |used, frame| {
+            used.checked_add(frame.len())
+                .ok_or_else(|| Error::EngineInputBytesFull {
+                    retained_bytes: self.retained_input_bytes.load(Ordering::Relaxed),
+                    request_bytes: usize::MAX,
+                    limit_bytes: self.input_byte_limit.load(Ordering::Relaxed),
+                })
+        })?;
+        // Control messages must still pass when the data budget is full.
+        let retained = RetainedInput::reserve(
+            &self.retained_input_bytes,
+            bytes,
+            if counted.is_some() {
+                self.input_byte_limit.load(Ordering::Relaxed)
+            } else {
+                usize::MAX
+            },
+        )?;
         if let Some(bytes) = counted {
             self.waiting_adds.fetch_add(1, Ordering::AcqRel);
             self.waiting_add_bytes.fetch_add(bytes, Ordering::AcqRel);
         }
         self.input_tx
             .send(InputFrame {
+                retained,
                 engine_id: engine_id.clone(),
                 request_type,
                 payload: payload.into(),
@@ -1029,8 +1164,38 @@ impl<P: EngineProtocol> ClientInner<P> {
             // own `current_wave` on the way out; track that so the next wake
             // names a wave the ranks will still accept.
             WaveEvent::Complete(wave) => {
-                let mut current = state.lock();
-                *current = (*current).max(wave.saturating_add(1));
+                let advanced = {
+                    let mut current = state.lock();
+                    let next = (*current).max(wave.saturating_add(1));
+                    let advanced = next > *current;
+                    *current = next;
+                    advanced
+                };
+                // A drain reported while a prompt the group was handed has no
+                // output yet is the drain racing a submit: the holder's peers
+                // read the wake while they were still stepping (a no-op) and
+                // the group agreed to park before the holder's loop had read
+                // the add, which an engine's input thread hands over later
+                // than a wake (it decodes and preprocesses the request
+                // first). The holder then reads the add alone and blocks in
+                // the group's collective; without a DP coordinator nobody
+                // wakes its peers again, and the silence watchdog ends the
+                // group. So the group is woken once more, at a fresh wave.
+                // Every rank reports the drain: the report that moves the
+                // clock wakes, the rest find it moved. A few times per
+                // prompt (`DRAIN_REWAKES_PER_PROMPT`): the holder's add can
+                // still be unread at the re-woken wave's first finish-sync
+                // (a large add slowly preprocessed, the input thread starved
+                // by the dummy steps), and the group parks again; a prompt
+                // the holder never schedules (an add the engine dropped
+                // while staying alive) buys those extra rounds, then the
+                // group stays parked and the silence watchdog ends it as it
+                // did before; every frame of a round would otherwise reset
+                // the watchdog and the group would cycle waves for good.
+                // Nothing pending, nothing sent: an idle group stays parked.
+                if advanced && self.registry.lock().take_rewake() {
+                    self.queue_wake(wave, "a prompt pending through a drained wave");
+                }
             }
             // A rank took a request for an already-drained wave and is asking
             // for the rest of the group to catch up.
@@ -1039,18 +1204,23 @@ impl<P: EngineProtocol> ClientInner<P> {
                     let mut current = state.lock();
                     *current = (*current).max(wave);
                 }
-                // Queued for every rank, not awaited: a frame blocked ahead in
-                // the input queue must not park the dispatcher (the output of
-                // every rank keeps flowing), and the wake reaches the whole
-                // group when the engine reads again.
-                let queued = match self.next_wave() {
-                    Some(next) => self.queue_start_wave(next),
-                    None => Ok(()),
-                };
-                if let Err(error) = queued {
-                    warn!(%error, wave, "failed to queue the requested wave");
-                }
+                self.queue_wake(wave, "the requested wave");
             }
+        }
+    }
+
+    /// Queue a wake of the whole group at a fresh wave, from the dispatcher:
+    /// for every rank and not awaited, since a frame blocked ahead in the
+    /// input queue must not park the dispatcher (the output of every rank
+    /// keeps flowing), and the wake reaches the whole group when the engine
+    /// reads again. `wave` and `why` name the notification it answers.
+    fn queue_wake(&self, wave: u64, why: &str) {
+        let queued = match self.next_wave() {
+            Some(next) => self.queue_start_wave(next),
+            None => Ok(()),
+        };
+        if let Err(error) = queued {
+            warn!(%error, wave, "failed to queue the wake for {why}");
         }
     }
 
@@ -1152,6 +1322,8 @@ impl<P: EngineProtocol> Client<P> {
             input_budget: Arc::new(InputBudget::default()),
             waiting_adds: AtomicUsize::new(0),
             waiting_add_bytes: AtomicUsize::new(0),
+            retained_input_bytes: Arc::new(AtomicUsize::new(0)),
+            input_byte_limit: AtomicUsize::new(ENGINE_INPUT_RETAINED_BYTES),
             writing_since: Mutex::new(None),
             refused: AtomicUsize::new(0),
             engines,
@@ -1164,8 +1336,54 @@ impl<P: EngineProtocol> Client<P> {
             next_call_id: AtomicI64::new(1),
             output_clock: Instant::now(),
             last_output_ms: AtomicU64::new(0),
+            last_progress_ms: AtomicU64::new(0),
+            step_reports_since_ms: AtomicU64::new(0),
             steps_reported: AtomicBool::new(false),
+            kv_transfer_wanted: AtomicBool::new(false),
         });
+
+        // The input monitor was opened when the frontend bound the input
+        // socket, before the handshake, and holds every peer event since.
+        // Read from the start, a disconnect queued there would pass for the
+        // fresh engine's transport loss; which of them are this link's, the
+        // order per identity tells. A connection under an identity the
+        // socket already holds replaces the earlier one, in the peer map and
+        // in the receive queue, before its accept is reported, and a replaced
+        // connection's end is never read again. So the data socket of a
+        // previous engine generation, which dialed this frontend's new bind
+        // by itself and closed when that generation was replaced, under the
+        // identity the next generation registers with, is a disconnect
+        // before the accept of the connection that carried the registration:
+        // not this link's, and read off here, else it would end a client
+        // whose engine, having handshaken once, never dials again. A
+        // disconnect after an engine's last accept is that engine's own
+        // loss: on a link of several engines, one that registered first can
+        // go away while the handshake still waits for the others, and the
+        // monitor arm below, armed at the admission, would never see a
+        // second event for a peer the socket has forgotten. Such a loss ends
+        // the link at its admission, as the arm ends it on a loss after.
+        let mut gone: HashSet<Bytes> = HashSet::new();
+        while let Ok(event) = input_events.try_recv() {
+            match event {
+                zeromq::SocketEvent::Accepted(_, peer) => {
+                    gone.remove(&peer[..]);
+                }
+                zeromq::SocketEvent::Disconnected(peer) => {
+                    info!(
+                        ?peer,
+                        "an input peer disconnected before this link was admitted"
+                    );
+                    gone.insert(Bytes::from(peer));
+                }
+                _ => {}
+            }
+        }
+        let lost_at_admission = inner
+            .engines
+            .iter()
+            .map(|engine| &engine.engine_id)
+            .find(|engine_id| gone.contains(&engine_id[..]))
+            .cloned();
 
         // Input writer: the one owner of the input socket's send half.
         let writer_inner = inner.clone();
@@ -1195,13 +1413,36 @@ impl<P: EngineProtocol> Client<P> {
                 } => {}
 
                 () = async {
+                    if let Some(engine_id) = lost_at_admission {
+                        warn!(
+                            ?engine_id,
+                            "an engine of this link disconnected while the handshake admitted it"
+                        );
+                        writer_inner.registry.lock().fail_all(Arc::new(Error::EngineCoreDead));
+                        writer_inner.routing.lock().inflight.clear();
+                        return;
+                    }
                     while let Some(event) = input_events.next().await {
-                        if let zeromq::SocketEvent::Disconnected(peer) = event {
-                            warn!(?peer, "engine input transport disconnected after queue admission");
-                            writer_inner.registry.lock().fail_all(Arc::new(Error::EngineCoreDead));
-                            writer_inner.routing.lock().inflight.clear();
-                            return;
+                        let zeromq::SocketEvent::Disconnected(peer) = event else {
+                            continue;
+                        };
+                        // The monitor reports every peer of the shared input
+                        // socket; only this link's engines are its loss.
+                        if !writer_inner
+                            .engines
+                            .iter()
+                            .any(|engine| engine.engine_id[..] == peer[..])
+                        {
+                            info!(
+                                ?peer,
+                                "an input peer that is not an engine of this link disconnected; ignored"
+                            );
+                            continue;
                         }
+                        warn!(?peer, "engine input transport disconnected after queue admission");
+                        writer_inner.registry.lock().fail_all(Arc::new(Error::EngineCoreDead));
+                        writer_inner.routing.lock().inflight.clear();
+                        return;
                     }
                     // Monitor closure alone does not prove engine death.
                     std::future::pending::<()>().await;
@@ -1292,19 +1533,47 @@ impl<P: EngineProtocol> Client<P> {
         self.inner.input_budget.released.notify_one();
     }
 
+    /// Bound logical payload bytes queued or being sent by this client (8 GiB
+    /// by default, capped at usize::MAX). Unlike the blocked-queue limit, this
+    /// check is unconditional and atomic; oversized adds are refused with
+    /// [`Error::EngineInputBytesFull`]. Control frames bypass the limit but count
+    /// toward usage. Cancellation of a caller does not release its queued frame.
+    /// Lowering the limit does not evict existing work. This is not an RSS cap:
+    /// transport-owned frames after admission have their own separate budget,
+    /// and codec/kernel buffers and allocations before enqueueing are excluded.
+    pub fn set_input_byte_limit(&self, bytes: usize) {
+        self.inner.input_byte_limit.store(bytes, Ordering::Relaxed);
+    }
+
     /// The latest per-rank load for one engine index (DP routing signal), if
     /// any batch has been seen from it yet.
     pub fn engine_load(&self, engine_index: u32) -> Option<EngineLoad> {
         self.inner.routing.lock().load.get(&engine_index).copied()
     }
 
+    /// The KV-transfer samples every rank's connector reported since the last
+    /// call, by engine index in order, nothing for a rank that reported none:
+    /// the servicer takes them on its stats tick and logs them in the
+    /// engine's own words ([`KvTransferStats::summary`]).
+    pub fn take_kv_transfer(&self) -> Vec<(u32, KvTransferStats)> {
+        let taken = std::mem::take(&mut self.inner.routing.lock().kv_transfer);
+        let mut reports: Vec<(u32, KvTransferStats)> = taken
+            .into_iter()
+            .filter(|(_, stats)| !stats.is_empty())
+            .collect();
+        reports.sort_unstable_by_key(|(engine_index, _)| *engine_index);
+        reports
+    }
+
     /// How long the engine has produced nothing while this client holds
     /// requests in flight on it that the engine reports on every step
     /// ([`EngineProtocol::reported_every_step`]): the time since its last
-    /// output batch of any kind (a token, a completion, a stats-only step),
-    /// counted from the dispatch of the first such request after a spell
-    /// without one; `None` while none is in flight. A request the engine
-    /// reports at intervals (one that does not stream, one streamed every so
+    /// output batch of any kind (a token, a completion, a stats-only step)
+    /// or sign of progress noted outside its output wire
+    /// ([`Self::note_progress`]), counted from the dispatch of the first such
+    /// request after a spell without one; `None` while none is in flight. A
+    /// request the engine reports at intervals (one that does not stream, one
+    /// streamed every so
     /// many tokens) is quiet while healthy, so it counts no silence of its
     /// own, though its prompt counts in [`Self::prefill_pending_tokens`]
     /// (its prefill silences the rest). A frozen engine keeps its connection
@@ -1317,8 +1586,25 @@ impl<P: EngineProtocol> Client<P> {
         if self.inner.registry.lock().reported_every_step() == 0 {
             return None;
         }
-        let since = Duration::from_millis(self.inner.last_output_ms.load(Ordering::Relaxed));
+        let since = Duration::from_millis(
+            self.inner
+                .last_output_ms
+                .load(Ordering::Relaxed)
+                .max(self.inner.last_progress_ms.load(Ordering::Relaxed))
+                .max(self.inner.step_reports_since_ms.load(Ordering::Relaxed)),
+        );
         Some(self.inner.output_clock.elapsed().saturating_sub(since))
+    }
+
+    /// When the engine last sent an output batch of any kind (a token, a
+    /// completion, a stats-only step), to the millisecond; `None` before
+    /// the first. Read whether or not anything is in flight, and never moved
+    /// by a dispatch: a caller that submitted a request of its own at some
+    /// instant reads a later one here as the engine having spoken since,
+    /// whichever request it spoke for (the servicers' deep health probe).
+    pub fn last_output_at(&self) -> Option<Instant> {
+        let millis = self.inner.last_output_ms.load(Ordering::Relaxed);
+        (millis > 0).then(|| self.inner.output_clock + Duration::from_millis(millis))
     }
 
     /// Whether the engine's wire reports every scheduler step: it has shown
@@ -1341,6 +1627,39 @@ impl<P: EngineProtocol> Client<P> {
     /// client told nothing is classified by what its wire shows.
     pub fn note_reports_steps(&self) {
         self.inner.steps_reported.store(true, Ordering::Relaxed);
+    }
+
+    /// Keep the KV-transfer samples the engines report from now on, for
+    /// [`Self::take_kv_transfer`]: the taker announces itself and drains on
+    /// its own interval (the servicer's stats tick). A client without a
+    /// taker folds nothing, whatever its engines report, so nothing grows
+    /// behind the routing lock of a client nobody drains.
+    pub fn keep_kv_transfer(&self) {
+        self.inner.kv_transfer_wanted.store(true, Ordering::Relaxed);
+    }
+
+    /// A sign of the engine's progress from outside its output wire: a
+    /// KV-event batch its publisher sent, read live and in sequence by the
+    /// servicer's relay, which reports it here. It ends the engine's silence
+    /// as an output of any kind does: [`Self::output_silence`] counts from
+    /// it, and the silence watchdog counts its window from it, past the
+    /// prefill work still in hand from `now`. So an engine that stores the
+    /// blocks of a long prefill chunk by chunk is not given up on while it
+    /// does, though its wire says nothing until the prompt's first token.
+    /// Only the engine's own work belongs here: a replayed batch, a relay
+    /// heartbeat or a process-alive poll is not progress, and a frozen
+    /// scheduler is still given up on at the window past its allowance,
+    /// counted from its last sign of life. [`Self::last_output_at`] does
+    /// not move: it says when the engine last spoke on its wire, which is
+    /// what a probe waits for.
+    pub fn note_progress(&self) {
+        let now = Instant::now();
+        self.inner
+            .last_progress_ms
+            .store(self.inner.clock_ms().max(1), Ordering::Relaxed);
+        let mut registry = self.inner.registry.lock();
+        registry.output_seen(now);
+        registry.work_resumes(now);
     }
 
     /// Prompt tokens of the requests the engine has accepted (their add
@@ -1386,7 +1705,9 @@ impl<P: EngineProtocol> Client<P> {
             // with nothing it reports every step had nothing to say until
             // now.
             if quiet && every_step {
-                self.inner.note_output();
+                self.inner
+                    .step_reports_since_ms
+                    .store(self.inner.clock_ms(), Ordering::Relaxed);
             }
             receiver
         };
@@ -1399,7 +1720,7 @@ impl<P: EngineProtocol> Client<P> {
         {
             Ok(engine_id) => engine_id,
             Err(error) => {
-                self.inner.registry.lock().remove_all([&request_id]);
+                self.inner.registry.lock().remove_all([request_id.as_str()]);
                 return Err(error);
             }
         };
@@ -1463,7 +1784,7 @@ impl<P: EngineProtocol> Client<P> {
     /// Explicitly abort an in-flight request.
     pub async fn abort(&self, engine_id: &EngineId, request_id: &str) -> Result<()> {
         let request_id = request_id.to_string();
-        self.inner.registry.lock().remove_all([&request_id]);
+        self.inner.registry.lock().remove_all([request_id.as_str()]);
         self.inner.release_one(engine_id, &request_id);
         self.inner.abort(engine_id, &request_id).await
     }
@@ -1491,6 +1812,8 @@ impl<P: EngineProtocol> Client<P> {
     /// `ClientInner::admit_add`): once the engine has stopped reading for
     /// a whole send window, a frame that would take the waiting payload past
     /// the bound is refused at once rather than parked and delivered later.
+    /// The unconditional [`Self::set_input_byte_limit`] also applies, returning
+    /// [`Error::EngineInputBytesFull`] even if input is not blocked.
     pub async fn send_typed(
         &self,
         engine_id: &EngineId,
@@ -1498,7 +1821,9 @@ impl<P: EngineProtocol> Client<P> {
         payload: Vec<u8>,
         aux_frames: Vec<Bytes>,
     ) -> Result<()> {
-        let bytes = payload.len() + aux_frames.iter().map(Bytes::len).sum::<usize>();
+        let bytes = aux_frames.iter().fold(payload.len(), |total, frame| {
+            total.saturating_add(frame.len())
+        });
         self.inner.admit_add(bytes)?;
         self.inner
             .send_frame(engine_id, request_type, payload, aux_frames, Some(bytes))
@@ -1598,9 +1923,14 @@ const ENGINE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// work counts. A wire that reports every scheduler step is never silent
 /// through a prefill; one that carries token batches only says nothing until
 /// a prompt's first token, and a batch of million-token prompts is silent for
-/// as long as their prefill takes, which no fixed window covers. Both figures
-/// are per client ([`Client::set_silence_death_timeout`]); neither removes
-/// the watchdog: without it a killed engine hangs its requests forever.
+/// as long as their prefill takes, which no fixed window covers. A sign of
+/// progress a caller reports from outside the wire, a KV-event batch the
+/// engine published, ends the silence as an output does
+/// ([`Client::note_progress`]):
+/// a chunked prefill stores its blocks chunk by chunk, so an engine whose
+/// publisher is on is not silent through one. Both figures are per client
+/// ([`Client::set_silence_death_timeout`]); neither removes the watchdog:
+/// without it a killed engine hangs its requests forever.
 pub const ENGINE_SILENCE_DEATH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// `at + after`, or an instant that never comes when the sum does not fit
@@ -1629,6 +1959,20 @@ fn far_future() -> Instant {
 /// the window, nothing with nothing pending.
 pub const ENGINE_PREFILL_TOKENS_PER_SEC: u64 = 2_000;
 
+/// How many times a lockstep group that drains while a prompt it was handed
+/// is still unanswered is woken again on that prompt's behalf
+/// (`ClientInner::observe_wave`, `RequestRegistry::take_rewake`). One round
+/// covers the drain racing the submit's wake; the holder's input thread can
+/// hand a large or slowly preprocessed add to its loop later still, past the
+/// first finish-sync of the re-woken wave, and each wave the add is late
+/// through costs one more. The cap keeps a prompt the holder never schedules
+/// (an add the engine dropped while staying alive) to this many rounds of a
+/// dummy wave before the group stays parked and the silence watchdog ends
+/// it, as it did before the re-wake existed; each round's reports reset the
+/// watchdog, so a larger cap defers that verdict by as many sync periods and
+/// a smaller one gives up on a late add sooner.
+const DRAIN_REWAKES_PER_PROMPT: u8 = 3;
+
 /// How long local admission to a full zeromq peer queue may stall before the
 /// engine is treated as dead. A pause the send window outlasts fails the
 /// requests that arrive during it, and only them; a core that has read nothing
@@ -1638,6 +1982,9 @@ pub const ENGINE_PREFILL_TOKENS_PER_SEC: u64 = 2_000;
 /// watchdog needs requests in flight, which the requests a blocked input
 /// failed are not.
 const ENGINE_INPUT_DEATH_TIMEOUT: Duration = ENGINE_SILENCE_DEATH_TIMEOUT;
+
+/// Default logical payload allowance for queued frames and the active writer.
+const ENGINE_INPUT_RETAINED_BYTES: usize = 8usize.saturating_mul(1 << 30);
 
 /// The bound on add-requests waiting behind a blocked input, in frames and in
 /// payload bytes: once a send window has elapsed with a frame unaccepted, a
@@ -1708,37 +2055,55 @@ impl<P: EngineProtocol> Dispatcher<P> {
         self.consecutive_decode_errors = 0;
         let inner = &self.inner;
         inner.note_output();
+        // A batch with neither outputs nor finished requests is a stats-only
+        // step report when it carries a load tail (the engine's wire reports
+        // every step); without one it is the engine's bare liveness signal
+        // (a scheduler answering a health probe it could not queue): an
+        // output like any other, and no step report.
         if batch.outputs.is_empty() && batch.finished_request_ids.is_empty() && batch.load.is_some()
         {
             inner.steps_reported.store(true, Ordering::Relaxed);
         }
-        if let Some(load) = batch.load {
-            inner.routing.lock().load.insert(batch.engine_index, load);
+        let kv_transfer = batch
+            .kv_transfer
+            .filter(|_| inner.kv_transfer_wanted.load(Ordering::Relaxed));
+        if batch.load.is_some() || kv_transfer.is_some() {
+            let mut routing = inner.routing.lock();
+            if let Some(load) = batch.load {
+                routing.load.insert(batch.engine_index, load);
+            }
+            if let Some(transfers) = kv_transfer {
+                routing
+                    .kv_transfer
+                    .entry(batch.engine_index)
+                    .or_default()
+                    .merge(*transfers);
+            }
         }
         if let Some(event) = batch.wave {
             inner.observe_wave(event, batch.engine_index);
         }
         // Unique finished ids: a terminal output and the out-of-band finished
         // list may name the same request.
-        let mut finished: HashSet<String> = batch.finished_request_ids.into_iter().collect();
+        let mut finished: HashSet<FrameStr> = batch.finished_request_ids.into_iter().collect();
         let mut registry = inner.registry.lock();
         if let Some(reply) = batch.utility {
             registry.resolve_utility(reply);
         }
         for output in batch.outputs {
             if output.finished() {
-                finished.insert(output.request_id().to_string());
+                finished.insert(output.request_id_shared());
             }
             registry.route(output);
         }
-        registry.remove_all(&finished);
+        registry.remove_all(finished.iter().map(FrameStr::as_str));
         // The work in hand is what the batch left pending; the watchdog counts
         // from its end.
         let now = Instant::now();
         registry.work_resumes(now);
         let next = registry.next_tick(now);
         drop(registry);
-        inner.release(batch.engine_index, &finished);
+        inner.release(batch.engine_index, finished.iter().map(FrameStr::as_str));
         next
     }
 
@@ -1774,7 +2139,7 @@ impl<P: EngineProtocol> Dispatcher<P> {
     /// routing the output of every rank. The input writer reports a write
     /// that failed.
     fn forward_abort(&self, engine_id: EngineId, request_id: String) {
-        self.inner.registry.lock().remove_all([&request_id]);
+        self.inner.registry.lock().remove_all([request_id.as_str()]);
         self.inner.release_one(&engine_id, &request_id);
         if let Err(error) = self.inner.queue_abort(&engine_id, &request_id) {
             warn!(%error, %request_id, "failed to queue abort");
@@ -1836,10 +2201,13 @@ async fn run_dispatcher<P: EngineProtocol>(
     mut abort_rx: mpsc::UnboundedReceiver<(EngineId, String)>,
     inner: Arc<ClientInner<P>>,
 ) {
-    // Positive-liveness watchdog: only output from the engine resets it. The
-    // aborts this loop also handles are the client's own events and say
-    // nothing about the engine; a steady trickle of them (a gateway retrying
-    // into a stalled engine) must not keep a silent engine alive.
+    // Positive-liveness watchdog: only output from the engine, or a sign of
+    // its progress a caller reported from outside the wire
+    // (`Client::note_progress`), resets it. The aborts this loop also
+    // handles are the client's own
+    // events and say nothing about the engine; a steady trickle of them (a
+    // gateway retrying into a stalled engine) must not keep a silent engine
+    // alive.
     let (window, busy_started) = {
         let registry = inner.registry.lock();
         (registry.silence_window, registry.busy_started.clone())
@@ -1904,8 +2272,7 @@ async fn run_input_writer<P: EngineProtocol>(
         let death_timeout = *inner.input_death_timeout.lock();
         *inner.writing_since.lock() = Some(Instant::now());
         let write = async {
-            let bytes =
-                frame.payload.len() + frame.aux_frames.iter().map(Bytes::len).sum::<usize>();
+            let bytes = frame.retained.bytes;
             let credit = inner.reserve_input(bytes).await;
             send_message(
                 &mut input_send,
@@ -1921,6 +2288,7 @@ async fn run_input_writer<P: EngineProtocol>(
             .await
         };
         let result = tokio::time::timeout(death_timeout, write).await;
+        drop(frame.retained);
         *inner.writing_since.lock() = None;
         let result = match result {
             Ok(result) => result,
@@ -1996,7 +2364,10 @@ impl<P: EngineProtocol> SubmitGuard<'_, P> {
     /// later read the add frame.
     fn take_back(&mut self, abort: bool) {
         self.armed = false;
-        self.inner.registry.lock().remove_all([&self.request_id]);
+        self.inner
+            .registry
+            .lock()
+            .remove_all([self.request_id.as_str()]);
         self.inner.release_one(&self.engine_id, &self.request_id);
         if abort {
             let _ = self

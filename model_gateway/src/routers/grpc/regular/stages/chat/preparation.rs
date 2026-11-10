@@ -4,6 +4,7 @@ use axum::response::Response;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ToolChoice, ToolChoiceValue},
+    profile::ProviderProfile,
 };
 use tracing::error;
 
@@ -17,6 +18,7 @@ use crate::{
                 stages::{
                     reading,
                     rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
+                    token_ids,
                 },
                 symphony,
             },
@@ -96,6 +98,17 @@ pub(crate) async fn prepare_chat_like(
         // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
         let tokenizer =
             utils::resolve_tokenizer(ctx, "ChatPreparationStage::prepare_chat").map_err(|e| *e)?;
+        token_ids::validate_logit_bias_token_ids(
+            request.logit_bias.as_ref(),
+            tokenizer.as_ref(),
+            || {
+                token_ids::reported_embedding_rows(
+                    &ctx.components.worker_registry,
+                    &ctx.input.model_id,
+                )
+            },
+        )
+        .map_err(|e| error::bad_request("logit_bias_invalid_key", e))?;
 
         // Step 1: the request whose tools the template renders (every tool
         // for a named tool_choice; the constraint built below forces the call;
@@ -118,6 +131,13 @@ pub(crate) async fn prepare_chat_like(
         .await?;
         let media_order = media.media_order;
 
+        // The model's provider profile, derived once for the request, before
+        // the render that reads it (the thinking the prompt is rendered with);
+        // the stages after this one read it from the state (the output
+        // budget, the constraint's tool-call reading, the response spec).
+        let provider = ProviderProfile::for_model(&request.model);
+        ctx.state.provider = Some(provider);
+
         // Step 2: Process messages and apply chat template
         let (processed_messages, prompt_encoding) =
             match utils::process_chat_messages_with_placeholders(
@@ -125,6 +145,7 @@ pub(crate) async fn prepare_chat_like(
                 &*tokenizer,
                 media.placeholders(),
                 media_order,
+                provider,
             ) {
                 Ok(msgs) => msgs,
                 Err(e) => {
@@ -169,13 +190,17 @@ pub(crate) async fn prepare_chat_like(
             constraint: tool_call_constraint,
             json_schema: json_schema_constraint,
             keeps_special_tokens: preserve_reasoning_special_tokens,
+            names: parser_names,
+            prompt_thought,
+            reading,
         } = reading::prepare(
             ctx,
             symphony::Asks::Chat(request),
             &constraint_tools,
             &processed_messages.text,
-            utils::chat_reasoning_starts_in_rendered_prefill(
+            utils::chat_reasoning_starts_in_rendered_prefill_for(
                 request,
+                provider,
                 processed_messages.generation_prompt,
                 processed_messages.continued_final_message,
                 tokenizer.as_ref(),
@@ -183,6 +208,9 @@ pub(crate) async fn prepare_chat_like(
             &tokenizer,
             "ChatPreparationStage::execute",
         )?;
+        ctx.state.parser_names = Some(parser_names);
+        ctx.state.prompt_thought = prompt_thought;
+        ctx.state.reading = reading;
 
         let skip_special_tokens = skips_special_tokens(
             request,
@@ -248,13 +276,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-
-    fn tool(name: &str) -> Value {
-        json!({
-            "type": "function",
-            "function": {"name": name, "parameters": {"type": "object", "properties": {}}}
-        })
-    }
+    use crate::routers::grpc::testing::tool;
 
     /// A system message declaring `tools`, as the profiles that read such
     /// declarations take it.

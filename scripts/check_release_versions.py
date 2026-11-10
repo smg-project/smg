@@ -3,33 +3,43 @@
 
 For every component (a workspace crate or a Python package), since the given tag:
 whether its files changed, whether its version was bumped, and, for a crate, whether
-the workspace root's dependency entry agrees. Then the files that must mirror the
-gateway's version. Issues are listed with the bump conventional commits ask for
-(``feat!:`` or ``BREAKING CHANGE``: major; ``feat:``: minor; otherwise patch) and,
-on request, applied.
+the workspace root's dependency entry agrees. A version is bumped when no release tag
+``v<x.y.z>`` (the given tag, or one another release line made) carries it with other
+code: the registries take a version once. Then the files that must mirror the gateway's
+version. Issues are listed with the bump conventional commits ask for (``feat!:`` or
+``BREAKING CHANGE``: major; ``feat:``: minor; otherwise patch), stepped past the
+versions release tags carry, and, on request, applied.
 
 Usage:
-    check_release_versions.py [tag] [--check | --fix]
+    check_release_versions.py [tag] [--check | --fix | --plan]
 
-    tag       the release to compare against (default: the newest tag)
+    tag       the release to compare against (default: the newest tag; for --plan the
+              highest final release tag, what a cut compares against)
     --check   report only, never prompt (for CI and dry runs)
     --fix     apply the proposed fixes without prompting
+    --plan    the bump the next cut writes against the tag, quietly: the proposed versions
+              only, nothing changed, exit 0 (on main every crate changed since the last
+              release reads as unbumped by design; the cut bumps them); VERSION_OVERRIDE
+              may be the cut's candidate version here (X.Y.Z-rc.N), what the cut writes
+              to the gateway and its mirrors; without it, main's development version
+              names it (1.15.0-dev: the first candidate, 1.15.0-rc.1)
 
 Environment:
     VERSION_OVERRIDE  X.Y.Z: the gateway's new version instead of the detected bump
 
-Exit code 0 = all versions consistent (or fixed), 1 = issues found and not fixed.
+Exit code 0 = all versions consistent (or fixed, or --plan), 1 = issues found and not fixed.
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import re
 import subprocess
 import sys
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # --- what is checked ----------------------------------------------------------
@@ -60,7 +70,7 @@ class Mirror:
 
     label: str
     file: str
-    kind: str  # "cargo" | "pyproject" | "helm" | "workflow"
+    kind: str  # "cargo" | "pyproject" | "python" | "helm" | "workflow"
 
 
 GATEWAY = "smg"
@@ -104,6 +114,8 @@ MIRRORS = (
     Mirror("smg-python", "bindings/python/Cargo.toml", "cargo"),
     Mirror("smg-golang", "bindings/golang/Cargo.toml", "cargo"),
     Mirror("smg pyproject", "bindings/python/pyproject.toml", "pyproject"),
+    # smg.__version__ as the installed package reports it; `make bump-version` writes it, this check reads it
+    Mirror("smg version.py", "bindings/python/src/smg/version.py", "python"),
     Mirror("helm chart", "deploy/helm/smg/Chart.yaml", "helm"),
     Mirror("engine-docker", ".github/workflows/release-engine-docker.yml", "workflow"),
 )
@@ -116,6 +128,11 @@ class Fatal(Exception):
 # --- version lines: read and rewrite ------------------------------------------
 
 SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
+RELEASE_VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?$")
+CUT_VERSION = re.compile(r"^\d+\.\d+\.\d+(-rc\.\d+)?$")  # what a cut writes: a final or a candidate
+# what main reads between cuts: the next development version (1.15.0-dev once release/1.14 is cut)
+DEV_VERSION = re.compile(r"^(\d+\.\d+\.\d+)-dev$")
+FINAL_TAG = re.compile(r"^v\d+\.\d+\.\d+$")
 TOML_VERSION = re.compile(r'^version\s*=\s*"([^"]*)"', re.M)
 TOML_WORKSPACE_VERSION = re.compile(
     r"^version\.workspace\s*=\s*true|^version\s*=\s*\{\s*workspace\s*=\s*true", re.M
@@ -124,6 +141,22 @@ DUNDER_VERSION = re.compile(r'__version__\s*=\s*"([^"]*)"')
 HELM_VERSION = re.compile(r'^version:\s*"?([^"\s]*)"?\s*$', re.M)
 HELM_APP_VERSION = re.compile(r"^appVersion:.*$", re.M)
 WORKFLOW_VERSION = re.compile(r"SMG_RELEASE_TAG:\s*v([0-9]\S*)")
+
+
+def version_key(version: str) -> tuple[int, int, int, int, int] | None:
+    """A sort key for ``X.Y.Z`` and ``X.Y.Z-rc.N`` (a candidate below its final); None otherwise."""
+    match = RELEASE_VERSION.match(version)
+    if not match:
+        return None
+    major, minor, patch, candidate = match.groups()
+    return (int(major), int(minor), int(patch), 0 if candidate else 1, int(candidate or 0))
+
+
+def first_candidate(version: str) -> str | None:
+    """The candidate a cut writes from main's development version: ``1.15.0-dev`` -> ``1.15.0-rc.1``;
+    None for any other spelling (a cut names its version then)."""
+    match = DEV_VERSION.match(version)
+    return f"{match.group(1)}-rc.1" if match else None
 
 
 def version_kind(file: str) -> str:
@@ -275,10 +308,47 @@ class Repo:
         tags = self.git("tag", "--sort=-creatordate").split()
         return tags[0] if tags else None
 
+    def highest_final_tag(self) -> str | None:
+        """The highest vX.Y.Z tag; a candidate (-rc.N) is not a final."""
+        finals = [t for t in self.git("tag", "--list", "v[0-9]*").split() if FINAL_TAG.match(t)]
+        return (
+            max(finals, key=lambda t: tuple(int(n) for n in t[1:].split("."))) if finals else None
+        )
+
     def show(self, ref: str, path: str) -> str | None:
         """A file's text at a ref; None when it is not there."""
         result = self._run("show", f"{ref}:{path}")
         return result.stdout if result.returncode == 0 else None
+
+    def release_tags(self) -> list[str]:
+        """Every release tag (``v<x.y.z>`` or ``v<x.y.z>-rc.<n>``), whichever line made it; a tag
+        of another shape (``v1.14.0-qa``) published nothing and is not one."""
+        tags = self.git("tag", "--list", "v[0-9]*").split()
+        return [tag for tag in tags if version_key(tag[1:]) is not None]
+
+    def texts_at(self, wanted: Sequence[tuple[str, str]]) -> dict[tuple[str, str], str]:
+        """The text of each (ref, path) that exists, read in one ``cat-file --batch`` call."""
+        out = subprocess.run(
+            ["git", "cat-file", "--batch"],
+            cwd=self.root,
+            env=self.env,
+            check=True,
+            input="".join(f"{ref}:{path}\n" for ref, path in wanted).encode(),
+            capture_output=True,
+        ).stdout
+        texts: dict[tuple[str, str], str] = {}
+        position = 0
+        # one answer per request, in order: "<sha> blob <size>\n<text>\n", or "<request> missing"
+        for ref_path in wanted:
+            end = out.index(b"\n", position)
+            header = out[position:end].decode("utf-8")
+            position = end + 1
+            if header.endswith((" missing", " ambiguous")):
+                continue
+            size = int(header.rsplit(" ", 1)[1])
+            texts[ref_path] = out[position : position + size].decode("utf-8")
+            position += size + 1
+        return texts
 
     def changed_since(self, tag: str, paths: Sequence[str]) -> list[str]:
         """``git diff --name-status`` lines since the tag, renames detected."""
@@ -308,15 +378,15 @@ class Repo:
 @dataclass
 class Verdict:
     component: Component
-    files_changed: int  # 0 = nothing to check
+    # against the tag the verdict is judged by; 0 = no files to publish (the carrier path may still check the pin)
+    files_changed: int
     version: str = ""
     tag_version: str | None = None  # None = not at the tag: a new component
+    tagged: dict[str, str] = field(default_factory=dict)  # version -> the release tag carrying it
+    carried_by: str | None = None  # the release tag, not the given one, that carries the version
+    unbumped: bool = False  # the version is a release tag's, carried there with other code
     level: str | None = None  # the bump asked for when the version was not bumped
     workspace_version: str | None = None  # the root's entry when it disagrees
-
-    @property
-    def unbumped(self) -> bool:
-        return self.tag_version is not None and self.tag_version == self.version
 
 
 def version_file_has_other_changes(repo: Repo, tag: str, file: str) -> bool:
@@ -348,17 +418,69 @@ def files_changed(repo: Repo, tag: str, component: Component) -> int:
     return count
 
 
-def check(repo: Repo, tag: str, component: Component, root_toml: str) -> Verdict:
-    verdict = Verdict(component, files_changed(repo, tag, component))
-    if verdict.files_changed == 0:
-        return verdict
-    kind = version_kind(component.version_file) if component.kind == "package" else "cargo"
+def manifest_kind(component: Component) -> str:
+    return version_kind(component.version_file) if component.kind == "package" else "cargo"
+
+
+def tagged_versions(repo: Repo, components: Sequence[Component]) -> dict[str, dict[str, str]]:
+    """Per component name, {version: release tag} over every release tag that carries it (the
+    newest tag for a version several carry), read in one git call; a tag whose copy has no
+    readable version is skipped."""
+    tags = sorted(repo.release_tags(), key=lambda tag: version_key(tag[1:]) or (-1, 0, 0, 0, 0))
+    wanted = [
+        (tag, path) for c in components for tag in tags for path in with_legacy(c.version_file)
+    ]
+    texts = repo.texts_at(wanted)
+    table: dict[str, dict[str, str]] = {}
+    for component in components:
+        found: dict[str, str] = {}
+        for tag in tags:
+            for path in with_legacy(component.version_file):
+                text = texts.get((tag, path))
+                if text is None:
+                    continue
+                try:
+                    found[tag] = read_version(manifest_kind(component), text, f"{path} at {tag}")
+                except Fatal:
+                    pass
+                break
+        table[component.name] = {found[tag]: tag for tag in tags if tag in found}
+    return table
+
+
+def check(
+    repo: Repo, tag: str, component: Component, root_toml: str, tagged: dict[str, str]
+) -> Verdict:
+    verdict = Verdict(component, files_changed(repo, tag, component), tagged=tagged)
+    if not (repo.root / component.version_file).is_file():
+        if verdict.files_changed:  # its files went since the tag: the table still names it
+            raise Fatal(f"{component.version_file} is gone: drop {component.name} from the table.")
+        return verdict  # a table entry this tree never had
+    kind = manifest_kind(component)
     verdict.version = read_version(kind, repo.read(component.version_file), component.version_file)
     for path in with_legacy(component.version_file):
         text = repo.show(tag, path)
         if text is not None:
             verdict.tag_version = read_version(kind, text, f"{path} at {tag}")
             break
+    # The release tag whose copy of the component carries HEAD's version: the given tag, or one
+    # another line made (a patch of an older line synced to main, a cut before that patch). The
+    # version is bumped only when no tag carries it, or the carrier's code is this code already.
+    carrier = tag if verdict.version == verdict.tag_version else tagged.get(verdict.version)
+    changed_since_tag = verdict.files_changed
+    if carrier is not None and carrier != tag:
+        verdict.carried_by = carrier
+        verdict.files_changed = files_changed(repo, carrier, component)
+    if verdict.files_changed == 0:
+        # Changed since the comparison tag, at a version another line's tag carries with this very
+        # code: nothing to publish, but the workspace pin still has to follow the version (the
+        # comparison tag's path reads it below; this path must not skip it).
+        if changed_since_tag and component.dep_key:
+            pinned = workspace_dep_version(root_toml, component.dep_key)
+            if pinned != verdict.version:
+                verdict.workspace_version = pinned or ""
+        return verdict
+    verdict.unbumped = carrier is not None
     if verdict.unbumped:
         verdict.level = bump_level(
             repo.commits_since(tag, [f"{p}/" for p in with_legacy(component.path)])
@@ -407,6 +529,17 @@ class Plan:
     mirrors: list[tuple[Mirror, str]]  # the mirrors that disagree, with the version they carry
     gateway_target: str
     override: str | None
+    gateway_version: str = ""  # what the gateway's manifest reads now
+    cut_version: str | None = (
+        None  # a plan only: what the cut writes to the gateway and its mirrors, whatever the verdict
+    )
+    # a plan only: the cut version was read from main's development version, not given as VERSION_OVERRIDE
+    cut_version_derived: bool = False
+
+    @property
+    def gateway_set(self) -> bool:
+        """Whether a plan moves the gateway to the cut's version (the cut always writes it; a line when it differs)."""
+        return self.cut_version is not None and self.gateway_version != self.cut_version
 
     @property
     def issues(self) -> int:
@@ -416,21 +549,35 @@ class Plan:
             + len(self.mirrors)
         )
 
-    def new_version(self, verdict: Verdict) -> str:
+    def proposal(self, verdict: Verdict) -> tuple[str, list[str]]:
+        """The version to write, and the versions stepped past because a release tag carries them."""
         if self.override and verdict.component.name == GATEWAY:
-            return self.override
-        return bumped(verdict.version, verdict.level or "patch")
+            return self.override, []
+        new, stepped = bumped(verdict.version, verdict.level or "patch"), []
+        while new in verdict.tagged:
+            stepped.append(f"v{new} is {verdict.tagged[new]}'s")
+            new = bumped(new, "patch")
+        return new, stepped
+
+    def new_version(self, verdict: Verdict) -> str:
+        return self.proposal(verdict)[0]
 
 
 def report(verdict: Verdict, out: Out) -> None:
     c, name = verdict.component, out.paint("bold", verdict.component.name)
     where, n = f"({c.path}/)", f"{verdict.files_changed} file(s) changed"
     ok, warn, bad = out.paint("green", "✓"), out.paint("yellow", "!"), out.paint("red", "✗")
-    if verdict.tag_version is None:
-        out.line(f"  {ok} {name} {where} — new {c.kind} (v{verdict.version}), {n}")
-    elif verdict.unbumped:
+    if verdict.unbumped:
+        carried = f", {verdict.carried_by}'s" if verdict.carried_by else ""
         out.line(
-            f"  {warn} {name} {where} — {n} but version not bumped (v{verdict.version}) [{out.level(verdict.level)}]"
+            f"  {warn} {name} {where} — {n} but version not bumped (v{verdict.version}{carried})"
+            f" [{out.level(verdict.level)}]"
+        )
+    elif verdict.tag_version is None:
+        out.line(f"  {ok} {name} {where} — new {c.kind} (v{verdict.version}), {n}")
+    elif verdict.carried_by and not verdict.files_changed:
+        out.line(
+            f"  {ok} {name} {where} — v{verdict.version} is {verdict.carried_by}'s, with this code"
         )
     else:
         out.line(f"  {ok} {name} {where} — v{verdict.tag_version} → v{verdict.version} ({n})")
@@ -448,14 +595,20 @@ def examine(
     crates: Sequence[Component] = CRATES,
     packages: Sequence[Component] = PACKAGES,
     mirrors: Sequence[Mirror] = MIRRORS,
+    cut_version: str | None = None,
 ) -> Plan:
-    """Walk the components and the mirrors, printing each verdict as the shell did."""
+    """Walk the components and the mirrors, printing each verdict as the shell did.
+
+    With ``cut_version`` (a plan) the gateway and its mirrors are measured against that version, as the cut
+    writes it unconditionally (``make bump-version`` first), not against the checker's own step.
+    """
     root_toml = repo.read("Cargo.toml")
+    tagged = tagged_versions(repo, (*crates, *packages))
     verdicts = []
     for component in (*crates, *packages):
-        verdict = check(repo, tag, component, root_toml)
+        verdict = check(repo, tag, component, root_toml, tagged.get(component.name, {}))
         verdicts.append(verdict)
-        if verdict.files_changed:
+        if verdict.files_changed or verdict.workspace_version is not None:
             report(verdict, out)
 
     gateway = next((v for v in verdicts if v.component.name == GATEWAY), None)
@@ -463,8 +616,10 @@ def examine(
     target = read_version(
         "cargo", repo.read(gateway_component.version_file), gateway_component.version_file
     )
-    plan = Plan(verdicts, [], target, override)
-    if gateway is not None and gateway.unbumped:
+    plan = Plan(verdicts, [], target, override, gateway_version=target, cut_version=cut_version)
+    if cut_version is not None:
+        plan.gateway_target = cut_version
+    elif gateway is not None and gateway.unbumped:
         plan.gateway_target = plan.new_version(gateway)
     for mirror in mirrors:
         carried = read_version(mirror.kind, repo.read(mirror.file), mirror.file)
@@ -480,8 +635,12 @@ def examine(
             )
 
     def count(kind: str, changed: bool) -> int:
+        # a verdict with a pin to sync is "with changes" too: the Summary matches the list above
         return sum(
-            1 for v in verdicts if v.component.kind == kind and bool(v.files_changed) == changed
+            1
+            for v in verdicts
+            if v.component.kind == kind
+            and bool(v.files_changed or v.workspace_version is not None) == changed
         )
 
     out.line()
@@ -493,18 +652,20 @@ def examine(
     return plan
 
 
-def propose(plan: Plan, out: Out) -> None:
+def propose(plan: Plan, out: Out, title: str = "Proposed fixes:") -> None:
     out.line()
-    out.line(out.paint("bold", "Proposed fixes:"))
+    out.line(out.paint("bold", title))
     sync = out.paint("blue", "sync")
     for v in plan.verdicts:
         c = v.component
-        if v.unbumped and c.kind == "crate":
+        if v.unbumped and c.kind == "crate" and not (c.name == GATEWAY and plan.cut_version):
+            new, stepped = plan.proposal(v)
+            note = f"; {', '.join(stepped)}" if stepped else ""
             out.line(
-                f"  {out.level(v.level)} {c.name} v{v.version} → v{plan.new_version(v)} ({c.version_file})"
+                f"  {out.level(v.level)} {c.name} v{v.version} → v{new} ({c.version_file}{note})"
             )
             if c.dep_key:
-                out.line(f"       sync workspace Cargo.toml {c.dep_key} → v{plan.new_version(v)}")
+                out.line(f"       sync workspace Cargo.toml {c.dep_key} → v{new}")
     for v in plan.verdicts:
         if v.workspace_version is not None:
             out.line(
@@ -513,11 +674,83 @@ def propose(plan: Plan, out: Out) -> None:
     for v in plan.verdicts:
         c = v.component
         if v.unbumped and c.kind == "package":
+            new, stepped = plan.proposal(v)
+            note = f"; {', '.join(stepped)}" if stepped else ""
             out.line(
-                f"  {out.level(v.level)} {c.name} v{v.version} → v{plan.new_version(v)} ({c.version_file})"
+                f"  {out.level(v.level)} {c.name} v{v.version} → v{new} ({c.version_file}{note})"
             )
+    if plan.gateway_set:
+        # the cut writes its version to the gateway whatever the conventional commits say: no level, a set
+        manifest = next(
+            v.component.version_file for v in plan.verdicts if v.component.name == GATEWAY
+        )
+        out.line(
+            f"  {out.paint('blue', 'set')} {GATEWAY} v{plan.gateway_version} → v{plan.cut_version} ({manifest})"
+        )
     for mirror, carried in plan.mirrors:
         out.line(f"  {sync} {mirror.label} v{carried} → v{plan.gateway_target} ({mirror.file})")
+
+
+def show_plan(plan: Plan, tag: str, out: Out) -> None:
+    """The bump the next cut writes against ``tag``: the proposal alone, nothing judged.
+
+    The crates and packages move by their conventional commits since the tag, as the cut's ``--fix`` moves them.
+    The gateway and its mirrors take the version the cut is given (``make bump-version VERSION=…`` runs first): with
+    ``VERSION_OVERRIDE`` the plan shows that version, without it the checker's own step for the gateway.
+    """
+    gateway_unbumped = any(v.component.name == GATEWAY and v.unbumped for v in plan.verdicts)
+    bumped_already = [
+        f"{v.component.name} v{v.version}" + (" (new)" if v.tag_version is None else "")
+        for v in plan.verdicts
+        if v.files_changed
+        and not v.unbumped
+        and not (v.component.name == GATEWAY and plan.gateway_set)
+    ]
+    # what the proposal lists: the issues, the gateway counted once as a set when the cut's version is known (a gateway
+    # already at that version is set nowhere: it stays among the components bumped already)
+    moving = (
+        plan.issues
+        - (1 if gateway_unbumped and plan.cut_version else 0)
+        + (1 if plan.gateway_set else 0)
+    )
+    if moving == 0:
+        out.line(
+            out.paint("bold", f"Nothing to bump against {tag}:")
+            + " every crate and package changed since it is bumped already"
+            + (f" ({', '.join(bumped_already)})" if bumped_already else "")
+            + "; the mirrors agree."
+        )
+        return
+    if plan.cut_version and plan.cut_version_derived:
+        gateway = (
+            f"the gateway and its mirrors to {plan.cut_version} (the first candidate of main's development version"
+            f" {plan.gateway_version}; VERSION_OVERRIDE names another)"
+        )
+    elif plan.cut_version:
+        gateway = f"the gateway and its mirrors to {plan.cut_version}"
+    else:
+        gateway = (
+            "the gateway and its mirrors by the checker's own step (the cut writes the VERSION it is given there:"
+            " pass it as VERSION_OVERRIDE for those lines)"
+        )
+    propose(
+        plan,
+        out,
+        f"The bump the next cut writes against {tag}: the crates and packages by their conventional commits since it,"
+        f" {gateway}. Nothing is changed here; `make release-cut` writes it:",
+    )
+    out.line()
+    out.line(
+        out.paint(
+            "bold",
+            f"{moving} component(s) and mirror(s) move (a crate's workspace pin follows it).",
+        )
+        + (
+            f" Bumped already since {tag}, left as they are: {', '.join(bumped_already)}."
+            if bumped_already
+            else ""
+        )
+    )
 
 
 def apply(plan: Plan, repo: Repo, out: Out) -> int:
@@ -584,16 +817,34 @@ def run(
     packages: Sequence[Component] = PACKAGES,
     mirrors: Sequence[Mirror] = MIRRORS,
 ) -> int:
-    """The check against ``tag`` in ``root``; mode is "check", "fix" or "prompt"."""
+    """The check against ``tag`` in ``root``; mode is "check", "fix", "prompt" or "plan"."""
     repo = Repo(root)
-    if override and not SEMVER.match(override):
-        raise Fatal(f"ERROR: VERSION_OVERRIDE must be in X.Y.Z format, got: '{override}'")
+    if override and not (CUT_VERSION if mode == "plan" else SEMVER).match(override):
+        expected = "X.Y.Z or X.Y.Z-rc.N" if mode == "plan" else "X.Y.Z"
+        raise Fatal(f"ERROR: VERSION_OVERRIDE must be in {expected} format, got: '{override}'")
     if tag is None:
-        tag = repo.newest_tag()
+        # a plan compares against what a cut compares against: the last final release
+        tag = repo.highest_final_tag() if mode == "plan" else repo.newest_tag()
         if tag is None:
             raise Fatal("No tags found in repository. Pass a tag explicitly.")
     if not repo.has_ref(tag):
         raise Fatal(f"Tag '{tag}' does not exist.")
+    if mode == "plan":
+        # the verdicts are walked in silence: on main before a cut every changed crate reads as unbumped by design
+        silent = Out(io.StringIO())
+        gateway = next(c for c in crates if c.name == GATEWAY)
+        derived = None
+        if override is None and (root / gateway.version_file).is_file():
+            # main reads the next development version between cuts: its first candidate is what the cut writes
+            derived = first_candidate(
+                read_version("cargo", repo.read(gateway.version_file), gateway.version_file)
+            )
+        plan = examine(
+            repo, tag, None, silent, crates, packages, mirrors, cut_version=override or derived
+        )
+        plan.cut_version_derived = derived is not None
+        show_plan(plan, tag, out)
+        return 0
 
     out.line(
         out.paint("bold", "Checking workspace versions against tag: ") + out.paint("blue", tag)
@@ -639,8 +890,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     group.add_argument(
         "--fix", action="store_true", help="apply the proposed fixes without prompting"
     )
+    group.add_argument(
+        "--plan",
+        action="store_true",
+        help="the bump the next cut writes against the tag, quietly; nothing is changed",
+    )
     args = parser.parse_args(argv)
-    mode = "check" if args.check else "fix" if args.fix else "prompt"
+    mode = "check" if args.check else "fix" if args.fix else "plan" if args.plan else "prompt"
     out = Out(sys.stdout)
     try:
         return run(

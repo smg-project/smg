@@ -1,0 +1,26 @@
+{{- if .Values.router.adminPort }}
+{{- /* The admin listener's Service: the control plane reachable inside the
+     cluster on its own name and port, never through the ingress, which
+     names the data Service alone. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "smg.fullname" . }}-router-admin
+  labels:
+    {{- include "smg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: router
+  {{- with .Values.router.adminService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.router.adminService.type }}
+  ports:
+    - name: admin
+      port: {{ .Values.router.adminService.port }}
+      targetPort: admin
+      protocol: TCP
+  selector:
+    {{- include "smg.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: router
+{{- end }}

@@ -13,7 +13,10 @@ use engine_zmq_client::{
     connector::EngineCoreStream,
     protocol::vllm::{
         logprobs::TokenLogprob,
-        output::{EngineCoreFinishReason, EngineCoreOutput, SpecDecodeMetrics, StopReason},
+        output::{
+            EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput, SpecDecodeMetrics,
+            StopReason,
+        },
         request::{EngineCoreRequest, MmFeaturesPayload},
         sampling::EngineCoreSamplingParams,
         structured_outputs::{StructuredOutputBackend, StructuredOutputsParams},
@@ -97,9 +100,14 @@ pub struct VllmGenerateStream {
     /// tokens: streaming frontends decode text/logprobs from chunks only, so
     /// the tick's delta goes out as a `Chunk` first.
     pending: Option<vllm::GenerateResponse>,
+    scheduled_at: Option<f64>,
+    prefill_sample: Option<(u32, f64, f64)>,
+    prefill_sampled: bool,
+    prefill_preempted: bool,
 }
 
 impl VllmGenerateStream {
+    /// Start one choice with no observed timing or capacity sample.
     pub(crate) fn new(
         inner: EngineCoreStream,
         index: u32,
@@ -116,7 +124,17 @@ impl VllmGenerateStream {
             first_prompt_token,
             input_logprobs_emitted: false,
             pending: None,
+            scheduled_at: None,
+            prefill_sample: None,
+            prefill_sampled: false,
+            prefill_preempted: false,
         }
+    }
+
+    /// Consume one actual computed-token sample and its engine-clock interval.
+    /// Initial queueing is excluded; preempted requests have no reliable interval.
+    pub fn take_prefill_sample(&mut self) -> Option<(u32, f64, f64)> {
+        self.prefill_sample.take()
     }
 
     /// The choice `index` stamped on this stream's responses.
@@ -203,10 +221,37 @@ impl MappedGenerateStream for VllmGenerateStream {
         &mut self.pending
     }
 
+    /// Map a step while retaining its first valid prefill timing for the servicer.
+    /// Scheduling events require vLLM `log_stats`; missing events yield no sample.
     fn map_output(
         &mut self,
         output: EngineCoreOutput,
     ) -> Result<vllm::GenerateResponse, tonic::Status> {
+        for event in output.events.iter().flatten() {
+            match event.r#type {
+                EngineCoreEventType::Scheduled if self.scheduled_at.is_none() => {
+                    self.scheduled_at = Some(event.timestamp);
+                }
+                EngineCoreEventType::Preempted => self.prefill_preempted = true,
+                _ => {}
+            }
+        }
+        if !self.prefill_sampled {
+            if let Some(stats) = &output.prefill_stats {
+                self.prefill_sampled = true;
+                if !self.prefill_preempted
+                    && !matches!(
+                        output.finish_reason,
+                        Some(EngineCoreFinishReason::Abort | EngineCoreFinishReason::Error)
+                    )
+                {
+                    self.prefill_sample = self
+                        .scheduled_at
+                        .zip(output.batch_timestamp)
+                        .map(|(start, end)| (stats.num_computed_tokens, start, end));
+                }
+            }
+        }
         let top_k = self.top_logprobs;
         let state = &mut self.state;
         if let Some(stats) = &output.prefill_stats {
@@ -238,14 +283,22 @@ impl MappedGenerateStream for VllmGenerateStream {
                 }
             }
         }
-        let chunk_logprobs = (!tick_logprobs_val.is_empty()).then(|| vllm::OutputLogProbs {
-            token_logprobs: tick_logprobs_val.clone(),
-            token_ids: tick_logprobs_idx.clone(),
-            top_logprobs: tick_top_logprobs.clone(),
+        // The tick's columns go into the chunk as they are; the history the
+        // terminal `Complete` drains is extended from them.
+        let chunk_logprobs = (!tick_logprobs_val.is_empty()).then_some(vllm::OutputLogProbs {
+            token_logprobs: tick_logprobs_val,
+            token_ids: tick_logprobs_idx,
+            top_logprobs: tick_top_logprobs,
         });
-        state.output_logprobs_val.extend(tick_logprobs_val);
-        state.output_logprobs_idx.extend(tick_logprobs_idx);
-        state.output_top_logprobs.extend(tick_top_logprobs);
+        if let Some(tick) = &chunk_logprobs {
+            state
+                .output_logprobs_val
+                .extend_from_slice(&tick.token_logprobs);
+            state.output_logprobs_idx.extend_from_slice(&tick.token_ids);
+            state
+                .output_top_logprobs
+                .extend(tick.top_logprobs.iter().cloned());
+        }
 
         // Prompt logprobs accumulate the same way (chunked prefill delivers
         // them incrementally); entry 0 per position is the actual prompt
@@ -319,6 +372,11 @@ impl MappedGenerateStream for VllmGenerateStream {
             &mut self.pending,
             output.kv_transfer_params.map(|params| *params),
         );
+        attach_ec_transfer_params(
+            &mut response,
+            &mut self.pending,
+            output.ec_transfer_params.map(|params| *params),
+        );
         attach_spec_decode_counts(
             &mut response,
             &mut self.pending,
@@ -391,6 +449,23 @@ fn attach_kv_transfer_params(
             remote_port,
         });
     complete.kv_transfer_params_json = Some(params.to_string());
+}
+
+/// Put the connector's returned encoder-cache transfer params (the encoder's
+/// handles an encode-prefill-decode prefill side pulls by) on the terminal
+/// `Complete`, direct or parked behind this tick's chunk: the JSON field
+/// verbatim, as the Python servicer reports them.
+fn attach_ec_transfer_params(
+    response: &mut vllm::GenerateResponse,
+    pending: &mut Option<vllm::GenerateResponse>,
+    params: Option<serde_json::Value>,
+) {
+    let Some(params) = params else {
+        return;
+    };
+    if let Some(complete) = complete_of(response, pending) {
+        complete.ec_transfer_params_json = Some(params.to_string());
+    }
 }
 
 impl Stream for VllmGenerateStream {
@@ -553,12 +628,15 @@ fn translate_batches_for(
     if batches.is_empty() {
         return Ok(TranslatedMedia::default());
     }
-    let has_kv_transfer = kv_transfer_params(req)?.is_some();
+    // A pixel-less batch is a remote leg's: a PD decode side's (remote KV) or
+    // an encoder-cache consumer's (the encoder's handles).
+    let has_remote_transfer =
+        kv_transfer_params(req)?.is_some() || ec_transfer_params(req)?.is_some();
     let (mm_features, cache_salt) = multimodal::translate_batches(
         batches,
         prompt_token_ids(req)?,
         model_dtype,
-        has_kv_transfer,
+        has_remote_transfer,
     )?;
     Ok(TranslatedMedia {
         mm_features: mm_features.map(MmFeaturesPayload::Typed),
@@ -649,6 +727,7 @@ pub(crate) fn translate_request_with_media(
     // Connector params ride `SamplingParams.extra_args`, where vLLM's own
     // frontend puts them, so a request carrying them always gets params.
     let kv_transfer_params = kv_transfer_params(&req)?;
+    let ec_transfer_params = ec_transfer_params(&req)?;
     // vLLM's frontend defaults an unset `max_tokens` to the remaining context
     // (`max_model_len - prompt_len`).
     let default_max_tokens = admit_prompt(prompt_token_ids(&req)?.len(), max_model_len)?;
@@ -679,13 +758,15 @@ pub(crate) fn translate_request_with_media(
         .sampling_params
         .as_ref()
         .is_some_and(|sp| sp.grammar_from_first_token && sp.constraint.is_some());
-    let sampling_params = match (req.sampling_params, kv_transfer_params.is_some()) {
+    let has_connector_params = kv_transfer_params.is_some() || ec_transfer_params.is_some();
+    let sampling_params = match (req.sampling_params, has_connector_params) {
         (None, false) => None,
         (sp, _) => Some(translate_sampling(
             sp.unwrap_or_default(),
             default_max_tokens,
             eos,
             kv_transfer_params,
+            ec_transfer_params,
             support.backend,
         )),
     };
@@ -733,11 +814,52 @@ pub(crate) fn kv_transfer_params(
     Ok(None)
 }
 
+/// Connector encoder-cache transfer params for encode-prefill-decode
+/// disaggregation, read as the Python servicer reads them: the JSON field
+/// verbatim (the encoder's request names the consumer's destination, the
+/// prefill side's the encoder's handles), which has to be a JSON object; the
+/// engine's connector interprets it. An empty field is no parameters.
+pub(crate) fn ec_transfer_params(
+    req: &vllm::GenerateRequest,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(json) = req
+        .ec_transfer_params_json
+        .as_deref()
+        .filter(|json| !json.is_empty())
+    else {
+        return Ok(None);
+    };
+    let params: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| format!("invalid ec_transfer_params_json: {error}"))?;
+    if !params.is_object() {
+        return Err("ec_transfer_params_json must be a JSON object".to_string());
+    }
+    Ok(Some(params))
+}
+
+/// The connector params as `SamplingParams.extra_args`, where vLLM's own
+/// frontend puts them: a PD leg's KV-transfer params, an encode-prefill-decode
+/// leg's encoder-cache params, either or both; `None` without any.
+fn connector_extra_args(
+    kv_transfer_params: Option<serde_json::Value>,
+    ec_transfer_params: Option<serde_json::Value>,
+) -> Option<HashMap<String, serde_json::Value>> {
+    let extra: HashMap<String, serde_json::Value> = [
+        ("kv_transfer_params", kv_transfer_params),
+        ("ec_transfer_params", ec_transfer_params),
+    ]
+    .into_iter()
+    .filter_map(|(key, params)| params.map(|params| (key.to_string(), params)))
+    .collect();
+    (!extra.is_empty()).then_some(extra)
+}
+
 pub(crate) fn translate_sampling(
     sp: vllm::SamplingParams,
     default_max_tokens: u32,
     eos: &EosTokenIds,
     kv_transfer_params: Option<serde_json::Value>,
+    ec_transfer_params: Option<serde_json::Value>,
     structured_backend: StructuredOutputsBackendConfig,
 ) -> EngineCoreSamplingParams {
     // Stopping at EOS is the frontend's duty here: the primary id rides
@@ -798,8 +920,7 @@ pub(crate) fn translate_sampling(
             .constraint
             .and_then(translate_constraint)
             .map(|params| params.with_backend(structured_backend.backend())),
-        extra_args: kv_transfer_params
-            .map(|params| HashMap::from([("kv_transfer_params".to_string(), params)])),
+        extra_args: connector_extra_args(kv_transfer_params, ec_transfer_params),
         ..EngineCoreSamplingParams::default()
     }
 }

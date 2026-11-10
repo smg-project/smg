@@ -13,6 +13,7 @@ use std::{
 };
 
 use axum::{body::to_bytes, http::StatusCode};
+use common::engine_answers::{TokenSpeedAnswers, TokenSpeedGenerateStream};
 use openai_protocol::{
     chat::ChatCompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
 };
@@ -28,11 +29,10 @@ use smg::{
     },
 };
 use smg_grpc_client::{
-    common_proto, stamp_media_code, tokenspeed_scheduler::tokenspeed_proto as ts, WorkerMediaFault,
+    stamp_media_code, tokenspeed_scheduler::tokenspeed_proto as ts, WorkerMediaFault,
 };
 use tokio::{net::TcpListener, time::timeout};
 use tonic::{transport::Server, Request, Response, Status};
-use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
 
 use crate::{common, scripted_worker};
 
@@ -46,18 +46,12 @@ struct RefusingWorker {
     served: scripted_worker::ScriptedWorker,
 }
 
-type Served = scripted_worker::ScriptedWorker;
-
 #[tonic::async_trait]
-impl TokenSpeedScheduler for RefusingWorker {
-    type GenerateStream = <Served as TokenSpeedScheduler>::GenerateStream;
-    type SubscribeKvEventsStream = <Served as TokenSpeedScheduler>::SubscribeKvEventsStream;
-    type GetTokenizerStream = <Served as TokenSpeedScheduler>::GetTokenizerStream;
-
+impl TokenSpeedAnswers for RefusingWorker {
     async fn generate(
         &self,
         request: Request<ts::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
+    ) -> Result<Response<TokenSpeedGenerateStream>, Status> {
         let refused = self
             .refusals
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
@@ -68,76 +62,6 @@ impl TokenSpeedScheduler for RefusingWorker {
             return Err(self.refusal.clone());
         }
         self.served.generate(request).await
-    }
-
-    async fn health_check(
-        &self,
-        request: Request<ts::HealthCheckRequest>,
-    ) -> Result<Response<ts::HealthCheckResponse>, Status> {
-        self.served.health_check(request).await
-    }
-
-    async fn abort(
-        &self,
-        request: Request<ts::AbortRequest>,
-    ) -> Result<Response<ts::AbortResponse>, Status> {
-        self.served.abort(request).await
-    }
-
-    async fn get_model_info(
-        &self,
-        request: Request<ts::GetModelInfoRequest>,
-    ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
-        self.served.get_model_info(request).await
-    }
-
-    async fn get_server_info(
-        &self,
-        request: Request<ts::GetServerInfoRequest>,
-    ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
-        self.served.get_server_info(request).await
-    }
-
-    async fn get_loads(
-        &self,
-        request: Request<ts::GetLoadsRequest>,
-    ) -> Result<Response<ts::GetLoadsResponse>, Status> {
-        self.served.get_loads(request).await
-    }
-
-    async fn subscribe_kv_events(
-        &self,
-        request: Request<common_proto::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        self.served.subscribe_kv_events(request).await
-    }
-
-    async fn flush_cache(
-        &self,
-        request: Request<common_proto::FlushCacheRequest>,
-    ) -> Result<Response<common_proto::FlushCacheResponse>, Status> {
-        self.served.flush_cache(request).await
-    }
-
-    async fn start_profile(
-        &self,
-        request: Request<common_proto::StartProfileRequest>,
-    ) -> Result<Response<common_proto::ProfileResponse>, Status> {
-        self.served.start_profile(request).await
-    }
-
-    async fn stop_profile(
-        &self,
-        request: Request<common_proto::StopProfileRequest>,
-    ) -> Result<Response<common_proto::ProfileResponse>, Status> {
-        self.served.stop_profile(request).await
-    }
-
-    async fn get_tokenizer(
-        &self,
-        request: Request<common_proto::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        self.served.get_tokenizer(request).await
     }
 }
 
@@ -167,16 +91,19 @@ async fn answers_of(
     let port = listener.local_addr().unwrap().port();
     let worker_task = tokio::spawn(async move {
         Server::builder()
-            .add_service(TokenSpeedSchedulerServer::new(RefusingWorker {
-                refusals: AtomicUsize::new(refusals),
-                refusal,
-                served: scripted_worker::ScriptedWorker {
-                    output_tokens: 2,
-                    finish_reasons: vec!["stop"],
-                    generation: Default::default(),
-                    requests: Default::default(),
-                },
-            }))
+            .add_service(
+                RefusingWorker {
+                    refusals: AtomicUsize::new(refusals),
+                    refusal,
+                    served: scripted_worker::ScriptedWorker {
+                        output_tokens: 2,
+                        finish_reasons: vec!["stop"],
+                        generation: Default::default(),
+                        requests: Default::default(),
+                    },
+                }
+                .into_server(),
+            )
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
             .expect("refusing gRPC worker failed");

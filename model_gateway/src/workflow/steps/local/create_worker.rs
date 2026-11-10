@@ -575,7 +575,7 @@ pub(super) fn validate_parser_overrides(
 /// the gRPC and ZMQ pipeline reads with Symphony. The legacy parser choice and a model the legacy
 /// parsers read resolve none either (the fallback series of such a model, under `none`, exist from
 /// start-up).
-pub(super) fn symphony_table_of(
+fn symphony_table_of(
     card: &ModelCard,
     parser: ParserChoice,
     connection_mode: ConnectionMode,
@@ -600,7 +600,7 @@ pub(super) fn symphony_table_of(
 /// registry does not know, flags that select nothing or the registry's own table, and the legacy
 /// parser choice. Workers of one model registering at the same moment may each say it, as the
 /// override check above may: the registry gains the worker a step later.
-pub(super) fn registry_reads_over_the_flags(
+fn registry_reads_over_the_flags(
     card: &ModelCard,
     worker_url: &str,
     parser: ParserChoice,
@@ -1151,7 +1151,7 @@ fn validate_zmq_dp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::RefusedAddress;
+    use crate::worker::test_support::RefusedAddress;
 
     /// Under `--parser symphony`, a gRPC worker's registration resolves the table whose failure
     /// classes are published at zero: the registry's table for an unlabeled worker of a model it
@@ -1437,7 +1437,7 @@ mod tests {
             create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
+        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
         let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
 
         assert_eq!(
@@ -1484,7 +1484,7 @@ mod tests {
             create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
+        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
         data.discovered_labels = HashMap::from([
             ("page_size".to_string(), "256".to_string()),
             ("max_num_seqs".to_string(), "8".to_string()),
@@ -1528,7 +1528,7 @@ mod tests {
         );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
+        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
         data
     }
 
@@ -1638,7 +1638,7 @@ mod tests {
         let mut data = create_worker_workflow_data(spec, registration_mode, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
+        data.http_client_handle = Some(Arc::new(crate::server::http_client()));
         WorkflowContext::new(WorkflowInstanceId::new(), data)
     }
 
@@ -2520,7 +2520,7 @@ mod rank_window_tests {
     use crate::{
         routers::grpc::client::ServerInfo,
         worker::{basic::merge_labels, BasicWorkerBuilder, ConnectionMode, Worker},
-        workflow::steps::local::discover_dp::dp_info_from_labels,
+        workflow::steps::local::{discover_dp::dp_info_from_labels, test_support::labels_of},
     };
 
     #[test]
@@ -2560,7 +2560,7 @@ mod rank_window_tests {
                     assert!(worker.try_admit_pd(window, window));
                     assert!(!worker.try_admit_pd(1, window));
 
-                    let override_labels = labels(&[("max_running_requests", "32")]);
+                    let override_labels = labels_of(&[("max_running_requests", "32")]);
                     let merged = merge_labels(&engine, &override_labels);
                     let overridden = BasicWorkerBuilder::new("grpc://w:30000")
                         .labels(labels_for_rank(&merged, rank, &override_labels))
@@ -2569,13 +2569,6 @@ mod rank_window_tests {
                 }
             }
         }
-    }
-
-    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect()
     }
 
     /// The rank's labels when every label was discovered (none set by hand).
@@ -2595,8 +2588,8 @@ mod rank_window_tests {
     /// operator's on top.
     #[test]
     fn a_window_the_operator_set_by_hand_is_the_workers_only_window() {
-        let by_hand = labels(&[("max_running_requests", "512"), ("served_model_name", "m")]);
-        let replicas = labels(&[
+        let by_hand = labels_of(&[("max_running_requests", "512"), ("served_model_name", "m")]);
+        let replicas = labels_of(&[
             ("max_num_seqs", "256"),
             ("dp_size", "4"),
             ("served_model_name", "engine"),
@@ -2604,7 +2597,7 @@ mod rank_window_tests {
         let merged = merge_labels(&replicas, &by_hand);
         assert_eq!(
             merged,
-            labels(&[
+            labels_of(&[
                 ("max_running_requests", "512"),
                 ("dp_size", "4"),
                 ("served_model_name", "m"),
@@ -2613,15 +2606,15 @@ mod rank_window_tests {
         assert_eq!(labels_for_rank(&merged, Some((1, 4)), &by_hand), merged);
         assert_eq!(labels_for_rank(&merged, None, &by_hand), merged);
 
-        let by_hand = labels(&[("max_num_seqs", "512")]);
-        let attention = labels(&[("max_running_requests", "16384"), ("attn_dp_size", "8")]);
+        let by_hand = labels_of(&[("max_num_seqs", "512")]);
+        let attention = labels_of(&[("max_running_requests", "16384"), ("attn_dp_size", "8")]);
         let merged = merge_labels(&attention, &by_hand);
         assert_eq!(merged.get("max_running_requests"), None);
         let rank = labels_for_rank(&merged, Some((0, 8)), &by_hand);
         assert_eq!(rank.get("max_num_seqs").map(String::as_str), Some("512"));
 
-        let nothing_by_hand = labels(&[("served_model_name", "m")]);
-        let both = labels(&[("max_running_requests", "2048"), ("max_num_seqs", "256")]);
+        let nothing_by_hand = labels_of(&[("served_model_name", "m")]);
+        let both = labels_of(&[("max_running_requests", "2048"), ("max_num_seqs", "256")]);
         let merged = merge_labels(&both, &nothing_by_hand);
         assert_eq!(
             merged.get("max_running_requests").map(String::as_str),
@@ -2639,7 +2632,7 @@ mod rank_window_tests {
     /// dp-aware width of every rank.
     #[test]
     fn an_attention_dp_engines_window_is_each_ranks_share() {
-        let engine = labels(&[
+        let engine = labels_of(&[
             ("max_running_requests", "16384"),
             ("enable_dp_attention", "true"),
             ("dp_size", "8"),
@@ -2650,14 +2643,14 @@ mod rank_window_tests {
             Some("2048")
         );
         assert_eq!(rank.get("dp_size").map(String::as_str), Some("8"));
-        let newer = labels(&[("max_running_requests", "16384"), ("attn_dp_size", "8")]);
+        let newer = labels_of(&[("max_running_requests", "16384"), ("attn_dp_size", "8")]);
         assert_eq!(
             discovered(&newer, Some((0, 8)))
                 .get("max_running_requests")
                 .map(String::as_str),
             Some("2048")
         );
-        let replicas_of_groups = labels(&[
+        let replicas_of_groups = labels_of(&[
             ("max_running_requests", "4096"),
             ("dp_size", "2"),
             ("attn_dp_size", "4"),
@@ -2676,11 +2669,11 @@ mod rank_window_tests {
     /// whole window.
     #[test]
     fn a_per_rank_window_and_an_unexpanded_worker_keep_their_labels() {
-        let replicas = labels(&[("max_running_requests", "2048"), ("dp_size", "8")]);
+        let replicas = labels_of(&[("max_running_requests", "2048"), ("dp_size", "8")]);
         assert_eq!(discovered(&replicas, Some((1, 8))), replicas);
-        let per_rank = labels(&[("max_num_seqs", "256"), ("dp_size", "4")]);
+        let per_rank = labels_of(&[("max_num_seqs", "256"), ("dp_size", "4")]);
         assert_eq!(discovered(&per_rank, Some((0, 4))), per_rank);
-        let attention = labels(&[
+        let attention = labels_of(&[
             ("max_running_requests", "16384"),
             ("enable_dp_attention", "true"),
         ]);

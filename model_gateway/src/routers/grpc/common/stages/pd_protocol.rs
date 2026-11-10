@@ -1,12 +1,13 @@
 //! Per-runtime PD (prefill/decode) disaggregation protocol descriptors.
 //!
 //! Every way one runtime's PD implementation differs from another's is a row
-//! in [`PdProtocol::for_runtime`]: dispatch shape, rendezvous carrier, and DP
-//! placement carrier. Stage code branches on these semantic axes, never on
-//! `RuntimeType` identity, so teaching the router a new runtime's PD protocol
-//! means deciding the three axes in one place — the exhaustive match below
-//! turns a skipped decision into a compile error instead of an audit of
-//! scattered `== RuntimeType::X` checks.
+//! in [`PdProtocol::for_runtime`]: dispatch shape, rendezvous carrier, DP
+//! placement carrier, and the encode handoff of its EPD (encode/prefill/decode)
+//! form. Stage code branches on these semantic axes, never on `RuntimeType`
+//! identity, so teaching the router a new runtime's PD protocol means deciding
+//! the four axes in one place — the exhaustive match below turns a skipped
+//! decision into a compile error instead of an audit of scattered
+//! `== RuntimeType::X` checks.
 
 use crate::worker::RuntimeType;
 
@@ -52,12 +53,33 @@ pub(crate) enum DpPlacement {
     RoomResidue,
 }
 
+/// How an encode worker's output reaches the prefill side under EPD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EncodeHandoff {
+    /// The gateway mints one bootstrap room per encode item and carries it
+    /// in the prefill request; the encode job is dispatched beside the
+    /// prefill/decode pair and the prefill side pulls the embedding at the
+    /// room. The encoder is reached by its RPC (a gRPC encode worker) or by
+    /// the encode frame of an encode server on the ZMQ lane (TokenSpeed).
+    Rendezvous,
+    /// The encoder answers first, with the prompt's expanded identity and
+    /// the transfer handles; the prefill side consumes a pixel-less prompt
+    /// that names them. A push connector also needs the consumer replica's
+    /// address and gateway-minted transfer ids, which the gateway releases
+    /// when the prefill side never takes them (vLLM's EC connectors). The
+    /// handoff is bound to the replica it reserved on, so an attempt that
+    /// encoded is never replayed on another pair.
+    Push,
+}
+
 /// PD disaggregation protocol for one runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PdProtocol {
     pub dispatch: PdDispatch,
     pub rendezvous: PdRendezvous,
     pub dp_placement: DpPlacement,
+    /// `None`: the runtime serves PD but no encode role beside it.
+    pub encode: Option<EncodeHandoff>,
 }
 
 impl PdProtocol {
@@ -69,16 +91,19 @@ impl PdProtocol {
                 dispatch: PdDispatch::Parallel,
                 rendezvous: PdRendezvous::SglangBootstrap,
                 dp_placement: DpPlacement::PinField,
+                encode: None,
             }),
             RuntimeType::Vllm => Some(Self {
                 dispatch: PdDispatch::Sequential,
                 rendezvous: PdRendezvous::None,
                 dp_placement: DpPlacement::PinField,
+                encode: Some(EncodeHandoff::Push),
             }),
             RuntimeType::TokenSpeed => Some(Self {
                 dispatch: PdDispatch::Parallel,
                 rendezvous: PdRendezvous::KvBootstrapRoom,
                 dp_placement: DpPlacement::RoomResidue,
+                encode: Some(EncodeHandoff::Rendezvous),
             }),
             RuntimeType::Trtllm
             | RuntimeType::Mlx
@@ -86,6 +111,12 @@ impl PdProtocol {
             | RuntimeType::External
             | RuntimeType::Unspecified => None,
         }
+    }
+
+    /// The encode handoff of a runtime's EPD form; `None` for a runtime
+    /// without PD or without an encode role.
+    pub(crate) fn encode_handoff(runtime: RuntimeType) -> Option<EncodeHandoff> {
+        Self::for_runtime(runtime).and_then(|protocol| protocol.encode)
     }
 }
 
@@ -99,16 +130,19 @@ mod tests {
         assert_eq!(sglang.dispatch, PdDispatch::Parallel);
         assert_eq!(sglang.rendezvous, PdRendezvous::SglangBootstrap);
         assert_eq!(sglang.dp_placement, DpPlacement::PinField);
+        assert_eq!(sglang.encode, None);
 
         let vllm = PdProtocol::for_runtime(RuntimeType::Vllm).unwrap();
         assert_eq!(vllm.dispatch, PdDispatch::Sequential);
         assert_eq!(vllm.rendezvous, PdRendezvous::None);
         assert_eq!(vllm.dp_placement, DpPlacement::PinField);
+        assert_eq!(vllm.encode, Some(EncodeHandoff::Push));
 
         let tokenspeed = PdProtocol::for_runtime(RuntimeType::TokenSpeed).unwrap();
         assert_eq!(tokenspeed.dispatch, PdDispatch::Parallel);
         assert_eq!(tokenspeed.rendezvous, PdRendezvous::KvBootstrapRoom);
         assert_eq!(tokenspeed.dp_placement, DpPlacement::RoomResidue);
+        assert_eq!(tokenspeed.encode, Some(EncodeHandoff::Rendezvous));
 
         for runtime in [
             RuntimeType::Trtllm,
@@ -121,6 +155,7 @@ mod tests {
                 PdProtocol::for_runtime(runtime).is_none(),
                 "{runtime} must not claim PD support"
             );
+            assert_eq!(PdProtocol::encode_handoff(runtime), None);
         }
     }
 }

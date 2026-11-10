@@ -230,6 +230,9 @@ message GenerateRequest {
   // its own modality, tensors, placeholders and hashes.
   repeated MultimodalInputs extra_mm_inputs = 11;
 
+  // Opaque EC connector request parameters for encoder disaggregation.
+  optional string ec_transfer_params_json = 12;
+
   // Connector KV-transfer params as a JSON object, passed verbatim to the
   // engine (e.g. NIXL's do_remote_prefill/remote_block_ids/remote_host/...).
   // Preferred over the legacy typed kv_transfer_params field.
@@ -340,6 +343,9 @@ message GenerateComplete {
   // pixel-less MultimodalInputs per modality (hashes, placeholders, grid
   // tensors). Absent on non-PD requests and from older servicers.
   MediaIdentity media_identity = 15;
+
+  // Encoder completion handles and placeholder metadata, including token-less E replies.
+  optional string ec_transfer_params_json = 16;
 }
 
 // What the prefill worker learned about the media it processed, in the shape
@@ -520,6 +526,12 @@ message GetServerInfoResponse {
   // language; a `token` node stays as derived, so a table that writes
   // single-token markers still meets the older compiler's refusal.
   string structural_tag_vocabulary = 26;
+  bool supports_ec_transfer = 27;
+  // Mooncake consumer entry point for each DP rank; each entry discovers its TP shards.
+  repeated string ec_zmq_addrs = 28;
+  // E/P must agree on the connector and advertise complementary roles.
+  string ec_connector = 29;
+  string ec_role = 30;
 }
 
 // =====================
@@ -564,8 +576,9 @@ message SchedulerLoad {
   double utilization = 10;
   int32 max_running_requests = 11;
   // Queued token-work: prompt tokens of waiting requests not served from the
-  // prefix cache, what the gateway's expected-wait score drains at
-  // gen_throughput. The servicer estimates it from the requests it forwarded
+  // prefix cache. The servicer estimates it from the requests it forwarded
   // that the engine has not started (same semantics as the SGLang field).
   int32 num_waiting_uncached_tokens = 12;
+  // Computed input tokens per active prefill second; absent if unknown or stale.
+  optional double prefill_throughput = 13;
 }

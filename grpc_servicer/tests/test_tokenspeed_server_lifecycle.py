@@ -431,11 +431,12 @@ def test_the_python_servicer_turns_the_kv_event_publisher_on_by_default_too(
     # An encode worker runs the vision tower only: no KV cache, nothing to turn on.
     assert serve(lambda args: setattr(args, "disaggregation_mode", "encode")) == (None, None)
     assert "KV event publishing" not in caplog.text
-    # A hybrid model keeps recurrent state in State groups, which span no
-    # tokens, and TokenSpeed's KV-event drain aborts the engine on them: the
-    # engine's own vocabulary of which layer labels get a State group, read
-    # off the model config built here as the launcher builds it, leaves the
-    # publisher off for such a model, and the operator reads why once.
+    # A hybrid model keeps recurrent state in State groups, and an engine
+    # whose KV events carry no cache group publishes only the boundaries
+    # every group holds: the engine's own vocabulary of which layer labels
+    # get a State group, read off the model config built here as the
+    # launcher builds it, leaves the publisher off for such a model, and the
+    # operator reads why once.
     monkeypatch.setitem(
         sys.modules,
         "tokenspeed.runtime.layers.attention.kv_cache.recipes.spec",
@@ -451,9 +452,10 @@ def test_the_python_servicer_turns_the_kv_event_publisher_on_by_default_too(
     assert serve(lambda args: setattr(args, "model", "org/hybrid")) == (None, None)
     assert (
         "KV event publishing left off: org/hybrid keeps recurrent state in 1 of its 2 layers "
-        "(linear_attention): State groups of TokenSpeed's cache, which span no tokens, and "
-        "TokenSpeed's KV-event drain aborts the engine on a group with no token span; pass "
-        "--kv-events-config to turn the publisher on anyway"
+        "(linear_attention): State groups of TokenSpeed's cache, and this engine's KV-event "
+        "feed publishes a boundary only while every group holds it, so the model's history "
+        "chain would never reach the router (an engine whose KV events name their cache group "
+        "publishes it); pass --kv-events-config to turn the publisher on anyway"
     ) in caplog.text
 
 

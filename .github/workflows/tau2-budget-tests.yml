@@ -5,10 +5,15 @@ on:
     paths:
       - scripts/tau2/budget*.py
       - scripts/tau2/costmap_shim/sitecustomize.py
-      - scripts/tests/test_tau2_budget.py
       - scripts/tests/test_tau2_budget_hook.py
       - scripts/tests/test_tau2_budget_startup.py
       - scripts/tests/test_tau2_costmap_shim.py
+      - .github/workflows/nightly-tau2.yml
+      - scripts/tau2/guarded_cli.py
+      - scripts/tests/test_tau2_guarded_cli.py
+      - scripts/tests/test_tau2_budget.py
+      - scripts/tau2/run_ab.py
+      - scripts/tests/test_tau2_run_ab.py
       - .github/workflows/tau2-budget-tests.yml
   workflow_dispatch:
 
@@ -32,7 +37,11 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: python -m pip install pytest ruff==0.15.0
-      - run: ruff check scripts/tau2/budget*.py scripts/tau2/costmap_shim/sitecustomize.py scripts/tests/test_tau2_budget*.py scripts/tests/test_tau2_costmap_shim.py
-      - run: ruff format --check scripts/tau2/budget*.py scripts/tau2/costmap_shim/sitecustomize.py scripts/tests/test_tau2_budget*.py scripts/tests/test_tau2_costmap_shim.py
-      - run: python -m pytest -q --confcutdir=scripts/tests scripts/tests/test_tau2_budget*.py scripts/tests/test_tau2_costmap_shim.py
+      - name: Install fixed SDKs for fake-HTTP-only tests
+        run: >-
+          python -m pip install pytest ruff==0.15.0 litellm==1.81.11 openai==2.20.0 httpx==0.28.1
+          websockets==15.0.1 pydub==0.25.1
+          'tau2 @ https://github.com/sierra-research/tau2-bench/archive/5bfa7e37b36656b37dc6d022156be6563c1007f3.tar.gz'
+      - run: ruff check scripts/tau2/budget*.py scripts/tau2/costmap_shim/sitecustomize.py scripts/tests/test_tau2_budget*.py scripts/tests/test_tau2_costmap_shim.py scripts/tau2/run_ab.py scripts/tests/test_tau2_run_ab.py scripts/tau2/guarded_cli.py scripts/tests/test_tau2_guarded_cli.py
+      - run: ruff format --check scripts/tau2/budget*.py scripts/tau2/costmap_shim/sitecustomize.py scripts/tests/test_tau2_budget*.py scripts/tests/test_tau2_costmap_shim.py scripts/tau2/run_ab.py scripts/tests/test_tau2_run_ab.py scripts/tau2/guarded_cli.py scripts/tests/test_tau2_guarded_cli.py
+      - run: python -m pytest -q --confcutdir=scripts/tests scripts/tests/test_tau2_budget*.py scripts/tests/test_tau2_costmap_shim.py scripts/tests/test_tau2_run_ab.py scripts/tests/test_tau2_guarded_cli.py

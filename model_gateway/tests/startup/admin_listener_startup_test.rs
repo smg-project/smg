@@ -162,6 +162,59 @@ fn the_admin_listener_carries_the_control_plane_and_the_data_listener_answers_40
     drop(gateway);
 }
 
+/// `--admin-max-connections` bounds the admin listener: with a bound of
+/// one, a second connection is closed at accept and answers nothing, the
+/// data listener answers throughout, and the admin listener answers again
+/// once the held connection closes.
+#[test]
+fn the_admin_listener_refuses_connections_beyond_its_bound_at_accept() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let [port, metrics_port, admin_port] = free_ports();
+    let mut args = base_args(port, metrics_port);
+    args.extend(
+        [
+            "--admin-port",
+            &admin_port.to_string(),
+            "--admin-max-connections",
+            "1",
+        ]
+        .map(str::to_string),
+    );
+    let data = SocketAddr::from((IP, port));
+    let admin = SocketAddr::from((IP, admin_port));
+    let gateway = Gateway::start(&args, data, &dir.path().join("gateway.log"));
+
+    let line = "HTTP connection limit on the admin listener";
+    if let Err(log) = log_with_line(&gateway.log, line, EXIT_TIMEOUT) {
+        panic!("the start does not report the admin listener's bound\n{log}");
+    }
+    assert_eq!(status_of(admin, "/health"), Some(200), "under the bound");
+
+    // One idle connection holds the bound; the next is closed at accept.
+    let held = TcpStream::connect_timeout(&admin, Duration::from_millis(500))
+        .expect("the connection within the bound");
+    assert_eq!(
+        status_of(admin, "/health"),
+        None,
+        "the bound-plus-one connection was answered"
+    );
+    assert_eq!(status_of(data, "/health"), Some(200), "the data listener");
+
+    // The permit goes with the held connection; the listener answers again.
+    drop(held);
+    let deadline = Instant::now() + EXIT_TIMEOUT;
+    while status_of(admin, "/health") != Some(200) {
+        assert!(
+            Instant::now() < deadline,
+            "the admin listener did not answer again after the held connection closed\n{}",
+            gateway.log()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    drop(gateway);
+}
+
 /// `--admin-host` without `--admin-port` is refused before anything binds,
 /// naming the field and the missing flag.
 #[test]

@@ -12,9 +12,13 @@
 # the second repeat of every cell, 0 = off) [30]; LOAD_MAX (wait while the host's 1-minute load average is above
 # it, 0 = never wait) [0]; HEAP_LG_SAMPLE (when set: one extra 60 s repeat per cell on a bed whose gateway runs
 # with jemalloc profiling at that lg_prof_sample, heap profiles at the window's start and end; needs a gateway
-# built with --features jemalloc-profiling) [unset]; HEAP_ONLY=1 runs only that pass.
+# built with --features jemalloc-profiling) [unset]; HEAP_ONLY=1 runs only that pass; BOUNDS (a bounds
+# file for the report's verdict; the nightly passes bounds.toml, whose figures hold for the nightly's
+# configuration, so a run under other settings is not judged unless it names a file of its own) [unset].
 #
-# Exits non-zero when a bed did not come up, a cell failed or the report could not be written.
+# Exits non-zero when a bed did not come up, a cell failed, a cell's figures are outside the bounds
+# (the report's verdict, exit 3 of report.py), the bounds file is not usable (exit 2) or the report
+# could not be written.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
@@ -24,6 +28,7 @@ export LOAD_BIN=${LOAD_BIN:-$ROOT/target/release/stress_load}
 : "${TOKENIZER:?set TOKENIZER to a chat tokenizer directory or hub id}"
 export TOKENIZER GW_CORES=${GW_CORES:-} MOCK_CORES=${MOCK_CORES:-} GEN_CORES=${GEN_CORES:-}
 REPEATS=${REPEATS:-3}; DURATION=${DURATION:-120}; WARMUP=${WARMUP:-10}; DRAIN=${DRAIN:-60}
+BOUNDS=${BOUNDS:-}
 PERF_ON=${PERF_SECS:-30}; LOAD_MAX=${LOAD_MAX:-0}; HEAP_LG_SAMPLE=${HEAP_LG_SAMPLE:-}
 LLAVA_TOKENIZER=${LLAVA_TOKENIZER:-}
 families=("$@"); [ ${#families[@]} -gt 0 ] || families=(unary stream idle idle-default long image tenants tools responses)
@@ -148,7 +153,14 @@ for fam in "${families[@]}"; do
     *) log "unknown family $fam"; exit 2 ;;
   esac
 done
-log "report"
-python3 "$HERE/report.py" "$GS_DIR" --md "$GS_DIR/report.md" --json "$GS_DIR/report.json" | tee -a "$GS_DIR/run_all.log" \
-  || { log "report failed"; failed=$((failed + 1)); }
+bounds_args=(); [ -n "$BOUNDS" ] && bounds_args=(--bounds "$BOUNDS")
+log "report${BOUNDS:+ (judged against $BOUNDS)}"
+python3 "$HERE/report.py" "$GS_DIR" --md "$GS_DIR/report.md" --json "$GS_DIR/report.json" \
+  ${bounds_args[@]+"${bounds_args[@]}"} | tee -a "$GS_DIR/run_all.log"
+case ${PIPESTATUS[0]} in
+  0) ;;
+  3) log "report: a cell is outside its bounds (see the verdict)"; failed=$((failed + 1)) ;;
+  2) log "report: the bounds file is not usable (see the message above)"; failed=$((failed + 1)) ;;
+  *) log "report failed"; failed=$((failed + 1)) ;;
+esac
 [ "$failed" -eq 0 ] || { log "$failed failure(s), see $GS_DIR/run_all.log"; exit 1; }

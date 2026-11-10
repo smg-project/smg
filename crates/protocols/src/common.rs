@@ -1,10 +1,15 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    sync::LazyLock,
 };
 
 use serde::{
-    de::{self, value::SeqAccessDeserializer, SeqAccess, Visitor},
+    de::{
+        self,
+        value::{MapDeserializer, SeqAccessDeserializer},
+        SeqAccess, Visitor,
+    },
     Deserialize, Deserializer, Serialize,
 };
 use serde_json::{Map, Value};
@@ -276,6 +281,81 @@ pub(crate) fn invalid(
     e
 }
 
+/// The parameter under which a validation error of a rule checked across
+/// fields names the field the refusal is about: the error envelope's
+/// `param`. The validator crate files such a rule's error under the whole
+/// request (`__all__`), a key that names no field.
+pub(crate) const FIELD_PARAM: &str = "field";
+
+/// [`invalid`] for a rule checked across fields, naming the field the
+/// refusal is about (the envelope's `param`); the message names it too, in
+/// the public API's words.
+pub(crate) fn invalid_at(
+    field: impl Into<String>,
+    code: &'static str,
+    message: impl Into<Cow<'static, str>>,
+) -> validator::ValidationError {
+    on_field(invalid(code, message), field)
+}
+
+/// `error`, naming `field` as the field it is about (see [`invalid_at`]).
+pub(crate) fn on_field(
+    mut error: validator::ValidationError,
+    field: impl Into<String>,
+) -> validator::ValidationError {
+    error.add_param(Cow::Borrowed(FIELD_PARAM), &field.into());
+    error
+}
+
+/// Validates `logit_bias` as the public API bounds it: every key a
+/// non-negative integer token id, no two keys spelling one id (`"5"` and
+/// `"05"` would reach an engine as one entry with either bias), every bias
+/// within -100..=100 (a bias of -100 bans the token, 100 forces it). Used by
+/// the chat and the completion request; the serving path bounds the ids by
+/// the model's vocabulary before the map reaches an engine.
+pub fn validate_logit_bias(bias: &HashMap<String, f32>) -> Result<(), validator::ValidationError> {
+    // The key first seen for each token id.
+    let mut keys_by_id = HashMap::with_capacity(bias.len());
+    for (key, bias) in bias {
+        let Some(id) = key.parse::<i32>().ok().filter(|id| *id >= 0) else {
+            return Err(invalid(
+                "logit_bias_invalid_key",
+                format!(
+                    "Invalid key in 'logit_bias': '{key}'; keys must be non-negative integer token \
+                     ids"
+                ),
+            ));
+        };
+        if let Some(other) = keys_by_id.insert(id, key.as_str()) {
+            let (first, second) = if other < key.as_str() {
+                (other, key.as_str())
+            } else {
+                (key.as_str(), other)
+            };
+            return Err(invalid(
+                "logit_bias_duplicate_key",
+                format!(
+                    "Invalid key in 'logit_bias': '{first}' and '{second}' both name token {id}; \
+                     each token takes one bias"
+                ),
+            ));
+        }
+        let code = match *bias {
+            b if b > 100.0 => "integer_above_max_value",
+            b if b < -100.0 => "integer_below_min_value",
+            _ => continue,
+        };
+        return Err(invalid(
+            code,
+            format!(
+                "Invalid value for 'logit_bias': token '{key}' has bias {bias}; each bias must be \
+                 between -100 and 100."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Validates stop sequences (max 4, non-empty strings)
 /// Used by both ChatCompletionRequest and ResponsesRequest
 pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationError> {
@@ -326,10 +406,26 @@ pub enum ContentPart {
     InputAudio { input_audio: InputAudio },
     #[serde(rename = "video_url")]
     VideoUrl { video_url: VideoUrl },
+    /// An assistant turn's refusal, as the public API returns one and a client
+    /// replays it in the history; the renderers read it as the turn's text.
+    #[serde(rename = "refusal")]
+    Refusal { refusal: String },
     /// Pass through unknown content objects to HTTP backends.
     /// Also matches malformed known types; gRPC backends reject this variant.
     #[serde(untagged)]
     Unknown(Map<String, Value>),
+}
+
+impl ContentPart {
+    /// The text a renderer reads from the part: a text part's text, a
+    /// refusal's text (the engines' own servers render a refusal part as the
+    /// turn's text); none for a media or an unknown part.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            ContentPart::Text { text } | ContentPart::Refusal { refusal: text } => Some(text),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
@@ -382,7 +478,7 @@ pub struct VideoUrl {
 // Response Format (for structured outputs)
 // ============================================================================
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type")]
 pub enum ResponseFormat {
     #[serde(rename = "text")]
@@ -393,12 +489,319 @@ pub enum ResponseFormat {
     JsonSchema { json_schema: JsonSchemaFormat },
 }
 
+/// The kind a `response_format` object names under `type`, read with the
+/// words serde uses for a tag: an unknown name lists the three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseFormatKind {
+    Text,
+    JsonObject,
+    JsonSchema,
+}
+
+impl ResponseFormatKind {
+    const ALL: [ResponseFormatKind; 3] = [
+        ResponseFormatKind::Text,
+        ResponseFormatKind::JsonObject,
+        ResponseFormatKind::JsonSchema,
+    ];
+
+    /// The name under `type`: the variant's rename on [`ResponseFormat`].
+    const fn name(self) -> &'static str {
+        match self {
+            ResponseFormatKind::Text => "text",
+            ResponseFormatKind::JsonObject => "json_object",
+            ResponseFormatKind::JsonSchema => "json_schema",
+        }
+    }
+}
+
+/// The names an unknown kind's error lists, in the variants' order.
+const RESPONSE_FORMAT_KINDS: &[&str] = &[
+    ResponseFormatKind::Text.name(),
+    ResponseFormatKind::JsonObject.name(),
+    ResponseFormatKind::JsonSchema.name(),
+];
+
+impl<'de> Deserialize<'de> for ResponseFormatKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KindVisitor;
+
+        impl Visitor<'_> for KindVisitor {
+            type Value = ResponseFormatKind;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("variant identifier")
+            }
+
+            fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
+                ResponseFormatKind::ALL
+                    .into_iter()
+                    .find(|kind| kind.name() == name)
+                    .ok_or_else(|| E::unknown_variant(name, RESPONSE_FORMAT_KINDS))
+            }
+        }
+
+        deserializer.deserialize_identifier(KindVisitor)
+    }
+}
+
+/// The object is read field by field. serde's derive for an internally
+/// tagged enum buffers the whole object before it picks the variant, so a
+/// JSON schema would be built twice (the buffer, then the `Value`); this
+/// reads `type` and `json_schema` in whatever order they arrive and builds
+/// the schema once: straight into its struct once the kind is known to want
+/// it, skipped once the kind is known not to, and kept as it arrived only
+/// when it arrives before the kind (a `KeptSchema`: an object as its entries
+/// in order, any other shape as a `Value`, for the schema's own derive to
+/// read at the end, so a repeated or malformed field is the derive's error
+/// in either order and ignored by the two kinds that carry no schema). The
+/// accepted shapes and the errors are the derive's: a missing `type`, an
+/// unknown kind, a missing or malformed `json_schema` for the kind that
+/// wants it, a duplicate key; a kind that carries no schema ignores a
+/// `json_schema` field of any shape, and every other key is ignored. One
+/// corner differs in text alone: with `type` first, a malformed schema
+/// followed by a repeated `type` reads the schema's error here, because the
+/// schema is read the moment the kind is known (the point of this reader),
+/// where the derive, still buffering, reads a duplicate `type`; both refuse
+/// the body.
+impl<'de> Deserialize<'de> for ResponseFormat {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        enum Field {
+            Kind,
+            JsonSchema,
+            Other,
+        }
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct FieldVisitor;
+
+                impl Visitor<'_> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        formatter.write_str("field identifier")
+                    }
+
+                    fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
+                        Ok(match name {
+                            "type" => Field::Kind,
+                            "json_schema" => Field::JsonSchema,
+                            _ => Field::Other,
+                        })
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        /// What was read under `json_schema` before the end of the object.
+        enum Schema {
+            /// Read straight into its struct: the kind was known to want it.
+            Read(JsonSchemaFormat),
+            /// Kept as read: the kind was not known yet.
+            Kept(KeptSchema),
+            /// Skipped: the kind was known not to want it.
+            Skipped,
+        }
+
+        struct FormatVisitor;
+
+        impl<'de> Visitor<'de> for FormatVisitor {
+            type Value = ResponseFormat;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("internally tagged enum ResponseFormat")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                // serde's derive also reads the kind and then the content
+                // from a sequence; the shape and its errors are kept
+                let kind: ResponseFormatKind = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::missing_field("type"))?;
+                let (format, read) = match kind {
+                    ResponseFormatKind::Text => (ResponseFormat::Text, 0),
+                    ResponseFormatKind::JsonObject => (ResponseFormat::JsonObject, 0),
+                    ResponseFormatKind::JsonSchema => {
+                        let json_schema = seq.next_element()?.ok_or_else(|| {
+                            de::Error::invalid_length(
+                                0,
+                                &"struct variant ResponseFormat::JsonSchema with 1 element",
+                            )
+                        })?;
+                        (ResponseFormat::JsonSchema { json_schema }, 1)
+                    }
+                };
+                let mut extra = 0;
+                while seq.next_element::<de::IgnoredAny>()?.is_some() {
+                    extra += 1;
+                }
+                if extra > 0 {
+                    let expected: &dyn de::Expected = if read == 1 {
+                        &"1 element in sequence"
+                    } else {
+                        &"0 elements in sequence"
+                    };
+                    return Err(de::Error::invalid_length(read + extra, expected));
+                }
+                Ok(format)
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut kind: Option<ResponseFormatKind> = None;
+                let mut schema: Option<Schema> = None;
+                let mut schema_twice = false;
+                while let Some(field) = map.next_key::<Field>()? {
+                    match field {
+                        Field::Kind => {
+                            if kind.is_some() {
+                                return Err(de::Error::duplicate_field("type"));
+                            }
+                            kind = Some(map.next_value()?);
+                        }
+                        Field::JsonSchema => {
+                            if schema.is_some() {
+                                // the derive reports the duplicate once the
+                                // object is read, whatever the second value
+                                schema_twice = true;
+                                map.next_value::<de::IgnoredAny>()?;
+                                continue;
+                            }
+                            schema = Some(match kind {
+                                Some(ResponseFormatKind::JsonSchema) => {
+                                    Schema::Read(map.next_value()?)
+                                }
+                                Some(_) => {
+                                    map.next_value::<de::IgnoredAny>()?;
+                                    Schema::Skipped
+                                }
+                                None => Schema::Kept(map.next_value()?),
+                            });
+                        }
+                        Field::Other => {
+                            map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                let kind = kind.ok_or_else(|| de::Error::missing_field("type"))?;
+                Ok(match kind {
+                    ResponseFormatKind::Text => ResponseFormat::Text,
+                    ResponseFormatKind::JsonObject => ResponseFormat::JsonObject,
+                    ResponseFormatKind::JsonSchema => {
+                        let json_schema = match schema {
+                            Some(Schema::Read(json_schema)) => json_schema,
+                            Some(Schema::Kept(KeptSchema::Object(entries))) => {
+                                // the derive's own visitor reads the entries as they
+                                // arrived, duplicates included, and raises its error first
+                                JsonSchemaFormat::deserialize(
+                                    MapDeserializer::<_, serde_json::Error>::new(
+                                        entries.into_iter(),
+                                    ),
+                                )
+                                .map_err(de::Error::custom)?
+                            }
+                            Some(Schema::Kept(KeptSchema::Other(value))) => {
+                                serde_json::from_value(value).map_err(de::Error::custom)?
+                            }
+                            Some(Schema::Skipped) | None => {
+                                return Err(de::Error::missing_field("json_schema"))
+                            }
+                        };
+                        if schema_twice {
+                            // the derive reads the first value before it meets the
+                            // second key: the value's own error comes first
+                            return Err(de::Error::duplicate_field("json_schema"));
+                        }
+                        ResponseFormat::JsonSchema { json_schema }
+                    }
+                })
+            }
+        }
+
+        deserializer.deserialize_any(FormatVisitor)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct JsonSchemaFormat {
     pub name: String,
     pub schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
+}
+
+/// A `json_schema` object that arrived before the kind, kept for the end of
+/// the enclosing object: an object's entries as they arrived (duplicates
+/// included), so that the schema's own derive reads them at the end and raises
+/// its own error first, whatever it is, exactly as it does when `type` comes
+/// first; any other shape is kept as a `Value`, for the kind to accept or
+/// refuse. The two kinds that carry no schema drop it unread.
+enum KeptSchema {
+    Object(Vec<(String, Value)>),
+    Other(Value),
+}
+
+impl<'de> Deserialize<'de> for KeptSchema {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KeptVisitor;
+
+        impl<'de> Visitor<'de> for KeptVisitor {
+            type Value = KeptSchema;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("any valid JSON value")
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::Null))
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::Bool(value)))
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::from(value)))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::from(value)))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::from(value)))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::String(value.to_owned())))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::String(value)))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<KeptSchema, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(KeptSchema::Other(Value::Array(items)))
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<KeptSchema, A::Error> {
+                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(key) = map.next_key::<String>()? {
+                    let value = map.next_value()?;
+                    entries.push((key, value));
+                }
+                Ok(KeptSchema::Object(entries))
+            }
+        }
+
+        deserializer.deserialize_any(KeptVisitor)
+    }
 }
 
 /// Strict structured outputs (`strict: true`) require every object node of the
@@ -527,22 +930,49 @@ pub enum ToolChoiceValue {
     None,
 }
 
-/// Tool choice for both Chat Completion and Responses APIs
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(untagged)]
+/// A Chat Completions `tool_choice`: one of the three words, a named
+/// function, or an allowed-tools choice (the Responses API has its own
+/// `ResponsesToolChoice`). On the wire the allowed-tools choice is the
+/// contract's nested object, `{"type": "allowed_tools", "allowed_tools":
+/// {"mode": ..., "tools": [{"type": "function", "function": {"name": ...}}]}}`,
+/// read and written in that shape; the flat spelling this route read before
+/// it read the contract's is still accepted (the `wire` module).
+#[derive(Debug, Clone)]
 pub enum ToolChoice {
     Value(ToolChoiceValue),
     Function {
-        #[serde(rename = "type")]
-        tool_type: String, // "function"
+        /// `"function"`.
+        tool_type: String,
         function: FunctionChoice,
     },
     AllowedTools {
-        #[serde(rename = "type")]
-        tool_type: String, // "allowed_tools"
-        mode: String, // "auto" | "required" TODO: need validation
+        /// `"allowed_tools"`.
+        tool_type: String,
+        /// `"auto"` or `"required"`; the chat validator refuses another word.
+        mode: String,
         tools: Vec<ToolReference>,
     },
+}
+
+impl<'de> Deserialize<'de> for ToolChoice {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        wire::ToolChoice::deserialize(deserializer).map(Self::from)
+    }
+}
+
+impl Serialize for ToolChoice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        wire::ToolChoiceView::from(self).serialize(serializer)
+    }
+}
+
+impl schemars::JsonSchema for ToolChoice {
+    fn schema_name() -> Cow<'static, str> {
+        "ToolChoice".into()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        wire::ToolChoice::json_schema(generator)
+    }
 }
 
 impl Default for ToolChoice {
@@ -599,6 +1029,191 @@ impl ToolChoice {
                     .collect(),
             ),
             ToolChoice::Value(_) => None,
+        }
+    }
+}
+
+/// The wire spellings of a chat [`ToolChoice`](super::ToolChoice). The read
+/// enum is named as the public type so serde's refusal of an unknown shape
+/// names the field's type, not a helper.
+mod wire {
+    use serde::{Deserialize, Serialize};
+
+    use super::{FunctionChoice, ToolChoiceValue};
+
+    /// The shapes read: the three words; the named function; the contract's
+    /// allowed-tools object; the flat allowed-tools object this route read
+    /// before it read the contract's.
+    #[derive(Deserialize, schemars::JsonSchema)]
+    #[serde(untagged)]
+    pub(super) enum ToolChoice {
+        Value(ToolChoiceValue),
+        Function {
+            #[serde(rename = "type")]
+            tool_type: String,
+            function: FunctionChoice,
+        },
+        AllowedTools {
+            #[serde(rename = "type")]
+            tool_type: String,
+            allowed_tools: AllowedToolsObject,
+        },
+        FlatAllowedTools {
+            #[serde(rename = "type")]
+            tool_type: String,
+            mode: String,
+            tools: Vec<AllowedToolReference>,
+        },
+    }
+
+    /// The contract's `allowed_tools` object: the mode and the tools.
+    #[derive(Deserialize, schemars::JsonSchema)]
+    pub(super) struct AllowedToolsObject {
+        pub(super) mode: String,
+        pub(super) tools: Vec<AllowedToolReference>,
+    }
+
+    /// An item of the allowed-tools list: the contract's nested function,
+    /// `{"type": "function", "function": {"name": ...}}`, or a flat reference
+    /// (`{"type": "function", "name": ...}` and the other kinds).
+    #[derive(Deserialize, schemars::JsonSchema)]
+    #[serde(untagged)]
+    pub(super) enum AllowedToolReference {
+        Nested {
+            #[serde(rename = "type")]
+            tool_type: FunctionTag,
+            function: FunctionChoice,
+        },
+        Flat(super::ToolReference),
+    }
+
+    /// The one `type` word of a nested function reference.
+    #[derive(Deserialize, schemars::JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub(super) enum FunctionTag {
+        Function,
+    }
+
+    impl From<AllowedToolReference> for super::ToolReference {
+        fn from(reference: AllowedToolReference) -> Self {
+            match reference {
+                AllowedToolReference::Nested {
+                    tool_type: FunctionTag::Function,
+                    function,
+                } => Self::Function {
+                    name: function.name,
+                },
+                AllowedToolReference::Flat(reference) => reference,
+            }
+        }
+    }
+
+    impl From<ToolChoice> for super::ToolChoice {
+        fn from(choice: ToolChoice) -> Self {
+            match choice {
+                ToolChoice::Value(value) => Self::Value(value),
+                ToolChoice::Function {
+                    tool_type,
+                    function,
+                } => Self::Function {
+                    tool_type,
+                    function,
+                },
+                ToolChoice::AllowedTools {
+                    tool_type,
+                    allowed_tools: AllowedToolsObject { mode, tools },
+                }
+                | ToolChoice::FlatAllowedTools {
+                    tool_type,
+                    mode,
+                    tools,
+                } => Self::AllowedTools {
+                    tool_type,
+                    mode,
+                    tools: tools.into_iter().map(Into::into).collect(),
+                },
+            }
+        }
+    }
+
+    /// A chat choice as the contract writes it, borrowed from the typed value.
+    #[derive(Serialize)]
+    #[serde(untagged)]
+    pub(super) enum ToolChoiceView<'a> {
+        Value(&'a ToolChoiceValue),
+        Function {
+            #[serde(rename = "type")]
+            tool_type: &'a str,
+            function: &'a FunctionChoice,
+        },
+        AllowedTools {
+            #[serde(rename = "type")]
+            tool_type: &'a str,
+            allowed_tools: AllowedToolsView<'a>,
+        },
+    }
+
+    #[derive(Serialize)]
+    pub(super) struct AllowedToolsView<'a> {
+        mode: &'a str,
+        #[serde(serialize_with = "nested_functions")]
+        tools: &'a [super::ToolReference],
+    }
+
+    impl<'a> From<&'a super::ToolChoice> for ToolChoiceView<'a> {
+        fn from(choice: &'a super::ToolChoice) -> Self {
+            match choice {
+                super::ToolChoice::Value(value) => Self::Value(value),
+                super::ToolChoice::Function {
+                    tool_type,
+                    function,
+                } => Self::Function {
+                    tool_type,
+                    function,
+                },
+                super::ToolChoice::AllowedTools {
+                    tool_type,
+                    mode,
+                    tools,
+                } => Self::AllowedTools {
+                    tool_type,
+                    allowed_tools: AllowedToolsView { mode, tools },
+                },
+            }
+        }
+    }
+
+    /// The allowed-tools list with each function reference in the contract's
+    /// nested spelling; a reference of another kind keeps its own shape.
+    fn nested_functions<S: serde::Serializer>(
+        tools: &[super::ToolReference],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(tools.iter().map(ToolReferenceView))
+    }
+
+    struct ToolReferenceView<'a>(&'a super::ToolReference);
+
+    impl Serialize for ToolReferenceView<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            #[derive(Serialize)]
+            struct NestedFunction<'a> {
+                #[serde(rename = "type")]
+                tool_type: &'a str,
+                function: FunctionName<'a>,
+            }
+            #[derive(Serialize)]
+            struct FunctionName<'a> {
+                name: &'a str,
+            }
+            match self.0 {
+                super::ToolReference::Function { name } => NestedFunction {
+                    tool_type: "function",
+                    function: FunctionName { name },
+                }
+                .serialize(serializer),
+                other => other.serialize(serializer),
+            }
         }
     }
 }
@@ -686,23 +1301,20 @@ pub struct Tool {
     pub function: Function,
 }
 
-/// Per the OpenAI spec, omitting `parameters` defines a function with an
-/// empty parameter list, so a missing field deserializes to an empty schema.
-fn empty_parameters_schema() -> Value {
-    Value::Object(Map::new())
-}
+/// The schema a function declared without `parameters` is read with wherever
+/// a schema is needed: per the OpenAI spec, omitting the field defines a
+/// function with an empty parameter list.
+static EMPTY_PARAMETERS_SCHEMA: LazyLock<Value> = LazyLock::new(|| Value::Object(Map::new()));
 
-/// An explicit `"parameters": null` means the same as omitting the field
-/// (the serving engine reads it as "no schema" too), and `null` is not a JSON Schema, so it
-/// is normalised to the empty schema once here rather than in every consumer:
-/// the structural-tag builders, the JSON-schema constraint and the renderers.
-fn deserialize_parameters<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Error> {
+/// `parameters` as the client gave it: `None` for an explicit `null` as for
+/// an absent field. The serving engine reads both as "no schema" and its own
+/// template sees `null` for both, so the two must stay apart from a client's
+/// own `{}`, which the template renders as `{}`.
+fn deserialize_parameters<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
     let value = Value::deserialize(deserializer)?;
-    Ok(if value.is_null() {
-        empty_parameters_schema()
-    } else {
-        value
-    })
+    Ok((!value.is_null()).then_some(value))
 }
 
 #[serde_with::skip_serializing_none]
@@ -710,11 +1322,16 @@ fn deserialize_parameters<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
 pub struct Function {
     pub name: String,
     pub description: Option<String>,
-    #[serde(
-        default = "empty_parameters_schema",
-        deserialize_with = "deserialize_parameters"
-    )]
-    pub parameters: Value, // JSON Schema
+    /// The parameter schema as the client gave it; `None` when it gave none
+    /// (the field absent or `null`). Left out of a serialized function then,
+    /// as any optional field the client left out (a Responses function tool,
+    /// whose reference lists the field as required and nullable, writes `null`
+    /// for it: [`crate::responses::FunctionTool`]); the chat template is handed
+    /// `null` for it (what the engine's own template reads for such a
+    /// function). Read through [`Function::parameters_schema`] where a schema
+    /// object is needed.
+    #[serde(default, deserialize_with = "deserialize_parameters")]
+    pub parameters: Option<Value>, // JSON Schema
     /// Whether to enable strict schema adherence (OpenAI structured outputs)
     pub strict: Option<bool>,
     /// The fields of the function object beyond the ones above, as the request
@@ -725,6 +1342,15 @@ pub struct Function {
     /// them.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl Function {
+    /// The schema the function is read with: the client's, or the empty
+    /// schema when it gave none. The constraint builders, the structural tags
+    /// and the parsers read an object; only the template sees the difference.
+    pub fn parameters_schema(&self) -> &Value {
+        self.parameters.as_ref().unwrap_or(&EMPTY_PARAMETERS_SCHEMA)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1121,6 +1747,21 @@ impl<'de> Deserialize<'de> for InputIds {
 
         deserializer.deserialize_seq(InputIdsVisitor)
     }
+}
+
+/// Token ids as their decimal rendering joined by spaces: the routing text of
+/// a prompt given as ids, on `/generate` and `/v1/completions` alike.
+pub(crate) fn join_ids<T: std::fmt::Display>(ids: impl IntoIterator<Item = T>) -> String {
+    use std::fmt::Write as _;
+    let ids = ids.into_iter();
+    let mut text = String::with_capacity(ids.size_hint().0 * 6);
+    for (i, id) in ids.enumerate() {
+        if i > 0 {
+            text.push(' ');
+        }
+        let _ = write!(text, "{id}");
+    }
+    text
 }
 
 /// LoRA adapter path - can be single path or batch of paths (an engine extension)
@@ -1647,23 +2288,36 @@ mod tests {
     #[test]
     fn function_deserializes_without_parameters() {
         // Per the OpenAI spec, omitting `parameters` defines a function with
-        // an empty parameter list.
+        // an empty parameter list: no schema was given, and a consumer that
+        // needs one reads the empty schema.
         let value = json!({"name": "web_search", "description": ""});
         let function: Function = serde_json::from_value(value).expect("parameterless function");
-        assert_eq!(function.parameters, json!({}));
+        assert_eq!(function.parameters, None);
+        assert_eq!(function.parameters_schema(), &json!({}));
 
-        // An explicit null is the same thing; `serde(default)` alone would
-        // keep `Value::Null`, which is not a JSON Schema and would reach the
-        // constraint builders as one.
+        // An explicit null is the same thing: `Value::Null` is not a JSON
+        // Schema and must not reach the constraint builders as one.
         let value = json!({"name": "web_search", "parameters": null});
         let function: Function = serde_json::from_value(value).expect("null parameters");
-        assert_eq!(function.parameters, json!({}));
+        assert_eq!(function.parameters, None);
+        assert_eq!(function.parameters_schema(), &json!({}));
+
+        // Serialized, such a function leaves the field out, as the client
+        // did; a client's own `{}` stays apart from it.
+        assert_eq!(
+            serde_json::to_value(&function).unwrap(),
+            json!({"name": "web_search"})
+        );
+        let empty: Function =
+            serde_json::from_value(json!({"name": "web_search", "parameters": {}})).unwrap();
+        assert_eq!(empty.parameters, Some(json!({})));
 
         // A real schema passes through untouched.
         let schema = json!({"type": "object", "properties": {"q": {"type": "string"}}});
         let value = json!({"name": "web_search", "parameters": schema});
         let function: Function = serde_json::from_value(value).expect("schema");
-        assert_eq!(function.parameters, schema);
+        assert_eq!(function.parameters.as_ref(), Some(&schema));
+        assert_eq!(function.parameters_schema(), &schema);
     }
 
     #[test]
@@ -1745,5 +2399,435 @@ mod tests {
         ] {
             assert!(!choice(free.clone()).forces_call(), "{free}");
         }
+    }
+
+    /// The allowed-tools choice reads in the contract's nested shape and in
+    /// the flat shape this route read before, to the same choice, and is
+    /// written back in the contract's shape; the words and the named function
+    /// round-trip as they are.
+    #[test]
+    fn an_allowed_tools_choice_reads_both_shapes_and_writes_the_contracts() {
+        let contract = json!({"type": "allowed_tools", "allowed_tools": {"mode": "required",
+            "tools": [{"type": "function", "function": {"name": "get_weather"}},
+                      {"type": "function", "function": {"name": "get_time"}}]}});
+        let flat = json!({"type": "allowed_tools", "mode": "required",
+            "tools": [{"type": "function", "name": "get_weather"},
+                      {"type": "function", "function": {"name": "get_time"}}]});
+        for body in [&contract, &flat] {
+            let choice: ToolChoice = serde_json::from_value(body.clone()).expect("a tool choice");
+            let ToolChoice::AllowedTools {
+                tool_type,
+                mode,
+                tools,
+            } = &choice
+            else {
+                panic!("{body} read as {choice:?}")
+            };
+            assert_eq!(
+                (tool_type.as_str(), mode.as_str()),
+                ("allowed_tools", "required")
+            );
+            assert_eq!(
+                tools
+                    .iter()
+                    .map(ToolReference::function_name)
+                    .collect::<Vec<_>>(),
+                [Some("get_weather"), Some("get_time")],
+                "{body}"
+            );
+            assert!(choice.forces_call(), "{body}");
+            assert_eq!(
+                serde_json::to_value(&choice).expect("json"),
+                contract,
+                "{body}"
+            );
+        }
+        for body in [
+            json!("auto"),
+            json!("required"),
+            json!({"type": "function", "function": {"name": "get_weather"}}),
+        ] {
+            let choice: ToolChoice = serde_json::from_value(body.clone()).expect("a tool choice");
+            assert_eq!(serde_json::to_value(&choice).expect("json"), body);
+        }
+        for refused in [
+            json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto"}}),
+            json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto",
+                "tools": [{"type": "custom", "function": {"name": "x"}}]}}),
+            json!({"type": "allowed_tools"}),
+        ] {
+            let err = serde_json::from_value::<ToolChoice>(refused.clone())
+                .expect_err(&refused.to_string())
+                .to_string();
+            assert_eq!(
+                err, "data did not match any variant of untagged enum ToolChoice",
+                "{refused}"
+            );
+        }
+    }
+
+    /// An assistant `refusal` part reads as a typed part, writes back as the
+    /// public API spells it, and is the turn's text to the renderers; a text
+    /// part keeps being text and a media part has none.
+    #[test]
+    fn a_refusal_part_is_typed_and_read_as_text() {
+        let body = json!({"type": "refusal", "refusal": "I cannot help with that."});
+        let part: ContentPart = serde_json::from_value(body.clone()).expect("a content part");
+        assert_eq!(
+            part,
+            ContentPart::Refusal {
+                refusal: "I cannot help with that.".to_string()
+            }
+        );
+        assert_eq!(part.text(), Some("I cannot help with that."));
+        assert_eq!(serde_json::to_value(&part).expect("json"), body);
+        let text: ContentPart =
+            serde_json::from_value(json!({"type": "text", "text": "hi"})).expect("a content part");
+        assert_eq!(text.text(), Some("hi"));
+        let image: ContentPart = serde_json::from_value(
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}),
+        )
+        .expect("a content part");
+        assert_eq!(image.text(), None);
+    }
+
+    /// `response_format` on the wire: `{"type": ...}` with the schema object
+    /// under `json_schema`. The three kinds read in either key order, an
+    /// unknown key is ignored, and a kind that carries no schema ignores a
+    /// `json_schema` field of any shape.
+    #[test]
+    fn a_response_format_reads_its_three_kinds_in_either_key_order() {
+        let read = |text: &str| serde_json::from_str::<ResponseFormat>(text);
+        assert!(matches!(
+            read(r#"{"type":"text"}"#).expect("text"),
+            ResponseFormat::Text
+        ));
+        assert!(matches!(
+            read(r#"{"type":"json_object"}"#).expect("json_object"),
+            ResponseFormat::JsonObject
+        ));
+        let schema = json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+            "required": ["city"],
+            "additionalProperties": false
+        });
+        let type_first = format!(
+            r#"{{"type":"json_schema","json_schema":{{"name":"answer","schema":{schema},"strict":true}}}}"#
+        );
+        let type_last = format!(
+            r#"{{"json_schema":{{"strict":true,"schema":{schema},"name":"answer"}},"type":"json_schema"}}"#
+        );
+        for text in [&type_first, &type_last] {
+            match read(text).expect("json_schema") {
+                ResponseFormat::JsonSchema { json_schema } => {
+                    assert_eq!(json_schema.name, "answer");
+                    assert_eq!(json_schema.schema, schema);
+                    assert_eq!(json_schema.strict, Some(true));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let format = read(&type_first).expect("json_schema");
+        assert_eq!(
+            serde_json::to_value(&format).expect("serializes"),
+            json!({"type": "json_schema", "json_schema": {"name": "answer", "schema": schema, "strict": true}})
+        );
+        assert!(matches!(
+            read(r#"{"type":"text","verbosity":"low"}"#).expect("an unknown key is ignored"),
+            ResponseFormat::Text
+        ));
+        assert!(matches!(
+            read(r#"{"type":"text","json_schema":"not an object"}"#).expect("ignored for text"),
+            ResponseFormat::Text
+        ));
+        assert!(matches!(
+            read(r#"{"json_schema":{"name":1},"type":"json_object"}"#)
+                .expect("ignored for json_object"),
+            ResponseFormat::JsonObject
+        ));
+        assert!(matches!(
+            read(r#"{"json_schema":{"name":"a","name":"b"},"type":"text"}"#)
+                .expect("a repeated field is ignored with the object, for text"),
+            ResponseFormat::Text
+        ));
+        assert!(matches!(
+            read(r#"{"json_schema":{"strict":true,"strict":false},"type":"json_object"}"#)
+                .expect("a repeated field is ignored with the object, for json_object"),
+            ResponseFormat::JsonObject
+        ));
+        assert!(matches!(
+            read(r#"{"type":"json_schema","json_schema":{"name":"a","schema":{}},"strict":true}"#)
+                .expect("a stray key beside the schema is ignored"),
+            ResponseFormat::JsonSchema { .. }
+        ));
+        assert!(serde_json::from_str::<Option<ResponseFormat>>("null")
+            .expect("null")
+            .is_none());
+    }
+
+    /// The errors are the derive's, word for word: the missing tag, an
+    /// unknown kind, the missing or malformed schema object, a duplicate key,
+    /// the sequence form's lengths. Read on their own they carry a position
+    /// where the derive gave none (it read the variant from its buffer after
+    /// the object); inside a request both point at the field's end, except a
+    /// malformed schema object under `json_schema`, whose column is the
+    /// failing token's instead of the closing brace's (pinned last).
+    #[test]
+    fn a_response_format_error_names_what_is_wrong() {
+        let err = |text: &str| {
+            serde_json::from_str::<ResponseFormat>(text)
+                .expect_err(text)
+                .to_string()
+        };
+        for (text, message) in [
+            (
+                r#"{"json_schema":{"name":"a","schema":{}}}"#,
+                "missing field `type` at line 1 column 40",
+            ),
+            ("{}", "missing field `type` at line 1 column 2"),
+            (
+                r#"{"type":"xml"}"#,
+                "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema` at line 1 column 13",
+            ),
+            (
+                r#"{"type":1}"#,
+                "invalid type: integer `1`, expected variant identifier at line 1 column 9",
+            ),
+            (
+                r#"{"type":"json_schema"}"#,
+                "missing field `json_schema` at line 1 column 22",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":null}"#,
+                "invalid type: null, expected struct JsonSchemaFormat at line 1 column 40",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":"text"}"#,
+                "invalid type: string \"text\", expected struct JsonSchemaFormat at line 1 column 42",
+            ),
+            (
+                r#"{"json_schema":"text","type":"json_schema"}"#,
+                "invalid type: string \"text\", expected struct JsonSchemaFormat at line 1 column 43",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"schema":{}}}"#,
+                "missing field `name` at line 1 column 49",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"name":"a"}}"#,
+                "missing field `schema` at line 1 column 48",
+            ),
+            (
+                r#"{"type":"text","type":"text"}"#,
+                "duplicate field `type` at line 1 column 21",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"name":"a","schema":{}},"json_schema":{"name":"b","schema":{}}}"#,
+                "duplicate field `json_schema` at line 1 column 100",
+            ),
+            (
+                r#""text""#,
+                "invalid type: string \"text\", expected internally tagged enum ResponseFormat at line 1 column 6",
+            ),
+            ("[]", "missing field `type` at line 1 column 2"),
+            (
+                r#"["xml"]"#,
+                "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema` at line 1 column 6",
+            ),
+            (
+                "[1]",
+                "invalid type: integer `1`, expected variant identifier at line 1 column 2",
+            ),
+            (
+                r#"["json_schema"]"#,
+                "invalid length 0, expected struct variant ResponseFormat::JsonSchema with 1 element at line 1 column 15",
+            ),
+            (
+                r#"["json_schema","text"]"#,
+                "invalid type: string \"text\", expected struct JsonSchemaFormat at line 1 column 21",
+            ),
+            (
+                r#"["json_schema",{"name":"a","schema":{}},"extra"]"#,
+                "invalid length 2, expected 1 element in sequence at line 1 column 48",
+            ),
+            (
+                r#"["text",{"json_schema":"x"}]"#,
+                "invalid length 1, expected 0 elements in sequence at line 1 column 28",
+            ),
+            (
+                r#"["json_object","x","y"]"#,
+                "invalid length 2, expected 0 elements in sequence at line 1 column 23",
+            ),
+        ] {
+            assert_eq!(err(text), message, "{text}");
+        }
+        // the sequence form the derive read is still read
+        assert!(matches!(
+            serde_json::from_str::<ResponseFormat>(r#"["text"]"#).expect("text"),
+            ResponseFormat::Text
+        ));
+        match serde_json::from_str::<ResponseFormat>(
+            r#"["json_schema",["a",{"type":"object"},true]]"#,
+        )
+        .expect("json_schema")
+        {
+            ResponseFormat::JsonSchema { json_schema } => {
+                assert_eq!(json_schema.name, "a");
+                assert_eq!(json_schema.strict, Some(true));
+            }
+            other => panic!("{other:?}"),
+        }
+        // inside a request: the field's end, and the one moved column
+        let request_err = |format: &str| {
+            let text = format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"response_format":{format},"max_tokens":8}}"#
+            );
+            serde_json::from_str::<crate::chat::ChatCompletionRequest>(&text)
+                .expect_err(format)
+                .to_string()
+        };
+        assert_eq!(
+            request_err(r#"{"json_schema":{"name":"a","schema":{}},"type":"xml"}"#),
+            "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema` at line 1 column 127"
+        );
+        assert_eq!(
+            request_err(r#"{"type":"json_schema","json_schema":"text"}"#),
+            "invalid type: string \"text\", expected struct JsonSchemaFormat at line 1 column 117"
+        );
+    }
+
+    /// One value of each kind writes its name under `type` and reads back as
+    /// the same kind, from a `Value` and from text; `kind_of` matches every
+    /// variant of `ResponseFormat`, so a new variant fails this build until
+    /// the reader learns it, and the unknown-kind list is the names in order.
+    #[test]
+    fn a_response_format_round_trips_each_kind_under_its_name() {
+        fn kind_of(format: &ResponseFormat) -> ResponseFormatKind {
+            match format {
+                ResponseFormat::Text => ResponseFormatKind::Text,
+                ResponseFormat::JsonObject => ResponseFormatKind::JsonObject,
+                ResponseFormat::JsonSchema { .. } => ResponseFormatKind::JsonSchema,
+            }
+        }
+        let formats = [
+            ResponseFormat::Text,
+            ResponseFormat::JsonObject,
+            ResponseFormat::JsonSchema {
+                json_schema: JsonSchemaFormat {
+                    name: "answer".to_owned(),
+                    schema: json!({"type": "object"}),
+                    strict: None,
+                },
+            },
+        ];
+        assert_eq!(formats.len(), ResponseFormatKind::ALL.len());
+        for (format, kind) in formats.iter().zip(ResponseFormatKind::ALL) {
+            assert_eq!(kind_of(format), kind);
+            let written = serde_json::to_value(format).expect("writes");
+            assert_eq!(written["type"], kind.name(), "{written}");
+            let read: ResponseFormat = serde_json::from_value(written.clone()).expect("reads back");
+            assert_eq!(kind_of(&read), kind, "{written}");
+            let read: ResponseFormat =
+                serde_json::from_str(&written.to_string()).expect("reads back from text");
+            assert_eq!(kind_of(&read), kind, "{written}");
+        }
+        assert_eq!(
+            RESPONSE_FORMAT_KINDS,
+            ResponseFormatKind::ALL.map(ResponseFormatKind::name)
+        );
+    }
+
+    /// A schema object that arrives before `type` is kept as it arrived and
+    /// read by the schema's own derive once the kind wants it: a repeated
+    /// field is the duplicate-field error, a field malformed before it repeats
+    /// the invalid-type error, in that order as in the other (the position
+    /// then being the enclosing object's end, the derive's); a duplicate
+    /// deeper in the schema keeps the last value in both orders, as a `Value`
+    /// does.
+    #[test]
+    fn a_kept_schema_object_refuses_a_repeated_field_in_either_order() {
+        let err = |text: &str| {
+            serde_json::from_str::<ResponseFormat>(text)
+                .expect_err(text)
+                .to_string()
+        };
+        for (text, message) in [
+            (
+                r#"{"type":"json_schema","json_schema":{"name":"a","name":"b","schema":{}}}"#,
+                "duplicate field `name` at line 1 column 54",
+            ),
+            (
+                r#"{"json_schema":{"name":"a","name":"b","schema":{}},"type":"json_schema"}"#,
+                "duplicate field `name` at line 1 column 72",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"name":"a","schema":{},"schema":{}}}"#,
+                "duplicate field `schema` at line 1 column 68",
+            ),
+            (
+                r#"{"json_schema":{"name":"a","schema":{},"schema":{}},"type":"json_schema"}"#,
+                "duplicate field `schema` at line 1 column 73",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"name":"a","schema":{},"strict":true,"strict":false}}"#,
+                "duplicate field `strict` at line 1 column 82",
+            ),
+            (
+                r#"{"json_schema":{"name":"a","schema":{},"strict":true,"strict":false},"type":"json_schema"}"#,
+                "duplicate field `strict` at line 1 column 90",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"name":1,"name":"b","schema":{}}}"#,
+                "invalid type: integer `1`, expected a string at line 1 column 45",
+            ),
+            (
+                r#"{"json_schema":{"name":1,"name":"b","schema":{}},"type":"json_schema"}"#,
+                "invalid type: integer `1`, expected a string at line 1 column 70",
+            ),
+            // the field repeated at the top level: the first value is read
+            // before the repeat is raised, as the derive's visitor does
+            (
+                r#"{"json_schema":{"name":1},"json_schema":{"name":"a","schema":{}},"type":"json_schema"}"#,
+                "invalid type: integer `1`, expected a string at line 1 column 86",
+            ),
+            (
+                r#"{"json_schema":5,"json_schema":{},"type":"json_schema"}"#,
+                "invalid type: integer `5`, expected struct JsonSchemaFormat at line 1 column 55",
+            ),
+            (
+                r#"{"json_schema":{"name":"a","schema":{}},"json_schema":{},"type":"json_schema"}"#,
+                "duplicate field `json_schema` at line 1 column 78",
+            ),
+            // the eager read's one difference in text: a repeated `type` after
+            // a malformed schema reads the schema's error here and
+            // `duplicate field `type`` under the derive; both refuse the body
+            (
+                r#"{"type":"json_schema","json_schema":{"name":1},"type":"text"}"#,
+                "invalid type: integer `1`, expected a string at line 1 column 45",
+            ),
+        ] {
+            assert_eq!(err(text), message, "{text}");
+        }
+        for text in [
+            r#"{"type":"json_schema","json_schema":{"name":"a","schema":{"x":1,"x":2}}}"#,
+            r#"{"json_schema":{"name":"a","schema":{"x":1,"x":2}},"type":"json_schema"}"#,
+        ] {
+            match serde_json::from_str::<ResponseFormat>(text).expect(text) {
+                ResponseFormat::JsonSchema { json_schema } => {
+                    assert_eq!(json_schema.schema, json!({"x": 2}), "{text}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // a kept object with a repeated unknown key is as the derive read it:
+        // the key ignored, no error
+        assert!(matches!(
+            serde_json::from_str::<ResponseFormat>(
+                r#"{"json_schema":{"name":"a","schema":{},"note":1,"note":2},"type":"json_schema"}"#
+            )
+            .expect("an unknown key twice is ignored"),
+            ResponseFormat::JsonSchema { .. }
+        ));
     }
 }

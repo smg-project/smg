@@ -1,6 +1,6 @@
 [package]
 name = "smg-auth"
-version = "1.2.4"
+version = "1.2.5"
 edition = "2021"
 description = "Authentication and authorization for control plane APIs"
 license = "Apache-2.0"
@@ -17,6 +17,7 @@ categories = ["authentication", "web-programming"]
 name = "smg_auth"
 
 [dependencies]
+arc-swap = "1.9.1"
 axum = { workspace = true, features = ["macros"] }
 chrono = { workspace = true, features = ["serde"] }
 http.workspace = true

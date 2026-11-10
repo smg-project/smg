@@ -38,6 +38,7 @@ use serde_json::json as value;
 use symphony::{
     format::CallId,
     formats::{self, Table},
+    json::Prefix,
     shape::{
         self, Arguments, Atom, CallShape, Class, Dialect, End, NameSource, Path, Pattern, Slot,
         ValueParser,
@@ -74,11 +75,11 @@ fn qwen3_tagged() -> Box<dyn Parser> {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "city": {"type": "string"},
                     "days": {"type": "integer"},
                     "note": {"type": ["string", "null"]},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -98,11 +99,11 @@ fn seed_oss() -> Box<dyn Parser> {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "city": {"type": "string"},
                     "days": {"type": "integer"},
                     "note": {"type": ["string", "null"]},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -123,11 +124,11 @@ fn keyed_tools() -> Declared {
         function: Function {
             name: "get_weather".to_string(),
             description: None,
-            parameters: value!({"type": "object", "properties": {
+            parameters: Some(value!({"type": "object", "properties": {
                 "city": {"type": "string"},
                 "days": {"type": "integer"},
                 "note": {"type": ["string", "null"]},
-            }}),
+            }})),
             strict: None,
             extra: Default::default(),
         },
@@ -299,12 +300,12 @@ fn minimax_m3() -> Box<dyn Parser> {
             function: Function {
                 name: "get_weather".to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
+                parameters: Some(value!({"type": "object", "properties": {
                     "city": {"type": "string"},
                     "days": {"type": "integer"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "opts": {"type": "object", "properties": {"unit": {"type": "string"}}},
-                }}),
+                }})),
                 strict: None,
                 extra: Default::default(),
             },
@@ -364,7 +365,7 @@ fn tool(name: &str, parameters: serde_json::Value) -> Tool {
         function: Function {
             name: name.to_string(),
             description: None,
-            parameters,
+            parameters: Some(parameters),
             strict: None,
             extra: Default::default(),
         },
@@ -1323,6 +1324,8 @@ const KIMI_K3_OUTPUTS: &[&str] = &[
      <|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>",
     "<|open|>think<|sep|>Janet sells 9 eggs.\nShe makes $18.<|close|>think<|sep|>\
      <|open|>response<|sep|>18<|close|>response<|sep|><|close|>message<|sep|>",
+    // The reply written straight into the prefilled thought and closed by the answer's closer.
+    "<|open|>think<|sep|>The answer is 42.<|close|>response<|sep|><|close|>message<|sep|>",
     "<|open|>think<|sep|><|close|>think<|sep|>\
      <|open|>response<|sep|><|close|>response<|sep|>\
      <|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>\
@@ -1387,6 +1390,30 @@ const KIMI_K3_OUTPUTS: &[&str] = &[
     "<|open|>think<|sep|>Only a thought.",
     "Plain prose with no marker at all.",
     "",
+    // An object-typed value nested past the JSON reader's bound (32 containers, the arguments
+    // object counted), whole and cut, and one cut right after a `\u` escape short of its
+    // digits: the fuzz campaign's `json-prefix` class on this syntax.
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|>\
+     <|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"o\" type=\"object\"<|sep|>[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]<|close|>argument<|sep|>\
+     <|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|>\
+     <|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"o\" type=\"object\"<|sep|>[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|>\
+     <|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"o\" type=\"object\"<|sep|>{\"\\u1\"=",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|>\
+     <|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"o\" type=\"object\"<|sep|>{\"\\u1\"",
+    "<|open|>think<|sep|><|close|>think<|sep|>\
+     <|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|>\
+     <|open|>call tool=\"f\" index=\"1\"<|sep|>\
+     <|open|>argument key=\"o\" type=\"object\"<|sep|>[\"\\u1\"]",
 ];
 
 /// The plain table: prose of every shape, the other families' markers as prose, and nothing.
@@ -1440,6 +1467,13 @@ const OLMO3_OUTPUTS: &[&str] = &[
 const LFM_OUTPUTS: &[&str] = &[
     "<|tool_call_start|>[get_weather(city='Paris', note='it\\'s fine'), get_stock_price()]\
      <|tool_call_end|>",
+    // A list nested past the JSON reader's bound (32 containers, the arguments object counted),
+    // whole at the call's `)` and cut inside it: the fuzz campaign's `json-prefix` class.
+    "<|tool_call_start|>[get_weather(days=[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]])]<|tool_call_end|>",
+    "<|tool_call_start|>[get_weather(days=[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[",
+    // A value cut right after a `\u` escape short of its digits, which a strict reader reads
+    // past the text's end: the same class.
+    "<|tool_call_start|>[get_weather(days=[\"\\u1\"]",
     "<|tool_call_start|>[get_weather(city='Par",
     "<|tool_call_start|>[get_weather(",
     "<|tool_call_start|>[get_weather(ci",
@@ -1660,6 +1694,14 @@ const GLM_OUTPUTS: &[&str] = &[
      </tool_call>",
     "<think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
     "<think></think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Par</tool_call>",
+    // A list nested past the JSON reader's bound (32 containers, the arguments object counted),
+    // whole at its closing tag and cut inside it: the fuzz campaign's `json-prefix` class.
+    "<think></think><tool_call>get_weather<arg_key>days</arg_key><arg_value>[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]</arg_value>\
+     </tool_call>",
+    "<think></think><tool_call>get_weather<arg_key>days</arg_key><arg_value>[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[",
+    // A value cut right after a `\u` escape short of its digits, which a strict reader reads
+    // past the text's end: the same class.
+    "<think></think><tool_call>get_weather<arg_key>days</arg_key><arg_value>[\"\\u1\"]",
     "<think></think><tool_call>get_weather<arg_key>q</arg_key><arg_value>計画 🌍 \"q\" \\ \
      </arg_value></tool_call>",
     "<think></think><tool_call>get_weather<arg_key>days</arg_key><arg_value>three</arg_value>\
@@ -1763,6 +1805,8 @@ const IQUEST_OUTPUTS: &[&str] = &[
 /// Outputs in DeepSeek's DSML: the recorded shapes, and the cuts and faults the assembler and the
 /// table name.
 const DSML_OUTPUTS: &[&str] = &[
+    // An invoke written outside a block: a call.
+    "<｜DSML｜ invoke name=\"add_integers\">\n<｜DSML｜ parameter name=\"a\" string=\"false\">6</｜DSML｜ parameter>\n</｜DSML｜ invoke>",
     "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter \
      name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" \
      string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke \
@@ -1930,6 +1974,10 @@ const QWEN3_TAGGED_DIRECT_OUTPUTS: &[&str] = &[
 /// blank line before the block, a third newline and a space before it, a thought cut short,
 /// content alone, and two cut short.
 const DEEPSEEK_V4_OUTPUTS: &[&str] = &[
+    // An invoke written outside a block, alone and then written again inside a block (a
+    // recorded draw): a call, and the model's text and two calls.
+    "<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">6</｜DSML｜parameter>\n</｜DSML｜invoke>",
+    "\n\n:tool\n<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">6</｜DSML｜parameter>\n</｜DSML｜invoke>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">6</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
     "<think>The user asks.</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Beijing</｜DSML｜parameter>\n<｜DSML｜parameter name=\"unit\" string=\"true\">celsius</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">17</｜DSML｜parameter>\n<｜DSML｜parameter name=\"b\" string=\"false\">25</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
     "Sure.\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Rome</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
@@ -1952,6 +2000,8 @@ const DEEPSEEK_V4_OUTPUTS: &[&str] = &[
 /// content in thinking and in chat mode with the blank line before the block, a third newline and
 /// a space before it, a thought cut short, content alone, and one cut short.
 const DEEPSEEK_V3_2_OUTPUTS: &[&str] = &[
+    // An invoke written outside a block: a call.
+    "<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">6</｜DSML｜parameter>\n</｜DSML｜invoke>",
     "<think>The user asks.</think>\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Beijing</｜DSML｜parameter>\n<｜DSML｜parameter name=\"unit\" string=\"true\">celsius</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
     "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"add_integers\">\n<｜DSML｜parameter name=\"a\" string=\"false\">17</｜DSML｜parameter>\n<｜DSML｜parameter name=\"b\" string=\"false\">true</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
     "Sure.\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Rome</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
@@ -2262,14 +2312,21 @@ fn replay(
 }
 
 /// Whether `text` is a prefix of JSON a strict reader accepts: whole, or cut where the reader asks
-/// for more bytes rather than refusing one it saw. The crate's partial parser is no oracle here: its
-/// prefix mode tolerates what JSON lacks (a trailing comma, a value left out, an escape JSON lacks),
-/// which is what a client's reader refuses once the call ends.
+/// for more bytes rather than refusing one it saw, and one the crate's own judge of a JSON prefix
+/// takes too, the judge the fuzz harness applies to every fragment. The strict reader alone is no
+/// oracle: it follows nesting past the bound the crate puts on a call's arguments, and it reads
+/// four bytes of a `\u` escape blindly and asks for more when the text ends under them, so an
+/// escape short of its digits before its string's closing quote (`"\u1"`) passes it, which no
+/// continuation makes JSON. The judge refuses both, the escape from its backslash. The crate's
+/// partial parser is no oracle either: its prefix mode tolerates what JSON lacks (a trailing
+/// comma, a value left out, an escape JSON lacks, the short escape read as unfinished and the
+/// quote as the string's text), which is what a client's reader refuses once the call ends.
 fn strict_json_prefix(text: &str) -> bool {
-    match serde_json::from_str::<serde_json::Value>(text) {
+    let strict = match serde_json::from_str::<serde_json::Value>(text) {
         Ok(_) => true,
         Err(error) => error.is_eof(),
-    }
+    };
+    strict && Prefix::default().feed(text).is_none()
 }
 
 /// Whether `fragment`, appended to the arguments `so_far`, closes a JSON string `so_far` left

@@ -10,9 +10,12 @@
 
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use common::grpc_harness::{
-    grpc_router, grpc_router_config, grpc_test_context_with_tokenizer, grpc_workers,
-    serve_canned_worker, Canned,
+use common::{
+    grpc_harness::{
+        grpc_router, grpc_router_config, grpc_test_context_with_tokenizer, grpc_workers,
+        serve_canned_worker, Canned,
+    },
+    test_app::read_body,
 };
 use llm_tokenizer::{
     chat_template::ChatTemplateParams,
@@ -145,17 +148,6 @@ fn completion_request(n: u32, stream: bool) -> CompletionRequest {
 
 fn tenant() -> TenantRequestMeta {
     TenantRequestMeta::new(TenantKey::new("pd-fanout-test-tenant"))
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
-async fn read_body(response: axum::response::Response) -> String {
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-        .await
-        .expect("response body");
-    String::from_utf8(bytes.to_vec()).expect("utf-8 body")
 }
 
 /// Three samples through one rendezvous-room PD pair: the fan-out runs three

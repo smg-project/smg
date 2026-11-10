@@ -16,17 +16,18 @@ use engine_zmq_adapter::{
     fold_tokenizer_eos_backstop, kv_transfer_rejection_params, stops::take_vllm_string_stops,
     VllmGenerateStream, ZmqEngineClient,
 };
-use futures::{stream::SelectAll, Stream};
+use futures::Stream;
 use llm_tokenizer::stop::StopSequenceDecoder;
 use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
 
-use super::{media::process_media_refs, State};
+use super::{encoder_cache, media::process_media_refs, State};
 use crate::{
+    load_tracker::{rank_of, ChoiceLoad, PendingGuard, PrefillProbe},
     metrics::{complete_finish_reason, ChoiceMetrics},
     requests::HeldTerminal,
     stop_match::{stop_decoder, StopMatcher},
-    stream::{poll_engine_item, Choice, RequestStream},
+    stream::{poll_engine_item, Choice, Choices, RequestStream},
     BoxStream,
 };
 
@@ -45,7 +46,88 @@ pub(super) async fn generate(
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
     }
+    log_request_line(&req);
     submit(state, client, req, trace_headers, arrival).await
+}
+
+/// The refusal of a request that carries encoder-cache transfer parameters
+/// (`ec_transfer_params_json`) on an engine without an encoder-cache
+/// connector (the launcher reports none off `ec_transfer_config`, and the
+/// Router reads it off the `supports_ec_transfer` label left unset); the
+/// shape is the Python servicer's refusal of a media reference with
+/// processing off (`media::PROCESSOR_OFF`).
+const NO_ENCODER_CACHE: &str = "ec_transfer_params_json sent but this worker runs no \
+                                encoder-cache connector; check this worker's \
+                                supports_ec_transfer label";
+
+/// Whether the request carries encoder-cache transfer parameters: a non-empty
+/// `ec_transfer_params_json` (the encoder's request names the consumer's
+/// destination, or an empty object for a pull connector; the prefill side's
+/// names the encoder's handles). An empty field is no parameters, as the
+/// Python servicer reads it.
+pub(super) fn ec_transfer_params_sent(req: &vllm::GenerateRequest) -> bool {
+    req.ec_transfer_params_json
+        .as_deref()
+        .is_some_and(|params| !params.is_empty())
+}
+
+/// The tracing target of the per-request line: a reader that wants it raises
+/// this target alone (`RUST_LOG=info,engine_servicer::request=debug`); the
+/// production filter leaves it off, and an event below the filter costs the
+/// enabled check and nothing else.
+pub(super) const REQUEST_LINE_TARGET: &str = "engine_servicer::request";
+
+/// Log the request as received, at DEBUG under [`REQUEST_LINE_TARGET`], in the
+/// words the Python servicer logs for every `Generate` at INFO: what a reader
+/// of a worker's log greps for (a PD side's media placement, the rank the
+/// gateway pinned). The line is formatted only when that target is enabled.
+pub(super) fn log_request_line(req: &vllm::GenerateRequest) {
+    if tracing::enabled!(target: REQUEST_LINE_TARGET, tracing::Level::DEBUG) {
+        tracing::debug!(target: REQUEST_LINE_TARGET, "{}", request_line(req));
+    }
+}
+
+/// One line describing a `Generate` request as received, in the Python
+/// servicer's words: the input kind by its field name, whether it streams,
+/// whether a multimodal batch carries tensors the preprocessed path can use
+/// (pixels or model-specific tensors; a PD decode side built from the
+/// prefill's identity carries its grid tensors and so reads
+/// `preprocessed_mm=True, media_refs=0`, while a bare payload of hashes alone
+/// does not count), the count of worker-side media references, and the
+/// data-parallel rank the
+/// gateway pinned (`None` when it pinned none). Booleans and the absent rank
+/// spell as Python does, so the same log readers serve both servicers.
+pub(super) fn request_line(req: &vllm::GenerateRequest) -> String {
+    let input_type = match req.input {
+        Some(vllm::generate_request::Input::Tokenized(_)) => "tokenized",
+        Some(vllm::generate_request::Input::Text(_)) => "text",
+        None => "None",
+    };
+    let preprocessed_mm = req
+        .mm_inputs
+        .iter()
+        .chain(req.extra_mm_inputs.iter())
+        .any(|batch| batch.pixel_values.is_some() || !batch.model_specific_tensors.is_empty());
+    let media_refs = req.media_refs.as_ref().map_or(0, |refs| refs.items.len());
+    let dp_rank = req
+        .data_parallel_rank
+        .map_or_else(|| "None".to_string(), |rank| rank.to_string());
+    format!(
+        "Generate request {}: input_type={input_type}, stream={}, preprocessed_mm={}, \
+         media_refs={media_refs}, dp_rank={dp_rank}",
+        req.request_id,
+        python_bool(req.stream),
+        python_bool(preprocessed_mm),
+    )
+}
+
+/// A boolean as Python's logger spells it.
+fn python_bool(value: bool) -> &'static str {
+    if value {
+        "True"
+    } else {
+        "False"
+    }
 }
 
 /// The rejection notice a refused PD decode side owes its prefill side, so the
@@ -179,6 +261,33 @@ async fn submit(
             "This model does not support generation",
         ));
     }
+    // An encode-prefill-decode leg (the encoder's request with the consumer's
+    // destination, or the prefill side's with the encoder's handles) rides
+    // the engine's encoder-cache connector, which the launcher reports off
+    // `ec_transfer_config` and `GetServerInfo` advertises, so a Router selects
+    // an engine without one for neither side. A leg that arrives there all
+    // the same is refused here, before the media stage or the engine sees it
+    // (the engine would run it as a plain request and the caller would read
+    // a completion without the handles), in the shape a media reference is
+    // refused on a worker whose processor is off.
+    if !state.model.supports_ec_transfer && ec_transfer_params_sent(&req) {
+        return Err(Status::invalid_argument(NO_ENCODER_CACHE));
+    }
+    // On an engine with a connector, the leg's parameters (a JSON object; a
+    // malformed field is refused by the adapter's parse) are checked as the
+    // Python servicer checks them: a consumer's pixel-less batches need a
+    // usable handle per media item before the engine sees the request.
+    let ec_params = (state.model.supports_ec_transfer && ec_transfer_params_sent(&req))
+        .then(|| {
+            req.ec_transfer_params_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        })
+        .flatten();
+    if let Some(params) = ec_params.as_ref() {
+        encoder_cache::check_consumer_handoff(&req, &state.model, params)?;
+    }
+    let ec_producer_leg = ec_params.is_some() && encoder_cache::is_producer(&state.model);
     let request_id = req.request_id.clone();
     // Register before anything slow: an `Abort` landing while the media is
     // processed must find the entry, and a duplicate id is refused up front.
@@ -202,6 +311,14 @@ async fn submit(
         Some((media, identity)) => (Some(media), identity.map(Arc::new)),
         None => (None, None),
     };
+    // An encoder's leg with router-preprocessed batches gets its identity
+    // from the batches themselves (the media stage saw no reference).
+    let media_identity = media_identity.or_else(|| {
+        ec_producer_leg
+            .then(|| encoder_cache::producer_identity(&req, &state.model))
+            .flatten()
+            .map(Arc::new)
+    });
     let streaming = req.stream;
     let skip_special_tokens = req
         .sampling_params
@@ -258,12 +375,12 @@ async fn submit(
         .iter()
         .find(|sub| sub.index() == 0)
         .or_else(|| subs.first())
-        .map_or(0, rank_of);
-    state.loads.submitted(rank, &request_id, prompt_tokens);
-    let loads = LoadsGuard {
-        state: Arc::clone(state),
-        request_id: request_id.clone(),
-    };
+        .map_or(0, |sub| rank_of(sub.engine_index()));
+    state
+        .shared
+        .loads
+        .submitted(rank, &request_id, prompt_tokens);
+    let loads = PendingGuard::new(Arc::clone(state), &request_id);
     let metrics = state.shared.metrics.request(
         arrival,
         u32::try_from(rank).ok(),
@@ -271,7 +388,7 @@ async fn submit(
         max_tokens,
         n,
     );
-    let mut choices = SelectAll::new();
+    let mut choices = Choices::new();
     for sub in subs {
         // Each choice decodes its own text: the matcher is per sequence.
         let decoder = match &decoder {
@@ -285,6 +402,7 @@ async fn submit(
             streaming,
             min_tokens,
             media_identity.clone(),
+            ec_producer_leg,
             request_id.clone(),
             metrics.choice(),
         ));
@@ -292,28 +410,6 @@ async fn submit(
     Ok(Box::pin(
         RequestStream::new(choices, cancel, registration, metrics).holding(loads),
     ))
-}
-
-/// The data-parallel rank a choice's engine request went to, as the load
-/// tracker and `GetLoads` name it (an engine whose identity names no index
-/// counts as the first).
-fn rank_of(sub: &VllmGenerateStream) -> i32 {
-    sub.engine_index()
-        .and_then(|index| i32::try_from(index).ok())
-        .unwrap_or(0)
-}
-
-/// Takes the request out of the load tracker's queue when the stream ends,
-/// in case the engine never started it.
-struct LoadsGuard {
-    state: Arc<State>,
-    request_id: String,
-}
-
-impl Drop for LoadsGuard {
-    fn drop(&mut self) {
-        self.state.loads.finished(&self.request_id);
-    }
 }
 
 /// One choice of a generate request: the ZMQ-mapped stream plus the string
@@ -333,18 +429,20 @@ struct ChoiceStream {
     streaming: bool,
     /// A frontend-synthesized terminal `Complete` to yield next.
     pending: Option<vllm::GenerateResponse>,
-    /// Whether this request's prompt went into the load tracker.
-    prompt_counted: bool,
     /// This choice's observation of the request's metrics.
     metrics: ChoiceMetrics,
     /// A PD prefill side's account of the media it processed, stamped on
     /// every `Complete` of the request for the decode side.
     media_identity: Option<Arc<vllm::MediaIdentity>>,
+    /// Whether this is an encoder's encoder-cache leg: its terminal
+    /// `Complete` must return the connector's handle for every media item of
+    /// the identity (`encoder_cache::check_producer_handles`).
+    ec_producer_leg: bool,
     /// The request this choice belongs to, for the load tracker.
     request_id: String,
-    /// The rank this choice's engine request went to, whose figures the
-    /// load tracker credits its prompt and tokens to.
-    rank: i32,
+    /// This choice's share of the load tracker's bookkeeping; its prefill
+    /// sample comes from the wire's engine timing, so its probe stays unarmed.
+    load: ChoiceLoad,
 }
 
 impl ChoiceStream {
@@ -356,39 +454,26 @@ impl ChoiceStream {
         streaming: bool,
         min_tokens: u32,
         media_identity: Option<Arc<vllm::MediaIdentity>>,
+        ec_producer_leg: bool,
         request_id: String,
         metrics: ChoiceMetrics,
     ) -> Self {
         Self {
             media_identity,
+            ec_producer_leg,
             request_id,
-            rank: rank_of(&inner),
+            load: ChoiceLoad::new(
+                rank_of(inner.engine_index()),
+                inner.index(),
+                PrefillProbe::default(),
+            ),
             state,
             inner: Some(inner),
             stops: StopMatcher::new(decoder, min_tokens),
             streaming,
             pending: None,
-            prompt_counted: false,
             metrics,
         }
-    }
-
-    /// Tell the load tracker, once per request (every choice of an `n > 1`
-    /// fan-out reports the same prompt), that the engine started it and how
-    /// much of the prompt was cached.
-    fn count_prompt(&mut self, prompt_tokens: u32, cached_tokens: u32) {
-        if self.prompt_counted || prompt_tokens == 0 {
-            return;
-        }
-        if self.inner.as_ref().is_some_and(|inner| inner.index() == 0) {
-            self.state.loads.first_output(
-                self.rank,
-                &self.request_id,
-                prompt_tokens,
-                cached_tokens,
-            );
-        }
-        self.prompt_counted = true;
     }
 
     /// A terminal response with the request's media identity on it, when
@@ -458,6 +543,7 @@ type ChoiceItem = Result<vllm::GenerateResponse, Status>;
 impl Stream for ChoiceStream {
     type Item = ChoiceItem;
 
+    /// Forward engine output and account for input capacity before frontend stop handling.
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
@@ -471,6 +557,16 @@ impl Stream for ChoiceStream {
                 ControlFlow::Continue(item) => item,
                 ControlFlow::Break(poll) => return poll,
             };
+            if let Some((tokens, start, end)) = this
+                .inner
+                .as_mut()
+                .and_then(|inner| inner.take_prefill_sample())
+            {
+                this.state
+                    .shared
+                    .loads
+                    .prefill_computed(this.load.rank(), tokens, start, end);
+            }
             let Some(vllm::generate_response::Response::Chunk(chunk)) = item.response.as_ref()
             else {
                 // The engine's own terminal `Complete` (or an empty response)
@@ -483,13 +579,32 @@ impl Stream for ChoiceStream {
                 if let Some(vllm::generate_response::Response::Complete(complete)) =
                     item.response.as_ref()
                 {
-                    this.count_prompt(complete.prompt_tokens, complete.cached_tokens);
+                    this.load.count_prompt(
+                        &this.state.shared.loads,
+                        &this.request_id,
+                        complete.prompt_tokens,
+                        complete.cached_tokens,
+                        Instant::now(),
+                    );
                     this.metrics.complete(
                         &complete.finish_reason,
                         complete.prompt_tokens,
                         complete.cached_tokens,
                     );
                     ended = true;
+                    if this.ec_producer_leg {
+                        if let Some(identity) = this.media_identity.as_deref() {
+                            if let Err(status) = encoder_cache::check_producer_handles(
+                                &this.state.model,
+                                identity,
+                                complete,
+                            ) {
+                                this.inner = None;
+                                this.metrics.failed(status.code());
+                                return Poll::Ready(Some(Err(status)));
+                            }
+                        }
+                    }
                 }
                 let response = this.stamped(item);
                 if ended {
@@ -497,14 +612,21 @@ impl Stream for ChoiceStream {
                 }
                 return Poll::Ready(Some(Ok(response)));
             };
-            this.count_prompt(chunk.prompt_tokens, chunk.cached_tokens);
             let tokens = u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX);
             // The metrics' clock read serves the load tracker's window too.
             let at = this
                 .metrics
                 .chunk(tokens, chunk.prompt_tokens, chunk.cached_tokens)
                 .unwrap_or_else(Instant::now);
-            this.state.loads.generated_at(this.rank, tokens, at);
+            let loads = &this.state.shared.loads;
+            this.load.count_prompt(
+                loads,
+                &this.request_id,
+                chunk.prompt_tokens,
+                chunk.cached_tokens,
+                at,
+            );
+            this.load.generated(loads, tokens, at);
             let matched = match this.stops.feed(&chunk.token_ids) {
                 Ok(matched) => matched,
                 Err(status) => {

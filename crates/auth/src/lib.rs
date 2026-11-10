@@ -12,8 +12,8 @@ mod jwks;
 mod jwt;
 mod middleware;
 
-pub use audit::{AuditEvent, AuditLogger, AuditOutcome};
-pub use config::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
+pub use audit::{AuditEvent, AuditLogger, AuditOutcome, AuditResource};
+pub use config::{ApiKeyEntry, ApiKeySet, ControlPlaneAuthConfig, JwtConfig, Role};
 pub use jwt::{JwtValidator, JwtValidatorError};
 pub use middleware::{
     bearer_token, control_plane_auth_middleware, AuthMethod, ControlPlaneAuthState, Principal,

@@ -28,7 +28,8 @@ module adds the one thing it lacks, discovery, and keeps everything else:
   (the token columns a frontend that detokenizes itself needs, plus a
   scheduler-load tail, so the output batch is the one in-band load channel),
   :class:`BatchEmbeddingSlimOutput` and :class:`ControlReplySlim` (the
-  scheduler's answer to a control call, under its call id).
+  scheduler's answer to a control call, under its call id); the scheduler's
+  bare health signal rides as an empty token batch without a load tail.
 
 The handshake structs are msgpack maps with named keys; the data-plane
 structs are positional arrays. SMG's codec relies on exactly that split. The
@@ -732,7 +733,9 @@ class MsgpackSendSocket:
     for a request becomes that request's terminal output, so SMG's stream
     never hangs on a scheduler-side abort; a control reply (handed back with
     the control request it answers) becomes a :class:`ControlReplySlim`
-    under the request's call id.
+    under the request's call id; the scheduler's bare health signal (its
+    answer to a probe it did not queue) becomes an empty token batch with no
+    load tail (:meth:`send_health_signal`).
     """
 
     def __init__(self, engine_index: int = 0) -> None:
@@ -842,6 +845,7 @@ class MsgpackSendSocket:
             BatchEmbeddingOutput,
             BatchTokenIDOutput,
             FlushCacheReqOutput,
+            HealthCheckOutput,
             ProfileReqOutput,
         )
 
@@ -885,6 +889,12 @@ class MsgpackSendSocket:
                 output.abort_message or reason.get("message") or "Aborted",
                 status=int(status) if isinstance(status, int) else None,
             )
+        elif isinstance(output, HealthCheckOutput):
+            # The scheduler's answer to a health probe it did not queue (busy
+            # with a chunked prefill or a running batch): a bare signal that
+            # it is alive, which SMG reads as any output since its probe
+            # started.
+            self.send_health_signal()
         else:
             logger.debug(
                 "zmq msgpack: dropping control reply %s (no consumer on this wire)",
@@ -913,6 +923,29 @@ class MsgpackSendSocket:
         )
         self.traces.finish(rid)
         self.hidden_rows.forget(rid)
+
+    def send_health_signal(self) -> None:
+        """The scheduler's bare health signal as an output with nothing in
+        it: no request columns and, on purpose, no load tail. SMG stamps any
+        output as the scheduler having spoken since its probe started, and
+        reads an outputs-less batch WITH a load tail as a stats-only step
+        report (a wire that reports every step), which this scheduler's
+        silences are not."""
+        self._send_slim(
+            BatchTokenIDSlimOutput(
+                rids=[],
+                output_ids=[],
+                finished_reasons=[],
+                finished_messages=[],
+                finished_matched=[],
+                prompt_tokens=[],
+                completion_tokens=[],
+                cached_tokens=[],
+                output_token_logprobs_val=[],
+                output_token_logprobs_idx=[],
+                engine_index=self.engine_index,
+            )
+        )
 
     def send_engine_dead(self) -> None:
         """Best-effort ENGINE_CORE_DEAD on shutdown or crash; never raises."""

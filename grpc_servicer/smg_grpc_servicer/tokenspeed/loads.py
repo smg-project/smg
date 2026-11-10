@@ -68,8 +68,9 @@ def convert_snapshot_to_protobuf(
     being derived from those blocks. Express used capacity as a token-budget
     equivalent instead; admission/finish traces report actual cached tokens.
     Cached blocks are resident but reclaimable; only active blocks exert pressure.
+    Resident tokens come from engines whose snapshot counts them.
     """
-    return tokenspeed_scheduler_pb2.SchedulerLoad(
+    load = tokenspeed_scheduler_pb2.SchedulerLoad(
         dp_rank=int(snapshot.dp_rank),
         num_running_reqs=int(snapshot.num_running_reqs),
         num_waiting_reqs=int(snapshot.num_waiting_reqs),
@@ -82,6 +83,10 @@ def convert_snapshot_to_protobuf(
         active_token_usage=snapshot.num_active_pages / snapshot.max_total_pages,
         max_running_requests=max_running_requests,
     )
+    resident = getattr(snapshot, "num_resident_tokens", None)
+    if resident is not None and "num_resident_tokens" in load.DESCRIPTOR.fields_by_name:
+        load.num_resident_tokens = int(resident)
+    return load
 
 
 def load_record(

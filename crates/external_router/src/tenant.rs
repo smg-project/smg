@@ -38,6 +38,12 @@ impl From<&str> for TenantKey {
     }
 }
 
+impl From<Arc<str>> for TenantKey {
+    fn from(value: Arc<str>) -> Self {
+        Self(value)
+    }
+}
+
 /// The tenant a stored response or conversation is scoped to for the caller
 /// `meta` describes: the identity the gateway can vouch for (the tenant of a
 /// data-plane API key, `auth:<tenant>`; a trusted tenant header,

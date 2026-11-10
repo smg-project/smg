@@ -361,7 +361,7 @@ impl HarmonyPreparationStage {
         // Build tags for each tool - need two patterns per tool for reasoning on/off
         for tool in tools_to_use {
             let tool_name = &tool.function.name;
-            let params_schema = &tool.function.parameters;
+            let params_schema = tool.function.parameters_schema();
 
             // Pattern 1: For reasoning-enabled mode (with analysis channel before commentary)
             tags.push(json!({
@@ -421,9 +421,7 @@ impl HarmonyPreparationStage {
 /// channel tokens (otherwise xgrammar blocks all non-trigger-prefix tokens).
 ///
 /// This is used for the Responses API text.format field (json_object or json_schema).
-pub(crate) fn build_text_format_structural_tag(
-    schema: &serde_json::Value,
-) -> Result<String, String> {
+fn build_text_format_structural_tag(schema: &serde_json::Value) -> Result<String, String> {
     let structural_tag = json!({
         "format": {
             "type": "triggered_tags",

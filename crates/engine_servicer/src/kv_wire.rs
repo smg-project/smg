@@ -15,12 +15,15 @@
 //! - only blocks the engine manages itself (`ownership` other than a
 //!   residency agent);
 //! - the storage tier from `medium`, unknown media dropped;
-//! - the main-attention KV cache group where a rank has one (hybrid models
-//!   publish one group per attention kind under the same hashes, and the
-//!   sliding-window and state-space groups' events, stores and removals, are
-//!   dropped); a rank that publishes only sliding-window groups forwards
-//!   their stores, the hashes aligned to the tail of the tokens, as its only
-//!   signal (see [`Normalizer`]);
+//! - the KV cache groups by their kind: the main-attention group's stores
+//!   carry their tokens and feed the prefix index; the other groups' events
+//!   on a rank that has a main group (hybrid models publish one group per
+//!   attention kind under the same hashes) are forwarded with their hashes
+//!   and group fields and no tokens, what a consumer needs to bound a prefix
+//!   hit by the blocks a sliding-window or state group retains; a rank that
+//!   publishes only sliding-window groups forwards their stores, the hashes
+//!   aligned to the tail of the tokens, as its only signal (see
+//!   [`Normalizer`]);
 //! - whole blocks only (hash count × block size == token count, or the
 //!   tail of a longer span), no self-referencing hash chains, no offload
 //!   placeholders (a chunk key with no tokens);
@@ -123,6 +126,12 @@ pub struct EventTail {
     pub locality: Option<String>,
     pub ownership: Option<String>,
     pub session_id: Option<String>,
+    /// The cache groups the event is about, bit i for the engine's group i:
+    /// on a store the groups that hold the boundary after it, on a removal
+    /// the groups that dropped it. Written by a publisher that reports a
+    /// boundary once for every group (after the reference layout's last
+    /// slot); absent from one that reports each group on its own.
+    pub group_mask: Option<u64>,
 }
 
 /// Token ids of a store: plain ids, or the (token, next token) bigrams a
@@ -296,6 +305,13 @@ impl Loose {
         }
     }
 
+    fn unsigned64(self) -> Option<u64> {
+        match self {
+            Loose::Unsigned(value) => Some(value),
+            _ => None,
+        }
+    }
+
     fn signed(self) -> Option<i64> {
         match self {
             Loose::Unsigned(value) => i64::try_from(value).ok(),
@@ -410,10 +426,10 @@ struct Fields {
     lora_name: Option<Loose>,
     cache_salt: Option<Loose>,
     extra_keys: Option<Loose>,
-    tail: [Option<Loose>; 7],
+    tail: [Option<Loose>; 8],
 }
 
-const TAIL_KEYS: [&str; 7] = [
+const TAIL_KEYS: [&str; 8] = [
     "medium",
     "group_idx",
     "kv_cache_spec_kind",
@@ -421,10 +437,11 @@ const TAIL_KEYS: [&str; 7] = [
     "locality",
     "ownership",
     "session_id",
+    "group_mask",
 ];
 
-fn tail_from(slots: [Option<Loose>; 7]) -> EventTail {
-    let [medium, group_idx, kind, sliding, locality, ownership, session_id] = slots;
+fn tail_from(slots: [Option<Loose>; 8]) -> EventTail {
+    let [medium, group_idx, kind, sliding, locality, ownership, session_id, group_mask] = slots;
     EventTail {
         medium: medium.and_then(Loose::text),
         group_idx: group_idx.and_then(Loose::unsigned32),
@@ -433,6 +450,7 @@ fn tail_from(slots: [Option<Loose>; 7]) -> EventTail {
         locality: locality.and_then(Loose::text),
         ownership: ownership.and_then(Loose::text),
         session_id: session_id.and_then(Loose::text),
+        group_mask: group_mask.and_then(Loose::unsigned64),
     }
 }
 
@@ -472,7 +490,7 @@ impl Fields {
                 None => WireEvent::Malformed("block_hashes"),
             },
             "AllBlocksCleared" => {
-                let [_, _, _, _, _, ownership, _] = self.tail;
+                let [_, _, _, _, _, ownership, _, _] = self.tail;
                 WireEvent::AllBlocksCleared {
                     ownership: ownership.and_then(Loose::text),
                 }
@@ -523,7 +541,9 @@ impl<'de> Deserialize<'de> for WireEvent {
             /// extra_keys, group_idx, kind, sliding_window, locality,
             /// ownership, session_id]`, a removal `[tag, block_hashes,
             /// medium, group_idx, locality, ownership]`, a clear `[tag]`;
-            /// trailing defaults are omitted. SGLang's legacy arrays put
+            /// trailing defaults are omitted. A publisher that reports a
+            /// boundary once for every group appends `group_mask` after the
+            /// layout's last slot of a store and of a removal. SGLang's legacy arrays put
             /// `cache_salt` where vLLM has `lora_name`; the two are not
             /// distinguishable there, and SGLang has published maps since it
             /// added the field.
@@ -553,13 +573,13 @@ impl<'de> Deserialize<'de> for WireEvent {
                         fields.lora_name = lora_name.map(Loose::Text);
                         fields.cache_salt = cache_salt.map(Loose::Text);
                         fields.extra_keys = Some(next());
-                        for slot in 1..=6 {
+                        for slot in 1..=7 {
                             fields.tail[slot] = Some(next());
                         }
                     }
                     "BlockRemoved" => {
                         fields.block_hashes = Some(next());
-                        for slot in [0, 1, 4, 5] {
+                        for slot in [0, 1, 4, 5, 7] {
                             fields.tail[slot] = Some(next());
                         }
                     }
@@ -587,7 +607,6 @@ pub enum DropReason {
     UnsupportedOwnership,
     NonLocalLocality,
     UnknownMedium,
-    NonMainAttentionGroup,
     UnalignedBlocks,
     SelfReferencingHashes,
     /// A store with nothing to index: an offload chunk placeholder (a chunk
@@ -604,7 +623,6 @@ impl DropReason {
             Self::UnsupportedOwnership => "unsupported_ownership",
             Self::NonLocalLocality => "non_local_locality",
             Self::UnknownMedium => "unknown_medium",
-            Self::NonMainAttentionGroup => "non_main_attention_group",
             Self::UnalignedBlocks => "unaligned_blocks",
             Self::SelfReferencingHashes => "self_referencing_hashes",
             Self::Placeholder => "placeholder",
@@ -639,6 +657,12 @@ pub struct Counts {
     /// Forwarded stores that named fewer blocks than their tokens spanned,
     /// the hashes aligned to the tail of the tokens.
     pub tail_aligned_stores: u64,
+    /// Forwarded stores and removals of a cache group other than main
+    /// attention on a rank that has a main group (a hybrid model's
+    /// sliding-window and state groups): hashes and group fields, no
+    /// tokens, see the group policy on [`Normalizer`].
+    pub group_stores: u64,
+    pub group_removals: u64,
     pub dropped: HashMap<DropReason, u64>,
 }
 
@@ -659,6 +683,8 @@ impl Counts {
         self.hash_unverifiable += other.hash_unverifiable;
         self.window_only_stores += other.window_only_stores;
         self.tail_aligned_stores += other.tail_aligned_stores;
+        self.group_stores += other.group_stores;
+        self.group_removals += other.group_removals;
         for (reason, count) in &other.dropped {
             *self.dropped.entry(*reason).or_insert(0) += count;
         }
@@ -703,7 +729,8 @@ struct RankState {
     /// KV cache groups seen on stores: whether each is a main-attention group.
     groups: HashMap<u32, bool>,
     /// Hashes forwarded from a sliding-window group while the rank had no
-    /// main-attention group, so their removals still go through once it has.
+    /// main-attention group: the record holds them as main-lane blocks, so
+    /// their removals reach it once the rank has a main group too.
     window_forwarded: HashSet<i64>,
 }
 
@@ -713,35 +740,56 @@ impl RankState {
     }
 }
 
-/// What the shared gates let through, and under which group policy.
+/// Which lane of the stream an admitted event belongs to: the group policy's
+/// answer for it (see [`Normalizer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lane {
+    /// The main-attention group, or an event with no group at all: whole
+    /// blocks with their tokens, what the prefix index is built from.
+    Main,
+    /// A sliding-window group's event on a rank without a main-attention
+    /// group, forwarded as the rank's only signal.
+    WindowOnly,
+    /// A cache group other than main attention on a rank that has a main
+    /// group: forwarded with its hashes and group fields, no tokens.
+    Group,
+}
+
+/// What the shared gates let through, and on which lane.
 struct Admitted {
     tier: KvCacheTier,
     locality: KvCacheLocality,
-    /// A sliding-window group's event on a rank without a main-attention
-    /// group, forwarded as the rank's only signal.
-    window_only: bool,
+    lane: Lane,
 }
 
 /// Per-stream normalization state (one engine endpoint, all its DP ranks).
 ///
 /// KV-cache groups: an event names its group (`group_idx`) and, on stores,
 /// the group's attention kind. A model with full attention alongside sliding
-/// windows (vLLM's hybrid KV-cache manager) publishes every block twice under
-/// the same hash, once per group: the full-attention group holds the whole
-/// prefix, which is what a prefix hit needs, while the window group names
-/// only the window's blocks against the whole computed span and removes them
-/// as the window moves on. So on a rank with a main-attention group every
-/// non-main event, store and removal alike, is dropped and counted
-/// ([`DropReason::NonMainAttentionGroup`]); forwarding the window group's
-/// removals would take the full group's copies out of the gateway's count.
-/// A rank that shows only sliding-window groups (a window-only model) would
-/// otherwise give the gateway nothing: its window stores are forwarded with
-/// their group identity, the hashes aligned to the tail of the tokens, and
-/// counted ([`Counts::window_only_stores`]). The groups are learned for the
-/// rank's life: an `AllBlocksCleared` empties the block records, not them,
-/// so the stores that share a batch with the clear (an engine that resets
-/// its prefix cache and stores the next prompt in one step) are judged
-/// like every other step's.
+/// windows or state-space layers (vLLM's hybrid KV-cache manager) publishes
+/// a block under the same hash once per group that keeps it: the
+/// full-attention group holds the whole prefix, which is what a prefix hit
+/// starts from, while a window group names only the window's blocks against
+/// the whole computed span and a state group the one block ending at a
+/// boundary, and each removes its own as it moves on. The engine's own hit
+/// is bounded by every group: the prefix it reuses ends where the window
+/// group's tail or the state group's boundary block is gone, however long
+/// the full-attention chain runs. So on a rank with a main-attention group
+/// the main group's events are forwarded whole and every other group's
+/// events, stores and removals alike, are forwarded on their own lane
+/// (`Lane::Group`): the hashes, the parent and the group fields, no
+/// tokens (a sparse group's token span is the step's whole range, not a
+/// token list per hash, and a consumer keys the group's blocks by their
+/// hash). The gateway keeps those memberships apart from its prefix index,
+/// so a window group's removal never takes a full-attention copy out of its
+/// count. A rank that shows only sliding-window groups (a window-only model)
+/// would otherwise give the gateway nothing: its window stores are forwarded
+/// with their group identity, the hashes aligned to the tail of the tokens,
+/// and counted ([`Counts::window_only_stores`]). The groups are learned for
+/// the rank's life: an `AllBlocksCleared` empties the block records, not
+/// them, so the stores that share a batch with the clear (an engine that
+/// resets its prefix cache and stores the next prompt in one step) are
+/// judged like every other step's.
 #[derive(Default)]
 pub struct Normalizer {
     ranks: HashMap<i32, RankState>,
@@ -754,7 +802,10 @@ pub struct Normalizer {
 /// relay in the process: `sglang` or `vllm-sha256-cbor`.
 pub const HASH_CHECK_ENV: &str = "SMG_KV_EVENT_HASH_CHECK";
 
-const MAIN_ATTENTION_KINDS: [&str; 3] = ["full_attention", "mla_attention", "sink_full_attention"];
+/// Cache-group kinds whose blocks hold the main attention KV: the lane the
+/// prefix index is built from. The gateway keeps the same list.
+pub(crate) const MAIN_ATTENTION_KINDS: [&str; 3] =
+    ["full_attention", "mla_attention", "sink_full_attention"];
 
 /// The tier an engine medium names: the device when the medium is absent,
 /// `None` for a medium this relay does not know.
@@ -956,16 +1007,14 @@ impl Normalizer {
         })
     }
 
-    /// The shared gates: ownership, locality, medium, cache group. `hashes`
-    /// are the event's, for the one non-main event a rank with a main group
-    /// still forwards: the removal of blocks it forwarded while window-only.
+    /// The shared gates: ownership, locality, medium, and the lane the
+    /// event's cache group puts it on.
     fn admit(
         &mut self,
         tail: &EventTail,
         rank: i32,
         event_id: u64,
         learn_group: bool,
-        hashes: &[BlockHash],
     ) -> Result<Admitted, DropReason> {
         if is_residency_agent(tail.ownership.as_deref()) {
             return Err(self.drop(DropReason::UnsupportedOwnership, event_id));
@@ -974,7 +1023,7 @@ impl Normalizer {
             .map_err(|()| self.drop(DropReason::NonLocalLocality, event_id))?;
         let tier = tier_of(tail.medium.as_deref())
             .ok_or_else(|| self.drop(DropReason::UnknownMedium, event_id))?;
-        let mut window_only = false;
+        let mut lane = Lane::Main;
         if let Some(group) = tail.group_idx {
             let state = self.ranks.entry(rank).or_default();
             let main = match tail.kv_cache_spec_kind.as_deref() {
@@ -991,21 +1040,112 @@ impl Normalizer {
                 None => state.groups.get(&group).copied().unwrap_or(true),
             };
             if !main {
-                let forwarded_before = !learn_group
-                    && hashes
-                        .iter()
-                        .any(|hash| state.window_forwarded.contains(&hash.0));
-                if state.main_seen() && !forwarded_before {
-                    return Err(self.drop(DropReason::NonMainAttentionGroup, event_id));
-                }
-                window_only = true;
+                lane = if state.main_seen() {
+                    Lane::Group
+                } else {
+                    Lane::WindowOnly
+                };
             }
         }
         Ok(Admitted {
             tier,
             locality,
-            window_only,
+            lane,
         })
+    }
+
+    /// The forwarded store once a lane has shaped its blocks: the event's
+    /// tail and the namespace the lane settled on go through as they are,
+    /// and the store counts as forwarded.
+    fn forward_stored(
+        &mut self,
+        blocks: Vec<common::KvBlock>,
+        parent: Option<BlockHash>,
+        tier: KvCacheTier,
+        locality: KvCacheLocality,
+        tail: EventTail,
+        namespace: Namespace,
+    ) -> kv_cache_event::Data {
+        self.counts.forwarded_stored += 1;
+        let EventTail {
+            medium,
+            group_idx,
+            kv_cache_spec_kind,
+            kv_cache_spec_sliding_window,
+            ownership,
+            session_id,
+            group_mask,
+            ..
+        } = tail;
+        kv_cache_event::Data::Stored(common::KvBlocksStored {
+            blocks,
+            parent_block_hash: parent.map(|hash| hash.0),
+            tier: Some(tier as i32),
+            medium,
+            group_idx,
+            kv_cache_spec_kind,
+            kv_cache_spec_sliding_window,
+            locality: Some(locality as i32),
+            ownership,
+            session_id,
+            lora_name: namespace.lora_name,
+            cache_salt: namespace.cache_salt,
+            group_mask,
+        })
+    }
+
+    /// A non-main group's store on a rank with a main group: its hashes,
+    /// parent and group fields go through, its tokens do not. The engine
+    /// writes such a store with the step's whole token span and only the
+    /// hashes the group retains, so the tokens are not a per-block list, and
+    /// the consumer keys the group's blocks by hash. The relay's own record
+    /// of the main lane (namespaces, copies, the hash check) is not touched.
+    fn forward_group_stored(
+        &mut self,
+        stored: WireStored,
+        tier: KvCacheTier,
+        locality: KvCacheLocality,
+        event_id: u64,
+    ) -> Result<kv_cache_event::Data, DropReason> {
+        if stored.block_hashes.is_empty() {
+            return Err(self.drop(DropReason::Placeholder, event_id));
+        }
+        {
+            let mut seen = HashSet::with_capacity(stored.block_hashes.len() + 1);
+            if let Some(parent) = stored.parent_block_hash {
+                seen.insert(parent.0);
+            }
+            if stored.block_hashes.iter().any(|hash| !seen.insert(hash.0)) {
+                return Err(self.drop(DropReason::SelfReferencingHashes, event_id));
+            }
+        }
+        let cache_level = cache_level_of(tier);
+        let block_size = i32::try_from(stored.block_size).unwrap_or(i32::MAX).max(0);
+        let blocks = stored
+            .block_hashes
+            .iter()
+            .map(|hash| common::KvBlock {
+                block_hash: hash.0,
+                token_ids: Vec::new(),
+                block_size,
+                lora_id: stored.lora_id,
+                cache_level,
+                extra_keys: Vec::new(),
+            })
+            .collect();
+        self.counts.group_stores += 1;
+        let namespace = Namespace {
+            lora_name: stored.lora_name.filter(|name| !name.is_empty()),
+            cache_salt: stored.cache_salt.filter(|salt| !salt.is_empty()),
+        };
+        Ok(self.forward_stored(
+            blocks,
+            stored.parent_block_hash,
+            tier,
+            locality,
+            stored.tail,
+            namespace,
+        ))
     }
 
     fn normalize_stored(
@@ -1017,8 +1157,12 @@ impl Normalizer {
         let Admitted {
             tier,
             locality,
-            window_only,
-        } = self.admit(&stored.tail, rank, event_id, true, &stored.block_hashes)?;
+            lane,
+        } = self.admit(&stored.tail, rank, event_id, true)?;
+        if lane == Lane::Group {
+            return self.forward_group_stored(stored, tier, locality, event_id);
+        }
+        let window_only = lane == Lane::WindowOnly;
         // A bigram page lists (token, next token) per position; its tokens
         // are the first elements and the page grid is unchanged. The pairs
         // stay around for the engine-hash check, which hashes both words.
@@ -1183,30 +1327,14 @@ impl Normalizer {
                     .unwrap_or_default(),
             })
             .collect();
-        self.counts.forwarded_stored += 1;
-        let EventTail {
-            medium,
-            group_idx,
-            kv_cache_spec_kind,
-            kv_cache_spec_sliding_window,
-            ownership,
-            session_id,
-            ..
-        } = stored.tail;
-        Ok(kv_cache_event::Data::Stored(common::KvBlocksStored {
+        Ok(self.forward_stored(
             blocks,
-            parent_block_hash: stored.parent_block_hash.map(|hash| hash.0),
-            tier: Some(tier as i32),
-            medium,
-            group_idx,
-            kv_cache_spec_kind,
-            kv_cache_spec_sliding_window,
-            locality: Some(locality as i32),
-            ownership,
-            session_id,
-            lora_name: namespace.lora_name,
-            cache_salt: namespace.cache_salt,
-        }))
+            stored.parent_block_hash,
+            tier,
+            locality,
+            stored.tail,
+            namespace,
+        ))
     }
 
     fn normalize_removed(
@@ -1218,23 +1346,31 @@ impl Normalizer {
         let Admitted {
             tier,
             locality,
-            window_only,
-        } = self.admit(&removed.tail, rank, event_id, false, &removed.block_hashes)?;
-        let mut block_hashes: Vec<i64> = removed.block_hashes.iter().map(|hash| hash.0).collect();
+            lane,
+        } = self.admit(&removed.tail, rank, event_id, false)?;
+        let block_hashes: Vec<i64> = removed.block_hashes.iter().map(|hash| hash.0).collect();
         if let Some(state) = self.ranks.get_mut(&rank) {
-            if window_only {
-                // Once the rank has a main group, a window group's removal
-                // reaches only the blocks forwarded while it had none.
-                if state.main_seen() {
-                    block_hashes.retain(|hash| state.window_forwarded.contains(hash));
+            // The relay's record follows the main lane. A window-only rank's
+            // removal names blocks forwarded as its main signal; once the rank
+            // has a main group, a group's removal touches the record only for
+            // the blocks forwarded while it had none.
+            let recorded: Vec<i64> = match lane {
+                Lane::Main => block_hashes.clone(),
+                Lane::WindowOnly => {
+                    for hash in &block_hashes {
+                        state.window_forwarded.remove(hash);
+                    }
+                    block_hashes.clone()
                 }
-                for hash in &block_hashes {
-                    state.window_forwarded.remove(hash);
-                }
-            }
+                Lane::Group => block_hashes
+                    .iter()
+                    .copied()
+                    .filter(|hash| state.window_forwarded.remove(hash))
+                    .collect(),
+            };
             if let Some(blocks_state) = state.tiers.get_mut(&(tier as i32)) {
                 // One physical copy goes; the record goes with the last.
-                for hash in &block_hashes {
+                for hash in &recorded {
                     if let Some(record) = blocks_state.get_mut(hash) {
                         record.copies = record.copies.saturating_sub(1);
                         if record.copies == 0 {
@@ -1244,11 +1380,15 @@ impl Normalizer {
                 }
             }
         }
+        if lane == Lane::Group {
+            self.counts.group_removals += 1;
+        }
         self.counts.forwarded_removed += 1;
         let EventTail {
             medium,
             group_idx,
             ownership,
+            group_mask,
             ..
         } = removed.tail;
         Ok(kv_cache_event::Data::Removed(common::KvBlocksRemoved {
@@ -1259,6 +1399,7 @@ impl Normalizer {
             group_idx,
             locality: Some(locality as i32),
             ownership,
+            group_mask,
         }))
     }
 }
@@ -1366,1057 +1507,4 @@ fn vllm_keys(keys: Option<&[ExtraKey]>, index: usize) -> Result<Option<Vec<VllmE
 }
 
 #[cfg(test)]
-mod shapes_tests;
-
-#[cfg(test)]
-mod tests {
-    use serde_json::{json, Value};
-
-    use super::*;
-
-    /// A publisher batch from JSON: objects become msgpack maps (the engines'
-    /// tagged-map events), arrays become arrays (the batch envelope and the
-    /// legacy event layout).
-    fn batch_from(value: Value) -> WireBatch {
-        let bytes = rmp_serde::to_vec_named(&value).expect("encodes");
-        rmp_serde::from_slice(&bytes).expect("decodes")
-    }
-
-    fn normalize_all(batches: Vec<Value>) -> (Vec<common::KvEventBatch>, Normalizer) {
-        let mut normalizer = Normalizer::new();
-        let mut event_id = 0;
-        let out = batches
-            .into_iter()
-            .enumerate()
-            .map(|(seq, value)| normalize(&mut normalizer, value, seq as u64, &mut event_id))
-            .collect();
-        (out, normalizer)
-    }
-
-    fn normalize(
-        normalizer: &mut Normalizer,
-        value: Value,
-        seq: u64,
-        event_id: &mut u64,
-    ) -> common::KvEventBatch {
-        normalizer.normalize_batch(batch_from(value), seq, event_id)
-    }
-
-    fn one(events: Vec<Value>) -> Value {
-        json!([1700000000.5, events, 0])
-    }
-
-    fn store(hashes: &[i64], parent: Option<i64>, tokens: &[u32]) -> Value {
-        json!({
-            "type": "BlockStored",
-            "block_hashes": hashes,
-            "parent_block_hash": parent,
-            "token_ids": tokens,
-            "block_size": 4,
-            "lora_id": null,
-            "medium": "GPU",
-            "lora_name": null,
-            "group_idx": 0,
-            "kv_cache_spec_kind": "full_attention",
-        })
-    }
-
-    fn remove(hashes: &[i64]) -> Value {
-        json!({"type": "BlockRemoved", "block_hashes": hashes, "medium": "GPU", "group_idx": 0})
-    }
-
-    fn with(mut value: Value, key: &str, item: Value) -> Value {
-        value[key] = item;
-        value
-    }
-
-    fn stored(event: &common::KvCacheEvent) -> &common::KvBlocksStored {
-        match event.data {
-            Some(kv_cache_event::Data::Stored(ref stored)) => stored,
-            ref other => panic!("not a store: {other:?}"),
-        }
-    }
-
-    fn removed(event: &common::KvCacheEvent) -> &common::KvBlocksRemoved {
-        match event.data {
-            Some(kv_cache_event::Data::Removed(ref removed)) => removed,
-            ref other => panic!("not a removal: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn hash_identity_folds_like_vllm() {
-        let mut digest = [0u8; 32];
-        digest[23] = 0xaa;
-        digest[24..].copy_from_slice(&0x8000_0000_0000_0001u64.to_be_bytes());
-        assert_eq!(low64_big_endian(&digest), 0x8000_0000_0000_0001);
-        assert_eq!(low64_big_endian(&[0, 0, 0, 0, 0, 0, 0, 7]), 7);
-
-        let (batches, _) = normalize_all(vec![one(vec![store(
-            &[i64::MIN + 1, -3],
-            None,
-            &[1, 2, 3, 4, 5, 6, 7, 8],
-        )])]);
-        let blocks = &stored(&batches[0].events[0]).blocks;
-        assert_eq!(
-            blocks[0].block_hash,
-            i64::MIN + 1,
-            "a u64 above i64::MAX keeps its bits"
-        );
-        assert_eq!(
-            blocks[1].block_hash, -3,
-            "SGLang's signed form passes through"
-        );
-    }
-
-    #[test]
-    fn unknown_and_malformed_events_cost_themselves_not_the_batch() {
-        let (batches, normalizer) = normalize_all(vec![one(vec![
-            json!({"type": "BlockMigrated", "block_hashes": [1], "destination": "peer"}),
-            json!({"type": "BlockStored", "block_hashes": "nope", "token_ids": [1], "block_size": 1}),
-            json!({"block_hashes": [1]}),
-            json!(["BlockStored", "nope"]),
-            remove(&[9]),
-        ])]);
-        assert_eq!(batches[0].events.len(), 1);
-        assert_eq!(removed(&batches[0].events[0]).block_hashes, vec![9]);
-        assert_eq!(
-            batches[0].events[0].event_id, 5,
-            "ids advance for dropped events too"
-        );
-        let counts = normalizer.counts();
-        assert_eq!(counts.dropped(DropReason::UnknownType), 1);
-        assert_eq!(counts.dropped(DropReason::Malformed), 3);
-        assert_eq!(counts.forwarded_removed, 1);
-    }
-
-    #[test]
-    fn residency_agent_events_are_dropped() {
-        let (batches, normalizer) = normalize_all(vec![one(vec![
-            with(store(&[1], None, &[1, 2, 3, 4]), "ownership", json!("kvcr")),
-            with(remove(&[1]), "ownership", json!("KVCR")),
-            json!({"type": "AllBlocksCleared", "ownership": "kvcr"}),
-            json!({"type": "AllBlocksCleared"}),
-        ])]);
-        assert_eq!(batches[0].events.len(), 1);
-        assert!(matches!(
-            batches[0].events[0].data,
-            Some(kv_cache_event::Data::Cleared(_))
-        ));
-        assert_eq!(
-            normalizer
-                .counts()
-                .dropped(DropReason::UnsupportedOwnership),
-            3
-        );
-        assert_eq!(normalizer.counts().forwarded_cleared, 1);
-    }
-
-    #[test]
-    fn remote_and_unknown_localities_are_dropped() {
-        let (batches, normalizer) = normalize_all(vec![one(vec![
-            with(
-                store(&[1], None, &[1, 2, 3, 4]),
-                "locality",
-                json!("REMOTE"),
-            ),
-            with(remove(&[1]), "locality", json!("elsewhere")),
-            with(store(&[2], None, &[1, 2, 3, 4]), "locality", json!("local")),
-        ])]);
-        assert_eq!(batches[0].events.len(), 1);
-        assert_eq!(
-            stored(&batches[0].events[0]).locality,
-            Some(KvCacheLocality::Local as i32)
-        );
-        assert_eq!(normalizer.counts().dropped(DropReason::NonLocalLocality), 2);
-    }
-
-    #[test]
-    fn media_map_to_tiers_and_cache_levels() {
-        let table = [
-            (None, KvCacheTier::Device, None),
-            (Some("GPU"), KvCacheTier::Device, None),
-            (Some("device"), KvCacheTier::Device, None),
-            (Some("CPU"), KvCacheTier::Host, Some(1)),
-            (Some("CPU_PINNED"), KvCacheTier::Host, Some(1)),
-            (Some("CPU_TIER1"), KvCacheTier::Host, Some(1)),
-            (Some("CPU_TIER2"), KvCacheTier::Disk, Some(2)),
-            (Some("DISK"), KvCacheTier::Disk, Some(2)),
-            (Some("NVME"), KvCacheTier::Disk, Some(2)),
-            (Some("STORAGE"), KvCacheTier::Disk, Some(2)),
-            (Some("EXTERNAL"), KvCacheTier::External, Some(3)),
-            (Some("NETWORK"), KvCacheTier::External, Some(3)),
-            (Some("REMOTE"), KvCacheTier::External, Some(3)),
-            (Some("SHARED"), KvCacheTier::External, Some(3)),
-        ];
-        for (medium, tier, level) in table {
-            assert_eq!(tier_of(medium), Some(tier), "{medium:?}");
-            assert_eq!(cache_level_of(tier), level, "{medium:?}");
-        }
-        assert_eq!(tier_of(Some("MARS")), None);
-
-        let (batches, normalizer) = normalize_all(vec![one(vec![
-            with(
-                store(&[1], None, &[1, 2, 3, 4]),
-                "medium",
-                json!("CPU_PINNED"),
-            ),
-            with(remove(&[1]), "medium", json!("STORAGE")),
-            with(store(&[2], None, &[1, 2, 3, 4]), "medium", json!("MARS")),
-            with(store(&[3], None, &[1, 2, 3, 4]), "medium", Value::Null),
-        ])]);
-        let events = &batches[0].events;
-        assert_eq!(events.len(), 3);
-        let host = stored(&events[0]);
-        assert_eq!(host.tier, Some(KvCacheTier::Host as i32));
-        assert_eq!(host.medium.as_deref(), Some("CPU_PINNED"));
-        assert_eq!(host.blocks[0].cache_level, Some(1));
-        let disk = removed(&events[1]);
-        assert_eq!(disk.tier, Some(KvCacheTier::Disk as i32));
-        assert_eq!(disk.cache_level, Some(2));
-        let device = stored(&events[2]);
-        assert_eq!(device.tier, Some(KvCacheTier::Device as i32));
-        assert_eq!(device.medium, None);
-        assert_eq!(device.blocks[0].cache_level, None);
-        assert_eq!(normalizer.counts().dropped(DropReason::UnknownMedium), 1);
-    }
-
-    #[test]
-    fn non_main_attention_groups_are_dropped_and_remembered() {
-        let sliding = |hash: i64| {
-            let event = with(store(&[hash], None, &[1, 2, 3, 4]), "group_idx", json!(1));
-            let event = with(event, "kv_cache_spec_kind", json!("sliding_window"));
-            with(event, "kv_cache_spec_sliding_window", json!(128))
-        };
-        let (batches, normalizer) = normalize_all(vec![
-            one(vec![
-                sliding(1),
-                store(&[2], None, &[1, 2, 3, 4]),
-                with(
-                    with(
-                        store(&[3], None, &[1, 2, 3, 4]),
-                        "kv_cache_spec_kind",
-                        json!("mla_attention"),
-                    ),
-                    "group_idx",
-                    json!(2),
-                ),
-                with(
-                    with(
-                        store(&[4], None, &[1, 2, 3, 4]),
-                        "kv_cache_spec_kind",
-                        json!("sink_full_attention"),
-                    ),
-                    "group_idx",
-                    json!(3),
-                ),
-                with(
-                    with(
-                        store(&[5], None, &[1, 2, 3, 4]),
-                        "kv_cache_spec_kind",
-                        json!("mamba"),
-                    ),
-                    "group_idx",
-                    json!(4),
-                ),
-            ]),
-            one(vec![
-                // Removals carry no kind: the learned groups decide.
-                with(remove(&[1]), "group_idx", json!(1)),
-                with(remove(&[2]), "group_idx", json!(0)),
-                // An unlearned group without a kind counts as main.
-                with(remove(&[7]), "group_idx", json!(9)),
-                // A kind-less store on a learned non-main group is dropped too.
-                with(
-                    with(store(&[8], None, &[1, 2, 3, 4]), "group_idx", json!(4)),
-                    "kv_cache_spec_kind",
-                    Value::Null,
-                ),
-            ]),
-        ]);
-        assert_eq!(batches[0].events.len(), 3);
-        assert_eq!(batches[1].events.len(), 2);
-        assert_eq!(removed(&batches[1].events[0]).block_hashes, vec![2]);
-        assert_eq!(removed(&batches[1].events[1]).block_hashes, vec![7]);
-        assert_eq!(
-            normalizer
-                .counts()
-                .dropped(DropReason::NonMainAttentionGroup),
-            4
-        );
-        assert_eq!(
-            stored(&batches[0].events[1]).kv_cache_spec_kind.as_deref(),
-            Some("mla_attention")
-        );
-    }
-
-    /// An engine that resets its prefix cache and stores the next prompt in
-    /// one step publishes the clear and the stores in one batch, the window
-    /// groups' stores ahead of the main group's. The clear empties the block
-    /// records but not the groups, so the window stores are dropped as on
-    /// every other step and the main group's store is forwarded whole; the
-    /// records cleared, the prompt's blocks are new, not duplicates.
-    #[test]
-    fn a_clear_in_the_batch_keeps_the_learned_groups() {
-        let window = |hashes: &[i64], tokens: &[u32]| {
-            let event = with(store(hashes, None, tokens), "group_idx", json!(1));
-            let event = with(event, "kv_cache_spec_kind", json!("sliding_window"));
-            with(event, "kv_cache_spec_sliding_window", json!(8))
-        };
-        let prompt: Vec<u32> = (1..=12).collect();
-        let (batches, normalizer) = normalize_all(vec![
-            // The groups are learned on the first step.
-            one(vec![
-                window(&[1], &[1, 2, 3, 4]),
-                store(&[1], None, &[1, 2, 3, 4]),
-            ]),
-            // The reset and the next prompt in one step: the window group
-            // names the prompt's last two blocks, the main group all three.
-            one(vec![
-                json!({"type": "AllBlocksCleared"}),
-                window(&[2, 3], &prompt),
-                store(&[1, 2, 3], None, &prompt),
-            ]),
-            // The step after is judged the same way.
-            one(vec![
-                window(&[4], &[13, 14, 15, 16]),
-                store(&[4], Some(3), &[13, 14, 15, 16]),
-            ]),
-        ]);
-        assert_eq!(batches[0].events.len(), 1);
-        assert_eq!(batches[1].events.len(), 2, "{:?}", batches[1].events);
-        assert!(matches!(
-            batches[1].events[0].data,
-            Some(kv_cache_event::Data::Cleared(_))
-        ));
-        let prompt_store = stored(&batches[1].events[1]);
-        assert_eq!(
-            prompt_store
-                .blocks
-                .iter()
-                .map(|block| block.block_hash)
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
-        assert_eq!(prompt_store.group_idx, Some(0));
-        assert_eq!(batches[2].events.len(), 1);
-        let counts = normalizer.counts();
-        assert_eq!(counts.dropped(DropReason::NonMainAttentionGroup), 3);
-        assert_eq!(counts.window_only_stores, 0);
-        assert_eq!(counts.forwarded_stored, 3);
-        assert_eq!(
-            counts.duplicate_stores, 0,
-            "block 1 was stored again after the clear: a new block, not a resend"
-        );
-    }
-
-    /// The relay's record of the reset step, as a snapshot hands it to a
-    /// subscriber that joins afterwards: the whole prompt as one run under
-    /// the main group, nothing under the window group. (Recorded under the
-    /// window group, the blocks the window named would be left out of the
-    /// main group's run and skipped by the gateway as non-main: a fresh
-    /// subscriber would score the prompt's first blocks only.)
-    #[test]
-    fn a_snapshot_after_a_reset_step_holds_the_prompt_under_the_main_group() {
-        use crate::kv_state::{LiveState, SnapshotChunks};
-
-        let window = |hashes: &[i64], tokens: &[u32]| {
-            let event = with(store(hashes, None, tokens), "group_idx", json!(1));
-            let event = with(event, "kv_cache_spec_kind", json!("sliding_window"));
-            with(event, "kv_cache_spec_sliding_window", json!(8))
-        };
-        let prompt: Vec<u32> = (1..=24).collect();
-        let (batches, _) = normalize_all(vec![
-            one(vec![
-                window(&[9], &[1, 2, 3, 4]),
-                store(&[9], None, &[1, 2, 3, 4]),
-            ]),
-            one(vec![
-                json!({"type": "AllBlocksCleared"}),
-                window(&[5, 6], &prompt),
-                store(&[1, 2, 3, 4, 5, 6], None, &prompt),
-            ]),
-        ]);
-        let mut state = LiveState::new();
-        for batch in &batches {
-            state.apply(batch);
-        }
-        let chunks: Vec<common::KvEventBatch> =
-            SnapshotChunks::at(state.snapshot(), 1, 2.0, 0).collect();
-        assert_eq!(chunks.len(), 1);
-        let chunk = &chunks[0];
-        assert_eq!(chunk.snapshot.as_ref().map(|marker| marker.blocks), Some(6));
-        assert!(matches!(
-            chunk.events[0].data,
-            Some(kv_cache_event::Data::Cleared(_))
-        ));
-        assert_eq!(chunk.events.len(), 2, "{:?}", chunk.events);
-        let run = stored(&chunk.events[1]);
-        assert_eq!(run.parent_block_hash, None);
-        assert_eq!(run.group_idx, Some(0));
-        assert_eq!(run.kv_cache_spec_kind.as_deref(), Some("full_attention"));
-        assert_eq!(
-            run.blocks
-                .iter()
-                .map(|block| block.block_hash)
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5, 6]
-        );
-    }
-
-    #[test]
-    fn placeholders_unaligned_and_self_referencing_stores_are_dropped() {
-        let (batches, normalizer) = normalize_all(vec![one(vec![
-            // vLLM's CPU offload placeholder: a chunk key, no tokens, block_size 0.
-            with(
-                with(store(&[1], None, &[]), "block_size", json!(0)),
-                "medium",
-                json!("CPU"),
-            ),
-            store(&[], None, &[1, 2, 3, 4]),
-            store(&[2], None, &[1, 2, 3, 4, 5, 6]),
-            with(store(&[3], None, &[1, 2, 3, 4]), "block_size", json!(0)),
-            store(&[4], Some(4), &[1, 2, 3, 4]),
-            store(&[5, 5], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
-            store(&[6], None, &[1, 2, 3, 4]),
-        ])]);
-        assert_eq!(batches[0].events.len(), 1);
-        assert_eq!(stored(&batches[0].events[0]).blocks[0].block_hash, 6);
-        let counts = normalizer.counts();
-        assert_eq!(counts.dropped(DropReason::Placeholder), 2);
-        assert_eq!(counts.dropped(DropReason::UnalignedBlocks), 2);
-        assert_eq!(counts.dropped(DropReason::SelfReferencingHashes), 2);
-    }
-
-    #[test]
-    fn bigram_pages_fold_to_their_tokens() {
-        let (batches, normalizer) = normalize_all(vec![one(vec![with(
-            store(&[1], None, &[]),
-            "token_ids",
-            json!([[1, 2], [2, 3], [3, 4], [4, 5]]),
-        )])]);
-        let block = &stored(&batches[0].events[0]).blocks[0];
-        assert_eq!(block.token_ids, vec![1, 2, 3, 4]);
-        assert_eq!(block.block_size, 4);
-        assert_eq!(normalizer.counts().bigram_stores, 1);
-        assert_eq!(normalizer.counts().forwarded_stored, 1);
-    }
-
-    #[test]
-    fn stores_and_removals_are_forwarded_one_for_one() {
-        let (batches, normalizer) = normalize_all(vec![
-            one(vec![
-                store(&[1, 2], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
-                store(&[1, 2], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
-                store(&[2, 3], Some(1), &[5, 6, 7, 8, 9, 10, 11, 12]),
-            ]),
-            one(vec![
-                remove(&[1]),
-                remove(&[1]),
-                remove(&[1, 2]),
-                store(&[1], None, &[1, 2, 3, 4]),
-            ]),
-        ]);
-        assert_eq!(batches[0].events.len(), 3);
-        assert_eq!(batches[1].events.len(), 4);
-        for event in &batches[1].events[..2] {
-            assert_eq!(removed(event).block_hashes, vec![1]);
-        }
-        assert_eq!(removed(&batches[1].events[2]).block_hashes, vec![1, 2]);
-        let counts = normalizer.counts();
-        assert_eq!(counts.forwarded_stored, 4);
-        assert_eq!(counts.forwarded_removed, 3);
-        assert_eq!(
-            counts.duplicate_stores, 1,
-            "only the exact resend; a re-store after removal is new"
-        );
-        assert!(counts.dropped.is_empty());
-    }
-
-    #[test]
-    fn namespaces_come_from_the_event_its_extra_keys_or_its_parent() {
-        // (A prompt-embeddings digest is msgpack bin, which JSON cannot
-        // express; the generated fixtures cover it.)
-        let lora = |value: Value| with(value, "lora_name", json!("adapter"));
-        let (batches, _) = normalize_all(vec![
-            one(vec![
-                // vLLM: the salt rides in block 0's extra keys, after the LoRA
-                // name and the multimodal (identifier, offset) pairs.
-                with(
-                    lora(store(&[1], None, &[1, 2, 3, 4])),
-                    "extra_keys",
-                    json!([["adapter", ["mm-abc", 0], "salt-1"]]),
-                ),
-                with(
-                    lora(store(&[2], Some(1), &[5, 6, 7, 8])),
-                    "extra_keys",
-                    json!([["adapter"]]),
-                ),
-                store(&[3], Some(2), &[9, 10, 11, 12]),
-                // SGLang: the salt is a field; empty strings count as absent.
-                with(
-                    store(&[4], None, &[1, 2, 3, 4]),
-                    "cache_salt",
-                    json!("tenant-a"),
-                ),
-                with(
-                    with(store(&[5], None, &[1, 2, 3, 4]), "cache_salt", json!("")),
-                    "lora_name",
-                    json!(""),
-                ),
-            ]),
-            // Another rank does not inherit from this one.
-            json!([1700000001.0, [store(&[6], Some(3), &[13, 14, 15, 16])], 1]),
-        ]);
-        let events = &batches[0].events;
-        let first = stored(&events[0]);
-        assert_eq!(first.lora_name.as_deref(), Some("adapter"));
-        assert_eq!(first.cache_salt.as_deref(), Some("salt-1"));
-        let keys: Vec<_> = first.blocks[0]
-            .extra_keys
-            .iter()
-            .map(|key| key.key.clone().expect("a key"))
-            .collect();
-        assert_eq!(
-            keys,
-            vec![
-                kv_block_extra_key::Key::Text("adapter".into()),
-                kv_block_extra_key::Key::Multimodal(common::KvMultimodalKey {
-                    identifier: "mm-abc".into(),
-                    offset: 0,
-                }),
-                kv_block_extra_key::Key::Text("salt-1".into()),
-            ]
-        );
-        let child = stored(&events[1]);
-        assert_eq!(child.lora_name.as_deref(), Some("adapter"));
-        assert_eq!(
-            child.cache_salt.as_deref(),
-            Some("salt-1"),
-            "inherited from block 0"
-        );
-        let grandchild = stored(&events[2]);
-        assert_eq!(grandchild.lora_name.as_deref(), Some("adapter"));
-        assert_eq!(grandchild.cache_salt.as_deref(), Some("salt-1"));
-        assert_eq!(stored(&events[3]).cache_salt.as_deref(), Some("tenant-a"));
-        assert_eq!(stored(&events[3]).lora_name, None);
-        assert_eq!(stored(&events[4]).cache_salt, None);
-        assert_eq!(stored(&events[4]).lora_name, None);
-        let other_rank = stored(&batches[1].events[0]);
-        assert_eq!(other_rank.lora_name, None);
-        assert_eq!(other_rank.cache_salt, None);
-    }
-
-    #[test]
-    fn a_clear_resets_its_rank_only() {
-        let (batches, normalizer) = normalize_all(vec![
-            one(vec![store(&[1], None, &[1, 2, 3, 4])]),
-            json!([1700000001.0, [store(&[1], None, &[1, 2, 3, 4])], 1]),
-            one(vec![
-                json!({"type": "AllBlocksCleared"}),
-                store(&[1], None, &[1, 2, 3, 4]),
-            ]),
-            json!([1700000003.0, [store(&[1], None, &[1, 2, 3, 4])], 1]),
-        ]);
-        assert!(matches!(
-            batches[2].events[0].data,
-            Some(kv_cache_event::Data::Cleared(_))
-        ));
-        assert_eq!(batches[2].events.len(), 2);
-        assert_eq!(normalizer.counts().forwarded_cleared, 1);
-        assert_eq!(
-            normalizer.counts().duplicate_stores,
-            1,
-            "rank 1 kept its seen set"
-        );
-        assert_eq!(batches[3].dp_rank, Some(1));
-    }
-
-    #[test]
-    fn array_and_map_layouts_decode_alike() {
-        let map = one(vec![
-            with(
-                with(
-                    store(&[1, 2], Some(7), &[1, 2, 3, 4, 5, 6, 7, 8]),
-                    "session_id",
-                    json!("req-1"),
-                ),
-                "lora_name",
-                json!("adapter"),
-            ),
-            with(remove(&[1]), "locality", json!("LOCAL")),
-            json!({"type": "AllBlocksCleared"}),
-        ]);
-        let array = json!([
-            1700000000.5,
-            [
-                [
-                    "BlockStored",
-                    [1, 2],
-                    7,
-                    [1, 2, 3, 4, 5, 6, 7, 8],
-                    4,
-                    null,
-                    "GPU",
-                    "adapter",
-                    null,
-                    0,
-                    "full_attention",
-                    null,
-                    null,
-                    null,
-                    "req-1"
-                ],
-                ["BlockRemoved", [1], "GPU", 0, "LOCAL"],
-                ["AllBlocksCleared"],
-            ],
-            0
-        ]);
-        let (from_map, _) = normalize_all(vec![map]);
-        let (from_array, _) = normalize_all(vec![array]);
-        assert_eq!(from_map, from_array);
-        let first = stored(&from_map[0].events[0]);
-        assert_eq!(first.session_id.as_deref(), Some("req-1"));
-        assert_eq!(first.lora_name.as_deref(), Some("adapter"));
-        assert_eq!(first.parent_block_hash, Some(7));
-        assert_eq!(first.group_idx, Some(0));
-        assert_eq!(
-            removed(&from_map[0].events[1]).locality,
-            Some(KvCacheLocality::Local as i32)
-        );
-    }
-
-    #[test]
-    fn legacy_arrays_keep_their_trailing_slots_in_order() {
-        // ownership is the removal's sixth slot and must gate the event even
-        // when locality (the fifth) is set.
-        let (batches, normalizer) = normalize_all(vec![json!([
-            1700000000.5,
-            [
-                ["BlockRemoved", [1], "STORAGE", 0, "LOCAL", "kvcr"],
-                ["BlockRemoved", [2], "STORAGE", 0, "REMOTE"],
-                ["BlockRemoved", [3], "GPU"],
-            ],
-            0
-        ])]);
-        assert_eq!(batches[0].events.len(), 1);
-        assert_eq!(removed(&batches[0].events[0]).block_hashes, vec![3]);
-        assert_eq!(
-            normalizer
-                .counts()
-                .dropped(DropReason::UnsupportedOwnership),
-            1
-        );
-        assert_eq!(normalizer.counts().dropped(DropReason::NonLocalLocality), 1);
-    }
-
-    #[test]
-    fn hash_check_verifies_sglang_chains_and_counts_mismatches() {
-        use crate::engine_hash::{sglang_chain, sglang_salt_seed};
-
-        let chain = sglang_chain(&[1, 2, 3, 4, 5, 6, 7, 8], 4, None);
-        let (first, second) = (chain[0].1, chain[1].1);
-        assert_eq!(first, -3488128144981237669);
-        let mut normalizer = Normalizer::with_hash_check(EngineHash::Sglang);
-        let mut event_id = 0;
-        let batch = normalize(
-            &mut normalizer,
-            one(vec![
-                store(&[first], None, &[1, 2, 3, 4]),
-                store(&[second], Some(first), &[5, 6, 7, 8]),
-                // Tampered: still forwarded, counted.
-                store(&[second + 1], Some(first), &[5, 6, 7, 8]),
-                // A parent this stream never saw: nothing to chain on.
-                store(&[99], Some(12345), &[9, 10, 11, 12]),
-            ]),
-            1,
-            &mut event_id,
-        );
-        assert_eq!(batch.events.len(), 4, "a mismatch never drops");
-        let counts = normalizer.counts();
-        assert_eq!(
-            (
-                counts.hash_checked,
-                counts.hash_mismatch,
-                counts.hash_unverifiable
-            ),
-            (3, 1, 1)
-        );
-
-        // A salted request seeds its chain; a coalesced two-page store
-        // chains page to page.
-        let seed = sglang_salt_seed("tenant-a");
-        let salted = sglang_chain(&[1, 2, 3, 4, 5, 6, 7, 8], 4, Some(&seed));
-        let mut normalizer = Normalizer::with_hash_check(EngineHash::Sglang);
-        normalize(
-            &mut normalizer,
-            one(vec![with(
-                store(&[salted[0].1, salted[1].1], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
-                "cache_salt",
-                json!("tenant-a"),
-            )]),
-            1,
-            &mut 0,
-        );
-        let counts = normalizer.counts();
-        assert_eq!((counts.hash_checked, counts.hash_mismatch), (2, 0));
-
-        // An Eagle bigram page hashes both words of every pair.
-        let mut normalizer = Normalizer::with_hash_check(EngineHash::Sglang);
-        normalize(
-            &mut normalizer,
-            one(vec![with(
-                store(&[-638950109823820341], None, &[]),
-                "token_ids",
-                json!([[1, 2], [2, 3], [3, 4], [4, 5]]),
-            )]),
-            1,
-            &mut 0,
-        );
-        let counts = normalizer.counts();
-        assert_eq!((counts.hash_checked, counts.hash_mismatch), (1, 0));
-    }
-
-    #[test]
-    fn hash_check_verifies_vllm_sha256_cbor_chains() {
-        use crate::engine_hash::{vllm_block, vllm_event_int};
-
-        // Vectors A and B from the reference run.
-        let (a, b) = (-8885242862429187823i64, -3153830497298837583i64);
-        let mut normalizer = Normalizer::with_hash_check(EngineHash::VllmSha256Cbor);
-        let batch = normalize(
-            &mut normalizer,
-            one(vec![
-                store(&[a, b], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
-                // A LoRA block: the adapter path is not in the event.
-                with(
-                    store(&[7], Some(b), &[9, 10, 11, 12]),
-                    "lora_name",
-                    json!("adapter"),
-                ),
-                // Unaligned: dropped before the check runs.
-                store(&[8], Some(b), &[9, 10, 11, 12, 13]),
-            ]),
-            1,
-            &mut 0,
-        );
-        assert_eq!(batch.events.len(), 2);
-        let counts = normalizer.counts();
-        assert_eq!(
-            (
-                counts.hash_checked,
-                counts.hash_mismatch,
-                counts.hash_unverifiable
-            ),
-            (2, 0, 1)
-        );
-
-        // Multimodal, salt and prompt-embeddings keys rebuild the tagged hash
-        // input (vectors E, F, G); the events carry the bytes JSON cannot.
-        let embeds: Vec<u8> = (0..32).collect();
-        let e = vllm_block(
-            None,
-            &[1, 2, 3, 4],
-            Some(&[
-                VllmExtraKey::Mm {
-                    identifier: "mm-abc".into(),
-                    offset: 0,
-                },
-                VllmExtraKey::CacheSalt("salt-1".into()),
-                VllmExtraKey::PromptEmbeds(embeds.clone()),
-            ]),
-        );
-        let f = vllm_block(
-            Some(&e),
-            &[5, 6, 7, 8],
-            Some(&[VllmExtraKey::Mm {
-                identifier: "mm-abc".into(),
-                offset: -4,
-            }]),
-        );
-        let g = vllm_block(Some(&f), &[9, 10, 11, 12], None);
-        let stored = |hashes: Vec<i64>, parent: Option<i64>, tokens: Vec<u32>, keys| {
-            WireEvent::BlockStored(WireStored {
-                block_hashes: hashes.into_iter().map(BlockHash).collect(),
-                parent_block_hash: parent.map(BlockHash),
-                token_ids: WireTokens::Ids(tokens),
-                block_size: 4,
-                lora_id: None,
-                lora_name: None,
-                cache_salt: None,
-                extra_keys: keys,
-                tail: EventTail {
-                    medium: Some("GPU".into()),
-                    group_idx: Some(0),
-                    kv_cache_spec_kind: Some("full_attention".into()),
-                    ..EventTail::default()
-                },
-            })
-        };
-        let mut normalizer = Normalizer::with_hash_check(EngineHash::VllmSha256Cbor);
-        let events = [
-            stored(
-                vec![vllm_event_int(&e)],
-                None,
-                vec![1, 2, 3, 4],
-                Some(vec![Some(vec![
-                    ExtraKey::Multimodal {
-                        identifier: "mm-abc".into(),
-                        offset: 0,
-                    },
-                    ExtraKey::Text("salt-1".into()),
-                    ExtraKey::Blob(embeds),
-                ])]),
-            ),
-            stored(
-                vec![vllm_event_int(&f)],
-                Some(vllm_event_int(&e)),
-                vec![5, 6, 7, 8],
-                Some(vec![Some(vec![ExtraKey::Multimodal {
-                    identifier: "mm-abc".into(),
-                    offset: -4,
-                }])]),
-            ),
-            stored(
-                vec![vllm_event_int(&g)],
-                Some(vllm_event_int(&f)),
-                vec![9, 10, 11, 12],
-                None,
-            ),
-            // A key shape the hash input cannot be rebuilt from.
-            stored(
-                vec![5],
-                Some(vllm_event_int(&g)),
-                vec![13, 14, 15, 16],
-                Some(vec![Some(vec![ExtraKey::Number(3)])]),
-            ),
-        ];
-        for (index, event) in events.into_iter().enumerate() {
-            assert!(normalizer
-                .normalize(event, Some(0), index as u64 + 1)
-                .is_ok());
-        }
-        let counts = normalizer.counts();
-        assert_eq!(
-            (
-                counts.hash_checked,
-                counts.hash_mismatch,
-                counts.hash_unverifiable
-            ),
-            (3, 0, 1)
-        );
-        assert_eq!(stored_salt(&normalizer), Some("salt-1".to_string()));
-    }
-
-    fn stored_salt(normalizer: &Normalizer) -> Option<String> {
-        normalizer
-            .ranks
-            .get(&0)
-            .and_then(|rank| rank.tiers.get(&(KvCacheTier::Device as i32)))
-            .and_then(|tier| tier.values().find_map(|record| record.namespace.clone()))
-            .and_then(|namespace| namespace.cache_salt)
-    }
-
-    #[test]
-    fn hash_check_is_off_unless_asked() {
-        assert_eq!(Normalizer::new().hash_check(), None);
-        assert_eq!(
-            Normalizer::with_hash_check(EngineHash::Sglang).hash_check(),
-            Some(EngineHash::Sglang)
-        );
-        // Without the check, a wrong hash is nobody's business here.
-        let (_, normalizer) = normalize_all(vec![one(vec![store(&[1], None, &[1, 2, 3, 4])])]);
-        assert_eq!(normalizer.counts().hash_checked, 0);
-    }
-
-    /// A sliding-window group's store: the window's blocks against the whole
-    /// span the step computed.
-    fn window(hashes: &[i64], parent: Option<i64>, tokens: &[u32]) -> Value {
-        let event = with(store(hashes, parent, tokens), "group_idx", json!(1));
-        let event = with(event, "kv_cache_spec_kind", json!("sliding_window"));
-        with(event, "kv_cache_spec_sliding_window", json!(128))
-    }
-
-    fn remove_in(hashes: &[i64], group: u32) -> Value {
-        with(remove(hashes), "group_idx", json!(group))
-    }
-
-    #[test]
-    fn two_groups_with_identical_hashes_index_the_full_attention_group_once() {
-        // vLLM's hybrid manager publishes every block in both groups under
-        // the same hash, the window group's store first in the step and its
-        // removals as the window moves on; only the full-attention group's
-        // events are forwarded, stores and removals alike, so the gateway
-        // counts one copy per physical block.
-        let (batches, normalizer) = normalize_all(vec![
-            one(vec![
-                window(&[2], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
-                store(&[1, 2], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
-            ]),
-            one(vec![
-                remove_in(&[2], 1),
-                store(&[1, 2], None, &[1, 2, 3, 4, 5, 6, 7, 8]), // the second copy
-                remove_in(&[1], 0),
-                remove_in(&[1], 0),
-            ]),
-        ]);
-        assert_eq!(batches[0].events.len(), 1);
-        let full = stored(&batches[0].events[0]);
-        assert_eq!(
-            full.blocks.iter().map(|b| b.block_hash).collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        assert_eq!(full.group_idx, Some(0));
-        assert_eq!(batches[1].events.len(), 3);
-        assert_eq!(removed(&batches[1].events[1]).block_hashes, vec![1]);
-        assert_eq!(removed(&batches[1].events[2]).block_hashes, vec![1]);
-        let counts = normalizer.counts();
-        assert_eq!(counts.dropped(DropReason::NonMainAttentionGroup), 2);
-        assert_eq!((counts.forwarded_stored, counts.forwarded_removed), (2, 2));
-        assert_eq!(
-            (
-                counts.duplicate_stores,
-                counts.window_only_stores,
-                counts.tail_aligned_stores
-            ),
-            (1, 0, 0)
-        );
-    }
-
-    #[test]
-    fn a_window_groups_hashes_take_the_tail_of_its_tokens() {
-        // A rank with only a sliding-window group: a store spans the whole
-        // range the step computed and names the window's last blocks, so the
-        // hashes get the tail of the tokens, and the group rides along.
-        let span: Vec<u32> = (1..=12).collect();
-        let (batches, normalizer) = normalize_all(vec![one(vec![
-            window(&[5], None, &span),
-            window(&[6, 7], Some(5), &span),
-            // A span that is not whole blocks is unreadable.
-            window(&[8], Some(7), &(1..=13).collect::<Vec<u32>>()),
-            // The window moved on without caching anything new.
-            window(&[], Some(7), &(1..=16).collect::<Vec<u32>>()),
-        ])]);
-        assert_eq!(batches[0].events.len(), 2);
-        let first = stored(&batches[0].events[0]);
-        assert_eq!(first.blocks[0].token_ids, vec![9, 10, 11, 12]);
-        assert_eq!(first.group_idx, Some(1));
-        assert_eq!(first.kv_cache_spec_kind.as_deref(), Some("sliding_window"));
-        assert_eq!(first.kv_cache_spec_sliding_window, Some(128));
-        let second = stored(&batches[0].events[1]);
-        assert_eq!(
-            second
-                .blocks
-                .iter()
-                .map(|b| b.token_ids.clone())
-                .collect::<Vec<_>>(),
-            vec![vec![5, 6, 7, 8], vec![9, 10, 11, 12]]
-        );
-        assert_eq!(second.parent_block_hash, Some(5));
-        let counts = normalizer.counts();
-        assert_eq!(
-            (counts.window_only_stores, counts.tail_aligned_stores),
-            (2, 2)
-        );
-        assert_eq!(counts.dropped(DropReason::UnalignedBlocks), 1);
-        assert_eq!(counts.dropped(DropReason::Placeholder), 1);
-    }
-
-    #[test]
-    fn a_window_only_rank_is_forwarded_until_a_main_group_appears() {
-        let (batches, normalizer) = normalize_all(vec![
-            one(vec![
-                window(&[1], None, &[1, 2, 3, 4]),
-                remove_in(&[1], 1),
-                window(&[2], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
-            ]),
-            one(vec![
-                store(&[3], None, &[1, 2, 3, 4]), // a main-attention group shows up
-                window(&[4], Some(3), &[1, 2, 3, 4, 5, 6, 7, 8]),
-                remove_in(&[2], 1), // forwarded while window-only: still removable
-                remove_in(&[9], 1), // never forwarded: dropped
-                remove_in(&[2, 9], 1), // nothing left of it
-            ]),
-        ]);
-        assert_eq!(batches[0].events.len(), 3);
-        assert_eq!(batches[1].events.len(), 2);
-        assert_eq!(removed(&batches[1].events[1]).block_hashes, vec![2]);
-        let counts = normalizer.counts();
-        assert_eq!(
-            (counts.window_only_stores, counts.tail_aligned_stores),
-            (2, 1)
-        );
-        assert_eq!(counts.dropped(DropReason::NonMainAttentionGroup), 3);
-    }
-
-    #[test]
-    fn one_copy_removals_pass_through_uncollapsed() {
-        // vLLM keeps up to two physical blocks per hash and publishes a
-        // removal when one copy goes; the gateway counts copies, so both
-        // stores and both removals must reach it as they are.
-        let (batches, normalizer) = normalize_all(vec![one(vec![
-            store(&[1], None, &[1, 2, 3, 4]),
-            store(&[1], None, &[1, 2, 3, 4]),
-            remove(&[1]),
-            remove(&[1]),
-        ])]);
-        assert_eq!(batches[0].events.len(), 4);
-        let counts = normalizer.counts();
-        assert_eq!(
-            (
-                counts.forwarded_stored,
-                counts.forwarded_removed,
-                counts.duplicate_stores
-            ),
-            (2, 2, 1)
-        );
-    }
-
-    /// The engine keeps up to two physical copies of a block and removes
-    /// them one at a time; the check's parent memory counts the copies the
-    /// way the gateway does, so a child stored after the first copy went
-    /// still chains on its parent's digest, and only after the last copy is
-    /// the parent gone and the child unverifiable. Both removals are
-    /// forwarded either way.
-    #[test]
-    fn the_hash_checks_parent_memory_counts_physical_copies() {
-        let root = engine_hash::sglang_chain(&[1, 2, 3, 4], 4, None)[0].1;
-        let child_b = engine_hash::sglang_chain(&[1, 2, 3, 4, 5, 6, 7, 8], 4, None)[1].1;
-        let child_c = engine_hash::sglang_chain(&[1, 2, 3, 4, 13, 14, 15, 16], 4, None)[1].1;
-        let mut normalizer = Normalizer::with_hash_check(EngineHash::Sglang);
-        let mut event_id = 0;
-        normalize(
-            &mut normalizer,
-            one(vec![
-                store(&[root], None, &[1, 2, 3, 4]),
-                store(&[root], None, &[1, 2, 3, 4]), // the second physical copy
-                remove(&[root]),                     // one copy goes
-                store(&[child_b], Some(root), &[5, 6, 7, 8]),
-            ]),
-            1,
-            &mut event_id,
-        );
-        let counts = normalizer.counts();
-        assert_eq!(
-            (
-                counts.hash_checked,
-                counts.hash_mismatch,
-                counts.hash_unverifiable,
-                counts.duplicate_stores
-            ),
-            (3, 0, 0, 1)
-        );
-        normalize(
-            &mut normalizer,
-            one(vec![
-                remove(&[root]), // the last copy
-                store(&[child_c], Some(root), &[13, 14, 15, 16]),
-            ]),
-            2,
-            &mut event_id,
-        );
-        let counts = normalizer.counts();
-        assert_eq!((counts.hash_checked, counts.hash_unverifiable), (3, 1));
-        assert_eq!((counts.forwarded_stored, counts.forwarded_removed), (4, 2));
-    }
-}
+mod tests;

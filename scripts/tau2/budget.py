@@ -1,7 +1,7 @@
 """Shared pre-request reservations; amounts are integer billionths of a USD.
 
 Callers must verify complete token bounds and provider limits before reserving.
-This module is not yet connected to tau2's LLM request path.
+The guarded CLI reserves at the actual paid HTTP transport boundary.
 """
 
 import json
@@ -9,6 +9,7 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
 
 class BudgetError(ValueError):
@@ -63,12 +64,45 @@ class Policy:
             amount += (tokens * numerator * 1000 + denominator - 1) // denominator
         return amount
 
+    def model_policy(self, model):
+        if model != self.model:
+            raise BudgetError("Unknown paid model")
+        return self
+
+
+@dataclass(frozen=True)
+class RunPolicy:
+    models: dict[str, Policy]
+    cap_nusd: int
+    calls: int
+    calls_per_arm: int
+    scope_id: str
+    contexts_sha256: str
+
+    def __post_init__(self):
+        for name in ("cap_nusd", "calls", "calls_per_arm"):
+            _integer(getattr(self, name))
+        if not self.scope_id or not self.contexts_sha256 or not self.models:
+            raise BudgetError("Explicit scope, context evidence and model policies required")
+        if any(key != policy.model for key, policy in self.models.items()):
+            raise BudgetError("Model policy identity mismatch")
+
+    def model_policy(self, model):
+        if model not in self.models:
+            raise BudgetError("Unknown paid model")
+        return self.models[model]
+
 
 class Ledger:
-    def __init__(self, path, policy):
-        self.path, self.policy = path, policy
+    def __init__(self, path, policy, *, create=True):
+        self.path, self.policy, self.create = Path(path).resolve(), policy, create
+        if not create and not self.path.is_file():
+            raise BudgetError("Existing shared ledger required; never recreate it at acceptance")
         self.config = json.dumps(asdict(policy), sort_keys=True)
         with self._transaction() as db:
+            if not create:
+                self._halted(db)
+                return
             db.execute(
                 "CREATE TABLE IF NOT EXISTS policy "
                 "(id INTEGER PRIMARY KEY CHECK(id=1), config TEXT, halted INTEGER)"
@@ -76,18 +110,28 @@ class Ledger:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS requests "
                 "(id TEXT PRIMARY KEY, arm TEXT, amount INTEGER, "
-                "input_cap INTEGER, output_cap INTEGER, state TEXT)"
+                "input_cap INTEGER, output_cap INTEGER, state TEXT, "
+                "metadata TEXT NOT NULL, model TEXT NOT NULL, "
+                "used_input INTEGER, used_output INTEGER)"
             )
             db.execute("INSERT OR IGNORE INTO policy VALUES (1, ?, 0)", (self.config,))
             self._halted(db)
 
     @contextmanager
     def _transaction(self):
-        db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+        db = sqlite3.connect(
+            self.path if self.create else self.path.as_uri() + "?mode=rw",
+            uri=not self.create,
+            timeout=5,
+            isolation_level=None,
+        )
         try:
             db.execute("BEGIN IMMEDIATE")
             yield db
             db.commit()
+        except sqlite3.Error as error:
+            db.rollback()
+            raise BudgetError("Shared ledger unavailable or incompatible") from error
         except BaseException:
             db.rollback()
             raise
@@ -110,21 +154,22 @@ class Ledger:
         *,
         num_retries=None,
         output_limit_verified=False,
+        metadata=None,
     ):
         if (
             not isinstance(request_id, str)
             or not 1 <= len(request_id) <= 128
             or arm not in {"vllm", "smg"}
-            or model != self.policy.model
         ):
             raise BudgetError("Unknown request, arm or model")
         if type(num_retries) is not int or num_retries != 0 or output_limit_verified is not True:
             raise BudgetError("Retries or an unverified output limit are forbidden")
+        price = self.policy.model_policy(model)
         _integer(input_tokens)
         _integer(output_tokens)
-        if input_tokens > self.policy.input_limit or output_tokens > self.policy.output_limit:
+        if input_tokens > price.input_limit or output_tokens > price.output_limit:
             raise BudgetError("Token bounds exceed the policy")
-        amount = self.policy.cost(input_tokens, output_tokens)
+        amount = price.cost(input_tokens, output_tokens)
         with self._transaction() as db:
             if self._halted(db):
                 raise BudgetError("The shared budget is halted")
@@ -141,12 +186,20 @@ class Ledger:
             ):
                 raise BudgetError("Shared budget exhausted")
             db.execute(
-                "INSERT INTO requests VALUES (?, ?, ?, ?, ?, 'pending')",
-                (request_id, arm, amount, input_tokens, output_tokens),
+                "INSERT INTO requests VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL)",
+                (
+                    request_id,
+                    arm,
+                    amount,
+                    input_tokens,
+                    output_tokens,
+                    json.dumps(metadata or {}, sort_keys=True),
+                    model,
+                ),
             )
         return amount
 
-    def finish(self, request_id, input_tokens=None, output_tokens=None):
+    def finish(self, request_id, input_tokens=None, output_tokens=None, *, outcome=None):
         problem = None
         with self._transaction() as db:
             self._halted(db)
@@ -155,13 +208,29 @@ class Ledger:
             ).fetchone()
             if row is None or row[2] != "pending":
                 raise BudgetError("No pending reservation")
+            if outcome:
+                saved = json.loads(
+                    db.execute(
+                        "SELECT metadata FROM requests WHERE id=?", (request_id,)
+                    ).fetchone()[0]
+                )
+                saved.update(outcome)
+                db.execute(
+                    "UPDATE requests SET metadata=? WHERE id=?",
+                    (json.dumps(saved, sort_keys=True), request_id),
+                )
             valid = all(
                 type(n) is int and 0 <= n <= cap
                 for n, cap in zip((input_tokens, output_tokens), row[:2])
             )
             db.execute(
-                "UPDATE requests SET state=? WHERE id=?",
-                ("complete" if valid else "unknown", request_id),
+                "UPDATE requests SET state=?, used_input=?, used_output=? WHERE id=?",
+                (
+                    "complete" if valid else "unknown",
+                    input_tokens if valid else None,
+                    output_tokens if valid else None,
+                    request_id,
+                ),
             )
             if not valid:
                 db.execute("UPDATE policy SET halted=1 WHERE id=1")
@@ -177,3 +246,36 @@ class Ledger:
                 "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM requests"
             ).fetchone()
         return {"calls": calls, "allocated_nusd": amount, "halted": halted}
+
+    def halt(self):
+        with self._transaction() as db:
+            self._halted(db)
+            db.execute("UPDATE policy SET halted=1 WHERE id=1")
+
+    def audit(self, invocation_id=None):
+        with self._transaction() as db:
+            halted = bool(self._halted(db))
+            rows = db.execute(
+                "SELECT id, arm, amount, state, metadata, model, used_input, used_output FROM requests"
+            ).fetchall()
+        records = [
+            dict(
+                request_id=row[0],
+                arm=row[1],
+                allocated_nusd=row[2],
+                state=row[3],
+                metadata=json.loads(row[4]),
+                model=row[5],
+                input_tokens=row[6],
+                output_tokens=row[7],
+            )
+            for row in rows
+        ]
+        if invocation_id is not None:
+            records = [r for r in records if r["metadata"].get("invocation_id") == invocation_id]
+        return {
+            "halted": halted,
+            "pending": sum(r["state"] == "pending" for r in records),
+            "unknown": sum(r["state"] == "unknown" for r in records),
+            "requests": records,
+        }

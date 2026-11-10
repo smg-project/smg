@@ -31,7 +31,9 @@ processing (``media_refs``, through the same ``--mm-processor`` backends as
 the Python servicer, see :mod:`smg_grpc_servicer.vllm.rust_media`, or through
 smg's own pipeline with ``--mm-processor smg``, see :func:`smg_media_options`),
 ``Embed``, ``FlushCache``, ``GetTokenizer`` and ``SubscribeKvEvents``. The
-Python implementation stays the default.
+Rust implementation is the default; the Python one is selected with
+``--servicer-impl python`` / ``SMG_VLLM_SERVICER_IMPL=python`` and is
+deprecated (the launcher logs its deprecation when it is chosen).
 """
 
 from __future__ import annotations
@@ -60,6 +62,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
     IMPLS,
+    SOURCE_DEFAULT,
     EngineProcess,
     EngineProcessGroup,
     RustLauncher,
@@ -170,7 +173,45 @@ def model_info_from_config(
         # lists): the servicer withholds a PD decode side's KV-transfer rejection
         # notice there, whatever connector the projection above reports.
         "runs_mooncake": runs_mooncake(vllm_config),
+        # Encoder-cache disaggregation, off `ec_transfer_config` as the Python
+        # servicer reads it; the Rust servicer refuses a leg that names a
+        # connector when none runs.
+        **ec_transfer_facts(vllm_config),
         "log_stats": log_stats,
+    }
+
+
+def ec_transfer_facts(vllm_config: Any) -> dict[str, Any]:
+    """The encoder-cache disaggregation identity the Rust servicer advertises,
+    read off ``ec_transfer_config`` as the Python servicer reads it: whether a
+    connector runs at all, which, this engine's role, and for a Mooncake
+    consumer one ZMQ address per data-parallel rank (``ec_port + rank *
+    tensor_parallel_size`` on ``ec_ip``). The Rust servicer manages every rank
+    it starts, so no rank's slot is left empty."""
+    ec_config = getattr(vllm_config, "ec_transfer_config", None)
+    if ec_config is None:
+        return {
+            "supports_ec_transfer": False,
+            "ec_connector": "",
+            "ec_role": "",
+            "ec_zmq_addrs": [],
+        }
+    connector = str(getattr(ec_config, "ec_connector", None) or "")
+    addrs: list[str] = []
+    if connector == "ECMooncakeConnector" and bool(getattr(ec_config, "is_ec_consumer", False)):
+        parallel = vllm_config.parallel_config
+        tensor_parallel = int(getattr(parallel, "tensor_parallel_size", 1) or 1)
+        ranks = int(getattr(parallel, "data_parallel_size", 1) or 1)
+        host = str(getattr(ec_config, "ec_ip", None) or "127.0.0.1")
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        port = int(getattr(ec_config, "ec_port", 0) or 0)
+        addrs = [f"tcp://{host}:{port + rank * tensor_parallel}" for rank in range(ranks)]
+    return {
+        "supports_ec_transfer": True,
+        "ec_connector": connector,
+        "ec_role": str(getattr(ec_config, "ec_role", None) or ""),
+        "ec_zmq_addrs": addrs,
     }
 
 
@@ -235,15 +276,18 @@ def smg_media_options(
     tokens as on the engine's own server for the families whose processor
     takes the loader's frames (unless ``SMG_VLLM_MM_MAX_VIDEO_FRAMES`` caps the
     budget below the engine's count, when the pipeline samples fewer frames
-    than the engine's server would, as the cap intends); a sampling rule of
-    the loader the pipeline cannot follow goes along by name
-    (``video_loader_rule``), and the pipeline refuses it for those families
-    only. The engine's encoder budget goes along as well (``encoder_budget``
-    when the caller derived it, else derived here): the pipeline refuses an
-    item above it before the engine, which would admit the item and never
-    schedule it.
+    than the engine's server would, as the cap intends); the sampling rules
+    of the engine's loader go along by name (``video_loader_rule``, which
+    says which rule reaches which family), and the pipeline refuses the
+    entries that reach the family (every rule the default loader reads for a
+    family on that loader, the flag rules for a family whose loader the engine
+    registers for its processor class, none for a sampler that never followed
+    a loader) and passes the rest. The engine's encoder budget goes along as
+    well (``encoder_budget`` when the caller derived it, else derived here):
+    the pipeline refuses an item above it before the engine, which would admit
+    the item and never schedule it.
     """
-    from smg_grpc_servicer.vllm.mm_processor import SOURCE_DEFAULT
+    from smg_grpc_servicer.vllm.mm_processor import SOURCE_DEFAULT as MEDIA_SOURCE_DEFAULT
 
     model_config = vllm_config.model_config
     if not getattr(model_config, "is_multimodal_model", False):
@@ -285,7 +329,9 @@ def smg_media_options(
         # reads SMG_MM_TURBOJPEG as the router does; a value from the flag or
         # from SMG_VLLM_MM_TURBOJPEG travels as resolved.
         "turbojpeg": (
-            settings.turbojpeg if settings.sources.get("turbojpeg") != SOURCE_DEFAULT else None
+            settings.turbojpeg
+            if settings.sources.get("turbojpeg") != MEDIA_SOURCE_DEFAULT
+            else None
         ),
         "source": settings.source,
     }
@@ -336,41 +382,63 @@ def video_frame_budget(model_config, environ: Mapping[str, str] | None = None) -
     return max(int(num_frames), 0)
 
 
+# The sampling keys of the ``--media-io-kwargs`` video dict that an engine
+# loader reads: vLLM forwards every key that is not a codec option to the
+# loader's frame picker; the default loader reads ``fps`` alone (``num_frames``
+# is the frame budget ``video_frame_budget`` reports and the pipeline follows),
+# the loaders the engine registers for a processor class read ``fps``,
+# ``max_frames``, ``min_frames`` and ``temporal_patch_size``. Reported as
+# given, values included: which of them reach a family, and what a value means
+# to its loader (a non-positive ``fps`` is no rate to the default loader and
+# ``min_frames`` per clip to the others), is the pipeline's call per family.
+VIDEO_SAMPLING_KEYS = ("fps", "max_frames", "min_frames", "temporal_patch_size")
+
+
 def video_loader_rule(model_config, environ: Mapping[str, str] | None = None) -> str | None:
-    """A sampling rule of the engine's video loader that the smg pipeline
-    cannot follow, named the way the launcher was given it, or ``None``: a
-    loader other than the default ``opencv`` (``video.video_backend`` in
-    ``--media-io-kwargs``, else ``VLLM_VIDEO_LOADER_BACKEND``, in vLLM's own
-    order of precedence), or a ``video.fps``
-    above zero, which thins the frames by the clip's duration (vLLM's default
-    ``-1`` and ``0`` do not). The pipeline refuses the rule at launch for a
-    family that samples the way the loader does (Gemma 4); the families with a
-    rate-based sampler of their own never followed the loader and start as
-    before, so a fleet-wide loader setting does not block them."""
+    """The sampling rules of the engine's video loader that the smg pipeline
+    cannot follow, each named the way the launcher was given it, or ``None``:
+    an explicit ``video.video_backend`` in ``--media-io-kwargs``, whatever its
+    value (vLLM's media connector adds the loader it registers for a processor
+    class only when the kwargs name none, so an explicit kwarg wins over that
+    loader and over the environment, ``opencv`` included), else a
+    ``VLLM_VIDEO_LOADER_BACKEND`` other than the default ``opencv``, and every
+    sampling key of the video kwargs that an engine loader reads
+    (``VIDEO_SAMPLING_KEYS``), whatever its value; several rules are joined by
+    ``"; "``, each spelled the way it was given (the flag rules with the
+    flag's name, the environment rule with the variable's). The pipeline
+    refuses them at launch per family: for a family that samples the way the
+    engine's default loader does (Gemma 4), the rules that loader reads (a
+    kwarg naming ``opencv`` is its own loader, a non-positive ``fps`` is no
+    rate to it, and it never reads the three keys of the per-class loaders, so
+    those pass); for a family whose loader the engine registers for its
+    processor class (the Qwen2-VL line, Qwen3-Omni, the GLM-5 family and the
+    Qwen3-VL family: the environment variable never reaches that loader, an
+    explicit ``opencv`` swaps it), the flag rules alone; and none for the
+    families with a sampler of their own, which never followed the loader and
+    start as before, so a fleet-wide loader setting does not block them."""
     source = os.environ if environ is None else environ
     mm_config = multimodal_config(model_config)
     kwargs = getattr(mm_config, "media_io_kwargs", None) or {}
     video = kwargs.get("video") if isinstance(kwargs, Mapping) else None
     video = video if isinstance(video, Mapping) else {}
     rules: list[str] = []
-    # vLLM takes the kwarg over the environment (`kwargs.pop("video_backend")
-    # or envs.VLLM_VIDEO_LOADER_BACKEND`), so only the loader it ends up with
-    # counts: a kwarg naming opencv silences a fleet-wide environment setting.
+    # vLLM takes the kwarg over the loader it registers for a processor class
+    # (the connector fills `video_backend` only when the kwargs carry none) and
+    # over the environment (`kwargs.pop("video_backend") or
+    # envs.VLLM_VIDEO_LOADER_BACKEND`), so an explicit kwarg is reported
+    # whatever its value: whether `opencv` is a family's own loader or a swap
+    # is the pipeline's call per family. The environment setting counts only
+    # without a kwarg, and only when it names another loader than the default.
     backend = video.get("video_backend")
     loader = (source.get("VLLM_VIDEO_LOADER_BACKEND") or "").strip()
     if backend is not None:
-        if str(backend).strip().lower() != "opencv":
-            rules.append(f"--media-io-kwargs video.video_backend={backend}")
+        rules.append(f"--media-io-kwargs video.video_backend={backend}")
     elif loader and loader.lower() != "opencv":
         rules.append(f"VLLM_VIDEO_LOADER_BACKEND={loader}")
-    fps = video.get("fps")
-    if fps is not None:
-        try:
-            thins = float(fps) > 0
-        except (TypeError, ValueError):
-            thins = True
-        if thins:
-            rules.append(f"--media-io-kwargs video.fps={fps}")
+    for key in VIDEO_SAMPLING_KEYS:
+        value = video.get(key)
+        if value is not None:
+            rules.append(f"--media-io-kwargs video.{key}={value}")
     return "; ".join(rules) or None
 
 
@@ -654,30 +722,49 @@ def resolve_servicer_impl(
     args: argparse.Namespace | None = None, environ: Mapping[str, str] | None = None
 ) -> str:
     """Which implementation serves this process: ``args.servicer_impl`` when the
-    launcher exposes the flag, else ``$SMG_VLLM_SERVICER_IMPL``, else python
-    (the shared :func:`~smg_grpc_servicer.rust_lifecycle.servicer_switch`). A
+    launcher exposes the flag, else ``$SMG_VLLM_SERVICER_IMPL``, else rust
+    (:data:`~smg_grpc_servicer.rust_lifecycle.DEFAULT_IMPL`, through the shared
+    :func:`~smg_grpc_servicer.rust_lifecycle.servicer_switch`). A
     decision made with the flag in hand is written back to the environment,
     so :func:`require_python_impl` (which has no flag) agrees with it when
     ``--servicer-impl python`` overrides an exported ``rust``."""
     return servicer_switch(SERVICER_IMPL_ENV, args, environ)[0]
 
 
+def servicer_impl_source(
+    args: Any = None, environ: Mapping[str, str] | None = None
+) -> tuple[str, str]:
+    """:func:`resolve_servicer_impl`'s answer with where it came from:
+    ``flag``, ``env`` or ``default`` (the shared
+    :func:`~smg_grpc_servicer.rust_lifecycle.servicer_switch`, which writes a
+    flag decision back to the environment the engine processes inherit)."""
+    return servicer_switch(SERVICER_IMPL_ENV, args, environ)
+
+
 def require_python_impl(environ: Mapping[str, str] | None = None) -> None:
-    """Refuse to start the Python servicer when the flag asks for Rust. A
-    launcher that gets this far ran without the switch; a silent fallback
-    would report Rust coverage that never ran."""
-    impl = resolve_servicer_impl(environ=environ)
-    if impl != "python":
-        raise RuntimeError(
-            f"{SERVICER_IMPL_ENV}={impl}, but this process is starting the Python "
-            "servicer: the switch this package installs over vLLM's gRPC launcher "
-            "never ran (a launcher run as a file path or with this package's plugin "
-            "left out of VLLM_PLUGINS, or one that did not import "
-            "smg_grpc_servicer.vllm.servicer before defining serve_grpc). Start "
-            "through `vllm serve <model> --grpc` or `python -m` on the launcher "
-            f"module (vLLM {SUPPORTED_VLLM_RELEASES}), or unset the flag; a silent "
-            "Python fallback would report Rust coverage that never ran."
-        )
+    """Refuse to start the Python servicer unless it was chosen explicitly. A
+    launcher that gets this far with the flag asking for Rust, or with nothing
+    chosen (the Rust servicer is the default), ran without the switch; a
+    silent Python servicer would report Rust coverage that never ran."""
+    impl, origin = servicer_impl_source(environ=environ)
+    if impl == "python":
+        return
+    asked = (
+        f"{SERVICER_IMPL_ENV}={impl}, but"
+        if origin != SOURCE_DEFAULT
+        else f"nothing chose a servicer ({SERVICER_IMPL_ENV} unset: the Rust servicer is the default), and"
+    )
+    raise RuntimeError(
+        f"{asked} this process is starting the Python "
+        "servicer: the switch this package installs over vLLM's gRPC launcher "
+        "never ran (a launcher run as a file path or with this package's plugin "
+        "left out of VLLM_PLUGINS, or one that did not import "
+        "smg_grpc_servicer.vllm.servicer before defining serve_grpc). Start "
+        "through `vllm serve <model> --grpc` or `python -m` on the launcher "
+        f"module (vLLM {SUPPORTED_VLLM_RELEASES}), or choose the deprecated Python "
+        f"servicer explicitly (--servicer-impl python / {SERVICER_IMPL_ENV}=python); "
+        "a silent Python servicer would report Rust coverage that never ran."
+    )
 
 
 def require_python_media_mode(
@@ -800,18 +887,28 @@ def _imports_servicer_at_module_level(source: str) -> bool:
     return False
 
 
-def require_upstream_hook() -> None:
-    """Fail a Rust lane whose vLLM would ignore the flag."""
-    if not upstream_hook_installed():
-        raise RuntimeError(
-            f"{SERVICER_IMPL_ENV}=rust needs a vLLM whose gRPC launcher consults this "
-            "package's flag: one that imports smg_grpc_servicer.vllm.servicer at module "
-            "level from a module path the switch binds (vllm/entrypoints/launchers/"
-            "grpc_server.py, or vllm/entrypoints/grpc_server.py on vLLM 0.28 and 0.29, "
-            "where the switch installs itself) or carries the check in its own "
-            "serve_grpc. This installation's launcher does neither, so its workers would "
-            "run the Python servicer; see grpc_servicer/README.md or select python."
-        )
+def require_upstream_hook(explicit: bool = True) -> None:
+    """Fail a Rust lane whose vLLM would ignore the choice. The refusal names
+    the choice as it was made: the variable when a flag or variable asked for
+    the Rust servicer (``explicit``), the default when nothing chose (the
+    operator set no variable to be told about), and the way out in both."""
+    if upstream_hook_installed():
+        return
+    chosen = (
+        f"{SERVICER_IMPL_ENV}=rust"
+        if explicit
+        else f"the Rust servicer (the default; --servicer-impl rust / {SERVICER_IMPL_ENV}=rust)"
+    )
+    raise RuntimeError(
+        f"{chosen} needs a vLLM whose gRPC launcher consults this "
+        "package's flag: one that imports smg_grpc_servicer.vllm.servicer at module "
+        "level from a module path the switch binds (vllm/entrypoints/launchers/"
+        "grpc_server.py, or vllm/entrypoints/grpc_server.py on vLLM 0.28 and 0.29, "
+        "where the switch installs itself) or carries the check in its own "
+        "serve_grpc. This installation's launcher does neither, so its workers would "
+        "run the Python servicer; see grpc_servicer/README.md or select the deprecated "
+        f"Python servicer with --servicer-impl python / {SERVICER_IMPL_ENV}=python."
+    )
 
 
 def configure_logging() -> None:

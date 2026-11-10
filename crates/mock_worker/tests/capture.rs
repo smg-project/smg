@@ -21,7 +21,7 @@ use tokio::net::TcpListener;
 use ts::generate_response::Response as GenResp;
 
 mod common;
-use common::{generate, start};
+use common::{free_port, generate, start};
 
 /// A canned worker that captures to `capture` when it is set.
 fn config(capture: Option<PathBuf>) -> Config {
@@ -372,10 +372,7 @@ async fn unopenable_capture_file_fails_at_startup() {
     let dir = tempfile::tempdir().expect("temp dir");
     // The parent directory does not exist, so the file cannot be created.
     let path = dir.path().join("missing").join("generate.jsonl");
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .expect("a free port")
-        .port();
+    let port = free_port();
     let port_arg = port.to_string();
 
     let mut mock_worker = tokio::process::Command::new(env!("CARGO_BIN_EXE_mock-worker"));

@@ -2,6 +2,11 @@
 // (vllm-project/vllm): protocol/logprobs.rs + protocol/logprobs/wire.rs.
 // The numpy-array decoders live in `crate::codec::tensor`.
 
+//! Log probabilities on the engine's wire: the per-token and per-position records a request's
+//! output carries, decoded from the engine's packed arrays.
+
+use std::borrow::Cow;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
@@ -105,6 +110,34 @@ pub(crate) struct WireLogprobs {
     pub(crate) cu_num_generated_tokens: Option<Vec<usize>>,
 }
 
+/// The names a logprobs payload's decode errors carry: the payload's own and
+/// its three arrays', spelled once per payload, so a decode that succeeds
+/// formats nothing.
+#[derive(Debug)]
+pub(crate) struct LogprobsFields {
+    pub(crate) payload: &'static str,
+    pub(crate) token_ids: &'static str,
+    pub(crate) logprobs: &'static str,
+    pub(crate) token_ranks: &'static str,
+}
+
+impl LogprobsFields {
+    /// The sampled tokens' payload of an output.
+    pub(crate) const NEW_LOGPROBS: Self = Self {
+        payload: "new_logprobs",
+        token_ids: "new_logprobs.logprob_token_ids",
+        logprobs: "new_logprobs.logprobs",
+        token_ranks: "new_logprobs.token_ranks",
+    };
+    /// The prompt's payload of an output.
+    pub(crate) const NEW_PROMPT_LOGPROBS_TENSORS: Self = Self {
+        payload: "new_prompt_logprobs_tensors",
+        token_ids: "new_prompt_logprobs_tensors.logprob_token_ids",
+        logprobs: "new_prompt_logprobs_tensors.logprobs",
+        token_ranks: "new_prompt_logprobs_tensors.token_ranks",
+    };
+}
+
 impl WireLogprobs {
     /// Convert semantic per-position logprobs into the Python wire tuple shape.
     /// Exists mainly so tests can inject semantic logprobs without hand-building
@@ -141,17 +174,17 @@ impl WireLogprobs {
 
         Ok(Self {
             logprob_token_ids: WireNdArray {
-                dtype: "<i8".to_string(),
+                dtype: Cow::Borrowed("<i8"),
                 shape: vec![rows, cols],
                 data: WireArrayData::RawView(token_ids.into()),
             },
             logprobs: WireNdArray {
-                dtype: "<f4".to_string(),
+                dtype: Cow::Borrowed("<f4"),
                 shape: vec![rows, cols],
                 data: WireArrayData::RawView(logprobs.into()),
             },
             token_ranks: WireNdArray {
-                dtype: "<i8".to_string(),
+                dtype: Cow::Borrowed("<i8"),
                 shape: vec![rows],
                 data: WireArrayData::RawView(token_ranks.into()),
             },
@@ -160,8 +193,10 @@ impl WireLogprobs {
     }
 
     /// Resolve wire-format logprobs into semantic [`Logprobs`] by decoding the
-    /// three arrays (via aux frames as needed) and grouping each row.
-    pub(crate) fn resolve(self, frames: &[Bytes], field_prefix: &str) -> Result<Logprobs> {
+    /// three arrays (via aux frames as needed) and grouping each row; `fields`
+    /// names the payload and its arrays in the errors.
+    pub(crate) fn resolve(self, frames: &[Bytes], fields: &LogprobsFields) -> Result<Logprobs> {
+        let field_prefix = fields.payload;
         if let Some(indices) = self.cu_num_generated_tokens {
             return Err(Error::ExtValueDecode {
                 message: format!(
@@ -171,18 +206,9 @@ impl WireLogprobs {
             });
         }
 
-        let token_ids = decode_array2_u32(
-            self.logprob_token_ids,
-            &format!("{field_prefix}.logprob_token_ids"),
-            frames,
-        )?;
-        let logprobs =
-            decode_array2_f32(self.logprobs, &format!("{field_prefix}.logprobs"), frames)?;
-        let token_ranks = decode_array1_u32(
-            self.token_ranks,
-            &format!("{field_prefix}.token_ranks"),
-            frames,
-        )?;
+        let token_ids = decode_array2_u32(self.logprob_token_ids, fields.token_ids, frames)?;
+        let logprobs = decode_array2_f32(self.logprobs, fields.logprobs, frames)?;
+        let token_ranks = decode_array1_u32(self.token_ranks, fields.token_ranks, frames)?;
 
         if token_ids.rows != logprobs.rows || token_ids.cols != logprobs.cols {
             return Err(Error::ExtValueDecode {
@@ -239,6 +265,13 @@ impl WireLogprobs {
 mod tests {
     use super::*;
 
+    const LP: LogprobsFields = LogprobsFields {
+        payload: "lp",
+        token_ids: "lp.logprob_token_ids",
+        logprobs: "lp.logprobs",
+        token_ranks: "lp.token_ranks",
+    };
+
     fn direct(positions: Vec<Vec<(u32, f32, u32)>>) -> Logprobs {
         Logprobs {
             positions: positions
@@ -267,7 +300,7 @@ mod tests {
         ]);
         let wire = WireLogprobs::from_direct(&original).unwrap();
         // Inline raw views, so no aux frames are needed to resolve.
-        let resolved = wire.resolve(&[Bytes::new()], "lp").unwrap();
+        let resolved = wire.resolve(&[Bytes::new()], &LP).unwrap();
         assert_eq!(resolved, original);
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved.positions[0].entries[0].rank, 5);
@@ -278,13 +311,13 @@ mod tests {
     fn resolve_rejects_nonnull_cu_num_generated_tokens() {
         let mut wire = WireLogprobs::from_direct(&direct(vec![vec![(1, -0.5, 1)]])).unwrap();
         wire.cu_num_generated_tokens = Some(vec![1]);
-        assert!(wire.resolve(&[Bytes::new()], "lp").is_err());
+        assert!(wire.resolve(&[Bytes::new()], &LP).is_err());
     }
 
     #[test]
     fn resolve_rejects_zero_sampled_rank() {
         let wire = WireLogprobs::from_direct(&direct(vec![vec![(1, -0.5, 0)]])).unwrap();
-        assert!(wire.resolve(&[Bytes::new()], "lp").is_err());
+        assert!(wire.resolve(&[Bytes::new()], &LP).is_err());
     }
 
     #[test]
@@ -294,7 +327,7 @@ mod tests {
         )
         .unwrap();
         let wire: WireLogprobs = rmp_serde::from_slice(&bytes).unwrap();
-        let resolved = wire.resolve(&[Bytes::new()], "lp").unwrap();
+        let resolved = wire.resolve(&[Bytes::new()], &LP).unwrap();
         assert_eq!(resolved.positions[0].entries[0].token_id, 7);
     }
 }

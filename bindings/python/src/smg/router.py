@@ -144,12 +144,14 @@ def policy_from_str(policy_str: str | None) -> PolicyType:
     return policy_map[policy_str]
 
 
-def backend_from_str(backend_str: str | None) -> BackendType:
-    """Convert backend string to BackendType enum."""
+def backend_from_str(backend_str: str | None) -> BackendType | None:
+    """The ``--backend`` name as the binding's enum. ``None`` stays ``None``: no
+    backend is pinned and the gateway's detection step decides the wire, as it
+    does for the Rust CLI without ``--backend``."""
     if isinstance(backend_str, BackendType):
         return backend_str
     if backend_str is None:
-        return BackendType.Sglang
+        return None
     backend_map = {
         "sglang": BackendType.Sglang,
         "openai": BackendType.Openai,
@@ -158,6 +160,10 @@ def backend_from_str(backend_str: str | None) -> BackendType:
         # the startup workers' wire protocol (vLLM EngineCore vs TokenSpeed).
         "vllm": BackendType.Vllm,
         "tokenspeed": BackendType.Tokenspeed,
+        # As on the Rust CLI: trtllm labels the start-up record and pins no
+        # wire; gemini selects the Gemini provider route.
+        "trtllm": BackendType.Trtllm,
+        "gemini": BackendType.Gemini,
     }
     backend_lower = backend_str.lower()
     if backend_lower not in backend_map:
@@ -269,9 +275,10 @@ class Router:
               one with the lower expected wait (least-load scoring over the pair)
             - PolicyType.LeastLoad: Route to the worker with the lowest load score
               (in-flight requests plus KV-cache pressure)
+            Default: PolicyType.CacheAware
         host: Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::,
             ::1), or 0.0.0.0 for all interfaces. Default: '0.0.0.0'
-        port: Port number to bind the router server. Default: 3001
+        port: Port number to bind the router server. Default: 30000
         worker_startup_timeout_secs: Timeout in seconds for worker startup and
             registration. Large models can take significant time to load into GPU
             memory. Default: 1800 (30 minutes)
@@ -288,7 +295,7 @@ class Router:
             Default: 200
         cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to
             cached worker if the match rate exceeds threshold, otherwise routes to the
-            worker with the smallest tree. Default: 0.5
+            worker with the smallest tree. Default: 0.3
         cache_boundaries: Token positions at which serving engines retain reusable
             prefix state; cache-affinity policies hash request heads at the deepest
             applicable boundary. Default: []
@@ -336,7 +343,7 @@ class Router:
             estimate later picks read. Misses, spills and decode picks keep the
             whole prompt. Default: False
         eviction_interval_secs: Interval in seconds between cache eviction operations
-            in cache-aware routing. Default: 60
+            in cache-aware routing. Default: 120
         overlap_decay: Cache-aware anti-hotspot decay: each candidate's overlap score
             is divided by 1 + overlap_decay * x, where x is the worker's
             waiting-prefill backlog (blocks above the candidate minimum) per request
@@ -344,7 +351,7 @@ class Router:
         selection_temperature: Cache-aware softmax temperature over min-max
             normalized scores for event-driven selection. 0.0 is exact argmax;
             larger values spread picks across candidates. Default: 0.0
-        max_payload_size: Maximum payload size in bytes. Default: 256MB
+        max_payload_size: Maximum payload size in bytes. Default: 512 MiB
         max_tree_size: Maximum total size of each model's approximation tree for
             cache-aware routing (chars for HTTP, tokens for gRPC), shared across
             all workers; eviction keeps every tree at or under this bound.

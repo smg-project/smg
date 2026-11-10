@@ -1,6 +1,6 @@
 //! [`ZmqEngineClient`]: the connected engine behind each engine's gRPC client
-//! surface (vLLM and TokenSpeed today), plus the connect entry points and
-//! metadata reads.
+//! surface, one connection for any of the four dialects of [`ZmqDialect`],
+//! plus the connect entry points and metadata reads.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -11,11 +11,12 @@ use std::{
 
 use engine_zmq_client::{
     check_engine_layouts,
-    codec::{tensor::encode_with_aux_frames, OpaqueValue},
+    codec::{add_request_capacity, tensor::encode_with_aux_frames, OpaqueValue},
     connect_handshake,
     connector::{Client, EngineCoreClient, SglangClient, TokenSpeedClient, TrtllmClient},
     protocol::{
         handshake::{EngineCoreReadyResponse, REQUEST_KIND_ENCODE},
+        kv_transfer::KvTransferStats,
         sglang::{request::SglangRequest, SglangProtocol},
         tokenspeed::{
             request::TokenSpeedRequestType, wire_carries_control_calls, TokenSpeedProtocol,
@@ -28,13 +29,15 @@ use engine_zmq_client::{
 };
 use futures::StreamExt;
 use llm_tokenizer::traits::Tokenizer;
-use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse};
+use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerType};
 use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto as vllm};
+use tokio::time::Instant;
 
 #[cfg(unix)]
 use crate::sockets::unlink_stale_socket;
 use crate::{
     eos::EosTokenIds,
+    pin_yield::PinYieldNote,
     sglang::{
         aggregate_control, constraint_ref as sglang_constraint_ref, control_outcome,
         encode_media_refs, fan_out_sglang_requests, translate_embed_request_sglang,
@@ -155,6 +158,9 @@ pub(crate) struct ZmqConnectionMeta {
     /// disagrees yielding to it
     /// (see [`ZmqEngineClient::note_engine_places_by_rendezvous_room`]).
     engine_places_by_rendezvous_room: OnceLock<()>,
+    /// A pin's yield to the room on this connection: the first is logged at
+    /// WARN, the rest at DEBUG (`PinYieldNote`).
+    pin_yield: PinYieldNote,
     /// The bound on every generate request this connection opens, from its
     /// dispatch to its last message, set once by the caller that knows it
     /// (see [`ZmqEngineClient::set_request_timeout`]); unset leaves the
@@ -389,6 +395,7 @@ impl ZmqEngineClient {
                 supported_tasks: tokio::sync::OnceCell::new(),
                 engine_truncates_long_prompts: OnceLock::new(),
                 engine_places_by_rendezvous_room: OnceLock::new(),
+                pin_yield: PinYieldNote::default(),
                 request_timeout: OnceLock::new(),
             }),
         };
@@ -484,10 +491,11 @@ impl ZmqEngineClient {
     /// pair whose engine follows the room, where the engine's KV sender
     /// fails a request that runs elsewhere and the decode side looks for the
     /// KV. A request with a room goes to that rank on this connection from
-    /// now, a pin that disagrees yielding to it with a warning; a request
-    /// without a room, and every request on a connection nobody notes this
-    /// on (an aggregated engine, a decode side), is placed by its pin. Set
-    /// once: a later call changes nothing.
+    /// now, a pin that disagrees yielding to it (logged at WARN once per
+    /// connection, at DEBUG after); a request without a room, and every
+    /// request on a connection nobody notes this on (an aggregated engine, a
+    /// decode side), is placed by its pin. Set once: a later call changes
+    /// nothing.
     pub fn note_engine_places_by_rendezvous_room(&self) {
         let _ = self.meta.engine_places_by_rendezvous_room.set(());
     }
@@ -635,25 +643,26 @@ impl ZmqEngineClient {
     }
 
     /// Check the disaggregation role every connected engine declared against
-    /// `registered`, the role its worker is registered for (`None` for one
-    /// that serves whole requests): a prefill engine registered as a decode
-    /// worker, or a whole-request engine as either, fails its connection with
-    /// both roles named instead of failing every request it takes. An encode
-    /// worker needs the wire's encode request, so an engine that does not
-    /// list it (one before the request, or a scheduler) fails the connection
-    /// of an `encode` registration whatever else it declares, as the servicer
-    /// refuses the same engine at its link. A prefill or encode worker's
-    /// requests name its engine's bootstrap rendezvous, which on this lane
-    /// only the handshake supplies (the worker's URL names the frontend's own
-    /// bind, not the engine's host), so an engine that declares no bootstrap
-    /// address fails the connection of either registration, whatever else it
-    /// declares, instead of sending every disaggregated request out with an
-    /// empty host. An engine that predates the declaration (it lists no
-    /// request types) is otherwise not checked.
-    pub fn check_declared_role(&self, registered: Option<&str>) -> Result<(), String> {
+    /// `registered`, the role its worker is registered for
+    /// ([`WorkerType::Regular`] for one that serves whole requests): a prefill
+    /// engine registered as a decode worker, or a whole-request engine as
+    /// either, fails its connection with both roles named instead of failing
+    /// every request it takes. An encode worker needs the wire's encode
+    /// request, so an engine that does not list it (one before the request,
+    /// or a scheduler) fails the connection of an encode registration whatever
+    /// else it declares, as the servicer refuses the same engine at its link.
+    /// A prefill or encode worker's requests name its engine's bootstrap
+    /// rendezvous, which on this lane only the handshake supplies (the
+    /// worker's URL names the frontend's own bind, not the engine's host), so
+    /// an engine that declares no bootstrap address fails the connection of
+    /// either registration, whatever else it declares, instead of sending
+    /// every disaggregated request out with an empty host. An engine that
+    /// predates the declaration (it lists no request types) is otherwise not
+    /// checked.
+    pub fn check_declared_role(&self, registered: WorkerType) -> Result<(), String> {
         for engine in self.engines() {
             let ready = &engine.ready_response;
-            if registered == Some("encode") && !ready.lists_request_kind(REQUEST_KIND_ENCODE) {
+            if registered == WorkerType::Encode && !ready.lists_request_kind(REQUEST_KIND_ENCODE) {
                 return Err(format!(
                     "engine {:?} lists no encode request on its wire (request_types {:?}) but \
                      its worker is registered as an encode worker: a newer engine, or the \
@@ -661,29 +670,28 @@ impl ZmqEngineClient {
                     engine.engine_id, ready.request_types,
                 ));
             }
-            if !ready.request_types.is_empty() {
-                let declared = ready.disaggregation_role();
-                if declared != registered {
-                    return Err(format!(
-                        "engine {:?} declared disaggregation role {} but its worker is \
-                         registered as {}",
-                        engine.engine_id,
-                        declared.unwrap_or("none (whole requests)"),
-                        registered.unwrap_or("a regular worker"),
-                    ));
-                }
+            if !ready.request_types.is_empty() && declared_worker_type(ready) != Some(registered) {
+                return Err(format!(
+                    "engine {:?} declared disaggregation role {} but its worker is registered \
+                     as {}",
+                    engine.engine_id,
+                    ready
+                        .disaggregation_role()
+                        .unwrap_or("none (whole requests)"),
+                    registered_words(registered),
+                ));
             }
-            if let Some(role @ ("prefill" | "encode")) = registered {
-                if ready.bootstrap_address().is_none() {
-                    return Err(format!(
-                        "engine {:?} declares no bootstrap address but its worker is registered \
-                         as {role}: a {role} worker's requests name its engine's rendezvous \
-                         (bootstrap_host and bootstrap_port in the handshake), which this lane \
-                         cannot take from the worker's own address; an engine that declares it \
-                         serves this worker",
-                        engine.engine_id,
-                    ));
-                }
+            if matches!(registered, WorkerType::Prefill | WorkerType::Encode)
+                && ready.bootstrap_address().is_none()
+            {
+                return Err(format!(
+                    "engine {:?} declares no bootstrap address but its worker is registered as \
+                     {registered}: a {registered} worker's requests name its engine's \
+                     rendezvous (bootstrap_host and bootstrap_port in the handshake), which \
+                     this lane cannot take from the worker's own address; an engine that \
+                     declares it serves this worker",
+                    engine.engine_id,
+                ));
             }
         }
         Ok(())
@@ -993,6 +1001,7 @@ impl ZmqEngineClient {
                 max_model_len,
                 &ranks,
                 logprobs,
+                &self.meta.pin_yield,
             )
             .map_err(tonic::Status::invalid_argument)?;
             let stream = client.submit(request).await.map_err(zmq_status)?;
@@ -1039,7 +1048,8 @@ impl ZmqEngineClient {
         }
         let request =
             translate_encode_request(req, rendezvous).map_err(tonic::Status::invalid_argument)?;
-        let (payload, aux_frames) = encode_with_aux_frames(&request).map_err(zmq_status)?;
+        let (payload, aux_frames) =
+            encode_with_aux_frames(&request, add_request_capacity(0)).map_err(zmq_status)?;
         let residue = request.bootstrap_room.rem_euclid(encoders.len() as i64) as usize;
         client
             .send_typed(
@@ -1111,6 +1121,26 @@ impl ZmqEngineClient {
         trace_headers: Option<BTreeMap<String, String>>,
         dispatcher: Option<&Arc<dyn SglangEncodeDispatcher>>,
     ) -> Result<Vec<SglangGenerateStream>, tonic::Status> {
+        self.generate_sglang_streams_dispatching_with_mm_hasher(
+            req,
+            trace_headers,
+            dispatcher,
+            None,
+        )
+        .await
+    }
+
+    /// As above, with bounded off-runtime CPU feature hashing. The caller must
+    /// opt in only for an engine using the SHA256 CPU identity algorithm, not
+    /// its GPU hash buffer or skip-hash path. This is a local option, never an
+    /// identity supplied by an untrusted RPC caller.
+    pub async fn generate_sglang_streams_dispatching_with_mm_hasher(
+        &self,
+        req: sglang_proto::GenerateRequest,
+        trace_headers: Option<BTreeMap<String, String>>,
+        dispatcher: Option<&Arc<dyn SglangEncodeDispatcher>>,
+        hasher: Option<&crate::SglangCpuMmHasher>,
+    ) -> Result<Vec<SglangGenerateStream>, tonic::Status> {
         let ZmqBackend::Sglang(client) = &self.backend else {
             return Err(tonic::Status::internal(
                 "this ZMQ backend is not an SGLang scheduler",
@@ -1137,17 +1167,30 @@ impl ZmqEngineClient {
             RankPlacement::Pin
         };
         let mut streams = Vec::new();
+        // Fan-out clones share identical media; cache only within this request.
+        let mut shared_hashes = None;
         for (index, sub) in fan_out_sglang_requests(req).into_iter().enumerate() {
             let image_refs = sub
                 .mm_inputs
-                .as_ref()
+                .as_deref()
                 .map(encode_media_refs)
                 .transpose()
                 .map_err(tonic::Status::invalid_argument)?
                 .flatten();
-            let mut request = translate_request_sglang(sub, max_model_len, ranks, placement)
-                .map_err(tonic::Status::invalid_argument)?;
+            let mut request = translate_request_sglang(
+                sub,
+                max_model_len,
+                ranks,
+                placement,
+                &self.meta.pin_yield,
+            )
+            .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);
+            if let (Some(hasher), Some(mm)) = (hasher, request.mm_inputs.as_mut()) {
+                hasher
+                    .precompute_shared(mm, &request.rid, &mut shared_hashes)
+                    .await?;
+            }
             let dispatched = match (image_refs, dispatcher) {
                 (None, _) => None,
                 (Some(_), None) => {
@@ -1512,9 +1555,11 @@ impl ZmqEngineClient {
         Ok(())
     }
 
-    /// Latest per-rank load for one engine index, if the backend has reported
-    /// it: every dialect piggybacks it on its output batches.
-    fn engine_load(&self, engine_index: u32) -> Option<EngineLoad> {
+    /// The latest load tail one rank sent (running, waiting, KV usage),
+    /// `None` before its first batch: every dialect piggybacks it on its
+    /// output batches. What [`Self::get_loads`] lists per rank, for a caller
+    /// that wants one rank's without the whole report.
+    pub fn engine_load(&self, engine_index: u32) -> Option<EngineLoad> {
         match &self.backend {
             ZmqBackend::Vllm(client) => client.engine_load(engine_index),
             ZmqBackend::TokenSpeed(client) => client.engine_load(engine_index),
@@ -1532,6 +1577,18 @@ impl ZmqEngineClient {
             ZmqBackend::TokenSpeed(client) => client.output_silence(),
             ZmqBackend::Sglang(client) => client.output_silence(),
             ZmqBackend::Trtllm(client) => client.output_silence(),
+        }
+    }
+
+    /// When the engine last sent an output batch of any kind, `None` before
+    /// the first (the ZMQ client's `last_output_at`): read whether or not
+    /// anything is in flight, and never moved by a dispatch.
+    pub fn last_output_at(&self) -> Option<Instant> {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.last_output_at(),
+            ZmqBackend::TokenSpeed(client) => client.last_output_at(),
+            ZmqBackend::Sglang(client) => client.last_output_at(),
+            ZmqBackend::Trtllm(client) => client.last_output_at(),
         }
     }
 
@@ -1557,6 +1614,18 @@ impl ZmqEngineClient {
             ZmqBackend::TokenSpeed(client) => client.note_reports_steps(),
             ZmqBackend::Sglang(client) => client.note_reports_steps(),
             ZmqBackend::Trtllm(client) => client.note_reports_steps(),
+        }
+    }
+
+    /// A sign of the engine's progress from outside its output wire, a live
+    /// KV-event batch it published: the engine's silence ends now, as on an
+    /// output of any kind (the ZMQ client's `note_progress`).
+    pub fn note_progress(&self) {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.note_progress(),
+            ZmqBackend::TokenSpeed(client) => client.note_progress(),
+            ZmqBackend::Sglang(client) => client.note_progress(),
+            ZmqBackend::Trtllm(client) => client.note_progress(),
         }
     }
 
@@ -1602,23 +1671,56 @@ impl ZmqEngineClient {
         let loads: Vec<SchedulerLoadSnapshot> = self
             .engines()
             .iter()
-            .filter_map(|engine| {
-                let dp_rank = engine.engine_id.engine_index()?;
-                let load = self.engine_load(dp_rank)?;
-                Some(SchedulerLoadSnapshot {
-                    dp_rank: i32::try_from(dp_rank).unwrap_or(i32::MAX),
-                    num_running_reqs: i32::try_from(load.num_running).unwrap_or(i32::MAX),
-                    num_waiting_reqs: i32::try_from(load.num_waiting).unwrap_or(i32::MAX),
-                    token_usage: load.kv_cache_usage,
-                    ..Default::default()
-                })
-            })
+            .filter_map(|engine| self.rank_load(engine.engine_id.engine_index()?))
             .collect();
         WorkerLoadResponse {
             timestamp: String::new(),
             dp_rank_count: i32::try_from(loads.len()).unwrap_or(i32::MAX),
             loads,
             ..Default::default()
+        }
+    }
+
+    /// One connected rank's entry of [`get_loads`](Self::get_loads), read
+    /// alone: what a per-rank reader (the relay's load record) wants, without
+    /// the vector of the other ranks. `None` for a rank not connected or not
+    /// reported yet.
+    pub fn rank_load(&self, dp_rank: u32) -> Option<SchedulerLoadSnapshot> {
+        self.engines()
+            .iter()
+            .any(|engine| engine.engine_id.engine_index() == Some(dp_rank))
+            .then(|| self.engine_load(dp_rank))
+            .flatten()
+            .map(|load| SchedulerLoadSnapshot {
+                dp_rank: i32::try_from(dp_rank).unwrap_or(i32::MAX),
+                num_running_reqs: i32::try_from(load.num_running).unwrap_or(i32::MAX),
+                num_waiting_reqs: i32::try_from(load.num_waiting).unwrap_or(i32::MAX),
+                token_usage: load.kv_cache_usage,
+                ..Default::default()
+            })
+    }
+
+    /// Keep the KV-transfer samples the engines report from now on, for
+    /// [`Self::take_kv_transfer`] ([`Client::keep_kv_transfer`]): the taker
+    /// asks once; a client nobody drains keeps none.
+    pub fn keep_kv_transfer(&self) {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.keep_kv_transfer(),
+            ZmqBackend::TokenSpeed(client) => client.keep_kv_transfer(),
+            ZmqBackend::Sglang(client) => client.keep_kv_transfer(),
+            ZmqBackend::Trtllm(client) => client.keep_kv_transfer(),
+        }
+    }
+
+    /// The KV-transfer samples every rank's connector reported since the last
+    /// call ([`Client::take_kv_transfer`]), by engine index; empty for an
+    /// engine family whose wire carries none or a client that never asked.
+    pub fn take_kv_transfer(&self) -> Vec<(u32, KvTransferStats)> {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.take_kv_transfer(),
+            ZmqBackend::TokenSpeed(client) => client.take_kv_transfer(),
+            ZmqBackend::Sglang(client) => client.take_kv_transfer(),
+            ZmqBackend::Trtllm(client) => client.take_kv_transfer(),
         }
     }
 
@@ -1767,6 +1869,7 @@ fn zmq_status_of(error: &engine_zmq_client::Error) -> tonic::Status {
         engine_zmq_client::Error::EngineCoreDead
         | engine_zmq_client::Error::EngineInputBlocked { .. }
         | engine_zmq_client::Error::EngineInputFull { .. }
+        | engine_zmq_client::Error::EngineInputBytesFull { .. }
         | engine_zmq_client::Error::ClientClosed { .. } => {
             tonic::Status::unavailable(error.to_string())
         }
@@ -1831,6 +1934,31 @@ fn utility_status(error: engine_zmq_client::Error) -> tonic::Status {
             tonic::Status::unimplemented(error.to_string())
         }
         other => zmq_status(other),
+    }
+}
+
+/// The disaggregation role an engine declared at its handshake, as the
+/// registry types a worker's role: [`WorkerType::Regular`] for an engine that
+/// serves whole requests (it declares no role), the role for the wire's three
+/// exact names, `None` for anything else (another spelling included), which
+/// no registration matches. The wire keeps the string the engine sent
+/// ([`EngineCoreReadyResponse::disaggregation_role`]); this is its one typed
+/// reading, and it is exact where [`WorkerType`]'s own parser is lenient.
+pub(crate) fn declared_worker_type(ready: &EngineCoreReadyResponse) -> Option<WorkerType> {
+    match ready.disaggregation_role() {
+        None => Some(WorkerType::Regular),
+        Some("prefill") => Some(WorkerType::Prefill),
+        Some("decode") => Some(WorkerType::Decode),
+        Some("encode") => Some(WorkerType::Encode),
+        Some(_) => None,
+    }
+}
+
+/// A registered role as the connection refusals name it.
+fn registered_words(role: WorkerType) -> String {
+    match role {
+        WorkerType::Regular => "a regular worker".to_string(),
+        role => role.to_string(),
     }
 }
 
@@ -1924,6 +2052,20 @@ mod tests {
             request_id: "req-1".to_string(),
         });
         assert_eq!(engine_failure.code(), Code::Internal, "{engine_failure:?}");
+    }
+
+    /// Byte-budget rejection remains retryable, including shared errors.
+    #[test]
+    fn retained_input_exhaustion_answers_unavailable() {
+        let status = zmq_status(engine_zmq_client::Error::Shared(Arc::new(
+            engine_zmq_client::Error::EngineInputBytesFull {
+                retained_bytes: 10,
+                request_bytes: 1,
+                limit_bytes: 10,
+            },
+        )));
+        assert_eq!(status.code(), Code::Unavailable);
+        assert!(status.message().contains("10 bytes"));
     }
 
     /// The failure the connector fans out to the requests in flight when its
@@ -2455,6 +2597,44 @@ mod tests {
         client.expect("adapter connect")
     }
 
+    /// The handshake's role string, typed once: no role, `null` and an empty
+    /// string read as a whole-request engine; the wire's three names read as
+    /// their roles, exactly; anything else, another spelling or `regular`
+    /// included, matches no registration (as the string compare before it).
+    #[test]
+    fn the_declared_role_is_read_as_a_worker_type() {
+        let declaring = |role: Option<&str>| EngineCoreReadyResponse {
+            disaggregation_mode: role.map(str::to_string),
+            ..default_ready_response()
+        };
+        for whole in [None, Some("null"), Some("")] {
+            assert_eq!(
+                declared_worker_type(&declaring(whole)),
+                Some(WorkerType::Regular),
+                "{whole:?}"
+            );
+        }
+        assert_eq!(
+            declared_worker_type(&declaring(Some("prefill"))),
+            Some(WorkerType::Prefill)
+        );
+        assert_eq!(
+            declared_worker_type(&declaring(Some("decode"))),
+            Some(WorkerType::Decode)
+        );
+        assert_eq!(
+            declared_worker_type(&declaring(Some("encode"))),
+            Some(WorkerType::Encode)
+        );
+        for unknown in ["verifier", "Decode", "PREFILL", "regular"] {
+            assert_eq!(
+                declared_worker_type(&declaring(Some(unknown))),
+                None,
+                "{unknown}"
+            );
+        }
+    }
+
     /// A worker registered for a disaggregated role connects only to engines
     /// that declared that role: a prefill rank among a decode worker's, or a
     /// whole-request engine behind a prefill worker, fails the check with both
@@ -2483,14 +2663,16 @@ mod tests {
         )
         .await;
         prefill
-            .check_declared_role(Some("prefill"))
+            .check_declared_role(WorkerType::Prefill)
             .expect("prefill engines");
-        let error = prefill.check_declared_role(Some("decode")).unwrap_err();
+        let error = prefill.check_declared_role(WorkerType::Decode).unwrap_err();
         assert!(
             error.contains("declared disaggregation role prefill") && error.contains("as decode"),
             "{error}"
         );
-        let error = prefill.check_declared_role(None).unwrap_err();
+        let error = prefill
+            .check_declared_role(WorkerType::Regular)
+            .unwrap_err();
         assert!(error.contains("as a regular worker"), "{error}");
 
         let mixed = tokenspeed_ranks(
@@ -2498,7 +2680,7 @@ mod tests {
             vec![declaring(Some("decode")), declaring(Some("prefill"))],
         )
         .await;
-        let error = mixed.check_declared_role(Some("decode")).unwrap_err();
+        let error = mixed.check_declared_role(WorkerType::Decode).unwrap_err();
         assert!(
             error.contains("declared disaggregation role prefill"),
             "{error}"
@@ -2506,10 +2688,24 @@ mod tests {
 
         let whole = tokenspeed_ranks(&dir.path().join("w"), vec![declaring(None)]).await;
         whole
-            .check_declared_role(None)
+            .check_declared_role(WorkerType::Regular)
             .expect("a whole-request engine");
-        let error = whole.check_declared_role(Some("prefill")).unwrap_err();
+        let error = whole.check_declared_role(WorkerType::Prefill).unwrap_err();
         assert!(error.contains("none (whole requests)"), "{error}");
+
+        // A role this lane does not know matches no registration and is
+        // named as the engine sent it.
+        let unknown =
+            tokenspeed_ranks(&dir.path().join("k"), vec![declaring(Some("verifier"))]).await;
+        let error = unknown
+            .check_declared_role(WorkerType::Regular)
+            .unwrap_err();
+        assert!(
+            error.contains("declared disaggregation role verifier")
+                && error.contains("as a regular worker"),
+            "{error}"
+        );
+        assert!(unknown.check_declared_role(WorkerType::Prefill).is_err());
 
         // A prefill worker's requests name the engine's rendezvous: an engine
         // that declares the role without a bootstrap address, or declares
@@ -2517,16 +2713,18 @@ mod tests {
         // needs none, so an engine that declares nothing serves it.
         let unplaced =
             tokenspeed_ranks(&dir.path().join("u"), vec![declaring(Some("prefill"))]).await;
-        let error = unplaced.check_declared_role(Some("prefill")).unwrap_err();
+        let error = unplaced
+            .check_declared_role(WorkerType::Prefill)
+            .unwrap_err();
         assert!(
             error.contains("declares no bootstrap address") && error.contains("as prefill"),
             "{error}"
         );
         let silent = tokenspeed_ranks(&dir.path().join("s"), vec![default_ready_response()]).await;
-        let error = silent.check_declared_role(Some("prefill")).unwrap_err();
+        let error = silent.check_declared_role(WorkerType::Prefill).unwrap_err();
         assert!(error.contains("declares no bootstrap address"), "{error}");
         silent
-            .check_declared_role(Some("decode"))
+            .check_declared_role(WorkerType::Decode)
             .expect("an engine that declares nothing serves a decode worker");
 
         // An encode worker needs the wire's encode request: an engine that
@@ -2534,14 +2732,16 @@ mod tests {
         // before the request) or a scheduler's request types, as the servicer
         // refuses the same engine at its link; one that lists it connects
         // when it also declares its bootstrap address.
-        let error = silent.check_declared_role(Some("encode")).unwrap_err();
+        let error = silent.check_declared_role(WorkerType::Encode).unwrap_err();
         assert!(
             error.contains("lists no encode request") && error.contains("--servicer-impl python"),
             "{error}"
         );
         let scheduler =
             tokenspeed_ranks(&dir.path().join("e"), vec![declaring(Some("encode"))]).await;
-        let error = scheduler.check_declared_role(Some("encode")).unwrap_err();
+        let error = scheduler
+            .check_declared_role(WorkerType::Encode)
+            .unwrap_err();
         assert!(error.contains("lists no encode request"), "{error}");
         let encoder = |bootstrap_host: Option<&str>| EngineCoreReadyResponse {
             request_types: vec!["encode".into()],
@@ -2552,7 +2752,7 @@ mod tests {
         };
         let unplaced_encoder = tokenspeed_ranks(&dir.path().join("g"), vec![encoder(None)]).await;
         let error = unplaced_encoder
-            .check_declared_role(Some("encode"))
+            .check_declared_role(WorkerType::Encode)
             .unwrap_err();
         assert!(
             error.contains("declares no bootstrap address") && error.contains("as encode"),
@@ -2561,7 +2761,7 @@ mod tests {
         let placed_encoder =
             tokenspeed_ranks(&dir.path().join("f"), vec![encoder(Some("10.0.0.9"))]).await;
         placed_encoder
-            .check_declared_role(Some("encode"))
+            .check_declared_role(WorkerType::Encode)
             .expect("an encode worker that lists the encode request and declares its address");
     }
 

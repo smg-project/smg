@@ -40,5 +40,9 @@ def tensor_from_parts(payload: bytes, shape, dtype_name: str) -> torch.Tensor:
             f"expected {expected}, got {len(payload)}"
         )
 
+    # A tensor with a zero dimension (a batch's crops when no image took
+    # any) has no bytes; torch.frombuffer refuses an empty buffer.
+    if element_count == 0:
+        return torch.empty(dims, dtype=torch_dtype)
     # bytearray so the buffer is writable; torch warns on read-only input.
     return torch.frombuffer(bytearray(payload), dtype=torch_dtype).reshape(*dims)

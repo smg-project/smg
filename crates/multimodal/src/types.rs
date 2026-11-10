@@ -12,9 +12,10 @@ use serde_json::Value;
 
 use crate::{
     audio::DecodedAudio,
+    buffer_pool,
     error::MediaConnectorError,
     media::{apply_transparency, decode_image_bytes},
-    vision::execution,
+    vision::{execution, transforms::resize_bicubic_pil},
 };
 
 /// Supported multimodal modalities.
@@ -39,7 +40,7 @@ impl fmt::Display for Modality {
 }
 
 /// Detail level passed by OpenAI style APIs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageDetail {
     #[default]
@@ -200,6 +201,7 @@ pub struct ImageFrame {
     from_pixels: bool,
     /// Decode directly to the M3 source-policy dimensions in `size`.
     minimax_resize: bool,
+    minimax_sglang_resize: bool,
 }
 
 /// Decoded audio payload captured by the media connector.
@@ -235,7 +237,7 @@ pub struct VideoClip {
     /// Blake3 hex-digest of raw_bytes, computed at decode time.
     pub hash: String,
     /// The long-side cap the caller asked for (MiniMax `max_long_side_pixel`);
-    /// the frames were already scaled to it when set.
+    /// decoding applies it except for native SGLang MiniMax, which defers to Pillow.
     pub max_long_side_pixel: Option<u32>,
 }
 
@@ -448,6 +450,16 @@ impl AudioClip {
     }
 }
 
+impl Drop for ImageFrame {
+    /// The decoded pixels' buffer goes back to the pool for the next
+    /// request's decode.
+    fn drop(&mut self) {
+        if let Some(image) = self.decoded.take() {
+            buffer_pool::recycle_image(image);
+        }
+    }
+}
+
 impl ImageFrame {
     /// A frame from pixels already decoded.
     pub fn new(
@@ -469,6 +481,7 @@ impl ImageFrame {
             transparency: TransparencyPolicy::KeepAlpha,
             from_pixels: true,
             minimax_resize: false,
+            minimax_sglang_resize: false,
         }
     }
 
@@ -493,12 +506,19 @@ impl ImageFrame {
             transparency: TransparencyPolicy::KeepAlpha,
             from_pixels: false,
             minimax_resize: false,
+            minimax_sglang_resize: false,
         }
     }
 
     /// Mark an encoded frame for one direct resize to its planned dimensions.
     pub(crate) fn with_minimax_resize(mut self) -> Self {
         self.minimax_resize = true;
+        self
+    }
+
+    /// Select Pillow's byte-exact image resize for SGLang's source geometry.
+    pub(crate) fn with_minimax_sglang_resize(mut self, enabled: bool) -> Self {
+        self.minimax_sglang_resize = enabled;
         self
     }
 
@@ -511,7 +531,9 @@ impl ImageFrame {
                 self.max_long_side_pixel,
                 self.transparency(),
             )?;
-            Ok(if self.minimax_resize {
+            Ok(if self.minimax_sglang_resize {
+                resize_bicubic_pil(&image, self.size.width, self.size.height)
+            } else if self.minimax_resize {
                 crate::minimax_resize::resize_image(image, self.size.width, self.size.height)
             } else {
                 image
@@ -1137,5 +1159,35 @@ mod tests {
         assert_eq!(ImageFrame::undecoded(&frames).len(), 2);
         assert!(ImageFrame::decode_all(&frames).is_err());
         assert!(good.image().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod buffer_pool_tests {
+    use super::*;
+    use crate::buffer_pool::{self, BufferPool};
+
+    /// A frame returns its decoded pixels to the buffer pool when it drops.
+    #[test]
+    fn a_dropped_frame_returns_its_decoded_pixels() {
+        static MINE: BufferPool = BufferPool::new();
+        buffer_pool::with_pool(&MINE, || {
+            let pixels = buffer_pool::take(1024 * 768 * 3);
+            let address = pixels.as_ptr();
+            let image =
+                DynamicImage::ImageRgb8(RgbImage::from_raw(1024, 768, pixels).expect("sized"));
+            let frame = ImageFrame::new(
+                image,
+                bytes::Bytes::new(),
+                ImageDetail::Auto,
+                ImageSource::InlineBytes,
+                String::new(),
+            );
+            assert_eq!(MINE.held(), 0);
+            drop(frame);
+            assert_eq!(MINE.held(), 4 << 20);
+            let again = buffer_pool::take(1024 * 768 * 3);
+            assert_eq!(again.as_ptr(), address);
+        });
     }
 }

@@ -7,6 +7,10 @@
 //! gateway that left the choice to its embedder never brought its mesh
 //! listener up: the panic surfaced only as "Mesh server failed" in its log
 //! while `/health` kept answering.
+//!
+//! The worker lane runs on the same bed, in the clear: a worker registered on
+//! one gateway is imported by the other under the same id, served through it,
+//! and dropped by it once the first gateway removes the worker.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::allow_attributes)]
 
 use std::{
@@ -19,7 +23,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::test_certs::TestCertificates;
+use common::{
+    mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
+    test_certs::TestCertificates,
+};
 use openssl::ssl::{HandshakeError, SslConnector, SslFiletype, SslMethod};
 
 use crate::{
@@ -129,14 +136,18 @@ impl Drop for Gateway {
 }
 
 /// A gateway with the mesh on, with this node's identity under mTLS, on
-/// `ports` (HTTP, mesh, metrics), dialing `peer_mesh_port` when given; its
-/// output goes to `<name>.log` next to the certificates.
+/// `ports` (HTTP, mesh, metrics), naming `peers` (mesh ports, in that order)
+/// in its peer URLs when given and registering `worker_urls` at its start;
+/// its output goes to `<name>.log` next to the certificates. A worker removed
+/// through its API goes at once (no drain settle), so a peer's view of the
+/// removal is read within the mesh timeout.
 fn spawn_gateway(
     name: &'static str,
     certs: &TestCertificates,
     ports: [u16; 3],
-    peer_mesh_port: Option<u16>,
+    peers: &[u16],
     mesh: Mesh,
+    worker_urls: &[&str],
 ) -> Gateway {
     let (cert, key) = certs.node_identity(name).expect("node identity");
     let [http_port, mesh_port, metrics_port] = ports;
@@ -150,6 +161,7 @@ fn spawn_gateway(
         .args(["--prometheus-port", &metrics_port.to_string()])
         .args(["--enable-mesh", "--mesh-server-name", name])
         .args(["--mesh-host", &ip, "--mesh-port", &mesh_port.to_string()])
+        .args(["--drain-settle-secs", "0"])
         .args(["--log-level", "info"])
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().expect("log handle")))
@@ -162,8 +174,13 @@ fn spawn_gateway(
             .arg("--mesh-tls-key")
             .arg(&key);
     }
-    if let Some(port) = peer_mesh_port {
-        command.args(["--mesh-peer-urls", &format!("{IP}:{port}")]);
+    if !peers.is_empty() {
+        command
+            .arg("--mesh-peer-urls")
+            .args(peers.iter().map(|port| format!("{IP}:{port}")));
+    }
+    if !worker_urls.is_empty() {
+        command.arg("--worker-urls").args(worker_urls);
     }
     let child = command.spawn().expect("spawn the gateway");
     Gateway {
@@ -176,14 +193,18 @@ fn spawn_gateway(
     }
 }
 
-/// Both gateways healthy with their mesh listeners' verdict in, B dialing
-/// A's mesh port. The pair is respawned on fresh ports when a gateway lost
-/// one of its ports between the pick and its bind, at most `SPAWN_ATTEMPTS`
-/// times.
+/// Both gateways healthy with their mesh listeners' verdict in, B naming
+/// A's mesh port in its peer URLs after `peers_before_a` (ports nobody
+/// listens on, for the join through a later entry), A registering
+/// `worker_urls` at its start. The pair is respawned on fresh ports when a
+/// gateway lost one of its ports between the pick and its bind, at most
+/// `SPAWN_ATTEMPTS` times.
 fn spawn_pair(
     certs: &TestCertificates,
     probe: &(PathBuf, PathBuf),
     mesh: Mesh,
+    peers_before_a: &[u16],
+    worker_urls: &[&str],
 ) -> (Gateway, Gateway) {
     // One launch at a time in this binary: the six ports are released for the
     // two gateways to bind, and no other test's pick may take one meanwhile.
@@ -192,13 +213,22 @@ fn spawn_pair(
     loop {
         attempts += 1;
         let [http_a, mesh_a, metrics_a, http_b, mesh_b, metrics_b] = free_ports::<6>();
-        let mut a = spawn_gateway("nodea", certs, [http_a, mesh_a, metrics_a], None, mesh);
+        let mut a = spawn_gateway(
+            "nodea",
+            certs,
+            [http_a, mesh_a, metrics_a],
+            &[],
+            mesh,
+            worker_urls,
+        );
+        let peers: Vec<u16> = peers_before_a.iter().copied().chain([mesh_a]).collect();
         let mut b = spawn_gateway(
             "nodeb",
             certs,
             [http_b, mesh_b, metrics_b],
-            Some(mesh_a),
+            &peers,
             mesh,
+            &[],
         );
         let failures = [
             a.start_up(certs, probe, mesh),
@@ -237,15 +267,120 @@ fn connect(port: u16) -> io::Result<TcpStream> {
 
 /// A plain HTTP/1.1 GET on the loopback; the whole response, headers first.
 fn http_get(port: u16, path: &str) -> Option<String> {
+    http_request(port, "GET", path, None)
+}
+
+/// A plain HTTP/1.1 request on the loopback, with `body` as JSON when given;
+/// the whole response, headers first. `None` when the port did not answer.
+fn http_request(port: u16, method: &str, path: &str, body: Option<&str>) -> Option<String> {
     let mut stream = connect(port).ok()?;
+    let body = body.unwrap_or_default();
     write!(
         stream,
-        "GET {path} HTTP/1.1\r\nHost: {IP}\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {IP}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     )
     .ok()?;
     let mut response = String::new();
     stream.read_to_string(&mut response).ok()?;
     Some(response)
+}
+
+/// Whether `response` is an HTTP/1.1 response with a 2xx status.
+fn is_success(response: Option<&str>) -> bool {
+    response.is_some_and(|r| r.starts_with("HTTP/1.1 2"))
+}
+
+/// The body of an HTTP/1.1 response: what follows the header block.
+fn body_of(response: &str) -> &str {
+    response.split_once("\r\n\r\n").map_or("", |(_, body)| body)
+}
+
+/// A worker as `gateway` lists it on `GET /workers`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListedWorker {
+    id: String,
+    url: String,
+    healthy: bool,
+}
+
+/// The workers `gateway` lists; `None` when the route did not answer with a
+/// list, which a wait reads as "not yet" and an assertion as its own failure.
+fn workers_on(gateway: &Gateway) -> Option<Vec<ListedWorker>> {
+    let response = http_get(gateway.http_port, "/workers")?;
+    if !response.starts_with("HTTP/1.1 200") {
+        return None;
+    }
+    let list: serde_json::Value = serde_json::from_str(body_of(&response)).ok()?;
+    list.get("workers")?
+        .as_array()?
+        .iter()
+        .map(|worker| {
+            Some(ListedWorker {
+                id: worker.get("id")?.as_str()?.to_owned(),
+                url: worker.get("url")?.as_str()?.to_owned(),
+                healthy: worker.get("is_healthy")?.as_bool()?,
+            })
+        })
+        .collect()
+}
+
+/// The id under which `gateway` lists a healthy worker at `url`.
+fn healthy_worker_id(gateway: &Gateway, url: &str) -> Option<String> {
+    workers_on(gateway)?
+        .into_iter()
+        .find(|worker| worker.url == url && worker.healthy)
+        .map(|worker| worker.id)
+}
+
+/// Whether `gateway` lists no worker at `url`; `false` while its list cannot
+/// be read.
+fn lists_no_worker_at(gateway: &Gateway, url: &str) -> bool {
+    workers_on(gateway).is_some_and(|workers| workers.iter().all(|worker| worker.url != url))
+}
+
+/// The harness's HTTP mock worker on an ephemeral loopback port, served from
+/// a runtime of its own: the start-up tests are synchronous, and the worker
+/// outlives the gateways that register it.
+struct MockHttpWorker {
+    runtime: tokio::runtime::Runtime,
+    worker: MockWorker,
+    url: String,
+}
+
+impl MockHttpWorker {
+    fn start() -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime for the mock worker");
+        let mut worker = MockWorker::new(MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+        let url = runtime
+            .block_on(worker.start())
+            .expect("the mock worker starts");
+        Self {
+            runtime,
+            worker,
+            url,
+        }
+    }
+}
+
+impl Drop for MockHttpWorker {
+    fn drop(&mut self) {
+        let Self {
+            runtime, worker, ..
+        } = self;
+        runtime.block_on(worker.stop());
+    }
 }
 
 fn healthy(gateway: &Gateway) -> bool {
@@ -282,16 +417,16 @@ fn nameless_peer_series(gateway: &Gateway) -> Option<Vec<String>> {
     )
 }
 
-/// `member`'s status in `gateway`'s latest view of the membership (its last
-/// `Round <n> Status` log line), such as `Alive` or `Leaving`; `None` while
-/// no round line names the member.
+/// `member`'s status in `gateway`'s view of the membership, read from the
+/// last transition line that names it (`Member <name> is <Status> at version
+/// <n> (...)`, written whenever the member's status changes in this node's
+/// table), such as `Alive` or `Leaving`; `None` while no line names the
+/// member.
 fn status_on(gateway: &Gateway, member: &str) -> Option<String> {
     let log = gateway.log();
-    let round = log.lines().rev().find(|line| {
-        line.contains("Status:{") && line.contains(&format!("\"{member}\": NodeState"))
-    })?;
-    let entry = &round[round.find(&format!("\"{member}\": NodeState"))?..];
-    let status = &entry[entry.find("status: ")? + "status: ".len()..];
+    let prefix = format!("Member {member} is ");
+    let line = log.lines().rev().find(|line| line.contains(&prefix))?;
+    let status = &line[line.find(&prefix)? + prefix.len()..];
     Some(
         status
             .chars()
@@ -300,13 +435,28 @@ fn status_on(gateway: &Gateway, member: &str) -> Option<String> {
     )
 }
 
+/// `signal` (as `kill` spells it) to `gateway`'s process.
+fn signal(gateway: &Gateway, signal: &str) {
+    let status = Command::new("kill")
+        .args([signal, &gateway.child.id().to_string()])
+        .status()
+        .expect("send the signal");
+    assert!(status.success(), "kill {signal} failed: {status}");
+}
+
 /// SIGTERM to `gateway`, the way an orchestrator stops it.
 fn terminate(gateway: &Gateway) {
-    let status = Command::new("kill")
-        .args(["-TERM", &gateway.child.id().to_string()])
-        .status()
-        .expect("send SIGTERM");
-    assert!(status.success(), "kill -TERM failed: {status}");
+    signal(gateway, "-TERM");
+}
+
+/// `gateway` held (SIGSTOP) until [`resume`]: it runs nothing meanwhile,
+/// probes nobody and answers nothing.
+fn pause(gateway: &Gateway) {
+    signal(gateway, "-STOP");
+}
+
+fn resume(gateway: &Gateway) {
+    signal(gateway, "-CONT");
 }
 
 /// What the mesh listener made of a handshake.
@@ -419,7 +569,7 @@ fn logs(gateways: &[&Gateway]) -> String {
 fn mesh_with_mtls_forms_between_two_gateway_processes() {
     let certs = TestCertificates::generate().expect("test certificates");
     let probe = certs.node_identity("probe").expect("probe identity");
-    let (a, b) = spawn_pair(&certs, &probe, Mesh::Mtls);
+    let (a, b) = spawn_pair(&certs, &probe, Mesh::Mtls, &[], &[]);
 
     // The mesh listener serves TLS to a peer that presents a certificate
     // from the CA.
@@ -504,7 +654,7 @@ fn mesh_with_mtls_forms_between_two_gateway_processes() {
 fn a_stopping_gateway_leaves_the_mesh() {
     let certs = TestCertificates::generate().expect("test certificates");
     let probe = certs.node_identity("probe").expect("probe identity");
-    let (a, mut b) = spawn_pair(&certs, &probe, Mesh::Plain);
+    let (a, mut b) = spawn_pair(&certs, &probe, Mesh::Plain, &[], &[]);
     assert!(
         wait_until(MESH_TIMEOUT, || peer_connected(&a, "nodeb")
             || peer_connected(&b, "nodea")),
@@ -536,6 +686,208 @@ fn a_stopping_gateway_leaves_the_mesh() {
         wait_until(EXIT_TIMEOUT, || b.exited()),
         "{} did not exit after its SIGTERM\n{}",
         b.name,
+        logs(&[&a, &b])
+    );
+}
+
+/// The worker lane across two gateway processes: a worker registered on one
+/// gateway (its `--worker-urls`) is imported by the other under the id the
+/// first gave it, a request through the other is served by it, and once the
+/// first gateway removes it through its API the other drops it. In the
+/// clear: the lane does not depend on the TLS mode.
+#[test]
+fn a_worker_registered_on_one_gateway_is_served_through_the_other() {
+    let certs = TestCertificates::generate().expect("test certificates");
+    let probe = certs.node_identity("probe").expect("probe identity");
+    // The worker's bind is a port pick too: under the guard, like the
+    // gateways' (the guard is not re-entrant, so it is let go before them).
+    let engine = {
+        let _serial = serial();
+        MockHttpWorker::start()
+    };
+    let (a, b) = spawn_pair(&certs, &probe, Mesh::Plain, &[], &[&engine.url]);
+
+    let mut id_on_a = None;
+    assert!(
+        wait_until(STARTUP_TIMEOUT, || {
+            id_on_a = healthy_worker_id(&a, &engine.url);
+            id_on_a.is_some()
+        }),
+        "{} did not register its worker: {:?}\n{}",
+        a.name,
+        workers_on(&a),
+        logs(&[&a, &b])
+    );
+    let id_on_a = id_on_a.expect("registered");
+    assert!(
+        wait_until(MESH_TIMEOUT, || healthy_worker_id(&b, &engine.url)
+            .as_deref()
+            == Some(id_on_a.as_str())),
+        "{} did not import {}'s worker under its id {id_on_a}: {:?}\n{}",
+        b.name,
+        a.name,
+        workers_on(&b),
+        logs(&[&a, &b])
+    );
+
+    // The import is the only worker B has: a completion through B is its.
+    let request =
+        r#"{"model":"mock-model","messages":[{"role":"user","content":"hello"}],"max_tokens":8}"#;
+    let mut answer = None;
+    assert!(
+        wait_until(MESH_TIMEOUT, || {
+            answer = http_request(b.http_port, "POST", "/v1/chat/completions", Some(request));
+            is_success(answer.as_deref())
+                && answer.as_deref().is_some_and(|r| r.contains("mock-model"))
+        }),
+        "a completion through {} was not served by the imported worker: {answer:?}\n{}",
+        b.name,
+        logs(&[&a, &b])
+    );
+
+    let removal = http_request(a.http_port, "DELETE", &format!("/workers/{id_on_a}"), None);
+    assert!(
+        is_success(removal.as_deref()),
+        "{} did not accept the removal of its worker: {removal:?}\n{}",
+        a.name,
+        logs(&[&a, &b])
+    );
+    assert!(
+        wait_until(MESH_TIMEOUT, || lists_no_worker_at(&b, &engine.url)),
+        "{} kept the worker {} removed: {:?}\n{}",
+        b.name,
+        a.name,
+        workers_on(&b),
+        logs(&[&a, &b])
+    );
+}
+
+/// An owner that comes back under its name after a crash registers its
+/// worker under a fresh id, and the key of its earlier life, which it could
+/// not tombstone, gossips back to it from its peer: it tombstones that key,
+/// so the peer rebinds its import to the new id and the owner's later
+/// removal reaches it. Before, the peer kept the import under the old id for
+/// good, deaf to the owner's tombstones. The test pins the registration-first
+/// ordering (the re-registration is awaited while the peer is still paused);
+/// the key-first ordering, where the start-up upsert claims the key under
+/// its id, is the adapter's unit test
+/// `a_key_back_before_the_new_life_registers_its_endpoint_is_claimed_under_its_id`.
+///
+/// The peer is paused across the restart so its probes do not see the owner
+/// go: a probe that fails marks the owner Suspected, a second Down, and no
+/// probe heals a Down member (a gap of the membership layer's own, not of
+/// this lane). The test reads the worker lane; the restart must be invisible
+/// to the membership for that.
+#[test]
+fn an_owner_back_from_a_crash_tombstones_the_keys_of_its_earlier_life_so_its_peer_follows_its_removal(
+) {
+    let certs = TestCertificates::generate().expect("test certificates");
+    let probe = certs.node_identity("probe").expect("probe identity");
+    // The worker's bind is a port pick too: under the guard, like the
+    // gateways' (the guard is not re-entrant, so it is let go before them).
+    let engine = {
+        let _serial = serial();
+        MockHttpWorker::start()
+    };
+    let (a, b) = spawn_pair(&certs, &probe, Mesh::Plain, &[], &[&engine.url]);
+
+    let mut first_id = None;
+    assert!(
+        wait_until(STARTUP_TIMEOUT, || {
+            first_id = healthy_worker_id(&a, &engine.url);
+            first_id.is_some()
+        }),
+        "{} did not register its worker: {:?}\n{}",
+        a.name,
+        workers_on(&a),
+        logs(&[&a, &b])
+    );
+    let first_id = first_id.expect("registered");
+    assert!(
+        wait_until(MESH_TIMEOUT, || healthy_worker_id(&b, &engine.url)
+            .as_deref()
+            == Some(first_id.as_str())),
+        "{} did not import {}'s worker under its id {first_id}: {:?}\n{}",
+        b.name,
+        a.name,
+        workers_on(&b),
+        logs(&[&a, &b])
+    );
+
+    // The crash and the return, on the same name and ports, with the peer
+    // held meanwhile. The ports are free for a moment: no other launch of
+    // this binary may pick them.
+    let first_life = a.log();
+    let ports = [a.http_port, a.mesh_port, a.metrics_port];
+    pause(&b);
+    let a = {
+        let _serial = serial();
+        drop(a);
+        let mut a = spawn_gateway("nodea", &certs, ports, &[], Mesh::Plain, &[&engine.url]);
+        let failure = a.start_up(&certs, &probe, Mesh::Plain);
+        assert!(
+            failure.is_none() && !a.lost_a_port(),
+            "{} did not come back after its crash: {failure:?}\n{}\n--- {} before the crash ---\n{first_life}",
+            a.name,
+            logs(&[&a]),
+            a.name
+        );
+        a
+    };
+    // The re-registration lands while the peer is still paused: A has no
+    // peer URL and a stopped B cannot dial it, so nothing gossips the old
+    // key to A before its start-up job has registered the endpoint again.
+    // That pins the registration-first ordering this test is about; the
+    // key-first one has its own test in the adapter's module.
+    let mut second_id = None;
+    assert!(
+        wait_until(STARTUP_TIMEOUT, || {
+            second_id = healthy_worker_id(&a, &engine.url);
+            second_id.is_some()
+        }),
+        "{} did not register its worker again: {:?}\n{}",
+        a.name,
+        workers_on(&a),
+        logs(&[&a, &b])
+    );
+    let second_id = second_id.expect("registered again");
+    assert_ne!(
+        second_id, first_id,
+        "a gateway back from a crash registers its worker under a fresh id"
+    );
+    resume(&b);
+
+    // The owner tombstones the key of its earlier life; the peer's import
+    // follows the live key.
+    assert!(
+        wait_until(MESH_TIMEOUT, || healthy_worker_id(&b, &engine.url)
+            .as_deref()
+            == Some(second_id.as_str())),
+        "{} kept its import of {}'s worker under the earlier id {first_id}: {:?}\n{}",
+        b.name,
+        a.name,
+        workers_on(&b),
+        logs(&[&a, &b])
+    );
+
+    let removal = http_request(
+        a.http_port,
+        "DELETE",
+        &format!("/workers/{second_id}"),
+        None,
+    );
+    assert!(
+        is_success(removal.as_deref()),
+        "{} did not accept the removal of its worker: {removal:?}\n{}",
+        a.name,
+        logs(&[&a, &b])
+    );
+    assert!(
+        wait_until(MESH_TIMEOUT, || lists_no_worker_at(&b, &engine.url)),
+        "{} kept the worker {} removed after its restart: {:?}\n{}",
+        b.name,
+        a.name,
+        workers_on(&b),
         logs(&[&a, &b])
     );
 }
@@ -633,4 +985,69 @@ fn unusable_mesh_tls_material_refuses_the_start() {
             "{name}: the mesh server served\n{log}"
         );
     }
+}
+
+/// A member whose first peer URL answers nobody joins through its second:
+/// every entry of `--mesh-peer-urls` is dialed in turn, each under its own
+/// retry state, and one live entry is enough.
+#[test]
+fn a_gateway_joins_through_its_second_peer_url_when_the_first_is_dead() {
+    let certs = TestCertificates::generate().expect("test certificates");
+    let probe = certs.node_identity("probe").expect("probe identity");
+    // A port nobody listens on, picked and released like the gateways' own.
+    let [dead] = free_ports();
+    let (a, b) = spawn_pair(&certs, &probe, Mesh::Plain, &[dead], &[]);
+    assert!(
+        wait_until(MESH_TIMEOUT, || status_on(&a, "nodeb").as_deref()
+            == Some("Alive")),
+        "{} did not join through its second peer URL while the first is dead; its status on {}: {:?}\n{}",
+        b.name,
+        a.name,
+        status_on(&a, "nodeb"),
+        logs(&[&a, &b])
+    );
+}
+
+/// Every entry of `--mesh-peer-urls` is read as a socket address, so a bad
+/// one refuses the start by name in whichever position it stands; before,
+/// only the first entry was read and the rest were taken for nothing.
+#[test]
+fn a_bad_entry_of_the_peer_urls_refuses_the_start_in_any_position() {
+    let _serial = serial();
+    let certs = TestCertificates::generate().expect("test certificates");
+    let [http_port, mesh_port, metrics_port, peer_port] = free_ports();
+    let ip = IP.to_string();
+    let mut args = base_args(http_port, metrics_port);
+    args.extend(
+        [
+            "--enable-mesh",
+            "--mesh-host",
+            &ip,
+            "--mesh-port",
+            &mesh_port.to_string(),
+            "--mesh-peer-urls",
+            &format!("{IP}:{peer_port}"),
+            "nowhere:x",
+        ]
+        .map(str::to_string),
+    );
+    let launch = launch_with(
+        &args,
+        &[http_port],
+        Until::Bound,
+        &certs.temp_dir.path().join("peer-urls.log"),
+    );
+    let log = &launch.log;
+    assert!(
+        launch.bound.is_none(),
+        "the HTTP port answered although the second peer URL is no socket address\n{log}"
+    );
+    assert!(
+        launch.status.is_some(),
+        "the gateway neither exited nor served within {EXIT_TIMEOUT:?}\n{log}"
+    );
+    assert!(
+        log.contains("nowhere:x"),
+        "the refusal names the entry\n{log}"
+    );
 }

@@ -2,6 +2,9 @@
 // Apache-2.0 reference `vllm-engine-core-client` (vllm-project/vllm,
 // rust/src/engine-core-client/src/error.rs). See crate root for provenance.
 
+//! The crate's `Error` variants (encode, decode, transport, a dead engine, the handshake's
+//! deadlines) and its `Result` alias.
+
 use std::{sync::Arc, time::Duration};
 
 use thiserror::Error;
@@ -75,6 +78,15 @@ pub enum Error {
         bytes: usize,
         request_bytes: usize,
         limit_frames: usize,
+        limit_bytes: usize,
+    },
+    /// Queued and actively sending payloads would exceed the client's byte budget.
+    #[error(
+        "engine input retains {retained_bytes} bytes; request of {request_bytes} bytes exceeds the {limit_bytes} byte budget"
+    )]
+    EngineInputBytesFull {
+        retained_bytes: usize,
+        request_bytes: usize,
         limit_bytes: usize,
     },
     #[error("engine utility call failed: {message}")]

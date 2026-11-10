@@ -1,19 +1,22 @@
-//! EPD encode stage: plan the encode-worker rendezvous and dispatch payloads.
+//! EPD encode stage: plan the encode handoff the selection's runtime takes.
 //!
-//! Runs after client acquisition and before request building. Borrows the
-//! multimodal intermediate, mints one bootstrap room per encode item, and
-//! serializes the encode payload with pixels for the encode workers, landing the
-//! results in `ProcessingState::encode_outputs`:
+//! Runs after client acquisition and before request building and lands its
+//! plan in `ProcessingState::encode_outputs`:
 //!
-//! - request building injects the per-item bootstrap info into the prefill
-//!   request and drops the prefill pixels;
-//! - request execution dispatches the encode jobs alongside the prefill/decode
-//!   dispatch.
+//! - a rendezvous handoff: borrows the multimodal intermediate, mints one
+//!   bootstrap room per encode item and serializes the encode payload with
+//!   pixels for the encode workers; request building injects the per-item
+//!   bootstrap info into the prefill request and drops the prefill pixels,
+//!   request execution dispatches the encode jobs alongside the prefill/decode
+//!   dispatch;
+//! - a push handoff: names the encoder the built prompt goes to first (under
+//!   an image anchor, the encoders its images fan out to) and the consumer
+//!   destination its transfers go to, and refuses what the handoff cannot
+//!   carry; request execution runs that encode call before the
+//!   prefill/decode dispatch.
 //!
-//! Also owns the backend wire details for EPD encode: item assembly,
-//! transport-specific tensor payloads, and the request to the encode worker
-//! (the encoder RPC of a gRPC worker, the encode frame of a TokenSpeed encode
-//! server on the direct ZMQ lane).
+//! Also owns the rendezvous items' assembly and transport-specific tensor
+//! payloads; the sends to the encode workers live in the backend layer.
 
 use std::sync::Arc;
 
@@ -22,28 +25,33 @@ use async_trait::async_trait;
 use axum::response::Response;
 use rand::RngExt;
 use smg_grpc_client::{
-    common_proto,
-    tokenspeed_encoder::{tokenspeed_encoder_proto as tokenspeed_encoder, TokenSpeedEncoderClient},
+    common_proto, tokenspeed_encoder::tokenspeed_encoder_proto as tokenspeed_encoder,
 };
 use tracing::error;
 use uuid::Uuid;
 
-use super::{helpers::bootstrap_rendezvous, PipelineStage};
+use super::{helpers::bootstrap_rendezvous, pd_protocol::EncodeHandoff, PipelineStage};
 use crate::{
-    routers::grpc::{
-        backend_client::BackendClient,
-        client::GrpcClient,
-        context::{ClientSelection, EncodeOutputs, RequestContext, WorkerSelection},
-        multimodal::{
-            assemble_tokenspeed_for_encode, assembly_error_response, mm_rdma_exporter,
-            MultimodalIntermediate,
+    routers::{
+        error,
+        grpc::{
+            backend_client::{
+                send_tokenspeed_encode_frame, send_tokenspeed_encode_rpc, BackendClient,
+            },
+            client::GrpcClient,
+            context::{ClientSelection, EncodeOutputs, RequestContext, WorkerSelection},
+            multimodal::{
+                assemble_tokenspeed_for_encode, assembly_error_response,
+                ec_push::{push_destination, ImageFanout, PushEncodePlan},
+                mm_rdma_exporter, worker_supports_ec_transfer, MultimodalIntermediate,
+            },
+            proto_wrapper::{
+                cleanup_mm_shm_handles, cleanup_tokenspeed_items_encoder_shm,
+                collect_tokenspeed_multimodal_inputs_shm_handles, stage_tokenspeed_tensor_rdma,
+                EncodeItemBootstrapInfo, TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
+            },
+            zmq_client::EncodeRendezvous,
         },
-        proto_wrapper::{
-            cleanup_mm_shm_handles, cleanup_tokenspeed_items_encoder_shm,
-            collect_tokenspeed_multimodal_inputs_shm_handles, stage_tokenspeed_tensor_rdma,
-            EncodeItemBootstrapInfo, TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
-        },
-        zmq_client::EncodeRendezvous,
     },
     worker::{ConnectionMode, RuntimeType, Worker},
 };
@@ -61,14 +69,30 @@ impl EncodeStage {
 
 #[async_trait]
 impl PipelineStage for EncodeStage {
+    /// Plan the handoff the selection takes: the rendezvous rooms and encode
+    /// jobs, or the push arm's encoder and destination.
     async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
-        if ctx
-            .state
-            .workers
-            .as_ref()
-            .and_then(WorkerSelection::encode_assignments)
+        let Some(workers) = ctx.state.workers.as_ref() else {
+            return Ok(());
+        };
+        if workers
+            .encode_assignments()
             .is_none_or(|assignments| assignments.is_empty())
         {
+            return Ok(());
+        }
+
+        // Under a push handoff the encoder takes the built prompt during
+        // request execution; the stage names the encoder and the consumer
+        // destination and refuses what the handoff cannot carry. There is no
+        // per-item bootstrap rendezvous.
+        if workers.encode_handoff() == Some(EncodeHandoff::Push) {
+            let plan = plan_push(
+                ctx.input.request_type.sampling_n(),
+                workers,
+                ctx.state.image_anchor,
+            )?;
+            ctx.state.encode_outputs = Some(EncodeOutputs::Push(plan));
             return Ok(());
         }
 
@@ -94,7 +118,7 @@ impl PipelineStage for EncodeStage {
         }
 
         let (bootstrap_info, dispatch) = plan.into_parts();
-        ctx.state.encode_outputs = Some(EncodeOutputs {
+        ctx.state.encode_outputs = Some(EncodeOutputs::Rendezvous {
             bootstrap_info,
             dispatch,
         });
@@ -263,6 +287,61 @@ impl Drop for PreparedEncodeItem {
     }
 }
 
+/// The push arm's plan from the selection: the encoder of the prompt (under
+/// an image anchor, the encoders its images fan out to) and the consumer
+/// side's destination, refused where the handoff cannot carry the request
+/// (more than one sample, more than one encoder without an anchor to fan out
+/// on, a consumer without the transfer).
+fn plan_push(
+    sampling_n: u32,
+    workers: &WorkerSelection,
+    image_anchor: Option<u32>,
+) -> Result<PushEncodePlan, Response> {
+    if sampling_n != 1 {
+        return Err(error::bad_request(
+            "ec_multiple_samples",
+            "a push encode handoff requires n=1",
+        ));
+    }
+    let WorkerSelection::Disaggregated {
+        encode_assignments: Some(assignments),
+        prefill,
+        ..
+    } = workers
+    else {
+        return Err(error::service_unavailable(
+            "ec_encoder_unavailable",
+            "No encoder selected for the push handoff",
+        ));
+    };
+    let Some(first) = assignments.first() else {
+        return Err(error::internal_error(
+            "ec_encoder_assignment",
+            "a push handoff takes an encoder",
+        ));
+    };
+    if image_anchor.is_none() && assignments.len() > 1 {
+        return Err(error::internal_error(
+            "ec_encoder_assignment",
+            "a push handoff takes one encoder per prompt",
+        ));
+    }
+    if !worker_supports_ec_transfer(prefill.as_ref()) {
+        return Err(error::service_unavailable(
+            "ec_consumer_unsupported",
+            "Prefill worker does not support EC transfer",
+        ));
+    }
+    Ok(PushEncodePlan {
+        encoder: Arc::clone(&first.worker),
+        destination: push_destination(prefill.as_ref())?,
+        fanout: image_anchor.map(|anchor| ImageFanout {
+            anchor,
+            assignments: assignments.clone(),
+        }),
+    })
+}
+
 fn build_plan(
     intermediate: &MultimodalIntermediate,
     clients: Option<&ClientSelection>,
@@ -418,52 +497,105 @@ fn backend_name(client: &BackendClient) -> &'static str {
     }
 }
 
-/// Hand an encode request to a TokenSpeed encode server over its worker's
-/// ZMQ connection. Nothing answers it: the server ships the embedding to the
-/// prefill side over the transfer engine, as the gRPC encoder acks after its
-/// send.
-async fn send_tokenspeed_encode_frame(
-    worker: &dyn Worker,
-    rendezvous: &EncodeRendezvous,
-    request: tokenspeed_encoder::EncodeRequest,
-) -> std::result::Result<(), String> {
-    let url = worker.url();
-    let client = worker
-        .get_backend_client()
-        .await
-        .map_err(|e| format!("encode worker {url} is not connected: {e}"))?
-        .ok_or_else(|| format!("encode worker {url} has no ZMQ connection"))?;
-    let BackendClient::Zmq(client) = client.as_ref() else {
-        return Err(format!("encode worker {url} is not a direct-ZMQ worker"));
-    };
-    client
-        .encode_tokenspeed(request, rendezvous)
-        .await
-        .map_err(|status| format!("encode request to {url} failed: {}", status.message()))
-}
-
-async fn send_tokenspeed_encode_rpc(
-    endpoint: String,
-    request: tokenspeed_encoder::EncodeRequest,
-) -> std::result::Result<(), String> {
-    let client = TokenSpeedEncoderClient::connect_cached(&endpoint)
-        .await
-        .map_err(|e| format!("connect to encode worker {endpoint} failed: {e}"))?;
-    let response = client
-        .encode(request)
-        .await
-        .map_err(|e| format!("encode RPC to {endpoint} failed: {}", e.message()))?;
-    if !response.accepted {
-        return Err(format!(
-            "encode worker {endpoint} did not accept the request"
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routers::grpc::context::EncodeWorkerAssignment;
+
+    fn ec_worker(url: &str, role: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
+        let mut builder = crate::worker::BasicWorkerBuilder::new(url)
+            .runtime_type(RuntimeType::Vllm)
+            .label("ec_role", role)
+            .label("ec_connector", "ECMooncakeConnector");
+        for (key, value) in labels {
+            builder = builder.label(*key, *value);
+        }
+        Arc::new(builder.build())
+    }
+
+    fn push_selection(encoders: Vec<Arc<dyn Worker>>, prefill: Arc<dyn Worker>) -> WorkerSelection {
+        WorkerSelection::Disaggregated {
+            encode_assignments: Some(
+                encoders
+                    .into_iter()
+                    .enumerate()
+                    .map(|(item_index, worker)| EncodeWorkerAssignment { item_index, worker })
+                    .collect(),
+            ),
+            decode: Arc::clone(&prefill),
+            prefill,
+            runtime_type: RuntimeType::Vllm,
+        }
+    }
+
+    const CONSUMER: [(&str, &str); 2] = [
+        ("supports_ec_transfer", "true"),
+        ("ec_zmq_addrs", r#"["tcp://127.0.0.1:9101"]"#),
+    ];
+
+    /// A push handoff plans the one encoder and the consumer's destination;
+    /// a pull connector plans no destination.
+    #[test]
+    fn a_push_handoff_plans_one_encoder_and_the_consumers_destination() {
+        let encoder = ec_worker("grpc://127.0.0.1:9000", "ec_producer", &[]);
+        let consumer = ec_worker("grpc://127.0.0.1:9001", "ec_consumer", &CONSUMER);
+        let plan = plan_push(1, &push_selection(vec![encoder], consumer), None).expect("a plan");
+        assert_eq!(plan.encoder.url(), "grpc://127.0.0.1:9000");
+        assert_eq!(plan.destination.as_deref(), Some("tcp://127.0.0.1:9101"));
+        assert!(plan.fanout.is_none());
+
+        let pull = ec_worker(
+            "grpc://127.0.0.1:9002",
+            "ec_consumer",
+            &[
+                ("supports_ec_transfer", "true"),
+                ("ec_connector", "ECCPUConnector"),
+            ],
+        );
+        let encoder = ec_worker("grpc://127.0.0.1:9000", "ec_producer", &[]);
+        let plan = plan_push(1, &push_selection(vec![encoder], pull), None).expect("a plan");
+        assert!(plan.destination.is_none());
+    }
+
+    /// The push arm refuses what the handoff cannot carry: more than one
+    /// sample, more than one encoder without an anchor to fan out on, a
+    /// consumer without the transfer; under an anchor the encoders are the
+    /// fan-out.
+    #[test]
+    fn a_push_handoff_refuses_what_it_cannot_carry() {
+        use axum::http::StatusCode;
+        let producer = || ec_worker("grpc://127.0.0.1:9000", "ec_producer", &[]);
+        let consumer = ec_worker("grpc://127.0.0.1:9001", "ec_consumer", &CONSUMER);
+        let refused = |n, encoders, prefill, anchor| {
+            plan_push(n, &push_selection(encoders, prefill), anchor)
+                .err()
+                .expect("refused")
+                .status()
+        };
+        assert_eq!(
+            refused(2, vec![producer()], Arc::clone(&consumer), None),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            refused(1, vec![producer(), producer()], Arc::clone(&consumer), None),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let no_transfer = ec_worker("grpc://127.0.0.1:9003", "ec_consumer", &[]);
+        assert_eq!(
+            refused(1, vec![producer()], no_transfer, None),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let fanned = plan_push(
+            1,
+            &push_selection(vec![producer(), producer()], consumer),
+            Some(7),
+        )
+        .expect("a fan-out plan");
+        assert_eq!(
+            fanned.fanout.map(|fanout| fanout.assignments.len()),
+            Some(2)
+        );
+    }
 
     #[test]
     fn empty_plan_is_empty_and_yields_no_jobs() {
@@ -701,7 +833,7 @@ mod tests {
             assert!(!dispatch.is_empty());
 
             let state = ProcessingState {
-                encode_outputs: Some(EncodeOutputs {
+                encode_outputs: Some(EncodeOutputs::Rendezvous {
                     bootstrap_info: Vec::new(),
                     dispatch,
                 }),

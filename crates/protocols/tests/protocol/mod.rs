@@ -8,3 +8,4 @@ mod provider_ext;
 mod responses;
 mod sampling_params;
 mod systemone;
+mod zai_profile;

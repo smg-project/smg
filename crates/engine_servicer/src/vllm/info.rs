@@ -4,12 +4,16 @@
 
 use std::{sync::Arc, time::Duration};
 
+use openai_protocol::worker::SchedulerLoadSnapshot;
 use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
 use tracing::info;
 
 use super::{State, HEALTHY, SERVER_TYPE};
-use crate::load_report::{rank_ids, RankFigures};
+use crate::{
+    load_report::{rank_entries, rank_entry, RankFigures},
+    servicer::proto_token_ids,
+};
 
 /// How often the engine stats line is logged (vLLM's `VLLM_LOG_STATS_INTERVAL`
 /// default).
@@ -18,7 +22,10 @@ pub(super) const STATS_INTERVAL: Duration = Duration::from_secs(10);
 /// vLLM's periodic stats line. Its AsyncLLM logs one every interval; the
 /// headless engine has no frontend to do it, so the servicer does, from the
 /// piggybacked scheduler stats and its own token counters. One line marks the
-/// transition to idle, then it stays quiet until there is traffic again.
+/// transition to idle, then it stays quiet until there is traffic again. The
+/// frontend's `KV Transfer metrics` line comes the same way: whenever a rank's
+/// KV connector reported transfers since the last tick, its figures in the
+/// frontend's words.
 pub(super) async fn log_engine_stats(state: Arc<State>) {
     let mut ticker = tokio::time::interval(STATS_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -29,6 +36,9 @@ pub(super) async fn log_engine_stats(state: Arc<State>) {
         let Some(client) = state.shared.engine.client.get() else {
             continue;
         };
+        for (engine_index, transfers) in client.take_kv_transfer() {
+            info!(engine_index, "KV Transfer metrics: {}", transfers.summary());
+        }
         let prompt = state.shared.metrics.prompt_tokens_total();
         let generation = state.shared.metrics.generation_tokens_total();
         let prompt_delta = prompt.saturating_sub(last_prompt);
@@ -78,14 +88,7 @@ pub(super) fn health_check(state: &State) -> vllm::HealthCheckResponse {
 /// as the fallback for a launcher that reported none.
 pub(super) fn model_info(state: &State) -> vllm::GetModelInfoResponse {
     let model = &state.model;
-    // The launcher's context length wins; the handshake's is the fallback
-    // for a launcher that reported none.
-    let mut max_context_length = model.max_context_length;
-    if max_context_length == 0 {
-        if let Some(ready) = state.shared.ready() {
-            max_context_length = u32::try_from(ready.max_model_len).unwrap_or(u32::MAX);
-        }
-    }
+    let max_context_length = state.shared.context_window(model.max_context_length);
     vllm::GetModelInfoResponse {
         model_path: model.model_path.clone(),
         is_generation: model.is_generation,
@@ -96,11 +99,7 @@ pub(super) fn model_info(state: &State) -> vllm::GetModelInfoResponse {
         tokenizer_path: model.tokenizer_path.clone(),
         model_type: model.model_type.clone(),
         architectures: model.architectures.clone(),
-        eos_token_ids: model
-            .eos_token_ids
-            .iter()
-            .map(|&id| i32::try_from(id).unwrap_or(i32::MAX))
-            .collect(),
+        eos_token_ids: proto_token_ids(&model.eos_token_ids),
         pad_token_id: model.pad_token_id,
         bos_token_id: model.bos_token_id,
         max_req_input_len: i32::try_from(max_context_length).unwrap_or(i32::MAX),
@@ -153,6 +152,10 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         kv_connector: model.kv_connector.clone(),
         kv_role: model.kv_role.clone(),
         kv_engine_id: model.kv_engine_id.clone(),
+        supports_ec_transfer: model.supports_ec_transfer,
+        ec_connector: model.ec_connector.clone(),
+        ec_role: model.ec_role.clone(),
+        ec_zmq_addrs: model.ec_zmq_addrs.clone(),
         kv_cache_dtype: model.kv_cache_dtype.clone(),
         attention_backend: model.attention_backend.clone(),
         pairing_protocol: model.pairing_protocol.clone(),
@@ -174,70 +177,96 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
     }
 }
 
-/// `GetLoads`: the per-rank load piggybacked on engine output, in the gRPC
-/// response shape, with the handshake's capacity figures and, from this
+/// The handshake's capacity figures every rank's entry carries.
+struct Capacity {
+    max_running_requests: i32,
+    max_total_num_tokens: i32,
+}
+
+impl Capacity {
+    fn of(state: &State) -> Self {
+        Self {
+            max_running_requests: state.shared.running_window(state.model.max_num_seqs),
+            max_total_num_tokens: state.shared.kv_capacity_tokens(),
+        }
+    }
+}
+
+/// A reported rank's entry: the snapshot's figures with, from this
 /// servicer's own bookkeeping ([`crate::load_tracker`]), the queued
-/// token-work, generation throughput and hit rate that vLLM's stats do not
-/// carry, each rank's own: the servicer picks the rank a request goes to
-/// and sees what that rank cached and streamed for it.
-pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
+/// token-work, prefill/generation throughput and hit rate that vLLM's stats
+/// do not carry, the rank's own: the servicer picks the rank a request goes
+/// to and sees what that rank cached and streamed for it.
+fn reported_entry(
+    state: &State,
+    load: &SchedulerLoadSnapshot,
+    figures: &RankFigures,
+    capacity: &Capacity,
+) -> vllm::SchedulerLoad {
+    let estimate = state
+        .shared
+        .loads
+        .estimate(load.dp_rank, load.num_waiting_reqs);
+    vllm::SchedulerLoad {
+        dp_rank: figures.dp_rank,
+        num_running_reqs: figures.running,
+        num_waiting_reqs: figures.waiting,
+        num_total_reqs: figures.total,
+        num_used_tokens: figures.used_tokens,
+        token_usage: figures.usage,
+        utilization: figures.usage,
+        max_running_requests: capacity.max_running_requests,
+        max_total_num_tokens: capacity.max_total_num_tokens,
+        num_waiting_uncached_tokens: estimate.queued_token_work,
+        gen_throughput: estimate.gen_throughput,
+        prefill_throughput: estimate.prefill_throughput,
+        cache_hit_rate: estimate.cache_hit_rate,
+    }
+}
+
+/// A connected rank no output batch has carried a snapshot for yet: a
+/// zero-filled entry (see [`rank_entries`]; the Router reads an empty list
+/// as no report at all). The servicer's own figures do not wait for the
+/// engine's first snapshot: what this rank cached and streamed so far, and
+/// the token-work queued to it. The engine has not said how many requests
+/// it holds waiting, and before its first snapshot that is every request
+/// submitted to the rank and not started, so all of them count (an
+/// overestimate by what is already in prefill, better than a zero that
+/// reads as known-empty).
+fn unreported_entry(state: &State, dp_rank: i32, capacity: &Capacity) -> vllm::SchedulerLoad {
+    let estimate = state.shared.loads.estimate(dp_rank, i32::MAX);
+    vllm::SchedulerLoad {
+        dp_rank,
+        max_running_requests: capacity.max_running_requests,
+        max_total_num_tokens: capacity.max_total_num_tokens,
+        num_waiting_uncached_tokens: estimate.queued_token_work,
+        gen_throughput: estimate.gen_throughput,
+        prefill_throughput: estimate.prefill_throughput,
+        cache_hit_rate: estimate.cache_hit_rate,
+        ..Default::default()
+    }
+}
+
+/// `GetLoads`: the per-rank load piggybacked on engine output, in the gRPC
+/// response shape, with the handshake's capacity figures and this servicer's
+/// own figures per rank ([`reported_entry`], [`unreported_entry`]). The rank
+/// the request names (`dp_rank`) is answered alone, every rank without one,
+/// as the other wires answer it; a rank this servicer does not serve answers
+/// no entry.
+pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<vllm::GetLoadsResponse, Status> {
     let client = state.shared.engine()?;
     let ready = client.ready_response();
-    let max_running_requests = state.shared.running_window(state.model.max_num_seqs);
-    let max_total_num_tokens = state.shared.kv_capacity_tokens();
-    let snapshot = client.get_loads();
-    let mut dp_rank_count = snapshot.dp_rank_count;
-    let mut loads: Vec<vllm::SchedulerLoad> = snapshot
-        .loads
-        .into_iter()
-        .map(|load| {
-            let figures = RankFigures::of(&load, max_total_num_tokens);
-            let estimate = state.loads.estimate(load.dp_rank, load.num_waiting_reqs);
-            vllm::SchedulerLoad {
-                dp_rank: figures.dp_rank,
-                num_running_reqs: figures.running,
-                num_waiting_reqs: figures.waiting,
-                num_total_reqs: figures.total,
-                num_used_tokens: figures.used_tokens,
-                token_usage: figures.usage,
-                utilization: figures.usage,
-                max_running_requests,
-                max_total_num_tokens,
-                num_waiting_uncached_tokens: estimate.queued_token_work,
-                gen_throughput: estimate.gen_throughput,
-                cache_hit_rate: estimate.cache_hit_rate,
-            }
-        })
-        .collect();
-    if loads.is_empty() {
-        // No output batch has carried a snapshot yet. The Python servicer
-        // reports a zero-filled entry per rank, and the Router reads an
-        // empty list as no report at all.
-        let ranks = state.shared.rank_count(state.model.data_parallel_size);
-        loads = rank_ids(ranks)
-            .map(|dp_rank| {
-                // The servicer's own figures do not wait for the engine's
-                // first snapshot: what this rank cached and streamed so far,
-                // and the token-work queued to it. The engine has not said
-                // how many requests it holds waiting, and before its first
-                // snapshot that is every request submitted to the rank and
-                // not started, so all of them count (an overestimate by
-                // what is already in prefill, better than a zero that reads
-                // as known-empty).
-                let estimate = state.loads.estimate(dp_rank, i32::MAX);
-                vllm::SchedulerLoad {
-                    dp_rank,
-                    max_running_requests,
-                    max_total_num_tokens,
-                    num_waiting_uncached_tokens: estimate.queued_token_work,
-                    gen_throughput: estimate.gen_throughput,
-                    cache_hit_rate: estimate.cache_hit_rate,
-                    ..Default::default()
-                }
-            })
-            .collect();
-        dp_rank_count = loads.len().try_into().unwrap_or_default();
-    }
+    let capacity = Capacity::of(state);
+    let ranks = state.shared.rank_count(state.model.data_parallel_size);
+    let (loads, _) = rank_entries(
+        client.get_loads().loads,
+        capacity.max_total_num_tokens,
+        ranks,
+        dp_rank,
+        |load, figures| reported_entry(state, load, figures, &capacity),
+        |dp_rank| unreported_entry(state, dp_rank, &capacity),
+    );
+    let dp_rank_count = i32::try_from(loads.len()).unwrap_or(i32::MAX);
     Ok(vllm::GetLoadsResponse {
         timestamp: chrono::Utc::now().to_rfc3339(),
         // The engine's version, as the Python servicer reports vLLM's.
@@ -248,4 +277,22 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
         dp_rank_count,
         loads,
     })
+}
+
+/// One rank's entry of [`loads`], built as that answer builds it and read
+/// alone: no timestamp, no version, no vector of the other ranks and this
+/// rank's estimate only, for the record the relay attaches to every batch
+/// and tick. `None` names the answer's first entry, rank 0 (a connected
+/// engine makes it a rank); a rank past the connected ones has no entry.
+pub(super) fn rank_load(state: &State, dp_rank: Option<i32>) -> Option<vllm::SchedulerLoad> {
+    let client = state.shared.engine().ok()?;
+    let capacity = Capacity::of(state);
+    rank_entry(
+        |index| client.rank_load(index),
+        capacity.max_total_num_tokens,
+        state.shared.rank_count(state.model.data_parallel_size),
+        dp_rank,
+        |load, figures| reported_entry(state, load, figures, &capacity),
+        |rank| unreported_entry(state, rank, &capacity),
+    )
 }

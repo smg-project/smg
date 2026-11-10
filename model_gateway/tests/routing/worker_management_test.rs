@@ -695,3 +695,58 @@ mod discovery_ownership_tests {
         .expect("an accepted DELETE of a discovered worker removes it");
     }
 }
+
+/// The JSON a GET of `uri` answers on the production route table.
+#[expect(clippy::unwrap_used, reason = "test helper: the answer is JSON")]
+async fn json_of(app: &axum::Router, uri: &str) -> serde_json::Value {
+    let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// `GET /workers?format=manifest` answers the registered fleet in the file
+/// provider's manifest shape; the default answer keeps its records, and
+/// `?origin=` tells the locally registered workers from the discovered ones.
+#[tokio::test]
+async fn the_manifest_format_exports_the_registered_fleet() {
+    let config = TestRouterConfig::round_robin(3916);
+    let ctx = AppTestContext::new_with_config(config, vec![TestWorkerConfig::healthy(19916)]).await;
+    let app = ctx.create_app();
+
+    let manifest = json_of(&app, "/workers?format=manifest").await;
+    assert_eq!(manifest["version"], json!(1), "{manifest}");
+    let worker = &manifest["workers"][0];
+    assert!(
+        worker["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with(":19916")),
+        "{manifest}"
+    );
+    assert_eq!(worker["worker_type"], json!("regular"), "{manifest}");
+    assert!(worker.get("id").is_none(), "{manifest}");
+    assert!(worker.get("api_key").is_none(), "{manifest}");
+    assert!(manifest.get("warnings").is_none(), "{manifest}");
+
+    let records = json_of(&app, "/workers").await;
+    assert_eq!(records["total"], json!(1), "{records}");
+    assert!(records["stats"].is_object(), "{records}");
+    assert!(
+        records["workers"][0]["is_healthy"].is_boolean(),
+        "{records}"
+    );
+
+    assert_eq!(
+        json_of(&app, "/workers?origin=local").await["total"],
+        json!(1)
+    );
+    assert_eq!(
+        json_of(&app, "/workers?origin=discovery").await["total"],
+        json!(0)
+    );
+
+    ctx.shutdown().await;
+}

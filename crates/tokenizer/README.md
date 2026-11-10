@@ -26,6 +26,7 @@ as of `tokenizer/src/*`.
 - `hub.rs` – Hugging Face Hub downloads via `hf_hub`
 - `huggingface.rs` – wrapper over `tokenizers::Tokenizer`, chat template loading, vocab access
 - `tiktoken.rs` – wrapper over `tiktoken-rs` encoders for OpenAI model families and hub-loaded tiktoken models (includes `tokenizer_config.json` parsing for the tiktoken path)
+- `tekken.rs` – the `tekken.json` reader (base64 ranks, the file's own split pattern, the special-token block below the ranks) that feeds the tiktoken backend
 - `chat_template.rs` – AST-driven Jinja template inspection, rendering utilities, shared `ChatTemplateState`, and template file loading
 - `registry.rs` – thread-safe tokenizer registry with deduplication for IGW mode, supporting lookup by UUID or name
 - `sequence.rs` – stateful incremental decoding helper used by router sequences
@@ -71,6 +72,14 @@ as of `tokenizer/src/*`.
   bases. Unknown model names return an error rather than silently defaulting.
 - `from_dir` loads hub-hosted tiktoken models (e.g. Kimi K2, DeepSeek) from a directory containing
   `tiktoken.model` and `tokenizer_config.json`, with full vocab maps and chat template support.
+- `from_tekken_file` loads a `tekken.json` vocabulary into the same engine, laid out as the file's
+  reference reader lays it out: an id is a rank plus the size of the special-token block, the
+  vocabulary is cut at the configured size, `encode(text, true)` prepends the file's BOS and
+  nothing else, and `skip_special_tokens` drops every id of the block. The chat templates render
+  under the structural form (the file's own reader writes its control tokens structurally and
+  encodes every request string as plain text): the template's control tokens are tokens and the
+  same spelling typed into a message stays text; the flat `encode` reads a spelling as its token,
+  as the checkpoint's conversion does.
 - Implements encode/decode operations; batch encode simply iterates sequentially.
 - Built-in OpenAI models provide approximate vocab sizes and common GPT special tokens.
   Hub-loaded models build full `token_to_id`/`id_to_token` mappings from the BPE file.
@@ -81,7 +90,13 @@ as of `tokenizer/src/*`.
 
 ## Factory and Backend Discovery (`factory.rs`)
 - `create_tokenizer{,_async}` accept either a filesystem path or a model identifier. Logic:
-   1. Paths are loaded directly; the file extension (or JSON autodetection) selects the backend.
+   1. Paths are loaded directly; a directory takes `tekken.json`, then `tokenizer.json`, then
+      `vocab.json` + `merges.txt` under a Qwen2 class, then a tiktoken vocabulary; a single file's
+      extension (or JSON autodetection) selects the backend, `tekken.json` by its name. Both
+      backends read the processor's legacy `chat_template.json` beside the files for the requests
+      without tools (`processor_chat_template`, one read): the tiktoken backend does so for every
+      vocabulary format it loads (`tiktoken.model`, `*.tiktoken`, `tekken.json`), as the engine's
+      processor and the conversion of the same checkpoint do.
    2. Strings that look like OpenAI model names (`gpt-*`, `davinci`, `curie`, `babbage`, `ada`) use
       `TiktokenTokenizer`.
    3. Everything else attempts a Hugging Face Hub download via `download_tokenizer_from_hf`.
@@ -227,7 +242,7 @@ The gateway exports process-lifetime totals across tokenizer instances on `/metr
 | `smg_tokenizer_cache_evictions_total` | `layer=l0` or `l1` | Entries actually removed for capacity, excluding clear, drop and replacement |
 | `smg_tokenizer_cache_reused_bytes_total` | `layer=l0` or `l1` | UTF-8 input bytes served by hits: whole input for L0, matched prefix for L1 |
 | `smg_tokenizer_encode_path_loads_total` | `path=v1`, `native` or `tokenizers` | Hugging Face tokenizers loaded, by the encode path chosen at load (see `encode_path.rs`); a tokenizer loaded twice counts twice |
-| `smg_tokenizer_encode_fallbacks_total` | `reason=not_nfc` or `piece_declined` | Inputs the direct byte-level encoder gave up to `tokenizers` after the load's choice |
+| `smg_tokenizer_encode_fallbacks_total` | `reason=piece_declined` | Inputs the direct byte-level encoder gave up to `tokenizers` after the load's choice |
 
 Labels are fixed; no model IDs or prompt text are retained. L0 hits bypass L1,
 so each layer's hit ratio uses its own lookup count. Disabled layers have no

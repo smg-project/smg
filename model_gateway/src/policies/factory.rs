@@ -26,13 +26,11 @@ impl PolicyFactory {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
-                max_waiting_requests,
                 ..
             } => Arc::new(LeastLoadPolicy::with_params(
                 *kv_pressure_weight,
                 *mean_prefill_tokens,
                 *default_throughput,
-                *max_waiting_requests,
             )),
             PolicyConfig::CacheAware {
                 cache_threshold,

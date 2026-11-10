@@ -79,6 +79,14 @@ impl ShardedChainIndex {
         &self.shards[shard]
     }
 
+    /// Lowers every shard's arena cap so a test reaches the caps in a few stores.
+    #[cfg(test)]
+    pub(crate) fn lower_arena_cap(&mut self, words: usize) {
+        for shard in &mut self.shards {
+            shard.lower_arena_cap(words);
+        }
+    }
+
     /// The shard a worker id names.
     #[inline]
     pub fn shard_of(worker: u32) -> usize {
@@ -303,6 +311,7 @@ impl ShardedChainIndex {
             total.header_bytes += stats.header_bytes;
             total.slab_bytes += stats.slab_bytes;
             total.engine_conflicts += stats.engine_conflicts;
+            total.cap_refusals += stats.cap_refusals;
             total.landing_mismatches += stats.landing_mismatches;
             total.moved_hashes += stats.moved_hashes;
             total.splits_by_branch += stats.splits_by_branch;
@@ -350,27 +359,42 @@ impl Default for ShardedChainIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reference::{request_prefix_hashes, ReferenceIndexer};
-
-    fn content(stream: u64, position: usize) -> ContentHash {
-        crate::compute_content_hash(&[stream as u32, (stream >> 32) as u32, position as u32])
-    }
-
-    fn blocks_of(contents: &[ContentHash]) -> Vec<StoredBlock> {
-        contents
-            .iter()
-            .zip(request_prefix_hashes(contents))
-            .map(|(&content_hash, seq_hash)| StoredBlock {
-                seq_hash,
-                content_hash,
-            })
-            .collect()
-    }
+    use crate::{
+        chain_index::tests::{blocks_of, content},
+        reference::ReferenceIndexer,
+    };
 
     fn sorted(scores: OverlapScores) -> Vec<(u32, u32)> {
         let mut v: Vec<(u32, u32)> = scores.scores.into_iter().collect();
         v.sort_unstable();
         v
+    }
+
+    /// A store a shard declines at its arena cap is counted in the sharded total, like every
+    /// other counter: the gateway's gauge reads the total.
+    #[test]
+    fn a_shards_cap_refusal_is_in_the_total() {
+        let mut index = ShardedChainIndex::new(2, 8);
+        index.shards[1].lower_arena_cap(64);
+        let w = index.intern_worker_in(1, "w").expect("id");
+        let mut map = ChainBlockMap::default();
+        let parent = content(5, 0);
+        for i in 0..13 {
+            index
+                .apply_stored(w, &blocks_of(&[parent, content(6, i)]), None, &mut map)
+                .expect("a child within the cap");
+        }
+        assert!(matches!(
+            index.apply_stored(w, &blocks_of(&[parent, content(6, 13)]), None, &mut map),
+            Err(ApplyError::ArenaCapReached { .. })
+        ));
+        assert_eq!(index.stats().cap_refusals, 1);
+        let per_shard: Vec<usize> = index
+            .shard_stats()
+            .iter()
+            .map(|stats| stats.cap_refusals)
+            .collect();
+        assert_eq!(per_shard, vec![0, 1]);
     }
 
     /// One shard is the chain index: the same ids, scores, blocks and counters for the same

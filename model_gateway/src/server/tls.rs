@@ -1,7 +1,19 @@
-//! The start-up check of who can read a private key file.
+//! The server's TLS half: the start-up check of who can read a private key
+//! file, the process-level rustls crypto provider, and the HTTP client
+//! constructors that need it.
+//!
+//! The constructors live beside the provider because they cannot be built
+//! without it: the HTTP client takes the process-level TLS crypto provider
+//! (reqwest's `rustls-no-provider` feature) and panics at build time when
+//! there is none, so every client of this crate, of its bindings and of its
+//! tests comes from the functions here, which install the provider first
+//! (see [`install_crypto_provider`]). [`crate::server`] re-exports them. The
+//! direct constructors are disallowed by the workspace's clippy configuration
+//! (`disallowed-methods` in `clippy.toml`) everywhere but here.
 
 use std::path::Path;
 
+use rustls::crypto::{ring, CryptoProvider};
 use tracing::warn;
 
 /// The permission bits of a private key file at `path` when more of the
@@ -12,7 +24,7 @@ use tracing::warn;
 /// (a secret volume with a group, a `root:ssl-cert` key) may be readable by
 /// the gateway's group, since that is how the gateway reads it at all, but
 /// not writable by it and not open to others (see [`shared_mode`]).
-pub(crate) fn shared_private_key_mode(path: &Path) -> Option<u32> {
+fn shared_private_key_mode(path: &Path) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -31,7 +43,7 @@ pub(crate) fn shared_private_key_mode(path: &Path) -> Option<u32> {
 /// any group or other bit on a file the gateway owns (`owned`), group write
 /// or any other bit on a file another user owns (group read is how the
 /// gateway reads such a file). Answers the mode when it does.
-pub(crate) fn shared_mode(mode: u32, owned: bool) -> Option<u32> {
+fn shared_mode(mode: u32, owned: bool) -> Option<u32> {
     let shared = if owned { 0o077 } else { 0o027 };
     (mode & shared != 0).then_some(mode)
 }
@@ -49,6 +61,62 @@ pub(crate) fn warn_if_private_key_is_shared(path: &Path, flag: &str) {
             "the TLS private key file is readable or writable by its group or by others (mode {mode:04o}); expected 0600 or 0400 (0640 when another user owns the file)"
         );
     }
+}
+
+/// Installs `ring` as the process-level rustls crypto provider, unless one
+/// is installed already.
+///
+/// `ring` is the only backend compiled into this crate's binaries. The bare
+/// rustls builders (the HTTPS listener, the mesh listener) pick it up on
+/// their own, but the HTTP client is built with reqwest's
+/// `rustls-no-provider` feature and uses whatever provider the process
+/// installed, panicking when there is none. Installing is idempotent: a
+/// provider installed earlier, by an embedding process or a previous start in
+/// the same process, stays. [`crate::server::startup`] calls it first thing,
+/// and so do the client functions of this module, through which this
+/// crate, its bindings and its tests build every HTTP client; nothing else
+/// needs to.
+pub fn install_crypto_provider() {
+    if CryptoProvider::get_default().is_none() {
+        // An error here means another thread installed one in between,
+        // which is the outcome wanted.
+        let _ = ring::default_provider().install_default();
+    }
+}
+
+/// A client with reqwest's defaults, the process provider installed.
+///
+/// Like `reqwest::Client::new`, panics when the client cannot be built.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the crate's one direct client construction; the process TLS crypto provider is installed first"
+)]
+pub fn http_client() -> reqwest::Client {
+    install_crypto_provider();
+    reqwest::Client::new()
+}
+
+/// A client builder, the process provider installed.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the crate's one direct client construction; the process TLS crypto provider is installed first"
+)]
+pub fn http_client_builder() -> reqwest::ClientBuilder {
+    install_crypto_provider();
+    reqwest::Client::builder()
+}
+
+/// A blocking client with reqwest's defaults, the process provider installed.
+///
+/// Like `reqwest::blocking::Client::new`, panics when the client cannot be
+/// built.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the crate's one direct client construction; the process TLS crypto provider is installed first"
+)]
+pub fn blocking_http_client() -> reqwest::blocking::Client {
+    install_crypto_provider();
+    reqwest::blocking::Client::new()
 }
 
 #[cfg(test)]

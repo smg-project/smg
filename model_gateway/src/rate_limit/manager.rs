@@ -2,18 +2,18 @@
 //!
 //! Built once at startup from the optional `--tenant-rate-limit-config`
 //! YAML. `Ok(None)` when disabled; `Err` when enabled but the YAML is
-//! invalid — callers must fail startup on `Err`, not run unlimited.
+//! invalid (or there is no Tokio runtime for the in-memory backend's idle
+//! sweep) — callers must fail startup on `Err`, not run unlimited.
 
 use std::sync::Arc;
 
 use tracing::info;
+use uuid::Uuid;
 
-#[cfg(test)]
-use super::backend::UsageSettlement;
 use super::{
-    backend::{RateLimitBackend, ReserveOutcome, ReserveRequest},
+    backend::{RateLimitBackend, ReserveOutcome, ReserveRequest, UsageSettlement},
     config::RateLimitYaml,
-    local_backend::LocalRateLimitBackend,
+    local_backend::{LocalRateLimitBackend, PolicyReplacement},
     policy::CompiledPolicySet,
     reservation::SharedReservationHandle,
 };
@@ -27,21 +27,70 @@ pub enum Reservation {
     Denied { retry_after_secs: u64 },
 }
 
+/// The backend a manager and its handles call. The in-memory one is called
+/// by static dispatch: none of its calls waits, so a reservation taken and
+/// settled on it builds no boxed future. Any other implementation of the
+/// [`RateLimitBackend`] contract is called through the trait object.
+#[derive(Clone)]
+pub(crate) enum Backend {
+    Local(Arc<LocalRateLimitBackend>),
+    Dyn(Arc<dyn RateLimitBackend>),
+}
+
+impl Backend {
+    pub(crate) async fn reserve(&self, request: ReserveRequest<'_>) -> ReserveOutcome {
+        match self {
+            Self::Local(backend) => backend.reserve_now(request),
+            Self::Dyn(backend) => backend.reserve(request).await,
+        }
+    }
+
+    pub(crate) async fn settle_success(&self, request_charge_id: Uuid, usage: UsageSettlement) {
+        match self {
+            Self::Local(backend) => backend.settle_success_now(request_charge_id, usage),
+            Self::Dyn(backend) => backend.settle_success(request_charge_id, usage).await,
+        }
+    }
+
+    pub(crate) async fn close_reserved_only(&self, request_charge_id: Uuid) {
+        match self {
+            Self::Local(backend) => backend.close_reserved_only_now(request_charge_id),
+            Self::Dyn(backend) => backend.close_reserved_only(request_charge_id).await,
+        }
+    }
+
+    pub(crate) async fn abandon(&self, request_charge_id: Uuid) {
+        match self {
+            Self::Local(backend) => backend.abandon_now(request_charge_id),
+            Self::Dyn(backend) => backend.abandon(request_charge_id).await,
+        }
+    }
+}
+
+impl From<Arc<dyn RateLimitBackend>> for Backend {
+    fn from(backend: Arc<dyn RateLimitBackend>) -> Self {
+        Self::Dyn(backend)
+    }
+}
+
 /// Call [`Self::reserve`] once per logical request, before any internal
 /// retry loop, and resolve the returned handle exactly once at the end.
 /// Each call builds an independent handle, so calling it again mid-retry
 /// risks one handle abandoning a reservation another still intends to
 /// settle.
 pub struct RateLimitManager {
-    backend: Arc<dyn RateLimitBackend>,
+    backend: Backend,
 }
 
 impl RateLimitManager {
-    /// A manager over `backend`: the in-memory backend [`Self::from_config`]
-    /// builds, or another implementation of the [`RateLimitBackend`]
-    /// contract (a test's, an external one's).
+    /// A manager over `backend`, an implementation of the
+    /// [`RateLimitBackend`] contract other than the in-memory one (a
+    /// test's, an external one's); [`Self::from_config`] builds the
+    /// in-memory one.
     pub fn new(backend: Arc<dyn RateLimitBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend: Backend::Dyn(backend),
+        }
     }
 
     pub fn from_config(rc: &RouterConfig) -> Result<Option<Arc<Self>>, String> {
@@ -69,15 +118,32 @@ impl RateLimitManager {
             }
         }
         let compiled = CompiledPolicySet::compile(&yaml).map_err(|e| e.to_string())?;
-        let backend: Arc<dyn RateLimitBackend> = Arc::new(LocalRateLimitBackend::new(compiled));
-        Ok(Self::new(backend))
+        let backend = LocalRateLimitBackend::start(compiled)?;
+        Ok(Self {
+            backend: Backend::Local(backend),
+        })
     }
 
-    pub async fn reserve(&self, request: ReserveRequest) -> Reservation {
+    /// Puts `policy` in force on the in-memory backend (its
+    /// `replace_policy`). The caller holds the document the set was compiled
+    /// from to the start's checks (a `header:` tenant key needs the trusted
+    /// tenant header), since a compiled set carries no such rule. A backend
+    /// behind the trait object takes no new policy while running: `Err`
+    /// says so.
+    pub fn replace_policy(&self, policy: CompiledPolicySet) -> Result<PolicyReplacement, String> {
+        match &self.backend {
+            Backend::Local(backend) => Ok(backend.replace_policy(policy)),
+            Backend::Dyn(_) => {
+                Err("the rate-limit backend in use takes no new policy while running".to_string())
+            }
+        }
+    }
+
+    pub async fn reserve(&self, request: ReserveRequest<'_>) -> Reservation {
         let request_charge_id = request.request_charge_id;
         match self.backend.reserve(request).await {
             ReserveOutcome::Admitted => Reservation::Admitted(Arc::new(
-                SharedReservationHandle::new(Arc::clone(&self.backend), request_charge_id),
+                SharedReservationHandle::new(self.backend.clone(), request_charge_id),
             )),
             ReserveOutcome::Denied { retry_after_secs } => Reservation::Denied { retry_after_secs },
         }
@@ -94,10 +160,8 @@ fn load_yaml(path: Option<&str>) -> Result<RateLimitYaml, String> {
 
 #[cfg(test)]
 mod tests {
-    use uuid::Uuid;
-
     use super::*;
-    use crate::{rate_limit::config::TenantPolicySpec, tenant::TenantKey};
+    use crate::rate_limit::{config::TenantPolicySpec, test_support::reserve_request};
 
     fn manager_with_limits(tpm: u32, rpm: u32) -> RateLimitManager {
         let yaml = RateLimitYaml {
@@ -110,23 +174,15 @@ mod tests {
             tenants: Vec::new(),
         };
         let compiled = CompiledPolicySet::compile(&yaml).unwrap();
-        let backend: Arc<dyn RateLimitBackend> = Arc::new(LocalRateLimitBackend::new(compiled));
-        RateLimitManager::new(backend)
-    }
-
-    fn request(tenant: &str, tokens: u32) -> ReserveRequest {
-        ReserveRequest {
-            request_charge_id: Uuid::now_v7(),
-            tenant_key: TenantKey::new(tenant),
-            model_id: None,
-            estimated_input_tokens: tokens,
+        RateLimitManager {
+            backend: Backend::Local(Arc::new(LocalRateLimitBackend::new(compiled))),
         }
     }
 
     #[tokio::test]
     async fn admitted_reservation_carries_a_handle() {
         let manager = manager_with_limits(100, 5);
-        match manager.reserve(request("auth:team-red", 50)).await {
+        match manager.reserve(reserve_request("auth:team-red", 50)).await {
             Reservation::Admitted(handle) => {
                 // The handle is independently usable -- settle through it,
                 // not through the backend directly.
@@ -140,7 +196,7 @@ mod tests {
     async fn denied_reservation_carries_no_handle() {
         let manager = manager_with_limits(100, 5);
         assert!(matches!(
-            manager.reserve(request("auth:team-red", 200)).await,
+            manager.reserve(reserve_request("auth:team-red", 200)).await,
             Reservation::Denied { .. }
         ));
     }
@@ -186,8 +242,8 @@ mod tests {
         assert!(RateLimitManager::from_config(&rc).is_err());
     }
 
-    #[test]
-    fn enabled_with_valid_policy_succeeds() {
+    #[tokio::test]
+    async fn enabled_with_valid_policy_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rate_limit.yaml");
         std::fs::write(
@@ -198,6 +254,23 @@ mod tests {
 
         let rc = router_config(true, Some(path.to_str().unwrap().to_string()));
         assert!(matches!(RateLimitManager::from_config(&rc), Ok(Some(_))));
+    }
+
+    /// The in-memory backend's idle sweep needs a runtime to run on: a
+    /// valid policy built outside one fails startup rather than panicking
+    /// or running without the sweep.
+    #[test]
+    fn enabled_outside_a_runtime_fails_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rate_limit.yaml");
+        std::fs::write(
+            &path,
+            "default_policy:\n  tokens_per_minute: 1000\n  requests_per_minute: 60\n",
+        )
+        .unwrap();
+
+        let rc = router_config(true, Some(path.to_str().unwrap().to_string()));
+        assert!(RateLimitManager::from_config(&rc).is_err());
     }
 
     #[test]
@@ -220,8 +293,8 @@ mod tests {
         assert!(RateLimitManager::from_config(&rc).is_err());
     }
 
-    #[test]
-    fn header_tenant_key_with_trust_tenant_header_succeeds() {
+    #[tokio::test]
+    async fn header_tenant_key_with_trust_tenant_header_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rate_limit.yaml");
         std::fs::write(

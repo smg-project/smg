@@ -18,6 +18,7 @@ use openai_protocol::{
         self, CountMessageTokensRequest, CreateMessageRequest, InputContent, InputContentBlock,
         InputMessage, SystemContent, ToolResultContent,
     },
+    profile::ProviderProfile,
 };
 use serde_json::{json, Value};
 use tracing::error;
@@ -57,15 +58,27 @@ pub(crate) struct MessagesPrompt<'a> {
     pub tool_choice: Option<&'a messages::ToolChoice>,
 }
 
-impl<'a> From<&'a CreateMessageRequest> for MessagesPrompt<'a> {
-    fn from(request: &'a CreateMessageRequest) -> Self {
+impl<'a> MessagesPrompt<'a> {
+    /// The prompt parts of `request`, with the model's provider profile the
+    /// caller derived already (the preparation stage derives it once per
+    /// request); `From` derives it for a caller without one.
+    pub(crate) fn for_request(
+        request: &'a CreateMessageRequest,
+        provider: ProviderProfile,
+    ) -> Self {
         Self {
             messages: &request.messages,
             system: request.system.as_ref(),
-            thinking: request.template_thinking(),
+            thinking: request.template_thinking_for(provider),
             reasoning_effort: request.reasoning_effort(),
             tool_choice: request.tool_choice.as_ref(),
         }
+    }
+}
+
+impl<'a> From<&'a CreateMessageRequest> for MessagesPrompt<'a> {
+    fn from(request: &'a CreateMessageRequest) -> Self {
+        Self::for_request(request, ProviderProfile::for_model(&request.model))
     }
 }
 
@@ -94,9 +107,10 @@ pub fn process_messages(
     chat_tools: Option<&[ChatTool]>,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
+    provider: ProviderProfile,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
     process_messages_prompt(
-        MessagesPrompt::from(request),
+        MessagesPrompt::for_request(request, provider),
         tokenizer,
         chat_tools,
         placeholder_tokens,
@@ -118,11 +132,12 @@ pub fn process_messages_with_encoding(
         chat_tools,
         None,
         MediaPartOrder::MediaFirst,
+        ProviderProfile::for_model(&request.model),
     )
 }
 
 /// [`process_messages`] over the prompt parts alone.
-pub(crate) fn process_messages_prompt(
+fn process_messages_prompt(
     request: MessagesPrompt<'_>,
     tokenizer: &dyn Tokenizer,
     chat_tools: Option<&[ChatTool]>,
@@ -231,8 +246,8 @@ pub(crate) fn process_messages_prompt(
     };
 
     let rendered = tokenizer
-        .apply_chat_template_with_encoding(
-            &transformed_messages,
+        .apply_chat_template_with_encoding_owned(
+            transformed_messages,
             params,
             assistant_prefix.as_deref(),
         )
@@ -275,7 +290,9 @@ pub fn template_tools<'a>(
 /// from the registries before the template renders, as the preparation
 /// stages resolve it: nothing is fetched or preprocessed here.
 pub(crate) struct ResolvedMedia {
-    /// Where the model's template wants media parts relative to text.
+    /// Where the model's template wants media parts relative to text; the
+    /// default (`MediaFirst`) for a request without media, which no renderer
+    /// acts on: with no media part there is nothing to place.
     pub(crate) media_order: MediaPartOrder,
     /// The request's media and the placeholders the template writes for it,
     /// when the request carries media.
@@ -328,9 +345,10 @@ pub(crate) async fn resolve_messages_media(
 }
 
 /// Resolve what a chat-like request's media needs before the template
-/// renders: the model's media-part order and, for a request with media, the
+/// renders: for a request with media, the model's media-part order and the
 /// plan `plan` builds from the request and the placeholder tokens (the
-/// engine's own limits applied). A renderer that writes media as template
+/// engine's own limits applied); a request without media returns before the
+/// registries are read, with the default order and no plan. A renderer that writes media as template
 /// text has no plan and keeps the authored order, its request's media
 /// recorded all the same. The chat and Messages
 /// preparation stages and count_tokens resolve through here, so the three
@@ -369,31 +387,6 @@ pub(crate) async fn resolve_media(
             media: None,
         });
     }
-    // The tokenizer's registry entry (its id and source) is read for the
-    // media paths alone, which need the multimodal components; a gateway
-    // without them looks nothing up.
-    let tokenizer_entry = components.multimodal.as_ref().and_then(|_| {
-        components
-            .tokenizer_registry
-            .get_by_name(model_id)
-            .or_else(|| components.tokenizer_registry.get_by_id(model_id))
-    });
-    // The media-part order comes from the model registry so every path
-    // renders a model consistently.
-    let media_order = match (components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
-        (Some(mm_components), Some(entry)) => {
-            multimodal::resolve_media_part_order(
-                model_id,
-                tokenizer,
-                mm_components,
-                &entry.id,
-                &entry.source,
-            )
-            .await
-        }
-        _ => MediaPartOrder::MediaFirst,
-    };
-
     let plan = plan();
     if record_media {
         record(&plan);
@@ -404,11 +397,16 @@ pub(crate) async fn resolve_media(
     // on the declared parts, before any byte of media is fetched, decoded or sent.
     multimodal::ensure_model_accepts_media(&components.worker_registry, model_id, &plan)?;
     if plan.is_empty() {
+        // A request without media renders the same under either order (its text parts in
+        // their own order): the registries are not asked for a model with nothing to place.
         return Ok(ResolvedMedia {
-            media_order,
+            media_order: MediaPartOrder::MediaFirst,
             media: None,
         });
     }
+    // The tokenizer's registry entry (its id and source) is read for the
+    // media paths alone, which need the multimodal components; a gateway
+    // without them looks nothing up.
     let Some(mm_components) = components.multimodal.as_ref() else {
         error!(
             function = stage,
@@ -419,7 +417,13 @@ pub(crate) async fn resolve_media(
             "Multimodal content detected but multimodal processing is not available",
         ));
     };
-    let Some(entry) = tokenizer_entry else {
+    // Bound straight from the lookup: a named `Option` moved from here would
+    // keep its slot in this future beside `entry` across both awaits below.
+    let Some(entry) = components
+        .tokenizer_registry
+        .get_by_name(model_id)
+        .or_else(|| components.tokenizer_registry.get_by_id(model_id))
+    else {
         error!(
             function = stage,
             model = %model_id,
@@ -432,28 +436,50 @@ pub(crate) async fn resolve_media(
     };
 
     // The per-request media limits the model's workers advertise for their
-    // engine, which the plan is held to before any fetch.
-    let engine_limits = multimodal::engine_item_limits(&components.worker_registry, model_id);
-    let placeholders = multimodal::prepare_placeholder_tokens(
-        &plan,
+    // engine, which the plan is held to before any fetch. They live for the
+    // preparation only, not across the order lookup after it: this future is
+    // inlined into the route and stage futures boxed once per request, and its
+    // largest state is the one that holds the prepared placeholders.
+    let placeholders = {
+        let engine_limits = multimodal::engine_item_limits(&components.worker_registry, model_id);
+        multimodal::prepare_placeholder_tokens(
+            &plan,
+            model_id,
+            tokenizer,
+            mm_components,
+            &entry.id,
+            &entry.source,
+            &engine_limits,
+            |format| multimodal::fleet_reads_format(&components.worker_registry, model_id, format),
+        )
+        .await
+    }
+    .map_err(|e| {
+        // The chain, not the outermost context alone: a hub failure's cause
+        // (the file, the hub's answer, its address) is answered generically
+        // below and lives here.
+        error!(
+            function = stage,
+            model = %model_id,
+            error = %format!("{e:#}"),
+            "Failed to prepare the multimodal prompt plan"
+        );
+        multimodal::config_unavailable_response(&e).unwrap_or_else(|| invalid_multimodal_request(e))
+    })?;
+    // The media-part order comes from the model registry so every path
+    // renders a model consistently. It is looked up after the placeholders,
+    // whose preparation resolved the model's configs and cached them, so the
+    // lookup is a cache hit and a request resolves the checkpoint once: looked
+    // up first, it would resolve on its own, fall back to media-first on a
+    // failure it does not report, and leave the preparation to resolve again.
+    let media_order = multimodal::resolve_media_part_order(
         model_id,
         tokenizer,
         mm_components,
         &entry.id,
         &entry.source,
-        &engine_limits,
-        |format| multimodal::fleet_reads_format(&components.worker_registry, model_id, format),
     )
-    .await
-    .map_err(|e| {
-        error!(
-            function = stage,
-            model = %model_id,
-            error = %e,
-            "Failed to prepare the multimodal prompt plan"
-        );
-        invalid_multimodal_request(e)
-    })?;
+    .await;
 
     Ok(ResolvedMedia {
         media_order,
@@ -520,7 +546,7 @@ pub(crate) async fn count_input_tokens(
 /// - User messages with Blocks → text/image blocks stay as user content,
 ///   ToolResult blocks become separate `{"role": "tool", ...}` messages
 /// - Assistant messages → `{"role": "assistant", "content": ..., "tool_calls": [...], "reasoning_content": ...}`
-pub(crate) fn process_message_content_format(
+fn process_message_content_format(
     messages: &[InputMessage],
     content_format: ChatTemplateContentFormat,
     placeholder_tokens: Option<&PlaceholderTokens>,
@@ -582,12 +608,13 @@ fn convert_system_message(content: &InputContent) -> Value {
 /// message past the leading run becomes a user turn at its position. A
 /// coding agent sends its environment block and its notes as `system`-role
 /// messages inside `messages[]`, after tool results too; such a renderer
-/// would write the message as bare text with no role marker and, for one
-/// that ends the conversation, no assistant header, and the model answers
-/// an empty turn. As a user turn the text keeps its place and the header
-/// follows it, the way the family's newer encoder renders a mid-conversation
-/// system message. The leading run stays: it is the system prompt, which
-/// every renderer writes.
+/// writes the message as bare text with no role marker, glued to the text
+/// before it (the assistant header after it follows the reference's own
+/// rule, not the message's role). As a user turn the text keeps its place
+/// and is set off from the text before it as the user's words, the way the
+/// family's newer encoder gives a mid-conversation system message a turn of
+/// its own. The leading run stays: it is the system prompt, which every
+/// renderer writes.
 fn system_messages_after_the_first_as_user_turns(messages: &mut [Value]) {
     let mut leading_run = true;
     for message in messages.iter_mut() {
@@ -676,10 +703,7 @@ fn convert_user_message(
 /// text renders: a text source, or a content source made of text blocks. A
 /// PDF or URL source needs a document reader this gateway has no path for
 /// and is refused naming the block (`at`), not handed to the template.
-pub(crate) fn render_document(
-    document: &messages::DocumentBlock,
-    at: &str,
-) -> Result<String, String> {
+fn render_document(document: &messages::DocumentBlock, at: &str) -> Result<String, String> {
     let text = match &document.source {
         messages::DocumentSource::Text { data } => data.as_str(),
         messages::DocumentSource::Content { content } => {
@@ -1130,11 +1154,17 @@ mod tests {
             ]
         }))
         .unwrap();
-        let rendered =
-            process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
-                .unwrap()
-                .0
-                .text;
+        let rendered = process_messages(
+            &request,
+            &tokenizer,
+            None,
+            None,
+            MediaPartOrder::MediaFirst,
+            ProviderProfile::for_model(&request.model),
+        )
+        .unwrap()
+        .0
+        .text;
         assert_eq!(
             rendered,
             "<|user|>What is the weather in Paris?<|end|><|assistant|><call:get_weather><|end|>\
@@ -1194,6 +1224,46 @@ mod tests {
         assert_eq!(string(MediaPartOrder::Authored), "question\n<image>");
     }
 
+    /// The early return in `resolve_media` (an empty plan: no registry is read
+    /// for the order) serves this renderer too: a user turn of text and
+    /// document blocks carries no media part, so both orders render it the
+    /// same under both content formats, as the chat renderer's twin test pins
+    /// for a content array without media.
+    #[test]
+    fn blocks_without_media_render_the_same_under_either_order() {
+        let messages = vec![InputMessage {
+            role: Role::User,
+            content: InputContent::Blocks(vec![
+                InputContentBlock::Text(TextBlock {
+                    text: "question".to_string(),
+                    cache_control: None,
+                    citations: None,
+                }),
+                InputContentBlock::Document(messages::DocumentBlock {
+                    source: messages::DocumentSource::Text {
+                        data: "the notes".to_string(),
+                    },
+                    cache_control: None,
+                    title: Some("notes".to_string()),
+                    context: None,
+                    citations: None,
+                }),
+            ]),
+        }];
+        for format in [
+            ChatTemplateContentFormat::String,
+            ChatTemplateContentFormat::OpenAI,
+        ] {
+            let media_first =
+                process_message_content_format(&messages, format, None, MediaPartOrder::MediaFirst)
+                    .unwrap();
+            let authored =
+                process_message_content_format(&messages, format, None, MediaPartOrder::Authored)
+                    .unwrap();
+            assert_eq!(media_first, authored, "{format:?}");
+        }
+    }
+
     /// The Messages path renders a user turn's blocks where the request put
     /// them on a template that walks the parts, like the chat path.
     #[test]
@@ -1218,10 +1288,17 @@ mod tests {
                 "messages": [{"role": "user", "content": blocks}]
             }))
             .unwrap();
-            process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
-                .unwrap()
-                .0
-                .text
+            process_messages(
+                &request,
+                &tokenizer,
+                None,
+                None,
+                MediaPartOrder::MediaFirst,
+                ProviderProfile::for_model(&request.model),
+            )
+            .unwrap()
+            .0
+            .text
         };
         let turn =
             |body: &str| format!("<|turn|>user<|body|>{body}<|end|><|turn|>assistant<|body|>");
@@ -1811,6 +1888,7 @@ mod tests {
             Some(&*tools),
             None,
             MediaPartOrder::MediaFirst,
+            ProviderProfile::for_model(&request.model),
         )
         .expect("render");
         let text = &processed.text;
@@ -1947,10 +2025,17 @@ mod tests {
     }
 
     fn render(request: &CreateMessageRequest, tokenizer: &dyn Tokenizer) -> String {
-        process_messages(request, tokenizer, None, None, MediaPartOrder::MediaFirst)
-            .unwrap()
-            .0
-            .text
+        process_messages(
+            request,
+            tokenizer,
+            None,
+            None,
+            MediaPartOrder::MediaFirst,
+            ProviderProfile::for_model(&request.model),
+        )
+        .unwrap()
+        .0
+        .text
     }
 
     /// A trailing assistant message with text is a prefill: a Jinja template
@@ -2036,8 +2121,7 @@ mod tests {
     /// A `system`-role message inside `messages[]` is forwarded in place
     /// unless the renderer writes no turn for a system message after the
     /// first: then every one past the leading run is a user turn at its
-    /// position, so the prompt keeps its assistant header after the note
-    /// that ends the conversation and before the historical assistant turn.
+    /// position, and the leading run stays.
     #[test]
     fn system_messages_after_the_first_are_user_turns_for_a_leading_system_only_renderer() {
         let request = coding_agent_request();
@@ -2147,12 +2231,13 @@ mod tests {
     }
 
     /// Through the DeepSeek V4 renderer the coding agent's notes are user
-    /// turns the encoder merges into the turn before them: the prompt ends
-    /// with the note, the assistant header and the open thought, where the
-    /// in-place system message left it ending with the bare note; and the
-    /// historical assistant turn has its header after the environment block.
-    /// The prompt is rendered before the parser is chosen, so every parser
-    /// reads this one.
+    /// turns the encoder merges into the turn before them behind a blank
+    /// line: the prompt ends with the tool result, the note, the assistant
+    /// header and the open thought, and the historical assistant turn has
+    /// its header after the environment block (in place, the encoder glues
+    /// a system message's text to the text before it with no separator and
+    /// opens the same headers). The prompt is rendered before the parser is
+    /// chosen, so every parser reads this one.
     #[test]
     fn the_deepseek_v4_renderer_gets_the_coding_agents_notes_as_user_turns() {
         let dir = deepseek_v4_stand_in_dir();
@@ -2280,12 +2365,14 @@ mod tests {
             )
             .unwrap();
         let rendered = |output_config| {
+            let request = request(output_config);
             process_messages(
-                &request(output_config),
+                &request,
                 &tokenizer,
                 None,
                 None,
                 MediaPartOrder::MediaFirst,
+                ProviderProfile::for_model(&request.model),
             )
             .unwrap()
             .0
@@ -2334,11 +2421,17 @@ mod tests {
                 "messages": [{"role": "user", "content": "Hello"}]
             }))
             .unwrap();
-            let rendered =
-                process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
-                    .unwrap()
-                    .0
-                    .text;
+            let rendered = process_messages(
+                &request,
+                &tokenizer,
+                None,
+                None,
+                MediaPartOrder::MediaFirst,
+                ProviderProfile::for_model(&request.model),
+            )
+            .unwrap()
+            .0
+            .text;
             assert_eq!(rendered, format!("user: Hello\nassistant: {prompt_end}"));
             assert_eq!(
                 messages_reasoning_starts_in_prefill(&request, false, &tokenizer),
@@ -2371,10 +2464,17 @@ mod tests {
                 "messages": [{"role": "user", "content": "Hello"}]
             }))
             .unwrap();
-            process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
-                .unwrap()
-                .0
-                .text
+            process_messages(
+                &request,
+                &tokenizer,
+                None,
+                None,
+                MediaPartOrder::MediaFirst,
+                ProviderProfile::for_model(&request.model),
+            )
+            .unwrap()
+            .0
+            .text
         };
         assert_eq!(rendered("none"), "user: Hello thinking=False");
         assert_eq!(rendered("high"), "user: Hello thinking=unset");

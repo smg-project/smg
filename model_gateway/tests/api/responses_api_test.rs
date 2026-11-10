@@ -14,7 +14,7 @@ use smg::{
     endpoints::conversations,
     routers::RouterFactory,
     tenant::{RouteRequestMeta, TenantKey},
-    test_support::RefusedAddress,
+    worker::test_support::RefusedAddress,
 };
 
 use crate::common::{

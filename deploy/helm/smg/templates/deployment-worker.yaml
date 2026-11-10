@@ -84,7 +84,8 @@ spec:
             limits:
               {{ $gpuType }}: {{ $gpuCount }}
           {{- end }}
-          {{- if or $.Values.huggingface.token $worker.extraEnv $metricsPort }}
+          {{- $servicerImpl := and (eq $mode "grpc") $worker.servicerImpl }}
+          {{- if or $.Values.huggingface.token $worker.extraEnv $metricsPort $servicerImpl }}
           env:
             {{- if $.Values.huggingface.token }}
             - name: HF_TOKEN
@@ -93,12 +94,24 @@ spec:
                   name: {{ include "smg.fullname" $ }}-hf-token
                   key: token
             {{- end }}
-            {{- if $metricsPort }}
-            {{- /* The engine's launcher reads the servicer implementation and
-                   the metrics listener's port from these variables (its
-                   --servicer-impl / --metrics-port flags override them). */}}
+            {{- /* The engine's launcher reads the servicer implementation from
+                   this variable (its --servicer-impl flag overrides it); unset,
+                   it runs its default, the Rust servicer. A gRPC worker's
+                   servicerImpl names one explicitly ("python" = the deprecated
+                   Python servicer, kept for the deprecation window); an HTTP
+                   worker has no servicer, so its value is not exported; a
+                   metrics port names the Rust servicer, whose listener serves it. */}}
+            {{- if $servicerImpl }}
+            - name: SMG_{{ upper $worker.engine }}_SERVICER_IMPL
+              value: {{ $worker.servicerImpl | quote }}
+            {{- else if $metricsPort }}
             - name: SMG_{{ upper $worker.engine }}_SERVICER_IMPL
               value: "rust"
+            {{- end }}
+            {{- if $metricsPort }}
+            {{- /* The Rust servicer's metrics listener port (the launcher's
+                   --metrics-port flag, or --servicer-metrics-port for TokenSpeed,
+                   overrides it). */}}
             - name: SMG_{{ upper $worker.engine }}_SERVICER_METRICS_PORT
               value: {{ $metricsPort | quote }}
             {{- end }}
@@ -115,11 +128,18 @@ spec:
             periodSeconds: {{ ($worker.startupProbe).periodSeconds | default 10 }}
             failureThreshold: {{ ($worker.startupProbe).failureThreshold | default 30 }}
           {{- else }}
-          {{/* gRPC mode: use TCP socket probe since not all engines
-               implement the gRPC Health Checking Protocol yet */}}
+          {{- /* gRPC mode: the engine runs behind a servicer, and every
+               servicer serves the gRPC Health Checking Protocol
+               (grpc.health.v1): the Rust servicer for every engine, the
+               Python servicers through their shared health frame. Its answer
+               is SERVING once the engine serves, so the probe follows the
+               engine's load; a TCP connect passed at the servicer's bind,
+               minutes before. The gRPC probe names the port by number (it
+               takes no port name) and no service, which asks for the whole
+               server. */}}
           startupProbe:
-            tcpSocket:
-              port: serve
+            grpc:
+              port: {{ $port }}
             initialDelaySeconds: {{ ($worker.startupProbe).initialDelaySeconds | default 60 }}
             periodSeconds: {{ ($worker.startupProbe).periodSeconds | default 10 }}
             failureThreshold: {{ ($worker.startupProbe).failureThreshold | default 30 }}

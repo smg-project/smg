@@ -22,7 +22,9 @@ pub mod structured_outputs;
 use bytes::Bytes;
 
 use crate::{
-    codec::{encode_msgpack, tensor::encode_with_aux_frames, OpaqueValue},
+    codec::{
+        add_request_capacity, encode_msgpack, tensor::encode_with_aux_frames, FrameStr, OpaqueValue,
+    },
     error::Result,
     protocol::{
         vllm::{
@@ -52,7 +54,15 @@ impl From<SchedulerStats> for EngineLoad {
 
 impl EngineOutput for EngineCoreOutput {
     fn request_id(&self) -> &str {
-        &self.request_id
+        self.request_id.as_str()
+    }
+
+    fn own_request_id(&mut self, id: FrameStr) {
+        self.request_id = id;
+    }
+
+    fn request_id_shared(&self) -> FrameStr {
+        self.request_id.clone()
     }
 
     fn finished(&self) -> bool {
@@ -104,9 +114,11 @@ impl EngineProtocol for VllmProtocol {
 
     /// Encode the request with its large typed tensors as auxiliary frames
     /// ([`encode_with_aux_frames`]); raw features keep the encoding their
-    /// producer gave them, and the text path its one allocation.
+    /// producer gave them, and the text path its one allocation: the payload's
+    /// buffer is sized from the prompt before the write.
     fn encode_add(request: &Self::Request, _layout: &()) -> Result<(Vec<u8>, Vec<Bytes>)> {
-        encode_with_aux_frames(request)
+        let prompt_tokens = request.prompt_token_ids.as_ref().map_or(0, Vec::len);
+        encode_with_aux_frames(request, add_request_capacity(prompt_tokens))
     }
 
     fn encode_abort(request_id: &str) -> Result<Vec<u8>> {
@@ -144,18 +156,27 @@ impl EngineProtocol for VllmProtocol {
         )))
     }
 
+    /// Decode the batch and retain its engine timestamp on each local output.
     fn decode_batch(frames: &[Bytes], _layout: &()) -> Result<EngineBatch<Self::Output>> {
         // vLLM multiplexes request batches, utility replies, and DP control on
         // one wire struct; each lands in its own slot of the batch.
         match decode_engine_core_outputs(frames)? {
             EngineCoreOutputs::RequestBatch(batch) => Ok(EngineBatch {
                 engine_index: batch.engine_index,
-                outputs: batch.outputs,
+                outputs: batch
+                    .outputs
+                    .into_iter()
+                    .map(|mut output| {
+                        output.batch_timestamp = Some(batch.timestamp);
+                        output
+                    })
+                    .collect(),
                 finished_request_ids: batch
                     .finished_requests
-                    .map(|ids| ids.into_iter().collect())
+                    .map(|ids| ids.into_iter().map(FrameStr::from).collect())
                     .unwrap_or_default(),
                 load: batch.scheduler_stats.map(EngineLoad::from),
+                kv_transfer: batch.kv_transfer,
                 wave: None,
                 utility: None,
             }),

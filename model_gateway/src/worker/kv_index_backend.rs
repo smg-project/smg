@@ -16,8 +16,8 @@
 use std::{collections::BTreeSet, fmt};
 
 use kv_index::{
-    ApplyError, ChainBlockMap, ChainIndexStats, ContentHash, OverlapScores, SequenceHash,
-    ShardedChainIndex, StoredBlock, WorkerIdExhausted,
+    request_prefix_hashes, ApplyError, ChainBlockMap, ChainIndexStats, ContentHash, GroupCap,
+    GroupViews, OverlapScores, SequenceHash, ShardedChainIndex, StoredBlock, WorkerIdExhausted,
 };
 
 /// Workers one chain index interns at once: the index's own ceiling per shard.
@@ -52,12 +52,16 @@ pub enum KvIndex {
 /// matter of which shard a worker is interned into.
 pub struct ChainBackend {
     index: ShardedChainIndex,
+    /// The cache groups of the model's hybrid workers beside the index
+    /// ([`kv_index::groups`]): empty, and never touched, on a plain fleet.
+    groups: GroupViews,
 }
 
 impl ChainBackend {
     fn new() -> Self {
         Self {
             index: ShardedChainIndex::new(CHAIN_INDEX_SHARDS, CHAIN_INDEX_MAX_WORKERS),
+            groups: GroupViews::new(),
         }
     }
 
@@ -164,6 +168,18 @@ impl WorkerBlocks {
         self.len() == 0
     }
 
+    /// The engine's hashes of the blocks the worker holds, in no order.
+    pub fn hashes(&self) -> Vec<SequenceHash> {
+        if let Some(map) = &self.chain {
+            return map.iter().map(|(seq_hash, _)| seq_hash).collect();
+        }
+        #[cfg(test)]
+        if let Some(held) = &self.reference {
+            return held.hashes();
+        }
+        Vec::new()
+    }
+
     fn chain(&mut self) -> &mut ChainBlockMap {
         self.chain.get_or_insert_with(ChainBlockMap::default)
     }
@@ -241,14 +257,69 @@ impl KvIndex {
         }
     }
 
-    /// Forget every block of `worker` and the worker itself; proportional to
-    /// the worker's blocks, not to the index.
+    /// Forget every block of `worker` and the worker itself, with its group
+    /// view; proportional to the worker's blocks, not to the index.
     pub fn remove_worker(&self, worker: u32, held: WorkerBlocks) {
+        self.groups().remove(worker);
         match self {
             Self::Chain(chain) => chain.remove_worker(worker, held),
             #[cfg(test)]
             Self::Reference(reference) => reference.remove_worker(worker),
         }
+    }
+
+    /// The non-main cache groups of the model's workers, by index id: written
+    /// by the workers' event streams, read by the decision through
+    /// [`Self::cap_by_groups`].
+    #[inline]
+    pub fn groups(&self) -> &GroupViews {
+        match self {
+            Self::Chain(chain) => &chain.groups,
+            #[cfg(test)]
+            Self::Reference(reference) => &reference.groups,
+        }
+    }
+
+    /// The engine's reuse rule over a hybrid worker's cache groups, applied
+    /// to the overlap the index scored: every holder with a group view has
+    /// its depth shrunk to what its sliding-window and state groups can serve
+    /// ([`kv_index::WorkerGroups::cap`]), and a holder shrunk to nothing
+    /// leaves the scores. Returns the holders it shrank, for the decision
+    /// trace. One atomic load on a fleet without such workers, one read of
+    /// the views table for every holder on a fleet with them.
+    pub fn cap_by_groups(
+        &self,
+        content_hashes: &[ContentHash],
+        block_size: usize,
+        overlap: &mut OverlapScores,
+    ) -> Vec<GroupCap> {
+        let views = self.groups();
+        if views.is_empty() {
+            return Vec::new();
+        }
+        let table = views.read();
+        let mut prefixes = Vec::new();
+        let mut caps = Vec::new();
+        overlap.scores.retain(|&worker, depth| {
+            let Some(view) = table.view(worker) else {
+                return true;
+            };
+            if prefixes.is_empty() {
+                prefixes = request_prefix_hashes(content_hashes);
+            }
+            let cap = view.cap(&prefixes, *depth, block_size);
+            if cap.depth < *depth {
+                caps.push(GroupCap {
+                    worker,
+                    uncapped: *depth,
+                    capped: cap.depth,
+                    group: cap.by.unwrap_or(0),
+                });
+                *depth = cap.depth;
+            }
+            cap.depth > 0
+        });
+        caps
     }
 
     /// Score every worker by how many leading blocks of the request it holds.
@@ -359,7 +430,7 @@ mod reference {
     };
     use parking_lot::Mutex;
 
-    use super::WorkerBlocks;
+    use super::{GroupViews, WorkerBlocks};
 
     /// The engine hashes a worker holds, mirrored from the reference so the
     /// monitor's copy counting sees the same `contains_key` answers.
@@ -367,6 +438,10 @@ mod reference {
     pub struct ReferenceBlocks(HashSet<SequenceHash>);
 
     impl ReferenceBlocks {
+        pub fn hashes(&self) -> Vec<SequenceHash> {
+            self.0.iter().copied().collect()
+        }
+
         pub fn contains(&self, seq_hash: SequenceHash) -> bool {
             self.0.contains(&seq_hash)
         }
@@ -386,6 +461,7 @@ mod reference {
     #[derive(Default)]
     pub struct ReferenceBackend {
         inner: Mutex<Inner>,
+        pub groups: GroupViews,
     }
 
     impl ReferenceBackend {
@@ -499,7 +575,7 @@ mod tests {
         let hashes: Vec<ContentHash> = contents.iter().map(|c| compute_content_hash(c)).collect();
         hashes
             .iter()
-            .zip(kv_index::request_prefix_hashes(&hashes))
+            .zip(request_prefix_hashes(&hashes))
             .map(|(&content_hash, seq_hash)| StoredBlock {
                 seq_hash,
                 content_hash,

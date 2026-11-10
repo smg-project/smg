@@ -10,6 +10,26 @@
 //! self-hosted engine serves that call (the gateway shapes the call's grammar
 //! for where the engine starts it, after the thought or around it), and the
 //! vendor's own API refuses it by itself where it still does.
+//!
+//! The sampling and length fields are the client's: this profile fills none
+//! of them. The family's reference library (the vendor's own request
+//! conversion, deepseek-recipe 0.2.0) resolves them for the vendor's serving:
+//! `temperature` 1.0 in thinking mode; `top_p` at least 0.95 under V4.1
+//! thinking, 0.95 under V4 thinking with tools, 1.0 under V4 thinking without
+//! them and under V4.1 outside thinking; an absent `max_tokens` 8192 outside
+//! thinking, 65536 in it and 131072 at `max` effort, within the context left
+//! after the prompt; a `max_tokens` above 393216 and an `n` other than 1
+//! refused; `thinking.type: adaptive` read as `enabled`. A self-hosted engine
+//! fills an absent value with its own default (the checkpoint's generation
+//! config through the worker's sampling defaults, the engine's length
+//! default), bounds the budget by its own window, serves `n` choices and
+//! honours a value the client wrote; the gateway's window check reads the
+//! input alone, and `thinking.type` keeps the pair the vendor's API
+//! documents. The thinking toggle resolves as the library resolves it. The
+//! effort spellings do too, except that V4.1 keeps `medium` and `xhigh` for
+//! the checkpoint's own table where the library reads `medium` as `high`,
+//! and V4 reads `xhigh` as `high` where the library keeps the level (see
+//! `normalize_chat` and `alias_effort_for_upstream`).
 
 use serde_json::Value;
 
@@ -57,22 +77,9 @@ fn vendor_alias(effort: &str) -> Option<&'static str> {
     }
 }
 
-/// The request's effort spellings, the top-level field and `thinking.effort`,
-/// whichever are present.
-fn effort_fields(req: &mut ChatCompletionRequest) -> impl Iterator<Item = &mut String> {
-    [
-        req.reasoning_effort.as_mut(),
-        req.thinking
-            .as_mut()
-            .and_then(|thinking| thinking.effort.as_mut()),
-    ]
-    .into_iter()
-    .flatten()
-}
-
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
     let is_v41 = is_v41_model(&req.model);
-    for effort in effort_fields(req) {
+    for effort in super::effort_fields(req) {
         // V4.1 accepts medium and xhigh natively (its renderer gives each
         // the budget of the checkpoint's own table).
         if is_v41 && matches!(effort.as_str(), "medium" | "xhigh") {
@@ -101,7 +108,7 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
 /// sent, as it always did (those encoders have it), and a chat-template kwarg
 /// is the client's word to the upstream's template and goes out as sent.
 pub(super) fn alias_effort_for_upstream(req: &mut ChatCompletionRequest) {
-    for effort in effort_fields(req).filter(|effort| effort.as_str() == "medium") {
+    for effort in super::effort_fields(req).filter(|effort| effort.as_str() == "medium") {
         if let Some(level) = vendor_alias(effort) {
             *effort = level.into();
         }

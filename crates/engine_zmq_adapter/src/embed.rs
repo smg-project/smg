@@ -206,7 +206,7 @@ mod tests {
         });
         EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             outputs: vec![EngineCoreOutput {
-                request_id: request_id.to_string(),
+                request_id: request_id.into(),
                 pooling_output,
                 finish_reason: Some(finish),
                 ..Default::default()

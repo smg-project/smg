@@ -180,8 +180,8 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
   it first: that grace arms no veto and lifts none), re-admits a worker on its first contact with a closed
   circuit breaker, and never touches the health status. A veto steers, it never refuses: when every
   candidate is vetoed, the request goes to the least-loaded ready worker among them (a cache-aware
-  prefill pool of a prefill/decode pair is not steered by the overload thresholds unless
-  `--worker-overload-shed` is set).
+  prefill pool of a prefill/decode pair, or a regular request that `consistent_hashing` places by
+  its routing key, is not steered by the overload thresholds unless `--worker-overload-shed` is set).
 - **Warm-up slice.** A worker that just became routable, or whose index is thin against the
   fleet's (`--worker-warmup-thin-ratio`), receives a share of cache-miss traffic until its index has
   grown, so an empty index does not starve it while every prompt has a holder elsewhere.
@@ -194,7 +194,8 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
   `--worker-overload-waiting-requests` or `--worker-overload-token-usage` is left out of selection
   while another is under them, and a fleet uniformly over them is routed to its least-loaded worker
   (a cache-aware prefill pool of a prefill/decode pair is balanced by its spill gate instead,
-  unless `--worker-overload-shed` is set);
+  and a regular request that `consistent_hashing` places by its routing key stays on its ring
+  owner, unless `--worker-overload-shed` is set);
   shedding stays opt-in (`--worker-overload-shed`).
 
 ## Flags and settings
@@ -216,9 +217,14 @@ Metrics added: `smg_kv_index_lookup_seconds{index}`, `smg_kv_event_apply_seconds
 `smg_kv_event_blocks_total{worker,op}`, `smg_kv_event_parentless_stores_total{worker}`,
 `smg_kv_event_sub_block_stores_total{worker}` (stores narrower than the worker's block of record,
 a hybrid engine's prefix entries at its hash granularity, left out of the index),
+`smg_kv_event_cap_refused_stores_total{worker}` and `smg_kv_event_cap_refused_blocks_total{worker}`
+(stores the index declined at an arena cap and the blocks they left out),
 `smg_kv_index_blocks{worker}`, `smg_kv_index_memberships` and `smg_kv_index_entries` per model,
 `smg_kv_index_runs_live`, `smg_kv_index_blocks_live`, `smg_kv_index_arena_bytes`,
-`smg_kv_index_arena_free_bytes`, `smg_kv_index_slab_bytes`, `smg_kv_index_moved_hashes`, `smg_kv_index_engine_conflicts`;
+`smg_kv_index_arena_free_bytes`, `smg_kv_index_arena_chunk_bytes` (what the arena holds from the
+allocator: whole 8 MiB chunks, kept once taken), `smg_kv_index_slab_bytes`, `smg_kv_index_moved_hashes`,
+`smg_kv_index_engine_conflicts`, `smg_kv_index_cap_refusals` (stores declined because a run's
+child table or hash array would outgrow an arena chunk);
 `smg_kv_event_batches_total{disposition}`, `smg_kv_event_gaps_total{outcome}`,
 `smg_kv_event_resyncs_total{reason}`, `smg_kv_event_lag_seconds`, `smg_kv_event_degraded_ranks`,
 `smg_kv_event_subscriptions_total`; `smg_worker_stalled{reason}`,

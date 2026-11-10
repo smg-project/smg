@@ -11,8 +11,11 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use openai_protocol::worker::{WorkerErrorResponse, WorkerInfo, WorkerSpec, WorkerUpdateRequest};
+use openai_protocol::worker::{
+    WorkerErrorResponse, WorkerInfo, WorkerListOrigin, WorkerSpec, WorkerUpdateRequest,
+};
 use serde_json::json;
+use smg_auth::AuditResource;
 use tracing::warn;
 
 use crate::{
@@ -222,13 +225,19 @@ fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerService
 /// stays allowed; the provider adds the worker back while it still
 /// publishes it.
 fn refuse_discovery_owned(worker: &dyn Worker) -> Result<(), WorkerServiceError> {
-    match worker.metadata().spec.labels.get(DISCOVERY_PROVIDER_LABEL) {
+    match discovery_provider(worker) {
         Some(provider) => Err(WorkerServiceError::DiscoveryOwned {
             url: worker.url().to_string(),
             provider: provider.clone(),
         }),
         None => Ok(()),
     }
+}
+
+/// The provider that owns `worker`, from the provenance label the
+/// reconciler writes; `None` for a worker registered locally.
+fn discovery_provider(worker: &dyn Worker) -> Option<&String> {
+    worker.metadata().spec.labels.get(DISCOVERY_PROVIDER_LABEL)
 }
 
 /// Error types for worker service operations
@@ -366,12 +375,15 @@ impl IntoResponse for CreateWorkerResult {
             "location": self.location,
             "message": "Worker addition queued for background processing"
         });
-        (
-            StatusCode::ACCEPTED,
-            [(http::header::LOCATION, self.location)],
-            Json(response),
+        AuditResource::name(
+            (
+                StatusCode::ACCEPTED,
+                [(http::header::LOCATION, self.location)],
+                Json(response),
+            )
+                .into_response(),
+            self.worker_id.as_str(),
         )
-            .into_response()
     }
 }
 
@@ -389,7 +401,10 @@ impl IntoResponse for DeleteWorkerResult {
             "worker_id": self.worker_id.as_str(),
             "message": "Worker removal queued for background processing"
         });
-        (StatusCode::ACCEPTED, Json(response)).into_response()
+        AuditResource::name(
+            (StatusCode::ACCEPTED, Json(response)).into_response(),
+            self.worker_id.as_str(),
+        )
     }
 }
 
@@ -407,7 +422,10 @@ impl IntoResponse for UpdateWorkerResult {
             "worker_id": self.worker_id.as_str(),
             "message": "Worker update queued for background processing"
         });
-        (StatusCode::ACCEPTED, Json(response)).into_response()
+        AuditResource::name(
+            (StatusCode::ACCEPTED, Json(response)).into_response(),
+            self.worker_id.as_str(),
+        )
     }
 }
 
@@ -650,12 +668,18 @@ impl WorkerService {
     }
 
     /// List all workers with their info, optionally filtered to workers
-    /// serving `model`. Building each `WorkerInfo` is cheap: `WorkerSpec`
-    /// is shared via `Arc`, so there is no per-worker spec deep clone.
+    /// serving `model` and to the workers of one `origin` (registered
+    /// locally, or by a discovery provider). Building each `WorkerInfo` is
+    /// cheap: `WorkerSpec` is shared via `Arc`, so there is no per-worker
+    /// spec deep clone.
     ///
     /// The counts reflect the returned (filtered) list, not the whole
     /// registry.
-    pub fn list_workers(&self, model: Option<&str>) -> ListWorkersResult {
+    pub fn list_workers(
+        &self,
+        model: Option<&str>,
+        origin: Option<WorkerListOrigin>,
+    ) -> ListWorkersResult {
         let mut worker_infos = Vec::new();
         let mut prefill_count = 0;
         let mut decode_count = 0;
@@ -664,6 +688,12 @@ impl WorkerService {
         for (worker_id, worker) in self.worker_registry.get_all_with_ids() {
             if let Some(model) = model {
                 if !worker.supports_model(model) {
+                    continue;
+                }
+            }
+            if let Some(origin) = origin {
+                let discovered = discovery_provider(worker.as_ref()).is_some();
+                if discovered != (origin == WorkerListOrigin::Discovery) {
                     continue;
                 }
             }
@@ -824,7 +854,7 @@ mod tests {
         );
         let service = make_service(registry);
 
-        let result = service.list_workers(None);
+        let result = service.list_workers(None, None);
         assert_eq!(result.workers.len(), 2);
         assert_eq!(result.total, 2);
         assert_eq!(result.regular_count, 2);
@@ -841,7 +871,7 @@ mod tests {
         );
         let service = make_service(registry);
 
-        let result = service.list_workers(Some("moonshotai/Kimi-K2.5"));
+        let result = service.list_workers(Some("moonshotai/Kimi-K2.5"), None);
         assert_eq!(result.workers.len(), 1);
         assert_eq!(
             result.workers[0].model_id.as_deref(),
@@ -850,7 +880,7 @@ mod tests {
         assert_eq!(result.total, 1);
         assert_eq!(result.regular_count, 1);
 
-        let result = service.list_workers(Some("no-such-model"));
+        let result = service.list_workers(Some("no-such-model"), None);
         assert!(result.workers.is_empty());
         assert_eq!(result.total, 0);
         assert_eq!(result.regular_count, 0);
@@ -862,7 +892,7 @@ mod tests {
         register_worker(&registry, "http://wildcard:30000", None);
         let service = make_service(registry);
 
-        let result = service.list_workers(Some("moonshotai/Kimi-K2.5"));
+        let result = service.list_workers(Some("moonshotai/Kimi-K2.5"), None);
         assert_eq!(result.workers.len(), 1);
         assert_eq!(result.total, 1);
     }
@@ -1318,5 +1348,34 @@ mod tests {
         let short: HashMap<String, String> = [("has space".to_string(), "v".to_string())].into();
         let err = validate_labels(&short).expect_err("a key with a space");
         assert!(err.to_string().contains("\"has space\""), "{err}");
+    }
+
+    #[test]
+    fn list_workers_by_origin_tells_local_from_discovered() {
+        let registry = Arc::new(WorkerRegistry::new());
+        register_worker(&registry, "http://local:30000", None);
+        let discovered: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://discovered:30000")
+                .worker_type(WorkerType::Regular)
+                .label(DISCOVERY_PROVIDER_LABEL, "file")
+                .build(),
+        );
+        registry.register(discovered).unwrap();
+        let service = make_service(registry);
+        let urls = |result: ListWorkersResult| -> Vec<String> {
+            result.workers.iter().map(|w| w.spec.url.clone()).collect()
+        };
+
+        assert_eq!(
+            urls(service.list_workers(None, Some(WorkerListOrigin::Local))),
+            ["http://local:30000"],
+            "local: the worker the API registered"
+        );
+        assert_eq!(
+            urls(service.list_workers(None, Some(WorkerListOrigin::Discovery))),
+            ["http://discovered:30000"],
+            "discovery: the worker a provider owns"
+        );
+        assert_eq!(service.list_workers(None, None).total, 2, "no origin: both");
     }
 }

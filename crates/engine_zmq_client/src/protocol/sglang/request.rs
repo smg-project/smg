@@ -1,8 +1,8 @@
-// SGLang's tokenized generate request — the scheduler's own
-// `TokenizedGenerateReqInput` from `io_struct.py`, a tagged
-// `msgspec.Struct(array_like=True)`: on the wire a positional msgpack array
-// with the class-name tag string as element 0. **Field order is the wire
-// contract** — do not reorder.
+//! SGLang's tokenized generate request — the scheduler's own
+//! `TokenizedGenerateReqInput` from `io_struct.py`, a tagged
+//! `msgspec.Struct(array_like=True)`: on the wire a positional msgpack array
+//! with the class-name tag string as element 0. **Field order is the wire
+//! contract** — do not reorder.
 
 use std::collections::BTreeMap;
 
@@ -751,6 +751,14 @@ impl SglangRequest {
             Self::Embed(request) => &request.rid,
         }
     }
+
+    /// The prompt's token ids.
+    pub fn input_ids(&self) -> &[u32] {
+        match self {
+            Self::Generate(request) => &request.input_ids,
+            Self::Embed(request) => &request.input_ids,
+        }
+    }
 }
 
 impl From<TokenizedGenerateReqInput> for SglangRequest {
@@ -895,7 +903,7 @@ mod tests {
 
     use super::{recorded::*, *};
     use crate::{
-        codec::{decode_msgpack, encode_msgpack},
+        codec::{decode_msgpack, encode_msgpack, hex},
         protocol::sglang::sampling::{
             recorded::PYTHON_PINNED_0_5_22, WIRE_FIELDS as SAMPLING_WIRE_FIELDS,
         },
@@ -908,13 +916,6 @@ mod tests {
     /// `require_reasoning=True`, the 19 defaulted fields between them at
     /// their defaults.
     const PYTHON_REQUEST: &str = "dc0022b9546f6b656e697a656447656e6572617465526571496e707574a27231c0c093010203c0c0c0dc002008c0c0c0cb3ff0000000000000cb3ff000000000000001cb0000000000000000cb0000000000000000cb0000000000000000cb3ff00000000000000001c0c0c0c0c0c2c3c3c2c0c0c0c0c0c00000c2c2c2ff00c0c3c2c2c2c200c2c0c0c0c0c0c0c0c0c0c0c0c0c0c3";
-
-    fn hex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
 
     #[test]
     fn encodes_the_prefix_through_require_reasoning_with_the_tag_first() {
@@ -1480,6 +1481,7 @@ mod tests {
             mm_inputs: Some(SglangWireMmInputs {
                 mm_items: vec![SglangWireMmItem {
                     modality: SglangWireModality::Image,
+                    hash: None,
                     offsets: Some(vec![(1, 3)]),
                     feature: Some(
                         SglangWireTensor::new("uint8", vec![3, 2], Bytes::from(vec![9u8; 6]))
@@ -1488,6 +1490,7 @@ mod tests {
                     model_specific_data: BTreeMap::new(),
                 }],
                 im_token_id: Some(7),
+                video_token_id: None,
             }),
             ..text.clone()
         };
@@ -1525,12 +1528,13 @@ mod tests {
             .flat_map(|i| (i as f32 * 0.5).to_le_bytes())
             .collect();
         let grid: Vec<u8> = [1i64, 2, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
-        let request = TokenizedGenerateReqInput {
+        let mut request = TokenizedGenerateReqInput {
             rid: "mm".into(),
             input_ids: vec![1, 7, 7, 7, 2],
             mm_inputs: Some(SglangWireMmInputs {
                 mm_items: vec![SglangWireMmItem {
                     modality: SglangWireModality::Image,
+                    hash: None,
                     offsets: Some(vec![(1, 3)]),
                     feature: Some(
                         SglangWireTensor::new("float32", vec![2, 4], Bytes::from(pixels)).unwrap(),
@@ -1541,10 +1545,23 @@ mod tests {
                     )]),
                 }],
                 im_token_id: Some(7),
+                video_token_id: None,
             }),
             ..TokenizedGenerateReqInput::default()
         };
         assert_eq!(encode_msgpack(&request).unwrap(), hex(PLUGIN_TEST_PAYLOAD));
+        let mm = request.mm_inputs.as_mut().unwrap();
+        mm.video_token_id = Some(7);
+        let item = &mut mm.mm_items[0];
+        item.modality = SglangWireModality::Video;
+        let grid = item.model_specific_data.remove("image_grid_thw").unwrap();
+        item.model_specific_data
+            .insert("video_grid_thw".into(), grid);
+        // The Python regression decodes this exact payload and runs SGLang's padding.
+        const VIDEO_PAYLOAD: &str = "9eb9546f6b656e697a656447656e6572617465526571496e707574a26d6dc0c0950107070702c099919902c0c09192010301c734020000001093920204a7666c6f61743332a3637075000000000000003f0000803f0000c03f00000040000020400000404000006040c0c281ae766964656f5f677269645f746877c72a020000000e93920103a5696e743634a3637075010000000000000002000000000000000200000000000000c0c007c0c0c0c007c0dc001acc80c0c0c0cb3ff0000000000000cb3ff0000000000000ffcb0000000000000000cb0000000000000000cb0000000000000000cb3ff00000000000000001c0c0c0c0c0c2c3c3c2c0c0c0c0c2ff00c0c2";
+        assert_eq!(encode_msgpack(&request).unwrap(), hex(VIDEO_PAYLOAD));
+        let decoded: TokenizedGenerateReqInput = decode_msgpack(&hex(VIDEO_PAYLOAD)).unwrap();
+        assert_eq!(decoded, request);
     }
 
     /// The `ADD` message the plugin's own test decodes with the pixel tensor
@@ -1579,6 +1596,7 @@ mod tests {
             mm_inputs: Some(SglangWireMmInputs {
                 mm_items: vec![SglangWireMmItem {
                     modality: SglangWireModality::Image,
+                    hash: None,
                     offsets: Some(vec![(1, 3)]),
                     feature: Some(
                         SglangWireTensor::new("float32", vec![8192], Bytes::from(pixels.clone()))
@@ -1590,6 +1608,7 @@ mod tests {
                     )]),
                 }],
                 im_token_id: Some(7),
+                video_token_id: None,
             }),
             ..TokenizedGenerateReqInput::default()
         };
