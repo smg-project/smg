@@ -76,7 +76,7 @@ fn a_grpc_worker_may_register(config: &RouterConfig) -> bool {
     {
         return true;
     }
-    let grpc = |url: &str| url.starts_with("grpc://") || url.starts_with("grpcs://");
+    let grpc = |url: &str| url.starts_with("grpc://");
     match &config.mode {
         RoutingMode::Regular { worker_urls } => worker_urls.iter().any(|url| grpc(url)),
         RoutingMode::PrefillDecode {
@@ -211,8 +211,23 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     // matches schemes case-sensitively, so a mixed-case scheme would be
     // rewritten downstream and diverge from the reservation key — the
     // same orphan failure as a schemeless URL.
-    const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "grpcs", "ipc", "tcp"];
+    const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "ipc", "tcp"];
     let scheme = url.split_once("://").map_or("", |(s, _)| s);
+    // A gRPC worker over TLS is refused by name, with the reason: the
+    // gateway's gRPC channel speaks plain HTTP/2 over TCP, and no build of
+    // the gateway holds a root store to validate an engine's certificate
+    // against, so no `grpcs://` worker ever completed a handshake the
+    // gateway could trust; the refusal belongs here, at start-up, not at
+    // the first call.
+    if scheme == "grpcs" {
+        return Err(ConfigError::invalid_value(
+            "worker_url",
+            Endpoint::redacted_str(url),
+            "grpcs:// workers are not supported: the gateway's gRPC channel speaks plain \
+             HTTP/2 and holds no certificate store to validate an engine's; use grpc://"
+                .to_string(),
+        ));
+    }
     // A refusal names the address through the gateway's masking: it is
     // written to stderr at start-up and answered to the API caller, and
     // the URL may carry credentials. What the address parser accepts (a
@@ -225,8 +240,7 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     // further into a URL could be a userinfo, and is left out.
     if !ALLOWED_SCHEMES.contains(&scheme) {
         let rule =
-            "URL must start with a lowercase http://, https://, grpc://, grpcs://, ipc://, or \
-             tcp:// scheme";
+            "URL must start with a lowercase http://, https://, grpc://, ipc://, or tcp:// scheme";
         let is_a_scheme = !scheme.is_empty()
             && scheme
                 .chars()
@@ -3307,7 +3321,6 @@ mod tests {
             "http://10.0.0.5:8000",
             "https://worker.example.com",
             "grpc://10.0.0.5:50051",
-            "grpcs://worker.example.com:443",
             "ipc:///tmp/smg-zmq/ts0.ipc",
             "tcp://10.0.0.5:31000",
         ] {
@@ -3363,6 +3376,12 @@ mod tests {
             "{masked}"
         );
         assert!(!masked.contains("secret"), "{masked}");
+        let tls = validate_worker_url("grpcs://user:secret@worker:50051")
+            .expect_err("refused")
+            .to_string();
+        assert!(tls.contains("grpcs://***@worker:50051"), "{tls}");
+        assert!(tls.contains("grpcs:// workers are not supported"), "{tls}");
+        assert!(!tls.contains("secret"), "{tls}");
         let echoed = validate_worker_url("10.0.0.5:8000")
             .expect_err("refused")
             .to_string();
@@ -4594,8 +4613,10 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// A gRPC worker over TLS is refused at start-up, by name and with the
+    /// reason, rather than at its first call.
     #[test]
-    fn test_validate_grpcs_worker_url() {
+    fn test_validate_grpcs_worker_url_is_refused() {
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
                 worker_urls: vec!["grpcs://worker:50051".to_string()],
@@ -4606,8 +4627,13 @@ mod tests {
         config.connection_mode = ConnectionMode::Grpc;
         config.model_path = Some("meta-llama/Llama-3-8B".to_string());
 
-        let result = ConfigValidator::validate(&config);
-        assert!(result.is_ok());
+        let error = ConfigValidator::validate(&config).expect_err("grpcs:// is refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("grpcs:// workers are not supported"),
+            "{text}"
+        );
+        assert!(text.contains("use grpc://"), "{text}");
     }
 
     #[test]
@@ -4775,8 +4801,8 @@ mod tests {
             ("igw", with(regular(&[]), true, None)),
             ("discovery", with(regular(&[]), false, Some(discovery))),
             (
-                "a grpcs url",
-                with(regular(&["grpcs://b:50051"]), false, None),
+                "a grpc url alone",
+                with(regular(&["grpc://b:50051"]), false, None),
             ),
             (
                 "a grpc url beside an http one",
