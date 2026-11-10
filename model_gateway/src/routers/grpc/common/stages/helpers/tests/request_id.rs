@@ -112,6 +112,24 @@ fn middleware_id_is_base_with_per_execution_suffix() {
     assert_ne!(first, second);
 }
 
+/// An engine id is written once, into a buffer of its exact size: the text
+/// reads `{base}-{uuid}` or `{prefix}{uuid}` as before, with no growth on
+/// the way.
+#[test]
+fn an_engine_id_is_written_once_at_its_exact_size() {
+    let uuid = uuid::Uuid::now_v7();
+    let suffixed = suffixed_id("chatcmpl-mw", uuid);
+    assert_eq!(suffixed, format!("chatcmpl-mw-{uuid}"));
+    assert_eq!(
+        suffixed.capacity(),
+        suffixed.len(),
+        "one buffer of the id's size, no growth"
+    );
+    let minted = minted_id("chatcmpl-", uuid);
+    assert_eq!(minted, format!("chatcmpl-{uuid}"));
+    assert_eq!(minted.capacity(), minted.len());
+}
+
 /// The suffix a request's engine id gets is stamped at the request's own
 /// time (its charge id's: the one wall-clock read the edge made for it), not
 /// at a read of its own; a request without meta reads the clock.
