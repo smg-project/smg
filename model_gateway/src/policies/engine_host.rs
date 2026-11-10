@@ -1198,6 +1198,51 @@ mod tests {
         }
     }
 
+    /// The sampled half of the `requests` mapping: three workers with
+    /// counts 5, 3 and 0 under idle reports. A drawn pair of the two fuller
+    /// workers comes up about one decision in three and the middle worker
+    /// leads it, so 64 decisions lead with position 1 at least once (the
+    /// best form, `count-first`, would lead with the idle worker every
+    /// time); the fullest worker never leads a pair.
+    #[test]
+    fn the_sampled_in_flight_metric_sometimes_leads_with_a_drawn_middle_worker() {
+        let workers = pool(3);
+        for _ in 0..5 {
+            workers[0].increment_load();
+        }
+        for _ in 0..3 {
+            workers[1].increment_load();
+        }
+        let (_tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(
+            workers
+                .iter()
+                .map(|w| (w.url().to_string(), one_rank_load(0, 0.1, 2000.0)))
+                .collect(),
+        ));
+        let request = HostRequest {
+            prompt_tokens: 512,
+            ..request()
+        };
+        let sampled = decider(&PolicyConfig::PowerOfTwo {
+            load_metric: PowerOfTwoLoadMetric::Requests,
+        });
+        sampled.set_load_receiver(Some(rx));
+        let mut leads = Vec::new();
+        for _ in 0..64 {
+            let (decision, _) = sampled.decide(&request, &workers, &[]);
+            let first = decision.pick().expect("a pick").targets.first().copied();
+            leads.extend(first.map(|t| t.position));
+        }
+        assert!(
+            !leads.contains(&0),
+            "the fullest worker never leads a pair: {leads:?}"
+        );
+        assert!(
+            leads.contains(&1),
+            "requests samples two, so the middle worker leads a drawn pair: {leads:?}"
+        );
+    }
+
     /// The decode side reads the request's tried URLs and the exclusions as
     /// the prefill side does: a tried or excluded decode is passed over
     /// while a partner remains.
