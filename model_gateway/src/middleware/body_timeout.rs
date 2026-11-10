@@ -240,13 +240,22 @@ struct TimedBody {
     ended: bool,
 }
 
+/// `now + total`, saturated to a far future when the sum does not fit an
+/// instant: a `request_timeout_secs` too large to hold (the "no timeout"
+/// idiom) is a deadline that never comes, as `tokio::time::sleep` treats it.
+fn deadline_from_now(total: Duration) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    now.checked_add(total)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30))
+}
+
 impl TimedBody {
     fn new(inner: Body, timeouts: RequestBodyTimeouts, outcome: Arc<AtomicU8>) -> Self {
         Self {
             inner,
             stall: timeouts.stall,
             stall_timer: None,
-            deadline_at: tokio::time::Instant::now() + timeouts.total,
+            deadline_at: deadline_from_now(timeouts.total),
             deadline: None,
             outcome,
             ended: false,
@@ -458,6 +467,23 @@ mod tests {
             waited >= Duration::from_secs(5) && waited < Duration::from_secs(6),
             "cut {waited:?} after the wrap: the 5 s timeout counted from the wrap, not from the first read at 3 s"
         );
+    }
+
+    /// A `request_timeout_secs` no instant can hold (the "no timeout" idiom;
+    /// validation rejects only zero) is a deadline that never comes, as the
+    /// replaced `sleep` saturated to, not an overflow at the wrap.
+    #[tokio::test(start_paused = true)]
+    async fn a_total_no_instant_can_hold_is_a_deadline_that_never_comes() {
+        let (request, outcome) = timed(
+            echo_request(trickle(3, Duration::from_secs(86_400 * 365))),
+            timeouts(0, u64::MAX),
+        );
+        let read = to_bytes(request.into_body(), usize::MAX).await;
+        assert_eq!(
+            read.expect("three frames a year apart arrive whole"),
+            Bytes::from_static(b"xxx")
+        );
+        assert_ne!(outcome.load(Ordering::Acquire), TIMED_OUT);
     }
 
     /// Progress inside the stall window resets the watchdog: a slow but
