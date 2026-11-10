@@ -302,6 +302,8 @@ pub fn create_worker_workflow_data(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::config::RouterConfig;
 
@@ -549,13 +551,7 @@ mod tests {
 
     async fn engine_with_slow_optional_version(
         models: serde_json::Value,
-    ) -> (
-        String,
-        tokio::task::JoinSet<()>,
-        Arc<std::sync::atomic::AtomicUsize>,
-    ) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
+    ) -> (String, tokio::task::JoinSet<()>, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let version_calls = Arc::clone(&calls);
         let app = axum::Router::new()
@@ -651,7 +647,7 @@ mod tests {
         assert_eq!(state.status, wfaas::WorkflowStatus::Failed);
         assert!(registry.get_by_url(&url).is_none());
         assert_eq!(
-            calls.load(std::sync::atomic::Ordering::Relaxed),
+            calls.load(Ordering::Relaxed),
             0,
             "explicit invalid metadata must escape before awaiting optional version"
         );
