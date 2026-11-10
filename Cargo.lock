@@ -3980,6 +3980,7 @@ dependencies = [
  "symphonia",
  "tempfile",
  "thiserror 2.0.21",
+ "tikv-jemallocator",
  "tokio",
  "tracing",
  "url",

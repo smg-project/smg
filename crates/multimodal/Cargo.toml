@@ -79,6 +79,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustix = { version = "1", default-features = false, features = ["time"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
+# The baseline harness runs the gateway's allocator (jemalloc with the gateway's options), so its cells read the
+# page-return policy production runs, not the system allocator's. Guarded like the gateway's own edge, and built
+# with the statistics the `smg` executable builds it with.
+[target.'cfg(all(not(target_env = "msvc"), not(target_env = "musl")))'.dev-dependencies]
+tikv-jemallocator = { workspace = true, features = ["stats"] }
+
 [build-dependencies]
 cc = "1"
 pkg-config = "0.3"
