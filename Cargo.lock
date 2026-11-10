@@ -7975,7 +7975,7 @@ dependencies = [
 
 [[package]]
 name = "smg-response-template"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "openai-protocol",
  "regex-syntax",

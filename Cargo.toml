@@ -12,7 +12,7 @@ rust-version = "1.98"
 openai-protocol = { version = "1.18.0", path = "crates/protocols" }
 smg-mm-rdma = { version = "0.1.1", path = "crates/mm_rdma" }
 reasoning-parser = { version = "1.11.0", path = "crates/reasoning_parser" }
-smg-response-template = { version = "0.2.0", path = "crates/response_template" }
+smg-response-template = { version = "0.3.0", path = "crates/response_template" }
 tool-parser = { version = "1.11.0", path = "crates/tool_parser" }
 smg-symphony = { version = "0.3.0", path = "crates/symphony" }
 wfaas = { version = "1.1.1", path = "crates/workflow" }
