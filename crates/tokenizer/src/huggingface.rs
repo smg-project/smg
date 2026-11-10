@@ -29,7 +29,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     byte_fallback::PieceTable,
-    byte_level::{cut_start, push_token_bytes, ByteLevelIncremental, ByteLevelTable, UnknownId},
+    byte_level::{cut_start, ByteLevelIncremental, ByteLevelTable, UnknownId},
     chat_template::{
         load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
         ChatTemplateState, ConfigChatTemplates, ThinkingKeyName, ThinkingToggle,
@@ -115,10 +115,6 @@ pub struct HuggingFaceTokenizer {
     /// The byte each `<0xHH>` token stands for, indexed by id (see
     /// [`byte_fallback_values`]); empty unless the decoder has ByteFallback.
     byte_fallback_values: Vec<Option<u8>>,
-    /// The decoder is a sequence with a byte-level member, which gets no
-    /// per-id table: the generic window then holds the bytes of an
-    /// unfinished character, and the stream's end judges a cut from them.
-    byte_level_chain: bool,
     /// The checkpoint ships the family's own vocabulary file beside the
     /// conversion (`tekken.json`): the file's own reader, the family's
     /// reference library, writes the control tokens of a request
@@ -161,17 +157,6 @@ fn has_byte_fallback(decoder: &DecoderWrapper) -> bool {
     match decoder {
         DecoderWrapper::ByteFallback(_) => true,
         DecoderWrapper::Sequence(sequence) => sequence.get_decoders().iter().any(has_byte_fallback),
-        _ => false,
-    }
-}
-
-/// Whether a `Sequence` decoder has a byte-level member (a plain `ByteLevel`
-/// decoder gets the per-id table instead, see `byte_level`).
-fn has_byte_level_member(decoder: &DecoderWrapper) -> bool {
-    match decoder {
-        DecoderWrapper::Sequence(sequence) => sequence.get_decoders().iter().any(|member| {
-            matches!(member, DecoderWrapper::ByteLevel(_)) || has_byte_level_member(member)
-        }),
         _ => false,
     }
 }
@@ -906,8 +891,6 @@ impl HuggingFaceTokenizer {
         let tools_block =
             deepseek_v31.is_some() && deepseek_v31::Checkpoint::renders_tools_block(&chat_template);
         let byte_level = ByteLevelTable::build(&tokenizer);
-        let byte_level_chain =
-            byte_level.is_none() && tokenizer.get_decoder().is_some_and(has_byte_level_member);
         let pieces = PieceTable::build(&tokenizer);
         log_decode_path(&tokenizer, byte_level.is_some(), pieces.is_some());
         let core = Arc::new(EncoderCore::new(tokenizer, encoders.native));
@@ -940,7 +923,6 @@ impl HuggingFaceTokenizer {
             renderer,
             has_byte_fallback,
             byte_fallback_values,
-            byte_level_chain,
             structural_controls,
             special_tokens_marked,
         })
@@ -991,23 +973,6 @@ impl HuggingFaceTokenizer {
             cut += 1;
         }
         cut
-    }
-
-    /// Whether the held ids of a window decoded by a sequence with a
-    /// byte-level member end in a character the stream's end cut short: their
-    /// bytes (the byte-level characters mapped back, a skipped special token
-    /// left out) end in the start of a character and nothing more.
-    fn byte_level_window_ends_cut(&self, held: &[TokenIdType], skip_special_tokens: bool) -> bool {
-        let mut bytes = Vec::new();
-        for &id in held {
-            if skip_special_tokens && self.special_added_token(id) {
-                continue;
-            }
-            if let Some(token) = self.token_text(id) {
-                push_token_bytes(&token, &mut bytes);
-            }
-        }
-        cut_start(&bytes) < bytes.len()
     }
 
     /// Whether the window is a lost byte run: every id a byte token rendered
@@ -1238,8 +1203,6 @@ impl HuggingFaceTokenizer {
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         let byte_fallback_values = byte_fallback_values(&tokenizer, has_byte_fallback);
         let byte_level = ByteLevelTable::build(&tokenizer);
-        let byte_level_chain =
-            byte_level.is_none() && tokenizer.get_decoder().is_some_and(has_byte_level_member);
         let pieces = PieceTable::build(&tokenizer);
         log_decode_path(&tokenizer, byte_level.is_some(), pieces.is_some());
         HuggingFaceTokenizer {
@@ -1260,7 +1223,6 @@ impl HuggingFaceTokenizer {
             profile: None,
             has_byte_fallback,
             byte_fallback_values,
-            byte_level_chain,
             structural_controls: false,
             special_tokens_marked: None,
         }
@@ -2214,14 +2176,16 @@ impl Decoder for HuggingFaceTokenizer {
         if self.has_byte_fallback {
             // The byte tokens of a character the end cut short come off the
             // window: the end releases the text before them and nothing for
-            // the character, where the window's decode would render one
-            // replacement character per byte of it.
+            // the character, where the window's decode would render the
+            // whole byte run around them as replacement characters,
+            // rewriting text already sent (the one end that differs from
+            // `decode`, see `IncrementalDecoder::finish_into`).
             let held = (*prefix_index).min(ids.len());
             let cut = self.cut_tail(&ids[held..], skip_special_tokens);
             ids.truncate(ids.len() - cut);
         }
         let decoded = self.window_decode(ids, skip_special_tokens)?;
-        let (mut pending, prefix_mismatch) = match decoded.strip_prefix(prefix.as_str()) {
+        let (pending, prefix_mismatch) = match decoded.strip_prefix(prefix.as_str()) {
             Some(pending) => (pending.to_string(), false),
             None => {
                 let run_start =
@@ -2237,18 +2201,6 @@ impl Decoder for HuggingFaceTokenizer {
                 (pending, true)
             }
         };
-        if self.byte_level_chain
-            && pending.ends_with(char::REPLACEMENT_CHARACTER)
-            && self.byte_level_window_ends_cut(
-                &ids[(*prefix_index).min(ids.len())..],
-                skip_special_tokens,
-            )
-        {
-            // The chain's byte-level decoder renders a sequence the end cut
-            // short as one replacement character at the very end: the start
-            // of a character the model never finished, released as nothing.
-            pending.pop();
-        }
         ids.clear();
         prefix.clear();
         *prefix_index = 0;

@@ -149,13 +149,15 @@ pub trait IncrementalDecoder: Send + Sync {
     }
 
     /// The stream's end: appends the text the decoder still holds, rendered
-    /// as [`Decoder::decode`] renders the end of the same ids (a complete
-    /// character as it is, a stray invalid byte as the replacement
-    /// character), except an incomplete trailing sequence, the start of a
-    /// character the model never finished: nothing is appended for it, where
-    /// `decode` would render a replacement character. Says whether anything
-    /// was appended. The default is for a decoder that holds nothing back
-    /// between steps.
+    /// as [`Decoder::decode`] renders the end of the same ids: a complete
+    /// character as it is, a stray invalid byte and an incomplete trailing
+    /// sequence (the start of a character the model never finished) as the
+    /// replacement character. The one exception is a ByteFallback
+    /// vocabulary's window, which keeps a cut character's byte tokens off
+    /// its end: its decoder renders the whole byte run around them as
+    /// replacement characters, rewriting text already sent. Says whether
+    /// anything was appended. The default is for a decoder that holds
+    /// nothing back between steps.
     fn finish_into(&mut self, out: &mut String) -> Result<bool> {
         let _ = out;
         Ok(false)
