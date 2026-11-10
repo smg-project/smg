@@ -725,14 +725,18 @@ mod tests {
         )
     }
 
+    /// Puts the test tool `name` of `server` into `orchestrator`'s inventory.
+    fn insert_test_tool(orchestrator: &McpOrchestrator, server: &str, name: &str) {
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(server, create_test_tool(name)));
+    }
+
     #[test]
     fn test_has_exposed_tool_with_inventory() {
         let orchestrator = McpOrchestrator::new_test();
 
-        // Insert a tool into the inventory
-        let tool = create_test_tool("test_tool");
-        let entry = ToolEntry::from_server_tool("server1", tool);
-        orchestrator.tool_inventory().insert_entry(entry);
+        insert_test_tool(&orchestrator, "server1", "test_tool");
 
         let mcp_servers = vec![McpServerBinding {
             label: "label1".to_string(),
@@ -749,9 +753,7 @@ mod tests {
     async fn test_execute_tool_result_preserves_pending_approval() {
         let orchestrator = McpOrchestrator::new_test();
 
-        let tool = create_test_tool("test_tool");
-        let entry = ToolEntry::from_server_tool("server1", tool);
-        orchestrator.tool_inventory().insert_entry(entry);
+        insert_test_tool(&orchestrator, "server1", "test_tool");
 
         let mut session = McpToolSession::new(
             &orchestrator,
@@ -791,9 +793,7 @@ mod tests {
     fn test_resolve_label_with_inventory() {
         let orchestrator = McpOrchestrator::new_test();
 
-        let tool = create_test_tool("test_tool");
-        let entry = ToolEntry::from_server_tool("server1", tool);
-        orchestrator.tool_inventory().insert_entry(entry);
+        insert_test_tool(&orchestrator, "server1", "test_tool");
 
         let mcp_servers = vec![McpServerBinding {
             label: "my_server".to_string(),
@@ -810,14 +810,8 @@ mod tests {
     fn test_exposed_names_are_unique_for_tool_name_collisions() {
         let orchestrator = McpOrchestrator::new_test();
 
-        let tool_a = create_test_tool("shared_tool");
-        let tool_b = create_test_tool("shared_tool");
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool("server1", tool_a));
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool("server2", tool_b));
+        insert_test_tool(&orchestrator, "server1", "shared_tool");
+        insert_test_tool(&orchestrator, "server2", "shared_tool");
 
         let session = McpToolSession::new(
             &orchestrator,
@@ -858,19 +852,9 @@ mod tests {
     fn test_exposed_names_handle_pre_suffixed_name_conflicts() {
         let orchestrator = McpOrchestrator::new_test();
 
-        let tool_base = create_test_tool("foo");
-        let tool_suffixed = create_test_tool("foo_1");
-        let tool_dup = create_test_tool("foo");
-
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool("s1", tool_base));
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool("s2", tool_suffixed));
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool("s3", tool_dup));
+        insert_test_tool(&orchestrator, "s1", "foo");
+        insert_test_tool(&orchestrator, "s2", "foo_1");
+        insert_test_tool(&orchestrator, "s3", "foo");
 
         let session = McpToolSession::new(
             &orchestrator,
@@ -964,18 +948,12 @@ mod tests {
             ..Default::default()
         });
 
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                create_test_tool("brave_web_search"),
-            ));
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                create_test_tool("internal_non_builtin_tool"),
-            ));
+        insert_test_tool(&orchestrator, "internal-server", "brave_web_search");
+        insert_test_tool(
+            &orchestrator,
+            "internal-server",
+            "internal_non_builtin_tool",
+        );
 
         let session = McpToolSession::new(
             &orchestrator,
@@ -1005,12 +983,7 @@ mod tests {
             ..Default::default()
         });
 
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "image-server",
-                create_test_tool("generate_image"),
-            ));
+        insert_test_tool(&orchestrator, "image-server", "generate_image");
 
         let session = McpToolSession::new(
             &orchestrator,
@@ -1030,18 +1003,8 @@ mod tests {
     fn test_allowed_tools_filters_inventory_and_list_tools() {
         let orchestrator = McpOrchestrator::new_test();
 
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "server1",
-                create_test_tool("brave_web_search"),
-            ));
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "server1",
-                create_test_tool("brave_local_search"),
-            ));
+        insert_test_tool(&orchestrator, "server1", "brave_web_search");
+        insert_test_tool(&orchestrator, "server1", "brave_local_search");
 
         let session = McpToolSession::new(
             &orchestrator,
@@ -1066,12 +1029,7 @@ mod tests {
     fn test_alias_tools_replace_target_tool_in_session_inventory() {
         let orchestrator = McpOrchestrator::new_test();
 
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "server1",
-                create_test_tool("brave_web_search"),
-            ));
+        insert_test_tool(&orchestrator, "server1", "brave_web_search");
 
         orchestrator
             .register_alias(
@@ -1110,12 +1068,7 @@ mod tests {
     fn test_allowed_tools_accepts_alias_name() {
         let orchestrator = McpOrchestrator::new_test();
 
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "server1",
-                create_test_tool("brave_web_search"),
-            ));
+        insert_test_tool(&orchestrator, "server1", "brave_web_search");
 
         orchestrator
             .register_alias("web_search", "server1", "brave_web_search", None)
@@ -1149,12 +1102,7 @@ mod tests {
         };
 
         let orchestrator = McpOrchestrator::new_test_with_config(config);
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                create_test_tool("internal_search"),
-            ));
+        insert_test_tool(&orchestrator, "internal-server", "internal_search");
 
         let session = McpToolSession::new(
             &orchestrator,
@@ -1184,12 +1132,7 @@ mod tests {
         };
 
         let orchestrator = McpOrchestrator::new_test_with_config(config);
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                create_test_tool("internal_search"),
-            ));
+        insert_test_tool(&orchestrator, "internal-server", "internal_search");
 
         orchestrator
             .register_alias("alias_search", "internal-server", "internal_search", None)
@@ -1253,32 +1196,12 @@ mod tests {
         let orchestrator = McpOrchestrator::new_test();
 
         // server1 has two tools
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "server1",
-                create_test_tool("brave_web_search"),
-            ));
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "server1",
-                create_test_tool("brave_local_search"),
-            ));
+        insert_test_tool(&orchestrator, "server1", "brave_web_search");
+        insert_test_tool(&orchestrator, "server1", "brave_local_search");
 
         // server2 has two tools
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "server2",
-                create_test_tool("deepwiki_search"),
-            ));
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "server2",
-                create_test_tool("deepwiki_read"),
-            ));
+        insert_test_tool(&orchestrator, "server2", "deepwiki_search");
+        insert_test_tool(&orchestrator, "server2", "deepwiki_read");
 
         let session = McpToolSession::new(
             &orchestrator,
