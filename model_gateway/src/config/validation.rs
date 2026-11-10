@@ -6,7 +6,6 @@ use std::{
 use axum::http::{HeaderName, HeaderValue, Uri};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
-use tracing::warn;
 
 use super::*;
 use crate::{
@@ -297,32 +296,72 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
             ));
         }
     }
-    // A userinfo (`user:secret@`) means something for an HTTP worker alone,
-    // whose client sends it as basic auth. A gRPC worker never receives it
-    // (the channel's authority is the host and port): the URL stays accepted,
-    // since it is otherwise valid and deployments may carry one, and the
-    // credential written there is named once, masked, instead of dropped in
-    // silence. A tcp:// worker URL is what the ZMQ sockets bind, where a
-    // userinfo has no meaning at all: refused.
-    if Endpoint::parse(url).is_ok_and(|endpoint| endpoint.has_credentials()) {
-        match scheme {
-            "tcp" => {
-                return Err(ConfigError::invalid_value(
-                    "worker_url",
-                    Endpoint::redacted_str(url),
-                    "a tcp:// worker URL takes no userinfo: the gateway binds its ZMQ sockets \
-                     at the host and port",
-                ));
-            }
-            "grpc" => warn!(
-                "worker URL {} carries userinfo, which is not sent to a gRPC worker: the \
-                 gateway's channel names the host and port alone",
-                Endpoint::redacted_str(url)
-            ),
-            _ => {}
-        }
+    // A tcp:// worker URL is what the ZMQ sockets bind, where a userinfo
+    // (`user:secret@`) has no meaning at all: refused. (A gRPC worker URL's
+    // userinfo is accepted and named by [`unused_credentials_warning`], at
+    // start-up and at registration, where a log line is seen.)
+    if scheme == "tcp" && Endpoint::parse(url).is_ok_and(|endpoint| endpoint.has_credentials()) {
+        return Err(ConfigError::invalid_value(
+            "worker_url",
+            Endpoint::redacted_str(url),
+            "a tcp:// worker URL takes no userinfo: the gateway binds its ZMQ sockets at the \
+             host and port",
+        ));
     }
     Ok(())
+}
+
+/// The warning for a `grpc://` worker URL that carries userinfo
+/// (`user:secret@`), `None` for every other URL. An HTTP worker's userinfo
+/// is sent as basic auth; a gRPC worker never receives it, since the channel
+/// names the host and port alone, so a credential written there is named
+/// once, masked, instead of dropped in silence. The URL stays accepted: it is
+/// otherwise valid and deployments may carry one. Pure, so that start-up can
+/// log it after the subscriber exists (the validator runs before) and the
+/// add-worker route can log it at registration.
+pub fn unused_credentials_warning(url: &str) -> Option<String> {
+    let endpoint = Endpoint::parse(url).ok()?;
+    (url.starts_with("grpc://") && endpoint.has_credentials()).then(|| {
+        format!(
+            "worker URL {} carries userinfo, which is not sent to a gRPC worker: the gateway's \
+             channel names the host and port alone",
+            endpoint.redacted()
+        )
+    })
+}
+
+/// [`unused_credentials_warning`] over every worker URL the configuration
+/// lists for a mode, in the order they are listed.
+pub fn unused_credentials_warnings(mode: &RoutingMode) -> Vec<String> {
+    let urls: Vec<&str> = match mode {
+        RoutingMode::Regular { worker_urls }
+        | RoutingMode::OpenAI { worker_urls }
+        | RoutingMode::Anthropic { worker_urls }
+        | RoutingMode::Gemini { worker_urls } => worker_urls.iter().map(String::as_str).collect(),
+        RoutingMode::PrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        } => prefill_urls
+            .iter()
+            .map(|(url, _)| url.as_str())
+            .chain(decode_urls.iter().map(String::as_str))
+            .collect(),
+        RoutingMode::EncodePrefillDecode {
+            encode_urls,
+            prefill_urls,
+            decode_urls,
+            ..
+        } => encode_urls
+            .iter()
+            .chain(prefill_urls.iter())
+            .map(|(url, _)| url.as_str())
+            .chain(decode_urls.iter().map(String::as_str))
+            .collect(),
+    };
+    urls.into_iter()
+        .filter_map(unused_credentials_warning)
+        .collect()
 }
 
 /// The encode side takes three policies. This is the one list: the mode walk
@@ -2441,7 +2480,6 @@ impl ConfigValidator {
 
 #[cfg(test)]
 mod tests {
-    use tracing_test::traced_test;
 
     use super::*;
     use crate::worker::ConnectionMode;
@@ -3561,10 +3599,7 @@ mod tests {
     }
 
     /// A userinfo is refused on a `tcp://` worker URL (the sockets bind the
-    /// host and port; nothing reads it) and accepted on a `grpc://` one with
-    /// one warning that names the address masked, since the gateway's channel
-    /// never sends it; an `http://` URL's userinfo is basic auth and warns
-    /// nothing, nor does a URL without one.
+    /// host and port; nothing reads it), masked in the refusal.
     #[test]
     fn a_tcp_worker_url_with_userinfo_is_refused_masked() {
         for url in [
@@ -3579,21 +3614,47 @@ mod tests {
         assert!(validate_worker_url("tcp://10.0.0.5:31000").is_ok());
     }
 
-    #[traced_test]
+    /// A `grpc://` worker URL with userinfo stays accepted and earns the one
+    /// warning, which names the address masked and never the secret; an
+    /// `http://` URL's userinfo is basic auth and earns none, nor does a URL
+    /// without one. Over a mode, every listed URL is read once, in order.
     #[test]
-    fn a_grpc_worker_url_with_userinfo_passes_and_warns_once_masked() {
+    fn a_grpc_worker_url_with_userinfo_is_accepted_and_named_once_masked() {
         validate_worker_url("grpc://user:secret@worker:50051").expect("accepted");
-        assert!(logs_contain("grpc://***@worker:50051"));
-        assert!(logs_contain("not sent to a gRPC worker"));
-        assert!(!logs_contain("secret"));
-    }
+        let warning = unused_credentials_warning("grpc://user:secret@worker:50051").unwrap();
+        assert!(warning.contains("grpc://***@worker:50051"), "{warning}");
+        assert!(warning.contains("not sent to a gRPC worker"), "{warning}");
+        assert!(!warning.contains("secret"), "{warning}");
+        for url in ["http://user:secret@worker:8000", "grpc://worker:50051"] {
+            assert_eq!(unused_credentials_warning(url), None, "{url}");
+        }
 
-    #[traced_test]
-    #[test]
-    fn an_http_worker_url_with_userinfo_and_a_url_without_warn_nothing() {
-        validate_worker_url("http://user:secret@worker:8000").expect("accepted");
-        validate_worker_url("grpc://worker:50051").expect("accepted");
-        assert!(!logs_contain("userinfo"));
+        let mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![
+                ("grpc://user:secret@prefill:50051".to_string(), Some(8998)),
+                ("http://user:secret@prefill-http:8000".to_string(), None),
+            ],
+            decode_urls: vec![
+                "grpc://decode:50051".to_string(),
+                "grpc://token@decode-2:50051".to_string(),
+            ],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        let warnings = unused_credentials_warnings(&mode);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("grpc://***@prefill:50051"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("grpc://***@decode-2:50051"),
+            "{warnings:?}"
+        );
+        assert!(unused_credentials_warnings(&RoutingMode::Regular {
+            worker_urls: vec!["http://user:secret@worker:8000".to_string()],
+        })
+        .is_empty());
     }
 
     #[test]

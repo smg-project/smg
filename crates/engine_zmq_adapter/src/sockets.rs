@@ -100,7 +100,8 @@ pub(crate) fn zmq_socket_addresses(
             if !address.starts_with("tcp://") {
                 return Err(format!(
                     "zmq_handshake_address must be a tcp:// address \
-                     (the engine dials a TCP handshake), got '{address}'"
+                     (the engine dials a TCP handshake), got '{}'",
+                    masked(address)
                 ));
             }
             address.to_string()
@@ -108,12 +109,24 @@ pub(crate) fn zmq_socket_addresses(
         Handshake::TcpOrIpc(address) => {
             if !address.starts_with("tcp://") && !address.starts_with("ipc://") {
                 return Err(format!(
-                    "handshake address must be tcp://host:port or ipc://<path>, got '{address}'"
+                    "handshake address must be tcp://host:port or ipc://<path>, got '{}'",
+                    masked(address)
                 ));
             }
             address.to_string()
         }
     };
+    // The override is what the engines dial: a userinfo has no meaning there
+    // either, and would otherwise be bound as written.
+    if handshake
+        .strip_prefix("tcp://")
+        .is_some_and(|authority| authority.contains('@'))
+    {
+        return Err(format!(
+            "handshake address must be tcp://<host>:<port> without userinfo, got '{}'",
+            masked(&handshake)
+        ));
+    }
     let input = format!("ipc://{path}-in.sock");
     let output = format!("ipc://{path}-out.sock");
     Ok((handshake, input, output))
@@ -177,9 +190,7 @@ fn tcp_socket_addresses(
 /// masked whole (`tcp://***@host:port`), since the text reaches the start-up
 /// log and the add-worker route's answer, and a userinfo may be a secret.
 fn masked(url: &str) -> String {
-    let (prefix, authority) = url
-        .split_once("://")
-        .map_or(("", url), |(scheme, rest)| (scheme, rest));
+    let (prefix, authority) = url.split_once("://").unwrap_or(("", url));
     match authority.rsplit_once('@') {
         Some((_, host_port)) if prefix.is_empty() => format!("***@{host_port}"),
         Some((_, host_port)) => format!("{prefix}://***@{host_port}"),
@@ -508,8 +519,9 @@ mod tests {
 
     /// A `tcp://` URL with userinfo is refused whatever the userinfo's shape
     /// (one with a colon would otherwise read as the host, one without would
-    /// be bound raw), and no refusal writes a userinfo as written: the
-    /// address is shown with it masked, in every refusal text.
+    /// be bound raw), so is a `tcp://` handshake override with one, and no
+    /// refusal writes a userinfo as written: the address is shown with it
+    /// masked, in every refusal text.
     #[test]
     fn a_tcp_worker_url_with_userinfo_is_refused_and_never_shown_raw() {
         for url in [
@@ -536,6 +548,18 @@ mod tests {
         assert!(err.contains("tcp://***@10.0.0.5:31000"), "{err}");
         assert!(!err.contains("secret"), "{err}");
         assert_eq!(masked("tcp://10.0.0.5:31000"), "tcp://10.0.0.5:31000");
+        for override_url in [
+            "http://user:secret@10.0.0.5:30500",
+            "user:secret@10.0.0.5:30500",
+            "tcp://user:secret@10.0.0.5:30500",
+        ] {
+            let err = zmq_handshake_address("ipc:///tmp/w", Some(override_url)).unwrap_err();
+            assert!(err.contains("***@10.0.0.5:30500"), "{override_url}: {err}");
+            assert!(!err.contains("secret"), "{override_url}: {err}");
+        }
+        let err = zmq_handshake_address("ipc:///tmp/w", Some("tcp://user:secret@10.0.0.5:30500"))
+            .unwrap_err();
+        assert!(err.contains("without userinfo"), "{err}");
     }
 
     #[tokio::test]

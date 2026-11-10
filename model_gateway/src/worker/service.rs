@@ -19,7 +19,7 @@ use smg_auth::AuditResource;
 use tracing::warn;
 
 use crate::{
-    config::{validate_worker_url, RouterConfig},
+    config::{unused_credentials_warning, validate_worker_url, RouterConfig},
     routers::provider_support,
     service_discovery::{DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL},
     worker::{
@@ -38,7 +38,11 @@ use crate::{
 fn validate_worker_url_request(url: &str) -> Result<(), WorkerServiceError> {
     validate_worker_url(url).map_err(|e| WorkerServiceError::BadRequest {
         message: e.to_string(),
-    })
+    })?;
+    if let Some(warning) = unused_credentials_warning(url) {
+        warn!("{warning}");
+    }
+    Ok(())
 }
 
 /// Longest URL a registration takes: longer ones are not addresses of a
