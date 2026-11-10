@@ -2252,6 +2252,178 @@ async fn a_qwen35_image_request_carries_the_position_table_the_engine_would_comp
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// A Qwen3-Omni checkpoint's mixed request (an audio run, an image, a video
+/// timed at one second per grid, the items out of order) reaches the
+/// scheduler with the table the engine's own Omni rule writes, computed from
+/// the launcher's thinker facts; the same checkpoint without its merge size
+/// refuses the items before the scheduler, naming the fact.
+#[tokio::test]
+async fn a_qwen3_omni_request_carries_the_position_table_the_engine_would_compute() {
+    let omni = TokenSpeedModelInfo {
+        model_type: "qwen3_omni_moe".to_string(),
+        architectures: vec!["Qwen3OmniMoeForConditionalGeneration".to_string()],
+        mrope_positions: Some(true),
+        spatial_merge_size: Some(2),
+        position_id_per_seconds: Some(13.0),
+        seconds_per_chunk: Some(2.0),
+        supports_vision: true,
+        supports_multimodal: true,
+        supported_modalities: vec![1, 2, 3],
+        ..model_info()
+    };
+    let tensor = |dtype: &str, shape: Vec<u32>, bytes: Vec<u8>| ts::TensorData {
+        shape,
+        dtype: dtype.to_string(),
+        payload: Some(ts::tensor_data::Payload::Inline(bytes.into())),
+    };
+    let grid = |rows: [i64; 3]| {
+        tensor(
+            "int64",
+            vec![1, 3],
+            rows.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        )
+    };
+    let item = |modality: common::Modality,
+                hash: u64,
+                offset: u32,
+                length: u32,
+                tensors: Vec<(&str, ts::TensorData)>| ts::MultimodalItem {
+        modality: modality as i32,
+        content_hash: hash.to_le_bytes().to_vec(),
+        encoder_input: Some(tensor(
+            "bfloat16",
+            vec![length, 4],
+            vec![0u8; length as usize * 8],
+        )),
+        model_specific_tensors: tensors
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+        placeholders: vec![ts::PlaceholderRange { offset, length }],
+        placeholder_token_id: None,
+    };
+    let mixed_request = |id: &str| {
+        let mut request = generate_request(id, false, Vec::new());
+        request.tokenized.as_mut().unwrap().input_ids = (0..25).collect();
+        request.mm_inputs = Some(ts::MultimodalInputs {
+            items: vec![
+                item(
+                    common::Modality::Video,
+                    3,
+                    15,
+                    8,
+                    vec![
+                        ("video_grid_thw", grid([2, 4, 4])),
+                        (
+                            "video_second_per_grid",
+                            tensor("float32", vec![1], 1.0f32.to_le_bytes().to_vec()),
+                        ),
+                    ],
+                ),
+                item(common::Modality::Audio, 1, 2, 3, Vec::new()),
+                item(
+                    common::Modality::Image,
+                    2,
+                    8,
+                    4,
+                    vec![("image_grid_thw", grid([1, 4, 4]))],
+                ),
+            ],
+        });
+        request
+    };
+
+    let mut h = harness(omni.clone(), None).await;
+    let mut stream = h
+        .client
+        .generate(mixed_request("omni-1"))
+        .await
+        .expect("generate")
+        .into_inner();
+    let frames = h.engine_in.recv_frames().await.unwrap();
+    let payload = decode_value(frames[1].as_ref()).unwrap();
+    let array = payload.as_array().expect("a positional array");
+    let mm = array[22].as_array().expect("multimodal inputs");
+    let raw_view = |value: &rmpv::Value| -> Vec<u8> {
+        match value {
+            rmpv::Value::Ext(_, bytes) => bytes.clone(),
+            other => panic!("expected the raw-view ext, got {other:?}"),
+        }
+    };
+    let table = mm[3].as_array().expect("the position table tuple");
+    assert_eq!(
+        table[1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![3, 25]
+    );
+    let values: Vec<i64> = raw_view(&table[2])
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
+        .collect();
+    let (time, rest) = values.split_at(25);
+    let (height, width) = rest.split_at(25);
+    // The engine's own mixed case: text, the audio run linear, the image's
+    // 2x2 at 8, text from 10, the video's two steps 13 positions apart, text
+    // from 27, a delta of 4.
+    for axis in [time, height, width] {
+        assert_eq!(&axis[..8], &(0..8).collect::<Vec<i64>>()[..]);
+        assert_eq!(&axis[12..15], &[10, 11, 12]);
+        assert_eq!(&axis[23..], &[27, 28]);
+    }
+    assert_eq!(&time[8..12], &[8, 8, 8, 8]);
+    assert_eq!(&height[8..12], &[8, 8, 9, 9]);
+    assert_eq!(&width[8..12], &[8, 9, 8, 9]);
+    assert_eq!(&time[15..23], &[13, 13, 13, 13, 26, 26, 26, 26]);
+    assert_eq!(&height[15..23], &[13, 13, 14, 14, 13, 13, 14, 14]);
+    assert_eq!(&width[15..23], &[13, 14, 13, 14, 13, 14, 13, 14]);
+    let delta = mm[4].as_array().expect("the delta tuple");
+    assert_eq!(
+        i64::from_le_bytes(raw_view(&delta[2]).as_chunks::<8>().0[0]),
+        4
+    );
+    assert_eq!(mm[5].as_i64(), Some(4));
+    send(
+        &mut h.engine_out,
+        &batch("omni-1", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert_scheduler_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    // The same checkpoint whose launcher found no merge size: refused before
+    // the scheduler, by the fact's name.
+    let without_merge = TokenSpeedModelInfo {
+        spatial_merge_size: None,
+        ..omni
+    };
+    let mut h = harness(without_merge, None).await;
+    let status = h
+        .client
+        .generate(mixed_request("omni-2"))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status
+            .message()
+            .contains("thinker_config.vision_config.spatial_merge_size"),
+        "{}",
+        status.message()
+    );
+    assert_scheduler_idle(&mut h.engine_in).await;
+    assert_eq!(h.server.active_requests(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// Two connected schedulers, one of which has reported a load tail: the
 /// report lists both ranks, the silent one zero-filled (an idle scheduler,
 /// not a gone one), on the poll, on the rank a request names and on the

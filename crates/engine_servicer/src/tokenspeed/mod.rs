@@ -17,7 +17,7 @@ mod tests;
 use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::{
-    EncodeRendezvous, GridTensors, MropeLayout, StructuredOutputBackend,
+    EncodeRendezvous, GridTensors, PositionFacts, StructuredOutputBackend,
     StructuredOutputsBackendConfig, StructuredOutputsSupport,
 };
 use engine_zmq_client::{protocol::handshake::REQUEST_KIND_ENCODE, ConnectedEngine};
@@ -86,6 +86,14 @@ pub struct TokenSpeedModelInfo {
     pub image_token_id: Option<u32>,
     /// The checkpoint's video placeholder token id (`video_token_id`).
     pub video_token_id: Option<u32>,
+    /// The Qwen3-Omni rule's clock (`thinker_config.position_id_per_seconds`):
+    /// the positions one second of media spans on the time axis; `None` when
+    /// the checkpoint says nothing (the rule takes the engine's default).
+    pub position_id_per_seconds: Option<f64>,
+    /// The seconds one temporal grid of a video spans for that rule when the
+    /// item carries no `video_second_per_grid` (`thinker_config.seconds_per_chunk`);
+    /// `None` when the checkpoint says nothing (the engine's default).
+    pub seconds_per_chunk: Option<f64>,
     pub model_dtype: String,
     pub multimodal_encoder_dtype: String,
     /// TokenSpeed's `ServerArgs` as a JSON object, reported as
@@ -119,28 +127,20 @@ pub struct TokenSpeedModelInfo {
 
 impl TokenSpeedModelInfo {
     /// What a multimodal item's grid tensors are for this model
-    /// ([`GridTensors`]): the position rule's layout facts travel together,
-    /// so a launcher that shipped only some of them ships none.
+    /// ([`GridTensors`]): the family's rule reads the facts it needs of the
+    /// ones the launcher shipped.
     pub(super) fn grid_tensors(&self) -> GridTensors {
-        let layout = match (
-            self.spatial_merge_size,
-            self.image_token_id,
-            self.video_token_id,
-        ) {
-            (Some(spatial_merge_size), Some(image_token_id), Some(video_token_id)) => {
-                Some(MropeLayout {
-                    spatial_merge_size,
-                    image_token_id,
-                    video_token_id,
-                })
-            }
-            _ => None,
-        };
         GridTensors::for_model(
             &self.architectures,
             &self.model_type,
             self.mrope_positions,
-            layout,
+            PositionFacts {
+                spatial_merge_size: self.spatial_merge_size,
+                image_token_id: self.image_token_id,
+                video_token_id: self.video_token_id,
+                position_id_per_seconds: self.position_id_per_seconds,
+                seconds_per_chunk: self.seconds_per_chunk,
+            },
         )
     }
 }

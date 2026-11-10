@@ -70,7 +70,8 @@ pub use structured_outputs::{
 };
 pub use tokenspeed::{
     qwen35_lineage, to_tokenspeed_response, translate_encode_request, EncodeRendezvous,
-    GridTensors, MropeLayout, TokenSpeedGenerateStream,
+    GridTensors, MropeLayout, OmniLayout, PositionFacts, PositionRule, RuleFamily,
+    TokenSpeedGenerateStream,
 };
 pub use trtllm::{to_trtllm_response, TrtllmGenerateStream};
 pub use vllm::{structured_outputs_backend_from_config, ProcessedMedia, VllmGenerateStream};

@@ -1,22 +1,27 @@
-//! The MRoPE position table of the Qwen3.5 lineage, computed as the engine's
-//! own input processor computes it on the path this wire bypasses.
+//! The MRoPE position tables of the families whose rule the engine's own
+//! input processor has, computed as it computes them on the path this wire
+//! bypasses.
 //!
 //! An MRoPE language model (a text rope config with an `mrope_section`) reads
 //! three position axes per token: text runs advance all three linearly, an
 //! image or video frame lays its merged patch grid out over (time, height,
 //! width). The engine derives the table in its frontend from the un-padded
 //! prompt, the items' `image_grid_thw` / `video_grid_thw` rows and their
-//! placeholder spans (`runtime/multimodal/mrope.py`,
-//! `_compute_qwen35_mrope_positions_from_offsets`): nothing between the
-//! msgpack wire and the executor repeats that step, and an empty table means
-//! the executor falls back to one-dimensional positions without a word. This
-//! module is that step, rule for rule, so the table on the wire is the one the
-//! engine would have written.
+//! placeholder spans (`runtime/multimodal/mrope.py`): the Qwen3.5 lineage by
+//! `_compute_qwen35_mrope_positions_from_offsets`, Qwen3-Omni by
+//! `_compute_qwen3_omni_mrope_positions`, and no other architecture (its
+//! dispatch, `_MROPE_ARCHITECTURES`, writes no table for the rest). Nothing
+//! between the msgpack wire and the executor repeats that step, and an empty
+//! table means the executor falls back to one-dimensional positions without a
+//! word. This module is that step, rule for rule, so the table on the wire is
+//! the one the engine would have written.
 
-use engine_zmq_client::codec::tensor::WireTensor;
+use engine_zmq_client::{
+    codec::tensor::WireTensor, protocol::tokenspeed::multimodal::TokenSpeedWireModality,
+};
 use smg_grpc_client::tokenspeed_proto;
 
-/// The checkpoint facts the rule needs besides the request: the vision
+/// The checkpoint facts the Qwen3.5 rule needs besides the request: the vision
 /// tower's spatial merge (patches per position along each axis) and the two
 /// placeholder token ids the engine checks each span against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,6 +29,155 @@ pub struct MropeLayout {
     pub spatial_merge_size: u32,
     pub image_token_id: u32,
     pub video_token_id: u32,
+}
+
+/// The checkpoint facts the Qwen3-Omni rule needs besides the request, which
+/// its checkpoint keeps under `thinker_config`: the vision tower's spatial
+/// merge and the model's clock.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OmniLayout {
+    pub spatial_merge_size: u32,
+    /// `position_id_per_seconds`: the positions one second of media spans on
+    /// the time axis ([`Self::DEFAULT_POSITION_ID_PER_SECONDS`] when the
+    /// checkpoint says nothing, as the engine defaults it).
+    pub position_id_per_seconds: f64,
+    /// `seconds_per_chunk`: the seconds one temporal grid of a video spans
+    /// when its item carries no `video_second_per_grid`
+    /// ([`Self::DEFAULT_SECONDS_PER_CHUNK`] when the checkpoint says nothing).
+    pub seconds_per_chunk: f64,
+}
+
+impl OmniLayout {
+    pub const DEFAULT_POSITION_ID_PER_SECONDS: f64 = 13.0;
+    pub const DEFAULT_SECONDS_PER_CHUNK: f64 = 2.0;
+}
+
+/// The checkpoint facts a launcher, or the engine's handshake, ships for the
+/// position rules, each `None` when the checkpoint has none; which of them a
+/// rule needs is the rule's ([`RuleFamily::rule`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PositionFacts {
+    pub spatial_merge_size: Option<u32>,
+    pub image_token_id: Option<u32>,
+    pub video_token_id: Option<u32>,
+    pub position_id_per_seconds: Option<f64>,
+    pub seconds_per_chunk: Option<f64>,
+}
+
+/// The families whose table the engine's frontend computes, hence the rules
+/// this module has: its dispatch, the architecture first (Qwen3-Omni has its
+/// own rule), then the Qwen3.5 model types of the remaining architectures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleFamily {
+    Qwen35,
+    Qwen3Omni,
+}
+
+/// The architectures the engine dispatches to the Qwen3.5 offsets rule
+/// (its `_MROPE_ARCHITECTURES` minus Qwen3-Omni, whose rule differs), with
+/// the model types that rule accepts.
+const QWEN35_ARCHITECTURES: [&str; 3] = [
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
+    "Qwen4ExpForConditionalGeneration",
+];
+const QWEN35_MODEL_TYPES: [&str; 3] = ["qwen3_5", "qwen3_5_moe", "qwen4_exp"];
+const QWEN3_OMNI_ARCHITECTURES: [&str; 1] = ["Qwen3OmniMoeForConditionalGeneration"];
+
+impl RuleFamily {
+    /// The family the engine computes this checkpoint's table with; `None`
+    /// for a checkpoint it writes no table for.
+    pub fn of(architectures: &[String], model_type: &str) -> Option<Self> {
+        let named = |names: &[&str]| {
+            architectures
+                .iter()
+                .any(|arch| names.contains(&arch.as_str()))
+        };
+        if named(&QWEN3_OMNI_ARCHITECTURES) {
+            return Some(Self::Qwen3Omni);
+        }
+        if named(&QWEN35_ARCHITECTURES) && QWEN35_MODEL_TYPES.contains(&model_type) {
+            return Some(Self::Qwen35);
+        }
+        None
+    }
+
+    /// The family's rule with the facts it reads, `None` when a fact it needs
+    /// is missing: the Qwen3.5 rule reads the merge size and both placeholder
+    /// ids, the Omni rule the merge size, with the engine's defaults for a
+    /// clock the checkpoint leaves unsaid.
+    pub fn rule(self, facts: PositionFacts) -> Option<PositionRule> {
+        match self {
+            Self::Qwen35 => match (
+                facts.spatial_merge_size,
+                facts.image_token_id,
+                facts.video_token_id,
+            ) {
+                (Some(spatial_merge_size), Some(image_token_id), Some(video_token_id)) => {
+                    Some(PositionRule::Qwen35(MropeLayout {
+                        spatial_merge_size,
+                        image_token_id,
+                        video_token_id,
+                    }))
+                }
+                _ => None,
+            },
+            Self::Qwen3Omni => facts.spatial_merge_size.map(|spatial_merge_size| {
+                PositionRule::Qwen3Omni(OmniLayout {
+                    spatial_merge_size,
+                    position_id_per_seconds: facts
+                        .position_id_per_seconds
+                        .unwrap_or(OmniLayout::DEFAULT_POSITION_ID_PER_SECONDS),
+                    seconds_per_chunk: facts
+                        .seconds_per_chunk
+                        .unwrap_or(OmniLayout::DEFAULT_SECONDS_PER_CHUNK),
+                })
+            }),
+        }
+    }
+
+    /// The facts the family's rule cannot run without, by their config names,
+    /// for the refusal that names them.
+    pub fn needs(self) -> &'static str {
+        match self {
+            Self::Qwen35 => "spatial_merge_size, image_token_id, video_token_id",
+            Self::Qwen3Omni => "thinker_config.vision_config.spatial_merge_size",
+        }
+    }
+}
+
+/// Whether the engine computes this checkpoint's positions with the Qwen3.5
+/// offsets rule: one of its architectures with one of its model types.
+pub fn qwen35_lineage(architectures: &[String], model_type: &str) -> bool {
+    RuleFamily::of(architectures, model_type) == Some(RuleFamily::Qwen35)
+}
+
+/// A family's rule with the checkpoint facts it reads.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PositionRule {
+    Qwen35(MropeLayout),
+    Qwen3Omni(OmniLayout),
+}
+
+impl PositionRule {
+    /// The table the engine's frontend would write for this prompt and these
+    /// items, or the precondition it would fail on, by name.
+    pub(crate) fn positions(
+        self,
+        input_ids: &[u32],
+        items: &[GridItem<'_>],
+    ) -> Result<MropeTable, String> {
+        match self {
+            Self::Qwen35(layout) => qwen35_positions(layout, input_ids, items),
+            Self::Qwen3Omni(layout) => qwen3_omni_positions(layout, input_ids.len(), items),
+        }
+    }
+
+    /// Whether the rule reads a video item's clock (`video_second_per_grid`)
+    /// and its `use_audio_in_video` flag: the Omni rule does.
+    pub(crate) fn reads_video_timing(self) -> bool {
+        matches!(self, Self::Qwen3Omni(_))
+    }
 }
 
 /// Which grid an item carries, by the key the engine looks for first.
@@ -40,13 +194,19 @@ impl GridKind {
     ];
 }
 
-/// One item's inputs to the rule: its grid rows `(t, h, w)` as the tensor
-/// carries them (`None` for an item without a grid, which contributes
-/// nothing) and its inclusive placeholder spans in prompt order.
+/// One item's inputs to the rules: its modality, its grid rows `(t, h, w)`
+/// as the tensor carries them (`None` for an item without a grid, which
+/// contributes nothing to the Qwen3.5 rule), its inclusive placeholder spans
+/// in prompt order, and what the Omni rule reads of a video: its
+/// `video_second_per_grid` values (`None` when the item carries none) and
+/// whether it asked for its audio interleaved.
 #[derive(Debug)]
 pub(crate) struct GridItem<'a> {
+    pub modality: TokenSpeedWireModality,
     pub grid: Option<(GridKind, Vec<[i64; 3]>)>,
     pub offsets: &'a [(u64, u64)],
+    pub seconds_per_grid: Option<Vec<f32>>,
+    pub audio_in_video: bool,
 }
 
 /// The three fields the engine's input processor writes: the table `(3, L)`
@@ -56,25 +216,6 @@ pub(crate) struct MropeTable {
     pub positions: WireTensor,
     pub delta: WireTensor,
     pub scalar: i64,
-}
-
-/// The architectures the engine dispatches to the Qwen3.5 offsets rule
-/// (its `_MROPE_ARCHITECTURES` minus Qwen3-Omni, whose rule differs), with
-/// the model types that rule accepts.
-const QWEN35_ARCHITECTURES: [&str; 3] = [
-    "Qwen3_5ForConditionalGeneration",
-    "Qwen3_5MoeForConditionalGeneration",
-    "Qwen4ExpForConditionalGeneration",
-];
-const QWEN35_MODEL_TYPES: [&str; 3] = ["qwen3_5", "qwen3_5_moe", "qwen4_exp"];
-
-/// Whether the engine computes this checkpoint's positions with the Qwen3.5
-/// offsets rule: one of its architectures with one of its model types.
-pub fn qwen35_lineage(architectures: &[String], model_type: &str) -> bool {
-    architectures
-        .iter()
-        .any(|arch| QWEN35_ARCHITECTURES.contains(&arch.as_str()))
-        && QWEN35_MODEL_TYPES.contains(&model_type)
 }
 
 /// Read a grid tensor's `(t, h, w)` rows: shape `[n, 3]` or `[3]`, an
@@ -94,34 +235,7 @@ pub(crate) fn grid_rows(
             ))
         }
     };
-    let bytes = match &tensor.payload {
-        Some(tokenspeed_proto::tensor_data::Payload::Inline(bytes)) => bytes,
-        _ => return Err(format!("multimodal item's {key} carries no inline payload")),
-    };
-    let values: Vec<i64> = match tensor.dtype.as_str() {
-        "int64" => elements::<8>(bytes, key)?
-            .iter()
-            .map(|c| i64::from_le_bytes(*c))
-            .collect(),
-        "uint64" => elements::<8>(bytes, key)?
-            .iter()
-            .map(|c| i64::try_from(u64::from_le_bytes(*c)))
-            .collect::<Result<_, _>>()
-            .map_err(|_| format!("multimodal item's {key} holds a value above i64"))?,
-        "int32" => elements::<4>(bytes, key)?
-            .iter()
-            .map(|c| i64::from(i32::from_le_bytes(*c)))
-            .collect(),
-        "uint32" => elements::<4>(bytes, key)?
-            .iter()
-            .map(|c| i64::from(u32::from_le_bytes(*c)))
-            .collect(),
-        other => {
-            return Err(format!(
-                "multimodal item's {key} has dtype {other:?}; a grid is an integer tensor"
-            ))
-        }
-    };
+    let values = integers(key, tensor)?;
     if values.len() != rows * 3 {
         return Err(format!(
             "multimodal item's {key} holds {} values for shape {shape:?}",
@@ -129,6 +243,91 @@ pub(crate) fn grid_rows(
         ));
     }
     Ok(values.as_chunks::<3>().0.to_vec())
+}
+
+/// The inline payload of a tensor, or the refusal for one that is not inline.
+fn inline_bytes<'a>(
+    key: &str,
+    tensor: &'a tokenspeed_proto::TensorData,
+) -> Result<&'a [u8], String> {
+    match &tensor.payload {
+        Some(tokenspeed_proto::tensor_data::Payload::Inline(bytes)) => Ok(bytes),
+        _ => Err(format!("multimodal item's {key} carries no inline payload")),
+    }
+}
+
+/// An integer tensor's values, whatever their width.
+fn integers(key: &str, tensor: &tokenspeed_proto::TensorData) -> Result<Vec<i64>, String> {
+    let bytes = inline_bytes(key, tensor)?;
+    match tensor.dtype.as_str() {
+        "int64" => Ok(elements::<8>(bytes, key)?
+            .iter()
+            .map(|c| i64::from_le_bytes(*c))
+            .collect()),
+        "uint64" => elements::<8>(bytes, key)?
+            .iter()
+            .map(|c| i64::try_from(u64::from_le_bytes(*c)))
+            .collect::<Result<_, _>>()
+            .map_err(|_| format!("multimodal item's {key} holds a value above i64")),
+        "int32" => Ok(elements::<4>(bytes, key)?
+            .iter()
+            .map(|c| i64::from(i32::from_le_bytes(*c)))
+            .collect()),
+        "uint32" => Ok(elements::<4>(bytes, key)?
+            .iter()
+            .map(|c| i64::from(u32::from_le_bytes(*c)))
+            .collect()),
+        other => Err(format!(
+            "multimodal item's {key} has dtype {other:?}; a grid is an integer tensor"
+        )),
+    }
+}
+
+/// A video item's `video_second_per_grid` values as the engine reads them:
+/// the tensor flattened and taken as float32 (a float64 or integer value
+/// rounds to the nearest float32, as `torch.as_tensor(dtype=float32)` rounds
+/// it); the gateway's media pipeline sends one float32 per clip.
+pub(crate) fn seconds_per_grid(
+    key: &str,
+    tensor: &tokenspeed_proto::TensorData,
+) -> Result<Vec<f32>, String> {
+    let bytes = inline_bytes(key, tensor)?;
+    match tensor.dtype.as_str() {
+        "float32" => Ok(elements::<4>(bytes, key)?
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect()),
+        "float64" => Ok(elements::<8>(bytes, key)?
+            .iter()
+            .map(|c| f64::from_le_bytes(*c) as f32)
+            .collect()),
+        "int64" | "uint64" | "int32" | "uint32" => {
+            Ok(integers(key, tensor)?.iter().map(|&v| v as f32).collect())
+        }
+        other => Err(format!(
+            "multimodal item's {key} has dtype {other:?}; a clip's seconds per grid are a float tensor"
+        )),
+    }
+}
+
+/// Whether a flag tensor holds any true value, as `torch.as_tensor(..).any()`
+/// reads it: a bool or integer tensor by its bytes (a non-zero element has a
+/// non-zero byte), a float tensor by its values.
+pub(crate) fn flag_set(key: &str, tensor: &tokenspeed_proto::TensorData) -> Result<bool, String> {
+    let bytes = inline_bytes(key, tensor)?;
+    match tensor.dtype.as_str() {
+        "bool" | "uint8" | "int8" | "int16" | "uint16" | "int32" | "uint32" | "int64"
+        | "uint64" => Ok(bytes.iter().any(|&b| b != 0)),
+        "float32" => Ok(elements::<4>(bytes, key)?
+            .iter()
+            .any(|c| f32::from_le_bytes(*c) != 0.0)),
+        "float64" => Ok(elements::<8>(bytes, key)?
+            .iter()
+            .any(|c| f64::from_le_bytes(*c) != 0.0)),
+        other => Err(format!(
+            "multimodal item's {key} has dtype {other:?}; a flag is a bool tensor"
+        )),
+    }
 }
 
 /// The tensor's bytes as `WIDTH`-byte elements; a length that is not a whole
@@ -229,13 +428,7 @@ pub(crate) fn qwen35_positions(
             ));
         }
         for (&(start, end), [t, h, w]) in item.offsets.iter().zip(rows) {
-            let (start, end) = (start as usize, end as usize);
-            if end < start || end >= seq_len {
-                return Err(format!(
-                    "multimodal item {index} placeholder span [{start}, {end}] does not fit the \
-                     {seq_len}-token prompt"
-                ));
-            }
+            let (start, end) = span_in(index, start, end, seq_len)?;
             if input_ids[start..=end].iter().any(|&id| id != placeholder) {
                 return Err(format!(
                     "multimodal item {index} placeholder span [{start}, {end}] holds a token other \
@@ -279,47 +472,263 @@ pub(crate) fn qwen35_positions(
     build_table(seq_len, &segments)
 }
 
-/// `_build_qwen35_mrope_positions`: text runs linear from the running
-/// position, a grid laid out row-major over (t, h, w) from it, the running
-/// position advanced by the grid's largest side.
-fn build_table(seq_len: usize, segments: &[Segment]) -> Result<MropeTable, String> {
-    /// A text run: the same linear positions on all three axes.
-    fn fill_text(axes: &mut [&mut [i64]; 3], from: usize, to: usize, next_pos: &mut i64) {
-        for pos in from..to {
-            let value = *next_pos + (pos - from) as i64;
-            for axis in axes.iter_mut() {
-                axis[pos] = value;
-            }
-        }
-        *next_pos += (to - from) as i64;
+/// An inclusive span as prompt indices, or the refusal for one outside the
+/// prompt.
+fn span_in(index: usize, start: u64, end: u64, seq_len: usize) -> Result<(usize, usize), String> {
+    let fits = end >= start && usize::try_from(end).is_ok_and(|end| end < seq_len);
+    if !fits {
+        return Err(format!(
+            "multimodal item {index} placeholder span [{start}, {end}] does not fit the \
+             {seq_len}-token prompt"
+        ));
     }
+    Ok((start as usize, end as usize))
+}
+
+/// A text run: the same linear positions on all three axes.
+fn fill_text(axes: &mut [&mut [i64]; 3], from: usize, to: usize, next_pos: &mut i64) {
+    for pos in from..to {
+        let value = *next_pos + (pos - from) as i64;
+        for axis in axes.iter_mut() {
+            axis[pos] = value;
+        }
+    }
+    *next_pos += (to - from) as i64;
+}
+
+/// The three axes of a table over `seq_len` tokens, and the table they make.
+fn table_of(
+    seq_len: usize,
+    fill: impl FnOnce(&mut [&mut [i64]; 3]) -> Result<i64, String>,
+) -> Result<MropeTable, String> {
     let mut positions = vec![0i64; 3 * seq_len];
     let (t_axis, rest) = positions.split_at_mut(seq_len);
     let (h_axis, w_axis) = rest.split_at_mut(seq_len);
     let mut axes = [t_axis, h_axis, w_axis];
-    let mut next_pos: i64 = 0;
-    let mut cursor = 0usize;
-    for segment in segments {
-        if cursor < segment.start {
-            fill_text(&mut axes, cursor, segment.start, &mut next_pos);
-        }
-        let (h, w) = (segment.h as usize, segment.w as usize);
-        for (offset, pos) in (segment.start..=segment.end).enumerate() {
-            axes[0][pos] = next_pos + (offset / (h * w)) as i64;
-            axes[1][pos] = next_pos + ((offset / w) % h) as i64;
-            axes[2][pos] = next_pos + (offset % w) as i64;
-        }
-        next_pos += segment.t.max(segment.h).max(segment.w);
-        cursor = segment.end + 1;
-    }
-    if cursor < seq_len {
-        fill_text(&mut axes, cursor, seq_len, &mut next_pos);
-    }
+    let next_pos = fill(&mut axes)?;
     let scalar = next_pos - seq_len as i64;
     Ok(MropeTable {
         positions: WireTensor::from_i64(vec![3, seq_len], positions)?,
         delta: WireTensor::from_i64(vec![1, 1], vec![scalar])?,
         scalar,
+    })
+}
+
+/// `_build_qwen35_mrope_positions`: text runs linear from the running
+/// position, a grid laid out row-major over (t, h, w) from it, the running
+/// position advanced by the grid's largest side.
+fn build_table(seq_len: usize, segments: &[Segment]) -> Result<MropeTable, String> {
+    table_of(seq_len, |axes| {
+        let mut next_pos: i64 = 0;
+        let mut cursor = 0usize;
+        for segment in segments {
+            if cursor < segment.start {
+                fill_text(axes, cursor, segment.start, &mut next_pos);
+            }
+            let (h, w) = (segment.h as usize, segment.w as usize);
+            for (offset, pos) in (segment.start..=segment.end).enumerate() {
+                axes[0][pos] = next_pos + (offset / (h * w)) as i64;
+                axes[1][pos] = next_pos + ((offset / w) % h) as i64;
+                axes[2][pos] = next_pos + (offset % w) as i64;
+            }
+            next_pos += segment.t.max(segment.h).max(segment.w);
+            cursor = segment.end + 1;
+        }
+        if cursor < seq_len {
+            fill_text(axes, cursor, seq_len, &mut next_pos);
+        }
+        Ok(next_pos)
+    })
+}
+
+/// A span of the Omni rule: an audio run, or a vision grid with the clock its
+/// time axis ticks on.
+#[derive(Debug, Clone, Copy)]
+struct OmniSegment {
+    item: usize,
+    start: usize,
+    end: usize,
+    media: OmniMedia,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OmniMedia {
+    Audio,
+    /// The grid as the tensor carries it and the float32 factor one temporal
+    /// step spans on the time axis.
+    Vision {
+        t: i64,
+        h: i64,
+        w: i64,
+        clock: f32,
+    },
+}
+
+/// The Qwen3-Omni rule over the prompt: the engine's
+/// `_compute_qwen3_omni_mrope_positions` with its `_omni_media_segments`.
+/// The items' spans are authoritative (sorted by start, never checked
+/// against the ids); an audio span advances all three axes linearly; an image
+/// or video item lays each grid row out over one span, row-major over
+/// (t, h/m, w/m), its time axis in steps of the model's clock: an image
+/// `position_id_per_seconds` per step, a video that times its seconds per
+/// grid, truncated to an integer as torch truncates a float32 (the arithmetic
+/// is float32, as the engine's is); the running position resumes one past
+/// the span's largest position. Every precondition the engine raises on is
+/// an error naming it.
+pub(crate) fn qwen3_omni_positions(
+    layout: OmniLayout,
+    seq_len: usize,
+    items: &[GridItem<'_>],
+) -> Result<MropeTable, String> {
+    if seq_len == 0 {
+        return Err("MRoPE positions need a non-empty prompt".to_string());
+    }
+    let merge = i64::from(layout.spatial_merge_size);
+    if merge <= 0 {
+        return Err("MRoPE positions need a positive spatial merge size".to_string());
+    }
+    let mut segments: Vec<OmniSegment> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        // An item without spans contributes nothing, as the engine skips it.
+        if item.offsets.is_empty() {
+            continue;
+        }
+        let modality = item.modality;
+        if modality == TokenSpeedWireModality::Audio {
+            for &(start, end) in item.offsets {
+                let (start, end) = span_in(index, start, end, seq_len)?;
+                segments.push(OmniSegment {
+                    item: index,
+                    start,
+                    end,
+                    media: OmniMedia::Audio,
+                });
+            }
+            continue;
+        }
+        let Some((_, rows)) = &item.grid else {
+            return Err(format!(
+                "multimodal item {index} ({modality:?}) carries no grid; the rule lays its span \
+                 out over one"
+            ));
+        };
+        if modality == TokenSpeedWireModality::Video && item.audio_in_video {
+            return Err(format!(
+                "multimodal item {index} asks for its audio interleaved with the video \
+                 (use_audio_in_video), which the engine's rule does not serve"
+            ));
+        }
+        for (row, &[t, h, w]) in rows.iter().enumerate() {
+            if t <= 0 || h <= 0 || w <= 0 {
+                return Err(format!(
+                    "multimodal item {index} grid row {row} ({t}, {h}, {w}) is not positive"
+                ));
+            }
+        }
+        if rows.len() != item.offsets.len() {
+            return Err(format!(
+                "multimodal item {index} has {} grid row(s) for {} placeholder span(s)",
+                rows.len(),
+                item.offsets.len()
+            ));
+        }
+        // A video's seconds per grid: the item's one value for every row, or
+        // one per row, else the checkpoint's; an image ticks the bare clock.
+        let seconds: Vec<Option<f64>> = if modality == TokenSpeedWireModality::Video {
+            match &item.seconds_per_grid {
+                Some(values) if values.len() == 1 => vec![Some(f64::from(values[0])); rows.len()],
+                Some(values) if values.len() == rows.len() => {
+                    values.iter().map(|&v| Some(f64::from(v))).collect()
+                }
+                Some(values) => {
+                    return Err(format!(
+                        "multimodal item {index} carries {} video_second_per_grid value(s) for \
+                         {} grid row(s); one, or one per row",
+                        values.len(),
+                        rows.len()
+                    ))
+                }
+                None => vec![Some(layout.seconds_per_chunk); rows.len()],
+            }
+        } else {
+            vec![None; rows.len()]
+        };
+        for ((&(start, end), &[t, h, w]), seconds) in item.offsets.iter().zip(rows).zip(seconds) {
+            let (start, end) = span_in(index, start, end, seq_len)?;
+            // The engine scales a float32 `arange` by a Python float: the
+            // product of the seconds and the clock, in double, narrowed to
+            // float32 at the multiply.
+            let clock = match seconds {
+                Some(seconds) => (seconds * layout.position_id_per_seconds) as f32,
+                None => layout.position_id_per_seconds as f32,
+            };
+            segments.push(OmniSegment {
+                item: index,
+                start,
+                end,
+                media: OmniMedia::Vision { t, h, w, clock },
+            });
+        }
+    }
+    segments.sort_by_key(|segment| segment.start);
+    table_of(seq_len, |axes| {
+        let mut next_pos: i64 = 0;
+        let mut cursor = 0usize;
+        for segment in &segments {
+            if segment.start < cursor {
+                return Err("multimodal placeholder spans overlap".to_string());
+            }
+            fill_text(axes, cursor, segment.start, &mut next_pos);
+            match segment.media {
+                OmniMedia::Audio => fill_text(axes, segment.start, segment.end + 1, &mut next_pos),
+                OmniMedia::Vision { t, h, w, clock } => {
+                    let index = segment.item;
+                    if h % merge != 0 || w % merge != 0 {
+                        return Err(format!(
+                            "multimodal item {index} grid ({t}, {h}, {w}) does not divide by the \
+                             spatial merge {merge}"
+                        ));
+                    }
+                    let (lh, lw) = (h / merge, w / merge);
+                    let expected = t
+                        .checked_mul(lh)
+                        .and_then(|n| n.checked_mul(lw))
+                        .ok_or_else(|| {
+                            format!("multimodal item {index} grid ({t}, {h}, {w}) overflows")
+                        })?;
+                    let span = segment.end - segment.start + 1;
+                    if span as i64 != expected {
+                        return Err(format!(
+                            "multimodal item {index} placeholder span [{}, {}] has {span} tokens; \
+                             its grid ({t}, {h}, {w}) under spatial merge {merge} needs {expected}",
+                            segment.start, segment.end
+                        ));
+                    }
+                    // One time position per temporal step, as the engine's
+                    // float32 `arange * clock` truncated; the span check above
+                    // bounds `t` by the prompt.
+                    let steps: Vec<i64> = (0..t).map(|step| (step as f32 * clock) as i64).collect();
+                    let (lh, lw) = (lh as usize, lw as usize);
+                    for (offset, pos) in (segment.start..=segment.end).enumerate() {
+                        let (step, cell) = (offset / (lh * lw), offset % (lh * lw));
+                        axes[0][pos] = next_pos + steps[step];
+                        axes[1][pos] = next_pos + (cell / lw) as i64;
+                        axes[2][pos] = next_pos + (cell % lw) as i64;
+                    }
+                    let top = steps
+                        .iter()
+                        .copied()
+                        .max()
+                        .unwrap_or(0)
+                        .max(lh as i64 - 1)
+                        .max(lw as i64 - 1);
+                    next_pos += top + 1;
+                }
+            }
+            cursor = segment.end + 1;
+        }
+        fill_text(axes, cursor, seq_len, &mut next_pos);
+        Ok(next_pos)
     })
 }
 
@@ -335,6 +744,13 @@ pub(crate) mod tests {
     };
     const VISION_START: u32 = 151652;
     const VISION_END: u32 = 151653;
+
+    /// The engine's own Omni test facts (`test/runtime/models/test_qwen3_omni.py`).
+    pub(crate) const OMNI: OmniLayout = OmniLayout {
+        spatial_merge_size: 2,
+        position_id_per_seconds: 13.0,
+        seconds_per_chunk: 2.0,
+    };
 
     pub(crate) fn rows_of(table: &MropeTable) -> Vec<Vec<i64>> {
         let bytes = table.positions.data.as_raw_view().expect("inline table");
@@ -368,13 +784,27 @@ pub(crate) mod tests {
         (Some((GridKind::Video, rows.to_vec())), offsets.to_vec())
     }
 
+    /// A rule's item from a spec: the modality follows the grid's kind.
+    fn item_of<'a>(
+        grid: Option<&(GridKind, Vec<[i64; 3]>)>,
+        offsets: &'a [(u64, u64)],
+    ) -> GridItem<'a> {
+        GridItem {
+            modality: match grid {
+                Some((GridKind::Video, _)) => TokenSpeedWireModality::Video,
+                _ => TokenSpeedWireModality::Image,
+            },
+            grid: grid.cloned(),
+            offsets,
+            seconds_per_grid: None,
+            audio_in_video: false,
+        }
+    }
+
     fn table(input_ids: &[u32], items: &[Spec]) -> Result<MropeTable, String> {
         let items: Vec<GridItem<'_>> = items
             .iter()
-            .map(|(grid, offsets)| GridItem {
-                grid: grid.clone(),
-                offsets,
-            })
+            .map(|(grid, offsets)| item_of(grid.as_ref(), offsets))
             .collect();
         qwen35_positions(LAYOUT, input_ids, &items)
     }
@@ -578,6 +1008,53 @@ pub(crate) mod tests {
         .contains("holds 2 values"));
     }
 
+    /// A clip's seconds per grid read as float32 whatever the tensor's
+    /// width, and a flag by any true value; a dtype neither is, is refused.
+    #[test]
+    fn video_timing_tensors_read_as_the_engine_reads_them() {
+        let tensor = |dtype: &str, shape: Vec<u32>, bytes: Vec<u8>| tokenspeed_proto::TensorData {
+            shape,
+            dtype: dtype.to_string(),
+            payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(bytes.into())),
+        };
+        let key = "video_second_per_grid";
+        let f32_bytes: Vec<u8> = [0.5f32, 0.1].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(
+            seconds_per_grid(key, &tensor("float32", vec![2], f32_bytes)).unwrap(),
+            vec![0.5, 0.1]
+        );
+        // A float64 rounds to the nearest float32, an integer converts.
+        assert_eq!(
+            seconds_per_grid(
+                key,
+                &tensor("float64", vec![1], 0.1f64.to_le_bytes().to_vec())
+            )
+            .unwrap(),
+            vec![0.1f32]
+        );
+        assert_eq!(
+            seconds_per_grid(key, &tensor("int64", vec![1], 2i64.to_le_bytes().to_vec())).unwrap(),
+            vec![2.0]
+        );
+        assert!(
+            seconds_per_grid(key, &tensor("bfloat16", vec![1], vec![0, 0]))
+                .unwrap_err()
+                .contains("dtype")
+        );
+        let flag = "use_audio_in_video";
+        assert!(flag_set(flag, &tensor("bool", vec![1], vec![1])).unwrap());
+        assert!(!flag_set(flag, &tensor("bool", vec![2], vec![0, 0])).unwrap());
+        assert!(flag_set(flag, &tensor("int64", vec![1], 1i64.to_le_bytes().to_vec())).unwrap());
+        assert!(!flag_set(
+            flag,
+            &tensor("float32", vec![1], 0.0f32.to_le_bytes().to_vec())
+        )
+        .unwrap());
+        assert!(flag_set(flag, &tensor("bfloat16", vec![1], vec![0, 0]))
+            .unwrap_err()
+            .contains("dtype"));
+    }
+
     #[test]
     fn the_lineage_is_the_engines_dispatch() {
         let arch = |a: &str| vec![a.to_string()];
@@ -593,16 +1070,24 @@ pub(crate) mod tests {
             &arch("Qwen4ExpForConditionalGeneration"),
             "qwen4_exp"
         ));
-        // Qwen3-Omni has its own rule; a Qwen3-VL checkpoint is outside the
-        // engine's set; an architecture without its model type is not the rule.
+        // Qwen3-Omni has its own rule, picked by its architecture whatever
+        // the model type says; a Qwen3-VL checkpoint is outside the engine's
+        // set; an architecture without its model type is not the rule.
+        assert_eq!(
+            RuleFamily::of(
+                &arch("Qwen3OmniMoeForConditionalGeneration"),
+                "qwen3_omni_moe"
+            ),
+            Some(RuleFamily::Qwen3Omni)
+        );
         assert!(!qwen35_lineage(
             &arch("Qwen3OmniMoeForConditionalGeneration"),
             "qwen3_omni_moe"
         ));
-        assert!(!qwen35_lineage(
-            &arch("Qwen3VLForConditionalGeneration"),
-            "qwen3_vl"
-        ));
+        assert_eq!(
+            RuleFamily::of(&arch("Qwen3VLForConditionalGeneration"), "qwen3_vl"),
+            None
+        );
         assert!(!qwen35_lineage(
             &arch("Qwen3_5ForConditionalGeneration"),
             "qwen3_vl"
@@ -610,88 +1095,377 @@ pub(crate) mod tests {
         assert!(!qwen35_lineage(&[], "qwen3_5"));
     }
 
-    /// The cost of the rule per request on one core, printed as a table
+    /// Each family's rule needs its own facts: the Qwen3.5 rule all three
+    /// layout facts, the Omni rule the merge size with the engine's defaults
+    /// for a clock the checkpoint leaves unsaid.
+    #[test]
+    fn each_family_reads_the_facts_its_rule_needs() {
+        let qwen35 = PositionFacts {
+            spatial_merge_size: Some(2),
+            image_token_id: Some(LAYOUT.image_token_id),
+            video_token_id: Some(LAYOUT.video_token_id),
+            ..PositionFacts::default()
+        };
+        assert_eq!(
+            RuleFamily::Qwen35.rule(qwen35),
+            Some(PositionRule::Qwen35(LAYOUT))
+        );
+        assert_eq!(
+            RuleFamily::Qwen35.rule(PositionFacts {
+                video_token_id: None,
+                ..qwen35
+            }),
+            None
+        );
+        let merge_only = PositionFacts {
+            spatial_merge_size: Some(2),
+            ..PositionFacts::default()
+        };
+        assert_eq!(
+            RuleFamily::Qwen3Omni.rule(merge_only),
+            Some(PositionRule::Qwen3Omni(OMNI))
+        );
+        assert_eq!(
+            RuleFamily::Qwen3Omni.rule(PositionFacts {
+                position_id_per_seconds: Some(25.0),
+                seconds_per_chunk: Some(0.5),
+                ..merge_only
+            }),
+            Some(PositionRule::Qwen3Omni(OmniLayout {
+                spatial_merge_size: 2,
+                position_id_per_seconds: 25.0,
+                seconds_per_chunk: 0.5,
+            }))
+        );
+        assert_eq!(RuleFamily::Qwen3Omni.rule(PositionFacts::default()), None);
+        assert!(RuleFamily::Qwen3Omni.needs().contains("thinker_config"));
+    }
+
+    /// An Omni item: its modality, its spans, its grid rows and a video's
+    /// seconds per grid.
+    struct OmniSpec {
+        modality: TokenSpeedWireModality,
+        offsets: Vec<(u64, u64)>,
+        rows: Vec<[i64; 3]>,
+        seconds: Option<Vec<f32>>,
+        audio_in_video: bool,
+    }
+
+    fn omni_audio(offsets: &[(u64, u64)]) -> OmniSpec {
+        OmniSpec {
+            modality: TokenSpeedWireModality::Audio,
+            offsets: offsets.to_vec(),
+            rows: Vec::new(),
+            seconds: None,
+            audio_in_video: false,
+        }
+    }
+
+    fn omni_image(rows: &[[i64; 3]], offsets: &[(u64, u64)]) -> OmniSpec {
+        OmniSpec {
+            modality: TokenSpeedWireModality::Image,
+            offsets: offsets.to_vec(),
+            rows: rows.to_vec(),
+            seconds: None,
+            audio_in_video: false,
+        }
+    }
+
+    fn omni_video(rows: &[[i64; 3]], offsets: &[(u64, u64)], seconds: Option<&[f32]>) -> OmniSpec {
+        OmniSpec {
+            modality: TokenSpeedWireModality::Video,
+            offsets: offsets.to_vec(),
+            rows: rows.to_vec(),
+            seconds: seconds.map(<[f32]>::to_vec),
+            audio_in_video: false,
+        }
+    }
+
+    fn omni_table(seq_len: usize, specs: &[OmniSpec]) -> Result<MropeTable, String> {
+        let items: Vec<GridItem<'_>> = specs
+            .iter()
+            .map(|spec| GridItem {
+                modality: spec.modality,
+                grid: (spec.modality != TokenSpeedWireModality::Audio && !spec.rows.is_empty())
+                    .then(|| {
+                        let kind = if spec.modality == TokenSpeedWireModality::Video {
+                            GridKind::Video
+                        } else {
+                            GridKind::Image
+                        };
+                        (kind, spec.rows.clone())
+                    }),
+                offsets: &spec.offsets,
+                seconds_per_grid: spec.seconds.clone(),
+                audio_in_video: spec.audio_in_video,
+            })
+            .collect();
+        qwen3_omni_positions(OMNI, seq_len, &items)
+    }
+
+    fn linear(from: i64, n: usize) -> Vec<i64> {
+        (from..from + n as i64).collect()
+    }
+
+    /// The engine's mixed case (`test_mixed_modalities_follow_authored_offsets`):
+    /// an audio run, an image and a one-second-per-grid video over 25 tokens,
+    /// the items handed over out of order; its expected table verbatim.
+    #[test]
+    fn omni_mixed_modalities_follow_the_authored_offsets() {
+        let table = omni_table(
+            25,
+            &[
+                omni_video(&[[2, 4, 4]], &[(15, 22)], Some(&[1.0])),
+                omni_audio(&[(2, 4)]),
+                omni_image(&[[1, 4, 4]], &[(8, 11)]),
+            ],
+        )
+        .unwrap();
+        let rows = rows_of(&table);
+        for axis in &rows {
+            assert_eq!(&axis[..8], &linear(0, 8)[..]);
+            assert_eq!(&axis[12..15], &[10, 11, 12]);
+            assert_eq!(&axis[23..], &[27, 28]);
+        }
+        assert_eq!(&rows[0][8..12], &[8, 8, 8, 8]);
+        assert_eq!(&rows[1][8..12], &[8, 8, 9, 9]);
+        assert_eq!(&rows[2][8..12], &[8, 9, 8, 9]);
+        assert_eq!(&rows[0][15..23], &[13, 13, 13, 13, 26, 26, 26, 26]);
+        assert_eq!(&rows[1][15..23], &[13, 13, 14, 14, 13, 13, 14, 14]);
+        assert_eq!(&rows[2][15..23], &[13, 14, 13, 14, 13, 14, 13, 14]);
+        assert_eq!(delta_of(&table), 4);
+        assert_eq!(table.scalar, 4);
+    }
+
+    /// The engine's fractional case (`test_multiple_videos_support_fractional_seconds_per_grid`):
+    /// two videos timed at half and one and a half seconds per grid; the
+    /// time axis truncates as torch truncates a float32.
+    #[test]
+    fn omni_videos_tick_their_own_seconds_per_grid() {
+        let table = omni_table(
+            22,
+            &[
+                omni_video(&[[2, 4, 4]], &[(12, 19)], Some(&[1.5])),
+                omni_video(&[[2, 4, 4]], &[(2, 9)], Some(&[0.5])),
+            ],
+        )
+        .unwrap();
+        let rows = rows_of(&table);
+        assert_eq!(&rows[0][2..10], &[2, 2, 2, 2, 8, 8, 8, 8]);
+        assert_eq!(&rows[0][12..20], &[11, 11, 11, 11, 30, 30, 30, 30]);
+        assert_eq!(delta_of(&table), 11);
+        // A video without its seconds ticks the checkpoint's seconds per
+        // chunk (two seconds: 26 positions a step); an image ticks the bare
+        // clock, which a one-step image never shows.
+        let table = omni_table(10, &[omni_video(&[[2, 4, 4]], &[(1, 8)], None)]).unwrap();
+        assert_eq!(&rows_of(&table)[0][1..9], &[1, 1, 1, 1, 27, 27, 27, 27]);
+        assert_eq!(delta_of(&table), 28 + 1 - 10);
+        // One value per grid row is read per row.
+        let table = omni_table(10, &[omni_video(&[[2, 4, 4]], &[(1, 8)], Some(&[0.5]))]).unwrap();
+        assert_eq!(&rows_of(&table)[0][1..9], &[1, 1, 1, 1, 7, 7, 7, 7]);
+    }
+
+    /// Every precondition the engine's Omni rule raises on is a refusal
+    /// naming it (`test_rejects_audio_in_video_interleaving`,
+    /// `test_rejects_placeholder_grid_mismatch` and the rest of its checks).
+    #[test]
+    fn the_omni_rules_preconditions_are_refused_by_name() {
+        let err = |seq_len: usize, specs: &[OmniSpec]| omni_table(seq_len, specs).unwrap_err();
+        let mut interleaved = omni_video(&[[1, 4, 4]], &[(1, 4)], None);
+        interleaved.audio_in_video = true;
+        assert!(err(6, &[interleaved]).contains("use_audio_in_video"));
+        assert!(err(5, &[omni_image(&[[1, 4, 4]], &[(1, 3)])]).contains("needs 4"));
+        assert!(err(6, &[omni_image(&[], &[(1, 4)])]).contains("carries no grid"));
+        assert!(err(6, &[omni_image(&[[1, 4, 4], [1, 4, 4]], &[(1, 4)])])
+            .contains("2 grid row(s) for 1"));
+        assert!(err(6, &[omni_image(&[[1, 0, 4]], &[(1, 4)])]).contains("is not positive"));
+        assert!(err(6, &[omni_image(&[[1, 3, 4]], &[(1, 2)])]).contains("does not divide"));
+        assert!(err(6, &[omni_image(&[[1, 4, 4]], &[(3, 6)])]).contains("does not fit"));
+        assert!(err(6, &[omni_audio(&[(5, 7)])]).contains("does not fit"));
+        assert!(err(
+            9,
+            &[
+                omni_image(&[[1, 4, 4]], &[(1, 4)]),
+                omni_image(&[[1, 4, 4]], &[(4, 7)])
+            ]
+        )
+        .contains("overlap"));
+        assert!(err(
+            10,
+            &[omni_video(&[[2, 4, 4]], &[(1, 8)], Some(&[0.5, 1.5]))]
+        )
+        .contains("2 video_second_per_grid value(s) for 1"));
+        assert!(err(0, &[]).contains("non-empty prompt"));
+        // An item without spans contributes nothing, as the engine skips it;
+        // a prompt of audio alone is linear with a zero delta.
+        let table = omni_table(4, &[omni_audio(&[(1, 2)]), omni_image(&[[1, 4, 4]], &[])]).unwrap();
+        assert_eq!(rows_of(&table), vec![linear(0, 4); 3]);
+        assert_eq!(table.scalar, 0);
+    }
+
+    /// The cost of the rules per request on one core, printed as a table
     /// (`--ignored --nocapture`, a release build, the core pinned): the
     /// shapes the gateway's media pipeline builds, from one small image to a
-    /// prompt that fills a window with a large image.
+    /// prompt that fills a window with a large image, for each rule.
     #[test]
     #[ignore = "a timing table, run alone on a pinned core"]
     #[expect(clippy::print_stdout)]
     fn speed_table() {
-        let shapes: [(&str, usize, Vec<[i64; 3]>, usize); 5] = [
+        type Shape = (
+            &'static str,
+            usize,
+            Vec<(TokenSpeedWireModality, [i64; 3], usize)>,
+            usize,
+        );
+        /// An item of a shape as the rule reads it: its modality, grid rows
+        /// and spans.
+        type ShapeItem = (TokenSpeedWireModality, Vec<[i64; 3]>, Vec<(u64, u64)>);
+        let image = |rows: [i64; 3]| (TokenSpeedWireModality::Image, rows, 0);
+        let video = |rows: [i64; 3]| (TokenSpeedWireModality::Video, rows, 0);
+        let audio = |n: usize| (TokenSpeedWireModality::Audio, [0, 0, 0], n);
+        let shapes: [Shape; 8] = [
             (
                 "1 image 16x16 merged (256 tokens), 64 text",
                 64,
-                vec![[1, 32, 32]],
+                vec![image([1, 32, 32])],
                 64,
             ),
             (
                 "1 image 36x36 merged (1296 tokens), 256 text",
                 256,
-                vec![[1, 72, 72]],
+                vec![image([1, 72, 72])],
                 256,
             ),
             (
                 "4 images 16x16 merged, 128 text between",
                 128,
-                vec![[1, 32, 32]; 4],
+                vec![image([1, 32, 32]); 4],
                 128,
             ),
             (
                 "1 grid of 8 temporal steps x 12x12 merged (1152 tokens), 16 text",
                 16,
-                vec![[8, 24, 24]],
+                vec![video([8, 24, 24])],
                 16,
             ),
             (
                 "1 image 60x60 merged (3600 tokens) in a 7.6k prompt",
                 2000,
-                vec![[1, 120, 120]],
+                vec![image([1, 120, 120])],
                 2000,
             ),
+            (
+                "1 video 8 steps x 12x12 merged as one span (1152 tokens), 64 text",
+                64,
+                vec![video([8, 24, 24])],
+                64,
+            ),
+            (
+                "1 audio run of 300 tokens, 64 text",
+                64,
+                vec![audio(300)],
+                64,
+            ),
+            (
+                "audio 300 + image 16x16 + video 4 steps x 8x8, 64 text between",
+                64,
+                vec![audio(300), image([1, 32, 32]), video([4, 16, 16])],
+                64,
+            ),
         ];
-        println!("| shape | prompt tokens | per request |");
-        println!("|---|---|---|");
-        for (name, lead, rows, tail) in shapes {
-            let mut ids: Vec<u32> = (0..lead as u32).map(|i| 1000 + i).collect();
-            let mut items = Vec::new();
-            for row in &rows {
-                let [t, h, w] = *row;
-                let n = (t * (h / 2) * (w / 2)) as usize;
-                let start = ids.len();
-                ids.extend(std::iter::repeat_n(LAYOUT.image_token_id, n));
-                ids.extend((0..64u32).map(|i| 2000 + i));
-                items.push((vec![*row], vec![(start as u64, (start + n - 1) as u64)]));
+        println!("| rule | shape | prompt tokens | per request |");
+        println!("|---|---|---|---|");
+        for (rule_name, rule) in [
+            ("Qwen3.5", PositionRule::Qwen35(LAYOUT)),
+            ("Qwen3-Omni", PositionRule::Qwen3Omni(OMNI)),
+        ] {
+            for (name, lead, specs, tail) in &shapes {
+                let omni = rule.reads_video_timing();
+                let mut ids: Vec<u32> = (0..*lead as u32).map(|i| 1000 + i).collect();
+                let mut items: Vec<ShapeItem> = Vec::new();
+                for &(modality, [t, h, w], audio_len) in specs {
+                    let (grid_rows, spans): (Vec<[i64; 3]>, Vec<(u64, u64)>) =
+                        if modality == TokenSpeedWireModality::Audio {
+                            if !omni {
+                                continue;
+                            }
+                            let start = ids.len();
+                            ids.extend(std::iter::repeat_n(151646, audio_len));
+                            (
+                                Vec::new(),
+                                vec![(start as u64, (start + audio_len - 1) as u64)],
+                            )
+                        } else if modality == TokenSpeedWireModality::Video && !omni {
+                            // The Qwen3.5 rule reads a video as one span per
+                            // temporal step.
+                            let per_step = ((h / 2) * (w / 2)) as usize;
+                            let mut spans = Vec::new();
+                            for _ in 0..t {
+                                let start = ids.len();
+                                ids.extend(std::iter::repeat_n(LAYOUT.video_token_id, per_step));
+                                spans.push((start as u64, (start + per_step - 1) as u64));
+                                ids.extend((0..8u32).map(|i| 4000 + i));
+                            }
+                            (vec![[t, h, w]], spans)
+                        } else {
+                            let n = (t * (h / 2) * (w / 2)) as usize;
+                            let start = ids.len();
+                            let id = if modality == TokenSpeedWireModality::Video {
+                                LAYOUT.video_token_id
+                            } else {
+                                LAYOUT.image_token_id
+                            };
+                            ids.extend(std::iter::repeat_n(id, n));
+                            (
+                                vec![[t, h, w]],
+                                vec![(start as u64, (start + n - 1) as u64)],
+                            )
+                        };
+                    ids.extend((0..64u32).map(|i| 2000 + i));
+                    items.push((modality, grid_rows, spans));
+                }
+                ids.extend((0..*tail as u32).map(|i| 3000 + i));
+                let grid_items: Vec<GridItem<'_>> = items
+                    .iter()
+                    .map(|(modality, rows, offsets)| GridItem {
+                        modality: *modality,
+                        grid: (!rows.is_empty()).then(|| {
+                            let kind = if *modality == TokenSpeedWireModality::Video {
+                                GridKind::Video
+                            } else {
+                                GridKind::Image
+                            };
+                            (kind, rows.clone())
+                        }),
+                        offsets,
+                        seconds_per_grid: (*modality == TokenSpeedWireModality::Video)
+                            .then(|| vec![2.0]),
+                        audio_in_video: false,
+                    })
+                    .collect();
+                let iterations = 2000;
+                let started = std::time::Instant::now();
+                for _ in 0..iterations {
+                    let table = rule.positions(&ids, &grid_items).unwrap();
+                    std::hint::black_box(table);
+                }
+                let per = started.elapsed() / iterations;
+                println!(
+                    "| {rule_name} | {name} | {} | {:.1} us |",
+                    ids.len(),
+                    per.as_secs_f64() * 1e6
+                );
             }
-            ids.extend((0..tail as u32).map(|i| 3000 + i));
-            let grid_items: Vec<GridItem<'_>> = items
-                .iter()
-                .map(|(rows, offsets)| GridItem {
-                    grid: Some((GridKind::Image, rows.clone())),
-                    offsets,
-                })
-                .collect();
-            let iterations = 2000;
-            let started = std::time::Instant::now();
-            for _ in 0..iterations {
-                let table = qwen35_positions(LAYOUT, &ids, &grid_items).unwrap();
-                std::hint::black_box(table);
-            }
-            let per = started.elapsed() / iterations;
-            println!(
-                "| {name} | {} | {:.1} us |",
-                ids.len(),
-                per.as_secs_f64() * 1e6
-            );
         }
     }
 
     /// The parity corpus: a JSON file of cases with the engine's own tables
     /// (`SMG_TOKENSPEED_MROPE_CORPUS=<file>`, produced by running the engine's
-    /// `compute_mrope_positions` from its source on CPU). Every table this
-    /// rule produces must match the engine's bit for bit; a case it refuses
-    /// must be one the engine answers by rescanning the prompt (its fast path
-    /// abandoned).
+    /// `compute_mrope_positions` from its source on CPU; `config.rule` names
+    /// the family, the Qwen3.5 one when absent). Every table a rule produces
+    /// must match the engine's bit for bit; a case it refuses must be one the
+    /// engine refused too, or (the Qwen3.5 rule) one the engine answered by
+    /// rescanning the prompt with its fast path abandoned.
     #[test]
     #[ignore = "set SMG_TOKENSPEED_MROPE_CORPUS to the engine-oracle corpus file"]
     #[expect(clippy::print_stderr)]
@@ -701,10 +1475,22 @@ pub(crate) mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).expect("corpus file"))
                 .expect("corpus json");
         let config = &corpus["config"];
-        let layout = MropeLayout {
-            spatial_merge_size: config["spatial_merge_size"].as_u64().unwrap() as u32,
-            image_token_id: config["image_token_id"].as_u64().unwrap() as u32,
-            video_token_id: config["video_token_id"].as_u64().unwrap() as u32,
+        let merge = config["spatial_merge_size"].as_u64().unwrap() as u32;
+        let rule = match config["rule"].as_str().unwrap_or("qwen3_5") {
+            "qwen3_omni" => PositionRule::Qwen3Omni(OmniLayout {
+                spatial_merge_size: merge,
+                position_id_per_seconds: config["position_id_per_seconds"]
+                    .as_f64()
+                    .unwrap_or(OmniLayout::DEFAULT_POSITION_ID_PER_SECONDS),
+                seconds_per_chunk: config["seconds_per_chunk"]
+                    .as_f64()
+                    .unwrap_or(OmniLayout::DEFAULT_SECONDS_PER_CHUNK),
+            }),
+            _ => PositionRule::Qwen35(MropeLayout {
+                spatial_merge_size: merge,
+                image_token_id: config["image_token_id"].as_u64().unwrap() as u32,
+                video_token_id: config["video_token_id"].as_u64().unwrap() as u32,
+            }),
         };
         let mut checked = 0;
         let mut refused = 0;
@@ -734,32 +1520,51 @@ pub(crate) mod tests {
                 .iter()
                 .zip(&offsets)
                 .map(|(item, offsets)| {
-                    let kind = match item["modality"].as_str().unwrap() {
-                        "image" => GridKind::Image,
-                        _ => GridKind::Video,
+                    let modality = match item["modality"].as_str().unwrap() {
+                        "image" => TokenSpeedWireModality::Image,
+                        "audio" => TokenSpeedWireModality::Audio,
+                        _ => TokenSpeedWireModality::Video,
                     };
-                    let rows = item["grid"]
+                    let kind = if modality == TokenSpeedWireModality::Video {
+                        GridKind::Video
+                    } else {
+                        GridKind::Image
+                    };
+                    let grid = item["grid"].as_array().map(|rows| {
+                        let rows = rows
+                            .iter()
+                            .map(|r| {
+                                [
+                                    r[0].as_i64().unwrap(),
+                                    r[1].as_i64().unwrap(),
+                                    r[2].as_i64().unwrap(),
+                                ]
+                            })
+                            .collect();
+                        (kind, rows)
+                    });
+                    let seconds_per_grid = item["seconds"]
                         .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|r| {
-                            [
-                                r[0].as_i64().unwrap(),
-                                r[1].as_i64().unwrap(),
-                                r[2].as_i64().unwrap(),
-                            ]
-                        })
-                        .collect();
+                        .map(|values| values.iter().map(|v| v.as_f64().unwrap() as f32).collect());
                     GridItem {
-                        grid: Some((kind, rows)),
+                        modality,
+                        grid,
                         offsets,
+                        seconds_per_grid,
+                        audio_in_video: item["audio_in_video"].as_bool().unwrap_or(false),
                     }
                 })
                 .collect();
             let expected = &case["expected"];
             let id = case["id"].as_str().unwrap_or("?");
-            match qwen35_positions(layout, &ids, &items) {
+            match rule.positions(&ids, &items) {
                 Ok(table) => {
+                    assert_ne!(
+                        expected["refused"].as_bool(),
+                        Some(true),
+                        "case {id}: served where the engine refused ({})",
+                        expected["error"]
+                    );
                     let rows: Vec<Vec<i64>> = expected["positions"]
                         .as_array()
                         .unwrap()
@@ -786,16 +1591,16 @@ pub(crate) mod tests {
                     checked += 1;
                 }
                 Err(reason) => {
-                    assert_eq!(
-                        expected["fast_path"].as_bool(),
-                        Some(false),
+                    assert!(
+                        expected["refused"].as_bool() == Some(true)
+                            || expected["fast_path"].as_bool() == Some(false),
                         "case {id}: refused ({reason}) where the engine's rule served it"
                     );
                     refused += 1;
                 }
             }
         }
-        eprintln!("corpus {path}: {checked} tables identical, {refused} rescan cases refused");
+        eprintln!("corpus {path}: {checked} tables identical, {refused} refusals matched");
         assert!(checked > 0);
     }
 }
