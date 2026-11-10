@@ -33,6 +33,7 @@ use serde_json::{
     value::{to_raw_value, RawValue},
     Value,
 };
+use smg_policy_controller::WorkerId;
 use tracing::{debug, error, warn};
 
 use super::{
@@ -49,7 +50,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{CacheNamespace, PolicyRegistry, WorkerRole},
+    policies::{CacheNamespace, Decider, PolicyRegistry, WorkerRole},
     rate_limit::RateLimitManager,
     routers::{
         common::{
@@ -83,9 +84,10 @@ use crate::{
         PD_PREFILL_QUEUE_TIMEOUT,
     },
     worker::{
-        acquire_prefill, endpoint::Endpoint, PdPairIndex, PdWire, PrefillAcquireError,
-        PrefillAdmission, PrefillAdmissionRejection, PrefillLoadGuard, PrefillSelectionContext,
-        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
+        acquire_prefill, acquire_prefill_decided, endpoint::Endpoint, PdPairIndex, PdWire,
+        PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection, PrefillLoadGuard,
+        PrefillSelectionContext, RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
+        UNKNOWN_MODEL_ID,
     },
 };
 
@@ -2167,21 +2169,33 @@ impl PDRouter {
     }
 
     /// Select a PD pair and take its load. With Prefill admission enabled
-    /// the selection runs at the head of the admission queue.
+    /// the selection runs at the head of the admission queue: under the lock
+    /// on the legacy path, outside it through the policy engine
+    /// ([`Self::acquire_pd_pair_decided`]).
     async fn select_pd_pair_with_admission(
         &self,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
     ) -> Result<(PdPair, PdLoadGuards), Box<PdSelectionFailure>> {
-        let ((prefill, decode), prefill_guard) = acquire_prefill(
-            self.prefill_admission.as_deref(),
-            sticky_key,
-            |(prefill, _): &PdPair| prefill,
-            |capacity| self.select_pd_pair(model_id, inputs, capacity),
-        )
-        .await
-        .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
+        let acquired = match placement::pair_decider(&self.policy_registry, &inputs) {
+            // Boxed so the legacy branch's future keeps its size: the decided
+            // state is paid only under the switch.
+            Some(decider) => {
+                Box::pin(self.acquire_pd_pair_decided(decider, model_id, inputs, sticky_key)).await
+            }
+            None => {
+                acquire_prefill(
+                    self.prefill_admission.as_deref(),
+                    sticky_key,
+                    |(prefill, _): &PdPair| prefill,
+                    |capacity| self.select_pd_pair(model_id, inputs, capacity),
+                )
+                .await
+            }
+        };
+        let ((prefill, decode), prefill_guard) =
+            acquired.map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
         let guards = PdLoadGuards {
             prefill: prefill_guard,
             decode: WorkerLoadGuard::with_key(Arc::clone(&decode), sticky_key),
@@ -2189,26 +2203,81 @@ impl PDRouter {
         Ok(((prefill, decode), guards))
     }
 
-    fn select_pd_pair(
+    /// [`Self::select_pd_pair`] through the policy engine under
+    /// `--policy-engine engine`: the pair decided with no lock held and
+    /// committed under the admission lock, by the request the queue lets
+    /// select (the head, or a newcomer with nobody waiting); a commit every
+    /// target of which missed re-decides once with the misses excluded. The
+    /// placement's prelude is the cheap availability answer of a newcomer
+    /// behind the queue.
+    async fn acquire_pd_pair_decided(
         &self,
+        decider: &Decider,
         model_id: &str,
         inputs: PlacementInputs<'_>,
-        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
-    ) -> Result<PdPair, Box<PairFailure>> {
-        debug!("Selecting PD pair: model_id={:?}", model_id);
+        sticky_key: Option<&str>,
+    ) -> Result<(PdPair, PrefillLoadGuard), PrefillAcquireError<Box<PairFailure>>> {
+        let missed: parking_lot::Mutex<Vec<WorkerId>> = parking_lot::Mutex::new(Vec::new());
+        acquire_prefill_decided(
+            self.prefill_admission.as_deref(),
+            sticky_key,
+            |(prefill, _): &PdPair| prefill,
+            || {
+                let pairs = self.pd_pairs(model_id);
+                placement::pair_available(
+                    &self.worker_registry,
+                    &self.policy_registry,
+                    model_id,
+                    &pairs,
+                    None,
+                    false,
+                    inputs,
+                )
+            },
+            |window| {
+                let pairs = self.pd_pairs(model_id);
+                let excluded = std::mem::take(&mut *missed.lock());
+                placement::decide_pair(
+                    &self.worker_registry,
+                    &self.policy_registry,
+                    decider,
+                    model_id,
+                    &pairs,
+                    None,
+                    false,
+                    &|worker| window.has_capacity(worker),
+                    inputs,
+                    &excluded,
+                )
+            },
+            |capacity, proposal| {
+                placement::commit_pair(
+                    &self.policy_registry,
+                    decider,
+                    model_id,
+                    proposal,
+                    &|worker| capacity.is_none_or(|capacity| capacity.has_capacity(worker)),
+                    &mut missed.lock(),
+                )
+                .map(|pair| (pair.prefill, pair.decode))
+            },
+        )
+        .await
+    }
 
-        // Shared HTTP-transport projections: this router proxies plain HTTP
-        // to the selected worker's URL, so a gRPC or ZMQ worker must never
-        // be selectable. Both pools derive from ONE snapshot's pair index:
-        // separate lookups could straddle a concurrent membership change and
-        // pair workers that never coexisted.
+    /// The pair index `model_id` routes within. Shared HTTP-transport
+    /// projections: this router proxies plain HTTP to the selected worker's
+    /// URL, so a gRPC or ZMQ worker must never be selectable. Both pools
+    /// derive from ONE snapshot's pair index: separate lookups could straddle
+    /// a concurrent membership change and pair workers that never coexisted.
+    fn pd_pairs(&self, model_id: &str) -> Arc<PdPairIndex> {
         let is_unknown_model = model_id == UNKNOWN_MODEL_ID;
         let mode = self.policy_registry.pd_pairing_mode();
         let by_model = self
             .worker_registry
             .model_routing_snapshot(model_id)
             .map(|snapshot| snapshot.pd_pairs(PdWire::Http, mode));
-        let pairs = match by_model {
+        match by_model {
             // A named model routes within its own entry. The wildcard's
             // literal "unknown" entry wins while it can pair at all; when it
             // cannot (a pool empty, or no compatible pair) both pools widen
@@ -2221,8 +2290,17 @@ impl PDRouter {
                 .get_routing_snapshot(UNKNOWN_MODEL_ID)
                 .pd_pairs(PdWire::Http, mode),
             _ => Arc::new(PdPairIndex::empty()),
-        };
+        }
+    }
 
+    fn select_pd_pair(
+        &self,
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    ) -> Result<PdPair, Box<PairFailure>> {
+        debug!("Selecting PD pair: model_id={:?}", model_id);
+        let pairs = self.pd_pairs(model_id);
         let pair = placement::select_pair(
             &self.worker_registry,
             &self.policy_registry,
@@ -6177,6 +6255,61 @@ mod tests {
                 .register_or_replace(Arc::from(create_test_worker(url, role, true)));
         }
         router
+    }
+
+    /// Under `--policy-engine engine` the pair is decided through the engine
+    /// outside the admission lock and committed under it: the admitted
+    /// request holds its prefill seat, nobody is queued, and the next
+    /// request is decided and admitted once the seat is released.
+    #[tokio::test]
+    async fn the_engine_decides_the_pair_at_the_admission_head() {
+        use std::time::Duration;
+
+        use crate::config::PolicyEngineMode;
+
+        let round_robin = PolicyConfig::RoundRobin;
+        let router = PDRouter {
+            policy_registry: Arc::new(PolicyRegistry::new(round_robin.clone()).with_policy_engine(
+                PolicyEngineMode::Engine,
+                &round_robin,
+                &round_robin,
+            )),
+            prefill_admission: Some(Arc::new(PrefillAdmission::new(
+                1,
+                1,
+                Duration::from_secs(5),
+            ))),
+            ..create_test_pd_router()
+        };
+        for (url, role) in [
+            ("http://prefill-1:8000", WorkerType::Prefill),
+            ("http://decode-1:8000", WorkerType::Decode),
+        ] {
+            router
+                .worker_registry
+                .register_or_replace(Arc::from(create_test_worker(url.to_string(), role, true)));
+        }
+        let decider = router.policy_registry.decider().expect("hosted");
+        let ((prefill, decode), guards) = router
+            .select_pd_pair_with_admission(UNKNOWN_MODEL_ID, PlacementInputs::default(), None)
+            .await
+            .expect("a pair is admitted");
+        assert_eq!(prefill.url(), "http://prefill-1:8000");
+        assert_eq!(decode.url(), "http://decode-1:8000");
+        assert_eq!(decider.decisions(), 1, "the engine decided the pair");
+        assert_eq!(prefill.load(), 1, "the admitted request holds its seat");
+        assert_eq!(
+            router.prefill_admission.as_ref().unwrap().queued_requests(),
+            0
+        );
+        drop(guards);
+        assert_eq!(prefill.load(), 0, "the seat is released with the guards");
+        let ((_, _), guards) = router
+            .select_pd_pair_with_admission(UNKNOWN_MODEL_ID, PlacementInputs::default(), None)
+            .await
+            .expect("the next request is admitted");
+        assert_eq!(decider.decisions(), 2);
+        drop(guards);
     }
 
     /// The prefill side's answer frees its seat before the decode side's

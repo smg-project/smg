@@ -432,6 +432,23 @@ impl PolicyRegistry {
         (policy.name() == self.default_policy.name()).then_some(decider)
     }
 
+    /// The policy engine for a pair placement (`--policy-engine engine`), or
+    /// `None` when the legacy path decides. The engine was built from the
+    /// prefill and decode policies, so it serves both by construction; a
+    /// request the sticky routing-key override places on either side keeps
+    /// the keyed path, whose pin moves behind the engine's view in a later
+    /// step.
+    pub(crate) fn pair_engine_for(&self, info: &SelectWorkerInfo<'_>) -> Option<&Arc<Decider>> {
+        let decider = self.decider.as_ref()?;
+        let keyed = self
+            .sticky_for(self.get_prefill_policy().as_ref(), info)
+            .is_some()
+            || self
+                .sticky_for(self.get_decode_policy().as_ref(), info)
+                .is_some();
+        (!keyed).then_some(decider)
+    }
+
     /// Derive the session key from a request id: trailing `_r<n>` retry and
     /// `_t<n>` turn suffixes are stripped so every turn of a conversation
     /// shares one key. `None` when the override is disabled, there is no rid,
@@ -3484,5 +3501,43 @@ mod tests {
             legacy.worker_needs_kv_events(worker.as_ref()),
             encode.needs_kv_events()
         );
+    }
+
+    /// The engine decides a pair unless the sticky routing-key override
+    /// places the request on one of its sides; the override off, a key is
+    /// only a fact in the view.
+    #[test]
+    fn the_engine_decides_a_pair_outside_the_sticky_override() {
+        let round_robin = PolicyConfig::RoundRobin;
+        let policies = PolicyRegistry::with_override(
+            round_robin.clone(),
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .with_policy_engine(PolicyEngineMode::Engine, &round_robin, &round_robin);
+        let unkeyed = SelectWorkerInfo::default();
+        assert!(policies.pair_engine_for(&unkeyed).is_some());
+        let headers = headers_with_routing_key("session-7");
+        let keyed = SelectWorkerInfo {
+            headers: Some(&headers),
+            ..SelectWorkerInfo::default()
+        };
+        assert!(policies.pair_engine_for(&keyed).is_none());
+        let by_rid = SelectWorkerInfo {
+            rid_key: Some("session-7"),
+            ..SelectWorkerInfo::default()
+        };
+        assert!(policies.pair_engine_for(&by_rid).is_none());
+
+        let no_override = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
+            PolicyEngineMode::Engine,
+            &round_robin,
+            &round_robin,
+        );
+        assert!(no_override.pair_engine_for(&keyed).is_some());
+        let legacy = PolicyRegistry::new(round_robin);
+        assert!(legacy.pair_engine_for(&unkeyed).is_none());
     }
 }
