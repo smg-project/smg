@@ -8,7 +8,11 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use super::*;
-use crate::{middleware::scheduler, policies::cost as selection_cost, worker::endpoint::Endpoint};
+use crate::{
+    middleware::scheduler,
+    policies::{cost as selection_cost, engine_host::preset_name},
+    worker::endpoint::Endpoint,
+};
 
 /// Each listener needs its own port. `listeners` are `(field, flag, port)`
 /// in configuration order; the first two on one port are refused under the
@@ -411,10 +415,36 @@ pub fn available_cpus() -> usize {
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 impl ConfigValidator {
+    /// Under `--policy-engine engine` every policy that decides (the default
+    /// and the two pair sides) is one whose stages the engine carries in
+    /// this build.
+    fn validate_policy_engine(config: &RouterConfig) -> ConfigResult<()> {
+        if config.policy_engine != PolicyEngineMode::Engine {
+            return Ok(());
+        }
+        let policies = [
+            &config.policy,
+            config.mode.get_prefill_policy(&config.policy),
+            config.mode.get_decode_policy(&config.policy),
+        ];
+        for policy in policies {
+            if preset_name(policy).is_none() {
+                return Err(ConfigError::invalid_value(
+                    "policy_engine",
+                    policy.name(),
+                    "the policy engine carries random, round_robin, passthrough, power_of_two \
+                     (expected_wait, requests, least_requests) and least_load in this build",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
+        Self::validate_policy_engine(config)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
         Self::validate_cors_allowed_origins(config)?;
@@ -2591,6 +2621,60 @@ mod tests {
         assert!(matches!(
             ConfigValidator::validate(&config),
             Err(ConfigError::InvalidValue { ref field, .. }) if field == "cache_boundaries"
+        ));
+    }
+
+    /// Under `engine` a policy the engine does not carry is refused at start
+    /// by name, on the default and on a pair side; the legacy path takes it.
+    #[test]
+    fn the_engine_switch_refuses_a_policy_the_engine_does_not_carry() {
+        let config = RouterConfig {
+            policy_engine: PolicyEngineMode::Engine,
+            policy: PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000),
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, ref value, .. })
+                if field == "policy_engine" && value == "cache_aware"
+        ));
+        let legacy = RouterConfig {
+            policy_engine: PolicyEngineMode::Legacy,
+            ..config
+        };
+        assert!(ConfigValidator::validate(&legacy).is_ok());
+
+        let carried = RouterConfig {
+            policy_engine: PolicyEngineMode::Engine,
+            policy: PolicyConfig::RoundRobin,
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: Some(PolicyConfig::LeastLoad {
+                    kv_pressure_weight: 1.0,
+                    mean_prefill_tokens: 100,
+                    default_throughput: 1000.0,
+                }),
+                decode_policy: None,
+            },
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&carried).is_ok());
+        let decode_side = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: Some(PolicyConfig::PowerOfTwo {
+                    load_metric: PowerOfTwoLoadMetric::ResidentTokens { request_tokens: 64 },
+                }),
+            },
+            ..carried
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&decode_side),
+            Err(ConfigError::InvalidValue { ref field, ref value, .. })
+                if field == "policy_engine" && value == "power_of_two"
         ));
     }
 

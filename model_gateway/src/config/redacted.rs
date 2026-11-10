@@ -30,6 +30,7 @@ const PLAIN: &[&str] = &[
     "cache_boundaries",
     "routing_key_override",
     "pd_pairing_mode",
+    "policy_engine",
     "host",
     "port",
     "health_check_port",

@@ -792,7 +792,12 @@ impl AppContextBuilder {
                 config.policy.clone(),
                 config.routing_key_override.clone(),
             )
-            .with_pd_pairing_mode(config.pd_pairing_mode),
+            .with_pd_pairing_mode(config.pd_pairing_mode)
+            .with_policy_engine(
+                config.policy_engine,
+                config.mode.get_prefill_policy(&config.policy),
+                config.mode.get_decode_policy(&config.policy),
+            ),
         ));
         self
     }
