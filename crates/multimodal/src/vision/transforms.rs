@@ -3,7 +3,7 @@
 //! This module provides composable transforms that match HuggingFace image processor
 //! behavior, enabling pure Rust preprocessing without Python dependencies.
 
-use std::{cell::RefCell, f64::consts::PI};
+use std::{cell::RefCell, f64::consts::PI, ops::Range};
 
 use fast_image_resize::{
     images::{Image as FirImage, ImageRef as FirImageRef},
@@ -943,6 +943,17 @@ impl FixedKernel {
             taps,
             precision,
         }
+    }
+
+    /// The kernel's entries for the outputs `window` alone, in place: those
+    /// outputs keep the taps and the source bounds they have in the whole, so
+    /// a pass run on this kernel writes the whole's bytes there.
+    fn window(mut self, window: Range<usize>) -> Self {
+        self.bounds.truncate(window.end);
+        self.bounds.drain(..window.start);
+        self.taps.truncate(window.end);
+        self.taps.drain(..window.start);
+        self
     }
 
     /// The rounding term an accumulator starts from.
@@ -2640,6 +2651,70 @@ fn resize_pil_bytes<const C: usize>(
     }
 }
 
+/// The `window` (`x, y, width, height` of the output) of
+/// [`resize_pil_bytes`]'s result, computed alone: the kernels are built for
+/// the window's columns and rows ([`FixedKernel::window`]), the width pass
+/// runs on those columns over the source rows the window's height taps read
+/// (the banded passes read no other), the height pass on those rows, so the
+/// bytes are the whole's bytes there and what a crop discards costs nothing.
+fn resize_pil_bytes_window<const C: usize>(
+    data: &[u8],
+    (in_w, in_h): (u32, u32),
+    (out_w, out_h): (u32, u32),
+    (x, y, w, h): (u32, u32, u32, u32),
+    filter: PilResizeFilter,
+    quantization: KernelQuantization,
+) -> Vec<u8> {
+    debug_assert!(x + w <= out_w && y + h <= out_h);
+    let (in_w, in_h, out_w, out_h) = (in_w as usize, in_h as usize, out_w as usize, out_h as usize);
+    let (x, y, w, h) = (x as usize, y as usize, w as usize, h as usize);
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let width = || FixedKernel::new(in_w, out_w, filter, quantization).window(x..x + w);
+    let height = || FixedKernel::new(in_h, out_h, filter, quantization).window(y..y + h);
+    match (in_w != out_w, in_h != out_h) {
+        (false, false) => crop_bytes::<C>(data, in_w, (x, y, w, h)),
+        // The window's rows are the source's: their columns alone.
+        (true, false) => pil_resample_horizontal::<C>(
+            &data[y * in_w * C..(y + h) * in_w * C],
+            h,
+            in_w,
+            w,
+            &width(),
+        ),
+        // The window's columns are the source's: their rows alone.
+        (false, true) => pil_resample_vertical::<C>(
+            &crop_bytes::<C>(data, in_w, (x, 0, w, in_h)),
+            h,
+            w,
+            &height(),
+        ),
+        (true, true) => pil_resample_both::<C>(
+            data,
+            (in_w, in_h),
+            (w, h),
+            &width(),
+            &height(),
+            PIL_BAND_BYTES,
+        ),
+    }
+}
+
+/// The `(x, y, width, height)` window of a `row_w`-wide buffer of `C`-channel
+/// pixels, copied out.
+fn crop_bytes<const C: usize>(
+    data: &[u8],
+    row_w: usize,
+    (x, y, w, h): (usize, usize, usize, usize),
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(w * h * C);
+    for row in y..y + h {
+        out.extend_from_slice(&data[(row * row_w + x) * C..(row * row_w + x + w) * C]);
+    }
+    out
+}
+
 /// `data` (`in_w` x `in_h` interleaved RGB) resampled to `out_w` x `out_h`
 /// with `filter`'s kernel in the torch `uint8` quantization, on the passes of
 /// this target: on x86-64 the banded Pillow-exact passes of
@@ -2778,6 +2853,61 @@ pub fn resize_bicubic_torch_aa(image: &DynamicImage, out_w: u32, out_h: u32) -> 
     )]
     DynamicImage::ImageRgb8(
         RgbImage::from_raw(out_w, out_h, output).expect("torch resize buffer size"),
+    )
+}
+
+/// [`resize_bicubic_torch_aa`] to `out_w` x `out_h` followed by the crop of
+/// `crop` (width, height) at `origin` (left, top). On x86-64 the crop's
+/// pixels alone, through the window form of the Pillow-exact passes with the
+/// torch taps ([`resize_pil_bytes_window`]): the width pass runs on the
+/// crop's columns only (a center crop after a shortest-edge resize discards
+/// 25 to 44 % of them) and over the source rows the crop's height taps read.
+/// Off x86-64, where those passes have their portable rows only, the torch
+/// rows ([`resize_torch_uint8_rgb`]: NEON on AArch64) resample the whole and
+/// the crop is cut from it. The same bytes either way.
+pub(crate) fn resize_bicubic_torch_aa_cropped(
+    image: &DynamicImage,
+    out_w: u32,
+    out_h: u32,
+    origin: (u32, u32),
+    crop: (u32, u32),
+) -> DynamicImage {
+    let (in_w, in_h, data) = rgb_bytes(image);
+    let output = if cfg!(target_arch = "x86_64") {
+        resize_pil_bytes_window::<3>(
+            &data,
+            (in_w as u32, in_h as u32),
+            (out_w, out_h),
+            (origin.0, origin.1, crop.0, crop.1),
+            PilResizeFilter::Bicubic,
+            KernelQuantization::TorchUint8,
+        )
+    } else {
+        let whole = resize_torch_uint8_rgb(
+            &data,
+            in_w as u32,
+            in_h as u32,
+            out_w,
+            out_h,
+            PilResizeFilter::Bicubic,
+        );
+        crop_bytes::<3>(
+            &whole,
+            out_w as usize,
+            (
+                origin.0 as usize,
+                origin.1 as usize,
+                crop.0 as usize,
+                crop.1 as usize,
+            ),
+        )
+    };
+    #[expect(
+        clippy::expect_used,
+        reason = "output is exactly crop.0*crop.1*3 bytes by construction"
+    )]
+    DynamicImage::ImageRgb8(
+        RgbImage::from_raw(crop.0, crop.1, output).expect("torch resize window buffer size"),
     )
 }
 
@@ -4250,6 +4380,76 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A window of the resample computed alone equals the crop of the whole,
+    /// under both tap quantizations: the LLaVA 1.5 shapes (a 16:9 and a 9:16
+    /// source to a 336 short side, the center crop's window), small windows
+    /// at the edges, an axis kept, both axes kept.
+    #[test]
+    fn a_window_of_the_resample_equals_the_crop_of_the_whole() {
+        let cases = [
+            (1920, 1080, 597, 336, (130, 0, 336, 336)),
+            (1080, 1920, 336, 597, (0, 130, 336, 336)),
+            (33, 17, 7, 5, (0, 0, 3, 2)),
+            (33, 17, 7, 5, (4, 3, 3, 2)),
+            (7, 5, 33, 17, (30, 15, 3, 2)),
+            (31, 23, 31, 17, (5, 4, 20, 9)),
+            (31, 23, 19, 23, (2, 20, 10, 3)),
+            (31, 23, 31, 23, (3, 2, 10, 5)),
+        ];
+        for quantization in QUANTIZATIONS {
+            for (seed, &(in_w, in_h, out_w, out_h, (x, y, w, h))) in cases.iter().enumerate() {
+                let data = gradient_rgb(in_w, in_h, seed * 7 + 3);
+                let whole = resize_pil_bytes::<3>(
+                    &data,
+                    in_w as u32,
+                    in_h as u32,
+                    out_w as u32,
+                    out_h as u32,
+                    PilResizeFilter::Bicubic,
+                    quantization,
+                );
+                let actual = resize_pil_bytes_window::<3>(
+                    &data,
+                    (in_w as u32, in_h as u32),
+                    (out_w as u32, out_h as u32),
+                    (x as u32, y as u32, w as u32, h as u32),
+                    PilResizeFilter::Bicubic,
+                    quantization,
+                );
+                assert_same_bytes(
+                    &actual,
+                    &crop_bytes::<3>(&whole, out_w, (x, y, w, h)),
+                    &format!(
+                        "{quantization:?} taps, {in_w}x{in_h} -> {out_w}x{out_h}, window {x},{y} {w}x{h}"
+                    ),
+                );
+            }
+        }
+    }
+
+    /// The cropped entry point equals the resize followed by the crop on
+    /// whichever route this target takes (the window form on x86-64, the
+    /// torch rows and a crop elsewhere): the LLaVA 1.5 pair.
+    #[test]
+    fn the_cropped_torch_resize_equals_the_resize_and_the_crop() {
+        let cases = [
+            (1920, 1080, 597, 336, (130, 0, 336, 336)),
+            (1080, 1920, 336, 597, (0, 130, 336, 336)),
+        ];
+        for (seed, &(in_w, in_h, out_w, out_h, (x, y, w, h))) in cases.iter().enumerate() {
+            let data = gradient_rgb(in_w as usize, in_h as usize, seed * 11 + 5);
+            let image = DynamicImage::ImageRgb8(RgbImage::from_raw(in_w, in_h, data).unwrap());
+            let whole = resize_bicubic_torch_aa(&image, out_w, out_h).into_rgb8();
+            assert_same_bytes(
+                resize_bicubic_torch_aa_cropped(&image, out_w, out_h, (x, y), (w, h))
+                    .into_rgb8()
+                    .as_raw(),
+                crop_rgb(&whole, x, y, w, h).as_raw(),
+                &format!("{in_w}x{in_h} -> {out_w}x{out_h}, crop {w}x{h} at {x},{y}"),
+            );
         }
     }
 
