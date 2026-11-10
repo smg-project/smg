@@ -1252,13 +1252,24 @@ impl Router {
         if non_dp_workers.is_empty() {
             let mut rows: Vec<Arc<dyn Worker>> = all_workers.to_vec();
             rows.sort_by_key(|w| w.dp_rank());
-            let mut engines: Vec<String> = Vec::new();
+            // One row per engine: its lowest available rank, its first rank
+            // when none is, so an open breaker on rank 0 alone does not hide
+            // the engine from the policy.
+            let mut engines: Vec<Arc<dyn Worker>> = Vec::new();
             for row in rows {
-                if !engines.iter().any(|engine| engine == row.base_url()) {
-                    engines.push(row.base_url().to_string());
-                    non_dp_workers.push(row);
+                match engines
+                    .iter_mut()
+                    .find(|chosen| chosen.base_url() == row.base_url())
+                {
+                    None => engines.push(row),
+                    Some(chosen) => {
+                        if !chosen.is_available() && row.is_available() {
+                            *chosen = row;
+                        }
+                    }
                 }
             }
+            non_dp_workers.extend(engines);
         }
         let Some(worker) = placement::select_from(
             &self.worker_registry,
@@ -3301,6 +3312,9 @@ mod tests {
                 "the engine's first row: {}",
                 worker.url()
             );
+            // The multipart path pins no rank: the address is the engine's own
+            // (documented here; endpoint_url builds it from base_url for every
+            // worker, so this line cannot tell pinned from unpinned).
             assert_eq!(
                 worker.endpoint_url("/v1/audio/transcriptions"),
                 format!("{}/v1/audio/transcriptions", worker.base_url()),
@@ -3308,12 +3322,64 @@ mod tests {
             );
             engines.insert(worker.base_url().to_string());
         }
-        assert!(!engines.is_empty());
+        assert_eq!(
+            engines.len(),
+            2,
+            "round-robin reaches both engines: {engines:?}"
+        );
         let Err(refused) = router.select_transcription_worker(None, "nobody-serves-this", &routing)
         else {
             panic!("an unserved model is refused");
         };
         assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// With rank 0's breaker open, the engine's row for a transcription is
+    /// its next available rank, so one open breaker does not hide the engine.
+    #[test]
+    fn a_transcription_over_rank_rows_skips_an_engines_open_first_rank() {
+        let router = create_test_regular_router();
+        for url in ["http://worker1:8080", "http://worker2:8080"] {
+            router.worker_registry.remove_by_url(url);
+        }
+        for rank in [0, 1] {
+            let row = BasicWorkerBuilder::new("http://engine-a:8000")
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .dp_config(rank, 2)
+                .build();
+            router.worker_registry.register_or_replace(Arc::new(row));
+        }
+        let first = router
+            .worker_registry
+            .get_all()
+            .into_iter()
+            .find(|row| row.dp_rank() == Some(0))
+            .expect("the first rank's row");
+        for _ in 0..100 {
+            if !first.is_available() {
+                break;
+            }
+            first.record_outcome(500);
+        }
+        assert!(!first.is_available(), "rank 0's breaker is open");
+        let routing = RoutingDerivatives {
+            tokens: None,
+            text: None,
+            rid_key: None,
+            cache_namespace: None,
+        };
+        let worker = router
+            .select_transcription_worker(None, crate::worker::UNKNOWN_MODEL_ID, &routing)
+            .unwrap_or_else(|refusal| {
+                panic!("the engine stays reachable, got {}", refusal.status())
+            });
+        assert_eq!(worker.dp_rank(), Some(1), "{}", worker.url());
+        assert!(worker.is_available());
+        assert_eq!(
+            worker.endpoint_url("/v1/audio/transcriptions"),
+            "http://engine-a:8000/v1/audio/transcriptions"
+        );
     }
 
     #[test]

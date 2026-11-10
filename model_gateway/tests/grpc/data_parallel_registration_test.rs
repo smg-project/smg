@@ -221,3 +221,115 @@ async fn a_single_rank_engine_registers_as_one_row() {
         assert_eq!((rows[0].0, rows[0].1), (None, None), "{rows:?}");
     }
 }
+
+/// A second POST of the same data-parallel engine, once its registration is
+/// done, is refused with 409 by the group (its rows hold their own IDs; the
+/// group is the conflict for the bare URL), and the first POST's ID keeps
+/// resolving to the group afterwards; DELETE by that ID removes every row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_post_of_a_data_parallel_engine_is_refused_with_409() {
+    let port = free_port().await;
+    let engine = MockEngine::start(port, 4).await;
+    let config = RouterConfig::builder()
+        .mode(RoutingMode::Regular {
+            worker_urls: vec![],
+        })
+        .grpc_connection()
+        .round_robin_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(1024 * 1024)
+        .build_unchecked();
+    let app_context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
+    let router = RouterFactory::create_router(&app_context)
+        .await
+        .expect("gRPC router");
+    let app = create_test_app_with_context(Arc::from(router), Arc::clone(&app_context));
+    let body = json!({
+        "url": format!("grpc://127.0.0.1:{port}"),
+        "connection_mode": "grpc",
+        "runtime": "tokenspeed",
+        "models": [{"id": MODEL}],
+    });
+    let post = || {
+        Request::builder()
+            .method("POST")
+            .uri("/workers")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("a registration request")
+    };
+    let response = app
+        .clone()
+        .oneshot(post())
+        .await
+        .expect("a registration answer");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let location = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .expect("the registration's Location");
+    let registry = Arc::clone(&app_context.worker_registry);
+    common::wait_until("the engine's rows are routable", REGISTRATION_BOUND, || {
+        registry
+            .get_all()
+            .iter()
+            .filter(|worker| worker.status() == WorkerStatus::Ready)
+            .count()
+            >= 4
+    })
+    .await;
+
+    // While the first registration's job is pending or processing, the
+    // in-flight guard refuses a second POST (409 as well) and releases
+    // nothing; the group is the conflict once that job is done, so the
+    // second POST waits for it. Without the group conflict it would be
+    // accepted, fail against the rank rows and release the reservation the
+    // Location resolves through.
+    let job_queue = Arc::clone(app_context.worker_job_queue.get().expect("the job queue"));
+    let engine_url = format!("grpc://127.0.0.1:{port}");
+    common::wait_until(
+        "the first registration's job is done",
+        REGISTRATION_BOUND,
+        || {
+            job_queue
+                .get_status(&engine_url)
+                .is_none_or(|status| !matches!(status.status.as_str(), "pending" | "processing"))
+        },
+    )
+    .await;
+
+    let response = app.clone().oneshot(post()).await.expect("a second answer");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the refusal body");
+    let refusal: serde_json::Value = serde_json::from_slice(&body).expect("the refusal");
+    assert_eq!(
+        refusal["code"], "WORKER_ALREADY_EXISTS",
+        "the group, not an in-flight job, is the conflict: {refusal}"
+    );
+    assert_eq!(registry.get_all().len(), 4, "the rows stay");
+
+    let request = Request::builder()
+        .uri(&location)
+        .body(Body::empty())
+        .expect("a lookup request");
+    let response = app.clone().oneshot(request).await.expect("a lookup answer");
+    assert_eq!(response.status(), StatusCode::OK, "{location}");
+
+    let request = Request::builder()
+        .method("DELETE")
+        .uri(&location)
+        .body(Body::empty())
+        .expect("a removal request");
+    let response = app.oneshot(request).await.expect("a removal answer");
+    assert!(response.status().is_success(), "{}", response.status());
+    common::wait_until("every row is gone", REGISTRATION_BOUND, || {
+        registry.get_all().is_empty()
+    })
+    .await;
+    engine.stop().await;
+}
