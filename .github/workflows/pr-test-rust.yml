@@ -1711,13 +1711,16 @@ jobs:
   # Independent opt-in; ordinary AMD chat does not enable this API lane.
   e2e-1gpu-completions-vllm-amd:
     name: e2e-1gpu-completions-vllm-amd (vllm)
-    needs:
-    - build-wheel
-    - detect-changes
-    if: always() && !cancelled() && vars.SMG_RUN_AMD_LEGS == 'true' && vars.SMG_RUN_AMD_VLLM_COMPLETIONS == 'true'
-      && needs.build-wheel.result == 'success' && (github.event_name != 'pull_request' || (vars.SMG_RUN_AMD_ON_PRS
-      == 'true' && needs.detect-changes.result == 'success')) && needs.detect-changes.outputs.skip-completions !=
-      'true'
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_COMPLETIONS == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-completions != 'true'
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
@@ -1729,19 +1732,22 @@ jobs:
       min_selected: 15
       gpu_vendor: amd
       container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
-      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video
-        --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
     secrets: inherit
 
   # Independent opt-in; ordinary AMD chat does not enable this API lane.
   e2e-1gpu-embeddings-vllm-amd:
     name: e2e-1gpu-embeddings-vllm-amd (vllm)
-    needs:
-    - build-wheel
-    - detect-changes
-    if: always() && !cancelled() && vars.SMG_RUN_AMD_LEGS == 'true' && vars.SMG_RUN_AMD_VLLM_EMBEDDINGS == 'true'
-      && needs.build-wheel.result == 'success' && (github.event_name != 'pull_request' || (vars.SMG_RUN_AMD_ON_PRS
-      == 'true' && needs.detect-changes.result == 'success')) && needs.detect-changes.outputs.skip-embeddings != 'true'
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_EMBEDDINGS == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-embeddings != 'true'
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
@@ -1754,20 +1760,22 @@ jobs:
       extra_deps: sentence-transformers
       gpu_vendor: amd
       container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
-      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video
-        --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
     secrets: inherit
 
   # Independent opt-in; ordinary AMD chat does not enable this API lane.
   e2e-1gpu-gateway-vllm-amd:
     name: e2e-1gpu-gateway-vllm-amd (vllm)
-    needs:
-    - build-wheel
-    - detect-changes
-    if: always() && !cancelled() && vars.SMG_RUN_AMD_LEGS == 'true' && vars.SMG_RUN_AMD_VLLM_GATEWAY == 'true' &&
-      needs.build-wheel.result == 'success' && (github.event_name != 'pull_request' || (vars.SMG_RUN_AMD_ON_PRS ==
-      'true' && needs.detect-changes.result == 'success')) && needs.detect-changes.outputs.skip-chat-one-engine !=
-      'true'
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_GATEWAY == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
@@ -1780,8 +1788,7 @@ jobs:
       enabled: ${{ needs.detect-changes.outputs.skip-chat-completions != 'true' }}
       gpu_vendor: amd
       container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
-      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video
-        --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
     secrets: inherit
 
   e2e-1gpu-completions:
@@ -2310,6 +2317,7 @@ jobs:
 
   # AMD counterpart of the full vLLM/NIXL four-GPU PD topology slice.
   # Its opt-in is independent of the two-GPU NIXL lane.
+  # This mixed-transport slice also needs Mooncake, hence SMG_AMD_MOONCAKE_IMAGE.
   e2e-4gpu-pd-vllm-nixl-amd:
     name: e2e-4gpu-pd-vllm-nixl-amd (vllm)
     needs: [e2e-1gpu-gateway, detect-changes]
