@@ -1322,3 +1322,53 @@ async fn the_selected_workers_policy_decides_and_what_no_grammar_holds_is_refuse
     }
     assert!(wrong.is_empty(), "not refused as expected: {wrong:#?}");
 }
+
+/// A `structural_tag` response format is a grammar of the request's own: the table shapes nothing
+/// over it (no answer's tag, no `auto` tag over the tools under `always`, no whole turn from the
+/// first token), and the engine receives the client's object as its structural tag, key for key.
+#[tokio::test]
+async fn a_structural_tag_response_format_is_the_engines_constraint_as_sent() {
+    let tag = json!({
+        "type": "structural_tag",
+        "structures": [{
+            "begin": "<w>",
+            "schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+            "end": "</w>"
+        }],
+        "triggers": ["<w>"]
+    });
+    let sent_tag = |gateway: &Gateway| -> Value {
+        let (kind, text) = gateway.last_constraint().expect("the request's own tag");
+        assert_eq!(kind, "structural_tag");
+        serde_json::from_str(&text).expect("the tag as JSON")
+    };
+    // The registry table, requested and always: without and with tools.
+    for policy in [None, Some(ConstrainedDecoding::Always)] {
+        let gateway = serve(Setup {
+            constrained_decoding: policy,
+            ..Setup::default()
+        })
+        .await;
+        for extra in [
+            json!({"response_format": tag}),
+            json!({"tools": tools(), "response_format": tag}),
+        ] {
+            chat(&gateway, extra.clone()).await;
+            assert_eq!(sent_tag(&gateway), tag, "{policy:?} {extra}");
+        }
+    }
+    // A table whose calls spell a whole turn, on a worker that takes it from the first token.
+    let gateway = serve(Setup {
+        template: Some(turn_template()),
+        chat_template: false,
+        prompt_tail: "<|head|>assistant",
+        output: "<|via|>notes<|body|>plan<|stop|><|head|>assistant<|via|>reply<|body|>Hello<|eos|>",
+        eos: "<|eos|>",
+        constrained_decoding: Some(ConstrainedDecoding::Always),
+        labels: vec![("constrained_decoding_start", "first_token")],
+        ..Setup::default()
+    })
+    .await;
+    chat(&gateway, json!({"tools": tools(), "response_format": tag})).await;
+    assert_eq!(sent_tag(&gateway), tag);
+}

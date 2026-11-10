@@ -487,22 +487,35 @@ pub enum ResponseFormat {
     JsonObject,
     #[serde(rename = "json_schema")]
     JsonSchema { json_schema: JsonSchemaFormat },
+    /// A structural tag: JSON held to a schema between the tags it names, free
+    /// text around them. The engines' grammar compilers read the object itself,
+    /// in more than one spelling (`structures` with `triggers`, or a `format`),
+    /// so it is carried as it arrived and nothing in it is judged here.
+    #[serde(rename = "structural_tag")]
+    StructuralTag {
+        /// Every key but `type`, in the order they arrived; written back the
+        /// same.
+        #[serde(flatten)]
+        spec: Map<String, Value>,
+    },
 }
 
 /// The kind a `response_format` object names under `type`, read with the
-/// words serde uses for a tag: an unknown name lists the three.
+/// words serde uses for a tag: an unknown name lists the four.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponseFormatKind {
     Text,
     JsonObject,
     JsonSchema,
+    StructuralTag,
 }
 
 impl ResponseFormatKind {
-    const ALL: [ResponseFormatKind; 3] = [
+    const ALL: [ResponseFormatKind; 4] = [
         ResponseFormatKind::Text,
         ResponseFormatKind::JsonObject,
         ResponseFormatKind::JsonSchema,
+        ResponseFormatKind::StructuralTag,
     ];
 
     /// The name under `type`: the variant's rename on [`ResponseFormat`].
@@ -511,6 +524,7 @@ impl ResponseFormatKind {
             ResponseFormatKind::Text => "text",
             ResponseFormatKind::JsonObject => "json_object",
             ResponseFormatKind::JsonSchema => "json_schema",
+            ResponseFormatKind::StructuralTag => "structural_tag",
         }
     }
 }
@@ -520,6 +534,7 @@ const RESPONSE_FORMAT_KINDS: &[&str] = &[
     ResponseFormatKind::Text.name(),
     ResponseFormatKind::JsonObject.name(),
     ResponseFormatKind::JsonSchema.name(),
+    ResponseFormatKind::StructuralTag.name(),
 ];
 
 impl<'de> Deserialize<'de> for ResponseFormatKind {
@@ -554,11 +569,16 @@ impl<'de> Deserialize<'de> for ResponseFormatKind {
 /// when it arrives before the kind (a `KeptSchema`: an object as its entries
 /// in order, any other shape as a `Value`, for the schema's own derive to
 /// read at the end, so a repeated or malformed field is the derive's error
-/// in either order and ignored by the two kinds that carry no schema). The
+/// in either order and ignored by the two kinds that carry no schema). A
+/// structural tag is every other key, so those are kept as `Value`s while
+/// the kind is unknown, dropped once it is known not to be a tag, and read
+/// into the tag's object once it is (a `json_schema` kept before the kind
+/// joins the object as the value it was). The
 /// accepted shapes and the errors are the derive's: a missing `type`, an
 /// unknown kind, a missing or malformed `json_schema` for the kind that
 /// wants it, a duplicate key; a kind that carries no schema ignores a
-/// `json_schema` field of any shape, and every other key is ignored. One
+/// `json_schema` field of any shape, and every other key is ignored by the
+/// three kinds that are not a tag. One
 /// corner differs in text alone: with `type` first, a malformed schema
 /// followed by a repeated `type` reads the schema's error here, because the
 /// schema is read the moment the kind is known (the point of this reader),
@@ -569,7 +589,8 @@ impl<'de> Deserialize<'de> for ResponseFormat {
         enum Field {
             Kind,
             JsonSchema,
-            Other,
+            /// A key no kind of the three reads, which a structural tag keeps.
+            Other(String),
         }
 
         impl<'de> Deserialize<'de> for Field {
@@ -587,7 +608,7 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                         Ok(match name {
                             "type" => Field::Kind,
                             "json_schema" => Field::JsonSchema,
-                            _ => Field::Other,
+                            other => Field::Other(other.to_owned()),
                         })
                     }
                 }
@@ -633,6 +654,15 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                         })?;
                         (ResponseFormat::JsonSchema { json_schema }, 1)
                     }
+                    ResponseFormatKind::StructuralTag => {
+                        let spec = seq.next_element()?.ok_or_else(|| {
+                            de::Error::invalid_length(
+                                0,
+                                &"struct variant ResponseFormat::StructuralTag with 1 element",
+                            )
+                        })?;
+                        (ResponseFormat::StructuralTag { spec }, 1)
+                    }
                 };
                 let mut extra = 0;
                 while seq.next_element::<de::IgnoredAny>()?.is_some() {
@@ -653,6 +683,9 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                 let mut kind: Option<ResponseFormatKind> = None;
                 let mut schema: Option<Schema> = None;
                 let mut schema_twice = false;
+                // the other keys, a structural tag's object: kept while the
+                // kind may still be one
+                let mut spec = Map::new();
                 while let Some(field) = map.next_key::<Field>()? {
                     match field {
                         Field::Kind => {
@@ -660,6 +693,12 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                                 return Err(de::Error::duplicate_field("type"));
                             }
                             kind = Some(map.next_value()?);
+                            if kind != Some(ResponseFormatKind::StructuralTag) {
+                                spec.clear();
+                            }
+                        }
+                        Field::JsonSchema if kind == Some(ResponseFormatKind::StructuralTag) => {
+                            spec.insert("json_schema".to_owned(), map.next_value()?);
                         }
                         Field::JsonSchema => {
                             if schema.is_some() {
@@ -680,15 +719,26 @@ impl<'de> Deserialize<'de> for ResponseFormat {
                                 None => Schema::Kept(map.next_value()?),
                             });
                         }
-                        Field::Other => {
-                            map.next_value::<de::IgnoredAny>()?;
-                        }
+                        Field::Other(name) => match kind {
+                            None | Some(ResponseFormatKind::StructuralTag) => {
+                                spec.insert(name, map.next_value()?);
+                            }
+                            Some(_) => {
+                                map.next_value::<de::IgnoredAny>()?;
+                            }
+                        },
                     }
                 }
                 let kind = kind.ok_or_else(|| de::Error::missing_field("type"))?;
                 Ok(match kind {
                     ResponseFormatKind::Text => ResponseFormat::Text,
                     ResponseFormatKind::JsonObject => ResponseFormat::JsonObject,
+                    ResponseFormatKind::StructuralTag => {
+                        if let Some(Schema::Kept(kept)) = schema {
+                            spec.insert("json_schema".to_owned(), Value::from(kept));
+                        }
+                        ResponseFormat::StructuralTag { spec }
+                    }
                     ResponseFormatKind::JsonSchema => {
                         let json_schema = match schema {
                             Some(Schema::Read(json_schema)) => json_schema,
@@ -741,6 +791,16 @@ pub struct JsonSchemaFormat {
 enum KeptSchema {
     Object(Vec<(String, Value)>),
     Other(Value),
+}
+
+/// The kept schema as the value it was, for a structural tag's object.
+impl From<KeptSchema> for Value {
+    fn from(kept: KeptSchema) -> Self {
+        match kept {
+            KeptSchema::Object(entries) => Value::Object(entries.into_iter().collect()),
+            KeptSchema::Other(value) => value,
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for KeptSchema {
@@ -2599,7 +2659,7 @@ mod tests {
             ("{}", "missing field `type` at line 1 column 2"),
             (
                 r#"{"type":"xml"}"#,
-                "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema` at line 1 column 13",
+                "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema`, `structural_tag` at line 1 column 13",
             ),
             (
                 r#"{"type":1}"#,
@@ -2644,7 +2704,7 @@ mod tests {
             ("[]", "missing field `type` at line 1 column 2"),
             (
                 r#"["xml"]"#,
-                "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema` at line 1 column 6",
+                "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema`, `structural_tag` at line 1 column 6",
             ),
             (
                 "[1]",
@@ -2700,11 +2760,79 @@ mod tests {
         };
         assert_eq!(
             request_err(r#"{"json_schema":{"name":"a","schema":{}},"type":"xml"}"#),
-            "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema` at line 1 column 127"
+            "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema`, `structural_tag` at line 1 column 127"
         );
         assert_eq!(
             request_err(r#"{"type":"json_schema","json_schema":"text"}"#),
             "invalid type: string \"text\", expected struct JsonSchemaFormat at line 1 column 117"
+        );
+    }
+
+    /// A structural tag is carried as it arrived: every key but `type`, in
+    /// the order they came, in whichever spelling the engine's grammar
+    /// compiler takes (`structures` with `triggers`, or a `format`), unknown
+    /// keys included, so the text written back is the text read. With `type`
+    /// last the keys before it are kept the same, a `json_schema` among them
+    /// as the value it was; the sequence form reads the kind, then the object.
+    #[test]
+    fn a_structural_tag_response_format_is_kept_as_it_arrived() {
+        let read = |text: &str| serde_json::from_str::<ResponseFormat>(text).expect(text);
+        let spec_of = |format: &ResponseFormat| match format {
+            ResponseFormat::StructuralTag { spec } => spec.clone(),
+            other => panic!("{other:?}"),
+        };
+        let structures = concat!(
+            r#"{"type":"structural_tag","structures":[{"begin":"<w>","schema":{"type":"object","#,
+            r#""properties":{"city":{"type":"string"},"temp_c":{"type":"integer"}},"#,
+            r#""required":["city","temp_c"],"additionalProperties":false},"end":"</w>"}],"#,
+            r#""triggers":["<w>"]}"#
+        );
+        let triggered = concat!(
+            r#"{"type":"structural_tag","format":{"type":"triggered_tags","triggers":["<w>"],"#,
+            r#""tags":[{"begin":"<w>","content":{"type":"json_schema","json_schema":"#,
+            r#"{"type":"object"}},"end":"</w>"}]},"note":"kept"}"#
+        );
+        for text in [structures, triggered] {
+            let format = read(text);
+            assert_eq!(serde_json::to_string(&format).expect("writes"), text);
+            assert_eq!(
+                serde_json::to_value(&format).expect("writes"),
+                serde_json::from_str::<Value>(text).expect("json")
+            );
+        }
+        assert_eq!(
+            spec_of(&read(structures)).keys().collect::<Vec<_>>(),
+            ["structures", "triggers"]
+        );
+        // `type` last: the keys before it are kept, a `json_schema` among them
+        let late = read(
+            r#"{"triggers":["<w>"],"json_schema":{"name":"n","name":"m"},"structures":[],"type":"structural_tag"}"#,
+        );
+        let spec = spec_of(&late);
+        assert_eq!(spec["triggers"], json!(["<w>"]));
+        assert_eq!(spec["structures"], json!([]));
+        assert_eq!(spec["json_schema"], json!({"name": "m"}));
+        assert_eq!(spec.len(), 3);
+        // inside a request: the field reads and writes back as sent
+        let body = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"response_format":{structures}}}"#
+        );
+        let request: crate::chat::ChatCompletionRequest =
+            serde_json::from_str(&body).expect("a request");
+        assert_eq!(
+            serde_json::to_value(&request).expect("writes")["response_format"],
+            serde_json::from_str::<Value>(structures).expect("json")
+        );
+        // the sequence form: the kind, then the object
+        assert_eq!(
+            spec_of(&read(r#"["structural_tag",{"triggers":[]}]"#)),
+            serde_json::from_str::<Map<String, Value>>(r#"{"triggers":[]}"#).expect("an object")
+        );
+        assert_eq!(
+            serde_json::from_str::<ResponseFormat>(r#"["structural_tag"]"#)
+                .expect_err("no object")
+                .to_string(),
+            "invalid length 0, expected struct variant ResponseFormat::StructuralTag with 1 element at line 1 column 18"
         );
     }
 
@@ -2719,6 +2847,7 @@ mod tests {
                 ResponseFormat::Text => ResponseFormatKind::Text,
                 ResponseFormat::JsonObject => ResponseFormatKind::JsonObject,
                 ResponseFormat::JsonSchema { .. } => ResponseFormatKind::JsonSchema,
+                ResponseFormat::StructuralTag { .. } => ResponseFormatKind::StructuralTag,
             }
         }
         let formats = [
@@ -2731,6 +2860,7 @@ mod tests {
                     strict: None,
                 },
             },
+            ResponseFormat::StructuralTag { spec: Map::new() },
         ];
         assert_eq!(formats.len(), ResponseFormatKind::ALL.len());
         for (format, kind) in formats.iter().zip(ResponseFormatKind::ALL) {

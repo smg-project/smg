@@ -277,6 +277,7 @@ impl HarmonyPreparationStage {
     ///
     /// Converts response_format (json_object, json_schema) to structural tag that constrains
     /// the final channel. Uses the same `build_text_format_structural_tag` as the Responses API.
+    /// A `structural_tag` response_format is the request's own tag, passed on as it arrived.
     /// Returns None if response_format is not specified or is "text".
     fn generate_response_format_constraint(
         response_format: Option<&ResponseFormat>,
@@ -289,6 +290,17 @@ impl HarmonyPreparationStage {
             ResponseFormat::Text => return Ok(None),
             ResponseFormat::JsonObject => Cow::Owned(serde_json::json!({"type": "object"})),
             ResponseFormat::JsonSchema { json_schema } => Cow::Borrowed(&json_schema.schema),
+            // The request's own tag goes to the engine as it arrived, as the
+            // engine's own server sends it; no channel framing is added.
+            ResponseFormat::StructuralTag { .. } => {
+                let tag = serde_json::to_string(format).map_err(|e| {
+                    Box::new(error::internal_error(
+                        "serialize_response_format_failed",
+                        e.to_string(),
+                    ))
+                })?;
+                return Ok(Some(("structural_tag".to_string(), tag)));
+            }
         };
 
         let tag = build_text_format_structural_tag(&schema).map_err(|e| {
