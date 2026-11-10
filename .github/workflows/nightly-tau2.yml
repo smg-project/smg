@@ -453,7 +453,7 @@ jobs:
             # cleanup10 + margin5), including window/expiry admission. No second
             # container lock, GPU nuke or unknown-PID cleanup on shared AMD.
             exec 9>/dev/null
-          else
+          elif [ "$TAU2_GPU_VENDOR" = nvidia ]; then
           exec 9>/tmp/tau2-host.lock
           echo "waiting for host lock..."
           flock -w 9000 9 || { echo "::error::host lock not acquired within 9000s"; exit 1; }
@@ -461,13 +461,20 @@ jobs:
           # Pre-flight GPU nuke: clear leftovers from a prior cancelled leg whose
           # teardown was skipped. Safe: we hold the host lock, so no other tau2 leg runs.
           bash scripts/ci_killall_sglang.sh nuke_gpus 9>&- || true
+          else
+            echo "::error::unsupported TAU2_GPU_VENDOR"
+            exit 2
           fi
           cleanup() {
-            bash scripts/tau2/launch_arms.sh stop 9>&- || return 2
+            local rc=0
+            bash scripts/tau2/launch_arms.sh stop 9>&- || rc=2
             # the verdict is discarded here: one reading, no wait for a draining card
-            if [ "$TAU2_GPU_VENDOR" != amd ]; then
+            # NV uses its original launcher and existing host-locked recovery.
+            # AMD ownership refusal must never enter that recovery branch.
+            if [ "$TAU2_GPU_VENDOR" = nvidia ]; then
               CI_GPU_GUARD_WAIT_SECS=0 bash scripts/ci_killall_sglang.sh nuke_gpus 9>&- || true
             fi
+            return "$rc"
           }
           trap 'rc=$?; cleanup || rc=2; exit "$rc"' EXIT
           trap 'exit 143' INT TERM
@@ -560,19 +567,33 @@ jobs:
           else
             echo "no $ROOT"
           fi
+      # Like BFCL, stage within the container/workspace before a single-path
+      # upload. Runner path translation does not map every line of a list.
+      - name: Stage results for upload
+        if: always()
+        run: |
+          set -euo pipefail
+          OUT=tau2_artifact
+          # This directory contains only this workflow's staged output.
+          rm -rf -- "$OUT"
+          mkdir -p "$OUT"
+          for name in tau2_ab.md tau2_ab.json tau2_expected_tasks.json tau2_transcripts.tgz; do
+            if [ -f "$RUNNER_TEMP/$name" ]; then
+              cp -- "$RUNNER_TEMP/$name" "$OUT/"
+            fi
+          done
+          for variable in TAU2_BUDGET_LEDGER TAU2_BUDGET_POLICY TAU2_BUDGET_CONTEXTS; do
+            source="${!variable:-}"
+            if [ -n "$source" ] && [ -f "$source" ]; then
+              cp -- "$source" "$OUT/"
+            fi
+          done
       - name: Upload results (summary + scores + transcripts)
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: tau2-ab-${{ matrix.name }}-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/tau2_ab.md
-            ${{ runner.temp }}/tau2_ab.json
-            ${{ runner.temp }}/tau2_expected_tasks.json
-            ${{ env.TAU2_BUDGET_LEDGER }}
-            ${{ env.TAU2_BUDGET_POLICY }}
-            ${{ env.TAU2_BUDGET_CONTEXTS }}
-            ${{ runner.temp }}/tau2_transcripts.tgz
+          path: tau2_artifact/
           if-no-files-found: warn
           retention-days: 30
       - name: Upload arm logs (failure only)

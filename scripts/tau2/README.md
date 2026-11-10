@@ -20,7 +20,7 @@ Two arms expose an identical OpenAI `/v1` endpoint. The same `tau2` CLI is point
 
 | file | what |
 |---|---|
-| `launch_arms.sh` | bring up one arm (`a` = pure vLLM, `b` = vLLM gRPC worker + SMG gateway); prints its base_url on stdout; `stop` tears down owned sessions with identity checks and completion receipts. Fully env-parameterised. |
+| `launch_arms.sh` | bring up one arm (`a` = pure vLLM, `b` = vLLM gRPC worker + SMG gateway); prints its base_url on stdout. AMD uses owned sessions and completion receipts; NVIDIA retains its existing launcher and cleanup. Fully env-parameterised. |
 | `run_ab.py` | point `tau2 run` at both arms (one domain at a time), read back `results.json`, compute pass^1 and pass^k per domain, emit a markdown + JSON comparison table, and apply a regression gate. Arms must already be serving. |
 
 ## Quick start (manual, e.g. on a GPU box)
@@ -34,7 +34,7 @@ cd ~/tau/tau2-bench && uv sync
 # 1) bring up both arms (here: Qwen3.8-27B, TP=2, one arm per GPU pair)
 # Admission and approved paid-policy setup are separate prerequisites.
 export TAU2_SCOPE="manual-$(date +%s)-$$"
-export TAU2_RUN_DIR="${TMPDIR:-/tmp}/$TAU2_SCOPE"  # helper creates private0700 directory
+export TAU2_RUN_DIR="${TMPDIR:-/tmp}/$TAU2_SCOPE"  # separate directory per comparison
 export TAU2_MODEL=Qwen/Qwen3.8-27B VLLM_BIN=~/vllm-env/bin/vllm \
        VLLM_PYTHON=~/vllm-env/bin/python SMG_LAUNCH="$HOME/smg/target/ci/smg launch" \
        TAU2_TP=2 TAU2_MAX_MODEL_LEN=16384 PATH=~/vllm-env/bin:$PATH
@@ -265,6 +265,16 @@ an otherwise approved guarded call. Both legacy startup/hook tests and the new
 pinned-SDK/result suites run in the same CPU workflow; this compatibility does
 not grant a policy, spending cap or execution permission.
 
+The source check resolves the actual imported `tau2` package, including the
+checkout used by `uv sync` editable installations, and verifies the same pinned
+request-path hashes in either installation mode. Distribution versions and SDK
+source fingerprints remain mandatory; an editable install does not waive them.
+
+A timeout or HTTP error from the exact uncharged loopback agent remains a
+simulation/quality failure, without halting the shared paid ledger. Unknown
+clients, redirects outside the fixed request contract, and paid request failures
+still halt it and make budget acceptance fail independently of quality tolerance.
+
 ### Optional AMD native arms (source capability, off by default)
 
 `SMG_RUN_AMD_TAU2=true` adds `qwen3.8-amd` to the existing matrix. This is
@@ -285,7 +295,7 @@ workflow does not extend it or establish permanent Sunday routing. The job
 creates no second host lock and never invokes GPU nuke/unknown-process cleanup
 on AMD. Opt-in does not grant runner maintenance, GPU admission or paid budget.
 
-`launch_arms.sh` now delegates to `native_arms.py`. Every a/b/stop invocation
+On AMD, `launch_arms.sh` delegates to `native_arms.py`. Every AMD a/b/stop invocation
 requires the same absolute `TAU2_RUN_DIR` and nonempty unique `TAU2_SCOPE`.
 The workflow uses run ID, attempt and matrix name for both, including its
 independent always-cleanup step. The directory is private0700, refuses symlinks
@@ -300,6 +310,18 @@ clean already-started arms. This is process ownership, not proof of reclaimed
 GPU memory or escaped native processes; host preclaim remains the final
 full-Worker cleanup boundary. Unique scope directories are not reused across
 jobs. Sequential NVIDIA a-stop-b remains supported within one scope.
+
+NVIDIA keeps the original launch commands, PID files, process-group teardown
+and existing host-lock/recovery path. A failed stop retains a failing job status
+while that existing NVIDIA fallback still runs. AMD ownership refusal never
+enters the NVIDIA fallback. The pidfd and receipt guarantees above apply to the
+AMD helper; restoring the NVIDIA path does not establish new ownership guarantees
+or grant permission to clean processes outside its existing resource scope.
+
+Result uploads stage the current summary, JSON comparison, expected-task manifest,
+transcripts and available budget files under one workspace directory. This avoids
+the container runner's partial translation of a multi-line upload path and retains
+available diagnostics after a failed run; unrelated caches are not included.
 
 AMD selects each disjoint physical list through `HIP_VISIBLE_DEVICES`, rejects
 inherited nonempty HIP/ROCR/CUDA visibility to avoid double mapping, and checks

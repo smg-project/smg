@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -637,6 +638,46 @@ def test_actual_async_openai_alternate_path_zero_send(installed):
     assert not sent and guard.ledger.summary()["calls"] == 0 and guard.ledger.summary()["halted"]
 
 
+@pytest.mark.parametrize("failure", [400, 500, "timeout"])
+def test_local_sdk_failure_does_not_halt_paid_budget(installed, monkeypatch, failure):
+    import httpx
+    from tau2.data_model.message import UserMessage
+    from tau2.utils import llm_utils
+
+    guard, sent = installed
+    visited = []
+
+    def handle(request):
+        visited.append(str(request.url))
+        if failure == "timeout":
+            raise httpx.ReadTimeout("offline local timeout", request=request)
+        return response(request, status=failure)
+
+    transport = httpx.MockTransport(handle)
+    monkeypatch.setattr(
+        httpx.HTTPTransport, "handle_request", lambda _, request: transport.handle_request(request)
+    )
+    token = gc.TASK.set(("task-local-failure", 0))
+    try:
+        with pytest.raises(Exception):
+            llm_utils.generate(
+                model="openai/local-model",
+                messages=[UserMessage(role="user", content="offline")],
+                api_base="http://127.0.0.1:8000/v1",
+                api_key="smg-local",
+                num_retries=0,
+                max_retries=0,
+            )
+        assert visited and all(httpx.URL(url).host == "127.0.0.1" for url in visited)
+        assert not sent and guard.ledger.summary()["calls"] == 0
+        assert not guard.failed and not guard.ledger.summary()["halted"]
+        assert user_turn().content == "hello"
+        assert len(sent) == 1 and guard.ledger.summary()["calls"] == 1
+        assert not guard.failed and not guard.ledger.summary()["halted"]
+    finally:
+        gc.TASK.reset(token)
+
+
 def test_actual_local_sdk_redirect_cannot_become_free_external_send(installed, monkeypatch):
     import httpx
     from tau2.data_model.message import UserMessage
@@ -689,6 +730,61 @@ def test_real_source_fingerprint_mismatch_refuses_bootstrap(configured, monkeypa
             ]
         )
     assert ledger.summary()["calls"] == 0
+
+
+def test_editable_package_source_initializes_and_rejects_changed_bytes(configured, tmp_path):
+    import importlib.metadata
+    import importlib.util
+
+    policy, contexts, digest, _, _ = configured
+    environment = tmp_path / "editable-venv"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(environment)], check=True)
+    site = environment / "lib/python3.12/site-packages"
+    source = tmp_path / "editable-source/tau2"
+    source.mkdir(parents=True)
+    actual = Path(importlib.util.find_spec("tau2").origin).parent
+    for name in ["__init__.py", *gc.TAU2_SHA]:
+        target = source / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(actual / name, target)
+    # Real interpreter startup consumes the PEP660 .pth layout, while the
+    # distribution metadata lives in site-packages without a tau2/ directory.
+    distribution = importlib.metadata.distribution("tau2")
+    metadata = site / "tau2-1.0.1.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text(distribution.read_text("METADATA"))
+    (metadata / "direct_url.json").write_text(
+        json.dumps({"url": source.parent.as_uri(), "dir_info": {"editable": True}})
+    )
+    (site / "_tau2.pth").write_text(str(source.parent) + "\n")
+    (site / "zz_qualified_sdks.pth").write_text(
+        str(Path(importlib.metadata.distribution("openai").locate_file(""))) + "\n"
+    )
+    ledger = tmp_path / "editable-new.db"
+    command = [
+        str(environment / "bin/python"),
+        "-I",
+        gc.__file__,
+        "--policy",
+        str(policy),
+        "--contexts",
+        str(contexts),
+        "--contexts-sha256",
+        digest,
+        "--ledger",
+        str(ledger),
+        "--scope",
+        "offline-two-model-scope",
+    ]
+    result = subprocess.run(command + ["--initialize"], capture_output=True, text=True, timeout=20)
+    assert not (site / "tau2").exists()
+    assert result.returncode == 0, result.stderr
+    assert ledger.is_file()
+    changed = source / "utils/llm_utils.py"
+    changed.write_bytes(changed.read_bytes() + b"\n# changed fixture\n")
+    rejected = subprocess.run(command + ["--check"], capture_output=True, text=True, timeout=20)
+    assert rejected.returncode == 2
+    assert "Unqualified tau2 source: utils/llm_utils.py" in rejected.stderr
 
 
 @pytest.mark.parametrize("parallel, fail", [(False, False), (True, False), (False, True)])

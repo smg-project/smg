@@ -298,9 +298,8 @@ def test_workflow_matrix_and_caller_contract():
         == 2
     )
     assert "run: bash scripts/tau2/launch_arms.sh stop || true" not in text
-    assert "bash scripts/tau2/launch_arms.sh stop 9>&- || return 2" in text
     assert 'if [ "$TAU2_GPU_VENDOR" = amd ]; then' in text
-    assert 'if [ "$TAU2_GPU_VENDOR" != amd ]; then' in text
+    assert 'if [ "$TAU2_GPU_VENDOR" = nvidia ]; then' in text
     assert "run: bash scripts/ci_setup_vllm_rocm_image.sh" in text
     assert "if: matrix.vendor != 'amd' && matrix.vllm_commit != ''" in text
     assert '--expected-tasks "$RUNNER_TEMP/tau2_expected_tasks.json" --seed 300' in text
@@ -312,7 +311,7 @@ def test_cli_sigterm_cleans_actual_sessions(invocation):
     run, capture, env = invocation
     child = subprocess.Popen(
         ["bash", str(ROOT / "scripts/tau2/launch_arms.sh"), "a"],
-        env=dict(os.environ, TAU2_STARTUP_TIMEOUT="30", ENGINE_CHILD="1"),
+        env=dict(os.environ, TAU2_GPU_VENDOR="amd", TAU2_STARTUP_TIMEOUT="30", ENGINE_CHILD="1"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -331,6 +330,142 @@ def test_cli_sigterm_cleans_actual_sessions(invocation):
         if child.poll() is None:
             child.kill()
             child.wait(timeout=3)
+
+
+def workflow_step(name):
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/nightly-tau2.yml").read_text())
+    return next(step for step in workflow["jobs"]["tau2-ab"]["steps"] if step.get("name") == name)
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_actual_artifact_staging_preserves_result_files(tmp_path, partial):
+    stage = workflow_step("Stage results for upload")
+    workspace, temp = tmp_path / "workspace", tmp_path / "container-temp"
+    workspace.mkdir()
+    temp.mkdir()
+    (workspace / "tau2_artifact").mkdir()
+    (workspace / "tau2_artifact/stale.json").write_text("previous invocation")
+    names = ["tau2_ab.md", "tau2_ab.json", "tau2_expected_tasks.json", "tau2_transcripts.tgz"]
+    expected = {}
+    for name in names[:1] if partial else names:
+        body = ("actual fixture bytes: " + name).encode()
+        (temp / name).write_bytes(body)
+        expected[name] = body
+    (temp / "unrelated-cache").write_text("must not copy")
+    environment = dict(os.environ, RUNNER_TEMP=str(temp))
+    for kind, name in [
+        ("LEDGER", "ledger.db"),
+        ("POLICY", "policy.json"),
+        ("CONTEXTS", "contexts.json"),
+    ]:
+        source = temp / name
+        if not partial:
+            source.write_text("synthetic " + kind)
+            expected[name] = source.read_bytes()
+        environment["TAU2_BUDGET_" + kind] = str(source)
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", stage["run"]],
+        cwd=workspace,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    upload = workflow_step("Upload results (summary + scores + transcripts)")
+    assert upload["with"]["path"] == "tau2_artifact/"
+    actual = {p.name: p.read_bytes() for p in (workspace / "tau2_artifact").iterdir()}
+    assert actual == expected
+
+
+@pytest.mark.parametrize("vendor", ["nvidia", "amd", "other"])
+def test_actual_cleanup_failure_keeps_vendor_recovery_and_failure(tmp_path, vendor):
+    body = workflow_step("Launch arms + run τ²-bench A/B")["run"]
+    function = body.split("cleanup() {", 1)[1].split("\n}", 1)[0]
+    script = (
+        """bash() {
+    case "$1" in
+      scripts/tau2/launch_arms.sh) echo stop >> "$TRACE"; return 2 ;;
+      scripts/ci_killall_sglang.sh) echo nv-fallback >> "$TRACE"; return 0 ;;
+      *) return 97 ;;
+    esac
+}
+cleanup() {"""
+        + function
+        + "\n}\ncleanup\n"
+    )
+    trace = tmp_path / "trace"
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env=dict(os.environ, TAU2_GPU_VENDOR=vendor, TRACE=str(trace)),
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 2
+    assert trace.read_text().splitlines() == (
+        ["stop", "nv-fallback"] if vendor == "nvidia" else ["stop"]
+    )
+
+
+@pytest.mark.parametrize("vendor,arm", [("nvidia", "a"), ("nvidia", "b"), ("amd", "a")])
+def test_actual_wrapper_keeps_nv_legacy_separate_from_amd_ownership(tmp_path, vendor, arm):
+    import socket
+
+    script = tmp_path / "launch_arms.sh"
+    script.write_bytes((ROOT / "scripts/tau2/launch_arms.sh").read_bytes())
+    marker, trace = tmp_path / "helper", tmp_path / "trace"
+    (tmp_path / "native_arms.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        "Path(os.environ['HELPER_MARKER']).write_text('called')\nraise SystemExit(2)\n"
+    )
+    bash_env = tmp_path / "bash-env"
+    bash_env.write_text("""setsid() { printf '%s\\n' "$*" >> "$TRACE"; }
+kill() { printf 'owned-fixture-kill %s\\n' "$*" >> "$TRACE"; }
+tail() { :; }
+curl() { :; }
+sleep() { :; }
+""")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        environment = dict(
+            os.environ,
+            BASH_ENV=str(bash_env),
+            TRACE=str(trace),
+            HELPER_MARKER=str(marker),
+            TAU2_GPU_VENDOR=vendor,
+            TAU2_RUN_DIR=str(tmp_path / "run"),
+            TAU2_ARM_A_PORT="32123",
+            TAU2_ARM_B_GRPC_PORT=str(listener.getsockname()[1]),
+            TAU2_ARM_B_GW_PORT="32124",
+            TAU2_ARM_B_METRICS_PORT="32125",
+        )
+        result = subprocess.run(
+            ["bash", str(script), arm], env=environment, capture_output=True, text=True, timeout=5
+        )
+    if vendor == "amd":
+        assert result.returncode == 2 and marker.read_text() == "called"
+        assert not trace.exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        assert not marker.exists()
+        text = trace.read_text()
+        assert "CUDA_VISIBLE_DEVICES=" in text
+        assert ("serve" if arm == "a" else "vllm.entrypoints.grpc_server") in text
+        stopped = subprocess.run(
+            ["bash", str(script), "stop"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert stopped.returncode == 0, stopped.stderr
+        assert not marker.exists()
+        assert "owned-fixture-kill -TERM" in trace.read_text()
+        assert "owned-fixture-kill -KILL" in trace.read_text()
 
 
 def test_pidfd_pinned_before_validation_never_numeric_signal(invocation, monkeypatch):
