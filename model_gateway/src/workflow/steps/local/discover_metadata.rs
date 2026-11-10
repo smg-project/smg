@@ -112,19 +112,20 @@ struct VersionResponse {
 /// GET JSON with optional bearer auth, with 404 fallback to `/get_<endpoint>`.
 /// Why a metadata endpoint gave no answer: the engine does not offer it (a
 /// 404 on every spelling), or the read failed (transport, timeout, a non-2xx
-/// other than 404, an unparsable body). Registration tolerates both; a strict
-/// refresh tolerates only the first.
+/// other than 404, an unparsable body). Registration tolerates optional failures;
+/// an explicitly invalid SMG extension fails in both modes.
 #[derive(Debug)]
 enum MetadataError {
     NotOffered,
     Failed(String),
+    InvalidExtension(String),
 }
 
 impl std::fmt::Display for MetadataError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotOffered => f.write_str("not offered (404)"),
-            Self::Failed(reason) => f.write_str(reason),
+            Self::Failed(reason) | Self::InvalidExtension(reason) => f.write_str(reason),
         }
     }
 }
@@ -202,11 +203,11 @@ async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
         .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))
 }
 
-async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
+async fn http_get_response_classified(
     client: &Client,
     url: &str,
     api_key: Option<&str>,
-) -> Result<T, MetadataError> {
+) -> Result<reqwest::Response, MetadataError> {
     let shown = Endpoint::redacted_str(url);
     let mut req = client.get(url).timeout(METADATA_TIMEOUT);
     if let Some(key) = api_key {
@@ -219,6 +220,16 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(MetadataError::NotOffered);
     }
+    Ok(resp)
+}
+
+async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> Result<T, MetadataError> {
+    let shown = Endpoint::redacted_str(url);
+    let resp = http_get_response_classified(client, url, api_key).await?;
     if !resp.status().is_success() {
         return Err(MetadataError::Failed(format!(
             "status {} from {shown}",
@@ -228,6 +239,71 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     resp.json::<T>()
         .await
         .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))
+}
+
+/// An explicitly invalid SMG extension must never become an absent protocol.
+async fn http_get_vllm_models_classified(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> Result<VllmModelsResponse, MetadataError> {
+    let shown = Endpoint::redacted_str(url);
+    let resp = http_get_response_classified(client, url, api_key).await?;
+    let status = resp.status();
+    if !status.is_success() {
+        if status == reqwest::StatusCode::BAD_GATEWAY
+            && resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .is_some_and(|body| {
+                    body.pointer("/error/code")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("smg_http_metadata_invalid")
+                })
+        {
+            return Err(MetadataError::InvalidExtension(
+                "smg_http_metadata_invalid response".to_string(),
+            ));
+        }
+        return Err(MetadataError::Failed(format!(
+            "status {status} from {shown}"
+        )));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| MetadataError::Failed(format!("Failed to read {shown}: {e}")))?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))?;
+    #[derive(Deserialize)]
+    struct PairingExtension {
+        pairing_protocol: Option<String>,
+    }
+    // Parse the field from the original wire so duplicate declarations cannot
+    // be hidden by a JSON map's last-value-wins normalization.
+    let extension = if body.get("pairing_protocol").is_some() {
+        serde_json::from_slice::<PairingExtension>(&bytes).map_err(|e| {
+            MetadataError::InvalidExtension(format!("Invalid pairing_protocol: {e}"))
+        })?
+    } else {
+        PairingExtension {
+            pairing_protocol: None,
+        }
+    };
+    let declares_protocol = extension
+        .pairing_protocol
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    serde_json::from_slice(&bytes).map_err(|e| {
+        if declares_protocol {
+            MetadataError::InvalidExtension(format!(
+                "Invalid model list with pairing_protocol: {e}"
+            ))
+        } else {
+            MetadataError::Failed(format!("Failed to parse {shown}: {e}"))
+        }
+    })
 }
 
 pub async fn get_server_info(
@@ -245,7 +321,8 @@ pub async fn get_server_info(
 /// back into service or finishes loading. Returns the labels and, for a gRPC
 /// engine, the runtime the probe confirmed. Registration reads tolerantly
 /// (`strict == false`: a failed endpoint leaves a gap); a refresh reads
-/// strictly, because a gap would read as labels the engine dropped: a read
+/// strictly, because a gap would read as labels the engine dropped. An explicitly
+/// invalid SMG extension is an error in either mode. A read
 /// that fails (transport, timeout, a non-2xx other than 404, an unparsable
 /// body, an unknown gRPC error) is an error, while an endpoint the engine does
 /// not offer (404 on every spelling, gRPC `Unimplemented`) is tolerated in
@@ -349,7 +426,7 @@ async fn fetch_sglang_http_metadata_checked(
     Ok(labels)
 }
 
-/// The tolerant read as a plain map, kept for the tests of the registration shape.
+/// A plain map for the tests of legacy optional metadata responses.
 #[cfg(test)]
 async fn fetch_vllm_http_metadata(
     client: &Client,
@@ -372,13 +449,7 @@ async fn fetch_vllm_http_metadata_checked(
     let mut labels = HashMap::new();
 
     // /v1/models — vLLM uses `root` as model_path, `id` as served_model_name
-    match http_get_json_classified::<VllmModelsResponse>(
-        client,
-        &format!("{base}/v1/models"),
-        api_key,
-    )
-    .await
-    {
+    match http_get_vllm_models_classified(client, &format!("{base}/v1/models"), api_key).await {
         Ok(models) => {
             if let Some(protocol) = models
                 .pairing_protocol
@@ -400,6 +471,7 @@ async fn fetch_vllm_http_metadata_checked(
                 }
             }
         }
+        Err(MetadataError::InvalidExtension(e)) => return Err(format!("/v1/models: {e}")),
         Err(MetadataError::Failed(e)) if strict => return Err(format!("/v1/models: {e}")),
         Err(_) => {}
     }
@@ -667,7 +739,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                         "sglang"
                     });
                 let client = context.data.http_client("discover_metadata")?;
-                discover_engine_labels(
+                let metadata = discover_engine_labels(
                     &client,
                     &config.url,
                     ConnectionMode::Http,
@@ -675,7 +747,17 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                     config.api_key.as_deref(),
                     false,
                 )
-                .await
+                .await;
+                if runtime == "vllm" {
+                    // Only explicit extension failures escape this tolerant read.
+                    let metadata = metadata.map_err(|message| WorkflowError::StepFailed {
+                        step_id: wfaas::StepId::new("discover_metadata"),
+                        message,
+                    })?;
+                    Ok(metadata)
+                } else {
+                    metadata
+                }
             }
             ConnectionMode::Grpc => {
                 let config_runtime = config.runtime_type.to_string();
@@ -1077,8 +1159,194 @@ mod tests {
         }
     }
 
+    fn vllm_registration_context(url: String) -> WorkflowContext<WorkerWorkflowData> {
+        use std::sync::Arc;
+
+        use openai_protocol::{
+            model_card::ModelCard,
+            worker::{WorkerModels, WorkerSpec},
+        };
+        use wfaas::WorkflowInstanceId;
+
+        let mut config = WorkerSpec::new(url);
+        // Configured model/connector must not make invalid discovery optional.
+        config.models = WorkerModels::Single(Box::new(ModelCard::new("configured-model")));
+        config.labels.insert("kv_connector".into(), "moriio".into());
+        WorkflowContext::new(
+            WorkflowInstanceId::new(),
+            WorkerWorkflowData {
+                config,
+                registration_mode: Default::default(),
+                worker_kind: Some(WorkerKind::Local),
+                connection_mode: Some(ConnectionMode::Http),
+                http2: Some(false),
+                http_client_handle: Some(Arc::new(crate::server::http_client())),
+                detected_runtime_type: Some("vllm".into()),
+                discovered_labels: HashMap::new(),
+                dp_info: None,
+                symphony_table: None,
+                model_cards: vec![],
+                workers: None,
+                final_labels: HashMap::new(),
+                app_context: None,
+                actual_workers: None,
+            },
+        )
+    }
+
     #[tokio::test]
-    async fn malformed_smg_http_extension_fails_strict_refresh_without_changing_sglang_schema() {
+    async fn registration_rejects_malformed_pairing_protocol_before_worker_creation() {
+        use http::StatusCode;
+
+        use crate::workflow::steps::local::test_support::serve_json_routes;
+
+        let mut payloads: Vec<_> = [
+            serde_json::json!(4),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(false),
+        ]
+        .into_iter()
+        .map(|value| serde_json::json!({"data": [{"id": "m"}], "pairing_protocol": value}))
+        .collect();
+        // A declared protocol cannot disappear because another field is invalid.
+        payloads.push(serde_json::json!({"data": "invalid", "pairing_protocol": "kv-v1"}));
+        for payload in payloads {
+            let base = serve_json_routes(vec![("/v1/models", StatusCode::OK, payload)]).await;
+            let mut context = vllm_registration_context(base);
+            let result = DiscoverMetadataStep.execute(&mut context).await;
+            match result {
+                Err(WorkflowError::StepFailed { step_id, message }) => {
+                    assert_eq!(step_id, wfaas::StepId::new("discover_metadata"));
+                    assert!(message.contains("pairing_protocol"), "{message}");
+                }
+                other => panic!("explicit invalid protocol cannot become absent: {other:?}"),
+            }
+            assert!(context.data.discovered_labels.is_empty());
+            assert!(context.data.actual_workers.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_smg_invalid_metadata_before_worker_creation() {
+        use http::StatusCode;
+
+        use crate::workflow::steps::local::test_support::serve_json_routes;
+
+        let base = serve_json_routes(vec![("/v1/models", StatusCode::BAD_GATEWAY,
+            serde_json::json!({"error": {"code": "smg_http_metadata_invalid", "message": "invalid extension"}}))]).await;
+        let mut context = vllm_registration_context(base);
+        let result = DiscoverMetadataStep.execute(&mut context).await;
+        match result {
+            Err(WorkflowError::StepFailed { step_id, message }) => {
+                assert_eq!(step_id, wfaas::StepId::new("discover_metadata"));
+                assert!(message.contains("smg_http_metadata_invalid"), "{message}");
+            }
+            other => panic!("our middleware explicitly refused the metadata: {other:?}"),
+        }
+        assert!(context.data.discovered_labels.is_empty());
+        assert!(context.data.actual_workers.is_none());
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_duplicate_pairing_protocol_even_when_last_is_null() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(|| async {
+                r#"{"data":[{"id":"m"}],"pairing_protocol":"kv-v1","pairing_protocol":null}"#
+            }),
+        );
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut context = vllm_registration_context(base);
+        let result = DiscoverMetadataStep.execute(&mut context).await;
+        servers.shutdown().await;
+        match result {
+            Err(WorkflowError::StepFailed { message, .. }) => {
+                assert!(message.contains("pairing_protocol"), "{message}");
+            }
+            other => panic!("duplicate protocol must not become an absent extension: {other:?}"),
+        }
+        assert!(context.data.actual_workers.is_none());
+    }
+
+    #[tokio::test]
+    async fn registration_preserves_legacy_absent_valid_and_optional_failures() {
+        use http::StatusCode;
+
+        use crate::{
+            worker::test_support::RefusedAddress,
+            workflow::steps::local::test_support::serve_json_routes,
+        };
+
+        for (status, body, expected) in [
+            (
+                StatusCode::OK,
+                serde_json::json!({"data": [{"id": "m"}]}),
+                None,
+            ),
+            (
+                StatusCode::OK,
+                serde_json::json!({"data": [{"id": "m"}], "pairing_protocol": null}),
+                None,
+            ),
+            (
+                StatusCode::OK,
+                serde_json::json!({"data": [{"id": "m"}], "pairing_protocol": "   "}),
+                None,
+            ),
+            (
+                StatusCode::OK,
+                serde_json::json!({"data": [{"id": "m"}], "pairing_protocol": " kv-v1 "}),
+                Some("kv-v1"),
+            ),
+            (
+                StatusCode::OK,
+                serde_json::json!({"data": "legacy malformed list"}),
+                None,
+            ),
+            (StatusCode::NOT_FOUND, serde_json::json!({}), None),
+            (
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({"error": {"code": "other_error"}}),
+                None,
+            ),
+        ] {
+            let base = serve_json_routes(vec![
+                ("/v1/models", status, body),
+                // The extension marker is interpreted only at its own endpoint.
+                (
+                    "/version",
+                    StatusCode::BAD_GATEWAY,
+                    serde_json::json!({"error": {"code": "smg_http_metadata_invalid"}}),
+                ),
+            ])
+            .await;
+            let mut context = vllm_registration_context(base);
+            assert!(matches!(
+                DiscoverMetadataStep.execute(&mut context).await,
+                Ok(StepResult::Success)
+            ));
+            assert_eq!(
+                label(&context.data.discovered_labels, "pairing_protocol"),
+                expected
+            );
+        }
+        let refused = RefusedAddress::reserve();
+        let mut context = vllm_registration_context(refused.http_url());
+        assert!(matches!(
+            DiscoverMetadataStep.execute(&mut context).await,
+            Ok(StepResult::Success)
+        ));
+        assert!(context.data.discovered_labels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_smg_http_extension_fails_both_modes_without_changing_sglang_schema() {
         use http::StatusCode;
 
         use crate::workflow::steps::local::test_support::serve_json_routes;
@@ -1099,8 +1367,7 @@ mod tests {
             assert!(
                 fetch_vllm_http_metadata_checked(&client, &base, None, false)
                     .await
-                    .unwrap()
-                    .is_empty()
+                    .is_err()
             );
         }
     }
