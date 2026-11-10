@@ -98,6 +98,11 @@ impl PixelCache {
         }
     }
 
+    /// Upper bound for the total size of resident entries.
+    pub(super) fn max_bytes(&self) -> usize {
+        self.inner.lock().max_bytes
+    }
+
     pub(crate) fn get(&self, key: &PixelCacheKey) -> Option<Arc<CachedPreprocessedItem>> {
         let mut inner = self.inner.lock();
         inner.map.get(key).cloned()

@@ -1,0 +1,171 @@
+//! Cache MiniMax M3 images independently while preprocessing misses as a batch.
+
+use std::{collections::HashMap, sync::Arc};
+
+use anyhow::{Context, Result};
+use llm_multimodal::{
+    EncoderDtype, EncoderFieldLayouts, EncoderInput, FieldLayout, ImageFrame, Modality,
+    PreprocessedEncoderInputs,
+};
+
+use super::{on_pool, preprocess_image_frames, PlanContext};
+use crate::{
+    observability::metrics::Metrics,
+    routers::grpc::multimodal::pixel_cache::{CachedPreprocessedItem, PixelCache, PixelCacheKey},
+};
+
+/// Reuse individual images, batch the unique misses, and restore request order.
+pub(super) async fn preprocess(
+    images: &[Arc<ImageFrame>],
+    cache: &Arc<PixelCache>,
+    ctx: &PlanContext<'_>,
+    fingerprint: u64,
+) -> Result<PreprocessedEncoderInputs> {
+    let images = images.to_vec();
+    let cache = Arc::clone(cache);
+    let model_id = Metrics::interned_model_label(ctx.model_id);
+    let processors = Arc::clone(&ctx.vision_processors);
+    let wire_dtype = ctx.image_wire_dtype;
+    let layouts = ctx.spec.encoder_field_layouts_for(Modality::Image);
+    on_pool(ctx.model_id, move || {
+        let mut indices = HashMap::new();
+        let mut order = Vec::with_capacity(images.len());
+        let mut parts = Vec::new();
+        let mut misses = Vec::new();
+        let mut miss_images = Vec::new();
+        for image in &images {
+            let next = parts.len();
+            let index = *indices.entry(image.hash.as_str()).or_insert(next);
+            order.push(index);
+            if index == next {
+                let key = PixelCacheKey {
+                    image_hash: image.hash.clone(),
+                    config_fingerprint: fingerprint,
+                };
+                let entry = cache.get(&key);
+                Metrics::record_mm_pixel_cache_lookup(&model_id, entry.is_some());
+                if entry.is_none() {
+                    misses.push((index, key));
+                    miss_images.push(Arc::clone(image));
+                }
+                parts.push(entry);
+            }
+        }
+
+        let mut inserts = Vec::new();
+        let mut cold_batch = None;
+        if !misses.is_empty() {
+            let mut batch = preprocess_image_frames(&miss_images, &processors, wire_dtype)?;
+            let direct = misses.len() == images.len();
+            // The fused M3 preprocessor emits neutral bytes for a lone
+            // image. Match the format of cached BF16 batches before joining.
+            if wire_dtype == Some(EncoderDtype::BFloat16)
+                && !matches!(batch.encoder_input, EncoderInput::Wire { .. })
+            {
+                let input = batch.encoder_input;
+                let shape = input.shape().to_vec();
+                let norm = input
+                    .pixel_norm()
+                    .context("M3 image input has no pixel normalization")?;
+                let bytes = input
+                    .into_bytes_as(EncoderDtype::BFloat16)
+                    .map_err(anyhow::Error::msg)?;
+                batch.encoder_input =
+                    EncoderInput::wire(bytes, EncoderDtype::BFloat16, shape, norm)
+                        .map_err(anyhow::Error::msg)?;
+            }
+            // Skip admission when the pixels alone exceed the budget.
+            let working_bytes = batch.encoder_input.nbytes().saturating_add(
+                parts
+                    .iter()
+                    .flatten()
+                    .map(|p| p.preprocessed.encoder_input.nbytes())
+                    .sum(),
+            );
+            let admit = working_bytes <= cache.max_bytes();
+            if direct && !admit {
+                return Ok(batch);
+            }
+            let items = split_batch(&batch, &layouts, misses.len())?;
+            for ((index, key), preprocessed) in misses.into_iter().zip(items) {
+                let entry = Arc::new(CachedPreprocessedItem { preprocessed });
+                if admit {
+                    inserts.push((key, Arc::clone(&entry)));
+                }
+                parts[index] = Some(entry);
+            }
+            if direct {
+                cold_batch = Some(batch);
+            }
+        }
+
+        let output = if let Some(batch) = cold_batch {
+            batch
+        } else {
+            let ordered = order
+                .into_iter()
+                .map(|index| {
+                    parts[index]
+                        .as_ref()
+                        .map(|entry| &entry.preprocessed)
+                        .context("missing M3 image cache output")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            PreprocessedEncoderInputs::concat_refs(&ordered, &layouts.model_specific)?
+        };
+        // Only publish entries after the request output has been assembled.
+        for (key, entry) in inserts {
+            cache.insert(key, entry);
+        }
+        Ok(output)
+    })
+    .await
+    .context("M3 image preprocessing task panicked")?
+}
+
+/// Own each image's patches and metadata so the LRU can evict images independently.
+fn split_batch(
+    batch: &PreprocessedEncoderInputs,
+    layouts: &EncoderFieldLayouts,
+    image_count: usize,
+) -> Result<Vec<PreprocessedEncoderInputs>> {
+    let FieldLayout::Flat { sizes_key } = &layouts.encoder_input else {
+        anyhow::bail!("expected a flat M3 image encoder input");
+    };
+    let sizes = batch
+        .model_specific
+        .get(sizes_key)
+        .context("missing M3 image patch counts")?
+        .as_flat_sizes()?;
+    anyhow::ensure!(
+        sizes.len() == image_count
+            && batch.item_sizes.len() == image_count
+            && batch.feature_token_counts.len() == image_count,
+        "M3 image preprocessing returned an unexpected item count"
+    );
+    let inputs = batch.encoder_input.split_axis0(&sizes)?;
+    let mut items = Vec::with_capacity(image_count);
+    for (index, encoder_input) in inputs.into_iter().enumerate() {
+        let model_specific = batch
+            .model_specific
+            .iter()
+            .map(|(key, value)| {
+                let value = match layouts.model_specific.get(key) {
+                    Some(FieldLayout::Batched) => value.slice_first_dim(index, 1)?,
+                    Some(FieldLayout::Flat { .. }) => {
+                        anyhow::bail!("unexpected flat M3 image metadata {key}")
+                    }
+                    None => value.clone(),
+                };
+                Ok((key.clone(), value))
+            })
+            .collect::<Result<_>>()?;
+        items.push(PreprocessedEncoderInputs {
+            encoder_input,
+            model_specific,
+            feature_token_counts: vec![batch.feature_token_counts[index]],
+            item_sizes: vec![batch.item_sizes[index]],
+        });
+    }
+    Ok(items)
+}

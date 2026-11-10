@@ -405,6 +405,44 @@ impl EncoderInput {
         Ok(self.view().slice_axis0(start, len)?.to_owned())
     }
 
+    /// Split a batch into owned slices along axis zero, in order.
+    pub fn split_axis0(&self, lengths: &[usize]) -> AnyhowResult<Vec<Self>> {
+        let input = self.view();
+        let mut start = 0;
+        let views = lengths
+            .iter()
+            .map(|&len| {
+                let view = input.slice_axis0(start, len)?;
+                start += len;
+                Ok(view)
+            })
+            .collect::<AnyhowResult<Vec<_>>>()?;
+        anyhow::ensure!(
+            self.shape().first() == Some(&start),
+            "slice lengths do not cover the encoder input"
+        );
+        let tasks = execution::task_count(self.nbytes(), views.len(), 1);
+        if tasks == 1 {
+            return Ok(views.iter().map(EncoderInputView::to_owned).collect());
+        }
+
+        let mut parts = vec![None; views.len()];
+        let chunk_len = views.len().div_ceil(tasks);
+        execution::scope(|spawner| {
+            for (views, slots) in views.chunks(chunk_len).zip(parts.chunks_mut(chunk_len)) {
+                spawner.spawn(move |_| {
+                    for (view, slot) in views.iter().zip(slots) {
+                        *slot = Some(view.to_owned());
+                    }
+                });
+            }
+        });
+        parts
+            .into_iter()
+            .collect::<Option<_>>()
+            .context("missing encoder slice")
+    }
+
     /// Stack inputs along the first axis. Bytes stack with bytes of the same
     /// normalization, floats with floats; the two forms do not mix.
     pub fn concat(parts: &[&Self]) -> AnyhowResult<Self> {
@@ -415,6 +453,7 @@ impl EncoderInput {
             } => {
                 let mut byte_len = 0usize;
                 let mut rows = 0usize;
+                let mut slices = Vec::with_capacity(parts.len());
                 for part in parts {
                     match part {
                         Self::Wire {
@@ -430,6 +469,7 @@ impl EncoderInput {
                                 .checked_add(part_bytes.len())
                                 .context("joined wire byte length overflows usize")?;
                             rows += part_shape.first().copied().unwrap_or(0);
+                            slices.push(part_bytes.as_slice());
                         }
                         Self::Wire { .. } => anyhow::bail!(
                             "encoder inputs of the batch parts disagree on wire dtype, normalization or shape"
@@ -439,15 +479,7 @@ impl EncoderInput {
                         ),
                     }
                 }
-                let mut bytes = Vec::with_capacity(byte_len);
-                for part in parts {
-                    if let Self::Wire {
-                        bytes: part_bytes, ..
-                    } = part
-                    {
-                        bytes.extend_from_slice(part_bytes);
-                    }
-                }
+                let bytes = concat_byte_slices(&slices, byte_len);
                 let mut joined = shape.clone();
                 if let Some(first_dim) = joined.first_mut() {
                     *first_dim = rows;
@@ -485,13 +517,72 @@ impl EncoderInput {
                     })
                     .collect::<AnyhowResult<Vec<_>>>()?;
                 Ok(Self::U8 {
-                    patches: ndarray::concatenate(Axis(0), &views)
-                        .context("encoder inputs of the batch parts do not stack")?,
+                    patches: concat_pixel_arrays(&views)?,
                     norm: *norm,
                 })
             }
         }
     }
+}
+
+/// Copy contiguous pixel arrays directly, retaining ndarray's strided path.
+fn concat_pixel_arrays(views: &[ArrayViewD<'_, u8>]) -> AnyhowResult<ArrayD<u8>> {
+    let shape = views[0].shape();
+    let slices = views
+        .iter()
+        .map(|part| part.as_slice())
+        .collect::<Option<Vec<_>>>();
+    let (Some((_, tail)), Some(slices)) = (shape.split_first(), slices) else {
+        return ndarray::concatenate(Axis(0), views)
+            .context("encoder inputs of the batch parts do not stack");
+    };
+    let mut joined = shape.to_vec();
+    joined[0] = 0;
+    let mut len = 0usize;
+    for (part, slice) in views.iter().zip(&slices) {
+        anyhow::ensure!(
+            part.shape().get(1..) == Some(tail),
+            "encoder inputs of the batch parts do not stack"
+        );
+        joined[0] = joined[0]
+            .checked_add(part.shape()[0])
+            .context("joined row count overflows usize")?;
+        len = len
+            .checked_add(slice.len())
+            .context("joined pixel count overflows usize")?;
+    }
+    ArrayD::from_shape_vec(IxDyn(&joined), concat_byte_slices(&slices, len))
+        .context("encoder inputs of the batch parts do not stack")
+}
+
+/// Copy large byte batches into disjoint output bands on the shared pool.
+fn concat_byte_slices(slices: &[&[u8]], len: usize) -> Vec<u8> {
+    let tasks = execution::task_count(len, slices.len(), 1);
+    if tasks == 1 {
+        let mut bytes = Vec::with_capacity(len);
+        for slice in slices {
+            bytes.extend_from_slice(slice);
+        }
+        return bytes;
+    }
+
+    let mut bytes = buffer_pool::take(len);
+    let mut remaining = bytes.as_mut_slice();
+    execution::scope(|spawner| {
+        for group in slices.chunks(slices.len().div_ceil(tasks)) {
+            let group_len = group.iter().map(|slice| slice.len()).sum();
+            let (mut dest, rest) = remaining.split_at_mut(group_len);
+            remaining = rest;
+            spawner.spawn(move |_| {
+                for src in group {
+                    let (band, rest) = dest.split_at_mut(src.len());
+                    band.copy_from_slice(src);
+                    dest = rest;
+                }
+            });
+        }
+    });
+    bytes
 }
 
 /// A borrowed [`EncoderInput`]: the whole, or rows of it. Per-destination
@@ -1766,6 +1857,49 @@ mod tests {
                     "{bits:#06x}"
                 ),
             }
+        }
+    }
+
+    /// Splitting and rejoining byte tensors preserves order and repeats.
+    #[test]
+    fn byte_batch_slices_join_in_the_requested_order() {
+        let norm = PixelNorm {
+            scale: 1.0,
+            offset: [0.0; 3],
+            divisor: [1.0; 3],
+            channel_block: 1,
+        };
+        let row_bytes = 1 << 17;
+        let mut bytes = vec![1; row_bytes];
+        bytes.extend(vec![2; row_bytes * 2]);
+        bytes.extend(vec![3; row_bytes * 3]);
+        let wire = EncoderInput::wire(
+            bytes.clone(),
+            EncoderDtype::BFloat16,
+            vec![6, row_bytes / 2],
+            norm,
+        )
+        .unwrap();
+        let pixels =
+            EncoderInput::bytes(Array::from_shape_vec((6, row_bytes), bytes).unwrap(), norm);
+        for (batch, dtype) in [
+            (wire, EncoderDtype::BFloat16),
+            (pixels, EncoderDtype::Uint8),
+        ] {
+            assert!(batch.split_axis0(&[1, 3]).is_err());
+            assert!(batch.split_axis0(&[1, 3, 3]).is_err());
+            let parts = batch.split_axis0(&[1, 2, 3]).unwrap();
+            let joined =
+                EncoderInput::concat(&[&parts[2], &parts[0], &parts[1], &parts[0]]).unwrap();
+            let bytes = joined.into_bytes_as(dtype).unwrap();
+            assert!(bytes[..row_bytes * 3].iter().all(|&byte| byte == 3));
+            assert!(bytes[row_bytes * 3..row_bytes * 4]
+                .iter()
+                .all(|&byte| byte == 1));
+            assert!(bytes[row_bytes * 4..row_bytes * 6]
+                .iter()
+                .all(|&byte| byte == 2));
+            assert_eq!(&bytes[row_bytes * 6..], &vec![1; row_bytes]);
         }
     }
 

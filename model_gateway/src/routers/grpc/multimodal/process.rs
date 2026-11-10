@@ -540,9 +540,7 @@ fn intermediate_of(
         .with_encoder_input_format(spec.encoder_input_format()))
 }
 
-/// Preprocess one modality's batch: a small image batch through the pixel
-/// cache, image by image, when the cache is on and the processor allows it;
-/// every other batch whole, on the blocking pool.
+/// Preprocess one modality's batch, using the pixel cache for eligible images.
 async fn preprocess_modality(
     media: &MediaBatch,
     ctx: &PlanContext<'_>,
@@ -553,11 +551,8 @@ async fn preprocess_modality(
     preprocess_batch(media, ctx).await
 }
 
-/// The per-image path through the pixel cache for an image batch the cache
-/// takes: one image, or fewer than 32 of a processor that preprocesses each
-/// image independently (retaining individual tensors plus their concatenation
-/// is costly for large requests, which keep their whole-batch allocation
-/// path). `None` sends the batch down the whole-batch path.
+/// M3 batches its cache misses. Other models retain the per-image cache
+/// for one image or small independent batches.
 async fn cached_images(
     media: &MediaBatch,
     ctx: &PlanContext<'_>,
@@ -568,9 +563,14 @@ async fn cached_images(
     let Some(cache) = &ctx.components.pixel_cache else {
         return Ok(None);
     };
-    let processor = ctx.vision_processors.image();
-    if !(images.len() == 1
-        || (images.len() < 32 && processor.is_ok_and(|p| p.supports_per_image_preprocessing())))
+    let batch_cache = ctx.spec.name() == "minimax_m3" && !images.is_empty();
+    if !(batch_cache
+        || images.len() == 1
+        || (images.len() < 32
+            && ctx
+                .vision_processors
+                .image()
+                .is_ok_and(|p| p.supports_per_image_preprocessing())))
     {
         return Ok(None);
     }
@@ -583,6 +583,11 @@ async fn cached_images(
         "transparency": ctx.transparency,
     });
     let fingerprint = config_fingerprint(ctx.tokenizer_id, &config, &ctx.model_config.config)?;
+    if batch_cache {
+        return minimax_image_cache::preprocess(images, cache, ctx, fingerprint)
+            .await
+            .map(Some);
+    }
     // Deduplicate within the request even if the result cannot fit
     // in the cache. Record every position before scheduling work.
     let mut unique = HashMap::new();
@@ -730,20 +735,7 @@ async fn preprocess_batch(
 
     on_pool(ctx.model_id, move || match media_for_preprocess {
         MediaBatch::Images(images) => {
-            // Decode every frame first, in parallel on the preprocessing
-            // pool, rather than one photo after another on this thread.
-            ImageFrame::decode_all(&images)
-                .map_err(llm_multimodal::MultiModalError::Media)?;
-            let processor = vision_processors.image()?;
-            // The frames' own pixels, borrowed from the cells `decode_all`
-            // just filled: no processor owns, consumes or mutates its input,
-            // so the batch costs one pointer per image instead of a deep copy
-            // of every decoded image.
-            let decoded: Vec<&image::DynamicImage> = images
-                .iter()
-                .map(|frame| frame.image().map_err(llm_multimodal::MultiModalError::Media))
-                .collect::<Result<_, _>>()?;
-            preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
+            preprocess_image_frames(&images, &vision_processors, image_wire_dtype)
         }
         MediaBatch::Videos(videos) => {
             let processor = vision_processors.video()?;
@@ -883,6 +875,7 @@ async fn preprocess_image_cached(
     Ok(cached)
 }
 
+/// Run image preprocessing on the blocking pool.
 async fn preprocess_image_batch(
     model_id: &str,
     vision_processors: Arc<VisionProcessors>,
@@ -891,20 +884,29 @@ async fn preprocess_image_batch(
 ) -> Result<PreprocessedEncoderInputs> {
     let images = images.to_vec();
     on_pool(model_id, move || {
-        // Borrowed from the frames' own cells, as the batch path borrows them.
-        let decoded: Vec<&image::DynamicImage> = images
-            .iter()
-            .map(|frame| {
-                frame
-                    .image()
-                    .map_err(llm_multimodal::MultiModalError::Media)
-            })
-            .collect::<Result<_, _>>()?;
-        let processor = vision_processors.image()?;
-        preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
+        preprocess_image_frames(&images, &vision_processors, image_wire_dtype)
     })
     .await
     .map_err(|e| anyhow::Error::new(e).context("Preprocessing task panicked"))?
+}
+
+/// Decode cache misses in parallel and borrow the decoded frames for the processor.
+fn preprocess_image_frames(
+    images: &[Arc<ImageFrame>],
+    vision_processors: &VisionProcessors,
+    image_wire_dtype: Option<EncoderDtype>,
+) -> Result<PreprocessedEncoderInputs> {
+    ImageFrame::decode_all(images).map_err(llm_multimodal::MultiModalError::Media)?;
+    let processor = vision_processors.image()?;
+    let decoded = images
+        .iter()
+        .map(|frame| {
+            frame
+                .image()
+                .map_err(llm_multimodal::MultiModalError::Media)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    preprocess_images(processor.as_ref(), &decoded, image_wire_dtype)
 }
 
 /// The images preprocessed: laid out in `wire_dtype` in one pass when the
@@ -1946,3 +1948,6 @@ mod tests {
 #[cfg(test)]
 #[path = "image_cache_tests.rs"]
 mod image_cache_tests;
+
+#[path = "minimax_image_cache.rs"]
+mod minimax_image_cache;

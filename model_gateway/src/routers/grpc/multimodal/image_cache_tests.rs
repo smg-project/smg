@@ -526,3 +526,104 @@ async fn the_policy_is_part_of_the_pixel_cache_key() {
         "the same image under another policy misses the cache; the first policy hits it again"
     );
 }
+
+/// Reuse previously cached images across turns and preserve wire bytes and order.
+#[tokio::test]
+async fn minimax_batch_cache_reuses_single_and_batch_misses_in_request_order() {
+    let config = MultimodalModelConfig::new(
+        serde_json::json!({"model_type": "minimax_m3_vl"}),
+        PreProcessorConfig::default(),
+        None,
+    );
+    let image = |id, width, height| {
+        Arc::new(ImageFrame::new(
+            image::RgbImage::from_pixel(width, height, image::Rgb([id, 21, 203])).into(),
+            Default::default(),
+            Default::default(),
+            ImageSource::InlineBytes,
+            id.to_string(),
+        ))
+    };
+    let cached_only = |image: &ImageFrame| {
+        // This frame can only succeed if preprocessing does not decode it.
+        Arc::new(ImageFrame::encoded(
+            bytes::Bytes::from_static(b"not an image"),
+            ImageDetail::Auto,
+            ImageSource::InlineBytes,
+            image.hash.clone(),
+            ImageSize::new(112, 112),
+            None,
+        ))
+    };
+    let first = image(1, 112, 112);
+    let second = image(2, 140, 112);
+    let third = image(3, 112, 168);
+    let first_hit = cached_only(&first);
+    let second_hit = cached_only(&second);
+    let third_hit = cached_only(&third);
+    let fourth = image(4, 168, 140);
+
+    for image_wire_dtype in [None, Some(EncoderDtype::BFloat16)] {
+        let mut components = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &MultimodalSettings::default(),
+        )
+        .unwrap();
+        components.pixel_cache = Some(Arc::new(PixelCache::new(16 * 1024 * 1024)));
+        let spec = components
+            .model_registry
+            .lookup(&ModelMetadata {
+                model_id: "MiniMax-M3",
+                tokenizer: &NoTokenizer,
+                config: &config.config,
+            })
+            .unwrap();
+        let ctx = PlanContext {
+            components: &components,
+            model_id: "MiniMax-M3",
+            model_type: Some("minimax_m3_vl"),
+            spec,
+            tokenizer_id: "m3",
+            model_config: &config,
+            vision_processors: config.vision_processors(spec),
+            image_wire_dtype,
+            transparency: TransparencyPolicy::KeepAlpha,
+            encoder_budget: None,
+        };
+        let batch = |images: &[&Arc<ImageFrame>]| {
+            MediaBatch::Images(images.iter().map(|image| Arc::clone(image)).collect())
+        };
+        let turns = [
+            (vec![&first], vec![&first]),
+            (
+                vec![&second, &first_hit, &second],
+                vec![&second, &first, &second],
+            ),
+            (
+                vec![&third, &second_hit, &fourth, &first_hit],
+                vec![&third, &second, &fourth, &first],
+            ),
+            (vec![&third_hit, &first_hit], vec![&third, &first]),
+        ];
+        for (request, reference) in turns {
+            let expected = preprocess_batch(&batch(&reference), &ctx).await.unwrap();
+            let actual = preprocess_modality(&batch(&request), &ctx).await.unwrap();
+            assert_eq!(actual.encoder_input_shape(), expected.encoder_input_shape());
+            assert_eq!(
+                actual.encoder_input.write_as(EncoderDtype::BFloat16),
+                expected.encoder_input.write_as(EncoderDtype::BFloat16)
+            );
+            assert_eq!(actual.feature_token_counts, expected.feature_token_counts);
+            assert_eq!(actual.item_sizes, expected.item_sizes);
+            assert_eq!(actual.model_specific.len(), expected.model_specific.len());
+            for (key, value) in expected.model_specific {
+                assert_eq!(
+                    format!("{:?}", actual.model_specific[&key]),
+                    format!("{value:?}")
+                );
+            }
+        }
+    }
+}
