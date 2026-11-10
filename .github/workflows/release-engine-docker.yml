@@ -58,6 +58,15 @@ on:
         required: false
         type: string
 
+# One live dry run per pull request: a newer push cancels the superseded head's run, whose
+# four image builds would otherwise stay queued on the image runner ahead of every later
+# job. A dispatch gets a group of its own, keyed on the run id rather than the ref: a release
+# dispatches one run per engine and release base against one tag, and a group keeps at most
+# one run pending. Keep the pull request form in sync with cancel-pr-workflows.yml.
+concurrency:
+  group: release-engine-docker-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   # The SMG release the images are built from on a dispatch that names no commit.
   # scripts/check_release_versions.py reads and bumps this line.
