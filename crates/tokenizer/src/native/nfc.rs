@@ -74,9 +74,31 @@ impl NfcQuick {
     /// stretch-wise check from the cut before the character the quick check
     /// could not place.
     pub(super) fn is_nfc(&self, text: &str) -> bool {
-        match self.check(text) {
-            Ok(in_nfc) => in_nfc,
-            Err(cut) => super::is_nfc(&text[cut..]),
+        let mut from = 0;
+        loop {
+            match self.check(&text[from..]) {
+                Ok(in_nfc) => return in_nfc,
+                Err(cut) => {
+                    // The library reads the one stretch the quick check
+                    // could not settle (`super::stretches`: the character at
+                    // the cut and the run after it; a settled stretch before
+                    // it is skipped), then the walk resumes where the next
+                    // stretch starts, an ASCII character or an ideograph,
+                    // where the library's own walk starts afresh too: no
+                    // composition or mark order crosses such a boundary.
+                    let rest = &text[from + cut..];
+                    let Some((start, stretch)) = super::stretches(rest)
+                        .find(|(_, _, settled)| !settled)
+                        .map(|(start, stretch, _)| (start, stretch))
+                    else {
+                        return true;
+                    };
+                    if !unicode_normalization_alignments::is_nfc(stretch) {
+                        return false;
+                    }
+                    from += cut + start + stretch.len();
+                }
+            }
         }
     }
 
@@ -197,6 +219,73 @@ mod tests {
         // a few hundred of them, the Maybes and Nos about a thousand.
         assert!((61_000..63_000).contains(&yes), "{yes}");
         assert!((500..1_000).contains(&marked), "{marked}");
+    }
+
+    #[test]
+    fn the_walk_resumes_after_each_stretch_the_library_settles() {
+        let quick = NfcQuick::read();
+        let plain = "plain ascii, eight bytes and more of it ".repeat(40);
+        for text in [
+            format!("x\u{301}{plain}x\u{301}{plain}x\u{301}"),
+            format!("x\u{301}{plain}e\u{301}{plain}"),
+            format!("e\u{301}{plain}x\u{301}"),
+            format!("{plain}x\u{301}{plain}"),
+            "漢字x\u{301}漢字x\u{301}".to_string(),
+            "\u{1100}\u{1161} abc \u{1100}\u{1161}".to_string(),
+            format!("ก\u{E38}\u{E48}{plain}ก\u{E48}\u{E38}"),
+            format!("{plain}x\u{301}"),
+        ] {
+            assert_eq!(quick.is_nfc(&text), library_is_nfc(&text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_walk_agrees_with_the_library_on_random_mixes_of_marks_and_starters() {
+        const PIECES: [&str; 26] = [
+            "a",
+            " ",
+            "x",
+            "e",
+            "\u{E9}",
+            "\u{301}",
+            "\u{300}",
+            "\u{323}",
+            "\u{338}",
+            "\u{344}",
+            "\u{E38}",
+            "\u{E48}",
+            "\u{E01}",
+            "\u{1100}",
+            "\u{1161}",
+            "\u{11A8}",
+            "\u{AC00}",
+            "\u{F73}",
+            "\u{41F}",
+            "\u{6F22}",
+            "\u{5B57}",
+            "\u{4E2D}",
+            "\u{1F642}",
+            "\u{3B1}",
+            "plain ascii, eight bytes and more of it ",
+            "\u{6F22}\u{5B57}\u{6F22}",
+        ];
+        let quick = NfcQuick::read();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut text = String::new();
+        for _ in 0..20_000 {
+            text.clear();
+            let pieces = 1 + (next() % 24) as usize;
+            for _ in 0..pieces {
+                text.push_str(PIECES[(next() % PIECES.len() as u64) as usize]);
+            }
+            assert_eq!(quick.is_nfc(&text), library_is_nfc(&text), "{text:?}");
+        }
     }
 
     #[test]

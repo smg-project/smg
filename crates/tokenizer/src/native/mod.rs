@@ -451,11 +451,17 @@ fn is_nfc(text: &str) -> bool {
 /// it is in NFC already: only a stretch that is not settled and not in NFC
 /// goes through the crate's normalizer (its iterator reports a byte-offset
 /// shift with each character, which this path has no use for), the other
-/// stretches are copied.
-fn nfc(text: &str) -> Cow<'_, str> {
+/// stretches are copied. A stretch is read by the quick check where the
+/// caller has one (its tables place most characters; the library reads the
+/// windows they cannot), by the library's check otherwise.
+fn nfc<'a>(text: &'a str, quick: Option<&NfcQuick>) -> Cow<'a, str> {
+    let in_nfc = |stretch: &str| match quick {
+        Some(quick) => quick.is_nfc(stretch),
+        None => unicode_normalization_alignments::is_nfc(stretch),
+    };
     let mut owned: Option<String> = None;
     for (start, stretch, settled) in stretches(text) {
-        if settled || unicode_normalization_alignments::is_nfc(stretch) {
+        if settled || in_nfc(stretch) {
             if let Some(out) = &mut owned {
                 out.push_str(stretch);
             }
@@ -1229,7 +1235,7 @@ impl NativeEncoder {
             if token.normalized {
                 let content = match normalizer {
                     Normalizer::None => token.content.clone(),
-                    Normalizer::Nfc => nfc(&token.content).into_owned(),
+                    Normalizer::Nfc => nfc(&token.content, None).into_owned(),
                 };
                 normalized.push((content, id));
             } else {
@@ -1783,7 +1789,8 @@ impl NativeEncoder {
     /// normalization changed.
     fn nfc_gaps<'t>(&self, text: &'t str, added: bool) -> Vec<Gap<'t>> {
         let mut gaps = Vec::new();
-        let push = |text: &'t str, gaps: &mut Vec<Gap<'t>>| gaps.push(Gap::Text(nfc(text)));
+        let quick = self.nfc_quick.as_ref();
+        let push = |text: &'t str, gaps: &mut Vec<Gap<'t>>| gaps.push(Gap::Text(nfc(text, quick)));
         match self.raw_added.as_ref().filter(|_| added) {
             Some(raw) => raw.split(text, |segment| match segment {
                 Segment::Added(id) => gaps.push(Gap::Added(id)),

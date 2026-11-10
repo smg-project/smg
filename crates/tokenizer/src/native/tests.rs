@@ -843,7 +843,7 @@ fn stable_cuts_leave_the_pieces_as_they_are() {
         let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
         let mut text = long_text(&mut state, &[], 2 * PARALLEL_MIN_BYTES);
         if shape.nfc {
-            text = nfc(&text).into_owned();
+            text = nfc(&text, None).into_owned();
         }
         let whole: Vec<String> = {
             let mut out = Vec::new();
@@ -1253,12 +1253,19 @@ fn the_nfc_check_and_copy_read_every_stretch_as_the_library_does() {
             library_is_nfc(&text),
             "{text:?} (quick)"
         );
-        let normalized = nfc(&text);
+        let normalized = nfc(&text, None);
         assert_eq!(normalized.as_ref(), expected, "{text:?}");
         assert_eq!(
             matches!(normalized, Cow::Borrowed(_)),
             text == expected,
             "{text:?}: borrowed only when nothing changed"
+        );
+        let with_quick = nfc(&text, Some(&quick));
+        assert_eq!(with_quick.as_ref(), expected, "{text:?} (quick)");
+        assert_eq!(
+            matches!(with_quick, Cow::Borrowed(_)),
+            text == expected,
+            "{text:?}: borrowed only when nothing changed (quick)"
         );
         changed += usize::from(text != expected);
     }
@@ -1302,7 +1309,12 @@ fn the_nfc_check_and_copy_read_every_stretch_as_the_library_does() {
     ] {
         assert_eq!(is_nfc(text), in_nfc, "{text:?}");
         assert_eq!(quick.is_nfc(text), in_nfc, "{text:?} (quick)");
-        assert_eq!(nfc(text).as_ref(), library_nfc(text), "{text:?}");
+        assert_eq!(nfc(text, None).as_ref(), library_nfc(text), "{text:?}");
+        assert_eq!(
+            nfc(text, Some(&quick)).as_ref(),
+            library_nfc(text),
+            "{text:?} (quick)"
+        );
     }
 }
 
@@ -2627,7 +2639,7 @@ fn an_ascii_free_line_splits_into_its_pieces_in_one_pass() {
     }
     assert_eq!(at, line.len());
     assert!(is_nfc(&line));
-    assert!(matches!(nfc(&line), Cow::Borrowed(_)));
+    assert!(matches!(nfc(&line, None), Cow::Borrowed(_)));
     // The checked run ends at an ideograph, at an ASCII byte, or at the end.
     assert_eq!(checked_run("，漢".as_bytes()), 3);
     assert_eq!(checked_run("，。、漢字".as_bytes()), 9);
