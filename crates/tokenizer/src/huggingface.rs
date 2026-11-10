@@ -711,35 +711,37 @@ impl HuggingFaceTokenizer {
     /// token only the configuration declares (a checkpoint's audio or
     /// speech controls, say) is a token of the model: without it the text
     /// encodes as plain pieces, its id decodes to nothing, and the gateway's
-    /// bound reads the id as unknown. A token the pipeline already holds
-    /// under its id is left as it is; one it holds under another id keeps the
-    /// file's id (the two files disagree: the file wins, as it does for
-    /// `transformers`, whose adds reuse an existing id) and is noted. The
-    /// pipeline assigns ids in order past the highest it holds, so a token
-    /// that lands elsewhere than declared is an error, as on the
-    /// vocab.json + merges.txt path. Returns how many tokens were added.
+    /// bound reads the id as unknown. The configuration is read against the
+    /// pipeline's added tokens, as `transformers` reads it, not against the
+    /// model's table: a token already added on its id is left as it is; one
+    /// added under another id keeps the pipeline's id (the two files
+    /// disagree: the file wins, as it does for `transformers`, whose adds
+    /// reuse an existing id) and is noted; a token the table holds as a plain
+    /// piece goes through the add and keeps the table's id, which makes it
+    /// an added token (matched whole, dropped by a skip-special decode) as
+    /// the configuration says. The pipeline assigns new ids in order past
+    /// the highest it holds, so a token that lands elsewhere than declared
+    /// is an error on both paths: a token left out would be a silent
+    /// disagreement with the engine's tokenizer on the ids the gateway
+    /// sends. Returns how many tokens were added.
     fn add_config_tokens<M: Model>(
         tokenizer: &mut TokenizerOf<M>,
         config_tokens: &[(u32, AddedToken)],
     ) -> Result<usize> {
         let mut missing: Vec<(u32, AddedToken)> = Vec::new();
+        let added = tokenizer.get_added_vocabulary().get_vocab();
         for (id, token) in config_tokens {
-            match tokenizer.token_to_id(&token.content) {
-                Some(held) if held == *id => {}
-                Some(held)
-                    if tokenizer
-                        .get_added_vocabulary()
-                        .get_added_tokens_decoder()
-                        .contains_key(&held) =>
-                {
+            match added.get(&token.content) {
+                Some(held) if held == id => {}
+                Some(held) => {
                     warn!(
                         token = %token.content,
                         config_id = id,
-                        file_id = held,
-                        "tokenizer_config.json and tokenizer.json disagree on an added token's id; the file's id stands"
+                        pipeline_id = held,
+                        "tokenizer_config.json and the pipeline disagree on an added token's id; the pipeline's id stands"
                     );
                 }
-                _ => missing.push((*id, token.clone())),
+                None => missing.push((*id, token.clone())),
             }
         }
         if missing.is_empty() {
@@ -752,14 +754,14 @@ impl HuggingFaceTokenizer {
             let actual_id = tokenizer.token_to_id(&token.content);
             if actual_id != Some(*expected_id) {
                 return Err(Error::msg(format!(
-                    "Added token '{}' expected ID {expected_id}, got {actual_id:?}; non-contiguous explicit added-token IDs are unsupported",
+                    "Added token '{}' expected ID {expected_id}, got {actual_id:?}: tokenizer_config.json declares an id the pipeline cannot place (a new token takes the next id past the ones held; a piece the model holds keeps the model's id)",
                     token.content
                 )));
             }
         }
         info!(
             added = missing.len(),
-            "added tokens tokenizer_config.json declares beyond tokenizer.json"
+            "added the tokens tokenizer_config.json declares that the pipeline did not hold"
         );
         Ok(missing.len())
     }

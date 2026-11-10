@@ -133,3 +133,51 @@ fn mixed_non_qwen_directory_falls_back_to_tiktoken() -> Result<()> {
     assert_eq!(tokenizer.encode("hello", false)?.token_ids(), &[0]);
     Ok(())
 }
+
+/// The files of `write_qwen2_files` with the control `<|endoftext|>` as a
+/// piece of vocab.json (id 9) that the configuration declares special, as a
+/// GPT-2 layout holds it; the two added tokens follow at 10 and 11.
+fn write_qwen2_files_with_a_control_in_the_table(dir: &Path) -> Result<()> {
+    write_qwen2_files(dir, false, 10)?;
+    let vocab = json!({
+        "H": 0,
+        "e": 1,
+        "l": 2,
+        "o": 3,
+        "Ġ": 4,
+        "w": 5,
+        "r": 6,
+        "d": 7,
+        "!": 8,
+        "<|endoftext|>": 9
+    });
+    fs::write(dir.join("vocab.json"), serde_json::to_vec(&vocab)?)?;
+    let config_path = dir.join("tokenizer_config.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&fs::read(&config_path)?)?;
+    config["added_tokens_decoder"]["9"] = json!({
+        "content": "<|endoftext|>",
+        "single_word": false,
+        "lstrip": false,
+        "rstrip": false,
+        "normalized": false,
+        "special": true
+    });
+    fs::write(config_path, serde_json::to_vec(&config)?)?;
+    Ok(())
+}
+
+#[test]
+fn qwen2_loader_adds_a_declared_control_the_table_holds() -> Result<()> {
+    let dir = TempDir::new()?;
+    write_qwen2_files_with_a_control_in_the_table(dir.path())?;
+
+    let tokenizer = create_tokenizer(dir.path().to_string_lossy().as_ref())?;
+    // The control keeps the table's id and is an added token: matched whole,
+    // dropped by a skip-special decode; the tokens after it land as declared.
+    assert_eq!(tokenizer.token_to_id("<|endoftext|>"), Some(9));
+    assert_eq!(tokenizer.encode("<|endoftext|>", false)?.token_ids(), &[9]);
+    assert_eq!(tokenizer.decode(&[9], true)?, "");
+    assert_eq!(tokenizer.token_to_id("<|im_start|>"), Some(10));
+    assert_eq!(tokenizer.token_to_id("<tool_call>"), Some(11));
+    Ok(())
+}

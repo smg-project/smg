@@ -3,8 +3,10 @@
 //! `added_tokens_decoder` on top of the file's added tokens, so a token only
 //! the configuration names is a token of the model: it encodes to its id,
 //! its id decodes to its text, and the id is known to the gateway's bound.
-//! A token both files name is held once; a declared id the pipeline cannot
-//! place is refused at load, as on the vocab.json + merges.txt path.
+//! A token both files name is held once; one the model's table holds as a
+//! plain piece becomes an added token on the table's id; a declared id the
+//! pipeline cannot place is refused at load, as on the vocab.json +
+//! merges.txt path.
 
 #![expect(clippy::expect_used, reason = "a test that stops on a broken setup")]
 
@@ -132,6 +134,40 @@ fn a_token_both_files_declare_is_held_once_on_its_id() {
             .token_ids(),
         &[2]
     );
+}
+
+#[test]
+fn a_declared_token_the_table_holds_as_a_piece_becomes_an_added_token() {
+    let dir = TempDir::new().expect("a temp dir");
+    // The table holds the control as a plain piece (id 2) that the file's
+    // added tokens leave out, as a GPT-2 layout holds `<|endoftext|>`.
+    let tokenizer = load(
+        &dir,
+        &tokenizer_json(&["<|endoftext|>"], &FILE_TOKENS),
+        config(&[(2, "<|endoftext|>"), (3, "<|im_start|>")]),
+    )
+    .expect("the tokenizer loads");
+
+    let added = tokenizer.tokenizers_pipeline().get_added_vocabulary();
+    assert_eq!(added.get_vocab().get("<|endoftext|>"), Some(&2));
+    assert!(added.is_special_token("<|endoftext|>"));
+    // Matched whole and dropped by a skip-special decode, as a control is.
+    assert_eq!(
+        tokenizer
+            .encode("<|endoftext|>", false)
+            .expect("the control encodes")
+            .token_ids(),
+        &[2]
+    );
+    assert_eq!(tokenizer.decode(&[2], true).expect("the id decodes"), "");
+    assert_eq!(
+        tokenizer.decode(&[2], false).expect("the id decodes"),
+        "<|endoftext|>"
+    );
+    // The table keeps its three pieces, and the count with the added tokens
+    // counts the control once.
+    assert_eq!(tokenizer.vocab_size(), 3);
+    assert_eq!(tokenizer.tokenizers_pipeline().get_vocab_size(true), 4);
 }
 
 #[test]
