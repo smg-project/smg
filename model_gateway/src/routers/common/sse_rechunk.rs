@@ -1,17 +1,18 @@
 //! Re-slicing of streamed chat completion deltas.
 //!
-//! MiniMax's provider verifier checks the size of every streamed delta:
-//! almost none may be shorter than five characters or longer than two
-//! hundred. Engines emit one token per event and tool arguments in one
-//! piece, so the gateway buffers `content`, `reasoning_content`, `reasoning`
-//! and tool-call `arguments` and emits them again in moderate slices. Text is
-//! only held back briefly: the relays flush it when the upstream has been
-//! quiet for `IDLE_FLUSH`, except a remainder shorter than `MIN_TAIL_CHARS`
-//! (a token or two that arrived just before the engine paused), which waits
-//! for the next text or the end of the stream: an event of its own would be
-//! exactly the tiny delta the contract forbids. Tool-call arguments keep a
-//! tail of `MIN_TAIL_CHARS` back on every cut and idle flush as well, until
-//! the stream moves on (another call opens, text of another field, the end):
+//! A wire whose contract bounds the size of every streamed delta (MiniMax's
+//! provider verifier does: `routers::grpc::wire::minimax`) hands this stage
+//! its numbers as a [`RechunkPolicy`]. Engines emit one token per event and
+//! tool arguments in one piece, so the gateway buffers `content`,
+//! `reasoning_content`, `reasoning` and tool-call `arguments` and emits them
+//! again in slices of the policy's size. Text is only held back briefly: the
+//! relays flush it when the upstream has been quiet for the policy's idle
+//! flush, except a remainder shorter than its minimum tail (a token or two
+//! that arrived just before the engine paused), which waits for the next
+//! text or the end of the stream: an event of its own would be exactly the
+//! tiny delta the contract forbids. Tool-call arguments keep that tail back
+//! on every cut and idle flush as well, until the stream moves on (another
+//! call opens, text of another field, the end):
 //! a call's closing punctuation is a token of one to four characters that
 //! may arrive on its own after a pause, and it rides with the held tail
 //! instead of being the only thing left when the next call opens.
@@ -36,7 +37,7 @@
 //! came from there on), events carrying `logprobs` or other choice-level
 //! metadata, frames after `[DONE]` or larger than `MAX_FRAME_BYTES`, and
 //! malformed frames; and the relays build the stage only for the streams
-//! whose wire asks for re-slicing (`routers::grpc::wire::Wire::rechunks_sse`,
+//! whose wire asks for re-slicing (`routers::grpc::wire::Wire::rechunk_policy`,
 //! the wire of the model the client asked for). The default, [`NoopObserver`],
 //! sees every slice and never objects.
 //! An observer that answers [`Verdict::Terminate`] ends the stream in its
@@ -54,20 +55,27 @@ use serde::{
 };
 use serde_json::value::RawValue;
 
-/// Slices hold at most `SLICE_CHARS` characters and are cut once at least
-/// `EMIT_THRESHOLD` are buffered. A cut never leaves a tail shorter than
-/// `MIN_TAIL_CHARS`, and an idle flush holds back a remainder shorter than
-/// it, so only a delta that is tiny in total yields a tiny event. A tool
-/// call's arguments keep `MIN_TAIL_CHARS` back on every cut and idle flush
-/// as well, until the stream moves on: the call's closer, which may arrive
-/// on its own after a pause, then rides with them. Their cut waits for
-/// `MIN_TAIL_CHARS` more than the threshold, so it still emits at least
-/// `EMIT_THRESHOLD` and the pieces keep their size. The held tail is a
-/// whole tail, not one short of it, because the stream may move on with
-/// nothing following and release it alone.
-const SLICE_CHARS: usize = 160;
-const EMIT_THRESHOLD: usize = 80;
-const MIN_TAIL_CHARS: usize = 5;
+/// The numbers of a wire's delta-size contract, owned by the wire that asks
+/// for re-slicing (`routers::grpc::wire::Wire::rechunk_policy`) and handed
+/// to the stage when it is built. Slices hold at most `slice_chars`
+/// characters and are cut once at least `emit_threshold` are buffered. A cut
+/// never leaves a tail shorter than `min_tail_chars`, and an idle flush
+/// holds back a remainder shorter than it, so only a delta that is tiny in
+/// total yields a tiny event. A tool call's arguments keep `min_tail_chars`
+/// back on every cut and idle flush as well, until the stream moves on: the
+/// call's closer, which may arrive on its own after a pause, then rides with
+/// them. Their cut waits for `min_tail_chars` more than the threshold, so it
+/// still emits at least `emit_threshold` and the pieces keep their size. The
+/// held tail is a whole tail, not one short of it, because the stream may
+/// move on with nothing following and release it alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RechunkPolicy {
+    pub slice_chars: usize,
+    pub emit_threshold: usize,
+    pub min_tail_chars: usize,
+    /// Buffered text is flushed after this much upstream silence.
+    pub idle_flush: Duration,
+}
 
 /// An unterminated frame longer than this is forwarded as it comes.
 const MAX_FRAME_BYTES: usize = 1 << 20;
@@ -75,12 +83,11 @@ const MAX_FRAME_BYTES: usize = 1 << 20;
 /// Delta fields whose text is buffered, in the order they are emitted.
 const PAYLOAD_FIELDS: [&str; 3] = ["reasoning_content", "reasoning", "content"];
 
-/// Buffered text is flushed after this much upstream silence.
-pub(crate) const IDLE_FLUSH: Duration = Duration::from_millis(250);
-
 /// Re-slices the deltas of one SSE stream: feed it the body chunks in order
 /// and forward what it returns.
 pub struct SseRechunker<O = NoopObserver> {
+    /// The wire's numbers.
+    policy: RechunkPolicy,
     /// Start of a frame whose delimiter has not arrived yet.
     partial: Vec<u8>,
     /// Bytes of `partial` already searched for a delimiter.
@@ -195,24 +202,20 @@ pub struct StreamStop {
     pub error_type: String,
 }
 
-impl Default for SseRechunker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl SseRechunker {
-    /// A stage nobody observes.
-    pub fn new() -> Self {
-        Self::with_observer(NoopObserver)
+    /// A stage nobody observes, re-slicing by `policy`.
+    pub fn new(policy: RechunkPolicy) -> Self {
+        Self::with_observer(policy, NoopObserver)
     }
 }
 
 impl<O: DeltaObserver> SseRechunker<O> {
-    /// A stage whose slices `observer` sees; it is told the stream opened.
-    pub fn with_observer(mut observer: O) -> Self {
+    /// A stage re-slicing by `policy` whose slices `observer` sees; it is
+    /// told the stream opened.
+    pub fn with_observer(policy: RechunkPolicy, mut observer: O) -> Self {
         observer.open();
         Self {
+            policy,
             partial: Vec::new(),
             scanned: 0,
             envelope: b"{".to_vec(),
@@ -235,6 +238,11 @@ impl<O: DeltaObserver> SseRechunker<O> {
     /// cancels the engine's work.
     pub fn stopped(&self) -> Option<&StreamStop> {
         self.stopped.as_ref()
+    }
+
+    /// The numbers this stage re-slices by.
+    pub fn policy(&self) -> RechunkPolicy {
+        self.policy
     }
 
     /// Takes one body chunk and returns the bytes to forward now.
@@ -271,26 +279,27 @@ impl<O: DeltaObserver> SseRechunker<O> {
     }
 
     /// Whether text is waiting that an idle flush would emit: a buffer of at
-    /// least `MIN_TAIL_CHARS`, or a tool call's arguments of at least that
-    /// beyond the tail they keep. A shorter remainder waits for more text.
+    /// least the policy's minimum tail, or a tool call's arguments of at
+    /// least that beyond the tail they keep. A shorter remainder waits for
+    /// more text.
     pub fn has_pending(&self) -> bool {
-        self.fields
-            .iter()
-            .any(|pending| pending.chars >= MIN_TAIL_CHARS)
+        let tail = self.policy.min_tail_chars;
+        self.fields.iter().any(|pending| pending.chars >= tail)
             || self
                 .tool_args
                 .values()
-                .any(|pending| pending.chars >= 2 * MIN_TAIL_CHARS)
+                .any(|pending| pending.chars >= 2 * tail)
     }
 
     /// Emits the buffered text without waiting for more input, except a
-    /// remainder shorter than `MIN_TAIL_CHARS` and the tail a tool call's
-    /// arguments keep, which stay for the next text or [`Self::finish`]: an
-    /// engine that pauses between tokens must not turn every token into an
-    /// event of its own.
+    /// remainder shorter than the policy's minimum tail and the tail a tool
+    /// call's arguments keep, which stay for the next text or
+    /// [`Self::finish`]: an engine that pauses between tokens must not turn
+    /// every token into an event of its own.
     pub fn flush_pending(&mut self) -> Bytes {
         let mut out = Vec::new();
-        self.flush_from(MIN_TAIL_CHARS, MIN_TAIL_CHARS, &mut out);
+        let tail = self.policy.min_tail_chars;
+        self.flush_from(tail, tail, &mut out);
         Bytes::from(out)
     }
 
@@ -569,9 +578,11 @@ impl<O: DeltaObserver> SseRechunker<O> {
     }
 
     fn emit_ready(&mut self, out: &mut Vec<u8>) -> Result<(), StreamStop> {
+        let policy = self.policy;
         for (field, pending) in PAYLOAD_FIELDS.iter().zip(&mut self.fields) {
-            while pending.chars >= EMIT_THRESHOLD {
+            while pending.chars >= policy.emit_threshold {
                 emit_text(
+                    policy,
                     &self.envelope,
                     self.usage_null,
                     &mut self.observer,
@@ -584,14 +595,15 @@ impl<O: DeltaObserver> SseRechunker<O> {
         for (index, pending) in &mut self.tool_args {
             // The cut waits for the held tail on top of the threshold, so the
             // pieces of a steady stream keep their size.
-            while pending.chars >= EMIT_THRESHOLD + MIN_TAIL_CHARS {
+            while pending.chars >= policy.emit_threshold + policy.min_tail_chars {
                 emit_arguments(
+                    policy,
                     &self.envelope,
                     self.usage_null,
                     &mut self.observer,
                     *index,
                     pending,
-                    MIN_TAIL_CHARS,
+                    policy.min_tail_chars,
                     out,
                 )?;
             }
@@ -619,10 +631,12 @@ impl<O: DeltaObserver> SseRechunker<O> {
         held: usize,
         out: &mut Vec<u8>,
     ) -> Result<(), StreamStop> {
+        let policy = self.policy;
         for (field, pending) in PAYLOAD_FIELDS.iter().zip(&mut self.fields) {
             if pending.chars >= min_chars {
                 while pending.chars > 0 {
                     emit_text(
+                        policy,
                         &self.envelope,
                         self.usage_null,
                         &mut self.observer,
@@ -637,6 +651,7 @@ impl<O: DeltaObserver> SseRechunker<O> {
             if pending.chars >= min_chars + held {
                 while pending.chars > held {
                     emit_arguments(
+                        policy,
                         &self.envelope,
                         self.usage_null,
                         &mut self.observer,
@@ -902,6 +917,7 @@ fn write_function(function: &RawObject<'_>, out: &mut Vec<u8>) {
 /// Writes one synthesized event with the next slice of `pending` as `field`,
 /// unless the observer ends the stream on it.
 fn emit_text<O: DeltaObserver>(
+    policy: RechunkPolicy,
     envelope: &[u8],
     usage_null: bool,
     observer: &mut O,
@@ -909,7 +925,7 @@ fn emit_text<O: DeltaObserver>(
     pending: &mut Pending,
     out: &mut Vec<u8>,
 ) -> Result<(), StreamStop> {
-    let (bytes, chars) = pending.next_slice(0);
+    let (bytes, chars) = pending.next_slice(policy, 0);
     observe(observer, DeltaField::Text(field), &pending.text[..bytes])?;
     out.extend_from_slice(b"data: ");
     out.extend_from_slice(envelope);
@@ -926,7 +942,12 @@ fn emit_text<O: DeltaObserver>(
 /// Writes one synthesized event with the next slice of `pending` as the
 /// arguments of tool call `index`, unless the observer ends the stream on it.
 /// The slice leaves `keep` characters in the buffer.
+// The stage's numbers and the latest event's frame (envelope, placeholder)
+// ride with the observer, the call and the slice's target: one over clippy's
+// seven.
+#[expect(clippy::too_many_arguments)]
 fn emit_arguments<O: DeltaObserver>(
+    policy: RechunkPolicy,
     envelope: &[u8],
     usage_null: bool,
     observer: &mut O,
@@ -935,7 +956,7 @@ fn emit_arguments<O: DeltaObserver>(
     keep: usize,
     out: &mut Vec<u8>,
 ) -> Result<(), StreamStop> {
-    let (bytes, chars) = pending.next_slice(keep);
+    let (bytes, chars) = pending.next_slice(policy, keep);
     observe(
         observer,
         DeltaField::ToolArguments(index),
@@ -1014,17 +1035,17 @@ impl Pending {
         self.chars = 0;
     }
 
-    /// Byte and character length of the next slice: at most `SLICE_CHARS`,
-    /// leaving `keep` characters (fewer than are buffered) and never a tail
-    /// shorter than `MIN_TAIL_CHARS` beyond them.
-    fn next_slice(&self, keep: usize) -> (usize, usize) {
+    /// Byte and character length of the next slice: at most the policy's
+    /// slice, leaving `keep` characters (fewer than are buffered) and never
+    /// a tail shorter than the policy's minimum beyond them.
+    fn next_slice(&self, policy: RechunkPolicy, keep: usize) -> (usize, usize) {
         let free = self.chars - keep;
-        let chars = if free <= SLICE_CHARS {
+        let chars = if free <= policy.slice_chars {
             free
-        } else if free - SLICE_CHARS < MIN_TAIL_CHARS {
-            free - MIN_TAIL_CHARS
+        } else if free - policy.slice_chars < policy.min_tail_chars {
+            free - policy.min_tail_chars
         } else {
-            SLICE_CHARS
+            policy.slice_chars
         };
         let bytes = self
             .text
@@ -1213,13 +1234,15 @@ fn find_frame_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
 }
 
 /// Re-chunks a stream of SSE body chunks: every chunk passes through an
-/// [`SseRechunker`] watched by `observer`, text held back is flushed once
-/// the upstream has been quiet for [`IDLE_FLUSH`], and the tail is flushed
+/// [`SseRechunker`] re-slicing by `policy` and watched by `observer`, text
+/// held back is flushed once the upstream has been quiet for the policy's
+/// idle flush, and the tail is flushed
 /// when the stream ends. An upstream error still follows whatever text was
 /// pending. A stream the observer stops ends with its error event, and the
 /// upstream is let go: on this relay, that is what cancels the engine's
 /// work.
 pub(crate) fn rechunk_stream<S, E, O>(
+    policy: RechunkPolicy,
     inner: S,
     observer: O,
 ) -> impl Stream<Item = Result<Bytes, E>> + Send
@@ -1231,6 +1254,7 @@ where
     struct State<S, E, O> {
         inner: S,
         rechunker: SseRechunker<O>,
+        idle_flush: Duration,
         idle: Pin<Box<tokio::time::Sleep>>,
         /// An upstream error, delivered after the flushed tail.
         deferred: Option<E>,
@@ -1239,8 +1263,9 @@ where
 
     let state = State {
         inner,
-        rechunker: SseRechunker::with_observer(observer),
-        idle: Box::pin(tokio::time::sleep(IDLE_FLUSH)),
+        rechunker: SseRechunker::with_observer(policy, observer),
+        idle_flush: policy.idle_flush,
+        idle: Box::pin(tokio::time::sleep(policy.idle_flush)),
         deferred: None,
         ended: false,
     };
@@ -1255,7 +1280,7 @@ where
             tokio::select! {
                 chunk = st.inner.next() => match chunk {
                     Some(Ok(bytes)) => {
-                        st.idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
+                        st.idle.as_mut().reset(tokio::time::Instant::now() + st.idle_flush);
                         let out = st.rechunker.feed(bytes);
                         st.ended |= st.rechunker.stopped().is_some();
                         if !out.is_empty() {
@@ -1286,7 +1311,7 @@ where
                     }
                 },
                 () = st.idle.as_mut(), if st.rechunker.has_pending() => {
-                    st.idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
+                    st.idle.as_mut().reset(tokio::time::Instant::now() + st.idle_flush);
                     let out = st.rechunker.flush_pending();
                     st.ended |= st.rechunker.stopped().is_some();
                     if !out.is_empty() {
@@ -1311,6 +1336,14 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
 
     use super::*;
+    use crate::routers::grpc::wire::Wire;
+
+    /// The one policy in the tree: MiniMax's.
+    fn policy() -> RechunkPolicy {
+        Wire::Minimax
+            .rechunk_policy()
+            .expect("MiniMax's streams are re-sliced")
+    }
 
     fn bytes(data: impl AsRef<[u8]>) -> Bytes {
         Bytes::copy_from_slice(data.as_ref())
@@ -1334,7 +1367,7 @@ mod tests {
     }
 
     fn run(frames: &[&str]) -> Vec<u8> {
-        let mut r = SseRechunker::new();
+        let mut r = SseRechunker::new(policy());
         let mut all = Vec::new();
         for frame in frames {
             all.extend_from_slice(r.feed(bytes(frame)).as_ref());
@@ -1402,7 +1435,7 @@ mod tests {
     fn frames_split_across_chunks_are_reassembled() {
         let frame = content_event(&"y".repeat(100));
         let frame = frame.as_bytes();
-        let mut r = SseRechunker::new();
+        let mut r = SseRechunker::new(policy());
         let mut all = Vec::new();
         for k in [7usize, 40, 90] {
             all.extend_from_slice(r.feed(bytes(&frame[..k])).as_ref());
@@ -1411,7 +1444,7 @@ mod tests {
             all.extend_from_slice(r.finish().as_ref());
             let sizes = content_sizes(&events(&all));
             assert_eq!(sizes, vec![100], "split at {k}");
-            r = SseRechunker::new();
+            r = SseRechunker::new(policy());
             all.clear();
         }
     }
@@ -1439,7 +1472,7 @@ mod tests {
     fn a_delimiter_split_across_feeds_is_found() {
         let frame = content_event(&"z".repeat(100));
         let frame = frame.as_bytes();
-        let mut r = SseRechunker::new();
+        let mut r = SseRechunker::new(policy());
         let mut all = Vec::new();
         all.extend_from_slice(r.feed(bytes(&frame[..frame.len() - 1])).as_ref());
         assert!(all.is_empty());
@@ -1449,7 +1482,7 @@ mod tests {
 
     #[test]
     fn oversized_unterminated_frames_switch_to_passthrough() {
-        let mut r = SseRechunker::new();
+        let mut r = SseRechunker::new(policy());
         assert!(r.feed(bytes(content_event("ab"))).is_empty());
         let fragment = vec![b'q'; 64 * 1024];
         let mut forwarded = Vec::new();
@@ -1466,7 +1499,7 @@ mod tests {
 
     #[test]
     fn passthrough_returns_the_chunk_it_was_given() {
-        let mut r = SseRechunker::new();
+        let mut r = SseRechunker::new(policy());
         r.feed(bytes(b"data: [DONE]\n\n"));
         let chunk = Bytes::from_static(b"trailing bytes");
         let returned = r.feed(chunk.clone());
@@ -1754,7 +1787,7 @@ mod tests {
     #[test]
     fn multi_choice_streams_pass_through_verbatim() {
         let two = "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}},{\"index\":1,\"delta\":{\"content\":\"b\"}}]}\n\n";
-        let mut r = SseRechunker::new();
+        let mut r = SseRechunker::new(policy());
         let mut all = Vec::new();
         all.extend_from_slice(r.feed(bytes(two)).as_ref());
         all.extend_from_slice(r.feed(bytes(two)).as_ref());
@@ -1812,7 +1845,7 @@ mod tests {
 
     #[test]
     fn flush_pending_emits_what_is_buffered() {
-        let mut r = SseRechunker::new();
+        let mut r = SseRechunker::new(policy());
         assert!(r.feed(bytes(content_event("hello"))).is_empty());
         assert!(r.has_pending());
         let evs = events(&r.flush_pending());
@@ -1825,7 +1858,7 @@ mod tests {
 
     #[test]
     fn flush_pending_holds_a_remainder_shorter_than_the_tiny_band() {
-        let mut r = SseRechunker::new();
+        let mut r = SseRechunker::new(policy());
         assert!(r.feed(bytes(content_event("hi"))).is_empty());
         assert!(!r.has_pending(), "two characters are not worth an event");
         assert!(r.flush_pending().is_empty());
@@ -1901,7 +1934,7 @@ mod tests {
     /// Streams `frames` with the idle timer firing after every one of them,
     /// as it does when the engine pauses between tokens.
     fn run_with_pauses(frames: &[String]) -> Vec<u8> {
-        let mut r = SseRechunker::new();
+        let mut r = SseRechunker::new(policy());
         let mut all = Vec::new();
         for frame in frames {
             all.extend_from_slice(r.feed(bytes(frame)).as_ref());
@@ -1999,7 +2032,7 @@ mod tests {
         let (text, closer) = call_0.split_at(240);
         assert_eq!(closer, "\"}");
         let call_1 = "{\"path\":\"b.txt\"}";
-        let mut r = SseRechunker::new();
+        let mut r = SseRechunker::new(policy());
         let mut all = Vec::new();
         all.extend_from_slice(r.feed(bytes(tool_identity_event_for(0))).as_ref());
         for piece in [&text[..80], &text[80..160], &text[160..]] {
@@ -2016,7 +2049,7 @@ mod tests {
         let pieces = argument_pieces_of(&evs, 0);
         let sizes: Vec<usize> = pieces.iter().map(|p| p.chars().count()).collect();
         assert!(
-            sizes.iter().all(|&s| s >= MIN_TAIL_CHARS),
+            sizes.iter().all(|&s| s >= policy().min_tail_chars),
             "call 0 pieces: {sizes:?}"
         );
         assert_eq!(pieces.concat(), call_0);
@@ -2037,7 +2070,7 @@ mod tests {
     /// releases it with whatever followed.
     #[test]
     fn an_idle_flush_keeps_a_tail_of_a_calls_arguments_for_its_closer() {
-        let mut r = SseRechunker::new();
+        let mut r = SseRechunker::new(policy());
         assert!(!r.feed(bytes(tool_identity_event())).is_empty());
         let text = format!("{{\"path\":\"{}", "p".repeat(59));
         assert!(r.feed(bytes(arguments_event(&text))).is_empty());
@@ -2059,7 +2092,7 @@ mod tests {
     /// included.
     #[test]
     fn content_before_a_tool_call_is_not_held_back() {
-        let mut r = SseRechunker::new();
+        let mut r = SseRechunker::new(policy());
         let mut all = Vec::new();
         for _ in 0..3 {
             all.extend_from_slice(r.feed(bytes(content_event(&"c".repeat(80)))).as_ref());
@@ -2104,7 +2137,7 @@ mod tests {
 
     #[test]
     fn done_passthrough_after_flush() {
-        let mut r = SseRechunker::new();
+        let mut r = SseRechunker::new(policy());
         let mut all = Vec::new();
         all.extend_from_slice(r.feed(bytes(content_event("hi"))).as_ref());
         all.extend_from_slice(r.feed(bytes(b"data: [DONE]\n\n")).as_ref());
@@ -2132,7 +2165,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stream_adapter_merges_tiny_deltas_and_flushes_the_tail() {
         let upstream = stream::iter((0..100).map(|_| Ok::<_, io::Error>(chunk("ab"))));
-        let frames: Vec<Bytes> = rechunk_stream(upstream, NoopObserver)
+        let frames: Vec<Bytes> = rechunk_stream(policy(), upstream, NoopObserver)
             .map(|frame| frame.unwrap())
             .collect()
             .await;
@@ -2141,7 +2174,7 @@ mod tests {
             .map(|c| c.chars().count())
             .collect();
         assert!(
-            sizes.iter().all(|&s| s >= MIN_TAIL_CHARS),
+            sizes.iter().all(|&s| s >= policy().min_tail_chars),
             "sizes: {sizes:?}"
         );
         assert_eq!(sizes.iter().sum::<usize>(), 200);
@@ -2150,7 +2183,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stream_adapter_flushes_pending_payload_when_upstream_idles() {
         let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(8);
-        let mut out = Box::pin(rechunk_stream(ReceiverStream::new(rx), NoopObserver));
+        let mut out = Box::pin(rechunk_stream(
+            policy(),
+            ReceiverStream::new(rx),
+            NoopObserver,
+        ));
         for _ in 0..3 {
             tx.send(Ok(chunk("ab"))).await.unwrap();
         }
@@ -2164,10 +2201,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stream_adapter_holds_a_tiny_remainder_across_an_upstream_pause() {
         let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(8);
-        let mut out = Box::pin(rechunk_stream(ReceiverStream::new(rx), NoopObserver));
+        let mut out = Box::pin(rechunk_stream(
+            policy(),
+            ReceiverStream::new(rx),
+            NoopObserver,
+        ));
         tx.send(Ok(chunk("ab"))).await.unwrap();
         // Quiet for far longer than the idle flush: nothing worth an event yet.
-        assert!(tokio::time::timeout(IDLE_FLUSH * 4, out.next())
+        assert!(tokio::time::timeout(policy().idle_flush * 4, out.next())
             .await
             .is_err());
         tx.send(Ok(chunk("cde"))).await.unwrap();
@@ -2184,7 +2225,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stream_adapter_delivers_the_tail_before_an_upstream_error() {
         let upstream = stream::iter(vec![Ok(chunk("ab")), Err(io::Error::other("boom"))]);
-        let mut out = Box::pin(rechunk_stream(upstream, NoopObserver));
+        let mut out = Box::pin(rechunk_stream(policy(), upstream, NoopObserver));
         let tail = out.next().await.unwrap().unwrap();
         assert_eq!(contents(&[tail]), vec!["ab"]);
         assert!(out.next().await.unwrap().is_err());
@@ -2197,7 +2238,11 @@ mod tests {
         // tail's slice, so the policy's error frame is the last thing the
         // client sees and the upstream's error is not yielded after it.
         let upstream = stream::iter(vec![Ok(chunk("ab")), Err(io::Error::other("boom"))]);
-        let mut out = Box::pin(rechunk_stream(upstream, Watcher::vetoing_after(0)));
+        let mut out = Box::pin(rechunk_stream(
+            policy(),
+            upstream,
+            Watcher::vetoing_after(0),
+        ));
         let frame = out.next().await.unwrap().unwrap();
         assert_eq!(frame.as_ref(), POLICY_ERROR_FRAME.as_bytes());
         assert!(out.next().await.is_none());
@@ -2312,7 +2357,7 @@ mod tests {
     }
 
     fn run_watched(frames: &[String], watcher: Watcher) -> Vec<u8> {
-        let mut r = SseRechunker::with_observer(watcher);
+        let mut r = SseRechunker::with_observer(policy(), watcher);
         let mut all = Vec::new();
         for frame in frames {
             all.extend_from_slice(r.feed(bytes(frame)).as_ref());
@@ -2360,7 +2405,7 @@ mod tests {
     #[test]
     fn a_vetoing_observer_ends_the_stream_with_the_error_event_and_nothing_after_it() {
         let watcher = Watcher::vetoing_after(2);
-        let mut r = SseRechunker::with_observer(watcher.clone());
+        let mut r = SseRechunker::with_observer(policy(), watcher.clone());
         // 500 characters: three slices are ready at once, the third is vetoed.
         let all = r.feed(bytes(content_event(&"a".repeat(500))));
         let text = String::from_utf8(all.to_vec()).unwrap();
@@ -2395,7 +2440,7 @@ mod tests {
     #[test]
     fn a_veto_on_the_tail_replaces_it_with_the_error_event() {
         let watcher = Watcher::vetoing_after(0);
-        let mut r = SseRechunker::with_observer(watcher.clone());
+        let mut r = SseRechunker::with_observer(policy(), watcher.clone());
         // Held back: too short for a slice until the stream ends.
         assert!(r.feed(bytes(content_event("hi"))).is_empty());
         assert_eq!(r.finish().as_ref(), POLICY_ERROR_FRAME.as_bytes());
@@ -2410,7 +2455,7 @@ mod tests {
 
     #[test]
     fn a_veto_on_arguments_ends_the_stream_too() {
-        let mut r = SseRechunker::with_observer(Watcher::vetoing_after(0));
+        let mut r = SseRechunker::with_observer(policy(), Watcher::vetoing_after(0));
         let mut all = Vec::new();
         all.extend_from_slice(r.feed(bytes(tool_identity_event())).as_ref());
         all.extend_from_slice(r.feed(bytes(arguments_event(&"x".repeat(100)))).as_ref());
@@ -2428,6 +2473,7 @@ mod tests {
     async fn stream_adapter_ends_on_the_observers_stop_and_lets_the_upstream_go() {
         let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(8);
         let mut out = Box::pin(rechunk_stream(
+            policy(),
             ReceiverStream::new(rx),
             Watcher::vetoing_after(0),
         ));

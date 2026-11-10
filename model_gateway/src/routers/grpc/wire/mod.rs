@@ -19,6 +19,8 @@
 
 use openai_protocol::{common::StreamOptions, profile::ProviderProfile};
 
+use crate::routers::common::sse_rechunk::RechunkPolicy;
+
 pub(crate) mod deepseek;
 pub(crate) mod minimax;
 
@@ -61,13 +63,14 @@ impl Wire {
         }
     }
 
-    /// Whether a chat stream's SSE events are re-sliced on their way out
+    /// How a chat stream's SSE events are re-sliced on their way out
     /// (`routers::common::sse_rechunk`), on the gRPC lane and the regular
-    /// HTTP relay alike.
-    pub(crate) fn rechunks_sse(self) -> bool {
+    /// HTTP relay alike: the wire's numbers, or `None` for a wire whose
+    /// events go out as the engine made them.
+    pub(crate) fn rechunk_policy(self) -> Option<RechunkPolicy> {
         match self {
-            Self::Minimax => minimax::RECHUNKS_SSE,
-            Self::OpenAi | Self::DeepSeek => false,
+            Self::Minimax => Some(minimax::RECHUNK),
+            Self::OpenAi | Self::DeepSeek => None,
         }
     }
 }
@@ -227,11 +230,16 @@ mod tests {
         assert!(!FinalUsageOn::LastFinish.carries(1, 2));
     }
 
-    /// Only MiniMax re-slices its stream.
+    /// Only MiniMax re-slices its stream, by its own numbers.
     #[test]
     fn rechunk_names_its_vendor() {
         for wire in [Wire::OpenAi, Wire::DeepSeek, Wire::Minimax] {
-            assert_eq!(wire.rechunks_sse(), wire == Wire::Minimax, "{wire:?}");
+            assert_eq!(
+                wire.rechunk_policy().is_some(),
+                wire == Wire::Minimax,
+                "{wire:?}"
+            );
         }
+        assert_eq!(Wire::Minimax.rechunk_policy(), Some(minimax::RECHUNK));
     }
 }

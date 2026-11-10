@@ -78,7 +78,7 @@ use crate::{
             retry::{
                 is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
             },
-            sse_rechunk::{NoopObserver, SseRechunker},
+            sse_rechunk::{NoopObserver, RechunkPolicy, SseRechunker},
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
@@ -124,7 +124,8 @@ const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
 #[derive(Clone, Copy)]
 struct StreamRelayMode {
     is_stream: bool,
-    rechunk: bool,
+    /// The numbers the stream is re-sliced by, when its wire asks for it.
+    rechunk: Option<RechunkPolicy>,
 }
 
 /// One dispatch attempt of a typed request: the inputs every stage of
@@ -881,19 +882,21 @@ impl Router {
 
     /// How the attempt's answer is relayed: streamed or buffered, and
     /// re-chunked when the wire of the model the client asked for re-slices
-    /// its stream ([`Wire::rechunks_sse`]; the wire follows the requested
+    /// its stream ([`Wire::rechunk_policy`]; the wire follows the requested
     /// model, as request validation selects it, not the alias-resolved id).
     fn relay_mode_for_attempt<T: GenerationRequest>(
         attempt: &TypedAttempt<'_, T>,
     ) -> StreamRelayMode {
         let is_stream = attempt.is_stream;
-        let rechunk = is_stream
-            && attempt.route == "/v1/chat/completions"
-            && attempt.lease.with_view(|view| {
-                view.request
-                    .get_model()
-                    .is_some_and(|model| Wire::for_model(model).rechunks_sse())
-            });
+        let rechunk = (is_stream && attempt.route == "/v1/chat/completions")
+            .then(|| {
+                attempt.lease.with_view(|view| {
+                    view.request
+                        .get_model()
+                        .and_then(|model| Wire::for_model(model).rechunk_policy())
+                })
+            })
+            .flatten();
         StreamRelayMode { is_stream, rechunk }
     }
 
@@ -1440,7 +1443,7 @@ impl Router {
     /// through a bounded channel with the load guard attached to the body; a
     /// buffered response is read capped at the ingress payload limit. With
     /// `rechunk`, SSE delta payloads are re-sliced to the bounds of the wire
-    /// of the model the client asked for ([`Wire::rechunks_sse`]). A streamed
+    /// of the model the client asked for ([`Wire::rechunk_policy`]). A streamed
     /// body the worker ends with an error after a successful head is
     /// accounted to `source` and, when it is SSE, ended with the typed error
     /// event.
@@ -1477,8 +1480,9 @@ impl Router {
                 Some(ct) => ct.starts_with("text/event-stream"),
                 None => status.is_success(),
             };
-            let rechunker =
-                (rechunk && upstream_sse).then(|| SseRechunker::with_observer(NoopObserver));
+            let rechunker = rechunk
+                .filter(|_| upstream_sse)
+                .map(|policy| SseRechunker::with_observer(policy, NoopObserver));
             if rechunker.is_some() {
                 // Re-chunking changes the body length.
                 response_headers.remove(CONTENT_LENGTH);
@@ -1629,7 +1633,7 @@ impl Router {
             res,
             StreamRelayMode {
                 is_stream,
-                rechunk: false,
+                rechunk: None,
             },
             source,
             load_guard,
@@ -5567,7 +5571,7 @@ mod tests {
                 reqwest::Response::from(upstream),
                 StreamRelayMode {
                     is_stream: true,
-                    rechunk: false,
+                    rechunk: None,
                 },
                 RelaySource::new("m", "/v1/chat/completions", Arc::clone(&worker)),
                 WorkerLoadGuard::with_key(Arc::clone(&worker), None),

@@ -426,9 +426,10 @@ impl StreamingProcessor {
         );
 
         // A wire that bounds its events' delta sizes (MiniMax's) has the
-        // channel re-chunked on its way out: the HTTP relay re-slices the
-        // upstream body, here the gateway encodes the frames itself.
-        let rechunk = chat_request.wire.rechunks_sse();
+        // channel re-chunked on its way out by its own numbers: the HTTP
+        // relay re-slices the upstream body, here the gateway encodes the
+        // frames itself.
+        let rechunk = chat_request.wire.rechunk_policy();
 
         // The body's channel: the reading parks on it until the body took
         // the frame before (see `driven_channel`).
@@ -539,8 +540,9 @@ impl StreamingProcessor {
 
         // Return SSE response; its body holds the guards for as long as it lives.
         let stream = GuardedStream::new(DrivenBody::new(reading, rx), guards);
-        if rechunk {
+        if let Some(policy) = rechunk {
             build_sse_response_from_stream(sse_rechunk::rechunk_stream(
+                policy,
                 stream,
                 sse_rechunk::NoopObserver,
             ))
