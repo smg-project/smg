@@ -537,6 +537,27 @@ mod tests {
         }
     }
 
+    /// A worker whose report lacks resident tokens keeps the router's live
+    /// count, its picks not counted until their guards are taken: of two such
+    /// workers, a burst goes to the one with fewer live requests.
+    #[test]
+    fn resident_tokens_reads_the_live_count_of_a_worker_whose_report_lacks_them() {
+        let policy = resident_tokens(0);
+        let feed = TestFeed::attached_to(&policy);
+        let workers = holding(&[0, 1]);
+        let mut loads = HashMap::new();
+        for i in 0..2 {
+            loads.insert(format!("http://w{i}:8000"), one_rank_load(0, 0.1, 100.0));
+        }
+        feed.publish(&loads);
+        for _ in 0..8 {
+            assert_eq!(
+                policy.select_worker(&workers, &SelectWorkerInfo::default()),
+                Some(0)
+            );
+        }
+    }
+
     #[test]
     fn resident_tokens_scores_a_worker_without_the_count_from_its_peers() {
         // w1's report predates resident tokens: it scores as the best peer

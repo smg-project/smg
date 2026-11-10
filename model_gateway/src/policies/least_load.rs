@@ -458,6 +458,16 @@ impl LeastLoadPolicy {
         )
     }
 
+    /// Test-only: this policy's picks on `url` whose request has not ended.
+    #[cfg(test)]
+    pub(crate) fn picked_for_test(&self, url: &str) -> u64 {
+        self.tally
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(url)
+            .map_or(0, |dispatch| dispatch.picked)
+    }
+
     /// The feed's current snapshot: one `Arc` clone, no guard held afterwards.
     fn snapshot(&self) -> Option<Arc<LoadSnapshot>> {
         let feed = self
