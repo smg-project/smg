@@ -40,12 +40,13 @@ use image::{imageops::FilterType, DynamicImage, GenericImageView};
 use ndarray::{self, Array3};
 use serde_json::Value;
 
+use super::qwen_vl_base::pixel_norm;
 use crate::vision::{
     preprocessor_config::PreProcessorConfig,
     processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
     transforms::{
-        center_crop, crop_rgb, expand_to_square, mean_to_rgb, normalize, paste_rgb, pil_to_filter,
-        resize, stack_batch, to_tensor, TransformError,
+        center_crop, crop_rgb, expand_to_square, mean_to_rgb, paste_rgb, pil_to_filter, resize,
+        resize_bicubic_torch_aa, stack_batch, to_tensor_by_table, TransformError,
     },
 };
 
@@ -54,6 +55,13 @@ pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 
 /// CLIP normalization std values used by LLaVA models.
 pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
+
+/// The reference processor's default grid pinpoints, `[[336, 672], [672, 336],
+/// [672, 672], [1008, 336], [336, 1008]]` as `[height, width]`, here as
+/// `(width, height)` in the same order: an image that fits several pinpoints
+/// with the same effective and wasted resolution takes the first of them.
+const DEFAULT_GRID_PINPOINTS: [(u32, u32); 5] =
+    [(672, 336), (336, 672), (672, 672), (336, 1008), (1008, 336)];
 
 /// Image aspect ratio handling mode.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -87,26 +95,30 @@ impl std::str::FromStr for ImageAspectRatio {
 #[derive(Debug, Clone)]
 struct LlavaTransforms {
     mean: [f64; 3],
-    std: [f64; 3],
     filter: FilterType,
     target_size: Option<(u32, u32)>,
     crop_size: Option<(u32, u32)>,
     do_resize: bool,
     do_center_crop: bool,
-    do_normalize: bool,
+    /// The `f32` each byte maps to, per channel: the reference's rescale and
+    /// normalize in its own order and rounding (`pixel_norm`), built once.
+    table: [[f32; 256]; 3],
 }
 
 impl LlavaTransforms {
     fn new(config: &PreProcessorConfig) -> Self {
         Self {
             mean: config.get_image_mean(),
-            std: config.get_image_std(),
-            filter: pil_to_filter(config.resampling),
+            // The reference's processors default to bicubic when the config
+            // omits `resample`; the crate-wide fallback is bilinear.
+            filter: pil_to_filter(config.resampling.or(Some(3))),
             target_size: config.get_target_size(),
             crop_size: config.get_crop_size(),
             do_resize: config.do_resize.unwrap_or(true),
             do_center_crop: config.do_center_crop.unwrap_or(true),
-            do_normalize: config.do_normalize.unwrap_or(true),
+            // Only the table is read here; the channel block describes a
+            // patch layout and does not enter it.
+            table: pixel_norm(config, CLIP_MEAN, CLIP_STD, 1).table_f32(),
         }
     }
 }
@@ -234,23 +246,17 @@ impl LlavaProcessor {
     /// - `Square`: Standard CLIP (resize shortest edge, center crop)
     /// - `Pad`: Expand to square with mean padding, then resize
     fn process_one_image(&self, image: &DynamicImage) -> Array3<f32> {
-        let mean = self.transforms.mean;
-        let std = self.transforms.std;
-        let filter = self.transforms.filter;
+        let transforms = &self.transforms;
+        let filter = transforms.filter;
 
         // Get target size from config or use default
-        let target_size = self
-            .transforms
+        let target_size = transforms
             .target_size
             .map(|(h, _w)| h)
             .unwrap_or(self.image_size);
 
         // Get crop size (may be different from target_size)
-        let crop_size = self
-            .transforms
-            .crop_size
-            .map(|(h, _w)| h)
-            .unwrap_or(target_size);
+        let crop_size = transforms.crop_size.map(|(h, _w)| h).unwrap_or(target_size);
 
         let processed = match self.aspect_ratio {
             ImageAspectRatio::Pad => {
@@ -259,43 +265,38 @@ impl LlavaProcessor {
                 let squared = if w == h {
                     Cow::Borrowed(image)
                 } else {
-                    let mean_color = mean_to_rgb(&mean);
+                    let mean_color = mean_to_rgb(&transforms.mean);
                     Cow::Owned(expand_to_square(image, mean_color))
                 };
 
                 // Resize to target size (maintaining square)
-                if self.transforms.do_resize {
-                    resize(&squared, target_size, target_size, filter)
+                if transforms.do_resize {
+                    Cow::Owned(
+                        resize_as_reference(&squared, target_size, target_size, filter)
+                            .into_owned(),
+                    )
                 } else {
-                    squared.into_owned()
+                    squared
                 }
             }
             ImageAspectRatio::Square | ImageAspectRatio::Anyres => {
                 // Square mode: Standard CLIP processing
                 // 1. Resize so shortest edge = target_size (preserving aspect ratio)
                 // 2. Center crop to crop_size x crop_size
-                let resized = if self.transforms.do_resize {
-                    // Resize so shortest edge = target_size
-                    let (w, h) = image.dimensions();
-                    let scale = if w < h {
-                        target_size as f32 / w as f32
-                    } else {
-                        target_size as f32 / h as f32
-                    };
-                    let new_w = (w as f32 * scale).round() as u32;
-                    let new_h = (h as f32 * scale).round() as u32;
-                    resize(image, new_w, new_h, filter)
+                let resized = if transforms.do_resize {
+                    let (new_w, new_h) = shortest_edge_size(image.dimensions(), target_size);
+                    resize_as_reference(image, new_w, new_h, filter)
                 } else {
-                    image.clone()
+                    Cow::Borrowed(image)
                 };
 
                 // Center crop to crop_size (skip if image already fits)
-                if self.transforms.do_center_crop {
+                if transforms.do_center_crop {
                     let (rw, rh) = resized.dimensions();
                     if crop_size >= rw && crop_size >= rh {
                         resized
                     } else {
-                        center_crop(&resized, crop_size, crop_size)
+                        Cow::Owned(center_crop(&resized, crop_size, crop_size))
                     }
                 } else {
                     resized
@@ -303,15 +304,8 @@ impl LlavaProcessor {
             }
         };
 
-        // Convert to tensor [C, H, W] normalized to [0, 1]
-        let mut tensor = to_tensor(&processed);
-
-        // Normalize with mean/std
-        if self.transforms.do_normalize {
-            normalize(&mut tensor, &mean, &std);
-        }
-
-        tensor
+        // [C, H, W] floats: the reference's rescale and normalize of every byte.
+        to_tensor_by_table(&processed, &transforms.table)
     }
 }
 
@@ -438,14 +432,7 @@ impl LlavaNextProcessor {
     pub fn new() -> Self {
         Self {
             base: LlavaProcessor::new(),
-            // Common LLaVA-NeXT grid pinpoints
-            image_grid_pinpoints: vec![
-                (336, 672),
-                (672, 336),
-                (672, 672),
-                (1008, 336),
-                (336, 1008),
-            ],
+            image_grid_pinpoints: DEFAULT_GRID_PINPOINTS.to_vec(),
         }
     }
 
@@ -475,7 +462,7 @@ impl LlavaNextProcessor {
                     })
                     .collect()
             })
-            .unwrap_or_else(|| vec![(336, 672), (672, 336), (672, 672), (1008, 336), (336, 1008)]);
+            .unwrap_or_else(|| DEFAULT_GRID_PINPOINTS.to_vec());
 
         Self {
             base,
@@ -509,12 +496,8 @@ impl LlavaNextProcessor {
     }
 
     /// Resize and pad image to target resolution, maintaining aspect ratio.
-    #[expect(
-        clippy::unused_self,
-        reason = "method logically belongs to the processor; keeps API consistent"
-    )]
     fn resize_and_pad_image(&self, image: &DynamicImage, target: (u32, u32)) -> DynamicImage {
-        resize_and_pad_image(image, target)
+        resize_and_pad_image(image, target, self.base.transforms.filter)
     }
 
     /// Divide image into crops of specified size.
@@ -529,8 +512,6 @@ impl LlavaNextProcessor {
     /// Process a single patch/crop.
     fn process_patch(&self, image: &DynamicImage) -> Array3<f32> {
         let transforms = &self.base.transforms;
-        let mean = transforms.mean;
-        let std = transforms.std;
         let filter = transforms.filter;
 
         // Get target size for patches
@@ -539,13 +520,9 @@ impl LlavaNextProcessor {
             .map(|(h, _w)| h)
             .unwrap_or(self.base.image_size);
 
-        // Resize patch to target size. An RGB sample that already has it (the
-        // crops of the padded image, and the base image resized to it) is
-        // taken as it is: the resizer's same-size pass is a copy of the bytes.
-        let same_size = image.dimensions() == (target_size, target_size)
-            && matches!(image, DynamicImage::ImageRgb8(_));
-        let resized = if transforms.do_resize && !same_size {
-            Cow::Owned(resize(image, target_size, target_size, filter))
+        // Resize patch to target size (a crop of that size stays as it is)
+        let resized = if transforms.do_resize {
+            resize_as_reference(image, target_size, target_size, filter)
         } else {
             Cow::Borrowed(image)
         };
@@ -566,15 +543,7 @@ impl LlavaNextProcessor {
             resized
         };
 
-        // Convert to tensor
-        let mut tensor = to_tensor(&cropped);
-
-        // Normalize
-        if transforms.do_normalize {
-            normalize(&mut tensor, &mean, &std);
-        }
-
-        tensor
+        to_tensor_by_table(&cropped, &transforms.table)
     }
 }
 
@@ -618,7 +587,8 @@ impl VisionPreProcessor for LlavaNextProcessor {
 
             let best_resolution = self.select_best_resolution(original_size);
             let image_padded = self.resize_and_pad_image(image, best_resolution);
-            let image_original_resize = resize(image, target_size, target_size, filter);
+            let image_original_resize =
+                resize_as_reference(image, target_size, target_size, filter).into_owned();
 
             let mut samples = vec![image_original_resize];
             samples.extend(self.divide_to_samples(&image_padded, crop_size));
@@ -679,28 +649,32 @@ impl VisionPreProcessor for LlavaNextProcessor {
         // Grid shape in crops (e.g. 1x2 for 336x672 best resolution)
         let (grid_w, grid_h) = self.get_anyres_grid_shape(original_size);
 
-        // Unpadded feature dimensions — matches the reference implementation's
-        // _get_num_unpadded_features which operates in feature space
-        // (npatches * grid_dim) per axis.
-        let current_w = (npatches * grid_w) as f32;
-        let current_h = (npatches * grid_h) as f32;
-        let aspect_ratio = width as f32 / height as f32;
+        // The unpadded feature dimensions as the reference's
+        // `_get_unpadded_features` computes them: feature space
+        // (npatches * grid_dim) per axis, the ratios in double precision, the
+        // unpadded side rounded to seven decimals and truncated. Rounding it
+        // moved the padding by one row on some sizes (1366x768: 1948 tokens
+        // against the reference's 1850), and the engine refuses a request
+        // whose placeholders do not match its own count.
+        let current_w = f64::from(npatches * grid_w);
+        let current_h = f64::from(npatches * grid_h);
+        let aspect_ratio = f64::from(width) / f64::from(height);
         let current_aspect = current_w / current_h;
 
         let (feat_h, feat_w) = if aspect_ratio > current_aspect {
-            // Landscape: height is unpadded
-            let new_h = (height as f32 * (current_w / width as f32)).round();
-            let padding = ((current_h - new_h) / 2.0).floor() as usize;
-            (current_h as usize - 2 * padding, current_w as usize)
+            // Landscape: the height is unpadded.
+            let new_h = unpadded_side(f64::from(height) * (current_w / f64::from(width)));
+            let padding = ((current_h - new_h) / 2.0).floor();
+            (current_h - 2.0 * padding, current_w)
         } else {
-            // Portrait or square: width is unpadded
-            let new_w = (width as f32 * (current_h / height as f32)).round();
-            let padding = ((current_w - new_w) / 2.0).floor() as usize;
-            (current_h as usize, current_w as usize - 2 * padding)
+            // Portrait or square: the width is unpadded.
+            let new_w = unpadded_side(f64::from(width) * (current_h / f64::from(height)));
+            let padding = ((current_w - new_w) / 2.0).floor();
+            (current_h, current_w - 2.0 * padding)
         };
 
-        let unpadded_features = feat_h * feat_w;
-        let newline_features = feat_h; // one newline token per row
+        let unpadded_features = (feat_h * feat_w) as usize;
+        let newline_features = feat_h as usize; // one newline token per row
 
         Ok(unpadded_features + newline_features + base_features)
     }
@@ -735,15 +709,15 @@ fn select_best_resolution(
 ) -> (u32, u32) {
     let (original_width, original_height) = original_size;
     let mut best_fit = (0, 0);
-    let original_width_f = original_width as f32;
-    let original_height_f = original_height as f32;
+    // The reference's arithmetic: double precision, truncation to integers.
+    let original_width_f = f64::from(original_width);
+    let original_height_f = f64::from(original_height);
     let mut max_effective_resolution = 0_u32;
     let mut min_wasted_resolution = u32::MAX;
 
     for &(width, height) in possible_resolutions {
-        let width_f = width as f32;
-        let height_f = height as f32;
-        let scale = (width_f / original_width_f).min(height_f / original_height_f);
+        let scale =
+            (f64::from(width) / original_width_f).min(f64::from(height) / original_height_f);
         let (downscaled_width, downscaled_height) = (
             (original_width_f * scale) as u32,
             (original_height_f * scale) as u32,
@@ -764,6 +738,13 @@ fn select_best_resolution(
         }
     }
     best_fit
+}
+
+/// The reference's `int(round(x, 7))` for an unpadded side: rounded to seven
+/// decimals, then truncated, so that a product one ulp under an integer counts
+/// as that integer and anything else rounds down.
+fn unpadded_side(value: f64) -> f64 {
+    ((value * 1e7).round() / 1e7).floor()
 }
 
 /// Calculate unpad dimensions based on aspect ratio.
@@ -787,59 +768,96 @@ fn calculate_unpad(size: (u32, u32), original_size: (u32, u32)) -> (u32, u32) {
 }
 
 /// Resize and pad image to target resolution, centering the image.
-fn resize_and_pad_image(image: &DynamicImage, target: (u32, u32)) -> DynamicImage {
+fn resize_and_pad_image(
+    image: &DynamicImage,
+    target: (u32, u32),
+    filter: FilterType,
+) -> DynamicImage {
     let (original_width, original_height) = image.dimensions();
     let (target_width, target_height) = target;
 
-    let scale_w = target_width as f32 / original_width as f32;
-    let scale_h = target_height as f32 / original_height as f32;
+    // The reference's arithmetic: double precision, the ceiling to an integer.
+    let scale_w = f64::from(target_width) / f64::from(original_width);
+    let scale_h = f64::from(target_height) / f64::from(original_height);
 
     let (new_width, new_height) = if scale_w < scale_h {
         (
             target_width,
             std::cmp::min(
-                (original_height as f32 * scale_w).ceil() as u32,
+                (f64::from(original_height) * scale_w).ceil() as u32,
                 target_height,
             ),
         )
     } else {
         (
             std::cmp::min(
-                (original_width as f32 * scale_h).ceil() as u32,
+                (f64::from(original_width) * scale_h).ceil() as u32,
                 target_width,
             ),
             target_height,
         )
     };
 
-    let resized = resize(image, new_width, new_height, FilterType::CatmullRom);
+    let resized = resize_as_reference(image, new_width, new_height, filter);
     let paste_x = (target_width - new_width) / 2;
     let paste_y = (target_height - new_height) / 2;
 
-    match resized {
-        // The paste of an opaque image onto a black canvas is a copy: the
-        // canvas is built from rows.
-        DynamicImage::ImageRgb8(rgb) => DynamicImage::ImageRgb8(paste_rgb(
-            &rgb,
-            target_width,
-            target_height,
-            paste_x,
-            paste_y,
-            [0, 0, 0],
-        )),
-        // Any other layout is pasted pixel by pixel, as the generic paste
-        // blends it (an alpha channel over the black canvas).
-        other => {
-            let mut new_image = DynamicImage::new_rgb8(target_width, target_height);
-            image::imageops::overlay(
-                &mut new_image,
-                &other,
-                i64::from(paste_x),
-                i64::from(paste_y),
-            );
-            new_image
-        }
+    // The paste onto the black canvas copies the stored colours: an alpha
+    // channel is dropped the way the reference's RGB conversion drops it,
+    // whatever the image's size (the reference resize hands a same-size
+    // image back as it is), so no layout blends over the canvas.
+    let rgb = match &*resized {
+        DynamicImage::ImageRgb8(rgb) => Cow::Borrowed(rgb),
+        other => Cow::Owned(other.to_rgb8()),
+    };
+    DynamicImage::ImageRgb8(paste_rgb(
+        &rgb,
+        target_width,
+        target_height,
+        paste_x,
+        paste_y,
+        [0, 0, 0],
+    ))
+}
+
+/// The size of the reference's shortest-edge resize: the shorter side becomes
+/// `size` and the longer side `size * long / short` truncated to an integer
+/// (the reference's `int()`), not rounded. One pixel on the long side moves
+/// every sample of the resize and the center crop with it.
+fn shortest_edge_size((width, height): (u32, u32), size: u32) -> (u32, u32) {
+    let (short, long) = if width <= height {
+        (width, height)
+    } else {
+        (height, width)
+    };
+    let long = ((u64::from(size) * u64::from(long)) as f64 / f64::from(short)) as u32;
+    if width <= height {
+        (size, long)
+    } else {
+        (long, size)
     }
+}
+
+/// The reference's resize of a decoded image to `width` x `height`: the image
+/// itself when it already has that size (the reference returns it untouched),
+/// the torchvision `uint8` antialiased bicubic for a bicubic `filter` (the
+/// kernel the family's reference processors run on the bytes, which the SIMD
+/// Catmull-Rom parts from by one to ten levels on a tenth of the pixels) and
+/// the SIMD resizer for the other filters.
+fn resize_as_reference(
+    image: &DynamicImage,
+    width: u32,
+    height: u32,
+    filter: FilterType,
+) -> Cow<'_, DynamicImage> {
+    if image.dimensions() == (width, height) {
+        return Cow::Borrowed(image);
+    }
+    Cow::Owned(if filter == FilterType::CatmullRom {
+        resize_bicubic_torch_aa(image, width, height)
+    } else {
+        resize(image, width, height, filter)
+    })
 }
 
 /// Divide image into crops of specified size.
@@ -906,7 +924,7 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     use super::*;
-    use crate::test_support::create_test_image;
+    use crate::{encoder_inputs::EncoderDtype, test_support::create_test_image};
 
     #[test]
     fn test_llava_processor_default() {
@@ -1086,31 +1104,52 @@ mod tests {
         // pasted with the generic paste onto a zeroed canvas.
         for (width, height, target) in [(100u32, 40u32, (672u32, 336u32)), (40, 100, (336, 672))] {
             let image = DynamicImage::ImageRgb8(gradient(width, height, 3));
-            let padded = resize_and_pad_image(&image, target);
+            let padded = resize_and_pad_image(&image, target, FilterType::CatmullRom);
             let (scale_w, scale_h) = (
-                target.0 as f32 / width as f32,
-                target.1 as f32 / height as f32,
+                target.0 as f64 / width as f64,
+                target.1 as f64 / height as f64,
             );
             let (new_w, new_h) = if scale_w < scale_h {
                 (
                     target.0,
-                    ((height as f32 * scale_w).ceil() as u32).min(target.1),
+                    ((height as f64 * scale_w).ceil() as u32).min(target.1),
                 )
             } else {
                 (
-                    ((width as f32 * scale_h).ceil() as u32).min(target.0),
+                    ((width as f64 * scale_h).ceil() as u32).min(target.0),
                     target.1,
                 )
             };
-            let resized = resize(&image, new_w, new_h, FilterType::CatmullRom);
+            let resized = resize_as_reference(&image, new_w, new_h, FilterType::CatmullRom);
             let mut expected = DynamicImage::new_rgb8(target.0, target.1);
             image::imageops::overlay(
                 &mut expected,
-                &resized,
+                &*resized,
                 i64::from((target.0 - new_w) / 2),
                 i64::from((target.1 - new_h) / 2),
             );
             assert_eq!(padded.dimensions(), (target.0, target.1));
+            assert_eq!(padded.as_bytes(), expected.as_bytes(), "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn an_image_with_alpha_is_pasted_by_its_stored_colours_at_every_size() {
+        // A same-size image comes back from the reference resize as it is, a
+        // resized one as RGB: both canvases hold the stored colours, the alpha
+        // dropped as the reference's RGB conversion drops it, not blended over
+        // the black canvas.
+        for (width, height) in [(672u32, 672u32), (673, 672)] {
+            let rgba = image::RgbaImage::from_fn(width, height, |x, y| {
+                image::Rgba([(x % 256) as u8, (y % 256) as u8, 200, 0])
+            });
+            let opaque = DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(rgba.clone()).to_rgb8());
+            let padded = resize_and_pad_image(
+                &DynamicImage::ImageRgba8(rgba),
+                (672, 672),
+                FilterType::CatmullRom,
+            );
+            let expected = resize_and_pad_image(&opaque, (672, 672), FilterType::CatmullRom);
             assert_eq!(padded.as_bytes(), expected.as_bytes(), "{width}x{height}");
         }
     }
@@ -1174,7 +1213,7 @@ mod tests {
         for (i, image) in [&square, &wide].into_iter().enumerate() {
             let best_resolution = processor.select_best_resolution(image.dimensions());
             let padded = processor.resize_and_pad_image(image, best_resolution);
-            let mut samples = vec![resize(image, 336, 336, filter)];
+            let mut samples = vec![resize_as_reference(image, 336, 336, filter).into_owned()];
             samples.extend(processor.divide_to_samples(&padded, (336, 336)));
             for (j, sample) in samples.iter().enumerate() {
                 expected
@@ -1183,5 +1222,241 @@ mod tests {
             }
         }
         assert_eq!(tensor.as_slice().unwrap(), expected.as_slice().unwrap());
+    }
+
+    /// The seeded bytes the reference constants below were produced from: a
+    /// 31-bit linear congruential generator, one byte per step.
+    fn lcg_bytes(count: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed;
+        (0..count)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
+                ((state >> 16) & 0xff) as u8
+            })
+            .collect()
+    }
+
+    fn lcg_image(width: u32, height: u32, seed: u32) -> DynamicImage {
+        let data = lcg_bytes((width * height * 3) as usize, seed);
+        DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, data).unwrap())
+    }
+
+    /// The checkpoint's `preprocessor_config.json` the reference ran with.
+    fn reference_config() -> PreProcessorConfig {
+        PreProcessorConfig::from_json(
+            r#"{"crop_size": {"height": 336, "width": 336}, "do_center_crop": true,
+                "do_convert_rgb": true, "do_normalize": true, "do_rescale": true,
+                "do_resize": true,
+                "image_mean": [0.48145466, 0.4578275, 0.40821073],
+                "image_std": [0.26862954, 0.26130258, 0.27577711],
+                "resample": 3, "rescale_factor": 0.00392156862745098,
+                "size": {"shortest_edge": 336}}"#,
+        )
+        .unwrap()
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn f32_at(bytes: &[u8], index: usize) -> f32 {
+        f32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
+    }
+
+    /// A pinned case: a seeded image, the SHA-256 of the reference's f32
+    /// tensor on the same bytes, and four of its elements as
+    /// `(index, the value the previous code gave, the reference's value)`.
+    struct Pinned {
+        width: u32,
+        height: u32,
+        seed: u32,
+        digest: &'static str,
+        witnesses: &'static [(usize, f32, f32)],
+    }
+
+    fn assert_pinned(bytes: &[u8], case: &Pinned) {
+        use sha2::{Digest, Sha256};
+
+        let Pinned {
+            width,
+            height,
+            digest,
+            witnesses,
+            ..
+        } = case;
+        for &(index, previous, reference) in *witnesses {
+            let value = f32_at(bytes, index);
+            assert!(
+                value.to_bits() == reference.to_bits(),
+                "{width}x{height} element {index}: {value} (the previous code gave {previous}, \
+                 the reference {reference})"
+            );
+        }
+        assert_eq!(hex(&Sha256::digest(bytes)), *digest, "{width}x{height}");
+    }
+
+    /// The reference's shortest-edge resize truncates the long side (`int()`);
+    /// rounding it, as the processor did, moved every sample of a 47x22 image.
+    #[test]
+    fn shortest_edge_resize_truncates_the_long_side_as_the_reference() {
+        assert_eq!(shortest_edge_size((47, 22), 336), (717, 336)); // 717.8: not 718
+        assert_eq!(shortest_edge_size((22, 47), 336), (336, 717));
+        assert_eq!(shortest_edge_size((1024, 768), 336), (448, 336));
+        assert_eq!(shortest_edge_size((336, 336), 336), (336, 336));
+    }
+
+    /// The reference's processors default to bicubic when a config omits
+    /// `resample`, and the crate-wide fallback is bilinear: a processor built
+    /// without a config (`new()`, `with_grid_pinpoints`) resized, padded and
+    /// patched through the other kernel.
+    #[test]
+    fn a_config_without_resample_resizes_bicubic_like_the_reference() {
+        let bicubic = LlavaTransforms::new(&PreProcessorConfig::default());
+        assert_eq!(bicubic.filter, FilterType::CatmullRom);
+        let bilinear = PreProcessorConfig {
+            resampling: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(LlavaTransforms::new(&bilinear).filter, FilterType::Triangle);
+    }
+
+    /// The anyres token count truncates the unpadded side as the reference's
+    /// `_get_unpadded_features` does (`int(round(x, 7))`); rounding it moved
+    /// the padding by one row on the first three sizes (default pinpoints,
+    /// a 336 image of 14-pixel patches).
+    #[test]
+    fn anyres_token_counts_truncate_the_unpadded_side_as_the_reference() {
+        let processor = LlavaNextProcessor::new();
+        for (width, height, tokens) in [
+            (1366, 768, 1850),  // rounded: 1948
+            (2560, 1080, 1944), // rounded: 1992
+            (100, 31, 1262),    // rounded: 1360
+            (1920, 1080, 1948),
+            (1024, 768, 2340),
+        ] {
+            assert_eq!(
+                processor.calculate_num_tokens(width, height).unwrap_or(0),
+                tokens,
+                "{width}x{height}"
+            );
+        }
+    }
+
+    /// A solid image goes through no resize and no crop, so every element is
+    /// the table's entry for its byte: the reference's
+    /// `(byte - mean * 255) / (std * 255)` in `f32`. The previous
+    /// `(byte / 255 - mean) * (1 / std)` landed one ULP away on most levels
+    /// (its bits in the comment column).
+    #[test]
+    fn the_byte_table_carries_the_reference_arithmetic() {
+        // (byte level, the reference's f32 bits per channel)
+        let levels: [(u8, [u32; 3]); 4] = [
+            (0, [0xbfe5_68dc, 0xbfe0_44b7, 0xbfbd_77d8]), // was bfe568db bfe044b8 bfbd77d7
+            (1, [0xbfe3_8a80, 0xbfde_58f1, 0xbfbb_a5e2]), // was bfe38a7f bfde58f1 bfbba5e1
+            (128, [0x3d9c_560e, 0x3e2c_f360, 0x3eae_0dc1]), // was 3d9c561f 3e2cf36b 3eae0dc4
+            (255, [0x3ff7_1542, 0x4004_cae4, 0x4009_5661]), // was 3ff71541 4004cae5 40095660
+        ];
+        let processor = LlavaProcessor::new().with_preprocessor_config(&reference_config());
+        let plane = 336 * 336;
+        for (level, bits) in levels {
+            let image = create_test_image(336, 336, Rgb([level, level, level]));
+            let result = processor.preprocess(&[&image]).unwrap();
+            let bytes = result.encoder_input.write_as(EncoderDtype::Float32);
+            assert_eq!(bytes.len(), 3 * plane * 4);
+            for (channel, expected) in bits.into_iter().enumerate() {
+                let differing = (channel * plane..(channel + 1) * plane)
+                    .filter(|&index| f32_at(&bytes, index).to_bits() != expected)
+                    .count();
+                assert_eq!(
+                    differing,
+                    0,
+                    "level {level} channel {channel}: {} elements are not {:e}",
+                    differing,
+                    f32::from_bits(expected)
+                );
+            }
+        }
+    }
+
+    /// Two seeded images through the LLaVA 1.5 pipeline (shortest edge to
+    /// 336, the long side truncated, center crop, the byte table) against
+    /// the reference processor's output on the same bytes. The previous
+    /// kernel and arithmetic differed on 98 % of the elements, by up to half
+    /// a normalized unit (34 levels).
+    #[test]
+    fn square_pixels_match_the_reference_bit_for_bit() {
+        let cases = [
+            Pinned {
+                width: 47,
+                height: 22,
+                seed: 17,
+                digest: "689379d9448235ebb241c2469828e6ca07bb76fd2085e463a0cb03680b5e7734",
+                witnesses: &[
+                    (0, 1.3755962, 1.3609976),
+                    (1, 1.3901947, 1.3755959),
+                    (168_469, 0.108866245, 0.13888161),
+                    (338_687, 1.5202143, 1.5059942),
+                ],
+            },
+            Pinned {
+                width: 22,
+                height: 47,
+                seed: 19,
+                digest: "93820fb925930e91c5352aaae675674154c2cce424534a0ad3a53d82d42745b7",
+                witnesses: &[
+                    (0, 0.36830464, 0.38290295),
+                    (1, 0.3537062, 0.36830452),
+                    (168_207, 1.9998451, 1.9848369),
+                    (338_687, -0.04399298, -0.029773047),
+                ],
+            },
+        ];
+        let processor = LlavaProcessor::new().with_preprocessor_config(&reference_config());
+        for case in &cases {
+            let image = lcg_image(case.width, case.height, case.seed);
+            let result = processor.preprocess(&[&image]).unwrap();
+            assert_eq!(result.encoder_input.shape(), &[1, 3, 336, 336]);
+            assert_pinned(&result.encoder_input.write_as(EncoderDtype::Float32), case);
+        }
+    }
+
+    /// Two seeded images through the anyres pipeline (the base image plus the
+    /// two crops of a 336x672 or 672x336 best fit, zero padding between)
+    /// against the reference processor's output on the same bytes.
+    #[test]
+    fn anyres_patches_match_the_reference_bit_for_bit() {
+        let cases = [
+            Pinned {
+                width: 50,
+                height: 80,
+                seed: 23,
+                digest: "0a3e2fce52f497bbb9924bf4c53c3f86de8a802dde9b92fb571e9247e36eec18",
+                witnesses: &[
+                    (0, 1.3901947, 1.3609976),
+                    (1, 1.404793, 1.3755959),
+                    (515_366, -0.041211426, 0.003811711),
+                    (1_016_063, -1.4802197, -1.4802198),
+                ],
+            },
+            Pinned {
+                width: 90,
+                height: 40,
+                seed: 29,
+                digest: "5d3e3201a87eff97701f05e6776916b659837e5b4bdbc10f51401bb25d3007ba",
+                witnesses: &[
+                    (0, 0.10553299, 0.120131284),
+                    (1, 0.0033440161, 0.0033438762),
+                    (504_902, 0.67916137, 0.67916125),
+                    (1_016_063, -1.4802197, -1.4802198),
+                ],
+            },
+        ];
+        let processor = LlavaNextProcessor::new().with_preprocessor_config(&reference_config());
+        for case in &cases {
+            let image = lcg_image(case.width, case.height, case.seed);
+            let result = processor.preprocess(&[&image]).unwrap();
+            assert_eq!(result.encoder_input.shape(), &[1, 3, 3, 336, 336]);
+            assert_pinned(&result.encoder_input.write_as(EncoderDtype::Float32), case);
+        }
     }
 }
