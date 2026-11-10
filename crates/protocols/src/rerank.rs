@@ -17,12 +17,6 @@ fn current_timestamp() -> i64 {
         .as_secs() as i64
 }
 
-/// Whether `model` is the gateway's wildcard (a `/v1/rerank` body that named
-/// none): it selects any worker and is left out of the body forwarded to it.
-fn is_unknown_model(model: &str) -> bool {
-    model == super::UNKNOWN_MODEL_ID
-}
-
 // ============================================================================
 // Rerank API
 // ============================================================================
@@ -42,7 +36,7 @@ pub struct RerankRequest {
     /// `/v1/rerank` body that named none) selects any worker and is not
     /// written to the body forwarded to it, so a single-model server applies
     /// its own model instead of refusing a name it does not serve.
-    #[serde(skip_serializing_if = "is_unknown_model")]
+    #[serde(skip_serializing_if = "super::common::is_unknown_model")]
     pub model: String,
 
     /// Maximum number of documents to return (optional)
@@ -371,7 +365,7 @@ impl From<V1RerankReqInput> for RerankRequest {
             documents: v1.documents,
             model: v1
                 .model
-                .unwrap_or_else(|| super::UNKNOWN_MODEL_ID.to_string()),
+                .unwrap_or_else(super::common::default_unknown_model),
             top_k: v1.top_n.filter(|n| *n > 0),
             return_documents: v1.return_documents,
             rid: v1.rid,
