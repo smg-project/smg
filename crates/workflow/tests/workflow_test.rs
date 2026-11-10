@@ -674,6 +674,23 @@ fn test_dag_validation_valid_workflow() {
 // Scheduled/Delayed Steps Tests (#24)
 // ============================================================================
 
+/// Register `workflow`, start it and wait for its completion: the time the
+/// run took, which a test judges against the delay or the schedule it gave
+/// a step (the clock starts with the registration, a synchronous validation
+/// of microseconds before the start; the tests hold a lower bound), or the
+/// registration's, the start's or the wait's error as text.
+async fn time_to_completion(
+    engine: &WorkflowEngine<TestWorkflowData>,
+    workflow: WorkflowDefinition<TestWorkflowData>,
+) -> Result<Duration, String> {
+    let clock = std::time::Instant::now();
+    let instance_id = started(engine, workflow).await?;
+    engine
+        .wait_for_completion(instance_id, "test", Duration::from_secs(5))
+        .await?;
+    Ok(clock.elapsed())
+}
+
 #[tokio::test]
 async fn test_step_delay() {
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
@@ -684,22 +701,7 @@ async fn test_step_delay() {
             .with_delay(Duration::from_millis(100)),
     );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    let start = std::time::Instant::now();
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
-
-    // Wait for completion
-    engine
-        .wait_for_completion(instance_id, "test", Duration::from_secs(5))
-        .await
-        .unwrap();
-
-    let duration = start.elapsed();
+    let duration = time_to_completion(&engine, workflow).await.unwrap();
 
     // Verify delay was applied (should take at least 100ms)
     // Note: wait_for_completion cleans up state, so we verify via timing
@@ -727,22 +729,7 @@ async fn test_step_scheduled_at() {
         .scheduled_at(scheduled_time),
     );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    let start = std::time::Instant::now();
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
-
-    // Wait for completion
-    engine
-        .wait_for_completion(instance_id, "test", Duration::from_secs(5))
-        .await
-        .unwrap();
-
-    let duration = start.elapsed();
+    let duration = time_to_completion(&engine, workflow).await.unwrap();
 
     // Verify scheduled time was respected (should take at least 100ms)
     // Note: wait_for_completion cleans up state, so we verify via timing
