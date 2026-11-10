@@ -698,8 +698,10 @@ impl LeastLoadPolicy {
     ///
     /// A worker without resident tokens (no fresh report, or an engine that
     /// does not count them) scores as the best-known reporting peer plus its
-    /// live in-flight, each request at the mean prefill and `request_tokens`;
-    /// with no candidate reporting them, the live in-flight count decides.
+    /// in-flight, each request at the mean prefill and `request_tokens`; with
+    /// no candidate reporting them, the in-flight count decides. Without a
+    /// report that count includes this policy's picks ([`Self::in_flight`]);
+    /// a report without resident tokens keeps the router's live count.
     fn resident_score(
         &self,
         worker: &Arc<dyn Worker>,
@@ -730,10 +732,18 @@ impl LeastLoadPolicy {
                     + unaccounted as f64 * mean_context
                     + inputs.request_tokens * requests as f64
             }
-            None if inputs.fleet_has_resident => {
-                inputs.peer_baseline + worker.load() as f64 * (mean_prefill + inputs.request_tokens)
+            None => {
+                let in_flight = if candidate.report.is_none() {
+                    Self::in_flight(worker, candidate)
+                } else {
+                    worker.load() as u64
+                } as f64;
+                if inputs.fleet_has_resident {
+                    inputs.peer_baseline + in_flight * (mean_prefill + inputs.request_tokens)
+                } else {
+                    in_flight
+                }
             }
-            None => worker.load() as f64,
         }
     }
 
@@ -1180,7 +1190,7 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
     }
 
     /// The load poll brings the worker's picks to the router's live count
-    /// ([`SincePollDispatch::reconcile`]): a pick the router dropped before
+    /// (`SincePollDispatch::reconcile`): a pick the router dropped before
     /// taking its guard never ends and leaves here, at the second poll to find
     /// it, and a request this policy did not pick is counted from here on,
     /// also on a worker it has not picked yet. A worker with nothing in flight

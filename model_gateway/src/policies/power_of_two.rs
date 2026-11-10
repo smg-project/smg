@@ -496,6 +496,45 @@ mod tests {
         assert_eq!(with_requests.select_worker(&workers, &info), Some(3));
     }
 
+    /// A burst on workers with no report, before the router takes any of its
+    /// guards: each pick must count the picks before it.
+    #[test]
+    fn resident_tokens_counts_the_picks_of_a_dark_burst() {
+        for request_tokens in [0, 100_000] {
+            let policy = resident_tokens(request_tokens);
+            let workers = holding(&[0, 0, 0, 0]);
+            let mut hits = [0usize; 4];
+            for _ in 0..8 {
+                hits[policy
+                    .select_worker(&workers, &SelectWorkerInfo::default())
+                    .unwrap()] += 1;
+            }
+            assert_eq!(hits, [2, 2, 2, 2], "request_tokens {request_tokens}");
+        }
+    }
+
+    /// Beside a peer that reports resident tokens, a worker with no report
+    /// scores as that peer plus its in-flight. Its picks count there too, so
+    /// a burst does not herd onto it.
+    #[test]
+    fn resident_tokens_counts_the_picks_on_a_dark_worker_beside_a_reporting_peer() {
+        for _ in 0..20 {
+            let policy = resident_tokens(100_000);
+            let feed = TestFeed::attached_to(&policy);
+            let workers = holding(&[0, 0, 0]);
+            let mut loads = HashMap::new();
+            loads.insert("http://w2:8000".to_string(), resident(0, 0));
+            feed.publish(&loads);
+            let mut hits = [0usize; 3];
+            for _ in 0..8 {
+                hits[policy
+                    .select_worker(&workers, &SelectWorkerInfo::default())
+                    .unwrap()] += 1;
+            }
+            assert!(hits[0] <= 1 && hits[1] <= 1, "{hits:?}");
+        }
+    }
+
     #[test]
     fn resident_tokens_scores_a_worker_without_the_count_from_its_peers() {
         // w1's report predates resident tokens: it scores as the best peer
