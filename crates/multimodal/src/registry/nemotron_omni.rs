@@ -50,12 +50,6 @@ const VIDEO_MARKER: &str = "<video>";
 const VIDEO_ANCHOR: &str = "<SPECIAL_30>";
 /// The engine's default video loader keeps at most this many frames of a clip.
 const MAX_SAMPLED_FRAMES: usize = 32;
-/// The engine leaves these counts unlimited; they are per-request defaults a
-/// deployment changes with `SMG_IMAGE_MAX_COUNT` / `SMG_VIDEO_MAX_COUNT` /
-/// `SMG_AUDIO_MAX_COUNT`.
-const MAX_IMAGES_PER_REQUEST: usize = 16;
-const MAX_AUDIOS_PER_REQUEST: usize = 4;
-const MAX_VIDEOS_PER_REQUEST: usize = 2;
 
 pub(super) struct NemotronOmniSpec;
 
@@ -272,17 +266,38 @@ impl ModelProcessorSpec for NemotronOmniSpec {
         }
     }
 
+    /// The family sets no per-request media count of its own for any of its
+    /// three modalities: its serving engines read all three as unlimited (the
+    /// family's processing info declares `image: None`, and `video: None` and
+    /// `audio: None` for a checkpoint that carries them), the checkpoint's
+    /// config bounds an image's patches and a clip's frames and parameterizes
+    /// the sound encoder, never how many items of each, and the context
+    /// length is the practical bound. The modalities the checkpoint carries
+    /// stay declared (an undeclared modality is refused as unsupported)
+    /// without a bound of the spec's, so the effective limit per modality is
+    /// the engine's advertised one, else the deployment's
+    /// `--mm-per-request-image-limit` / `SMG_IMAGE_MAX_COUNT`,
+    /// `SMG_VIDEO_MAX_COUNT` or `SMG_AUDIO_MAX_COUNT`.
+    ///
+    /// What still bounds such a request, and where it lives. Before any
+    /// fetch: the per-request limit the model's workers advertise for their
+    /// engine, which caps the router's own limit in the gateway's limit
+    /// resolution, and the deployment's `SMG_IMAGE_MAX_COUNT` /
+    /// `SMG_VIDEO_MAX_COUNT` / `SMG_AUDIO_MAX_COUNT` (and
+    /// `--mm-per-request-image-limit` for images), read in the same
+    /// resolution. At or after the fetch: the gateway's cap on media bytes
+    /// in flight (`multimodal_max_inflight_bytes`), the engine's advertised
+    /// encoder budget and the context length. A number of the spec's own
+    /// would be a declared default again, not a bound of the family's.
     fn modality_limits(
         &self,
         metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
         Self::check_config(metadata.config)?;
-        let mut limits = HashMap::from([
-            (Modality::Image, MAX_IMAGES_PER_REQUEST),
-            (Modality::Video, MAX_VIDEOS_PER_REQUEST),
-        ]);
+        let mut limits =
+            HashMap::from([(Modality::Image, usize::MAX), (Modality::Video, usize::MAX)]);
         if Self::has_audio(metadata.config) {
-            limits.insert(Modality::Audio, MAX_AUDIOS_PER_REQUEST);
+            limits.insert(Modality::Audio, usize::MAX);
         }
         Ok(limits)
     }
@@ -518,6 +533,54 @@ mod tests {
                 field: "sound_config.num_mel_bins".to_string()
             }
         );
+    }
+
+    /// The family bounds its media by context, not by count: the spec
+    /// declares its three modalities without a limit of its own (the 16
+    /// images, 2 clips and 4 recordings it carried were declared defaults,
+    /// never counts of the family's), so a deployment knob or the engine's
+    /// advertised limit is the only router-side bound for each.
+    #[test]
+    fn nemotron_omni_declares_its_media_without_a_count_of_its_own() {
+        let tokenizer = tokenizer();
+        let config = checkpoint_config();
+        let metadata = ModelMetadata {
+            model_id: "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let spec = NemotronOmniSpec;
+
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap(),
+            HashMap::from([
+                (Modality::Image, usize::MAX),
+                (Modality::Video, usize::MAX),
+                (Modality::Audio, usize::MAX),
+            ])
+        );
+        for (modality, cap) in [
+            (Modality::Image, 16),
+            (Modality::Video, 2),
+            (Modality::Audio, 4),
+        ] {
+            for count in [cap + 1, 1_000] {
+                spec.validate_media_request(&metadata, &[(modality, count)])
+                    .unwrap_or_else(|error| panic!("{count} {modality} items: {error}"));
+            }
+            // A deployment's own cap (the flag or the environment override, or
+            // the engine's advertised limit the gateway passes in) still binds.
+            let capped = HashMap::from([(modality, cap)]);
+            assert_eq!(
+                spec.validate_media_request_with_limits(&metadata, &[(modality, cap + 1)], &capped),
+                Err(ModelRegistryError::ModalityLimitExceeded {
+                    spec: "nemotron_omni",
+                    modality,
+                    limit: cap,
+                    requested: cap + 1,
+                })
+            );
+        }
     }
 
     #[test]

@@ -125,31 +125,29 @@ pub struct TrtllmServicerConfig {
     pub model: TrtllmModelInfo,
 }
 
-/// The per-rank load the relay attaches to every batch it streams: the
-/// engine's proto has no `GetLoads`, so the record is built from the load
-/// tail of the shim's batches directly.
+/// The servicer's `GetLoads` figures, read for the load record the relay
+/// attaches to every batch it streams: the same entry the poll answers with
+/// for the rank, so both wires carry one field set (the token counts and
+/// the KV capacity included). A connected rank reads its own entry,
+/// zero-filled before its first load tail; a rank past the connected ones
+/// gets no record (`info::rank_load`).
 impl crate::kv_events::RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad> {
-        let client = self.shared.engine.client.get()?;
-        let load = client
-            .get_loads()
-            .loads
-            .into_iter()
-            .find(|load| dp_rank.is_none_or(|rank| rank == load.dp_rank))?;
-        Some(common::EngineLoad {
-            running_requests: u32::try_from(load.num_running_reqs).unwrap_or(0),
-            waiting_requests: u32::try_from(load.num_waiting_reqs).unwrap_or(0),
-            token_usage: load.token_usage,
-            max_running_requests: u32::try_from(
-                self.shared.running_window(self.model.max_running_requests),
-            )
-            .unwrap_or(0),
-            ..Default::default()
-        })
+        let load = info::rank_load(self, dp_rank)?;
+        // The queued token-work is this servicer's own estimate for the
+        // rank (see `info::rank_load`), so every rank's record reports it.
+        let mut record = common::EngineLoad::from(&load);
+        record.waiting_uncached_tokens =
+            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+        Some(record)
     }
 
     fn engine_link(&self) -> &EngineLink {
         &self.shared.engine
+    }
+
+    fn rank_count(&self) -> usize {
+        self.shared.rank_count(self.model.data_parallel_size)
     }
 }
 
@@ -210,7 +208,12 @@ impl TrtllmServicerServer {
         )?;
         let state = Arc::new(State {
             model: config.model,
-            shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
+            shared: Shared::new(
+                kv_relay,
+                metrics,
+                config.servicer.tokenizer_dir.clone(),
+                config.servicer.warmup_nonce.clone(),
+            ),
         });
         let routes = Routes::new(
             TrtllmServiceServer::new(service::TrtllmServicer {
@@ -273,7 +276,8 @@ impl TrtllmServicerServer {
 
     /// Hold (`false`) or release (`true`) readiness alone: health flips as
     /// with `set_serving`, admission stays open to the lifecycle owner's own
-    /// requests (its planned warm-up before SERVING, `smg-warmup-<n>`) and to
+    /// requests (its planned warm-up before SERVING, `smg-warmup-<nonce>-<n>`
+    /// with the configured `warmup_nonce`, else `smg-warmup-<n>`) and to
     /// nothing else. `set_serving(false)` is the drain switch and closes
     /// admission as well.
     pub fn set_ready(&self, ready: bool) {

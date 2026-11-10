@@ -25,7 +25,7 @@ use crate::{
     observability::metrics::Metrics,
     routers::{
         common::{
-            mcp_utils::ensure_request_mcp_client,
+            mcp_utils::{ensure_request_mcp_client, DEFAULT_MAX_ITERATIONS},
             openai_bridge,
             persistence_utils::{
                 persist_conversation_items, persist_conversation_items_if_open, PersistError,
@@ -49,20 +49,40 @@ pub(crate) fn generation_failure_error(finish_reason: Option<&str>) -> Option<Va
 }
 
 /// Map a Chat finish reason to a generated function-call item's status: a call whose arguments
-/// are not complete JSON was cut, by the token limit or an abort, unless the turn ended on the
-/// call (`tool_calls`), whose arguments stand as the parser wrote them.
+/// are no JSON value is `incomplete` whatever the finish, since a client must not run it as a
+/// whole one: cut by the token limit or an abort, or ended by the model and not read whole (a
+/// tagged syntax that refused bytes inside the call writes no close for it; a JSON syntax carries
+/// the bytes as written from where they stopped being JSON), the turn ending on the call
+/// (`tool_calls`) all the same; a failed generation stays `in_progress`.
 pub(crate) fn function_call_status(finish_reason: Option<&str>, arguments: &str) -> &'static str {
     match finish_reason {
         Some("failed" | "error") => "in_progress",
-        Some("tool_calls") => "completed",
         _ if serde_json::from_str::<Value>(arguments).is_err() => "incomplete",
         _ => "completed",
     }
 }
 
+/// Whether a turn's calls hold one that is no whole call, cut or not read whole: a call whose
+/// status under the finish reason reads `incomplete` (`function_call_status`), read on the
+/// function-shaped arguments of every call before a custom tool's call becomes its
+/// `custom_tool_call` item, which carries no status on the wire.
+pub(crate) fn cut_call<'a>(
+    finish_reason: Option<&str>,
+    arguments: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    arguments
+        .into_iter()
+        .any(|arguments| function_call_status(finish_reason, arguments) == "incomplete")
+}
+
 /// The response's status for the Chat finish reason, with why it is incomplete: a `length`
-/// finish is the token limit; a call cut by anything else (`cut_call`) leaves the response
-/// incomplete with no stated reason, as the item says.
+/// finish is the token limit; a call that is no whole call under any other finish (`cut_call`,
+/// read on the calls' function-shaped arguments) leaves the response incomplete with no stated
+/// reason. Every
+/// builder of a Responses object reads its status here: the non-streaming conversions,
+/// regular and Harmony, the stored object of a regular streamed turn, and the emitter for its
+/// terminal event and stored object under the finish it holds, whether chat chunks or a
+/// Harmony stream gave it.
 pub(crate) fn response_status(
     finish_reason: Option<&str>,
     cut_call: bool,
@@ -78,6 +98,14 @@ pub(crate) fn response_status(
         _ if cut_call => (ResponseStatus::Incomplete, None),
         _ => (ResponseStatus::Completed, None),
     }
+}
+
+/// The MCP tool calls a request may make in all: its `max_tool_calls`
+/// capped by the loop's safety limit, the safety limit when it names none.
+pub(crate) fn tool_call_limit(max_tool_calls: Option<usize>) -> usize {
+    max_tool_calls.map_or(DEFAULT_MAX_ITERATIONS, |user_max| {
+        user_max.min(DEFAULT_MAX_ITERATIONS)
+    })
 }
 
 /// Ensure MCP connection succeeds if MCP tools or builtin tools are declared.
@@ -227,7 +255,7 @@ pub(crate) fn custom_tool_as_function(ct: &CustomTool) -> openai_protocol::commo
     openai_protocol::common::Function {
         name: ct.name.clone(),
         description: ct.description.clone(),
-        parameters: serde_json::json!({
+        parameters: Some(serde_json::json!({
             "type": "object",
             "properties": {
                 "input": {
@@ -237,7 +265,7 @@ pub(crate) fn custom_tool_as_function(ct: &CustomTool) -> openai_protocol::commo
             },
             "required": ["input"],
             "additionalProperties": false
-        }),
+        })),
         strict: Some(false),
         extra: Default::default(),
     }
@@ -649,7 +677,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        routers::grpc::common::responses::test_support::completed_response,
+        routers::grpc::common::responses::test_support::{
+            completed_response, response_storage_over,
+        },
         worker::{BasicWorkerBuilder, UNKNOWN_MODEL_ID},
     };
 
@@ -979,15 +1009,9 @@ mod tests {
         conditional_stores: AtomicUsize,
     }
 
-    #[async_trait::async_trait]
-    impl ResponseStorage for TimingOutAfterWriteStorage {
-        async fn store_response(
-            &self,
-            response: StoredResponse,
-        ) -> Result<ResponseId, ResponseStorageError> {
-            self.inner.store_response(response).await
-        }
-
+    response_storage_over! {
+        TimingOutAfterWriteStorage.inner;
+        passes store_response, update_response_object_if_open, get_response, delete_response, list_identifier_responses, delete_identifier_responses;
         async fn store_response_if_open(
             &self,
             response: StoredResponse,
@@ -1002,51 +1026,6 @@ mod tests {
                 ));
             }
             Ok(outcome)
-        }
-
-        async fn update_response_object_if_open(
-            &self,
-            id: &ResponseId,
-            raw_response: Value,
-        ) -> Result<ConditionalStore, ResponseStorageError> {
-            self.inner
-                .update_response_object_if_open(id, raw_response)
-                .await
-        }
-
-        async fn get_response(
-            &self,
-            response_id: &ResponseId,
-        ) -> Result<Option<StoredResponse>, ResponseStorageError> {
-            self.inner.get_response(response_id).await
-        }
-
-        async fn delete_response(
-            &self,
-            response_id: &ResponseId,
-        ) -> Result<(), ResponseStorageError> {
-            self.inner.delete_response(response_id).await
-        }
-
-        async fn list_identifier_responses(
-            &self,
-            identifier: &str,
-            tenant: Option<&str>,
-            limit: Option<usize>,
-        ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
-            self.inner
-                .list_identifier_responses(identifier, tenant, limit)
-                .await
-        }
-
-        async fn delete_identifier_responses(
-            &self,
-            identifier: &str,
-            tenant: Option<&str>,
-        ) -> Result<usize, ResponseStorageError> {
-            self.inner
-                .delete_identifier_responses(identifier, tenant)
-                .await
         }
     }
 
@@ -1200,16 +1179,25 @@ mod tests {
     }
 
     #[test]
-    fn a_call_whose_arguments_are_not_complete_json_is_incomplete_unless_the_turn_ended_on_it() {
-        for finish in [Some("length"), Some("abort"), Some("stop"), None] {
-            assert_eq!(function_call_status(finish, "{\"a\": \"b"), "incomplete");
-            assert_eq!(function_call_status(finish, ""), "incomplete");
-            assert_eq!(function_call_status(finish, "{\"a\": 1}"), "completed");
-        }
-        for arguments in ["{\"a\": 1}", "", "weather in Paris"] {
+    fn a_call_whose_arguments_are_no_json_value_is_incomplete_whatever_the_finish() {
+        for finish in [
+            Some("length"),
+            Some("abort"),
+            Some("stop"),
+            Some("tool_calls"),
+            None,
+        ] {
+            for arguments in ["{\"a\": \"b", "", "weather in Paris"] {
+                assert_eq!(
+                    function_call_status(finish, arguments),
+                    "incomplete",
+                    "{finish:?} {arguments:?}"
+                );
+            }
             assert_eq!(
-                function_call_status(Some("tool_calls"), arguments),
-                "completed"
+                function_call_status(finish, "{\"a\": 1}"),
+                "completed",
+                "{finish:?}"
             );
         }
         assert_eq!(function_call_status(Some("failed"), "{"), "in_progress");
@@ -1233,6 +1221,17 @@ mod tests {
         assert_eq!(
             response_status(Some("error"), true),
             (ResponseStatus::Failed, None)
+        );
+    }
+
+    #[test]
+    fn the_tool_call_limit_is_the_users_figure_under_the_safety_limit() {
+        assert_eq!(tool_call_limit(None), DEFAULT_MAX_ITERATIONS);
+        assert_eq!(tool_call_limit(Some(3)), 3);
+        assert_eq!(tool_call_limit(Some(0)), 0);
+        assert_eq!(
+            tool_call_limit(Some(DEFAULT_MAX_ITERATIONS + 5)),
+            DEFAULT_MAX_ITERATIONS
         );
     }
 }

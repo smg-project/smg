@@ -29,8 +29,10 @@ mod embed;
 mod eos;
 mod fanout;
 pub mod multimodal;
+mod pin_yield;
 mod sglang;
 pub mod sglang_encode;
+mod sglang_mm_hash;
 mod sockets;
 pub mod stops;
 mod stream;
@@ -59,6 +61,7 @@ pub use sglang_encode::{
     EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
     EncodeRelease, EncoderDispatchErrorReq, SglangEncodeDispatcher,
 };
+pub use sglang_mm_hash::SglangCpuMmHasher;
 pub use sockets::{zmq_handshake_address, Handshake};
 pub use stream::ZmqGenerateStream;
 pub use structured_outputs::{

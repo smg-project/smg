@@ -37,7 +37,7 @@
 use std::{any::Any, fmt, future::Future, panic::AssertUnwindSafe, sync::OnceLock};
 
 use futures::FutureExt;
-use tracing::error;
+use tracing::{error, Span};
 
 use crate::routers::grpc::regular::symphony::telemetry;
 
@@ -89,13 +89,16 @@ impl Panicked {
     }
 
     /// Records the failure: one increment under the table's `panicked`
-    /// outcome when a table read the response, and one ERROR line with the
+    /// outcome when a table read the response, the outcome and the table on
+    /// the request's span (current here: the whole response's handler, or
+    /// the stream's failure sent under the span), and one ERROR line with the
     /// request id, the model, the table and the message. Once per request,
     /// where the request's answer is decided.
     pub(crate) fn record(&self, request_id: &str, model: &str) {
         if let Some(table) = self.table {
             telemetry::record_panicked(table);
         }
+        telemetry::mark_panicked(&Span::current(), self.table);
         error!(
             request_id,
             model,
@@ -120,9 +123,9 @@ impl fmt::Display for Panicked {
 /// A plain function returning the combinator, not an `async fn`: an `async
 /// fn` keeps its argument in the prefix of its future after the argument
 /// has moved into the combinator that lives across the `await`, so its
-/// future holds the reading's state twice. The streaming paths spawn the
-/// guarded reading as a task, whose allocation is its future's size: the
-/// guard adds a few words to it, not a second copy
+/// future holds the reading's state twice. The streaming paths box the
+/// guarded reading for the response body that drives it, an allocation of
+/// its future's size: the guard adds a few words to it, not a second copy
 /// (`the_guard_holds_the_readings_future_once`).
 pub(crate) fn isolated<F: Future>(work: F) -> impl Future<Output = Result<F::Output, Panicked>> {
     AssertUnwindSafe(work)

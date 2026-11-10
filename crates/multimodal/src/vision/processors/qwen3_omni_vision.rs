@@ -4,11 +4,14 @@
 //! `QwenVLProcessorBase`, but cannot use `Qwen3VLProcessor` directly. Omni
 //! applies video pixel limits per frame rather than across the sampled clip,
 //! gives its video preprocessor config precedence for video-specific limits,
-//! and emits timing metadata required by mixed-modality M-RoPE.
+//! and emits the timing metadata mixed-modality M-RoPE needs at the rate its
+//! processor fixes rather than the clip's sampled rate.
 
 use image::DynamicImage;
 
-use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
+use super::qwen_vl_base::{
+    QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode, QwenVideoTiming,
+};
 use crate::{
     encoder_inputs::EncoderDtype,
     types::{Modality, RgbFrameRef},
@@ -28,6 +31,13 @@ pub const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 32 * 32;
 pub const DEFAULT_PATCH_SIZE: usize = 16;
 pub const DEFAULT_MERGE_SIZE: usize = 2;
 pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
+
+/// The `fps` argument of the checkpoint's processor. It computes a clip's
+/// `video_second_per_grid`, the time one temporal patch spans in the
+/// position ids, as the temporal patch size over this argument, which
+/// defaults to 1.0 and which the serving path leaves at its default: two
+/// seconds a temporal patch, whatever rate the clip was sampled at.
+const PROCESSOR_FPS_ARGUMENT: f64 = 1.0;
 
 #[derive(Debug, Clone)]
 pub struct Qwen3OmniVisionProcessor {
@@ -75,7 +85,8 @@ impl Qwen3OmniVisionProcessor {
                 mean: QWEN3_OMNI_MEAN,
                 std: QWEN3_OMNI_STD,
                 model_name: "qwen3-omni",
-            }),
+            })
+            .with_video_timing(QwenVideoTiming::FixedRate(PROCESSOR_FPS_ARGUMENT)),
         }
     }
 
@@ -123,10 +134,13 @@ impl Qwen3OmniVisionProcessor {
         if modality == Modality::Video && !config.is_image_only_processor_type() {
             Self::from_video_preprocessor_config(config)
         } else {
-            // Qwen3-Omni's shared preprocessor_config.json carries image
-            // limits. The HF processor supplies separate video defaults at
-            // call time, so those image limits must not become a per-frame
-            // video budget here.
+            // The checkpoint's one preprocessor_config.json carries the image
+            // bounds. The family's composite processor hands its video
+            // processor a size of its own at call time, the module's video
+            // defaults (128 and 768 merged patches of 32 x 32 pixels per
+            // frame), over whatever that processor read from the file, so
+            // the file's image bounds must not become the per-frame video
+            // budget here.
             Self::from_preprocessor_config(config)
         }
     }
@@ -147,14 +161,14 @@ impl VisionPreProcessor for Qwen3OmniVisionProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         self.inner.preprocess(images)
     }
 
     fn preprocess_wire(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
         dtype: EncoderDtype,
     ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
         self.inner.preprocess_wire(images, dtype)
@@ -242,6 +256,11 @@ mod tests {
         );
     }
 
+    /// The checkpoint ships one `preprocessor_config.json` for its image and
+    /// its video processor, but the family's composite processor passes its
+    /// own video size at call time, so a clip keeps the per-frame video
+    /// defaults and never takes the file's image bounds: a 720p frame is
+    /// sized to 1152x640 (36 x 20 patches), not kept at 1280x720.
     #[test]
     fn shared_image_config_keeps_omni_video_defaults() {
         let config = PreProcessorConfig::from_json(
@@ -262,7 +281,7 @@ mod tests {
     fn empty_config_uses_omni_half_normalization() {
         let image = DynamicImage::ImageRgb8(RgbImage::new(32, 32));
         let output = Qwen3OmniVisionProcessor::new()
-            .preprocess(&[image])
+            .preprocess(&[&image])
             .unwrap();
 
         assert!(output
@@ -272,8 +291,14 @@ mod tests {
             .all(|value| (*value + 1.0).abs() < 1e-6));
     }
 
+    /// The checkpoint's processor computes `video_second_per_grid` as the
+    /// temporal patch size over its own `fps` argument, 1.0 unless a caller
+    /// passes one, and the serving path passes none: a two-frame temporal
+    /// patch spans two seconds whatever rate the clip was sampled at, where
+    /// the Qwen2-VL line's processors report the sampled rate's share (0.5
+    /// at 4 frames a second).
     #[test]
-    fn sampled_video_fps_controls_mrope_grid_timing() {
+    fn video_second_per_grid_is_the_processors_constant() {
         let config = PreProcessorConfig::from_json(
             r#"{"size":{"shortest_edge":1024,"longest_edge":65536}}"#,
         )
@@ -282,15 +307,20 @@ mod tests {
             DynamicImage::ImageRgb8(RgbImage::new(32, 32)),
             DynamicImage::ImageRgb8(RgbImage::new(32, 32)),
         ];
+        let processor = Qwen3OmniVisionProcessor::from_config_for(&config, Modality::Video);
 
-        let output = Qwen3OmniVisionProcessor::from_config_for(&config, Modality::Video)
-            .preprocess_video(&frames, &VideoClipOptions::sampled_at(4.0))
-            .unwrap();
-
-        assert!(matches!(
-            output.model_specific.get("video_second_per_grid"),
-            Some(ModelSpecificValue::Tensor { data, shape })
-                if data == &vec![0.5] && shape == &vec![1]
-        ));
+        for sampled_fps in [0.8, 2.0, 4.0] {
+            let output = processor
+                .preprocess_video(&frames, &VideoClipOptions::sampled_at(sampled_fps))
+                .unwrap();
+            assert!(
+                matches!(
+                    output.model_specific.get("video_second_per_grid"),
+                    Some(ModelSpecificValue::Tensor { data, shape })
+                        if data == &vec![2.0] && shape == &vec![1]
+                ),
+                "sampled at {sampled_fps}"
+            );
+        }
     }
 }

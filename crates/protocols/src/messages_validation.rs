@@ -11,6 +11,16 @@
 //! output-token cap. The rule that `thinking.budget_tokens` stays under
 //! `max_tokens` reads the `anthropic-beta` header (the interleaved-thinking
 //! beta lifts it), so the gateway's handler applies it.
+//!
+//! Tighter than the public API in one place, on purpose: `top_p` is refused
+//! at 0.0 and `top_k` outside 1 to `i32::MAX`, the bounds this gateway's Chat
+//! and Responses APIs apply to the same fields and the engines behind it
+//! enforce, because their wires cannot carry either zero as the request
+//! meant it and carry `top_k` as a signed 32-bit integer, which a larger
+//! value would wrap (`validate_sampling`). The Chat and Responses field is
+//! signed and takes -1 as "disabled"; the Messages field is unsigned, so -1
+//! is a type error there, refused by the deserializer before this validation
+//! runs.
 
 use std::collections::HashSet;
 
@@ -40,18 +50,49 @@ pub(crate) fn validate(req: &CreateMessageRequest) -> Result<(), ValidationError
     validate_tool_pairing(&req.messages)?;
     validate_stop_sequences(req.stop_sequences.as_deref())?;
     validate_tools(req.tools.as_deref())?;
+    validate_output_format(req)?;
     validate_thinking(req)
 }
 
-/// `temperature` and `top_p` take the public API's range, 0 to 1.
+/// `temperature` takes the public API's range, 0 to 1; `top_p` the same range
+/// without its zero, and `top_k` from 1 to `i32::MAX`: the bounds the Chat
+/// and Responses requests apply to the same fields
+/// ([`crate::sampling_params::validate_top_p_value`],
+/// [`crate::sampling_params::validate_top_k_value`]). Every engine refuses a
+/// nucleus of nothing, and a `top_k` of 0 is "disabled" on some engines and
+/// an error on the others (never a top of nothing); the wire the engines read
+/// cannot tell either zero from a field the client left out, so such a request
+/// is refused here, with the engine's answer, instead of being sampled over
+/// the whole distribution or failing at the engine. The lower bound of
+/// `top_p` and the ceiling of `top_k` are judged on the values the wires
+/// carry, a 32-bit float and a signed 32-bit integer: a positive `top_p`
+/// below the smallest 32-bit float would arrive as the zero, and a `top_k`
+/// above `i32::MAX` would wrap to "disabled" (-1) or to a negative number the
+/// engine refuses. The upper bound of `top_p` stays on the value given, as
+/// the public API states it; the Chat and Responses requests read the field
+/// as a 32-bit float, so a value within one rounding step above 1 passes
+/// there as 1.0 and is refused here.
 fn validate_sampling(req: &CreateMessageRequest) -> Result<(), ValidationError> {
-    for (name, value) in [("temperature", req.temperature), ("top_p", req.top_p)] {
-        if value.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
-            return Err(invalid(
-                "value_out_of_range",
-                format!("{name}: range: 0..1"),
-            ));
-        }
+    if req.temperature.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
+        return Err(invalid(
+            "value_out_of_range",
+            "temperature: range: 0..1".to_owned(),
+        ));
+    }
+    if req.top_p.is_some_and(|v| !(v <= 1.0 && (v as f32) > 0.0)) {
+        return Err(invalid(
+            "value_out_of_range",
+            "top_p: range: (0, 1]".to_owned(),
+        ));
+    }
+    if req
+        .top_k
+        .is_some_and(|k| !(1..=i32::MAX as u32).contains(&k))
+    {
+        return Err(invalid(
+            "value_out_of_range",
+            "top_k: range: 1..2147483647".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -329,20 +370,59 @@ fn validate_tools(tools: Option<&[Tool]>) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// A thinking budget starts at 1024 tokens. (That it stays under
-/// `max_tokens` depends on the `anthropic-beta` header, so the gateway's
-/// handler checks it.)
-fn validate_thinking(req: &CreateMessageRequest) -> Result<(), ValidationError> {
-    if let Some(ThinkingConfig::Enabled { budget_tokens, .. }) = &req.thinking {
-        if *budget_tokens < 1024 {
+/// An output format's schema is a JSON object, under either field it comes
+/// in ([`CreateMessageRequest::output_schema`]); the format's `type` is the
+/// deserializer's to refuse.
+fn validate_output_format(req: &CreateMessageRequest) -> Result<(), ValidationError> {
+    let under = [
+        (
+            "output_config.format",
+            req.output_config
+                .as_ref()
+                .and_then(|config| config.format.as_ref()),
+        ),
+        ("output_format", req.output_format.as_deref()),
+    ];
+    for (field, format) in under {
+        if format.is_some_and(|format| !format.schema().is_object()) {
             return Err(invalid(
-                "thinking_budget_too_small",
-                "thinking.enabled.budget_tokens: Input should be greater than or equal to 1024"
-                    .to_owned(),
+                "output_format_schema_not_an_object",
+                format!("{field}.schema: Input should be a valid dictionary"),
             ));
         }
     }
     Ok(())
+}
+
+/// `enabled` needs a budget of at least 1024 tokens (that it stays under
+/// `max_tokens` depends on the `anthropic-beta` header, so the gateway's
+/// handler checks it); `between_tools` takes `type` alone (the public API
+/// refuses `display`, `budget_tokens` or `block_binding` sent with it).
+fn validate_thinking(req: &CreateMessageRequest) -> Result<(), ValidationError> {
+    match &req.thinking {
+        Some(ThinkingConfig::Enabled { budget_tokens, .. }) if *budget_tokens < 1024 => {
+            Err(invalid(
+                "thinking_budget_too_small",
+                "thinking.enabled.budget_tokens: Input should be greater than or equal to 1024"
+                    .to_owned(),
+            ))
+        }
+        Some(ThinkingConfig::BetweenTools { other }) if !other.is_empty() => {
+            let mut fields: Vec<&str> = other.keys().map(String::as_str).collect();
+            fields.sort_unstable();
+            let refusals: Vec<String> = fields
+                .iter()
+                .map(|field| {
+                    format!("thinking.between_tools.{field}: Extra inputs are not permitted")
+                })
+                .collect();
+            Err(invalid(
+                "thinking_between_tools_takes_no_other_field",
+                refusals.join("; "),
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -375,13 +455,92 @@ mod tests {
     }
 
     use super::*;
+    use crate::sampling_params::{validate_top_k_value, validate_top_p_value};
 
     #[test]
     fn sampling_parameters_take_the_public_range() {
         assert!(rejection(json!({"temperature": 2.0})).contains("temperature: range: 0..1"));
         assert!(rejection(json!({"temperature": -1.0})).contains("temperature: range: 0..1"));
-        assert!(rejection(json!({"top_p": 1.5})).contains("top_p: range: 0..1"));
-        accepted(json!({"temperature": 1.0, "top_p": 0.0}));
+        assert!(rejection(json!({"top_p": 1.5})).contains("top_p: range: (0, 1]"));
+        assert!(rejection(json!({"top_p": -0.5})).contains("top_p: range: (0, 1]"));
+        accepted(json!({"temperature": 1.0, "top_p": 1.0, "top_k": 1}));
+        accepted(json!({"temperature": 0.0, "top_p": 0.5, "top_k": 40}));
+    }
+
+    #[test]
+    fn a_nucleus_of_nothing_and_a_top_k_of_zero_are_refused() {
+        // Every engine rejects a top_p of 0.0; a top_k of 0 is "disabled" on
+        // some engines and an error on the others; and the wire cannot tell
+        // either zero from a field the client left out, so the request gets
+        // the engine's answer here instead of a whole-distribution sample.
+        assert!(rejection(json!({"top_p": 0.0})).contains("top_p: range: (0, 1]"));
+        assert!(rejection(json!({"top_k": 0})).contains("top_k: range: 1..2147483647"));
+    }
+
+    #[test]
+    fn a_top_p_the_wires_would_carry_as_zero_is_refused() {
+        // The engines' wires carry top_p as a 32-bit float: a positive value
+        // below its smallest magnitude arrives as the zero the engines read
+        // as a field left out, so it is refused like the zero itself.
+        assert_eq!((1e-46_f64 as f32).to_bits(), 0);
+        assert!((1e-45_f64 as f32) > 0.0);
+        accepted(json!({"top_p": 1e-45}));
+        assert!(rejection(json!({"top_p": 1e-46})).contains("top_p: range: (0, 1]"));
+    }
+
+    #[test]
+    fn a_top_k_above_the_wires_signed_range_is_refused() {
+        // The engines' wires carry top_k as a signed 32-bit integer: u32::MAX
+        // would wrap to -1 ("disabled": the whole distribution) and i32::MAX + 1
+        // to i32::MIN (an engine error), neither what the client asked for.
+        accepted(json!({"top_k": i32::MAX}));
+        assert!(rejection(json!({"top_k": i32::MAX as u32 + 1}))
+            .contains("top_k: range: 1..2147483647"));
+        assert!(rejection(json!({"top_k": u32::MAX})).contains("top_k: range: 1..2147483647"));
+    }
+
+    #[test]
+    fn the_bounds_are_the_chat_and_responses_bounds() {
+        // The same JSON value is accepted or refused alike on the three
+        // request paths (the Chat and Responses requests read these fields
+        // as f32 and i32 and apply the shared validators), with one
+        // difference: a value within one rounding step above 1 is 1.0 as an
+        // f32 and passes there, while the Messages request keeps the public
+        // API's bound on the value given.
+        for (value, chat_accepts, messages_accepts) in [
+            (json!(0.0), false, false),
+            (json!(1e-46), false, false),
+            (json!(1e-45), true, true),
+            (json!(0.5), true, true),
+            (json!(1.0), true, true),
+            (json!(1.000_000_01), true, false),
+            (json!(1.5), false, false),
+            (json!(-0.5), false, false),
+        ] {
+            let as_chat: f32 = serde_json::from_value(value.clone()).expect("a number");
+            assert_eq!(
+                validate_top_p_value(as_chat).is_ok(),
+                chat_accepts,
+                "chat top_p {value}"
+            );
+            assert_eq!(
+                request(json!({"top_p": value})).validate().is_ok(),
+                messages_accepts,
+                "messages top_p {value}"
+            );
+        }
+        for (value, accepted_everywhere) in [(0, false), (1, true), (40, true), (i32::MAX, true)] {
+            assert_eq!(
+                validate_top_k_value(value).is_ok(),
+                accepted_everywhere,
+                "chat top_k {value}"
+            );
+            assert_eq!(
+                request(json!({"top_k": value})).validate().is_ok(),
+                accepted_everywhere,
+                "messages top_k {value}"
+            );
+        }
     }
 
     #[test]
@@ -583,5 +742,47 @@ mod tests {
         .expect_err("the public API refuses an unknown field in a message")
         .to_string();
         assert!(err.contains("extra"), "{err}");
+    }
+
+    /// `between_tools` passes with `type` alone and is refused, naming each
+    /// field the way the module's other refusals do, with anything else
+    /// beside it.
+    #[test]
+    fn between_tools_takes_no_other_field() {
+        assert!(request(json!({"thinking": {"type": "between_tools"}}))
+            .validate()
+            .is_ok());
+        let refusal = rejection(json!({
+            "thinking": {"type": "between_tools", "display": "omitted", "budget_tokens": 2048}
+        }));
+        assert!(
+            refusal.contains(
+                "thinking.between_tools.budget_tokens: Extra inputs are not permitted; \
+                 thinking.between_tools.display: Extra inputs are not permitted"
+            ),
+            "{refusal}"
+        );
+    }
+
+    /// An output format's schema is a JSON object, under either field it
+    /// comes in; the field is named as the public API names it.
+    #[test]
+    fn an_output_formats_schema_is_an_object() {
+        for field in ["output_config.format", "output_format"] {
+            let body = |schema: Value| {
+                let format = json!({"type": "json_schema", "schema": schema});
+                match field {
+                    "output_format" => json!({"output_format": format}),
+                    _ => json!({"output_config": {"format": format}}),
+                }
+            };
+            accepted(body(json!({"type": "object"})));
+            assert!(
+                rejection(body(json!("an object"))).contains(&format!(
+                    "{field}.schema: Input should be a valid dictionary"
+                )),
+                "{field}"
+            );
+        }
     }
 }

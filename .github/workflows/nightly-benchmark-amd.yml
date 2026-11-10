@@ -36,8 +36,6 @@ permissions:
   contents: read
 
 env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
   GENAI_BENCH_IMAGE: ghcr.io/moirai-internal/genai-bench:0.0.4
   BENCH_TEST_MODE: ${{ inputs.quick && '1' || '0' }}
 
@@ -105,12 +103,11 @@ jobs:
     container:
       image: ${{ matrix.variant.image }}
       options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
-    timeout-minutes: 1440
+    # Three retained Sunday runs peaked at 4h09m11s per GPU job. Bound the
+    # job to six hours; host admission must also budget preparation/cleanup
+    # and wait if the whole occupancy would cross Router's 05:00 UTC start.
+    timeout-minutes: 360
     env:
-      # SGLang's workers build its Rust radix tree with Cargo at startup, and
-      # its image has no sccache, which the workflow sets as RUSTC_WRAPPER.
-      # Empty, Cargo runs rustc directly.
-      RUSTC_WRAPPER: ""
       # Each job starts in a fresh container, so an engine's first start
       # compiles its kernels: SGLang's first Qwen3-30B-A3B worker takes about
       # 300 s on MI300X, the default startup wait. Raise the floor on every
@@ -220,9 +217,11 @@ jobs:
     container:
       image: ${{ matrix.variant.image }}
       options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
-    timeout-minutes: 1440
+    # Three retained Sunday runs peaked at 4h09m11s per GPU job. Bound the
+    # job to six hours; host admission must also budget preparation/cleanup
+    # and wait if the whole occupancy would cross Router's 05:00 UTC start.
+    timeout-minutes: 360
     env:
-      RUSTC_WRAPPER: "" # as in single-worker
       E2E_STARTUP_TIMEOUT: "900" # as in single-worker
     strategy:
       fail-fast: false

@@ -1,12 +1,13 @@
 //! The tokenizer caches on the request path: what one request costs with the
 //! caches off, on an L0 hit, on an L1 prefix hit (the next turn of a
-//! conversation whose earlier turns were seen) and on an L1 miss, next to the
-//! steps a lookup is made of, per vocabulary and prompt size.
+//! conversation whose earlier turns were seen), on an L1 miss and under
+//! pressure (a working set twice the L1 budget, requested with a skew), next
+//! to the steps a lookup is made of, per vocabulary and prompt size.
 //!
 //! `PREFIX_BENCH_TOKENIZERS=name=dir[,name=dir...]` (directories holding a
 //! `tokenizer.json`), `PREFIX_BENCH_TOKENS=2048,8192,32768,81920` (the prompt
 //! sizes, default as shown), `PREFIX_BENCH_VARIANTS=40` (distinct requests
-//! prepared per scenario), `PREFIX_BENCH_SCENARIOS=encode,l0,l1,both,components`
+//! prepared per scenario), `PREFIX_BENCH_SCENARIOS=encode,l0,l1,both,pressure,components`
 //! (the scenario groups to run, default all; a group left out constructs no
 //! cached tokenizer, so the inner tokenizer sees only that group's encodes).
 //! One JSON line per measurement and a table at the end.
@@ -452,7 +453,8 @@ fn main() {
 
             // L1 alone: the same text again (a hit at the deepest boundary), the
             // next turn of a seen conversation (10 % and 1 % new text), and
-            // distinct conversations (a miss that seeds every boundary).
+            // distinct conversations (a miss that seeds geometric checkpoints
+            // plus the deepest boundary).
             if wanted("l1") {
                 let t = cached(&inner, false, true);
                 assert_eq!(ids(&t, &text0), reference);
@@ -500,6 +502,67 @@ fn main() {
                     black_box(t.encode(&unique[v], false).expect("encode"));
                 });
                 rows.push(("both_unique".into(), stat, delta(before, counters(&t))));
+            }
+
+            // L1 under pressure: four times the variants' conversations at a
+            // budget that holds half of what they retain, requested with a
+            // skew (the hottest quarter of them gets half of the requests).
+            // The hit rate reads the sampler's choice of victim; the time per
+            // request, its cost. The same binary reads the same sequence.
+            if wanted("pressure") {
+                let set: Vec<String> = (0..4 * variants)
+                    .map(|v| {
+                        shape(
+                            Family::detect(&specials),
+                            10_000 + v as u64,
+                            bytes_per_token,
+                            tokens,
+                            0.10,
+                            1,
+                        )
+                        .request(0)
+                    })
+                    .collect();
+                let whole = cached(&inner, false, true);
+                for text in &set {
+                    whole.encode(text, false).expect("encode");
+                }
+                let retained = whole.l1_cache_stats().map_or(0, |s| s.memory_bytes);
+                let t = CachedTokenizer::new(
+                    Arc::clone(&inner),
+                    CacheConfig {
+                        enable_l0: false,
+                        enable_l1: true,
+                        l1_max_memory: retained / 2,
+                        ..CacheConfig::default()
+                    },
+                );
+                let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+                let order: Vec<usize> = (0..10 * set.len())
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        let u = (state >> 11) as f64 / (1u64 << 53) as f64;
+                        ((u * u) * set.len() as f64) as usize
+                    })
+                    .collect();
+                let (before, evictions_before) = (counters(&t), l1_evictions());
+                let started = Instant::now();
+                let stat = timed(order.len(), Duration::MAX, |i| {
+                    black_box(t.encode(&set[order[i]], false).expect("encode"));
+                });
+                let total_ms = started.elapsed().as_secs_f64() * 1e3;
+                let counts = delta(before, counters(&t));
+                println!(
+                    "{}",
+                    json!({"kind":"pressure","model":name,"path":path,"tokens":measured_tokens,
+                        "conversations":set.len(),"retained_bytes":retained,"budget_bytes":retained / 2,
+                        "requests":order.len(),"l1_hits":counts[2],"l1_misses":counts[3],
+                        "hit_rate":counts[2] as f64 / order.len() as f64,
+                        "evictions":l1_evictions() - evictions_before,"total_ms":total_ms})
+                );
+                rows.push(("l1_pressure".into(), stat, counts));
             }
 
             // The steps a lookup is made of, on the same text.
@@ -589,6 +652,14 @@ fn main() {
     for (model, path, tokens, scenario, ms) in &table {
         println!("{model:<24} {path:<8} {tokens:>8} {scenario:<26} {ms:>10.3}");
     }
+}
+
+/// The process-wide count of L1 evictions so far.
+fn l1_evictions() -> u64 {
+    llm_tokenizer::cache::cache_activity_stats()
+        .iter()
+        .find(|stats| stats.layer == "l1")
+        .map_or(0, |stats| stats.evictions)
 }
 
 fn delta(before: [u64; 4], after: [u64; 4]) -> [u64; 4] {

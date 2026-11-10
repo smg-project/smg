@@ -1,4 +1,5 @@
 {{- include "smg.validateDiscovery" . -}}
+{{- include "smg.validateAdmission" . -}}
 apiVersion: apps/v1
 {{- if .Values.router.mesh.enabled }}
 kind: StatefulSet
@@ -44,6 +45,9 @@ spec:
         {{- if and .Values.auth.apiKey (not .Values.auth.existingSecret) }}
         checksum/auth: {{ .Values.auth.apiKey | sha256sum }}
         {{- end }}
+        {{- if and .Values.auth.controlPlane.apiKeys (not .Values.auth.controlPlane.existingSecret) }}
+        checksum/control-plane: {{ .Values.auth.controlPlane.apiKeys | sha256sum }}
+        {{- end }}
         {{- if include "smg.historySecretManaged" . }}
         checksum/history-secret: {{ include (print $.Template.BasePath "/secret-history.yaml") . | sha256sum }}
         {{- end }}
@@ -79,6 +83,11 @@ spec:
             - name: metrics
               containerPort: {{ .Values.router.metrics.port }}
               protocol: TCP
+            {{- if .Values.router.adminPort }}
+            - name: admin
+              containerPort: {{ .Values.router.adminPort }}
+              protocol: TCP
+            {{- end }}
             {{- if .Values.router.mesh.enabled }}
             - name: mesh
               containerPort: {{ .Values.router.mesh.port }}
@@ -170,9 +179,24 @@ spec:
               mountPath: /etc/smg/auth
               readOnly: true
             {{- end }}
+            {{- if include "smg.controlPlaneSecretName" . }}
+            - name: control-plane
+              mountPath: /etc/smg/control-plane
+              readOnly: true
+            {{- end }}
             {{- if and (eq (.Values.router.discovery.provider | default "") "file") .Values.router.discovery.file.configMap.name }}
             - name: discovery-manifest
               mountPath: /etc/smg/discovery
+              readOnly: true
+            {{- end }}
+            {{- if .Values.router.tenantRateLimit.configMap.name }}
+            - name: rate-limit
+              mountPath: /etc/smg/rate-limit
+              readOnly: true
+            {{- end }}
+            {{- if .Values.router.priorityScheduler.configMap.name }}
+            - name: scheduler
+              mountPath: /etc/smg/scheduler
               readOnly: true
             {{- end }}
             {{- if include "smg.consulTlsFiles" . | fromJsonArray }}
@@ -191,6 +215,14 @@ spec:
               - key: {{ include "smg.authSecretKey" . }}
                 path: {{ include "smg.authSecretKey" . }}
         {{- end }}
+        {{- if include "smg.controlPlaneSecretName" . }}
+        - name: control-plane
+          secret:
+            secretName: {{ include "smg.controlPlaneSecretName" . }}
+            items:
+              - key: {{ include "smg.controlPlaneSecretKey" . }}
+                path: {{ include "smg.controlPlaneSecretKey" . }}
+        {{- end }}
         {{- /* The whole ConfigMap, not a subPath of it: the kubelet projects an
              update by swapping a symlink in this directory, which the
              gateway's watch on it reports. Optional, as the gateway waits for
@@ -200,6 +232,20 @@ spec:
           configMap:
             name: {{ .Values.router.discovery.file.configMap.name }}
             optional: true
+        {{- end }}
+        {{- /* Whole ConfigMaps, as the discovery manifest: an edit reaches the
+             file by the kubelet's symlink swap. Not optional: the gateway
+             reads the file at start, so a pod waits for a ConfigMap not there
+             yet instead of starting without it. */}}
+        {{- if .Values.router.tenantRateLimit.configMap.name }}
+        - name: rate-limit
+          configMap:
+            name: {{ .Values.router.tenantRateLimit.configMap.name }}
+        {{- end }}
+        {{- if .Values.router.priorityScheduler.configMap.name }}
+        - name: scheduler
+          configMap:
+            name: {{ .Values.router.priorityScheduler.configMap.name }}
         {{- end }}
         {{- with include "smg.consulTlsFiles" . | fromJsonArray }}
         - name: consul-tls

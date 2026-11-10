@@ -1,5 +1,5 @@
 //! Media-reference forwarding: decide per request whether the router
-//! preprocesses media itself or forwards references to a vLLM gRPC worker that
+//! preprocesses media itself or forwards references to a gRPC worker that
 //! advertises worker-side processing, and build the wire payload.
 
 use std::{
@@ -22,7 +22,10 @@ use crate::{
     routers::{
         common::placement::{self, PipelinePin, NO_MEDIA_REF_CAPABLE_WORKER_CODE},
         error,
-        grpc::context::WorkerSelection,
+        grpc::{
+            common::stages::pd_protocol::{EncodeHandoff, PdProtocol},
+            context::WorkerSelection,
+        },
     },
     worker::{ConnectionMode, RuntimeType, Worker, WorkerRegistry, WorkerType},
 };
@@ -208,12 +211,26 @@ impl std::fmt::Display for MmRefsError {
 /// Whether `worker` can fetch and process media references itself.
 pub(crate) fn worker_accepts_media_refs(worker: &dyn Worker) -> bool {
     let spec = &worker.metadata().spec;
-    spec.runtime_type == RuntimeType::Vllm
-        && *worker.connection_mode() == ConnectionMode::Grpc
+    *worker.connection_mode() == ConnectionMode::Grpc
         && spec
             .labels
             .get(MM_PROCESSOR_LABEL)
-            .is_some_and(|value| !value.is_empty())
+            .is_some_and(|value| match spec.runtime_type {
+                RuntimeType::Vllm => !value.is_empty(),
+                RuntimeType::Sglang => value
+                    .trim()
+                    .eq_ignore_ascii_case(GATEWAY_PIPELINE_PROCESSOR),
+                _ => false,
+            })
+}
+
+pub(crate) fn worker_supports_ec_transfer(worker: &dyn Worker) -> bool {
+    worker
+        .metadata()
+        .spec
+        .labels
+        .get("supports_ec_transfer")
+        .is_some_and(|value| value == "true")
 }
 
 /// Whether `worker` processes media references with the gateway's own
@@ -237,10 +254,7 @@ pub(crate) fn worker_runs_gateway_pipeline(worker: &dyn Worker) -> bool {
 /// for the engine's prompt updates. Such a request is placed only on workers
 /// that run the pipeline ([`worker_runs_gateway_pipeline`]); a model without
 /// a spec renders the engine's own placeholders and needs no pin.
-pub(crate) fn plan_needs_gateway_pipeline(
-    plan: &MediaPlan,
-    placeholders: &PlaceholderTokens,
-) -> bool {
+fn plan_needs_gateway_pipeline(plan: &MediaPlan, placeholders: &PlaceholderTokens) -> bool {
     !placeholders.is_worker_only()
         && plan
             .modalities()
@@ -264,7 +278,7 @@ fn fleet_runs_gateway_pipeline(registry: &WorkerRegistry, model_id: &str) -> boo
 /// `"true"`, see [`SUPPORTS_VISION_LABEL`]) on the gRPC pipeline and does not
 /// process media references: under worker-side placement no image or video
 /// ever reaches it. A worker without the label is unknown, never this.
-pub(crate) fn vision_worker_without_media_processing(worker: &dyn Worker) -> bool {
+fn vision_worker_without_media_processing(worker: &dyn Worker) -> bool {
     worker.connection_mode().uses_grpc_pipeline()
         && worker
             .metadata()
@@ -284,9 +298,7 @@ pub(crate) fn vision_worker_without_media_processing(worker: &dyn Worker) -> boo
 /// model is neither refused in preparation nor named as waiting for a
 /// media-capable worker (readiness, the registration warning): a capable
 /// worker changes nothing for it.
-pub(crate) fn pool_has_encode_worker<'a>(
-    workers: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
-) -> bool {
+fn pool_has_encode_worker<'a>(workers: impl IntoIterator<Item = &'a Arc<dyn Worker>>) -> bool {
     workers
         .into_iter()
         .any(|worker| matches!(worker.worker_type(), WorkerType::Encode))
@@ -351,7 +363,7 @@ pub(crate) fn models_without_media_processing(
 }
 
 /// URL schemes `worker` advertised; empty when it advertised none.
-pub(crate) fn worker_media_ref_schemes(worker: &dyn Worker) -> HashSet<String> {
+fn worker_media_ref_schemes(worker: &dyn Worker) -> HashSet<String> {
     worker
         .metadata()
         .spec
@@ -497,16 +509,26 @@ pub(crate) fn resolve_mm_processing(
                 // Every registered worker, healthy or not: a health flap must
                 // not flip a model between modes request to request.
                 let workers = registry.get_by_model(model_id);
-                // On an encode-prefill-decode pool references never travel
-                // (`pool_has_encode_worker`), whatever its workers advertise:
-                // the router processes the media itself rather than resolve
-                // to a mode selection would refuse.
+                // An encode pool whose encoders take references under a
+                // push handoff processes them itself; its prefill/decode
+                // workers consume the identity and need no media processor.
                 let epd = pool_has_encode_worker(workers.iter());
-                let uniform = !workers.is_empty()
-                    && !epd
+                let push_encode = epd
                     && workers
                         .iter()
-                        .all(|worker| worker_accepts_media_refs(worker.as_ref()));
+                        .filter(|worker| *worker.worker_type() == WorkerType::Encode)
+                        .all(|worker| {
+                            PdProtocol::encode_handoff(worker.metadata().spec.runtime_type)
+                                == Some(EncodeHandoff::Push)
+                                && worker_supports_ec_transfer(worker.as_ref())
+                                && worker_accepts_media_refs(worker.as_ref())
+                        });
+                let uniform = push_encode
+                    || (!workers.is_empty()
+                        && !epd
+                        && workers
+                            .iter()
+                            .all(|worker| worker_accepts_media_refs(worker.as_ref())));
                 // The gateway's own pipeline on every worker expands any
                 // spec's anchor; a fleet mixing it with the engine's
                 // processors keeps the spec's opt-in.
@@ -570,6 +592,13 @@ pub(crate) fn ensure_selection_supports_media_refs(
     let needs_pipeline = pin == PipelinePin::Only;
     let workers: Vec<&dyn Worker> = match workers {
         WorkerSelection::Single { worker } => vec![worker.as_ref()],
+        WorkerSelection::Disaggregated {
+            encode_assignments: Some(assignments),
+            ..
+        } if !assignments.is_empty() => assignments
+            .iter()
+            .map(|assignment| assignment.worker.as_ref())
+            .collect(),
         WorkerSelection::Disaggregated {
             prefill, decode, ..
         } => vec![prefill.as_ref(), decode.as_ref()],
@@ -766,6 +795,7 @@ mod tests {
         )
         .expect("components");
         components.processing = mode;
+        assert!(!components.drain_fetches_on_error);
         components
     }
 
@@ -807,8 +837,9 @@ mod tests {
     );
 
     #[test]
-    fn accepts_only_labeled_vllm_grpc_workers() {
-        let cases: [AcceptCase; 5] = [
+    /// Forward references only to gRPC workers advertising a supported processor.
+    fn accepts_only_supported_labeled_grpc_workers() {
+        let cases: [AcceptCase; 8] = [
             (
                 RuntimeType::Vllm,
                 ConnectionMode::Grpc,
@@ -832,6 +863,19 @@ mod tests {
                 RuntimeType::Sglang,
                 ConnectionMode::Grpc,
                 &[(MM_PROCESSOR_LABEL, "inprocess")],
+                false,
+            ),
+            (
+                RuntimeType::Sglang,
+                ConnectionMode::Grpc,
+                &[(MM_PROCESSOR_LABEL, "smg")],
+                true,
+            ),
+            (RuntimeType::Sglang, ConnectionMode::Grpc, &[], false),
+            (
+                RuntimeType::Sglang,
+                ConnectionMode::Zmq,
+                &[(MM_PROCESSOR_LABEL, "smg")],
                 false,
             ),
         ];

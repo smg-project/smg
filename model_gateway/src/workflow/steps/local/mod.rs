@@ -12,6 +12,8 @@ mod rediscover_labels;
 mod remove_from_policy_registry;
 mod remove_from_worker_registry;
 mod submit_tokenizer_job;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod update_policies_for_worker;
 mod update_remaining_policies;
 mod update_worker_properties;

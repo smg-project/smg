@@ -201,9 +201,7 @@ pub(super) fn check_item_counts(
 mod tests {
     use std::sync::Arc;
 
-    use llm_multimodal::MediaContentPart;
-
-    use super::*;
+    use super::{super::plan::tests::image_urls, *};
     use crate::worker::test_support::{grpc_worker, registry_with};
 
     const MODEL: &str = "vision-model";
@@ -221,15 +219,6 @@ mod tests {
             .iter()
             .map(|&(modality, limit, runtime)| (modality, EngineItemLimit { limit, runtime }))
             .collect()
-    }
-
-    fn images(count: usize) -> MediaPlan {
-        MediaPlan::new((0..count).map(|i| MediaContentPart::ImageUrl {
-            url: format!("https://example.com/{i}.png"),
-            detail: None,
-            uuid: None,
-            max_long_side_pixel: None,
-        }))
     }
 
     /// The label parses as the servicers write it; anything else in it is
@@ -350,7 +339,7 @@ mod tests {
     fn over_limit_requests_are_refused_naming_the_limit_and_its_origin() {
         let refusal = |source| {
             let limits = HashMap::from([(Modality::Image, ItemLimit { limit: 8, source })]);
-            check_item_counts(&images(9), &limits).unwrap_err()
+            check_item_counts(&image_urls(9), &limits).unwrap_err()
         };
         assert_eq!(
             refusal(ItemLimitSource::Engine(RuntimeType::Vllm)),
@@ -375,8 +364,8 @@ mod tests {
                 source: ItemLimitSource::Spec,
             },
         )]);
-        assert!(check_item_counts(&images(8), &limits).is_ok());
+        assert!(check_item_counts(&image_urls(8), &limits).is_ok());
         // A modality without a limit here is the spec's to validate.
-        assert!(check_item_counts(&images(9), &HashMap::new()).is_ok());
+        assert!(check_item_counts(&image_urls(9), &HashMap::new()).is_ok());
     }
 }

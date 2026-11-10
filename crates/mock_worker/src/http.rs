@@ -1,12 +1,13 @@
 //! Mock HTTP worker endpoints — the vLLM/SGLang-compatible surface the SMG
 //! gateway probes and routes to.
 //!
-//! In canned mode every response is fixed (no model). In realistic mode each
-//! worker is backed by the engine simulator ([`crate::engine`]); since the HTTP
-//! path carries text rather than token ids, the prompt is approximated into
-//! synthetic token ids (one per whitespace word) so shared text prefixes still
-//! produce cache hits and prompt length still drives prefill latency. Token-id
-//! KV events (event-driven `cache_aware`) remain a gRPC-path feature.
+//! In canned mode every response is fixed (no model), in the shape of the
+//! route it answers. In realistic mode each worker is backed by the engine
+//! simulator ([`crate::engine`]); since the HTTP path carries text rather
+//! than token ids, the prompt is approximated into synthetic token ids (one
+//! per whitespace word) so shared text prefixes still produce cache hits and
+//! prompt length still drives prefill latency. Token-id KV events
+//! (event-driven `cache_aware`) remain a gRPC-path feature.
 
 use std::{
     convert::Infallible,
@@ -32,14 +33,23 @@ use axum::{
 };
 use futures::{stream, Stream};
 use serde_json::{json, Value};
-use tokio::{net::TcpListener, sync::mpsc};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, watch},
+};
 
 use crate::{
-    config::Config,
-    drain::InFlight,
+    admin_ops::{AdminOps, ProfileOptions},
+    config::{Config, Role},
+    drain::{InFlight, WorkerInFlight},
     engine::{self, Engine, NewRequest},
     script::{self, Answer},
 };
+
+/// The bootstrap port a scheduler takes without being told one, and the
+/// one the gateway probes for a prefill worker registered without a port:
+/// what a missing or null `bootstrap_port` in a request means.
+const DEFAULT_BOOTSTRAP_PORT: u16 = 8998;
 
 /// Per-listener HTTP state: shared config plus an optional engine simulator.
 struct AppState {
@@ -48,6 +58,15 @@ struct AppState {
     /// and the script store address it by.
     name: String,
     engine: Option<Engine>,
+    /// The requests this worker is serving: what its load report counts as
+    /// running when no engine simulation runs.
+    in_flight: WorkerInFlight,
+    /// The flush and profile operations the gateway fans out, and their counts.
+    ops: Arc<AdminOps>,
+    /// The bootstrap port a prefill worker bound and advertises: where its
+    /// decode partner's engine would rendezvous, the port the gateway tells
+    /// both sides of (`None` on every other worker).
+    bootstrap_port: Option<u16>,
 }
 
 /// Build the router serving the mock HTTP worker contract.
@@ -57,8 +76,13 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
-        .route("/generate", post(chat_completions))
+        .route("/generate", post(generate))
         .route("/v1/loads", get(loads))
+        .route("/server_info", get(server_info))
+        .route("/get_server_info", get(server_info))
+        .route("/flush_cache", post(flush_cache))
+        .route("/start_profile", post(start_profile))
+        .route("/stop_profile", post(stop_profile))
         .with_state(state)
 }
 
@@ -103,14 +127,36 @@ pub async fn serve_with_listener_until(
         tracing::error!("http worker {port} cannot load script: {e}");
         return;
     }
+    // A prefill worker's bootstrap port, numbered by the worker's offset from
+    // the base port as a gRPC worker's is: bound before the worker serves, as
+    // an engine's bootstrap server is up when its health answers; a port that
+    // cannot be bound stops the worker as its own port would.
+    let bootstrap_port = port
+        .checked_sub(cfg.http_base_port)
+        .and_then(|index| cfg.bootstrap_port_for(index));
+    let bootstrap = match crate::bootstrap::bind(&cfg.host, bootstrap_port).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("http worker {port} {e}");
+            return;
+        }
+    };
     // One simulated engine per listener (i.e. per virtual worker), registered
     // in the process fleet under `http:<port>` for the oracle and admin API.
     let name = format!("http:{port}");
     script::register(&name);
+    let ops = AdminOps::register(&name);
     let engine = cfg
         .realistic
         .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
-    let state = Arc::new(AppState { cfg, name, engine });
+    let state = Arc::new(AppState {
+        cfg,
+        name,
+        engine,
+        in_flight: WorkerInFlight::default(),
+        ops,
+        bootstrap_port,
+    });
     // TCP_NODELAY: without it Nagle holds each small SSE frame until the
     // gateway's delayed ACK (~40ms) arrives, which stalls every streamed
     // response on a pooled keep-alive connection and distorts ITL/CPU numbers.
@@ -119,12 +165,27 @@ pub async fn serve_with_listener_until(
             tracing::warn!("http worker {port}: set_nodelay failed: {e}");
         }
     });
-    if let Err(e) = axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown)
-        .await
-    {
-        tracing::error!("http worker {port} stopped: {e}");
-    }
+    // The bootstrap listener ends with the worker: the shutdown that stops
+    // the server stops its accept loop.
+    let (stop, stopped) = watch::channel(false);
+    let shutdown = async move {
+        shutdown.await;
+        let _ = stop.send(true);
+    };
+    let bootstrap = async {
+        if let Some(listener) = bootstrap {
+            crate::bootstrap::accept_and_close(listener, stopped).await;
+        }
+    };
+    let server = async {
+        if let Err(e) = axum::serve(listener, router(state))
+            .with_graceful_shutdown(shutdown)
+            .await
+        {
+            tracing::error!("http worker {port} stopped: {e}");
+        }
+    };
+    tokio::join!(server, bootstrap);
 }
 
 async fn health() -> &'static str {
@@ -166,20 +227,27 @@ async fn loads(State(state): State<Arc<AppState>>) -> Response {
             "utilization": s.token_usage,
             "max_running_requests": s.max_running_requests,
         }),
-        None => json!({
-            "dp_rank": 0,
-            "num_running_reqs": 0,
-            "num_waiting_reqs": 0,
-            "num_waiting_uncached_tokens": 0,
-            "num_total_reqs": 0,
-            "num_used_tokens": 0,
-            "max_total_num_tokens": 1_000_000,
-            "token_usage": 0.0,
-            "gen_throughput": 0.0,
-            "cache_hit_rate": 0.0,
-            "utilization": 0.0,
-            "max_running_requests": 0,
-        }),
+        None => {
+            // Without an engine simulation the work in flight is the canned
+            // and scripted answers whose responses are still open on this
+            // worker (not the process's other workers): the running count a
+            // load poll asks about, and nothing waits.
+            let running = state.in_flight.get();
+            json!({
+                "dp_rank": 0,
+                "num_running_reqs": running,
+                "num_waiting_reqs": 0,
+                "num_waiting_uncached_tokens": 0,
+                "num_total_reqs": running,
+                "num_used_tokens": 0,
+                "max_total_num_tokens": 1_000_000,
+                "token_usage": 0.0,
+                "gen_throughput": 0.0,
+                "cache_hit_rate": 0.0,
+                "utilization": 0.0,
+                "max_running_requests": 0,
+            })
+        }
     };
     Json(json!({ "timestamp": "", "dp_rank_count": 1, "loads": [value] })).into_response()
 }
@@ -194,45 +262,302 @@ enum Endpoint {
     Completions,
 }
 
+/// The completion routes as the request named them. The canned answer takes
+/// the route's own shape; the scripted, realistic and prompt-side answers
+/// take the shape of [`Route::endpoint`].
+#[derive(Clone, Copy)]
+enum Route {
+    Chat,
+    Completions,
+    Generate,
+}
+
+impl Route {
+    /// The shape of the scripted, realistic and prompt-side answers on the
+    /// route: `/generate` takes the chat completion's until something reads
+    /// the generate shape there (the gateway's generate tests drive the gRPC
+    /// wire).
+    fn endpoint(self) -> Endpoint {
+        match self {
+            Route::Chat | Route::Generate => Endpoint::Chat,
+            Route::Completions => Endpoint::Completions,
+        }
+    }
+}
+
 async fn chat_completions(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    handle(Endpoint::Chat, state, body).await
+    handle(Route::Chat, state, body).await
 }
 
 async fn completions(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    handle(Endpoint::Completions, state, body).await
+    handle(Route::Completions, state, body).await
 }
 
-async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Response {
+/// `POST /generate`, the engine-native route.
+async fn generate(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    handle(Route::Generate, state, body).await
+}
+
+/// `POST /flush_cache`: the engine's cache cleared at once (a canned worker
+/// has none), answered 200 as the engines' servers answer it.
+async fn flush_cache(State(state): State<Arc<AppState>>) -> Response {
+    let message = state.ops.flush(state.engine.iter());
+    Json(json!({ "status": "ok", "message": message })).into_response()
+}
+
+/// `POST /start_profile` with the profile options as its JSON body (an
+/// empty body is the defaults); a run already in progress is a 409.
+async fn start_profile(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let options = if body.is_empty() {
+        ProfileOptions::default()
+    } else {
+        match serde_json::from_slice::<ProfileOptions>(&body) {
+            Ok(options) => options,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("profile options: {e}")).into_response()
+            }
+        }
+    };
+    profile_answer(state.ops.start_profile(options))
+}
+
+/// `POST /stop_profile`: the run's trace file written; no run is a 409.
+async fn stop_profile(State(state): State<Arc<AppState>>) -> Response {
+    profile_answer(state.ops.stop_profile())
+}
+
+fn profile_answer(result: Result<String, String>) -> Response {
+    match result {
+        Ok(message) => Json(json!({ "status": "ok", "message": message })).into_response(),
+        Err(message) => (StatusCode::CONFLICT, message).into_response(),
+    }
+}
+
+/// `GET /server_info` (and its older spelling `/get_server_info`): what the
+/// gateway's metadata read of an HTTP engine asks for. A disaggregated worker
+/// reports its role and, on the prefill side, the port its partners
+/// rendezvous on, as the engines' server info carries them; the mock moves
+/// no KV cache and names the one transport the gateway pairs its workers on.
+async fn server_info(State(state): State<Arc<AppState>>) -> Response {
+    let mut info = json!({ "model_path": state.cfg.model_id });
+    if let Some(role) = state.cfg.role {
+        info["disaggregation_mode"] = json!(role.as_str());
+        info["disaggregation_transfer_backend"] = json!(crate::grpc::KV_TRANSPORT);
+        if let Some(port) = state.bootstrap_port {
+            info["disaggregation_bootstrap_port"] = json!(port);
+        }
+    }
+    Json(info).into_response()
+}
+
+/// What a disaggregated worker reads of the rendezvous the gateway injected
+/// into the request: a `bootstrap_room` (one, or one per prompt of a batch)
+/// on either side, as the engines' disaggregated servers require of every
+/// request; on a prefill side that bound its port, a `bootstrap_port` naming
+/// that port, the one its decode partner would come to for the handoff this
+/// mock stands in for.
+fn bootstrap_of(request: &Value, own_port: Option<u16>) -> Result<(), String> {
+    match request.get("bootstrap_room") {
+        Some(room) if !room.is_null() => {}
+        _ => return Err("a disaggregated request carries no bootstrap_room".to_string()),
+    }
+    let Some(own) = own_port else {
+        return Ok(());
+    };
+    // A missing or null port is the engines' default: a scheduler fills it
+    // with its own bootstrap port (8998 unless told otherwise), and the
+    // gateway, which sends null for a prefill worker registered without a
+    // port, probes that default for it. A worker on another port refuses
+    // it, as the pairing would send the decode side elsewhere.
+    let names_own = |port: &Value| match port {
+        Value::Null => own == DEFAULT_BOOTSTRAP_PORT,
+        port => port.as_u64() == Some(u64::from(own)),
+    };
+    let named: &[Value] = match request.get("bootstrap_port") {
+        Some(Value::Array(ports)) => ports,
+        Some(port) => std::slice::from_ref(port),
+        None => &[Value::Null],
+    };
+    if named.is_empty() || !named.iter().all(names_own) {
+        return Err(format!(
+            "bootstrap_port {} is not this worker's {own} (a missing port means {DEFAULT_BOOTSTRAP_PORT})",
+            request.get("bootstrap_port").unwrap_or(&Value::Null)
+        ));
+    }
+    Ok(())
+}
+
+/// A request this side cannot serve, refused as the engines' servers refuse
+/// one: a 400 with an OpenAI-shaped error body naming the reason.
+fn bad_request(why: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": {"message": why, "type": "invalid_request_error"}})),
+    )
+        .into_response()
+}
+
+/// The prompt side's admission: the realistic engine's fault and admission
+/// hooks as the regular path counts them ([`Engine::admit_without_tokens`]),
+/// then the canned delay. The finish reason of the completion to answer
+/// (`error` for an armed `finish=error`), or the status to answer instead.
+async fn prompt_side_admission(state: &AppState) -> Result<&'static str, Response> {
+    let mut finish_reason = "stop";
+    if let Some(engine) = &state.engine {
+        if engine
+            .admit_without_tokens()
+            .await
+            .map_err(injected_error)?
+        {
+            finish_reason = "error";
+        }
+    }
+    if !state.cfg.gen_delay.is_zero() {
+        tokio::time::sleep(state.cfg.gen_delay).await;
+    }
+    Ok(finish_reason)
+}
+
+/// The prompt side's completion: no output, the prompt's tokens and the
+/// finish reason, in the endpoint's shape; one body, or a stream of its
+/// finish frame and `[DONE]` when the request asked for one (what the
+/// gateway drains on the prefill side).
+fn prompt_side_response(
+    endpoint: Endpoint,
+    model: &str,
+    prompt_len: usize,
+    finish_reason: &str,
+    stream: bool,
+    in_flight: InFlight,
+) -> Response {
+    if stream {
+        let finish = match endpoint {
+            Endpoint::Chat => json!({"index": 0, "delta": {}, "finish_reason": finish_reason}),
+            Endpoint::Completions => {
+                json!({"index": 0, "text": "", "finish_reason": finish_reason})
+            }
+        };
+        let frames: [Result<Event, Infallible>; 2] = [
+            Ok(Event::default().data(scripted_chunk(endpoint, model, finish).to_string())),
+            Ok(Event::default().data("[DONE]")),
+        ];
+        return Sse::new(in_flight.until_done(stream::iter(frames))).into_response();
+    }
+    let usage = json!({
+        "prompt_tokens": prompt_len,
+        "completion_tokens": 0,
+        "total_tokens": prompt_len,
+    });
+    let body = match endpoint {
+        Endpoint::Chat => json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "created": 0,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": ""},
+                "finish_reason": finish_reason,
+            }],
+            "usage": usage,
+        }),
+        Endpoint::Completions => json!({
+            "id": "cmpl-mock",
+            "object": "text_completion",
+            "created": 0,
+            "model": model,
+            "choices": [{"index": 0, "text": "", "finish_reason": finish_reason}],
+            "usage": usage,
+        }),
+    };
+    Json(body).into_response()
+}
+
+async fn handle(route: Route, state: Arc<AppState>, body: Bytes) -> Response {
+    let endpoint = route.endpoint();
     // In flight from here until the response is complete or its stream is
-    // done, so a shutdown knows what it waits for.
-    let in_flight = InFlight::enter();
+    // done, so a shutdown knows what it waits for and this worker's load
+    // report counts it.
+    let in_flight = InFlight::enter_on(&state.in_flight);
     let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    // A disaggregated worker reads the rendezvous the gateway injected before
+    // anything is spent on the request: a request without it went to the
+    // wrong pool, or came from a gateway that is not pairing. The check is
+    // pure, so an armed fault waits for a request this side serves.
+    if state.cfg.role.is_some() {
+        if let Err(why) = bootstrap_of(&parsed, state.bootstrap_port) {
+            return bad_request(why);
+        }
+    }
     let stream_requested = parsed
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    // The prompt as this wire knows it: synthetic ids, one per whitespace
-    // word, the realistic engine's prompt and the script's key alike. The
-    // canned path does without them until something is scripted.
-    let prompt_ids = if script::active() || state.engine.is_some() {
-        synth_token_ids(&extract_prompt_text(&parsed))
-    } else {
-        Vec::new()
-    };
+    // The prompt as this wire knows it: its text, and synthetic ids, one per
+    // whitespace word, the realistic engine's prompt and the script's key
+    // alike (and the prompt side's count). The canned path does without them
+    // until something is scripted.
+    let prompt_text =
+        if script::active() || state.engine.is_some() || state.cfg.role == Some(Role::Prefill) {
+            extract_prompt_text(&parsed)
+        } else {
+            String::new()
+        };
+    let prompt_ids = synth_token_ids(&prompt_text);
 
-    // A scripted answer, ahead of either engine mode: the worker's queue or
-    // the prompt's key decides ([`crate::script`]).
-    if let Some(answer) = script::take(&state.name, &prompt_ids) {
-        return scripted_response(
+    // A prefill worker's answer: the prompt side's completion alone, ahead
+    // of the script and of either engine mode. The decode side of the pair
+    // has the prompt and generates the output, so nothing is scripted here
+    // and nothing counts as a miss; the realistic engine's fault and
+    // admission hooks apply as to any request, and the canned delay paces
+    // it as it paces a canned answer.
+    if state.cfg.role == Some(Role::Prefill) {
+        let finish_reason = match prompt_side_admission(&state).await {
+            Ok(finish_reason) => finish_reason,
+            Err(refused) => return refused,
+        };
+        return prompt_side_response(
             endpoint,
-            &state.cfg,
-            &parsed,
-            answer,
+            &state.cfg.model_id,
             prompt_ids.len(),
+            finish_reason,
             stream_requested,
             in_flight,
-        )
-        .await;
+        );
+    }
+
+    // A scripted answer, ahead of either engine mode: the worker's queue, the
+    // prompt's text or its key decides ([`crate::script`]).
+    // One scripted answer per choice the request samples (`n`).
+    match script::take_per_choice(
+        &state.name,
+        &prompt_ids,
+        Some(&prompt_text),
+        extract_n(&parsed),
+    ) {
+        Ok(Some(answers)) => {
+            // The request's limit ends each answer as it would an engine's.
+            let limit = extract_max_tokens(&parsed);
+            let answers = answers
+                .into_iter()
+                .map(|answer| answer.cut_to(limit))
+                .collect();
+            return scripted_response(
+                endpoint,
+                &state.cfg,
+                &parsed,
+                answers,
+                prompt_ids.len(),
+                stream_requested,
+                in_flight,
+            )
+            .await;
+        }
+        Ok(None) => {}
+        // A precondition the script does not meet (the gRPC wire's
+        // `FAILED_PRECONDITION`): a status the gateway does not retry, so the
+        // reason reaches the test instead of a retry's canned choice.
+        Err(why) => return (StatusCode::PRECONDITION_FAILED, why).into_response(),
     }
 
     // Realistic mode: drive the engine simulator.
@@ -279,58 +604,98 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
         };
     }
 
-    // Canned mode: a single up-front delay, then a fixed chat-shaped response,
-    // whichever endpoint was called.
+    // Canned mode: a single up-front delay, then a fixed answer in the shape
+    // of the route that was called.
     if !state.cfg.gen_delay.is_zero() {
         tokio::time::sleep(state.cfg.gen_delay).await;
     }
     if stream_requested {
-        stream_chat(&state.cfg, in_flight).into_response()
+        canned_stream(route, &state.cfg, in_flight).into_response()
     } else {
-        Json(completion(&state.cfg)).into_response()
+        Json(canned_answer(route, &state.cfg)).into_response()
     }
 }
 
 // ── Canned responses ───────────────────────────────────────────────────────
 
-fn completion(cfg: &Config) -> Value {
-    json!({
-        "id": "chatcmpl-mock",
-        "object": "chat.completion",
-        "created": 0,
-        "model": cfg.model_id,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": "mock"},
-            "finish_reason": "stop",
-        }],
-        "usage": {
-            "prompt_tokens": 1,
-            "completion_tokens": cfg.output_tokens,
-            "total_tokens": u64::from(cfg.output_tokens) + 1,
-        },
-    })
+/// The canned answer in the route's own shape: a chat completion, a text
+/// completion, or the generate body (`text` and `meta_info`, as the engines
+/// answer it).
+fn canned_answer(route: Route, cfg: &Config) -> Value {
+    let usage = json!({
+        "prompt_tokens": 1,
+        "completion_tokens": cfg.output_tokens,
+        "total_tokens": u64::from(cfg.output_tokens) + 1,
+    });
+    match route {
+        Route::Chat => json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "created": 0,
+            "model": cfg.model_id,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "mock"},
+                "finish_reason": "stop",
+            }],
+            "usage": usage,
+        }),
+        Route::Completions => json!({
+            "id": "cmpl-mock",
+            "object": "text_completion",
+            "created": 0,
+            "model": cfg.model_id,
+            "choices": [{
+                "index": 0,
+                "text": "mock",
+                "logprobs": null,
+                "finish_reason": "stop",
+            }],
+            "usage": usage,
+        }),
+        Route::Generate => json!({
+            "text": "mock",
+            "meta_info": {
+                "prompt_tokens": 1,
+                "completion_tokens": cfg.output_tokens,
+                "completion_tokens_wo_jump_forward": cfg.output_tokens,
+                "input_token_logprobs": null,
+                "output_token_logprobs": null,
+                "first_token_latency": cfg.gen_delay.as_secs_f64(),
+                "time_to_first_token": cfg.gen_delay.as_secs_f64(),
+                "time_per_output_token": 0.0,
+                "finish_reason": {"type": "stop", "reason": "stop"},
+            },
+        }),
+    }
 }
 
-fn stream_chat(
+/// The canned stream in the route's own shape: one frame per output token
+/// and the finish frame on the chat and text completion routes; one frame
+/// with the whole answer on the generate route, as the engines' last frame
+/// carries it. `[DONE]` ends each.
+fn canned_stream(
+    route: Route,
     cfg: &Config,
     in_flight: InFlight,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut events: Vec<Result<Event, Infallible>> = Vec::new();
-    for _ in 0..cfg.output_tokens {
-        let frame = json!({
-            "id": "chatcmpl-mock",
-            "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": null}],
-        });
-        events.push(Ok(Event::default().data(frame.to_string())));
+    match route {
+        Route::Generate => {
+            events.push(Ok(
+                Event::default().data(canned_answer(route, cfg).to_string())
+            ));
+        }
+        Route::Chat | Route::Completions => {
+            let endpoint = route.endpoint();
+            for _ in 0..cfg.output_tokens {
+                let frame = token_chunk(endpoint, &cfg.model_id);
+                events.push(Ok(Event::default().data(frame.to_string())));
+            }
+            let frame = final_chunk(endpoint, &cfg.model_id);
+            events.push(Ok(Event::default().data(frame.to_string())));
+        }
     }
-    let final_frame = json!({
-        "id": "chatcmpl-mock",
-        "object": "chat.completion.chunk",
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-    });
-    events.push(Ok(Event::default().data(final_frame.to_string())));
     events.push(Ok(Event::default().data("[DONE]")));
     Sse::new(in_flight.until_done(stream::iter(events)))
 }
@@ -348,34 +713,70 @@ fn wants_logprobs(endpoint: Endpoint, request: &Value) -> bool {
     }
 }
 
-/// The usage block of a scripted answer.
-fn scripted_usage(answer: &Answer, prompt_len: usize) -> Value {
-    let prompt_tokens = answer.prompt_tokens(prompt_len);
-    let completion_tokens = answer.completion_tokens();
+/// How many top alternatives the request asked for per token: chat's
+/// `top_logprobs`, a completion's `logprobs: <n>` (the sampled token counts
+/// as one of them).
+fn wants_top(endpoint: Endpoint, request: &Value) -> usize {
+    let key = match endpoint {
+        Endpoint::Chat => "top_logprobs",
+        Endpoint::Completions => "logprobs",
+    };
+    request
+        .get(key)
+        .and_then(Value::as_u64)
+        .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
+}
+
+/// The usage of a request's scripted answers: the prompt once, every
+/// choice's completion, as an engine reports a request that samples `n` times.
+fn scripted_usage(answers: &[Answer], prompt_len: usize) -> Value {
+    let first = answers.first();
+    let prompt_tokens = first.map_or(0, |answer| answer.prompt_tokens(prompt_len));
+    let completion_tokens: u32 = answers.iter().map(Answer::completion_tokens).sum();
     json!({
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
-        "prompt_tokens_details": { "cached_tokens": answer.cached_tokens },
+        "prompt_tokens_details": { "cached_tokens": first.map_or(0, |answer| answer.cached_tokens) },
     })
 }
 
 /// The logprobs of some text pieces in the endpoint's shape: chat's
-/// `content` entries, a completion's parallel `tokens` and `token_logprobs`.
-fn scripted_logprobs(endpoint: Endpoint, pieces: &[String], logprobs: &[f32]) -> Value {
+/// `content` entries, a completion's parallel `tokens` and `token_logprobs`,
+/// with the answer's `top` alternatives per piece where the request asked for
+/// them (chat's entry list, a completion's piece-to-logprob map).
+fn scripted_logprobs(
+    endpoint: Endpoint,
+    answer: &Answer,
+    pieces: &[String],
+    logprobs: &[f32],
+    top: usize,
+) -> Value {
+    let mut alternatives = answer.top_pieces(pieces, logprobs, top).into_iter();
     match endpoint {
         Endpoint::Chat => json!({
             "content": pieces.iter().zip(logprobs).map(|(piece, logprob)| json!({
                 "token": piece,
                 "logprob": logprob,
                 "bytes": Value::Null,
-                "top_logprobs": [],
+                "top_logprobs": alternatives.next().unwrap_or_default().into_iter().map(|(token, logprob)| json!({
+                    "token": token,
+                    "logprob": logprob,
+                    "bytes": Value::Null,
+                })).collect::<Vec<Value>>(),
             })).collect::<Vec<Value>>(),
         }),
         Endpoint::Completions => json!({
             "tokens": pieces,
             "token_logprobs": logprobs,
-            "top_logprobs": pieces.iter().map(|_| json!({})).collect::<Vec<Value>>(),
+            "top_logprobs": pieces.iter().map(|_| {
+                alternatives
+                    .next()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(token, logprob)| (token, json!(logprob)))
+                    .collect::<serde_json::Map<String, Value>>()
+            }).collect::<Vec<serde_json::Map<String, Value>>>(),
             "text_offset": [],
         }),
     }
@@ -391,15 +792,19 @@ async fn scripted_response(
     endpoint: Endpoint,
     cfg: &Config,
     request: &Value,
-    answer: Answer,
+    answers: Vec<Answer>,
     prompt_len: usize,
     stream: bool,
     in_flight: InFlight,
 ) -> Response {
     let want_logprobs = wants_logprobs(endpoint, request);
-    let usage = scripted_usage(&answer, prompt_len);
+    let top = if want_logprobs {
+        wants_top(endpoint, request)
+    } else {
+        0
+    };
+    let usage = scripted_usage(&answers, prompt_len);
     let model = cfg.model_id.clone();
-    let frames = answer.text_frames();
     if stream {
         let include_usage = request
             .pointer("/stream_options/include_usage")
@@ -409,47 +814,61 @@ async fn scripted_response(
         return Sse::new(in_flight.until_done(scripted_frames(
             endpoint,
             model,
-            answer,
-            frames,
+            answers,
             want_logprobs,
+            top,
             usage,
         )))
         .into_response();
     }
-    let pauses = u32::try_from(frames.len().saturating_sub(1)).unwrap_or(u32::MAX);
-    if pauses > 0 && !answer.delay.is_zero() {
-        tokio::time::sleep(answer.delay * pauses).await;
+    // The pauses the choices' frames would take one after the other, as one wait.
+    let pauses: std::time::Duration = answers
+        .iter()
+        .map(|answer| {
+            answer.delay
+                * u32::try_from(answer.text_frames().len().saturating_sub(1)).unwrap_or(u32::MAX)
+        })
+        .sum();
+    if !pauses.is_zero() {
+        tokio::time::sleep(pauses).await;
     }
-    let text = answer.text();
-    let mut choice = match endpoint {
-        Endpoint::Chat => json!({
-            "index": 0,
-            "message": {"role": "assistant", "content": text},
-            "finish_reason": answer.finish_reason,
-        }),
-        Endpoint::Completions => json!({
-            "index": 0,
-            "text": text,
-            "finish_reason": answer.finish_reason,
-        }),
-    };
-    if let Some(stop) = &answer.matched_stop {
-        choice["matched_stop"] = stop.to_json();
-    }
-    if let (true, Some(pieces), Some(logprobs)) =
-        (want_logprobs, &answer.output_text, &answer.logprobs)
-    {
-        if pieces.len() == logprobs.len() {
-            choice["logprobs"] = scripted_logprobs(endpoint, pieces, logprobs);
-        }
-    }
+    let choices: Vec<Value> = answers
+        .iter()
+        .enumerate()
+        .map(|(index, answer)| {
+            let text = answer.text();
+            let mut choice = match endpoint {
+                Endpoint::Chat => json!({
+                    "index": index,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": answer.finish_reason,
+                }),
+                Endpoint::Completions => json!({
+                    "index": index,
+                    "text": text,
+                    "finish_reason": answer.finish_reason,
+                }),
+            };
+            if let Some(stop) = &answer.matched_stop {
+                choice["matched_stop"] = stop.to_json();
+            }
+            if let (true, Some(pieces), Some(logprobs)) =
+                (want_logprobs, &answer.output_text, &answer.logprobs)
+            {
+                if pieces.len() == logprobs.len() {
+                    choice["logprobs"] = scripted_logprobs(endpoint, answer, pieces, logprobs, top);
+                }
+            }
+            choice
+        })
+        .collect();
     let body = match endpoint {
         Endpoint::Chat => json!({
             "id": "chatcmpl-mock",
             "object": "chat.completion",
             "created": 0,
             "model": model,
-            "choices": [choice],
+            "choices": choices,
             "usage": usage,
         }),
         Endpoint::Completions => json!({
@@ -457,52 +876,88 @@ async fn scripted_response(
             "object": "text_completion",
             "created": 0,
             "model": model,
-            "choices": [choice],
+            "choices": choices,
             "usage": usage,
         }),
     };
     Json(body).into_response()
 }
 
-/// The frames of a scripted stream: the text frames, the finish frame, the
-/// usage chunk when asked for, `[DONE]`.
+/// The frames of a scripted stream, choice by choice in order: each choice's
+/// text frames and its finish frame, then the usage chunk when asked for,
+/// then `[DONE]`.
 fn scripted_frames(
     endpoint: Endpoint,
     model: String,
-    answer: Answer,
-    frames: Vec<script::Frame>,
+    answers: Vec<Answer>,
     want_logprobs: bool,
+    top: usize,
     usage: Option<Value>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
+    struct Choice {
+        index: usize,
+        answer: Answer,
+        frames: std::collections::VecDeque<script::Frame>,
+        started: bool,
+    }
     struct Scripted {
         endpoint: Endpoint,
         model: String,
-        answer: Answer,
-        frames: std::collections::VecDeque<script::Frame>,
+        choices: std::collections::VecDeque<Choice>,
         want_logprobs: bool,
+        top: usize,
         usage: Option<Value>,
-        started: bool,
-        finished: bool,
         ended: bool,
     }
+    let choices = answers
+        .into_iter()
+        .enumerate()
+        .map(|(index, answer)| Choice {
+            index,
+            frames: answer.text_frames().into(),
+            answer,
+            started: false,
+        })
+        .collect();
     let init = Scripted {
         endpoint,
         model,
-        answer,
-        frames: frames.into(),
+        choices,
         want_logprobs,
+        top,
         usage,
-        started: false,
-        finished: false,
         ended: false,
     };
     stream::unfold(init, |mut st| async move {
         if st.ended {
             return None;
         }
-        if st.finished {
-            // The usage rides in a chunk of its own after the finish frame,
-            // with no choices, as the engines send it.
+        if st
+            .choices
+            .front()
+            .is_some_and(|choice| choice.frames.is_empty())
+        {
+            // Every frame of the choice went out: its finish frame, then the
+            // next choice from its first frame.
+            let choice = st.choices.pop_front()?;
+            let mut finish = match st.endpoint {
+                Endpoint::Chat => json!({
+                    "index": choice.index, "delta": {}, "finish_reason": choice.answer.finish_reason
+                }),
+                Endpoint::Completions => json!({
+                    "index": choice.index, "text": "", "finish_reason": choice.answer.finish_reason
+                }),
+            };
+            if let Some(stop) = &choice.answer.matched_stop {
+                finish["matched_stop"] = stop.to_json();
+            }
+            let frame = scripted_chunk(st.endpoint, &st.model, finish);
+            return Some((Ok(Event::default().data(frame.to_string())), st));
+        }
+        let Some(choice) = st.choices.front_mut() else {
+            // Every choice finished. The usage rides in a chunk of its own
+            // after the finish frames, with no choices, as the engines send
+            // it; then the end.
             if let Some(usage) = st.usage.take() {
                 let mut chunk = scripted_chunk(st.endpoint, &st.model, Value::Null);
                 chunk["choices"] = json!([]);
@@ -511,47 +966,40 @@ fn scripted_frames(
             }
             st.ended = true;
             return Some((Ok(Event::default().data("[DONE]")), st));
-        }
-        let Some(frame) = st.frames.pop_front() else {
-            st.finished = true;
-            let mut choice = match st.endpoint {
-                Endpoint::Chat => {
-                    json!({"index": 0, "delta": {}, "finish_reason": st.answer.finish_reason})
-                }
-                Endpoint::Completions => {
-                    json!({"index": 0, "text": "", "finish_reason": st.answer.finish_reason})
-                }
-            };
-            if let Some(stop) = &st.answer.matched_stop {
-                choice["matched_stop"] = stop.to_json();
-            }
-            let frame = scripted_chunk(st.endpoint, &st.model, choice);
-            return Some((Ok(Event::default().data(frame.to_string())), st));
         };
-        if st.started && !st.answer.delay.is_zero() {
-            tokio::time::sleep(st.answer.delay).await;
+        let frame = choice.frames.pop_front()?;
+        if choice.started && !choice.answer.delay.is_zero() {
+            tokio::time::sleep(choice.answer.delay).await;
         }
         let text = frame.text();
-        let mut choice = match st.endpoint {
-            // The first delta names the role, as an engine's does.
-            Endpoint::Chat if !st.started => {
-                json!({"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": Value::Null})
-            }
-            Endpoint::Chat => {
-                json!({"index": 0, "delta": {"content": text}, "finish_reason": Value::Null})
-            }
-            Endpoint::Completions => {
-                json!({"index": 0, "text": text, "finish_reason": Value::Null})
-            }
+        let mut delta = match st.endpoint {
+            // The first delta of a choice names the role, as an engine's does.
+            Endpoint::Chat if !choice.started => json!({
+                "index": choice.index,
+                "delta": {"role": "assistant", "content": text},
+                "finish_reason": Value::Null,
+            }),
+            Endpoint::Chat => json!({
+                "index": choice.index, "delta": {"content": text}, "finish_reason": Value::Null
+            }),
+            Endpoint::Completions => json!({
+                "index": choice.index, "text": text, "finish_reason": Value::Null
+            }),
         };
         if st.want_logprobs
             && !frame.logprobs.is_empty()
             && frame.logprobs.len() == frame.pieces.len()
         {
-            choice["logprobs"] = scripted_logprobs(st.endpoint, &frame.pieces, &frame.logprobs);
+            delta["logprobs"] = scripted_logprobs(
+                st.endpoint,
+                &choice.answer,
+                &frame.pieces,
+                &frame.logprobs,
+                st.top,
+            );
         }
-        st.started = true;
-        let frame = scripted_chunk(st.endpoint, &st.model, choice);
+        choice.started = true;
+        let frame = scripted_chunk(st.endpoint, &st.model, delta);
         Some((Ok(Event::default().data(frame.to_string())), st))
     })
 }
@@ -783,21 +1231,43 @@ fn final_chunk(endpoint: Endpoint, model: &str) -> Value {
 
 // ── HTTP prompt helpers ──────────────────────────────────────────────────────
 
-/// Extract prompt text from a chat/completions/generate body.
+/// Extract prompt text from a chat/completions/generate body: the messages'
+/// content (a string, or the `text` of its parts), else the prompt (a
+/// string, or an array of them), joined by spaces.
 fn extract_prompt_text(v: &Value) -> String {
     if let Some(messages) = v.get("messages").and_then(Value::as_array) {
         return messages
             .iter()
-            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .filter_map(|m| m.get("content"))
+            .flat_map(texts_of)
             .collect::<Vec<_>>()
             .join(" ");
     }
     for key in ["prompt", "text", "inputs"] {
-        if let Some(s) = v.get(key).and_then(Value::as_str) {
-            return s.to_string();
+        if let Some(value) = v.get(key) {
+            let texts = texts_of(value);
+            if !texts.is_empty() {
+                return texts.join(" ");
+            }
         }
     }
     String::new()
+}
+
+/// The texts of a content value: the string itself, or the `text` fields of
+/// an array's parts (`{"type": "text", "text": ...}`) and its plain strings.
+fn texts_of(value: &Value) -> Vec<&str> {
+    match value {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                part.as_str()
+                    .or_else(|| part.get("text").and_then(Value::as_str))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Approximate a prompt's token ids from its text: one id per whitespace word,
@@ -818,8 +1288,18 @@ fn hash_word(w: &str) -> u32 {
     h % 30_000
 }
 
+/// The choices a request samples: its `n`, one when absent or zero.
+fn extract_n(v: &Value) -> usize {
+    v.get("n")
+        .and_then(Value::as_u64)
+        .map_or(1, |n| usize::try_from(n).unwrap_or(usize::MAX))
+        .max(1)
+}
+
 fn extract_max_tokens(v: &Value) -> Option<u32> {
-    for key in ["max_tokens", "max_new_tokens"] {
+    // The chat API's current name first, then the one it deprecates and the
+    // engines' native one.
+    for key in ["max_completion_tokens", "max_tokens", "max_new_tokens"] {
         if let Some(n) = v.get(key).and_then(Value::as_u64) {
             return Some(n as u32);
         }
@@ -838,6 +1318,35 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn the_prompt_text_is_read_from_string_content_text_parts_and_prompt_arrays() {
+        use serde_json::json;
+        assert_eq!(
+            extract_prompt_text(&json!({"messages": [{"role": "user", "content": "say apricot"}]})),
+            "say apricot"
+        );
+        assert_eq!(
+            extract_prompt_text(&json!({"messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "say"},
+                    {"type": "image_url", "image_url": {"url": "data:,"}},
+                    {"type": "text", "text": "apricot"},
+                ]},
+            ]})),
+            "be brief say apricot"
+        );
+        assert_eq!(
+            extract_prompt_text(&json!({"prompt": "say apricot"})),
+            "say apricot"
+        );
+        assert_eq!(
+            extract_prompt_text(&json!({"prompt": ["say", "apricot"]})),
+            "say apricot"
+        );
+        assert_eq!(extract_prompt_text(&json!({"prompt": [1, 2, 3]})), "");
+    }
+
     fn token() -> engine::GenEvent {
         engine::GenEvent::Token {
             token_id: 7,
@@ -853,6 +1362,70 @@ mod tests {
             completion_tokens: tokens,
             cached_tokens: 0,
         }
+    }
+
+    #[test]
+    fn the_request_limit_is_read_under_each_of_its_names() {
+        for key in ["max_completion_tokens", "max_tokens", "max_new_tokens"] {
+            assert_eq!(extract_max_tokens(&json!({ key: 7 })), Some(7), "{key}");
+        }
+        assert_eq!(extract_max_tokens(&json!({ "stream": true })), None);
+        assert_eq!(
+            extract_max_tokens(&json!({ "max_completion_tokens": 3, "max_tokens": 9 })),
+            Some(3),
+            "the current name wins over the deprecated one"
+        );
+    }
+
+    /// The admin fan-out's three routes on a canned worker, through their
+    /// handlers: the flush is a 200, a profiling run ends with one trace file
+    /// in the requested directory, a second start and a stop with no run are
+    /// 409s, a body that is not the options is a 400.
+    #[tokio::test]
+    async fn the_admin_fan_out_routes_answer_on_a_canned_worker() {
+        let state = Arc::new(AppState {
+            cfg: Arc::new(Config::default()),
+            name: "http:test".to_string(),
+            engine: None,
+            in_flight: WorkerInFlight::default(),
+            ops: AdminOps::register("http:test"),
+            bootstrap_port: None,
+        });
+        let start =
+            |body: &str| start_profile(State(Arc::clone(&state)), Bytes::from(body.to_string()));
+        let stop = || stop_profile(State(Arc::clone(&state)));
+
+        assert_eq!(
+            flush_cache(State(Arc::clone(&state))).await.status(),
+            StatusCode::OK
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let traces = dir.path().join("traces");
+        let options =
+            json!({ "output_dir": traces.display().to_string(), "num_steps": 2 }).to_string();
+        assert_eq!(start(&options).await.status(), StatusCode::OK);
+        assert_eq!(
+            start(&options).await.status(),
+            StatusCode::CONFLICT,
+            "a run is in progress"
+        );
+        assert_eq!(stop().await.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_dir(&traces)
+                .expect("the output directory")
+                .count(),
+            1
+        );
+        assert_eq!(
+            stop().await.status(),
+            StatusCode::CONFLICT,
+            "no run in progress"
+        );
+        assert_eq!(start("{not json").await.status(), StatusCode::BAD_REQUEST);
+        let ops = AdminOps::find("http:test").expect("the worker's operations");
+        assert_eq!(ops.status()["flushes"], 1);
+        assert_eq!(ops.status()["profiles_stopped"], 1);
     }
 
     #[tokio::test]
@@ -942,5 +1515,322 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR
         );
         assert_eq!(injected_error(429).status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// A canned worker of `role` for the handler-level tests: no engine, a
+    /// name of its own in the script store, the bootstrap port it would have
+    /// bound.
+    fn state_of(role: Option<Role>, bootstrap_port: Option<u16>, name: &str) -> Arc<AppState> {
+        script::register(name);
+        Arc::new(AppState {
+            cfg: Arc::new(Config {
+                role,
+                output_tokens: 2,
+                ..Config::default()
+            }),
+            name: name.to_string(),
+            engine: None,
+            in_flight: WorkerInFlight::default(),
+            ops: AdminOps::register(name),
+            bootstrap_port,
+        })
+    }
+
+    /// A chat request as the gateway's disaggregated dispatch sends it to
+    /// both sides: the prompt, and the rendezvous it injected (the room and
+    /// the prefill side's port).
+    fn disaggregated_chat(room: Option<u64>, port: Option<Value>, stream: bool) -> Bytes {
+        let mut body = json!({
+            "messages": [{"role": "user", "content": "say apricot now"}],
+            "stream": stream,
+        });
+        if let Some(room) = room {
+            body["bootstrap_host"] = json!("127.0.0.1");
+            body["bootstrap_room"] = json!(room);
+        }
+        if let Some(port) = port {
+            body["bootstrap_port"] = port;
+        }
+        Bytes::from(body.to_string())
+    }
+
+    async fn text_of(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body");
+        String::from_utf8(bytes.to_vec()).expect("utf-8")
+    }
+
+    async fn json_of(response: Response) -> Value {
+        serde_json::from_str(&text_of(response).await).expect("json")
+    }
+
+    /// The prompt side's completion in both shapes and as a stream, with
+    /// the scripted answer left where the decode side takes it.
+    #[tokio::test]
+    async fn a_prefill_worker_answers_the_prompt_side_alone_and_leaves_the_script_to_decode() {
+        let state = state_of(Some(Role::Prefill), Some(8998), "http:prefill-test");
+        let scripted =
+            script::Answer::parse(&json!({"output_text": "apricot"})).expect("an answer");
+        script::enqueue("http:prefill-test", vec![scripted]).expect("a known worker");
+
+        for stream in [false, true] {
+            let response = handle(
+                Route::Chat,
+                Arc::clone(&state),
+                disaggregated_chat(Some(7), Some(json!(8998)), stream),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let text = text_of(response).await;
+            if stream {
+                assert!(
+                    text.contains(r#""finish_reason":"stop""#) && text.contains("[DONE]"),
+                    "the finish frame and the end: {text}"
+                );
+                assert!(
+                    !text.contains(r#""content":"x""#),
+                    "no output on the prompt side: {text}"
+                );
+            } else {
+                let body: Value = serde_json::from_str(&text).expect("json");
+                assert_eq!(body["choices"][0]["message"]["content"], "");
+                assert_eq!(body["choices"][0]["finish_reason"], "stop");
+                assert_eq!(
+                    (
+                        body["usage"]["prompt_tokens"].as_u64(),
+                        body["usage"]["completion_tokens"].as_u64()
+                    ),
+                    (Some(3), Some(0)),
+                    "the prompt's words, no output: {body}"
+                );
+            }
+        }
+        let completion = json_of(
+            handle(
+                Route::Completions,
+                Arc::clone(&state),
+                Bytes::from(
+                    json!({"prompt": "say apricot", "bootstrap_room": 1, "bootstrap_port": 8998})
+                        .to_string(),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(completion["object"], "text_completion");
+        assert_eq!(completion["choices"][0]["text"], "");
+        let status = script::status("http:prefill-test").expect("a known worker");
+        assert_eq!(
+            (
+                status["queued"].as_u64(),
+                status["hits"].as_u64(),
+                status["misses"].as_u64()
+            ),
+            (Some(1), Some(0), Some(0)),
+            "the scripted answer waits for the decode side, and no miss is counted: {status}"
+        );
+    }
+
+    /// The canned answers in each route's own shape: a chat completion, a
+    /// text completion (`choices[].text`, no logprobs, a `cmpl-` id) and the
+    /// generate body (`text`, `meta_info`); as a stream, the route's frames
+    /// and `[DONE]`.
+    #[tokio::test]
+    async fn the_canned_answers_take_the_shape_of_their_route() {
+        let state = state_of(None, None, "http:canned-shape-test");
+        let request = |stream: bool| {
+            Bytes::from(json!({"prompt": "say apricot", "stream": stream}).to_string())
+        };
+
+        let chat = json_of(handle(Route::Chat, Arc::clone(&state), request(false)).await).await;
+        assert_eq!(chat["object"], "chat.completion", "{chat}");
+        assert_eq!(chat["choices"][0]["message"]["content"], "mock");
+
+        let completion =
+            json_of(handle(Route::Completions, Arc::clone(&state), request(false)).await).await;
+        assert_eq!(completion["object"], "text_completion", "{completion}");
+        assert_eq!(completion["id"], "cmpl-mock");
+        assert_eq!(completion["choices"][0]["text"], "mock");
+        assert_eq!(completion["choices"][0]["logprobs"], Value::Null);
+        assert_eq!(completion["choices"][0]["finish_reason"], "stop");
+        assert!(
+            completion["choices"][0].get("message").is_none(),
+            "{completion}"
+        );
+        assert_eq!(completion["usage"]["completion_tokens"], 2);
+
+        let generate =
+            json_of(handle(Route::Generate, Arc::clone(&state), request(false)).await).await;
+        assert_eq!(generate["text"], "mock", "{generate}");
+        assert!(generate.get("choices").is_none(), "{generate}");
+        assert_eq!(generate["meta_info"]["prompt_tokens"], 1);
+        assert_eq!(generate["meta_info"]["completion_tokens"], 2);
+        assert_eq!(generate["meta_info"]["finish_reason"]["type"], "stop");
+
+        let frames =
+            text_of(handle(Route::Completions, Arc::clone(&state), request(true)).await).await;
+        assert_eq!(
+            frames.matches(r#""text":"x""#).count(),
+            2,
+            "one frame per output token: {frames}"
+        );
+        assert!(
+            frames.contains(r#""object":"text_completion""#)
+                && !frames.contains("delta")
+                && frames.ends_with("data: [DONE]\n\n"),
+            "{frames}"
+        );
+        let frames = text_of(handle(Route::Generate, state, request(true)).await).await;
+        assert!(
+            frames.contains(r#""text":"mock""#)
+                && frames.contains(r#""meta_info""#)
+                && frames.ends_with("data: [DONE]\n\n"),
+            "{frames}"
+        );
+    }
+
+    /// Either side of a disaggregated pair refuses a request that carries no
+    /// rendezvous; a regular worker reads none.
+    #[tokio::test]
+    async fn a_disaggregated_worker_refuses_a_request_without_its_bootstrap_room() {
+        for role in [Role::Prefill, Role::Decode] {
+            let state = state_of(
+                Some(role),
+                None,
+                &format!("http:{}-room-test", role.as_str()),
+            );
+            let refused = handle(
+                Route::Chat,
+                Arc::clone(&state),
+                disaggregated_chat(None, None, false),
+            )
+            .await;
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{role:?}");
+            let body = json_of(refused).await;
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("bootstrap_room")),
+                "{body}"
+            );
+            let served = handle(
+                Route::Chat,
+                state,
+                disaggregated_chat(Some(3), Some(json!(8998)), false),
+            )
+            .await;
+            assert_eq!(served.status(), StatusCode::OK, "{role:?}");
+        }
+        let regular = state_of(None, None, "http:regular-room-test");
+        assert_eq!(
+            handle(Route::Chat, regular, disaggregated_chat(None, None, false))
+                .await
+                .status(),
+            StatusCode::OK,
+            "a regular worker reads no rendezvous"
+        );
+    }
+
+    /// A prefill worker that bound its port takes requests naming that port
+    /// alone (one, or one per prompt of a batch). A missing or null port is
+    /// the engines' default, 8998: the worker on that port takes it, one on
+    /// another refuses it. One that bound none is told nothing to check.
+    #[tokio::test]
+    async fn a_prefill_worker_takes_the_bootstrap_port_it_bound_alone() {
+        let bound = state_of(Some(Role::Prefill), Some(8998), "http:port-test");
+        for (port, status) in [
+            (json!(8998), StatusCode::OK),
+            (json!([8998, 8998]), StatusCode::OK),
+            (json!(null), StatusCode::OK),
+            (json!([null, 8998]), StatusCode::OK),
+            (json!(8999), StatusCode::BAD_REQUEST),
+            (json!([8998, 8999]), StatusCode::BAD_REQUEST),
+            (json!("8998"), StatusCode::BAD_REQUEST),
+            (json!([]), StatusCode::BAD_REQUEST),
+        ] {
+            let response = handle(
+                Route::Chat,
+                Arc::clone(&bound),
+                disaggregated_chat(Some(1), Some(port.clone()), false),
+            )
+            .await;
+            assert_eq!(response.status(), status, "bootstrap_port {port}");
+        }
+        let missing = handle(
+            Route::Chat,
+            Arc::clone(&bound),
+            disaggregated_chat(Some(1), None, false),
+        )
+        .await;
+        assert_eq!(
+            missing.status(),
+            StatusCode::OK,
+            "no port named: the default"
+        );
+        let elsewhere = state_of(Some(Role::Prefill), Some(9001), "http:elsewhere-test");
+        for port in [Some(json!(null)), None] {
+            let response = handle(
+                Route::Chat,
+                Arc::clone(&elsewhere),
+                disaggregated_chat(Some(1), port.clone(), false),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "bootstrap_port {port:?} on a worker off the default port"
+            );
+        }
+        let unbound = state_of(Some(Role::Prefill), None, "http:unbound-test");
+        assert_eq!(
+            handle(
+                Route::Chat,
+                unbound,
+                disaggregated_chat(Some(1), Some(json!(8999)), false)
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+    }
+
+    /// The server info names the role and, on the prefill side, the
+    /// bootstrap port; a regular worker reports neither.
+    #[tokio::test]
+    async fn the_server_info_reports_the_role_and_the_bootstrap_port() {
+        let regular =
+            json_of(server_info(State(state_of(None, None, "http:info-regular"))).await).await;
+        assert_eq!(regular["model_path"], Config::default().model_id);
+        assert!(regular.get("disaggregation_mode").is_none(), "{regular}");
+        let prefill = json_of(
+            server_info(State(state_of(
+                Some(Role::Prefill),
+                Some(8998),
+                "http:info-prefill",
+            )))
+            .await,
+        )
+        .await;
+        assert_eq!(prefill["disaggregation_mode"], "prefill");
+        assert_eq!(prefill["disaggregation_bootstrap_port"], 8998);
+        assert_eq!(
+            prefill["disaggregation_transfer_backend"],
+            crate::grpc::KV_TRANSPORT
+        );
+        let decode = json_of(
+            server_info(State(state_of(
+                Some(Role::Decode),
+                None,
+                "http:info-decode",
+            )))
+            .await,
+        )
+        .await;
+        assert_eq!(decode["disaggregation_mode"], "decode");
+        assert!(
+            decode.get("disaggregation_bootstrap_port").is_none(),
+            "{decode}"
+        );
     }
 }

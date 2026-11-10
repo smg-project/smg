@@ -18,9 +18,14 @@
 //! vLLM wire (`Wire::Vllm`): events in vLLM's field order with its
 //! `omit_defaults`: a `BlockStored` carries `block_hashes`,
 //! `parent_block_hash`, `token_ids`, `block_size`, `lora_id`, `medium`,
-//! `lora_name` (required, nil when unset) and then `group_idx` and
-//! `kv_cache_spec_kind`; a `BlockRemoved` carries `block_hashes`, `medium`,
-//! `group_idx`; hashes are unsigned 64-bit integers; replay replies are
+//! `lora_name` (required, nil when unset) and then `group_idx`,
+//! `kv_cache_spec_kind` and, for a window group, `kv_cache_spec_sliding_window`
+//! (a sparse group's store carries the step's whole token span while its
+//! hashes name only the blocks the group retains, as the engine's
+//! `cache_full_blocks` writes a masked group)
+//! (a hybrid engine publishes one store per cache group, see
+//! `crate::engine::KvCacheGroup`); a `BlockRemoved` carries `block_hashes`,
+//! `medium`, `group_idx`; hashes are unsigned 64-bit integers; replay replies are
 //! `[routing…, topic, seq, payload]` and `[routing…, b"", END, b""]`.
 //!
 //! SGLang wire (`Wire::Sglang`): hashes are signed 64-bit integers (SGLang
@@ -139,7 +144,7 @@ async fn run(
     let mut generation = engine.fault_status().generation;
     if cfg.wire == Wire::Sglang {
         // SGLang's scheduler clears its cache at startup and says so.
-        let message = state.publish(&startup_cleared());
+        let message = state.publish(&startup_cleared(), &[]);
         if let Err(e) = publisher.send(message).await {
             tracing::warn!("kv-events publish failed: {e}");
         }
@@ -153,7 +158,7 @@ async fn run(
                     generation = item.generation;
                     state.restart();
                 }
-                let message = state.publish(&item.batch);
+                let message = state.publish(&item.batch, &item.spans);
                 if item.dropped {
                     continue; // lost on the wire; replay still has it
                 }
@@ -213,8 +218,8 @@ impl Publisher {
 
     /// Encode `batch`, assign it the next sequence, keep it for replay and
     /// return the PUB message.
-    fn publish(&mut self, batch: &common::KvEventBatch) -> ZmqMessage {
-        let payload = encode_batch(batch, self.dp_rank, self.wire);
+    fn publish(&mut self, batch: &common::KvEventBatch, spans: &[(usize, Vec<u32>)]) -> ZmqMessage {
+        let payload = encode_batch(batch, self.dp_rank, self.wire, spans);
         let seq = self.seq;
         self.seq += 1;
         self.buffer.push_back((seq, payload.clone()));
@@ -302,12 +307,21 @@ fn startup_cleared() -> common::KvEventBatch {
 /// The engine's `EventBatch` for a proto batch: `[ts, events, rank]`, the
 /// rank being `data_parallel_rank` on the vLLM wire and a nil `attn_dp_rank`
 /// on SGLang's.
-pub fn encode_batch(batch: &common::KvEventBatch, dp_rank: i32, wire: Wire) -> Vec<u8> {
+pub fn encode_batch(
+    batch: &common::KvEventBatch,
+    dp_rank: i32,
+    wire: Wire,
+    spans: &[(usize, Vec<u32>)],
+) -> Vec<u8> {
     let mut events: Vec<Value> = Vec::new();
-    for event in &batch.events {
+    for (index, event) in batch.events.iter().enumerate() {
         match (&event.data, wire) {
             (Some(common::kv_cache_event::Data::Stored(stored)), Wire::Vllm) => {
-                events.push(stored_map(stored));
+                let span = spans
+                    .iter()
+                    .find(|(at, _)| *at == index)
+                    .map(|(_, span)| span.as_slice());
+                events.push(stored_map(stored, span));
             }
             (Some(common::kv_cache_event::Data::Stored(stored)), Wire::Sglang) => {
                 events.push(sglang_stored_map(stored));
@@ -351,20 +365,25 @@ fn hash_value(hash: i64) -> Value {
     Value::from(hash as u64)
 }
 
-/// `BlockStored` as vLLM encodes it: the block_size of the first block, the
-/// token ids of every block in order.
-fn stored_map(stored: &common::KvBlocksStored) -> Value {
+/// A store as vLLM's `BlockStored`: the block_size of the first block and,
+/// for a sparse cache-group store, `span`, the step's whole token range, as
+/// the engine writes it under a block mask; otherwise `token_ids` is the
+/// blocks' own tokens in order.
+fn stored_map(stored: &common::KvBlocksStored, span: Option<&[u32]>) -> Value {
     let block_size = stored
         .blocks
         .first()
         .map(|b| i64::from(b.block_size))
         .unwrap_or(0);
-    let token_ids: Vec<Value> = stored
-        .blocks
-        .iter()
-        .flat_map(|b| b.token_ids.iter().map(|t| Value::from(*t)))
-        .collect();
-    Value::Map(vec![
+    let token_ids: Vec<Value> = match span {
+        Some(span) => span.iter().map(|t| Value::from(*t)).collect(),
+        None => stored
+            .blocks
+            .iter()
+            .flat_map(|b| b.token_ids.iter().map(|t| Value::from(*t)))
+            .collect(),
+    };
+    let mut entries = vec![
         (key("type"), Value::String("BlockStored".into())),
         (
             key("block_hashes"),
@@ -388,12 +407,23 @@ fn stored_map(stored: &common::KvBlocksStored) -> Value {
         (key("lora_id"), Value::Nil),
         (key("medium"), Value::String("GPU".into())),
         (key("lora_name"), Value::Nil),
-        (key("group_idx"), Value::from(0)),
+        (key("group_idx"), Value::from(stored.group_idx.unwrap_or(0))),
         (
             key("kv_cache_spec_kind"),
-            Value::String("full_attention".into()),
+            Value::String(
+                stored
+                    .kv_cache_spec_kind
+                    .clone()
+                    .unwrap_or_else(|| "full_attention".to_string())
+                    .into(),
+            ),
         ),
-    ])
+    ];
+    // vLLM omits the window field unless the group has one.
+    if let Some(window) = stored.kv_cache_spec_sliding_window {
+        entries.push((key("kv_cache_spec_sliding_window"), Value::from(window)));
+    }
+    Value::Map(entries)
 }
 
 fn removed_map(removed: &common::KvBlocksRemoved) -> Value {
@@ -410,7 +440,10 @@ fn removed_map(removed: &common::KvBlocksRemoved) -> Value {
             ),
         ),
         (key("medium"), Value::String("GPU".into())),
-        (key("group_idx"), Value::from(0)),
+        (
+            key("group_idx"),
+            Value::from(removed.group_idx.unwrap_or(0)),
+        ),
     ])
 }
 
@@ -471,6 +504,9 @@ mod tests {
     use std::time::Duration;
 
     use engine_servicer::kv_wire::{Normalizer, WireBatch};
+
+    /// A relayed store as the hybrid-batch test reads it: the group and the (hash, token count) of every block.
+    type RelayedStore = (Option<u32>, Vec<(i64, usize)>);
     use tokio::time::timeout;
     use zeromq::{DealerSocket, SubSocket};
 
@@ -562,7 +598,7 @@ mod tests {
 
     #[test]
     fn encodes_vllm_event_batches_field_for_field() {
-        let payload = encode_batch(&sample_batch(), 3, Wire::Vllm);
+        let payload = encode_batch(&sample_batch(), 3, Wire::Vllm, &[]);
         let value = rmpv::decode::read_value(&mut payload.as_slice()).expect("msgpack");
         let Value::Array(batch) = value else {
             panic!("batch is array-like");
@@ -571,7 +607,7 @@ mod tests {
         assert!(batch[0].as_f64().is_some_and(|ts| ts > 1.7e9));
         let mut stamped = sample_batch();
         stamped.timestamp = 1_700_000_000.25;
-        let again = encode_batch(&stamped, 3, Wire::Vllm);
+        let again = encode_batch(&stamped, 3, Wire::Vllm, &[]);
         let Value::Array(again) = rmpv::decode::read_value(&mut again.as_slice()).expect("msgpack")
         else {
             panic!("array");
@@ -635,9 +671,88 @@ mod tests {
         assert_eq!(field(&events[2], "type").as_str(), Some("AllBlocksCleared"));
     }
 
+    /// A sparse group's store on the wire: the step's whole token span, the
+    /// retained hashes only, as the engine writes a masked group.
+    #[test]
+    fn a_sparse_group_store_carries_the_step_span_and_its_retained_hashes() {
+        let mut batch = sample_batch();
+        let retained = match &mut batch.events[0].data {
+            Some(common::kv_cache_event::Data::Stored(stored)) => {
+                stored.group_idx = Some(1);
+                stored.kv_cache_spec_kind = Some("sliding_window".to_string());
+                stored.kv_cache_spec_sliding_window = Some(8);
+                stored.blocks.len()
+            }
+            _ => panic!("the sample batch starts with a store"),
+        };
+        let span: Vec<u32> = (100..124).collect();
+        let payload = encode_batch(&batch, 0, Wire::Vllm, &[(0, span.clone())]);
+        let Value::Array(root) =
+            rmpv::decode::read_value(&mut payload.as_slice()).expect("msgpack")
+        else {
+            panic!("array");
+        };
+        let events = root[1].as_array().expect("events");
+        let hashes = field(&events[0], "block_hashes")
+            .as_array()
+            .expect("hashes")
+            .len();
+        assert_eq!(hashes, retained, "the hashes are the retained blocks'");
+        let tokens: Vec<u64> = field(&events[0], "token_ids")
+            .as_array()
+            .expect("tokens")
+            .iter()
+            .map(|t| t.as_u64().expect("token"))
+            .collect();
+        assert_eq!(
+            tokens,
+            span.iter().map(|t| u64::from(*t)).collect::<Vec<_>>(),
+            "the token span is the step's whole range, wider than the hashes"
+        );
+        assert_eq!(
+            field(&events[0], "kv_cache_spec_sliding_window").as_i64(),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn a_window_group_store_carries_its_group_kind_and_window_on_the_wire() {
+        let mut batch = sample_batch();
+        if let Some(common::kv_cache_event::Data::Stored(stored)) = &mut batch.events[0].data {
+            stored.group_idx = Some(2);
+            stored.kv_cache_spec_kind = Some("sliding_window".to_string());
+            stored.kv_cache_spec_sliding_window = Some(1024);
+        }
+        if let Some(common::kv_cache_event::Data::Removed(removed)) = &mut batch.events[1].data {
+            removed.group_idx = Some(2);
+        }
+        let payload = encode_batch(&batch, 0, Wire::Vllm, &[]);
+        let Value::Array(root) =
+            rmpv::decode::read_value(&mut payload.as_slice()).expect("msgpack")
+        else {
+            panic!("array");
+        };
+        let events = root[1].as_array().expect("events");
+        assert_eq!(
+            keys(&events[0]).last().map(String::as_str),
+            Some("kv_cache_spec_sliding_window"),
+            "the window field follows the kind, as vLLM's field order has it"
+        );
+        assert_eq!(field(&events[0], "group_idx").as_i64(), Some(2));
+        assert_eq!(
+            field(&events[0], "kv_cache_spec_kind").as_str(),
+            Some("sliding_window")
+        );
+        assert_eq!(
+            field(&events[0], "kv_cache_spec_sliding_window").as_i64(),
+            Some(1024)
+        );
+        assert_eq!(field(&events[1], "group_idx").as_i64(), Some(2));
+    }
+
     #[test]
     fn the_relay_normalizes_the_payload_back_into_the_proto() {
-        let payload = encode_batch(&sample_batch(), 0, Wire::Vllm);
+        let payload = encode_batch(&sample_batch(), 0, Wire::Vllm, &[]);
         let wire: WireBatch = rmp_serde::from_slice(&payload).expect("the relay decodes it");
         let mut event_id = 0;
         let relayed = Normalizer::new().normalize_batch(wire, 7, &mut event_id);
@@ -673,11 +788,97 @@ mod tests {
         assert_eq!(removed.block_hashes, [11]);
     }
 
+    /// What the relay makes of a hybrid engine's batch: the main group's
+    /// store and removal go through whole, every other group's event goes
+    /// through on its own lane (a store with its hashes and no tokens), and
+    /// nothing is stored twice under the shared hash on the main lane.
+    #[test]
+    fn the_relay_forwards_every_group_of_a_hybrid_batch_the_sparse_ones_hashes_only() {
+        let mut batch = sample_batch();
+        batch.events.clear();
+        let mut full = stored(&[11, -2], Some(10), &[&[1, 2, 3, 4], &[5, 6, 7, 8]]);
+        let mut window = stored(&[-2], Some(10), &[&[5, 6, 7, 8]]);
+        let mut state = stored(&[-2], Some(10), &[&[5, 6, 7, 8]]);
+        for (event, group, kind, window_tokens) in [
+            (&mut full, 0, "full_attention", None),
+            (&mut window, 1, "sliding_window", Some(8)),
+            (&mut state, 2, "mamba", None),
+        ] {
+            if let Some(common::kv_cache_event::Data::Stored(stored)) = &mut event.data {
+                stored.group_idx = Some(group);
+                stored.kv_cache_spec_kind = Some(kind.to_string());
+                stored.kv_cache_spec_sliding_window = window_tokens;
+            }
+        }
+        // The relay's answer does not depend on the order within the batch:
+        // the window groups' stores go first here.
+        batch.events.push(window);
+        batch.events.push(state);
+        batch.events.push(full);
+        for group in 0..3u32 {
+            let mut gone = removed(&[-2]);
+            if let Some(common::kv_cache_event::Data::Removed(removed)) = &mut gone.data {
+                removed.group_idx = Some(group);
+            }
+            batch.events.push(gone);
+        }
+        let payload = encode_batch(&batch, 0, Wire::Vllm, &[]);
+        let wire: WireBatch = rmp_serde::from_slice(&payload).expect("the relay decodes it");
+        let mut relay = Normalizer::new();
+        let mut event_id = 0;
+        let relayed = relay.normalize_batch(wire, 3, &mut event_id);
+        let stores: Vec<RelayedStore> = relayed
+            .events
+            .iter()
+            .filter_map(|e| match &e.data {
+                Some(common::kv_cache_event::Data::Stored(stored)) => Some((
+                    stored.group_idx,
+                    stored
+                        .blocks
+                        .iter()
+                        .map(|block| (block.block_hash, block.token_ids.len()))
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stores,
+            [
+                (Some(1), vec![(-2, 0)]),
+                (Some(2), vec![(-2, 0)]),
+                (Some(0), vec![(11, 4), (-2, 4)]),
+            ],
+            "every group's store is forwarded; the sparse ones carry hashes, no tokens"
+        );
+        let removed_groups: Vec<Option<u32>> = relayed
+            .events
+            .iter()
+            .filter_map(|e| match &e.data {
+                Some(common::kv_cache_event::Data::Removed(removed)) => Some(removed.group_idx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            removed_groups,
+            [Some(0), Some(1), Some(2)],
+            "and every removal"
+        );
+        let counts = relay.counts();
+        assert_eq!((counts.group_stores, counts.group_removals), (2, 2));
+        assert_eq!((counts.forwarded_stored, counts.forwarded_removed), (3, 3));
+        assert_eq!(
+            counts.duplicate_stores, 0,
+            "a group lane's store is not a second copy on the main lane"
+        );
+        assert!(counts.dropped.is_empty(), "{:?}", counts.dropped);
+    }
+
     #[test]
     fn replay_answers_from_the_start_sequence_and_ends_with_the_marker() {
         let mut publisher = Publisher::new(b"kv".to_vec(), 3, 0, Wire::Vllm);
         for _ in 0..5 {
-            let message = publisher.publish(&sample_batch());
+            let message = publisher.publish(&sample_batch(), &[]);
             assert_eq!(message.len(), 3);
             assert_eq!(message.get(0).map(|t| t.as_ref()), Some(&b"kv"[..]));
         }
@@ -728,7 +929,7 @@ mod tests {
 
     #[test]
     fn sglang_wire_encodes_signed_hashes_without_group_or_spec_fields() {
-        let payload = encode_batch(&sample_batch(), 0, Wire::Sglang);
+        let payload = encode_batch(&sample_batch(), 0, Wire::Sglang, &[]);
         let value = rmpv::decode::read_value(&mut payload.as_slice()).expect("msgpack");
         let Value::Array(batch) = value else {
             panic!("batch is array-like");
@@ -761,7 +962,7 @@ mod tests {
 
     #[test]
     fn the_relay_normalizes_the_sglang_payload_too() {
-        let payload = encode_batch(&sample_batch(), 0, Wire::Sglang);
+        let payload = encode_batch(&sample_batch(), 0, Wire::Sglang, &[]);
         let wire: WireBatch = rmp_serde::from_slice(&payload).expect("the relay decodes it");
         assert_eq!(wire.dp_rank, None);
         let mut event_id = 0;
@@ -791,8 +992,8 @@ mod tests {
     #[test]
     fn sglang_replay_frames_carry_no_topic() {
         let mut publisher = Publisher::new(b"kv".to_vec(), 10, 0, Wire::Sglang);
-        publisher.publish(&startup_cleared());
-        publisher.publish(&sample_batch());
+        publisher.publish(&startup_cleared(), &[]);
+        publisher.publish(&sample_batch(), &[]);
         let mut request = ZmqMessage::from(b"peer".to_vec());
         request.push_back(Vec::new().into());
         request.push_back(0u64.to_be_bytes().to_vec().into());

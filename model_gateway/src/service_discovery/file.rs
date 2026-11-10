@@ -30,18 +30,13 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    ffi::OsStr,
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 
-use notify::{event::ModifyKind, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use openai_protocol::worker::WorkerType;
-use serde::Deserialize;
+use openai_protocol::worker::{WorkerInfo, WorkerType};
+use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, task, time};
 use tracing::{info, warn};
 
@@ -53,6 +48,7 @@ use super::{
 use crate::{
     app_context::AppContext,
     config::{ConfigError, ConfigResult, RoutingMode},
+    fs_watch::{settle, DirectoryWatch},
     observability::metrics::metrics_labels,
     worker::{endpoint::Endpoint, EndpointKey},
 };
@@ -94,28 +90,105 @@ struct ManifestVersion {
     version: u64,
 }
 
-#[derive(Deserialize)]
+/// The manifest as the file holds it, and as `GET /workers?format=manifest`
+/// writes it (see [`export_manifest`]).
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Manifest {
+pub(crate) struct Manifest {
     /// Checked by [`ManifestVersion`]; named here only so it is a known field.
     #[serde(rename = "version")]
     _version: u64,
     workers: Vec<ManifestWorker>,
+    /// What an export could not carry (a worker's key, an address's
+    /// credentials), one line per worker. Ignored on read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestWorker {
     /// Defaults to the endpoint. Giving one lets a producer signal a new
     /// instance at an address it reuses.
+    #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     worker_type: Option<WorkerType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     bootstrap_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     kv_connector: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     kv_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     kv_engine_id: Option<String>,
+}
+
+/// The registered fleet in the manifest's shape, for
+/// `GET /workers?format=manifest`: what a second gateway reads with
+/// `--discovery-provider file`. A data-parallel group is one record at the
+/// address it was registered with. No `id` is written: the reader derives
+/// one from the address, and an id that changed with every restart of the
+/// exporting gateway would re-register the fleet on every reader. A
+/// worker's key is no manifest field and an address's credentials never
+/// leave: both are dropped, and each such address is named in `warnings`.
+pub(crate) fn export_manifest(workers: &[WorkerInfo]) -> Manifest {
+    // One record per data-parallel group: the lowest rank speaks for it.
+    let mut lowest_rank: HashMap<&str, usize> = HashMap::new();
+    for info in workers {
+        if let (Some(base), Some(rank)) = (info.spec.dp_base_url.as_deref(), info.spec.dp_rank) {
+            let lowest = lowest_rank.entry(base).or_insert(rank);
+            *lowest = (*lowest).min(rank);
+        }
+    }
+
+    let mut warnings = Vec::new();
+    let mut records = Vec::with_capacity(workers.len());
+    for info in workers {
+        let spec = &info.spec;
+        if let (Some(base), Some(rank)) = (spec.dp_base_url.as_deref(), spec.dp_rank) {
+            if lowest_rank.get(base) != Some(&rank) {
+                continue;
+            }
+        }
+        let address = spec.dp_base_url.as_deref().unwrap_or(&spec.url);
+        // No registered address fails to parse; one that did is not written
+        // raw, as it may carry a credential.
+        let Ok(endpoint) = Endpoint::parse(address) else {
+            warnings.push(format!(
+                "{}: not exported, the address does not parse",
+                Endpoint::redacted_str(address)
+            ));
+            continue;
+        };
+        let url = endpoint.without_credentials().render();
+        if endpoint.has_credentials() {
+            warnings.push(format!("{url}: url credentials not exported"));
+        }
+        if spec.api_key.is_some() {
+            warnings.push(format!("{url}: api_key not exported"));
+        }
+        records.push(ManifestWorker {
+            id: None,
+            url,
+            worker_type: Some(spec.worker_type),
+            bootstrap_port: spec
+                .bootstrap_port
+                .filter(|_| takes_bootstrap_port(spec.worker_type)),
+            model_id: info.model_id.clone(),
+            kv_connector: spec.kv_connector.clone(),
+            kv_role: spec.kv_role.clone(),
+            kv_engine_id: spec.kv_engine_id.clone(),
+        });
+    }
+    Manifest {
+        _version: MANIFEST_VERSION,
+        workers: records,
+        warnings,
+    }
 }
 
 impl ManifestWorker {
@@ -142,9 +215,7 @@ impl ManifestWorker {
         if self.bootstrap_port == Some(0) {
             return Err("bootstrap_port must be between 1 and 65535".to_string());
         }
-        if self.bootstrap_port.is_some()
-            && !matches!(worker_type, WorkerType::Encode | WorkerType::Prefill)
-        {
+        if self.bootstrap_port.is_some() && !takes_bootstrap_port(worker_type) {
             return Err(format!(
                 "bootstrap_port applies only to encode and prefill workers, not {worker_type}"
             ));
@@ -170,6 +241,12 @@ impl ManifestWorker {
             compat_labels: BTreeMap::new(),
         })
     }
+}
+
+/// Whether a worker of this type opens a bootstrap port: the reader refuses
+/// one on any other type, and the writer leaves it out.
+fn takes_bootstrap_port(worker_type: WorkerType) -> bool {
+    matches!(worker_type, WorkerType::Encode | WorkerType::Prefill)
 }
 
 /// Parse a whole manifest, or reject it whole: no partial list is applied.
@@ -259,113 +336,10 @@ async fn read_manifest(config: &FileProviderConfig) -> Result<DesiredState, Mani
     Ok(DesiredState::from_workers(workers))
 }
 
-/// How long a burst of filesystem events is left to settle before the one
-/// reread it causes. A writer's rename, or an editor's several writes, arrive
-/// as a handful of events within a few milliseconds.
-const SETTLE: Duration = Duration::from_millis(200);
-
 /// How often an unwatched manifest's directory is tried again. A try on a
 /// directory that is still missing is one `stat`, and a directory that a
 /// deploy tool recreates is back within about this long.
 const REWATCH: Duration = Duration::from_secs(1);
-
-/// A watch on the manifest's directory. Dropping it stops the watch.
-struct ManifestWatch {
-    _watcher: RecommendedWatcher,
-    /// Set once the watched directory itself is removed or moved away. The
-    /// watch then reports nothing more, not even for a directory recreated at
-    /// the same path, so it has to be started again.
-    lost: Arc<AtomicBool>,
-}
-
-impl ManifestWatch {
-    fn is_lost(&self) -> bool {
-        self.lost.load(Ordering::Relaxed)
-    }
-}
-
-/// Watch the manifest's directory and send on `wake` whenever the manifest may
-/// have changed, or the watch stopped working.
-///
-/// The directory rather than the file: a writer that renames a new file over
-/// the manifest replaces its inode, and a watch on the old inode never
-/// reports it. A send that finds the channel full is dropped, because a wake
-/// is already pending and the reread it causes reads the latest file.
-fn watch_manifest(path: &Path, wake: mpsc::Sender<()>) -> notify::Result<ManifestWatch> {
-    let dir = match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
-    // Watched by its absolute path, which is how inotify names the directory
-    // in an event about the directory itself. FSEvents names it resolved.
-    let dir = std::path::absolute(dir).map_err(notify::Error::io)?;
-    // Checked before building the watcher, which on Linux starts an inotify
-    // instance and a thread even when the watch then fails.
-    match std::fs::metadata(&dir) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => return Err(notify::Error::generic("not a directory").add_path(dir)),
-        Err(error) => return Err(notify::Error::io(error).add_path(dir)),
-    }
-    let dir_names: Vec<PathBuf> = [Some(dir.clone()), dir.canonicalize().ok()]
-        .into_iter()
-        .flatten()
-        .collect();
-    let name = path.file_name().map(OsStr::to_os_string);
-    let lost = Arc::new(AtomicBool::new(false));
-    let lost_by_event = Arc::clone(&lost);
-    let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
-        let wakes = match event {
-            Ok(event) if removes_directory(&event, &dir_names) => {
-                lost_by_event.store(true, Ordering::Relaxed);
-                true
-            }
-            Ok(event) => concerns_manifest(&event, name.as_deref()),
-            // A failed watch may have dropped a change, so it rereads too.
-            Err(_) => true,
-        };
-        if wakes {
-            let _ = wake.try_send(());
-        }
-    })?;
-    watcher.watch(&dir, RecursiveMode::NonRecursive)?;
-    Ok(ManifestWatch {
-        _watcher: watcher,
-        lost,
-    })
-}
-
-/// Whether an event says the watched directory itself was removed or moved
-/// away, given the names an event may call it by.
-fn removes_directory(event: &Event, dir_names: &[PathBuf]) -> bool {
-    matches!(
-        event.kind,
-        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
-    ) && event.paths.iter().any(|path| dir_names.contains(path))
-}
-
-/// Whether an event in the manifest's directory may have changed the manifest.
-fn concerns_manifest(event: &Event, name: Option<&OsStr>) -> bool {
-    if event.need_rescan() {
-        return true;
-    }
-    // Reads change nothing, and the provider's own reread is one of them.
-    if matches!(event.kind, EventKind::Access(_)) {
-        return false;
-    }
-    event.paths.iter().any(|path| {
-        path.file_name().is_some_and(|file| {
-            // Kubernetes updates a mounted ConfigMap or Secret by swapping a
-            // `..data` symlink beside the file, never touching the file's name.
-            Some(file) == name || file.as_encoded_bytes().starts_with(b"..data")
-        })
-    })
-}
-
-/// Let a burst of events settle, then take every wake it sent as one.
-async fn settle(wake: &mut mpsc::Receiver<()>) {
-    time::sleep(SETTLE).await;
-    while wake.try_recv().is_ok() {}
-}
 
 /// Read the manifest now, whenever it changes, and on every tick, reconciling
 /// the last good snapshot each time.
@@ -410,7 +384,7 @@ struct FileDiscovery {
     wake: mpsc::Sender<()>,
     woken: mpsc::Receiver<()>,
     /// Held for as long as the loop runs: dropping it stops the watch.
-    watch: Option<ManifestWatch>,
+    watch: Option<DirectoryWatch>,
     warned: bool,
     last_good: LastGood,
 }
@@ -497,7 +471,7 @@ impl FileDiscovery {
 
     /// Start the watch again once the directory it was on is gone.
     fn rewatch_if_lost(&mut self, timers: &mut Timers) {
-        if self.watch.as_ref().is_some_and(ManifestWatch::is_lost) {
+        if self.watch.as_ref().is_some_and(DirectoryWatch::is_lost) {
             warn!(
                 "The directory of discovery manifest {} was removed or moved; watching it again once it exists",
                 self.config.path.display()
@@ -512,7 +486,7 @@ impl FileDiscovery {
     /// watch tried again in [`REWATCH`]. Polling alone is still correct: the
     /// tick rereads whatever the watch would have reported.
     fn start_watch(&mut self, timers: &mut Timers) {
-        self.watch = match watch_manifest(&self.config.path, self.wake.clone()) {
+        self.watch = match DirectoryWatch::of_file(&self.config.path, self.wake.clone()) {
             Ok(watch) => {
                 if self.warned {
                     info!(
@@ -551,6 +525,8 @@ impl FileDiscovery {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::service_discovery::testing::create_test_app_context;
 
@@ -810,204 +786,6 @@ mod tests {
         );
     }
 
-    fn event(kind: EventKind, paths: &[&str]) -> Event {
-        paths
-            .iter()
-            .fold(Event::new(kind), |event, path| event.add_path(path.into()))
-    }
-
-    /// Which events in the manifest's directory cause a reread.
-    #[test]
-    fn only_a_change_to_the_manifest_wakes_the_provider() {
-        use notify::event::{
-            AccessKind, CreateKind, DataChange, Flag, ModifyKind, RemoveKind, RenameMode,
-        };
-
-        let name = Some(OsStr::new("workers.json"));
-        let wakes = [
-            // A writer renaming its temporary file over the manifest.
-            event(
-                EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
-                &["/run/smg/workers.json.tmp", "/run/smg/workers.json"],
-            ),
-            event(
-                EventKind::Modify(ModifyKind::Name(RenameMode::To)),
-                &["/run/smg/workers.json"],
-            ),
-            // Written in place, created late, or deleted.
-            event(
-                EventKind::Modify(ModifyKind::Data(DataChange::Content)),
-                &["/run/smg/workers.json"],
-            ),
-            event(
-                EventKind::Create(CreateKind::File),
-                &["/run/smg/workers.json"],
-            ),
-            event(
-                EventKind::Remove(RemoveKind::File),
-                &["/run/smg/workers.json"],
-            ),
-            // Kubernetes swapping a ConfigMap's `..data` symlink.
-            event(
-                EventKind::Modify(ModifyKind::Name(RenameMode::To)),
-                &["/etc/smg/..data"],
-            ),
-            event(EventKind::Create(CreateKind::Any), &["/etc/smg/..data_tmp"]),
-            // The watch dropped events; anything may have changed.
-            event(EventKind::Other, &[]).set_flag(Flag::Rescan),
-        ];
-        for event in &wakes {
-            assert!(concerns_manifest(event, name), "{event:?} should wake");
-        }
-
-        let ignored = [
-            // The provider's own read.
-            event(
-                EventKind::Access(AccessKind::Read),
-                &["/run/smg/workers.json"],
-            ),
-            event(
-                EventKind::Access(AccessKind::Any),
-                &["/run/smg/workers.json"],
-            ),
-            // Another file in the same directory, including the writer's
-            // temporary file before its rename.
-            event(
-                EventKind::Modify(ModifyKind::Data(DataChange::Any)),
-                &["/run/smg/workers.json.tmp"],
-            ),
-            event(
-                EventKind::Create(CreateKind::File),
-                &["/run/smg/other.json"],
-            ),
-        ];
-        for event in &ignored {
-            assert!(!concerns_manifest(event, name), "{event:?} should not wake");
-        }
-    }
-
-    async fn woken(wake: &mut mpsc::Receiver<()>, within: Duration) -> bool {
-        time::timeout(within, wake.recv()).await.is_ok()
-    }
-
-    /// The real watcher: a rename over the manifest wakes the provider, a burst
-    /// of writes settles into one wake, and another file in the directory does
-    /// not wake it.
-    #[tokio::test]
-    async fn the_watcher_reports_the_manifest_and_only_the_manifest() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("workers.json");
-        let (tx, mut rx) = mpsc::channel(1);
-        let _watcher = watch_manifest(&path, tx).unwrap();
-
-        let staged = dir.path().join("workers.json.staged");
-        std::fs::write(&staged, manifest("")).unwrap();
-        std::fs::rename(&staged, &path).unwrap();
-        assert!(
-            woken(&mut rx, Duration::from_secs(10)).await,
-            "rename not seen"
-        );
-        settle(&mut rx).await;
-
-        for _ in 0..20 {
-            std::fs::write(&path, manifest("")).unwrap();
-        }
-        assert!(
-            woken(&mut rx, Duration::from_secs(10)).await,
-            "writes not seen"
-        );
-        settle(&mut rx).await;
-        assert!(rx.try_recv().is_err(), "the burst woke the provider twice");
-
-        // Let any late event from the burst arrive and be drained first.
-        time::sleep(Duration::from_secs(1)).await;
-        while rx.try_recv().is_ok() {}
-        std::fs::write(dir.path().join("other.json"), "{}").unwrap();
-        assert!(
-            !woken(&mut rx, Duration::from_secs(1)).await,
-            "another file woke the provider"
-        );
-    }
-
-    /// Only an event about the watched directory itself, removed or moved
-    /// away, marks the watch lost; events about files inside it do not.
-    #[test]
-    fn only_the_directory_going_away_loses_the_watch() {
-        use notify::event::{CreateKind, RemoveKind, RenameMode};
-
-        let dir = [PathBuf::from("/run/smg")];
-        for event in [
-            // inotify's DELETE_SELF and MOVE_SELF.
-            event(EventKind::Remove(RemoveKind::Folder), &["/run/smg"]),
-            event(
-                EventKind::Modify(ModifyKind::Name(RenameMode::From)),
-                &["/run/smg"],
-            ),
-        ] {
-            assert!(removes_directory(&event, &dir), "{event:?}");
-        }
-        for event in [
-            event(
-                EventKind::Remove(RemoveKind::File),
-                &["/run/smg/workers.json"],
-            ),
-            event(
-                EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
-                &["/run/smg/workers.json.tmp", "/run/smg/workers.json"],
-            ),
-            event(EventKind::Create(CreateKind::Folder), &["/run/smg"]),
-        ] {
-            assert!(!removes_directory(&event, &dir), "{event:?}");
-        }
-    }
-
-    /// Removing the watched directory marks the watch lost and wakes the
-    /// provider, which then watches the path again.
-    #[tokio::test]
-    async fn removing_the_directory_loses_the_watch() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join("smg");
-        std::fs::create_dir(&dir).unwrap();
-        let (tx, mut rx) = mpsc::channel(1);
-        let watch = watch_manifest(&dir.join("workers.json"), tx).unwrap();
-        assert!(!watch.is_lost());
-
-        std::fs::remove_dir(&dir).unwrap();
-        assert!(
-            woken(&mut rx, Duration::from_secs(10)).await,
-            "removal not seen"
-        );
-        let deadline = time::Instant::now() + Duration::from_secs(10);
-        while !watch.is_lost() {
-            assert!(time::Instant::now() < deadline, "the watch never lost");
-            time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
-    /// The directory must exist to be watched; until it does, the provider
-    /// polls, and retries the watch every second. The `stat` that refuses it
-    /// names the cause and the path.
-    #[test]
-    fn a_missing_directory_cannot_be_watched() {
-        let dir = tempfile::tempdir().unwrap();
-        let (tx, _rx) = mpsc::channel(1);
-        let Err(error) = watch_manifest(&dir.path().join("absent/workers.json"), tx.clone()) else {
-            panic!("watched a missing directory");
-        };
-        assert!(
-            matches!(&error.kind, notify::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
-            "{error}"
-        );
-        assert!(
-            error.paths.iter().any(|path| path.ends_with("absent")),
-            "{error}"
-        );
-
-        let file = dir.path().join("a-file");
-        std::fs::write(&file, "").unwrap();
-        assert!(watch_manifest(&file.join("workers.json"), tx).is_err());
-    }
-
     fn discovery(path: &Path) -> FileDiscovery {
         discovery_checking_every(path, Duration::from_secs(60))
     }
@@ -1135,5 +913,140 @@ mod tests {
             );
             assert!(!discovery.warned, "the watch starting is logged in turn");
         }
+    }
+
+    /// The export of a fleet, fed back through the parser, yields the same
+    /// endpoints, types and settings; a key and an address's credentials
+    /// stay behind and are named in the warnings.
+    #[test]
+    fn an_exported_fleet_parses_back_without_its_credentials() {
+        use openai_protocol::model_card::ModelCard;
+
+        use crate::worker::{basic::worker_to_info, BasicWorkerBuilder, Worker};
+
+        fn info(worker: BasicWorkerBuilder) -> WorkerInfo {
+            let worker: Arc<dyn Worker> = Arc::new(worker.build());
+            worker_to_info(&worker)
+        }
+        let fleet = [
+            info(
+                BasicWorkerBuilder::new("http://10.0.0.22:8000")
+                    .worker_type(WorkerType::Prefill)
+                    .bootstrap_port(Some(8998))
+                    .kv_connector("MooncakeConnector")
+                    .kv_role("kv_producer")
+                    .kv_engine_id("engine-a")
+                    .model(ModelCard::new("llama")),
+            ),
+            info(
+                BasicWorkerBuilder::new("grpc://decode.internal:9000")
+                    .worker_type(WorkerType::Decode)
+                    .model(ModelCard::new("llama")),
+            ),
+            info(
+                BasicWorkerBuilder::new("http://admin:hunter2@10.0.0.23:8001")
+                    .worker_type(WorkerType::Decode)
+                    .api_key("s3cr3t"),
+            ),
+        ];
+
+        let exported = export_manifest(&fleet);
+        let text = serde_json::to_string(&exported).unwrap();
+
+        for secret in ["hunter2", "s3cr3t", r#""api_key""#, "admin", r#""id""#] {
+            assert!(
+                !text.contains(secret),
+                "{secret} reached the export: {text}"
+            );
+        }
+        assert_eq!(
+            exported.warnings,
+            [
+                "http://10.0.0.23:8001: url credentials not exported",
+                "http://10.0.0.23:8001: api_key not exported"
+            ]
+        );
+
+        let parsed = parse(&text, Roles::PrefillDecode).unwrap();
+        let summary: Vec<_> = parsed
+            .iter()
+            .map(|w| {
+                (
+                    w.endpoint.render(),
+                    w.worker_type,
+                    w.bootstrap_port,
+                    w.model_id_override.as_deref(),
+                    w.kv_connector.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (
+                    "http://10.0.0.22:8000".to_string(),
+                    WorkerType::Prefill,
+                    Some(8998),
+                    Some("llama"),
+                    Some("MooncakeConnector"),
+                ),
+                (
+                    "grpc://decode.internal:9000".to_string(),
+                    WorkerType::Decode,
+                    None,
+                    Some("llama"),
+                    None,
+                ),
+                (
+                    "http://10.0.0.23:8001".to_string(),
+                    WorkerType::Decode,
+                    None,
+                    None,
+                    None,
+                ),
+            ]
+        );
+        assert_eq!(parsed[0].kv_role.as_deref(), Some("kv_producer"));
+        assert_eq!(parsed[0].kv_engine_id.as_deref(), Some("engine-a"));
+    }
+
+    /// A data-parallel group was registered at one address; its export is
+    /// that one record, not one per rank.
+    #[test]
+    fn a_data_parallel_group_exports_as_one_record_at_its_base_address() {
+        use crate::worker::{basic::worker_to_info, BasicWorkerBuilder, Worker};
+
+        let fleet: Vec<WorkerInfo> = (0..2)
+            .map(|rank| {
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new("http://10.0.0.30:8000")
+                        .worker_type(WorkerType::Regular)
+                        .dp_config(rank, 2)
+                        .build(),
+                );
+                worker_to_info(&worker)
+            })
+            .collect();
+
+        let exported = export_manifest(&fleet);
+        let text = serde_json::to_string(&exported).unwrap();
+
+        assert_eq!(exported.workers.len(), 1, "{text}");
+        assert_eq!(exported.workers[0].url, "http://10.0.0.30:8000");
+        assert!(exported.workers[0].id.is_none(), "{text}");
+        assert!(exported.warnings.is_empty(), "{text}");
+        assert_eq!(parse(&text, Roles::Regular).unwrap().len(), 1);
+    }
+
+    /// An export with warnings is still a manifest: the field is known and
+    /// ignored on read, so the fleet registers minus what was not carried.
+    #[test]
+    fn warnings_in_a_manifest_are_read_past() {
+        let workers = parse(
+            r#"{"version": 1, "workers": [{"url": "10.0.0.5:8000"}], "warnings": ["worker a: api_key not exported"]}"#,
+            Roles::Regular,
+        )
+        .unwrap();
+        assert_eq!(workers.len(), 1);
     }
 }

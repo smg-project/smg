@@ -5,12 +5,13 @@ use serde_json::Value;
 use crate::{
     audio::{AudioPreProcessor, Qwen3AudioProcessor},
     encoder_inputs::PreprocessedEncoderInputs,
-    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
+    registry::{
+        qwen3_omni::AUDIO_PAD_TOKEN, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
+        RegistryResult,
+    },
     types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
     vision::PreProcessorConfig,
 };
-
-const AUDIO_PAD_TOKEN: &str = "<|audio_pad|>";
 
 /// Qwen3-ASR's transcription-side knowledge: the family's implementation of
 /// the contract in [`crate::registry::transcription`], plus the identifiers,
@@ -341,11 +342,30 @@ impl ModelProcessorSpec for Qwen3AsrSpec {
         }
     }
 
+    /// The family sets no per-request audio count of its own: its serving
+    /// engines read the count as unlimited (the family's processing info
+    /// declares `audio: None`), the checkpoint's feature extractor bounds a
+    /// clip's length, not how many clips, and the context length is the
+    /// practical bound. Audio stays declared (an undeclared modality is
+    /// refused as unsupported) without a bound of the spec's, so the
+    /// effective limit is the engine's advertised one, else the deployment's
+    /// `SMG_AUDIO_MAX_COUNT`.
+    ///
+    /// What still bounds such a request, and where it lives. Before any
+    /// fetch: the per-request limit the model's workers advertise for their
+    /// engine, which caps the router's own limit in the gateway's limit
+    /// resolution, and the deployment's `SMG_IMAGE_MAX_COUNT` /
+    /// `SMG_VIDEO_MAX_COUNT` / `SMG_AUDIO_MAX_COUNT` (and
+    /// `--mm-per-request-image-limit` for images), read in the same
+    /// resolution. At or after the fetch: the gateway's cap on media bytes
+    /// in flight (`multimodal_max_inflight_bytes`), the engine's advertised
+    /// encoder budget and the context length. A number of the spec's own
+    /// would be a declared default again, not a bound of the family's.
     fn modality_limits(
         &self,
         _metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
-        Ok(HashMap::from([(Modality::Audio, 10)]))
+        Ok(HashMap::from([(Modality::Audio, usize::MAX)]))
     }
 
     fn audio_processor(
@@ -460,7 +480,48 @@ mod tests {
         );
         assert_eq!(
             spec.modality_limits(&metadata).unwrap(),
-            HashMap::from([(Modality::Audio, 10)])
+            HashMap::from([(Modality::Audio, usize::MAX)])
+        );
+    }
+
+    /// The family bounds its audio by context and clip length, not by count:
+    /// the spec declares the modality without a limit of its own (the ten it
+    /// carried was a declared default, never a count of the family's), so a
+    /// deployment's `SMG_AUDIO_MAX_COUNT` or the engine's advertised limit is
+    /// the only router-side bound.
+    #[test]
+    fn asr_declares_audio_without_a_count_of_its_own() {
+        let tokenizer = TestTokenizer::new(&[(AUDIO_PAD_TOKEN, 151676)]);
+        let config = json!({
+            "model_type": "qwen3_asr",
+            "thinker_config": {"audio_token_id": 151676}
+        });
+        let metadata = ModelMetadata {
+            model_id: "Qwen/Qwen3-ASR-1.7B",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let spec = Qwen3AsrSpec;
+
+        assert_eq!(
+            spec.modality_limits(&metadata).unwrap(),
+            HashMap::from([(Modality::Audio, usize::MAX)])
+        );
+        for count in [11, 1_000] {
+            spec.validate_media_request(&metadata, &[(Modality::Audio, count)])
+                .unwrap_or_else(|error| panic!("{count} clips: {error}"));
+        }
+        // A deployment's own cap (the environment override, or the engine's
+        // advertised limit the gateway passes in) still binds.
+        let capped = HashMap::from([(Modality::Audio, 10)]);
+        assert_eq!(
+            spec.validate_media_request_with_limits(&metadata, &[(Modality::Audio, 11)], &capped),
+            Err(ModelRegistryError::ModalityLimitExceeded {
+                spec: "qwen3_asr",
+                modality: Modality::Audio,
+                limit: 10,
+                requested: 11,
+            })
         );
     }
 

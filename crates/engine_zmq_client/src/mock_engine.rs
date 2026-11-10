@@ -6,6 +6,9 @@
 // HELLO/INIT/READY handshake, a DEALER registers on the input socket and
 // receives requests, and a PUSH sends outputs back.
 
+//! A mock engine for tests and test tooling: it plays the engine process's role over ZMQ, for the
+//! crate's loopback tests and, behind `mock-engine`, for `mock-worker` and other crates' tests.
+
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -280,7 +283,6 @@ fn peer_identity(engine_id: &EngineId) -> Result<PeerIdentity> {
     })
 }
 
-/// Wait for a ZMQ endpoint to become connectable before dialing it.
 /// `step` under the mock's deadline; the error names the step that hung.
 async fn within<T>(step: &'static str, future: impl std::future::Future<Output = T>) -> Result<T> {
     timeout(MOCK_DEADLINE, future)
@@ -291,7 +293,11 @@ async fn within<T>(step: &'static str, future: impl std::future::Future<Output =
         })
 }
 
-async fn wait_for_endpoint(endpoint: &str) -> Result<()> {
+/// Wait for a ZMQ endpoint to become connectable before dialing it, for up
+/// to the mock's deadline: the frontend's bind of its socket file or its TCP
+/// port. `connect_to_frontend` waits once; a mock engine process whose dial
+/// should outlive the frontend's start waits in rounds of this first.
+pub async fn wait_for_endpoint(endpoint: &str) -> Result<()> {
     // A dial to an endpoint nothing listens on yet fails at once, so wait
     // for the frontend's bind: its socket file, or its TCP port.
     timeout(CONNECT_TIMEOUT, async {
@@ -413,6 +419,14 @@ impl MockEngineHandshake {
     /// Announce READY, then register on the input socket with `ready_response`
     /// and open the output PUSH socket.
     pub async fn ready(self, ready_response: EngineCoreReadyResponse) -> Result<MockEngine> {
+        self.announce_ready().await?.register(ready_response).await
+    }
+
+    /// Announce READY and stop there, the data sockets not yet dialed: the
+    /// instant between a real engine's READY and its input connection, held
+    /// for as long as a test needs the frontend to act first (it turns to
+    /// its input socket once the last READY is in).
+    pub async fn announce_ready(self) -> Result<MockEngineReady> {
         let Self {
             mut handshake,
             identity,
@@ -423,7 +437,7 @@ impl MockEngineHandshake {
                 "READY", None,
             ))?))
             .await?;
-        Self::register(identity, init, ready_response).await
+        Ok(MockEngineReady { identity, init })
     }
 
     async fn register(
@@ -476,4 +490,41 @@ impl MockEngineHandshake {
             output: MockEngineOutput { socket: output },
         })
     }
+}
+
+/// A mock engine that has announced READY and not yet registered on the
+/// input socket.
+pub struct MockEngineReady {
+    identity: PeerIdentity,
+    init: HandshakeInitMessage,
+}
+
+impl MockEngineReady {
+    /// Register on the input socket with `ready_response` and open the
+    /// output PUSH socket.
+    pub async fn register(self, ready_response: EngineCoreReadyResponse) -> Result<MockEngine> {
+        let Self { identity, init } = self;
+        MockEngineHandshake::register(identity, init, ready_response).await
+    }
+}
+
+/// An engine generation's input DEALER dialing the frontend's input endpoint
+/// anew, as libzmq's does by itself when the frontend binds again under a
+/// connected engine: no handshake and no registration, which an engine says
+/// once at its start. Dropping the half is that generation's exit.
+pub async fn redial_input(
+    input_address: &str,
+    engine_id: impl Into<EngineId>,
+) -> Result<MockEngineInput> {
+    let identity = peer_identity(&engine_id.into())?;
+    wait_for_endpoint(input_address).await?;
+    let mut input_options = SocketOptions::default();
+    input_options.peer_identity(identity);
+    let mut socket = DealerSocket::with_options(input_options);
+    within(
+        "mock engine: dialing the input endpoint again",
+        socket.connect(input_address),
+    )
+    .await??;
+    Ok(MockEngineInput { socket })
 }

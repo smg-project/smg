@@ -40,10 +40,10 @@ The gateway image is on Docker Hub, engine images are on GitHub Container Regist
 
 | Component | Registry | Image |
 |-----------|----------|-------|
-| Gateway | `docker.io` | `lightseekorg/smg:1.13.0` |
-| vLLM worker | `ghcr.io` | `smg-project/smg:1.13.0-vllm-v0.31.0` |
-| TRT-LLM worker | `ghcr.io` | `smg-project/smg:1.13.0-trtllm-1.3.0rc24` |
-| SGLang worker | `ghcr.io` | `smg-project/smg:1.13.0-sglang-v0.5.21` |
+| Gateway | `docker.io` | `lightseekorg/smg:1.14.0` |
+| vLLM worker | `ghcr.io` | `smg-project/smg:1.14.0-vllm-v0.31.0` |
+| TRT-LLM worker | `ghcr.io` | `smg-project/smg:1.14.0-trtllm-1.3.0rc24` |
+| SGLang worker | `ghcr.io` | `smg-project/smg:1.14.0-sglang-v0.5.21` |
 
 Worker images default to `ghcr.io/smg-project/smg`. Set `workers[].image.tag` to the engine-specific tag; `workers[].image.registry` and `workers[].image.repository` override the path.
 
@@ -61,14 +61,41 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 | `router` | Router deployment, routing policy, networking, observability |
 | `workers` | Worker (inference engine) deployments |
 | `huggingface` | HuggingFace token for gated model downloads |
-| `auth` | API key authentication, rate limiting |
+| `auth` | API key authentication, control-plane keys, rate limiting |
 | `history` | Storage backend (none/memory/postgres/redis/oracle) and the Secret its connection URL or credentials come from |
 | `serviceAccount` | Service account creation and annotations |
 | `rbac` | RBAC for reading pods through the Kubernetes API (Kubernetes discovery, mesh peer discovery) |
 
 ### Routing Policies
 
-`cache_aware` (default), `round_robin`, `power_of_two`, `consistent_hashing`, `prefix_hash`, `manual`, `random`, `bucket`
+`cache_aware` (default), `round_robin`, `power_of_two`, `least_load`, `passthrough`, `consistent_hashing`, `prefix_hash`, `manual`, `random`: the launcher's `--policy` choices, which `values.schema.json` lists. `bucket` is a prefill-side policy: the launcher takes it for `--prefill-policy` (`router.disaggregation.prefillPolicy`), not for `--policy`.
+
+### Disaggregated Serving
+
+`router.disaggregation.mode` selects the gateway's `--pd-disaggregation` (`pd`) or `--epd-disaggregation` (`epd`); empty, the default, is a regular fleet. The role policies `prefillPolicy`, `decodePolicy` and `encodePolicy` are the launcher's `--prefill-policy`, `--decode-policy` and `--encode-policy` choices, which the schema lists (`bucket` is a prefill-side choice). The role workers are either static URLs, `prefill`, `decode` and `encode` lists of `{url, bootstrapPort}` rendered as `--prefill URL [BOOTSTRAP_PORT]`, `--decode URL` and `--encode URL [BOOTSTRAP_PORT]`, or, under Kubernetes discovery, the pods matching `router.discovery.kubernetes.prefillSelector`, `decodeSelector` and `encodeSelector`. A role given without its mode, or the encode role outside `epd`, is refused at render rather than ignored by the gateway at start-up; a typo in a role key is refused by the schema. A prefill-decode fleet found by label:
+
+```yaml
+router:
+  disaggregation:
+    mode: pd
+    prefillPolicy: cache_aware
+    decodePolicy: power_of_two
+  discovery:
+    provider: kubernetes
+    kubernetes:
+      prefillSelector: "app=engine role=prefill"
+      decodeSelector: "app=engine role=decode"
+```
+
+Under a mode the gateway reads only its role workers. `router.workerUrls` and the regular Slurm `jobNames` are refused, the chart's own `workers` are passed only through a role or a discovery provider, and chart workers given no role fail the render. The Slurm role job names `prefillJobNames`, `decodeJobNames` and `encodeJobNames` follow the same rule as the role selectors.
+
+### Admission Bound
+
+`router.maxConcurrentRequests` is the gateway's `--max-concurrent-requests`: the in-flight requests it admits before shedding with 429 or 503, each permit held for the whole response, streaming bodies included. `-1` (the default) derives the bound from the host, 1024 per available core and at least 4096; `0` lifts the bound; a positive value is the bound.
+
+### Native JPEG Decoder
+
+`router.mmTurbojpeg` is the gateway's `--mm-turbojpeg`: what it does when libjpeg-turbo (`libturbojpeg.so.0`) cannot be loaded. `require` (the default) refuses to start, so a gateway never decodes JPEGs with the pure-Rust fallback, whose pixels differ from the engine's by a few levels. `prefer` decodes with the fallback, says so once at start-up and sets the gauge `smg_mm_turbojpeg_available` to 0. The published image ships the library; a custom image without it needs `prefer`.
 
 ### Workers
 
@@ -84,7 +111,7 @@ workers:
     gpu:
       count: 1                        # GPUs per replica (tensor parallel)
     image:
-      tag: "1.13.0-vllm-v0.31.0"     # engine image tag
+      tag: "1.14.0-vllm-v0.31.0"     # engine image tag
 ```
 
 Workers are automatically wired to the router via `--worker-urls`, unless the router discovers its workers ([Worker Discovery](#worker-discovery)). The URL scheme (`http://` or `grpc://`) is set based on `connectionMode`.
@@ -126,16 +153,37 @@ labelled `model`, `rank` and `wire`; it binds beside the gRPC listener before
 the engine connects, so a scrape during start-up answers
 `smg_servicer_state{state="starting"} 1`.
 
-Off (the default), nothing changes: the launcher's own servicer choice stands
-and the pod exposes no metrics port. The Python servicer has no endpoint, so
-`extraArgs: ["--servicer-impl", "python"]` together with `metrics.enabled`
-is refused by the launcher before the engine starts. The SGLang Rust servicer
-serves neither PD/EPD disaggregation nor image and video input yet (it
-advertises no vision support, so the gateway refuses media for that worker at
-its gate), so a disaggregated or multimodal SGLang worker keeps `metrics` off.
-A `metrics.port` equal to the serving port is refused when the chart renders.
+Off (the default), the pod exposes no metrics port and the launcher's own
+servicer choice stands: the Rust servicer, its default, unless the worker's
+`servicerImpl` is `"python"` (the deprecated Python servicer, kept for the
+deprecation window; the pod then gets `SMG_<ENGINE>_SERVICER_IMPL=python`).
+The Python servicer has no metrics endpoint, so `servicerImpl: "python"` (or
+`extraArgs: ["--servicer-impl", "python"]`) together with `metrics.enabled`
+is refused by the launcher before the engine starts. A `metrics.port` equal to
+the serving port is refused when the chart renders.
 An HTTP worker runs the engine's own server, which has its own `/metrics`; the
 setting is ignored there.
+
+#### Parser
+
+`router.parser` picks the parser that reads a chat completion's reasoning and
+tool calls: `symphony` (one table per model family, the gateway's default from
+the release after 1.13.0 on) or `legacy` (the older per-model parsers). Empty,
+the default, renders no `--parser`, so the image's own default applies and the
+value is safe on every image. A set value needs a gateway image of 1.13.0 or
+later: the flag arrived in 1.13.0 (with `legacy` as its default there), and an
+earlier image rejects it and exits at startup. The choice applies to gRPC and
+ZMQ workers; an HTTP worker's engine parses its own output, so the value changes
+nothing there. A deployment that set `--parser` through `router.extraArgs` removes
+it there when it sets this value: the gateway refuses the flag twice and exits at
+startup. A request's `X-SMG-Parser` header overrides the flag for that
+request. `router.toolCallParser` and `router.reasoningParser` are read
+differently by each parser: under Symphony, a model the registry knows keeps
+its own table and the flags apply only to models it does not know; under
+`legacy`, each flag takes only a legacy parser's name of its own kind: `hf`
+and a Symphony-only name (`muse`, for one) are refused at startup, while a
+name a legacy parser of that kind also has (`qwen` as `toolCallParser`, for
+one) keeps that parser.
 
 #### Worker Discovery
 
@@ -188,6 +236,31 @@ The gateway also reads its other secrets from the environment or from files, whi
 The gateway reads the key file once, at start-up, so a rotated key reaches a pod when the pod restarts. A rotated `auth.apiKey` rolls the router pods by itself: the pod template carries a `checksum/auth` annotation over the chart-managed Secret, so `helm upgrade` with a new key is a rolling update. A rotated `auth.existingSecret` is not seen by the chart; roll the pods by hand after updating it, or the running pods keep accepting the old key until they restart. By label, which covers both workload kinds and every release name: `kubectl rollout restart deployment,statefulset -l app.kubernetes.io/instance=<release>,app.kubernetes.io/component=router` (the workload is `<fullname>-router`, where `<fullname>` is `<release>-smg` unless the release name contains `smg` or `fullnameOverride` is set).
 
 An older gateway image does not know `--api-key-file`; a chart of this version with such an image refuses to start rather than starting without the key.
+
+#### Control Plane
+
+`router.adminPort` starts the admin listener (`--admin-port`): the control-plane routes (the admin routes, `/workers` and `/v1/rl`) are served on that container port, with the probes, and the data port answers 404 for them. The chart renders a second Service, `<fullname>-router-admin` (`router.adminService`, ClusterIP by default), so the control plane has a name of its own inside the cluster; the ingress never names it. `router.adminHost` binds the listener on another address.
+
+The control-plane API keys (`auth.controlPlane`) reach the gateway as a file, like the shared key: `auth.controlPlane.apiKeys` (one `id:name:role:key` entry per line, role `admin` or `user`) is written into a chart-managed Secret, or `auth.controlPlane.existingSecret` names one, mounted at `/etc/smg/control-plane` and read with `--control-plane-api-keys-file`. A rotated `auth.controlPlane.apiKeys` rolls the router pods (`checksum/control-plane`); a rotated existing Secret needs the rollout restart described above. [`examples/with-admin-plane.yaml`](examples/with-admin-plane.yaml) sets both.
+
+```bash
+kubectl create secret generic smg-control-plane \
+  --from-file=control-plane-api-keys=./control-plane-keys.txt
+helm install smg deploy/helm/smg \
+  --set router.adminPort=9001 \
+  --set auth.controlPlane.existingSecret=smg-control-plane
+```
+
+#### Admission Config
+
+`router.tenantRateLimit` and `router.priorityScheduler` carry the admission configuration the gateway reads from files: `enabled` renders the feature's flag (`--tenant-rate-limit-enabled`, `--priority-scheduler-enabled`), and `configMap.name` names a ConfigMap of yours, mounted whole at `/etc/smg/rate-limit` or `/etc/smg/scheduler` and read through `--tenant-rate-limit-config` or `--priority-scheduler-config` (`configMap.key` names the file: `rate-limit.yaml` and `scheduler.yaml` by default). The chart refuses what the gateway would refuse or ignore: the rate limit enabled without its ConfigMap, and a scheduler ConfigMap without the scheduler enabled.
+
+```bash
+kubectl create configmap smg-rate-limit --from-file=rate-limit.yaml=./rate-limit.yaml
+helm install smg deploy/helm/smg \
+  --set router.tenantRateLimit.enabled=true \
+  --set router.tenantRateLimit.configMap.name=smg-rate-limit
+```
 
 #### Store URLs
 
@@ -256,24 +329,27 @@ shutdowns and local Ctrl+C exits. A value of 0 skips the propagation wait
 
 #### Dashboard and Alerts
 
-`grafana.dashboard.enabled` ships a Grafana dashboard as a ConfigMap (label `grafana_dashboard: "1"` for the sidecar loader) with `namespace` and `job` variables that pick the release (every query is scoped to both) and 41 panels in seven rows: traffic (request rate, responses by status, 5xx ratio, errors by API code and router error type, token throughput), latency (TTFT and time per output token p50/p95/p99 and per model, request and HTTP duration p99), capacity and queues (admission in-flight and queued, rejections, engine running and waiting requests, KV cache usage and in-flight request age per worker, connections), workers (healthy count, health and circuit-breaker state per worker, health checks, overload shed and fallback, retries), cache and KV events (engine prefix cache hit rate, cache-aware decisions and match ratio, KV event lag, integrity counters, degraded ranks, index size), Symphony (outputs by outcome, malformed outputs by reason, fallbacks and refusals) and runtime (tokio busy ratio, event-loop stalls and delay, dropped log lines, memory, tasks, tokenizer cache). Every panel queries a family the gateway describes; the gateway's test suite holds the dashboard to the catalog.
+`grafana.dashboard.enabled` ships a Grafana dashboard as a ConfigMap (label `grafana_dashboard: "1"` for the sidecar loader) with `namespace` and `job` variables that pick the release (every query is scoped to both) and 49 panels in eight rows: traffic (request rate, responses by status, 5xx ratio, errors by API code and router error type, token throughput), latency (TTFT and time per output token p50/p95/p99 and per model, request and HTTP duration p99), capacity and queues (admission in-flight and queued, rejections, engine running and waiting requests, KV cache usage and in-flight request age per worker, connections), workers (healthy count, health and circuit-breaker state per worker, health checks, overload shed and fallback, retries), cache and KV events (engine prefix cache hit rate, cache-aware decisions and match ratio, KV event lag, integrity counters, degraded ranks, index size), Symphony (outputs by outcome, malformed outputs by reason, fallbacks and refusals), runtime (tokio busy ratio, event-loop stalls and delay, dropped log lines, memory, tasks, tokenizer cache) and prefill-decode (time to first token p99 by phase and by model, rendezvous, bootstrap and KV transfer failures, prefill admission in flight, queued, rejections, waits and sheds, the admission wait, the admission window per decode worker, KV connector mode decisions). Every panel queries a family the gateway describes; the gateway's test suite holds the dashboard to the catalog.
 
-`prometheusRule.enabled` adds a `PrometheusRule` with ten alerts, thresholds under `prometheusRule.alerts` (the defaults and their rationale are in `values.yaml`). Every expression selects this release's series through `prometheusRule.jobSelector` (empty = this release's namespace and the Service the ServiceMonitor scrapes, the Operator's default `namespace` and `job` labels, so a same-named release in another namespace stays out) and keeps `namespace` and `job` through its aggregation, so several releases on one Prometheus alert apart and a firing alert names its gateway:
+`prometheusRule.enabled` adds a `PrometheusRule` with eleven alerts, thresholds under `prometheusRule.alerts` (the defaults and their rationale are in `values.yaml`). Every expression selects this release's series through `prometheusRule.jobSelector` (empty = this release's namespace and the Service the ServiceMonitor scrapes, the Operator's default `namespace` and `job` labels, so a same-named release in another namespace stays out) and keeps `namespace` and `job` through its aggregation, so several releases on one Prometheus alert apart and a firing alert names its gateway:
 
 | Alert | Severity | Fires when |
 |---|---|---|
 | `SmgGatewayDown` | critical | the router's scrape target is down, or no target matches the selector, for `scrapeMissingFor` |
-| `SmgNoHealthyWorker` | critical | no registered worker is healthy for `noHealthyWorkerFor` |
-| `SmgHighErrorRatio` | critical | the 5xx share of responses exceeds `errorRatio` for `errorRatioFor` |
-| `SmgTtftP99High` | critical | p99 time to first token exceeds `ttftP99Seconds` for `ttftP99For` |
+| `SmgNoHealthyWorker` | critical | no registered worker is healthy, or no worker is registered at all while the gateway's scrape is up, for `noHealthyWorkerFor` |
+| `SmgHighErrorRatio` | critical | the 5xx share of responses, the probe routes (`/health`, `/readiness`, `/liveness`) excluded, exceeds `errorRatio` for `errorRatioFor` |
+| `SmgHighRouterErrorRatio` | critical | the router's server-side failed share of its requests (upstream failures and streams that failed after their first token, which the edge counts as 200s; the client's own refusals are not counted) exceeds `errorRatio` for `errorRatioFor` |
+| `SmgTtftP99High` | critical | p99 time to first token of the gRPC router's streamed answers (the HTTP router records none; a collected answer, and a streamed Responses answer on the Harmony pipeline, records no first token) exceeds `ttftP99Seconds` for `ttftP99For`, evaluated per namespace and job |
 | `SmgKvUsageNearCapacity` | warning | a worker's KV token usage exceeds `kvUsage` for `kvUsageFor` |
 | `SmgCircuitBreakerOpen` | warning | a worker's circuit breaker is open or half-open for `circuitBreakerOpenFor` (a worker failing requests while passing its probes cycles between the two) |
-| `SmgAdmissionRejections` | warning | the admission queue rejects requests for `admissionRejectionsFor` |
+| `SmgAdmissionRejections` | warning | the concurrency limit's queue or the priority scheduler's per-class queues reject requests for `admissionRejectionsFor` |
 | `SmgEventLoopStalls` | warning | more than `eventLoopStalls` event-loop stalls in ten minutes |
 | `SmgDroppedLogLines` | warning | a log sink dropped lines in the last ten minutes |
 | `SmgKvEventDegradedRanks` | warning | an engine rank's KV index stays degraded for `degradedRanksFor` |
 
 Readiness itself is a kubelet signal: with kube-state-metrics in the cluster, `kube_pod_status_ready` on the router pods complements `SmgGatewayDown`.
+
+The rules have unit tests under `tests/rules`: `tests/rules/run.sh` (needs `helm` and `promtool`) renders the chart's rules and replays each test file's traffic shape against them. The `PR Helm Chart` workflow (`.github/workflows/pr-helm.yml`) lints the chart and runs them on every pull request that touches it.
 
 #### Readiness Deadlines
 
@@ -293,7 +369,7 @@ The budget is not a startup probe on the router's `/readiness`: a startup probe 
 Model loading takes from a minute to tens of minutes, depending on the checkpoint and where it is streamed from. Workers have startup probes with these defaults (`initialDelaySeconds` plus `failureThreshold` times `periodSeconds`: 360 s of budget):
 
 - HTTP mode: `httpGet /health` with `initialDelaySeconds: 60`, `failureThreshold: 30`
-- gRPC mode: `tcpSocket` probe (not all engines implement gRPC health checking yet)
+- gRPC mode: `grpc` probe on the serving port, the same budget. The probe asks the servicer's `grpc.health.v1` service, which every servicer serves (the Rust servicer for every engine, the Python servicers alike) and which answers `SERVING` once the engine serves. The pod therefore counts as started when the engine does, not when the servicer binds its port. The built-in gRPC probe needs Kubernetes 1.24 or later; the chart requires 1.26.
 
 Override per worker:
 

@@ -6,6 +6,9 @@
 // reference's `expect`/`panic`/`hex`/`thiserror-ext`/`enum-as-inner` are
 // replaced with std/error-handled equivalents to satisfy `clippy -D warnings`.
 
+//! The ZMQ transport: the sockets the frontend binds, the handshake that admits each engine, the
+//! sends to one engine and the output loop that reads them all.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
@@ -680,7 +683,7 @@ mod tests {
         let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
             outputs: vec![EngineCoreOutput {
-                request_id: "req-1".to_string(),
+                request_id: "req-1".into(),
                 new_token_ids: vec![100, 101],
                 finish_reason: Some(EngineCoreFinishReason::Stop),
                 ..EngineCoreOutput::default()

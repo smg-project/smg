@@ -4,8 +4,9 @@
 //! - API keys are hashed at load time (never stored in plaintext in memory)
 //! - Constant-time comparison for API key validation
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -136,7 +137,7 @@ fn hash_api_key(key: &str) -> [u8; 32] {
 
 /// API key entry for service account authentication.
 /// The key is hashed at construction time and never stored in plaintext.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiKeyEntry {
     /// Unique identifier for this key
     pub id: String,
@@ -230,14 +231,67 @@ impl ControlPlaneAuthConfig {
     /// Find an API key by its value and return the entry if found.
     /// Uses constant-time hash comparison to prevent timing attacks.
     pub fn find_api_key(&self, key: &str) -> Option<&ApiKeyEntry> {
-        // Scan all entries (no early return) to avoid leaking which key matched.
-        let mut found: Option<&ApiKeyEntry> = None;
-        for entry in &self.api_keys {
-            if entry.verify(key) {
-                found = Some(entry);
-            }
+        find_entry(&self.api_keys, key)
+    }
+}
+
+/// The entry `key` matches: every entry is checked and none is skipped,
+/// so the scan's duration tells nothing of which key matched.
+fn find_entry<'a>(entries: &'a [ApiKeyEntry], key: &str) -> Option<&'a ApiKeyEntry> {
+    let mut found = None;
+    for entry in entries {
+        if entry.verify(key) {
+            found = Some(entry);
         }
-        found
+    }
+    found
+}
+
+/// The control-plane API keys in force. Every clone shares the set, so a
+/// reload from the key file reaches the middleware's copy; a reader takes
+/// the set once and keeps it for its request. A reload never empties the
+/// set (an empty key file is refused where it is read), so a gate that
+/// required a key at start requires one still.
+#[derive(Clone, Default)]
+pub struct ApiKeySet {
+    entries: Arc<ArcSwap<Vec<ApiKeyEntry>>>,
+}
+
+impl ApiKeySet {
+    pub fn new(entries: Vec<ApiKeyEntry>) -> Self {
+        Self {
+            entries: Arc::new(ArcSwap::from_pointee(entries)),
+        }
+    }
+
+    /// The entries in force, one snapshot.
+    pub fn load(&self) -> Arc<Vec<ApiKeyEntry>> {
+        self.entries.load_full()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.load().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.load().is_empty()
+    }
+
+    /// The entry `key` matches in the set in force, if any.
+    pub fn find(&self, key: &str) -> Option<ApiKeyEntry> {
+        find_entry(&self.entries.load(), key).cloned()
+    }
+
+    /// Put `entries` in force and return the set they replace; a request
+    /// that took the previous set finishes under it.
+    pub fn replace(&self, entries: Vec<ApiKeyEntry>) -> Arc<Vec<ApiKeyEntry>> {
+        self.entries.swap(Arc::new(entries))
+    }
+}
+
+impl std::fmt::Debug for ApiKeySet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.entries.load().iter()).finish()
     }
 }
 

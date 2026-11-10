@@ -28,9 +28,14 @@
 //!   HTTP and gRPC families used to each carry a copy of
 //! - [`worker_selection`] — per-request worker-selection helpers used
 //!   by every routing path (regular, PD, fallback, external provider)
+//! - `test_support` (test builds only) — the fast retry policy the HTTP
+//!   and gRPC routers' tests retry under
 //! - `attempt_ledger` — one request's bookkeeping across its retry
 //!   attempts: the circuit breaker charged once per request per worker,
 //!   and a worker's definitive answer never replayed on it
+//! - `rate_limit_cell` — one logical request's tenant rate-limit
+//!   reservation: reserved once before any dispatch, then settled, handed
+//!   to a streaming body, or closed unsettled
 //! - [`request_lease`] — dispatch-phase owner of a request's parsed
 //!   body, routing derivatives and serialized upstream bytes, with a
 //!   retry-aware release point
@@ -54,6 +59,7 @@ pub mod pd_admission;
 pub(crate) mod pd_failure;
 pub use smg_external_router::persistence_utils;
 pub(crate) mod placement;
+pub(crate) mod rate_limit_cell;
 pub use smg_external_router::realtime;
 pub mod request_lease;
 pub(crate) use smg_external_router::sglang_fields;
@@ -73,7 +79,7 @@ pub(crate) const STREAM_UPSTREAM_BODY_OVER: usize = 1 << 20;
 /// Buffer capacity for reserializing a parsed request of `raw_len` incoming
 /// bytes: the round trip stays close to raw size, and the 1/16 + 512B slack
 /// absorbs injected fields (bootstrap, kv_transfer_params, dp ranks).
-pub(crate) fn serialized_capacity(raw_len: usize) -> usize {
+fn serialized_capacity(raw_len: usize) -> usize {
     raw_len + raw_len / 16 + 512
 }
 
@@ -121,6 +127,25 @@ pub(crate) fn attach_sized_body(
         )))
     } else {
         builder.body(body)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! What the HTTP and gRPC routers' tests share.
+
+    use crate::config::types::RetryConfig;
+
+    /// `max_retries` attempts with one to two milliseconds between them and
+    /// no jitter: a retrying test's whole schedule fits in its own bound.
+    pub(crate) fn fast_retry_config(max_retries: u32) -> RetryConfig {
+        RetryConfig {
+            max_retries,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 2,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        }
     }
 }
 

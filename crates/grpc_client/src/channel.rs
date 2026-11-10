@@ -1,11 +1,13 @@
 //! Shared `tonic::Channel` builder for SMG gRPC clients.
 //!
-//! Each engine client (sglang, vllm, trtllm, mlx) connects to its backend
-//! the same way: accept either an `http(s)://` or a `grpc(s)://` endpoint,
-//! convert the gRPC schemes to tonic-compatible HTTP(S) ones, and build a
-//! `Channel` with the same keep-alive / window-size profile. This module
-//! centralises that pipeline so adding a new engine — or tuning the
-//! transport profile — touches one file instead of four.
+//! Each gRPC client of this crate (`vllm_engine`, `sglang_scheduler`,
+//! `tokenspeed_scheduler`, `trtllm_service`, `mlx_engine`, and the EPD
+//! encode client `tokenspeed_encoder`) connects to its backend the same
+//! way: accept either an `http(s)://` or a `grpc(s)://` endpoint, convert
+//! the gRPC schemes to tonic-compatible HTTP(S) ones, and build a `Channel`
+//! with the same keep-alive / window-size profile. This module centralises
+//! that pipeline so adding a new engine — or tuning the transport profile —
+//! touches one file instead of one per client.
 
 use std::time::Duration;
 

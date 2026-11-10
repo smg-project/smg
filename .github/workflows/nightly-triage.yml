@@ -1,10 +1,10 @@
 name: Nightly Triage
 
-# Daily: collect recent nightly eval and build failures and have Claude
-# triage them — classify each (regression vs infra/upstream flake vs
-# config), rerun clear one-off flakes once, and keep one rolling issue per
-# workflow so failures stop landing in a void. Runs after the ~7h bfcl/tau2
-# windows finish.
+# Daily: collect recent nightly eval, build, fuzz and stress failures and
+# have Claude triage them — classify each (regression vs infra/upstream
+# flake vs config), rerun clear one-off flakes once, and keep one rolling
+# issue per workflow so failures stop landing in a void. Runs after the ~7h
+# bfcl/tau2 windows finish.
 
 on:
   schedule:
@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WATCHED_WORKFLOWS: nightly-bfcl.yml nightly-tau2.yml nightly-docker.yml nightly-engine-docker.yml nightly-pd.yml cargo-audit-nightly.yml
+  WATCHED_WORKFLOWS: nightly-bfcl.yml nightly-tau2.yml nightly-docker.yml nightly-engine-docker.yml nightly-pd.yml cargo-audit-nightly.yml symphony-fuzz.yml radix-tree-fuzz.yml nightly-grpc-stress.yml
 
 jobs:
   collect:
@@ -78,9 +78,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Export API key from pod env
-        uses: ./.github/actions/export-pod-api-key
-
       - name: Install gh CLI
         uses: ./.github/actions/setup-gh
 
@@ -91,9 +88,11 @@ jobs:
           gh label create nightly-triage --repo "$GITHUB_REPOSITORY" \
             --description "Automated nightly failure triage" --color d93f0b --force
 
+      # No key in the job: the runner pod's key-proxy sidecar holds it (see
+      # scripts/k8s-runner-resources/runner-values-cpu.yaml); Claude gets a placeholder.
       - uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
+          anthropic_api_key: sk-ant-placeholder-the-sidecar-holds-the-key
           prompt: |
             REPO: ${{ github.repository }}
             FAILED NIGHTLY RUNS (last 48h, JSON): ${{ needs.collect.outputs.failures }}
@@ -114,12 +113,22 @@ jobs:
                - infra/flake: runner lost, OOM-killed runner, network timeout,
                  registry/HF download failure, upstream API 5xx
                - regression: assertion/score threshold failures (bfcl/tau2
-                 score drops, benchmark deltas), build breaks in our code
+                 score drops, benchmark deltas), build breaks in our code,
+                 a symphony-fuzz runner row with crashes > 0 or a named
+                 breach class, a radix-tree-fuzz divergence panic (seed and
+                 op), a gRPC stress bed whose gateway did not come up,
+                 failed its probe or died mid-cell (nightly-grpc-stress)
                - config/env: version conflicts, missing secrets, disk full
             4. Rerun policy (conservative): if AND ONLY IF the failure is a
                clear infra/flake and the run's attempt == 1, rerun it once:
                `gh run rerun <run_id> --repo ${{ github.repository }} --failed`.
-               Never rerun regressions or second attempts.
+               Never rerun regressions or second attempts, and never a fuzz
+               campaign red: symphony-fuzz is a random search, so a green
+               second attempt proves nothing and would turn the run's
+               conclusion green, hiding the breach from the next day's
+               gather; radix-tree-fuzz is seeded, so a second attempt repeats
+               the divergence. A stress bed red whose cause is a download or
+               the runner is an infra/flake like any other.
             5. Report per workflow in the rolling issue:
                - If it exists, add a comment titled with today's date holding
                  the day's triage (classification, key log lines, action
@@ -138,4 +147,5 @@ jobs:
             --max-turns 60
             --allowedTools "Read,Glob,Grep,Bash,WebFetch,WebSearch,TaskCreate,TaskUpdate,TaskGet"
         env:
+          ANTHROPIC_BASE_URL: http://127.0.0.1:8787/anthropic
           GH_TOKEN: ${{ github.token }}

@@ -204,6 +204,45 @@ fn bench_decode(c: &mut Criterion) {
     group.bench_function("full_decode_once", |b| {
         b.iter(|| tokenizer.decode(&ids, false).expect("decode").len());
     });
+
+    // The stream's end alone (the setup streams the ids): after the text,
+    // when nothing is held, and after a lead byte the end cuts, when the
+    // decoder holds the start of a character. A byte-level vocabulary has the
+    // byte's one-character token, which decodes alone to one replacement
+    // character; a vocabulary where that name is a complete character (the
+    // text `ð` of a tiktoken or sentencepiece-style vocabulary) or absent
+    // skips the row rather than measure a settled stream under its label.
+    group.throughput(Throughput::Elements(1));
+    let streamed = |ids: &[u32]| {
+        let mut seq = Sequence::new(dyn_tokenizer.clone());
+        for &id in ids {
+            seq.append_token(id).expect("step");
+        }
+        seq
+    };
+    group.bench_function("sequence_finish_settled", |b| {
+        b.iter_batched(
+            || streamed(&ids),
+            |mut seq| seq.finish().expect("finish").len(),
+            BatchSize::SmallInput,
+        );
+    });
+    let lone_lead_byte = dyn_tokenizer.token_to_id("\u{F0}").filter(|&id| {
+        dyn_tokenizer
+            .decode(&[id], false)
+            .is_ok_and(|text| text == "\u{FFFD}")
+    });
+    if let Some(lead) = lone_lead_byte {
+        let mut cut = ids.clone();
+        cut.push(lead);
+        group.bench_function("sequence_finish_cut", |b| {
+            b.iter_batched(
+                || streamed(&cut),
+                |mut seq| seq.finish().expect("finish").len(),
+                BatchSize::SmallInput,
+            );
+        });
+    }
     group.finish();
 }
 

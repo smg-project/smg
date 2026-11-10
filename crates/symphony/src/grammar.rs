@@ -813,7 +813,7 @@ impl Format {
             CallSyntax::Attributed(tags) if tags.typing == Typing::TypeAttribute => {
                 let markers = markers?;
                 let ways_in = self.ways_into(markers.block.as_ref()?.state);
-                (xtml::calls(markers, &ways_in, &named, count)?, false)
+                (xtml::calls(markers, &ways_in, tags, &named, count)?, false)
             }
             CallSyntax::Attributed(tags) => {
                 (attributed::calls(markers?, tags, &named, count)?, true)
@@ -1805,7 +1805,7 @@ mod tests {
             function: Function {
                 name: name.to_string(),
                 description: None,
-                parameters,
+                parameters: Some(parameters),
                 strict,
                 extra: Default::default(),
             },
@@ -2522,7 +2522,7 @@ mod tests {
         let one_call = value!({"type": "or", "elements": tools
             .iter()
             .filter(|tool| !tool.function.name.is_empty())
-            .map(|tool| call(&tool.function.name, tool.function.parameters.clone()))
+            .map(|tool| call(&tool.function.name, tool.function.parameters_schema().clone()))
             .collect::<Vec<_>>()});
         assert_eq!(
             payload,

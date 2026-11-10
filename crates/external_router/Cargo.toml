@@ -1,6 +1,6 @@
 [package]
 name = "smg-external-router"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Routers for third-party providers behind the SMG gateway, and the contract they are built on"
 license = "Apache-2.0"
@@ -45,7 +45,8 @@ openai-protocol = { workspace = true, features = ["axum"] }
 rand.workspace = true
 regex = "1.12"
 reqwest = { workspace = true, features = ["stream", "blocking", "json", "rustls-no-provider", "multipart", "http2"] }
-rmcp = { version = "1.7", features = ["client"] }
+rmcp = { version = "3.9", features = ["client"] }
+rustc-hash = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std", "preserve_order", "raw_value"] }

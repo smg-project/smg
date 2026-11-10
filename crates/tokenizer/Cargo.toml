@@ -1,6 +1,6 @@
 [package]
 name = "llm-tokenizer"
-version = "1.10.0"
+version = "1.11.0"
 edition = "2021"
 description = "LLM tokenizer library with caching and chat template support"
 license = "Apache-2.0"
@@ -17,7 +17,7 @@ categories = ["text-processing", "parsing"]
 name = "llm_tokenizer"
 
 [features]
-# Opt-in encoding and full ByteLevel decode acceleration; streaming stays unchanged.
+# Opt-in encoding through the tokenizers v1 pipeline; decoding and streaming are the same in every build.
 tokenizers-v1 = ["dep:tokenizers-v1"]
 
 [dependencies]
@@ -62,12 +62,17 @@ tokenizers-v1 = { package = "tokenizers", version = "=1.0.0-rc.3", optional = tr
     "wordlevel",
     "unicode-scripts",
 ] }
-unicode-normalization = "0.1"
+# The NFC tables of the native encode path: the crate `tokenizers` normalizes with, so the two paths compose
+# the same text (a newer crate's tables know marks and compositions the library's do not).
+unicode-normalization-alignments = "0.1"
 
 [dev-dependencies]
 criterion = "0.8"
 openai-protocol.workspace = true
 reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
+# The hub tests build the Hub's answers to a file request: http for the response, the reqwest hf-hub binds for the error.
+http.workspace = true
+reqwest-hub = { package = "reqwest", version = "0.12", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tempfile = "3.27"
 # The bellwether fixtures test reads the fixture manifests (TOML).

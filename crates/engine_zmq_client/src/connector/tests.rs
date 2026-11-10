@@ -1,15 +1,18 @@
 use std::time::Duration;
 
-use futures::StreamExt;
+use futures::{channel::mpsc::channel as monitor_channel, SinkExt, StreamExt};
+use zeromq::{util::PeerIdentity, Endpoint, SocketEvent};
 
 use super::*;
 use crate::{
-    codec::{decode_msgpack, encode_msgpack},
+    codec::{decode_msgpack, encode_msgpack, tensor::lies_within},
     mock_engine::{
-        connect_to_frontend, default_ready_response, EngineInbound, IpcNamespace, MockEngine,
+        connect_to_frontend, default_ready_response, hello, redial_input, EngineInbound,
+        IpcNamespace, MockEngine,
     },
     protocol::{
         handshake::EngineCoreReadyResponse,
+        kv_transfer::KvTransferStats,
         vllm::{
             output::{
                 DpControlMessage, DpControlOutput, EngineCoreFinishReason, EngineCoreOutput,
@@ -129,6 +132,34 @@ fn request_for(request_id: &str, rank: u32) -> EngineCoreRequest {
     }
 }
 
+/// The unpinned add-request `request_id` submitted through `client` and read
+/// as its Add on `engine`, the rank the client's routing must choose for it;
+/// the request's stream comes back so the test keeps it in flight as long as
+/// it needs to.
+async fn unpinned_request_lands_on(
+    client: &EngineCoreClient,
+    engine: &mut MockEngine,
+    request_id: &str,
+) -> EngineCoreStream {
+    let next = client
+        .submit(EngineCoreRequest {
+            request_id: request_id.into(),
+            prompt_token_ids: Some(vec![1, 2, 3]),
+            ..EngineCoreRequest::default()
+        })
+        .await
+        .unwrap();
+    match tokio::time::timeout(TIMEOUT, engine.recv())
+        .await
+        .expect("the unpinned request should reach this engine")
+        .unwrap()
+    {
+        EngineInbound::Add(request) => assert_eq!(request.request_id, request_id),
+        other => panic!("expected the unpinned request's Add, got {other:?}"),
+    }
+    next
+}
+
 fn wave_control(engine_index: u32, control: DpControlMessage) -> Vec<Bytes> {
     let outputs = EngineCoreOutputs::DpControl(DpControlOutput {
         engine_index,
@@ -141,7 +172,7 @@ fn wave_control(engine_index: u32, control: DpControlMessage) -> Vec<Bytes> {
 fn batch(engine_index: u32, output: EngineCoreOutput) -> Vec<Bytes> {
     let finished = output.finish_reason.map(|_| {
         let mut set = std::collections::BTreeSet::new();
-        set.insert(output.request_id.clone());
+        set.insert(String::from(&output.request_id));
         set
     });
     let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
@@ -202,6 +233,104 @@ async fn submit_streams_tokens_until_finish() {
     assert!(second.finished());
     // Terminal output ends the stream.
     assert!(stream.next().await.is_none());
+}
+
+/// The engine's last output as the servicers' deep health probe reads it:
+/// `None` before the first batch, set by any batch (a stats-only step
+/// included), moved forward by the next, and never by a dispatch, which
+/// only restarts the silence counted for a request reported every step.
+#[tokio::test]
+async fn last_output_at_follows_the_engines_batches_and_not_the_dispatches() {
+    let (client, mut engine, _ns) = connect().await;
+    assert_eq!(client.last_output_at(), None, "nothing received yet");
+    let mut stream = client.submit(request_for("req-1", 0)).await.unwrap();
+    engine.recv_request().await.unwrap();
+    assert_eq!(client.last_output_at(), None, "a dispatch is not an output");
+    assert!(
+        client.output_silence().is_some(),
+        "though the silence of the request it dispatched counts from it"
+    );
+
+    let stats_only = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+        engine_index: 0,
+        scheduler_stats: Some(SchedulerStats {
+            num_running_reqs: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    engine
+        .send_output(vec![Bytes::from(encode_msgpack(&stats_only).unwrap())])
+        .await
+        .unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let first = loop {
+        if let Some(at) = client.last_output_at() {
+            break at;
+        }
+        assert!(Instant::now() < deadline, "stats never arrived");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert!(first <= Instant::now(), "stamped when it was routed");
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    engine
+        .send_output(batch(
+            0,
+            EngineCoreOutput {
+                request_id: "req-1".into(),
+                new_token_ids: vec![11],
+                finish_reason: Some(EngineCoreFinishReason::Stop),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(stream.next().await.unwrap().unwrap().finished());
+    let second = client
+        .last_output_at()
+        .expect("the terminal batch is an output too");
+    assert!(
+        second >= first + Duration::from_millis(15),
+        "moved forward by the next batch: {first:?} then {second:?}"
+    );
+    assert_eq!(client.output_silence(), None, "nothing in flight again");
+}
+
+/// On a wire whose outputs-less batches carry a load tail (a stats-only
+/// step report), one without a tail is the engine's bare liveness signal: an
+/// output, stamped as one, and no step report.
+#[tokio::test]
+async fn an_outputs_less_batch_without_a_load_tail_is_an_output_and_no_step_report() {
+    use crate::protocol::sglang::{output::BatchTokenIDSlimOutput, SglangProtocol};
+    let (client, mut engine, _ns) = connect_wire::<SglangProtocol>().await;
+    assert_eq!(client.last_output_at(), None, "nothing received yet");
+    let signal = BatchTokenIDSlimOutput::default();
+    engine
+        .send_output(vec![Bytes::from(encode_msgpack(&signal).unwrap())])
+        .await
+        .unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    while client.last_output_at().is_none() {
+        assert!(Instant::now() < deadline, "the signal never arrived");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!client.reports_steps(), "no load tail: no step report");
+
+    // The same batch with a load tail is a stats-only step report.
+    let step = BatchTokenIDSlimOutput {
+        num_running: 1,
+        kv_total_tokens: 100,
+        ..BatchTokenIDSlimOutput::default()
+    };
+    engine
+        .send_output(vec![Bytes::from(encode_msgpack(&step).unwrap())])
+        .await
+        .unwrap();
+    while !client.reports_steps() {
+        assert!(Instant::now() < deadline, "the step never arrived");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// The silence the servicer reports for a frozen engine: nothing while
@@ -393,22 +522,7 @@ async fn unpinned_requests_prefer_the_least_loaded_engine() {
 
     // An unpinned request must now land on the idle engine 1, not
     // engines.first().
-    let _stream = client
-        .submit(EngineCoreRequest {
-            request_id: "cold".into(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            ..EngineCoreRequest::default()
-        })
-        .await
-        .unwrap();
-    let inbound = tokio::time::timeout(TIMEOUT, engines[1].recv())
-        .await
-        .expect("unpinned request should route to the least-loaded engine")
-        .unwrap();
-    match inbound {
-        EngineInbound::Add(request) => assert_eq!(request.request_id, "cold"),
-        other => panic!("expected Add on engine 1, got {other:?}"),
-    }
+    let _stream = unpinned_request_lands_on(&client, &mut engines[1], "cold").await;
 }
 
 #[tokio::test]
@@ -459,15 +573,7 @@ async fn failed_submit_releases_its_reservation() {
     // With counts (1, 0) the next request must land on engine 1. If the
     // failed attempt leaked its reservation the counts would read (1, 1)
     // and rotation could send this to engine 0.
-    let _next = client.submit(unpinned("after")).await.unwrap();
-    match tokio::time::timeout(TIMEOUT, engines[1].recv())
-        .await
-        .expect("request should route to the unloaded engine")
-        .unwrap()
-    {
-        EngineInbound::Add(request) => assert_eq!(request.request_id, "after"),
-        other => panic!("expected Add on engine 1, got {other:?}"),
-    }
+    let _next = unpinned_request_lands_on(&client, &mut engines[1], "after").await;
 }
 
 #[tokio::test]
@@ -506,22 +612,7 @@ async fn retiring_one_request_twice_frees_only_its_own_slot() {
     // Engine 0 still holds "held". An unpinned request must therefore go
     // to the idle engine 1 — it would go to 0 if the second retirement had
     // freed "held"'s slot too.
-    let _next = client
-        .submit(EngineCoreRequest {
-            request_id: "next".into(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            ..EngineCoreRequest::default()
-        })
-        .await
-        .unwrap();
-    match tokio::time::timeout(TIMEOUT, engines[1].recv())
-        .await
-        .expect("request should route to the idle engine")
-        .unwrap()
-    {
-        EngineInbound::Add(request) => assert_eq!(request.request_id, "next"),
-        other => panic!("expected Add on engine 1, got {other:?}"),
-    }
+    let _next = unpinned_request_lands_on(&client, &mut engines[1], "next").await;
 }
 
 #[tokio::test]
@@ -566,22 +657,141 @@ async fn an_emptied_rank_sheds_its_stale_queue_counts() {
     // it behind rank 1's real work.
     let _held = client.submit(request_for("held", 1)).await.unwrap();
     engines[1].recv().await.unwrap();
-    let _next = client
-        .submit(EngineCoreRequest {
-            request_id: "next".into(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            ..EngineCoreRequest::default()
-        })
+    let _next = unpinned_request_lands_on(&client, &mut engines[0], "next").await;
+}
+
+/// The step's finished set is the union of the out-of-band finished list
+/// and the terminal outputs. A finish the engine reports out of band alone,
+/// with no output for the request in the step, ends the request's stream
+/// as the closed-stream error (no output said how it ended) and frees its
+/// slot on the rank.
+#[tokio::test]
+async fn an_out_of_band_finish_without_a_terminal_output_ends_the_request() {
+    let (client, mut engine, _ns) = connect().await;
+    let mut stream = client.submit(request_for("req-1", 0)).await.unwrap();
+    engine.recv_request().await.unwrap();
+
+    let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+        engine_index: 0,
+        outputs: Vec::new(),
+        finished_requests: Some(std::collections::BTreeSet::from(["req-1".to_string()])),
+        ..Default::default()
+    });
+    engine
+        .send_output(vec![Bytes::from(encode_msgpack(&outputs).unwrap())])
         .await
         .unwrap();
-    match tokio::time::timeout(TIMEOUT, engines[0].recv())
+
+    let end = tokio::time::timeout(TIMEOUT, stream.next())
         .await
-        .expect("request should route to the emptied rank")
+        .expect("the out-of-band finish should end the stream");
+    assert!(
+        matches!(end, Some(Err(Error::RequestStreamClosed { .. }))),
+        "an out-of-band finish without an output closes the stream as an error: {end:?}"
+    );
+    assert!(stream.next().await.is_none());
+    assert!(
+        !client
+            .inner
+            .routing
+            .lock()
+            .inflight
+            .values()
+            .any(|ids| ids.contains("req-1")),
+        "the out-of-band finish should free the request's slot"
+    );
+}
+
+/// A terminal output names its request's finish by itself: with no
+/// out-of-band list in the step, the stream ends and the slot is freed all
+/// the same, and a request the step did not finish keeps its slot.
+#[tokio::test]
+async fn a_terminal_output_alone_frees_its_slot_and_no_other() {
+    let (client, mut engine, _ns) = connect().await;
+    let mut done = client.submit(request_for("done", 0)).await.unwrap();
+    let _held = client.submit(request_for("held", 0)).await.unwrap();
+    engine.recv_request().await.unwrap();
+    engine.recv_request().await.unwrap();
+
+    let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+        engine_index: 0,
+        outputs: vec![EngineCoreOutput {
+            request_id: "done".into(),
+            new_token_ids: vec![7],
+            finish_reason: Some(EngineCoreFinishReason::Stop),
+            ..Default::default()
+        }],
+        finished_requests: None,
+        ..Default::default()
+    });
+    engine
+        .send_output(vec![Bytes::from(encode_msgpack(&outputs).unwrap())])
+        .await
+        .unwrap();
+
+    let last = tokio::time::timeout(TIMEOUT, done.next())
+        .await
+        .expect("the terminal output should arrive")
         .unwrap()
-    {
-        EngineInbound::Add(request) => assert_eq!(request.request_id, "next"),
-        other => panic!("expected Add on engine 0, got {other:?}"),
-    }
+        .unwrap();
+    assert!(last.finished());
+    assert!(
+        done.next().await.is_none(),
+        "the terminal output ends the stream"
+    );
+    let routing = client.inner.routing.lock();
+    assert!(
+        !routing.inflight.values().any(|ids| ids.contains("done")),
+        "the terminal output should free the request's slot"
+    );
+    assert!(
+        routing.inflight.values().any(|ids| ids.contains("held")),
+        "a request the step did not finish keeps its slot"
+    );
+}
+
+/// A finish named twice in one step, by a terminal output and by the
+/// out-of-band list, retires once; a finish for an id the client never
+/// submitted touches nothing.
+#[tokio::test]
+async fn a_finish_named_twice_or_for_a_stranger_retires_at_most_once() {
+    let (client, mut engines, _ns) = connect_ranks(2, false).await;
+    let mut twice = client.submit(request_for("twice", 0)).await.unwrap();
+    let _held = client.submit(request_for("held", 0)).await.unwrap();
+    engines[0].recv().await.unwrap();
+    engines[0].recv().await.unwrap();
+
+    let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+        engine_index: 0,
+        outputs: vec![EngineCoreOutput {
+            request_id: "twice".into(),
+            new_token_ids: vec![7],
+            finish_reason: Some(EngineCoreFinishReason::Stop),
+            ..Default::default()
+        }],
+        finished_requests: Some(std::collections::BTreeSet::from([
+            "twice".to_string(),
+            "stranger".to_string(),
+        ])),
+        ..Default::default()
+    });
+    engines[0]
+        .send_output(vec![Bytes::from(encode_msgpack(&outputs).unwrap())])
+        .await
+        .unwrap();
+    while tokio::time::timeout(TIMEOUT, twice.next())
+        .await
+        .expect("the stream should end")
+        .is_some()
+    {}
+
+    // Engine 0 still holds "held": an unpinned request goes to the idle
+    // engine 1. It would go to 0 if the second retirement, or the
+    // stranger's, had freed a slot the step never finished.
+    let _next = unpinned_request_lands_on(&client, &mut engines[1], "next").await;
+    let routing = client.inner.routing.lock();
+    assert!(!routing.inflight.values().any(|ids| ids.contains("twice")));
+    assert!(routing.inflight.values().any(|ids| ids.contains("held")));
 }
 
 #[tokio::test]
@@ -725,24 +935,7 @@ async fn tokenspeed_client_submits_and_streams() {
         sampling::SamplingParams,
     };
 
-    let ns = IpcNamespace::new().unwrap();
-    let (handshake, input, output) = (
-        ns.handshake_endpoint(),
-        ns.input_endpoint(),
-        ns.output_endpoint(),
-    );
-    // Held for the test duration so the ipc files outlive the client.
-    let _ns = ns;
-    let (transport, engine) = tokio::join!(
-        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    let client = TokenSpeedClient::new(transport.unwrap());
-    let mut engine = engine.unwrap();
+    let (client, mut engine, _ns) = connect_wire::<TokenSpeedProtocol>().await;
 
     let request = TokenizedGenerateReqInput {
         rid: "ts-1".to_string(),
@@ -846,23 +1039,7 @@ async fn a_request_reported_at_intervals_counts_no_silence() {
     use crate::protocol::tokenspeed::{
         output::BatchTokenIDOutSlim, request::TokenizedGenerateReqInput, sampling::SamplingParams,
     };
-    let ns = IpcNamespace::new().unwrap();
-    let (handshake, input, output) = (
-        ns.handshake_endpoint(),
-        ns.input_endpoint(),
-        ns.output_endpoint(),
-    );
-    let _ns = ns;
-    let (transport, engine) = tokio::join!(
-        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    let client = TokenSpeedClient::new(transport.unwrap());
-    let mut engine = engine.unwrap();
+    let (client, mut engine, _ns) = connect_wire::<TokenSpeedProtocol>().await;
     let request =
         |rid: &str, input_ids: Vec<u32>, stream: bool, stream_interval| TokenizedGenerateReqInput {
             rid: rid.to_string(),
@@ -876,7 +1053,7 @@ async fn a_request_reported_at_intervals_counts_no_silence() {
             ..TokenizedGenerateReqInput::default()
         };
     let done = |rid: &str, prompt_tokens: u32| BatchTokenIDOutSlim {
-        rids: vec![rid.to_string()],
+        rids: vec![rid.into()],
         output_ids: vec![vec![11]],
         finished_reasons: vec!["stop".into()],
         prompt_tokens: vec![prompt_tokens],
@@ -973,23 +1150,7 @@ async fn an_sglang_request_reported_at_intervals_counts_no_silence() {
         request::{SglangRequest, TokenizedEmbeddingReqInput, TokenizedGenerateReqInput},
         sampling::SamplingParams,
     };
-    let ns = IpcNamespace::new().unwrap();
-    let (handshake, input, output) = (
-        ns.handshake_endpoint(),
-        ns.input_endpoint(),
-        ns.output_endpoint(),
-    );
-    let _ns = ns;
-    let (transport, engine) = tokio::join!(
-        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    let client = SglangClient::new(transport.unwrap());
-    let mut engine = engine.unwrap();
+    let (client, mut engine, _ns) = connect_wire::<SglangProtocol>().await;
     let generate = |rid: &str, input_ids: Vec<u32>, stream: bool, stream_interval| {
         SglangRequest::Generate(TokenizedGenerateReqInput {
             rid: rid.to_string(),
@@ -1004,7 +1165,7 @@ async fn an_sglang_request_reported_at_intervals_counts_no_silence() {
         })
     };
     let done = |rid: &str, prompt_tokens: u32| BatchTokenIDSlimOutput {
-        rids: vec![rid.to_string()],
+        rids: vec![rid.into()],
         output_ids: vec![vec![11]],
         finished_reasons: vec!["stop".into()],
         finished_messages: vec![None],
@@ -1056,7 +1217,7 @@ async fn an_sglang_request_reported_at_intervals_counts_no_silence() {
     assert_eq!(client.prefill_pending_tokens(), 7);
     // Its result ends it, and the silence with it.
     let result = BatchEmbeddingSlimOutput {
-        rids: vec!["sg-embed".to_string()],
+        rids: vec!["sg-embed".into()],
         embeddings: vec![vec![0.5]],
         prompt_tokens: vec![2],
         cached_tokens: vec![0],
@@ -1249,8 +1410,10 @@ async fn a_ranks_start_wave_request_wakes_the_whole_group() {
 }
 
 /// A drain notification is bookkeeping, not a wake: `wave_complete` folds
-/// into the clock but must NOT restart the group, or the ranks would never
-/// stay parked and an idle group would spin.
+/// into the clock but must NOT restart the group while no prompt the group
+/// was handed is unanswered, or the ranks would never stay parked and an
+/// idle group would spin. (With such a prompt pending it is the drain
+/// racing a submit, and the group is woken once more: the next test.)
 #[tokio::test]
 async fn wave_complete_updates_the_clock_without_waking() {
     let (client, mut engines, _ns) = connect_ranks(2, true).await;
@@ -1271,6 +1434,229 @@ async fn wave_complete_updates_the_clock_without_waking() {
     // must clear the wave the ranks parked on.
     let _stream = client.submit(request_for("req-1", 1)).await.unwrap();
     assert!(next_wake(&mut engines[0]).await > 3);
+}
+
+/// The drain can race a submit. The holder's peers read the submit's wake
+/// while they are still stepping (a no-op) and the group agrees to park
+/// before the holder's loop has read the add: an engine's input thread
+/// decodes and preprocesses a request before it reaches the loop, a wake it
+/// hands over at once. The holder then reads the add alone and blocks in the
+/// group's collective, and without a DP coordinator nobody wakes its peers
+/// again. So a drained wave reported while a prompt the group was handed has
+/// no output yet wakes the group once more, at a fresh wave, once for the
+/// park however many ranks report it; answered, the prompt leaves a drained
+/// wave the bookkeeping it is.
+#[tokio::test]
+async fn a_wave_drained_while_a_handed_prompt_is_unanswered_wakes_the_group_again() {
+    let (client, mut engines, _ns) = connect_ranks(2, true).await;
+    let (mut stream, first) = submitted_to_the_group(&client, &mut engines, "req-1", 0).await;
+
+    // Both ranks report the wave drained: they parked before the holder's
+    // loop read the add, the prompt still unanswered.
+    let again = drained_then_woken_again(&mut engines, first, "its drain").await;
+
+    // The holder answers and finishes the prompt: the next drain is
+    // bookkeeping again, and the group stays parked.
+    answered_prompt_leaves_the_group_parked(&client, &mut engines, &mut stream, "req-1", 0, again)
+        .await;
+
+    // A later prompt is owed its own re-wake: the bound is per prompt, not
+    // per group.
+    let (_second, second) = submitted_to_the_group(&client, &mut engines, "req-2", 1).await;
+    drained_then_woken_again(&mut engines, second, "the second prompt's drain").await;
+}
+
+/// The holder's add can be late through more than one wave: its input
+/// thread is still preprocessing the add while the re-woken group runs its
+/// dummy steps (a large add, or the thread starved by those steps), so the
+/// group reaches its next finish-sync with the add unread, parks a second
+/// time and reports a second drain. The re-wake is owed again then, a few
+/// times per prompt, so the add is served when the holder's loop reads it at
+/// last; answered, the prompt leaves a drained wave the bookkeeping it is.
+#[tokio::test]
+async fn a_holder_whose_add_is_still_unread_after_the_rewoken_wave_is_woken_again() {
+    let (client, mut engines, _ns) = connect_ranks(2, true).await;
+    let (mut stream, first) = submitted_to_the_group(&client, &mut engines, "req-1", 0).await;
+
+    // Two parks in a row with the add unread through both: each drain pair
+    // is answered by one wake on every rank, above the wave the ranks
+    // parked on. The second park is the one a single re-wake per prompt
+    // left to the silence watchdog.
+    let again = drained_then_woken_again(&mut engines, first, "the first park's drain").await;
+    let once_more = drained_then_woken_again(&mut engines, again, "the second park's drain").await;
+
+    // The holder's loop reads the add at last and answers it: the next
+    // drain is bookkeeping again, and the group stays parked.
+    answered_prompt_leaves_the_group_parked(
+        &client,
+        &mut engines,
+        &mut stream,
+        "req-1",
+        0,
+        once_more,
+    )
+    .await;
+}
+
+/// Submit `request_id` pinned to `rank` on a two-rank lockstep group: the
+/// rank reads its add and every rank the wake, whose wave is returned with
+/// the request's stream.
+async fn submitted_to_the_group(
+    client: &EngineCoreClient,
+    engines: &mut [MockEngine],
+    request_id: &str,
+    rank: u32,
+) -> (EngineCoreStream, u64) {
+    let stream = client.submit(request_for(request_id, rank)).await.unwrap();
+    match engines[rank as usize].recv().await.unwrap() {
+        EngineInbound::Add(request) => assert_eq!(request.request_id, request_id),
+        other => panic!("rank {rank} expected the Add, got {other:?}"),
+    }
+    let wave = next_wake(&mut engines[0]).await;
+    assert_eq!(next_wake(&mut engines[1]).await, wave);
+    (stream, wave)
+}
+
+/// Both ranks report the wave they `parked` on drained while the handed
+/// prompt is still unanswered: the group is woken again, once for the park,
+/// above that wave on every rank. Returns the wave of the wake; `drain`
+/// names the report in the failure messages.
+async fn drained_then_woken_again(engines: &mut [MockEngine], parked: u64, drain: &str) -> u64 {
+    for rank in 0..2u32 {
+        engines[rank as usize]
+            .send_output(wave_control(rank, DpControlMessage::WaveComplete(parked)))
+            .await
+            .unwrap();
+    }
+    let again = tokio::time::timeout(TIMEOUT, next_wake(&mut engines[0]))
+        .await
+        .unwrap_or_else(|_| panic!("the group was not woken again after {drain}"));
+    assert!(
+        again > parked,
+        "wake {again} after {drain} does not outrank the parked ranks at {}",
+        parked + 1
+    );
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, next_wake(&mut engines[1]))
+            .await
+            .unwrap_or_else(|_| panic!("rank 1 was not woken again after {drain}")),
+        again,
+        "the ranks of one park share one wake"
+    );
+    again
+}
+
+/// The holder, `rank`, answers and finishes `request_id`: the next drain, of
+/// the wave the group `parked` on, is bookkeeping again and the group stays
+/// parked. Nothing else may have reached the other rank meanwhile: the
+/// reports of one park were one wake.
+async fn answered_prompt_leaves_the_group_parked(
+    client: &EngineCoreClient,
+    engines: &mut [MockEngine],
+    stream: &mut EngineCoreStream,
+    request_id: &str,
+    rank: u32,
+    parked: u64,
+) {
+    let other = (1 - rank) as usize;
+    engines[rank as usize]
+        .send_output(batch(
+            rank,
+            EngineCoreOutput {
+                request_id: request_id.into(),
+                new_token_ids: vec![10],
+                finish_reason: Some(EngineCoreFinishReason::Stop),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(tokio::time::timeout(TIMEOUT, stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .is_ok());
+    assert!(stream.next().await.is_none());
+    engines[rank as usize]
+        .send_output(wave_control(rank, DpControlMessage::WaveComplete(parked)))
+        .await
+        .unwrap();
+    tokio::time::timeout(TIMEOUT, async {
+        while *client.inner.wave.as_ref().unwrap().lock() <= parked {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the drained wave never reached the clock");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), engines[other].recv())
+            .await
+            .is_err(),
+        "a drained wave with nothing pending woke the group"
+    );
+}
+
+/// The re-wake is bounded, a few times per handed prompt, so the silence
+/// watchdog stays the last resort: a prompt the holder never schedules (an
+/// add the engine dropped while every rank stays healthy and answers each
+/// wake with a drain) buys `DRAIN_REWAKES_PER_PROMPT` extra rounds, after
+/// which the group stays parked and the client declares the engine dead at
+/// the window, as it did before the re-wake existed. Unbounded, every drain
+/// would wake the group again and every report of the round would reset the
+/// watchdog, for good.
+#[tokio::test]
+async fn a_prompt_the_holder_never_schedules_is_rewoken_a_few_times_and_then_given_up_on() {
+    let (client, mut engines, _ns) = connect_ranks(2, true).await;
+    let window = Duration::from_millis(600);
+    client.set_silence_death_timeout(window);
+
+    // Each rank answers every wake with a drain report at that wave and
+    // never schedules the add: the engine that dropped it.
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let mut responders = Vec::new();
+    for rank in (0..2u32).rev() {
+        let mut engine = engines.remove(rank as usize);
+        let wakes = wakes.clone();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a responder ends with its engine's socket and is aborted at the end of the test"
+        )]
+        let responder = tokio::spawn(async move {
+            while let Ok(inbound) = engine.recv().await {
+                if let EngineInbound::StartDpWave { wave, .. } = inbound {
+                    wakes.fetch_add(1, Ordering::SeqCst);
+                    engine
+                        .send_output(wave_control(rank, DpControlMessage::WaveComplete(wave)))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        responders.push(responder);
+    }
+
+    let started = std::time::Instant::now();
+    let mut stream = client.submit(request_for("req-1", 0)).await.unwrap();
+    let error = tokio::time::timeout(window * 3, stream.next())
+        .await
+        .expect("the group cycled waves past three windows: the re-wake is unbounded")
+        .expect("the stream ends with an error, not cleanly")
+        .expect_err("a prompt the holder never schedules cannot be answered");
+    assert!(
+        matches!(&error, Error::Shared(shared) if matches!(**shared, Error::EngineCoreDead)),
+        "{error:?}"
+    );
+    assert!(started.elapsed() >= window, "given up on before the window");
+    assert!(!client.is_alive());
+    // The submit's wake and the capped re-wakes, on each of the two ranks.
+    assert_eq!(
+        wakes.load(Ordering::SeqCst),
+        2 * (1 + usize::from(DRAIN_REWAKES_PER_PROMPT)),
+        "wakes per rank = the submit's and one per re-wake round"
+    );
+    for responder in responders {
+        responder.abort();
+    }
 }
 
 /// Independent ranks keep no wave clock, so a stray wave notification (a
@@ -1712,6 +2098,219 @@ async fn disconnected_peer_fails_already_accepted_requests() {
         .unwrap()
         .is_err());
     assert!(!client.is_alive());
+}
+
+/// One request through `client`, served by `engine`: the add reaches the
+/// engine and the engine's terminal output reaches the stream.
+async fn round_trip(client: &EngineCoreClient, engine: &mut MockEngine, request_id: &str) {
+    let mut stream = client.submit(request_for(request_id, 0)).await.unwrap();
+    assert!(matches!(
+        engine.recv().await.unwrap(),
+        EngineInbound::Add(_)
+    ));
+    engine
+        .send_output(batch(
+            0,
+            EngineCoreOutput {
+                request_id: request_id.into(),
+                new_token_ids: vec![1],
+                finish_reason: Some(EngineCoreFinishReason::Stop),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+    let output = tokio::time::timeout(TIMEOUT, stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(output.finished());
+}
+
+/// The input monitor is opened when the frontend binds its input socket,
+/// before the handshake, and holds every peer event since; the client built
+/// from the handshake reads it from the start. A disconnect queued there
+/// before the handshake admitted the link is of a connection the handshake
+/// did not admit: the data socket of a previous engine generation, which
+/// dialed this frontend's new bind by itself and closed when that
+/// generation was replaced, under the identity the next generation
+/// registers with. Replayed on the monitor stream in the socket's order (the
+/// previous connection's accept and end, then the admitted connection's
+/// accept): queued before the client is built, it leaves the link up and
+/// serving; after, a disconnect of another identity leaves it up too, and
+/// one of the link's own engine ends it.
+#[tokio::test]
+async fn a_disconnect_queued_before_the_link_was_admitted_does_not_end_it() {
+    let ns = IpcNamespace::new().unwrap();
+    let (handshake, input, output) = (
+        ns.handshake_endpoint(),
+        ns.input_endpoint(),
+        ns.output_endpoint(),
+    );
+    let (transport, engine) = tokio::join!(
+        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+        connect_to_frontend(
+            &handshake,
+            EngineId::from_engine_index(0),
+            default_ready_response()
+        ),
+    );
+    let mut transport = transport.unwrap();
+    let mut engine = engine.unwrap();
+
+    // The monitor stream, replayed in the order the socket reports a
+    // previous generation's connection and the admitted one: its accept, its
+    // end, then the accept of the connection that carried the registration,
+    // all queued when the client is built.
+    let own = PeerIdentity::try_from(EngineId::from_engine_index(0)).unwrap();
+    let (mut events, replay) = monitor_channel(8);
+    for event in [
+        SocketEvent::Accepted(Endpoint::Ipc(None), own.clone()),
+        SocketEvent::Disconnected(own.clone()),
+        SocketEvent::Accepted(Endpoint::Ipc(None), own.clone()),
+    ] {
+        events.try_send(event).unwrap();
+    }
+    transport.input_events = replay;
+    let client = EngineCoreClient::new(transport);
+
+    round_trip(&client, &mut engine, "after-a-disconnect-queued-before").await;
+    assert!(client.is_alive());
+
+    // After the admission: a peer that is not an engine of this link.
+    let other = PeerIdentity::try_from(EngineId::from_engine_index(7)).unwrap();
+    events.send(SocketEvent::Disconnected(other)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    round_trip(&client, &mut engine, "after-another-peers-disconnect").await;
+    assert!(client.is_alive());
+
+    // After the admission: this link's engine.
+    events.send(SocketEvent::Disconnected(own)).await.unwrap();
+    tokio::time::timeout(TIMEOUT, async {
+        while client.is_alive() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the link ends on its own engine's disconnect");
+    assert!(matches!(
+        client.submit(request_for("after-the-end", 0)).await,
+        Err(Error::ClientClosed { .. })
+    ));
+}
+
+/// The same on the sockets, as a frontend restart under a live engine plays
+/// it: the engine's input socket dials the frontend's new bind by itself (no
+/// handshake and no registration: an engine says both once), the engine is
+/// then replaced, and the next generation handshakes under the same
+/// identity. Its READY turns the frontend to its input socket, where the
+/// old connection's end is read before the new generation registers there;
+/// the link admitted then stays up.
+#[tokio::test]
+async fn a_previous_generations_disconnect_does_not_end_the_next_link() {
+    let ns = IpcNamespace::new().unwrap();
+    let (handshake, input, output) = (
+        ns.handshake_endpoint(),
+        ns.input_endpoint(),
+        ns.output_endpoint(),
+    );
+    let engine_id = EngineId::from_engine_index(0);
+
+    // Generation one serves on the first link.
+    let (transport, engine) = tokio::join!(
+        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+        connect_to_frontend(&handshake, engine_id.clone(), default_ready_response()),
+    );
+    let client = EngineCoreClient::new(transport.unwrap());
+    let mut engine = engine.unwrap();
+    round_trip(&client, &mut engine, "generation-one").await;
+
+    // The frontend restarts: its sockets go with the client, and it binds
+    // again (the dropped listeners' socket files go on their own tasks).
+    drop(client);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (transport, next) = tokio::join!(
+        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+        async {
+            // The surviving engine's input socket dials the new bind by
+            // itself; then the engine is replaced and its sockets close.
+            let reconnected = redial_input(&input, engine_id.clone()).await?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(reconnected);
+            drop(engine);
+            // The next generation handshakes, and registers once the
+            // frontend has turned to its input socket.
+            let ready = hello(&handshake, engine_id.clone())
+                .await?
+                .announce_ready()
+                .await?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            ready.register(default_ready_response()).await
+        },
+    );
+    let client = EngineCoreClient::new(transport.unwrap());
+    let mut next = next.unwrap();
+    round_trip(&client, &mut next, "generation-two").await;
+    assert!(client.is_alive());
+}
+
+/// A link of several engines admits them together, and an engine that
+/// registered first can go away while the handshake still waits for the
+/// others: its disconnect is queued on the monitor before the client is
+/// built, after its own accept, and no second event for it ever comes (the
+/// socket has forgotten the peer). Replayed: the first engine's accept, its
+/// disconnect, then the second engine's accept; the link ends at its
+/// admission (`is_alive()` false, submits refused), as the monitor arm ends
+/// it on a loss after.
+#[tokio::test]
+async fn an_engine_lost_while_the_handshake_waited_for_the_others_ends_the_link() {
+    let ns = IpcNamespace::new().unwrap();
+    let (handshake, input, output) = (
+        ns.handshake_endpoint(),
+        ns.input_endpoint(),
+        ns.output_endpoint(),
+    );
+    let (transport, first, second) = tokio::join!(
+        connect_handshake(&handshake, 2, &input, &output, TIMEOUT),
+        connect_to_frontend(
+            &handshake,
+            EngineId::from_engine_index(0),
+            default_ready_response()
+        ),
+        connect_to_frontend(
+            &handshake,
+            EngineId::from_engine_index(1),
+            default_ready_response()
+        ),
+    );
+    let mut transport = transport.unwrap();
+    let (_first, _second) = (first.unwrap(), second.unwrap());
+
+    let lost = PeerIdentity::try_from(EngineId::from_engine_index(0)).unwrap();
+    let other = PeerIdentity::try_from(EngineId::from_engine_index(1)).unwrap();
+    let (mut events, replay) = monitor_channel(8);
+    for event in [
+        SocketEvent::Accepted(Endpoint::Ipc(None), lost.clone()),
+        SocketEvent::Disconnected(lost),
+        SocketEvent::Accepted(Endpoint::Ipc(None), other),
+    ] {
+        events.try_send(event).unwrap();
+    }
+    transport.input_events = replay;
+    let client = EngineCoreClient::new(transport);
+
+    tokio::time::timeout(TIMEOUT, async {
+        while client.is_alive() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the link ends at its admission on a registered engine's loss");
+    assert!(matches!(
+        client.submit(request_for("after-the-end", 0)).await,
+        Err(Error::ClientClosed { .. })
+    ));
 }
 
 /// Local admission completes before receipt; output silence still detects stalls.
@@ -2485,25 +3084,7 @@ use crate::protocol::tokenspeed::request::TokenizedGenerateReqInput as TaggedWir
 
 /// A client of that protocol over the same mock engine.
 async fn connect_tagged() -> (TokenSpeedClient, MockEngine, IpcNamespace) {
-    let ns = IpcNamespace::new().unwrap();
-    let (handshake, input, output) = (
-        ns.handshake_endpoint(),
-        ns.input_endpoint(),
-        ns.output_endpoint(),
-    );
-    let (transport, engine) = tokio::join!(
-        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    (
-        TokenSpeedClient::new(transport.unwrap()),
-        engine.unwrap(),
-        ns,
-    )
+    connect_wire::<TokenSpeedProtocol>().await
 }
 
 /// A request of that wire with a 64 MiB typed feature tensor.
@@ -2784,36 +3365,49 @@ async fn a_pending_prompt_extends_the_bound_on_the_vllm_wire() {
     .await;
 }
 
+/// A streaming add-request of `prompt_tokens` prompt tokens on the
+/// TokenSpeed wire, reported every step.
+fn tokenspeed_request(
+    rid: &str,
+    prompt_tokens: usize,
+) -> <TokenSpeedProtocol as EngineProtocol>::Request {
+    use crate::protocol::tokenspeed::{
+        request::TokenizedGenerateReqInput, sampling::SamplingParams,
+    };
+    TokenizedGenerateReqInput {
+        rid: rid.to_string(),
+        input_ids: vec![1; prompt_tokens],
+        sampling_params: SamplingParams {
+            max_new_tokens: Some(4),
+            ..SamplingParams::default()
+        },
+        stream: true,
+        ..TokenizedGenerateReqInput::default()
+    }
+}
+
+/// The TokenSpeed wire's finished output for `rid`: one token, `stop`.
+fn tokenspeed_done(rid: &str, prompt_tokens: u32) -> Vec<Bytes> {
+    use crate::protocol::tokenspeed::output::BatchTokenIDOutSlim;
+    let done = BatchTokenIDOutSlim {
+        rids: vec![rid.into()],
+        output_ids: vec![vec![11]],
+        finished_reasons: vec!["stop".into()],
+        prompt_tokens: vec![prompt_tokens],
+        completion_tokens: vec![1],
+        cached_tokens: vec![0],
+        output_token_logprobs_val: vec![vec![]],
+        output_token_logprobs_idx: vec![vec![]],
+        ..Default::default()
+    };
+    vec![Bytes::from(encode_msgpack(&done).unwrap())]
+}
+
 #[tokio::test]
 async fn a_pending_prompt_extends_the_bound_on_the_tokenspeed_wire() {
-    use crate::protocol::tokenspeed::{
-        output::BatchTokenIDOutSlim, request::TokenizedGenerateReqInput, sampling::SamplingParams,
-    };
     a_pending_prompt_extends_the_bound_and_nothing_pending_does_not::<TokenSpeedProtocol>(
-        |rid, prompt_tokens| TokenizedGenerateReqInput {
-            rid: rid.to_string(),
-            input_ids: vec![1; prompt_tokens],
-            sampling_params: SamplingParams {
-                max_new_tokens: Some(4),
-                ..SamplingParams::default()
-            },
-            stream: true,
-            ..TokenizedGenerateReqInput::default()
-        },
-        |rid, prompt_tokens| {
-            let done = BatchTokenIDOutSlim {
-                rids: vec![rid.to_string()],
-                output_ids: vec![vec![11]],
-                finished_reasons: vec!["stop".into()],
-                prompt_tokens: vec![prompt_tokens],
-                completion_tokens: vec![1],
-                cached_tokens: vec![0],
-                output_token_logprobs_val: vec![vec![]],
-                output_token_logprobs_idx: vec![vec![]],
-                ..Default::default()
-            };
-            vec![Bytes::from(encode_msgpack(&done).unwrap())]
-        },
+        tokenspeed_request,
+        tokenspeed_done,
     )
     .await;
 }
@@ -2840,7 +3434,7 @@ async fn a_pending_prompt_extends_the_bound_on_the_sglang_wire() {
         },
         |rid, prompt_tokens| {
             let done = BatchTokenIDSlimOutput {
-                rids: vec![rid.to_string()],
+                rids: vec![rid.into()],
                 output_ids: vec![vec![11]],
                 finished_reasons: vec!["stop".into()],
                 finished_messages: vec![None],
@@ -2857,6 +3451,86 @@ async fn a_pending_prompt_extends_the_bound_on_the_sglang_wire() {
         },
     )
     .await;
+}
+
+/// A sign of the engine's progress noted outside its output wire ends its
+/// silence as an output does: a prompt whose prefill runs past the window
+/// and its
+/// allowance is served while the notes keep coming and the silence the
+/// servicer reports restarts at each; once the notes stop, the engine is
+/// given up on at the window past its allowance, counted from the last
+/// note.
+#[tokio::test]
+async fn a_sign_of_progress_noted_outside_the_wire_ends_the_silence_like_an_output() {
+    let (client, mut engine, _ns) = connect_wire::<TokenSpeedProtocol>().await;
+    let window = Duration::from_millis(400);
+    client.set_silence_death_timeout(window);
+    // 4k prompt tokens at 10k tokens/s: an allowance of one window, so a
+    // silent engine would be given up on two windows after the dispatch.
+    client.set_prefill_tokens_per_sec(10_000);
+    let allowance = window;
+    let mut stream = client
+        .submit(tokenspeed_request("req-long", 4_000))
+        .await
+        .unwrap();
+    engine.recv_request().await.unwrap();
+    // Five windows of silence on the wire with a note every half window:
+    // a prefill in progress, not a dead engine.
+    for _ in 0..10 {
+        tokio::time::sleep(window / 2).await;
+        client.note_progress();
+        assert_eq!(
+            client.last_output_at(),
+            None,
+            "a note is not an output on the wire: the health probe's stamp stays put"
+        );
+        let silence = client.output_silence().expect("a request is in flight");
+        assert!(
+            silence < window / 4,
+            "the note restarted the silence: {silence:?}"
+        );
+    }
+    assert!(
+        client.is_alive(),
+        "served through five windows of silence on the wire"
+    );
+    engine
+        .send_output(tokenspeed_done("req-long", 4_000))
+        .await
+        .unwrap();
+    let output = stream
+        .next()
+        .await
+        .expect("an item")
+        .expect("served, not failed by the watchdog");
+    assert!(output.finished());
+    assert!(stream.next().await.is_none());
+    // The notes stop on the next prompt: the engine is given up on at the
+    // window past the prompt's allowance, counted from the last note.
+    let mut stream = client
+        .submit(tokenspeed_request("req-stalled", 4_000))
+        .await
+        .unwrap();
+    engine.recv_request().await.unwrap();
+    for _ in 0..3 {
+        tokio::time::sleep(window / 2).await;
+        client.note_progress();
+    }
+    let last_note = std::time::Instant::now();
+    let error = match stream.next().await {
+        Some(Err(error)) => error,
+        Some(Ok(_)) => {
+            panic!("an engine silent past the window and its allowance is dead, not serving")
+        }
+        None => panic!("the stream ended without the engine's death"),
+    };
+    assert!(is_engine_dead(&error), "{error:?}");
+    let since_last_note = last_note.elapsed();
+    assert!(
+        since_last_note >= window + allowance && since_last_note < 2 * window + allowance,
+        "given up on at the window past the allowance, from the last note: {since_last_note:?}"
+    );
+    assert!(!client.is_alive());
 }
 
 /// With no prefill allowance (zero tokens per second) the bound is the
@@ -3072,6 +3746,43 @@ async fn an_add_the_engine_never_received_queues_no_allowance_on_the_wire() {
     assert!(!client.is_alive());
 }
 
+/// A decoded output's id is a view of its step frame; the routed output
+/// carries its request's own id instead, so a stream that reads slowly
+/// holds its outputs' bytes and not every step frame they came in.
+#[test]
+fn a_routed_output_keeps_its_request_id_and_frees_the_step_frame() {
+    let mut registry = RequestRegistry::<<VllmProtocol as EngineProtocol>::Output>::default();
+    let mut receiver = registry
+        .register("req-1".to_string(), 1, true)
+        .expect("register");
+    let mut frames = batch(
+        0,
+        EngineCoreOutput {
+            request_id: "req-1".into(),
+            new_token_ids: vec![10],
+            ..Default::default()
+        },
+    );
+    let decoded = VllmProtocol::decode_batch(&frames, &()).expect("decode");
+    let output = decoded.outputs.into_iter().next().expect("one output");
+    assert!(
+        lies_within(&frames[0], output.request_id().as_bytes()),
+        "decoded within the frame, the id is a view of it"
+    );
+    registry.route(output);
+    let routed = receiver.try_recv().expect("routed").expect("an output");
+    assert_eq!(routed.request_id(), "req-1");
+    assert!(
+        !lies_within(&frames[0], routed.request_id().as_bytes()),
+        "the routed id is the request's own"
+    );
+    let frame = frames.pop().expect("the frame");
+    assert!(
+        frame.try_into_mut().is_ok(),
+        "nothing else holds the step frame"
+    );
+}
+
 /// The registry's side of it: a registered prompt is neither pending nor
 /// in the bound until it is handed over; one retired before that leaves
 /// both where they were; a hand-over of a prompt already handed or gone
@@ -3169,4 +3880,264 @@ fn a_disagreeing_rank_in_the_middle_of_the_group_fails_the_agreement() {
         connection_layout::<SglangProtocol>(&[]),
         SglangLayout::default()
     );
+}
+
+/// A connector's transfer samples are kept for a taker only, fold per rank
+/// until the taker drains them, and a take leaves nothing behind.
+#[tokio::test]
+async fn kv_transfer_samples_fold_for_a_taker_until_taken() {
+    let (client, mut engine, _ns) = connect().await;
+    let report = |durations: Vec<f64>| {
+        EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            scheduler_stats: Some(SchedulerStats::default()),
+            kv_transfer: Some(Box::new(
+                KvTransferStats::default().with_samples("transfer_duration", durations),
+            )),
+            ..Default::default()
+        })
+    };
+    // A later load report on the same socket proves the batches before it
+    // were routed.
+    let marker = |running: u64| {
+        EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            scheduler_stats: Some(SchedulerStats {
+                num_running_reqs: running,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    };
+    async fn routed(client: &EngineCoreClient, running: u64) {
+        let deadline = Instant::now() + TIMEOUT;
+        while client.engine_load(0).map(|load| load.num_running) != Some(running) {
+            assert!(
+                Instant::now() < deadline,
+                "the marker {running} never arrived"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    // Nobody asked: the report is not kept.
+    for outputs in [report(vec![0.7]), marker(5)] {
+        engine
+            .send_output(vec![Bytes::from(encode_msgpack(&outputs).unwrap())])
+            .await
+            .unwrap();
+    }
+    routed(&client, 5).await;
+    assert!(
+        client.take_kv_transfer().is_empty(),
+        "without a taker nothing is kept"
+    );
+    // A taker asked: the reports fold until taken, once.
+    client.keep_kv_transfer();
+    for outputs in [report(vec![0.1]), report(vec![0.3]), marker(7)] {
+        engine
+            .send_output(vec![Bytes::from(encode_msgpack(&outputs).unwrap())])
+            .await
+            .unwrap();
+    }
+    routed(&client, 7).await;
+    let taken = client.take_kv_transfer();
+    assert_eq!(taken.len(), 1, "{taken:?}");
+    let (engine_index, stats) = &taken[0];
+    assert_eq!(*engine_index, 0);
+    assert_eq!(stats.samples("transfer_duration"), Some(&[0.1, 0.3][..]));
+    assert!(client.take_kv_transfer().is_empty(), "taken once");
+}
+
+/// Reservation is atomic at the boundary, and overflow cannot wrap usage.
+#[test]
+fn retained_input_rejects_exhaustion_and_overflow() {
+    let total = Arc::new(AtomicUsize::new(0));
+    let first = RetainedInput::reserve(&total, 7, 10).unwrap();
+    assert!(matches!(
+        RetainedInput::reserve(&total, 4, 10),
+        Err(Error::EngineInputBytesFull {
+            retained_bytes: 7,
+            request_bytes: 4,
+            limit_bytes: 10
+        })
+    ));
+    let control = RetainedInput::reserve(&total, 4, usize::MAX).unwrap();
+    assert_eq!(total.load(Ordering::Relaxed), 11);
+    drop((first, control));
+    let full = RetainedInput::reserve(&total, usize::MAX, usize::MAX).unwrap();
+    assert!(RetainedInput::reserve(&total, 1, usize::MAX).is_err());
+    assert_eq!(total.load(Ordering::Relaxed), usize::MAX);
+    drop(full);
+    assert_eq!(total.load(Ordering::Relaxed), 0);
+}
+
+/// Concurrent producers must not overshoot the limit before the writer runs.
+#[test]
+fn retained_input_concurrent_reservations_are_bounded() {
+    let total = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(std::sync::Barrier::new(16));
+    std::thread::scope(|scope| {
+        for _ in 0..16 {
+            let total = total.clone();
+            let barrier = barrier.clone();
+            scope.spawn(move || {
+                let reservation = RetainedInput::reserve(&total, 1, 4);
+                barrier.wait();
+                assert_eq!(total.load(Ordering::Relaxed), 4);
+                barrier.wait();
+                drop(reservation);
+            });
+        }
+    });
+    assert_eq!(total.load(Ordering::Relaxed), 0);
+}
+
+/// Active writes and queued aux frames retain credit even after callers cancel;
+/// control messages still enqueue, and closing the client releases all of them.
+#[tokio::test]
+async fn retained_input_covers_active_queued_cancelled_and_closed_frames() {
+    let (client, _engine, _ns) = connect().await;
+    client.set_input_queue_limit(1, 1);
+    client.set_input_byte_limit(10);
+    let transport_credit = client.inner.reserve_input(1).await;
+    let id = EngineId::from_engine_index(0);
+    let first = client
+        .inner
+        .queue_write(
+            &id,
+            Bytes::from_static(b"x"),
+            vec![0; 3],
+            vec![Bytes::from_static(b"aux")],
+            Some(6),
+        )
+        .unwrap();
+    tokio::time::timeout(TIMEOUT, async {
+        while client.inner.writing_since.lock().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(client.inner.waiting_adds.load(Ordering::Relaxed), 0);
+    assert_eq!(client.inner.retained_input_bytes.load(Ordering::Relaxed), 6);
+    let second = client
+        .inner
+        .queue_write(&id, Bytes::from_static(b"x"), vec![0; 4], vec![], Some(4))
+        .unwrap();
+    drop((first, second));
+    assert!(matches!(
+        client
+            .send_typed(&id, Bytes::from_static(b"x"), vec![0], vec![])
+            .await,
+        Err(Error::EngineInputBytesFull {
+            retained_bytes: 10,
+            ..
+        })
+    ));
+    client
+        .inner
+        .queue_frame(&id, Bytes::from_static(b"x"), vec![0], vec![], None, None)
+        .unwrap();
+    let total = client.inner.retained_input_bytes.clone();
+    assert_eq!(total.load(Ordering::Relaxed), 11);
+    drop(client);
+    tokio::time::timeout(TIMEOUT, async {
+        while total.load(Ordering::Relaxed) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(transport_credit);
+}
+
+/// A failed socket send and enqueueing to a closed writer both return credit.
+#[tokio::test]
+async fn retained_input_releases_on_send_and_enqueue_failure() {
+    let (client, _engine, _ns) = connect().await;
+    let missing = EngineId::from_engine_index(99);
+    assert!(client
+        .send_typed(&missing, Bytes::from_static(b"x"), vec![0; 4], vec![])
+        .await
+        .is_err());
+    assert_eq!(client.inner.retained_input_bytes.load(Ordering::Relaxed), 0);
+    let inner = client.inner.clone();
+    drop(client);
+    tokio::time::timeout(TIMEOUT, async {
+        while !inner.input_tx.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        inner.queue_frame(
+            &missing,
+            Bytes::from_static(b"x"),
+            vec![0; 4],
+            vec![],
+            None,
+            Some(4)
+        ),
+        Err(Error::ClientClosed { .. })
+    ));
+    assert_eq!(inner.retained_input_bytes.load(Ordering::Relaxed), 0);
+}
+
+/// Successful local admission releases the writer allowance independently of
+/// any references still held by the transport.
+#[tokio::test]
+async fn retained_input_releases_after_successful_send() {
+    let (client, mut engine, _ns) = connect().await;
+    let stream = client
+        .submit(request_for("retained-success", 0))
+        .await
+        .unwrap();
+    assert_eq!(client.inner.retained_input_bytes.load(Ordering::Relaxed), 0);
+    let _ = tokio::time::timeout(TIMEOUT, engine.recv()).await.unwrap();
+    drop(stream);
+}
+
+/// Both the input-death timeout and a peer disconnect destroy active and
+/// queued frames without requiring the caller to drop the client.
+#[tokio::test]
+async fn retained_input_releases_on_timeout_and_peer_disconnect() {
+    for disconnect in [false, true] {
+        let (client, engine, _ns) = connect().await;
+        client.set_input_queue_limit(1, 1);
+        if !disconnect {
+            client.set_input_death_timeout(Duration::from_millis(20));
+        }
+        let credit = client.inner.reserve_input(1).await;
+        let id = EngineId::from_engine_index(0);
+        for _ in 0..2 {
+            client
+                .inner
+                .queue_frame(
+                    &id,
+                    Bytes::from_static(b"x"),
+                    vec![0; 4],
+                    vec![],
+                    None,
+                    Some(4),
+                )
+                .unwrap();
+        }
+        assert_eq!(client.inner.retained_input_bytes.load(Ordering::Relaxed), 8);
+        let engine = if disconnect {
+            drop(engine);
+            None
+        } else {
+            Some(engine)
+        };
+        tokio::time::timeout(TIMEOUT, async {
+            while client.inner.retained_input_bytes.load(Ordering::Relaxed) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!client.is_alive());
+        drop((credit, engine));
+    }
 }

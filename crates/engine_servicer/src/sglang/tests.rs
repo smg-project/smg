@@ -16,8 +16,8 @@ use bytes::Bytes;
 use engine_zmq_client::{
     codec::{decode_msgpack, encode_msgpack, OpaqueValue},
     mock_engine::{
-        connect_to_frontend, default_ready_response, hello, MockEngineInput, MockEngineOutput,
-        MOCK_DEADLINE,
+        connect_to_frontend, default_ready_response, hello, MockEngine, MockEngineInput,
+        MockEngineOutput, MOCK_DEADLINE,
     },
     protocol::sglang::{
         output::{BatchEmbeddingSlimOutput, BatchTokenIDSlimOutput, ControlReplySlim, MatchedStop},
@@ -76,6 +76,7 @@ fn config(dir: &std::path::Path, handshake: &str, model: SglangModelInfo) -> Sgl
         servicer: servicer_config(dir, handshake),
         model,
         encode_dispatcher: None,
+        media_processor: None,
     }
 }
 
@@ -131,12 +132,32 @@ async fn harness_with(
     model: SglangModelInfo,
     configure: impl FnOnce(&mut SglangServicerConfig),
 ) -> Harness {
+    harness_with_media_reuse(model, configure, false).await
+}
+
+/// Create a connected fake scheduler with explicit media reuse settings for control-stream tests.
+async fn harness_with_media_reuse(
+    model: SglangModelInfo,
+    configure: impl FnOnce(&mut SglangServicerConfig),
+    reuse: bool,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let mut config = config(dir.path(), &handshake, model);
     configure(&mut config);
     let ranks = u32::try_from(config.servicer.engine_count).expect("a small rank count");
-    let server = SglangServicerServer::start(config).expect("servicer starts");
+    let server = if reuse {
+        SglangServicerServer::start_with_media_options(
+            config,
+            Some(engine_zmq_adapter::SglangCpuMmHasher::new(
+                std::num::NonZeroUsize::new(2).unwrap(),
+            )),
+            true,
+        )
+    } else {
+        SglangServicerServer::start(config)
+    }
+    .expect("servicer starts");
     let mut engines = Vec::new();
     for index in 0..ranks {
         engines.push(
@@ -174,7 +195,7 @@ fn batch(
 ) -> BatchTokenIDSlimOutput {
     let (num_running, num_waiting, kv_used_tokens, kv_total_tokens) = load.unwrap_or_default();
     BatchTokenIDSlimOutput {
-        rids: vec![rid.to_string()],
+        rids: vec![rid.into()],
         output_ids: vec![tokens],
         finished_reasons: vec![finish.unwrap_or_default().to_string()],
         finished_messages: vec![None],
@@ -191,6 +212,13 @@ fn batch(
         kv_total_tokens,
         ..Default::default()
     }
+}
+
+/// The plugin's relay of the scheduler's bare health signal (its answer to
+/// a probe it did not queue, busy with a long prefill): a token batch with
+/// no columns and no load tail.
+fn health_signal() -> BatchTokenIDSlimOutput {
+    BatchTokenIDSlimOutput::default()
 }
 
 async fn send(engine_out: &mut MockEngineOutput, batch: &BatchTokenIDSlimOutput) {
@@ -216,6 +244,23 @@ async fn recv_abort(engine: &mut MockEngineInput) -> Vec<String> {
         Some(SglangRequestType::Abort)
     );
     decode_msgpack(frames[1].as_ref()).unwrap()
+}
+
+/// The mock scheduler's step for the health probe the servicer sends: its
+/// one token, finished, so nothing lingers.
+async fn answer_probe(engine: &mut MockEngine) {
+    let frames = engine.recv_request().await.unwrap();
+    assert_eq!(
+        SglangRequestType::from_frame(frames[0].as_ref()),
+        Some(SglangRequestType::Add)
+    );
+    let probe: TokenizedGenerateReqInput = decode_msgpack(frames[1].as_ref()).unwrap();
+    assert!(probe.rid.starts_with("HEALTH_CHECK_"), "{}", probe.rid);
+    let step = batch(&probe.rid, vec![7], 1, Some("length"), None);
+    engine
+        .send_output(vec![Bytes::from(encode_msgpack(&step).unwrap())])
+        .await
+        .unwrap();
 }
 
 fn generate_request(id: &str, stream: bool, stops: Vec<String>) -> sg::GenerateRequest {
@@ -449,7 +494,7 @@ async fn health_follows_the_engine_link_and_the_drain_flag() {
     assert!(!before.healthy);
     assert_eq!(before.message, "Engine is starting");
 
-    let _engine = connect_to_frontend(
+    let mut engine = connect_to_frontend(
         &handshake,
         EngineId::from_engine_index(0),
         default_ready_response(),
@@ -461,6 +506,14 @@ async fn health_follows_the_engine_link_and_the_drain_flag() {
         status(health.check(check.clone()).await.unwrap().into_inner()),
         ServingStatus::Serving as i32
     );
+    // SERVING: the wire's answer is the scheduler's step for the probe.
+    let (probed, ()) = tokio::join!(
+        client.health_check(sg::HealthCheckRequest {}),
+        answer_probe(&mut engine)
+    );
+    let probed = probed.unwrap().into_inner();
+    assert!(probed.healthy);
+    assert_eq!(probed.message, "Health check passed");
     // Readiness held alone (the lifecycle owner's planned warm-up): health
     // answers NOT_SERVING with its own message while admission stays open to
     // the warm-up's own requests only, then the release restores SERVING and
@@ -497,14 +550,11 @@ async fn health_follows_the_engine_link_and_the_drain_flag() {
         .register("held-probe")
         .expect("the release admits every request");
     drop(admitted);
-    assert!(
-        client
-            .health_check(sg::HealthCheckRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .healthy
+    let (released, ()) = tokio::join!(
+        client.health_check(sg::HealthCheckRequest {}),
+        answer_probe(&mut engine)
     );
+    assert!(released.unwrap().into_inner().healthy);
 
     server.set_serving(false);
     assert_eq!(
@@ -522,6 +572,196 @@ async fn health_follows_the_engine_link_and_the_drain_flag() {
         "the drain closes admission"
     );
     server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The deep probe, as the Python servicer sends it: a scheduler that never
+/// steps is unhealthy at the bound (the request on the wire is one token
+/// from `[0]` at temperature zero, not streamed, under a `HEALTH_CHECK_`
+/// id, and it is aborted when the wait ends); a scheduler that steps for
+/// anything while the next probe is out is healthy before it answers the
+/// probe itself.
+#[tokio::test]
+async fn health_probes_the_scheduler_and_reads_any_step_as_alive() {
+    let mut h = harness(model_info()).await;
+    let state = &h.server.state;
+    let (engine_in, engine_out) = (&mut h.engine_in, &mut h.engine_out);
+    let started = Instant::now();
+    let (frozen, probe) = tokio::join!(
+        info::health_check_with(state, Duration::from_secs(1)),
+        recv_add(engine_in)
+    );
+    assert!(!frozen.healthy);
+    assert_eq!(frozen.message, "Health check timeout after 1s");
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert!(probe.rid.starts_with("HEALTH_CHECK_"), "{}", probe.rid);
+    assert_eq!(probe.input_ids, vec![0]);
+    assert_eq!(probe.sampling_params.max_new_tokens, Some(1));
+    assert!(probe.sampling_params.temperature.abs() < f64::EPSILON);
+    assert!(!probe.stream);
+    // The wait's end dropped the probe's stream: the scheduler is told.
+    assert_eq!(recv_abort(engine_in).await, vec![probe.rid]);
+
+    let (alive, ()) = tokio::join!(
+        info::health_check_with(state, Duration::from_secs(5)),
+        async {
+            let second = recv_add(engine_in).await;
+            assert!(second.rid.starts_with("HEALTH_CHECK_"), "{}", second.rid);
+            // A step for some other request, not the probe's own output.
+            send(engine_out, &batch("other", vec![9], 1, Some("stop"), None)).await;
+        }
+    );
+    assert!(alive.healthy, "{}", alive.message);
+    assert_eq!(alive.message, "Health check passed");
+}
+
+/// A model without generation is probed with an embedding request, as the
+/// Python servicer probes it; its one vector is the answer.
+#[tokio::test]
+async fn health_probes_an_embedding_model_with_an_embedding_request() {
+    let mut h = harness(SglangModelInfo {
+        is_generation: false,
+        ..model_info()
+    })
+    .await;
+    let state = &h.server.state;
+    let (engine_in, engine_out) = (&mut h.engine_in, &mut h.engine_out);
+    let (answer, ()) = tokio::join!(
+        info::health_check_with(state, Duration::from_secs(5)),
+        async {
+            let frames = engine_in.recv_frames().await.unwrap();
+            assert_eq!(
+                SglangRequestType::from_frame(frames[0].as_ref()),
+                Some(SglangRequestType::Add)
+            );
+            let probe: TokenizedEmbeddingReqInput = decode_msgpack(frames[1].as_ref()).unwrap();
+            assert!(probe.rid.starts_with("HEALTH_CHECK_"), "{}", probe.rid);
+            assert_eq!(probe.input_ids, vec![0]);
+            let vector = BatchEmbeddingSlimOutput {
+                rids: vec![probe.rid],
+                embeddings: vec![vec![0.5]],
+                prompt_tokens: vec![1],
+                cached_tokens: vec![0],
+                finished_reasons: vec!["stop".to_string()],
+                finished_messages: vec![None],
+                finished_status: vec![None],
+                ..Default::default()
+            };
+            engine_out
+                .send_frames(vec![Bytes::from(encode_msgpack(&vector).unwrap())])
+                .await
+                .unwrap();
+        }
+    );
+    assert!(answer.healthy);
+    assert_eq!(answer.message, "Health check passed");
+}
+
+/// A scheduler busy with a long chunked prefill never queues the probe and
+/// answers it with a bare health signal, which the plugin relays as a token
+/// batch with no columns and no load tail: the scheduler spoke since the
+/// probe started, so it is healthy before the bound, and the wire is not
+/// thereby read as one that reports every step (that reading is an
+/// outputs-less batch with a load tail).
+#[tokio::test]
+async fn health_reads_the_schedulers_bare_signal_as_alive_and_not_as_a_step_report() {
+    let mut h = harness(model_info()).await;
+    let state = &h.server.state;
+    let (engine_in, engine_out) = (&mut h.engine_in, &mut h.engine_out);
+    let (alive, probe) = tokio::join!(
+        info::health_check_with(state, Duration::from_secs(5)),
+        async {
+            let probe = recv_add(engine_in).await;
+            send(engine_out, &health_signal()).await;
+            probe
+        }
+    );
+    assert!(alive.healthy, "{}", alive.message);
+    assert_eq!(alive.message, "Health check passed");
+    assert!(
+        !state.shared.engine().expect("engine").reports_steps(),
+        "the signal is no step report"
+    );
+    // The verdict dropped the probe's stream: the scheduler is told.
+    assert_eq!(recv_abort(engine_in).await, vec![probe.rid]);
+}
+
+/// The probe is the servicer's own, not a client's: its one token goes into
+/// neither the request metrics (no request counted by its finish, no prompt
+/// or generation total) nor the load tracker (nothing queued, no
+/// servicer-clock prefill sample on the idle rank it meets, no hit-rate
+/// sample), where a quiet worker probed every interval would otherwise read
+/// as serving a stream of one-token requests.
+#[tokio::test]
+async fn a_health_probe_is_counted_neither_as_a_request_nor_as_load() {
+    let mut h = metrics_harness(model_info()).await;
+    let state = &h.server.state;
+    let (engine_in, engine_out) = (&mut h.engine_in, &mut h.engine_out);
+    let (answer, ()) = tokio::join!(
+        info::health_check_with(state, Duration::from_secs(5)),
+        async {
+            let probe = recv_add(engine_in).await;
+            assert_eq!(
+                state.shared.registry.active(),
+                0,
+                "a probe in flight is not an active request"
+            );
+            // Answered after more than the tracker's millisecond of
+            // validity: a counted probe would leave a prefill sample.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            send(
+                engine_out,
+                &batch(&probe.rid, vec![7], 1, Some("length"), None),
+            )
+            .await;
+        }
+    );
+    assert!(answer.healthy, "{}", answer.message);
+    let loads = &state.shared.loads;
+    assert_eq!((loads.pending(), loads.prefill_samples(0)), (0, 0));
+    let estimate = loads.estimate(0, 0);
+    assert_eq!(
+        (estimate.cache_hit_rate, estimate.gen_throughput),
+        (0.0, 0.0),
+        "no hit-rate sample, no generation of the rank's"
+    );
+    let metrics = &state.shared.metrics;
+    assert_eq!(
+        (
+            metrics.prompt_tokens_total(),
+            metrics.generation_tokens_total()
+        ),
+        (0, 0)
+    );
+    let body = scrape(&h.server);
+    for reason in ["stop", "length", "abort", "cut", "error"] {
+        assert_eq!(
+            sample(
+                &body,
+                "smg_servicer_requests_total",
+                &format!("finish_reason=\"{reason}\""),
+            ),
+            0.0,
+            "no request ended as {reason}"
+        );
+    }
+}
+
+/// A disaggregated role is answered healthy without a probe: its requests
+/// pair with a peer, so a lone one would not reach the scheduler.
+#[tokio::test]
+async fn a_disaggregated_role_answers_health_without_a_probe() {
+    let mut h = harness(SglangModelInfo {
+        server_args_json: r#"{"disaggregation_mode":"decode"}"#.to_string(),
+        ..model_info()
+    })
+    .await;
+    let shallow = info::health_check_with(&h.server.state, Duration::from_secs(1)).await;
+    assert!(shallow.healthy);
+    assert_eq!(
+        shallow.message,
+        "Health check passed (disaggregation worker; shallow probe)"
+    );
+    assert_scheduler_idle(&mut h.engine_in).await;
 }
 
 /// Readiness held for the lifecycle owner's planned warm-up: a request that
@@ -811,8 +1051,8 @@ fn disaggregated_request(id: &str, room: i32, pin: i32) -> sg::GenerateRequest {
 /// `disaggregation_mode`) the room places the request: a request whose
 /// Router pin names rank 0 but whose room's residue over two ranks is 1
 /// reaches rank 1's scheduler, `routed_dp_rank` 1 and the room on the wire,
-/// with one warning line naming the request; a request whose pin agrees
-/// logs nothing.
+/// with one warning line naming the request, and a second such request on
+/// the connection with no warning; a request whose pin agrees logs nothing.
 #[tokio::test]
 async fn a_prefill_sides_request_runs_on_the_rank_of_its_rooms_residue() {
     let logs = captured_logs();
@@ -857,6 +1097,40 @@ async fn a_prefill_sides_request_runs_on_the_rank_of_its_rooms_residue() {
         lines[0].contains("data_parallel_rank conflicts with the bootstrap_room residue"),
         "{}",
         lines[0]
+    );
+
+    // Room 9 is rank 1 again and the pin still says 0: the connection's
+    // second yield, logged below WARN (the capture reads WARN and above).
+    let mut stream = h
+        .client
+        .generate(disaggregated_request("room9", 9, 0))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.routed_dp_rank, add.bootstrap_room),
+        ("room9", Some(1), Some(9))
+    );
+    rank1_out
+        .send_frames(vec![Bytes::from(
+            encode_msgpack(&BatchTokenIDSlimOutput {
+                engine_index: 1,
+                ..batch("room9", vec![12], 1, Some("stop"), None)
+            })
+            .unwrap(),
+        )])
+        .await
+        .unwrap();
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert!(
+        logs.lines_containing("room9").is_empty(),
+        "the connection's second yield logs below WARN: {:?}",
+        logs.lines_containing("room9")
     );
 
     // Room 8 is rank 0; the pin agrees: nothing logged.
@@ -1355,7 +1629,7 @@ async fn multimodal_inputs_reach_the_scheduler_as_its_processor_output() {
         input_ids: vec![1, 7, 7, 7, 2, 3, 4, 5, 6],
     });
     request.sampling_params.as_mut().unwrap().n = 2;
-    request.mm_inputs = Some(sg::MultimodalInputs {
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         modalities: vec!["image".to_string()],
         pixel_values: Some(sg::TensorData {
             data: pixels.clone().into(),
@@ -1378,7 +1652,7 @@ async fn multimodal_inputs_reach_the_scheduler_as_its_processor_output() {
             length: 3,
         }],
         ..Default::default()
-    });
+    }));
     let _stream = h
         .client
         .generate(request)
@@ -1548,11 +1822,11 @@ fn media_reference_request(id: &str, n: u32) -> sg::GenerateRequest {
         input_ids: vec![1, 7, 7, 7, 2],
     });
     request.sampling_params.as_mut().unwrap().n = n;
-    request.mm_inputs = Some(sg::MultimodalInputs {
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         modalities: vec!["image".to_string()],
         image_urls: vec![IMAGE_REFERENCE.to_string()],
         ..Default::default()
-    });
+    }));
     request
 }
 
@@ -1825,7 +2099,21 @@ async fn info_rpcs_report_launcher_facts_and_handshake_figures() {
     assert_eq!(busy.loads[0].num_running_reqs, 1);
     assert_eq!(busy.loads[0].num_waiting_reqs, 2);
     assert!((busy.loads[0].token_usage - 0.05).abs() < 1e-9);
-    assert_eq!(busy.aggregate.unwrap().total_reqs, 3);
+    assert!(
+        (busy.loads[0].utilization - 0.05).abs() < 1e-9,
+        "the usage, as the vLLM and TensorRT-LLM answers report it: {busy:?}"
+    );
+    let aggregate = busy.aggregate.unwrap();
+    assert_eq!(aggregate.total_reqs, 3);
+    assert!(
+        (aggregate.avg_utilization - 0.05).abs() < 1e-9,
+        "the mean of the entries' utilization: {aggregate:?}"
+    );
+    assert!(
+        aggregate.avg_throughput > 0.0
+            && (aggregate.avg_throughput - busy.loads[0].gen_throughput).abs() < 1e-9,
+        "the mean of the entries' throughput, one token streamed: {aggregate:?}"
+    );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -2616,6 +2904,7 @@ async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
         &h.server.state,
         generate_request("r12", true, Vec::new()),
         None,
+        servicer::RequestOrigin::Client,
     )
     .await
     .expect("generate");
@@ -3430,7 +3719,10 @@ async fn the_listener_binds_before_the_engine_connects_and_answers_starting() {
 /// Two connected schedulers whose handshakes each say a data-parallel size
 /// of one: the zero-filled `GetLoads` before the first snapshot names the
 /// ranks the servicer serves (one per connected scheduler), as the pinned
-/// request path counts them.
+/// request path counts them; once one scheduler has reported a load, the
+/// other keeps its zero entry (an idle scheduler, not a gone one) on the
+/// poll, on the rank a request names and on the record the records-only
+/// stream reads for it.
 #[tokio::test]
 async fn the_zero_filled_loads_count_the_connected_ranks() {
     let mut model = model_info();
@@ -3453,4 +3745,582 @@ async fn the_zero_filled_loads_count_the_connected_ranks() {
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
+
+    // A rank the request names gets its own zero entry (the records-only
+    // stream reads each rank this way before any snapshot); a rank past the
+    // connected ones gets none.
+    let one = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(1),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        one.loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(one.loads[0].num_running_reqs, 0);
+    let past = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(2),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(past.loads.is_empty());
+
+    // Rank 0 reports a load with its first batch; rank 1 has not.
+    let mut request = generate_request("r0", true, Vec::new());
+    request.data_parallel_rank = Some(0);
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r0", vec![10], 1, None, Some((1, 2, 50, 1000))),
+    )
+    .await;
+    chunk(stream.message().bounded().await.unwrap().unwrap());
+    let loads = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2);
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs, load.num_waiting_reqs))
+            .collect::<Vec<_>>(),
+        vec![(0, 1, 2), (1, 0, 0)]
+    );
+    let idle = h
+        .client
+        .get_loads(sg::GetLoadsRequest {
+            dp_rank: Some(1),
+            include: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        idle.loads
+            .iter()
+            .map(|load| (load.dp_rank, load.num_running_reqs))
+            .collect::<Vec<_>>(),
+        vec![(1, 0)]
+    );
+    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record =
+        crate::kv_events::LoadSource::load(&source, Some(1)).expect("the idle rank's record");
+    assert_eq!((record.running_requests, record.waiting_requests), (0, 0));
+    assert!(crate::kv_events::LoadSource::load(&source, Some(2)).is_none());
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+struct NativeVideoProcessor;
+
+impl SglangMediaProcessor for NativeVideoProcessor {
+    /// Advertise the deterministic processor contract used by this test fixture.
+    fn identity_key(&self) -> Option<&str> {
+        Some("test-processor")
+    }
+
+    /// Provide deterministic media behavior without decoding or model inference.
+    fn process(
+        &self,
+        mut request: sg::GenerateRequest,
+    ) -> crate::BoxFuture<Result<sg::GenerateRequest, tonic::Status>> {
+        Box::pin(async move {
+            let refs = request.mm_inputs.take().unwrap();
+            assert_eq!(refs.video_urls, ["data:video/mp4;base64,AA=="]);
+            assert!(refs.pixel_values.is_none());
+            assert_eq!(request.tokenized.as_ref().unwrap().input_ids, [1, 7, 2]);
+            request.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 7, 7, 2];
+            request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+                modalities: vec!["video".into()],
+                pixel_values: Some(sg::TensorData {
+                    data: vec![0; 32].into(),
+                    shape: vec![2, 4],
+                    dtype: "float32".into(),
+                }),
+                model_specific_tensors: [(
+                    "video_grid_thw".into(),
+                    sg::TensorData {
+                        data: [1i64, 2, 2]
+                            .iter()
+                            .flat_map(|x| x.to_le_bytes())
+                            .collect::<Vec<_>>()
+                            .into(),
+                        shape: vec![1, 3],
+                        dtype: "int64".into(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                im_token_id: Some(7),
+                mm_placeholders: vec![sg::PlaceholderRange {
+                    offset: 1,
+                    length: 3,
+                }],
+                ..Default::default()
+            }));
+            Ok(request)
+        })
+    }
+}
+
+#[tokio::test]
+/// References must expand tokens before their video tensors reach the scheduler.
+async fn native_video_refs_expand_before_scheduler_dispatch() {
+    use engine_zmq_client::protocol::sglang::multimodal::SglangWireModality;
+    let mut h = harness_with(model_info(), |config| {
+        config.media_processor = Some(Arc::new(NativeVideoProcessor));
+    })
+    .await;
+    let info = h
+        .client
+        .get_server_info(sg::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        info.server_args.unwrap().fields["mm_processor"].kind,
+        Some(Kind::StringValue("smg".into()))
+    );
+    let mut request = generate_request("native-video", true, Vec::new());
+    request.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 2];
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+        video_urls: vec!["data:video/mp4;base64,AA==".into()],
+        ..Default::default()
+    }));
+    let _stream = h.client.generate(request).await.unwrap().into_inner();
+    let received = recv_add(&mut h.engine_in).await;
+    assert_eq!(received.input_ids, [1, 7, 7, 7, 2]);
+    let mm = received.mm_inputs.unwrap();
+    assert_eq!(mm.mm_items[0].modality, SglangWireModality::Video);
+    assert_eq!(mm.mm_items[0].offsets, Some(vec![(1, 3)]));
+    assert!(mm.mm_items[0]
+        .model_specific_data
+        .contains_key("video_grid_thw"));
+    h.server.stop(Duration::from_secs(5)).unwrap();
+}
+
+struct PendingMediaProcessor;
+
+impl SglangMediaProcessor for PendingMediaProcessor {
+    /// Provide deterministic media behavior without decoding or model inference.
+    fn process(
+        &self,
+        _request: sg::GenerateRequest,
+    ) -> crate::BoxFuture<Result<sg::GenerateRequest, tonic::Status>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test]
+/// Aborting preprocessing unregisters the request without sending scheduler work.
+async fn abort_during_native_media_processing_never_submits_to_scheduler() {
+    let mut h = harness_with(model_info(), |config| {
+        config.media_processor = Some(Arc::new(PendingMediaProcessor));
+    })
+    .await;
+    let mut request = generate_request("pending-media", true, Vec::new());
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+        image_urls: vec!["https://example.test/image.png".into()],
+        ..Default::default()
+    }));
+    let mut client = h.client.clone();
+    #[expect(clippy::disallowed_methods, reason = "test awaits this request task")]
+    let pending = tokio::spawn(async move { client.generate(request).await });
+    wait_until(|| h.server.active_requests() == 1).await;
+    h.client
+        .abort(sg::AbortRequest {
+            request_id: "pending-media".into(),
+            reason: String::new(),
+        })
+        .await
+        .unwrap();
+    let error = pending.bounded().await.unwrap().unwrap_err();
+    assert_eq!(error.code(), Code::Cancelled);
+    wait_until(|| h.server.active_requests() == 0).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), h.engine_in.recv_frames())
+            .await
+            .is_err()
+    );
+    h.server.stop(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+/// Keep engine hash opt-outs authoritative and reject out-of-range concurrency.
+fn cpu_mm_hash_configuration_preserves_engine_opt_outs() {
+    use super::mm_hash_threads;
+    assert_eq!(mm_hash_threads(Some("0"), true, "0", "0").unwrap(), 0);
+    assert_eq!(mm_hash_threads(Some("16"), true, "0", "0").unwrap(), 16);
+    for (gpu, skip) in [("64", "0"), ("0", "1"), ("unknown", "0"), ("0", "true")] {
+        assert_eq!(mm_hash_threads(Some("16"), true, gpu, skip).unwrap(), 0);
+    }
+    for invalid in ["-1", "33", "x"] {
+        assert!(mm_hash_threads(Some(invalid), true, "0", "0").is_err());
+    }
+}
+
+#[tokio::test]
+/// Verify early metadata delivery and Decode reuse or original-reference fallback.
+async fn media_identity_arrives_before_kv_and_decode_falls_back_when_invalid() {
+    use smg_grpc_client::sglang_media_identity as contract;
+    let mut model = model_info();
+    model.server_args_json = r#"{"disaggregation_mode":"prefill"}"#.into();
+    let mut p = harness_with_media_reuse(
+        model,
+        |c| c.media_processor = Some(Arc::new(NativeVideoProcessor)),
+        true,
+    )
+    .await;
+    let mut original = generate_request("reuse-video", true, Vec::new());
+    original.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 2];
+    original.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+        video_urls: vec!["data:video/mp4;base64,AA==".into()],
+        ..Default::default()
+    }));
+    original.disaggregated_params = Some(sg::DisaggregatedParams {
+        bootstrap_host: "127.0.0.1".into(),
+        bootstrap_port: 8998,
+        bootstrap_room: 1,
+    });
+    let mut prefill = original.clone();
+    prefill.return_media_identity = true;
+    let mut stream = p.client.generate(prefill).await.unwrap().into_inner();
+    let prefill_wire = recv_add(&mut p.engine_in).await;
+    // No engine output or KV readiness has been supplied: the control item
+    // must still arrive, otherwise real PD would deadlock here.
+    let early = tokio::time::timeout(Duration::from_secs(1), stream.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(early.response.is_none());
+    let identity = early.media_identity.unwrap();
+    assert!(contract::validate(
+        &identity,
+        &original,
+        "v1:0.5.20:test-processor"
+    ));
+    let mut model = model_info();
+    model.server_args_json = r#"{"disaggregation_mode":"decode"}"#.into();
+    let mut d = harness_with_media_reuse(
+        model,
+        |c| c.media_processor = Some(Arc::new(NativeVideoProcessor)),
+        true,
+    )
+    .await;
+    let mut decode = original.clone();
+    decode.media_identity = Some(Box::new(identity.clone()));
+    let _decode_stream = d.client.generate(decode).await.unwrap().into_inner();
+    let wire = recv_add(&mut d.engine_in).await;
+    assert_eq!(wire.input_ids, prefill_wire.input_ids);
+    let pmm = prefill_wire.mm_inputs.unwrap();
+    let dmm = wire.mm_inputs.unwrap();
+    assert!(dmm.mm_items[0].feature.is_none());
+    assert!(pmm.mm_items[0].feature.is_some());
+    assert_eq!(dmm.mm_items[0].hash, pmm.mm_items[0].hash);
+    assert_eq!(dmm.mm_items[0].offsets, pmm.mm_items[0].offsets);
+    assert_eq!(
+        dmm.mm_items[0].model_specific_data,
+        pmm.mm_items[0].model_specific_data
+    );
+    let mut fallback_streams = Vec::new();
+    for case in 0..5 {
+        let mut req = original.clone();
+        req.request_id = format!("fallback-{case}");
+        let mut bad = identity.clone();
+        bad.request_digest = contract::request_digest(&req);
+        match case {
+            0 => bad.processor_key = "different-config".into(),
+            1 => bad.request_digest[0] ^= 1,
+            2 => bad.mm_inputs.as_mut().unwrap().mm_placeholders[0].length = u32::MAX,
+            3 => bad
+                .mm_inputs
+                .as_mut()
+                .unwrap()
+                .model_specific_tensors
+                .clear(),
+            _ => bad.version += 1,
+        }
+        req.media_identity = Some(Box::new(bad));
+        fallback_streams.push(d.client.generate(req).await.unwrap().into_inner());
+        let wire = recv_add(&mut d.engine_in).await;
+        assert_eq!(wire.input_ids, [1, 7, 7, 7, 2]);
+        assert!(
+            wire.mm_inputs.unwrap().mm_items[0].feature.is_some(),
+            "case {case} must process references"
+        );
+    }
+    p.server.stop(Duration::from_secs(5)).unwrap();
+    d.server.stop(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+/// Only complete supported processor contracts enable the default optimization.
+fn media_optimization_defaults_require_a_supported_identity() {
+    assert!(media_reuse_enabled(None, true).unwrap());
+    assert!(!media_reuse_enabled(None, false).unwrap());
+    assert!(!media_reuse_enabled(Some("0"), true).unwrap());
+    assert!(media_reuse_enabled(Some("1"), false).unwrap());
+    assert!(media_reuse_enabled(Some("auto"), true).is_err());
+    assert_eq!(mm_hash_threads(None, true, "0", "0").unwrap(), 16);
+    assert_eq!(mm_hash_threads(None, false, "0", "0").unwrap(), 0);
+    assert_eq!(mm_hash_threads(None, true, "64", "0").unwrap(), 0);
+    assert_eq!(mm_hash_threads(None, true, "0", "1").unwrap(), 0);
+}
+
+/// The production path on this wire, which carries no engine timing: two
+/// requests that met no queue on the scheduler, each answered after its
+/// prefill, calibrate the rank's input capacity on the servicer's clock, and
+/// `GetLoads` and the pushed record carry it with the figures the load tail
+/// does not (queued work, hit rate, generation rate). A request handed over
+/// behind one still in flight samples too: its wait is the other's prefill,
+/// which the union counts once.
+#[tokio::test]
+async fn prefill_capacity_is_measured_on_the_servicers_clock_and_published() {
+    let mut h = harness(model_info()).await;
+    let loads = &h.server.state.shared.loads;
+    // Two idle arrivals, each prefilled alone: 3 prompt tokens, the second
+    // with one of them cached, each answered 20 ms or more after the submit.
+    for (id, cached) in [("c1", 0), ("c2", 1)] {
+        let mut stream = h
+            .client
+            .generate(generate_request(id, true, Vec::new()))
+            .await
+            .unwrap()
+            .into_inner();
+        recv_add(&mut h.engine_in).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut done = batch(id, vec![10], 1, Some("length"), Some((0, 0, 0, 1000)));
+        done.cached_tokens = vec![cached];
+        send(&mut h.engine_out, &done).await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!((loads.prefill_samples(0), loads.pending()), (2, 0));
+    let polled = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let rank0 = &polled.loads[0];
+    let rate = rank0
+        .prefill_throughput
+        .expect("two samples calibrate the rank");
+    // 5 computed tokens over two prefills of 20 ms or more each.
+    assert!(rate > 0.0 && rate <= 125.0, "{rate} tokens per second");
+    assert!((rank0.cache_hit_rate - 1.0 / 6.0).abs() < 1e-9);
+    assert_eq!(rank0.num_waiting_uncached_tokens, 0);
+    let source = crate::kv_events::LoadFromState(Arc::downgrade(&h.server.state));
+    let record = crate::kv_events::LoadSource::load(&source, Some(0)).expect("rank 0's record");
+    assert_eq!(record.prefill_throughput, Some(rate));
+    assert_eq!(record.waiting_uncached_tokens, Some(0));
+    assert_eq!(record.cache_hit_rate, Some(rank0.cache_hit_rate));
+
+    // `q1` and `q2` are handed over together: `q2` counts as queued work
+    // until it starts, and both sample, `q2` from a submit that waited
+    // behind `q1`.
+    let mut first = h
+        .client
+        .generate(generate_request("q1", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let mut second = h
+        .client
+        .generate(generate_request("q2", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    assert_eq!(loads.pending(), 2);
+    // A sample must clear the estimator's 1 ms rule: the batches below
+    // follow their submits by more than that.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    send(
+        &mut h.engine_out,
+        &batch("q1", vec![10], 1, None, Some((1, 1, 0, 1000))),
+    )
+    .await;
+    chunk(first.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 3, "q1 sampled");
+    let busy = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    // q2's 3 prompt tokens, discounted by the rank's 1-in-9 hit rate.
+    assert_eq!(busy.loads[0].num_waiting_uncached_tokens, 3);
+    send(
+        &mut h.engine_out,
+        &batch("q2", vec![11], 1, None, Some((2, 0, 0, 1000))),
+    )
+    .await;
+    chunk(second.message().bounded().await.unwrap().unwrap());
+    assert_eq!(loads.prefill_samples(0), 4, "q2 sampled behind q1");
+    // Every request finishes on the engine's word (a stream dropped
+    // mid-flight would send the scheduler an abort frame).
+    for (id, stream) in [("q1", &mut first), ("q2", &mut second)] {
+        send(
+            &mut h.engine_out,
+            &batch(id, Vec::new(), 1, Some("length"), Some((0, 0, 0, 1000))),
+        )
+        .await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!(loads.pending(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A burst of 256 requests handed over together and answered together after
+/// one prefill batch reads the capacity of the whole batch: every one of
+/// them is a sample, merged into one busy period as they overlap, so 256 x 3
+/// computed tokens over the batch time (50 ms or more: at most 15,360 tokens
+/// per second), never below the run's own tokens over its wall time. A rule
+/// that sampled the burst's first arrival alone read one 256th; a ring of 64
+/// per-request samples read the newest 64 over the seconds of all.
+#[tokio::test]
+async fn a_burst_of_overlapping_prefills_reads_the_capacity_of_the_whole_batch() {
+    let mut h = harness(model_info()).await;
+    // A second channel: one carries at most 200 open streams.
+    let mut second = SglangSchedulerClient::new(grpc_channel(h.server.address()).await);
+    let loads = &h.server.state.shared.loads;
+    let batch_time = Duration::from_millis(50);
+    let started = Instant::now();
+    let ids: Vec<String> = (0..256).map(|index| format!("b{index}")).collect();
+    let mut streams = Vec::new();
+    for (index, id) in ids.iter().enumerate() {
+        let client = if index % 2 == 0 {
+            &mut h.client
+        } else {
+            &mut second
+        };
+        streams.push(
+            client
+                .generate(generate_request(id, true, Vec::new()))
+                .await
+                .unwrap()
+                .into_inner(),
+        );
+        recv_add(&mut h.engine_in).await;
+    }
+    assert_eq!(loads.pending(), 256);
+    tokio::time::sleep(batch_time).await;
+    // The batch ends: every request's first (and last) output together.
+    for id in &ids {
+        send(
+            &mut h.engine_out,
+            &batch(id, vec![10], 1, Some("length"), Some((256, 0, 0, 1000))),
+        )
+        .await;
+    }
+    for stream in &mut streams {
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
+    assert_eq!(loads.pending(), 0);
+    let wall = started.elapsed().as_secs_f64();
+    let samples = loads.prefill_samples(0);
+    let polled = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let rate = polled.loads[0]
+        .prefill_throughput
+        .expect("the burst calibrates the rank");
+    assert_eq!(
+        samples, 256,
+        "every request of the burst is a sample ({rate} tokens per second)"
+    );
+    // 256 x 3 computed tokens: over a batch of 50 ms or more at most, over
+    // the run's whole wall time at least (the union never exceeds it).
+    let floor = 768.0 / wall;
+    assert!(
+        rate <= 15_360.0 && rate >= floor,
+        "{rate} tokens per second from {samples} samples, expected within [{floor}, 15360]"
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The record the relay attaches to a batch for a rank is the `GetLoads`
+/// entry of that rank, read alone: zero-filled before the rank's first load
+/// tail, the tail's figures after it; `None` names rank 0; a rank past the
+/// connected ones has no record.
+#[tokio::test]
+async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
+    use crate::kv_events::RankLoads;
+
+    let record_of = |load: &sg::SchedulerLoad| {
+        let mut record = common::EngineLoad::from(load);
+        record.waiting_uncached_tokens =
+            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+        record
+    };
+    let own = sg::GetLoadsRequest {
+        dp_rank: Some(0),
+        include: Vec::new(),
+    };
+    let mut h = harness(model_info()).await;
+    let idle = h.client.get_loads(own.clone()).await.unwrap().into_inner();
+    assert_eq!(
+        h.server.state.rank_load(Some(0)),
+        Some(record_of(&idle.loads[0])),
+        "before the first load tail"
+    );
+
+    let mut stream = h
+        .client
+        .generate(generate_request("rl", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("rl", vec![10], 1, None, Some((1, 2, 50, 1000))),
+    )
+    .await;
+    chunk(stream.message().bounded().await.unwrap().unwrap());
+    let busy = h.client.get_loads(own).await.unwrap().into_inner();
+    assert_eq!(
+        (
+            busy.loads[0].num_running_reqs,
+            busy.loads[0].num_waiting_reqs
+        ),
+        (1, 2),
+        "the tail reached the report: {busy:?}"
+    );
+    let state = &h.server.state;
+    assert_eq!(
+        state.rank_load(Some(0)),
+        Some(record_of(&busy.loads[0])),
+        "after the load tail"
+    );
+    assert_eq!(state.rank_load(None), state.rank_load(Some(0)));
+    assert!(state.rank_load(Some(1)).is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

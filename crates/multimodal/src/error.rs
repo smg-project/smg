@@ -43,6 +43,8 @@ pub enum MediaConnectorError {
     },
     #[error("image max_long_side_pixel must be positive, got {value}")]
     InvalidImageLongSideCap { value: u32 },
+    #[error("SGLang MiniMax max_long_side_pixel must be a multiple of 28 within 112..=3584, got {value}")]
+    InvalidSglangLongSideCap { value: u32 },
     #[error("max_long_side_pixel must be a positive multiple of {factor}, got {value}")]
     InvalidMaxLongSidePixel { value: u32, factor: u32 },
     #[error("fps must be between {min} and {max}, got {value}")]
@@ -115,6 +117,18 @@ pub enum MediaConnectorError {
         bytes: usize,
         limit: usize,
         knob: &'static str,
+    },
+    /// The list of a video's picks would be longer than the decoder's
+    /// process can be given in one argument: a size refusal, the request's
+    /// own ([`MediaFault::Client`], [`MediaErrorCode::TooLarge`]), answered
+    /// by another sampling rate or a shorter clip.
+    #[error(
+        "the clip's {picks} picks at this sampling rate need a frame list of {bytes} bytes, over the decoder's bound of {limit}; use another rate or a shorter clip"
+    )]
+    FrameListTooLong {
+        picks: usize,
+        bytes: usize,
+        limit: usize,
     },
     #[error("media decode task failed: {0}")]
     Blocking(#[from] tokio::task::JoinError),
@@ -199,7 +213,9 @@ pub enum MediaErrorCode {
     /// `media_too_large`: the media is over a size cap: its input bytes
     /// ([`MediaConnectorError::PayloadTooLarge`]), the bytes it would decode
     /// to ([`MediaConnectorError::DecodedTooLarge`]: a video's frames, an
-    /// audio clip's samples), or the image decoder's own limits. A bound on
+    /// audio clip's samples), the frame list a video's picks would need
+    /// ([`MediaConnectorError::FrameListTooLong`]), or the image decoder's
+    /// own limits. A bound on
     /// decode work rather than on size (`SMG_VIDEO_MAX_DECODE_PIXELS`) is
     /// not one: a clip over it is a fetch failure.
     TooLarge,
@@ -231,8 +247,10 @@ impl MediaConnectorError {
             Self::PixelBudgetExceeded { .. }
             | Self::PayloadTooLarge { .. }
             | Self::DecodedTooLarge { .. }
+            | Self::FrameListTooLong { .. }
             | Self::Image(image::ImageError::Limits(_)) => MediaErrorCode::TooLarge,
             Self::InvalidImageLongSideCap { .. }
+            | Self::InvalidSglangLongSideCap { .. }
             | Self::InvalidMaxLongSidePixel { .. }
             | Self::InvalidSampleFps { .. }
             | Self::InvalidVideoLongSideCap { .. }
@@ -271,6 +289,7 @@ impl MediaConnectorError {
                 MediaFault::Internal
             }
             Self::InvalidImageLongSideCap { .. }
+            | Self::InvalidSglangLongSideCap { .. }
             | Self::InvalidMaxLongSidePixel { .. }
             | Self::InvalidSampleFps { .. }
             | Self::InvalidVideoLongSideCap { .. }
@@ -288,6 +307,7 @@ impl MediaConnectorError {
             | Self::PixelBudgetExceeded { .. }
             | Self::PayloadTooLarge { .. }
             | Self::DecodedTooLarge { .. }
+            | Self::FrameListTooLong { .. }
             | Self::Image(_)
             | Self::AudioDecode(_)
             | Self::VideoDecode(_) => MediaFault::Client,
@@ -314,9 +334,9 @@ impl MediaConnectorError {
     /// task keeps the error this process's ([`Self::DecodeIo`]); two decoders
     /// that could not start leave it unavailable, so a decode that runs this
     /// one as its fallback reads it the same way. A verdict that refused the
-    /// clip for its size ([`Self::DecodedTooLarge`]) stands as it is: it
-    /// names the cap itself, and the words of the decoder that ran before it
-    /// add nothing a client can act on.
+    /// clip for its size ([`Self::DecodedTooLarge`], [`Self::FrameListTooLong`])
+    /// stands as it is: it names the cap itself, and the words of the decoder
+    /// that ran before it add nothing a client can act on.
     pub fn fallback_failed(
         first: Self,
         fallback: Self,
@@ -332,7 +352,7 @@ impl MediaConnectorError {
                 Self::DecoderUnavailable(std::io::Error::new(io.kind(), message))
             }
             Self::DecodeIo(io) => Self::DecodeIo(std::io::Error::new(io.kind(), message)),
-            verdict @ Self::DecodedTooLarge { .. } => verdict,
+            verdict @ (Self::DecodedTooLarge { .. } | Self::FrameListTooLong { .. }) => verdict,
             verdict if verdict.fault() == MediaFault::Internal => {
                 Self::DecodeIo(std::io::Error::other(message))
             }
@@ -406,6 +426,11 @@ mod tests {
                 limit: 1_073_741_824,
                 knob: "SMG_VIDEO_MAX_DECODED_BYTES",
             },
+            MediaConnectorError::FrameListTooLong {
+                picks: 40_001,
+                bytes: 552_613,
+                limit: 130_048,
+            },
             MediaConnectorError::Image(image::ImageError::Decoding(
                 image::error::DecodingError::new(
                     image::error::ImageFormatHint::Unknown,
@@ -420,9 +445,10 @@ mod tests {
     }
 
     /// A size refusal has a code of its own, whatever stage refused: the
-    /// input bytes, the bytes the clip would decode to, the image decoder's
-    /// limits. Every other failure of the media is a fetch failure to the
-    /// client, and the codes spell and parse the same.
+    /// input bytes, the bytes the clip would decode to, the frame list its
+    /// picks would need, the image decoder's limits. Every other failure of
+    /// the media is a fetch failure to the client, and the codes spell and
+    /// parse the same.
     #[test]
     fn a_size_refusal_has_its_own_code() {
         for error in [
@@ -441,6 +467,11 @@ mod tests {
                 bytes: 12,
                 limit: 8,
                 knob: "SMG_AUDIO_MAX_DECODED_BYTES",
+            },
+            MediaConnectorError::FrameListTooLong {
+                picks: 40_001,
+                bytes: 552_613,
+                limit: 130_048,
             },
             MediaConnectorError::Image(image::ImageError::Limits(
                 image::error::LimitError::from_kind(
@@ -593,6 +624,20 @@ mod tests {
                 "{refused}"
             );
             assert_eq!(refused.code(), MediaErrorCode::TooLarge);
+            // So does a frame list past the decoder's bound: the fallback's
+            // refusal keeps its code through the first decoder's failure.
+            let list_too_long = || MediaConnectorError::FrameListTooLong {
+                picks: 40_001,
+                bytes: 552_613,
+                limit: 130_048,
+            };
+            let refused = compose(bad_clip(), list_too_long(), media);
+            assert!(
+                matches!(refused, MediaConnectorError::FrameListTooLong { .. }),
+                "{refused}"
+            );
+            assert_eq!(refused.code(), MediaErrorCode::TooLarge);
+            assert_eq!(refused.fault(), MediaFault::Client);
         }
     }
 }

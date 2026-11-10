@@ -1,19 +1,22 @@
-"""The Rust request path of the SGLang gRPC servicer, behind one flag.
+"""The Rust request path of the SGLang gRPC servicer, behind one switch.
 
 ``sglang.launch_server --grpc-mode`` hands the process to this package's
 :func:`smg_grpc_servicer.sglang.server.serve_grpc`, which serves
 ``sglang.grpc.scheduler.SglangScheduler`` from Python over a request manager
-in front of the scheduler. With ``--servicer-impl rust`` (a flag this package
-adds to SGLang's parser as an SGLang plugin, see
-:mod:`smg_grpc_servicer.sglang.plugin`; ``SMG_SGLANG_SERVICER_IMPL=rust`` is
-the fallback the flag overrides) the same entrypoint hands the process to
-:func:`serve_rust` before any of that exists:
+in front of the scheduler. When the switch selects the Rust servicer
+(``--servicer-impl``, a flag this package adds to SGLang's parser as an SGLang
+plugin, see :mod:`smg_grpc_servicer.sglang.plugin`; ``SMG_SGLANG_SERVICER_IMPL``
+is the fallback the flag overrides; the launcher's default decides when neither
+is set) the same entrypoint hands the process to :func:`serve_rust` before any
+of that exists:
 the contract is served by the Rust :class:`smg.servicer.SglangGrpcServer` on a
 Rust-owned thread, and the scheduler ranks are started from this same process
 (SGLang's own spawner, the way this package's :mod:`headless` launcher starts
 them), each with this package's SGLang plugin dialing the servicer's same-host
 msgpack ZMQ handshake. Python keeps the lifecycle only. The Router cannot tell
-the two implementations apart.
+the two implementations apart. This path is the default; the Python servicer
+is selected with ``--servicer-impl python`` / ``SMG_SGLANG_SERVICER_IMPL=python``
+and is deprecated (the launcher logs its deprecation when it is chosen).
 
 Prefill/decode disaggregation is served as on the Python servicer: a request's
 bootstrap fields (host, port, room) ride the scheduler's own request struct
@@ -116,7 +119,8 @@ def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = 
     """Which implementation serves this process: the launcher's
     ``--servicer-impl`` when it carried one (``args.servicer_impl``, or the
     value this package's SGLang plugin parsed in this process), else
-    ``$SMG_SGLANG_SERVICER_IMPL``, else python."""
+    ``$SMG_SGLANG_SERVICER_IMPL``, else rust
+    (:data:`~smg_grpc_servicer.rust_lifecycle.DEFAULT_IMPL`)."""
     return servicer_impl_source(args, environ)[0]
 
 
@@ -463,7 +467,7 @@ def refuse_epd_disaggregation(server_args: Any) -> None:
     args = EngineConfigView(server_args).server_args
     if args.encoder_only:
         raise ServicerConfigError(
-            f"{SERVICER_IMPL_ENV}=rust does not serve an encoder-only worker: the engine's "
+            "The Rust servicer does not serve an encoder-only worker: the engine's "
             "entrypoint runs that role on its own encoder server, not on a servicer"
         )
     if args.language_only:
@@ -475,7 +479,7 @@ def refuse_epd_disaggregation(server_args: Any) -> None:
         backend = resolve_encoder_transfer_backend(server_args)
         if backend not in SCHEDULER_RECEIVE_BACKENDS:
             raise ServicerConfigError(
-                f"{SERVICER_IMPL_ENV}=rust does not serve a language-only worker on the "
+                f"The Rust servicer does not serve a language-only worker on the "
                 f"{backend!r} encoder transfer backend (the frontend receives and processes "
                 "the embeddings itself there); use one of "
                 f"{', '.join(SCHEDULER_RECEIVE_BACKENDS)}"
@@ -564,6 +568,44 @@ class SglangLauncher(RustLauncher):
             dispatches_from_the_frontend,
         )
 
+        processor = os.environ.get("SMG_SGLANG_MM_PROCESSOR", "").strip().lower()
+        if processor not in ("", "smg"):
+            raise ValueError("SMG_SGLANG_MM_PROCESSOR must be empty or smg")
+        if processor:
+            if dispatches_from_the_frontend(args):
+                raise ValueError(
+                    "native media processing cannot be combined with encode disaggregation"
+                )
+            if not tokenizer_dir:
+                raise ValueError("native media processing requires a tokenizer directory")
+            try:
+                concurrency = int(os.environ.get("SMG_SGLANG_MM_MAX_INFLIGHT", "64"))
+            except ValueError as error:
+                raise ValueError("SMG_SGLANG_MM_MAX_INFLIGHT must be positive integer") from error
+            if concurrency <= 0:
+                raise ValueError("SMG_SGLANG_MM_MAX_INFLIGHT must be positive integer")
+            from smg_grpc_servicer.sglang.mm_defaults import configure_threads, encoder_dtype
+
+            dtype = encoder_dtype(
+                os.environ.get("SMG_SGLANG_MM_DTYPE"),
+                lambda: _model_config(args).dtype,
+            )
+            configure_threads()
+            return {
+                "smg_media_processor": {
+                    "model_dir": str(args.model_path),
+                    "model_id": str(args.model_path),
+                    "encoder_dtype": dtype,
+                    "source": "env",
+                    "max_inflight": concurrency,
+                    "engine_item_limits": {
+                        modality: int(count)
+                        for entry in sglang_item_limits(args).split(",")
+                        if entry
+                        for modality, count in [entry.split("=", 1)]
+                    },
+                }
+            }
         if not dispatches_from_the_frontend(args):
             return {}
         self.encode = EncodeDispatchBridge(args)

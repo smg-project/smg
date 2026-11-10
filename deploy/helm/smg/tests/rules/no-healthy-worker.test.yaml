@@ -1,0 +1,97 @@
+# SmgNoHealthyWorker: every registered worker unhealthy, or no worker series
+# at all while the gateway's scrape is up. The series carry the labels the
+# chart's job selector renders (run.sh).
+rule_files:
+  - rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # One worker, unhealthy, then removed: its series leaves the scrape with a
+  # stale marker at 5m. The alert fires while the series reads 0 and keeps
+  # firing once there is no series (the fleet is gone, not healed).
+  - interval: 1m
+    name: a fleet whose last worker is removed keeps the alert firing
+    input_series:
+      - series: 'up{namespace="smg", job="smg-router", instance="router-0:29000"}'
+        values: '1x20'
+      - series: 'smg_worker_health{namespace="smg", job="smg-router", worker="http://worker-a:8000"}'
+        values: '0 0 0 0 0 stale _ _ _ _ _ _ _ _ _ _ _ _ _ _ _'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: SmgNoHealthyWorker
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: smg
+              job: smg-router
+            exp_annotations:
+              summary: "No healthy worker behind the gateway"
+              description: "Every worker registered with smg/smg-router has failed its health probes, or none is registered at all, for 1m; requests are refused until a healthy one is registered."
+      - eval_time: 12m
+        alertname: SmgNoHealthyWorker
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: smg
+              job: smg-router
+            exp_annotations:
+              summary: "No healthy worker behind the gateway"
+              description: "Every worker registered with smg/smg-router has failed its health probes, or none is registered at all, for 1m; requests are refused until a healthy one is registered."
+
+  # A gateway that never registered a worker (a selector that matches nothing,
+  # an engine that never reports healthy): no series from the start.
+  - interval: 1m
+    name: a gateway with no worker series fires after a minute
+    input_series:
+      - series: 'up{namespace="smg", job="smg-router", instance="router-0:29000"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SmgNoHealthyWorker
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: smg
+              job: smg-router
+            exp_annotations:
+              summary: "No healthy worker behind the gateway"
+              description: "Every worker registered with smg/smg-router has failed its health probes, or none is registered at all, for 1m; requests are refused until a healthy one is registered."
+
+  # A gateway whose scrape is down has no worker series either: that is
+  # SmgGatewayDown's, and SmgNoHealthyWorker stays quiet.
+  - interval: 1m
+    name: a down gateway is SmgGatewayDown's alone
+    input_series:
+      - series: 'up{namespace="smg", job="smg-router", instance="router-0:29000"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SmgNoHealthyWorker
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: SmgGatewayDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: smg
+              job: smg-router
+              instance: router-0:29000
+            exp_annotations:
+              summary: "A gateway stopped answering its metrics scrape, or has no scrape target"
+              description: "The scrape target router-0:29000 has been down for 2m, or no target matches the release's job selector at all: the pod is gone, not ready, unreachable on its metrics port, or the selector names no Service."
+
+  # One healthy worker beside an unhealthy one: quiet.
+  - interval: 1m
+    name: one healthy worker keeps the alert quiet
+    input_series:
+      - series: 'up{namespace="smg", job="smg-router", instance="router-0:29000"}'
+        values: '1x10'
+      - series: 'smg_worker_health{namespace="smg", job="smg-router", worker="http://worker-a:8000"}'
+        values: '1x10'
+      - series: 'smg_worker_health{namespace="smg", job="smg-router", worker="http://worker-b:8000"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SmgNoHealthyWorker
+        exp_alerts: []

@@ -204,7 +204,7 @@ fn preprocess_matches_the_reference_fingerprints() {
         match case.max_soft_tokens {
             280 => {
                 let out = image_processor
-                    .preprocess(&images)
+                    .preprocess(&images.iter().collect::<Vec<_>>())
                     .unwrap_or_else(|e| panic!("{}: preprocess failed: {e}", case.name));
                 assert_eq!(
                     out.feature_token_counts,

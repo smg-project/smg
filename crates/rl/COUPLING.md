@@ -10,7 +10,7 @@ that adds a surface must update this file.
 | (d) | `AppContext.rl: Option<Arc<RlState>>` | `src/app_context.rs` | built in `AppContextBuilder::build()` when `router_config.rl.enabled` |
 | (d) | route mount | `src/server.rs` `build_app` | `nest("/v1/rl", smg_rl::router(..))` under `apply_control_plane_auth` |
 | (d) | metrics HELP registration | `src/observability/metrics.rs` | `smg_rl::init_rl_metrics()` |
-| (d) | config + flags | `src/config/{types,builder,validation}.rs`, `src/main.rs`, `bindings/python/src/smg/router_args.py`, `bindings/python/src/lib.rs` | `RouterConfig.rl`, three CLI flags |
+| (d) | config + flags | `src/config/{types,builder,validation}.rs`, `src/main.rs`, `src/cli/configure.rs`, `bindings/python/src/smg/router_args.py`, `bindings/python/src/lib.rs` | `RouterConfig.rl`, three CLI flags |
 | (d) | manifests | `model_gateway/Cargo.toml`, `bindings/python/Cargo.toml` | `smg-rl` pulled in via `workspace = true` (router crate and the pyo3 bindings crate) |
 
 Test-only files that the mount also touches, none of them a new surface:
@@ -42,7 +42,9 @@ version and the shape the gRPC `/generate` path reports.
 
 Wire types are not a gateway coupling: they live in `crates/protocols/src/rl.rs`
 (`openai_protocol::rl`) next to the `/workers` types, and
-`clients/openapi-gen/src/main.rs` registers the `/v1/rl/*` paths.
+`clients/openapi-gen/src/lib.rs` lists the `/v1/rl/*` paths as
+`RL_CONTROL_PLANE_ROUTES`; the gateway's route-list test reads that list
+against `router` here.
 
 ## Why the proxy is separate
 

@@ -1,0 +1,30 @@
+[package]
+name = "gateway-perf"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The gateway's cost per request, base against head, measured on the CPU mock bed: the driver of the bed script, the scripted mock engines and the open-loop load client"
+
+[lib]
+name = "gateway_perf"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gateway-perf"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono = { workspace = true, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+fancy-regex = "0.13"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+toml = "1.1"
+
+[dev-dependencies]
+minijinja = { version = "=2.24.0", features = ["json", "builtins", "preserve_order"] }
+tempfile = "3"
+
+[lints]
+workspace = true

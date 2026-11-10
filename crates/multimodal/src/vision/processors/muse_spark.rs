@@ -470,7 +470,7 @@ impl MuseSparkVisionProcessor {
         let mut original = (0u32, 0u32);
         let mut rows_per_group = 0;
         let mut out: Vec<u8> = Vec::new();
-        let mut group: Vec<Vec<u8>> = Vec::with_capacity(temporal);
+        let mut group: Vec<std::borrow::Cow<'a, [u8]>> = Vec::with_capacity(temporal);
         let mut written = 0;
         for (index, (width, height, data)) in frames.enumerate() {
             let plan = match plan {
@@ -488,10 +488,10 @@ impl MuseSparkVisionProcessor {
                 return Err(TransformError::InconsistentShapes);
             }
             let frame = resized_frame(data, width, height, plan, do_resize)?;
-            group.push(frame.data.into_owned());
+            group.push(frame.data);
             let last_of_group = group.len() == temporal || index + 1 == count;
             if last_of_group {
-                let refs: Vec<&[u8]> = group.iter().map(Vec::as_slice).collect();
+                let refs: Vec<&[u8]> = group.iter().map(|data| data.as_ref()).collect();
                 let slice =
                     &mut out[written * rows_per_group * features..][..rows_per_group * features];
                 patchify_group(&refs, plan, settings, slice);
@@ -552,7 +552,7 @@ impl VisionPreProcessor for MuseSparkVisionProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
@@ -780,7 +780,7 @@ mod tests {
     fn image_rows_are_temporal_channel_row_column_and_normalized_in_f32() {
         let image = solid(28, 28, Rgb([255, 128, 0]));
         let output = MuseSparkVisionProcessor::from_preprocessor_config(&image_config())
-            .preprocess(&[image])
+            .preprocess(&[&image])
             .unwrap();
         assert_eq!(output.encoder_input.shape(), &[4, 1176]);
         assert_eq!(output.feature_token_counts, vec![1]);
@@ -817,7 +817,7 @@ mod tests {
             }
         }
         let output = MuseSparkVisionProcessor::from_preprocessor_config(&image_config())
-            .preprocess(&[DynamicImage::ImageRgb8(image)])
+            .preprocess(&[&DynamicImage::ImageRgb8(image)])
             .unwrap();
         assert_eq!(output.encoder_input.shape(), &[8, 1176]);
         let values = output.encoder_input.as_f32().into_owned();
@@ -841,7 +841,7 @@ mod tests {
     fn alpha_is_dropped_and_sixteen_bit_grey_is_clipped_like_the_reference_loader() {
         let rgba = image::RgbaImage::from_pixel(28, 28, image::Rgba([10, 20, 30, 0]));
         let output = MuseSparkVisionProcessor::from_preprocessor_config(&image_config())
-            .preprocess(&[DynamicImage::ImageRgba8(rgba)])
+            .preprocess(&[&DynamicImage::ImageRgba8(rgba)])
             .unwrap();
         let values = output.encoder_input.as_f32().into_owned();
         let row = values.index_axis(ndarray::Axis(0), 0);
@@ -854,7 +854,7 @@ mod tests {
             image::Luma([300u16]),
         );
         let output = MuseSparkVisionProcessor::from_preprocessor_config(&image_config())
-            .preprocess(&[DynamicImage::ImageLuma16(grey)])
+            .preprocess(&[&DynamicImage::ImageLuma16(grey)])
             .unwrap();
         let values = output.encoder_input.as_f32().into_owned();
         assert_eq!(values[[0, 0]], 1.0);
@@ -864,7 +864,7 @@ mod tests {
             image::Luma([100u16]),
         );
         let output = MuseSparkVisionProcessor::from_preprocessor_config(&image_config())
-            .preprocess(&[DynamicImage::ImageLuma16(grey)])
+            .preprocess(&[&DynamicImage::ImageLuma16(grey)])
             .unwrap();
         let values = output.encoder_input.as_f32().into_owned();
         assert_eq!(values[[0, 0]], (100.0 - 127.5) / 127.5);
@@ -875,9 +875,9 @@ mod tests {
         let processor = MuseSparkVisionProcessor::from_preprocessor_config(&image_config());
         let a = solid(100, 60, Rgb([1, 2, 3]));
         let b = solid(61, 99, Rgb([250, 100, 7]));
-        let batched = processor.preprocess(&[a.clone(), b.clone()]).unwrap();
-        let single_a = processor.preprocess(&[a]).unwrap();
-        let single_b = processor.preprocess(&[b]).unwrap();
+        let batched = processor.preprocess(&[&a, &b]).unwrap();
+        let single_a = processor.preprocess(&[&a]).unwrap();
+        let single_b = processor.preprocess(&[&b]).unwrap();
         let rows_a = single_a.encoder_input.shape()[0];
         let rows_b = single_b.encoder_input.shape()[0];
         assert_eq!(batched.encoder_input.shape()[0], rows_a + rows_b);

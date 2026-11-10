@@ -22,13 +22,16 @@ use engine_zmq_client::{
     ConnectedEngine,
 };
 use futures::Stream;
+use openai_protocol::worker::WorkerType;
 use smg_grpc_client::{common_proto as common, tokenspeed_proto, vllm_proto as vllm};
 use tracing::warn;
 
 use crate::{
     abort_status::engine_abort_status,
+    client::declared_worker_type,
     context_window::admit_prompt,
     fanout::fan_out_n,
+    pin_yield::PinYieldNote,
     stream::{map_slim_output, poll_mapped, MappedGenerateStream, StreamState},
     structured_outputs::ConstraintRef,
 };
@@ -412,11 +415,12 @@ impl GridTensors {
 /// the window, is refused before it reaches the scheduler
 /// ([`admit_prompt`]). `ranks` is how the connected attention data-parallel
 /// ranks are reached ([`RankIndices`]), which places the request as the
-/// engine's own dispatcher would ([`rendezvous_rank`]). `logprobs` is which
-/// logprob columns the engines report beside the sampled tokens'
-/// ([`LogprobColumns`]): prompt logprobs and top-k candidates ride to an
-/// engine that reports them and are refused by one that does not, rather
-/// than answered short.
+/// engine's own dispatcher would ([`rendezvous_rank`]), a pin's yield to a
+/// room logged on `yields`, the connection's note, at WARN once and at DEBUG
+/// after. `logprobs` is which logprob columns the engines report beside the
+/// sampled tokens' ([`LogprobColumns`]): prompt logprobs and top-k candidates
+/// ride to an engine that reports them and are refused by one that does not,
+/// rather than answered short.
 ///
 /// The disaggregation fields ride as the Python servicer forwards them: the
 /// prefill/decode rendezvous (`kv_bootstrap_info`) onto the request's
@@ -430,6 +434,7 @@ pub(crate) fn translate_request_tokenspeed_for(
     max_model_len: u64,
     ranks: &RankIndices,
     logprobs: LogprobColumns,
+    yields: &PinYieldNote,
 ) -> Result<TokenizedGenerateReqInput, String> {
     let mut input_ids = match req.tokenized {
         Some(tokenized) => tokenized.input_ids,
@@ -455,6 +460,7 @@ pub(crate) fn translate_request_tokenspeed_for(
         ranks.len(),
         ranks.is_decode(),
         &req.request_id,
+        yields,
     )? {
         Some(rank) => Some(ranks.index_of(rank).ok_or_else(|| {
             format!("no connected attention data-parallel rank {rank} to place the request on")
@@ -632,9 +638,9 @@ impl RankIndices {
     /// The ranks behind `engines`, each read at its handshake.
     pub(crate) fn of(engines: &[ConnectedEngine]) -> Self {
         let decode = !engines.is_empty()
-            && engines
-                .iter()
-                .all(|engine| engine.ready_response.disaggregation_role() == Some("decode"));
+            && engines.iter().all(|engine| {
+                declared_worker_type(&engine.ready_response) == Some(WorkerType::Decode)
+            });
         let mut declared: Vec<(u32, u32)> = engines
             .iter()
             .filter_map(|engine| {
@@ -704,8 +710,9 @@ impl RankIndices {
 /// and input processor, which the direct wire bypasses). A disaggregated
 /// request (one with a `bootstrap_room`) goes to `room % ranks` on a prefill
 /// engine, since the decode side's receiver locates the KV on the prefill
-/// rank of that residue: a pin that disagrees is logged and ignored, never
-/// refused. A `decode` engine finds the prefill rank from the room on any of
+/// rank of that residue: a pin that disagrees yields, logged on `yields` (at
+/// WARN once per connection, at DEBUG after), never refused. A `decode`
+/// engine finds the prefill rank from the room on any of
 /// its ranks, so it takes a disaggregated request on its pin, and on the
 /// room's residue without one. An in-range pin is otherwise honoured and an
 /// out-of-range one refused as the engine refuses it. A single rank takes
@@ -717,6 +724,7 @@ pub(crate) fn rendezvous_rank(
     ranks: usize,
     decode: bool,
     request_id: &str,
+    yields: &PinYieldNote,
 ) -> Result<Option<u32>, String> {
     let Ok(ranks) = u32::try_from(ranks) else {
         return Ok(None);
@@ -737,14 +745,7 @@ pub(crate) fn rendezvous_rank(
         let rank = u32::try_from(room.rem_euclid(i64::from(ranks))).unwrap_or(0);
         if let Some(pin) = pin {
             if u32::try_from(pin).ok() != Some(rank) {
-                warn!(
-                    request_id,
-                    data_parallel_rank = pin,
-                    bootstrap_room = room,
-                    dp_size = ranks,
-                    "data_parallel_rank conflicts with the bootstrap_room residue; the room \
-                     stays authoritative on a prefill engine, the pin is ignored"
-                );
+                yields.log(request_id, pin, room, ranks);
             }
         }
         return Ok(Some(rank));
@@ -1102,6 +1103,12 @@ pub(crate) fn translate_sampling_tokenspeed(
         // Proto `0` means unspecified; TokenSpeed expects at least one sample.
         // n>1 is fanned out before translation, so this is always 1 on the wire.
         n: sp.n.max(1),
+        logit_bias: (!sp.logit_bias.is_empty()).then(|| {
+            sp.logit_bias
+                .into_iter()
+                .map(|(token, bias)| (token, f64::from(bias)))
+                .collect()
+        }),
         ..TokenSpeedSamplingParams::default()
     };
     apply_tokenspeed_constraint(&mut params, sp.constraint);
@@ -1200,6 +1207,7 @@ mod tests {
             default_ready_response().max_model_len,
             &RankIndices::new(vec![0]),
             LogprobColumns::default(),
+            &PinYieldNote::default(),
         )
     }
 
@@ -1295,6 +1303,22 @@ mod tests {
         assert_eq!(first.prompt_tokens, 3);
 
         engine_task.await.unwrap();
+    }
+
+    /// The proto's `logit_bias` map rides the wire as the engine's record
+    /// (token id text to a bias); an empty map rides as `None`.
+    #[test]
+    fn tokenspeed_sampling_forwards_logit_bias() {
+        let mapped = translate_sampling_tokenspeed(tokenspeed_proto::SamplingParams {
+            logit_bias: [("1".to_string(), -100.0f32), ("2".to_string(), 100.0)].into(),
+            ..Default::default()
+        });
+        let bias = mapped.logit_bias.expect("a bias map");
+        assert_eq!(bias["1"], -100.0);
+        assert_eq!(bias["2"], 100.0);
+        assert_eq!(bias.len(), 2);
+        let none = translate_sampling_tokenspeed(tokenspeed_proto::SamplingParams::default());
+        assert!(none.logit_bias.is_none());
     }
 
     #[test]
@@ -1416,6 +1440,7 @@ mod tests {
                 default_ready_response().max_model_len,
                 &RankIndices::new(vec![0]),
                 columns,
+                &PinYieldNote::default(),
             )
         };
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
@@ -1615,6 +1640,38 @@ mod tests {
         assert_eq!(wire.data_parallel_rank, None);
     }
 
+    /// A pin's yield to the room goes through the note of the connection it
+    /// came on (the note's own test pins the WARN-once-then-DEBUG levels): a
+    /// conflicting pin on a prefill engine marks that note, a pin a decode
+    /// engine honours marks nothing, and a second connection's conflicting
+    /// pin marks the second note.
+    #[test]
+    fn a_pins_yield_to_the_room_is_noted_on_the_connection() {
+        let connection = PinYieldNote::default();
+        assert_eq!(
+            rendezvous_rank(Some(7), Some(0), 2, true, "decode", &connection).unwrap(),
+            Some(0)
+        );
+        assert!(
+            !connection.noted(),
+            "a decode engine's honoured pin is no yield"
+        );
+        assert_eq!(
+            rendezvous_rank(Some(7), Some(0), 2, false, "yields", &connection).unwrap(),
+            Some(1)
+        );
+        assert!(
+            connection.noted(),
+            "the conflicting pin yielded on this connection"
+        );
+        let other = PinYieldNote::default();
+        assert_eq!(
+            rendezvous_rank(Some(7), Some(0), 2, false, "other", &other).unwrap(),
+            Some(1)
+        );
+        assert!(other.noted(), "each connection keeps its own note");
+    }
+
     /// Placement is the engine's own dispatch rule: a disaggregated request
     /// goes to its room's residue on a prefill engine (a disagreeing pin is
     /// ignored) and to its pin on a decode engine, an aggregated one to its
@@ -1623,57 +1680,61 @@ mod tests {
     /// the least-loaded selection.
     #[test]
     fn tokenspeed_places_a_request_as_the_engines_dispatcher_would() {
+        let note = PinYieldNote::default();
         assert_eq!(
-            rendezvous_rank(Some(7), None, 2, false, "r").unwrap(),
+            rendezvous_rank(Some(7), None, 2, false, "r", &note).unwrap(),
             Some(1)
         );
         assert_eq!(
-            rendezvous_rank(Some(8), None, 2, false, "r").unwrap(),
+            rendezvous_rank(Some(8), None, 2, false, "r", &note).unwrap(),
             Some(0)
         );
         assert_eq!(
-            rendezvous_rank(Some(7), Some(0), 2, false, "r").unwrap(),
+            rendezvous_rank(Some(7), Some(0), 2, false, "r", &note).unwrap(),
             Some(1),
             "the room stays authoritative over the pin"
         );
         assert_eq!(
-            rendezvous_rank(Some(-3), None, 4, false, "r").unwrap(),
+            rendezvous_rank(Some(-3), None, 4, false, "r", &note).unwrap(),
             Some(1),
             "a negative room folds as Python's % does"
         );
         assert_eq!(
-            rendezvous_rank(Some(7), Some(1), 1, false, "r").unwrap(),
+            rendezvous_rank(Some(7), Some(1), 1, false, "r", &note).unwrap(),
             None
         );
         assert_eq!(
-            rendezvous_rank(None, Some(1), 2, false, "r").unwrap(),
+            rendezvous_rank(None, Some(1), 2, false, "r", &note).unwrap(),
             Some(1)
         );
-        assert_eq!(rendezvous_rank(None, None, 2, false, "r").unwrap(), None);
         assert_eq!(
-            rendezvous_rank(None, Some(5), 1, false, "r").unwrap(),
+            rendezvous_rank(None, None, 2, false, "r", &note).unwrap(),
+            None
+        );
+        assert_eq!(
+            rendezvous_rank(None, Some(5), 1, false, "r", &note).unwrap(),
             None,
             "without attention DP the pin is meaningless and dropped"
         );
         assert_eq!(
-            rendezvous_rank(None, Some(2), 2, false, "r").unwrap_err(),
+            rendezvous_rank(None, Some(2), 2, false, "r", &note).unwrap_err(),
             "data_parallel_rank must be in [0, 2), got 2"
         );
-        assert!(rendezvous_rank(None, Some(-1), 2, false, "r").is_err());
+        assert!(rendezvous_rank(None, Some(-1), 2, false, "r", &note).is_err());
 
         // A decode engine takes a disaggregated request on its pin (any of
         // its ranks finds the prefill rank from the room), on the room's
         // residue without one, and refuses an out-of-range pin.
         assert_eq!(
-            rendezvous_rank(Some(7), Some(0), 2, true, "r").unwrap(),
+            rendezvous_rank(Some(7), Some(0), 2, true, "r", &note).unwrap(),
             Some(0)
         );
         assert_eq!(
-            rendezvous_rank(Some(7), None, 2, true, "r").unwrap(),
+            rendezvous_rank(Some(7), None, 2, true, "r", &note).unwrap(),
             Some(1)
         );
         assert_eq!(
-            rendezvous_rank(Some(7), Some(2), 2, true, "r").unwrap_err(),
+            rendezvous_rank(Some(7), Some(2), 2, true, "r", &note).unwrap_err(),
             "data_parallel_rank must be in [0, 2), got 2"
         );
 
@@ -1690,6 +1751,7 @@ mod tests {
             window,
             &reversed,
             LogprobColumns::default(),
+            &PinYieldNote::default(),
         )
         .expect("an in-range pin");
         assert_eq!(wire.data_parallel_rank, Some(0), "rank 1 is index 0");
@@ -1702,6 +1764,7 @@ mod tests {
             window,
             &reversed,
             LogprobColumns::default(),
+            &PinYieldNote::default(),
         )
         .expect("a disaggregated request");
         assert_eq!(
@@ -1718,6 +1781,7 @@ mod tests {
             window,
             &RankIndices::decode(vec![1, 0]),
             LogprobColumns::default(),
+            &PinYieldNote::default(),
         )
         .expect("a pinned decode request");
         assert_eq!(
@@ -1733,6 +1797,7 @@ mod tests {
             window,
             &reversed,
             LogprobColumns::default(),
+            &PinYieldNote::default(),
         )
         .expect_err("an out-of-range pin");
         assert!(
@@ -2051,6 +2116,7 @@ mod tests {
                     max_model_len,
                     &RankIndices::new(vec![0]),
                     LogprobColumns::default(),
+                    &PinYieldNote::default(),
                 );
                 assert_eq!(
                     result.is_ok(),
@@ -2085,6 +2151,7 @@ mod tests {
             5,
             &RankIndices::new(vec![0]),
             LogprobColumns::default(),
+            &PinYieldNote::default(),
         )
         .expect_err("the prompt fills the window");
         assert!(error.contains("length 5"), "{error}");
@@ -2095,6 +2162,7 @@ mod tests {
             6,
             &RankIndices::new(vec![0]),
             LogprobColumns::default(),
+            &PinYieldNote::default(),
         )
         .expect("one position left for output");
         assert_eq!(wire.input_ids.len(), 5);

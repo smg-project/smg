@@ -31,9 +31,11 @@ use crate::{
     },
 };
 
-/// When the gateway took the request in: stamped on the route request meta as
-/// it is built and stamped again when an admission permit is granted
-/// ([`restamp_accepted_at`]), so the bound on the wait ahead of worker
+/// When the gateway accepted the request: stamped as the route request meta
+/// is built (after the serving auth and the wasm hooks, so their time is not
+/// the request's wait), and stamped again when an admission permit is granted
+/// (by the scheduler on every admit, by the legacy limiter after a wait in its
+/// queue; [`restamp_accepted_at`]), so the bound on the wait ahead of worker
 /// selection measures the time after admission, not the admission queue's
 /// own, bounded wait. Read once: the first worker selection of a request
 /// takes the stamp ([`Self::take_for_selection`]); a later pipeline run of the
@@ -55,9 +57,9 @@ impl AcceptedAt {
     /// The clock an acceptance is stamped on and the bound ahead of worker
     /// selection is read on, both ends the same: the runtime's, which is the
     /// wall clock in production and the paused clock of a test that advances
-    /// time itself.
+    /// time itself (the clock of the edge's entry stamp, `request_start`).
     pub fn clock_now() -> Instant {
-        tokio::time::Instant::now().into_std()
+        super::request_start::clock_now()
     }
 
     /// A stamp taken at `at`.
@@ -81,9 +83,12 @@ impl AcceptedAt {
 }
 
 /// Stamp the request's route meta with a fresh [`AcceptedAt`]: called when an
-/// admission permit is granted, so the wait in the admission queue (bounded by
-/// its own timeout) does not count against the bound ahead of worker
-/// selection. `false` when the request carries no route meta.
+/// admission permit is granted (by the scheduler on every admit, by the legacy
+/// limiter only after a wait in its queue), so a wait in the admission queue
+/// (bounded by its own timeout) does not count against the bound ahead of
+/// worker selection; a legacy permit granted at once leaves the stamp taken at
+/// tenant resolution as the acceptance. `false` when the request carries no
+/// route meta.
 pub fn restamp_accepted_at(extensions: &mut Extensions) -> bool {
     match extensions.get_mut::<RouteRequestMeta>() {
         Some(meta) => {

@@ -90,7 +90,7 @@ impl InklingParser {
                     ),
                     "content": {
                         "type": "json_schema",
-                        "json_schema": &tool.function.parameters,
+                        "json_schema": tool.function.parameters_schema(),
                     },
                     "end": format!("}}{END_MESSAGE}"),
                 })

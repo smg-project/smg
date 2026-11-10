@@ -19,8 +19,9 @@ use std::{collections::HashSet, sync::Arc};
 
 use axum::response::Response;
 use llm_multimodal::{
-    AudioClip, EncoderFieldLayouts, EncoderInputFormat, ImageFrame, MediaConnectorError,
-    MediaFault, Modality, MultiModalError, PlaceholderRange, PreprocessedEncoderInputs, VideoClip,
+    hub::HubFetchError, AudioClip, EncoderFieldLayouts, EncoderInputFormat, ImageFrame,
+    MediaConnectorError, MediaFault, Modality, MultiModalError, PlaceholderRange,
+    PreprocessedEncoderInputs, VideoClip,
 };
 use llm_tokenizer::{Encoding, TokenizerTrait};
 
@@ -54,6 +55,7 @@ mod assemble;
 mod capability;
 mod config;
 mod detect;
+pub(crate) mod ec_push;
 mod encoder_budget;
 mod inflight;
 mod item_limits;
@@ -96,7 +98,8 @@ pub(crate) use refs::{
     assemble_media_refs, ensure_selection_supports_media_refs, media_refs_pipeline_pin,
     models_without_media_processing, pool_processes_media_refs,
     registration_lacks_media_processing, resolve_mm_processing, worker_accepts_media_refs,
-    worker_runs_gateway_pipeline, MmProcessing, MmRefsError, GATEWAY_PIPELINE_PROCESSOR,
+    worker_runs_gateway_pipeline, worker_supports_ec_transfer, MmProcessing, MmRefsError,
+    GATEWAY_PIPELINE_PROCESSOR,
 };
 pub(crate) use serialize::WireMismatch;
 pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};
@@ -155,12 +158,16 @@ pub(crate) fn media_verdict(error: &anyhow::Error) -> Option<&MediaConnectorErro
 /// `multimodal_processing_failed`.
 /// An item the engine could never place ([`encoder_budget::ItemOverEncoderBudget`])
 /// is a 400 under a code of its own, so a client can tell the item's size from a
-/// fetch or a decode that failed.
+/// fetch or a decode that failed. A configuration file the model's hub failed
+/// to serve is answered by [`config_unavailable_response`].
 pub(crate) fn processing_failed_response(error: &anyhow::Error) -> Response {
     const PIPELINE_CODE: &str = "multimodal_processing_failed";
     let message = processing_failed_message(error);
     if encoder_budget::ItemOverEncoderBudget::is(error) {
         return error::bad_request(encoder_budget::ITEM_OVER_ENCODER_BUDGET_CODE, message);
+    }
+    if let Some(response) = config_unavailable_response(error) {
+        return response;
     }
     if let Some(media) = media_verdict(error) {
         return match media.fault() {
@@ -184,6 +191,25 @@ pub(crate) fn processing_failed_response(error: &anyhow::Error) -> Response {
     } else {
         error::bad_request(PIPELINE_CODE, message)
     }
+}
+
+/// The client's answer when the model's hub failed to serve a configuration
+/// file ([`HubFetchError`] in the chain), on every path a request's media
+/// is resolved: a 502 under `multimodal_config_unavailable` with a generic
+/// message, since the fault is upstream of the gateway and the message of the
+/// chain names the hub's address. The response is left retryable: nothing of
+/// the model is kept from the failed attempt, so the next request resolves
+/// the checkpoint again (unlike a media host's transient fault, which the
+/// same host would repeat). The cause (the file, the hub's answer) is for the
+/// log at the call site. `None` for any other failure.
+pub(crate) fn config_unavailable_response(error: &anyhow::Error) -> Option<Response> {
+    HubFetchError::is(error).then(|| {
+        error::bad_gateway(
+            "multimodal_config_unavailable",
+            "The model's configuration could not be fetched from the model hub; \
+             retry the request",
+        )
+    })
 }
 
 /// Whether verbose multimodal timing logs are enabled (`--log-mm-timing` /
@@ -413,17 +439,54 @@ mod tests {
 
     use axum::body::to_bytes;
     use http::StatusCode;
-    use llm_multimodal::{MediaConnectorError, Modality, MultiModalError};
+    use llm_multimodal::{hub::HubFetchError, MediaConnectorError, Modality, MultiModalError};
 
     use super::{
-        encoder_budget::ItemOverEncoderBudget, processing_failed_message,
-        processing_failed_response, record_decoder_availability, report_jpeg_decoder, Response,
+        config_unavailable_response, encoder_budget::ItemOverEncoderBudget,
+        processing_failed_message, processing_failed_response, record_decoder_availability,
+        report_jpeg_decoder, Response,
     };
+    use crate::{middleware::test_support::json_of, routers::common::retry::NonRetryable};
 
     async fn status_and_error(response: Response) -> (u16, serde_json::Value) {
         let status = response.status().as_u16();
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        (status, serde_json::from_slice(&body).unwrap())
+        (status, json_of(response).await)
+    }
+
+    /// A configuration file the model's hub failed to serve is a 502 under its
+    /// own code with a generic message: the hub's answer and its address stay
+    /// out of the body, and the response carries no non-retryable mark, since
+    /// the next request resolves the checkpoint again. Any other failure is
+    /// not this answer.
+    #[tokio::test]
+    async fn a_processor_config_the_hub_failed_to_serve_answers_a_502_without_the_cause() {
+        let failed = anyhow::Error::from(HubFetchError {
+            model: "org/name".to_string(),
+            file: "preprocessor_config.json",
+            cause: "request error: HTTP status server error (503 Service Unavailable) for url \
+                    (http://hub.internal/org/name/resolve/main/preprocessor_config.json)"
+                .to_string(),
+        })
+        .context("Failed to resolve model config directory for 'org/name'");
+        let response = processing_failed_response(&failed);
+        assert!(
+            response.extensions().get::<NonRetryable>().is_none(),
+            "a hub failure is retried by the next request"
+        );
+        let (status, json) = status_and_error(response).await;
+        assert_eq!(status, 502);
+        assert_eq!(json["error"]["code"], "multimodal_config_unavailable");
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(
+            !message.contains("hub.internal") && !message.contains("503"),
+            "the cause stays out of the body: {message}"
+        );
+        assert!(
+            message.contains("configuration could not be fetched"),
+            "the body says what was not fetched: {message}"
+        );
+
+        assert!(config_unavailable_response(&anyhow::anyhow!("decode failed")).is_none());
     }
 
     /// An item the engine could never place answers under a code of its own,

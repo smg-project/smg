@@ -1,7 +1,7 @@
-// TokenSpeed per-step batched output — the native `BatchTokenIDOutSlim` from
-// `io_struct.py`, a tagged `msgspec.Struct(array_like=True)`: on the wire it is
-// a positional msgpack array with the class-name tag string as element 0.
-// **Field order is the wire contract** — do not reorder.
+//! TokenSpeed per-step batched output — the native `BatchTokenIDOutSlim` from
+//! `io_struct.py`, a tagged `msgspec.Struct(array_like=True)`: on the wire it is
+//! a positional msgpack array with the class-name tag string as element 0.
+//! **Field order is the wire contract** — do not reorder.
 
 use std::collections::BTreeMap;
 
@@ -12,7 +12,7 @@ use serde::{
 };
 
 use crate::{
-    codec::decode_msgpack_seed,
+    codec::{decode_msgpack_seed, FrameStr},
     error::{Error, Result},
     protocol::{
         control::{read_control_reply_after_tag, ControlReplySlim, CONTROL_REPLY_SLIM_TAG},
@@ -167,7 +167,8 @@ pub fn decode_slim_batch(bytes: &[u8], layout: &SlimOutputLayout) -> Result<Batc
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BatchTokenIDOutSlim {
     /// Request ids, one per column.
-    pub rids: Vec<String>,
+    /// The request ids, views of the frame they were decoded within.
+    pub rids: Vec<FrameStr>,
     /// Newly generated token ids per request this step.
     pub output_ids: Vec<Vec<u32>>,
     /// Finish reason per request (`"stop"`, `"length"`, `"abort"`); an empty
@@ -456,8 +457,9 @@ pub fn decode_wire_output(bytes: &[u8], layout: &SlimOutputLayout) -> Result<Tok
 /// shape the connector routes to per-request streams.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TokenSpeedOutput {
-    /// The request id this output belongs to.
-    pub request_id: String,
+    /// The request id this output belongs to, a view of the frame it was
+    /// decoded within.
+    pub request_id: FrameStr,
     /// Newly generated token ids this step.
     pub output_ids: Vec<u32>,
     /// Finish reason; `None` while the request is still generating.
@@ -499,7 +501,15 @@ pub struct TokenSpeedOutput {
 
 impl EngineOutput for TokenSpeedOutput {
     fn request_id(&self) -> &str {
-        &self.request_id
+        self.request_id.as_str()
+    }
+
+    fn own_request_id(&mut self, id: FrameStr) {
+        self.request_id = id;
+    }
+
+    fn request_id_shared(&self) -> FrameStr {
+        self.request_id.clone()
     }
 
     fn finished(&self) -> bool {
@@ -631,10 +641,7 @@ mod tests {
     use rmpv::Value;
 
     use super::*;
-    use crate::{
-        codec::{decode_msgpack, decode_value, encode_msgpack},
-        protocol::positional::vector_bytes,
-    };
+    use crate::codec::{decode_msgpack, decode_value, encode_msgpack, hex};
 
     /// A slim output batch captured from the Python msgspec encoder: rids
     /// ["vec-1"], output_ids [[10, 11]], finished_reasons ["length"], prompt 3
@@ -659,7 +666,7 @@ mod tests {
          6774689103910291019192cbbfe0000000000000cbbfd000000000000091920a0b";
 
     fn python_output_bytes() -> Vec<u8> {
-        vector_bytes(PYTHON_OUTPUT_VECTOR)
+        hex(PYTHON_OUTPUT_VECTOR)
     }
 
     fn vector_batch() -> BatchTokenIDOutSlim {
@@ -734,7 +741,7 @@ mod tests {
     #[test]
     fn pre_dp_nine_element_batch_decodes_as_rank_zero() {
         let decoded: BatchTokenIDOutSlim =
-            decode_msgpack(&vector_bytes(PYTHON_OUTPUT_VECTOR_PRE_DP)).unwrap();
+            decode_msgpack(&hex(PYTHON_OUTPUT_VECTOR_PRE_DP)).unwrap();
         assert_eq!(
             decoded,
             BatchTokenIDOutSlim {
@@ -753,7 +760,7 @@ mod tests {
     #[test]
     fn pre_load_ten_element_batch_decodes_with_zero_snapshot() {
         let decoded: BatchTokenIDOutSlim =
-            decode_msgpack(&vector_bytes(PYTHON_OUTPUT_VECTOR_PRE_LOAD)).unwrap();
+            decode_msgpack(&hex(PYTHON_OUTPUT_VECTOR_PRE_LOAD)).unwrap();
         assert_eq!(
             decoded,
             BatchTokenIDOutSlim {

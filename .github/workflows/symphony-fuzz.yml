@@ -1,17 +1,12 @@
 name: symphony fuzz campaign
 
-# The Symphony crate's coverage-guided fuzz targets (crates/symphony/fuzz, cargo-fuzz on
-# nightly): the engine over every table, with random bytes cut into random deltas, checked
-# against the crate's contract on every input. They run here nightly, bounded, so that the
-# parser's robustness does not depend on someone remembering to run them; a crash fails the
-# job and its artifact is uploaded for the report crates/symphony/fuzz/README.md describes.
-# Budget: nine targets, three at a time, ten minutes each on a hosted runner. The run looks past
-# the classes reported and not yet fixed, by the name of their shape (SYMPHONY_FUZZ_ALLOW); a
-# name covers that shape from any reader, on every target: tolerated-json, the JSON syntax
-# passing on what its prefix judge tolerates, and empty-arguments, the pythonic reader's call
-# cut at the stream's end, today. A night's red is then a shape not yet reported; a name leaves
-# the list with its fix (made-up-empty-string left it with the pythonic reader's fix for a
-# parameter without a value), and a new breach of an allowed shape surfaces then.
+# The Symphony crate's coverage-guided fuzz targets (crates/symphony/fuzz, cargo-fuzz on nightly)
+# run here nightly, bounded: nine targets, three at a time, ten minutes each; a crash fails the job
+# and uploads its artifact for the report crates/symphony/fuzz/README.md describes. The run looks
+# past no breach class: the record of the names that were allowed and left is in that README,
+# "The classes the nightly allows". A night's red is a shape not yet reported; a class a report
+# allows for a while is named through SYMPHONY_FUZZ_ALLOW from both lines that write it (the
+# scheduled run's list below and the dispatch input's default), and leaves them with its fix.
 
 on:
   schedule:
@@ -26,7 +21,7 @@ on:
         default: ""
       allow:
         description: "Breach names the run looks past (comma separated; empty for none)"
-        default: "tolerated-json,empty-arguments"
+        default: ""
 
 concurrency:
   group: symphony-fuzz
@@ -69,14 +64,15 @@ jobs:
         with:
           key: symphony-fuzz
           workspaces: crates/symphony/fuzz
-      # The crate is a workspace of its own, outside the repository's fmt and clippy jobs. Its
-      # seed tests read the tree; without the variable they would skip.
-      - name: Format, lint and test the fuzz crate
+      # The crate is a workspace of its own, outside the repository's fmt, clippy and rustdoc
+      # jobs. Its seed tests read the tree; without the variable they would skip.
+      - name: Format, lint, document and test the fuzz crate
         env:
           BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures
         run: |
           cargo fmt --manifest-path crates/symphony/fuzz/Cargo.toml --all -- --check
           cargo clippy --manifest-path crates/symphony/fuzz/Cargo.toml --all-targets -- -D warnings
+          RUSTDOCFLAGS='-D warnings' cargo doc --manifest-path crates/symphony/fuzz/Cargo.toml --no-deps
           cargo test --manifest-path crates/symphony/fuzz/Cargo.toml
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
@@ -89,8 +85,9 @@ jobs:
           ALLOW_INPUT: ${{ github.event.inputs.allow }}
         run: |
           # A dispatch's allowance is its own, an empty one included (an expression's `||` would
-          # put the default back); a scheduled run looks past the classes reported and not yet fixed.
-          if [ "$EVENT" = workflow_dispatch ]; then ALLOW=$ALLOW_INPUT; else ALLOW=tolerated-json,empty-arguments; fi
+          # put the default back); a scheduled run allows nothing, the record of the classes that
+          # were allowed is in crates/symphony/fuzz/README.md, "The classes the nightly allows".
+          if [ "$EVENT" = workflow_dispatch ]; then ALLOW=$ALLOW_INPUT; else ALLOW=; fi
           # shellcheck disable=SC2086
           crates/symphony/fuzz/run.sh --minutes "$MINUTES" --jobs 3 ${ALLOW:+--allow "$ALLOW"} $TARGETS
       - name: Upload crashes and logs

@@ -27,6 +27,13 @@ What a user of PD mode hits, in the order they hit it:
 TokenSpeed runs Qwen3.5-9B, the model its disaggregation path is proven on;
 SGLang and vLLM run Llama-3.1-8B.
 
+On the mock engine (``E2E_RUNTIME=mock``) the gRPC and HTTP topologies run on
+scripted mock workers in the prefill and decode roles: the gateway's pairing,
+dual dispatch, placement, streaming and failure handling with no KV moving
+(the decode side has the prompt). A test that reads the answer states it with
+the prompt it is for (``mock_answers``, filed on every decode worker); the
+asymmetric-tp pairs and the engine-death case stay on the engines.
+
 A MoRI-IO lane (``E2E_VLLM_KV_BACKEND=moriio``, ``E2E_VLLM_MORIIO_MODE`` read
 or write) runs every topology on SMG's HTTP PD router, the one that speaks the
 MoRI-IO handoff, so every row moves real KV. It reads idleness from the
@@ -82,7 +89,11 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _PAIR_RE = re.compile(r"prefill=(\S+)\s+decode=(\S+)")
 
 _MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-_MODEL_BY_ENGINE = {"tokenspeed": "Qwen/Qwen3.5-9B"}
+# The mock engine reads the model's tokenizer and template from an ungated twin.
+_MODEL_BY_ENGINE = {
+    "tokenspeed": "Qwen/Qwen3.5-9B",
+    "mock": "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8",
+}
 # A restart reloads the model on the same GPUs: give it the budget the model
 # declares for its first load, not Worker.start()'s default.
 _RESTART_TIMEOUT = get_model_spec(_MODEL_BY_ENGINE.get(get_runtime(), _MODEL)).get(
@@ -172,7 +183,8 @@ _TOPOLOGIES = (
     + [
         # Asymmetric tensor parallelism: the KV layout changes across the
         # handoff. A prefill wider than its decodes and the reverse both fit
-        # four GPUs.
+        # four GPUs. The mock engine has no tensor parallelism, so there
+        # these pairs would be the symmetric ones again.
         pytest.param(
             ("pd_grpc", (p, d, ptp, dtp)),
             id=f"{p}p{d}d-ptp{ptp}-dtp{dtp}",
@@ -182,7 +194,7 @@ _TOPOLOGIES = (
                 "rank holds all KV heads (vllm-project/vllm#46332); the model's 8 are split",
             ),
         )
-        for p, d, ptp, dtp in [(1, 2, 2, 1), (2, 1, 1, 2)]
+        for p, d, ptp, dtp in ([(1, 2, 2, 1), (2, 1, 1, 2)] if get_runtime() != "mock" else [])
     ]
     + [
         # The HTTP PD router is its own code path: pairing and error answers
@@ -190,7 +202,10 @@ _TOPOLOGIES = (
         # URL carries no kv_connector, so the router passes the request
         # through and decode recomputes the prompt; vLLM's handoff is covered
         # by the gRPC rows, where the worker reports its connector. The
-        # TokenSpeed e2e worker has no HTTP frontend.
+        # TokenSpeed e2e worker has no HTTP frontend. On the mock engine the
+        # HTTP workers take the roles: the router's injected bootstrap
+        # fields, its bootstrap probe and its server-info read are answered,
+        # and no KV moves.
         pytest.param(
             ("pd_http", (p, d)),
             id=f"{p}p{d}d-http",
@@ -260,6 +275,43 @@ def _wait_for_pairs(minimum: int, timeout: float = LOG_FLUSH_TIMEOUT_S) -> list[
         f"is --log-level debug reaching {_LOG_DIR}/smg*?"
     )
     return pairs
+
+
+FANOUT_MARKER = "PD fan-out: one single-sample pair per sample"
+_UUID = r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}"
+
+
+def _fanout_logged(parent: str) -> tuple[bool, set[int]]:
+    """Whether the gateway logged the fan-out of ``parent`` and the choice
+    indices of the single-sample children it dispatched under it
+    (``<parent>-<uuid>-<index>``)."""
+    # The response's id may already carry the dispatch uuid the children
+    # extend; the fan-out line names the request by its bare id.
+    bare = re.sub("-" + _UUID + "$", "", parent)
+    child_re = re.compile(re.escape(bare) + "-" + _UUID + r"-(\d+)\b")
+    taken = False
+    children: set[int] = set()
+    for raw in read_logs(_LOG_DIR, "smg*").splitlines():
+        line = _ANSI.sub("", raw)
+        if FANOUT_MARKER in line and bare in line:
+            taken = True
+        children.update(int(m.group(1)) for m in child_re.finditer(line))
+    return taken, children
+
+
+def _wait_for_fanout(parent: str, count: int, timeout: float = LOG_FLUSH_TIMEOUT_S) -> None:
+    deadline = time.monotonic() + timeout
+    taken, children = _fanout_logged(parent)
+    while not (taken and len(children) >= count) and time.monotonic() < deadline:
+        time.sleep(0.5)
+        taken, children = _fanout_logged(parent)
+    assert taken, (
+        f"router logged no PD fan-out for {parent}; is --log-level debug reaching {_LOG_DIR}/smg*?"
+    )
+    assert children == set(range(count)), (
+        f"router dispatched the choices of {parent} as children {sorted(children)}, "
+        f"expected one single-sample child per choice, 0..{count - 1}"
+    )
 
 
 def _log_sizes(log_dir: Path) -> dict[Path, int]:
@@ -489,9 +541,10 @@ def _fleet_idle(gateway: Gateway) -> tuple[bool, list[dict]]:
 def _require_load_reports(backend: str) -> None:
     """The idle check reads /loads; HTTP SGLang workers report none without metrics.
 
-    A MoRI-IO lane reads its engines' own metrics instead (see ``_fleet_idle``).
+    A MoRI-IO lane reads its engines' own metrics instead (see ``_fleet_idle``);
+    the mock's HTTP workers report their loads as its gRPC workers do.
     """
-    if backend == "pd_http" and not _moriio_lane():
+    if backend == "pd_http" and not _moriio_lane() and get_runtime() != "mock":
         pytest.skip("load reports need gRPC workers")
 
 
@@ -587,10 +640,10 @@ def _long_prompt(secret: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.engine("sglang", "vllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed", "mock")
 @pytest.mark.gpu(4)
 @pytest.mark.e2e
-@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"])
+@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"], mock=_MODEL_BY_ENGINE["mock"])
 @pytest.mark.workers(parallel_start=True)
 @pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=_GATEWAY_ARGS)
 @pytest.mark.parametrize("setup_backend", _TOPOLOGIES, indirect=True)
@@ -656,9 +709,15 @@ class TestPDTopology:
 
     # -- transfer ----------------------------------------------------------
 
-    def test_concurrent_requests_do_not_alias(self, setup_backend):
+    def test_concurrent_requests_do_not_alias(self, setup_backend, mock_answers):
         _, model, client, gateway = setup_backend
         answers: dict[str, str] = {}
+        # On the mock: each word's answer, filed for the prompt that names it
+        # (the phrase, not the bare word: the rendered prompt holds the
+        # template's own text too), whichever decode worker and order the
+        # requests land in.
+        for word in _WORDS:
+            mock_answers.enqueue(word, prompt_contains=f"nothing else: {word}")
 
         def _echo(word: str) -> Callable[[], None]:
             def _run() -> None:
@@ -679,10 +738,13 @@ class TestPDTopology:
             foreign = [w for w in _WORDS if w != word and w in content]
             assert not foreign, f"answer for {word!r} carried {foreign}: {content[:120]!r}"
 
-    def test_long_prompt_context_reaches_decode(self, setup_backend):
+    def test_long_prompt_context_reaches_decode(self, setup_backend, mock_answers):
         _, model, client, gateway = setup_backend
         secret = "48213"
         computed_before = self._decode_computed(gateway) if _moriio_lane() else 0.0
+        # On the mock: the decode side reads the whole prompt (it is sent it),
+        # and answers the code it holds.
+        mock_answers.enqueue(secret, prompt_contains=f"the access code is {secret}")
 
         response = client.chat.completions.create(
             model=model,
@@ -717,14 +779,19 @@ class TestPDTopology:
             for w in gateway.decode_workers
         )
 
-    def test_second_turn_sees_the_first(self, setup_backend):
+    def test_second_turn_sees_the_first(self, setup_backend, mock_answers):
         _, model, client, gateway = setup_backend
         first = {"role": "user", "content": "Remember this: the password is marigold. Reply OK."}
+        # On the mock: the first turn's answer, then the second's, each filed
+        # for the prompt that ends with its question (the second prompt holds
+        # the first turn too).
+        mock_answers.enqueue("OK", prompt_contains="Reply OK.")
         reply = client.chat.completions.create(
             model=model, messages=[first], temperature=0, max_tokens=64, timeout=120.0
         )
         assistant = reply.choices[0].message
 
+        mock_answers.enqueue("marigold", prompt_contains="What is the password?")
         follow_up = client.chat.completions.create(
             model=model,
             messages=[
@@ -742,8 +809,12 @@ class TestPDTopology:
 
     # -- streaming ---------------------------------------------------------
 
-    def test_stream_completes_with_usage(self, setup_backend):
+    def test_stream_completes_with_usage(self, setup_backend, mock_answers):
         _, model, client, gateway = setup_backend
+        mock_answers.enqueue(
+            "one two three four five six seven eight nine ten",
+            prompt_contains="Count from one to ten",
+        )
 
         stream = client.chat.completions.create(
             model=model,
@@ -829,7 +900,7 @@ class TestPDTopology:
         _assert_fleet_idle_within(gateway, 30.0)
         _wait_until_served(gateway, model, timeout=60.0)
 
-    def test_batched_completion_serves_every_choice(self, setup_backend, request):
+    def test_batched_completion_serves_every_choice(self, setup_backend, request, mock_answers):
         """Every choice of an ``n>1`` request must come back through the PD pair.
 
         On the room-based engines (SGLang, TokenSpeed) the gRPC router fans
@@ -838,6 +909,13 @@ class TestPDTopology:
         handoff for ``n>1``, leaving decode to recompute the prompt.
         """
         mode, model, _, gateway = setup_backend
+        # On the mock: one stated answer per single-sample child of the
+        # fan-out, each filed under the prompt, taken on whichever decode
+        # worker its child lands. The hits count one per choice, so the
+        # answers alone cannot tell four children from one n=4 dispatch:
+        # the gateway's dispatch log is read below.
+        for _ in range(4):
+            mock_answers.enqueue("red, yellow and blue.", prompt_contains="primary colors")
         if _moriio_lane():
             # One MoRI-IO handoff moves one request's KV, so SMG refuses n>1
             # rather than letting the samples share a prefill.
@@ -878,6 +956,13 @@ class TestPDTopology:
         choices = resp.json().get("choices", [])
         assert len(choices) == 4, f"expected 4 choices, got {len(choices)}"
         assert all(c.get("text", "").strip() for c in choices), f"empty choice in {choices}"
+        if get_runtime() == "mock" and mode != "pd_http":
+            # The fan-out itself: one single-sample child per choice under
+            # the one selected pair, each with its own room. The HTTP PD
+            # router dispatches the request once instead (one room for every
+            # sample, the shape above); the mock's decode side has the
+            # prompt and serves the four choices itself.
+            _wait_for_fanout(resp.json()["id"], 4)
 
     # -- failure -----------------------------------------------------------
 
@@ -922,6 +1007,9 @@ class TestPDTopology:
         self._pool_survives_losing_one(setup_backend, "prefill")
 
     @pytest.mark.flaky(reruns=0)  # a restart per attempt; a real failure must surface once
+    @pytest.mark.skip_for_runtime(
+        "mock", reason="the engine runs inside the mock worker: nothing dies under it"
+    )
     def test_decode_engine_death_under_streaming_traffic(self, setup_backend):
         """A decode engine dies under live streams.
 
@@ -1181,10 +1269,10 @@ class TestPDMismatchedTransport:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.engine("sglang", "vllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed", "mock")
 @pytest.mark.gpu(4)
 @pytest.mark.e2e
-@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"])
+@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"], mock=_MODEL_BY_ENGINE["mock"])
 @pytest.mark.workers(parallel_start=True)
 @pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=_GATEWAY_ARGS)
 @pytest.mark.parametrize(
@@ -1344,10 +1432,10 @@ class TestPDSmallWindow:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.engine("sglang", "vllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed", "mock")
 @pytest.mark.gpu(4)
 @pytest.mark.e2e
-@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"])
+@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"], mock=_MODEL_BY_ENGINE["mock"])
 class TestPDAssembledAtRuntime:
     """IGW gateway with no workers; prefill and decode arrive through the API."""
 

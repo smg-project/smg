@@ -29,7 +29,9 @@ use crate::{
             mcp_utils::{prepare_hosted_dispatch_args, DEFAULT_MAX_ITERATIONS},
             openai_bridge::{self, ResponseFormat},
         },
-        grpc::common::responses::{history::current_input_items, utils::resolve_function_identity},
+        grpc::common::responses::{
+            history::current_input_items, tool_call_limit, utils::resolve_function_identity,
+        },
     },
 };
 
@@ -219,14 +221,12 @@ pub(super) fn partition_tool_calls(
 /// A batch that fits may continue to a final model answer. An overflowing
 /// batch executes its permitted prefix, then stops normally for a user cap
 /// or fails for the internal safety cap. A user cap wins when both are equal.
-pub(super) fn apply_mcp_tool_call_limit(
+fn apply_mcp_tool_call_limit(
     calls: &mut Vec<ExtractedToolCall>,
     total_calls: usize,
     max_tool_calls: Option<usize>,
 ) -> Option<McpToolCallLimit> {
-    let effective_limit = max_tool_calls
-        .unwrap_or(DEFAULT_MAX_ITERATIONS)
-        .min(DEFAULT_MAX_ITERATIONS);
+    let effective_limit = tool_call_limit(max_tool_calls);
     let remaining = effective_limit.saturating_sub(total_calls);
     if calls.len() <= remaining {
         return None;

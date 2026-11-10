@@ -7,19 +7,23 @@ import os
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
 import httpx
 
+from .cloud_credentials import PROXY_ENV, cloud_environment, resolve_cloud_credentials
 from .constants import (
+    CLOUD_REQUEST_TIMEOUT_SECS,
     DEFAULT_HOST,
     DEFAULT_ROUTER_TIMEOUT,
     ENV_SHOW_ROUTER_LOGS,
     get_parser,
     get_zmq_engine_count,
     host_port,
+    trtllm_runs_engines_own_servicer,
 )
 from .process_utils import (
     ProcessExitedError,
@@ -35,6 +39,17 @@ if TYPE_CHECKING:
     from .worker import Worker
 
 logger = logging.getLogger(__name__)
+
+
+def workers_labelled_by_hand(workers: list | None) -> list:
+    """The workers of ``workers`` whose servicer advertises no structural-tag
+    vocabulary, so the harness labels them: the TensorRT-LLM workers on the
+    engine's own gRPC server. On the Rust servicer the launcher advertises
+    the vocabulary of the xgrammar installed beside the engine itself."""
+    labelled = [w for w in workers or () if getattr(w, "engine", None) == "trtllm"]
+    if not labelled or not trtllm_runs_engines_own_servicer():
+        return []
+    return labelled
 
 
 def build_epd_mode_args(
@@ -165,7 +180,11 @@ class Gateway:
         if self._started:
             raise RuntimeError("Gateway already started")
         if env:
-            self._env = {**os.environ, **env}
+            proxy = bool(cloud_backend and env.get(PROXY_ENV, os.environ.get(PROXY_ENV, "")))
+            self._env = {
+                **cloud_environment(os.environ, proxy=proxy),
+                **cloud_environment(env, proxy=proxy),
+            }
 
         is_epd_mode = encode_workers is not None
         is_pd_mode = (prefill_workers is not None or decode_workers is not None) and not is_epd_mode
@@ -290,6 +309,32 @@ class Gateway:
                 worker_urls=worker_urls,
                 workers=workers,
             )
+            # A worker whose servicer cannot advertise which structural-tag
+            # vocabulary its grammar compiler takes is labelled by its
+            # operator: a TensorRT-LLM worker on the engine's own gRPC
+            # servicer (`tensorrt_llm.commands.serve`), which reports no such
+            # fact, over the xgrammar its pinned wheel carries
+            # (scripts/ci_install_trtllm.sh: 0.1.32, before the `optional`,
+            # `plus`, `star` and `token` nodes), and the gateway spells that
+            # worker's structural tags in the older vocabulary. On the Rust
+            # servicer the launcher advertises the vocabulary itself
+            # (`workers_labelled_by_hand`).
+            # The router is up by now (`_launch`): a label that does not land
+            # within its wait takes the router down with it before the error
+            # goes out, so a caller that does not shut down on failure leaves
+            # no process and no port behind. The launch is marked failed
+            # first, so a temporary log is kept and the error names its tail
+            # (`_open_log_file`'s contract), as `_launch` does when the router
+            # exits.
+            try:
+                self.label_workers(
+                    workers_labelled_by_hand(workers), {"structural_tag_vocabulary": "older"}
+                )
+            except Exception as e:
+                detail = self._output_tail()
+                self._started = False
+                self.shutdown()
+                raise RuntimeError(f"{e}; {detail}") from e
 
     def _ensure_ports_free(self) -> None:
         """Re-check the auto-allocated ports right before the launch.
@@ -491,21 +536,16 @@ class Gateway:
 
     def _build_cloud_args(self, cloud_backend: str, history_backend: str) -> list[str]:
         """Build CLI args and env for cloud mode."""
-        cloud_configs = {
-            "openai": ("https://api.openai.com", "OPENAI_API_KEY", "openai"),
-            "xai": ("https://api.x.ai", "XAI_API_KEY", "openai"),
-            "anthropic": ("https://api.anthropic.com", "ANTHROPIC_API_KEY", "anthropic"),
-        }
-        if cloud_backend not in cloud_configs:
-            raise ValueError(f"Unsupported cloud backend: {cloud_backend}")
-
-        worker_url, api_key_env, backend_type = cloud_configs[cloud_backend]
-        api_key = os.environ.get(api_key_env)
-        if not api_key:
-            raise ValueError(f"{api_key_env} environment variable required")
-
-        self._env = dict(self._env or os.environ)
-        self._env[api_key_env] = api_key
+        credentials = resolve_cloud_credentials(cloud_backend, environ=self._env)
+        worker_url, api_key_env, backend_type = (
+            credentials.worker_root,
+            credentials.api_key_env,
+            credentials.backend_type,
+        )
+        self._env = cloud_environment(
+            self._env if self._env is not None else os.environ, proxy=credentials.is_proxy
+        )
+        self._env[api_key_env] = credentials.api_key
 
         actual_history_backend = history_backend
         if history_backend == "oracle-custom":
@@ -530,6 +570,8 @@ class Gateway:
             "--history-backend",
             actual_history_backend,
             "--disable-health-check",
+            "--request-timeout-secs",
+            str(CLOUD_REQUEST_TIMEOUT_SECS),
         ]
 
         if history_backend == "oracle-custom":
@@ -589,6 +631,45 @@ class Gateway:
             if strict:
                 raise
             return []
+
+    def label_workers(self, workers: list, labels: dict[str, str], timeout: float = 10.0) -> None:
+        """Merge ``labels`` into the labels of ``workers`` the gateway already
+        registered (``PATCH /workers/{id}``): what an operator sets on a worker
+        whose servicer does not advertise the fact itself. The gateway keeps an
+        operator's label across its own refreshes of the labels it discovered.
+        The gateway queues the update (202), so this returns once ``GET
+        /workers`` shows the labels on every one of ``workers``, and raises
+        when they are not there after ``timeout`` seconds.
+        """
+        if not workers:
+            return
+        ids_by_url = {w.url.rstrip("/"): w.id for w in self.list_workers(strict=True)}
+        pending: set[str] = set()
+        for worker in workers:
+            worker_id = ids_by_url.get(worker.base_url.rstrip("/"))
+            if not worker_id:
+                raise RuntimeError(f"{worker.base_url} is not registered; it cannot be labelled")
+            resp = httpx.patch(
+                f"{self.base_url}/workers/{worker_id}", json={"labels": labels}, timeout=10.0
+            )
+            if resp.status_code not in (200, 202):
+                raise RuntimeError(
+                    f"PATCH /workers/{worker_id} returned {resp.status_code}: {resp.text}"
+                )
+            pending.add(worker_id)
+        deadline = time.monotonic() + timeout
+        while pending:
+            resp = httpx.get(f"{self.base_url}/workers", timeout=5.0)
+            if resp.status_code == 200:
+                for w in resp.json().get("workers", []):
+                    if w.get("id") in pending and all(
+                        (w.get("labels") or {}).get(key) == value for key, value in labels.items()
+                    ):
+                        pending.discard(w["id"])
+            if pending and time.monotonic() > deadline:
+                raise RuntimeError(f"labels {labels} are not on {sorted(pending)} after {timeout}s")
+            if pending:
+                time.sleep(0.1)
 
     def add_worker(
         self,
@@ -689,12 +770,15 @@ def launch_cloud_gateway(
     timeout: float = 60,
     show_output: bool | None = None,
     max_attempts: int = 3,
+    post_start: Callable[[Gateway, float], None] | None = None,
 ) -> Gateway:
     """Launch gateway with a cloud API runtime (openai, xai, anthropic).
 
     Retries up to max_attempts because the AddWorker workflow can fail
     intermittently due to a race condition in the workflow engine's
-    parallel step context handling.
+    parallel step context handling. An optional post_start barrier receives
+    the same attempt's absolute deadline; its TimeoutError uses these existing
+    attempts, while other failures are cleaned up and propagated without retry.
     """
     from .model_specs import THIRD_PARTY_MODELS
 
@@ -706,7 +790,9 @@ def launch_cloud_gateway(
     last_error: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         gateway = Gateway()
+        barrier_started = False
         try:
+            deadline = time.monotonic() + timeout
             gateway.start(
                 cloud_backend=runtime,
                 history_backend=history_backend,
@@ -714,14 +800,28 @@ def launch_cloud_gateway(
                 show_output=show_output,
                 extra_args=extra_args,
             )
+            if post_start is not None:
+                barrier_started = True
+                post_start(gateway, deadline)
             return gateway
-        except TimeoutError as e:
-            last_error = e
+        except BaseException as error:
+            if barrier_started:
+                gateway._started = False
+                if gateway.log_path is not None:
+                    error.add_note(f"Gateway setup log retained at {gateway.log_path}")
+            if not isinstance(error, TimeoutError):
+                if barrier_started:
+                    gateway.shutdown()
+                raise
+            last_error = error
             logger.warning(
-                "Cloud gateway startup attempt %d/%d timed out: %s",
+                "Cloud gateway startup attempt %d/%d timed out: %s (log: %s)",
                 attempt,
                 max_attempts,
-                e,
+                error,
+                gateway.log_path,
             )
+            # Cleanup failures propagate from here, never becoming another
+            # startup attempt with ownership of the previous router uncertain.
             gateway.shutdown()
     raise last_error  # type: ignore[misc]

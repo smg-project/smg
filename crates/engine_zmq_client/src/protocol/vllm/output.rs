@@ -5,6 +5,9 @@
 // preserved; `utility_output` is typed (`UtilityOutput`) so replies route to
 // their callers.
 
+//! The engine's per-step outputs: request batches with each request's tokens, events and finish
+//! reason, utility replies routed to their callers, and data-parallel control messages.
+
 use std::collections::BTreeSet;
 
 use bytes::Bytes;
@@ -15,13 +18,18 @@ use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use crate::{
     codec::{
-        decode_msgpack, deserialize_tolerant_seq, tensor::WireTensor, OpaqueValue, TrailingTolerant,
+        decode_msgpack, deserialize_tolerant_seq,
+        tensor::{decode_within_frame, WireTensor},
+        FrameStr, OpaqueValue, TrailingTolerant,
     },
     error::{Error, Result},
-    protocol::vllm::{
-        logprobs::{Logprobs, WireLogprobs},
-        pooling::PoolingOutput,
-        stats::{PrefillStats, SchedulerStats},
+    protocol::{
+        kv_transfer::KvTransferStats,
+        vllm::{
+            logprobs::{Logprobs, LogprobsFields, WireLogprobs},
+            pooling::PoolingOutput,
+            stats::{PrefillStats, SchedulerStats},
+        },
     },
 };
 
@@ -81,7 +89,10 @@ pub struct EngineCoreEvent {
 /// every token batch pays.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct EngineCoreOutput {
-    pub request_id: String,
+    /// Local metadata copied from the enclosing batch; never serialized.
+    pub batch_timestamp: Option<f64>,
+    /// The request's id, a view of the frame it was decoded within.
+    pub request_id: FrameStr,
     pub new_token_ids: Vec<u32>,
     /// Decoded sample logprobs for the newly generated positions.
     pub new_logprobs: Option<Logprobs>,
@@ -167,7 +178,7 @@ impl Serialize for EngineCoreOutput {
         let new_logprobs = wire_logprobs(self.new_logprobs.as_ref())?;
         let new_prompt_logprobs_tensors = wire_logprobs(self.new_prompt_logprobs_tensors.as_ref())?;
         WireEngineCoreOutputRef {
-            request_id: &self.request_id,
+            request_id: self.request_id.as_str(),
             new_token_ids: &self.new_token_ids,
             new_logprobs: new_logprobs.as_ref(),
             new_prompt_logprobs_tensors: new_prompt_logprobs_tensors.as_ref(),
@@ -205,7 +216,7 @@ fn wire_logprobs<E: serde::ser::Error>(
 /// [`EngineCoreOutput`] is built.
 #[derive(Debug, Clone, PartialEq, Deserialize_tuple, DefaultFromSerde)]
 struct WireEngineCoreOutput {
-    request_id: String,
+    request_id: FrameStr,
     new_token_ids: Vec<u32>,
     #[serde(default)]
     new_logprobs: Option<Box<WireLogprobs>>,
@@ -246,15 +257,16 @@ impl WireEngineCoreOutput {
     /// Resolve the wire-format logprobs using the aux frames.
     fn resolve(self, frames: &[Bytes]) -> Result<EngineCoreOutput> {
         Ok(EngineCoreOutput {
+            batch_timestamp: None,
             request_id: self.request_id,
             new_token_ids: self.new_token_ids,
             new_logprobs: self
                 .new_logprobs
-                .map(|value| value.resolve(frames, "new_logprobs"))
+                .map(|value| value.resolve(frames, &LogprobsFields::NEW_LOGPROBS))
                 .transpose()?,
             new_prompt_logprobs_tensors: self
                 .new_prompt_logprobs_tensors
-                .map(|value| value.resolve(frames, "new_prompt_logprobs_tensors"))
+                .map(|value| value.resolve(frames, &LogprobsFields::NEW_PROMPT_LOGPROBS_TENSORS))
                 .transpose()?,
             pooling_output: self
                 .pooling_output
@@ -309,7 +321,7 @@ struct WireEngineCoreOutputs {
     #[serde(default, deserialize_with = "deserialize_tolerant_seq")]
     outputs: Vec<WireEngineCoreOutput>,
     #[serde(default)]
-    scheduler_stats: Option<SchedulerStats>,
+    scheduler_stats: Option<WireSchedulerStats>,
     #[serde(default)]
     timestamp: f64,
     /// A utility RPC reply, tolerant of fields a newer engine appends.
@@ -326,6 +338,73 @@ struct WireEngineCoreOutputs {
     start_wave: Option<u64>,
 }
 
+/// The scheduler stats map as the engine sends it, as far as this client reads
+/// it: the load fields, which ride the batch unboxed as [`SchedulerStats`], and
+/// the connector's KV-transfer samples when the engine runs a KV connector
+/// (absent or nil otherwise), which ride boxed beside them. The rest of the map
+/// (cache hit counts, eviction samples, speculative-decoding, graph and
+/// performance stats) is skipped.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct WireSchedulerStats {
+    num_running_reqs: u64,
+    num_waiting_reqs: u64,
+    #[serde(default)]
+    num_skipped_waiting_reqs: u64,
+    kv_cache_usage: f64,
+    #[serde(default)]
+    kv_connector_stats: Option<OpaqueValue>,
+}
+
+impl WireSchedulerStats {
+    /// The load and, when the connector recorded any, its samples.
+    fn split(self) -> (SchedulerStats, Option<Box<KvTransferStats>>) {
+        let Self {
+            num_running_reqs,
+            num_waiting_reqs,
+            num_skipped_waiting_reqs,
+            kv_cache_usage,
+            kv_connector_stats,
+        } = self;
+        let load = SchedulerStats {
+            num_running_reqs,
+            num_waiting_reqs,
+            num_skipped_waiting_reqs,
+            kv_cache_usage,
+        };
+        let transfers = kv_connector_stats
+            .as_ref()
+            .map(KvTransferStats::from_wire)
+            .filter(|stats| !stats.is_empty())
+            .map(Box::new);
+        (load, transfers)
+    }
+}
+
+/// The same map on the send side: the load fields and, when the batch carries
+/// connector samples, their wire form.
+#[derive(Serialize)]
+struct WireSchedulerStatsOut {
+    num_running_reqs: u64,
+    num_waiting_reqs: u64,
+    num_skipped_waiting_reqs: u64,
+    kv_cache_usage: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_connector_stats: Option<OpaqueValue>,
+}
+
+impl WireSchedulerStatsOut {
+    fn from_batch(batch: &RequestBatchOutputs) -> Option<Self> {
+        let load = batch.scheduler_stats?;
+        Some(Self {
+            num_running_reqs: load.num_running_reqs,
+            num_waiting_reqs: load.num_waiting_reqs,
+            num_skipped_waiting_reqs: load.num_skipped_waiting_reqs,
+            kv_cache_usage: load.kv_cache_usage,
+            kv_connector_stats: batch.kv_transfer.as_ref().map(|stats| stats.to_wire()),
+        })
+    }
+}
+
 /// Data-parallel control notifications multiplexed through `EngineCoreOutputs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DpControlMessage {
@@ -339,6 +418,9 @@ pub struct RequestBatchOutputs {
     pub engine_index: u32,
     pub outputs: Vec<EngineCoreOutput>,
     pub scheduler_stats: Option<SchedulerStats>,
+    /// The KV-transfer samples the engine's connector reported with this
+    /// batch, when it runs one and recorded any.
+    pub kv_transfer: Option<Box<KvTransferStats>>,
     pub timestamp: f64,
     pub finished_requests: Option<BTreeSet<String>>,
 }
@@ -474,6 +556,13 @@ impl WireEngineCoreOutputs {
             wave_complete,
             start_wave,
         } = self;
+        let (scheduler_stats, kv_transfer) = match scheduler_stats {
+            Some(stats) => {
+                let (load, transfers) = stats.split();
+                (Some(load), transfers)
+            }
+            None => (None, None),
+        };
         let has_request_payload =
             !outputs.is_empty() || scheduler_stats.is_some() || finished_requests.is_some();
 
@@ -496,6 +585,7 @@ impl WireEngineCoreOutputs {
                     engine_index,
                     outputs: resolved,
                     scheduler_stats,
+                    kv_transfer,
                     timestamp,
                     finished_requests,
                 }
@@ -533,7 +623,7 @@ impl WireEngineCoreOutputs {
 struct WireEngineCoreOutputsRef<'a> {
     engine_index: u32,
     outputs: &'a [EngineCoreOutput],
-    scheduler_stats: Option<&'a SchedulerStats>,
+    scheduler_stats: Option<WireSchedulerStatsOut>,
     timestamp: f64,
     utility_output: Option<&'a UtilityOutput>,
     finished_requests: Option<&'a BTreeSet<String>>,
@@ -557,7 +647,7 @@ impl<'a> From<&'a EngineCoreOutputs> for WireEngineCoreOutputsRef<'a> {
             EngineCoreOutputs::RequestBatch(batch) => Self {
                 engine_index: batch.engine_index,
                 outputs: &batch.outputs,
-                scheduler_stats: batch.scheduler_stats.as_ref(),
+                scheduler_stats: WireSchedulerStatsOut::from_batch(batch),
                 timestamp: batch.timestamp,
                 finished_requests: batch.finished_requests.as_ref(),
                 ..empty
@@ -603,10 +693,14 @@ pub fn decode_engine_core_outputs(frames: &[Bytes]) -> Result<EngineCoreOutputs>
     })?;
 
     // Decoded through `TrailingTolerant` so an envelope a newer engine grew
-    // past this struct still yields the fields this client knows.
-    decode_msgpack::<TrailingTolerant<WireEngineCoreOutputs>>(first_frame)?
-        .0
-        .into_semantic(frames)
+    // past this struct still yields the fields this client knows; within the
+    // frame's scope, so an inline array is a slice of it, not a copy: the
+    // logprobs columns are read into their vectors below, before the frame
+    // drops, and a pooled tensor takes bytes of its own (`PoolingOutput::resolve`).
+    let wire = decode_within_frame(first_frame, || {
+        decode_msgpack::<TrailingTolerant<WireEngineCoreOutputs>>(first_frame)
+    })?;
+    wire.0.into_semantic(frames)
 }
 
 #[cfg(test)]
@@ -615,8 +709,7 @@ mod tests {
     use crate::{
         codec::{
             decode_value, encode_msgpack, hex,
-            tensor::{WireArrayData, WireNdArray},
-            unhex,
+            tensor::{lies_within, WireArrayData, WireNdArray},
         },
         protocol::vllm::logprobs::{PositionLogprobs, TokenLogprob},
     };
@@ -633,8 +726,8 @@ mod tests {
 
     #[test]
     fn decode_vllm_pooling_output_inline() {
-        let frame = Bytes::from(unhex(VLLM_POOLING_OUTPUTS_INLINE));
-        let batch = decode_engine_core_outputs(&[frame])
+        let frame = Bytes::from(hex(VLLM_POOLING_OUTPUTS_INLINE));
+        let batch = decode_engine_core_outputs(std::slice::from_ref(&frame))
             .unwrap()
             .into_request_batch()
             .expect("request batch");
@@ -651,6 +744,13 @@ mod tests {
         assert_eq!(pooled.dtype(), "float32");
         assert_eq!(pooled.shape(), &[3]);
         assert_eq!(pooled.to_vector().unwrap(), vec![0.25, -1.5, 3.0]);
+        // The pooled tensor outlives the decode: its bytes are its own, not a
+        // slice that would pin the step's frame.
+        let view = pooled.as_wire().data.as_raw_view().expect("inline view");
+        assert!(
+            !lies_within(&frame, view),
+            "the pooled bytes alias the frame"
+        );
     }
 
     #[test]
@@ -662,7 +762,7 @@ mod tests {
                 .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<_>>(),
         );
-        let frames = vec![Bytes::from(unhex(VLLM_POOLING_OUTPUTS_AUX)), aux.clone()];
+        let frames = vec![Bytes::from(hex(VLLM_POOLING_OUTPUTS_AUX)), aux.clone()];
         let batch = decode_engine_core_outputs(&frames)
             .unwrap()
             .into_request_batch()
@@ -683,7 +783,7 @@ mod tests {
     #[test]
     fn pooling_output_roundtrips_through_the_mock_send_path() {
         let outputs = batch(vec![EngineCoreOutput {
-            request_id: "req-1".to_string(),
+            request_id: "req-1".into(),
             pooling_output: Some(Box::new(PoolingOutput::new(
                 WireTensor::from_f32(vec![2], vec![1.0, -2.0]).unwrap(),
             ))),
@@ -721,7 +821,7 @@ mod tests {
             per_step_drafted: Some(vec![2, 2]),
         };
         let outputs = batch(vec![EngineCoreOutput {
-            request_id: "req-1".to_string(),
+            request_id: "req-1".into(),
             new_token_ids: vec![1],
             spec_decode_metrics: Some(Box::new(metrics.clone())),
             ..Default::default()
@@ -786,7 +886,7 @@ mod tests {
     #[test]
     fn engine_core_outputs_roundtrip_finished_fields() {
         let outputs = batch(vec![EngineCoreOutput {
-            request_id: "req-1".to_string(),
+            request_id: "req-1".into(),
             new_token_ids: vec![42],
             finish_reason: Some(EngineCoreFinishReason::Length),
             stop_reason: Some(StopReason::Text("stop".to_string())),
@@ -817,7 +917,7 @@ mod tests {
             }],
         };
         let outputs = batch(vec![EngineCoreOutput {
-            request_id: "req-1".to_string(),
+            request_id: "req-1".into(),
             new_token_ids: vec![5],
             new_logprobs: Some(logprobs.clone()),
             ..Default::default()
@@ -848,23 +948,23 @@ mod tests {
         );
         let ranks = Bytes::from(2_i64.to_le_bytes().to_vec());
         let aux = |index| WireNdArray {
-            dtype: "<i8".to_string(),
+            dtype: "<i8".into(),
             shape: vec![1, 2],
             data: WireArrayData::AuxIndex(index),
         };
         let wire = WireEngineCoreOutputs {
             outputs: vec![WireEngineCoreOutput {
-                request_id: "req-1".to_string(),
+                request_id: "req-1".into(),
                 new_token_ids: vec![7],
                 new_logprobs: Some(Box::new(WireLogprobs {
                     logprob_token_ids: aux(1),
                     logprobs: WireNdArray {
-                        dtype: "<f4".to_string(),
+                        dtype: "<f4".into(),
                         shape: vec![1, 2],
                         data: WireArrayData::AuxIndex(2),
                     },
                     token_ranks: WireNdArray {
-                        dtype: "<i8".to_string(),
+                        dtype: "<i8".into(),
                         shape: vec![1],
                         data: WireArrayData::AuxIndex(3),
                     },
@@ -893,7 +993,7 @@ mod tests {
     fn classify_request_batch() {
         let wire = WireEngineCoreOutputs {
             outputs: vec![WireEngineCoreOutput {
-                request_id: "req-1".to_string(),
+                request_id: "req-1".into(),
                 new_token_ids: vec![7],
                 ..Default::default()
             }],
@@ -1018,7 +1118,7 @@ mod tests {
     fn classify_rejects_mixed_shape() {
         let wire = WireEngineCoreOutputs {
             outputs: vec![WireEngineCoreOutput {
-                request_id: "req-1".to_string(),
+                request_id: "req-1".into(),
                 new_token_ids: vec![7],
                 ..Default::default()
             }],
@@ -1051,7 +1151,7 @@ mod tests {
         // A newer engine appends fields to both the envelope and each output;
         // the elements this client knows must still decode.
         let mut output = wire_array(&EngineCoreOutput {
-            request_id: "req-1".to_string(),
+            request_id: "req-1".into(),
             new_token_ids: vec![7],
             mm_cache_miss_hashes: Some(vec!["hash-1".to_string()]),
             ..Default::default()
@@ -1075,9 +1175,9 @@ mod tests {
     }
 
     /// The engine's scheduler stats map carries more than the load (cache hit
-    /// counts, eviction samples, speculative-decoding, connector, graph and
-    /// performance stats, and whatever a newer engine adds): the decoder reads
-    /// the load fields and skips the rest.
+    /// counts, eviction samples, speculative-decoding, graph and performance
+    /// stats, and whatever a newer engine adds): the decoder reads the load
+    /// fields (and the connector's samples, below) and skips the rest.
     #[test]
     fn scheduler_stats_decode_the_load_and_skip_the_rest() {
         use rmpv::Value;
@@ -1177,10 +1277,103 @@ mod tests {
         );
     }
 
+    /// A connector-equipped engine's `kv_connector_stats` ride beside the
+    /// load, as the connector keyed them; an engine without a connector (nil
+    /// or absent) and a report without a sample yield none. The send side
+    /// writes what the decode side reads.
+    #[test]
+    fn the_connectors_kv_transfer_samples_ride_beside_the_load() {
+        use rmpv::Value;
+        let map = |pairs: Vec<(&str, Value)>| {
+            Value::Map(
+                pairs
+                    .into_iter()
+                    .map(|(key, value)| (Value::from(key), value))
+                    .collect(),
+            )
+        };
+        let stats_with = |kv_connector_stats: Value| {
+            map(vec![
+                ("num_running_reqs", Value::from(1u64)),
+                ("num_waiting_reqs", Value::from(0u64)),
+                ("kv_cache_usage", Value::from(0.5f64)),
+                ("kv_connector_stats", kv_connector_stats),
+            ])
+        };
+        let decode = |stats: Value| {
+            let mut envelope = wire_array(&batch(Vec::new()));
+            envelope[2] = stats;
+            let frame = Bytes::from(encode_value(&Value::Array(envelope)));
+            decode_engine_core_outputs(&[frame])
+                .unwrap()
+                .into_request_batch()
+                .expect("request batch")
+        };
+        let report = map(vec![
+            (
+                "transfer_duration",
+                Value::Array(vec![Value::from(0.25f64)]),
+            ),
+            (
+                "bytes_transferred",
+                Value::Array(vec![Value::from(4096u64)]),
+            ),
+            ("num_descriptors", Value::Array(vec![Value::from(2u64)])),
+            ("num_failed_transfers", Value::Array(vec![])),
+        ]);
+        let decoded = decode(stats_with(report));
+        assert_eq!(
+            decoded.scheduler_stats,
+            Some(SchedulerStats {
+                num_running_reqs: 1,
+                num_waiting_reqs: 0,
+                num_skipped_waiting_reqs: 0,
+                kv_cache_usage: 0.5,
+            })
+        );
+        assert_eq!(
+            decoded.kv_transfer.as_deref(),
+            Some(
+                &KvTransferStats::default()
+                    .with_samples("transfer_duration", vec![0.25])
+                    .with_samples("bytes_transferred", vec![4096.0])
+                    .with_samples("num_descriptors", vec![2.0])
+                    .with_samples("num_failed_transfers", vec![])
+            )
+        );
+        assert_eq!(
+            decode(stats_with(Value::Nil)).kv_transfer,
+            None,
+            "no connector"
+        );
+        let nothing_recorded = map(vec![("transfer_duration", Value::Array(vec![]))]);
+        assert_eq!(decode(stats_with(nothing_recorded)).kv_transfer, None);
+        let sent = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            scheduler_stats: Some(SchedulerStats::default()),
+            kv_transfer: Some(Box::new(
+                KvTransferStats::default().with_samples("transfer_duration", vec![0.5]),
+            )),
+            ..Default::default()
+        });
+        let frame = Bytes::from(encode_msgpack(&sent).unwrap());
+        let back = decode_engine_core_outputs(&[frame])
+            .unwrap()
+            .into_request_batch()
+            .expect("request batch");
+        assert_eq!(back.scheduler_stats, Some(SchedulerStats::default()));
+        assert_eq!(
+            back.kv_transfer
+                .as_deref()
+                .and_then(|stats| stats.samples("transfer_duration")),
+            Some(&[0.5][..])
+        );
+    }
+
     #[test]
     fn decode_engine_core_outputs_from_single_frame() {
         let outputs = batch(vec![EngineCoreOutput {
-            request_id: "req-1".to_string(),
+            request_id: "req-1".into(),
             new_token_ids: vec![1, 2, 3],
             ..Default::default()
         }]);

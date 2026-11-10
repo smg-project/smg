@@ -14,26 +14,31 @@ use std::{
 };
 
 use engine_zmq_adapter::{to_sglang_response, SglangGenerateStream};
-use futures::{stream::SelectAll, Stream};
+use futures::{Stream, StreamExt};
 use smg_grpc_client::{sglang_proto as sg, vllm_proto as vllm};
 use tonic::Status;
 
 use super::{hidden_states_cap, HiddenStatesCap, SglangModelInfo, State};
 use crate::{
+    load_tracker::{rank_of, ChoiceLoad, PendingGuard, PrefillProbe, Submission},
     metrics::{complete_finish_reason, ChoiceMetrics},
     requests::HeldTerminal,
-    stream::{poll_engine_item, Choice, RequestStream},
+    servicer::RequestOrigin,
+    stream::{poll_engine_item, Choice, Choices, RequestStream},
     BoxStream,
 };
 
 /// Handle one `Generate` request against the connected scheduler.
 /// `trace_headers` is the caller's W3C trace context (see
 /// [`crate::trace_context::trace_headers`]), carried to the scheduler beside
-/// each choice's request so the engine's spans join the Router's trace.
+/// each choice's request so the engine's spans join the Router's trace;
+/// `origin` says whose request it is, which decides what is counted
+/// ([`RequestOrigin`]).
 pub(super) async fn generate(
     state: &Arc<State>,
-    req: sg::GenerateRequest,
+    mut req: sg::GenerateRequest,
     trace_headers: Option<BTreeMap<String, String>>,
+    origin: RequestOrigin,
 ) -> Result<BoxStream<sg::GenerateResponse>, Status> {
     // The request's arrival, the instant its latencies are measured from.
     let arrival = Instant::now();
@@ -47,7 +52,77 @@ pub(super) async fn generate(
     let request_id: Arc<str> = Arc::from(req.request_id.as_str());
     // Register before the submit: an `Abort` landing in the gap must find the
     // entry, and a duplicate id is refused up front.
-    let (registration, cancel) = state.shared.registry.register(&request_id)?;
+    // The servicer's own probe is registered for cancellation and settling
+    // like a client's request, outside the active count the scrape reports.
+    let (registration, mut cancel) = match origin {
+        RequestOrigin::Client => state.shared.registry.register(&request_id)?,
+        RequestOrigin::HealthProbe => state.shared.registry.register_uncounted(&request_id)?,
+    };
+    let original = req.return_media_identity.then(|| req.clone());
+    let reused = super::media_identity::apply(state, &mut req);
+    // Hash fields are only accepted on an internally validated pixel-less hint
+    // or on the freshly processed Prefill result below.
+    if let Some(mm) = &mut req.mm_inputs {
+        if !reused {
+            mm.feature_hash = None;
+            for batch in &mut req.extra_mm_inputs {
+                batch.feature_hash = None;
+            }
+        }
+    }
+    if req.mm_inputs.as_ref().is_some_and(|mm| {
+        mm.pixel_values.is_none() && (!mm.image_urls.is_empty() || !mm.video_urls.is_empty())
+    }) {
+        if let Some(processor) = &state.media {
+            state.shared.metrics.media_identity("processed");
+            req = tokio::select! {
+                biased;
+                _ = &mut cancel => return Err(Status::cancelled("media request aborted")),
+                result = processor.process(req) => result?,
+            };
+        }
+    }
+    let mut early_identity = None;
+    if let Some(original) = original {
+        let mut identity = sg::MediaIdentity::default();
+        if super::media_identity::mode(state, "prefill") {
+            if let (Some(key), Some(hasher), Some(mm)) = (
+                super::media_identity::key(state),
+                state.mm_hasher.as_ref(),
+                req.mm_inputs.as_mut(),
+            ) {
+                if smg_grpc_client::sglang_media_identity::reusable_request(&original) {
+                    tokio::select! {
+                        biased;
+                        _ = &mut cancel => return Err(Status::cancelled("media identity request aborted")),
+                        result = hasher.precompute_proto(mm, &req.request_id) => result?,
+                    };
+                    identity = sg::MediaIdentity {
+                        version: smg_grpc_client::sglang_media_identity::VERSION,
+                        processor_key: key.to_string(),
+                        request_digest: smg_grpc_client::sglang_media_identity::request_digest(
+                            &original,
+                        ),
+                        input_ids: req
+                            .tokenized
+                            .as_ref()
+                            .map_or_else(Vec::new, |t| t.input_ids.clone()),
+                        mm_inputs: Some(smg_grpc_client::sglang_media_identity::pixel_less(mm)),
+                    };
+                    if smg_grpc_client::sglang_media_identity::validate(&identity, &original, key) {
+                        state.shared.metrics.media_identity("prepared");
+                    } else {
+                        identity = sg::MediaIdentity::default();
+                    }
+                }
+            }
+        }
+        early_identity = Some(sg::GenerateResponse {
+            request_id: req.request_id.clone(),
+            media_identity: Some(identity),
+            response: None,
+        });
+    }
     let streaming = req.stream;
     let prompt_tokens = req.tokenized.as_ref().map_or(0, |tokenized| {
         u32::try_from(tokenized.input_ids.len()).unwrap_or(u32::MAX)
@@ -60,30 +135,74 @@ pub(super) async fn generate(
     // encoders before the submit (the dispatcher the lifecycle owner
     // supplied); every other worker refuses such a request there.
     let subs = client
-        .generate_sglang_streams_dispatching(req, trace_headers, state.encode.as_ref())
+        .generate_sglang_streams_dispatching_with_mm_hasher(
+            req,
+            trace_headers,
+            state.encode.as_ref(),
+            state.mm_hasher.as_ref(),
+        )
         .await?;
-    let metrics = state.shared.metrics.request(
-        arrival,
-        subs.first().and_then(SglangGenerateStream::engine_index),
-        prompt_tokens,
-        max_tokens,
-        n,
-    );
-    let mut choices = SelectAll::new();
+    // A client's request is in the load tracker's view (in flight on the
+    // rank its first choice went to, the choice that reports the prompt,
+    // from here until the engine's first output or the stream's end, each
+    // choice's prefill sampled on the servicer's clock from here to its
+    // first output: this wire carries no engine timing) and in the request
+    // metrics; the servicer's own health probe is in neither.
+    let (probe, loads, metrics) = match origin {
+        RequestOrigin::Client => {
+            let at = Instant::now();
+            let rank = rank_of(
+                subs.iter()
+                    .find(|sub| sub.index() == 0)
+                    .or_else(|| subs.first())
+                    .and_then(SglangGenerateStream::engine_index),
+            );
+            (
+                state.shared.loads.submit(Submission {
+                    request_id: &request_id,
+                    rank,
+                    prompt_tokens,
+                    at,
+                }),
+                Some(PendingGuard::new(Arc::clone(state), &request_id)),
+                state.shared.metrics.request(
+                    arrival,
+                    subs.first().and_then(SglangGenerateStream::engine_index),
+                    prompt_tokens,
+                    max_tokens,
+                    n,
+                ),
+            )
+        }
+        RequestOrigin::HealthProbe => (
+            PrefillProbe::default(),
+            None,
+            state.shared.metrics.uncounted(),
+        ),
+    };
+    let mut choices = Choices::new();
     for sub in subs {
+        // Each choice's engine request went to its own rank (an unpinned
+        // fan-out is placed per choice): its tokens are credited there.
+        let load = match origin {
+            RequestOrigin::Client => {
+                ChoiceLoad::new(rank_of(sub.engine_index()), sub.index(), probe)
+            }
+            RequestOrigin::HealthProbe => ChoiceLoad::uncounted(),
+        };
         choices.push(ChoiceStream {
             request_id: Arc::clone(&request_id),
+            state: Arc::clone(state),
             inner: Some(sub),
             streaming,
             metrics: metrics.choice(),
+            load,
         });
     }
-    Ok(Box::pin(RequestStream::new(
-        choices,
-        cancel,
-        registration,
-        metrics,
-    )))
+    let stream = RequestStream::new(choices, cancel, registration, metrics).holding(loads);
+    Ok(Box::pin(
+        futures::stream::iter(early_identity.map(Ok)).chain(stream),
+    ))
 }
 
 /// `return_hidden_states` on a scheduler launched below `full`
@@ -119,6 +238,10 @@ struct ChoiceStream {
     streaming: bool,
     /// This choice's observation of the request's metrics.
     metrics: ChoiceMetrics,
+    /// The servicer state, for the load tracker.
+    state: Arc<State>,
+    /// This choice's share of the load tracker's bookkeeping.
+    load: ChoiceLoad,
 }
 
 impl ChoiceStream {
@@ -189,14 +312,31 @@ impl Stream for ChoiceStream {
             };
             let is_chunk = match item.response.as_ref() {
                 Some(vllm::generate_response::Response::Chunk(chunk)) => {
-                    this.metrics.chunk(
-                        u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX),
+                    let tokens = u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX);
+                    // The metrics' clock read serves the load tracker too.
+                    let at = this
+                        .metrics
+                        .chunk(tokens, chunk.prompt_tokens, chunk.cached_tokens)
+                        .unwrap_or_else(Instant::now);
+                    let loads = &this.state.shared.loads;
+                    this.load.count_prompt(
+                        loads,
+                        &this.request_id,
                         chunk.prompt_tokens,
                         chunk.cached_tokens,
+                        at,
                     );
+                    this.load.generated(loads, tokens, at);
                     true
                 }
                 Some(vllm::generate_response::Response::Complete(complete)) => {
+                    this.load.count_prompt(
+                        &this.state.shared.loads,
+                        &this.request_id,
+                        complete.prompt_tokens,
+                        complete.cached_tokens,
+                        Instant::now(),
+                    );
                     this.metrics.complete(
                         &complete.finish_reason,
                         complete.prompt_tokens,

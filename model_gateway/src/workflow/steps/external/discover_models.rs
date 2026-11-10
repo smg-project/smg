@@ -23,7 +23,7 @@ use crate::{
     reason = "Lazy static initialization — reqwest::Client::build() only fails on TLS backend misconfiguration which is unrecoverable"
 )]
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
-    crate::clients::http_client_builder()
+    crate::server::http_client_builder()
         .timeout(Duration::from_secs(30))
         .build()
         .expect("Failed to create HTTP client")

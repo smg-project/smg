@@ -28,12 +28,11 @@ rustup toolchain install nightly
 rustup component add rustfmt --toolchain nightly
 rustup component add clippy rustfmt
 
-# 3. Install pre-commit hooks (enforces rustfmt, clippy, DCO, no-AI-attribution, branch naming)
+# 3. Install the pre-commit, commit-msg and pre-push hooks (rustfmt, clippy, DCO, no-AI-attribution, branch naming)
 pip install pre-commit
 pre-commit install
-pre-commit install --hook-type commit-msg
 
-# 4. Create a branch (must match <type>/<desc> or <username>/<desc>)
+# 4. Create a branch (lowercase <type>/<desc> or <username>/<desc>; the rule is scripts/branch-name-check.sh)
 git checkout -b feat/my-change
 
 # 5. Build and test
@@ -98,6 +97,10 @@ The gateway's prefill-decode code uses one word per thing, so a reader never has
 
 "Leg" is not used for any of these: it meant all three at once, and it does not come back in code, comments, test names or log lines. Metric names and labels keep their published spelling.
 
+## Where a module's tests live
+
+Unit tests sit in `#[cfg(test)] mod tests` at the bottom of the file they test. When they outgrow the file, the whole module moves out of line under one name: `x.rs` declares `#[cfg(test)] mod tests;` once, and the tests live in `x/tests.rs`. Past about 1,500 lines, and once the tests fall into named topics, `x/tests.rs` becomes a directory: `x/tests/mod.rs` declares one file per topic (`x/tests/eof.rs`, `x/tests/usage.rs`; the directory already says they are tests, so the files carry no `_tests` suffix; a topic keeps a distinct name when the bare word would shadow a crate or a sibling module, so the Symphony cases are `symphony_chat.rs`, not `symphony.rs`), and the recorded fixtures the tests read sit in `x/tests/fixtures/`. A directory `x/` whose only child is production code is a submodule tree with one leaf: fold the leaf back into `x.rs`, or give the tree the children its name promises. A move is `git mv` plus the `mod` and `use` lines, never a test body change, so the diff reads as renames and the test list before and after is the same.
+
 ## Pull requests
 
 - **Fill in the [PR template](./.github/PULL_REQUEST_TEMPLATE.md)** — especially
@@ -161,7 +164,8 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_GPU_2` | `2-gpu-h100` | 2-GPU e2e jobs |
 | `SMG_RUNNER_GPU_4` | `4-gpu-h100` | 4-GPU e2e and benchmark jobs |
 | `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD nightly benchmark (off unless `SMG_RUN_AMD_LEGS` is `true`) |
-| `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD legs of the BFCL A/B and AMD rows of the nightly PD sweep (off unless `SMG_RUN_AMD_LEGS` is `true`) |
+| `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD BFCL and nightly PD runner; automatic AMD selection requires `SMG_RUN_AMD_LEGS=true` |
+| `SMG_RUN_AMD_BFCL` | `false` | Required for every AMD BFCL selection, including explicit dispatch; keep off until shared-host admission and owned teardown are qualified |
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.
@@ -211,6 +215,17 @@ if: github.repository == 'smg-project/smg' || vars.SMG_RUN_BENCHMARKS == 'true'
 They stay off in a fork until you set `SMG_RUN_BENCHMARKS` to `true`. Only
 `benchmark-radix-tree` runs on the self-hosted CPU pool, so it also needs
 `SMG_RUNNER_CPU`; the other four are on `ubuntu-latest` and need nothing else.
+
+A pull request's bench binary is gated against the base's by `scripts/bench_gate.py`,
+with the thresholds of `.github/bench-gates/*.toml`. A gated bench binary's sources, the
+bench file and what it includes (the gate file's `sources`), stay byte-identical unless
+the change is to what they measure: the bench profile links one codegen unit under thin
+LTO, so a row linked into the binary changes the inlining of the code the other rows
+time, and the gated rows move with the measured crate untouched. A new row goes to a
+bench target of its own, with a gate file of its own when it is to be gated. The gate
+builds the base's binary with the pull request's bench sources, so the rows compare the
+measured code alone, and its report names the case where those sources do not build on
+the base.
 
 The `release-*`, `nightly-*` and `stale` workflows are deliberately **not**
 opt-in — a fork should not publish artifacts or manage upstream's issues.

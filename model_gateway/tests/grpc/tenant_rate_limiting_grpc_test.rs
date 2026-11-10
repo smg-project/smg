@@ -4,7 +4,7 @@
 //! in isolation.
 //!
 //! Calls `RouterTrait` methods directly, mirroring
-//! `routers/grpc/router.rs`'s own `pd_tests` module, rather than going
+//! `routers/grpc/router.rs`'s own `tests` module (`router/tests.rs`), rather than going
 //! through the full HTTP app: `test_harness/src/test_app.rs`'s lightweight test
 //! app doesn't wire the tenant-resolution middleware that would otherwise
 //! populate `tenant_request_meta`, so a real per-request tenant identity is
@@ -27,6 +27,7 @@ use std::{
 
 use async_trait::async_trait;
 use common::{
+    engine_answers::{TokenSpeedAnswers, VllmAnswers},
     grpc_harness::{
         grpc_router, grpc_router_config, grpc_test_context_with_rate_limiter,
         grpc_test_context_with_tokenizer, grpc_worker, serve_canned_worker, serve_engine, Canned,
@@ -61,12 +62,8 @@ use smg::{
     tenant::TenantKey,
     worker::{RuntimeType, Worker, WorkerType},
 };
-use smg_grpc_client::{
-    tokenspeed_scheduler::tokenspeed_proto::token_speed_scheduler_server::TokenSpeedSchedulerServer,
-    vllm_proto as proto,
-};
+use smg_grpc_client::vllm_proto as proto;
 use tokio::time::timeout;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
@@ -152,7 +149,7 @@ impl KeepingBackend {
 
 #[async_trait]
 impl RateLimitBackend for KeepingBackend {
-    async fn reserve(&self, request: ReserveRequest) -> ReserveOutcome {
+    async fn reserve(&self, request: ReserveRequest<'_>) -> ReserveOutcome {
         if !self.seen.lock().insert(request.request_charge_id) {
             return ReserveOutcome::Admitted;
         }
@@ -406,8 +403,8 @@ async fn feature_disabled_is_a_no_op() {
 /// routes into it, and PD needs a distinct prefill+decode worker pair --
 /// both larger harness investments than this suite carries for its other
 /// cases, and the underlying reserve/settle mechanics they'd exercise are
-/// identical to what's already proven above and in `pipeline.rs`'s own
-/// `rate_limit_reserve_tests` (which drives `RateLimitReserveStage` directly
+/// identical to what's already proven above and in the pipeline's own
+/// `tests/rate_limit_reserve.rs` (which drives `RateLimitReserveStage` directly
 /// rather than through a real backend).
 #[tokio::test]
 async fn completion_denial_reaches_the_client() {
@@ -440,30 +437,7 @@ struct EmbedEngine {
 }
 
 #[tonic::async_trait]
-impl proto::vllm_engine_server::VllmEngine for EmbedEngine {
-    async fn start_profile(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::StartProfileRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    async fn stop_profile(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::StopProfileRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    type GenerateStream = ReceiverStream<Result<proto::GenerateResponse, Status>>;
-
-    async fn generate(
-        &self,
-        _request: Request<proto::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
+impl VllmAnswers for EmbedEngine {
     async fn embed(
         &self,
         _request: Request<proto::EmbedRequest>,
@@ -477,73 +451,6 @@ impl proto::vllm_engine_server::VllmEngine for EmbedEngine {
             embedding_dim: 2,
         }))
     }
-
-    async fn abort(
-        &self,
-        _request: Request<proto::AbortRequest>,
-    ) -> Result<Response<proto::AbortResponse>, Status> {
-        Ok(Response::new(proto::AbortResponse::default()))
-    }
-
-    async fn flush_cache(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::FlushCacheRequest>,
-    ) -> Result<Response<smg_grpc_client::common_proto::FlushCacheResponse>, Status> {
-        Ok(Response::new(
-            smg_grpc_client::common_proto::FlushCacheResponse::default(),
-        ))
-    }
-
-    async fn health_check(
-        &self,
-        _request: Request<proto::HealthCheckRequest>,
-    ) -> Result<Response<proto::HealthCheckResponse>, Status> {
-        Ok(Response::new(proto::HealthCheckResponse {
-            healthy: true,
-            ..Default::default()
-        }))
-    }
-
-    async fn get_model_info(
-        &self,
-        _request: Request<proto::GetModelInfoRequest>,
-    ) -> Result<Response<proto::GetModelInfoResponse>, Status> {
-        Ok(Response::new(proto::GetModelInfoResponse::default()))
-    }
-
-    async fn get_server_info(
-        &self,
-        _request: Request<proto::GetServerInfoRequest>,
-    ) -> Result<Response<proto::GetServerInfoResponse>, Status> {
-        Ok(Response::new(proto::GetServerInfoResponse::default()))
-    }
-
-    async fn get_loads(
-        &self,
-        _request: Request<proto::GetLoadsRequest>,
-    ) -> Result<Response<proto::GetLoadsResponse>, Status> {
-        Ok(Response::new(proto::GetLoadsResponse::default()))
-    }
-
-    type GetTokenizerStream =
-        ReceiverStream<Result<smg_grpc_client::common_proto::GetTokenizerChunk, Status>>;
-
-    async fn get_tokenizer(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
-
-    type SubscribeKvEventsStream =
-        ReceiverStream<Result<smg_grpc_client::common_proto::KvEventBatch, Status>>;
-
-    async fn subscribe_kv_events(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented("unused in this test"))
-    }
 }
 
 /// A router over one [`EmbedEngine`] serving [`MODEL`] on the vLLM wire.
@@ -551,7 +458,7 @@ async fn build_embed_router(
     budget: Option<Budget>,
     engine: EmbedEngine,
 ) -> (Box<dyn RouterTrait>, Option<tempfile::TempDir>) {
-    let port = serve_engine(proto::vllm_engine_server::VllmEngineServer::new(engine)).await;
+    let port = serve_engine(engine.into_server()).await;
     let worker = grpc_worker(
         port,
         WorkerType::Regular,
@@ -916,12 +823,15 @@ async fn build_tool_loop_router(
     Option<tempfile::TempDir>,
     MockMCPServer,
 ) {
-    let port = serve_engine(TokenSpeedSchedulerServer::new(ScriptedWorker {
-        output_tokens,
-        finish_reasons: vec!["stop"],
-        generation: Default::default(),
-        requests: Default::default(),
-    }))
+    let port = serve_engine(
+        ScriptedWorker {
+            output_tokens,
+            finish_reasons: vec!["stop"],
+            generation: Default::default(),
+            requests: Default::default(),
+        }
+        .into_server(),
+    )
     .await;
     let worker = grpc_worker(
         port,

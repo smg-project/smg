@@ -35,7 +35,7 @@ use crate::{
     tagged::{
         assembler::push_escaped,
         end_cut_call,
-        value::{cut as cut_json, json, python_literal, Kind},
+        value::{cut as cut_json, json, python_literal, reads_back_as_an_argument, Kind},
     },
     Declared,
 };
@@ -761,7 +761,7 @@ impl Assembler {
         let value = match self.values {
             Values::Quoted => quoted_value(&text, kind),
             Values::Python | Values::Json => python_literal(&text)
-                .filter(|json| reads_back(json))
+                .filter(|json| reads_back_as_an_argument(json))
                 .unwrap_or_else(|| json(&text, None)),
         };
         self.push_member(key, &value, out);
@@ -830,7 +830,7 @@ impl Assembler {
                 return Some(json(inner, kind));
             }
         }
-        python_literal(text).filter(|json| reads_back(json))
+        python_literal(text).filter(|json| reads_back_as_an_argument(json))
     }
 
     /// The call's own `)`: `}` (or `{}`) with `source`, then `ToolCallEnd` with the parenthesis.
@@ -903,11 +903,6 @@ impl Assembler {
     }
 }
 
-/// Whether `json` is one JSON value a client can take as an argument.
-fn reads_back(json: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(json).is_ok()
-}
-
 /// A value under [`Values::Quoted`]: between double quotes, the text inside them as it stands,
 /// since the template writes the string's characters as they are and decodes no escape (a
 /// backslash and an `r` in a value are those two characters, not a carriage return, and a
@@ -920,7 +915,7 @@ fn quoted_value(text: &str, kind: Option<Kind>) -> String {
         return json(inner, kind);
     }
     python_literal(text)
-        .filter(|json| reads_back(json))
+        .filter(|json| reads_back_as_an_argument(json))
         .unwrap_or_else(|| json(text, kind))
 }
 
@@ -1005,7 +1000,10 @@ mod tests {
     use serde_json::json as value;
 
     use super::*;
-    use crate::testing::{bytes, content, tool};
+    use crate::{
+        json::PartialJson,
+        testing::{arguments, bytes, content, tool},
+    };
 
     fn ids() -> CallIds {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
@@ -1056,6 +1054,39 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A list nested past the bound the crate's JSON reader puts on a call's arguments, the
+    /// arguments object counted: the value is a string holding its text, as any text that reader
+    /// does not take is, whole at the call's `)` and at a cut alike, so that the fragments stay a
+    /// prefix the reader takes (the fuzz campaign's `json-prefix` class on this syntax). One level
+    /// shallower reads as the JSON it is.
+    #[test]
+    fn a_value_nested_past_the_json_readers_bound_is_a_string_whole_and_cut() {
+        let past = PartialJson::DEFAULT_MAX_DEPTH;
+        let deep = format!("{}1{}", "[".repeat(past), "]".repeat(past));
+        let within = format!("{}1{}", "[".repeat(past - 1), "]".repeat(past - 1));
+        assert_eq!(
+            arguments(&run(&[&format!("f(a={deep})")])),
+            format!("{{\"a\": \"{deep}\"}}")
+        );
+        assert_eq!(
+            arguments(&run(&[&format!("f(a={within})")])),
+            format!("{{\"a\": {within}}}")
+        );
+        let open = "[".repeat(past);
+        assert_eq!(
+            arguments(&Ending::Stream.run(&[&format!("f(a={open}")])),
+            format!("{{\"a\": \"{open}")
+        );
+        // A value cut right after a `\u` escape short of its digits: no JSON prefix the crate's
+        // own judge takes (a strict reader reads four bytes past the text's end rather than
+        // refuse the quote), so a string holding its text.
+        let short = "[\"\\u1\"]";
+        assert_eq!(
+            arguments(&Ending::Stream.run(&[&format!("f(a={short}")])),
+            "{\"a\": \"[\\\"\\\\u1\\\"]"
+        );
     }
 
     /// Content with a `[name(` of its own: a name no tool declares is given back as content at its
@@ -2290,6 +2321,17 @@ mod tests {
                 "",
                 Found::Open,
             ),
+            // The fuzz campaign's `empty-arguments` class on this syntax: a call of no
+            // arguments at its `)`, at its list's `]`, and before a second call the ending
+            // cuts; a second name cut before its parenthesis.
+            ("[get_weather()", "", Found::Whole),
+            ("[get_weather()]", "]", Found::Wrapping),
+            ("[get_weather(), get_stock_price(", "", Found::Open),
+            (
+                "[get_weather(city='Paris'), get_stock_price",
+                "get_stock_price",
+                Found::Name,
+            ),
         ];
         for ending in [Ending::Close, Ending::Stream] {
             for (text, held, found) in cuts {
@@ -2365,14 +2407,18 @@ mod tests {
                             assert_eq!(said(&events), [*held], "{place}: the name");
                         }
                     }
-                    if *found != Found::Open {
-                        assert!(
-                            calls(&events)
-                                .iter()
-                                .all(|(_, _, arguments)| arguments.ends_with('}')),
-                            "{place}: every call is whole"
-                        );
-                    }
+                    // Every call before the cut is whole; where nothing is cut, every call.
+                    let made = calls(&events);
+                    let before_the_cut = match found {
+                        Found::Open => &made[..made.len() - 1],
+                        _ => &made[..],
+                    };
+                    assert!(
+                        before_the_cut
+                            .iter()
+                            .all(|(_, _, arguments)| arguments.ends_with('}')),
+                        "{place}: every call before the cut is whole"
+                    );
                 }
             }
         }

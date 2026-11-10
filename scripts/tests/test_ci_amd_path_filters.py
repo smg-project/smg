@@ -10,7 +10,6 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/pr-test-rust.yml"
 AREAS = (
     "chat-completions",
-    "chat-symphony",
     "completions",
     "embeddings",
     "realtime",
@@ -31,8 +30,6 @@ def lane_decisions(path, tmp_path, monkeypatch):
         "DOCS": "false",
         "NON_DOCS": "true",
         "TESTS": "false",
-        "SYMPHONY": "false",
-        "OUTSIDE_SYMPHONY": "true",
         "GITHUB_OUTPUT": str(outputs),
     }.items():
         monkeypatch.setenv(key, value)
@@ -48,11 +45,11 @@ def lane_decisions(path, tmp_path, monkeypatch):
     [
         (
             "scripts/ci_setup_sglang_rocm_image.sh",
-            "chat-completions chat-symphony completions embeddings agentic go-bindings",
+            "chat-completions completions embeddings agentic go-bindings",
         ),
         (
             "scripts/ci_setup_vllm_rocm_image.sh",
-            "chat-completions chat-symphony completions embeddings realtime",
+            "chat-completions completions embeddings realtime",
         ),
         ("scripts/ci_check_e2e_dependencies.py", " ".join(AREAS)),
         ("scripts/ci_check_vllm_engine_units.py", " ".join(AREAS)),
@@ -74,3 +71,14 @@ def test_unrelated_changes_do_not_select_gpu_lanes(tmp_path, monkeypatch, path):
 
 def test_unclassified_paths_keep_the_full_coverage_fallback(tmp_path, monkeypatch):
     assert lane_decisions("new-subsystem/source.py", tmp_path, monkeypatch) == set(AREAS)
+
+
+def test_a_symphony_only_change_reaches_every_engines_chat_messages_and_responses_lanes(
+    tmp_path, monkeypatch
+):
+    """Symphony is the default parser, so a change confined to its crate reaches the lanes
+    of every engine's chat, messages and responses path (the tier table's row); the chat
+    lanes read through it, and no lane pins it any more."""
+    assert lane_decisions("crates/symphony/src/lib.rs", tmp_path, monkeypatch) == set(
+        "chat-completions agentic vendor".split()
+    )

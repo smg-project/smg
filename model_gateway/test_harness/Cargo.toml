@@ -28,10 +28,14 @@ futures.workspace = true
 futures-util = "0.3"
 http.workspace = true
 http-body-util = "0.1"
+# The metrics a test case emits, captured by a recorder local to the case (the
+# gateway's own versions).
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 openssl = "0.10.81"
 rand.workspace = true
 reqwest = { workspace = true, features = ["stream", "blocking", "json", "rustls-no-provider", "multipart", "http2"] }
-rmcp = { version = "1.7", features = ["client"] }
+rmcp = { version = "3.9", features = ["client"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2"
 serde_json = { version = "1.0", default-features = false, features = ["std", "preserve_order", "raw_value"] }
