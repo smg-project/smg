@@ -36,8 +36,8 @@ use crate::{
     native::{AddedTokens, NativeEncoder},
     tekken,
     traits::{
-        past_emitted, ChatTemplateOutput, DecodeStep, Decoder, EncodeJob, Encoder, Encoding,
-        IncrementalDecoder, PromptEncoding, RendererCapabilities, SpecialTokens, TokenIdType,
+        ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, IncrementalDecoder,
+        PromptEncoding, RendererCapabilities, SpecialTokens, TokenIdType,
         Tokenizer as TokenizerTrait,
     },
 };
@@ -1240,30 +1240,6 @@ impl Decoder for TiktokenTokenizer {
                 Ok(String::from_utf8_lossy(&bytes).into_owned())
             }
         }
-    }
-
-    /// The end of a stream on the generic window (a vocabulary without the
-    /// per-id table): the held bytes as `decode` renders them, a character
-    /// the end cut short as its replacement character; a window of ranks
-    /// ends inside a character as easily as the per-stream decoder's buffer
-    /// does.
-    fn finish_decode(
-        &self,
-        ids: &mut Vec<TokenIdType>,
-        prefix: &mut String,
-        prefix_index: &mut usize,
-        skip_special_tokens: bool,
-    ) -> Result<DecodeStep> {
-        let step = if ids.len() <= *prefix_index {
-            DecodeStep::default()
-        } else {
-            let decoded = self.decode(ids, skip_special_tokens)?;
-            past_emitted(&decoded, prefix)
-        };
-        ids.clear();
-        prefix.clear();
-        *prefix_index = 0;
-        Ok(step)
     }
 
     /// Every id stands for fixed bytes, so one stream needs only a

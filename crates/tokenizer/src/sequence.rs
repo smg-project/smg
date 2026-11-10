@@ -245,7 +245,11 @@ impl Sequence {
     /// text after it, a complete character held with the bytes after it, a
     /// character the end cut short, its first bytes with no token to finish
     /// it, as the replacement character), rendered as the full decode
-    /// renders the end of the same ids. That holds whatever ended the
+    /// renders the end of the same ids; the one exception is a ByteFallback
+    /// vocabulary's window, which keeps a cut character's byte tokens off
+    /// its end and releases nothing for them (see
+    /// [`IncrementalDecoder::finish_into`](crate::traits::IncrementalDecoder::finish_into)).
+    /// That holds whatever ended the
     /// stream, a length limit or a stop token the stop decoder matched (the
     /// stop token never goes through the decoder, and a visible stop's own
     /// text follows the held text); a token the decoder does see after those

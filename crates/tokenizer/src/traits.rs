@@ -129,8 +129,9 @@ pub trait Encoder: Send + Sync {
 ///
 /// Implementations own whatever they need (pending bytes, a decode window)
 /// and must produce, over a whole stream, steps and finish together, the
-/// text [`Decoder::decode`] gives for all of its ids, except for a character
-/// the stream's end cut short, for which the finish releases nothing (see
+/// text [`Decoder::decode`] gives for all of its ids, a character the
+/// stream's end cut short included, as the replacement character (the one
+/// exception, a ByteFallback vocabulary's window, is named at
 /// [`finish_into`](Self::finish_into)).
 pub trait IncrementalDecoder: Send + Sync {
     /// Feed one token; returns the text that became final with it (empty when
@@ -249,14 +250,13 @@ pub trait Decoder: Send + Sync {
     /// decoder whose final text no longer starts with what it emitted reports
     /// `prefix_mismatch` and returns the remainder instead of failing. The
     /// default releases what [`decode_step`](Self::decode_step) holds: the
-    /// window's decode past the emitted prefix, and leaves the window empty.
-    /// A window of whole-character tokens holds back only a literal
-    /// replacement character, which is text; the decoders whose window can
-    /// hold the bytes of an unfinished character (a tiktoken vocabulary
-    /// without its per-id table, a Hugging Face vocabulary with byte fallback
-    /// or with a byte-level decoder inside a sequence) override this so that
-    /// a character the end cut short is released as nothing, not as the
-    /// replacement character `decode` renders for it.
+    /// window's decode past the emitted prefix, and leaves the window empty;
+    /// a window that holds the bytes of a character the end cut short (a
+    /// tiktoken vocabulary without its per-id table) releases them as
+    /// `decode` renders them, the replacement character. A Hugging Face
+    /// vocabulary with byte fallback overrides this: its window keeps a cut
+    /// character's byte tokens off its end (see
+    /// [`IncrementalDecoder::finish_into`]).
     fn finish_decode(
         &self,
         ids: &mut Vec<TokenIdType>,
