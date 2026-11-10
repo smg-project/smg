@@ -8,7 +8,8 @@ use ndarray::Array2;
 
 use super::*;
 use crate::routers::grpc::multimodal::{
-    config::MultimodalConfigRegistry, settings::MultimodalSettings,
+    config::MultimodalConfigRegistry, encoder_budget::ItemOverEncoderBudget,
+    settings::MultimodalSettings,
 };
 
 #[derive(Default)]
@@ -23,6 +24,9 @@ struct Processor {
     reorder: bool,
     /// The config's `rescale_factor`, as a processor built from it retains it.
     scale: f32,
+    /// Whether the size-only count is the width, the count the preprocessing
+    /// produces, rather than one.
+    size_counted: bool,
 }
 
 impl VisionPreProcessor for Processor {
@@ -35,8 +39,8 @@ impl VisionPreProcessor for Processor {
     fn default_std(&self) -> [f64; 3] {
         [1.0; 3]
     }
-    fn calculate_num_tokens(&self, _: u32, _: u32) -> Result<usize, TransformError> {
-        Ok(1)
+    fn calculate_num_tokens(&self, width: u32, _: u32) -> Result<usize, TransformError> {
+        Ok(if self.size_counted { width as usize } else { 1 })
     }
     fn model_name(&self) -> &'static str {
         "cache-test"
@@ -103,18 +107,45 @@ fn model_config(
     reorder: bool,
     preprocessor_config: PreProcessorConfig,
 ) -> MultimodalModelConfig {
-    let processor = Arc::new(Processor {
+    let processor = Processor {
         calls: calls.clone(),
         independent,
         reorder,
         scale: preprocessor_config.rescale_factor.unwrap_or(1.0) as f32,
-    });
+        size_counted: false,
+    };
+    config_with(processor, preprocessor_config)
+}
+
+/// A Qwen2-VL model config whose processor counts an image's feature tokens
+/// from its size as its preprocessing produces them (one per pixel of
+/// width), so a size alone can put an image over a budget.
+fn size_counted_config(calls: &Arc<Calls>) -> MultimodalModelConfig {
+    let processor = Processor {
+        calls: calls.clone(),
+        independent: true,
+        reorder: false,
+        scale: 1.0,
+        size_counted: true,
+    };
+    config_with(processor, PreProcessorConfig::default())
+}
+
+/// A Qwen2-VL model config with `preprocessor_config` and `processor` in the
+/// place of the one its spec would build.
+fn config_with(
+    processor: Processor,
+    preprocessor_config: PreProcessorConfig,
+) -> MultimodalModelConfig {
     MultimodalModelConfig::new(
         serde_json::json!({"model_type": "qwen2_vl"}),
         preprocessor_config,
         None,
     )
-    .with_vision_processors("qwen_vl", VisionProcessors::of("qwen_vl", processor))
+    .with_vision_processors(
+        "qwen_vl",
+        VisionProcessors::of("qwen_vl", Arc::new(processor)),
+    )
 }
 
 fn setup(
@@ -150,42 +181,89 @@ async fn run_for(
     tokenizer_id: &str,
     image_wire_dtype: Option<EncoderDtype>,
 ) -> PreprocessedEncoderInputs {
-    let media = MediaBatch::Images(
-        ids.iter()
-            .map(|&id| {
-                Arc::new(ImageFrame::new(
-                    image::DynamicImage::new_rgb8(id, 1),
-                    Default::default(),
-                    Default::default(),
-                    ImageSource::InlineBytes,
-                    id.to_string(),
-                ))
-            })
-            .collect(),
-    );
+    run_budgeted(
+        components,
+        config,
+        ids,
+        tokenizer_id,
+        image_wire_dtype,
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+/// `ids` as images of that width and a height of one, through the stage
+/// under `encoder_budget`.
+async fn run_budgeted(
+    components: &MultimodalComponents,
+    config: &MultimodalModelConfig,
+    ids: &[u32],
+    tokenizer_id: &str,
+    image_wire_dtype: Option<EncoderDtype>,
+    encoder_budget: Option<usize>,
+) -> Result<PreprocessedEncoderInputs> {
     let metadata = ModelMetadata {
         model_id: "qwen2-vl",
         tokenizer: &NoTokenizer,
         config: &config.config,
     };
     let spec = components.model_registry.lookup(&metadata).unwrap();
-    preprocess_modality(
-        &media,
-        &PlanContext {
-            components,
-            model_id: metadata.model_id,
-            model_type: Some("qwen2_vl"),
-            spec,
-            tokenizer_id,
-            model_config: config,
-            vision_processors: config.vision_processors(spec),
-            image_wire_dtype,
-            transparency: TransparencyPolicy::KeepAlpha,
-            encoder_budget: None,
-        },
+    let ctx = context(
+        components,
+        config,
+        spec,
+        metadata.model_id,
+        tokenizer_id,
+        image_wire_dtype,
+        encoder_budget,
+    );
+    preprocess_modality(&images_of_width(ids), &ctx).await
+}
+
+/// One `width` x 1 frame per entry of `widths`, from pixels.
+fn images_of_width(widths: &[u32]) -> MediaBatch {
+    MediaBatch::Images(
+        widths
+            .iter()
+            .map(|&width| {
+                Arc::new(ImageFrame::new(
+                    image::DynamicImage::new_rgb8(width, 1),
+                    Default::default(),
+                    Default::default(),
+                    ImageSource::InlineBytes,
+                    width.to_string(),
+                ))
+            })
+            .collect(),
     )
-    .await
-    .unwrap()
+}
+
+/// The stage's context for `config` and `spec`, under `encoder_budget`.
+fn context<'a>(
+    components: &'a MultimodalComponents,
+    config: &'a MultimodalModelConfig,
+    spec: &'a dyn ModelProcessorSpec,
+    model_id: &'a str,
+    tokenizer_id: &'a str,
+    image_wire_dtype: Option<EncoderDtype>,
+    encoder_budget: Option<usize>,
+) -> PlanContext<'a> {
+    PlanContext {
+        components,
+        model_id,
+        model_type: config
+            .config
+            .get("model_type")
+            .and_then(serde_json::Value::as_str),
+        spec,
+        tokenizer_id,
+        model_config: config,
+        vision_processors: config.vision_processors(spec),
+        image_wire_dtype,
+        transparency: TransparencyPolicy::KeepAlpha,
+        encoder_budget,
+    }
 }
 
 /// A result preprocessed for one wire dtype is served again for that wire
@@ -312,6 +390,172 @@ async fn large_batches_unconfirmed_processors_and_disabled_cache_use_batch_path(
         } else {
             assert_eq!(*batches, vec![ids]);
         }
+    }
+}
+
+/// An image whose header size alone puts it over the engine's budget is
+/// refused before the processor is asked for anything, with the item's
+/// place, its count and the budget, on the pixel cache's per-image path and
+/// on the whole-batch path alike; at the budget the same images are
+/// preprocessed.
+#[tokio::test]
+async fn an_image_over_the_budget_on_its_size_is_refused_before_any_preprocessing() {
+    for cached in [true, false] {
+        let (mut components, calls, _) = setup(true, false);
+        if !cached {
+            components.pixel_cache = None;
+        }
+        let config = size_counted_config(&calls);
+        let error = run_budgeted(&components, &config, &[2, 3], "tok", None, Some(2))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ItemOverEncoderBudget>(),
+            Some(&ItemOverEncoderBudget {
+                modality: Modality::Image,
+                position: 2,
+                count: 2,
+                feature_tokens: 3,
+                sampled_frames: None,
+                budget: 2,
+            }),
+            "cached {cached}: {error:#}"
+        );
+        assert!(
+            calls.batches.lock().unwrap().is_empty(),
+            "cached {cached}: nothing is preprocessed before the refusal"
+        );
+        let result = run_budgeted(&components, &config, &[2, 3], "tok", None, Some(3))
+            .await
+            .unwrap();
+        assert_eq!(result.feature_token_counts, [2, 3]);
+        assert_eq!(
+            calls.batches.lock().unwrap().len(),
+            if cached { 2 } else { 1 },
+            "cached {cached}"
+        );
+    }
+}
+
+/// The size-only check and the check on the produced counts are one rule
+/// applied twice: a processor whose size-only count is under the budget and
+/// whose produced count is over passes the first, is preprocessed, and is
+/// refused by the second on the produced count.
+#[tokio::test]
+async fn the_produced_count_is_held_to_the_budget_after_the_size_was() {
+    let (components, calls, config) = setup(true, false);
+    let metadata = ModelMetadata {
+        model_id: "qwen2-vl",
+        tokenizer: &NoTokenizer,
+        config: &config.config,
+    };
+    let spec = components.model_registry.lookup(&metadata).unwrap();
+    let ctx = context(&components, &config, spec, "qwen2-vl", "tok", None, Some(1));
+    let error = prepare_parts(
+        vec![images_of_width(&[2])],
+        &ctx,
+        &metadata,
+        &llm_tokenizer::MockTokenizer::new(),
+    )
+    .await
+    .err()
+    .expect("the refusal on the produced count");
+    assert_eq!(
+        error.downcast_ref::<ItemOverEncoderBudget>(),
+        Some(&ItemOverEncoderBudget {
+            modality: Modality::Image,
+            position: 1,
+            count: 1,
+            feature_tokens: 2,
+            sampled_frames: None,
+            budget: 1,
+        }),
+        "{error:#}"
+    );
+    assert_eq!(*calls.batches.lock().unwrap(), vec![vec![2]]);
+}
+
+/// Every image family the registry builds from a model type alone is held to
+/// the budget on its header size: one token over is refused before any
+/// decode (the frame's bytes are empty, so a decode would fail rather than
+/// count), and at the budget a small image goes through the family's own
+/// preprocessing, which produces the count its size gave.
+#[tokio::test]
+async fn every_image_family_is_held_to_the_budget_on_its_header_size() {
+    for model_type in [
+        "qwen2_vl",
+        "qwen3_vl",
+        "step3_vl",
+        "deepseek_v41",
+        "llava",
+        "llava_next",
+        "phi3_v",
+        "llama4",
+        "kimi_k25",
+        "kimi_k3",
+        "inkling",
+        "muse_spark",
+    ] {
+        let (components, _, _) = setup(true, false);
+        let config = MultimodalModelConfig::new(
+            serde_json::json!({"model_type": model_type}),
+            PreProcessorConfig::default(),
+            None,
+        );
+        let metadata = ModelMetadata {
+            model_id: model_type,
+            tokenizer: &NoTokenizer,
+            config: &config.config,
+        };
+        let spec = components
+            .model_registry
+            .lookup(&metadata)
+            .unwrap_or_else(|| panic!("{model_type}: no spec"));
+        let processors = config.vision_processors(spec);
+        let processor = processors
+            .image()
+            .unwrap_or_else(|error| panic!("{model_type}: {error:#}"));
+        let ctx = |budget| context(&components, &config, spec, model_type, "tok", None, budget);
+
+        let (width, height) = (1600, 1200);
+        let count = processor.calculate_num_tokens(width, height).unwrap();
+        let header_only = MediaBatch::Images(vec![Arc::new(ImageFrame::encoded(
+            Default::default(),
+            Default::default(),
+            ImageSource::InlineBytes,
+            format!("{model_type}-header"),
+            ImageSize::new(width, height),
+            None,
+        ))]);
+        let error = preprocess_modality(&header_only, &ctx(Some(count - 1)))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ItemOverEncoderBudget>(),
+            Some(&ItemOverEncoderBudget {
+                modality: Modality::Image,
+                position: 1,
+                count: 1,
+                feature_tokens: count,
+                sampled_frames: None,
+                budget: count - 1,
+            }),
+            "{model_type}: {error:#}"
+        );
+
+        let (width, height) = (64, 64);
+        let count = processor.calculate_num_tokens(width, height).unwrap();
+        let small = MediaBatch::Images(vec![Arc::new(ImageFrame::new(
+            image::DynamicImage::new_rgb8(width, height),
+            Default::default(),
+            Default::default(),
+            ImageSource::InlineBytes,
+            format!("{model_type}-small"),
+        ))]);
+        let result = preprocess_modality(&small, &ctx(Some(count)))
+            .await
+            .unwrap_or_else(|error| panic!("{model_type}: {error:#}"));
+        assert_eq!(result.feature_token_counts, [count], "{model_type}");
     }
 }
 
