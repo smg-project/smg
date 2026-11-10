@@ -217,6 +217,30 @@ jobs:
               raise SystemExit("Mooncake PD gateway startup floor must not exceed 60 seconds")
           PY
 
+      # This is an input check, not HIP transfer qualification. Operators must
+      # approve the immutable image and enable the caller separately.
+      - name: Validate AMD Mooncake image input
+        if: inputs.gpu_vendor == 'amd' && inputs.engine == 'vllm'
+        env:
+          PROFILE_INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          inputs = json.loads(os.environ["PROFILE_INPUTS"])
+          backends = [inputs.get("vllm_kv_backend", ""), inputs.get("kv_backend", "")]
+          backends += inputs.get("vllm_extra_kv_backends", "").split(",")
+          if "mooncake" not in {value.strip().lower() for value in backends}:
+              raise SystemExit(0)
+          image = inputs.get("container_image", "")
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}", image):
+              raise SystemExit("AMD Mooncake requires an explicitly qualified image pinned by sha256")
+          if image.rsplit("@sha256:", 1)[1] == "749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f":
+              raise SystemExit("The stock 749f6f3 AMD image has no Mooncake; supply a qualified image")
+          PY
+
       - name: Checkout code
         uses: actions/checkout@v7
 

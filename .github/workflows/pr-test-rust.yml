@@ -2008,6 +2008,7 @@ jobs:
       always()
       && !cancelled()
       && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_AMD_MOONCAKE_IMAGE != ''
       && vars.SMG_RUN_AMD_VLLM_PD2_MOONCAKE == 'true'
       && vars.SMG_RUNNER_AMD_GPU_2 != ''
       && needs.build-wheel.result == 'success'
@@ -2029,7 +2030,7 @@ jobs:
       startup_profile: "vllm-mooncake-pd2"
       worker_log_filter: info,engine_servicer::request=debug
       gpu_vendor: amd
-      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_image: ${{ vars.SMG_AMD_MOONCAKE_IMAGE }}
       container_options: ${{ format('{0} --ulimit memlock=-1:-1', vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN') }}
     secrets: inherit
 
@@ -2316,6 +2317,7 @@ jobs:
       always()
       && !cancelled()
       && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_AMD_MOONCAKE_IMAGE != ''
       && vars.SMG_RUN_AMD_NIXL_PD4 == 'true'
       && vars.SMG_RUNNER_AMD_GPU_4 != ''
       && needs.e2e-1gpu-gateway.result == 'success'
@@ -2337,7 +2339,7 @@ jobs:
       worker_log_filter: info,engine_servicer::request=debug
       min_selected: 14 # Full original17-ID coverage is separate from this floor.
       gpu_vendor: amd
-      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_image: ${{ vars.SMG_AMD_MOONCAKE_IMAGE }}
       container_options: ${{ format('{0} --ulimit memlock=-1:-1', vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN') }}
     secrets: inherit
 

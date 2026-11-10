@@ -1018,3 +1018,85 @@ def test_original1_caller_keeps_original_cohort_caps_and_optin_gate():
     assert (inputs["test_dirs"], inputs["test_filter"]) == ("e2e_test/chat_completions", "")
     assert "vars.SMG_RUN_AMD_VLLM_CHAT_LEGACY == 'true'" in job["if"]
     assert "vars.SMG_RUN_AMD_ON_PRS == 'true'" in job["if"]
+
+
+@pytest.mark.parametrize(
+    "name,floor",
+    [("e2e-2gpu-pd-vllm-mooncake-amd", 15), ("e2e-4gpu-pd-vllm-nixl-amd", 14)],
+)
+def test_mooncake_image_callers_require_explicit_image_without_stock_fallback(name, floor):
+    caller, _callee = _mooncake_pd2_workflows()
+    job = caller["jobs"][name]
+    assert "vars.SMG_AMD_MOONCAKE_IMAGE != ''" in job["if"]
+    assert job["with"]["container_image"] == "${{ vars.SMG_AMD_MOONCAKE_IMAGE }}"
+    assert job["with"]["min_selected"] == floor
+    if floor == 15:
+        assert job["with"]["test_dirs"] == "e2e_test/router"
+        assert job["with"]["test_filter"] == ""
+    else:
+        assert job["with"]["test_dirs"] == "e2e_test/router/test_pd_topologies.py"
+        assert job["with"]["test_filter"] == (
+            '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport or MismatchedProtocol"'
+        )
+
+
+def _run_mooncake_image_guard(image, **overrides):
+    import json
+    import subprocess
+    import sys
+
+    _caller, callee = _mooncake_pd2_workflows()
+    step = next(
+        step
+        for step in callee["jobs"]["run"]["steps"]
+        if step["name"] == "Validate AMD Mooncake image input"
+    )
+    assert step["if"] == "inputs.gpu_vendor == 'amd' && inputs.engine == 'vllm'"
+    assert step["env"] == {"PROFILE_INPUTS": "${{ toJSON(inputs) }}"}
+    code = step["run"].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    inputs = {
+        "engine": "vllm",
+        "gpu_vendor": "amd",
+        "container_image": image,
+        "vllm_kv_backend": "mooncake",
+        "kv_backend": "",
+        "vllm_extra_kv_backends": "",
+    }
+    inputs.update(overrides)
+    return subprocess.run(
+        [sys.executable, "-I", "-S", "-c", code],
+        env=dict(os.environ, PROFILE_INPUTS=json.dumps(inputs)),
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize("field", ["vllm_kv_backend", "kv_backend", "vllm_extra_kv_backends"])
+@pytest.mark.parametrize(
+    "image,accepted",
+    [
+        ("", False),
+        ("qualified/mori:latest", False),
+        ("qualified/mori@sha256:not-a-digest", False),
+        ("qualified/mori@sha256:" + "a" * 64 + "\n", False),
+        ("qualified/mori@sha256:" + "a" * 64, True),
+        (
+            "qualified/mori@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f",
+            False,
+        ),
+    ],
+)
+def test_mooncake_image_guard_executes_actual_input_check(field, image, accepted):
+    overrides = {
+        "vllm_kv_backend": "nixl",
+        field: "nixl, MoOnCaKe " if field == "vllm_extra_kv_backends" else " MoOnCaKe ",
+    }
+    result = _run_mooncake_image_guard(image, **overrides)
+    assert (result.returncode == 0) == accepted, result.stderr
+    if not accepted:
+        assert "Mooncake" in result.stderr
+
+
+def test_mooncake_image_guard_keeps_stock_chat_and_new_api_inputs_unchanged():
+    stock = "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f"
+    assert _run_mooncake_image_guard(stock, vllm_kv_backend="nixl").returncode == 0
