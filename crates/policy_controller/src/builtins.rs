@@ -707,9 +707,9 @@ impl Picker for PowerOfTwo {
     }
 }
 
-/// A rotation per survivor set, keyed by the set's ids in order; a set seen
-/// first starts from a shared advancing position. The table holds
-/// 4096 sets and is cleared when full, so no decision walks
+/// A rotation per survivor set, keyed by the set's rows (id and DP rank) in
+/// order; a set seen first starts from a shared advancing position. The table
+/// holds 4096 sets and is cleared when full, so no decision walks
 /// it: a set seen again after a clear starts from the shared position.
 #[derive(Debug)]
 pub struct RoundRobin {
@@ -738,10 +738,15 @@ impl RoundRobin {
         }
     }
 
+    /// The set's identity: each row's id and DP rank in order, so two sets
+    /// that differ by which ranks of a worker survive keep separate rotations.
+    /// The rank rides the id's top bits, so a row costs one multiply as before
+    /// (a second multiply per row cost the 512-row decision 7 %).
     fn set_key(candidates: &[Candidate], kept: &[u32]) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for &i in kept {
-            h ^= candidates[i as usize].id.0;
+            let c = &candidates[i as usize];
+            h ^= c.id.0 ^ (u64::from(c.dp_rank) << 48);
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
         }
         h
@@ -843,6 +848,42 @@ mod tests {
             &mut out,
         );
         assert!(out.first().is_some());
+    }
+
+    #[test]
+    fn survivor_sets_that_differ_by_rank_alone_rotate_apart() {
+        // A is a two-rank worker whose rows share its id; a per-rank bit drops
+        // one rank at a time, so the survivors alternate between [A1, B] and
+        // [A0, B]. Each set keeps its own rotation and walks both of its rows.
+        let rr = RoundRobin::new();
+        let mut pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
+        pool[1].id = pool[0].id;
+        pool[1].dp_rank = 1;
+        let x = [1u32, 2];
+        let y = [0u32, 2];
+        assert_ne!(
+            RoundRobin::set_key(&pool, &x),
+            RoundRobin::set_key(&pool, &y)
+        );
+        let facts = RequestFacts::default();
+        let mut seen_x = [0usize; 3];
+        let mut seen_y = [0usize; 3];
+        for _ in 0..4 {
+            for (kept, seen) in [(&x[..], &mut seen_x), (&y[..], &mut seen_y)] {
+                let mut out = Targets::new();
+                rr.pick(
+                    &facts,
+                    &pool,
+                    kept,
+                    &[0.0; 2],
+                    TieBand::NORMALIZED,
+                    &mut out,
+                );
+                seen[out.first().expect("a pick").position as usize] += 1;
+            }
+        }
+        assert_eq!(seen_x, [0, 2, 2], "X walks A1 and B in turn: {seen_x:?}");
+        assert_eq!(seen_y, [2, 0, 2], "Y walks A0 and B in turn: {seen_y:?}");
     }
 
     #[test]
