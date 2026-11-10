@@ -1155,6 +1155,49 @@ mod tests {
         }
     }
 
+    /// Two workers where the samplers disagree: the lower-count worker
+    /// carries the heavier wait (40,000 waiting tokens against an idle
+    /// report). `requests` leads the pair with the lower count on every
+    /// seed, as the count-first sampler does; the plain sampler would take
+    /// the lighter wait. The other worker is the alternate.
+    #[test]
+    fn the_sampled_in_flight_metric_leads_its_pair_with_the_lower_count() {
+        let workers = pool(2);
+        workers[0].increment_load();
+        workers[1].increment_load();
+        workers[1].increment_load();
+        let (_tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(vec![
+            (
+                workers[0].url().to_string(),
+                one_rank_load(40_000, 0.1, 2000.0),
+            ),
+            (workers[1].url().to_string(), one_rank_load(0, 0.1, 2000.0)),
+        ]));
+        let request = HostRequest {
+            prompt_tokens: 512,
+            ..request()
+        };
+        let sampled = decider(&PolicyConfig::PowerOfTwo {
+            load_metric: PowerOfTwoLoadMetric::Requests,
+        });
+        sampled.set_load_receiver(Some(rx));
+        for _ in 0..20 {
+            let (decision, _) = sampled.decide(&request, &workers, &[]);
+            let positions: Vec<u32> = decision
+                .pick()
+                .expect("a pick")
+                .targets
+                .iter()
+                .map(|t| t.position)
+                .collect();
+            assert_eq!(
+                positions,
+                [0, 1],
+                "the lower count leads the pair whatever its wait: {decision:?}"
+            );
+        }
+    }
+
     /// The decode side reads the request's tried URLs and the exclusions as
     /// the prefill side does: a tried or excluded decode is passed over
     /// while a partner remains.
