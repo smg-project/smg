@@ -790,12 +790,11 @@ mod tests {
     /// expected pixels and the FNV-1a 64 hash of the RGB8 buffer are what
     /// PIL 12.3 on libjpeg-turbo 2.1.5 returns for `Image.open(f).convert("RGB")`.
     /// Needs libturbojpeg at runtime; without it the pure-Rust fallback
-    /// decodes CMYK with its own DCT and upsampling, so this test skips.
+    /// decodes CMYK with its own DCT and upsampling, so this test skips, or
+    /// fails where `SMG_REQUIRE_TURBOJPEG` says the library must be there.
     #[test]
-    #[expect(clippy::print_stderr)]
     fn cmyk_and_ycck_jpegs_decode_to_pils_pixels() {
-        if !turbojpeg_available() {
-            eprintln!("libturbojpeg not found: skipping the CMYK parity test");
+        if !crate::test_support::turbojpeg_or_skip("the CMYK parity test") {
             return;
         }
         type Pixel = (u32, u32, [u8; 3]);
@@ -915,10 +914,8 @@ mod tests {
     /// the frame header stands in and the image decodes through the library
     /// (the pure-Rust fallback differs from it by a few levels per pixel).
     #[test]
-    #[expect(clippy::print_stderr)]
     fn a_four_component_jpeg_with_unequal_sampling_decodes_through_turbojpeg() {
-        if !turbojpeg_available() {
-            eprintln!("libturbojpeg not found: skipping the unequal-sampling test");
+        if !crate::test_support::turbojpeg_or_skip("the unequal-sampling test") {
             return;
         }
         let image = decode_jpeg_rgb(&unequal_sampling_cmyk_jpeg())
@@ -992,10 +989,8 @@ mod buffer_pool_tests {
     /// takes the buffer the first one returned and writes the same pixels
     /// into it (the library writes every pixel of the frame it reports).
     #[test]
-    #[expect(clippy::print_stderr)]
     fn a_decode_reuses_the_returned_buffer_and_writes_the_same_pixels() {
-        if !turbojpeg_available() {
-            eprintln!("libturbojpeg not found: skipping the pooled decode test");
+        if !crate::test_support::turbojpeg_or_skip("the pooled decode test") {
             return;
         }
         static MINE: BufferPool = BufferPool::new();
@@ -1029,10 +1024,8 @@ mod buffer_pool_tests {
     /// buffer to the pool instead of freeing it, so the next decode of that
     /// class is warm.
     #[test]
-    #[expect(clippy::print_stderr)]
     fn a_failed_decode_returns_its_buffer_to_the_pool() {
-        if !turbojpeg_available() {
-            eprintln!("libturbojpeg not found: skipping the failed-decode pool test");
+        if !crate::test_support::turbojpeg_or_skip("the failed-decode pool test") {
             return;
         }
         static MINE: BufferPool = BufferPool::new();

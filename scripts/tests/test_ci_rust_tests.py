@@ -265,7 +265,7 @@ class ShardTableTests(unittest.TestCase):
                 {
                     "shard": "multimodal",
                     "filter": "rust-multimodal",
-                    "needs": "golden,ffmpeg",
+                    "needs": "golden,ffmpeg,turbojpeg",
                     "test_timeout": 20,
                 }
             ],
