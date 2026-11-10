@@ -50,65 +50,60 @@ pub(super) async fn preprocess(
     let fingerprint = image_cache_fingerprint(ctx)?;
     let working_bytes = remaining.map_or(0, |remaining| (budget / width - remaining) * width);
     let working_capacity = buffer_pool::allocation_capacity(working_bytes);
+    let mut indices = HashMap::new();
+    let mut order = Vec::with_capacity(images.len());
+    let mut parts = Vec::new();
+    let mut misses = Vec::new();
+    let mut miss_images = Vec::new();
+    for image in images {
+        let next = parts.len();
+        let index = *indices.entry(image.hash.as_str()).or_insert(next);
+        order.push(index);
+        if index != next {
+            continue;
+        }
+        let key = PixelCacheKey {
+            image_hash: image.hash.clone(),
+            config_fingerprint: fingerprint,
+        };
+        let entry = cache.get(&key);
+        Metrics::record_mm_pixel_cache_lookup(&model_id, entry.is_some());
+        if entry.is_none() {
+            misses.push((index, key));
+            miss_images.push(Arc::clone(image));
+        }
+        parts.push(entry);
+    }
+
+    const LARGE_WIRE_BYTES: usize = 8 * 1024 * 1024;
+    let direct = misses.len() == images.len();
+    // Leave large pooled buffers available to other cold waves until the
+    // incoming images recur. The caller handles this with its normal batch.
+    if direct
+        && newly_cacheable
+        && (LARGE_WIRE_BYTES..=buffer_pool::LARGEST).contains(&working_bytes)
+        && !cache.admit_repeated(misses.iter().map(|(_, key)| key), working_capacity)
+    {
+        return Ok(None);
+    }
+
+    let distinct = parts.len() == images.len();
+    let has_misses = !misses.is_empty();
     let images = images.to_vec();
     let cache = Arc::clone(cache);
     let processors = Arc::clone(&ctx.vision_processors);
     let layouts = ctx.spec.encoder_field_layouts_for(Modality::Image);
     on_pool(ctx.model_id, move || {
-        let mut indices = HashMap::new();
-        let mut order = Vec::with_capacity(images.len());
-        let mut unique = Vec::new();
-        for image in &images {
-            let next = unique.len();
-            let index = *indices.entry(image.hash.as_str()).or_insert(next);
-            order.push(index);
-            if index == next {
-                unique.push(image);
-            }
-        }
-
-        let distinct = unique.len() == images.len();
-
-        let mut parts = Vec::new();
-        let mut misses = Vec::new();
-        let mut miss_images = Vec::new();
-        for (index, image) in unique.into_iter().enumerate() {
-            let key = PixelCacheKey {
-                image_hash: image.hash.clone(),
-                config_fingerprint: fingerprint,
-            };
-            let entry = cache.get(&key);
-            Metrics::record_mm_pixel_cache_lookup(&model_id, entry.is_some());
-            if entry.is_none() {
-                misses.push((index, key));
-                miss_images.push(Arc::clone(image));
-            }
-            parts.push(entry);
-        }
-
-        let has_misses = !misses.is_empty();
         let mut inserts = Vec::new();
         let mut direct_output = None;
         if has_misses {
-            let direct = misses.len() == images.len();
-            // Large cold fills can hold the buffers that the next wave would
-            // reuse. Leave those buffers in the pool until images recur.
-            let large_pooled = 8 * 1024 * 1024..=buffer_pool::LARGEST;
-            if direct
-                && newly_cacheable
-                && large_pooled.contains(&working_bytes)
-                && !cache.admit_repeated(misses.iter().map(|(_, key)| key), working_capacity)
-            {
-                return preprocess_image_frames(&images, &processors, wire_dtype).map(Some);
-            }
             // For a large, mostly new request, keep one contiguous output.
             // Recompute the small set of hits rather than gather a second
             // full tensor. Keep the hit-assisted path if decoding fails.
-            const MIN_RECOMPUTE_BYTES: usize = 8 * 1024 * 1024;
             if distinct
                 && !direct
                 && misses.len() >= images.len() - misses.len()
-                && working_bytes >= MIN_RECOMPUTE_BYTES
+                && working_bytes >= LARGE_WIRE_BYTES
                 && working_capacity < budget
             {
                 if let Ok(mut batch) = preprocess_image_frames(&images, &processors, wire_dtype) {
