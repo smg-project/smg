@@ -1120,6 +1120,20 @@ mod client_closed_tests {
             .expect("request")
     }
 
+    /// The response `build`'s router streams at `uri`, its first chunk `first`
+    /// already sent; the sender keeps the stream open until the test drops it.
+    async fn streamed(
+        build: fn(Body) -> Router,
+        uri: &str,
+        first: &'static [u8],
+    ) -> (Response, mpsc::Sender<Result<Bytes, Infallible>>) {
+        let (tx, rx) = mpsc::channel(4);
+        let body = Body::from_stream(ReceiverStream::new(rx));
+        let response = build(body).oneshot(request(uri)).await.expect("response");
+        tx.send(Ok(Bytes::from_static(first))).await.expect("send");
+        (response, tx)
+    }
+
     /// `/stream` hands out `body` once; `/slow` never answers.
     fn app(body: Body) -> Router {
         let slot = Arc::new(Mutex::new(Some(body)));
@@ -1178,14 +1192,7 @@ mod client_closed_tests {
         // left.
         let sink = ResponseLines::default();
         let _subscriber = test_subscriber(sink.clone());
-        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
-        let response = relay_app(Body::from_stream(ReceiverStream::new(rx)))
-            .oneshot(request("/relay"))
-            .await
-            .expect("response");
-        tx.send(Ok(Bytes::from_static(b"data: x\n\n")))
-            .await
-            .expect("send");
+        let (response, tx) = streamed(relay_app, "/relay", b"data: x\n\n").await;
         let mut body = response.into_body();
         let frame = body.frame().await.expect("one frame").expect("frame ok");
         assert_eq!(frame.data_ref().map(Bytes::len), Some(9));
@@ -1203,14 +1210,7 @@ mod client_closed_tests {
         // the body short of its declared bytes.
         let sink = ResponseLines::default();
         let _subscriber = test_subscriber(sink.clone());
-        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
-        let response = relay_app(Body::from_stream(ReceiverStream::new(rx)))
-            .oneshot(request("/relay"))
-            .await
-            .expect("response");
-        tx.send(Ok(Bytes::from_static(b"data:")))
-            .await
-            .expect("send");
+        let (response, tx) = streamed(relay_app, "/relay", b"data:").await;
         let mut body = response.into_body();
         let frame = body.frame().await.expect("one frame").expect("frame ok");
         assert_eq!(frame.data_ref().map(Bytes::len), Some(5));
@@ -1248,14 +1248,7 @@ mod client_closed_tests {
     async fn a_stream_the_client_dropped_logs_one_info_line_after_the_access_log() {
         let sink = ResponseLines::default();
         let _subscriber = test_subscriber(sink.clone());
-        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
-        let response = app(Body::from_stream(ReceiverStream::new(rx)))
-            .oneshot(request("/stream"))
-            .await
-            .expect("response");
-        tx.send(Ok(Bytes::from_static(b"data: x\n\n")))
-            .await
-            .expect("send");
+        let (response, tx) = streamed(app, "/stream", b"data: x\n\n").await;
         let mut body = response.into_body();
         let frame = body.frame().await.expect("one frame").expect("frame ok");
         assert!(frame.is_data());
@@ -1277,14 +1270,7 @@ mod client_closed_tests {
     async fn a_stream_that_ends_logs_no_client_close() {
         let sink = ResponseLines::default();
         let _subscriber = test_subscriber(sink.clone());
-        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
-        let response = app(Body::from_stream(ReceiverStream::new(rx)))
-            .oneshot(request("/stream"))
-            .await
-            .expect("response");
-        tx.send(Ok(Bytes::from_static(b"data: x\n\n")))
-            .await
-            .expect("send");
+        let (response, tx) = streamed(app, "/stream", b"data: x\n\n").await;
         drop(tx);
         let _ = response.into_body().collect().await.expect("body");
         assert_eq!(
