@@ -10,7 +10,10 @@
 
 use llm_multimodal::vision::{
     processor::ModelSpecificValue,
-    processors::step3_vl::{NUM_PATCHES, PATCH_NEWLINE_MASK, PATCH_PIXEL_VALUES},
+    processors::step3_vl::{
+        IMAGE_FEATURE_TOKENS, NUM_PATCHES, PATCH_FEATURE_TOKENS, PATCH_NEWLINE_MASK,
+        PATCH_PIXEL_VALUES,
+    },
     Step3VLProcessor, VisionPreProcessor,
 };
 use serde::Deserialize;
@@ -96,18 +99,27 @@ fn preprocess_matches_the_reference_fingerprints() {
             "{}: shape",
             case.name
         );
+        // The fixture's token count is the reference's prompt layout; the
+        // features behind it are the image tokens inside that layout.
+        assert_eq!(
+            processor.plan(case.width, case.height).num_tokens(),
+            case.num_tokens,
+            "{}: tokens",
+            case.name
+        );
+        let features = case.num_patches * PATCH_FEATURE_TOKENS + IMAGE_FEATURE_TOKENS;
         assert_eq!(
             out.feature_token_counts,
-            vec![case.num_tokens],
-            "{}: tokens",
+            vec![features],
+            "{}: features",
             case.name
         );
         assert_eq!(
             processor
                 .calculate_num_tokens(case.width, case.height)
                 .unwrap(),
-            case.num_tokens,
-            "{}: tokens from the size",
+            features,
+            "{}: features from the size",
             case.name
         );
         let Some(ModelSpecificValue::IntTensor { data: counts, .. }) =

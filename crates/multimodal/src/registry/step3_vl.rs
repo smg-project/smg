@@ -260,9 +260,7 @@ mod tests {
             ndarray::Array4::<f32>::zeros((counts.len(), 3, 8, 8)),
             counts
                 .iter()
-                .map(|&count| {
-                    count as usize * (PATCH_FEATURE_TOKENS + 2) + IMAGE_FEATURE_TOKENS + 2
-                })
+                .map(|&count| count as usize * PATCH_FEATURE_TOKENS + IMAGE_FEATURE_TOKENS)
                 .collect(),
             vec![(16, 16); counts.len()],
         );
@@ -467,10 +465,11 @@ mod tests {
     }
 
     /// The processor the spec builds and the replacements it writes agree:
-    /// the replacement of an image is as long as the processor's token count
-    /// for it, crops and newlines included.
+    /// the replacement of an image carries as many image tokens as the
+    /// processor counts features for it, and its length is the layout's,
+    /// crops, newlines and the structural tokens included.
     #[test]
-    fn the_processors_token_count_is_the_replacements_length() {
+    fn the_processors_feature_count_is_the_replacements_image_token_count() {
         let tokenizer = tokenizer();
         let config = config("step3_vl");
         let metadata = metadata(&tokenizer, &config);
@@ -483,17 +482,28 @@ mod tests {
         let replacements = Step3VLVisionSpec
             .prompt_replacements(&metadata, &out)
             .unwrap();
+        let image_tokens: Vec<usize> = replacements
+            .iter()
+            .map(|replacement| {
+                replacement
+                    .tokens
+                    .iter()
+                    .filter(|&&token| token == IMAGE_TOKEN_ID)
+                    .count()
+            })
+            .collect();
+        assert_eq!(image_tokens, out.feature_token_counts);
+        assert_eq!(image_tokens, vec![331, 817]);
         let lengths: Vec<usize> = replacements
             .iter()
             .map(|replacement| replacement.tokens.len())
             .collect();
-        assert_eq!(lengths, out.feature_token_counts);
         assert_eq!(lengths, vec![337, 836]);
         assert_eq!(
             processor
                 .calculate_num_tokens(ImageSize::new(1920, 1080).width, 1080)
                 .unwrap(),
-            836
+            817
         );
     }
 }

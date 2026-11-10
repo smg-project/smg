@@ -418,6 +418,62 @@ fn a_patched_item_may_span_a_wider_structural_range() {
     assert_eq!(assembled.items[0].mm_placeholders, vec![(11, 2)]);
 }
 
+/// One image in a layout with structural tokens around its feature runs:
+/// four crops of 81 image tokens between their start and end tokens, a
+/// newline after the first row, then the view's 169 between its own. The
+/// runs are the reservation (493 of the 504 positions); `features` is the
+/// count the item claims for them.
+fn one_image_in_a_structural_layout(features: usize) -> PrecomputedMultimodalIntermediate {
+    let mut offset = 10;
+    let mut patches = Vec::new();
+    for crop in 0..4 {
+        patches.push(PlaceholderRange {
+            offset: offset + 1,
+            length: 81,
+        });
+        offset += 83 + usize::from(crop == 1);
+    }
+    patches.push(PlaceholderRange {
+        offset: offset + 1,
+        length: 169,
+    });
+    let mut intermediate = one_image_intermediate(504, patches);
+    intermediate.preprocessed.feature_token_counts = vec![features];
+    intermediate
+}
+
+/// The structural tokens of a layout are prompt text, not reserved
+/// positions: an item fits when its feature count is the runs' length, and a
+/// count that took the structural tokens for features never fits.
+#[test]
+fn a_layouts_structural_tokens_are_not_reserved_positions() {
+    let fits = one_image_in_a_structural_layout(493);
+    assert!(validate_precomputed_batch(&fits).is_ok());
+    // The wire that picks the feature positions out of the structural range
+    // is sent the whole range; the wires that take the runs as they are get
+    // exactly as many positions as the item has features.
+    assert_eq!(
+        placeholders_for_bindings(&fits.bindings, false).unwrap(),
+        vec![(10, 504)]
+    );
+    let runs = placeholders_for_bindings(&fits.bindings, true).unwrap();
+    assert_eq!(runs.len(), 5);
+    assert_eq!(
+        runs.iter()
+            .map(|&(_, length)| length as usize)
+            .sum::<usize>(),
+        493
+    );
+
+    let error = validate_precomputed_batch(&one_image_in_a_structural_layout(504))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("reserves 493 prompt positions for 504 encoder features"),
+        "{error}"
+    );
+}
+
 #[test]
 fn assemble_tokenspeed_v41_layouts_stay_inline_when_shm_disabled() {
     use crate::routers::grpc::proto_wrapper::TokenSpeedTensorStorage;

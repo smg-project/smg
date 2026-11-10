@@ -54,10 +54,13 @@
 //! `[N, 3, 728, 728]`, the crops as `patch_pixel_values` `[P, 3, 504, 504]`
 //! (flat, split per image by `num_patches`), `num_patches` `[N]`, and
 //! `patch_newline_mask` `[P]`, one per crop, set after every crop row but the
-//! last. The token count per image is `crops * (81 + 2) + 169 + 2 +
-//! newlines`: the crops each between a start and an end token, a newline
-//! token after every row but the last, then the view between its own start
-//! and end tokens.
+//! last. The prompt layout per image is `crops * (81 + 2) + 169 + 2 +
+//! newlines` tokens: the crops each between a start and an end token, a
+//! newline token after every row but the last, then the view between its own
+//! start and end tokens. The feature count per image is the image tokens
+//! inside that layout, `crops * 81 + 169`: the rows the encoder produces and
+//! the engine scatters into those positions. The start, end and newline
+//! tokens around them are prompt text, as the other tile families' are.
 
 use std::{borrow::Cow, collections::HashMap};
 
@@ -83,8 +86,8 @@ pub const IMAGE_FEATURE_TOKENS: usize = 169;
 /// The feature tokens of one crop.
 pub const PATCH_FEATURE_TOKENS: usize = 81;
 /// The per-image maximum the serving engine publishes for the family: the
-/// count of a 3024 x 3024 image (36 crops, five newlines, the view). A plan
-/// past it is refused; see the module doc.
+/// prompt layout of a 3024 x 3024 image (36 crops, five newlines, the view),
+/// structural tokens included. A plan past it is refused; see the module doc.
 pub const MAX_IMAGE_TOKENS: usize = 3164;
 
 /// The crops, flat across the batch: `[P, 3, 504, 504]`.
@@ -140,6 +143,13 @@ impl CropPlan {
             + IMAGE_FEATURE_TOKENS
             + 2
             + self.num_newlines()
+    }
+
+    /// The positions of that expansion that carry an encoder feature: the
+    /// image tokens of every crop and of the view. The start, end and newline
+    /// tokens around them are prompt text with no feature behind them.
+    pub fn num_features(&self) -> usize {
+        self.num_patches() * PATCH_FEATURE_TOKENS + IMAGE_FEATURE_TOKENS
     }
 }
 
@@ -327,7 +337,7 @@ impl Step3VLProcessor {
         let tokens = plan.num_tokens();
         if tokens > MAX_IMAGE_TOKENS {
             return Err(TransformError::ShapeError(format!(
-                "a {width}x{height} image plans {} crops and {tokens} feature tokens, above the {MAX_IMAGE_TOKENS} the serving engine publishes as its per-image maximum (a {MAX_IMAGE_SIZE}x{MAX_IMAGE_SIZE} image's; a larger item is admitted only under its batched-token budget, a deployment setting)",
+                "a {width}x{height} image plans {} crops and {tokens} prompt tokens, above the {MAX_IMAGE_TOKENS} the serving engine publishes as its per-image maximum (a {MAX_IMAGE_SIZE}x{MAX_IMAGE_SIZE} image's; a larger item is admitted only under its batched-token budget, a deployment setting)",
                 plan.num_patches()
             )));
         }
@@ -481,12 +491,12 @@ impl VisionPreProcessor for Step3VLProcessor {
         let mut newlines = Vec::with_capacity(total_crops);
         let mut views: Vec<Vec<f32>> = Vec::with_capacity(images.len());
         let mut counts = Vec::with_capacity(images.len());
-        let mut tokens = Vec::with_capacity(images.len());
+        let mut features = Vec::with_capacity(images.len());
         let mut sizes = Vec::with_capacity(images.len());
         for (image, plan) in images.iter().zip(&plans) {
             views.push(self.process(image, *plan, &mut crops, &mut newlines)?);
             counts.push(plan.num_patches() as i64);
-            tokens.push(plan.num_tokens());
+            features.push(plan.num_features());
             sizes.push((image.width(), image.height()));
         }
         // One image's planes are the batch; several are copied back to back.
@@ -527,14 +537,16 @@ impl VisionPreProcessor for Step3VLProcessor {
         ]);
         Ok(PreprocessedEncoderInputs {
             encoder_input: encoder_input.into(),
-            feature_token_counts: tokens,
+            feature_token_counts: features,
             item_sizes: sizes,
             model_specific,
         })
     }
 
+    /// The features of a `width` x `height` image, the count `preprocess`
+    /// reports for it: the image tokens of its layout, not the layout's length.
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
-        Ok(self.checked_plan(width, height)?.num_tokens())
+        Ok(self.checked_plan(width, height)?.num_features())
     }
 
     fn model_name(&self) -> &'static str {
@@ -557,8 +569,12 @@ mod tests {
         Step3VLProcessor::new().plan(width, height)
     }
 
-    /// The reference's crop counts, newline counts and token counts over the
-    /// sizes that exercise every branch of its rule: no crops under a 728 px
+    /// The features of the engine's most-features image: 36 crops and the view.
+    const MAX_FEATURES: usize = 36 * PATCH_FEATURE_TOKENS + IMAGE_FEATURE_TOKENS;
+
+    /// The reference's crop counts, newline counts and token counts, and the
+    /// feature counts behind them, over the sizes that exercise every branch
+    /// of its rule: no crops under a 728 px
     /// long side at a gentle aspect ratio, crops of the short side past 1.5,
     /// the 504 window from 728 px, the short-side window past an aspect ratio
     /// of 4, the square pad under 32 px, and the 3024 px cap.
@@ -588,13 +604,15 @@ mod tests {
             assert_eq!(plan.num_patches(), crops, "{width}x{height} crops");
             assert_eq!(plan.num_newlines(), newlines, "{width}x{height} newlines");
             assert_eq!(plan.num_tokens(), tokens, "{width}x{height} tokens");
-            // The public entry point agrees with the plan inside the bound and
-            // refuses past it (2000x40 and 40x2000 here).
+            let features = crops * PATCH_FEATURE_TOKENS + IMAGE_FEATURE_TOKENS;
+            assert_eq!(plan.num_features(), features, "{width}x{height} features");
+            // The public entry point counts the features of a plan inside the
+            // bound and refuses past it (2000x40 and 40x2000 here).
             let counted = Step3VLProcessor::new().calculate_num_tokens(width, height);
             if tokens > MAX_IMAGE_TOKENS {
                 assert!(counted.is_err(), "{width}x{height} refused");
             } else {
-                assert_eq!(counted.unwrap(), tokens, "{width}x{height} counted");
+                assert_eq!(counted.unwrap(), features, "{width}x{height} counted");
             }
         }
     }
@@ -693,6 +711,7 @@ mod tests {
         let plan = processor.plan(1920, 1080);
         assert_eq!(plan.crops, None);
         assert_eq!(plan.num_tokens(), 171);
+        assert_eq!(plan.num_features(), IMAGE_FEATURE_TOKENS);
         assert!(Step3VLProcessor::from_model_config(&json!({"vision_config": {}})).crops_enabled());
     }
 
@@ -705,7 +724,10 @@ mod tests {
         let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(1000, 300, Rgb([200, 100, 50])));
         let out = processor.preprocess(&[&image]).unwrap();
         assert_eq!(out.encoder_input.shape(), &[1, 3, 728, 728]);
-        assert_eq!(out.feature_token_counts, vec![337]);
+        assert_eq!(
+            out.feature_token_counts,
+            vec![2 * PATCH_FEATURE_TOKENS + IMAGE_FEATURE_TOKENS]
+        );
         assert_eq!(out.item_sizes, vec![(1000, 300)]);
         let Some(ModelSpecificValue::Tensor { data, shape }) =
             out.model_specific.get(PATCH_PIXEL_VALUES)
@@ -741,7 +763,13 @@ mod tests {
         let frame = DynamicImage::ImageRgb8(RgbImage::from_pixel(1920, 1080, Rgb([40, 50, 60])));
         let out = processor.preprocess(&[&small, &frame]).unwrap();
         assert_eq!(out.encoder_input.shape(), &[2, 3, 728, 728]);
-        assert_eq!(out.feature_token_counts, vec![171, 836]);
+        assert_eq!(
+            out.feature_token_counts,
+            vec![
+                IMAGE_FEATURE_TOKENS,
+                8 * PATCH_FEATURE_TOKENS + IMAGE_FEATURE_TOKENS
+            ]
+        );
         assert!(matches!(
             out.model_specific.get(NUM_PATCHES),
             Some(ModelSpecificValue::IntTensor { data, .. }) if data == &[0, 8]
@@ -789,16 +817,18 @@ mod tests {
     #[test]
     fn a_plan_past_the_engines_declared_image_is_refused_before_any_pixel_moves() {
         let processor = Step3VLProcessor::new();
-        // The engine's own count: a 3024 x 3024 image, 36 crops, five newlines.
+        // The engine's own count: a 3024 x 3024 image, 36 crops, five newlines;
+        // 3085 of its 3164 positions carry a feature.
         assert_eq!(processor.plan(3024, 3024).num_tokens(), MAX_IMAGE_TOKENS);
         assert_eq!(
             processor.calculate_num_tokens(3024, 3024).unwrap(),
-            MAX_IMAGE_TOKENS
+            MAX_FEATURES
         );
         // One row of 36 windows of 84 px: just under the count, the engine's own plan.
+        assert_eq!(processor.plan(3024, 84).num_tokens(), MAX_IMAGE_TOKENS - 5);
         assert_eq!(
             processor.calculate_num_tokens(3024, 84).unwrap(),
-            36 * (PATCH_FEATURE_TOKENS + 2) + IMAGE_FEATURE_TOKENS + 2
+            MAX_FEATURES
         );
         // 6048 x 64: the short side passes the pad, the cap halves it to 32, 95 windows.
         let error = processor
@@ -808,7 +838,7 @@ mod tests {
         assert!(
             error.contains("6048x64")
                 && error.contains("95 crops")
-                && error.contains("8056 feature tokens")
+                && error.contains("8056 prompt tokens")
                 && error.contains("3164"),
             "{error}"
         );
@@ -842,13 +872,13 @@ mod tests {
         assert_eq!(processor.plan(10_000, 10).square, Some(10_000));
         assert_eq!(
             processor.calculate_num_tokens(10_000, 10).unwrap(),
-            MAX_IMAGE_TOKENS
+            MAX_FEATURES
         );
         // The last square inside the limit (536832387 bytes) and the first
         // past it.
         assert_eq!(
             processor.calculate_num_tokens(13_377, 31).unwrap(),
-            MAX_IMAGE_TOKENS
+            MAX_FEATURES
         );
         let error = processor
             .calculate_num_tokens(13_378, 31)
