@@ -6,6 +6,7 @@ use std::{
 use axum::http::{HeaderName, HeaderValue, Uri};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
+use tracing::warn;
 
 use super::*;
 use crate::{
@@ -294,6 +295,31 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
                 Endpoint::redacted_str(url),
                 format!("Invalid URL format: {e}"),
             ));
+        }
+    }
+    // A userinfo (`user:secret@`) means something for an HTTP worker alone,
+    // whose client sends it as basic auth. A gRPC worker never receives it
+    // (the channel's authority is the host and port): the URL stays accepted,
+    // since it is otherwise valid and deployments may carry one, and the
+    // credential written there is named once, masked, instead of dropped in
+    // silence. A tcp:// worker URL is what the ZMQ sockets bind, where a
+    // userinfo has no meaning at all: refused.
+    if Endpoint::parse(url).is_ok_and(|endpoint| endpoint.has_credentials()) {
+        match scheme {
+            "tcp" => {
+                return Err(ConfigError::invalid_value(
+                    "worker_url",
+                    Endpoint::redacted_str(url),
+                    "a tcp:// worker URL takes no userinfo: the gateway binds its ZMQ sockets \
+                     at the host and port",
+                ));
+            }
+            "grpc" => warn!(
+                "worker URL {} carries userinfo, which is not sent to a gRPC worker: the \
+                 gateway's channel names the host and port alone",
+                Endpoint::redacted_str(url)
+            ),
+            _ => {}
         }
     }
     Ok(())
@@ -2415,6 +2441,8 @@ impl ConfigValidator {
 
 #[cfg(test)]
 mod tests {
+    use tracing_test::traced_test;
+
     use super::*;
     use crate::worker::ConnectionMode;
 
@@ -3530,6 +3558,42 @@ mod tests {
             assert!(!text.contains("secret"), "{text}");
             assert!(text.contains("<unparsable address>"), "{text}");
         }
+    }
+
+    /// A userinfo is refused on a `tcp://` worker URL (the sockets bind the
+    /// host and port; nothing reads it) and accepted on a `grpc://` one with
+    /// one warning that names the address masked, since the gateway's channel
+    /// never sends it; an `http://` URL's userinfo is basic auth and warns
+    /// nothing, nor does a URL without one.
+    #[test]
+    fn a_tcp_worker_url_with_userinfo_is_refused_masked() {
+        for url in [
+            "tcp://user:secret@10.0.0.5:31000",
+            "tcp://secret@10.0.0.5:31000",
+        ] {
+            let text = validate_worker_url(url).expect_err("refused").to_string();
+            assert!(text.contains("tcp://***@10.0.0.5:31000"), "{text}");
+            assert!(text.contains("takes no userinfo"), "{text}");
+            assert!(!text.contains("secret"), "{text}");
+        }
+        assert!(validate_worker_url("tcp://10.0.0.5:31000").is_ok());
+    }
+
+    #[traced_test]
+    #[test]
+    fn a_grpc_worker_url_with_userinfo_passes_and_warns_once_masked() {
+        validate_worker_url("grpc://user:secret@worker:50051").expect("accepted");
+        assert!(logs_contain("grpc://***@worker:50051"));
+        assert!(logs_contain("not sent to a gRPC worker"));
+        assert!(!logs_contain("secret"));
+    }
+
+    #[traced_test]
+    #[test]
+    fn an_http_worker_url_with_userinfo_and_a_url_without_warn_nothing() {
+        validate_worker_url("http://user:secret@worker:8000").expect("accepted");
+        validate_worker_url("grpc://worker:50051").expect("accepted");
+        assert!(!logs_contain("userinfo"));
     }
 
     #[test]
