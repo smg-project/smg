@@ -17,7 +17,7 @@ use engine_zmq_client::{
             EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput, SpecDecodeMetrics,
             StopReason,
         },
-        request::{EngineCoreRequest, MmFeaturesPayload},
+        request::{EngineCoreRequest, MmFeaturesPayload, ReasoningParserKwargs},
         sampling::EngineCoreSamplingParams,
         structured_outputs::{StructuredOutputBackend, StructuredOutputsParams},
     },
@@ -724,6 +724,17 @@ pub(crate) fn translate_request_with_media(
     eos: &EosTokenIds,
     support: StructuredOutputsSupport,
 ) -> Result<EngineCoreRequest, String> {
+    let reasoning_parser_kwargs = req
+        .chat_template_kwargs_json
+        .as_deref()
+        .map(|json| {
+            serde_json::from_str(json)
+                .map(|chat_template_kwargs| ReasoningParserKwargs {
+                    chat_template_kwargs,
+                })
+                .map_err(|error| format!("invalid chat_template_kwargs_json: {error}"))
+        })
+        .transpose()?;
     // Connector params ride `SamplingParams.extra_args`, where vLLM's own
     // frontend puts them, so a request carrying them always gets params.
     let kv_transfer_params = kv_transfer_params(&req)?;
@@ -779,6 +790,7 @@ pub(crate) fn translate_request_with_media(
         data_parallel_rank,
         cache_salt,
         reasoning_ended: grammar_from_first_token.then_some(true),
+        reasoning_parser_kwargs,
         ..EngineCoreRequest::default()
     })
 }
