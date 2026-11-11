@@ -9,7 +9,7 @@ use crate::{
     builtins::{Best, FewestSessions, LeastRequests, Random},
     decision::{Decision, Pair, Pick, Shed, ShedReason, Target, Targets, Trace, TRACE_TOP},
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
-    sessions::{Assignment, SessionRule, SessionTable, SessionVerdict},
+    sessions::{Assignment, Claim, SessionRule, SessionTable, SessionVerdict},
     spec::Needs,
     view::{Candidate, Constraints, Phase, PoolFacts, RequestFacts, WorkerId},
     Draw,
@@ -765,7 +765,13 @@ impl Engine {
             // claimed at the decision, so concurrent requests agree on the
             // first claim when its worker is among this decision's survivors.
             if let Some(first) = pick.targets.first().map(|t| t.id) {
-                let owner = self.sessions.claim(key, pins, first);
+                let owner = match self.sessions.claim(key, pins, first) {
+                    Claim::Made(id) => {
+                        pick.session = SessionVerdict::Claimed(id);
+                        id
+                    }
+                    Claim::Standing(id) => id,
+                };
                 if owner != first {
                     if let Some(&i) = buf
                         .kept
@@ -1083,11 +1089,8 @@ impl Lifecycle for Engine {
             _ => target.id,
         };
         if lease.session != SessionVerdict::None {
-            self.sessions.dispatched(
-                lease.session_key,
-                lease.session == SessionVerdict::Respill,
-                dispatched,
-            );
+            self.sessions
+                .dispatched(lease.session_key, lease.session, dispatched);
         }
         for profile in &self.profiles {
             for w in &profile.scorers {
@@ -2379,7 +2382,8 @@ mod tests {
         let first = decide_keyed(&engine, &pool, 7, 10);
         let first_pick = first.pick().expect("a pick");
         assert_eq!(first_pick.targets.first().map(|t| t.position), Some(0));
-        assert_eq!(first_pick.session, SessionVerdict::Pinned);
+        let claimed = first_pick.targets.first().expect("a target").id;
+        assert_eq!(first_pick.session, SessionVerdict::Claimed(claimed));
         // Before the first commits, a second decision under a changed load
         // would place the key elsewhere; it reads the claim as the pin and
         // takes it as a hit. (Between a decision's own reading and its claim

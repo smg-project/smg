@@ -47,11 +47,27 @@ pub enum SessionVerdict {
     /// The routable pin was over the in-flight cap and the stages placed the
     /// request: the commit fronts the worker it lands on.
     Respill,
+    /// The key had no routable pin and the decision claimed the worker it
+    /// placed the request on: that decision's commit confirms the claim on
+    /// the worker, or withdraws it when the dispatch landed elsewhere.
+    Claimed(WorkerId),
 }
 
 /// The pins of one key: the preferred worker first, the failover second;
 /// `WorkerId(0)` is an empty slot.
 pub type Pins = [WorkerId; 2];
+
+/// What [`SessionTable::claim`] did for a decision that found no routable
+/// pin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Claim {
+    /// The decision's own worker is the claim of record; that decision's
+    /// commit settles it.
+    Made(WorkerId),
+    /// The pin of record is another decision's standing claim, or nothing
+    /// was recorded (an empty key or target): the decision follows it.
+    Standing(WorkerId),
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Entry {
@@ -60,10 +76,11 @@ struct Entry {
     /// under a rule without a TTL.
     expires_at_micros: u64,
     recovery: Recovery,
-    /// The pin a decision's claim wrote before any dispatch confirmed it;
-    /// `WorkerId(0)` when none stands. A dispatch of the key to it confirms
-    /// it; one elsewhere withdraws it, so a claim whose commit never came
-    /// cannot push a worker that served out of the pins.
+    /// The pin a decision's claim wrote before its commit; `WorkerId(0)`
+    /// when none stands. The claiming decision's dispatch to it confirms it,
+    /// that decision's dispatch elsewhere withdraws it, and no other dispatch
+    /// touches it; a claim whose commit never comes stands until the TTL
+    /// sweeps the key.
     claim: WorkerId,
 }
 
@@ -168,11 +185,11 @@ impl SessionTable {
     /// the newcomer among them is the claim to follow instead, when it is
     /// among this decision's survivors; the pin of record is returned. The
     /// claim is the one pin made before a commit, and it is marked as such:
-    /// the key's next dispatch confirms it or withdraws it (`dispatched`),
-    /// the TTL sweeps it otherwise.
-    pub(crate) fn claim(&self, key: u64, seen: Pins, target: WorkerId) -> WorkerId {
+    /// the claiming decision's own dispatch confirms it or withdraws it
+    /// (`dispatched`), the TTL sweeps it otherwise.
+    pub(crate) fn claim(&self, key: u64, seen: Pins, target: WorkerId) -> Claim {
         if key == 0 || target == WorkerId(0) {
-            return target;
+            return Claim::Standing(target);
         }
         let mut shard = self.shard(key).lock();
         let entry = shard.entry(key).or_default();
@@ -182,38 +199,46 @@ impl SessionTable {
                 Recovery::Original => entry.append(target),
             }
             entry.claim = target;
-            return target;
+            return Claim::Made(target);
         }
-        entry
-            .pins
-            .iter()
-            .copied()
-            .find(|pin| *pin != WorkerId(0) && !seen.contains(pin))
-            .unwrap_or(target)
+        Claim::Standing(
+            entry
+                .pins
+                .iter()
+                .copied()
+                .find(|pin| *pin != WorkerId(0) && !seen.contains(pin))
+                .unwrap_or(target),
+        )
     }
 
-    /// The commit dispatched a decision for `key` to `target`, `respill` when
-    /// the decision placed the request past its saturated pin: the pin
-    /// follows the rule. The preferred pin taken, or the failover taken while
-    /// the preferred one was unroutable, leaves the pins as they are; a
-    /// respill, and a worker outside the pins, move them by the key's
-    /// recovery rule.
-    pub(crate) fn dispatched(&self, key: u64, respill: bool, target: WorkerId) {
+    /// The commit dispatched a decision for `key` to `target` under the
+    /// decision's `verdict`: the pin follows the rule. The preferred pin
+    /// taken, or the failover taken while the preferred one was unroutable,
+    /// leaves the pins as they are; a respill, and a worker outside the pins,
+    /// move them by the key's recovery rule. A claiming decision settles its
+    /// own claim first.
+    pub(crate) fn dispatched(&self, key: u64, verdict: SessionVerdict, target: WorkerId) {
         if key == 0 || target == WorkerId(0) {
             return;
         }
         let mut shard = self.shard(key).lock();
         let entry = shard.entry(key).or_default();
-        // Any dispatch of the key settles a standing claim: to the claimed
-        // worker it is confirmed, elsewhere it is withdrawn, so a claim whose
-        // commit never came cannot rotate a worker that served out of the pins.
-        let claim = std::mem::replace(&mut entry.claim, WorkerId(0));
-        if claim != WorkerId(0) && claim != target {
-            entry.withdraw(claim);
+        // The decision that claimed settles its own claim and no other
+        // dispatch touches it: confirmed on the claimed worker, withdrawn when
+        // this commit landed elsewhere. An older request's commit on the
+        // owner leaves a retry's claim standing for the retries after it.
+        if let SessionVerdict::Claimed(claimed) = verdict {
+            if entry.claim == claimed {
+                entry.claim = WorkerId(0);
+                if claimed != target {
+                    entry.withdraw(claimed);
+                }
+            }
         }
         if entry.pins[0] == target {
             return;
         }
+        let respill = verdict == SessionVerdict::Respill;
         if !respill && entry.pins.contains(&target) {
             return;
         }
@@ -307,23 +332,23 @@ mod tests {
     fn the_latest_dispatch_leads_and_the_one_before_it_is_the_failover() {
         let table = SessionTable::new(RULE.sweep_micros);
         assert_eq!(table.lookup(7, 10, &RULE), [WorkerId(0); 2]);
-        table.dispatched(7, false, WorkerId(1));
+        table.dispatched(7, SessionVerdict::Pinned, WorkerId(1));
         assert_eq!(table.pins(7), Some([WorkerId(1), WorkerId(0)]));
         // A hit on the preferred pin changes nothing.
         table.lookup(7, 20, &RULE);
-        table.dispatched(7, false, WorkerId(1));
+        table.dispatched(7, SessionVerdict::Pinned, WorkerId(1));
         assert_eq!(table.pins(7), Some([WorkerId(1), WorkerId(0)]));
         // A worker outside the pins (the pins were unroutable) leads.
         table.lookup(7, 30, &RULE);
-        table.dispatched(7, false, WorkerId(2));
+        table.dispatched(7, SessionVerdict::Pinned, WorkerId(2));
         assert_eq!(table.pins(7), Some([WorkerId(2), WorkerId(1)]));
         // The failover taken while the preferred one is unroutable keeps the
         // order; a respill to it makes it the preferred one.
         table.lookup(7, 40, &RULE);
-        table.dispatched(7, false, WorkerId(1));
+        table.dispatched(7, SessionVerdict::Pinned, WorkerId(1));
         assert_eq!(table.pins(7), Some([WorkerId(2), WorkerId(1)]));
         table.lookup(7, 50, &RULE);
-        table.dispatched(7, true, WorkerId(1));
+        table.dispatched(7, SessionVerdict::Respill, WorkerId(1));
         assert_eq!(table.pins(7), Some([WorkerId(1), WorkerId(2)]));
     }
 
@@ -331,13 +356,13 @@ mod tests {
     fn under_original_recovery_the_first_worker_keeps_the_lead() {
         let table = SessionTable::new(RULE.sweep_micros);
         table.lookup(3, 10, &ORIGINAL);
-        table.dispatched(3, false, WorkerId(1));
+        table.dispatched(3, SessionVerdict::Pinned, WorkerId(1));
         table.lookup(3, 20, &ORIGINAL);
-        table.dispatched(3, false, WorkerId(2));
+        table.dispatched(3, SessionVerdict::Pinned, WorkerId(2));
         assert_eq!(table.pins(3), Some([WorkerId(1), WorkerId(2)]));
         // A third worker evicts the oldest.
         table.lookup(3, 30, &ORIGINAL);
-        table.dispatched(3, false, WorkerId(3));
+        table.dispatched(3, SessionVerdict::Pinned, WorkerId(3));
         assert_eq!(table.pins(3), Some([WorkerId(2), WorkerId(3)]));
     }
 
@@ -345,9 +370,9 @@ mod tests {
     fn idle_keys_are_swept_once_the_interval_passes() {
         let table = SessionTable::new(RULE.sweep_micros);
         table.lookup(1, 0, &RULE);
-        table.dispatched(1, false, WorkerId(1));
+        table.dispatched(1, SessionVerdict::Pinned, WorkerId(1));
         table.lookup(2, 900, &RULE);
-        table.dispatched(2, false, WorkerId(2));
+        table.dispatched(2, SessionVerdict::Pinned, WorkerId(2));
         assert_eq!(table.len(), 2);
         // Within the sweep interval nothing is swept.
         table.lookup(5, 950, &RULE);
@@ -364,7 +389,7 @@ mod tests {
             ..RULE
         };
         forever.lookup(1, 0, &no_ttl);
-        forever.dispatched(1, false, WorkerId(1));
+        forever.dispatched(1, SessionVerdict::Pinned, WorkerId(1));
         forever.lookup(2, 1_000_000, &no_ttl);
         assert_eq!(forever.pins(1), Some([WorkerId(1), WorkerId(0)]));
     }
@@ -381,9 +406,9 @@ mod tests {
         };
         let table = SessionTable::new(RULE.sweep_micros.min(hourly.sweep_micros));
         table.lookup(1, 0, &hourly);
-        table.dispatched(1, false, WorkerId(1));
+        table.dispatched(1, SessionVerdict::Pinned, WorkerId(1));
         table.lookup(2, 0, &RULE);
-        table.dispatched(2, false, WorkerId(2));
+        table.dispatched(2, SessionVerdict::Pinned, WorkerId(2));
         // Past the short rule's TTL the next decision sweeps its key; the
         // hourly key stays.
         assert_eq!(table.lookup(2, 2_000, &RULE), [WorkerId(0); 2]);
@@ -396,16 +421,44 @@ mod tests {
     fn an_expired_key_is_forgotten_at_its_lookup_before_any_sweep() {
         let rarely = SessionTable::new(1_000_000);
         rarely.lookup(1, 0, &RULE);
-        rarely.dispatched(1, false, WorkerId(1));
+        rarely.dispatched(1, SessionVerdict::Pinned, WorkerId(1));
         assert_eq!(rarely.lookup(1, 500, &RULE), [WorkerId(1), WorkerId(0)]);
         assert_eq!(rarely.lookup(1, 2_000, &RULE), [WorkerId(0); 2]);
+    }
+
+    /// A retry's claim survives the commit of an older request on the owner:
+    /// only the claiming decision settles its claim, so the retries after it
+    /// read the claim as the pin of record instead of claiming elsewhere, and
+    /// the claim is confirmed when its own commit lands.
+    #[test]
+    fn an_older_requests_commit_on_the_owner_leaves_a_retrys_claim_standing() {
+        let table = SessionTable::new(RULE.sweep_micros);
+        let seen = table.lookup(1, 0, &ORIGINAL);
+        assert_eq!(table.claim(1, seen, WorkerId(1)), Claim::Made(WorkerId(1)));
+        table.dispatched(1, SessionVerdict::Claimed(WorkerId(1)), WorkerId(1));
+        // An older request decided on the owner is still in flight when a
+        // retry that cannot use the owner claims B.
+        let seen = table.lookup(1, 10, &ORIGINAL);
+        assert_eq!(table.claim(1, seen, WorkerId(2)), Claim::Made(WorkerId(2)));
+        assert_eq!(table.pins(1), Some([WorkerId(1), WorkerId(2)]));
+        table.dispatched(1, SessionVerdict::Pinned, WorkerId(1));
+        assert_eq!(
+            table.pins(1),
+            Some([WorkerId(1), WorkerId(2)]),
+            "the older request's commit on the owner leaves the claim standing"
+        );
+        // The next retry reads B as the pin of record; the claiming retry's
+        // own commit confirms it.
+        assert_eq!(table.lookup(1, 20, &ORIGINAL), [WorkerId(1), WorkerId(2)]);
+        table.dispatched(1, SessionVerdict::Claimed(WorkerId(2)), WorkerId(2));
+        assert_eq!(table.pins(1), Some([WorkerId(1), WorkerId(2)]));
     }
 
     #[test]
     fn an_empty_key_or_target_writes_nothing() {
         let table = SessionTable::new(RULE.sweep_micros);
-        table.dispatched(0, false, WorkerId(1));
-        table.dispatched(4, false, WorkerId(0));
+        table.dispatched(0, SessionVerdict::Pinned, WorkerId(1));
+        table.dispatched(4, SessionVerdict::Pinned, WorkerId(0));
         assert!(table.is_empty());
     }
 
@@ -417,22 +470,22 @@ mod tests {
     fn a_respill_verdict_travels_with_its_decision_past_another_decisions_reading() {
         let table = SessionTable::new(RULE.sweep_micros);
         table.lookup(9, 10, &RULE);
-        table.dispatched(9, false, WorkerId(1));
+        table.dispatched(9, SessionVerdict::Pinned, WorkerId(1));
         table.lookup(9, 20, &RULE);
-        table.dispatched(9, false, WorkerId(2));
+        table.dispatched(9, SessionVerdict::Pinned, WorkerId(2));
         assert_eq!(table.pins(9), Some([WorkerId(2), WorkerId(1)]));
         // A decides a respill onto the failover, B reads the key and takes
         // the failover as a plain hit, B commits first: B's hit leaves the
         // pins, A's respill fronts the failover whatever came between.
         table.lookup(9, 30, &RULE);
         table.lookup(9, 31, &RULE);
-        table.dispatched(9, false, WorkerId(1));
+        table.dispatched(9, SessionVerdict::Pinned, WorkerId(1));
         assert_eq!(
             table.pins(9),
             Some([WorkerId(2), WorkerId(1)]),
             "B's dispatch onto the failover is a hit"
         );
-        table.dispatched(9, true, WorkerId(1));
+        table.dispatched(9, SessionVerdict::Respill, WorkerId(1));
         assert_eq!(
             table.pins(9),
             Some([WorkerId(1), WorkerId(2)]),
@@ -445,11 +498,19 @@ mod tests {
         let table = SessionTable::new(RULE.sweep_micros);
         let none = [WorkerId(0); 2];
         let seen = table.lookup(5, 10, &ORIGINAL);
-        assert_eq!(table.claim(5, seen, WorkerId(3)), WorkerId(3), "the first");
-        assert_eq!(table.claim(5, none, WorkerId(4)), WorkerId(3), "follows it");
+        assert_eq!(
+            table.claim(5, seen, WorkerId(3)),
+            Claim::Made(WorkerId(3)),
+            "the first"
+        );
+        assert_eq!(
+            table.claim(5, none, WorkerId(4)),
+            Claim::Standing(WorkerId(3)),
+            "follows it"
+        );
         assert_eq!(table.pins(5), Some([WorkerId(3), WorkerId(0)]));
-        table.dispatched(5, false, WorkerId(3));
-        table.dispatched(5, false, WorkerId(4));
+        table.dispatched(5, SessionVerdict::Claimed(WorkerId(3)), WorkerId(3));
+        table.dispatched(5, SessionVerdict::Pinned, WorkerId(4));
         assert_eq!(
             table.pins(5),
             Some([WorkerId(3), WorkerId(4)]),
@@ -459,20 +520,20 @@ mod tests {
         // its worker by the recovery (the oldest slot goes), the second
         // follows the newcomer.
         let seen = table.lookup(5, 20, &ORIGINAL);
-        assert_eq!(table.claim(5, seen, WorkerId(7)), WorkerId(7));
+        assert_eq!(table.claim(5, seen, WorkerId(7)), Claim::Made(WorkerId(7)));
         assert_eq!(table.pins(5), Some([WorkerId(4), WorkerId(7)]));
         assert_eq!(
             table.claim(5, seen, WorkerId(8)),
-            WorkerId(7),
+            Claim::Standing(WorkerId(7)),
             "the newcomer"
         );
         // Under the latest-first recovery the claim leads at once.
         let seen = table.lookup(6, 30, &RULE);
-        assert_eq!(table.claim(6, seen, WorkerId(1)), WorkerId(1));
+        assert_eq!(table.claim(6, seen, WorkerId(1)), Claim::Made(WorkerId(1)));
         assert_eq!(table.pins(6), Some([WorkerId(1), WorkerId(0)]));
         assert_eq!(
             table.claim(0, none, WorkerId(9)),
-            WorkerId(9),
+            Claim::Standing(WorkerId(9)),
             "no key, no claim"
         );
         assert_eq!(table.len(), 2);
@@ -486,11 +547,11 @@ mod tests {
     fn a_claim_whose_commit_landed_elsewhere_is_withdrawn_before_the_pins_move() {
         let table = SessionTable::new(RULE.sweep_micros);
         table.lookup(1, 10, &ORIGINAL);
-        table.dispatched(1, false, WorkerId(1));
+        table.dispatched(1, SessionVerdict::Pinned, WorkerId(1));
         let seen = table.lookup(1, 20, &ORIGINAL);
-        assert_eq!(table.claim(1, seen, WorkerId(2)), WorkerId(2));
+        assert_eq!(table.claim(1, seen, WorkerId(2)), Claim::Made(WorkerId(2)));
         assert_eq!(table.pins(1), Some([WorkerId(1), WorkerId(2)]));
-        table.dispatched(1, false, WorkerId(3));
+        table.dispatched(1, SessionVerdict::Claimed(WorkerId(2)), WorkerId(3));
         assert_eq!(
             table.pins(1),
             Some([WorkerId(1), WorkerId(3)]),
@@ -500,18 +561,18 @@ mod tests {
         // instead and the owner stays the failover.
         let table = SessionTable::new(RULE.sweep_micros);
         table.lookup(2, 10, &RULE);
-        table.dispatched(2, false, WorkerId(1));
+        table.dispatched(2, SessionVerdict::Pinned, WorkerId(1));
         let seen = table.lookup(2, 20, &RULE);
-        assert_eq!(table.claim(2, seen, WorkerId(2)), WorkerId(2));
+        assert_eq!(table.claim(2, seen, WorkerId(2)), Claim::Made(WorkerId(2)));
         assert_eq!(table.pins(2), Some([WorkerId(2), WorkerId(1)]));
-        table.dispatched(2, false, WorkerId(3));
+        table.dispatched(2, SessionVerdict::Claimed(WorkerId(2)), WorkerId(3));
         assert_eq!(table.pins(2), Some([WorkerId(3), WorkerId(1)]));
         // A dispatch to the claimed worker confirms the claim.
         let seen = table.lookup(2, 30, &RULE);
-        assert_eq!(table.claim(2, seen, WorkerId(4)), WorkerId(4));
-        table.dispatched(2, false, WorkerId(4));
+        assert_eq!(table.claim(2, seen, WorkerId(4)), Claim::Made(WorkerId(4)));
+        table.dispatched(2, SessionVerdict::Claimed(WorkerId(4)), WorkerId(4));
         assert_eq!(table.pins(2), Some([WorkerId(4), WorkerId(3)]));
-        table.dispatched(2, false, WorkerId(5));
+        table.dispatched(2, SessionVerdict::Pinned, WorkerId(5));
         assert_eq!(
             table.pins(2),
             Some([WorkerId(5), WorkerId(4)]),
@@ -524,10 +585,10 @@ mod tests {
         let table = SessionTable::new(RULE.sweep_micros);
         for (key, first, second) in [(1, 1, 2), (2, 2, 0), (3, 2, 1), (4, 3, 0)] {
             table.lookup(key, 10, &ORIGINAL);
-            table.dispatched(key, false, WorkerId(first));
+            table.dispatched(key, SessionVerdict::Pinned, WorkerId(first));
             if second != 0 {
                 table.lookup(key, 20, &ORIGINAL);
-                table.dispatched(key, false, WorkerId(second));
+                table.dispatched(key, SessionVerdict::Pinned, WorkerId(second));
             }
         }
         assert_eq!(table.pins(3), Some([WorkerId(2), WorkerId(1)]));
