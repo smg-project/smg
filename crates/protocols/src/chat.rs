@@ -741,25 +741,31 @@ fn validate_chat_cross_parameters(
         }
     }
 
-    // 4. Validate structured output conflicts
-    let has_json_format = matches!(
+    // 4. Validate structured output conflicts: a response format that
+    //    constrains the output (a JSON one, a structural tag) beside a grammar
+    //    of the request's own
+    let has_format_constraint = matches!(
         req.response_format,
-        Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        Some(
+            ResponseFormat::JsonObject
+                | ResponseFormat::JsonSchema { .. }
+                | ResponseFormat::StructuralTag { .. }
+        )
     );
 
-    if has_json_format && req.regex.is_some() {
+    if has_format_constraint && req.regex.is_some() {
         return Err(invalid_at(
             "regex",
             "regex_conflicts_with_json",
-            "cannot use regex constraint with JSON response format",
+            "cannot use regex constraint with a JSON or structural_tag response format",
         ));
     }
 
-    if has_json_format && req.ebnf.is_some() {
+    if has_format_constraint && req.ebnf.is_some() {
         return Err(invalid_at(
             "ebnf",
             "ebnf_conflicts_with_json",
-            "cannot use EBNF constraint with JSON response format",
+            "cannot use EBNF constraint with a JSON or structural_tag response format",
         ));
     }
 
@@ -773,8 +779,8 @@ fn validate_chat_cross_parameters(
     .filter(|&&x| x)
     .count();
 
-    // Only `regex` beside `ebnf` reaches this rule (a JSON format beside
-    // either was refused above); the second constraint is the one named.
+    // Only `regex` beside `ebnf` reaches this rule (a format beside either
+    // was refused above); the second constraint is the one named.
     if constraint_count > 1 {
         return Err(invalid_at(
             "ebnf",

@@ -35,12 +35,14 @@ use crate::{
     worker::{Worker, WorkerType},
 };
 
-/// The schema a JSON `response_format` asks the answer to follow: any object for `json_object`.
+/// The schema a JSON `response_format` asks the answer to follow: any object for `json_object`;
+/// none for a structural tag, a grammar of the request's own that no table shapes
+/// (`Asks::own_structural_tag`).
 fn answer_schema(response_format: Option<&ResponseFormat>) -> Option<Value> {
     match response_format? {
         ResponseFormat::JsonObject => Some(json!({"type": "object"})),
         ResponseFormat::JsonSchema { json_schema } => Some(json_schema.schema.clone()),
-        ResponseFormat::Text => None,
+        ResponseFormat::Text | ResponseFormat::StructuralTag { .. } => None,
     }
 }
 
@@ -275,6 +277,22 @@ impl<'a> Asks<'a> {
         }
     }
 
+    /// The request's `response_format` is a structural tag: a grammar of the request's own over
+    /// the sections it names, with the text around them free, which the engine takes whole and as
+    /// it arrived (its request builder sends it, `response_format_constraint`). No table shapes an
+    /// answer's tag, an `auto` tag or a turn's grammar over it; a template's format stands around
+    /// it, so a compiled table does not refuse it as it refuses a `regex` or an `ebnf`. A Messages
+    /// request names none.
+    pub(super) fn own_structural_tag(self) -> bool {
+        match self {
+            Self::Chat(request) => matches!(
+                request.response_format,
+                Some(ResponseFormat::StructuralTag { .. })
+            ),
+            Self::Messages { .. } => false,
+        }
+    }
+
     /// The JSON schema the request's answer must fit: a chat request's `response_format`'s, a
     /// Messages request's `output_config.format`'s.
     pub(super) fn answer_schema(self) -> Option<Value> {
@@ -291,7 +309,7 @@ impl<'a> Asks<'a> {
     /// turn forced into a call has no text answer to format, whether or not the call has a
     /// constraint of its own (a legacy parser may give a forced call none and let the model
     /// write its native call). A chat request's reaches the engine through its request builder
-    /// (`response_format_schema`), so none is named here.
+    /// (`response_format_constraint`), so none is named here.
     pub(crate) fn untabled_answer_schema(self, tools: &[Tool]) -> Option<Value> {
         match self {
             Self::Chat(_) => None,
@@ -337,8 +355,8 @@ impl<'a> Asks<'a> {
     /// whether one call at most. Nothing where the request has no callable tool, forbids the
     /// calls (`tool_choice: none`), or continues the assistant's message (the tag writes a turn
     /// from its start). A chat request that carries a constraint of its own, which the tag would
-    /// displace (a JSON `response_format`, a `regex`, an `ebnf`), takes none; a Messages choice
-    /// that forces a call takes none, its tag being [`constraint_for`]'s.
+    /// displace (a JSON or structural-tag `response_format`, a `regex`, an `ebnf`), takes none; a
+    /// Messages choice that forces a call takes none, its tag being [`constraint_for`]'s.
     fn auto_calls(self, tools: &[Tool]) -> Option<bool> {
         if tools.is_empty() || self.continues() {
             return None;
@@ -349,7 +367,9 @@ impl<'a> Asks<'a> {
                     request.tool_choice,
                     Some(ToolChoice::Value(ToolChoiceValue::None))
                 );
-                let own = self.answer_schema().is_some() || self.constrains_outside_the_format();
+                let own = self.answer_schema().is_some()
+                    || self.constrains_outside_the_format()
+                    || self.own_structural_tag();
                 (!forbids && !own).then(|| request.disables_parallel_tool_calls())
             }
             Self::Messages { request, .. } => match &request.tool_choice {
@@ -1024,7 +1044,9 @@ pub(crate) fn turn_constraint(
 
 /// [`turn_constraint`] over `format`: the request's tools and choice, its parallel use, and the
 /// answer's format, a chat request's `response_format`, `regex` or `ebnf` (the protocol refuses
-/// more than one) or a Messages request's `output_config.format`.
+/// more than one) or a Messages request's `output_config.format`. `Ok(None)` for a structural-tag
+/// `response_format`: no turn's grammar holds a tag of the request's own, so none starts and the
+/// tag goes to the engine as it arrived.
 pub(super) fn turn_of(
     format: &Format,
     asks: Asks<'_>,
@@ -1032,6 +1054,9 @@ pub(super) fn turn_of(
     prompt: &str,
     vocabulary: TagVocabulary,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
+    if asks.own_structural_tag() {
+        return Ok(None);
+    }
     let choice = asks.choice();
     let callable = callable(choice.as_deref(), declared);
     let schema = asks.answer_schema();
