@@ -6550,19 +6550,17 @@ mod tests {
         drop(listener);
     }
 
-    /// A worker that answers the chat route with `body` as one sized SSE
-    /// answer: hyper writes the `Content-Length` an upstream that knows its
-    /// length would.
+    /// A worker that answers the chat route with `body` as one sized answer
+    /// under `content_type`: hyper writes the `Content-Length` an upstream
+    /// that knows its length would.
     #[expect(
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    async fn spawn_sized_sse_worker(body: &'static str) -> String {
+    async fn spawn_sized_worker(body: &'static str, content_type: &'static str) -> String {
         let app = axum::Router::new().route(
             "/v1/chat/completions",
-            axum::routing::post(
-                move || async move { ([(CONTENT_TYPE, "text/event-stream")], body) },
-            ),
+            axum::routing::post(move || async move { ([(CONTENT_TYPE, content_type)], body) }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -6587,7 +6585,7 @@ mod tests {
                             \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\
                             \"finish_reason\":null}]}\n\n\
                             data: [DONE]\n\n";
-        let url = spawn_sized_sse_worker(BODY).await;
+        let url = spawn_sized_worker(BODY, "text/event-stream").await;
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
         let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
         for model in ["MiniMax-M3", "served-plain-relay-model"] {
@@ -6622,6 +6620,52 @@ mod tests {
                 })
                 .collect();
             assert_eq!(text, "Hello", "{model}: the text is whole");
+        }
+    }
+
+    /// A streamed answer that is not SSE is relayed byte for byte, on the
+    /// re-chunking model and the plain one alike, so a sized upstream answer
+    /// keeps the upstream's `Content-Length` and reaches the client whole.
+    #[tokio::test]
+    async fn a_streamed_relay_keeps_the_content_length_of_a_sized_non_sse_answer() {
+        use openai_protocol::validated::Normalizable;
+
+        const BODY: &str = "{\"id\":\"sized\",\"object\":\"chat.completion\",\"created\":1700000000,\
+                            \"model\":\"m\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\
+                            \"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}";
+        let url = spawn_sized_worker(BODY, "application/json").await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        for model in ["MiniMax-M3", "served-plain-relay-model"] {
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 16,
+                "stream": true,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .and_then(|length| length.to_str().ok()),
+                Some(BODY.len().to_string().as_str()),
+                "{model}: the upstream's Content-Length of a sized non-SSE answer"
+            );
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            assert_eq!(
+                bytes.as_ref(),
+                BODY.as_bytes(),
+                "{model}: the bytes are whole"
+            );
         }
     }
 
