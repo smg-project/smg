@@ -271,7 +271,9 @@ impl Roles {
     /// and so does a run of characters beyond ASCII); after an ASCII member,
     /// whole words of members pass at once up to the first byte outside the
     /// set, which ends the run when it is ASCII and is read by
-    /// [`Self::beyond`] when it is not, or the tail under eight bytes.
+    /// [`Self::beyond`] when it is not, or the tail under eight bytes. With
+    /// `WORDS` off (an input under the encoder's `WORD_SCAN_MIN_BYTES`) it is
+    /// [`Self::run_end`] whatever `SCAN` names.
     #[inline(always)]
     pub(super) fn run_end_as<const SCAN: u8, const WORDS: bool>(
         &self,
