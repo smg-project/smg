@@ -362,8 +362,9 @@ own code path), and the client reads the decode side's output.
   `bootstrap_room`, on the gRPC wires `InvalidArgument` for a missing
   `kv_bootstrap_info` (TokenSpeed), `disaggregated_params` (SGLang) or
   `kv_transfer_params_json` (vLLM, the typed `kv_transfer_params` also
-  taken), or for a named rendezvous without a host or a port (a room of 0 is
-  one the gateway can mint, and is taken). On the
+  taken, and refused under its own name when it names no host or port), or
+  for a named rendezvous without a host or a port (a room of 0 is one the
+  gateway can mint, and is taken). On the
   vLLM wire the decode side alone refuses: the gateway names the pair to it,
   and the prefill request carries the connector's parameters only when a
   connector relays them. A prefill worker refuses one whose bootstrap port is
