@@ -40,6 +40,7 @@ use crate::{
         PromptSegment, RendererProfile, TemplateAnswers,
     },
     native::{AddedTokens, NativeEncoder},
+    token_text::TokenTextTable,
     traits::{
         append_step_text, AppendedStep, ChatTemplateOutput, DecodeStep, Decoder, EncodeJob,
         Encoder, Encoding, IncrementalDecoder, PromptEncoding, SpecialTokens, TokenIdType,
@@ -107,6 +108,12 @@ pub struct HuggingFaceTokenizer {
     /// byte fallback (see `byte_fallback`): the streaming step's window
     /// decodes read it instead of running the `tokenizers` decode.
     pieces: Option<Arc<PieceTable>>,
+    /// Text per id as a first and as a later token, when the decoder reads
+    /// tokens one at a time (`WordPiece`, `Metaspace`; see `token_text`),
+    /// built at load so that no request pays for it: full and window decodes
+    /// read it instead of running the `tokenizers` decode. `None` for
+    /// another decoder.
+    token_texts: Option<Arc<TokenTextTable>>,
     /// The opt-in v1 pipeline, when the choice took it (then the core's
     /// `native` is `None`).
     #[cfg(feature = "tokenizers-v1")]
@@ -132,23 +139,27 @@ pub struct HuggingFaceTokenizer {
 
 /// Logs, once per load, which path a tokenizer's full decode takes: the
 /// byte-level table (a `ByteLevel` decoder), the piece table (byte fallback),
-/// or `tokenizers` itself, with the decoder kind that kept the tables out.
-fn log_decode_path(tokenizer: &HfTokenizer, byte_level: bool, pieces: bool) {
+/// the token-text table (a `WordPiece` or `Metaspace` decoder), or
+/// `tokenizers` itself, with the decoder kind that kept the tables out.
+fn log_decode_path(tokenizer: &HfTokenizer, byte_level: bool, pieces: bool, token_texts: bool) {
     let path = if byte_level {
         "byte-level table"
     } else if pieces {
         "piece table"
+    } else if token_texts {
+        "token-text table"
     } else {
         "tokenizers"
     };
-    if byte_level || pieces {
+    if byte_level || pieces || token_texts {
         tracing::info!(path, "tokenizer decode path");
     } else {
         tracing::info!(
             path,
             declined = %crate::byte_level::decoder_kind(tokenizer.get_decoder()),
-            "tokenizer decode path (the tables take a ByteLevel decoder, or the chain \
-             [Replace U+2581 -> space] ByteFallback Fuse [Strip one leading space])"
+            "tokenizer decode path (the tables take a ByteLevel decoder, the chain \
+             [Replace U+2581 -> space] ByteFallback Fuse [Strip one leading space], \
+             or a WordPiece or Metaspace decoder)"
         );
     }
 }
@@ -438,7 +449,7 @@ impl EncoderCore {
         }
         let encoding = self
             .plain_tokenizer(at_start)
-            .encode(text, false)
+            .encode_fast(text, false)
             .map_err(|e| Error::msg(format!("Encoding failed: {e}")))?;
         ids.extend_from_slice(encoding.get_ids());
         Ok(())
@@ -892,7 +903,13 @@ impl HuggingFaceTokenizer {
             deepseek_v31.is_some() && deepseek_v31::Checkpoint::renders_tools_block(&chat_template);
         let byte_level = ByteLevelTable::build(&tokenizer);
         let pieces = PieceTable::build(&tokenizer);
-        log_decode_path(&tokenizer, byte_level.is_some(), pieces.is_some());
+        let token_texts = TokenTextTable::build(&tokenizer);
+        log_decode_path(
+            &tokenizer,
+            byte_level.is_some(),
+            pieces.is_some(),
+            token_texts.is_some(),
+        );
         let core = Arc::new(EncoderCore::new(tokenizer, encoders.native));
         let structural_controls = tokenizer_path
             .parent()
@@ -908,6 +925,7 @@ impl HuggingFaceTokenizer {
         Ok(HuggingFaceTokenizer {
             byte_level,
             pieces,
+            token_texts,
             #[cfg(feature = "tokenizers-v1")]
             v1: encoders.v1,
             core,
@@ -929,12 +947,22 @@ impl HuggingFaceTokenizer {
     }
 
     /// The text of a window of the stream (a handful of ids): a walk of the
-    /// piece table when the vocabulary has one, else the `tokenizers` decode.
+    /// piece table or the token-text table when the vocabulary has one, else
+    /// the `tokenizers` decode.
     fn window_decode(&self, ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
-        match &self.pieces {
-            Some(table) => Ok(table.render(ids, skip_special_tokens)),
-            None => self.decode(ids, skip_special_tokens),
+        if let Some(table) = &self.pieces {
+            return Ok(table.render(ids, skip_special_tokens));
         }
+        if let Some(table) = self.token_texts() {
+            return Ok(table.render(ids, skip_special_tokens));
+        }
+        self.decode(ids, skip_special_tokens)
+    }
+
+    /// The token-text table (see `token_text`); `None` for a decoder it does
+    /// not read.
+    fn token_texts(&self) -> Option<&Arc<TokenTextTable>> {
+        self.token_texts.as_ref()
     }
 
     /// The byte a ByteFallback byte token (`<0xHH>`) stands for.
@@ -1204,10 +1232,17 @@ impl HuggingFaceTokenizer {
         let byte_fallback_values = byte_fallback_values(&tokenizer, has_byte_fallback);
         let byte_level = ByteLevelTable::build(&tokenizer);
         let pieces = PieceTable::build(&tokenizer);
-        log_decode_path(&tokenizer, byte_level.is_some(), pieces.is_some());
+        let token_texts = TokenTextTable::build(&tokenizer);
+        log_decode_path(
+            &tokenizer,
+            byte_level.is_some(),
+            pieces.is_some(),
+            token_texts.is_some(),
+        );
         HuggingFaceTokenizer {
             byte_level,
             pieces,
+            token_texts,
             #[cfg(feature = "tokenizers-v1")]
             v1: encoders.v1,
             core: Arc::new(EncoderCore::new(tokenizer, encoders.native)),
@@ -1609,7 +1644,10 @@ impl Encoder for HuggingFaceTokenizer {
         }
         // The direct path frames the ids itself on a request for special
         // tokens (what the post-processor it read at load adds). An input it
-        // gives up is counted and encoded by `tokenizers`.
+        // gives up is counted and encoded by `tokenizers`, in the form that
+        // skips the offsets of every token in the original text: nothing
+        // reads them (an `Encoding` gives out its ids), and the ids are those
+        // of the full form.
         if let Some(native) = &self.core.native {
             match native.encode(
                 Some(self.core.tokenizer.get_model()),
@@ -1622,7 +1660,7 @@ impl Encoder for HuggingFaceTokenizer {
         }
         self.core
             .tokenizer
-            .encode(input, add_special_tokens)
+            .encode_fast(input, add_special_tokens)
             .map_err(|e| Error::msg(format!("Encoding failed: {e}")))
             .map(|encoding| Encoding::Hf(Box::new(encoding)))
     }
@@ -1647,7 +1685,7 @@ impl Encoder for HuggingFaceTokenizer {
         }
         self.core
             .tokenizer
-            .encode_batch(inputs.to_vec(), add_special_tokens)
+            .encode_batch_fast(inputs.to_vec(), add_special_tokens)
             .map_err(|e| Error::msg(format!("Batch encoding failed: {e}")))
             .map(|encodings| {
                 encodings
@@ -1928,6 +1966,23 @@ impl HuggingFaceTokenizer {
                 }
             }
         }
+        if let Some(table) = self.token_texts() {
+            // Nothing pending and a plain token after a kept one: the window's
+            // text grows by exactly this token's text, which streams at once,
+            // borrowed from the table; the token on its own becomes the
+            // window, with its first-token text as the prefix the full step
+            // would record.
+            if *prefix_index == ids.len() && !prefix.is_empty() && !prefix.ends_with('\u{FFFD}') {
+                if let Some((text, first)) = table.step_texts(token_id, skip_special_tokens) {
+                    ids.clear();
+                    ids.push(token_id);
+                    prefix.clear();
+                    prefix.push_str(first);
+                    *prefix_index = 1;
+                    return Ok(Stepped::Piece(text));
+                }
+            }
+        }
         let step = self.step_decode_lenient(
             &[token_id],
             skip_special_tokens,
@@ -2018,6 +2073,13 @@ impl Decoder for HuggingFaceTokenizer {
         // its piece table, as its streaming windows do: one pass over the ids
         // in place of the `tokenizers` decoder chain over every piece.
         if let Some(table) = &self.pieces {
+            return Ok(table.render(token_ids, skip_special_tokens));
+        }
+        // A vocabulary whose decoder reads tokens one at a time (WordPiece,
+        // Metaspace) decodes through its token-text table: one pass over the
+        // ids in place of a string per token and the decoder's passes over
+        // each.
+        if let Some(table) = self.token_texts() {
             return Ok(table.render(token_ids, skip_special_tokens));
         }
         self.core
