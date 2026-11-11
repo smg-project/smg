@@ -3689,7 +3689,13 @@ mod tests {
         assert!(warning.contains("grpc://***@worker:50051"), "{warning}");
         assert!(warning.contains("not sent to a gRPC worker"), "{warning}");
         assert!(!warning.contains("secret"), "{warning}");
-        for url in ["http://user:secret@worker:8000", "grpc://worker:50051"] {
+        // An `@` inside a query or fragment is no userinfo: no warning.
+        for url in [
+            "http://user:secret@worker:8000",
+            "grpc://worker:50051",
+            "grpc://worker:50051?token=a@b",
+            "grpc://worker:50051#a@b",
+        ] {
             assert_eq!(unused_credentials_warning(url), None, "{url}");
         }
 
