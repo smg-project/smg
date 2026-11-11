@@ -1572,8 +1572,9 @@ impl NativeEncoder {
         table
     }
 
-    /// The `Split` stages of a pre-tokenizer that is zero or more `Split`s
-    /// followed by one `ByteLevel` without prefix space.
+    /// The stages of a pre-tokenizer that is zero or more `Split`s (or
+    /// `Digits`, a split on numeric characters) followed by one `ByteLevel`
+    /// without prefix space.
     fn stages_from(pre_tokenizer: &Value) -> Result<Vec<Stage>, Declined> {
         if pre_tokenizer.is_null() {
             return Err(Declined::from(
@@ -1614,10 +1615,26 @@ impl NativeEncoder {
     }
 
     /// One `Split` before the `ByteLevel` as a stage: a regex or a literal
-    /// the pattern engine takes, `Isolated`, or `Removed` inverted.
+    /// the pattern engine takes, `Isolated`, or `Removed` inverted. A
+    /// `Digits` is the `Isolated` split on numeric characters, each one a
+    /// piece under `individual_digits`, else each run (the reference splits
+    /// on `char::is_numeric`, the `\p{N}` category).
     fn split_stage(split: &Value) -> Result<Stage, Declined> {
         match type_of("pre-tokenizer stage", split)? {
             "Split" => {}
+            "Digits" => {
+                let each = split
+                    .get("individual_digits")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let pattern = if each { r"\p{N}" } else { r"\p{N}+" };
+                return Pattern::parse(pattern)
+                    .map(|pattern| Stage {
+                        pattern,
+                        keep_gaps: true,
+                    })
+                    .ok_or_else(|| Declined::from("the Digits split pattern"));
+            }
             other => {
                 return Err(Declined::from(format!(
                     "pre-tokenizer {other} before the ByteLevel (only Split)"

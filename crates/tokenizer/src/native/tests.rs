@@ -15,6 +15,7 @@ use tokenizers::{
     },
     pre_tokenizers::{
         byte_level::ByteLevel as ByteLevelPreTokenizer,
+        digits::Digits,
         metaspace::{Metaspace, PrependScheme},
         sequence::Sequence,
         split::{Split, SplitPattern},
@@ -369,6 +370,32 @@ fn shapes() -> Vec<Shape> {
             ],
             added: &[("<think>", false), ("<|tool_call_start|>", false)],
         },
+        // `Digits` before the `ByteLevel` with its own regex: every numeric
+        // character its own piece, the rest cut by the byte-level pattern.
+        Shape {
+            name: "digits-then-byte-level-regex",
+            nfc: false,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Digits(Digits::new(true)),
+                byte_level(true),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+            added: &[],
+        },
+        // `Digits` in runs before a split and the `ByteLevel`.
+        Shape {
+            name: "digit-runs",
+            nfc: false,
+            pre_tokenizers: vec![
+                PreTokenizerWrapper::Digits(Digits::new(false)),
+                split(CL100K, SplitDelimiterBehavior::Isolated, false),
+                byte_level(false),
+            ],
+            ignore_merges: false,
+            special: &["<|endoftext|>"],
+            added: &[],
+        },
         // Added tokens with a space inside, matched after normalization
         // (the default of `add_tokens`): a cut at that space would turn
         // the token into pieces.
@@ -442,9 +469,17 @@ fn every_shape_gets_a_native_path() {
         let expected_stages = shape
             .pre_tokenizers
             .iter()
-            .filter(|p| matches!(p, PreTokenizerWrapper::Split(_)))
+            .filter(|p| {
+                matches!(
+                    p,
+                    PreTokenizerWrapper::Split(_) | PreTokenizerWrapper::Digits(_)
+                )
+            })
             .count()
-            + usize::from(shape.name == "byte-level-regex");
+            + usize::from(matches!(
+                shape.pre_tokenizers.last(),
+                Some(PreTokenizerWrapper::ByteLevel(byte_level)) if byte_level.use_regex
+            ));
         assert_eq!(
             native.expect("native").stages.len(),
             expected_stages,
