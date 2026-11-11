@@ -1313,24 +1313,42 @@ impl ResponseStreamEventEmitter {
 
         // output_index and item_id are always set in the block above
         // when current_item_id was None and we allocated new ones
-        if let (Some(output_index), Some(item_id)) = (
-            self.current_message_output_index,
-            self.current_item_id.clone(),
-        ) {
-            let content_index = 0; // Single content part for now
+        let Some(output_index) = self.current_message_output_index else {
+            return Ok(());
+        };
+        let content_index = 0; // Single content part for now
 
-            // Emit content_part.added before first delta
-            if !self.has_emitted_content_part_added {
-                let event = self.emit_content_part_added(output_index, &item_id, content_index);
-                self.send_event(&event, tx).await?;
-                self.has_emitted_content_part_added = true;
-            }
-
-            // Emit text delta
-            self.send_text_delta(content, output_index, &item_id, content_index, tx)
-                .await?;
+        // Emit content_part.added before first delta: once per item, so the
+        // id's copy for the borrow split stays on this branch.
+        if !self.has_emitted_content_part_added {
+            let Some(item_id) = self.current_item_id.clone() else {
+                return Ok(());
+            };
+            let event = self.emit_content_part_added(output_index, &item_id, content_index);
+            self.send_event(&event, tx).await?;
+            self.has_emitted_content_part_added = true;
         }
-        Ok(())
+
+        // Emit text delta: the id borrowed from the emitter, the counter
+        // advanced on its field (the method would take the whole emitter while
+        // the id is borrowed, and the guard must not cost a number when it
+        // fires) and the frame written over the encoder alone, so no copy of
+        // the id is made per token.
+        let Some(item_id) = self.current_item_id.as_deref() else {
+            return Ok(());
+        };
+        let sequence_number = self.sequence_number;
+        self.sequence_number += 1;
+        self.accumulated_text.push_str(content);
+        let event = OutputTextDelta {
+            kind: OutputTextEvent::DELTA,
+            sequence_number,
+            output_index,
+            item_id,
+            content_index,
+            delta: content,
+        };
+        Self::send_frame(&mut self.encoder, OutputTextEvent::DELTA, &event, tx).await
     }
 
     /// A chat tool-call delta as Responses function_call events; without this
@@ -1449,16 +1467,29 @@ impl ResponseStreamEventEmitter {
         self.send_typed(event_type, event, tx).await
     }
 
-    /// One event of any serializable shape under `event_type`: the one frame
-    /// writer of this emitter, serialized once into the frame.
+    /// One event of any serializable shape under `event_type`: the frame
+    /// writer over `self`, [`Self::send_frame`] with this emitter's encoder.
     async fn send_typed<T: Serialize>(
         &mut self,
         event_type: &str,
         event: &T,
         tx: &SseSender,
     ) -> Result<(), String> {
-        let frame = self
-            .encoder
+        Self::send_frame(&mut self.encoder, event_type, event, tx).await
+    }
+
+    /// The one frame writer of this emitter, over the encoder alone: `event`
+    /// serialized once into the frame under `event_type`. [`Self::send_typed`]
+    /// delegates here; a caller holding a borrow of another field while the
+    /// frame goes out (the per-token delta borrows the current item's id)
+    /// calls it directly.
+    async fn send_frame<T: Serialize>(
+        encoder: &mut SseEncoder,
+        event_type: &str,
+        event: &T,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        let frame = encoder
             .encode_event(event_type, event)
             .map_err(|e| match e {
                 SseEncodeError::Json(e) => format!("Failed to serialize event: {e}"),
@@ -2259,6 +2290,20 @@ mod process_chunk_tests {
         assert!(output[0].get("encrypted_content").is_none());
         assert_eq!(output[1]["type"], "message");
         assert_eq!(output[1]["content"][0]["text"], "Hello");
+        // The deltas through the emitter's own path carry the item's id, the
+        // text of their chunk and consecutive sequence numbers.
+        assert_eq!(events[8]["item_id"], output[1]["id"]);
+        assert_eq!(events[9]["item_id"], output[1]["id"]);
+        assert_eq!(
+            (events[8]["delta"].as_str(), events[9]["delta"].as_str()),
+            (Some("Hel"), Some("lo"))
+        );
+        for pair in events.windows(2) {
+            assert_eq!(
+                pair[1]["sequence_number"].as_u64(),
+                pair[0]["sequence_number"].as_u64().map(|s| s + 1)
+            );
+        }
     }
 
     #[tokio::test]
