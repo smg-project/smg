@@ -313,9 +313,9 @@ impl DirectEncoders {
         }
     }
 
-    /// Reads the vocabulary into the direct encoder's seed, through the model
-    /// once its word cache is bounded: the words the seed merges then leave
-    /// nothing in the model's per-thread caches.
+    /// Reads the vocabulary into the direct encoder's seed: an entry's ids
+    /// from the path's own tables, the model asked only where the path has
+    /// none (see `NativeEncoder::seed_vocabulary`).
     fn seed_native(&mut self, model: &ModelWrapper) {
         if let Some(native) = &mut self.native {
             native.seed_vocabulary(model);
