@@ -318,6 +318,17 @@ impl Class {
         self.first().non_ascii
     }
 
+    /// Whether every character the class can hold is printable ASCII
+    /// (U+0021..=U+007E): no category, no negation, every range within.
+    pub(super) fn within_printable_ascii(&self) -> bool {
+        !self.negated
+            && self.categories == 0
+            && self
+                .ranges
+                .iter()
+                .all(|&(start, end)| start >= 0x21 && end <= 0x7E)
+    }
+
     /// The characters the class may hold, exact below U+0080 and one bit for
     /// the rest, set unless every member of the class is ASCII.
     fn first(&self) -> First {
@@ -543,6 +554,12 @@ impl Pattern {
     /// What the pattern is as a stage of a three-stage chain, if anything.
     pub(super) fn part(&self) -> Option<&chain::Part> {
         self.part.as_ref()
+    }
+
+    /// Whether every class of the pattern is within printable ASCII, so that
+    /// the pattern cuts a text and its byte-level image at the same places.
+    pub(super) fn within_printable_ascii(&self) -> bool {
+        self.classes.iter().all(Class::within_printable_ascii)
     }
 
     /// This pattern matched by its program alone, the scanner set aside: the
