@@ -2085,6 +2085,76 @@ mod tests {
         assert_eq!(error["message"], "engine unavailable");
     }
 
+    /// A chat body whose read fails mid-stream ends the response as failed,
+    /// not completed: the text before the cut reaches the client, the
+    /// terminal event is `response.failed` with the read error, and the
+    /// stored record reads failed and carries it.
+    #[tokio::test]
+    async fn a_body_read_error_fails_the_responses_stream_and_its_record() {
+        let frames: Vec<Result<String, std::io::Error>> = vec![
+            Ok(chat_event(
+                json!({"role":"assistant","content":"Part"}),
+                None,
+            )),
+            Err(std::io::Error::other("the engine reset the connection")),
+        ];
+        let body = Body::from_stream(futures_util::stream::iter(frames));
+        let response_storage = Arc::new(smg_data_connector::MemoryResponseStorage::new());
+        let (tx, mut rx) = mpsc::channel(64);
+        process_and_transform_sse_stream(
+            body,
+            ResponsesRequest {
+                store: Some(true),
+                ..Default::default()
+            },
+            None,
+            response_storage.clone(),
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
+            None,
+            tx,
+        )
+        .await
+        .unwrap();
+        let mut events: Vec<Value> = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            let text = std::str::from_utf8(&bytes).unwrap();
+            for data in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                events.push(serde_json::from_str(data).unwrap());
+            }
+        }
+        let text: String = events
+            .iter()
+            .filter(|e| e["type"] == "response.output_text.delta")
+            .map(|e| e["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(text, "Part", "the text before the cut reaches the client");
+        let terminal = events.last().expect("a terminal event");
+        assert_eq!(terminal["type"], "response.failed", "{terminal}");
+        assert_eq!(terminal["response"]["status"], "failed");
+        assert_eq!(terminal["response"]["error"]["code"], "stream_error");
+        let message = terminal["response"]["error"]["message"]
+            .as_str()
+            .expect("the error's message");
+        assert!(
+            message.starts_with("Stream read error: ")
+                && message.contains("the engine reset the connection"),
+            "{message}"
+        );
+        assert!(!events.iter().any(|e| e["type"] == "response.completed"));
+        let id = terminal["response"]["id"]
+            .as_str()
+            .expect("the response id");
+        let stored = response_storage
+            .get_response(&smg_data_connector::ResponseId::from(id))
+            .await
+            .unwrap()
+            .expect("the failed response is stored");
+        assert_eq!(stored.raw_response["status"], "failed");
+        assert_eq!(stored.raw_response["error"]["code"], "stream_error");
+    }
+
     #[test]
     fn a_frame_of_valid_bytes_is_borrowed_and_an_invalid_one_is_replaced() {
         let valid = b"data: {\"id\":\"chatcmpl-1\"}\n\n";
