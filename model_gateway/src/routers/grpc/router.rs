@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
 };
 use openai_protocol::{
     chat::ChatCompletionRequest,
@@ -20,6 +19,7 @@ use openai_protocol::{
     },
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
+    validated::JsonBody,
 };
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -534,7 +534,7 @@ impl GrpcRouter {
                 serve_harmony_responses_stream(&harmony_ctx, body, tenant_meta.clone(), None).await
             } else {
                 match serve_harmony_responses(&harmony_ctx, body, tenant_meta.clone(), None).await {
-                    Ok(response) => Json(response).into_response(),
+                    Ok(response) => JsonBody(response).into_response(),
                     Err(error_response) => error_response,
                 }
             }
@@ -685,7 +685,7 @@ impl GrpcRouter {
                 }),
             );
         }
-        (StatusCode::OK, Json(queued)).into_response()
+        (StatusCode::OK, JsonBody(queued)).into_response()
     }
 
     /// Main route_embeddings implementation
@@ -819,7 +819,7 @@ impl GrpcRouter {
         {
             Ok(input_tokens) => (
                 StatusCode::OK,
-                Json(CountMessageTokensResponse { input_tokens }),
+                JsonBody(CountMessageTokensResponse { input_tokens }),
             )
                 .into_response(),
             Err(refused) => refused,
@@ -960,7 +960,7 @@ impl GrpcRouter {
             container: None,
         };
         if !stream {
-            return (StatusCode::OK, Json(message)).into_response();
+            return (StatusCode::OK, JsonBody(message)).into_response();
         }
 
         let events = [

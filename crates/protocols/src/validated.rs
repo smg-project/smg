@@ -13,6 +13,8 @@ pub trait Normalizable {
 
 #[cfg(feature = "axum")]
 use std::borrow::Cow;
+#[cfg(feature = "axum")]
+use std::cell::RefCell;
 
 #[cfg(feature = "axum")]
 use axum::{
@@ -21,7 +23,7 @@ use axum::{
         rejection::{BytesRejection, FailedToBufferBody, JsonRejection},
         FromRequest, Request,
     },
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -549,6 +551,75 @@ impl<T> std::ops::Deref for ValidatedJson<T> {
 impl<T> std::ops::DerefMut for ValidatedJson<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+/// A JSON response body written once into a buffer of its own size.
+///
+/// `axum::Json` serializes into a 128-byte buffer that doubles as the body
+/// grows, so a chat completion of 513 to 1,024 bytes costs four allocations
+/// and three copies of what was written so far. This responder serializes
+/// into a thread-local buffer and copies the finished body once into
+/// exact-size [`Bytes`]: one allocation per response. The wire is
+/// `axum::Json`'s: `content-type: application/json` and the serialized bytes,
+/// or a 500 with the error text when serialization fails. A thread's buffer
+/// keeps up to 64 KiB between responses; a larger body's buffer is dropped
+/// after use.
+#[cfg(feature = "axum")]
+pub struct JsonBody<T>(pub T);
+
+#[cfg(feature = "axum")]
+impl<T: serde::Serialize> IntoResponse for JsonBody<T> {
+    fn into_response(self) -> Response {
+        JSON_BODY_BUFFER.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut buffer) => {
+                buffer.clear();
+                let result = serde_json::to_writer(&mut *buffer, &self.0);
+                let response = json_body_response(&buffer, result);
+                if buffer.capacity() > JSON_BODY_RETAINED {
+                    *buffer = Vec::new();
+                }
+                response
+            }
+            // A serializer that builds a response of its own while this one
+            // holds the thread's buffer (none does today): a buffer of this
+            // call's own.
+            Err(_) => {
+                let mut buffer = Vec::new();
+                let result = serde_json::to_writer(&mut buffer, &self.0);
+                json_body_response(&buffer, result)
+            }
+        })
+    }
+}
+
+/// The capacity a thread's JSON body buffer keeps between responses.
+#[cfg(feature = "axum")]
+const JSON_BODY_RETAINED: usize = 64 * 1024;
+
+#[cfg(feature = "axum")]
+thread_local! {
+    static JSON_BODY_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The response of a serialized JSON body, compiled once for every `T`.
+#[cfg(feature = "axum")]
+fn json_body_response(body: &[u8], result: serde_json::Result<()>) -> Response {
+    match result {
+        Ok(()) => (
+            [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+            Bytes::copy_from_slice(body),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            err.to_string(),
+        )
+            .into_response(),
     }
 }
 

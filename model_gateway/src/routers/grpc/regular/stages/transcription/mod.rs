@@ -18,7 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use llm_multimodal::registry::transcription::{TranscriptionFamily, FAMILIES};
-use openai_protocol::transcription::AudioFile;
+use openai_protocol::{transcription::AudioFile, validated::JsonBody};
 pub(crate) use preparation::TranscriptionPreparationStage;
 pub(crate) use request_building::TranscriptionRequestBuildingStage;
 pub(crate) use response_processing::TranscriptionResponseProcessingStage;
@@ -92,7 +92,7 @@ pub(crate) fn parse_response_format(
 /// Render the final transcript in the chosen wire format.
 pub(crate) fn render(format: TranscriptionResponseFormat, text: String) -> Response {
     match format {
-        TranscriptionResponseFormat::Json => axum::Json(json!({ "text": text })).into_response(),
+        TranscriptionResponseFormat::Json => JsonBody(json!({ "text": text })).into_response(),
         TranscriptionResponseFormat::Text => {
             ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
         }

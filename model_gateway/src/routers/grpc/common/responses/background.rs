@@ -43,10 +43,12 @@ use axum::{
     body::{to_bytes, Body},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use futures::{future::BoxFuture, FutureExt};
-use openai_protocol::responses::{ResponseStatus, ResponsesRequest, ResponsesResponse};
+use openai_protocol::{
+    responses::{ResponseStatus, ResponsesRequest, ResponsesResponse},
+    validated::JsonBody,
+};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use smg_data_connector::{
@@ -1049,7 +1051,7 @@ async fn cancel_with(
                         response_id,
                         "Background response closed as cancelled; no task runs it on this gateway"
                     );
-                    (StatusCode::OK, Json(raw)).into_response()
+                    (StatusCode::OK, JsonBody(raw)).into_response()
                 }
                 Ok(Transition::Terminal(raw)) => answer_for_closed(raw),
                 Ok(Transition::Missing) => error::not_found(
@@ -1098,7 +1100,7 @@ fn response_not_found(id: &str) -> Response {
 /// the `cancelled` object, or the refusal its status earns.
 fn answer_for_closed(raw: Value) -> Response {
     match raw["status"].as_str().unwrap_or("unknown") {
-        "cancelled" => (StatusCode::OK, Json(raw)).into_response(),
+        "cancelled" => (StatusCode::OK, JsonBody(raw)).into_response(),
         "completed" | "incomplete" => error::bad_request(
             "response_already_completed",
             "Cannot cancel completed response",

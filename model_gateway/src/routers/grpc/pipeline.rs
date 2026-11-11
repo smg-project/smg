@@ -27,6 +27,7 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::{GenerateRequest, GenerateResponse},
     messages::CreateMessageRequest,
+    validated::JsonBody,
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_external_router::header_utils::insert_routed_worker_id;
@@ -1164,7 +1165,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, JsonBody(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_chat",
@@ -1225,7 +1226,7 @@ impl RequestPipeline {
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     let body = generate_response_body(single_prompt, n, response);
-                    Self::routed_response(&dctx, axum::Json(body).into_response())
+                    Self::routed_response(&dctx, JsonBody(body).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_generate",
@@ -1269,7 +1270,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, JsonBody(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_completion",
@@ -1316,7 +1317,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, JsonBody(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_messages",
@@ -1363,7 +1364,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, JsonBody(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_decisions",
@@ -1407,7 +1408,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, JsonBody(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_embeddings",
@@ -1508,7 +1509,7 @@ impl RequestPipeline {
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    Self::routed_response(&dctx, JsonBody(response).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_classify",

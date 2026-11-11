@@ -28,7 +28,10 @@ use axum::{
     http,
     response::{IntoResponse, Response},
 };
-use openai_protocol::responses::{ResponsesRequest, ResponsesResponse};
+use openai_protocol::{
+    responses::{ResponsesRequest, ResponsesResponse},
+    validated::JsonBody,
+};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -130,7 +133,7 @@ async fn route_responses_sync(
 ) -> Response {
     match non_streaming::route_responses_internal(ctx, request, params).await {
         Ok((responses_response, parser)) => naming_parser(
-            axum::Json(responses_response).into_response(),
+            JsonBody(responses_response).into_response(),
             parser.map(|parser| http::HeaderValue::from_static(parser.name())),
         ),
         Err(response) => response, // Already a Response with proper status code
