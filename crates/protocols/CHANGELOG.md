@@ -35,6 +35,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 
 ### Fixed
 
+- A completion choice without log probabilities is written with `"logprobs": null`, in a buffered
+  body and in each chunk of a stream, as the public API sends it and a chat choice is written. The
+  key was left out, so a client generated from the public schema, which marks it required, read a
+  choice it does not expect. A choice with log probabilities is written as before.
 - A usage object whose `prompt_tokens_details` leaves out `cached_tokens` parses, with no tokens
   cached, as the public API defaults the key. The crate refused the whole usage, and the
   completion around it, with ``missing field `cached_tokens` ``. The newer counters an upstream

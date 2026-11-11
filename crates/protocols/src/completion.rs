@@ -437,7 +437,8 @@ pub struct CompletionResponse {
 pub struct CompletionChoice {
     pub text: String,
     pub index: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always present (`null` unless log probabilities were requested), as
+    /// the OpenAI API sends it.
     pub logprobs: Option<LogProbs>,
     pub finish_reason: Option<String>, // "stop", "length", "content_filter", etc.
     /// Information about which stop condition was matched
@@ -462,7 +463,8 @@ pub struct CompletionStreamResponse {
 pub struct CompletionStreamChoice {
     pub text: String,
     pub index: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always present (`null` unless log probabilities were requested), as
+    /// the OpenAI API sends it.
     pub logprobs: Option<LogProbs>,
     pub finish_reason: Option<String>,
 }
