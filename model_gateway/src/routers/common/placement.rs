@@ -303,11 +303,11 @@ pub(crate) fn select_from(
 
     // Under `--policy-engine engine` the engine decides over the bounded view
     // of the pool and the commit re-validates each target under this host's
-    // eligibility; a keyed request under the sticky override, and a model on
-    // another policy than the default, keep the legacy selection below. The
-    // lift travels with the request although no preset the engine serves
-    // places by session key, so the seam is exact when a keyed preset moves.
-    if let Some(decider) = policies.engine_for(policy.as_ref(), &info) {
+    // eligibility; a model on another policy than the default keeps the
+    // legacy selection below. A keyed request is a session of the engine's
+    // binding (the sticky override's rule, or the manual policy's own), and
+    // the lift travels with it as the legacy keyed path lifts the veto.
+    if let Some(decider) = policies.engine_for(policy.as_ref()) {
         return select_from_decided(RegularDecision {
             decider,
             registry,
@@ -3735,9 +3735,9 @@ mod tests {
         );
     }
 
-    /// Under the switch a keyed request stays with the sticky routing-key
-    /// override, whose legacy selection pins its owner, while an unkeyed one
-    /// rotates through the engine.
+    /// Under the switch a keyed request is a session of the engine's default
+    /// binding, pinned to its owner by the sticky routing-key override's
+    /// rule, while an unkeyed one rotates through the engine.
     #[test]
     fn with_the_engine_switch_the_sticky_override_keeps_its_owner() {
         let round_robin = PolicyConfig::RoundRobin;
@@ -3771,6 +3771,136 @@ mod tests {
             );
         }
         assert_eq!(seen.len(), 3, "an unkeyed request rotates: {seen:?}");
+        assert_eq!(
+            policies.decider().expect("the engine").decisions(),
+            8,
+            "the keyed placements were decided through the engine too"
+        );
+    }
+
+    /// Under the switch the manual policy and the sticky override decide
+    /// through the engine with the legacy outcomes, under the same inputs: a
+    /// key pins its first worker, every turn of a conversation shares that
+    /// owner under the override, and a new turn is a new key without it.
+    #[test]
+    fn with_the_engine_switch_the_manual_policy_and_the_override_pin_like_legacy() {
+        let keyed = |key: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-routing-key", key.parse().unwrap());
+            headers
+        };
+        let manual = || PolicyConfig::Manual {
+            eviction_interval_secs: 0,
+            max_idle_secs: 0,
+            assignment_mode: ManualAssignmentMode::MinLoad,
+        };
+        let turns = ["conv_t1", "conv_t2", "conv_t3_r1", "conv_r2"];
+        let modes = [PolicyEngineMode::Legacy, PolicyEngineMode::Engine];
+        for (config, mode) in [PolicyConfig::RoundRobin, manual()]
+            .iter()
+            .flat_map(|config| modes.iter().map(move |mode| (config, *mode)))
+        {
+            let policies = PolicyRegistry::with_override(
+                config.clone(),
+                RoutingKeyOverrideConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            )
+            .with_policy_engine(mode, config, config);
+            assert_eq!(
+                policies.decider().is_some(),
+                mode == PolicyEngineMode::Engine
+            );
+            let name = policies.get_default_policy().name();
+            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+            let base = keyed("conv");
+            let owner = pick(&registry, &policies, with_headers(&base));
+            // A vacant key would go to a lighter worker.
+            owner.increment_load();
+            for turn in turns {
+                let headers = keyed(turn);
+                assert_eq!(
+                    pick(&registry, &policies, with_headers(&headers)).url(),
+                    owner.url(),
+                    "{name} under {mode:?}: {turn} left the owner of conv"
+                );
+            }
+            if let Some(decider) = policies.decider() {
+                assert_eq!(
+                    decider.decisions(),
+                    1 + turns.len() as u64,
+                    "{name}: every keyed placement was decided through the engine"
+                );
+            }
+        }
+
+        // Override off: the manual policy pins each raw key on its own.
+        for mode in modes {
+            let policies =
+                PolicyRegistry::new(manual()).with_policy_engine(mode, &manual(), &manual());
+            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+            let first = keyed("conv_t1");
+            let owner = pick(&registry, &policies, with_headers(&first));
+            owner.increment_load();
+            let second = keyed("conv_t2");
+            assert_ne!(
+                pick(&registry, &policies, with_headers(&second)).url(),
+                owner.url(),
+                "{mode:?}: without the override a new turn is a new key"
+            );
+        }
+    }
+
+    /// Under the switch a key whose owner is not ready takes a failover and
+    /// returns to its first owner once that worker is back under the manual
+    /// policy, as under legacy; under the override it stays on the failover,
+    /// as the legacy override pins the newest worker first.
+    #[test]
+    fn with_the_engine_switch_a_key_recovers_as_the_legacy_paths_do() {
+        let headers = keyed_headers();
+        let manual = PolicyConfig::Manual {
+            eviction_interval_secs: 0,
+            max_idle_secs: 0,
+            assignment_mode: ManualAssignmentMode::Random,
+        };
+        let cases = [
+            (manual, false, true),
+            (PolicyConfig::RoundRobin, true, false),
+        ];
+        for (config, override_on, returns) in cases {
+            for mode in [PolicyEngineMode::Legacy, PolicyEngineMode::Engine] {
+                let policies = PolicyRegistry::with_override(
+                    config.clone(),
+                    RoutingKeyOverrideConfig {
+                        enabled: override_on,
+                        ..Default::default()
+                    },
+                )
+                .with_policy_engine(mode, &config, &config);
+                let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+                let owner = pick(&registry, &policies, with_headers(&headers));
+                owner.set_status(WorkerStatus::NotReady);
+                let failover = pick(&registry, &policies, with_headers(&headers));
+                assert_ne!(failover.url(), owner.url(), "{mode:?}");
+                for _ in 0..3 {
+                    assert_eq!(
+                        pick(&registry, &policies, with_headers(&headers)).url(),
+                        failover.url(),
+                        "{mode:?}: the failover holds the key"
+                    );
+                }
+                owner.set_status(WorkerStatus::Ready);
+                let back = pick(&registry, &policies, with_headers(&headers));
+                assert_eq!(
+                    back.url() == owner.url(),
+                    returns,
+                    "{} under {mode:?}: the key went to {}",
+                    config.name(),
+                    back.url()
+                );
+            }
+        }
     }
 
     /// Under the switch a pool whose every worker is over the overload
